@@ -7,7 +7,7 @@ LDFLAGS     = -s -w \
               -X $(VERSION_PKG).BuildHash=$(GIT_HASH) \
               -X $(VERSION_PKG).BuildDate=$(BUILD_DATE)
 
-.PHONY: build test test-race lint fmt validate bench check docker docker-up docker-down certs update-homebrew clean help
+.PHONY: build test test-race lint fmt validate bench check docker docker-up docker-down certs clean help
 
 build: ## Build the sbproxy binary
 	go build -ldflags '$(LDFLAGS)' -o bin/sbproxy ./cmd/sbproxy/
@@ -46,9 +46,6 @@ docker-down: ## Stop Docker Compose stack
 
 certs: ## Generate self-signed dev certificates (CA, server, client)
 	@./scripts/generate-certs.sh
-
-update-homebrew: ## Update Homebrew formula after a release
-	@./scripts/update-homebrew.sh
 
 clean: ## Remove build artifacts
 	rm -rf bin/

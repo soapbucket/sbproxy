@@ -21,7 +21,6 @@ import (
 	"time"
 
 	masque "github.com/quic-go/masque-go"
-	"github.com/soapbucket/sbproxy/internal/ai/pricing"
 	"github.com/soapbucket/sbproxy/internal/config"
 	"github.com/soapbucket/sbproxy/internal/loader/configloader"
 	"github.com/soapbucket/sbproxy/internal/observe/events"
@@ -1421,9 +1420,6 @@ func populateAIUsageFromBody(requestData *reqctx.RequestData, trackingWriter *re
 			requestData.AIUsage.InputTokens = prompt
 			requestData.AIUsage.OutputTokens = completion
 			requestData.AIUsage.TotalTokens = total
-			if ps := pricing.Global(); ps != nil {
-				requestData.AIUsage.CostUSD = ps.CalculateCost(requestData.AIUsage.Model, prompt, completion, 0)
-			}
 			return
 		}
 	}
@@ -1439,9 +1435,6 @@ func populateAIUsageFromBody(requestData *reqctx.RequestData, trackingWriter *re
 			requestData.AIUsage.InputTokens = prompt
 			requestData.AIUsage.OutputTokens = completion
 			requestData.AIUsage.TotalTokens = total
-			if ps := pricing.Global(); ps != nil {
-				requestData.AIUsage.CostUSD = ps.CalculateCost(requestData.AIUsage.Model, prompt, completion, 0)
-			}
 		}
 	}
 }

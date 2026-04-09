@@ -1008,15 +1008,6 @@ type TokenCountTransform struct {
 	HeaderPrefix string `json:"header_prefix,omitempty"` // Default: "X-Token-Count"
 }
 
-// CostEstimateTransform estimates API call costs based on token usage.
-type CostEstimateTransform struct {
-	BaseTransform
-	Provider   string             `json:"provider,omitempty"` // "openai", "anthropic"
-	Model      string             `json:"model,omitempty"`
-	PricingMap map[string]float64 `json:"pricing_map,omitempty"` // Custom $/million-token rates: "input", "output"
-	Currency   string             `json:"currency,omitempty"`    // Default: "USD"
-}
-
 // AISchemaTransform validates LLM API request/response schemas.
 type AISchemaTransform struct {
 	BaseTransform

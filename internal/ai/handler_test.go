@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/soapbucket/sbproxy/internal/ai/pricing"
 	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -942,7 +941,6 @@ func TestHandler_ChatCompletion_RecordsAIUsage(t *testing.T) {
 
 	cfg := &ProviderConfig{Name: "test-provider"}
 	h := newTestHandler(t, mp, cfg)
-	h.config.Pricing = pricing.NewSource(nil)
 
 	reqBody := `{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(reqBody))
@@ -1015,7 +1013,6 @@ func TestHandler_ChatCompletion_Streaming_RecordsAIUsage(t *testing.T) {
 
 	cfg := &ProviderConfig{Name: "stream-provider"}
 	h := newTestHandler(t, mp, cfg)
-	h.config.Pricing = pricing.NewSource(nil)
 
 	reqBody := `{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}],"stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(reqBody))

@@ -146,8 +146,6 @@ const (
 	TransformClassify       = "classify"
 	// TransformTokenCount is a constant for transform token count.
 	TransformTokenCount     = "token_count"
-	// TransformCostEstimate is a constant for transform cost estimate.
-	TransformCostEstimate   = "cost_estimate"
 	// TransformAISchema is a constant for transform ai schema.
 	TransformAISchema       = "ai_schema"
 	// TransformAICache is a constant for transform ai cache.

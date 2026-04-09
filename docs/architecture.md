@@ -50,7 +50,7 @@ sbproxy/
       identity/       - Consumer identity resolution.
       limits/         - Rate limiting and concurrency controls.
       memory/         - Conversation context window management.
-      pricing/        - Cost tracking and provider pricing catalog.
+      pricing/        - Token usage tracking interfaces.
       providers/      - OpenAI, Anthropic, Gemini, and other LLM adapters.
       response/       - Fake streaming, spend tracking, response normalization.
       routing/        - Fallback chains, context window routing, model selection.

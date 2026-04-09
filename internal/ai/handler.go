@@ -19,7 +19,6 @@ import (
 	"github.com/soapbucket/sbproxy/internal/ai/keys"
 	"github.com/soapbucket/sbproxy/internal/ai/memory"
 	"github.com/soapbucket/sbproxy/internal/ai/limits"
-	"github.com/soapbucket/sbproxy/internal/ai/pricing"
 	"github.com/soapbucket/sbproxy/internal/observe/events"
 	"github.com/soapbucket/sbproxy/internal/observe/logging"
 	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
@@ -80,8 +79,6 @@ type HandlerConfig struct {
 	PromptRegistryURL string `json:"prompt_registry_url,omitempty"`
 	// Guardrails runs safety checks on input/output.
 	Guardrails GuardrailRunner `json:"-"`
-	// Pricing calculates cost from token usage.
-	Pricing *pricing.Source `json:"-"`
 	// Budget enforces spending/token limits.
 	Budget *BudgetEnforcer `json:"-"`
 	// Cache provides semantic similarity-based response caching.
@@ -1024,10 +1021,6 @@ func (h *Handler) handleNonStreamingCompletion(w http.ResponseWriter, r *http.Re
 			totalTokens = resp.Usage.PromptTokens + resp.Usage.CompletionTokens
 		}
 		w.Header().Set("X-Sb-AI-Tokens-Total", strconv.Itoa(totalTokens))
-		if h.config.Pricing != nil {
-			cost := h.config.Pricing.CalculateCost(req.Model, resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.Usage.PromptTokensCached)
-			w.Header().Set("X-Sb-AI-Cost", strconv.FormatFloat(cost, 'f', -1, 64))
-		}
 	}
 
 	respBytes, _ := json.Marshal(resp)
@@ -1230,9 +1223,6 @@ func (h *Handler) handleStreamingCompletion(w http.ResponseWriter, r *http.Reque
 				if accumulated != nil {
 					latencyMs := time.Since(streamStart).Milliseconds()
 					var cost float64
-					if h.config.Pricing != nil {
-						cost = h.config.Pricing.CalculateCost(req.Model, accumulated.PromptTokens, accumulated.CompletionTokens, accumulated.PromptTokensCached)
-					}
 					totalTokens := accumulated.TotalTokens
 					if totalTokens == 0 {
 						totalTokens = accumulated.PromptTokens + accumulated.CompletionTokens
@@ -1327,9 +1317,6 @@ func (h *Handler) recordUsage(ctx context.Context, provider, model string, usage
 	}
 
 	var cost float64
-	if h.config.Pricing != nil {
-		cost = h.config.Pricing.CalculateCost(model, usage.PromptTokens, usage.CompletionTokens, usage.PromptTokensCached)
-	}
 
 	totalTokens := usage.TotalTokens
 	if totalTokens == 0 {

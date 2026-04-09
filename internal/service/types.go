@@ -225,9 +225,6 @@ type ProxyConfig struct {
 	SignatureCacheNormalizePath    bool   `yaml:"signature_cache_normalize_path" mapstructure:"signature_cache_normalize_path"`
 	SignatureCacheDefaultMethod    string `yaml:"signature_cache_default_method" mapstructure:"signature_cache_default_method"`
 
-	// AI pricing file path (LiteLLM format JSON) for cost-optimized routing
-	AIPricingFile string `yaml:"ai_pricing_file" mapstructure:"ai_pricing_file"`
-
 	// AI providers file path (YAML) for HTTPS proxy AI provider detection
 	AIProvidersFile string `yaml:"ai_providers_file" mapstructure:"ai_providers_file"`
 }

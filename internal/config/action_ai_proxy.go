@@ -17,7 +17,6 @@ import (
 	"github.com/soapbucket/sbproxy/internal/ai/routing"
 	"github.com/soapbucket/sbproxy/internal/ai/guardrails"
 	"github.com/soapbucket/sbproxy/internal/ai/memory"
-	"github.com/soapbucket/sbproxy/internal/ai/pricing"
 
 	// Import providers to trigger init() registration
 	_ "github.com/soapbucket/sbproxy/internal/ai/providers"
@@ -196,7 +195,6 @@ func (a *AIProxyAction) Init(cfg *Config) error {
 		MaxRequestBodySize: a.MaxRequestBodySize,
 		Routing:            a.Routing,
 		PromptRegistryURL:  a.PromptRegistryURL,
-		Pricing:            pricingSource(),
 		AllowedModels:      a.AllowedModels,
 		BlockedModels:      a.BlockedModels,
 		AllowedProviders:   a.AllowedProviders,
@@ -494,12 +492,4 @@ func (g *guardrailAdapter) CheckContent(ctx context.Context, content string, mod
 		})
 	}
 	return out, nil
-}
-
-// pricingSource returns the global pricing source, falling back to defaults.
-func pricingSource() *pricing.Source {
-	if s := pricing.Global(); s != nil {
-		return s
-	}
-	return pricing.NewSource(nil)
 }

@@ -1,8 +1,8 @@
-# AI Gateway with Cost-Optimized Routing
+# AI Gateway with Token-Based Cost Routing
 #
-# Automatically routes to the cheapest provider that supports the
-# requested model. Uses a built-in pricing catalog. Premium users
-# (identified by header) get higher rate limits and the best model.
+# Routes to the provider with the most available token capacity based
+# on max_tokens_per_minute limits. Premium users (identified by header)
+# get higher rate limits and the best model.
 #
 # Test (standard user):
 #   curl -H "Host: ai.example.com" -X POST http://localhost:8080/v1/chat/completions \
