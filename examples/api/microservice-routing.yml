@@ -1,0 +1,74 @@
+# Microservice Routing with Forward Rules
+#
+# A single hostname routes to different backends based on URL path.
+# Each sub-route can have its own auth, rate limits, and transforms.
+#
+# Test:
+#   curl -H "Host: api.example.com" http://localhost:8080/api/users
+#   curl -H "Host: api.example.com" http://localhost:8080/api/orders
+#   curl -H "Host: api.example.com" http://localhost:8080/health
+#   curl -H "Host: api.example.com" http://localhost:8080/anything-else
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.example.com":
+    # Default backend for unmatched paths
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    forward_rules:
+      # /api/users/* -> Users microservice
+      - rules:
+          - path:
+              prefix: /api/users
+        origin:
+          id: users-service
+          hostname: users-service
+          workspace_id: example
+          version: "1.0.0"
+          action:
+            type: proxy
+            url: https://httpbin.org/anything
+          policies:
+            - type: rate_limit
+              requests_per_minute: 100
+
+      # /api/orders/* -> Orders microservice
+      - rules:
+          - path:
+              prefix: /api/orders
+        origin:
+          id: orders-service
+          hostname: orders-service
+          workspace_id: example
+          version: "1.0.0"
+          action:
+            type: proxy
+            url: https://httpbin.org/anything
+          authentication:
+            type: api_key
+            api_keys:
+              - ${ORDERS_API_KEY}
+
+      # /health -> Static health check (no backend needed)
+      - rules:
+          - path:
+              exact: /health
+        origin:
+          id: health
+          hostname: health
+          workspace_id: example
+          version: "1.0.0"
+          action:
+            type: static
+            status_code: 200
+            content_type: application/json
+            json_body:
+              status: healthy
+              version: "1.0.0"
+              services:
+                users: up
+                orders: up

@@ -1,0 +1,63 @@
+# AI Gateway with CEL Guardrails
+#
+# Blocks prompt injection attempts and enforces department tagging.
+# Combines content-based guardrails with authentication and rate limiting.
+#
+# Test (blocked - no department header):
+#   curl -H "Host: ai.example.com" -X POST http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -H "X-API-Key: ${AI_GATEWAY_KEY}" \
+#     -d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Hello"}]}'
+#
+# Test (allowed):
+#   curl -H "Host: ai.example.com" -X POST http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -H "X-API-Key: ${AI_GATEWAY_KEY}" \
+#     -H "X-Department: engineering" \
+#     -d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Hello"}]}'
+#
+# Requires: OPENAI_API_KEY, AI_GATEWAY_KEY environment variables
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o, gpt-4o-mini]
+      default_model: gpt-4o-mini
+      routing:
+        strategy: round_robin
+      # Budget and guardrails should block on failure, not pass through
+      failure_mode: open
+      failure_overrides:
+        budget: closed
+        guardrails: closed
+    authentication:
+      type: api_key
+      api_keys:
+        - ${AI_GATEWAY_KEY}
+    policies:
+      - type: rate_limit
+        requests_per_minute: 100
+    # Block requests without a department header
+    request_modifiers:
+      cel:
+        - expression: >
+            request.headers['x-department'] == ''
+              ? {"set_headers": {"X-Block": "true"}}
+              : {}
+    # Block prompt injection attempts
+    guardrail_expressions:
+      - name: block_injection
+        phase: input
+        condition: |
+          request.messages.exists(m,
+            m.role == "user" &&
+            m.content.contains("ignore previous instructions"))
+        action: block
+        message: "Request blocked: prompt injection detected"

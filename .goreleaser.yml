@@ -1,0 +1,47 @@
+version: 2
+
+builds:
+  - main: ./cmd/sbproxy
+    binary: sbproxy
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/soapbucket/sbproxy/internal/version.Version={{.Version}}
+      - -X github.com/soapbucket/sbproxy/internal/version.BuildHash={{.ShortCommit}}
+      - -X github.com/soapbucket/sbproxy/internal/version.BuildDate={{.Date}}
+      - -X github.com/soapbucket/sbproxy/internal/version.BuildNumber={{.Env.BUILD_NUMBER}}
+
+archives:
+  - format: tar.gz
+    name_template: "sbproxy_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+
+dockers:
+  - image_templates:
+      - "ghcr.io/soapbucket/sbproxy:{{ .Tag }}"
+      - "ghcr.io/soapbucket/sbproxy:latest"
+    dockerfile: Dockerfile
+    build_flag_templates:
+      - "--pull"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.title=sbproxy"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"

@@ -1,0 +1,62 @@
+# Docker Compose example: auto-TLS with Pebble ACME + Redis-backed rate limiting
+#
+# This config mirrors the setup in docker/sb.yml and is intended for use
+# with the Compose stack in the docker/ directory.
+#
+# Start the full stack:
+#   docker compose -f docker/docker-compose.yml up
+#
+# Or run sbproxy directly (requires local Redis and Pebble):
+#   redis-server &
+#   pebble -config docker/pebble-config.json &
+#   sbproxy serve -f examples/docker-redis-acme.yml
+#
+# Test auto-TLS (Pebble uses a self-signed CA; fetch its root with the management API):
+#   curl https://localhost:15000/roots/0 -o pebble-root.pem
+#   curl --cacert pebble-root.pem -H "Host: demo.localhost" https://localhost:8443/get
+#
+# Test rate limiting (send 11 requests; the 11th returns 429):
+#   for i in $(seq 1 11); do curl -s -o /dev/null -w "%{http_code}\n" \
+#     -H "Host: demo.localhost" http://localhost:8080/get; done
+
+proxy:
+  http_bind_port: 8080
+  https_bind_port: 8443
+
+  certificate_settings:
+    use_acme: true
+    acme_email: test@example.com
+    # Point at Pebble for local testing. Change to the Let's Encrypt production
+    # directory (https://acme-v02.api.letsencrypt.org/directory) for real deployments.
+    acme_directory_url: https://pebble:14000/dir
+    acme_insecure_skip_verify: true
+    acme_cache_dir: /etc/sbproxy/certs
+
+  logging:
+    format: dev
+
+# Redis L2 cache enables distributed, accurate rate limit counters across replicas.
+l2_cache_settings:
+  driver: redis
+  params:
+    dsn: redis://redis:6379/0
+
+messenger_settings:
+  driver: redis
+  params:
+    addr: redis:6379
+
+origins:
+  "demo.localhost":
+    action:
+      type: proxy
+      url: https://httpbin.org
+    policies:
+      - type: rate_limit
+        limit: 10
+        window: 1m
+        key: client_ip
+
+  "echo.localhost":
+    action:
+      type: echo

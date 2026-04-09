@@ -1,0 +1,92 @@
+services:
+  sbproxy:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+      - "8443:8443/udp"
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+      - pebble-certs:/etc/sbproxy/certs
+    environment:
+      - SB_LOG_LEVEL=info
+    depends_on:
+      redis:
+        condition: service_healthy
+      pebble:
+        condition: service_started
+      jaeger:
+        condition: service_started
+    networks:
+      - sbnet
+
+  pebble:
+    image: letsencrypt/pebble:latest
+    command: pebble -config /test/config/pebble-config.json
+    ports:
+      - "14000:14000"
+      - "15000:15000"
+    environment:
+      # Skip sleep delays between validation attempts for fast local testing
+      - PEBBLE_VA_NOSLEEP=1
+      # Accept all validation challenges without actually verifying DNS/HTTP
+      - PEBBLE_VA_ALWAYS_VALID=1
+    volumes:
+      - ./pebble-config.json:/test/config/pebble-config.json:ro
+    networks:
+      - sbnet
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - sbnet
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - sbnet
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+    depends_on:
+      - prometheus
+    networks:
+      - sbnet
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - sbnet
+
+networks:
+  sbnet:
+    driver: bridge
+
+volumes:
+  pebble-certs:

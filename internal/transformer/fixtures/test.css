@@ -1,0 +1,50 @@
+/* Test CSS file for minification */
+body {
+    font-family: Arial, sans-serif;
+    margin: 0;
+    padding: 20px;
+    background-color: #ffffff;
+}
+
+.container {
+    width: 100%;
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+.header {
+    background-color: #333333;
+    color: #ffffff;
+    padding: 20px;
+    text-align: center;
+}
+
+/* Nested selectors */
+.content {
+    display: flex;
+    flex-direction: column;
+}
+
+.content .item {
+    margin: 10px 0;
+    padding: 15px;
+    border: 1px solid #cccccc;
+}
+
+.content .item:hover {
+    background-color: #f0f0f0;
+}
+
+/* Media queries */
+@media (max-width: 768px) {
+    .container {
+        padding: 10px;
+    }
+    
+    .header {
+        font-size: 18px;
+    }
+}
+
+/* Comments should be removed */
+

@@ -1,0 +1,41 @@
+# API Proxy with Distributed Rate Limiting (Redis)
+#
+# Rate limits are shared across all proxy instances via Redis.
+# Clients get 60 requests per minute with a burst of 10.
+# Internal IPs (10.0.0.0/8) are exempt from rate limiting.
+#
+# Test:
+#   # Send requests rapidly - the limit kicks in after 60/min
+#   for i in $(seq 1 65); do
+#     curl -s -o /dev/null -w "%{http_code}\n" \
+#       -H "Host: api.example.com" http://localhost:8080/get
+#   done
+#
+# Requires: Redis running on localhost:6379
+
+proxy:
+  http_bind_port: 8080
+
+l2_cache_settings:
+  driver: redis
+  params:
+    dsn: redis://localhost:6379/0
+
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://httpbin.org
+    authentication:
+      type: api_key
+      api_keys:
+        - ${API_KEY}
+    policies:
+      - type: rate_limit
+        requests_per_minute: 60
+        requests_per_hour: 1000
+        burst_size: 10
+        algorithm: sliding_window
+        whitelist:
+          - 10.0.0.0/8
+          - 127.0.0.1/32

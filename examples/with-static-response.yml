@@ -1,0 +1,40 @@
+# Static response example
+# Returns fixed responses without proxying to an upstream
+# Useful for health endpoints, maintenance pages, and mock APIs
+#
+# Test:
+#   curl -H "Host: api.example.com" http://localhost:8080/
+#   curl -H "Host: api.example.com" http://localhost:8080/api/status
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.example.com":
+    action:
+      type: static
+      status_code: 200
+      content_type: application/json
+      json_body:
+        name: sbproxy
+        version: "0.1.0"
+        status: running
+        endpoints:
+          - /api/status
+          - /api/health
+    forward_rules:
+      - rules:
+          - path:
+              exact: /api/status
+        origin:
+          id: status
+          hostname: status
+          workspace_id: example
+          version: "1.0.0"
+          action:
+            type: static
+            status_code: 200
+            content_type: application/json
+            json_body:
+              status: healthy
+              uptime: "running"

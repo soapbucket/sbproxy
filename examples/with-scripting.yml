@@ -1,0 +1,36 @@
+# CEL + Lua scripting example
+# Demonstrates CEL expressions for routing and Lua for request modification
+#
+# Test: curl -H "Host: ai.example.com" -X POST http://localhost:8080/v1/chat/completions \
+#   -H "Content-Type: application/json" \
+#   -d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Hello"}]}'
+#
+# Note: Requires OPENAI_API_KEY environment variable
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o, gpt-4o-mini]
+      default_model: gpt-4o-mini
+      routing:
+        strategy: weighted
+        # CEL expression: route code questions to gpt-4o, everything else to gpt-4o-mini
+        model_selector: |
+          request.messages.exists(m, m.content.contains("```")) ? "gpt-4o" : "gpt-4o-mini"
+    # CEL guardrails: block prompt injection attempts
+    guardrail_expressions:
+      - name: block_injection
+        phase: input
+        condition: |
+          request.messages.exists(m,
+            m.role == "user" &&
+            m.content.contains("ignore previous instructions"))
+        action: block
+        message: "Request blocked: prompt injection detected"

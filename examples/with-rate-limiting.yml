@@ -1,0 +1,17 @@
+# Rate limiting example
+# Test: curl -H "Host: api.example.com" http://localhost:8080/get
+# Send 6 rapid requests - the 6th should return 429
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://httpbin.org
+    policies:
+      - type: rate_limit
+        limit: 5
+        window: 1m
+        key: client_ip

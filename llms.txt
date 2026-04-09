@@ -1,0 +1,131 @@
+# sbproxy
+
+> A high-performance reverse proxy and AI gateway in a single binary.
+
+sbproxy sits between your clients and backends, providing authentication, caching, rate limiting, request/response transforms, load balancing, and AI model routing with zero external dependencies.
+
+## Overview
+
+- Single Go binary, sub-millisecond proxy overhead
+- 103 native LLM providers (OpenAI, Anthropic, Google, Mistral, and more)
+- Path-based routing with hostname matching
+- CEL expressions and Lua scripting for custom logic
+- HTTP/3 with QUIC, WebSocket, and gRPC support
+- Prometheus metrics and OpenTelemetry tracing
+- Apache License 2.0
+
+## Documentation
+
+- [Manual](https://github.com/soapbucket/sbproxy/blob/main/docs/manual.md): Runtime reference, CLI flags, deployment, logging, metrics, TLS, health checks
+- [Configuration](https://github.com/soapbucket/sbproxy/blob/main/docs/configuration.md): All config options with YAML examples
+- [Architecture](https://github.com/soapbucket/sbproxy/blob/main/docs/architecture.md): Package layout, request pipeline, plugin system
+- [Scripting](https://github.com/soapbucket/sbproxy/blob/main/docs/scripting.md): CEL and Lua reference with all context variables and functions
+- [AI Gateway](https://github.com/soapbucket/sbproxy/blob/main/docs/ai-gateway.md): Provider setup, routing strategies, guardrails
+- [Examples](https://github.com/soapbucket/sbproxy/tree/main/examples): Ready-to-use configuration files
+
+## Quick Start
+
+Install:
+```
+go install github.com/soapbucket/sbproxy/cmd/sbproxy@latest
+```
+
+Minimal config (sb.yml):
+```yaml
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://httpbin.org
+```
+
+Run:
+```
+sbproxy serve -f sb.yml
+```
+
+## AI Gateway
+
+sbproxy provides a unified OpenAI-compatible API across all providers.
+
+```yaml
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o, gpt-4o-mini]
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          models: [claude-sonnet-4-20250514]
+      default_model: gpt-4o-mini
+      routing:
+        strategy: fallback_chain
+```
+
+Routing strategies: round_robin, fallback_chain, cost, latency.
+
+## Configuration Model
+
+Top-level structure:
+- `proxy:` - global settings (ports, TLS, ACME, timeouts)
+- `origins:` - per-hostname routing rules
+
+Each origin has:
+- `action` - what to do (proxy, ai_proxy, static, redirect, echo, loadbalancer, websocket, grpc, mcp)
+- `authentication` - who can access (api_key, basic_auth, jwt, oauth2, forward_auth, ip_filter)
+- `policies` - rules and limits (rate_limiting, concurrency, expression, security_headers, cors, csrf, circuit_breaker)
+- `response_cache` - HTTP response caching with TTL
+- `request_modifiers` / `response_modifiers` - CEL or Lua scripts
+- `transforms` - response body transforms (json, html, css)
+- `forward_rules` - sub-route to different backends
+- `variables` / `secrets` - template variables and vault-managed secrets
+- `events` - subscriber configuration
+
+## Scripting
+
+Two engines:
+- CEL (Common Expression Language): compiled, microsecond evaluation. Best for routing decisions and simple checks.
+- Lua: interpreted, full scripting. Best for complex transformations.
+
+Nine context namespaces available in both: request, session, origin, server, vars, features, client, ctx, response.
+
+## Actions
+
+| Type | Description |
+|------|-------------|
+| proxy | Forward requests to an upstream URL |
+| ai_proxy | Route across LLM providers with fallback and routing strategies |
+| static | Serve files from a directory |
+| redirect | Return HTTP redirects |
+| echo | Return the request as JSON (debugging) |
+| loadbalancer | Distribute traffic across backends |
+| websocket | Proxy WebSocket connections |
+| grpc | Proxy gRPC traffic |
+| mcp | Model Context Protocol gateway |
+
+## Authentication Types
+
+| Type | Description |
+|------|-------------|
+| api_key | Check X-API-Key header or query parameter |
+| basic_auth | HTTP Basic authentication |
+| jwt | JWT validation with JWKS endpoint |
+| oauth2 | OAuth 2.0 authorization code flow |
+| forward_auth | Delegate to external auth service |
+| ip_filter | Whitelist/blacklist by IP or CIDR |
+
+## Links
+
+- Source: https://github.com/soapbucket/sbproxy
+- Website: https://www.soapbucket.com
+- Docker: ghcr.io/soapbucket/sbproxy
+- License: Apache 2.0

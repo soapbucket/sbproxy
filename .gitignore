@@ -1,0 +1,38 @@
+# Binaries
+bin/
+/sbproxy
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Benchmarks
+new.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Generated certs (use make certs to regenerate)
+certs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+dist/
+
+# Temporary
+tmp/
+*.tmp
+*.log

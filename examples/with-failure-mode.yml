@@ -1,0 +1,37 @@
+# Fail-open/fail-closed configuration example
+# Demonstrates how the proxy handles subsystem failures gracefully
+#
+# With failure_mode: open (default), the proxy continues serving requests
+# even when Redis is down or a subsystem errors. Budget and guardrails
+# are set to fail-closed for safety.
+#
+# Test: curl -H "Host: ai.example.com" -X POST http://localhost:8080/v1/chat/completions \
+#   -H "Content-Type: application/json" \
+#   -d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Hello"}]}'
+#
+# Note: Requires OPENAI_API_KEY environment variable
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o-mini]
+      default_model: gpt-4o-mini
+      # Global default: fail open (keep serving)
+      failure_mode: open
+      # Per-subsystem overrides
+      failure_overrides:
+        # Budget checks fail closed: if we can't verify budget, block the request
+        budget: closed
+        # Guardrails fail closed: if guardrail check errors, block the request
+        guardrails: closed
+        # Rate limiting fails open: if Redis is down, allow requests
+        rate_limiting: open
+        # Cache fails open: if cache is unavailable, go direct to provider
+        cache: open

@@ -1,0 +1,24 @@
+# Request/response transform example
+# Test: curl -H "Host: api.example.com" http://localhost:8080/get
+# The response will have custom headers injected
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://httpbin.org
+    request_modifiers:
+      - type: header
+        set:
+          X-Forwarded-By: sbproxy
+          X-Custom-Header: hello-from-proxy
+    response_modifiers:
+      - type: header
+        set:
+          X-Powered-By: sbproxy
+          X-Response-Time: "{{ request.start_time }}"
+        remove:
+          - Server

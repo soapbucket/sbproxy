@@ -1,0 +1,15 @@
+# WebSocket proxy example
+# Test: Use a WebSocket client to connect to ws://localhost:8080
+# The proxy forwards WebSocket connections to the echo server
+#
+# Quick test with websocat (install: cargo install websocat):
+#   websocat ws://localhost:8080 -H "Host: ws.example.com"
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ws.example.com":
+    action:
+      type: websocket_rfc8441
+      url: wss://echo.websocket.org

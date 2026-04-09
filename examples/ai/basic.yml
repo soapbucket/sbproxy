@@ -1,0 +1,25 @@
+# Basic AI Proxy - Single Provider
+#
+# The simplest AI gateway configuration. Routes all requests to OpenAI.
+#
+# Test:
+#   curl -H "Host: ai.example.com" -X POST http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Hello"}]}'
+#
+# Requires: OPENAI_API_KEY environment variable
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o, gpt-4o-mini]
+      default_model: gpt-4o-mini
+      routing:
+        strategy: round_robin

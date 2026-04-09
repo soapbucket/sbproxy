@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.5'
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download release artifacts and compute hashes
+        id: hashes
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          BASE_URL="https://github.com/soapbucket/sbproxy/releases/download/v${VERSION}"
+
+          for platform in darwin_arm64 darwin_amd64 linux_arm64 linux_amd64; do
+            archive="sbproxy_${platform}.tar.gz"
+            echo "Downloading ${archive}..."
+            curl -fsSL "${BASE_URL}/${archive}" -o "/tmp/${archive}" || {
+              echo "WARN: ${archive} not available"
+              continue
+            }
+            hash=$(sha256sum "/tmp/${archive}" | awk '{print $1}')
+            echo "${platform}=${hash}" >> "$GITHUB_OUTPUT"
+            echo "  ${platform}: ${hash}"
+          done
+
+      - name: Update Homebrew formula
+        uses: actions/checkout@v4
+        with:
+          repository: soapbucket/homebrew-sbproxy
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-sbproxy
+
+      - name: Write updated formula
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          cat > homebrew-sbproxy/sbproxy.rb << 'FORMULA'
+          class Sbproxy < Formula
+            desc "High-performance reverse proxy and AI gateway"
+            homepage "https://github.com/soapbucket/sbproxy"
+            license "Apache-2.0"
+            version "VERSION_PLACEHOLDER"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/soapbucket/sbproxy/releases/download/v#{version}/sbproxy_darwin_arm64.tar.gz"
+                sha256 "DARWIN_ARM64_PLACEHOLDER"
+              else
+                url "https://github.com/soapbucket/sbproxy/releases/download/v#{version}/sbproxy_darwin_amd64.tar.gz"
+                sha256 "DARWIN_AMD64_PLACEHOLDER"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/soapbucket/sbproxy/releases/download/v#{version}/sbproxy_linux_arm64.tar.gz"
+                sha256 "LINUX_ARM64_PLACEHOLDER"
+              else
+                url "https://github.com/soapbucket/sbproxy/releases/download/v#{version}/sbproxy_linux_amd64.tar.gz"
+                sha256 "LINUX_AMD64_PLACEHOLDER"
+              end
+            end
+
+            def install
+              bin.install "sbproxy"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/sbproxy --version")
+            end
+          end
+          FORMULA
+
+          # Replace placeholders
+          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/" homebrew-sbproxy/sbproxy.rb
+          sed -i "s/DARWIN_ARM64_PLACEHOLDER/${{ steps.hashes.outputs.darwin_arm64 }}/" homebrew-sbproxy/sbproxy.rb
+          sed -i "s/DARWIN_AMD64_PLACEHOLDER/${{ steps.hashes.outputs.darwin_amd64 }}/" homebrew-sbproxy/sbproxy.rb
+          sed -i "s/LINUX_ARM64_PLACEHOLDER/${{ steps.hashes.outputs.linux_arm64 }}/" homebrew-sbproxy/sbproxy.rb
+          sed -i "s/LINUX_AMD64_PLACEHOLDER/${{ steps.hashes.outputs.linux_amd64 }}/" homebrew-sbproxy/sbproxy.rb
+
+          # Fix indentation (heredoc adds leading spaces)
+          sed -i 's/^          //' homebrew-sbproxy/sbproxy.rb
+
+      - name: Commit and push formula
+        working-directory: homebrew-sbproxy
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add sbproxy.rb
+          git commit -m "sbproxy ${{ steps.version.outputs.version }}"
+          git push

@@ -1,0 +1,38 @@
+# API Proxy with Response Caching and Stale-While-Revalidate
+#
+# Caches GET responses for 5 minutes. When a cache entry expires, serves
+# the stale version while refreshing in the background. If the backend is
+# down, serves stale for up to 60 seconds.
+#
+# Test:
+#   # First request hits the backend
+#   curl -v -H "Host: api.example.com" http://localhost:8080/get
+#   # Second request is served from cache (much faster)
+#   curl -v -H "Host: api.example.com" http://localhost:8080/get
+#
+# POST/PUT/DELETE automatically invalidate the cache.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://httpbin.org
+    response_cache:
+      enabled: true
+      ttl: 5m
+      conditions:
+        methods: [GET, HEAD]
+        status_codes: [200, 301, 404]
+        max_size: 1048576
+      vary_by: [Authorization, Accept-Language]
+      stale_while_revalidate:
+        enabled: true
+        duration: 30s
+        stale_if_error: 60s
+        async_revalidate: true
+      invalidation:
+        on_methods: [POST, PUT, DELETE]
+        pattern: "/.*"

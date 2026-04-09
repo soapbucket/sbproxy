@@ -1,0 +1,5 @@
+# Ignore encryption keys
+*.key
+.encryption-key
+.crypto-key
+

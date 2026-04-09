@@ -1,0 +1,13 @@
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.example.com":
+    action:
+      type: loadbalancer
+      targets:
+        - url: https://backend1.example.com
+          weight: 70
+        - url: https://backend2.example.com
+          weight: 30
+      algorithm: weighted_round_robin

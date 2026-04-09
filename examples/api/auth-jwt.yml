@@ -1,0 +1,27 @@
+# API Proxy with JWT Authentication
+#
+# Validates JWTs using a JWKS endpoint. Supports multiple audiences,
+# claims namespaces, and automatic key rotation.
+#
+# Test (will fail without a valid JWT):
+#   curl -H "Host: api.example.com" \
+#     -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+#     http://localhost:8080/api/users
+#
+# This config works with any OIDC provider (Auth0, Okta, Google, etc.)
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://httpbin.org/anything
+    authentication:
+      type: jwt
+      jwks_url: https://auth.example.com/.well-known/jwks.json
+      jwks_cache_duration: 1h
+      issuer: https://auth.example.com
+      audiences: [api.example.com, api.example.com/v2]
+      algorithm: RS256

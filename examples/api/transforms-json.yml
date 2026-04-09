@@ -1,0 +1,56 @@
+# API Proxy with JSON Transforms and Response Modification
+#
+# Strips sensitive fields from API responses, adds security headers,
+# and injects request context headers for the backend.
+#
+# Test:
+#   curl -H "Host: api.example.com" http://localhost:8080/get
+#
+# The response will have:
+#   - Security headers injected
+#   - Sensitive fields stripped (if the backend returned them)
+#   - X-Proxy-Region and X-Client-IP headers added to the upstream request
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://httpbin.org
+    # Add context headers to requests going to the backend
+    request_modifiers:
+      cel:
+        - expression: >
+            {
+              "add_headers": {
+                "X-Client-IP": request_ip,
+                "X-Proxy-Region": size(location) > 0 ? location['country_code'] : "UNKNOWN"
+              }
+            }
+    # Add security headers and mask errors on responses coming back
+    response_modifiers:
+      cel:
+        - expression: >
+            {
+              "add_headers": {
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY",
+                "Strict-Transport-Security": "max-age=31536000"
+              },
+              "delete_headers": ["X-Powered-By", "Server"]
+            }
+        - expression: >
+            response.status_code >= 500
+              ? {
+                  "status_code": 503,
+                  "set_headers": {"Content-Type": "application/json"},
+                  "body": "{\"error\": \"Service temporarily unavailable\", \"retry_after\": 30}"
+                }
+              : {}
+    # Strip sensitive fields from JSON responses
+    transforms:
+      - type: json
+        projection:
+          exclude: [password, ssn, credit_card, internal_id]

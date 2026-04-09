@@ -1,0 +1,40 @@
+# CEL expression routing example
+# Routes requests to different backends based on path patterns
+#
+# Test:
+#   curl -H "Host: api.example.com" http://localhost:8080/api/users
+#   curl -H "Host: api.example.com" http://localhost:8080/health
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://httpbin.org
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /api/
+        origin:
+          id: api-backend
+          hostname: api-backend
+          workspace_id: example
+          version: "1.0.0"
+          action:
+            type: proxy
+            url: https://httpbin.org/anything
+      - rules:
+          - path:
+              exact: /health
+        origin:
+          id: health
+          hostname: health
+          workspace_id: example
+          version: "1.0.0"
+          action:
+            type: static
+            status_code: 200
+            body: '{"status": "healthy"}'
+            content_type: application/json

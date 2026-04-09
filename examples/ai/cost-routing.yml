@@ -1,0 +1,53 @@
+# AI Gateway with Cost-Optimized Routing
+#
+# Automatically routes to the cheapest provider that supports the
+# requested model. Uses a built-in pricing catalog. Premium users
+# (identified by header) get higher rate limits and the best model.
+#
+# Test (standard user):
+#   curl -H "Host: ai.example.com" -X POST http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -H "X-API-Key: ${AI_GATEWAY_KEY}" \
+#     -d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Hello"}]}'
+#
+# Test (premium user):
+#   curl -H "Host: ai.example.com" -X POST http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -H "X-API-Key: ${AI_GATEWAY_KEY}" \
+#     -H "X-Tier: premium" \
+#     -d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Hello"}]}'
+#
+# Requires: OPENAI_API_KEY, ANTHROPIC_API_KEY, AI_GATEWAY_KEY environment variables
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o, gpt-4o-mini, gpt-4-turbo]
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          models: [claude-sonnet-4-20250514, claude-3-5-haiku-20241022]
+      default_model: gpt-4o-mini
+      routing:
+        strategy: cost_optimized
+        # Premium users get the full model; everyone else gets the cheap one
+        model_selector: >
+          request.headers['x-tier'] == 'premium'
+            ? 'gpt-4o'
+            : 'gpt-4o-mini'
+        # Premium users get 10x the rate limit
+        dynamic_rpm: >
+          request.headers['x-tier'] == 'premium' ? 1000 : 100
+    authentication:
+      type: api_key
+      api_keys:
+        - ${AI_GATEWAY_KEY}
+    policies:
+      - type: rate_limit
+        requests_per_minute: 100

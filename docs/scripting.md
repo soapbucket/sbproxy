@@ -1,0 +1,1058 @@
+# Scripting Reference: CEL and Lua
+
+sbproxy includes two scripting engines for custom logic: CEL (Common Expression Language) and Lua. Both run in sandboxed environments with access to request context. Use CEL for simple one-liner expressions evaluated at microsecond speed. Use Lua when you need variables, loops, helper functions, or multi-step logic.
+
+---
+
+## 1. Overview
+
+| Engine | Execution | Compilation | Best for |
+|--------|-----------|-------------|----------|
+| CEL | Compiled, non-Turing-complete | Once at config load | Routing decisions, simple checks, AI selectors |
+| Lua | Interpreted, sandboxed VM | Cached after first load | Complex transformations, multi-step logic, body rewriting |
+
+CEL expressions are compiled once when your config loads. Any syntax errors surface at startup, not at request time. Lua VMs are pooled and reused across requests to amortize initialization cost.
+
+---
+
+## 2. Where Scripts Are Used
+
+| Config field | Accepts | Return type | Purpose |
+|---|---|---|---|
+| `forward_rules[].match.cel` | CEL | bool | Match requests for routing |
+| `forward_rules[].match.lua` | Lua | bool | Match requests for routing |
+| `request_modifiers.cel` | CEL | map | Modify outgoing requests |
+| `request_modifiers.lua` | Lua | table | Modify outgoing requests |
+| `response_modifiers.cel` | CEL | map | Modify upstream responses |
+| `response_modifiers.lua` | Lua | table | Modify upstream responses |
+| `policies[].expression` | CEL or Lua | bool | Policy enforcement conditions |
+| `routing.model_selector` | CEL | string | AI model override per request |
+| `routing.provider_selector` | CEL | string | AI provider preference |
+| `routing.cache_bypass` | CEL | bool | Skip response cache |
+| `routing.dynamic_rpm` | CEL | int | Per-request RPM override |
+| `cel_guardrails[].condition` | CEL | bool | AI content safety rules |
+
+---
+
+## 3. CEL Expressions
+
+CEL is a non-Turing-complete expression language. It has no loops, no side effects, and no I/O. What it does have is fast, safe evaluation of conditions and transformations.
+
+### 3.1 Context Variables
+
+All nine namespaces are available in every CEL expression except where noted.
+
+#### `request` - Incoming HTTP request
+
+| Field | Type | Description |
+|---|---|---|
+| `request["method"]` | string | HTTP method (GET, POST, etc.) |
+| `request["path"]` | string | URL path |
+| `request["host"]` | string | Host header value |
+| `request["scheme"]` | string | `http` or `https` |
+| `request["query"]` | string | Raw query string |
+| `request["headers"]` | map | Request headers, keys lowercase |
+| `request["body"]` | string | Request body (if buffered) |
+| `request["remote_addr"]` | string | Raw remote address |
+| `request["content_length"]` | int | Content-Length value |
+| `request["protocol"]` | string | HTTP protocol version |
+| `request["tls"]` | bool | Whether the connection is TLS |
+
+> Headers are normalized to lowercase. Use `request["headers"]["content-type"]`, not `request["headers"]["Content-Type"]`.
+
+#### `session` - Session state
+
+| Field | Type | Description |
+|---|---|---|
+| `session["id"]` | string | Session ID |
+| `session["is_authenticated"]` | bool | Whether the user is authenticated |
+| `session["data"]` | map | Custom session data from session callbacks |
+| `session["auth"]` | map | Auth data (type, email, roles, permissions, etc.) |
+
+#### `origin` - Config metadata for this origin
+
+| Field | Type | Description |
+|---|---|---|
+| `origin["id"]` | string | Origin UUID |
+| `origin["workspace_id"]` | string | Workspace UUID |
+| `origin["hostname"]` | string | Origin hostname |
+| `origin["environment"]` | string | Environment name (dev, stage, prod) |
+| `origin["tags"]` | list | User-defined tags |
+
+#### `server` - Proxy instance info
+
+| Field | Type | Description |
+|---|---|---|
+| `server["version"]` | string | Proxy version |
+| `server["hostname"]` | string | OS hostname |
+| `server["pid"]` | int | Process ID |
+| `server["start_time"]` | string | Instance start time (RFC 3339) |
+
+#### `vars` - User-defined variables
+
+A map of variables set via `on_load` callbacks or config-level variable definitions. Access with `vars["my_var"]`.
+
+#### `features` - Feature flags
+
+A map of workspace-scoped feature flags. Access with `features["flag_name"]`.
+
+#### `client` - Client enrichment data
+
+| Field | Type | Description |
+|---|---|---|
+| `client["ip"]` | string | Client IP address |
+| `client["user_agent"]` | map | Parsed user agent (family, os_family, device_family, major, etc.) |
+| `client["country"]` | string | ISO country code |
+| `client["asn"]` | string | Autonomous System Number |
+
+> The top-level `request_ip` variable is also available as a shorthand for `client["ip"]`.
+
+#### `ctx` - Per-request mutable state
+
+| Field | Type | Description |
+|---|---|---|
+| `ctx["id"]` | string | Request ID |
+| `ctx["cache_status"]` | string | Cache hit/miss status |
+| `ctx["start_time"]` | string | Request start time (RFC 3339) |
+| `ctx["data"]` | map | Mutable per-request data |
+
+#### `response` - Response data (response_modifiers only)
+
+| Field | Type | Description |
+|---|---|---|
+| `response["status"]` | int | HTTP status code |
+| `response["headers"]` | map | Response headers |
+| `response["body"]` | string | Response body (if buffered) |
+
+#### `oauth_user` - OAuth user data (response_modifiers only)
+
+Available when OAuth authentication is active. Contains provider-specific user profile fields.
+
+---
+
+### 3.2 Built-in Functions
+
+CEL includes standard operators (`+`, `-`, `*`, `/`, `%`, `in`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `&&`, `||`, `!`) plus the following functions.
+
+#### String functions (from `ext.Strings()`)
+
+| Function | Description |
+|---|---|
+| `s.contains(sub)` | Returns true if `s` contains `sub` |
+| `s.startsWith(prefix)` | Returns true if `s` starts with `prefix` |
+| `s.endsWith(suffix)` | Returns true if `s` ends with `suffix` |
+| `s.matches(pattern)` | Returns true if `s` matches the RE2 regex `pattern` |
+| `s.substring(start)` | Substring from `start` to end |
+| `s.substring(start, end)` | Substring from `start` to `end` (exclusive) |
+| `s.replace(old, new)` | Replace all occurrences of `old` with `new` |
+| `s.split(sep)` | Split `s` on `sep`, returns list |
+| `s.trim()` | Trim leading and trailing whitespace |
+| `s.upperAscii()` | Uppercase ASCII characters |
+| `s.lowerAscii()` | Lowercase ASCII characters |
+
+#### Encoder functions (from `ext.Encoders()`)
+
+| Function | Description |
+|---|---|
+| `base64.encode(bytes)` | Base64-encode a byte string |
+| `base64.decode(string)` | Base64-decode a string |
+| `url.encode(string)` | URL-encode a string |
+| `url.decode(string)` | URL-decode a string |
+
+#### Type conversion functions
+
+| Function | Description |
+|---|---|
+| `int(value)` | Convert to integer |
+| `string(value)` | Convert to string |
+| `double(value)` | Convert to float |
+| `size(value)` | Length of string, list, or map |
+| `type(value)` | Return the type name as a string |
+
+#### IP functions
+
+| Function | Returns | Description |
+|---|---|---|
+| `ip.parse(ip)` | map | Parse IP, returns `{valid, ip, is_ipv4, is_ipv6, is_private, is_loopback}` |
+| `ip.inCIDR(ip, cidr)` | bool | True if `ip` falls within `cidr` (e.g., `"10.0.0.0/8"`) |
+| `ip.isPrivate(ip)` | bool | True if `ip` is in a private range (RFC 1918, link-local, loopback) |
+| `ip.isLoopback(ip)` | bool | True if `ip` is a loopback address |
+| `ip.isIPv4(ip)` | bool | True if `ip` is an IPv4 address |
+| `ip.isIPv6(ip)` | bool | True if `ip` is an IPv6 address |
+| `ip.inRange(ip, start, end)` | bool | True if `ip` is between `start` and `end` (inclusive) |
+| `ip.compare(ip1, ip2)` | int | -1, 0, or 1 (less than, equal, greater than) |
+
+> Note: CEL uses camelCase for IP functions (`inCIDR`, `isPrivate`). Lua uses snake_case (`in_cidr`, `is_private`).
+
+---
+
+### 3.3 CEL Examples
+
+#### Match: API traffic only
+
+```yaml
+forward_rules:
+  - match:
+      cel: request["path"].startsWith("/api/") && request["method"] in ["GET", "POST"]
+    origin:
+      action:
+        type: proxy
+        url: https://api-backend.example.com
+```
+
+#### Match: Requests from a CIDR range
+
+```yaml
+forward_rules:
+  - match:
+      cel: ip.inCIDR(request_ip, "10.0.0.0/8")
+    origin:
+      action:
+        type: proxy
+        url: https://internal-backend.example.com
+```
+
+#### Match: Authenticated admin users
+
+```yaml
+forward_rules:
+  - match:
+      cel: >
+        size(session) > 0 &&
+        session["is_authenticated"] == true &&
+        size(session["auth"]) > 0 &&
+        "admin" in session["auth"]["roles"]
+    origin:
+      action:
+        type: proxy
+        url: https://admin-backend.example.com
+```
+
+#### Match: Mobile users from Europe
+
+```yaml
+forward_rules:
+  - match:
+      cel: >
+        size(client["user_agent"]) > 0 &&
+        client["user_agent"]["os_family"] in ["iOS", "Android"] &&
+        client["country"] == "EU"
+    origin:
+      action:
+        type: proxy
+        url: https://eu-mobile.example.com
+```
+
+#### Request modifier: Add geo headers
+
+```yaml
+request_modifiers:
+  cel:
+    - expression: >
+        {
+          "add_headers": {
+            "X-Country": size(client) > 0 ? client["country"] : "UNKNOWN",
+            "X-Client-IP": request_ip,
+            "X-IP-Type": ip.isPrivate(request_ip) ? "private" : "public"
+          }
+        }
+```
+
+#### Request modifier: Rewrite path
+
+```yaml
+request_modifiers:
+  cel:
+    - expression: >
+        {
+          "path": request["path"].startsWith("/old/")
+            ? "/new/" + request["path"].substring(5)
+            : request["path"]
+        }
+```
+
+#### Request modifier: Add and remove query params
+
+```yaml
+request_modifiers:
+  cel:
+    - expression: >
+        {
+          "add_query": {"source": "proxy", "version": "v2"},
+          "delete_query": ["debug", "internal_id"]
+        }
+```
+
+#### Response modifier: Security headers
+
+```yaml
+response_modifiers:
+  cel:
+    - expression: >
+        {
+          "add_headers": {
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+            "Strict-Transport-Security": "max-age=31536000"
+          }
+        }
+```
+
+#### Response modifier: Custom error body
+
+```yaml
+response_modifiers:
+  cel:
+    - expression: >
+        response["status"] >= 500
+          ? {
+              "status": 503,
+              "set_headers": {"Content-Type": "application/json"},
+              "body": "{\"error\": \"Service temporarily unavailable\"}"
+            }
+          : {}
+```
+
+#### Rate limiting by header value
+
+```yaml
+policies:
+  - name: premium-rate
+    expression: request["headers"]["x-tier"] == "premium"
+    rate_limit:
+      requests: 10000
+      window: "1m"
+```
+
+#### Block private IPs from public routes
+
+```yaml
+forward_rules:
+  - match:
+      cel: '!ip.isPrivate(request_ip) && request["path"].startsWith("/public/")'
+    origin:
+      action:
+        type: proxy
+        url: https://public-backend.example.com
+```
+
+#### Traffic splitting by request hash
+
+```yaml
+forward_rules:
+  - match:
+      cel: int(string(request_ip).substring(string(request_ip).length() - 1)) % 2 == 0
+    origin:
+      action:
+        type: proxy
+        url: https://variant-b.example.com
+```
+
+#### JSON modifier: Strip sensitive fields
+
+```yaml
+response_modifiers:
+  cel:
+    - expression: >
+        {
+          "delete_fields": ["password", "ssn", "credit_card"]
+        }
+```
+
+#### JSON modifier: Add computed fields
+
+```yaml
+response_modifiers:
+  cel:
+    - expression: >
+        {
+          "set_fields": {
+            "full_name": json["first_name"] + " " + json["last_name"],
+            "is_adult": json["age"] >= 18
+          }
+        }
+```
+
+---
+
+## 4. Lua Scripting
+
+Lua gives you the full power of a scripting language: variables, loops, helper functions, conditionals, and string pattern matching. Scripts run in a sandboxed VM with a 100ms timeout and a 1,000,000 instruction limit.
+
+### 4.1 Function Signature
+
+Lua scripts must define a top-level expression or return a value directly. Most scripts use the inline return style, but you can define local functions:
+
+```lua
+-- Request matcher: return bool
+return request.method == "POST" and ip.is_private(request_ip)
+```
+
+```lua
+-- Request modifier: return table
+local function tier_for_ip(ip_addr)
+  if ip.in_cidr(ip_addr, "10.0.1.0/24") then return "admin" end
+  if ip.in_cidr(ip_addr, "10.0.0.0/16") then return "user" end
+  return "guest"
+end
+
+return {
+  add_headers = {
+    ["X-Access-Level"] = tier_for_ip(request_ip)
+  }
+}
+```
+
+For forward rule matchers using the `lua.script` field, the script must `return` a boolean value. For request and response modifiers, it must return a table.
+
+### 4.2 Context Variables
+
+Lua scripts have the same nine namespaces as CEL, accessed via dot notation or bracket notation.
+
+#### `request` table
+
+```lua
+request.method           -- "GET", "POST", etc.
+request.path             -- "/api/users"
+request.host             -- "example.com"
+request.scheme           -- "http" or "https"
+request.query            -- raw query string
+request.protocol         -- "HTTP/1.1", "HTTP/2.0"
+request.headers          -- table, keys are lowercase
+request.size             -- Content-Length as number
+
+-- Example access:
+request.headers["content-type"]
+request.headers["authorization"]
+```
+
+#### `request_ip` (string)
+
+The client IP, resolved in this order: `X-Real-IP`, first entry of `X-Forwarded-For`, then `RemoteAddr`.
+
+#### `session` table
+
+```lua
+session.id               -- session ID string
+session.is_authenticated -- boolean
+session.expires          -- expiration time string
+session.auth.type        -- "oauth", "jwt", "apikey", etc.
+session.auth.email       -- user email (from auth data)
+session.auth.name        -- user display name
+session.auth.provider    -- OAuth provider name
+session.auth.roles       -- array of role strings
+session.auth.permissions -- permissions table
+session.data             -- custom data from session callbacks
+session.visited_count    -- number of URLs visited in this session
+session.cookie_count     -- number of cookies
+```
+
+#### `origin` table
+
+```lua
+origin.id            -- origin UUID
+origin.hostname      -- origin hostname
+origin.workspace_id  -- workspace UUID
+origin.environment   -- "dev", "stage", "prod", etc.
+origin.name          -- origin slug name
+origin.version       -- config version string
+origin.tags          -- array of tag strings
+origin.params        -- on_load callback data
+```
+
+#### `server` table
+
+```lua
+server.version       -- proxy version string
+server.hostname      -- OS hostname
+server.start_time    -- RFC 3339 start time
+server.environment   -- deployment environment
+```
+
+#### `vars` table
+
+User-defined variables from `on_load` callbacks or config-level variable definitions.
+
+```lua
+vars["my_key"]       -- access by key
+vars.my_key          -- dot notation also works
+```
+
+#### `features` table
+
+Feature flag values for the workspace.
+
+```lua
+features["beta_ui"]
+```
+
+#### `client` table
+
+```lua
+client.ip                      -- client IP string
+client.location.country        -- country name
+client.location.country_code   -- ISO country code
+client.location.continent      -- continent name
+client.location.continent_code -- continent code
+client.location.asn            -- ASN string
+client.location.as_name        -- AS organization name
+client.location.as_domain      -- AS domain
+client.user_agent.family        -- browser family
+client.user_agent.major         -- browser major version
+client.user_agent.os_family     -- OS family
+client.user_agent.device_family -- device family
+client.user_agent.device_brand  -- device brand
+```
+
+> Legacy top-level variables `location` and `user_agent` are also available and mirror `client.location` and `client.user_agent` respectively.
+
+#### `ctx` table
+
+```lua
+ctx.id           -- request ID
+ctx.cache_status -- cache hit/miss status
+ctx.start_time   -- RFC 3339 start time
+ctx.data         -- mutable per-request data table
+```
+
+#### `response` table (response_modifiers only)
+
+```lua
+response.status_code   -- numeric HTTP status code
+response.status        -- status text (e.g. "200 OK")
+response.headers       -- response headers table
+response.body          -- response body string
+```
+
+#### `secrets` table
+
+Resolved secrets from the origin's secret store. Available in Lua but not in CEL (by design).
+
+```lua
+secrets["api_key"]
+secrets["webhook_secret"]
+```
+
+#### Cookies and query params
+
+```lua
+cookies["session_id"]   -- cookie value by name
+params["page"]          -- query parameter value by name
+```
+
+### 4.3 Request Modification
+
+Return a table from a request modifier script. All fields are optional.
+
+```lua
+return {
+  add_headers    = { ["X-Key"] = "value" },  -- add or append header
+  set_headers    = { ["X-Key"] = "value" },  -- replace header
+  delete_headers = { "X-Internal", "X-Debug" },
+  path           = "/new/path",
+  method         = "POST",
+  add_query      = { source = "proxy" },
+  delete_query   = { "debug" }
+}
+```
+
+### 4.4 Response Modification
+
+```lua
+return {
+  add_headers    = { ["X-Cache"] = "HIT" },
+  set_headers    = { ["Content-Type"] = "application/json" },
+  delete_headers = { "X-Powered-By", "Server" },
+  status_code    = 200,
+  body           = '{"status": "ok"}'
+}
+```
+
+### 4.5 JSON Transformation
+
+When the response is JSON, you can also use:
+
+```lua
+return {
+  set_fields    = { full_name = "Alice Smith", is_adult = true },
+  delete_fields = { "password", "internal_id" },
+  modified_json = { replace = "the", whole = "body" }  -- replace entire JSON
+}
+```
+
+### 4.6 Lua Examples
+
+#### Add headers based on GeoIP
+
+```yaml
+request_modifiers:
+  lua:
+    script: |
+      return {
+        add_headers = {
+          ["X-Country"] = client.location.country_code or "UNKNOWN",
+          ["X-Continent"] = client.location.continent_code or "UNKNOWN",
+          ["X-Client-IP"] = request_ip,
+          ["X-IP-Type"] = ip.is_private(request_ip) and "private" or "public"
+        }
+      }
+```
+
+#### Custom authentication check
+
+```yaml
+forward_rules:
+  - match:
+      lua:
+        script: |
+          local function has_role(roles, role)
+            if not roles then return false end
+            for i = 1, #roles do
+              if roles[i] == role then return true end
+            end
+            return false
+          end
+
+          return session and
+                 session.is_authenticated and
+                 session.auth and
+                 has_role(session.auth.roles, "admin")
+    origin:
+      action:
+        type: proxy
+        url: https://admin-backend.example.com
+```
+
+#### Block by multiple CIDRs
+
+```yaml
+forward_rules:
+  - match:
+      lua:
+        script: |
+          return ip.in_cidr(request_ip, "10.0.0.0/8") or
+                 ip.in_cidr(request_ip, "172.16.0.0/12") or
+                 ip.in_cidr(request_ip, "192.168.0.0/16")
+    origin:
+      action:
+        type: proxy
+        url: https://internal.example.com
+```
+
+#### Path rewriting based on version prefix
+
+```yaml
+request_modifiers:
+  lua:
+    script: |
+      local path = request.path
+      if string.sub(path, 1, 4) == "/v1/" then
+        path = "/v2/" .. string.sub(path, 5)
+      end
+      return {
+        path = path,
+        set_headers = { ["X-API-Version"] = "v2" }
+      }
+```
+
+#### Device-based routing
+
+```yaml
+request_modifiers:
+  lua:
+    script: |
+      local ua = client.user_agent
+      local is_mobile = ua and
+        (ua.device_family == "iPhone" or
+         ua.os_family == "Android")
+
+      return {
+        path = is_mobile and "/mobile" .. request.path or request.path,
+        add_headers = {
+          ["X-Device-Type"] = is_mobile and "mobile" or "desktop"
+        }
+      }
+```
+
+#### Geo-based content restriction
+
+```yaml
+response_modifiers:
+  lua:
+    script: |
+      local code = client.location.country_code
+      local allowed = code == "US" or code == "CA" or code == "GB"
+
+      if not allowed then
+        return {
+          status_code = 451,
+          set_headers = { ["Content-Type"] = "application/json" },
+          body = '{"error": "Content not available in your region"}'
+        }
+      end
+
+      return {
+        add_headers = {
+          ["X-User-Country"] = code or "UNKNOWN"
+        }
+      }
+```
+
+#### Conditional response body rewrite
+
+```yaml
+response_modifiers:
+  lua:
+    script: |
+      local body = response.body
+      if response.status_code >= 500 then
+        body = '{"error": "Service temporarily unavailable", "code": ' ..
+               response.status_code .. '}'
+      end
+      return {
+        body = body,
+        add_headers = {
+          ["X-Content-Type-Options"] = "nosniff"
+        }
+      }
+```
+
+#### Tiered access control by CIDR
+
+```yaml
+request_modifiers:
+  lua:
+    script: |
+      local access_level = "guest"
+      if ip.in_cidr(request_ip, "10.0.1.0/24") then
+        access_level = "admin"
+      elseif ip.in_cidr(request_ip, "10.0.0.0/16") then
+        access_level = "user"
+      end
+
+      return {
+        add_headers = { ["X-Access-Level"] = access_level },
+        add_query   = { access_level = access_level }
+      }
+```
+
+---
+
+## 5. Modification Operations Reference
+
+Both CEL and Lua support the same set of modifications. CEL returns a map literal. Lua returns a table.
+
+### Request modifications
+
+| Field | Type | Description |
+|---|---|---|
+| `add_headers` | map | Add or append header values |
+| `set_headers` | map | Replace header values |
+| `delete_headers` | list | Remove headers by name |
+| `path` | string | Override the request path |
+| `method` | string | Override the HTTP method |
+| `add_query` | map | Add query string parameters |
+| `delete_query` | list | Remove query string parameters |
+
+### Response modifications
+
+| Field | Type | Description |
+|---|---|---|
+| `add_headers` | map | Add or append header values |
+| `set_headers` | map | Replace header values |
+| `delete_headers` | list | Remove headers by name |
+| `status_code` | int | Override the response status code |
+| `body` | string | Replace the response body |
+
+### JSON modifications
+
+| Field | Type | Description |
+|---|---|---|
+| `set_fields` | map | Add or update JSON fields (dot-notation keys supported) |
+| `delete_fields` | list | Remove JSON fields by key |
+| `modified_json` | map | Replace the entire JSON response body |
+
+---
+
+## 6. AI-Specific Scripting
+
+When using the AI proxy action, CEL expressions control routing and safety at the AI layer. These use a different variable set than standard proxy CEL expressions.
+
+### 6.1 AI CEL Selector Variables
+
+AI selector expressions (`model_selector`, `provider_selector`, `cache_bypass`, `dynamic_rpm`) receive these variables:
+
+| Variable | Type | Description |
+|---|---|---|
+| `request["model"]` | string | Requested model name |
+| `request["messages"]` | list | List of `{role, content}` message maps |
+| `request["temperature"]` | double | Sampling temperature |
+| `request["max_tokens"]` | int | Token limit |
+| `request["tools"]` | bool | Whether tools/functions are present |
+| `request["stream"]` | bool | Whether streaming is requested |
+| `headers` | map | HTTP request headers (canonical case) |
+| `workspace` | string | Workspace identifier |
+| `timestamp["hour"]` | int | Current hour (0-23) |
+| `timestamp["minute"]` | int | Current minute (0-59) |
+| `timestamp["day_of_week"]` | string | e.g. `"Monday"` |
+| `timestamp["date"]` | string | e.g. `"2024-01-15"` |
+
+### 6.2 CEL Model Selectors
+
+`model_selector` returns a string model name to override the model in the request. Return an empty string to use the default.
+
+```yaml
+action:
+  type: ai_proxy
+  routing:
+    model_selector: >
+      request["headers"]["X-Tier"] == "premium"
+        ? "gpt-4o"
+        : "gpt-4o-mini"
+```
+
+```yaml
+# Route by requested model token budget
+routing:
+  model_selector: >
+    request["max_tokens"] > 8000
+      ? "gpt-4o"
+      : "gpt-4o-mini"
+```
+
+```yaml
+# Time-based routing (off-peak uses larger model)
+routing:
+  model_selector: >
+    timestamp["hour"] >= 22 || timestamp["hour"] < 6
+      ? "gpt-4o"
+      : "gpt-4o-mini"
+```
+
+```yaml
+# Route by request header tag
+routing:
+  model_selector: >
+    request["headers"]["x-plan"] == "pro"
+      ? "claude-sonnet-4-20250514"
+      : "claude-3-5-haiku-20241022"
+```
+
+### 6.3 CEL Provider Selectors
+
+`provider_selector` returns a provider name string. Return empty to use normal cost-based routing.
+
+```yaml
+routing:
+  provider_selector: >
+    request["model"].startsWith("gpt-")
+      ? "openai"
+      : "anthropic"
+```
+
+### 6.4 Cache Bypass
+
+`cache_bypass` returns a bool. When true, the response cache is skipped for this request.
+
+```yaml
+routing:
+  cache_bypass: >
+    request["temperature"] > 0.5 ||
+    "no-cache" in request["headers"]
+```
+
+### 6.5 Dynamic RPM
+
+`dynamic_rpm` returns an int to override the per-model rate limit for this request.
+
+```yaml
+routing:
+  dynamic_rpm: >
+    request["headers"]["x-tier"] == "premium" ? 1000 : 100
+```
+
+### 6.6 CEL Guardrails
+
+Guardrails are CEL expressions evaluated before (input phase) or after (output phase) the provider call. A condition returning `true` means the rule triggered.
+
+Input guardrail variables:
+
+| Variable | Type | Description |
+|---|---|---|
+| `request["model"]` | string | Model name |
+| `request["messages"]` | list | Message list (`{role, content}`) |
+| `request["temperature"]` | double | Temperature |
+| `request["max_tokens"]` | int | Token limit |
+
+Output guardrail variables:
+
+| Variable | Type | Description |
+|---|---|---|
+| `response["content"]` | string | First choice message content |
+| `response["model"]` | string | Model used |
+| `response["finish_reason"]` | string | Stop reason |
+| `response["tokens_input"]` | int | Prompt token count |
+| `response["tokens_output"]` | int | Completion token count |
+
+```yaml
+action:
+  type: ai_proxy
+  cel_guardrails:
+    - name: block-jailbreak
+      phase: input
+      condition: >
+        request["messages"].exists(m,
+          m["content"].contains("ignore previous instructions") ||
+          m["content"].contains("jailbreak")
+        )
+      action: block
+      message: "Request blocked by content policy."
+
+    - name: flag-long-output
+      phase: output
+      condition: response["tokens_output"] > 4000
+      action: flag
+
+    - name: block-ssn-in-response
+      phase: output
+      condition: >
+        response["content"].matches("\\b\\d{3}-\\d{2}-\\d{4}\\b")
+      action: block
+      message: "Response blocked: contains sensitive data pattern."
+```
+
+Actions:
+- `block` - Reject the request (input) or suppress the response (output) and return the `message` as an error.
+- `flag` - Record the violation in audit logs. Does not stop the request.
+
+Guardrails are evaluated in order. The first `block` action wins and evaluation stops. All `flag` actions are recorded.
+
+---
+
+## 7. IP Function Reference
+
+Both CEL and Lua include the same IP functions with different naming conventions.
+
+| CEL | Lua | Description |
+|---|---|---|
+| `ip.parse(ip)` | `ip.parse(ip)` | Parse IP, returns info map/table |
+| `ip.inCIDR(ip, cidr)` | `ip.in_cidr(ip, cidr)` | True if IP is in CIDR range |
+| `ip.isPrivate(ip)` | `ip.is_private(ip)` | True if IP is private (RFC 1918, loopback, link-local) |
+| `ip.isLoopback(ip)` | `ip.is_loopback(ip)` | True if IP is loopback |
+| `ip.isIPv4(ip)` | `ip.is_ipv4(ip)` | True if IP is IPv4 |
+| `ip.isIPv6(ip)` | `ip.is_ipv6(ip)` | True if IP is IPv6 |
+| `ip.inRange(ip, start, end)` | `ip.in_range(ip, start, end)` | True if IP is between start and end (inclusive) |
+| `ip.compare(ip1, ip2)` | `ip.compare(ip1, ip2)` | -1, 0, or 1 |
+
+`ip.parse()` returns a map/table with these fields:
+
+```
+valid        bool   - whether the string was a valid IP
+ip           string - normalized IP string
+is_ipv4      bool
+is_ipv6      bool
+is_private   bool
+is_loopback  bool
+```
+
+Private ranges covered by `isPrivate`/`is_private`:
+- `10.0.0.0/8`
+- `172.16.0.0/12`
+- `192.168.0.0/16`
+- `169.254.0.0/16` (link-local)
+- `127.0.0.0/8` (loopback)
+- `fc00::/7` (IPv6 ULA)
+- `fe80::/10` (IPv6 link-local)
+
+---
+
+## 8. Sandbox Limits
+
+### CEL
+
+- Non-Turing-complete: no loops, no side effects, no I/O.
+- Expressions are compiled once at config load time. Syntax errors fail fast.
+- No access to secrets (intentionally). Use Lua if you need `secrets["key"]`.
+- Evaluation typically completes in microseconds.
+
+### Lua
+
+- No file I/O (`io` module blocked).
+- No OS operations (`os` module blocked).
+- No package loading (`require`, `dofile`, `loadfile` blocked).
+- No debug access (`debug` module blocked).
+- No meta-operations (`getmetatable`, `setmetatable`, `rawset`, `rawget` blocked).
+- No network operations.
+- Global variable modification is blocked.
+
+Available Lua standard library functions:
+- `string.*` - full string library (find, match, gmatch, gsub, sub, upper, lower, format, etc.)
+- `table.*` - insert, remove, sort, concat
+- `math.*` - abs, ceil, floor, max, min, sqrt, random, etc.
+- `tonumber`, `tostring`, `type`, `pairs`, `ipairs`, `unpack`, `select`, `pcall`, `error`
+
+Execution limits:
+- Timeout: 100ms per script execution.
+- Instruction limit: 1,000,000 instructions. This prevents infinite loops without relying on timers.
+- Call stack: 1,000 levels maximum.
+
+---
+
+## 9. Performance Notes
+
+**CEL** compiles at config load time and evaluates in microseconds per request. It is appropriate for any routing decision, including high-frequency hot paths. Prefer CEL over Lua when the logic fits.
+
+**Lua** is interpreted per-request from a pooled VM. Simple scripts typically complete in 60-100 microseconds with around 233 KB of memory per execution. Lua VMs are reused to amortize initialization cost.
+
+Tips:
+- Avoid regex in CEL hot paths (`matches()`). Use `startsWith`, `endsWith`, or `contains` instead. They are faster and avoid RE2 compilation on evaluation.
+- In Lua, use `local` variables. Local variable access is faster than global lookup.
+- In Lua, prefer `table.concat()` over string concatenation in loops.
+- Keep Lua scripts under ~30 lines. If you need more, consider whether a config-level callback is more appropriate.
+- CEL expressions that always return the same result regardless of request data should be replaced with static config values.
+
+---
+
+## 10. Debugging Scripts
+
+### Config validation
+
+Validate your config and catch CEL compilation errors before deployment:
+
+```bash
+sbproxy validate -c sb.yml
+```
+
+CEL expressions are compiled at validation time. Any syntax error or type mismatch will be reported with the field name and expression.
+
+### Enabling debug logging
+
+```bash
+sbproxy --log-level debug -c sb.yml
+```
+
+With debug logging enabled:
+- CEL evaluation results are logged per-request.
+- Lua script execution times are logged.
+- Lua runtime errors include the script name, error message, and stack trace.
+
+### Error behavior
+
+| Engine | Compile error | Runtime error |
+|---|---|---|
+| CEL | Config load fails immediately | Logged, expression returns zero value |
+| Lua | Config load fails immediately | Logged per-request, script returns false/nil |
+
+### Common mistakes
+
+**CEL: Header key case.** Headers are normalized to lowercase. Use `request["headers"]["content-type"]`, not `request["headers"]["Content-Type"]`.
+
+**CEL: Nil map access.** Accessing a missing key in a CEL map returns a zero value (empty string, 0, false), not an error. Check `size(session) > 0` before accessing session fields when session middleware may not be active.
+
+**Lua: Array indexing is 1-based.** `arr[1]` is the first element. `#arr` is the length.
+
+**Lua: Nil context variables.** Context tables like `client.user_agent` and `client.location` may be empty tables if the corresponding middleware is not enabled. Check `client.location.country_code ~= nil` or use `or "UNKNOWN"` as a default.
+
+**Lua: Inequality operator.** Lua uses `~=` for not-equal, not `!=`.
+
+**CEL: AI selector vs proxy CEL.** AI routing selectors (`model_selector`, `provider_selector`, etc.) and guardrail expressions use a different set of variables than standard proxy CEL expressions. The `request` variable in selectors refers to the AI chat completion request, not the HTTP request.
