@@ -16,7 +16,7 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test ./... -count=1 -timeout 300s -race
-      - uses: golangci/golangci-lint-action@v6
+      - uses: golangci/golangci-lint-action@v9
         with:
           version: latest
       - run: ./scripts/import-guard.sh
