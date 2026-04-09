@@ -1,0 +1,48 @@
+# Test Dockerfile for running Go tests
+FROM golang:1.25-alpine
+
+# Install build dependencies and testing tools
+# Note: All storage drivers are pure Go (no CGO required)
+RUN apk add --no-cache \
+    git \
+    ca-certificates \
+    tzdata \
+    curl \
+    redis \
+    bash
+
+# Set working directory
+WORKDIR /app
+
+# Copy go mod files first for better caching
+COPY go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Install additional Go tools for testing
+RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+
+# Create directories for test data
+RUN mkdir -p /tmp/badger-test /tmp/file-test /tmp/test-data
+
+# Set permissions for test directories
+RUN chmod -R 777 /tmp/badger-test /tmp/file-test /tmp/test-data
+
+# Create a non-root user for testing
+RUN addgroup -g 1000 testuser && \
+    adduser -D -u 1000 -G testuser testuser
+
+# Switch to test user
+USER testuser
+
+# Set environment variables for testing
+# Note: All storage drivers are pure Go (no CGO required)
+ENV CGO_ENABLED=0
+ENV GOOS=linux
+
+# Default command runs all tests
+CMD ["go", "test", "-v", "./..."]

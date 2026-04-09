@@ -1,0 +1,43 @@
+{
+  "css-transform-comprehensive.test": {
+    "id": "css-transform-comprehensive",
+    "hostname": "css-transform-comprehensive.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.css"
+    },
+    "transforms": [
+      {
+        "type": "css",
+        "content_types": ["text/css"],
+        "minify": true,
+        "add_rules": [
+          {
+            "selector": "body",
+            "rules": {
+              "background-color": "#f0f0f0",
+              "font-family": "Arial, sans-serif"
+            }
+          },
+          {
+            "selector": ".test-section",
+            "rules": {
+              "border": "1px solid #ccc",
+              "padding": "10px",
+              "margin": "5px"
+            }
+          },
+          {
+            "selector": ".css-test",
+            "rules": {
+              "color": "#2196F3",
+              "font-weight": "bold",
+              "text-decoration": "underline"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
+

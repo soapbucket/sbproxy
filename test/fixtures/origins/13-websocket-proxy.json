@@ -1,0 +1,15 @@
+{
+  "websocket.test": {
+    "id": "websocket",
+    "hostname": "websocket.test",
+    "action": {
+      "type": "websocket",
+      "url": "ws://e2e-test-server:8091/echo",
+      "strip_base_path": true,
+      "preserve_query": true,
+      "ping_interval": "30s",
+      "pong_timeout": "10s"
+    }
+  }
+}
+

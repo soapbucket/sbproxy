@@ -1,0 +1,79 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: proxy-metrics
+  namespace: soapbucket
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: proxy
+  endpoints:
+  - port: telemetry
+    interval: 15s
+    path: /metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: proxy-workspace-alerts
+  namespace: soapbucket
+  labels:
+    release: prometheus
+spec:
+  groups:
+  - name: workspace-operator
+    interval: 60s
+    rules:
+    - alert: PromotionFailed
+      expr: |
+        kube_customresource_workspaceproxy_status_phase{phase="Provisioning"}
+        and on() (time() - kube_customresource_workspaceproxy_status_phase_transition_time > 300)
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "WorkspaceProxy stuck in Provisioning"
+        description: "{{ $labels.name }} has been in Provisioning state for over 5 minutes"
+
+    - alert: DemotionStuck
+      expr: |
+        kube_customresource_workspaceproxy_status_phase{phase="Draining"}
+        and on() (time() - kube_customresource_workspaceproxy_status_phase_transition_time > 600)
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "WorkspaceProxy stuck in Draining"
+        description: "{{ $labels.name }} has been in Draining state for over 10 minutes"
+
+    - alert: DedicatedPodCrashLoop
+      expr: |
+        rate(kube_pod_container_status_restarts_total{namespace="soapbucket",container="proxy"}[5m]) > 0.6
+        * on(pod) group_left(label_workspace) kube_pod_labels{label_tier="dedicated"}
+      for: 2m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Dedicated workspace pod crash looping"
+        description: "Pod {{ $labels.pod }} for workspace {{ $labels.label_workspace }} is restarting frequently"
+
+    - alert: SharedFleetOverloaded
+      expr: |
+        avg(rate(container_cpu_usage_seconds_total{namespace="soapbucket",pod=~"proxy-shared-fleet.*"}[5m]))
+        / avg(kube_pod_container_resource_limits{namespace="soapbucket",pod=~"proxy-shared-fleet.*",resource="cpu"}) > 0.8
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Shared proxy fleet CPU usage above 80%"
+
+    - alert: OperatorDown
+      expr: |
+        absent(up{job="workspace-operator"} == 1)
+      for: 2m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Workspace operator is not running"

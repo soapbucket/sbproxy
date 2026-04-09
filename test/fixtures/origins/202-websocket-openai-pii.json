@@ -1,0 +1,31 @@
+{
+  "ws-openai-pii.test": {
+    "id": "ws-openai-pii",
+    "hostname": "ws-openai-pii.test",
+    "policies": [
+      {
+        "type": "pii",
+        "mode": "block",
+        "direction": "request",
+        "detectors": {
+          "email": true
+        },
+        "match": {
+          "protocols": ["websocket"],
+          "phases": ["message"],
+          "directions": ["client_to_backend"],
+          "event_types": ["response.create"],
+          "providers": ["openai"]
+        }
+      }
+    ],
+    "action": {
+      "type": "websocket",
+      "url": "ws://e2e-test-server:8091/echo",
+      "provider": "openai",
+      "ping_interval": "30s",
+      "pong_timeout": "10s",
+      "handshake_timeout": "10s"
+    }
+  }
+}

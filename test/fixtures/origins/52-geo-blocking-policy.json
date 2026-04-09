@@ -1,0 +1,19 @@
+{
+  "geo-blocking.test": {
+    "id": "geo-blocking",
+    "hostname": "geo-blocking.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "policies": [
+      {
+        "type": "geo_blocking",
+        "disabled": false,
+        "allowed_countries": ["US", "CA", "GB"],
+        "action": "block"
+      }
+    ]
+  }
+}
+

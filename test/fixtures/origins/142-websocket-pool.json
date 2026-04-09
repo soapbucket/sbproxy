@@ -1,0 +1,21 @@
+{
+  "websocket-pool.test": {
+    "id": "websocket-pool",
+    "hostname": "websocket-pool.test",
+    "action": {
+      "type": "websocket",
+      "url": "ws://e2e-test-server:8091/echo",
+      "disable_pool": false,
+      "pool_max_connections": 10,
+      "pool_max_idle_connections": 5,
+      "pool_max_lifetime": "1m",
+      "pool_max_idle_time": "1m",
+      "disable_pool_auto_reconnect": false,
+      "pool_reconnect_delay": "5s",
+      "pool_max_reconnect_attempts": 3,
+      "ping_interval": "30s",
+      "pong_timeout": "10s"
+    }
+  }
+}
+

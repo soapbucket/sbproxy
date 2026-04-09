@@ -1,0 +1,40 @@
+{
+  "error-pages-content-types.test": {
+    "id": "error-pages-content-types",
+    "hostname": "error-pages-content-types.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "error_pages": [
+      {
+        "status": [404],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/404?content_type=application/json",
+          "method": "GET"
+        },
+        "content_type": "application/json"
+      },
+      {
+        "status": [500],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/500?content_type=application/xml",
+          "method": "GET"
+        },
+        "content_type": "application/xml"
+      },
+      {
+        "status": [503],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/503?content_type=text/plain",
+          "method": "GET"
+        },
+        "content_type": "text/plain"
+      }
+    ]
+  }
+}
+

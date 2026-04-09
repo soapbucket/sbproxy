@@ -1,0 +1,29 @@
+{
+  "id": "session-cookie-jar-test",
+  "hostname": "cookie-test.example.com",
+  "version": "1.0",
+  "session_config": {
+    "enable_cookie_jar": true,
+    "cookie_jar_config": {
+      "max_cookies": 50,
+      "max_cookie_size": 4096,
+      "store_secure_only": false,
+      "disable_store_http_only": false
+    },
+    "cookie_name": "sb_session",
+    "cookie_max_age": 3600,
+    "cookie_same_site": "lax"
+  },
+  "forward_rules": {
+    "routes": [
+      {
+        "path": "/api",
+        "action": {
+          "type": "proxy",
+          "url": "http://backend.example.com"
+        }
+      }
+    ]
+  }
+}
+

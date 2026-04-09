@@ -1,0 +1,171 @@
+{
+  "forwarder-comprehensive.test": {
+    "id": "forwarder-comprehensive",
+    "hostname": "forwarder-comprehensive.test",
+    "forward_rules": [
+      {
+        "hostname": "forwarder-api.test",
+        "rules": [
+          {
+            "path": {
+              "prefix": "/api"
+            }
+          }
+        ]
+      },
+      {
+        "hostname": "forwarder-admin.test",
+        "rules": [
+          {
+            "path": {
+              "contains": "/admin"
+            },
+            "headers": {
+              "exact": {
+                "X-Admin-Auth": "true"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "hostname": "forwarder-static.test",
+        "rules": [
+          {
+            "path": {
+              "suffix": ".html"
+            }
+          },
+          {
+            "path": {
+              "suffix": ".css"
+            }
+          },
+          {
+            "path": {
+              "suffix": ".js"
+            }
+          }
+        ]
+      },
+      {
+        "hostname": "forwarder-json.test",
+        "rules": [
+          {
+            "path": {
+              "suffix": ".json"
+            },
+            "content_types": ["application/json"]
+          }
+        ]
+      },
+      {
+        "hostname": "forwarder-cel.test",
+        "rules": [
+          {
+            "cel_expr": "request.path.contains('/cel') && request.method == 'GET'"
+          }
+        ]
+      },
+      {
+        "hostname": "forwarder-lua.test",
+        "rules": [
+          {
+            "lua_script": "return request.path:match('/lua') ~= nil and request.method == 'POST'"
+          }
+        ]
+      },
+      {
+        "hostname": "forwarder-query.test",
+        "rules": [
+          {
+            "query": {
+              "exact": {
+                "forward": "true"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "hostname": "forwarder-ip.test",
+        "rules": [
+          {
+            "ip": {
+              "ips": ["127.0.0.1"]
+            }
+          }
+        ]
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.html"
+    }
+  },
+  "forwarder-api.test": {
+    "id": "forwarder-api",
+    "hostname": "forwarder-api.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.json"
+    }
+  },
+  "forwarder-admin.test": {
+    "id": "forwarder-admin",
+    "hostname": "forwarder-admin.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.html"
+    }
+  },
+  "forwarder-static.test": {
+    "id": "forwarder-static",
+    "hostname": "forwarder-static.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    }
+  },
+  "forwarder-json.test": {
+    "id": "forwarder-json",
+    "hostname": "forwarder-json.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.json"
+    }
+  },
+  "forwarder-cel.test": {
+    "id": "forwarder-cel",
+    "hostname": "forwarder-cel.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.html"
+    }
+  },
+  "forwarder-lua.test": {
+    "id": "forwarder-lua",
+    "hostname": "forwarder-lua.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.html"
+    }
+  },
+  "forwarder-query.test": {
+    "id": "forwarder-query",
+    "hostname": "forwarder-query.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.html"
+    }
+  },
+  "forwarder-ip.test": {
+    "id": "forwarder-ip",
+    "hostname": "forwarder-ip.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.html"
+    }
+  }
+}
+

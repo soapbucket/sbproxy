@@ -1,0 +1,22 @@
+# Binaries
+e2e-test-server
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+
+# TLS certificates (generated at runtime)
+*.pem
+*.key
+tls-cert.pem
+tls-key.pem
+

@@ -1,0 +1,40 @@
+# Prometheus configuration for Soapbucket Proxy
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'soapbucket-proxy'
+    environment: 'development'
+
+# Scrape configurations
+scrape_configs:
+  # Soapbucket Proxy metrics
+  - job_name: 'soapbucket-proxy'
+    static_configs:
+      - targets: ['proxy:8888']
+        labels:
+          service: 'proxy'
+          protocol: 'http/1.1,http/2,http/3'
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+    scrape_timeout: 5s
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          service: 'prometheus'
+
+# Alerting configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+# Rule files
+rule_files:
+  - '/etc/prometheus/alerts.yml'
+
+
+

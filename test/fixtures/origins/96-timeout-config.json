@@ -1,0 +1,17 @@
+{
+  "timeout-config.test": {
+    "id": "timeout-config",
+    "hostname": "timeout-config.test",
+    "timeout_config": {
+      "connect_timeout": "5s",
+      "read_timeout": "10s",
+      "write_timeout": "10s",
+      "idle_timeout": "30s"
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/api/delay?ms=2000"
+    }
+  }
+}
+

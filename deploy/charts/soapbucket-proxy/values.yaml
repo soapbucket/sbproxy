@@ -1,0 +1,100 @@
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 2
+
+image:
+  repository: soapbucket/proxy
+  tag: latest
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: false
+  name: ""
+  annotations: {}
+
+mode: shared
+workspaceID: ""
+
+config:
+  logLevel: info
+  redisURL: ""
+  storageDSN: ""
+  clickhouseDSN: ""
+  vaultAddr: ""
+  vaultToken: ""
+  proxySyncRemoteURL: ""
+  proxySyncSharedSecret: ""
+  proxySyncClusterID: ""
+  configSyncMode: ""
+  syncPollInterval: ""
+  extraEnv: {}
+
+service:
+  type: ClusterIP
+  httpPort: 80
+  telemetryPort: 8888
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations: {}
+  defaultBackend: false
+  hosts:
+    - host: ""
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: "25%"
+    maxUnavailable: 0
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  cpuAverageUtilization: 70
+  memoryAverageUtilization: 80
+
+pdb:
+  enabled: true
+  minAvailable: 1
+
+resources:
+  requests:
+    memory: 128Mi
+    cpu: 200m
+  limits:
+    memory: 512Mi
+    cpu: 1000m
+
+serviceMonitor:
+  enabled: false
+  interval: 15s
+  labels: {}
+
+terminationGracePeriodSeconds: 30
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels: {}
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels: {}

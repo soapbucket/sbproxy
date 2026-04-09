@@ -1,0 +1,24 @@
+{
+  "request-signing.test": {
+    "id": "request-signing",
+    "hostname": "request-signing.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "policies": [
+      {
+        "type": "request_signing",
+        "disabled": false,
+        "algorithm": "hmac-sha256",
+        "secret": "test-signing-secret-key-12345678901234567890",
+        "header_name": "X-Signature",
+        "include_headers": ["Host", "Content-Type", "X-Request-ID"],
+        "include_body": true,
+        "cache_signatures": true,
+        "signature_cache_ttl": 300
+      }
+    ]
+  }
+}
+

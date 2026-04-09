@@ -1,0 +1,1095 @@
+{
+  "test1.test": {
+    "id": "e2e-test1",
+    "hostname": "test1.test",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "headers": { "X-Custom": "yes" },
+      "json_body": { "msg": "hello" }
+    }
+  },
+
+  "test2.test": {
+    "id": "e2e-test2",
+    "hostname": "test2.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com",
+      "strip_base_path": true
+    }
+  },
+
+  "test3.test": {
+    "id": "e2e-test3",
+    "hostname": "test3.test",
+    "action": {
+      "type": "redirect",
+      "url": "https://example.com",
+      "status_code": 301,
+      "strip_base_path": true,
+      "preserve_query": true
+    }
+  },
+
+  "test4.test": {
+    "id": "e2e-test4",
+    "hostname": "test4.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com",
+      "strip_base_path": true
+    }
+  },
+
+  "test5.test": {
+    "id": "e2e-test5",
+    "hostname": "test5.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://jsonplaceholder.typicode.com/posts",
+      "strip_base_path": false
+    }
+  },
+
+  "test6.test": {
+    "id": "e2e-test6",
+    "hostname": "test6.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com",
+      "strip_base_path": true,
+      "shadow": {
+        "upstream_url": "https://httpbin.org/anything",
+        "sample_rate": 1.0,
+        "fail_on_error": false,
+        "timeout": "2s"
+      }
+    },
+    "response_modifiers": [
+      { "headers": { "set": { "X-Shadow-Enabled": "true" } } }
+    ]
+  },
+
+  "test7.test": {
+    "id": "e2e-test7",
+    "hostname": "test7.test",
+    "action": {
+      "type": "loadbalancer",
+      "disable_sticky": true,
+      "targets": [
+        {
+          "url": "https://postman-echo.com/get?backend=1",
+          "weight": 34,
+          "response_modifiers": [
+            { "headers": { "add": { "X-Served-By": "backend-1" } } }
+          ]
+        },
+        {
+          "url": "https://postman-echo.com/get?backend=2",
+          "weight": 33,
+          "response_modifiers": [
+            { "headers": { "add": { "X-Served-By": "backend-2" } } }
+          ]
+        },
+        {
+          "url": "https://postman-echo.com/get?backend=3",
+          "weight": 33,
+          "response_modifiers": [
+            { "headers": { "add": { "X-Served-By": "backend-3" } } }
+          ]
+        }
+      ]
+    }
+  },
+
+  "test8.test": {
+    "id": "e2e-test8",
+    "hostname": "test8.test",
+    "action": {
+      "type": "abtest",
+      "test_name": "e2e-checkout-test",
+      "cookie_name": "_ab_e2e",
+      "cookie_ttl": "1d",
+      "variants": [
+        {
+          "name": "control",
+          "weight": 50,
+          "action": {
+            "type": "static",
+            "status_code": 200,
+            "content_type": "application/json",
+            "json_body": { "variant": "control", "test": "checkout" }
+          }
+        },
+        {
+          "name": "treatment",
+          "weight": 50,
+          "action": {
+            "type": "static",
+            "status_code": 200,
+            "content_type": "application/json",
+            "json_body": { "variant": "treatment", "test": "checkout" }
+          }
+        }
+      ]
+    },
+    "response_modifiers": [
+      { "headers": { "set": { "X-AB-Test": "e2e-checkout-test" } } }
+    ]
+  },
+
+  "test9.test": {
+    "id": "e2e-test9",
+    "hostname": "test9.test",
+    "action": {
+      "type": "beacon",
+      "empty_gif": true
+    }
+  },
+
+  "test10.test": {
+    "id": "e2e-test10",
+    "hostname": "test10.test",
+    "action": {
+      "type": "orchestration",
+      "parallel": true,
+      "timeout": "10s",
+      "steps": [
+        {
+          "name": "get_user",
+          "callback": {
+            "url": "https://jsonplaceholder.typicode.com/users/1",
+            "method": "GET"
+          }
+        },
+        {
+          "name": "get_post",
+          "callback": {
+            "url": "https://jsonplaceholder.typicode.com/posts/1",
+            "method": "GET"
+          }
+        }
+      ],
+      "response_builder": {
+        "template": "{\n  \"user\": {{{steps.get_user.response_json}}},\n  \"post\": {{{steps.get_post.response_json}}}\n}",
+        "content_type": "application/json",
+        "status_code": 200
+      }
+    }
+  },
+
+  "test11.test": {
+    "id": "e2e-test11",
+    "hostname": "test11.test",
+    "action": {
+      "type": "websocket",
+      "url": "wss://echo.websocket.org",
+      "strip_base_path": false,
+      "handshake_timeout": "5s",
+      "check_origin": false
+    }
+  },
+
+  "test12.test": {
+    "id": "e2e-test12",
+    "hostname": "test12.test",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "text/html",
+      "body": "<!DOCTYPE html><html><head><title>Test</title><!-- remove this comment --></head><body><h1>Hello</h1></body></html>"
+    },
+    "transforms": [
+      {
+        "type": "optimized_html",
+        "content_types": ["text/html"],
+        "optimized_format_options": {
+          "strip_comments": true,
+          "optimize_attributes": true
+        },
+        "add_to_tags": [
+          {
+            "tag": "head",
+            "content": "<meta name=\"injected\" content=\"true\">"
+          }
+        ]
+      }
+    ]
+  },
+
+  "test13.test": {
+    "id": "e2e-test13",
+    "hostname": "test13.test",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": {
+        "user_id": 123,
+        "first_name": "John",
+        "last_name": "Doe",
+        "secret_field": "hidden",
+        "empty_val": ""
+      }
+    },
+    "transforms": [
+      {
+        "type": "json",
+        "content_types": ["application/json"],
+        "pretty_print": true,
+        "remove_empty_strings": true,
+        "rules": [
+          { "path": "$.full_name", "value": "John Doe" },
+          { "path": "$.secret_field", "value": "[REDACTED]" }
+        ]
+      }
+    ]
+  },
+
+  "test14.test": {
+    "id": "e2e-test14",
+    "hostname": "test14.test",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": {
+        "user_id": 123,
+        "first_name": "John",
+        "last_name": "Doe",
+        "country_code": "UNITED_STATES"
+      }
+    },
+    "transforms": [
+      {
+        "type": "lua_json",
+        "content_types": ["application/json"],
+        "timeout": "100ms",
+        "lua_script": "function modify_json(data, ctx)\n  local result = {\n    id = data.user_id,\n    fullName = (data.first_name or '') .. ' ' .. (data.last_name or ''),\n    country = 'US'\n  }\n  return result\nend"
+      }
+    ]
+  },
+
+  "test15.test": {
+    "id": "e2e-test15",
+    "hostname": "test15.test",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "text/html",
+      "body": "<html><body><p>Hello World from FooBar Corp</p></body></html>"
+    },
+    "transforms": [
+      {
+        "type": "replace_strings",
+        "replace_strings": {
+          "replacements": [
+            { "find": "FooBar Corp", "replace": "TestCo" },
+            { "find": "Hello World", "replace": "Greetings" }
+          ]
+        }
+      }
+    ]
+  },
+
+  "test16.test": {
+    "id": "e2e-test16",
+    "hostname": "test16.test",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": {
+        "id": 1,
+        "name": "John",
+        "email": "john@example.com",
+        "password_hash": "abc123secret",
+        "internal_notes": "do not expose"
+      }
+    },
+    "transforms": [
+      {
+        "type": "json_projection",
+        "content_types": ["application/json"],
+        "include": ["id", "name", "email"]
+      }
+    ]
+  },
+
+  "test17.test": {
+    "id": "e2e-test17",
+    "hostname": "test17.test",
+    "forward_rules": [
+      {
+        "hostname": "test17-valid",
+        "rules": [{ "path": { "prefix": "/valid" } }]
+      },
+      {
+        "hostname": "test17-invalid",
+        "rules": [{ "path": { "prefix": "/invalid" } }]
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 404,
+      "body": "Use /valid or /invalid"
+    }
+  },
+  "test17-valid": {
+    "id": "e2e-test17-valid",
+    "hostname": "test17-valid",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "name": "John", "age": 30 }
+    },
+    "transforms": [
+      {
+        "type": "json_schema",
+        "content_types": ["application/json"],
+        "action": "validate",
+        "schema": {
+          "type": "object",
+          "required": ["name", "age"],
+          "properties": {
+            "name": { "type": "string" },
+            "age": { "type": "integer" }
+          }
+        }
+      }
+    ]
+  },
+  "test17-invalid": {
+    "id": "e2e-test17-invalid",
+    "hostname": "test17-invalid",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "name": "John" }
+    },
+    "transforms": [
+      {
+        "type": "json_schema",
+        "content_types": ["application/json"],
+        "action": "validate",
+        "schema": {
+          "type": "object",
+          "required": ["name", "age"],
+          "properties": {
+            "name": { "type": "string" },
+            "age": { "type": "integer" }
+          }
+        }
+      }
+    ]
+  },
+
+  "test18.test": {
+    "id": "e2e-test18",
+    "hostname": "test18.test",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/xml",
+      "body": "<?xml version=\"1.0\"?><root><name>John</name><age>30</age></root>"
+    },
+    "transforms": [
+      {
+        "type": "format_convert",
+        "content_types": ["application/xml"],
+        "from": "xml",
+        "to": "json"
+      }
+    ]
+  },
+
+  "test19.test": {
+    "id": "e2e-test19",
+    "hostname": "test19.test",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "text/markdown",
+      "body": "# Hello World\n\nThis is **bold** and *italic*.\n\n- Item 1\n- Item 2\n"
+    },
+    "transforms": [
+      {
+        "type": "markdown",
+        "content_types": ["text/markdown"],
+        "disable_tables": false,
+        "disable_fenced_code": false
+      }
+    ]
+  },
+
+  "test20.test": {
+    "id": "e2e-test20",
+    "hostname": "test20.test",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "name": "World", "count": 42 }
+    },
+    "transforms": [
+      {
+        "type": "template",
+        "content_types": ["application/json"],
+        "template": "Hello {{response.name}}! The answer is {{response.count}}."
+      }
+    ]
+  },
+
+  "test21.test": {
+    "id": "e2e-test21",
+    "hostname": "test21.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com",
+      "strip_base_path": true
+    },
+    "transforms": [
+      {
+        "type": "classify",
+        "content_types": ["application/json"],
+        "header_name": "X-Content-Class",
+        "rules": [
+          { "name": "api-response", "pattern": "postman-echo" },
+          { "name": "unknown", "pattern": ".*" }
+        ]
+      }
+    ]
+  },
+
+  "test22.test": {
+    "id": "e2e-test22",
+    "hostname": "test22.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com",
+      "strip_base_path": true
+    },
+    "transforms": [
+      {
+        "type": "payload_limit",
+        "max_size": 100,
+        "action": "reject"
+      }
+    ]
+  },
+
+  "test23.test": {
+    "id": "e2e-test23",
+    "hostname": "test23.test",
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "algorithm": "sliding_window",
+        "requests_per_minute": 5,
+        "burst_size": 2,
+        "headers": {
+          "enabled": true,
+          "include_retry_after": true,
+          "include_remaining": true
+        }
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "status": "ok" }
+    }
+  },
+
+  "test24.test": {
+    "id": "e2e-test24",
+    "hostname": "test24.test",
+    "policies": [
+      {
+        "type": "waf",
+        "action_on_match": "block",
+        "owasp_crs": {
+          "enabled": true,
+          "paranoia_level": 1
+        }
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "status": "ok" }
+    }
+  },
+
+  "test25.test": {
+    "id": "e2e-test25",
+    "hostname": "test25.test",
+    "policies": [
+      {
+        "type": "security_headers",
+        "strict_transport_security": {
+          "enabled": true,
+          "max_age": 31536000,
+          "include_subdomains": true
+        },
+        "content_security_policy": {
+          "enabled": true,
+          "directives": {
+            "default_src": ["'self'"],
+            "script_src": ["'self'"]
+          }
+        },
+        "x_frame_options": {
+          "enabled": true,
+          "value": "DENY"
+        },
+        "x_content_type_options": {
+          "enabled": true
+        },
+        "referrer_policy": {
+          "enabled": true,
+          "policy": "strict-origin-when-cross-origin"
+        }
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "text/html",
+      "body": "<html><body>Secure Page</body></html>"
+    }
+  },
+
+  "test26.test": {
+    "id": "e2e-test26",
+    "hostname": "test26.test",
+    "policies": [
+      {
+        "type": "expression",
+        "cel_expr": "ip.isPrivate(request_ip) || ip.inCIDR(request_ip, '127.0.0.0/8') || request_ip == '::1'",
+        "status_code": 403,
+        "message": "IP not whitelisted"
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "access": "granted", "test": "ip_filtering" }
+    }
+  },
+
+  "test27.test": {
+    "id": "e2e-test27",
+    "hostname": "test27.test",
+    "policies": [
+      {
+        "type": "geo_blocking",
+        "blocked_countries": ["XX", "YY"],
+        "action": "block"
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "access": "granted", "test": "geo_blocking" }
+    }
+  },
+
+  "test28.test": {
+    "id": "e2e-test28",
+    "hostname": "test28.test",
+    "policies": [
+      {
+        "type": "expression",
+        "cel_expr": "!request.path.startsWith('/admin')",
+        "status_code": 403,
+        "message": "Admin access denied"
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "access": "granted" }
+    }
+  },
+
+  "test29.test": {
+    "id": "e2e-test29",
+    "hostname": "test29.test",
+    "policies": [
+      {
+        "type": "expression",
+        "lua_script": "if request.headers['x_allow'] then return true end\nreturn false",
+        "status_code": 403,
+        "message": "Missing X-Allow header"
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "access": "granted" }
+    }
+  },
+
+  "test30.test": {
+    "id": "e2e-test30",
+    "hostname": "test30.test",
+    "policies": [
+      {
+        "type": "csrf",
+        "cookie_name": "_csrf",
+        "header_name": "X-CSRF-Token",
+        "secret": "test-csrf-secret-key",
+        "methods": ["POST", "PUT", "DELETE"]
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "status": "ok" }
+    }
+  },
+
+  "test31.test": {
+    "id": "e2e-test31",
+    "hostname": "test31.test",
+    "policies": [
+      {
+        "type": "request_limiting",
+        "size_limits": {
+          "max_url_length": 100,
+          "max_header_size": "1KB",
+          "max_request_size": "1KB"
+        }
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "body": "ok"
+    }
+  },
+
+  "test32.test": {
+    "id": "e2e-test32",
+    "hostname": "test32.test",
+    "policies": [
+      {
+        "type": "pii",
+        "mode": "redact",
+        "direction": "response",
+        "detectors": {
+          "ssn": true
+        },
+        "content_types": ["application/json"],
+        "log_findings": true
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com",
+      "strip_base_path": true
+    }
+  },
+
+  "test33.test": {
+    "id": "e2e-test33",
+    "hostname": "test33.test",
+    "authentication": {
+      "type": "jwt",
+      "secret": "your-256-bit-secret",
+      "algorithm": "HS256",
+      "header_name": "Authorization",
+      "header_prefix": "Bearer "
+    },
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "authenticated": true }
+    }
+  },
+
+  "test34.test": {
+    "id": "e2e-test34",
+    "hostname": "test34.test",
+    "authentication": {
+      "type": "api_key",
+      "api_keys": ["test-key-123", "test-key-456"],
+      "header_name": "X-API-Key"
+    },
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "authenticated": true }
+    }
+  },
+
+  "test35.test": {
+    "id": "e2e-test35",
+    "hostname": "test35.test",
+    "authentication": {
+      "type": "basic_auth",
+      "users": [
+        { "username": "testuser", "password": "testpass" }
+      ]
+    },
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "authenticated": true }
+    }
+  },
+
+  "test36.test": {
+    "id": "e2e-test36",
+    "hostname": "test36.test",
+    "authentication": {
+      "type": "bearer_token",
+      "tokens": ["test-bearer-token-abc123"]
+    },
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "authenticated": true }
+    }
+  },
+
+  "test37.test": {
+    "id": "e2e-test37",
+    "hostname": "test37.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com",
+      "strip_base_path": true
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Custom-Added": "by-modifier",
+            "X-Request-Time": "{{timestamp}}"
+          }
+        },
+        "url": {
+          "path": {
+            "replace": { "old": "/original", "new": "/get" }
+          }
+        }
+      }
+    ]
+  },
+
+  "test38.test": {
+    "id": "e2e-test38",
+    "hostname": "test38.test",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "data": "test" }
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Custom-Response": "modified",
+            "X-Powered-By": "soapbucket-e2e"
+          }
+        }
+      }
+    ]
+  },
+
+  "test39.test": {
+    "id": "e2e-test39",
+    "hostname": "test39.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com/get",
+      "strip_base_path": false
+    },
+    "request_modifiers": [
+      {
+        "cel_expr": "{'set_headers': {'X-CEL-Modified': 'true'}}"
+      }
+    ]
+  },
+
+  "test40.test": {
+    "id": "e2e-test40",
+    "hostname": "test40.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com/get",
+      "strip_base_path": false
+    },
+    "request_modifiers": [
+      {
+        "lua_script": "return { set_headers = { ['X-Lua-Modified'] = 'true' } }"
+      }
+    ]
+  },
+
+  "test41.test": {
+    "id": "e2e-test41",
+    "hostname": "test41.test",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "data": "test" }
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": { "X-Response-Modified": "true" }
+        },
+        "rules": [
+          { "status": { "codes": [200] } }
+        ]
+      },
+      {
+        "headers": {
+          "set": { "X-Error-Modified": "true" }
+        },
+        "rules": [
+          { "status": { "codes": [500] } }
+        ]
+      }
+    ]
+  },
+
+  "test42.test": {
+    "id": "e2e-test42",
+    "hostname": "test42.test",
+    "forward_rules": [
+      {
+        "hostname": "test42-api",
+        "rules": [{ "path": { "prefix": "/api" } }]
+      },
+      {
+        "hostname": "test42-web",
+        "rules": [{ "path": { "prefix": "/web" } }]
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 404,
+      "content_type": "application/json",
+      "json_body": { "error": "not found", "hint": "try /api/data or /web/page" }
+    }
+  },
+  "test42-api": {
+    "id": "e2e-test42-api",
+    "hostname": "test42-api",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "source": "api-backend", "type": "api" }
+    }
+  },
+  "test42-web": {
+    "id": "e2e-test42-web",
+    "hostname": "test42-web",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "source": "web-backend", "type": "web" }
+    }
+  },
+
+  "test43.test": {
+    "id": "e2e-test43",
+    "hostname": "test43.test",
+    "forward_rules": [
+      {
+        "hostname": "test43-mobile",
+        "rules": [
+          {
+            "cel_expr": "size(user_agent) > 0 && user_agent['device_family'] in ['iPhone', 'iPad', 'Android']"
+          }
+        ]
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "platform": "desktop", "variant": "default" }
+    }
+  },
+  "test43-mobile": {
+    "id": "e2e-test43-mobile",
+    "hostname": "test43-mobile",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "platform": "mobile", "variant": "optimized" }
+    }
+  },
+
+  "test44.test": {
+    "id": "e2e-test44",
+    "hostname": "test44.test",
+    "forward_rules": [
+      {
+        "hostname": "test44-premium",
+        "rules": [
+          {
+            "headers": { "exists": ["X-Premium"] }
+          }
+        ]
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "tier": "standard" }
+    }
+  },
+  "test44-premium": {
+    "id": "e2e-test44-premium",
+    "hostname": "test44-premium",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "tier": "premium", "features": ["priority", "extended-limits"] }
+    }
+  },
+
+  "test45.test": {
+    "id": "e2e-test45",
+    "hostname": "test45.test",
+    "session_config": {
+      "cookie_name": "_sb_test_session",
+      "cookie_max_age": 3600,
+      "allow_non_ssl": true
+    },
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": { "session": "active" }
+    }
+  },
+
+  "test46.test": {
+    "id": "e2e-test46",
+    "hostname": "test46.test",
+    "traffic_capture": {
+      "enabled": true,
+      "sample_rate": 1.0,
+      "max_body_size": "10kb",
+      "retention": "1h"
+    },
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com",
+      "strip_base_path": true
+    }
+  },
+
+  "test47.test": {
+    "id": "e2e-test47",
+    "hostname": "test47.test",
+    "on_load": [
+      {
+        "url": "https://jsonplaceholder.typicode.com/posts/1",
+        "method": "GET",
+        "variable_name": "loaded_post",
+        "cache_duration": "1h",
+        "on_error": "warn"
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "text/html",
+      "body": "<html><body><h1>Post: {{config.loaded_post.title}}</h1><p>ID: {{config.loaded_post.id}}</p><p>Request: {{request.id}}</p></body></html>"
+    },
+    "response_modifiers": [
+      { "headers": { "set": { "X-Data-Loaded": "true" } } }
+    ]
+  },
+
+  "test48.test": {
+    "id": "e2e-test48",
+    "hostname": "test48.test",
+    "error_pages": [
+      {
+        "status": [404],
+        "content_type": "text/html",
+        "body": "<html><body><h1>Custom 404</h1><p>The page you requested was not found.</p></body></html>"
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 404,
+      "body": "default not found"
+    }
+  },
+
+  "test49.test": {
+    "id": "e2e-test49",
+    "hostname": "test49.test",
+    "force_ssl": true,
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "body": "secure content"
+    }
+  },
+
+  "test50.test": {
+    "id": "e2e-test50",
+    "hostname": "test50.test",
+    "response_cache": {
+      "enabled": true,
+      "ttl": "5m",
+      "conditions": {
+        "status_codes": [200],
+        "methods": ["GET"]
+      }
+    },
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com",
+      "strip_base_path": true
+    },
+    "response_modifiers": [
+      { "headers": { "set": { "X-Cache-Status": "{{cache.status}}" } } }
+    ]
+  },
+
+  "test51.test": {
+    "id": "e2e-test51",
+    "hostname": "test51.test",
+    "action": {
+      "type": "graphql",
+      "url": "https://postman-echo.com/post",
+      "max_depth": 3,
+      "max_complexity": 100,
+      "enable_introspection": false
+    }
+  }
+}

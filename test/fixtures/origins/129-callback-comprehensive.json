@@ -1,0 +1,156 @@
+{
+  "callback-onstart.test": {
+    "id": "callback-onstart",
+    "hostname": "callback-onstart.test",
+    "on_load": [{
+      "type": "http",
+      "url": "http://e2e-test-server:8090/callback/config",
+      "method": "GET",
+      "timeout": 5
+    }],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.html"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Config-Version": "{{config.version}}",
+            "X-Config-Env": "{{config.env}}"
+          }
+        }
+      }
+    ]
+  },
+  "callback-onsession.test": {
+    "id": "callback-onsession",
+    "hostname": "callback-onsession.test",
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_sb.session",
+      "cookie_max_age": 3600,
+      "callbacks": [
+        {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_prefs",
+          "timeout": 5
+        }
+      ],
+      "allow_non_ssl": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.html"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-Theme": "{{session_data.user_prefs.user_preferences.theme}}",
+            "X-User-Language": "{{session_data.user_prefs.user_preferences.language}}",
+            "X-Is-Premium": "{{session_data.user_prefs.subscription.tier}}"
+          }
+        }
+      }
+    ]
+  },
+  "callback-cel.test": {
+    "id": "callback-cel",
+    "hostname": "callback-cel.test",
+    "on_load": [{
+      "type": "http",
+      "url": "http://e2e-test-server:8090/callback/config",
+      "method": "GET",
+      "timeout": 5,
+      "cel_expr": "{\"modified_json\": {\"config_data\": {\"api_version\": string('version' in json ? json['version'] : 'v1'), \"environment\": 'env' in json ? json['env'] : 'production', \"features\": 'features' in json ? json['features'] : {}}}}"
+    }],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.html"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-API-Version": "{{config.config_data.api_version}}",
+            "X-Environment": "{{config.config_data.environment}}"
+          }
+        }
+      }
+    ]
+  },
+  "callback-lua.test": {
+    "id": "callback-lua",
+    "hostname": "callback-lua.test",
+    "on_load": [{
+      "type": "http",
+      "url": "http://e2e-test-server:8090/callback/config",
+      "method": "GET",
+      "timeout": 5,
+      "lua_script": "return {modified_json = {config_data = {api_version = json.version or 'v1', environment = json.env or 'production', features = json.features or {}}}}"
+    }],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.html"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-API-Version": "{{config.config_data.api_version}}",
+            "X-Environment": "{{config.config_data.environment}}"
+          }
+        }
+      }
+    ]
+  },
+  "callback-jsonpath.test": {
+    "id": "callback-jsonpath",
+    "hostname": "callback-jsonpath.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.json"
+    },
+    "transforms": [
+      {
+        "type": "jsonpath",
+        "content_types": ["application/json"],
+        "operations": [
+          {
+            "type": "extract",
+            "path": "$.status",
+            "target": "X-Response-Status"
+          },
+          {
+            "type": "extract",
+            "path": "$.data.metadata.total",
+            "target": "X-Total-Count"
+          },
+          {
+            "type": "set",
+            "path": "$.modified",
+            "value": true
+          },
+          {
+            "type": "set",
+            "path": "$.proxy_version",
+            "value": "1.0.0"
+          },
+          {
+            "type": "delete",
+            "path": "$.sensitive"
+          },
+          {
+            "type": "copy",
+            "path": "$.data.metadata.total",
+            "target": "$.total_users"
+          }
+        ]
+      }
+    ]
+  }
+}
+

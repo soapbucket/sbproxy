@@ -1,0 +1,196 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-runner-scripts
+  namespace: default
+data:
+  run-tests.sh: |
+    #!/bin/bash
+    set -e
+    
+    echo "🧪 Starting E2E Tests"
+    echo "===================="
+    
+    PROXY_URL="http://proxy-test"
+    TEST_SERVER_URL="http://e2e-test-server"
+    
+    # Colors
+    GREEN='\033[0;32m'
+    RED='\033[0;31m'
+    NC='\033[0m'
+    
+    PASSED=0
+    FAILED=0
+    
+    # Test function
+    test_endpoint() {
+      local name=$1
+      local url=$2
+      local expected_status=$3
+      
+      echo -n "Testing: $name ... "
+      
+      response=$(curl -s -w "\n%{http_code}" "$url")
+      status=$(echo "$response" | tail -n 1)
+      body=$(echo "$response" | head -n -1)
+      
+      if [ "$status" -eq "$expected_status" ]; then
+        echo -e "${GREEN}✅ PASS${NC}"
+        ((PASSED++))
+      else
+        echo -e "${RED}❌ FAIL${NC} (expected $expected_status, got $status)"
+        ((FAILED++))
+      fi
+    }
+    
+    # Health checks
+    echo ""
+    echo "📋 Health Checks"
+    echo "----------------"
+    test_endpoint "Test Server Health" "$TEST_SERVER_URL/health" 200
+    test_endpoint "Proxy Health" "$PROXY_URL/health" 200
+    
+    # Direct test server tests
+    echo ""
+    echo "📋 Direct Test Server Tests"
+    echo "---------------------------"
+    test_endpoint "Simple 200" "$TEST_SERVER_URL/test/simple-200" 200
+    test_endpoint "Not Found" "$TEST_SERVER_URL/test/not-found" 404
+    test_endpoint "Error 500" "$TEST_SERVER_URL/test/error-500" 500
+    test_endpoint "Custom Headers" "$TEST_SERVER_URL/test/custom-headers" 200
+    
+    # Proxy tests
+    echo ""
+    echo "📋 Proxy Tests"
+    echo "--------------"
+    test_endpoint "Proxy Simple 200" "$PROXY_URL/test/simple-200" 200
+    test_endpoint "Proxy Auth Required" "$PROXY_URL/test/auth-required" 200
+    test_endpoint "Proxy Delayed Response" "$PROXY_URL/test/delayed-response" 200
+    
+    # Kubernetes-specific tests
+    echo ""
+    echo "📋 Kubernetes Tests"
+    echo "-------------------"
+    test_endpoint "K8s Health Check" "$TEST_SERVER_URL/test/k8s-health" 200
+    test_endpoint "K8s Proxy Test" "$TEST_SERVER_URL/test/k8s-proxy-test" 200
+    test_endpoint "K8s Auth Test" "$TEST_SERVER_URL/test/k8s-auth-test" 200
+    
+    # Callback tests
+    echo ""
+    echo "📋 Callback Tests"
+    echo "-----------------"
+    session_response=$(curl -s -X POST "$TEST_SERVER_URL/callback/session")
+    if echo "$session_response" | grep -q "user_preferences"; then
+      echo -e "Session Callback ... ${GREEN}✅ PASS${NC}"
+      ((PASSED++))
+    else
+      echo -e "Session Callback ... ${RED}❌ FAIL${NC}"
+      ((FAILED++))
+    fi
+    
+    auth_response=$(curl -s -X POST "$TEST_SERVER_URL/callback/auth" \
+      -H "Content-Type: application/json" \
+      -d '{"email":"admin@example.com"}')
+    if echo "$auth_response" | grep -q "roles"; then
+      echo -e "Auth Callback ... ${GREEN}✅ PASS${NC}"
+      ((PASSED++))
+    else
+      echo -e "Auth Callback ... ${RED}❌ FAIL${NC}"
+      ((FAILED++))
+    fi
+    
+    # GraphQL tests
+    echo ""
+    echo "📋 GraphQL Tests"
+    echo "----------------"
+    graphql_response=$(curl -s -X POST "http://e2e-test-server:8092/graphql" \
+      -H "Content-Type: application/json" \
+      -d '{"query": "{ users { id name } }"}')
+    if echo "$graphql_response" | grep -q "data"; then
+      echo -e "GraphQL Query ... ${GREEN}✅ PASS${NC}"
+      ((PASSED++))
+    else
+      echo -e "GraphQL Query ... ${RED}❌ FAIL${NC}"
+      ((FAILED++))
+    fi
+    
+    # Summary
+    echo ""
+    echo "===================="
+    echo "📊 Test Summary"
+    echo "===================="
+    echo -e "Passed: ${GREEN}$PASSED${NC}"
+    echo -e "Failed: ${RED}$FAILED${NC}"
+    echo "Total:  $((PASSED + FAILED))"
+    
+    if [ $FAILED -eq 0 ]; then
+      echo ""
+      echo -e "${GREEN}✅ All tests passed!${NC}"
+      exit 0
+    else
+      echo ""
+      echo -e "${RED}❌ Some tests failed${NC}"
+      exit 1
+    fi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: e2e-test-runner
+  namespace: default
+  labels:
+    app: test-runner
+spec:
+  template:
+    metadata:
+      labels:
+        app: test-runner
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: test-runner
+        image: curlimages/curl:latest
+        command: ["/bin/sh", "/scripts/run-tests.sh"]
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+          readOnly: true
+      volumes:
+      - name: scripts
+        configMap:
+          name: test-runner-scripts
+          defaultMode: 0755
+  backoffLimit: 3
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: e2e-test-runner-scheduled
+  namespace: default
+  labels:
+    app: test-runner
+spec:
+  schedule: "*/30 * * * *"  # Run every 30 minutes
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: test-runner
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: test-runner
+            image: curlimages/curl:latest
+            command: ["/bin/sh", "/scripts/run-tests.sh"]
+            volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+          volumes:
+          - name: scripts
+            configMap:
+              name: test-runner-scripts
+              defaultMode: 0755
+      backoffLimit: 2
+

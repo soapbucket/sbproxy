@@ -1,0 +1,40 @@
+{
+  "content-negotiation.test": {
+    "id": "content-negotiation",
+    "hostname": "content-negotiation.test",
+    "transforms": [
+      {
+        "type": "json",
+        "content_types": ["application/json"],
+        "json_transform": {
+          "set_fields": {
+            "format": "json"
+          }
+        },
+        "rules": [
+          {
+            "headers": {"Accept": "application/json"}
+          }
+        ]
+      },
+      {
+        "type": "template",
+        "content_types": ["application/json"],
+        "template_transform": {
+          "template": "<html><body>{{.}}</body></html>",
+          "content_type": "text/html"
+        },
+        "rules": [
+          {
+            "headers": {"Accept": "text/html"}
+          }
+        ]
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test/json-data"
+    }
+  }
+}
+

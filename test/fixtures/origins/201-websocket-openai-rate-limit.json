@@ -1,0 +1,27 @@
+{
+  "ws-openai-rate.test": {
+    "id": "ws-openai-rate",
+    "hostname": "ws-openai-rate.test",
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "requests_per_minute": 1,
+        "match": {
+          "protocols": ["websocket"],
+          "phases": ["message"],
+          "directions": ["client_to_backend"],
+          "event_types": ["response.create"],
+          "providers": ["openai"]
+        }
+      }
+    ],
+    "action": {
+      "type": "websocket",
+      "url": "ws://e2e-test-server:8091/echo",
+      "provider": "openai",
+      "ping_interval": "30s",
+      "pong_timeout": "10s",
+      "handshake_timeout": "10s"
+    }
+  }
+}

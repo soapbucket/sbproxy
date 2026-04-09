@@ -1,0 +1,11 @@
+{
+  "attributes": {
+    "title": "proxy-security-*",
+    "timeFieldName": "@timestamp",
+    "fields": "[]"
+  },
+  "id": "proxy-security-pattern",
+  "type": "index-pattern",
+  "version": "1"
+}
+

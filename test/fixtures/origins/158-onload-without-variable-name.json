@@ -1,0 +1,30 @@
+{
+  "onload-without-variable-name.test": {
+    "id": "onload-without-variable-name",
+    "hostname": "onload-without-variable-name.test",
+    "on_load": [
+      {
+        "type": "http",
+        "url": "http://e2e-test-server:8090/callback/config",
+        "method": "GET",
+        "timeout": 5,
+        "cel_expr": "{\"modified_json\": {\"api_version\": string('version' in json ? json['version'] : 'v1'), \"environment\": 'env' in json ? json['env'] : 'production'}}"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-API-Version": "{{config.api_version}}",
+            "X-Environment": "{{config.environment}}"
+          }
+        }
+      }
+    ]
+  }
+}
+

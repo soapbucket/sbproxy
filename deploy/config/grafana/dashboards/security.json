@@ -1,0 +1,169 @@
+{
+  "title": "SoapBucket Proxy - Security",
+  "tags": ["soapbucket", "security"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+        {
+          "name": "origin",
+          "type": "query",
+          "label": "Origin",
+          "datasource": "Prometheus",
+          "query": "label_values(sb_requests_total, origin)",
+          "refresh": 1,
+          "regex": "",
+          "multi": true,
+          "includeAll": true
+        }
+      ]
+    },
+    "panels": [
+      {
+        "id": 1,
+        "title": "TLS Certificate Expiration",
+        "type": "stat",
+        "gridPos": {"h": 8, "w": 8, "x": 0, "y": 0},
+        "targets": [{
+          "expr": "sb_tls_cert_expiry_days{origin=~\"$origin\"} < 30"
+        }],
+        "thresholds": {
+          "steps": [
+            {"value": 0, "color": "red"},
+            {"value": 30, "color": "yellow"},
+            {"value": null, "color": "green"}
+          ]
+        }
+      },
+      {
+        "id": 2,
+        "title": "TLS Insecure Skip Verify",
+        "type": "table",
+        "gridPos": {"h": 8, "w": 8, "x": 8, "y": 0},
+        "targets": [{
+          "expr": "sb_tls_insecure_skip_verify_enabled{origin=~\"$origin\"} == 1"
+        }]
+      },
+      {
+        "id": 3,
+        "title": "DDoS Attacks Detected",
+        "type": "stat",
+        "gridPos": {"h": 8, "w": 8, "x": 16, "y": 0},
+        "targets": [{
+          "expr": "sum(rate(sb_ddos_attacks_detected_total{origin=~\"$origin\"}[5m]))"
+        }],
+        "thresholds": {
+          "steps": [
+            {"value": 0, "color": "green"},
+            {"value": null, "color": "red"}
+          ]
+        }
+      },
+      {
+        "id": 4,
+        "title": "TLS Handshake Failures",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+        "targets": [{
+          "expr": "sum by (error_type) (rate(sb_tls_handshake_failures_total{origin=~\"$origin\"}[5m]))",
+          "legendFormat": "{{error_type}}"
+        }]
+      },
+      {
+        "id": 5,
+        "title": "TLS Version Usage",
+        "type": "piechart",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+        "targets": [{
+          "expr": "sum by (tls_version) (rate(sb_tls_version_usage_total{origin=~\"$origin\"}[5m]))"
+        }]
+      },
+      {
+        "id": 6,
+        "title": "Authentication Failures",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+        "targets": [{
+          "expr": "sum by (auth_type, failure_reason) (rate(sb_auth_failures_total{origin=~\"$origin\"}[5m]))",
+          "legendFormat": "{{auth_type}} - {{failure_reason}}"
+        }]
+      },
+      {
+        "id": 7,
+        "title": "Rate Limit Violations",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+        "targets": [{
+          "expr": "sum by (rate_limit_type) (rate(sb_rate_limit_violations_total{origin=~\"$origin\"}[5m]))",
+          "legendFormat": "{{rate_limit_type}}"
+        }]
+      },
+      {
+        "id": 8,
+        "title": "Authorization Failures",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+        "targets": [{
+          "expr": "sum by (resource) (rate(sb_authz_failures_total{origin=~\"$origin\"}[5m]))",
+          "legendFormat": "{{resource}}"
+        }]
+      },
+      {
+        "id": 9,
+        "title": "Security Header Violations",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+        "targets": [{
+          "expr": "sum by (header_name, violation_type) (rate(sb_security_header_violations_total{origin=~\"$origin\"}[5m]))",
+          "legendFormat": "{{header_name}} - {{violation_type}}"
+        }]
+      },
+      {
+        "id": 10,
+        "title": "Certificate Pinning Failures",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+        "targets": [{
+          "expr": "sum by (error_type) (rate(sb_cert_pin_failures_total{origin=~\"$origin\"}[5m]))",
+          "legendFormat": "{{error_type}}"
+        }]
+      },
+      {
+        "id": 11,
+        "title": "CSRF Validation Failures",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+        "targets": [{
+          "expr": "sum by (failure_reason) (rate(sb_csrf_validation_failures_total{origin=~\"$origin\"}[5m]))",
+          "legendFormat": "{{failure_reason}}"
+        }]
+      },
+      {
+        "id": 12,
+        "title": "Input Validation Failures",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 40},
+        "targets": [{
+          "expr": "sum by (validation_type) (rate(sb_input_validation_failures_total{origin=~\"$origin\"}[5m]))",
+          "legendFormat": "{{validation_type}}"
+        }]
+      },
+      {
+        "id": 13,
+        "title": "Geo-Blocking Violations",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 40},
+        "targets": [{
+          "expr": "sum by (country_code) (rate(sb_geo_block_violations_total{origin=~\"$origin\"}[5m]))",
+          "legendFormat": "{{country_code}}"
+        }]
+      }
+    ],
+    "schemaVersion": 27,
+    "version": 1
+}
+

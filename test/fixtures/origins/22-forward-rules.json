@@ -1,0 +1,38 @@
+{
+  "forward-rules.test": {
+    "id": "forward-rules",
+    "hostname": "forward-rules.test",
+    "forward_rules": [
+      {
+        "hostname": "forward-rules-api.test",
+        "rules": [
+          {
+            "path": {"contains": "/api"}
+          }
+        ]
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    }
+  },
+  "forward-rules-api.test": {
+    "id": "forward-rules-api",
+    "hostname": "forward-rules-api.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-API-Version": "v2"
+          }
+        }
+      }
+    ]
+  }
+}
+

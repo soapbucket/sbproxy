@@ -1,0 +1,23 @@
+{
+  "cache-compress.test": {
+    "id": "cache-compress",
+    "hostname": "cache-compress.test",
+    "cache_settings": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": "1m"
+    },
+    "compression": {
+      "disabled": false,
+      "min_length": 100,
+      "content_types": [
+        "application/json",
+        "text/html"
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test/large-data"
+    }
+  }
+}

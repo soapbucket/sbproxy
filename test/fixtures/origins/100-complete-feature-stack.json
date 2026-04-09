@@ -1,0 +1,104 @@
+{
+  "feature-stack.test": {
+    "id": "feature-stack",
+    "hostname": "feature-stack.test",
+    "authentication": {
+      "type": "bearer_token",
+      "disabled": false,
+      "header_name": "Authorization",
+      "header_prefix": "Bearer ",
+      "tokens": [
+        "feature-test-token"
+      ]
+    },
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_feature_session",
+      "cookie_max_age": 3600,
+      "allow_non_ssl": true
+    },
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "disabled": false,
+        "limit": 100,
+        "window": "1m",
+        "key_by": "ip"
+      },
+      {
+        "type": "security_headers",
+        "disabled": false,
+        "strict_transport_security": {
+          "disabled": false,
+          "max_age": "1y"
+        },
+        "content_security_policy": {
+          "disabled": false,
+          "directives": {
+            "default_src": [
+              "'self'"
+            ],
+            "script_src": [
+              "'self'",
+              "'unsafe-inline'"
+            ]
+          }
+        }
+      }
+    ],
+    "cache_settings": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": "1m"
+    },
+    "compression": {
+      "disabled": false,
+      "min_length": 100,
+      "content_types": [
+        "application/json"
+      ]
+    },
+    "transforms": [
+      {
+        "type": "json",
+        "content_types": [
+          "application/json"
+        ],
+        "json_transform": {
+          "set_fields": {
+            "processed": true,
+            "version": "v1"
+          }
+        }
+      }
+    ],
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Request-ID": "{{uuid}}",
+            "X-Timestamp": "{{timestamp}}"
+          }
+        }
+      }
+    ],
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Proxy-Version": "1.0",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization"
+          }
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/api/headers"
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "cel-callback-auth.test": {
+    "id": "cel-callback-auth",
+    "hostname": "cel-callback-auth.test",
+    "authentication": {
+      "type": "api_key",
+      "disabled": false,
+      "header_name": "X-API-Key",
+      "api_keys": ["test-key-123"],
+      "authentication_callback": {
+        "type": "http",
+        "url": "http://e2e-test-server:8090/callback/auth",
+        "method": "POST",
+        "timeout": 5,
+        "cel_expr": "{\"modified_json\": {\"user_id\": string('user_id' in json ? json['user_id'] : 'unknown'), \"roles\": 'roles' in json ? json['roles'] : [], \"permissions\": 'permissions' in json ? json['permissions'] : {}}}"
+      }
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-ID": "{{auth_data.user_id}}",
+            "X-User-Roles": "{{auth_data.roles}}"
+          }
+        }
+      }
+    ]
+  }
+}
+

@@ -1,0 +1,132 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: proxy-ws-alpha-config
+  namespace: soapbucket
+data:
+  SB_WORKSPACE_ID: "ws-alpha"
+  SB_WORKSPACE_MODE: "dedicated"
+  REDIS_URL: "redis://host.k3d.internal:6379"
+  STORAGE_DSN: "postgres://soapbucket:localdev@host.k3d.internal:5432/soapbucket?sslmode=disable"
+  CLICKHOUSE_DSN: "clickhouse://soapbucket:localdev@host.k3d.internal:9000/soapbucket"
+  VAULT_ADDR: "http://host.k3d.internal:8200"
+  VAULT_TOKEN: "dev-root-token"
+  LOG_LEVEL: "debug"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proxy-ws-alpha
+  namespace: soapbucket
+  labels:
+    app: proxy
+    tier: dedicated
+    workspace: ws-alpha
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: proxy
+      workspace: ws-alpha
+  template:
+    metadata:
+      labels:
+        app: proxy
+        tier: dedicated
+        workspace: ws-alpha
+    spec:
+      containers:
+      - name: proxy
+        image: k3d-soapbucket-registry.localhost:5111/soapbucket/proxy:dev
+        ports:
+        - name: http
+          containerPort: 8080
+        - name: telemetry
+          containerPort: 8888
+        envFrom:
+        - configMapRef:
+            name: proxy-ws-alpha-config
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "1000m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: proxy-ws-alpha-svc
+  namespace: soapbucket
+  labels:
+    app: proxy
+    workspace: ws-alpha
+spec:
+  selector:
+    app: proxy
+    workspace: ws-alpha
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+  - name: telemetry
+    port: 8888
+    targetPort: 8888
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: proxy-ws-alpha
+  namespace: soapbucket
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: "ws-alpha.local"
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: proxy-ws-alpha-svc
+            port:
+              number: 80
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: proxy-ws-alpha-hpa
+  namespace: soapbucket
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: proxy-ws-alpha
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80

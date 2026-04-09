@@ -1,0 +1,8 @@
+{
+  "hostname": "e2e-test-server",
+  "pin_sha256": "17HrCmhMmNdCzGFcCUTF7ef2/1cyZr3GZYzLP31+lV0=",
+  "certificate": "/Users/rick/projects/soapbucket/proxy/certs/e2e-test-server.crt",
+  "private_key": "/Users/rick/projects/soapbucket/proxy/certs/e2e-test-server.key",
+  "generated_at": "2026-02-02T06:35:31Z",
+  "valid_until": "Feb  2 06:35:31 2027 GMT"
+}

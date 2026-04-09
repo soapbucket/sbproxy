@@ -1,0 +1,531 @@
+{
+  "name": "Comprehensive E2E Test Configuration",
+  "description": "Complete test scenarios covering all proxy features for end-to-end validation",
+  "defaults": {
+    "status": 200,
+    "headers": {
+      "X-Test-Server": "e2e-test-server",
+      "X-Test-Version": "1.0"
+    }
+  },
+  "scenarios": [
+    {
+      "id": "health-check",
+      "name": "Health Check Endpoint",
+      "path": "/test/health-check",
+      "method": "GET",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "healthy",
+          "checks": {
+            "database": "ok",
+            "cache": "ok",
+            "api": "ok"
+          }
+        }
+      },
+      "metadata": {
+        "category": "monitoring",
+        "critical": true
+      }
+    },
+    {
+      "id": "basic-auth",
+      "name": "Basic Authentication",
+      "path": "/test/basic-auth",
+      "method": "GET",
+      "request": {
+        "headers": {
+          "Authorization": "Basic dGVzdDpwYXNzd29yZA=="
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "authenticated",
+          "auth_type": "basic",
+          "user": "test"
+        }
+      },
+      "metadata": {
+        "category": "auth",
+        "auth_required": true
+      }
+    },
+    {
+      "id": "bearer-token",
+      "name": "Bearer Token Authentication",
+      "path": "/test/bearer-token",
+      "method": "GET",
+      "request": {
+        "headers": {
+          "Authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "authenticated",
+          "auth_type": "bearer",
+          "token_valid": true
+        }
+      },
+      "metadata": {
+        "category": "auth",
+        "auth_required": true
+      }
+    },
+    {
+      "id": "json-post",
+      "name": "JSON POST Request",
+      "path": "/test/json-post",
+      "method": "POST",
+      "request": {
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "name": "Test User",
+          "email": "test@example.com"
+        }
+      },
+      "response": {
+        "status": 201,
+        "headers": {
+          "Content-Type": "application/json",
+          "Location": "/users/12345"
+        },
+        "body": {
+          "status": "created",
+          "id": "12345",
+          "name": "Test User",
+          "email": "test@example.com"
+        }
+      },
+      "metadata": {
+        "category": "rest-api",
+        "operation": "create"
+      }
+    },
+    {
+      "id": "json-put",
+      "name": "JSON PUT Request",
+      "path": "/test/json-put",
+      "method": "PUT",
+      "request": {
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "id": "12345",
+          "name": "Updated User"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "updated",
+          "id": "12345",
+          "name": "Updated User"
+        }
+      },
+      "metadata": {
+        "category": "rest-api",
+        "operation": "update"
+      }
+    },
+    {
+      "id": "json-delete",
+      "name": "JSON DELETE Request",
+      "path": "/test/json-delete",
+      "method": "DELETE",
+      "request": {},
+      "response": {
+        "status": 204,
+        "headers": {},
+        "body": {}
+      },
+      "metadata": {
+        "category": "rest-api",
+        "operation": "delete"
+      }
+    },
+    {
+      "id": "pagination",
+      "name": "Paginated Response",
+      "path": "/test/pagination",
+      "method": "GET",
+      "request": {
+        "query_params": {
+          "page": "1",
+          "per_page": "10"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Total-Count": "100",
+          "X-Page": "1",
+          "X-Per-Page": "10"
+        },
+        "body": {
+          "items": [
+            {"id": 1, "name": "Item 1"},
+            {"id": 2, "name": "Item 2"},
+            {"id": 3, "name": "Item 3"}
+          ],
+          "pagination": {
+            "page": 1,
+            "per_page": 10,
+            "total": 100,
+            "total_pages": 10
+          }
+        }
+      },
+      "metadata": {
+        "category": "rest-api",
+        "feature": "pagination"
+      }
+    },
+    {
+      "id": "cache-control",
+      "name": "Cache Control Headers",
+      "path": "/test/cache-control",
+      "method": "GET",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "Cache-Control": "public, max-age=3600",
+          "ETag": "\"abc123\"",
+          "Last-Modified": "Mon, 01 Jan 2024 00:00:00 GMT"
+        },
+        "body": {
+          "status": "success",
+          "cached": true
+        }
+      },
+      "metadata": {
+        "category": "caching",
+        "cacheable": true
+      }
+    },
+    {
+      "id": "compression",
+      "name": "Compressed Response",
+      "path": "/test/compression",
+      "method": "GET",
+      "request": {
+        "headers": {
+          "Accept-Encoding": "gzip, deflate, br"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "Content-Encoding": "gzip"
+        },
+        "body": {
+          "status": "success",
+          "compressed": true,
+          "data": "large payload would be compressed"
+        }
+      },
+      "metadata": {
+        "category": "performance",
+        "feature": "compression"
+      }
+    },
+    {
+      "id": "redirect-302",
+      "name": "Temporary Redirect",
+      "path": "/test/redirect-302",
+      "method": "GET",
+      "response": {
+        "status": 302,
+        "headers": {
+          "Location": "/test/health-check"
+        },
+        "body": {}
+      },
+      "metadata": {
+        "category": "redirects",
+        "redirect_type": "temporary"
+      }
+    },
+    {
+      "id": "redirect-307",
+      "name": "Temporary Redirect (Preserve Method)",
+      "path": "/test/redirect-307",
+      "method": "POST",
+      "response": {
+        "status": 307,
+        "headers": {
+          "Location": "/test/json-post"
+        },
+        "body": {}
+      },
+      "metadata": {
+        "category": "redirects",
+        "redirect_type": "temporary",
+        "preserve_method": true
+      }
+    },
+    {
+      "id": "error-400",
+      "name": "Bad Request Error",
+      "path": "/test/error-400",
+      "method": "GET",
+      "response": {
+        "status": 400,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "code": "BAD_REQUEST",
+          "message": "Invalid request parameters",
+          "details": {
+            "field": "email",
+            "error": "Invalid email format"
+          }
+        }
+      },
+      "metadata": {
+        "category": "errors",
+        "error_type": "client"
+      }
+    },
+    {
+      "id": "error-401",
+      "name": "Unauthorized Error",
+      "path": "/test/error-401",
+      "method": "GET",
+      "response": {
+        "status": 401,
+        "headers": {
+          "Content-Type": "application/json",
+          "WWW-Authenticate": "Bearer realm=\"test\""
+        },
+        "body": {
+          "status": "error",
+          "code": "UNAUTHORIZED",
+          "message": "Authentication required"
+        }
+      },
+      "metadata": {
+        "category": "errors",
+        "error_type": "auth"
+      }
+    },
+    {
+      "id": "error-403",
+      "name": "Forbidden Error",
+      "path": "/test/error-403",
+      "method": "GET",
+      "response": {
+        "status": 403,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "code": "FORBIDDEN",
+          "message": "Insufficient permissions"
+        }
+      },
+      "metadata": {
+        "category": "errors",
+        "error_type": "auth"
+      }
+    },
+    {
+      "id": "error-503",
+      "name": "Service Unavailable",
+      "path": "/test/error-503",
+      "method": "GET",
+      "response": {
+        "status": 503,
+        "headers": {
+          "Content-Type": "application/json",
+          "Retry-After": "120"
+        },
+        "body": {
+          "status": "error",
+          "code": "SERVICE_UNAVAILABLE",
+          "message": "Service temporarily unavailable"
+        }
+      },
+      "metadata": {
+        "category": "errors",
+        "error_type": "server"
+      }
+    },
+    {
+      "id": "slow-response",
+      "name": "Slow Response (2 seconds)",
+      "path": "/test/slow-response",
+      "method": "GET",
+      "response": {
+        "status": 200,
+        "delay": 2000,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "success",
+          "delayed": true,
+          "delay_ms": 2000
+        }
+      },
+      "metadata": {
+        "category": "performance",
+        "timeout_test": true
+      }
+    },
+    {
+      "id": "multipart-form",
+      "name": "Multipart Form Upload",
+      "path": "/test/multipart-form",
+      "method": "POST",
+      "request": {
+        "headers": {
+          "Content-Type": "multipart/form-data"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "success",
+          "uploaded": true,
+          "files": ["file1.txt", "file2.jpg"]
+        }
+      },
+      "metadata": {
+        "category": "file-upload",
+        "multipart": true
+      }
+    },
+    {
+      "id": "streaming-response",
+      "name": "Streaming Response",
+      "path": "/test/streaming-response",
+      "method": "GET",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive"
+        },
+        "body": {
+          "stream": true,
+          "chunks": 10
+        }
+      },
+      "metadata": {
+        "category": "streaming",
+        "sse": true
+      }
+    },
+    {
+      "id": "websocket-upgrade",
+      "name": "WebSocket Upgrade Request",
+      "path": "/test/websocket-upgrade",
+      "method": "GET",
+      "request": {
+        "headers": {
+          "Upgrade": "websocket",
+          "Connection": "Upgrade"
+        }
+      },
+      "response": {
+        "status": 101,
+        "headers": {
+          "Upgrade": "websocket",
+          "Connection": "Upgrade"
+        },
+        "body": {}
+      },
+      "metadata": {
+        "category": "websocket",
+        "upgrade": true
+      }
+    },
+    {
+      "id": "premium-user",
+      "name": "Premium User Response",
+      "path": "/test/premium-user",
+      "method": "GET",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-User-Tier": "premium"
+        },
+        "body": {
+          "status": "success",
+          "user": {
+            "id": "user-123",
+            "tier": "premium",
+            "features": {
+              "api_rate_limit": 10000,
+              "advanced_features": true,
+              "priority_support": true
+            }
+          }
+        }
+      },
+      "metadata": {
+        "category": "session",
+        "user_tier": "premium"
+      }
+    },
+    {
+      "id": "rate-limit-remaining",
+      "name": "Rate Limit Info",
+      "path": "/test/rate-limit-remaining",
+      "method": "GET",
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-RateLimit-Limit": "1000",
+          "X-RateLimit-Remaining": "950",
+          "X-RateLimit-Reset": "1704067200"
+        },
+        "body": {
+          "status": "success",
+          "rate_limit": {
+            "limit": 1000,
+            "remaining": 950,
+            "reset": 1704067200
+          }
+        }
+      },
+      "metadata": {
+        "category": "rate-limiting",
+        "within_limit": true
+      }
+    }
+  ]
+}
+

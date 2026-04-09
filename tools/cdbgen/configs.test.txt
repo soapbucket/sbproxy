@@ -1,0 +1,143 @@
+# Comprehensive Test Configuration for Origin Config
+# Format: hostname <space> json-config
+# The 'id' field will be auto-generated
+
+# =============================================================================
+# JSON OPTIMIZATION SECTION
+# =============================================================================
+# Test: JSON API optimization with minification and compression
+# Uses JSONPlaceholder API for realistic JSON data testing
+json-api.test.com {"hostname":"json-api.test.com","type":"proxy","config":{"url":"https://jsonplaceholder.typicode.com","timeout":"30s"},"transform":{"minifyJSON":true,"disableCompression":false},"responseModifier":{"rules":[{"statusCode":200,"contentType":"application/json","responseModifications":{"setHeaders":{"X-JSON-Optimized":"true","Content-Encoding":"gzip"},"bodyRegexReplace":{"pattern":"\\s+","replacement":" "}}}]}}
+
+# Test: JSON beautification for development/debugging
+json-pretty.test.com {"hostname":"json-pretty.test.com","type":"proxy","config":{"url":"https://jsonplaceholder.typicode.com","timeout":"30s"},"transform":{"minifyJSON":false},"responseModifier":{"rules":[{"statusCode":200,"contentType":"application/json","responseModifications":{"setHeaders":{"X-JSON-Pretty":"true","Content-Type":"application/json; charset=utf-8"}}}]}}
+
+# =============================================================================
+# PROXY EXAMPLES SECTION (using news.ycombinator.com)
+# =============================================================================
+# Test: Basic proxy forwarding to Hacker News
+hackernews.test.com {"hostname":"hackernews.test.com","type":"proxy","config":{"url":"https://news.ycombinator.com","timeout":"30s"}}
+
+# Test: Proxy with HTML optimization and compression
+hackernews-optimized.test.com {"hostname":"hackernews-optimized.test.com","type":"proxy","config":{"url":"https://news.ycombinator.com","timeout":"30s"},"transform":{"disableOptimizeHTML":false,"stripSpace":true,"stripNewlines":true,"stripComments":true,"optimizeAttributes":true,"sortAttributes":true},"responseModifier":{"rules":[{"statusCode":200,"contentType":"text/html","responseModifications":{"setHeaders":{"X-HTML-Optimized":"true","Cache-Control":"public, max-age=3600"}}}]}}
+
+# Test: Proxy with custom headers and caching
+hackernews-cached.test.com {"hostname":"hackernews-cached.test.com","type":"proxy","config":{"url":"https://news.ycombinator.com","timeout":"30s"},"responseModifier":{"rules":[{"statusCode":200,"responseModifications":{"setHeaders":{"X-Cache-Status":"HIT","X-Proxy-Server":"soapbucket","Cache-Control":"public, max-age=7200"},"setCookies":{"proxy-session":{"value":"active","path":"/","maxAge":3600,"secure":true,"httpOnly":true,"sameSite":"Lax"}}}}]}}
+
+# =============================================================================
+# MATCHER TEST SECTION
+# =============================================================================
+# Test: Header-based matching - forwards requests with x-test:1 to example.com
+header-matcher.test.com {"hostname":"header-matcher.test.com","hostMatcher":{"rules":[{"hostname":"example.com","headers":{"x-test":"1"}}]},"type":"proxy","config":{"url":"https://example.com","timeout":"30s"}}
+
+# Test: Multiple header matching with forwarding
+multi-header.test.com {"hostname":"multi-header.test.com","hostMatcher":{"rules":[{"hostname":"api.example.com","headers":{"x-test":"1","x-api":"true"},"headerExists":["authorization"]}]},"type":"proxy","config":{"url":"https://api.example.com","timeout":"30s"}}
+
+# Test: Path-based matching
+path-matcher.test.com {"hostname":"path-matcher.test.com","hostMatcher":{"rules":[{"hostname":"api.example.com","pathPrefix":"/api/v1"},{"hostname":"static.example.com","pathPrefix":"/static"}]},"type":"proxy","config":{"url":"https://api.example.com","timeout":"30s"}}
+
+# Test: Method-based matching
+method-matcher.test.com {"hostname":"method-matcher.test.com","hostMatcher":{"rules":[{"hostname":"api.example.com","method":"POST","pathPrefix":"/api"},{"hostname":"static.example.com","method":"GET","pathPrefix":"/static"}]},"type":"proxy","config":{"url":"https://api.example.com","timeout":"30s"}}
+
+# =============================================================================
+# STATIC ORIGIN EXAMPLES
+# =============================================================================
+# Test: Static content serving with custom headers
+static.test.com {"hostname":"static.test.com","type":"static","config":{"content":"<html><body><h1>Static Content Test</h1><p>This is a test of static content serving.</p></body></html>","contentType":"text/html","statusCode":200,"headers":{"Cache-Control":"public, max-age=3600","X-Static-Served":"true"}}}
+
+# Test: Static JSON content
+static-json.test.com {"hostname":"static-json.test.com","type":"static","config":{"content":"{\"message\":\"Hello World\",\"timestamp\":\"2024-01-01T00:00:00Z\",\"status\":\"success\"}","contentType":"application/json","statusCode":200,"headers":{"X-Content-Source":"static"}}}
+
+
+# =============================================================================
+# REDIRECT ORIGIN EXAMPLES
+# =============================================================================
+# Test: Basic redirect
+redirect.test.com {"hostname":"redirect.test.com","type":"redirect","config":{"url":"https://example.com","statusCode":301}}
+
+# Test: Temporary redirect with custom headers
+redirect-temp.test.com {"hostname":"redirect-temp.test.com","type":"redirect","config":{"url":"https://example.com","statusCode":302},"responseModifier":{"rules":[{"statusCode":302,"responseModifications":{"setHeaders":{"X-Redirect-Reason":"maintenance","X-Redirect-Duration":"temporary"}}}]}}
+
+# =============================================================================
+# TRANSFORM EXAMPLES
+# =============================================================================
+# Test: HTML transformation with content injection
+transform-html.test.com {"hostname":"transform-html.test.com","type":"proxy","config":{"url":"https://example.com","timeout":"30s"},"transform":{"addToHead":["<meta name=\"proxy-injected\" content=\"true\">","<script>console.log('Proxy active');</script>"],"addToBody":["<div id=\"proxy-footer\">Powered by SoapBucket Proxy</div>"],"stripComments":true,"optimizeAttributes":true}}
+
+# Test: String replacement transformations
+transform-strings.test.com {"hostname":"transform-strings.test.com","type":"proxy","config":{"url":"https://example.com","timeout":"30s"},"transform":{"replaceStrings":[{"src":"Example Domain","dest":"Proxy Modified Domain"},{"src":"example.com","dest":"proxy-modified.com"}]}}
+
+# Test: JSON transformation with minification
+transform-json.test.com {"hostname":"transform-json.test.com","type":"proxy","config":{"url":"https://jsonplaceholder.typicode.com","timeout":"30s"},"transform":{"minifyJSON":true},"responseModifier":{"rules":[{"statusCode":200,"contentType":"application/json","responseModifications":{"setHeaders":{"X-JSON-Minified":"true"}}}]}}
+
+# =============================================================================
+# REQUEST/RESPONSE MODIFIER EXAMPLES
+# =============================================================================
+# Test: Request modification with header injection
+request-modifier.test.com {"hostname":"request-modifier.test.com","type":"proxy","config":{"url":"https://httpbin.org","timeout":"30s"},"requestModifier":{"rules":[{"pathPrefix":"/api","regexModifications":{"setHeaders":{"X-Proxy-Request":"true","X-Request-Time":"{{.Timestamp}}"},"addHeaders":{"X-Forwarded-For":"{{.ClientIP}}"}}}]}}
+
+# Test: Response modification with content transformation
+response-modifier.test.com {"hostname":"response-modifier.test.com","type":"proxy","config":{"url":"https://httpbin.org","timeout":"30s"},"responseModifier":{"rules":[{"statusCode":200,"responseModifications":{"setHeaders":{"X-Proxy-Response":"true","X-Response-Time":"{{.Timestamp}}"},"bodyRegexReplace":{"pattern":"httpbin","replacement":"proxy-modified-httpbin"}}}]}}
+
+# =============================================================================
+# ERROR HANDLING EXAMPLES
+# =============================================================================
+# Test: Custom error pages
+error-pages.test.com {"hostname":"error-pages.test.com","type":"proxy","config":{"url":"https://httpbin.org/status/500","timeout":"30s"},"errorPages":{"404":"/404.html","500":"/500.html","503":"/503.html"},"defaultErrorURL":"/error.html"}
+
+# Test: Error handling with custom status codes
+error-custom.test.com {"hostname":"error-custom.test.com","type":"proxy","config":{"url":"https://httpbin.org","timeout":"5s"},"responseModifier":{"rules":[{"statusCode":200,"responseModifications":{"statusCode":418,"setHeaders":{"X-Custom-Error":"I'm a teapot"}}}]}}
+
+# =============================================================================
+# SECURITY EXAMPLES
+# =============================================================================
+# Test: Role-based access control
+rbac.test.com {"hostname":"rbac.test.com","type":"proxy","config":{"url":"https://api.example.com","timeout":"30s"},"roles":{"required":["admin","user"],"optional":["premium"]}}
+
+# Test: API bearer token authentication
+api-auth.test.com {"hostname":"api-auth.test.com","type":"proxy","config":{"url":"https://api.example.com","timeout":"30s"},"enableAPI":true,"apiBearer":"your-api-bearer-token-here"}
+
+# Test: SSL/TLS configuration
+ssl.test.com {"hostname":"ssl.test.com","type":"proxy","config":{"url":"https://api.example.com","timeout":"30s"},"forceSSL":true,"disableACME":false}
+
+# =============================================================================
+# PERFORMANCE EXAMPLES
+# =============================================================================
+# Test: Connection limiting
+connection-limit.test.com {"hostname":"connection-limit.test.com","type":"proxy","config":{"url":"https://api.example.com","timeout":"30s"},"maxConnections":100}
+
+# Test: Compression control
+compression.test.com {"hostname":"compression.test.com","type":"proxy","config":{"url":"https://api.example.com","timeout":"30s"},"disableCompression":false,"responseModifier":{"rules":[{"statusCode":200,"responseModifications":{"setHeaders":{"Content-Encoding":"gzip","Vary":"Accept-Encoding"}}}]}}
+
+# Test: Content type specific transformations
+content-type.test.com {"hostname":"content-type.test.com","type":"proxy","config":{"url":"https://api.example.com","timeout":"30s"},"disableByContentTypes":{"application/json":false,"text/html":true,"image/png":true}}
+
+# =============================================================================
+# DEBUGGING EXAMPLES
+# =============================================================================
+# Test: Debug mode with detailed logging
+debug.test.com {"hostname":"debug.test.com","type":"proxy","config":{"url":"https://httpbin.org","timeout":"30s"},"debug":true,"responseModifier":{"rules":[{"statusCode":200,"responseModifications":{"setHeaders":{"X-Debug-Info":"enabled","X-Request-ID":"{{.RequestID}}","X-Processing-Time":"{{.ProcessingTime}}"}}}]}}
+
+# Test: Callback configuration for monitoring
+callback.test.com {"hostname":"callback.test.com","type":"proxy","config":{"url":"https://httpbin.org","timeout":"30s"},"callbacks":[{"url":"https://webhook.site/your-webhook-url","method":"POST","headers":{"Content-Type":"application/json"},"timeout":5}]}
+
+# =============================================================================
+# HTML TRANSFORMER EXAMPLES (using example.com)
+# =============================================================================
+# Test: HTML head injection - adds meta tags and scripts to document head
+html-head-inject.test.com {"hostname":"html-head-inject.test.com","type":"proxy","config":{"url":"https://example.com","timeout":"30s"},"transform":{"addToHead":["<meta name=\"proxy-injected\" content=\"true\">","<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">","<script>console.log('Proxy transformation active');</script>","<style>body { border: 2px solid #007bff; }</style>"]}}
+
+# Test: HTML body injection - adds content to document body
+html-body-inject.test.com {"hostname":"html-body-inject.test.com","type":"proxy","config":{"url":"https://example.com","timeout":"30s"},"transform":{"addToBody":["<div id=\"proxy-banner\" style=\"background: #007bff; color: white; padding: 10px; text-align: center;\">Content served through SoapBucket Proxy</div>","<footer style=\"margin-top: 20px; padding: 10px; background: #f8f9fa; text-align: center;\">Powered by SoapBucket Proxy</footer>"]}}
+
+# Test: Combined head and body injection with HTML optimization
+html-combined.test.com {"hostname":"html-combined.test.com","type":"proxy","config":{"url":"https://example.com","timeout":"30s"},"transform":{"addToHead":["<meta name=\"proxy-optimized\" content=\"true\">","<script>window.proxyActive = true;</script>","<link rel=\"stylesheet\" href=\"data:text/css,body{font-family:Arial,sans-serif;}\">"],"addToBody":["<div id=\"proxy-header\" style=\"background: linear-gradient(90deg, #007bff, #0056b3); color: white; padding: 15px; text-align: center; font-weight: bold;\">🚀 Enhanced by SoapBucket Proxy</div>","<div id=\"proxy-footer\" style=\"background: #343a40; color: white; padding: 10px; text-align: center; margin-top: 20px;\">© 2024 SoapBucket Proxy - All rights reserved</div>"],"stripComments":true,"optimizeAttributes":true,"sortAttributes":true}}
+
+# Test: HTML transformation with string replacement and content injection
+html-transform-advanced.test.com {"hostname":"html-transform-advanced.test.com","type":"proxy","config":{"url":"https://example.com","timeout":"30s"},"transform":{"addToHead":["<meta name=\"transformation\" content=\"advanced\">","<script>console.log('Advanced proxy transformation loaded');</script>","<style>.proxy-enhanced { border: 3px dashed #28a745; padding: 10px; margin: 10px 0; }</style>"],"addToBody":["<div class=\"proxy-enhanced\"><h3>🔧 Advanced Proxy Features</h3><p>This content was injected by the proxy transformation engine.</p></div>"],"replaceStrings":[{"src":"Example Domain","dest":"Proxy Enhanced Example Domain"},{"src":"example.com","dest":"proxy-enhanced.example.com"}],"stripComments":true,"optimizeAttributes":true}}
+
+# Test: HTML transformation with conditional content injection
+html-conditional.test.com {"hostname":"html-conditional.test.com","type":"proxy","config":{"url":"https://example.com","timeout":"30s"},"transform":{"addToHead":["<meta name=\"conditional-transform\" content=\"true\">","<script>if (window.location.hostname.includes('test')) { document.body.classList.add('test-environment'); }</script>","<style>.test-environment { background-color: #fff3cd; border-left: 4px solid #ffc107; }</style>"],"addToBody":["<div id=\"conditional-content\" style=\"display: none; background: #d1ecf1; padding: 10px; margin: 10px 0; border-left: 4px solid #17a2b8;\"><strong>Test Environment:</strong> This content is only visible in test environments.</div><script>if (window.location.hostname.includes('test')) { document.getElementById('conditional-content').style.display = 'block'; }</script>"]}}
+
+# Test: HTML transformation with analytics and tracking injection
+html-analytics.test.com {"hostname":"html-analytics.test.com","type":"proxy","config":{"url":"https://example.com","timeout":"30s"},"transform":{"addToHead":["<meta name=\"analytics-enabled\" content=\"true\">","<script>window.proxyAnalytics = { startTime: Date.now(), hostname: window.location.hostname };</script>","<script>console.log('Analytics tracking initialized');</script>"],"addToBody":["<div id=\"analytics-footer\" style=\"position: fixed; bottom: 0; left: 0; right: 0; background: rgba(0,0,0,0.8); color: white; padding: 5px; text-align: center; font-size: 12px;\">📊 Proxy Analytics Active | Load Time: <span id=\"load-time\">calculating...</span></div><script>document.getElementById('load-time').textContent = (Date.now() - window.proxyAnalytics.startTime) + 'ms';</script>"]}}

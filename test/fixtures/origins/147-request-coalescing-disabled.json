@@ -1,0 +1,17 @@
+{
+  "request-coalescing-disabled.test": {
+    "id": "request-coalescing-disabled",
+    "hostname": "request-coalescing-disabled.test",
+    "description": "Request coalescing disabled - per-origin override",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090",
+      "request_coalescing": {
+        "enabled": false,
+        "max_inflight": 1000,
+        "max_waiters": 100
+      }
+    }
+  }
+}
+

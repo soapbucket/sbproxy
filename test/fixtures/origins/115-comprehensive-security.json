@@ -1,0 +1,176 @@
+{
+  "comprehensive-security.test": {
+    "id": "comprehensive-security",
+    "hostname": "comprehensive-security.test",
+    "authentication": {
+      "type": "jwt",
+      "disabled": false,
+      "secret": "comprehensive-secret-1234567890",
+      "issuer": "secure-issuer",
+      "audience": "secure-audience",
+      "algorithm": "HS256"
+    },
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "disabled": false,
+        "limit": 100,
+        "window": "1m",
+        "key_by": "jwt_sub"
+      },
+      {
+        "type": "waf",
+        "custom_rules": [
+          {
+            "id": "sql-injection",
+            "name": "SQL Injection",
+            "disabled": false,
+            "phase": 2,
+            "severity": "critical",
+            "action": "block",
+            "variables": [
+              {
+                "name": "ARGS",
+                "collection": "ARGS"
+              }
+            ],
+            "operator": "rx",
+            "pattern": "(?i)(union|select|insert|delete|update|drop)",
+            "transformations": [
+              "lowercase",
+              "urlDecode"
+            ]
+          },
+          {
+            "id": "xss",
+            "name": "XSS",
+            "disabled": false,
+            "phase": 2,
+            "severity": "high",
+            "action": "block",
+            "variables": [
+              {
+                "name": "ARGS",
+                "collection": "ARGS"
+              }
+            ],
+            "operator": "rx",
+            "pattern": "(?i)(<script|javascript:|onerror=)",
+            "transformations": [
+              "htmlEntityDecode"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "ip_filtering",
+        "whitelist": [
+          "127.0.0.1",
+          "::1",
+          "172.21.0.0/16",
+          "172.24.0.0/16"
+        ],
+        "action": "block"
+      },
+      {
+        "type": "threat_detection",
+        "disabled": false,
+        "patterns": {
+          "xss": {
+            "disabled": false,
+            "action": "block"
+          },
+          "path_traversal": {
+            "disabled": false,
+            "action": "block"
+          },
+          "command_injection": {
+            "disabled": false,
+            "action": "block"
+          }
+        }
+      },
+      {
+        "type": "csrf",
+        "disabled": false,
+        "secret": "csrf-secret-key-12345678901234567890",
+        "cookie_name": "_csrf",
+        "header_name": "X-CSRF-Token",
+        "methods": [
+          "POST",
+          "PUT",
+          "DELETE",
+          "PATCH"
+        ]
+      },
+      {
+        "type": "security_headers",
+        "disabled": false,
+        "strict_transport_security": {
+          "disabled": false,
+          "max_age": "1y",
+          "include_subdomains": true,
+          "preload": true
+        },
+        "content_security_policy": {
+          "disabled": false,
+          "directives": {
+            "default_src": [
+              "'self'"
+            ],
+            "script_src": [
+              "'self'",
+              "'unsafe-inline'"
+            ],
+            "style_src": [
+              "'self'",
+              "'unsafe-inline'"
+            ],
+            "img_src": [
+              "'self'",
+              "data:",
+              "https:"
+            ],
+            "connect_src": [
+              "'self'"
+            ],
+            "font_src": [
+              "'self'"
+            ],
+            "object_src": [
+              "'none'"
+            ],
+            "frame_ancestors": [
+              "'none'"
+            ],
+            "base_uri": [
+              "'self'"
+            ],
+            "form_action": [
+              "'self'"
+            ]
+          }
+        },
+        "x_frame_options": {
+          "disabled": false,
+          "mode": "DENY"
+        },
+        "x_content_type_options": {
+          "disabled": false
+        },
+        "x_xss_protection": {
+          "disabled": false,
+          "mode": "block"
+        },
+        "referrer_policy": {
+          "disabled": false,
+          "policy": "strict-origin-when-cross-origin"
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/api/headers"
+    }
+  }
+}

@@ -1,0 +1,153 @@
+{
+  "error-pages-comprehensive.test": {
+    "id": "error-pages-comprehensive",
+    "hostname": "error-pages-comprehensive.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "error_pages": [
+      {
+        "status": [400],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/400",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [401],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/401",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [403],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/403",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [408],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/408",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [410],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/410",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [413],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/413",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [414],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/414",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [415],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/415",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [422],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/422",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [451],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/451",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [507],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/507",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [508],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/508",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [510],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/510",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [511],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/511",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      }
+    ]
+  }
+}
+

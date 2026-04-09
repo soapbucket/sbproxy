@@ -1,0 +1,78 @@
+{
+  "html-transform-caching.test": {
+    "id": "html-transform-caching",
+    "hostname": "html-transform-caching.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.html"
+    },
+    "transforms": [
+      {
+        "type": "optimized_html",
+        "content_types": ["text/html"],
+        "optimized_format_options": {
+          "strip_comments": true,
+          "remove_boolean_attributes": true,
+          "remove_trailing_slashes": true,
+          "optimize_attributes": true,
+          "sort_attributes": true,
+          "strip_newlines": true,
+          "strip_space": true
+        },
+        "attribute_options": {
+          "add_unique_ids": true,
+          "unique_id_prefix": "proxy-id-",
+          "use_random_suffix": true
+        },
+        "add_to_tags": [
+          {
+            "tag": "head",
+            "add_before_end_tag": false,
+            "content": "<meta name=\"proxy\" content=\"enabled\">"
+          }
+        ]
+      }
+    ]
+  },
+  "html-transform-fingerprint-caching.test": {
+    "id": "html-transform-fingerprint-caching",
+    "hostname": "html-transform-fingerprint-caching.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://news.ycombinator.com"
+    },
+    "chunk_cache": {
+      "signature_cache": {
+        "enabled": true,
+        "content_types": ["text/html"],
+        "signatures": [
+          {
+            "name": "html_tag",
+            "pattern_type": "regex",
+            "regex_pattern": "<html",
+            "cache_ttl": "1h",
+            "max_examine_bytes": 512
+          }
+        ],
+        "max_examine_bytes": 1024,
+        "default_ttl": "1h"
+      }
+    },
+    "transforms": [
+      {
+        "type": "optimized_html",
+        "content_types": ["text/html"],
+        "optimized_format_options": {
+          "strip_comments": true,
+          "remove_boolean_attributes": true,
+          "optimize_attributes": true
+        },
+        "attribute_options": {
+          "add_unique_ids": true,
+          "unique_id_prefix": "fp-id-"
+        }
+      }
+    ]
+  }
+}
+

@@ -1,0 +1,27 @@
+{
+  "conditional-cache.test": {
+    "id": "conditional-cache",
+    "hostname": "conditional-cache.test",
+    "cache_settings": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": "1m",
+      "cache_control": {
+        "respect_cache_control": true,
+        "respect_expires": true,
+        "cache_private": false
+      },
+      "vary_on_headers": [
+        "Accept-Language",
+        "Accept-Encoding"
+      ],
+      "cache_key_pattern": "{{hostname}}:{{path}}:{{query}}:{{headers.Accept-Language}}"
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/cache-test/conditional"
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  }
+}

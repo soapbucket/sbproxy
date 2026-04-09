@@ -1,0 +1,38 @@
+{
+  "session-on-session-start.test": {
+    "id": "session-on-session-start",
+    "hostname": "session-on-session-start.test",
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_sb.session",
+      "cookie_max_age": 3600,
+      "on_session_start": [
+        {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_prefs",
+          "timeout": 5,
+          "cel_expr": "{\"modified_json\": {\"theme\": json['user_preferences']['theme'], \"language\": json['user_preferences']['language'], \"is_premium\": json['subscription']['tier'] == 'premium'}}"
+        }
+      ],
+      "allow_non_ssl": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-Theme": "{{session_data.user_prefs.theme}}",
+            "X-User-Language": "{{session_data.user_prefs.language}}",
+            "X-Is-Premium": "{{session_data.user_prefs.is_premium}}"
+          }
+        }
+      }
+    ]
+  }
+}
+

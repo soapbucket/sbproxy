@@ -1,0 +1,11 @@
+{
+  "encoding-fix.test": {
+    "id": "encoding-fix",
+    "hostname": "encoding-fix.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    }
+  }
+}
+

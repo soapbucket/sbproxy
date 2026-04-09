@@ -1,0 +1,116 @@
+# General mode - production-like with Redis for persistence
+# Uses Redis for L2 cache, sessions, rate limiting, and config reload.
+#
+# Run: scripts/run_proxy_general.sh
+# Or:  docker compose -f docker/docker-compose.general.yml up
+
+proxy:
+  http_bind_port: 8080
+  https_bind_port: 8443
+  http3_bind_port: 8443
+  bind_address: "0.0.0.0"
+  enable_http3: true
+
+  certificate_settings:
+    certificate_dir: "/app/certs"
+    certificate_key_dir: "/app/certs"
+    min_tls_version: 13
+
+  logging:
+    format: "json"
+    application:
+      level: "info"
+      outputs:
+        - type: "stderr"
+    request:
+      enabled: true
+      level: "info"
+      slow_request_threshold: "5s"
+      outputs:
+        - type: "stderr"
+      fields:
+        timestamps: true
+        headers: false
+        forwarded_headers: true
+        query_string: false
+        cache_info: true
+        auth_info: true
+        app_version: true
+        location: true
+      sampling:
+        enabled: false
+        rate: 1
+    security:
+      level: "info"
+      outputs:
+        - type: "stderr"
+
+  debug_settings:
+    debug: true
+
+# Telemetry (metrics endpoint)
+telemetry:
+  bind_port: 8888
+  bind_address: "0.0.0.0"
+  enable_profiler: false
+
+# Site config storage (sites.setup.json has example.local, api.local)
+storage_settings:
+  driver: "file"
+  params:
+    path: "/app/config/sites.setup.json"
+
+# In-memory L1 cache
+l1_cache_settings:
+  driver: "memory"
+  params:
+    max_size: 500000000  # 500MB
+
+# Redis L2 cache
+l2_cache_settings:
+  driver: "redis"
+  params:
+    dsn: "redis://redis:6379"
+    pool_size: 100
+
+# Redis session storage
+session_cacher_settings:
+  driver: "redis"
+  params:
+    dsn: "redis://redis:6379"
+    pool_size: 100
+
+# Redis security/rate limiting storage
+security_settings:
+  driver: "redis"
+  params:
+    dsn: "redis://redis:6379"
+    pool_size: 100
+
+# Redis pub/sub for config reload
+messenger_settings:
+  driver: "redis"
+  params:
+    dsn: "redis://redis:6379"
+
+# Crypto configuration (required for session/auth features)
+crypto_settings:
+  driver: "local"
+  params:
+    encryption_key: "Y2FzdGxlYXBwcm9wcmlhdGVnYXRlY29tcG9zaXRpb24="
+    signing_key: "Y2FzdGxlYXBwcm9wcmlhdGVnYXRlY29tcG9zaXRpb24="
+
+# MaxMind GeoIP database
+maxmind_settings:
+  driver: "maxmind"
+  params:
+    path: "/app/config/ipinfo_lite.mmdb"
+
+# User-Agent parser
+uaparser_settings:
+  driver: "uaparser"
+  params:
+    path: "/app/config/regexes.yml"
+
+# Debug: verbose logging for TLS handshake, config loading, etc.
+log_level: "debug"

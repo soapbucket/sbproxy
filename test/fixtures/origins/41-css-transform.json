@@ -1,0 +1,26 @@
+{
+  "css-transform.test": {
+    "id": "css-transform",
+    "hostname": "css-transform.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "transforms": [
+      {
+        "type": "css",
+        "content_types": ["text/css"],
+        "minify": true,
+        "add_rules": [
+          {
+            "selector": "body",
+            "rules": {
+              "background-color": "#f0f0f0"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
+

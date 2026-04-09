@@ -1,0 +1,51 @@
+{
+  "req-resp-modifiers.test": {
+    "id": "req-resp-modifiers",
+    "hostname": "req-resp-modifiers.test",
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Request-ID": "generated-{{uuid}}",
+            "X-Timestamp": "{{timestamp}}",
+            "X-Client-IP": "{{ip}}"
+          },
+          "add": {
+            "X-Forwarded-For": "1.2.3.4"
+          },
+          "delete": ["Cookie", "Authorization"]
+        }
+      },
+      {
+        "url": {
+          "query": {
+            "set": {
+              "proxy": "true",
+              "version": "v1"
+            }
+          }
+        }
+      }
+    ],
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Proxy-Version": "1.0",
+            "X-Response-Time": "{{response_time}}"
+          },
+          "add": {
+            "X-Powered-By": "SoapBucket"
+          },
+          "delete": ["Server", "X-Powered-By-Original"]
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/api/headers",
+      "strip_base_path": true
+    }
+  }
+}
+

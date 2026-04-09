@@ -1,0 +1,20 @@
+{
+  "request-limiting.test": {
+    "id": "request-limiting",
+    "hostname": "request-limiting.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "policies": [
+      {
+        "type": "request_limiting",
+        "disabled": false,
+        "max_request_size": 1048576,
+        "max_header_size": 8192,
+        "max_query_size": 2048
+      }
+    ]
+  }
+}
+

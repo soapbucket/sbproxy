@@ -1,0 +1,26 @@
+replicaCount: 2
+
+image:
+  repository: localhost:5111/soapbucket/proxy
+  tag: dev
+  pullPolicy: Always
+
+mode: shared
+
+config:
+  logLevel: debug
+  redisURL: redis://host.k3d.internal:6379
+  storageDSN: postgres://soapbucket:localdev@host.k3d.internal:5432/soapbucket?sslmode=disable
+  clickhouseDSN: clickhouse://soapbucket:localdev@host.k3d.internal:9000/soapbucket
+  vaultAddr: http://host.k3d.internal:8200
+  vaultToken: dev-root-token
+
+ingress:
+  enabled: true
+  className: nginx
+  defaultBackend: true
+
+serviceMonitor:
+  enabled: false
+  labels:
+    release: prometheus

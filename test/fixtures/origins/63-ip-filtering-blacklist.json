@@ -1,0 +1,19 @@
+{
+  "ip-blacklist.test": {
+    "id": "ip-blacklist",
+    "hostname": "ip-blacklist.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "policies": [
+      {
+        "type": "ip_filtering",
+        "disabled": false,
+        "blacklist": ["192.168.1.100", "10.0.0.50"],
+        "action": "block"
+      }
+    ]
+  }
+}
+

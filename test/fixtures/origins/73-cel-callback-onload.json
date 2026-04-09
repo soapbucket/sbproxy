@@ -1,0 +1,28 @@
+{
+  "cel-callback-onload.test": {
+    "id": "cel-callback-onload",
+    "hostname": "cel-callback-onload.test",
+    "on_load": [{
+      "type": "http",
+      "url": "http://e2e-test-server:8090/callback/config",
+      "method": "GET",
+      "timeout": 5,
+      "cel_expr": "{\"modified_json\": {\"config_data\": {\"api_version\": string('version' in json ? json['version'] : 'v1'), \"environment\": 'env' in json ? json['env'] : 'production', \"features\": 'features' in json ? json['features'] : {}}}}"
+    }],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-API-Version": "{{config.config_data.api_version}}",
+            "X-Environment": "{{config.config_data.environment}}"
+          }
+        }
+      }
+    ]
+  }
+}
+

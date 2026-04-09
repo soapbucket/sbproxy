@@ -1,0 +1,62 @@
+{
+  "conditional-routing.test": {
+    "id": "conditional-routing",
+    "hostname": "conditional-routing.test",
+    "forward_rules": [
+      {
+        "hostname": "admin-backend.test",
+        "rules": [
+          {
+            "path": {"prefix": "/admin"}
+          }
+        ]
+      },
+      {
+        "hostname": "api-v2-backend.test",
+        "rules": [
+          {
+            "path": {"prefix": "/api/v2"}
+          }
+        ]
+      },
+      {
+        "hostname": "beta-backend.test",
+        "rules": [
+          {
+            "headers": {"X-Beta": "true"}
+          }
+        ]
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test/simple-200"
+    }
+  },
+  "admin-backend.test": {
+    "id": "admin-backend",
+    "hostname": "admin-backend.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    }
+  },
+  "api-v2-backend.test": {
+    "id": "api-v2-backend",
+    "hostname": "api-v2-backend.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    }
+  },
+  "beta-backend.test": {
+    "id": "beta-backend",
+    "hostname": "beta-backend.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test/beta-response",
+      "strip_base_path": true
+    }
+  }
+}
+

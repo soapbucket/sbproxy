@@ -1,0 +1,18 @@
+{
+  "cache-l2.test": {
+    "id": "cache-l2",
+    "hostname": "cache-l2.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "cache": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": "10m",
+      "cache_control": true,
+      "etag": true,
+      "stale_while_revalidate": "1m"
+    }
+  }
+}

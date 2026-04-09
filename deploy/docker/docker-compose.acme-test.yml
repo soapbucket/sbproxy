@@ -1,0 +1,95 @@
+# Docker Compose Configuration for ACME E2E Testing
+# Uses Pebble (Let's Encrypt's official test ACME server)
+#
+# Usage:
+#   docker compose -f docker/docker-compose.acme-test.yml up -d
+#   PEBBLE_ACME_URL=https://localhost:14000/dir go test -tags=integration ./internal/service/... -v -run TestACME
+#   docker compose -f docker/docker-compose.acme-test.yml down
+#
+# Services:
+#   - pebble: ACME test server (Let's Encrypt's official test server)
+#   - challtestsrv: Challenge test server for validating ACME challenges
+
+services:
+  # Pebble ACME Test Server
+  # Documentation: https://github.com/letsencrypt/pebble
+  # Image: https://github.com/letsencrypt/pebble/pkgs/container/pebble
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:latest
+    container_name: pebble-acme
+    # The image entrypoint is /app (pebble binary), just pass args
+    # Uses built-in default config at test/config/pebble-config.json
+    command: ["-strict"]
+    ports:
+      - "14000:14000"  # ACME directory (https://localhost:14000/dir)
+      - "15000:15000"  # Management interface
+    environment:
+      # Skip actual domain validation - certificates are issued immediately
+      # This is essential for local testing without real DNS
+      PEBBLE_VA_ALWAYS_VALID: "1"
+      # Don't sleep between validation attempts (faster tests)
+      PEBBLE_VA_NOSLEEP: "1"
+      # Disable external account binding requirement
+      PEBBLE_WFE_NONCEREJECT: "0"
+    networks:
+      - acme_test_net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "--no-check-certificate", "https://localhost:14000/dir"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # Challenge Test Server (optional, for more realistic testing)
+  # Responds to HTTP-01 and TLS-ALPN-01 challenges
+  # Image: https://github.com/letsencrypt/pebble/pkgs/container/pebble-challtestsrv
+  challtestsrv:
+    image: ghcr.io/letsencrypt/pebble-challtestsrv:latest
+    container_name: pebble-challtestsrv
+    command: pebble-challtestsrv -http01 "" -https01 "" -tlsalpn01 ":5001"
+    ports:
+      - "8055:8055"   # Management API
+      - "5002:5002"   # HTTP-01 challenge port
+      - "5001:5001"   # TLS-ALPN-01 challenge port
+    networks:
+      - acme_test_net
+    depends_on:
+      pebble:
+        condition: service_healthy
+
+  # Proxy configured for ACME testing with Pebble
+  proxy-acme-test:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    container_name: proxy-acme-test
+    ports:
+      - "8080:8080"   # HTTP
+      - "8443:8443"   # HTTPS
+    environment:
+      # ACME configuration pointing to Pebble
+      SB_PROXY__CERTIFICATE_SETTINGS__USE_ACME: "true"
+      SB_PROXY__CERTIFICATE_SETTINGS__ACME_EMAIL: "test@example.com"
+      SB_PROXY__CERTIFICATE_SETTINGS__ACME_DOMAINS: "test.local,example.local"
+      SB_PROXY__CERTIFICATE_SETTINGS__ACME_DIRECTORY_URL: "https://pebble:14000/dir"
+      SB_PROXY__CERTIFICATE_SETTINGS__ACME_INSECURE_SKIP_VERIFY: "true"
+      # Logging
+      SB_LOG_LEVEL: "debug"
+    volumes:
+      - ../../deploy/config/server/sb.yml:/app/config/server/sb.yml:ro
+      - acme-cache:/app/certs/acme-cache
+    networks:
+      - acme_test_net
+    depends_on:
+      pebble:
+        condition: service_healthy
+    profiles:
+      - with-proxy
+
+networks:
+  acme_test_net:
+    driver: bridge
+
+volumes:
+  acme-cache:
+    driver: local

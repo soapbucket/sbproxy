@@ -1,0 +1,22 @@
+{
+  "csrf.test": {
+    "id": "csrf",
+    "hostname": "csrf.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "policies": [
+      {
+        "type": "csrf",
+        "disabled": false,
+        "secret": "test-csrf-secret-key-12345678901234567890",
+        "cookie_name": "_csrf_token",
+        "header_name": "X-CSRF-Token",
+        "methods": ["POST", "PUT", "DELETE", "PATCH"],
+        "exempt_paths": ["/api/webhook"]
+      }
+    ]
+  }
+}
+

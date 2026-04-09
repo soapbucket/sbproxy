@@ -1,0 +1,132 @@
+{
+  "index_patterns": ["proxy-application-*", "proxy-security-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "index.refresh_interval": "5s"
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp": {
+          "type": "date"
+        },
+        "timestamp": {
+          "type": "date"
+        },
+        "level": {
+          "type": "keyword"
+        },
+        "message": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "caller": {
+          "type": "keyword"
+        },
+        "type": {
+          "type": "keyword"
+        },
+        "request_id": {
+          "type": "keyword"
+        },
+        "request": {
+          "properties": {
+            "method": {
+              "type": "keyword"
+            },
+            "path": {
+              "type": "keyword"
+            },
+            "host": {
+              "type": "keyword"
+            },
+            "remote_addr": {
+              "type": "ip"
+            },
+            "user_agent": {
+              "type": "text"
+            }
+          }
+        },
+        "response": {
+          "properties": {
+            "status_code": {
+              "type": "integer"
+            },
+            "bytes": {
+              "type": "long"
+            },
+            "duration_ms": {
+              "type": "float"
+            }
+          }
+        },
+        "origin": {
+          "properties": {
+            "origin_id": {
+              "type": "keyword"
+            },
+            "hostname": {
+              "type": "keyword"
+            },
+            "type": {
+              "type": "keyword"
+            }
+          }
+        },
+        "user": {
+          "properties": {
+            "user_id": {
+              "type": "keyword"
+            },
+            "email": {
+              "type": "keyword"
+            },
+            "roles": {
+              "type": "keyword"
+            }
+          }
+        },
+        "error": {
+          "properties": {
+            "error": {
+              "type": "text"
+            },
+            "error_type": {
+              "type": "keyword"
+            },
+            "error_code": {
+              "type": "keyword"
+            }
+          }
+        },
+        "program_info": {
+          "properties": {
+            "app_version": {
+              "type": "keyword"
+            },
+            "build_hash": {
+              "type": "keyword"
+            },
+            "app_env": {
+              "type": "keyword"
+            }
+          }
+        },
+        "source": {
+          "type": "keyword"
+        },
+        "log_source": {
+          "type": "keyword"
+        }
+      }
+    }
+  }
+}
+

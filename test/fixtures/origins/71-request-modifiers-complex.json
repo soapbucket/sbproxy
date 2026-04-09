@@ -1,0 +1,36 @@
+{
+  "request-modifiers-complex.test": {
+    "id": "request-modifiers-complex",
+    "hostname": "request-modifiers-complex.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Forwarded-Proto": "https",
+            "X-Real-IP": "{{request.remote_addr}}",
+            "X-Request-ID": "{{request.id}}"
+          },
+          "remove": ["X-Forwarded-For"]
+        },
+        "url": {
+          "path": {
+            "replace": {
+              "old": "/old",
+              "new": "/new"
+            }
+          },
+          "query": {
+            "add": {
+              "source": "proxy"
+            }
+          }
+        }
+      }
+    ]
+  }
+}
+

@@ -1,0 +1,22 @@
+{
+  "proxy-query.test": {
+    "id": "proxy-query",
+    "hostname": "proxy-query.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "query": {
+          "add": {
+            "source": "proxy",
+            "timestamp": "{{timestamp}}"
+          }
+        }
+      }
+    ],
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  }
+}

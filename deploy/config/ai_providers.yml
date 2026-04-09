@@ -1,0 +1,749 @@
+# Auto-generated from proxy/data/model_pricing.json
+# Edit this file manually only if needed for custom provider configuration.
+# Regenerate with: python3 scripts/generate_ai_providers.py
+
+providers:
+  - type: ai21
+    name: Ai21
+    description: "Ai21 API"
+    hostnames:
+      - ai21.com
+    ports: [443]
+
+  - type: aiml
+    name: Aiml
+    description: "Aiml API"
+    hostnames:
+      - aiml.com
+    ports: [443]
+
+  - type: aleph_alpha
+    name: Aleph Alpha
+    description: "Aleph Alpha API"
+    hostnames:
+      - aleph_alpha.com
+    ports: [443]
+
+  - type: amazon_nova
+    name: Amazon Nova
+    description: "Amazon Nova API"
+    hostnames:
+      - amazon_nova.com
+    ports: [443]
+
+  - type: anthropic
+    name: Anthropic
+    description: "Anthropic Claude API"
+    hostnames:
+      - api.anthropic.com
+    ports: [443]
+
+  - type: anyscale
+    name: Anyscale
+    description: "Anyscale API"
+    hostnames:
+      - anyscale.com
+    ports: [443]
+
+  - type: assemblyai
+    name: Assemblyai
+    description: "Assemblyai API"
+    hostnames:
+      - assemblyai.com
+    ports: [443]
+
+  - type: aws_polly
+    name: Aws Polly
+    description: "Aws Polly API"
+    hostnames:
+      - aws_polly.com
+    ports: [443]
+
+  - type: azure
+    name: Azure OpenAI
+    description: "Microsoft Azure OpenAI"
+    hostnames:
+      - *.openai.azure.com
+    ports: [443]
+
+  - type: azure_ai
+    name: Azure Ai
+    description: "Azure Ai API"
+    hostnames:
+      - azure_ai.com
+    ports: [443]
+
+  - type: azure_text
+    name: Azure Text
+    description: "Azure Text API"
+    hostnames:
+      - azure_text.com
+    ports: [443]
+
+  - type: bedrock
+    name: AWS Bedrock
+    description: "Amazon Bedrock"
+    hostnames:
+      - bedrock.*.amazonaws.com
+    ports: [443]
+
+  - type: bedrock_converse
+    name: Bedrock Converse
+    description: "Bedrock Converse API"
+    hostnames:
+      - bedrock_converse.com
+    ports: [443]
+
+  - type: cerebras
+    name: Cerebras
+    description: "Cerebras API"
+    hostnames:
+      - cerebras.com
+    ports: [443]
+
+  - type: chatgpt
+    name: Chatgpt
+    description: "Chatgpt API"
+    hostnames:
+      - chatgpt.com
+    ports: [443]
+
+  - type: cloudflare
+    name: Cloudflare
+    description: "Cloudflare API"
+    hostnames:
+      - cloudflare.com
+    ports: [443]
+
+  - type: codestral
+    name: Codestral
+    description: "Codestral API"
+    hostnames:
+      - codestral.com
+    ports: [443]
+
+  - type: cohere
+    name: Cohere
+    description: "Cohere API"
+    hostnames:
+      - api.cohere.ai
+    ports: [443]
+
+  - type: cohere_chat
+    name: Cohere Chat
+    description: "Cohere Chat API"
+    hostnames:
+      - cohere_chat.com
+    ports: [443]
+
+  - type: dashscope
+    name: Dashscope
+    description: "Dashscope API"
+    hostnames:
+      - dashscope.com
+    ports: [443]
+
+  - type: databricks
+    name: Databricks
+    description: "Databricks API"
+    hostnames:
+      - databricks.com
+    ports: [443]
+
+  - type: dataforseo
+    name: Dataforseo
+    description: "Dataforseo API"
+    hostnames:
+      - dataforseo.com
+    ports: [443]
+
+  - type: deepgram
+    name: Deepgram
+    description: "Deepgram API"
+    hostnames:
+      - deepgram.com
+    ports: [443]
+
+  - type: deepinfra
+    name: Deepinfra
+    description: "Deepinfra API"
+    hostnames:
+      - deepinfra.com
+    ports: [443]
+
+  - type: deepseek
+    name: DeepSeek
+    description: "DeepSeek API"
+    hostnames:
+      - api.deepseek.com
+    ports: [443]
+
+  - type: elevenlabs
+    name: Elevenlabs
+    description: "Elevenlabs API"
+    hostnames:
+      - elevenlabs.com
+    ports: [443]
+
+  - type: exa_ai
+    name: Exa Ai
+    description: "Exa Ai API"
+    hostnames:
+      - exa_ai.com
+    ports: [443]
+
+  - type: fal_ai
+    name: Fal Ai
+    description: "Fal Ai API"
+    hostnames:
+      - fal_ai.com
+    ports: [443]
+
+  - type: featherless_ai
+    name: Featherless Ai
+    description: "Featherless Ai API"
+    hostnames:
+      - featherless_ai.com
+    ports: [443]
+
+  - type: firecrawl
+    name: Firecrawl
+    description: "Firecrawl API"
+    hostnames:
+      - firecrawl.com
+    ports: [443]
+
+  - type: fireworks_ai
+    name: Fireworks Ai
+    description: "Fireworks Ai API"
+    hostnames:
+      - fireworks_ai.com
+    ports: [443]
+
+  - type: fireworks_ai-embedding-models
+    name: Fireworks Ai-Embedding-Models
+    description: "Fireworks Ai-Embedding-Models API"
+    hostnames:
+      - fireworks_ai-embedding-models.com
+    ports: [443]
+
+  - type: friendliai
+    name: Friendliai
+    description: "Friendliai API"
+    hostnames:
+      - friendliai.com
+    ports: [443]
+
+  - type: gemini
+    name: Google Gemini
+    description: "Google Gemini API"
+    hostnames:
+      - generativelanguage.googleapis.com
+    ports: [443]
+
+  - type: gigachat
+    name: Gigachat
+    description: "Gigachat API"
+    hostnames:
+      - gigachat.com
+    ports: [443]
+
+  - type: github_copilot
+    name: Github Copilot
+    description: "Github Copilot API"
+    hostnames:
+      - github_copilot.com
+    ports: [443]
+
+  - type: gmi
+    name: Gmi
+    description: "Gmi API"
+    hostnames:
+      - gmi.com
+    ports: [443]
+
+  - type: google_pse
+    name: Google Pse
+    description: "Google Pse API"
+    hostnames:
+      - google_pse.com
+    ports: [443]
+
+  - type: gradient_ai
+    name: Gradient Ai
+    description: "Gradient Ai API"
+    hostnames:
+      - gradient_ai.com
+    ports: [443]
+
+  - type: groq
+    name: Groq
+    description: "Groq API"
+    hostnames:
+      - api.groq.com
+    ports: [443]
+
+  - type: heroku
+    name: Heroku
+    description: "Heroku API"
+    hostnames:
+      - heroku.com
+    ports: [443]
+
+  - type: hyperbolic
+    name: Hyperbolic
+    description: "Hyperbolic API"
+    hostnames:
+      - hyperbolic.com
+    ports: [443]
+
+  - type: jina_ai
+    name: Jina Ai
+    description: "Jina Ai API"
+    hostnames:
+      - jina_ai.com
+    ports: [443]
+
+  - type: lambda_ai
+    name: Lambda Ai
+    description: "Lambda Ai API"
+    hostnames:
+      - lambda_ai.com
+    ports: [443]
+
+  - type: lemonade
+    name: Lemonade
+    description: "Lemonade API"
+    hostnames:
+      - lemonade.com
+    ports: [443]
+
+  - type: linkup
+    name: Linkup
+    description: "Linkup API"
+    hostnames:
+      - linkup.com
+    ports: [443]
+
+  - type: llamagate
+    name: Llamagate
+    description: "Llamagate API"
+    hostnames:
+      - llamagate.com
+    ports: [443]
+
+  - type: meta_llama
+    name: Meta Llama
+    description: "Meta Llama API"
+    hostnames:
+      - meta_llama.com
+    ports: [443]
+
+  - type: minimax
+    name: Minimax
+    description: "Minimax API"
+    hostnames:
+      - minimax.com
+    ports: [443]
+
+  - type: mistral
+    name: Mistral
+    description: "Mistral AI API"
+    hostnames:
+      - api.mistral.ai
+    ports: [443]
+
+  - type: moonshot
+    name: Moonshot
+    description: "Moonshot API"
+    hostnames:
+      - moonshot.com
+    ports: [443]
+
+  - type: morph
+    name: Morph
+    description: "Morph API"
+    hostnames:
+      - morph.com
+    ports: [443]
+
+  - type: nlp_cloud
+    name: Nlp Cloud
+    description: "Nlp Cloud API"
+    hostnames:
+      - nlp_cloud.com
+    ports: [443]
+
+  - type: novita
+    name: Novita
+    description: "Novita API"
+    hostnames:
+      - novita.com
+    ports: [443]
+
+  - type: nscale
+    name: Nscale
+    description: "Nscale API"
+    hostnames:
+      - nscale.com
+    ports: [443]
+
+  - type: nvidia_nim
+    name: Nvidia Nim
+    description: "Nvidia Nim API"
+    hostnames:
+      - nvidia_nim.com
+    ports: [443]
+
+  - type: oci
+    name: Oci
+    description: "Oci API"
+    hostnames:
+      - oci.com
+    ports: [443]
+
+  - type: ollama
+    name: Ollama
+    description: "Ollama local models"
+    hostnames:
+      - localhost
+      - 127.0.0.1
+    ports: [11434]
+
+  - type: openai
+    name: OpenAI
+    description: "OpenAI APIs (ChatGPT, GPT-4)"
+    hostnames:
+      - api.openai.com
+      - api-*.openai.com
+    ports: [443]
+
+  - type: openrouter
+    name: OpenRouter
+    description: "OpenRouter API"
+    hostnames:
+      - openrouter.ai
+    ports: [443]
+
+  - type: ovhcloud
+    name: Ovhcloud
+    description: "Ovhcloud API"
+    hostnames:
+      - ovhcloud.com
+    ports: [443]
+
+  - type: palm
+    name: Palm
+    description: "Palm API"
+    hostnames:
+      - palm.com
+    ports: [443]
+
+  - type: parallel_ai
+    name: Parallel Ai
+    description: "Parallel Ai API"
+    hostnames:
+      - parallel_ai.com
+    ports: [443]
+
+  - type: perplexity
+    name: Perplexity
+    description: "Perplexity API"
+    hostnames:
+      - api.perplexity.ai
+    ports: [443]
+
+  - type: publicai
+    name: Publicai
+    description: "Publicai API"
+    hostnames:
+      - publicai.com
+    ports: [443]
+
+  - type: recraft
+    name: Recraft
+    description: "Recraft API"
+    hostnames:
+      - recraft.com
+    ports: [443]
+
+  - type: replicate
+    name: Replicate
+    description: "Replicate API"
+    hostnames:
+      - replicate.com
+    ports: [443]
+
+  - type: runwayml
+    name: Runwayml
+    description: "Runwayml API"
+    hostnames:
+      - runwayml.com
+    ports: [443]
+
+  - type: sagemaker
+    name: Sagemaker
+    description: "Sagemaker API"
+    hostnames:
+      - sagemaker.com
+    ports: [443]
+
+  - type: sambanova
+    name: Sambanova
+    description: "Sambanova API"
+    hostnames:
+      - sambanova.com
+    ports: [443]
+
+  - type: sarvam
+    name: Sarvam
+    description: "Sarvam API"
+    hostnames:
+      - sarvam.com
+    ports: [443]
+
+  - type: searxng
+    name: Searxng
+    description: "Searxng API"
+    hostnames:
+      - searxng.com
+    ports: [443]
+
+  - type: snowflake
+    name: Snowflake
+    description: "Snowflake API"
+    hostnames:
+      - snowflake.com
+    ports: [443]
+
+  - type: stability
+    name: Stability
+    description: "Stability API"
+    hostnames:
+      - stability.com
+    ports: [443]
+
+  - type: tavily
+    name: Tavily
+    description: "Tavily API"
+    hostnames:
+      - tavily.com
+    ports: [443]
+
+  - type: text-completion-codestral
+    name: Text-Completion-Codestral
+    description: "Text-Completion-Codestral API"
+    hostnames:
+      - text-completion-codestral.com
+    ports: [443]
+
+  - type: text-completion-openai
+    name: Text-Completion-Openai
+    description: "Text-Completion-Openai API"
+    hostnames:
+      - text-completion-openai.com
+    ports: [443]
+
+  - type: together_ai
+    name: Together AI
+    description: "Together AI API"
+    hostnames:
+      - api.together.xyz
+    ports: [443]
+
+  - type: v0
+    name: V0
+    description: "V0 API"
+    hostnames:
+      - v0.com
+    ports: [443]
+
+  - type: vercel_ai_gateway
+    name: Vercel Ai Gateway
+    description: "Vercel Ai Gateway API"
+    hostnames:
+      - vercel_ai_gateway.com
+    ports: [443]
+
+  - type: vertex_ai
+    name: Google Vertex AI
+    description: "Google Vertex AI"
+    hostnames:
+      - vertexai.googleapis.com
+    ports: [443]
+
+  - type: vertex_ai-ai21_models
+    name: Vertex Ai-Ai21 Models
+    description: "Vertex Ai-Ai21 Models API"
+    hostnames:
+      - vertex_ai-ai21_models.com
+    ports: [443]
+
+  - type: vertex_ai-anthropic_models
+    name: Vertex Ai-Anthropic Models
+    description: "Vertex Ai-Anthropic Models API"
+    hostnames:
+      - vertex_ai-anthropic_models.com
+    ports: [443]
+
+  - type: vertex_ai-chat-models
+    name: Vertex Ai-Chat-Models
+    description: "Vertex Ai-Chat-Models API"
+    hostnames:
+      - vertex_ai-chat-models.com
+    ports: [443]
+
+  - type: vertex_ai-code-chat-models
+    name: Vertex Ai-Code-Chat-Models
+    description: "Vertex Ai-Code-Chat-Models API"
+    hostnames:
+      - vertex_ai-code-chat-models.com
+    ports: [443]
+
+  - type: vertex_ai-code-text-models
+    name: Vertex Ai-Code-Text-Models
+    description: "Vertex Ai-Code-Text-Models API"
+    hostnames:
+      - vertex_ai-code-text-models.com
+    ports: [443]
+
+  - type: vertex_ai-deepseek_models
+    name: Vertex Ai-Deepseek Models
+    description: "Vertex Ai-Deepseek Models API"
+    hostnames:
+      - vertex_ai-deepseek_models.com
+    ports: [443]
+
+  - type: vertex_ai-embedding-models
+    name: Vertex Ai-Embedding-Models
+    description: "Vertex Ai-Embedding-Models API"
+    hostnames:
+      - vertex_ai-embedding-models.com
+    ports: [443]
+
+  - type: vertex_ai-image-models
+    name: Vertex Ai-Image-Models
+    description: "Vertex Ai-Image-Models API"
+    hostnames:
+      - vertex_ai-image-models.com
+    ports: [443]
+
+  - type: vertex_ai-language-models
+    name: Vertex Ai-Language-Models
+    description: "Vertex Ai-Language-Models API"
+    hostnames:
+      - vertex_ai-language-models.com
+    ports: [443]
+
+  - type: vertex_ai-llama_models
+    name: Vertex Ai-Llama Models
+    description: "Vertex Ai-Llama Models API"
+    hostnames:
+      - vertex_ai-llama_models.com
+    ports: [443]
+
+  - type: vertex_ai-minimax_models
+    name: Vertex Ai-Minimax Models
+    description: "Vertex Ai-Minimax Models API"
+    hostnames:
+      - vertex_ai-minimax_models.com
+    ports: [443]
+
+  - type: vertex_ai-mistral_models
+    name: Vertex Ai-Mistral Models
+    description: "Vertex Ai-Mistral Models API"
+    hostnames:
+      - vertex_ai-mistral_models.com
+    ports: [443]
+
+  - type: vertex_ai-moonshot_models
+    name: Vertex Ai-Moonshot Models
+    description: "Vertex Ai-Moonshot Models API"
+    hostnames:
+      - vertex_ai-moonshot_models.com
+    ports: [443]
+
+  - type: vertex_ai-openai_models
+    name: Vertex Ai-Openai Models
+    description: "Vertex Ai-Openai Models API"
+    hostnames:
+      - vertex_ai-openai_models.com
+    ports: [443]
+
+  - type: vertex_ai-qwen_models
+    name: Vertex Ai-Qwen Models
+    description: "Vertex Ai-Qwen Models API"
+    hostnames:
+      - vertex_ai-qwen_models.com
+    ports: [443]
+
+  - type: vertex_ai-text-models
+    name: Vertex Ai-Text-Models
+    description: "Vertex Ai-Text-Models API"
+    hostnames:
+      - vertex_ai-text-models.com
+    ports: [443]
+
+  - type: vertex_ai-video-models
+    name: Vertex Ai-Video-Models
+    description: "Vertex Ai-Video-Models API"
+    hostnames:
+      - vertex_ai-video-models.com
+    ports: [443]
+
+  - type: vertex_ai-vision-models
+    name: Vertex Ai-Vision-Models
+    description: "Vertex Ai-Vision-Models API"
+    hostnames:
+      - vertex_ai-vision-models.com
+    ports: [443]
+
+  - type: vertex_ai-zai_models
+    name: Vertex Ai-Zai Models
+    description: "Vertex Ai-Zai Models API"
+    hostnames:
+      - vertex_ai-zai_models.com
+    ports: [443]
+
+  - type: volcengine
+    name: Volcengine
+    description: "Volcengine API"
+    hostnames:
+      - volcengine.com
+    ports: [443]
+
+  - type: voyage
+    name: Voyage
+    description: "Voyage API"
+    hostnames:
+      - voyage.com
+    ports: [443]
+
+  - type: wandb
+    name: Wandb
+    description: "Wandb API"
+    hostnames:
+      - wandb.com
+    ports: [443]
+
+  - type: watsonx
+    name: Watsonx
+    description: "Watsonx API"
+    hostnames:
+      - watsonx.com
+    ports: [443]
+
+  - type: xai
+    name: Xai
+    description: "Xai API"
+    hostnames:
+      - xai.com
+    ports: [443]
+
+  - type: zai
+    name: Zai
+    description: "Zai API"
+    hostnames:
+      - zai.com
+    ports: [443]
+

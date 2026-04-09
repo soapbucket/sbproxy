@@ -1,0 +1,40 @@
+{
+  "multiple-onload-callbacks.test": {
+    "id": "multiple-onload-callbacks",
+    "hostname": "multiple-onload-callbacks.test",
+    "on_load": [
+      {
+        "type": "http",
+        "url": "http://e2e-test-server:8090/callback/config",
+        "method": "GET",
+        "timeout": 5,
+        "variable_name": "app_config",
+        "cel_expr": "{\"modified_json\": {\"version\": string('version' in json ? json['version'] : 'v1'), \"environment\": 'env' in json ? json['env'] : 'production'}}"
+      },
+      {
+        "type": "http",
+        "url": "http://e2e-test-server:8090/callback/features",
+        "method": "GET",
+        "timeout": 5,
+        "variable_name": "feature_flags",
+        "cel_expr": "{\"modified_json\": {\"features\": 'features' in json ? json['features'] : {}}}"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-App-Version": "{{config.app_config.version}}",
+            "X-Environment": "{{config.app_config.environment}}",
+            "X-Features": "{{config.feature_flags}}"
+          }
+        }
+      }
+    ]
+  }
+}
+

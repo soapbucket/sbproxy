@@ -1,0 +1,19 @@
+{
+  "cache-vary.test": {
+    "id": "cache-vary",
+    "hostname": "cache-vary.test",
+    "cache_settings": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": "1m",
+      "vary_on_headers": [
+        "Accept-Language",
+        "Accept-Encoding"
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/cache/vary-test"
+    }
+  }
+}

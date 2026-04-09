@@ -1,0 +1,15 @@
+{
+  "storage.test": {
+    "id": "storage",
+    "hostname": "storage.test",
+    "action": {
+      "type": "storage",
+      "kind": "s3",
+      "bucket": "test-bucket",
+      "region": "us-east-1",
+      "key": "test-access-key",
+      "secret": "test-secret-key"
+    }
+  }
+}
+

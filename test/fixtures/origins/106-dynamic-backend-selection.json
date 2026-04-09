@@ -1,0 +1,31 @@
+{
+  "dynamic-backend.test": {
+    "id": "dynamic-backend",
+    "hostname": "dynamic-backend.test",
+    "on_request": [
+      {
+        "type": "http",
+        "url": "http://e2e-test-server:8090/callback/backend-selector",
+        "method": "POST",
+        "timeout": 3,
+        "variable_name": "backend_info",
+        "cel_expr": "{\"modified_json\": {\"backend\": json['backend_url'], \"headers\": json['extra_headers']}}"
+      }
+    ],
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Backend-Selected": "{{request_data.backend_info.backend}}"
+          }
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/api/headers"
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  }
+}

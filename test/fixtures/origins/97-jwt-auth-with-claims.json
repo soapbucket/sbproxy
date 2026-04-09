@@ -1,0 +1,34 @@
+{
+  "jwt-claims.test": {
+    "id": "jwt-claims",
+    "hostname": "jwt-claims.test",
+    "authentication": {
+      "type": "jwt",
+      "disabled": false,
+      "secret": "test-secret-key-1234567890123456",
+      "issuer": "test-issuer",
+      "audience": "test-audience",
+      "algorithm": "HS256",
+      "required_claims": {
+        "role": "admin",
+        "premium": true
+      }
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/api/headers"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-Role": "{{jwt.role}}",
+            "X-User-Sub": "{{jwt.sub}}",
+            "X-User-Email": "{{jwt.email}}"
+          }
+        }
+      }
+    ]
+  }
+}
+

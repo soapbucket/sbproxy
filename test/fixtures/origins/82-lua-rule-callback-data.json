@@ -1,0 +1,40 @@
+{
+  "lua-rule-callback-data.test": {
+    "id": "lua-rule-callback-data",
+    "hostname": "lua-rule-callback-data.test",
+    "session_config": {
+      "disabled": false,
+      "allow_non_ssl": true,
+      "cookie_name": "_sb.session",
+      "cookie_max_age": 3600,
+      "callbacks": [
+        {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_data",
+          "timeout": 5
+        }
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-Tier": "{{session_data.user_data.subscription.tier}}"
+          }
+        },
+        "rules": [
+          {
+            "lua_script": "return session ~= nil and session.data ~= nil and session.data.user_data ~= nil and session.data.user_data.subscription ~= nil and session.data.user_data.subscription.tier == 'premium'"
+          }
+        ]
+      }
+    ]
+  }
+}
+

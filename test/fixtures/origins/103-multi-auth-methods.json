@@ -1,0 +1,23 @@
+{
+  "multi-auth.test": {
+    "id": "multi-auth",
+    "hostname": "multi-auth.test",
+    "authentication": {
+      "type": "noop",
+      "disabled": false
+    },
+    "policies": [
+      {
+        "type": "expression",
+        "disabled": false,
+        "cel_expr": "('authorization' in request.headers && request.headers['authorization'].startsWith('Bearer bearer-token-123')) || ('x-api-key' in request.headers && request.headers['x-api-key'] == 'api-key-456')"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/api/headers"
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  }
+}

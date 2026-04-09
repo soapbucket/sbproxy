@@ -1,0 +1,17 @@
+{
+  "cache-last-modified.test": {
+    "id": "cache-last-modified",
+    "hostname": "cache-last-modified.test",
+    "cache_settings": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": "5s",
+      "use_conditional_requests": true,
+      "respect_last_modified": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/cache-test/last-modified-test"
+    }
+  }
+}

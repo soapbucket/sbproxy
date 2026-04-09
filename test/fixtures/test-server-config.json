@@ -1,0 +1,1154 @@
+{
+  "name": "E2E Test Configuration",
+  "description": "Standard test scenarios for proxy end-to-end testing",
+  "defaults": {
+    "status": 200,
+    "headers": {
+      "X-Test-Server": "e2e-test-server"
+    }
+  },
+  "scenarios": [
+    {
+      "id": "simple-200",
+      "name": "Simple 200 OK Response",
+      "path": "/test/simple-200",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Test-Scenario": "simple-200"
+        },
+        "body": {
+          "status": "success",
+          "message": "Simple test response",
+          "test_id": "simple-200"
+        }
+      }
+    },
+    {
+      "id": "auth-required",
+      "name": "Authentication Required",
+      "path": "/test/auth-required",
+      "method": "GET",
+      "request": {
+        "headers": {
+          "Authorization": "Bearer test-token"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Auth-Validated": "true"
+        },
+        "body": {
+          "status": "authenticated",
+          "user": "test-user",
+          "roles": ["user", "tester"]
+        }
+      }
+    },
+    {
+      "id": "delayed-response",
+      "name": "Delayed Response (500ms)",
+      "path": "/test/delayed-response",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "delay": 500,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "success",
+          "delayed_ms": 500
+        }
+      }
+    },
+    {
+      "id": "json-payload",
+      "name": "JSON Payload Echo",
+      "path": "/test/json-payload",
+      "method": "POST",
+      "request": {
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "test": "data"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "success",
+          "received": true,
+          "echo": "test data received"
+        }
+      }
+    },
+    {
+      "id": "error-500",
+      "name": "Internal Server Error",
+      "path": "/test/error-500",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 500,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "Simulated internal server error",
+          "code": "INTERNAL_ERROR"
+        }
+      }
+    },
+    {
+      "id": "not-found",
+      "name": "Not Found Error",
+      "path": "/test/not-found",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 404,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "Resource not found",
+          "code": "NOT_FOUND"
+        }
+      }
+    },
+    {
+      "id": "rate-limited",
+      "name": "Rate Limited Response",
+      "path": "/test/rate-limited",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 429,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-RateLimit-Limit": "100",
+          "X-RateLimit-Remaining": "0",
+          "Retry-After": "60"
+        },
+        "body": {
+          "status": "error",
+          "message": "Rate limit exceeded",
+          "code": "RATE_LIMITED"
+        }
+      }
+    },
+    {
+      "id": "large-payload",
+      "name": "Large JSON Payload",
+      "path": "/test/large-payload",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "success",
+          "data": {
+            "users": [
+              {"id": 1, "name": "User 1", "email": "user1@example.com"},
+              {"id": 2, "name": "User 2", "email": "user2@example.com"},
+              {"id": 3, "name": "User 3", "email": "user3@example.com"},
+              {"id": 4, "name": "User 4", "email": "user4@example.com"},
+              {"id": 5, "name": "User 5", "email": "user5@example.com"}
+            ],
+            "metadata": {
+              "total": 5,
+              "page": 1,
+              "per_page": 5
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "custom-headers",
+      "name": "Custom Headers Test",
+      "path": "/test/custom-headers",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Custom-Header": "test-value",
+          "X-Request-ID": "test-12345",
+          "Cache-Control": "no-cache, no-store, must-revalidate"
+        },
+        "body": {
+          "status": "success",
+          "headers_set": ["X-Custom-Header", "X-Request-ID", "Cache-Control"]
+        }
+      }
+    },
+    {
+      "id": "redirect-301",
+      "name": "Permanent Redirect",
+      "path": "/test/redirect-301",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 301,
+        "headers": {
+          "Location": "/test/simple-200"
+        },
+        "body": {
+          "status": "redirect",
+          "location": "/test/simple-200"
+        }
+      }
+    },
+    {
+      "id": "cors-preflight",
+      "name": "CORS Preflight Response",
+      "path": "/test/cors-preflight",
+      "method": "OPTIONS",
+      "request": {},
+      "response": {
+        "status": 204,
+        "headers": {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+          "Access-Control-Max-Age": "3600"
+        }
+      }
+    },
+    {
+      "id": "session-data",
+      "name": "Session Data Test",
+      "path": "/test/session-data",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "success",
+          "session": {
+            "user_id": "test-user-123",
+            "preferences": {
+              "theme": "dark",
+              "language": "en"
+            },
+            "subscription": {
+              "tier": "premium",
+              "active": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "api-v1-test",
+      "name": "API v1 Test Endpoint",
+      "path": "/api/v1/test",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "success",
+          "message": "API v1 test endpoint",
+          "path": "/api/v1/test"
+        }
+      }
+    },
+    {
+      "id": "old-test",
+      "name": "Old Service Test Endpoint",
+      "path": "/old/test",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "success",
+          "message": "Old service test endpoint",
+          "path": "/old/test"
+        }
+      }
+    },
+    {
+      "id": "admin-response",
+      "name": "Admin Backend Response",
+      "path": "/admin/test",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Test-Scenario": "admin-response"
+        },
+        "body": {
+          "status": "success",
+          "message": "Admin backend response",
+          "test_id": "admin-response"
+        }
+      }
+    },
+    {
+      "id": "api-v2-response",
+      "name": "API v2 Backend Response",
+      "path": "/api/v2/test",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Test-Scenario": "api-v2-response"
+        },
+        "body": {
+          "status": "success",
+          "message": "API v2 backend response",
+          "test_id": "api-v2-response"
+        }
+      }
+    },
+    {
+      "id": "beta-response",
+      "name": "Beta Backend Response",
+      "path": "/test/beta-response",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Test-Scenario": "beta-response"
+        },
+        "body": {
+          "status": "success",
+          "message": "Beta backend response",
+          "test_id": "beta-response"
+        }
+      }
+    },
+    {
+      "id": "default-route",
+      "name": "Default Route Response",
+      "path": "/",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Test-Scenario": "default-route"
+        },
+        "body": {
+          "status": "success",
+          "message": "Default route response",
+          "test_id": "default-route"
+        }
+      }
+    },
+    {
+      "id": "api-v1-default",
+      "name": "API v1 Default Response",
+      "path": "/test/api-v1-default",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Test-Scenario": "api-v1-default"
+        },
+        "body": {
+          "status": "success",
+          "message": "API v1 default response",
+          "test_id": "api-v1-default"
+        }
+      }
+    },
+    {
+      "id": "users-api",
+      "name": "Users API Response",
+      "path": "/api/v1/users/test",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Test-Scenario": "users-api"
+        },
+        "body": {
+          "status": "success",
+          "message": "Users API response",
+          "test_id": "users-api"
+        }
+      }
+    },
+    {
+      "id": "products-api",
+      "name": "Products API Response",
+      "path": "/test/products-api",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Test-Scenario": "products-api"
+        },
+        "body": {
+          "status": "success",
+          "message": "Products API response",
+          "test_id": "products-api"
+        }
+      }
+    },
+    {
+      "id": "global-response",
+      "name": "Global Response",
+      "path": "/",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Test-Scenario": "global-response"
+        },
+        "body": {
+          "status": "success",
+          "message": "Global response",
+          "test_id": "global-response"
+        }
+      }
+    },
+    {
+      "id": "us-response",
+      "name": "US Backend Response",
+      "path": "/test/us-response",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Test-Scenario": "us-response"
+        },
+        "body": {
+          "status": "success",
+          "message": "US backend response",
+          "test_id": "us-response"
+        }
+      }
+    },
+    {
+      "id": "uk-response",
+      "name": "UK Backend Response",
+      "path": "/test/uk-response",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Test-Scenario": "uk-response"
+        },
+        "body": {
+          "status": "success",
+          "message": "UK backend response",
+          "test_id": "uk-response"
+        }
+      }
+    },
+    {
+      "id": "json-data",
+      "name": "JSON Data Endpoint",
+      "path": "/test/json-data",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "success",
+          "data": {
+            "users": [
+              {"id": 1, "name": "Alice", "email": "alice@example.com"},
+              {"id": 2, "name": "Bob", "email": "bob@example.com"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "large-data",
+      "name": "Large Data Endpoint",
+      "path": "/test/large-data",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "success",
+          "data": {
+            "users": [
+              {"id": 1, "name": "User 1", "email": "user1@example.com"},
+              {"id": 2, "name": "User 2", "email": "user2@example.com"},
+              {"id": 3, "name": "User 3", "email": "user3@example.com"},
+              {"id": 4, "name": "User 4", "email": "user4@example.com"},
+              {"id": 5, "name": "User 5", "email": "user5@example.com"}
+            ],
+            "metadata": {
+              "total": 5,
+              "page": 1,
+              "per_page": 5
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "flaky-endpoint",
+      "name": "Flaky Endpoint for Retry Testing",
+      "path": "/test/flaky-endpoint",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "success",
+          "message": "Flaky endpoint - may fail intermittently",
+          "test_id": "flaky-endpoint"
+        }
+      }
+    },
+    {
+      "id": "error",
+      "name": "Error Page Callback Endpoint",
+      "path": "/error",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "text/html"
+        },
+        "body": "<html><head><title>Error</title></head><body><h1>Error Page from Callback</h1><p>This error page was fetched from a callback endpoint.</p></body></html>"
+      }
+    },
+    {
+      "id": "error-502",
+      "name": "Bad Gateway Error",
+      "path": "/test/error-502",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 502,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "Bad Gateway",
+          "code": "BAD_GATEWAY"
+        }
+      }
+    },
+    {
+      "id": "error-503",
+      "name": "Service Unavailable Error",
+      "path": "/test/error-503",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 503,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "Service Unavailable",
+          "code": "SERVICE_UNAVAILABLE"
+        }
+      }
+    },
+    {
+      "id": "error-404",
+      "name": "Error Page Callback for 404",
+      "path": "/error/404",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "text/html"
+        },
+        "body": "<html><head><title>404 Not Found</title></head><body><h1>404 - Page Not Found</h1><p>The requested page could not be found.</p><p>Error fetched from callback endpoint.</p></body></html>"
+      }
+    },
+    {
+      "id": "error-500",
+      "name": "Error Page Callback for 500",
+      "path": "/error/500",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "text/html"
+        },
+        "body": "<html><head><title>500 Internal Server Error</title></head><body><h1>500 - Internal Server Error</h1><p>An internal server error occurred.</p><p>Error page fetched from callback.</p></body></html>"
+      }
+    },
+    {
+      "id": "error-5xx",
+      "name": "Error Page Callback for 5xx Errors",
+      "path": "/error/5xx",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "text/html"
+        },
+        "body": "<html><head><title>Server Error</title></head><body><h1>Server Error (5xx)</h1><p>A server error occurred. Please try again later.</p><p>This error page handles 502, 503, and 504 errors.</p></body></html>"
+      }
+    },
+    {
+      "id": "error-429",
+      "name": "Error Page Callback for 429 Rate Limit",
+      "path": "/error/429",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "error": "Rate Limit Exceeded",
+          "message": "Too many requests. Please try again later.",
+          "retry_after": 60,
+          "fetched_from": "callback"
+        }
+      }
+    },
+    {
+      "id": "error-template",
+      "name": "Error Page Callback with Template",
+      "path": "/error/template",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "text/html"
+        },
+        "body": "<html><head><title>Error {{ status_code }}</title></head><body><h1>Error {{ status_code }}</h1><p>Origin ID: {{ origin_id }}</p><p>Hostname: {{ hostname }}</p><p>This error page uses template variables.</p></body></html>"
+      }
+    },
+    {
+      "id": "error-base64",
+      "name": "Error Page Callback with Base64",
+      "path": "/error/base64",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/octet-stream"
+        },
+        "body": "PGh0bWw+PGhlYWQ+PHRpdGxlPjUwMCBFcnJvcjwvdGl0bGU+PC9oZWFkPjxib2R5PjxoMT41MDAgLSBJbnRlcm5hbCBTZXJ2ZXIgRXJyb3I8L2gxPjxwPkVycm9yIHBhZ2UgZW5jb2RlZCBpbiBCYXNlNjQuPC9wPjwvYm9keT48L2h0bWw+"
+      }
+    },
+    {
+      "id": "api-headers",
+      "name": "API Headers Endpoint",
+      "path": "/api/headers",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "success",
+          "message": "Headers endpoint",
+          "headers": {}
+        }
+      }
+    },
+    {
+      "id": "api-delay",
+      "name": "API Delay Endpoint",
+      "path": "/api/delay",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "success",
+          "message": "Delayed response",
+          "delay_ms": 0
+        }
+      }
+    },
+    {
+      "id": "callback-features",
+      "name": "Callback Features Endpoint",
+      "path": "/callback/features",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "features": {
+            "feature1": true,
+            "feature2": false
+          }
+        }
+      }
+    },
+    {
+      "id": "callback-backend-selector",
+      "name": "Callback Backend Selector",
+      "path": "/callback/backend-selector",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "backend": "primary",
+          "available": ["primary", "secondary", "tertiary"]
+        }
+      }
+    },
+    {
+      "id": "test-unhealthy-endpoint",
+      "name": "Unhealthy Endpoint for Health Check Testing",
+      "path": "/test/unhealthy-endpoint",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 503,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "Service unhealthy",
+          "code": "SERVICE_UNAVAILABLE"
+        }
+      }
+    },
+    {
+      "id": "test-canary",
+      "name": "Canary Deployment Endpoint",
+      "path": "/test/canary",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Deployment": "canary"
+        },
+        "body": {
+          "status": "success",
+          "message": "Canary deployment response",
+          "version": "canary-v1"
+        }
+      }
+    },
+    {
+      "id": "test-primary",
+      "name": "Primary Backend Endpoint",
+      "path": "/test/primary",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Backend": "primary"
+        },
+        "body": {
+          "status": "success",
+          "message": "Primary backend response",
+          "backend": "primary"
+        }
+      }
+    },
+    {
+      "id": "test-secondary",
+      "name": "Secondary Backend Endpoint",
+      "path": "/test/secondary",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Backend": "secondary"
+        },
+        "body": {
+          "status": "success",
+          "message": "Secondary backend response",
+          "backend": "secondary"
+        }
+      }
+    },
+    {
+      "id": "test-tertiary",
+      "name": "Tertiary Backend Endpoint",
+      "path": "/test/tertiary",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Backend": "tertiary"
+        },
+        "body": {
+          "status": "success",
+          "message": "Tertiary backend response",
+          "backend": "tertiary"
+        }
+      }
+    },
+    {
+      "id": "test-stable",
+      "name": "Stable Backend Endpoint",
+      "path": "/test/stable",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Backend": "stable"
+        },
+        "body": {
+          "status": "success",
+          "message": "Stable backend response",
+          "backend": "stable"
+        }
+      }
+    },
+    {
+      "id": "health",
+      "name": "Health Check Endpoint",
+      "path": "/health",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "healthy",
+          "service": "e2e-test-server"
+        }
+      }
+    },
+    {
+      "id": "error-400",
+      "name": "Bad Request Error",
+      "path": "/error/400",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 400,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "Bad Request",
+          "code": "BAD_REQUEST"
+        }
+      }
+    },
+    {
+      "id": "error-401",
+      "name": "Unauthorized Error",
+      "path": "/error/401",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 401,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "Unauthorized",
+          "code": "UNAUTHORIZED"
+        }
+      }
+    },
+    {
+      "id": "error-403",
+      "name": "Forbidden Error",
+      "path": "/error/403",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 403,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "Forbidden",
+          "code": "FORBIDDEN"
+        }
+      }
+    },
+    {
+      "id": "error-408",
+      "name": "Request Timeout Error",
+      "path": "/error/408",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 408,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "Request Timeout",
+          "code": "REQUEST_TIMEOUT"
+        }
+      }
+    },
+    {
+      "id": "error-410",
+      "name": "Gone Error",
+      "path": "/error/410",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 410,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "Gone",
+          "code": "GONE"
+        }
+      }
+    },
+    {
+      "id": "error-413",
+      "name": "Payload Too Large Error",
+      "path": "/error/413",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 413,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "Payload Too Large",
+          "code": "PAYLOAD_TOO_LARGE"
+        }
+      }
+    },
+    {
+      "id": "error-414",
+      "name": "URI Too Long Error",
+      "path": "/error/414",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 414,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "URI Too Long",
+          "code": "URI_TOO_LONG"
+        }
+      }
+    },
+    {
+      "id": "error-415",
+      "name": "Unsupported Media Type Error",
+      "path": "/error/415",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 415,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "Unsupported Media Type",
+          "code": "UNSUPPORTED_MEDIA_TYPE"
+        }
+      }
+    },
+    {
+      "id": "error-422",
+      "name": "Unprocessable Entity Error",
+      "path": "/error/422",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 422,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "Unprocessable Entity",
+          "code": "UNPROCESSABLE_ENTITY"
+        }
+      }
+    },
+    {
+      "id": "error-451",
+      "name": "Unavailable For Legal Reasons Error",
+      "path": "/error/451",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 451,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "Unavailable For Legal Reasons",
+          "code": "UNAVAILABLE_FOR_LEGAL_REASONS"
+        }
+      }
+    },
+    {
+      "id": "error-507",
+      "name": "Insufficient Storage Error",
+      "path": "/error/507",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 507,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "Insufficient Storage",
+          "code": "INSUFFICIENT_STORAGE"
+        }
+      }
+    },
+    {
+      "id": "error-508",
+      "name": "Loop Detected Error",
+      "path": "/error/508",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 508,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "Loop Detected",
+          "code": "LOOP_DETECTED"
+        }
+      }
+    },
+    {
+      "id": "error-510",
+      "name": "Not Extended Error",
+      "path": "/error/510",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 510,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "Not Extended",
+          "code": "NOT_EXTENDED"
+        }
+      }
+    },
+    {
+      "id": "error-511",
+      "name": "Network Authentication Required Error",
+      "path": "/error/511",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 511,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "error",
+          "message": "Network Authentication Required",
+          "code": "NETWORK_AUTHENTICATION_REQUIRED"
+        }
+      }
+    }
+  ]
+}
+

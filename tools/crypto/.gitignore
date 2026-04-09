@@ -1,0 +1,14 @@
+# Binary
+crypto
+
+# Encryption keys
+*.key
+.encryption-key
+.crypto-key
+
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+

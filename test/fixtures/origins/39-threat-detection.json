@@ -1,0 +1,29 @@
+{
+  "threat-detection.test": {
+    "id": "threat-detection",
+    "hostname": "threat-detection.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "policies": [
+      {
+        "type": "threat_detection",
+        "disabled": false,
+        "patterns": {
+          "xss": {
+            "disabled": false,
+            "action": "block",
+            "log_level": "warn"
+          },
+          "path_traversal": {
+            "disabled": false,
+            "action": "log",
+            "log_level": "info"
+          }
+        }
+      }
+    ]
+  }
+}
+

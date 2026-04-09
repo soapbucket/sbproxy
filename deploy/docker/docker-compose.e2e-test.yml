@@ -1,0 +1,74 @@
+# E2E Test Environment Override
+# This file extends docker-compose.yml with test-specific configurations for end-to-end testing
+# 
+# This is DIFFERENT from docker-compose.test.yml which is for Go unit/integration tests
+#
+# Usage: 
+#   docker compose -f docker-compose.yml -f docker-compose.e2e-test.yml up -d
+#
+# Services added/overridden:
+#   - proxy: Overridden with test configs (sb.test.yml, test certs, postgres storage)
+#   - e2e-test-server: Backend test server for E2E testing
+#   - prometheus/grafana: Test-specific configurations
+
+services:
+  proxy:
+    ports:
+      - "${PROXY_HTTP_PORT:-8080}:8080/tcp"       # HTTP
+      - "${PROXY_HTTPS_PORT:-8443}:8443/tcp"       # HTTPS (HTTP/2, HTTP/1.1)
+      - "${PROXY_HTTPS_PORT:-8443}:8443/udp"       # HTTP/3 (QUIC)
+      - "${PROXY_TELEMETRY_PORT:-8888}:8888/tcp"       # Telemetry
+    volumes:
+      # Mount test configuration files from proxy/config and proxy/test/conf/certs
+      - ../../deploy/config/server/sb.test.yml:/app/config/server/sb.yml:ro
+      - ../../test/conf/certs:/app/certs:ro
+      - ../../data/regexes.yml:/app/data/regexes.yml:ro
+      - ../../data/ipinfo_lite.mmdb:/app/data/ipinfo_lite.mmdb:ro
+      - ../../test/tmp:/app/tmp
+    environment:
+      # Use PostgreSQL storage for test environment
+      SB_STORAGE_SETTINGS__DRIVER: "postgres"
+      SB_STORAGE_SETTINGS__PARAMS__DSN: "postgres://proxy:proxy@postgres:5432/proxy?sslmode=disable"
+      # Remove PATH parameter when using postgres (it's only for file storage)
+      SB_STORAGE_SETTINGS__PARAMS__PATH: ""
+      # Set config file path
+      SB_CONFIG_FILE: "/app/config/server/sb.yml"
+      # Set log level for testing
+      SB_LOG_LEVEL: "debug"
+
+  prometheus:
+    volumes:
+      # Use test-specific Prometheus config
+      - ../../deploy/config/prometheus/prometheus.test.yml:/etc/prometheus/prometheus.yml:ro
+      - ../../deploy/config/prometheus/alerts.test.yml:/etc/prometheus/alerts.yml:ro
+
+  grafana:
+    volumes:
+      # Use test-specific Grafana configs
+      - ../../deploy/config/grafana/test/provisioning:/etc/grafana/provisioning:ro
+      - ../../deploy/config/grafana/test/dashboards:/var/lib/grafana/dashboards:ro
+
+  # E2E Test Server (not in main compose, add it for test environment)
+  e2e-test-server:
+    build:
+      context: ../../tools/e2e-test-server
+      dockerfile: Dockerfile
+    container_name: ${ENV_PREFIX}e2e-server
+    ports:
+      - "8090:8090"
+      - "8091:8091"
+      - "8092:8092"
+      - "9443:9443"
+    volumes:
+      - ../../test/fixtures/test-server-config.json:/app/test-config.json:ro
+      - ../../test/conf/certs:/app/certs:ro
+    command:
+      - ./e2e-test-server
+      - -http-port=8090
+      - -https-port=9443
+      - -ws-port=8091
+      - -graphql-port=8092
+      - -config=/app/test-config.json
+    networks:
+      - proxy_net
+

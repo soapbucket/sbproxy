@@ -1,0 +1,154 @@
+{
+  "request-matcher-comprehensive.test": {
+    "id": "request-matcher-comprehensive",
+    "hostname": "request-matcher-comprehensive.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.html"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Path": "true",
+            "X-Matched-Method": "true"
+          }
+        },
+        "rules": [
+          {
+            "path": {
+              "prefix": "/test-page"
+            },
+            "methods": ["GET"]
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Header": "true"
+          }
+        },
+        "rules": [
+          {
+            "headers": {
+              "exact": {
+                "User-Agent": "TestAgent"
+              },
+              "exists": ["Authorization"],
+              "not_exist": ["X-Blocked"]
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Query": "true"
+          }
+        },
+        "rules": [
+          {
+            "query": {
+              "exact": {
+                "version": "v2"
+              },
+              "exists": ["api_key"],
+              "not_exist": ["debug"]
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-IP": "true"
+          }
+        },
+        "rules": [
+          {
+            "ip": {
+              "ips": ["127.0.0.1", "::1"],
+              "cidrs": ["192.168.0.0/16", "10.0.0.0/8"]
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Content-Type": "true"
+          }
+        },
+        "rules": [
+          {
+            "content_types": ["application/json", "application/xml"]
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-CEL": "true"
+          }
+        },
+        "rules": [
+          {
+            "cel_expr": "request.method == 'POST' && 'Content-Type' in request.headers && request.headers['Content-Type'].contains('json')"
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Lua": "true"
+          }
+        },
+        "rules": [
+          {
+            "lua_script": "return request.method == 'PUT' and request.path:match('/api/') ~= nil"
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-URL": "true"
+          }
+        },
+        "rules": [
+          {
+            "url": {
+              "contains": "/api/v1"
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Scheme": "true"
+          }
+        },
+        "rules": [
+          {
+            "scheme": "https"
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Protocol": "true"
+          }
+        },
+        "rules": [
+          {
+            "protocol": "http"
+          }
+        ]
+      }
+    ]
+  }
+}
+

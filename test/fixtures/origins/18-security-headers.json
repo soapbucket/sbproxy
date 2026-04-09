@@ -1,0 +1,33 @@
+{
+  "security-headers.test": {
+    "id": "security-headers",
+    "hostname": "security-headers.test",
+    "policies": [
+      {
+        "type": "security_headers",
+        "strict_transport_security": {
+          "disabled": false,
+          "max_age": "1y",
+          "include_subdomains": true
+        },
+        "content_security_policy": {
+          "disabled": false,
+          "policy": "default-src 'self'",
+          "report_only": false
+        },
+        "x_frame_options": {
+          "disabled": false,
+          "value": "DENY"
+        },
+        "x_content_type_options": {
+          "disabled": false,
+          "no_sniff": true
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    }
+  }
+}

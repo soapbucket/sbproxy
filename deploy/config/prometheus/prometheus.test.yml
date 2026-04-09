@@ -1,0 +1,48 @@
+# Prometheus configuration for proxy testing
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'test'
+    environment: 'test'
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+# Load rules once and periodically evaluate them
+rule_files:
+  - 'alerts.yml'
+
+# Scrape configurations
+scrape_configs:
+  # Proxy metrics
+  - job_name: 'proxy'
+    static_configs:
+      - targets: ['test-proxy:8888']
+        labels:
+          service: 'proxy'
+    metrics_path: '/metrics'
+    scrape_interval: 5s
+
+  # E2E Test Server metrics (if it exposes metrics)
+  - job_name: 'e2e-test-server'
+    static_configs:
+      - targets: ['localhost:8090']
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+
+  # Redis metrics (if redis_exporter is running)
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['localhost:9121']
+    scrape_interval: 10s
+
+  # PostgreSQL metrics (if postgres_exporter is running)
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['localhost:9187']
+    scrape_interval: 10s
+

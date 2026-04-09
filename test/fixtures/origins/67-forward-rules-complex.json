@@ -1,0 +1,63 @@
+{
+  "forward-rules-complex.test": {
+    "id": "forward-rules-complex",
+    "hostname": "forward-rules-complex.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "forward_rules": [
+      {
+        "hostname": "api-v1-backend.test",
+        "rules": [
+          {
+            "path": {"prefix": "/api/v1"}
+          }
+        ]
+      },
+      {
+        "hostname": "old-service-backend.test",
+        "rules": [
+          {
+            "path": {"prefix": "/old"}
+          }
+        ]
+      }
+    ]
+  },
+  "api-v1-backend.test": {
+    "id": "api-v1-backend",
+    "hostname": "api-v1-backend.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Forwarded-From": "api-v1"
+          }
+        }
+      }
+    ]
+  },
+  "old-service-backend.test": {
+    "id": "old-service-backend",
+    "hostname": "old-service-backend.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Forwarded-From": "old-service"
+          }
+        }
+      }
+    ]
+  }
+}
+

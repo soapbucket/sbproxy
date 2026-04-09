@@ -1,0 +1,33 @@
+{
+  "transform-chain.test": {
+    "id": "transform-chain",
+    "hostname": "transform-chain.test",
+    "transforms": [
+      {
+        "type": "json",
+        "content_types": ["application/json"],
+        "json_transform": {
+          "set_fields": {
+            "transformed": true,
+            "stage": 1
+          }
+        }
+      },
+      {
+        "type": "json",
+        "content_types": ["application/json"],
+        "json_transform": {
+          "set_fields": {
+            "double_transformed": true,
+            "stage": 2
+          }
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test/json-data"
+    }
+  }
+}
+

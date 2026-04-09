@@ -1,0 +1,66 @@
+{
+  "proxy-conditional.test": {
+    "id": "proxy-conditional",
+    "hostname": "proxy-conditional.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-API-Version": "v2"
+          }
+        },
+        "rules": [
+          {
+            "path": {
+              "contains": "/api"
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Admin-Request": "true"
+          }
+        },
+        "rules": [
+          {
+            "path": {
+              "contains": "/admin"
+            },
+            "headers": {
+              "exists": [
+                "Authorization"
+              ]
+            }
+          }
+        ]
+      }
+    ],
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "Cache-Control": "no-cache"
+          }
+        },
+        "rules": [
+          {
+            "status": {
+              "codes": [
+                200,
+                201
+              ]
+            }
+          }
+        ]
+      }
+    ],
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  }
+}

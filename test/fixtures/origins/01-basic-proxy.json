@@ -1,0 +1,12 @@
+{
+  "basic-proxy.test": {
+    "id": "basic-proxy",
+    "hostname": "basic-proxy.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  }
+}

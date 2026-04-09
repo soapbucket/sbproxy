@@ -1,0 +1,50 @@
+{
+  "cel-multiple-callbacks.test": {
+    "id": "cel-multiple-callbacks",
+    "hostname": "cel-multiple-callbacks.test",
+    "on_load": [{
+      "type": "http",
+      "url": "http://e2e-test-server:8090/callback/config",
+      "method": "GET",
+      "timeout": 5,
+      "variable_name": "app_config",
+      "cel_expr": "{\"modified_json\": {\"version\": string('version' in json ? json['version'] : 'v1'), \"features\": 'features' in json ? json['features'] : {}}}"
+    }],
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_sb.session",
+      "cookie_max_age": 3600,
+      "callbacks": [
+        {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_prefs",
+          "timeout": 5,
+          "cel_expr": "{\"modified_json\": {\"theme\": json['user_preferences']['theme'], \"subscription\": json['subscription']}}"
+        }
+      ],
+      "allow_non_ssl": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-App-Version": "{{config.app_config.version}}",
+            "X-User-Theme": "{{session_data.user_prefs.theme}}",
+            "X-Subscription-Tier": "{{session_data.user_prefs.subscription.tier}}"
+          }
+        },
+        "rules": [
+          {
+            "cel_expr": "config['app_config']['version'] == 'v2.1.0' && session.data.user_prefs.subscription.tier == 'premium'"
+          }
+        ]
+      }
+    ]
+  }
+}

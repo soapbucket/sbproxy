@@ -1,0 +1,31 @@
+{
+  "error-pages.test": {
+    "id": "error-pages",
+    "hostname": "error-pages.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "error_pages": [
+      {
+        "status": [404],
+        "body": "<html><body><h1>404 - Not Found</h1><p>Custom error page</p></body></html>",
+        "content_type": "text/html"
+      },
+      {
+        "status": [500],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error",
+          "method": "GET"
+        }
+      },
+      {
+        "status": [503],
+        "body": "{\"error\":\"Service Unavailable\"}",
+        "content_type": "application/json"
+      }
+    ]
+  }
+}
+

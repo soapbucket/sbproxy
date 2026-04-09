@@ -1,0 +1,122 @@
+{
+  "response-matcher-comprehensive.test": {
+    "id": "response-matcher-comprehensive",
+    "hostname": "response-matcher-comprehensive.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.html"
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Status": "true"
+          }
+        },
+        "rules": [
+          {
+            "status": {
+              "code": 200
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Status-Range": "true"
+          }
+        },
+        "rules": [
+          {
+            "status": {
+              "min": 200,
+              "max": 299
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Status-Codes": "true"
+          }
+        },
+        "rules": [
+          {
+            "status": {
+              "codes": [200, 201, 204]
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Content-Type": "true"
+          }
+        },
+        "rules": [
+          {
+            "content_types": ["text/html", "text/css", "application/javascript"]
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Header": "true"
+          }
+        },
+        "rules": [
+          {
+            "headers": {
+              "exact": {
+                "Content-Type": "text/html"
+              },
+              "exists": ["X-Test-Server"],
+              "not_exist": ["X-Error"]
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Body": "true"
+          }
+        },
+        "rules": [
+          {
+            "body_contains": "Proxy Test Page"
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-CEL": "true"
+          }
+        },
+        "rules": [
+          {
+            "cel_expr": "response.status_code == 200 && 'Content-Type' in response.headers && response.headers['Content-Type'].contains('html')"
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Lua": "true"
+          }
+        },
+        "rules": [
+          {
+            "lua_script": "return response.status_code >= 200 and response.status_code < 300 and response.headers['Content-Type'] ~= nil"
+          }
+        ]
+      }
+    ]
+  }
+}
+

@@ -1,0 +1,86 @@
+{
+  "complex.test": {
+    "id": "complex",
+    "hostname": "complex.test",
+    "force_ssl": true,
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "requests_per_minute": 60,
+        "burst_size": 10
+      },
+      {
+        "type": "security_headers",
+        "strict_transport_security": {
+          "disabled": false,
+          "max_age": "1y"
+        }
+      }
+    ],
+    "authentication": {
+      "type": "jwt",
+      "secret": "test-secret-key-change-in-production",
+      "header_name": "Authorization",
+      "header_prefix": "Bearer "
+    },
+    "action": {
+      "type": "proxy",
+      "url": "https://news.ycombinator.com"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Proxy-Request-ID": "{{uuid}}",
+            "X-Forwarded-For": "{{request.ip}}"
+          }
+        }
+      },
+      {
+        "query": {
+          "add": {
+            "source": "proxy"
+          }
+        }
+      }
+    ],
+    "transforms": [
+      {
+        "type": "optimized_html",
+        "content_types": [
+          "text/html"
+        ],
+        "optimized_format_options": {
+          "strip_comments": true,
+          "optimize_attributes": true
+        },
+        "add_to_tags": [
+          {
+            "tag": "head",
+            "add_before_end_tag": false,
+            "content": "<script>console.log('Complex proxy');</script>"
+          }
+        ]
+      }
+    ],
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Proxy-Version": "1.0",
+            "Cache-Control": "public, max-age=3600"
+          }
+        },
+        "rules": [
+          {
+            "status": {
+              "codes": [
+                200
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

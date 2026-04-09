@@ -1,0 +1,11 @@
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://httpbin.org
+    response_cache:
+      enabled: true
+      ttl: 5m

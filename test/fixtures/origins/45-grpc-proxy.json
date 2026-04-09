@@ -1,0 +1,15 @@
+{
+  "grpc.test": {
+    "id": "grpc",
+    "hostname": "grpc.test",
+    "action": {
+      "type": "grpc",
+      "url": "https://e2e-test-server:8093",
+      "skip_tls_verify_host": true,
+      "enable_grpc_web": true,
+      "max_call_recv_msg_size": 10485760,
+      "max_call_send_msg_size": 10485760
+    }
+  }
+}
+

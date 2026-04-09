@@ -1,0 +1,417 @@
+{
+  "name": "Callback and Caching Test Configuration",
+  "description": "Test scenarios for callback functionality and caching behavior",
+  "defaults": {
+    "status": 200,
+    "headers": {
+      "X-Test-Server": "e2e-test-server",
+      "X-Test-Type": "callback-cache"
+    }
+  },
+  "scenarios": [
+    {
+      "id": "callback-basic",
+      "name": "Basic Callback Test",
+      "path": "/test/callback-basic",
+      "method": "POST",
+      "request": {
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "test": "data"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "success": true,
+          "callback_id": "basic",
+          "timestamp": 0
+        }
+      },
+      "metadata": {
+        "category": "callback",
+        "type": "basic"
+      }
+    },
+    {
+      "id": "callback-with-status",
+      "name": "Callback with Custom Status Code",
+      "path": "/test/callback-with-status",
+      "method": "POST",
+      "request": {
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": 201
+        }
+      },
+      "response": {
+        "status": 201,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "success": true,
+          "status": 201
+        }
+      },
+      "metadata": {
+        "category": "callback",
+        "type": "status-code"
+      }
+    },
+    {
+      "id": "callback-with-variable",
+      "name": "Callback with Variable Name Wrapping",
+      "path": "/test/callback-with-variable",
+      "method": "POST",
+      "request": {
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "variable_name": "user_data"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "user_data": {
+            "success": true
+          }
+        }
+      },
+      "metadata": {
+        "category": "callback",
+        "type": "variable-name"
+      }
+    },
+    {
+      "id": "cache-basic",
+      "name": "Basic Cache Test",
+      "path": "/test/cache-basic",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "Cache-Control": "public, max-age=3600",
+          "ETag": "\"test-etag\""
+        },
+        "body": {
+          "cached": true,
+          "data": "test data"
+        }
+      },
+      "metadata": {
+        "category": "cache",
+        "type": "basic"
+      }
+    },
+    {
+      "id": "cache-etag",
+      "name": "Cache with ETag Support",
+      "path": "/test/cache-etag",
+      "method": "GET",
+      "request": {
+        "headers": {
+          "If-None-Match": "\"test-etag\""
+        }
+      },
+      "response": {
+        "status": 304,
+        "headers": {
+          "ETag": "\"test-etag\""
+        },
+        "body": {}
+      },
+      "metadata": {
+        "category": "cache",
+        "type": "etag",
+        "conditional": true
+      }
+    },
+    {
+      "id": "cache-last-modified",
+      "name": "Cache with Last-Modified Support",
+      "path": "/test/cache-last-modified",
+      "method": "GET",
+      "request": {
+        "headers": {
+          "If-Modified-Since": "Mon, 01 Jan 2024 00:00:00 GMT"
+        }
+      },
+      "response": {
+        "status": 304,
+        "headers": {
+          "Last-Modified": "Mon, 01 Jan 2024 00:00:00 GMT"
+        },
+        "body": {}
+      },
+      "metadata": {
+        "category": "cache",
+        "type": "last-modified",
+        "conditional": true
+      }
+    },
+    {
+      "id": "cache-no-cache",
+      "name": "No-Cache Response",
+      "path": "/test/cache-no-cache",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-cache, no-store, must-revalidate"
+        },
+        "body": {
+          "cached": false
+        }
+      },
+      "metadata": {
+        "category": "cache",
+        "type": "no-cache"
+      }
+    },
+    {
+      "id": "cache-private",
+      "name": "Private Cache Response",
+      "path": "/test/cache-private",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "Cache-Control": "private, max-age=300"
+        },
+        "body": {
+          "cached": true,
+          "private": true
+        }
+      },
+      "metadata": {
+        "category": "cache",
+        "type": "private"
+      }
+    },
+    {
+      "id": "callback-session-cached",
+      "name": "Session Callback with Caching",
+      "path": "/test/callback-session-cached",
+      "method": "POST",
+      "request": {
+        "headers": {
+          "Content-Type": "application/json",
+          "If-None-Match": "\"session-etag\""
+        },
+        "body": {
+          "session_id": "test-session"
+        }
+      },
+      "response": {
+        "status": 304,
+        "headers": {
+          "ETag": "\"session-etag\"",
+          "Cache-Control": "private, max-age=300"
+        },
+        "body": {}
+      },
+      "metadata": {
+        "category": "callback",
+        "type": "session",
+        "cached": true
+      }
+    },
+    {
+      "id": "callback-auth-cached",
+      "name": "Auth Callback with Caching",
+      "path": "/test/callback-auth-cached",
+      "method": "POST",
+      "request": {
+        "headers": {
+          "Content-Type": "application/json",
+          "If-None-Match": "\"auth-etag\""
+        },
+        "body": {
+          "email": "test@example.com"
+        }
+      },
+      "response": {
+        "status": 304,
+        "headers": {
+          "ETag": "\"auth-etag\"",
+          "Cache-Control": "private, max-age=600"
+        },
+        "body": {}
+      },
+      "metadata": {
+        "category": "callback",
+        "type": "auth",
+        "cached": true
+      }
+    },
+    {
+      "id": "circuit-breaker-closed",
+      "name": "Circuit Breaker Closed State",
+      "path": "/test/circuit-breaker-closed",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "success": true,
+          "state": "closed"
+        }
+      },
+      "metadata": {
+        "category": "circuit-breaker",
+        "state": "closed"
+      }
+    },
+    {
+      "id": "circuit-breaker-open",
+      "name": "Circuit Breaker Open State",
+      "path": "/test/circuit-breaker-open",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 503,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "error": "Circuit breaker is open",
+          "state": "open"
+        }
+      },
+      "metadata": {
+        "category": "circuit-breaker",
+        "state": "open"
+      }
+    },
+    {
+      "id": "callback-error-500",
+      "name": "Callback Error Response",
+      "path": "/test/callback-error-500",
+      "method": "POST",
+      "request": {
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "error": true
+        }
+      },
+      "response": {
+        "status": 500,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "error": "Internal server error",
+          "code": "CALLBACK_ERROR"
+        }
+      },
+      "metadata": {
+        "category": "callback",
+        "type": "error"
+      }
+    },
+    {
+      "id": "callback-timeout",
+      "name": "Callback Timeout Simulation",
+      "path": "/test/callback-timeout",
+      "method": "POST",
+      "request": {
+        "headers": {
+          "Content-Type": "application/json"
+        }
+      },
+      "response": {
+        "status": 200,
+        "delay": 5000,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "success": true,
+          "delayed": true
+        }
+      },
+      "metadata": {
+        "category": "callback",
+        "type": "timeout"
+      }
+    },
+    {
+      "id": "cache-expiration",
+      "name": "Cache Expiration Test",
+      "path": "/test/cache-expiration",
+      "method": "GET",
+      "request": {},
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json",
+          "Cache-Control": "public, max-age=1",
+          "ETag": "\"expiring-etag\""
+        },
+        "body": {
+          "cached": true,
+          "expires_in": 1
+        }
+      },
+      "metadata": {
+        "category": "cache",
+        "type": "expiration"
+      }
+    },
+    {
+      "id": "callback-multiple-status",
+      "name": "Callback with Multiple Expected Status Codes",
+      "path": "/test/callback-multiple-status",
+      "method": "POST",
+      "request": {
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "statuses": [200, 201, 202]
+        }
+      },
+      "response": {
+        "status": 201,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "success": true,
+          "status": 201
+        }
+      },
+      "metadata": {
+        "category": "callback",
+        "type": "multi-status"
+      }
+    }
+  ]
+}
+
+
+

@@ -1,0 +1,30 @@
+{
+  "graphql-rate-limit.test": {
+    "id": "graphql-rate-limit",
+    "hostname": "graphql-rate-limit.test",
+    "authentication": {
+      "type": "api_key",
+      "disabled": false,
+      "header_name": "X-API-Key",
+      "api_keys": ["graphql-api-key"]
+    },
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "disabled": false,
+        "limit": 50,
+        "window": "1m",
+        "key_by": "auth_key",
+        "action": "block"
+      }
+    ],
+    "action": {
+      "type": "graphql",
+      "url": "http://e2e-test-server:8092/graphql",
+      "max_depth": 10,
+      "max_complexity": 100,
+      "enable_introspection": true
+    }
+  }
+}
+

@@ -1,0 +1,15 @@
+{
+  "redirect.test": {
+    "id": "redirect",
+    "hostname": "redirect.test",
+    "action": {
+      "type": "redirect",
+      "url": "https://example.com",
+      "status_code": 301,
+      "strip_base_path": true,
+      "preserve_query": true
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  }
+}

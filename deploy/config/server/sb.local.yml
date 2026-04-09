@@ -1,0 +1,112 @@
+# Local dev mode - minimal config for local development and testing
+# No Redis, DB, or external dependencies. Uses in-memory storage only.
+#
+# Features enabled with in-memory drivers:
+#   - Traffic capture (SSE streaming + REST API via memory messenger/cacher)
+#   - Contract governance (OpenAPI validation via on_load + policies)
+#   - Traffic shadowing (async mirroring with circuit breaker)
+#   - All caching, sessions, and messaging work in-process
+#
+# Run: scripts/run_proxy_standalone.sh
+# Or:  go run . serve --config-dir conf --config-file sb.local.yml
+
+proxy:
+  http_bind_port: 8080
+  https_bind_port: 8443
+  http3_bind_port: 8443
+  bind_address: "0.0.0.0"
+  enable_http3: true
+
+  certificate_settings:
+    certificate_dir: "certs"
+    certificate_key_dir: "certs"
+    min_tls_version: 13
+
+  logging:
+    format: "dev"
+    application:
+      level: "debug"
+      outputs:
+        - type: "stderr"
+    request:
+      enabled: true
+      level: "debug"
+      slow_request_threshold: "5s"
+      outputs:
+        - type: "stderr"
+      fields:
+        timestamps: true
+        headers: true
+        forwarded_headers: true
+        query_string: true
+        cache_info: true
+        auth_info: true
+        app_version: true
+    security:
+      level: "debug"
+      outputs:
+        - type: "stderr"
+
+  debug_settings:
+    debug: true
+
+# Telemetry (metrics endpoint)
+telemetry:
+  bind_port: 8888
+  bind_address: "0.0.0.0"
+  enable_profiler: false
+
+# Site config storage (sites.setup.json has example.local, api.local)
+storage_settings:
+  driver: "file"
+  params:
+    path: "config/sites/demo.hosts.json"
+
+# In-memory L1 cache
+l1_cache_settings:
+  driver: "memory"
+  params:
+    max_size: 100000000  # 100MB
+
+# L2 cache (distributed in prod, in-memory for local dev)
+# Used by: traffic capture buffered retention, callback cache, session cache
+l2_cache_settings:
+  driver: "memory"
+
+# L3 cache (disk-backed in prod, in-memory for local dev)
+# Used by: chunk cache, error page cache, response cache
+l3_cache_settings:
+  driver: "memory"
+
+session_cacher_settings:
+  driver: "memory"
+
+security_settings:
+  driver: "memory"
+
+# Messenger (Redis pub/sub in prod, in-memory for local dev)
+# Used by: traffic capture SSE streaming, config refresh, cache expiration
+messenger_settings:
+  driver: "memory"
+
+# Crypto configuration (required for session/auth features)
+crypto_settings:
+  driver: "local"
+  params:
+    encryption_key: "Y2FzdGxlYXBwcm9wcmlhdGVnYXRlY29tcG9zaXRpb24="
+    signing_key: "Y2FzdGxlYXBwcm9wcmlhdGVnYXRlY29tcG9zaXRpb24="
+
+# MaxMind GeoIP database
+maxmind_settings:
+  driver: "maxmind"
+  params:
+    path: "data/ipinfo_lite.mmdb"
+
+# User-Agent parser
+uaparser_settings:
+  driver: "uaparser"
+  params:
+    path: "data/regexes.yml"
+
+# Debug: verbose logging for TLS handshake, config loading, etc.
+log_level: "debug"

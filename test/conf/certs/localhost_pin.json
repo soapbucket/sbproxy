@@ -1,0 +1,8 @@
+{
+  "hostname": "localhost",
+  "pin_sha256": "Lc8ZY5FUEQkHLtXoMWx4BCBiTNM+BEw5zNcUp2R2FQQ=",
+  "certificate": "test/conf/certs/localhost.crt",
+  "private_key": "test/conf/certs/localhost.key",
+  "generated_at": "2025-11-12T23:44:28Z",
+  "valid_until": "Nov 12 23:44:28 2026 GMT"
+}

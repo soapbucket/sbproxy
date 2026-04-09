@@ -1,0 +1,22 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.5'
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./... -count=1 -timeout 300s -race
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+      - run: ./scripts/import-guard.sh

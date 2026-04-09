@@ -1,0 +1,107 @@
+{
+  "response-modifier-comprehensive.test": {
+    "id": "response-modifier-comprehensive",
+    "hostname": "response-modifier-comprehensive.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.html"
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Proxy-Version": "1.0.0",
+            "X-Processed-By": "soapbucket-proxy",
+            "X-Response-Time": "{{response_time_ms}}ms"
+          },
+          "add": {
+            "X-Additional-Header": "added-value"
+          },
+          "remove": ["X-Powered-By", "Server"]
+        },
+        "status_code": {
+          "replace": {
+            "old": 200,
+            "new": 201
+          }
+        }
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Conditional-Header": "matched"
+          }
+        },
+        "rules": [
+          {
+            "status": {
+              "code": 200
+            },
+            "content_types": ["text/html"]
+          }
+        ]
+      },
+      {
+        "body": {
+          "replace": [
+            {
+              "old": "Proxy Test Page",
+              "new": "Modified Proxy Test Page"
+            }
+          ]
+        },
+        "rules": [
+          {
+            "content_types": ["text/html"]
+          }
+        ]
+      },
+      {
+        "body": {
+          "json": {
+            "set": {
+              "$.modified": true,
+              "$.proxy_version": "1.0.0"
+            },
+            "remove": ["$.sensitive"]
+          }
+        },
+        "rules": [
+          {
+            "content_types": ["application/json"]
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-CEL-Modified": "true"
+          }
+        },
+        "cel_expr": "response.headers['X-CEL-Modified'] = 'true'",
+        "rules": [
+          {
+            "status": {
+              "min": 200,
+              "max": 299
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Lua-Modified": "true"
+          }
+        },
+        "lua_script": "response.headers['X-Lua-Modified'] = 'true'",
+        "rules": [
+          {
+            "body_contains": "test"
+          }
+        ]
+      }
+    ]
+  }
+}
+

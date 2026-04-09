@@ -1,0 +1,38 @@
+{
+  "json-transform-comprehensive.test": {
+    "id": "json-transform-comprehensive",
+    "hostname": "json-transform-comprehensive.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.json"
+    },
+    "transforms": [
+      {
+        "type": "json",
+        "content_types": ["application/json"],
+        "pretty_print": true,
+        "remove_empty_objects": true,
+        "remove_empty_arrays": false,
+        "rules": [
+          {
+            "path": "$.sensitive",
+            "value": "REDACTED"
+          },
+          {
+            "path": "$.data.users.0.email",
+            "value": "user1@redacted.com"
+          },
+          {
+            "path": "$.proxy_processed",
+            "value": true
+          },
+          {
+            "path": "$.processing_timestamp",
+            "value": "{{timestamp}}"
+          }
+        ]
+      }
+    ]
+  }
+}
+

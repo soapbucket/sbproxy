@@ -1,0 +1,58 @@
+{
+  "waf.test": {
+    "id": "waf",
+    "hostname": "waf.test",
+    "policies": [
+      {
+        "type": "waf",
+        "custom_rules": [
+          {
+            "id": "block-sql-injection",
+            "name": "Block SQL Injection",
+            "disabled": false,
+            "phase": 2,
+            "severity": "critical",
+            "action": "block",
+            "variables": [
+              {
+                "name": "ARGS",
+                "collection": "ARGS"
+              }
+            ],
+            "operator": "rx",
+            "pattern": "(?i)(union\\s+select|select\\s+.*\\s+from|insert\\s+into|update\\s+.*\\s+set|delete\\s+from|drop\\s+table|truncate\\s+table|alter\\s+table|exec\\s*\\(|execute\\s*\\(|sp_executesql|\\bor\\s+['\"]?1\\s*=\\s*['\"]?1|\\band\\s+['\"]?1\\s*=\\s*['\"]?1|'or'1'='1|'and'1'='1|'\\s*or\\s*'1'\\s*=\\s*'1|'\\s*and\\s*'1'\\s*=\\s*'1|['\"]?1['\"]?\\s*or\\s*['\"]?1|['\"]?1['\"]?\\s*and\\s*['\"]?1)",
+            "transformations": ["lowercase", "urlDecode"]
+          },
+          {
+            "id": "block-xss",
+            "name": "Block XSS Attempts",
+            "disabled": false,
+            "phase": 2,
+            "severity": "critical",
+            "action": "block",
+            "variables": [
+              {
+                "name": "ARGS",
+                "collection": "ARGS"
+              },
+              {
+                "name": "REQUEST_URI",
+                "collection": "REQUEST_URI"
+              }
+            ],
+            "operator": "rx",
+            "pattern": "(?i)(<script[^>]*>|</script>|javascript\\s*:|on\\w+\\s*=|<iframe[^>]*>|<img[^>]*onerror)",
+            "transformations": ["lowercase", "htmlEntityDecode", "urlDecode"]
+          }
+        ],
+        "default_action": "log",
+        "action_on_match": "block"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    }
+  }
+}
+

@@ -1,0 +1,32 @@
+{
+  "jwt-encrypted.test": {
+    "id": "jwt-encrypted",
+    "hostname": "jwt-encrypted.test",
+    "authentication": {
+      "type": "jwt",
+      "disabled": false,
+      "secret": "local:Pwr9+SXpUxRaD6ZqYk2BZ1IyC1PlFqC8zZrkT/m0tuyZP1h4MtwU09BCg2xhINI5GcriS9zub1agbo8O",
+      "header_name": "Authorization",
+      "header_prefix": "Bearer ",
+      "issuer": "test-issuer",
+      "audience": "test-audience",
+      "algorithm": "HS256"
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-ID": "{{auth.sub}}",
+            "X-User-Email": "{{auth.email}}",
+            "X-User-Name": "{{auth.name}}"
+          }
+        }
+      }
+    ]
+  }
+}
+

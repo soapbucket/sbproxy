@@ -1,0 +1,23 @@
+{
+  "ws-auth.test": {
+    "id": "ws-auth",
+    "hostname": "ws-auth.test",
+    "authentication": {
+      "type": "bearer_token",
+      "disabled": false,
+      "header_name": "Authorization",
+      "header_prefix": "Bearer ",
+      "tokens": ["ws-token-123"]
+    },
+    "action": {
+      "type": "websocket",
+      "url": "ws://e2e-test-server:8091/echo",
+      "provider": "openai",
+      "subprotocols": ["realtime"],
+      "ping_interval": "30s",
+      "pong_timeout": "10s",
+      "handshake_timeout": "10s"
+    }
+  }
+}
+

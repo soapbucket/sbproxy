@@ -1,0 +1,159 @@
+groups:
+  - name: soapbucket_security
+    interval: 30s
+    rules:
+      # TLS Certificate Expiring Soon
+      - alert: TLSCertificateExpiringSoon
+        expr: sb_tls_cert_expiry_days < 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TLS certificate expiring soon"
+          description: "Certificate for {{$labels.origin}} expires in {{$value}} days"
+
+      # TLS Insecure Skip Verify Enabled
+      - alert: TLSInsecureSkipVerifyEnabled
+        expr: sb_tls_insecure_skip_verify_enabled == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "TLS certificate verification disabled"
+          description: "Origin {{$labels.origin}} has insecure TLS configuration"
+
+      # High TLS Handshake Failure Rate
+      - alert: HighTLSHandshakeFailureRate
+        expr: rate(sb_tls_handshake_failures_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High TLS handshake failure rate"
+          description: "{{$value}} TLS handshake failures per second"
+
+      # Authentication Failure Spike
+      - alert: AuthenticationFailureSpike
+        expr: rate(sb_auth_failures_total[5m]) > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Spike in authentication failures"
+          description: "{{$value}} authentication failures per second - possible brute force attack"
+
+      # DDoS Attack Detected
+      - alert: DDoSAttackDetected
+        expr: rate(sb_ddos_attacks_detected_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DDoS attack detected"
+          description: "DDoS attack of type {{$labels.attack_type}} from {{$labels.ip_address}}"
+
+  - name: soapbucket_reliability
+    interval: 30s
+    rules:
+      # High Request Timeout Rate
+      - alert: HighRequestTimeoutRate
+        expr: sum(rate(sb_request_timeouts_total[5m])) / sum(rate(sb_requests_total[5m])) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High request timeout rate"
+          description: "{{$value | humanizePercentage}} of requests are timing out"
+
+      # Connection Pool Exhaustion
+      - alert: ConnectionPoolExhaustion
+        expr: rate(sb_connection_pool_exhaustions_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Connection pool exhausted"
+          description: "Connection pool {{$labels.pool_type}} exhausted for {{$labels.origin}}"
+
+      # Upstream Down
+      - alert: UpstreamDown
+        expr: sb_upstream_availability == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Upstream target down"
+          description: "Upstream {{$labels.target}} for {{$labels.origin}} is down"
+
+      # Circuit Breaker Open
+      - alert: CircuitBreakerOpen
+        expr: sb_lb_circuit_breaker_state == 2
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Circuit breaker open"
+          description: "Circuit breaker for {{$labels.target_url}} is open"
+
+      - alert: ClickHouseLogDropsDetected
+        expr: increase(sb_clickhouse_dropped_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ClickHouse log drops detected"
+          description: "{{$value}} log entries dropped in the last 5 minutes"
+
+      - alert: EventBusDropsDetected
+        expr: increase(sb_event_bus_dropped_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Event bus drops detected"
+          description: "Dropped events detected for type {{$labels.event_type}}"
+
+      - alert: HostFilterRejectionSpike
+        expr: rate(sb_host_filter_rejections_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Host filter rejection spike"
+          description: "Host filter is rejecting {{$value}} requests per second"
+
+  - name: soapbucket_performance
+    interval: 30s
+    rules:
+      # High P95 Latency
+      - alert: HighP95Latency
+        expr: histogram_quantile(0.95, sum(rate(sb_request_latency_seconds_bucket[5m])) by (le)) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High P95 latency"
+          description: "P95 latency is {{$value}}s"
+
+      # Low Cache Hit Rate
+      - alert: LowCacheHitRate
+        expr: sb_cache_hit_rate < 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low cache hit rate"
+          description: "Cache hit rate for {{$labels.cache_layer}} is {{$value | humanizePercentage}}"
+
+      # High Error Rate
+      - alert: HighErrorRate
+        expr: sum(rate(sb_errors_total[5m])) / sum(rate(sb_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate"
+          description: "{{$value | humanizePercentage}} of requests are errors"
+
+
+

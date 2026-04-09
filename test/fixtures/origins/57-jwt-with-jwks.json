@@ -1,0 +1,19 @@
+{
+  "jwt-jwks.test": {
+    "id": "jwt-jwks",
+    "hostname": "jwt-jwks.test",
+    "authentication": {
+      "type": "jwt",
+      "disabled": false,
+      "jwks_url": "https://example.com/.well-known/jwks.json",
+      "algorithm": "RS256",
+      "issuer": "test-issuer",
+      "audience": "test-audience"
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    }
+  }
+}
+

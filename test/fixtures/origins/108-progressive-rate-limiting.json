@@ -1,0 +1,30 @@
+{
+  "progressive-rate-limit.test": {
+    "id": "progressive-rate-limit",
+    "hostname": "progressive-rate-limit.test",
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "disabled": false,
+        "limit": 100,
+        "window": "1m",
+        "key_by": "ip",
+        "action": "throttle",
+        "throttle_delay": "100ms"
+      },
+      {
+        "type": "rate_limiting",
+        "disabled": false,
+        "limit": 1000,
+        "window": "1h",
+        "key_by": "ip",
+        "action": "block"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/api/headers"
+    }
+  }
+}
+

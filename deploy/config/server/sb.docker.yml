@@ -1,0 +1,221 @@
+# Docker configuration file for Soapbucket Proxy
+# This file has paths configured for the Docker container environment
+
+telemetry:
+  bind_port: 8888
+  bind_address: "0.0.0.0"              # Allow external connections in Docker
+  enable_profiler: false
+  certificate_file: ""
+  certificate_key_file: ""
+  min_tls_version: 13
+
+otel:
+  enabled: false
+  service_name: "soapbucket-proxy"
+  service_version: ""
+  otlp_endpoint: "localhost:4317"
+  otlp_insecure: true
+  sample_rate: 1.0
+  environment: "docker"
+
+proxy:
+  http_bind_port: 8080
+  https_bind_port: 8443
+  http3_bind_port: 8443
+  enable_http3: true
+  bind_address: "0.0.0.0"              # Allow external connections in Docker
+  
+  read_timeout: "5s"
+  write_timeout: "10s"
+  idle_timeout: "15s"
+  compression_level: 5
+
+  certificate_settings:
+    certificate_dir: "/app/certs"
+    certificate_key_dir: "/app/certs"
+    min_tls_version: 13
+    tls_cipher_suites: []
+    # ACME settings - controlled via environment variables from docker-compose.yml:
+    #   SB_PROXY__CERTIFICATE_SETTINGS__USE_ACME (default: false)
+    #   SB_PROXY__CERTIFICATE_SETTINGS__ACME_EMAIL 
+    #   SB_PROXY__CERTIFICATE_SETTINGS__ACME_DIRECTORY_URL (for Pebble: https://pebble:14000/dir)
+    #   SB_PROXY__CERTIFICATE_SETTINGS__ACME_INSECURE_SKIP_VERIFY (for Pebble: true)
+    # Note: Do not set values here - let env vars take precedence
+    acme_cache_dir: "/app/data/acme-cache"
+
+  origin_loader_settings:  
+    max_origin_forward_depth: 10
+    origin_cache_ttl: "5m"
+    hostname_fallback: true
+
+  session_cacher_settings:
+    session_cookie_name: "_sb.s"
+    session_max_age: 3600
+    l2_cache_timeout: "5m"
+
+  sticky_cookie_settings:
+    sticky_cookie_name: "_sb.l"
+
+  logging:
+    format: "json"                     # JSON format for Docker log aggregation
+    application:
+      level: "info"
+      outputs:
+        - type: "stderr"
+    request:
+      enabled: true
+      level: "info"
+      slow_request_threshold: "5s"
+      error_detail_level: "standard"
+      outputs:
+        - type: "stderr"
+      fields:
+        timestamps: true
+        headers: false
+        forwarded_headers: true
+        query_string: false
+        cookies: false
+        fingerprint: false
+        original_request: false
+        cache_info: true
+        auth_info: true
+        app_version: true
+        location: true
+      sampling:
+        enabled: false
+        rate: 1
+    security:
+      level: "info"
+      outputs:
+        - type: "stderr"
+
+  debug_settings:
+    debug: false
+    display_headers: false
+
+  http2_coalescing:
+    disabled: false
+    max_idle_conns_per_host: 20
+    idle_conn_timeout: "90s"
+    max_conn_lifetime: "1h"
+    allow_ip_based_coalescing: true
+    allow_cert_based_coalescing: true
+    strict_cert_validation: false
+
+  request_coalescing:
+    enabled: false
+    max_inflight: 1000
+    coalesce_window: "100ms"
+    max_waiters: 100
+    cleanup_interval: "30s"
+    key_strategy: "default"
+
+# Caching - L1 (in-memory)
+l1_cache_settings:
+  driver: "memory"
+  params:
+    max_size: 1000000000
+    compression: true
+    cleanup_interval: "5m"
+    max_objects: 1000000
+    max_memory: 1000000000
+  enable_metrics: true
+  enable_tracing: true
+
+# Caching - L2 (Redis)
+l2_cache_settings:
+  driver: "redis"
+  params:
+    dsn: "redis://redis:6379"          # Docker service name
+    pool_size: 200
+    min_idle_conns: 20
+    pool_timeout: "10s"
+    max_retries: 5
+    read_timeout: "5s"
+    write_timeout: "5s"
+  enable_metrics: true
+  enable_tracing: true
+
+# Caching - L3 (Pebble disk cache)
+l3_cache_settings:
+  driver: "pebble"
+  params:
+    path: "/app/data/pebble.db"        # Docker volume path
+  enable_metrics: true
+  enable_tracing: true
+
+# Session caching (Redis)
+session_cacher_settings:
+  driver: "redis"
+  params:
+    dsn: "redis://redis:6379"          # Docker service name
+    pool_size: 200
+    min_idle_conns: 20
+    pool_timeout: "10s"
+    max_retries: 5
+    read_timeout: "5s"
+    write_timeout: "5s"
+  enable_metrics: true
+  enable_tracing: true
+
+# Security caching (Redis)
+security_settings:
+  driver: "redis"
+  params:
+    dsn: "redis://redis:6379"          # Docker service name
+    pool_size: 200
+    min_idle_conns: 20
+    pool_timeout: "10s"
+    max_retries: 5
+    read_timeout: "5s"
+    write_timeout: "5s"
+  enable_metrics: true
+  enable_tracing: true
+
+# Origin configuration storage
+# Path can be overridden via: SB_STORAGE_SETTINGS__PARAMS__PATH=/path/to/file.json
+storage_settings:
+  driver: "file"
+  params:
+    path: "/app/config/sites.json"     # Default: sites.json from mounted config dir
+  enable_metrics: true
+  enable_tracing: true
+
+# Crypto configuration
+crypto_settings:
+  driver: "local"
+  params:
+    encryption_key: "Y2FzdGxlYXBwcm9wcmlhdGVnYXRlY29tcG9zaXRpb24="
+    signing_key: "Y2FzdGxlYXBwcm9wcmlhdGVnYXRlY29tcG9zaXRpb24="
+  enable_metrics: true
+  enable_tracing: true
+
+# MaxMind GeoIP database
+maxmind_settings:
+  driver: "maxmind"
+  params:
+    path: "/app/config/ipinfo_lite.mmdb"  # Docker config mount path
+  enable_metrics: true
+  enable_tracing: true
+
+# User-Agent parser
+uaparser_settings:
+  driver: "uaparser"
+  params:
+    path: "/app/config/regexes.yml"   # Docker config mount path
+  enable_metrics: true
+  enable_tracing: true
+
+# Messenger (Redis pub/sub)
+messenger_settings:
+  driver: "redis"
+  params:
+    dsn: "redis://redis:6379"          # Docker service name
+    pool_size: 200
+    min_idle_conns: 20
+    pool_timeout: "10s"
+    max_retries: 5
+    read_timeout: "5s"
+    write_timeout: "5s"
+  enable_metrics: true
+  enable_tracing: true

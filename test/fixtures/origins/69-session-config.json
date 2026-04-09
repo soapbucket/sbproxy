@@ -1,0 +1,21 @@
+{
+  "session-config.test": {
+    "id": "session-config",
+    "hostname": "session-config.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_sb_session",
+      "cookie_path": "/",
+      "cookie_domain": ".session-config.test",
+      "max_age": "1h",
+      "secure": true,
+      "http_only": true,
+      "same_site": "Lax",
+      "allow_non_ssl": true
+    }
+  }
+}

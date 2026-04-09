@@ -1,0 +1,19 @@
+# Example configuration file for cdbgen
+# Format: hostname <space> json-config
+# The 'id' field will be auto-generated
+
+# Proxy origin
+api.soapbucket.com:8443 {"hostname":"api.soapbucket.com:8443", "forwardHostname":"api.soapbucket.com"}
+api.soapbucket.com {"hostname":"api.soapbucket.com","enableAPI":true,"type":"proxy","config":{"url":"https://news.ycombinator.com","timeout":"30s"}}
+
+# Static origin
+cdn.example.com {"hostname":"cdn.example.com","type":"static","config":{"root":"/var/www/static"}}
+
+# Redirect origin
+redirect.example.com {"hostname":"redirect.example.com","type":"redirect","config":{"url":"https://api.soapbucket.com:8443","statusCode":301}}
+
+
+# Oauth example
+oauth.soapbucket.com:8443 {"hostname": "oauth.soapbucket.com:8443","forwardHostname": "api.soapbucket.com","oauth": {"provider": "google","client_id": "781990534849-t6v26s5v7blu48kgkocdluvjv0jvlrhk.apps.googleusercontent.com","client_secret": "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","redirect_url": "https://oauth.soapbucket.com:8443/oauth/callback","session_secret": "your-32-char-secret-key","session_cookie_name": "sb_s","session_max_age": 3600}}
+# static
+static.example.com:8443 {"hostname": "static.example.com:8443","type": "static","config": {"content": "<html><body><h1>Hello World</h1></body></html>","contentType": "text/html","statusCode": 200,"headers": {"Cache-Control": "public, max-age=3600"}},"responseModifier": {"rules": [{"statusCode": 200,"responseModifications": {"setHeaders": {"X-Custom": "static-content","X-Processed": "true"},"addHeaders": {"X-Timestamp": "{{.Timestamp}}"},"deleteHeaders": ["X-Debug"],"replaceHeaders": {"Cache-Control": {"pattern": "max-age=([0-9]+)","replacement": "max-age=$1, must-revalidate"}},"setCookies": {"static-session": {"value": "active","path": "/","maxAge": 3600,"secure": true,"httpOnly": true,"sameSite": "Strict"}},"deleteCookies": ["old-cookie"],"bodyRegexReplace": {"pattern": "<h1>([^<]+)</h1>","replacement": "<h1>$1 - Modified</h1>"}}}]}}

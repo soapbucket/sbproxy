@@ -1,0 +1,32 @@
+{
+  "rate-limit-user.test": {
+    "id": "rate-limit-user",
+    "hostname": "rate-limit-user.test",
+    "authentication": {
+      "type": "api_key",
+      "disabled": false,
+      "header_name": "X-API-Key",
+      "api_keys": [
+        "user1-key",
+        "user2-key",
+        "user3-key"
+      ]
+    },
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "disabled": false,
+        "limit": 10,
+        "window": "1m",
+        "key_by": "auth_key",
+        "action": "block"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/api/headers"
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  }
+}

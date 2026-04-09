@@ -1,0 +1,37 @@
+{
+  "failover-lb.test": {
+    "id": "failover-lb",
+    "hostname": "failover-lb.test",
+    "action": {
+      "type": "loadbalancer",
+      "targets": [
+        {
+          "url": "http://e2e-test-server:8090/test/primary",
+          "weight": 100,
+          "priority": 1
+        },
+        {
+          "url": "http://e2e-test-server:8090/test/secondary",
+          "weight": 100,
+          "priority": 2
+        },
+        {
+          "url": "http://e2e-test-server:8090/test/tertiary",
+          "weight": 100,
+          "priority": 3
+        }
+      ],
+      "round_robin": false,
+      "failover_mode": true,
+      "health_check": {
+        "disabled": false,
+        "interval": "10s",
+        "timeout": "5s",
+        "path": "/health",
+        "unhealthy_threshold": 2,
+        "healthy_threshold": 1
+      }
+    }
+  }
+}
+

@@ -1,0 +1,50 @@
+{
+  "session-auth-callbacks.test": {
+    "id": "session-auth-callbacks",
+    "hostname": "session-auth-callbacks.test",
+    "authentication": {
+      "type": "api_key",
+      "api_keys": [
+        "session-test-key"
+      ],
+      "authentication_callback": {
+        "type": "http",
+        "url": "http://e2e-test-server:8090/callback/auth",
+        "method": "POST",
+        "timeout": 5,
+        "cel_expr": "{\"modified_json\": {\"auth_data\": {\"user_id\": string('user_id' in json ? json['user_id'] : 'unknown'), \"roles\": 'roles' in json ? json['roles'] : []}}}"
+      }
+    },
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_session",
+      "cookie_max_age": 3600,
+      "callbacks": [
+        {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_data",
+          "timeout": 5,
+          "cel_expr": "{\"modified_json\": {\"user_data\": {\"theme\": json['user_preferences']['theme'], \"tier\": json['subscription']['tier']}}}"
+        }
+      ],
+      "allow_non_ssl": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/api/headers"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-ID": "{{auth.data.auth_data.user_id}}",
+            "X-User-Theme": "{{session.data.user_data.theme}}",
+            "X-User-Tier": "{{session.data.user_data.tier}}"
+          }
+        }
+      }
+    ]
+  }
+}

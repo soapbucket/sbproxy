@@ -1,0 +1,72 @@
+{
+  "waf-multiple.test": {
+    "id": "waf-multiple",
+    "hostname": "waf-multiple.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "policies": [
+      {
+        "type": "waf",
+        "disabled": false,
+        "custom_rules": [
+          {
+            "id": "block-sql-injection",
+            "name": "Block SQL Injection",
+            "disabled": false,
+            "phase": 2,
+            "severity": "critical",
+            "action": "block",
+            "variables": [
+              {
+                "name": "ARGS",
+                "collection": "ARGS"
+              }
+            ],
+            "operator": "rx",
+            "pattern": "(?i)(union|select|insert|delete|update|drop|create|alter|or|and)",
+            "transformations": ["lowercase", "urlDecode"]
+          },
+          {
+            "id": "block-xss",
+            "name": "Block XSS",
+            "disabled": false,
+            "phase": 2,
+            "severity": "high",
+            "action": "block",
+            "variables": [
+              {
+                "name": "ARGS",
+                "collection": "ARGS"
+              }
+            ],
+            "operator": "rx",
+            "pattern": "(?i)(<script|javascript:|onerror=)",
+            "transformations": ["lowercase", "urlDecode"]
+          },
+          {
+            "id": "block-path-traversal",
+            "name": "Block Path Traversal",
+            "disabled": false,
+            "phase": 2,
+            "severity": "high",
+            "action": "block",
+            "variables": [
+              {
+                "name": "REQUEST_URI",
+                "collection": "REQUEST_URI"
+              }
+            ],
+            "operator": "rx",
+            "pattern": "(?i)(\\.\\./|\\.\\.\\\\\\\\)",
+            "transformations": ["urlDecode"]
+          }
+        ],
+        "default_action": "log",
+        "action_on_match": "block"
+      }
+    ]
+  }
+}
+

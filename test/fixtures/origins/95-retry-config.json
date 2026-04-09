@@ -1,0 +1,18 @@
+{
+  "retry-config.test": {
+    "id": "retry-config",
+    "hostname": "retry-config.test",
+    "retry_config": {
+      "disabled": false,
+      "max_retries": 3,
+      "retry_on_status_codes": [502, 503, 504],
+      "retry_on_timeout": true,
+      "retry_on_connection_error": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test/flaky-endpoint"
+    }
+  }
+}
+

@@ -1,0 +1,49 @@
+{
+  "transport-wrappers-hedging.test": {
+    "id": "transport-wrappers-hedging",
+    "hostname": "transport-wrappers-hedging.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090",
+      "transport_wrappers": {
+        "hedging": {
+          "enabled": true,
+          "delay": "50ms",
+          "max_hedges": 1,
+          "max_cost_ratio": 0.5
+        }
+      }
+    }
+  },
+  "transport-wrappers-hedging-get.test": {
+    "id": "transport-wrappers-hedging-get",
+    "hostname": "transport-wrappers-hedging-get.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090",
+      "transport_wrappers": {
+        "hedging": {
+          "enabled": true,
+          "delay": "50ms",
+          "max_hedges": 2,
+          "methods": ["GET", "HEAD"],
+          "max_cost_ratio": 0.3
+        }
+      }
+    }
+  },
+  "transport-wrappers-hedging-disabled.test": {
+    "id": "transport-wrappers-hedging-disabled",
+    "hostname": "transport-wrappers-hedging-disabled.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090",
+      "transport_wrappers": {
+        "hedging": {
+          "enabled": false
+        }
+      }
+    }
+  }
+}
+

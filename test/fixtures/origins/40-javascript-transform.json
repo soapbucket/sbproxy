@@ -1,0 +1,20 @@
+{
+  "javascript-transform.test": {
+    "id": "javascript-transform",
+    "hostname": "javascript-transform.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "transforms": [
+      {
+        "type": "javascript",
+        "content_types": ["application/javascript", "text/javascript"],
+        "number_precision": 2,
+        "change_variable_names": false,
+        "supported_version": 5
+      }
+    ]
+  }
+}
+

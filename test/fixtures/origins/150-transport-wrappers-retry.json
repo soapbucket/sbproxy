@@ -1,0 +1,79 @@
+{
+  "transport-wrappers-retry.test": {
+    "id": "transport-wrappers-retry",
+    "hostname": "transport-wrappers-retry.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090",
+      "transport_wrappers": {
+        "retry": {
+          "enabled": true,
+          "max_retries": 3,
+          "initial_delay": "100ms",
+          "max_delay": "10s",
+          "multiplier": 2.0,
+          "jitter": 0.1,
+          "retryable_status": [502, 503, 504, 429]
+        }
+      }
+    }
+  },
+  "transport-wrappers-retry-success.test": {
+    "id": "transport-wrappers-retry-success",
+    "hostname": "transport-wrappers-retry-success.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/retry/test-success?success_after=2&retryable_code=503&final_code=200",
+      "transport_wrappers": {
+        "retry": {
+          "enabled": true,
+          "max_retries": 5,
+          "initial_delay": "50ms",
+          "max_delay": "5s",
+          "multiplier": 2.0,
+          "jitter": 0.1,
+          "retryable_status": [502, 503, 504, 429]
+        }
+      }
+    }
+  },
+  "transport-wrappers-retry-exhaust.test": {
+    "id": "transport-wrappers-retry-exhaust",
+    "hostname": "transport-wrappers-retry-exhaust.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/retry/test-exhaust?success_after=0&retryable_code=502&final_code=502",
+      "transport_wrappers": {
+        "retry": {
+          "enabled": true,
+          "max_retries": 2,
+          "initial_delay": "50ms",
+          "max_delay": "1s",
+          "multiplier": 2.0,
+          "jitter": 0.1,
+          "retryable_status": [502, 503, 504, 429]
+        }
+      }
+    }
+  },
+  "transport-wrappers-retry-429.test": {
+    "id": "transport-wrappers-retry-429",
+    "hostname": "transport-wrappers-retry-429.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/retry/test-429?success_after=3&retryable_code=429&final_code=200",
+      "transport_wrappers": {
+        "retry": {
+          "enabled": true,
+          "max_retries": 5,
+          "initial_delay": "200ms",
+          "max_delay": "10s",
+          "multiplier": 2.0,
+          "jitter": 0.2,
+          "retryable_status": [429]
+        }
+      }
+    }
+  }
+}
+

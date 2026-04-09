@@ -1,0 +1,68 @@
+replicaCount: 3
+
+image:
+  repository: <aws-account-id>.dkr.ecr.<region>.amazonaws.com/soapbucket/proxy
+  tag: latest
+  pullPolicy: IfNotPresent
+
+mode: shared
+
+config:
+  logLevel: info
+  redisURL: redis://<elasticache-endpoint>:6379
+  storageDSN: postgres://<user>:<password>@<rds-endpoint>:5432/soapbucket?sslmode=require
+  clickhouseDSN: clickhouse://<user>:<password>@<clickhouse-endpoint>:9440/soapbucket?secure=true
+  vaultAddr: https://<vault-endpoint>
+  vaultToken: ""
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 50m
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+  hosts:
+    - host: "*.proxy.soapbucket.com"
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: proxy-soapbucket-com-tls
+      hosts:
+        - "*.proxy.soapbucket.com"
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+
+pdb:
+  enabled: true
+  minAvailable: 1
+
+serviceMonitor:
+  enabled: true
+
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: "25%"
+    maxUnavailable: 0
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels: {}
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels: {}

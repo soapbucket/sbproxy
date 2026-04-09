@@ -1,0 +1,21 @@
+{
+  "api-key.test": {
+    "id": "api-key",
+    "hostname": "api-key.test",
+    "authentication": {
+      "type": "api_key",
+      "disabled": false,
+      "header_name": "X-API-Key",
+      "query_param": "api_key",
+      "api_keys": [
+        "test-api-key-123",
+        "admin-api-key-456"
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    }
+  }
+}
+

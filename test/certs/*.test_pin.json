@@ -1,0 +1,8 @@
+{
+  "hostname": "*.test",
+  "pin_sha256": "G6lv+AK2nWtxIQCWdLB1DCzunzYPmkA2Gq8Fg1qGplw=",
+  "certificate": "/Users/rick/projects/proxy/certs/*.test.crt",
+  "private_key": "/Users/rick/projects/proxy/certs/*.test.key",
+  "generated_at": "2025-11-11T00:29:04Z",
+  "valid_until": "Nov 11 00:29:03 2026 GMT"
+}

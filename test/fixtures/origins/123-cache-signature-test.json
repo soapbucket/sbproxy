@@ -1,0 +1,16 @@
+{
+  "cache-signature-detailed.test": {
+    "id": "cache-signature-detailed",
+    "hostname": "cache-signature-detailed.test",
+    "cache_settings": {
+      "disabled": false,
+      "level": "signature",
+      "ttl": "10s",
+      "signature_method": "sha256"
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/cache/signature-test"
+    }
+  }
+}

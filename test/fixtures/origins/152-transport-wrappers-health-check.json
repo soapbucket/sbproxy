@@ -1,0 +1,61 @@
+{
+  "transport-wrappers-health-check.test": {
+    "id": "transport-wrappers-health-check",
+    "hostname": "transport-wrappers-health-check.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090",
+      "transport_wrappers": {
+        "health_check": {
+          "enabled": true,
+          "type": "http",
+          "endpoint": "/health",
+          "interval": "5s",
+          "timeout": "2s",
+          "healthy_threshold": 1,
+          "unhealthy_threshold": 1,
+          "expected_status": 200
+        }
+      }
+    }
+  },
+  "transport-wrappers-health-check-tcp.test": {
+    "id": "transport-wrappers-health-check-tcp",
+    "hostname": "transport-wrappers-health-check-tcp.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090",
+      "transport_wrappers": {
+        "health_check": {
+          "enabled": true,
+          "type": "tcp",
+          "interval": "10s",
+          "timeout": "3s",
+          "healthy_threshold": 1,
+          "unhealthy_threshold": 1
+        }
+      }
+    }
+  },
+  "transport-wrappers-health-check-unhealthy.test": {
+    "id": "transport-wrappers-health-check-unhealthy",
+    "hostname": "transport-wrappers-health-check-unhealthy.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090",
+      "transport_wrappers": {
+        "health_check": {
+          "enabled": true,
+          "type": "http",
+          "endpoint": "/health",
+          "interval": "5s",
+          "timeout": "2s",
+          "healthy_threshold": 2,
+          "unhealthy_threshold": 1,
+          "expected_status": 200
+        }
+      }
+    }
+  }
+}
+

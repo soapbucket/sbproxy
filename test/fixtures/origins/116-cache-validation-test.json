@@ -1,0 +1,16 @@
+{
+  "cache-validation.test": {
+    "id": "cache-validation",
+    "hostname": "cache-validation.test",
+    "cache_settings": {
+      "disabled": false,
+      "level": "l1",
+      "ttl": "10s",
+      "use_conditional_requests": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/cache/validation-test"
+    }
+  }
+}

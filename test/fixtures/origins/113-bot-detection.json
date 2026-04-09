@@ -1,0 +1,31 @@
+{
+  "bot-detection.test": {
+    "id": "bot-detection",
+    "hostname": "bot-detection.test",
+    "policies": [
+      {
+        "type": "expression",
+        "disabled": false,
+        "cel_expr": "size(user_agent) > 0 && user_agent['family'] != 'scraperbot' && user_agent['family'] != 'evilbot'",
+        "action": "block",
+        "status_code": 403
+      },
+      {
+        "type": "threat_detection",
+        "disabled": false,
+        "patterns": {
+          "xss": {
+            "disabled": false,
+            "action": "log",
+            "log_level": "warn"
+          }
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/api/headers"
+    }
+  }
+}
+

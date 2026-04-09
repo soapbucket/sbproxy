@@ -1,0 +1,230 @@
+{
+  "configs": [
+    {
+      "id": "hn-signature-cache",
+      "hostname": "hn-signature.test",
+      "description": "HackerNews with signature-based caching for HTML head",
+      "action": {
+        "proxy": {
+          "url": "https://news.ycombinator.com",
+          "preserve_host": false
+        }
+      },
+      "chunk_cache": {
+        "ignore_no_cache": false,
+        "signature_cache": {
+          "enabled": true,
+          "content_types": ["text/html"],
+          "max_examine_bytes": 16384,
+          "default_ttl": "30m",
+          "signatures": [
+            {
+              "name": "html_doctype_to_body",
+              "pattern_type": "regex",
+              "regex_pattern": "<!DOCTYPE[^>]*>.*?<body[^>]*>",
+              "min_prefix_length": 100,
+              "max_prefix_length": 8192,
+              "cache_ttl": "1h"
+            }
+          ]
+        },
+        "url_cache": {
+          "enabled": false
+        }
+      }
+    },
+    {
+      "id": "hn-url-cache",
+      "hostname": "hn-url.test",
+      "description": "HackerNews with URL-based caching",
+      "action": {
+        "proxy": {
+          "url": "https://news.ycombinator.com",
+          "preserve_host": false
+        }
+      },
+      "chunk_cache": {
+        "ignore_no_cache": false,
+        "signature_cache": {
+          "enabled": false
+        },
+        "url_cache": {
+          "enabled": true,
+          "ttl": "5m"
+        }
+      }
+    },
+    {
+      "id": "hn-hybrid-cache",
+      "hostname": "hn-hybrid.test",
+      "description": "HackerNews with both signature and URL caching",
+      "action": {
+        "proxy": {
+          "url": "https://news.ycombinator.com",
+          "preserve_host": false
+        }
+      },
+      "chunk_cache": {
+        "ignore_no_cache": false,
+        "signature_cache": {
+          "enabled": true,
+          "content_types": ["text/html"],
+          "max_examine_bytes": 16384,
+          "default_ttl": "30m",
+          "signatures": [
+            {
+              "name": "html_head",
+              "pattern_type": "regex",
+              "regex_pattern": "<!DOCTYPE[^>]*>.*?</head>",
+              "min_prefix_length": 100,
+              "max_prefix_length": 8192,
+              "cache_ttl": "2h"
+            }
+          ]
+        },
+        "url_cache": {
+          "enabled": true,
+          "ttl": "10m"
+        }
+      }
+    },
+    {
+      "id": "hn-ignore-nocache",
+      "hostname": "hn-ignore-nocache.test",
+      "description": "HackerNews ignoring Cache-Control: no-cache from client",
+      "action": {
+        "proxy": {
+          "url": "https://news.ycombinator.com",
+          "preserve_host": false
+        }
+      },
+      "chunk_cache": {
+        "ignore_no_cache": true,
+        "signature_cache": {
+          "enabled": true,
+          "content_types": ["text/html"],
+          "signatures": [
+            {
+              "name": "html_prefix",
+              "pattern_type": "regex",
+              "regex_pattern": "<!DOCTYPE[^>]*>.*?<body[^>]*>",
+              "cache_ttl": "1h"
+            }
+          ]
+        },
+        "url_cache": {
+          "enabled": true,
+          "ttl": "5m"
+        }
+      }
+    },
+    {
+      "id": "hn-with-modifiers",
+      "hostname": "hn-modifiers.test",
+      "description": "HackerNews with cache control header modifications",
+      "action": {
+        "proxy": {
+          "url": "https://news.ycombinator.com",
+          "preserve_host": false
+        }
+      },
+      "response_modifiers": [
+        {
+          "type": "add_header",
+          "config": {
+            "name": "Cache-Control",
+            "value": "public, max-age=300"
+          }
+        },
+        {
+          "type": "remove_header",
+          "config": {
+            "name": "Set-Cookie"
+          }
+        }
+      ],
+      "chunk_cache": {
+        "ignore_no_cache": false,
+        "signature_cache": {
+          "enabled": true,
+          "content_types": ["text/html"],
+          "signatures": [
+            {
+              "name": "html_head",
+              "pattern_type": "regex",
+              "regex_pattern": "<!DOCTYPE[^>]*>.*?</head>",
+              "cache_ttl": "10m"
+            }
+          ]
+        },
+        "url_cache": {
+          "enabled": true,
+          "ttl": "5m"
+        }
+      }
+    },
+    {
+      "id": "hn-exact-signature",
+      "hostname": "hn-exact.test",
+      "description": "HackerNews with exact byte signature matching",
+      "action": {
+        "proxy": {
+          "url": "https://news.ycombinator.com",
+          "preserve_host": false
+        }
+      },
+      "chunk_cache": {
+        "ignore_no_cache": false,
+        "signature_cache": {
+          "enabled": true,
+          "content_types": ["text/html"],
+          "max_examine_bytes": 8192,
+          "signatures": [
+            {
+              "name": "doctype_html",
+              "pattern_type": "exact",
+              "exact_bytes": "PCFET0NUWVBFIGh0bWw+",
+              "min_prefix_length": 50,
+              "cache_ttl": "30m"
+            }
+          ]
+        },
+        "url_cache": {
+          "enabled": false
+        }
+      }
+    },
+    {
+      "id": "hn-hash-signature",
+      "hostname": "hn-hash.test",
+      "description": "HackerNews with hash-based signature detection",
+      "action": {
+        "proxy": {
+          "url": "https://news.ycombinator.com",
+          "preserve_host": false
+        }
+      },
+      "chunk_cache": {
+        "ignore_no_cache": false,
+        "signature_cache": {
+          "enabled": true,
+          "content_types": ["text/html"],
+          "signatures": [
+            {
+              "name": "first_2kb_hash",
+              "pattern_type": "hash",
+              "hash_algorithm": "xxhash",
+              "hash_length": 2048,
+              "hash_pattern": "auto",
+              "cache_ttl": "1h"
+            }
+          ]
+        },
+        "url_cache": {
+          "enabled": false
+        }
+      }
+    }
+  ]
+}
+

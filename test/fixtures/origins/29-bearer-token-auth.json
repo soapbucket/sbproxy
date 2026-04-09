@@ -1,0 +1,21 @@
+{
+  "bearer-token.test": {
+    "id": "bearer-token",
+    "hostname": "bearer-token.test",
+    "authentication": {
+      "type": "bearer_token",
+      "disabled": false,
+      "header_name": "Authorization",
+      "header_prefix": "Bearer ",
+      "tokens": [
+        "test-bearer-token-123",
+        "admin-bearer-token-456"
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    }
+  }
+}
+

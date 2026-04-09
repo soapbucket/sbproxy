@@ -1,0 +1,48 @@
+{
+  "auth-waf.test": {
+    "id": "auth-waf",
+    "hostname": "auth-waf.test",
+    "authentication": {
+      "type": "basic_auth",
+      "disabled": false,
+      "users": [
+        {
+          "username": "testuser",
+          "password": "testpass"
+        }
+      ]
+    },
+    "policies": [
+      {
+        "type": "waf",
+        "custom_rules": [
+          {
+            "id": "block-sql-injection",
+            "name": "Block SQL Injection",
+            "disabled": false,
+            "phase": 2,
+            "severity": "critical",
+            "action": "block",
+            "variables": [
+              {
+                "name": "ARGS",
+                "collection": "ARGS"
+              }
+            ],
+            "operator": "rx",
+            "pattern": "(?i)(union|select|insert|delete|update|drop|create|alter|or|and)",
+            "transformations": ["lowercase", "urlDecode"]
+          }
+        ],
+        "default_action": "log",
+        "action_on_match": "block"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/api/headers",
+      "strip_base_path": true
+    }
+  }
+}
+

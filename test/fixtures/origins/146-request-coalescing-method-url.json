@@ -1,0 +1,19 @@
+{
+  "request-coalescing-method-url.test": {
+    "id": "request-coalescing-method-url",
+    "hostname": "request-coalescing-method-url.test",
+    "description": "Request coalescing with method_url key strategy - simpler key generation",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090",
+      "request_coalescing": {
+        "enabled": true,
+        "max_inflight": 2000,
+        "coalesce_window": "200ms",
+        "max_waiters": 200,
+        "key_strategy": "method_url"
+      }
+    }
+  }
+}
+

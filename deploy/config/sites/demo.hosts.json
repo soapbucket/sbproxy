@@ -1,0 +1,1436 @@
+{
+  "api-gateway.demo.soapbucket.com": {
+    "id": "api-gateway-demo",
+    "hostname": "api-gateway.demo.soapbucket.com",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "authentication": {
+      "type": "jwt",
+      "secret": "your-256-bit-secret",
+      "algorithm": "HS256",
+      "header_name": "Authorization",
+      "header_prefix": "Bearer "
+    },
+    "forward_rules": [
+      {
+        "hostname": "hello-backend",
+        "rules": [{ "path": { "prefix": "/v1/hello-world" } }]
+      },
+      {
+        "hostname": "weather-backend",
+        "rules": [{ "path": { "prefix": "/v1/weather" } }]
+      },
+      {
+        "hostname": "echo-backend",
+        "rules": [{ "path": { "prefix": "/v1/echo" } }]
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 404,
+      "content_type": "application/json",
+      "body": "{\"error\": \"Not Found\", \"message\": \"No route matched. Available: /v1/hello-world, /v1/weather, /v1/echo\"}"
+    }
+  },
+
+  "hello-backend": {
+    "id": "hello-backend",
+    "hostname": "hello-backend",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "body": "{\"message\": \"Hello, World!\", \"service\": \"hello-service\", \"version\": \"1.0.0\"}"
+    },
+    "request_modifiers": [
+      {
+        "url": {
+          "path": { "replace": { "old": "/v1/hello-world", "new": "" } }
+        }
+      }
+    ]
+  },
+
+  "weather-backend": {
+    "id": "weather-backend",
+    "hostname": "weather-backend",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "action": {
+      "type": "proxy",
+      "url": "https://api.weather.gov",
+      "strip_base_path": true
+    },
+    "request_modifiers": [
+      {
+        "url": {
+          "path": { "replace": { "old": "/v1/weather", "new": "" } }
+        }
+      },
+      {
+        "headers": {
+          "set": {
+            "User-Agent": "SoapBucket-Demo/1.0"
+          }
+        }
+      }
+    ]
+  },
+
+  "echo-backend": {
+    "id": "echo-backend",
+    "hostname": "echo-backend",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com"
+    },
+    "request_modifiers": [
+      {
+        "url": {
+          "path": { "replace": { "old": "/v1/echo", "new": "/get" } }
+        }
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Forwarded-User": "{{auth.sub}}",
+            "X-Request-ID": "{{uuid}}"
+          }
+        }
+      }
+    ]
+  },
+
+  "migration.demo.soapbucket.com": {
+    "id": "migration-proxy-demo",
+    "hostname": "migration.demo.soapbucket.com",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "forward_rules": [
+      {
+        "hostname": "v2-transformer",
+        "rules": [{ "path": { "prefix": "/v2" } }]
+      },
+      {
+        "hostname": "v3-lua-transformer",
+        "rules": [{ "path": { "prefix": "/v3" } }]
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "body": "{\"user_id\": 123, \"first_name\": \"John\", \"last_name\": \"Doe\", \"email_address\": \"john@example.com\", \"created_at\": \"2024-01-15T10:30:00Z\", \"is_active\": true, \"account_type\": \"premium\"}"
+    }
+  },
+
+  "v2-transformer": {
+    "id": "v2-transformer",
+    "hostname": "v2-transformer",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "body": "{\"user_id\": 123, \"first_name\": \"John\", \"last_name\": \"Doe\", \"email_address\": \"john@example.com\", \"created_at\": \"2024-01-15T10:30:00Z\", \"is_active\": true, \"account_type\": \"premium\", \"internal_id\": \"INT-12345\"}"
+    },
+    "request_modifiers": [
+      {
+        "url": {
+          "path": { "replace": { "old": "/v2", "new": "/v1" } }
+        }
+      }
+    ],
+    "transforms": [
+      {
+        "type": "json",
+        "content_types": ["application/json"],
+        "pretty_print": true,
+        "remove_empty_strings": true,
+        "rules": [
+          { "path": "$.apiVersion", "value": "2.0" },
+          { "path": "$.id", "value": 123 },
+          { "path": "$.name", "value": { "first": "John", "last": "Doe" } },
+          { "path": "$.email", "value": "john@example.com" },
+          { "path": "$.metadata", "value": { "createdAt": "2024-01-15T10:30:00Z", "status": "active", "tier": "premium" } },
+          { "path": "$.user_id", "value": null },
+          { "path": "$.first_name", "value": null },
+          { "path": "$.last_name", "value": null },
+          { "path": "$.email_address", "value": null },
+          { "path": "$.created_at", "value": null },
+          { "path": "$.is_active", "value": null },
+          { "path": "$.account_type", "value": null },
+          { "path": "$.internal_id", "value": "[REDACTED]" }
+        ]
+      }
+    ]
+  },
+
+  "v3-lua-transformer": {
+    "id": "v3-lua-transformer",
+    "hostname": "v3-lua-transformer",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": {
+        "user_id": 123,
+        "first_name": "John",
+        "last_name": "Doe",
+        "email_address": "john@example.com",
+        "created_at": "2024-01-15T10:30:00Z",
+        "is_active": true,
+        "account_type": "premium",
+        "internal_id": "INT-12345"
+      }
+    },
+    "request_modifiers": [
+      {
+        "url": {
+          "path": { "replace": { "old": "/v3", "new": "/v1" } }
+        }
+      }
+    ],
+    "transforms": [
+      {
+        "type": "lua_json",
+        "content_types": ["application/json"],
+        "timeout": "100ms",
+        "lua_script": "function modify_json(data, ctx)\n  local result = {\n    apiVersion = '2.0',\n    id = data.user_id,\n    name = {\n      first = data.first_name,\n      last = data.last_name\n    },\n    email = data.email_address,\n    metadata = {\n      createdAt = data.created_at,\n      status = data.is_active and 'active' or 'inactive',\n      tier = data.account_type\n    },\n    internal_id = '[REDACTED]'\n  }\n  return result\nend"
+      }
+    ]
+  },
+
+  "hn-secure.demo.soapbucket.com": {
+    "id": "hn-secure-demo",
+    "hostname": "hn-secure.demo.soapbucket.com",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "force_ssl": false,
+    "session_config": {
+      "enabled": true,
+      "cookie_name": "_sb_session",
+      "cookie_path": "/",
+      "cookie_secure": false,
+      "cookie_http_only": true,
+      "cookie_same_site": "Lax",
+      "cookie_max_age": 86400,
+      "idle_timeout": 3600,
+      "cookie_jar": {
+        "enabled": true,
+        "preserve_cookies": true,
+        "allowed_domains": ["news.ycombinator.com"],
+        "excluded_cookies": ["tracking_id", "_ga"]
+      }
+    },
+    "response_cache": {
+      "enabled": true,
+      "ttl": "5m",
+      "conditions": {
+        "status_codes": [200],
+        "methods": ["GET", "HEAD"]
+      },
+      "vary_by": ["Accept", "Accept-Language"],
+      "key_normalization": {
+        "sort_query_params": true,
+        "lowercase_path": true,
+        "ignore_query_params": ["_t", "timestamp", "nocache"]
+      },
+      "stale_while_revalidate": {
+        "enabled": true,
+        "max_stale_age": "1h",
+        "refresh_timeout": "5s"
+      }
+    },
+    "chunk_cache": {
+      "ignore_no_cache": false,
+      "url_cache": {
+        "enabled": true,
+        "ttl": "30m"
+      },
+      "signature_cache": {
+        "enabled": true,
+        "content_types": ["text/html"],
+        "default_ttl": "30m",
+        "signatures": [
+          {
+            "name": "HN HTML Header",
+            "pattern_type": "regex",
+            "regex_pattern": "^<!DOCTYPE html>",
+            "max_examine_bytes": 4096,
+            "cache_ttl": "1h"
+          }
+        ]
+      }
+    },
+    "action": {
+      "type": "proxy",
+      "url": "https://news.ycombinator.com",
+      "strip_base_path": true,
+      "skip_tls_verify_host": true
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Request-ID": "{{uuid}}"
+          }
+        }
+      }
+    ],
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Cache-Status": "{{cache.status}}",
+            "X-Served-By": "soapbucket-proxy"
+          }
+        }
+      }
+    ],
+    "transforms": [
+      {
+        "type": "html",
+        "content_types": ["text/html"],
+        "add_to_tags": [
+          {
+            "tag": "body",
+            "add_before_end_tag": false,
+            "content": "<div style='position:fixed;bottom:0;left:0;right:0;background:#ff6600;color:white;text-align:center;padding:5px;z-index:9999;font-size:12px;'>Proxied by SoapBucket Demo</div>"
+          }
+        ]
+      }
+    ]
+  },
+
+  "secure.demo.soapbucket.com": {
+    "id": "secure-demo",
+    "hostname": "secure.demo.soapbucket.com",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "algorithm": "sliding_window",
+        "requests_per_minute": 60,
+        "requests_per_hour": 1000,
+        "burst_size": 10,
+        "whitelist": ["10.0.0.0/8", "172.16.0.0/12"],
+        "blacklist": [],
+        "headers": {
+          "enabled": true,
+          "include_retry_after": true,
+          "include_remaining": true,
+          "include_limit": true,
+          "include_reset": true
+        }
+      },
+      {
+        "type": "geo_blocking",
+        "blocked_countries": ["RU", "CN", "KP", "IR"],
+        "action": "block"
+      },
+      {
+        "type": "waf",
+        "action_on_match": "block",
+        "test_mode": false,
+        "owasp_crs": {
+          "enabled": true,
+          "version": "3.3.0",
+          "paranoia_level": 2,
+          "anomaly_score_threshold": 5,
+          "categories": [
+            "sql-injection",
+            "xss",
+            "rfi",
+            "lfi",
+            "rce",
+            "php-injection",
+            "session-fixation"
+          ]
+        },
+        "custom_rules": [
+          {
+            "id": "CUSTOM-001",
+            "name": "Block Prototype Pollution",
+            "description": "Blocks prototype pollution attacks",
+            "enabled": true,
+            "phase": 1,
+            "severity": "critical",
+            "action": "block",
+            "operator": "rx",
+            "pattern": "(?i)(__proto__|constructor\\s*\\[\\s*['\"]prototype['\"]\\s*\\])",
+            "variables": [
+              { "name": "ARGS" },
+              { "name": "REQUEST_BODY" },
+              { "name": "REQUEST_URI" }
+            ],
+            "transformations": ["urlDecode", "lowercase"]
+          },
+          {
+            "id": "CUSTOM-002",
+            "name": "Block React Server Component Exploit",
+            "description": "Blocks React Server Component exploitation patterns",
+            "enabled": true,
+            "phase": 1,
+            "severity": "critical",
+            "action": "block",
+            "operator": "rx",
+            "pattern": "(?i)(\\$\\$typeof|\\$\\$id)",
+            "variables": [
+              { "name": "REQUEST_BODY" },
+              { "name": "ARGS" },
+              { "name": "REQUEST_URI" }
+            ],
+            "transformations": ["urlDecode"]
+          }
+        ]
+      },
+      {
+        "type": "security_headers",
+        "strict_transport_security": {
+          "enabled": true,
+          "max_age": 31536000,
+          "include_subdomains": true
+        },
+        "content_security_policy": {
+          "enabled": true,
+          "directives": {
+            "default_src": ["'self'"],
+            "script_src": ["'self'"],
+            "style_src": ["'self'", "'unsafe-inline'"],
+            "img_src": ["'self'", "data:", "https:"],
+            "frame_ancestors": ["'none'"]
+          }
+        },
+        "x_frame_options": {
+          "enabled": true,
+          "value": "DENY"
+        },
+        "x_content_type_options": {
+          "enabled": true
+        },
+        "referrer_policy": {
+          "enabled": true,
+          "policy": "strict-origin-when-cross-origin"
+        }
+      },
+      {
+        "type": "request_limiting",
+        "size_limits": {
+          "max_url_length": 2048,
+          "max_query_string_length": 1024,
+          "max_headers_count": 50,
+          "max_header_size": "8KB",
+          "max_request_size": "10MB"
+        },
+        "complexity_limits": {
+          "max_nested_depth": 10,
+          "max_object_properties": 100,
+          "max_array_elements": 1000
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com/get"
+    }
+  },
+
+  "weather-mcp.demo.soapbucket.com": {
+    "id": "weather-mcp-demo",
+    "hostname": "weather-mcp.demo.soapbucket.com",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "action": {
+      "type": "mcp",
+      "server_info": {
+        "name": "weather-mcp-server",
+        "version": "1.0.0"
+      },
+      "capabilities": {
+        "tools": { "listChanged": false },
+        "resources": { "subscribe": false, "listChanged": false }
+      },
+      "tools": [
+        {
+          "name": "get_alerts",
+          "description": "Get active weather alerts for a US state. Returns current warnings, watches, and advisories.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "description": "Two-letter US state code (e.g., CA, NY, TX)"
+              }
+            },
+            "required": ["state"]
+          },
+          "handler": {
+            "type": "proxy",
+            "proxy": {
+              "url": "https://api.weather.gov/alerts/active?area={{ tool.arguments.state }}",
+              "method": "GET",
+              "headers": {
+                "User-Agent": "SoapBucket-MCP-Weather/1.0",
+                "Accept": "application/geo+json"
+              }
+            },
+            "lua_script": "function modify_json(data, ctx)\n  data.alert_count = data.features and #data.features or 0\n  data.has_alerts = data.alert_count > 0\n  return data\nend",
+            "response_template": "{{#has_alerts}}Found {{alert_count}} active alerts for {{tool.arguments.state}}:\n{{#features}}\n- {{properties.headline}}\n  Severity: {{properties.severity}}\n{{/features}}{{/has_alerts}}{{^has_alerts}}No active weather alerts for {{tool.arguments.state}}.{{/has_alerts}}"
+          },
+          "timeout": "10s"
+        },
+        {
+          "name": "get_forecast",
+          "description": "Get detailed weather forecast for a location using latitude and longitude coordinates.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "latitude": {
+                "type": "number",
+                "description": "Latitude of the location (e.g., 40.7128 for New York)"
+              },
+              "longitude": {
+                "type": "number",
+                "description": "Longitude of the location (e.g., -74.0060 for New York)"
+              }
+            },
+            "required": ["latitude", "longitude"]
+          },
+          "handler": {
+            "type": "orchestration",
+            "orchestration": {
+              "steps": [
+                {
+                  "name": "get_grid",
+                  "callback": {
+                    "url": "https://api.weather.gov/points/{{ tool.arguments.latitude }},{{ tool.arguments.longitude }}",
+                    "method": "GET",
+                    "headers": {
+                      "User-Agent": "SoapBucket-MCP-Weather/1.0",
+                      "Accept": "application/geo+json"
+                    }
+                  }
+                },
+                {
+                  "name": "get_forecast",
+                  "depends_on": ["get_grid"],
+                  "callback": {
+                    "url": "{{ steps.get_grid.response.properties.forecast }}",
+                    "method": "GET",
+                    "headers": {
+                      "User-Agent": "SoapBucket-MCP-Weather/1.0",
+                      "Accept": "application/geo+json"
+                    }
+                  }
+                }
+              ],
+              "parallel": false,
+              "timeout": "25s"
+            },
+            "lua_script": "function modify_json(data, ctx)\n  local periods = data.steps and data.steps.get_forecast and data.steps.get_forecast.response and data.steps.get_forecast.response.properties and data.steps.get_forecast.response.properties.periods\n  local sliced = {}\n  if periods then\n    for i = 1, math.min(5, #periods) do sliced[i] = periods[i] end\n  end\n  data.forecast_periods = sliced\n  return data\nend",
+            "response_template": "Weather forecast for {{tool.arguments.latitude}}, {{tool.arguments.longitude}}:\n\n{{#forecast_periods}}{{name}}: {{detailedForecast}}\n\n{{/forecast_periods}}"
+          },
+          "timeout": "30s"
+        },
+        {
+          "name": "get_current_conditions",
+          "description": "Get current weather conditions for a US city by name. Resolves city to coordinates via geocoding, then fetches forecast.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "city": { "type": "string", "description": "City name (e.g., 'New York', 'Los Angeles')" },
+              "state": { "type": "string", "description": "Two-letter state code (e.g., 'NY', 'CA')" }
+            },
+            "required": ["city", "state"]
+          },
+          "handler": {
+            "type": "orchestration",
+            "orchestration": {
+              "steps": [
+                {
+                  "name": "geocode",
+                  "callback": {
+                    "url": "https://nominatim.openstreetmap.org/search?city={{#urlencode}}{{tool.arguments.city}}{{/urlencode}}&state={{tool.arguments.state}}&country=US&format=json&limit=1",
+                    "method": "GET",
+                    "headers": { "User-Agent": "SoapBucket-MCP-Weather/1.0", "Accept": "application/json" }
+                  }
+                },
+                {
+                  "name": "get_grid",
+                  "depends_on": ["geocode"],
+                  "callback": {
+                    "url": "https://api.weather.gov/points/{{ steps.geocode.response.0.lat }},{{ steps.geocode.response.0.lon }}",
+                    "method": "GET",
+                    "headers": { "User-Agent": "SoapBucket-MCP-Weather/1.0", "Accept": "application/geo+json" }
+                  }
+                },
+                {
+                  "name": "get_forecast",
+                  "depends_on": ["get_grid"],
+                  "callback": {
+                    "url": "{{ steps.get_grid.response.properties.forecast }}",
+                    "method": "GET",
+                    "headers": { "User-Agent": "SoapBucket-MCP-Weather/1.0", "Accept": "application/geo+json" }
+                  }
+                }
+              ],
+              "parallel": false,
+              "timeout": "30s"
+            },
+            "lua_script": "function modify_json(data, ctx)\n  local geocode = data.steps and data.steps.geocode and data.steps.geocode.response\n  if geocode then\n    data.geocode_location = geocode['0'] or (geocode[1]) or {}\n  else\n    data.geocode_location = {}\n  end\n  local periods = data.steps and data.steps.get_forecast and data.steps.get_forecast.response and data.steps.get_forecast.response.properties and data.steps.get_forecast.response.properties.periods\n  local sliced = {}\n  if periods then\n    for i = 1, math.min(4, #periods) do sliced[i] = periods[i] end\n  end\n  data.forecast_periods = sliced\n  return data\nend",
+            "response_template": "Current conditions for {{tool.arguments.city}}, {{tool.arguments.state}}:\n\nLocation: {{geocode_location.display_name}}\nCoordinates: {{geocode_location.lat}}, {{geocode_location.lon}}\n\n{{#forecast_periods}}{{name}}: {{detailedForecast}}\n\n{{/forecast_periods}}"
+          },
+          "timeout": "35s"
+        },
+        {
+          "name": "say_hello",
+          "description": "A simple greeting tool that returns Hello with the provided name.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "The name to greet"
+              }
+            },
+            "required": ["name"]
+          },
+          "handler": {
+            "type": "static",
+            "static": { "content": "" },
+            "response_template": "Hello, {{ tool.arguments.name }}!"
+          },
+          "timeout": "5s"
+        }
+      ],
+      "resources": [
+        {
+          "uri": "weather://alerts/active",
+          "name": "Active Weather Alerts",
+          "description": "All currently active weather alerts in the US",
+          "mime_type": "application/json",
+          "handler": {
+            "type": "proxy",
+            "proxy": {
+              "url": "https://api.weather.gov/alerts/active",
+              "method": "GET",
+              "headers": {
+                "User-Agent": "SoapBucket-MCP-Weather/1.0"
+              }
+            }
+          }
+        },
+        {
+          "uri": "weather://glossary",
+          "name": "Weather Glossary",
+          "description": "NWS weather terminology glossary",
+          "mime_type": "application/json",
+          "handler": {
+            "type": "proxy",
+            "proxy": {
+              "url": "https://api.weather.gov/glossary",
+              "method": "GET",
+              "headers": {
+                "User-Agent": "SoapBucket-MCP-Weather/1.0"
+              }
+            }
+          }
+        }
+      ],
+      "default_timeout": "30s",
+      "error_handling": {
+        "include_stack_trace": false,
+        "retry_upstream_errors": true,
+        "circuit_breaker": {
+          "enabled": true,
+          "failure_threshold": 5,
+          "success_threshold": 2,
+          "reset_timeout": "30s"
+        }
+      }
+    }
+  },
+
+  "routing.demo.soapbucket.com": {
+    "id": "routing-demo",
+    "hostname": "routing.demo.soapbucket.com",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "policies": [
+      {
+        "type": "expression",
+        "cel_expr": "!(request.path.startsWith('/admin/') && !ip.isPrivate(request_ip))",
+        "status_code": 403,
+        "message": "Admin access restricted to internal networks"
+      },
+      {
+        "type": "expression",
+        "cel_expr": "!(request.path.startsWith('/internal/') && !('x_internal_token' in request.headers))",
+        "status_code": 401,
+        "message": "Internal API requires authentication token"
+      }
+    ],
+    "forward_rules": [
+      {
+        "hostname": "mobile-backend",
+        "rules": [
+          {
+            "cel_expr": "size(user_agent) > 0 && user_agent['device_family'] in ['iPhone', 'iPad', 'Android']"
+          }
+        ]
+      },
+      {
+        "hostname": "premium-backend",
+        "rules": [
+          {
+            "cel_expr": "'x_api_tier' in request.headers && request.headers['x_api_tier'] == 'premium'"
+          }
+        ]
+      },
+      {
+        "hostname": "internal-backend",
+        "rules": [
+          {
+            "cel_expr": "ip.inCIDR(request_ip, '10.0.0.0/8') || ip.inCIDR(request_ip, '172.16.0.0/12') || ip.inCIDR(request_ip, '192.168.0.0/16')"
+          }
+        ]
+      }
+    ],
+    "request_modifiers": [
+      {
+        "lua_script": "local client_type = 'desktop'\nif user_agent and user_agent.device_family then\n  if user_agent.device_family == 'iPhone' or user_agent.device_family == 'iPad' or user_agent.device_family == 'Android' then\n    client_type = 'mobile'\n  elseif user_agent.device_family == 'Spider' then\n    client_type = 'bot'\n  end\nend\nlocal ip_type = ip.is_private(request_ip) and 'private' or 'public'\nlocal country = location.country_code or 'UNKNOWN'\nreturn {\n  add_headers = {\n    ['X-Client-Type'] = client_type,\n    ['X-IP-Type'] = ip_type,\n    ['X-Country'] = country,\n    ['X-Request-ID'] = request.id\n  }\n}"
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": {
+        "backend": "default",
+        "message": "Request routed to default backend (no CEL rule matched)",
+        "features": {
+          "standard_processing": true
+        }
+      }
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Routed-By": "soapbucket-cel-lua"
+          }
+        }
+      }
+    ]
+  },
+
+  "mobile-backend": {
+    "id": "mobile-backend",
+    "hostname": "mobile-backend",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": {
+        "backend": "mobile-optimized",
+        "message": "Request routed to mobile backend via CEL expression",
+        "features": {
+          "compressed_images": true,
+          "reduced_payload": true,
+          "mobile_friendly": true
+        }
+      }
+    }
+  },
+
+  "premium-backend": {
+    "id": "premium-backend",
+    "hostname": "premium-backend",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": {
+        "backend": "premium-tier",
+        "message": "Request routed to premium backend via CEL expression",
+        "features": {
+          "priority_processing": true,
+          "extended_rate_limits": true,
+          "dedicated_resources": true
+        }
+      }
+    }
+  },
+
+  "internal-backend": {
+    "id": "internal-backend",
+    "hostname": "internal-backend",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": {
+        "backend": "internal-only",
+        "message": "Request routed to internal backend via CEL IP check",
+        "features": {
+          "debug_mode": true,
+          "full_logging": true,
+          "admin_access": true
+        }
+      }
+    }
+  },
+
+  "website.demo.soapbucket.com": {
+    "id": "website-demo",
+    "hostname": "website.demo.soapbucket.com",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "on_load": [
+      {
+        "url": "https://jsonplaceholder.typicode.com/posts/1",
+        "method": "GET",
+        "timeout": 10,
+        "cache_duration": "1h",
+        "variable_name": "site_config",
+        "on_error": "warn"
+      }
+    ],
+    "on_request": [
+      {
+        "url": "https://jsonplaceholder.typicode.com/users",
+        "method": "GET",
+        "timeout": 5,
+        "cache_duration": "5m",
+        "variable_name": "dynamic_data",
+        "on_error": "warn"
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "text/html",
+      "body": "<!DOCTYPE html>\n<html>\n<head>\n  <title>SoapBucket Webhook Demo</title>\n  <style>body{font-family:system-ui;max-width:800px;margin:0 auto;padding:20px;}h1{color:#333;}.config{background:#f5f5f5;padding:15px;border-radius:8px;}.data{background:#e3f2fd;padding:15px;border-radius:8px;margin-top:20px;}</style>\n</head>\n<body>\n  <h1>SoapBucket Webhook + Template Demo</h1>\n  <div class='config'>\n    <h2>Config (loaded once via on_load)</h2>\n    <p><strong>Config ID:</strong> {{config.site_config.id}}</p>\n    <p><strong>Title:</strong> {{config.site_config.title}}</p>\n    <p><em>This data was fetched once when the config loaded and is cached.</em></p>\n  </div>\n  <div class='data'>\n    <h2>Dynamic Data (loaded per-request via on_request)</h2>\n    <p><strong>Request ID:</strong> {{request.id}}</p>\n    <p><strong>Timestamp:</strong> {{timestamp}}</p>\n    <p><em>This data is fetched for each request (with caching).</em></p>\n  </div>\n  <footer style='margin-top:40px;color:#666;font-size:12px;'>Generated by SoapBucket Proxy</footer>\n</body>\n</html>"
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Config-Loaded": "true",
+            "X-Request-ID": "{{request.id}}",
+            "X-Generated-At": "{{timestamp}}"
+          }
+        }
+      }
+    ]
+  },
+
+  "lb.demo.soapbucket.com": {
+    "id": "lb-demo",
+    "hostname": "lb.demo.soapbucket.com",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "action": {
+      "type": "loadbalancer",
+      "least_connections": true,
+      "disable_sticky": false,
+      "sticky_cookie_name": "_sb_lb",
+      "strip_base_path": false,
+      "targets": [
+        {
+          "url": "https://postman-echo.com/get?backend=1",
+          "weight": 40,
+          "response_modifiers": [
+            { "headers": { "add": { "X-Served-By": "backend-1", "X-Backend-Version": "v2.1.0" } } }
+          ]
+        },
+        {
+          "url": "https://postman-echo.com/get?backend=2",
+          "weight": 40,
+          "response_modifiers": [
+            { "headers": { "add": { "X-Served-By": "backend-2", "X-Backend-Version": "v2.1.0" } } }
+          ]
+        },
+        {
+          "url": "https://postman-echo.com/get?backend=3",
+          "weight": 20,
+          "response_modifiers": [
+            { "headers": { "add": { "X-Served-By": "backend-3", "X-Canary": "true", "X-Backend-Version": "v2.2.0-canary" } } }
+          ]
+        }
+      ]
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Load-Balancer": "soapbucket",
+            "X-Request-ID": "{{request.id}}"
+          }
+        }
+      }
+    ]
+  },
+
+  "abtest.demo.soapbucket.com": {
+    "id": "abtest-demo",
+    "hostname": "abtest.demo.soapbucket.com",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "action": {
+      "type": "abtest",
+      "test_name": "demo-checkout-test",
+      "cookie_name": "_ab_demo",
+      "cookie_ttl": "1d",
+      "variants": [
+        {
+          "name": "control",
+          "weight": 70,
+          "action": {
+            "type": "static",
+            "status_code": 200,
+            "content_type": "application/json",
+            "json_body": {
+              "variant": "control",
+              "version": "v1.0.0",
+              "message": "You are seeing the control variant (70% of users)",
+              "features": {
+                "express_checkout": false,
+                "apple_pay": false
+              }
+            }
+          }
+        },
+        {
+          "name": "treatment",
+          "weight": 30,
+          "action": {
+            "type": "static",
+            "status_code": 200,
+            "content_type": "application/json",
+            "json_body": {
+              "variant": "treatment",
+              "version": "v2.0.0",
+              "message": "You are seeing the treatment variant (30% of users)",
+              "features": {
+                "express_checkout": true,
+                "apple_pay": true
+              }
+            }
+          }
+        }
+      ],
+      "targeting": {
+        "exclude_rules": {
+          "user_agents": ["*bot*", "*crawler*", "*spider*"]
+        }
+      }
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-AB-Test": "demo-checkout-test",
+            "X-Request-ID": "{{request.id}}"
+          }
+        }
+      }
+    ]
+  },
+
+  "ws.demo.soapbucket.com": {
+    "id": "ws-demo",
+    "hostname": "ws.demo.soapbucket.com",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "action": {
+      "type": "websocket",
+      "url": "wss://echo.websocket.org",
+      "strip_base_path": false,
+      "ping_interval": "30s",
+      "pong_timeout": "10s",
+      "handshake_timeout": "10s",
+      "enable_compression": true,
+      "check_origin": true,
+      "allowed_origins": ["https://app.example.com", "https://www.example.com"],
+      "disable_pool": false,
+      "pool_max_connections": 100,
+      "pool_max_idle_connections": 10,
+      "disable_pool_auto_reconnect": false
+    }
+  },
+
+  "capture.demo.soapbucket.com": {
+    "id": "capture-demo",
+    "hostname": "capture.demo.soapbucket.com",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "traffic_capture": {
+      "enabled": true,
+      "sample_rate": 1.0,
+      "max_body_size": "10kb",
+      "retention": "1h",
+      "max_count": 10000
+    },
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com",
+      "strip_base_path": true
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Capture-Enabled": "true",
+            "X-Request-ID": "{{request.id}}"
+          }
+        }
+      }
+    ]
+  },
+
+  "contract.demo.soapbucket.com": {
+    "id": "contract-demo",
+    "hostname": "contract.demo.soapbucket.com",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "on_load": [
+      {
+        "url": "https://petstore3.swagger.io/api/v3/openapi.json",
+        "method": "GET",
+        "variable_name": "openapi_spec",
+        "cache_duration": "10m",
+        "on_error": "warn",
+        "retry": { "enabled": true, "max_attempts": 3 }
+      }
+    ],
+    "policies": [
+      {
+        "type": "contract_governance",
+        "spec_from": "openapi_spec",
+        "validate_requests": true,
+        "validate_responses": false,
+        "enforcement": "advisory",
+        "sample_rate": 1.0
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "https://petstore3.swagger.io/api/v3"
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Contract-Governance": "advisory",
+            "X-Request-ID": "{{request.id}}"
+          }
+        }
+      }
+    ]
+  },
+
+  "shadow.demo.soapbucket.com": {
+    "id": "shadow-demo",
+    "hostname": "shadow.demo.soapbucket.com",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "traffic_capture": {
+      "enabled": true,
+      "sample_rate": 1.0,
+      "max_body_size": "10kb",
+      "retention": "30m"
+    },
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com",
+      "strip_base_path": true,
+      "shadow": {
+        "upstream_url": "https://httpbin.org/anything",
+        "sample_rate": 1.0,
+        "fail_on_error": false,
+        "timeout": "2s",
+        "max_concurrent": 50,
+        "max_body_size": "1MB",
+        "modifiers": [
+          { "headers": { "remove": ["Authorization", "Cookie"] } },
+          { "headers": { "set": { "X-Shadow": "true", "X-Shadow-Source": "demo" } } }
+        ],
+        "circuit_breaker": {
+          "enabled": true,
+          "failure_threshold": 5,
+          "success_threshold": 2,
+          "timeout": "30s"
+        }
+      }
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Shadow-Enabled": "true",
+            "X-Request-ID": "{{request.id}}"
+          }
+        }
+      }
+    ]
+  },
+
+  "compose.localhost": {
+    "id": "orchestration-parallel",
+    "hostname": "compose.localhost",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "action": {
+      "type": "orchestration",
+      "parallel": true,
+      "timeout": "10s",
+      "steps": [
+        {
+          "name": "get_user",
+          "callback": {
+            "url": "https://jsonplaceholder.typicode.com/users/1",
+            "method": "GET"
+          }
+        },
+        {
+          "name": "get_posts",
+          "callback": {
+            "url": "https://jsonplaceholder.typicode.com/posts?userId=1&_limit=3",
+            "method": "GET"
+          }
+        }
+      ],
+      "response_builder": {
+        "template": "{\n  \"user\": {{{steps.get_user.response_json}}},\n  \"posts\": {{{steps.get_posts.response_json}}},\n  \"meta\": {\n    \"user_ms\": {{steps.get_user.duration}},\n    \"posts_ms\": {{steps.get_posts.duration}},\n    \"total_ms\": {{total_duration}}\n  }\n}",
+        "content_type": "application/json",
+        "status_code": 200,
+        "headers": {
+          "X-Composed-By": "SoapBucket Orchestration"
+        }
+      }
+    }
+  },
+
+  "chain.localhost": {
+    "id": "orchestration-chain",
+    "hostname": "chain.localhost",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "action": {
+      "type": "orchestration",
+      "timeout": "15s",
+      "steps": [
+        {
+          "name": "get_user",
+          "callback": {
+            "url": "https://jsonplaceholder.typicode.com/users/1",
+            "method": "GET"
+          }
+        },
+        {
+          "name": "get_posts",
+          "depends_on": ["get_user"],
+          "callback": {
+            "url": "https://jsonplaceholder.typicode.com/posts?userId={{ steps.get_user.response.id }}",
+            "method": "GET"
+          },
+          "retry": {
+            "max_attempts": 2,
+            "backoff": "exponential",
+            "initial_delay": "200ms"
+          }
+        }
+      ],
+      "response_builder": {
+        "template": "{\n  \"user\": {\n    \"id\": {{steps.get_user.response.id}},\n    \"name\": \"{{steps.get_user.response.name}}\",\n    \"email\": \"{{steps.get_user.response.email}}\"\n  },\n  \"posts\": {{{steps.get_posts.response_json}}},\n  \"total_ms\": {{total_duration}}\n}",
+        "content_type": "application/json",
+        "status_code": 200
+      }
+    }
+  },
+
+  "dashboard.localhost": {
+    "id": "orchestration-diamond",
+    "hostname": "dashboard.localhost",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "action": {
+      "type": "orchestration",
+      "parallel": true,
+      "timeout": "10s",
+      "continue_on_error": false,
+      "steps": [
+        {
+          "name": "fetch_user",
+          "callback": {
+            "url": "https://jsonplaceholder.typicode.com/users/1",
+            "method": "GET"
+          }
+        },
+        {
+          "name": "fetch_orders",
+          "depends_on": ["fetch_user"],
+          "callback": {
+            "url": "https://jsonplaceholder.typicode.com/posts?userId={{ steps.fetch_user.response.id }}",
+            "method": "GET"
+          }
+        },
+        {
+          "name": "fetch_recommendations",
+          "depends_on": ["fetch_user"],
+          "condition": "{{#steps.fetch_user.response.company}}true{{/steps.fetch_user.response.company}}",
+          "callback": {
+            "url": "https://jsonplaceholder.typicode.com/todos?userId={{ steps.fetch_user.response.id }}&_limit=5",
+            "method": "GET"
+          },
+          "continue_on_error": true,
+          "retry": {
+            "max_attempts": 3,
+            "backoff": "exponential",
+            "initial_delay": "100ms",
+            "max_delay": "2s"
+          }
+        }
+      ],
+      "response_builder": {
+        "template": "{\n  \"user\": {{{steps.fetch_user.response_json}}},\n  \"orders\": {{{steps.fetch_orders.response_json}}},\n  \"recommendations\": {{#steps.fetch_recommendations}}{{{response_json}}}{{/steps.fetch_recommendations}}{{^steps.fetch_recommendations}}null{{/steps.fetch_recommendations}},\n  \"meta\": {\n    \"total_ms\": {{total_duration}},\n    \"error_count\": {{error_count}}\n  }\n}",
+        "content_type": "application/json",
+        "status_code": 200
+      }
+    }
+  },
+
+  "api-bridge.demo.soapbucket.com": {
+    "id": "api-bridge-demo",
+    "hostname": "api-bridge.demo.soapbucket.com",
+    "workspace_id": "demo",
+    "version": "1.0.0",
+    "action": {
+      "type": "mcp",
+      "server_info": {
+        "name": "api-bridge-server",
+        "version": "1.0.0"
+      },
+      "capabilities": {
+        "tools": { "listChanged": false },
+        "resources": { "subscribe": false, "listChanged": false }
+      },
+      "tools": [
+        {
+          "name": "list_posts",
+          "description": "List recent blog posts. Returns title, body, and author ID for each post.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "limit": { "type": "integer", "description": "Maximum number of posts to return (1-100)", "default": 10 }
+            }
+          },
+          "handler": {
+            "type": "proxy",
+            "proxy": {
+              "url": "https://jsonplaceholder.typicode.com/posts",
+              "method": "GET",
+              "headers": { "Accept": "application/json" }
+            },
+            "lua_script": "function modify_json(data, ctx)\n  local limit = tonumber(data.tool and data.tool.arguments and data.tool.arguments.limit) or 10\n  local posts = {}\n  if data.result and type(data.result) == 'table' then\n    for i = 1, math.min(limit, #data.result) do\n      local post = data.result[i]\n      local body = post.body or ''\n      if #body > 120 then body = string.sub(body, 1, 120) .. '...' end\n      post.body_short = body\n      posts[i] = post\n    end\n    data.total_count = #data.result\n  else\n    data.total_count = 0\n  end\n  data.posts = posts\n  return data\nend",
+            "response_template": "{{#posts}}**{{title}}** (Post #{{id}})\nAuthor ID: {{userId}}\n{{body_short}}\n\n{{/posts}}Found {{total_count}} total posts."
+          },
+          "timeout": "10s"
+        },
+        {
+          "name": "get_post",
+          "description": "Get a specific blog post by ID, including its comments.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "post_id": { "type": "integer", "description": "The post ID to retrieve" }
+            },
+            "required": ["post_id"]
+          },
+          "handler": {
+            "type": "orchestration",
+            "orchestration": {
+              "steps": [
+                {
+                  "name": "fetch_post",
+                  "callback": {
+                    "url": "https://jsonplaceholder.typicode.com/posts/{{ tool.arguments.post_id }}",
+                    "method": "GET",
+                    "headers": { "Accept": "application/json" }
+                  }
+                },
+                {
+                  "name": "fetch_comments",
+                  "callback": {
+                    "url": "https://jsonplaceholder.typicode.com/posts/{{ tool.arguments.post_id }}/comments",
+                    "method": "GET",
+                    "headers": { "Accept": "application/json" }
+                  }
+                }
+              ],
+              "parallel": true,
+              "timeout": "10s"
+            },
+            "lua_script": "function modify_json(data, ctx)\n  local comments = data.steps and data.steps.fetch_comments and data.steps.fetch_comments.response\n  local trimmed = {}\n  if comments and type(comments) == 'table' then\n    for i, c in ipairs(comments) do\n      local body = c.body or ''\n      if #body > 100 then body = string.sub(body, 1, 100) .. '...' end\n      c.body_short = body\n      trimmed[i] = c\n    end\n    data.comment_count = #comments\n  else\n    data.comment_count = 0\n  end\n  data.comments = trimmed\n  return data\nend",
+            "response_template": "## {{steps.fetch_post.response.title}}\n\nAuthor ID: {{steps.fetch_post.response.userId}}\n\n{{steps.fetch_post.response.body}}\n\n---\nComments ({{comment_count}}):\n{{#comments}}{{name}} ({{email}}): {{body_short}}\n{{/comments}}"
+          },
+          "timeout": "15s"
+        },
+        {
+          "name": "create_post",
+          "description": "Create a new blog post with a title and body.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "title": { "type": "string", "description": "Post title" },
+              "content": { "type": "string", "description": "Post body content" },
+              "user_id": { "type": "integer", "description": "Author user ID", "default": 1 }
+            },
+            "required": ["title", "content"]
+          },
+          "handler": {
+            "type": "proxy",
+            "proxy": {
+              "url": "https://jsonplaceholder.typicode.com/posts",
+              "method": "POST",
+              "headers": { "Content-Type": "application/json", "Accept": "application/json" },
+              "body": "{\"title\": \"{{tool.arguments.title}}\", \"body\": \"{{tool.arguments.content}}\", \"userId\": {{#tool.arguments.user_id}}{{tool.arguments.user_id}}{{/tool.arguments.user_id}}{{^tool.arguments.user_id}}1{{/tool.arguments.user_id}}}"
+            },
+            "response_template": "Post created successfully!\n\n- ID: {{ result.id }}\n- Title: {{ result.title }}\n- Author: User {{ result.userId }}"
+          },
+          "timeout": "10s"
+        },
+        {
+          "name": "get_user",
+          "description": "Get user profile information.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "user_id": { "type": "integer", "description": "User ID to look up (1-10)" }
+            },
+            "required": ["user_id"]
+          },
+          "handler": {
+            "type": "proxy",
+            "proxy": {
+              "url": "https://jsonplaceholder.typicode.com/users/{{ tool.arguments.user_id }}",
+              "method": "GET",
+              "headers": { "Accept": "application/json" }
+            },
+            "response_template": "{{ result.name }} (@{{ result.username }})\n- Email: {{ result.email }}\n- Phone: {{ result.phone }}\n- Company: {{ result.company.name }}"
+          },
+          "timeout": "10s"
+        },
+        {
+          "name": "create_and_verify_post",
+          "description": "Create a blog post and immediately verify it was created. Macro Tool pattern.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "title": { "type": "string", "description": "Post title" },
+              "content": { "type": "string", "description": "Post body content" }
+            },
+            "required": ["title", "content"]
+          },
+          "handler": {
+            "type": "orchestration",
+            "orchestration": {
+              "steps": [
+                {
+                  "name": "create",
+                  "callback": {
+                    "url": "https://jsonplaceholder.typicode.com/posts",
+                    "method": "POST",
+                    "headers": { "Content-Type": "application/json", "Accept": "application/json" },
+                    "body": "{\"title\": \"{{ tool.arguments.title }}\", \"body\": \"{{ tool.arguments.content }}\", \"userId\": 1}"
+                  }
+                },
+                {
+                  "name": "verify",
+                  "depends_on": ["create"],
+                  "callback": {
+                    "url": "https://jsonplaceholder.typicode.com/posts/{{ steps.create.response.id }}",
+                    "method": "GET",
+                    "headers": { "Accept": "application/json" }
+                  }
+                }
+              ],
+              "parallel": false,
+              "timeout": "15s"
+            },
+            "response_template": "Post created and verified!\n\nCreated: ID {{ steps.create.response.id }}, Title: {{ steps.create.response.title }}\nVerified: Post {{ steps.verify.response.id }} exists."
+          },
+          "timeout": "20s"
+        },
+        {
+          "name": "simulate_delete_post",
+          "description": "Simulate deleting a post (dry-run, Shadow Mode pattern).",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "post_id": { "type": "integer", "description": "Post ID to simulate deleting" }
+            },
+            "required": ["post_id"]
+          },
+          "handler": {
+            "type": "static",
+            "static": { "content": "" },
+            "response_template": "DRY RUN: Simulated deletion of Post #{{ tool.arguments.post_id }}\nStatus: simulated_success\nAction: DELETE /posts/{{ tool.arguments.post_id }}\nResult: Post would have been deleted."
+          },
+          "timeout": "5s"
+        }
+      ],
+      "resources": [
+        {
+          "uri": "posts://recent",
+          "name": "Recent Posts",
+          "description": "The 10 most recent blog posts",
+          "mime_type": "application/json",
+          "handler": {
+            "type": "proxy",
+            "proxy": {
+              "url": "https://jsonplaceholder.typicode.com/posts?_limit=10",
+              "method": "GET",
+              "headers": { "Accept": "application/json" }
+            }
+          }
+        },
+        {
+          "uri": "users://directory",
+          "name": "User Directory",
+          "description": "All users in the system",
+          "mime_type": "application/json",
+          "handler": {
+            "type": "proxy",
+            "proxy": {
+              "url": "https://jsonplaceholder.typicode.com/users",
+              "method": "GET",
+              "headers": { "Accept": "application/json" }
+            }
+          }
+        }
+      ],
+      "default_timeout": "15s",
+      "error_handling": {
+        "include_stack_trace": false,
+        "retry_upstream_errors": true
+      }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "signature-cache.test": {
+    "id": "signature-cache",
+    "hostname": "signature-cache.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "policies": [
+      {
+        "type": "request_signing",
+        "disabled": false,
+        "algorithm": "hmac-sha256",
+        "secret": "test-signing-secret",
+        "header_name": "X-Signature",
+        "include_headers": ["Host", "Content-Type"],
+        "include_body": true,
+        "cache_signatures": true,
+        "signature_cache_ttl": 300
+      }
+    ]
+  }
+}
+

@@ -1,0 +1,37 @@
+{
+  "html-transform-example.test": {
+    "id": "html-transform-example",
+    "hostname": "html-transform-example.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://example.com",
+      "skip_tls_verify_host": true
+    },
+    "transforms": [
+      {
+        "type": "html",
+        "content_types": ["text/html"],
+        "add_to_tags": [
+          {
+            "tag": "body",
+            "add_before_end_tag": true,
+            "content": "<div id=\"proxy-banner\">Proxied by SoapBucket</div>"
+          }
+        ],
+        "modify_tags": [
+          {
+            "selector": "h1",
+            "action": "wrap",
+            "content": "<div class=\"proxy-wrapper\">"
+          }
+        ],
+        "remove_tags": [
+          {
+            "selector": "script[src*='tracking']"
+          }
+        ]
+      }
+    ]
+  }
+}
+

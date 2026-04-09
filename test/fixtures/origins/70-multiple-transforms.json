@@ -1,0 +1,35 @@
+{
+  "multiple-transforms.test": {
+    "id": "multiple-transforms",
+    "hostname": "multiple-transforms.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "transforms": [
+      {
+        "type": "replace_strings",
+        "content_types": ["text/html"],
+        "replace_strings": {
+          "replacements": [
+            {
+              "find": "old",
+              "replace": "new",
+              "regex": false
+            }
+          ]
+        }
+      },
+      {
+        "type": "json",
+        "content_types": ["application/json"],
+        "modify_json": {
+          "add_fields": {
+            "proxy": "soapbucket"
+          }
+        }
+      }
+    ]
+  }
+}
+

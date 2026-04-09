@@ -1,0 +1,17 @@
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /app
+COPY . .
+WORKDIR /app/tools/e2e-test-server
+RUN go mod download
+RUN go build -o /app/e2e-test-server .
+
+FROM alpine:latest
+WORKDIR /app
+COPY --from=builder /app/e2e-test-server .
+COPY tools/e2e-test-server/test-config.json .
+
+EXPOSE 8090 9443 8091 8092 8093 8094
+
+ENTRYPOINT ["./e2e-test-server"]
+CMD ["--http-port=8090", "--bind=0.0.0.0"]

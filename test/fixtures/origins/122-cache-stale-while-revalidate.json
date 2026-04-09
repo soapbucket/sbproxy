@@ -1,0 +1,17 @@
+{
+  "cache-stale-revalidate.test": {
+    "id": "cache-stale-revalidate",
+    "hostname": "cache-stale-revalidate.test",
+    "cache_settings": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": "5s",
+      "stale_while_revalidate": "30s",
+      "background_revalidation": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/cache/stale-test"
+    }
+  }
+}

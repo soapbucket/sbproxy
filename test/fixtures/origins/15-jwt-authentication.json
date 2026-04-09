@@ -1,0 +1,30 @@
+{
+  "jwt-auth.test": {
+    "id": "jwt-auth",
+    "hostname": "jwt-auth.test",
+    "authentication": {
+      "type": "jwt",
+      "secret": "test-secret-key-change-in-production",
+      "header_name": "Authorization",
+      "header_prefix": "Bearer ",
+      "issuer": "test-issuer",
+      "audience": "test-audience",
+      "algorithm": "HS256"
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-ID": "{{auth.sub}}",
+            "X-User-Email": "{{auth.email}}"
+          }
+        }
+      }
+    ]
+  }
+}
+

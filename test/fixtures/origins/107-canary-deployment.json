@@ -1,0 +1,33 @@
+{
+  "canary.test": {
+    "id": "canary",
+    "hostname": "canary.test",
+    "action": {
+      "type": "loadbalancer",
+      "targets": [
+        {
+          "url": "http://e2e-test-server:8090/test/stable",
+          "weight": 95
+        },
+        {
+          "url": "http://e2e-test-server:8090/test/canary",
+          "weight": 5
+        }
+      ],
+      "round_robin": true,
+      "disable_sticky": false,
+      "sticky_cookie_name": "_canary_session"
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Deployment-Type": "canary"
+          }
+        }
+      }
+    ],
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  }
+}

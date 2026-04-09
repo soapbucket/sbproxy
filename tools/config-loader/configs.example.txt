@@ -1,0 +1,24 @@
+# Origin Configuration File
+# Format: hostname json-config
+# Lines starting with # are comments
+# Note: The 'id' field will be auto-generated as a UUID and injected into the origin config
+
+# Proxy to Hacker News - Full configuration
+api.soapbucket.com {"hostname":"api.soapbucket.com","type":"proxy","config":{"url":"https://news.ycombinator.com","timeout":"30s","maxConnections":100,"rateLimit":1000,"burstLimit":2000,"flushInterval":"100ms","idleConnTimeout":"90s","tlsHandshakeTimeout":"10s","dialTimeout":"30s","keepAlive":"30s"}}
+
+# Forward hostname configuration for specific port
+api.soapbucket.com:8443 {"hostname":"api.soapbucket.com:8443","type":"proxy","forwardHostname":"api.soapbucket.com","config":{"url":"https://api.soapbucket.com","timeout":"60s"}}
+
+# Local development proxy to example.com
+localhost:8443 {"hostname":"localhost:8443","type":"proxy","config":{"url":"https://example.com","timeout":"30s","maxConnections":50,"flushInterval":"100ms"}}
+
+# Example with ForceSSL enabled - redirects HTTP to HTTPS
+secure.example.com {"hostname":"secure.example.com","type":"proxy","forceSSL":true,"config":{"url":"https://backend.example.com","timeout":"30s","maxConnections":100}}
+
+# Additional examples (commented out)
+# Backend proxy with custom settings
+# api.backend.com {"hostname":"api.backend.com","type":"proxy","config":{"url":"https://backend-server.internal","timeout":"45s","maxConnections":200,"rateLimit":500,"skipTLSVerifyHost":false}}
+
+# CDN proxy with caching optimizations
+# cdn.example.com {"hostname":"cdn.example.com","type":"proxy","config":{"url":"https://cdn.cloudfront.net","timeout":"20s","idleConnTimeout":"120s","maxConnections":500}}
+

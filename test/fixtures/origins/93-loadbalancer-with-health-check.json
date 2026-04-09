@@ -1,0 +1,25 @@
+{
+  "lb-health.test": {
+    "id": "lb-health",
+    "hostname": "lb-health.test",
+    "action": {
+      "type": "loadbalancer",
+      "targets": [
+        {"url": "http://e2e-test-server:8090", "weight": 60},
+        {"url": "http://e2e-test-server:8090", "weight": 40}
+      ],
+      "round_robin": true,
+      "disable_sticky": false,
+      "sticky_cookie_name": "_lb_session",
+      "health_check": {
+        "disabled": false,
+        "interval": "10s",
+        "timeout": "5s",
+        "path": "/health",
+        "unhealthy_threshold": 3,
+        "healthy_threshold": 2
+      }
+    }
+  }
+}
+

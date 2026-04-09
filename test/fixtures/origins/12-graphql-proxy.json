@@ -1,0 +1,16 @@
+{
+  "graphql.test": {
+    "id": "graphql",
+    "hostname": "graphql.test",
+    "action": {
+      "type": "graphql",
+      "url": "http://e2e-test-server:8092/graphql",
+      "max_depth": 10,
+      "max_complexity": 100,
+      "enable_introspection": true,
+      "enable_query_batching": true,
+      "enable_query_deduplication": true
+    }
+  }
+}
+

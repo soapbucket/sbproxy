@@ -1,0 +1,80 @@
+{
+  "nested-forward.test": {
+    "id": "nested-forward",
+    "hostname": "nested-forward.test",
+    "forward_rules": [
+      {
+        "hostname": "api-v1-router.test",
+        "rules": [
+          {
+            "path": {
+              "prefix": "/api/v1"
+            }
+          }
+        ]
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090",
+      "strip_base_path": true
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "api-v1-router.test": {
+    "id": "api-v1-router",
+    "hostname": "api-v1-router.test",
+    "forward_rules": [
+      {
+        "hostname": "users-service.test",
+        "rules": [
+          {
+            "path": {
+              "prefix": "/api/v1/users"
+            }
+          }
+        ]
+      },
+      {
+        "hostname": "products-service.test",
+        "rules": [
+          {
+            "path": {
+              "prefix": "/api/v1/products"
+            }
+          }
+        ]
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test/api-v1-default",
+      "strip_base_path": true
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "users-service.test": {
+    "id": "users-service",
+    "hostname": "users-service.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090",
+      "strip_base_path": true
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "products-service.test": {
+    "id": "products-service",
+    "hostname": "products-service.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test/products-api",
+      "strip_base_path": true
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  }
+}

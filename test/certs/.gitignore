@@ -1,0 +1,10 @@
+# Test certificates (can be regenerated)
+*.pem
+*.key
+*.csr
+*.srl
+
+# Keep the generation script
+!generate_test_certs.sh
+
+

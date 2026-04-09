@@ -1,0 +1,15 @@
+{
+  "mtls-proxy.test": {
+    "id": "mtls-proxy",
+    "hostname": "mtls-proxy.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://e2e-test-server:9444",
+      "skip_tls_verify_host": true,
+      "mtls_client_cert_file": "/app/certs/client-cert.pem",
+      "mtls_client_key_file": "/app/certs/client-key.pem",
+      "mtls_ca_cert_file": "/app/certs/ca-cert.pem"
+    }
+  }
+}
+

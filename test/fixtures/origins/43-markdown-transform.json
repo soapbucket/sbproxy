@@ -1,0 +1,19 @@
+{
+  "markdown-transform.test": {
+    "id": "markdown-transform",
+    "hostname": "markdown-transform.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "transforms": [
+      {
+        "type": "markdown",
+        "content_types": ["text/markdown", "text/x-markdown"],
+        "extensions": ["autolink", "strikethrough", "tables"],
+        "output_format": "html"
+      }
+    ]
+  }
+}
+

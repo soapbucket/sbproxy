@@ -1,0 +1,36 @@
+{
+  "error-pages-callback-failures.test": {
+    "id": "error-pages-callback-failures",
+    "hostname": "error-pages-callback-failures.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "error_pages": [
+      {
+        "status": [404],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/404?fail=true",
+          "method": "GET"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [500],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/500?fail=true",
+          "method": "GET"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [503],
+        "body": "<html><body><h1>503 - Service Unavailable</h1><p>Fallback error page when callback fails</p></body></html>",
+        "content_type": "text/html"
+      }
+    ]
+  }
+}
+

@@ -1,0 +1,111 @@
+{
+  "title": "SoapBucket Proxy - System Overview",
+  "tags": ["soapbucket", "system", "overview"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "panels": [
+      {
+        "id": 1,
+        "title": "Total Request Rate",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+        "targets": [{
+          "expr": "sum(rate(sb_requests_total[5m])) by (status_code)",
+          "legendFormat": "{{status_code}}"
+        }],
+        "yaxes": [{"format": "reqps"}]
+      },
+      {
+        "id": 2,
+        "title": "Error Rate",
+        "type": "stat",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+        "targets": [{
+          "expr": "sum(rate(sb_errors_total[5m])) / sum(rate(sb_requests_total[5m])) * 100"
+        }],
+        "thresholds": {
+          "steps": [
+            {"value": 0, "color": "green"},
+            {"value": 1, "color": "yellow"},
+            {"value": 5, "color": "red"}
+          ]
+        },
+        "unit": "percent"
+      },
+      {
+        "id": 3,
+        "title": "Request Latency (P50, P95, P99)",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, sum(rate(sb_request_latency_seconds_bucket[5m])) by (le))",
+            "legendFormat": "P50"
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(sb_request_latency_seconds_bucket[5m])) by (le))",
+            "legendFormat": "P95"
+          },
+          {
+            "expr": "histogram_quantile(0.99, sum(rate(sb_request_latency_seconds_bucket[5m])) by (le))",
+            "legendFormat": "P99"
+          }
+        ],
+        "yaxes": [{"format": "s"}]
+      },
+      {
+        "id": 4,
+        "title": "Total Bandwidth Usage",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+        "targets": [{
+          "expr": "sum(rate(sb_bandwidth_bytes_total[5m])) by (direction)",
+          "legendFormat": "{{direction}}"
+        }],
+        "yaxes": [{"format": "bytes"}]
+      },
+      {
+        "id": 5,
+        "title": "Active Connections",
+        "type": "stat",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+        "targets": [{
+          "expr": "sum(active_connections) by (connection_type)",
+          "legendFormat": "{{connection_type}}"
+        }]
+      },
+      {
+        "id": 6,
+        "title": "HTTP Version Distribution",
+        "type": "piechart",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+        "targets": [{
+          "expr": "sum by (http_version) (rate(sb_http_version_usage_total[5m]))"
+        }]
+      },
+      {
+        "id": 7,
+        "title": "Cache Hit Rate",
+        "type": "gauge",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+        "targets": [{
+          "expr": "avg(sb_cache_hit_rate) by (cache_layer)",
+          "legendFormat": "{{cache_layer}}"
+        }],
+        "thresholds": {
+          "steps": [
+            {"value": 0, "color": "red"},
+            {"value": 0.5, "color": "yellow"},
+            {"value": 0.7, "color": "green"}
+          ]
+        }
+      }
+    ],
+    "schemaVersion": 27,
+    "version": 1
+}
+

@@ -1,0 +1,57 @@
+{
+  "google-oauth.test": {
+    "id": "google-oauth",
+    "hostname": "google-oauth.test",
+    "authentication": {
+      "type": "oauth",
+      "disabled": false,
+      "provider": "google",
+      "client_id": "781990534849-t6v26s5v7blu48kgkocdluvjv0jvlrhk.apps.googleusercontent.com",
+      "client_secret": "local:kYZKjfsaegQg7UnWZyI8m+XD5KRF2xE8nKrNmME5q3oawxUVTCTpMU/TyhiDAVlwTFAHMZHEKUhHwK7S7A1n",
+      "redirect_url": "https://google-oauth.test:8443/oauth/callback",
+      "session_secret": "local:XtpHOiDGG8bircQZi6s7CdNSz6Y7CZ4nMBk0eHVLOBBIEg0haM5A5y2dbjEMZJxOoWmMrJJU2ehxfhDDaaThWUWs",
+      "session_cookie_name": "_sb.oauth",
+      "session_max_age": 3600,
+      "scopes": ["openid", "profile", "email"],
+      "callback_path": "/oauth/callback",
+      "login_path": "/oauth/login",
+      "logout_path": "/oauth/logout",
+      "force_authentication": true,
+      "default_roles": {
+        "required": ["user"],
+        "optional": ["admin"]
+      }
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-ID": "{{auth.sub}}",
+            "X-User-Email": "{{auth.email}}",
+            "X-User-Name": "{{auth.name}}"
+          }
+        },
+        "rules": [
+          {
+            "auth_conditions": [
+              {
+                "auth_type": "oauth",
+                "auth_condition_rules": [
+                  {
+                    "path": "sub",
+                    "exists": true
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
+

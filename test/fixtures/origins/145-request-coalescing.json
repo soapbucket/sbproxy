@@ -1,0 +1,19 @@
+{
+  "request-coalescing.test": {
+    "id": "request-coalescing",
+    "hostname": "request-coalescing.test",
+    "description": "Request coalescing test - deduplicates identical concurrent requests",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090",
+      "request_coalescing": {
+        "enabled": true,
+        "max_inflight": 1000,
+        "coalesce_window": "100ms",
+        "max_waiters": 100,
+        "key_strategy": "default"
+      }
+    }
+  }
+}
+

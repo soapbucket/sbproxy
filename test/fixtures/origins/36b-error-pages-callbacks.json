@@ -1,0 +1,93 @@
+{
+  "error-pages-callbacks.test": {
+    "id": "error-pages-callbacks",
+    "hostname": "error-pages-callbacks.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "error_pages": [
+      {
+        "status": [404],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/404",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [500],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/500",
+          "method": "GET",
+          "cache_duration": "10m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [502, 503, 504],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/5xx",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [429],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/429",
+          "method": "GET"
+        },
+        "content_type": "application/json"
+      }
+    ]
+  },
+  "error-pages-callback-template.test": {
+    "id": "error-pages-callback-template",
+    "hostname": "error-pages-callback-template.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "error_pages": [
+      {
+        "status": [404, 500],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/template",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "template": true,
+        "content_type": "text/html"
+      }
+    ]
+  },
+  "error-pages-callback-base64.test": {
+    "id": "error-pages-callback-base64",
+    "hostname": "error-pages-callback-base64.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "error_pages": [
+      {
+        "status": [500],
+        "callback": {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/error/base64",
+          "method": "GET"
+        },
+        "decode_base64": true,
+        "content_type": "text/html"
+      }
+    ]
+  }
+}
+

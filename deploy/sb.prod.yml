@@ -1,0 +1,26 @@
+# Soapbucket Proxy Production Configuration
+server:
+  http_port: 80
+  https_port: 443
+  enable_quic: true # Enabled for UDP 443 support
+
+database:
+  driver: postgres
+  # Injected via SB_DB_URL env var
+  url: ${SB_DB_URL}
+
+cache:
+  # Injected via SB_REDIS_URL env var
+  url: ${SB_REDIS_URL}
+
+tls:
+  provider: letsencrypt
+  email: admin@soapbucket.com
+  # Injected via SB_CERT_DIR (EFS Mount)
+  cert_dir: ${SB_CERT_DIR}
+  # Supports {origin}.{workspace}.proxy.soapbucket.com
+  wildcard_domain: ${SB_WILDCARD_DOMAIN}
+
+logging:
+  level: info
+  format: json

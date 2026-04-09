@@ -1,0 +1,21 @@
+{
+  "javascript-transform-comprehensive.test": {
+    "id": "javascript-transform-comprehensive",
+    "hostname": "javascript-transform-comprehensive.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.js"
+    },
+    "transforms": [
+      {
+        "type": "javascript",
+        "content_types": ["application/javascript", "text/javascript"],
+        "number_precision": 2,
+        "change_variable_names": false,
+        "supported_version": 5,
+        "minify": true
+      }
+    ]
+  }
+}
+

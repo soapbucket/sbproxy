@@ -1,0 +1,19 @@
+{{- if and .Values.serviceMonitor.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/ServiceMonitor") }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "soapbucket-proxy.fullname" . }}
+  labels:
+    {{- include "soapbucket-proxy.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "soapbucket-proxy.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: telemetry
+      interval: {{ .Values.serviceMonitor.interval }}
+      path: /metrics
+{{- end }}

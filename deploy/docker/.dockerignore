@@ -1,0 +1,53 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Documentation
+*.md
+README.md
+LICENSE
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Cache directories (prevent corruption on rebuild)
+tmp/
+badger.db/
+*.db/
+l1*/
+l2*/
+l3*/
+
+# Build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile*
+.dockerignore
+
+# Testing
+coverage.txt
+*.cover
+
+# Config (if you don't want local configs in the image)
+# config/local.*
+

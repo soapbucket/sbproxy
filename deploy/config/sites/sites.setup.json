@@ -1,0 +1,512 @@
+{
+  "localhost": {
+    "id": "localhost-basic",
+    "hostname": "localhost",
+    "workspace_id": "default",
+    "version": "1.0",
+    "action": {
+      "type": "proxy",
+      "url": "https://news.ycombinator.com",
+      "skip_tls_verify_host": true,
+      "enable_http3": true
+    }
+  },
+  "hn.local": {
+    "id": "hn-basic",
+    "hostname": "hn.local",
+    "workspace_id": "default",
+    "version": "1.0",
+    "action": {
+      "type": "proxy",
+      "url": "https://news.ycombinator.com",
+      "skip_tls_verify_host": true,
+      "enable_http3": true
+    }
+  },
+  "transform.localhost": {
+    "id": "hn-transform",
+    "hostname": "transform.localhost",
+    "workspace_id": "default",
+    "version": "1.0",
+    "action": {
+      "type": "proxy",
+      "url": "https://news.ycombinator.com",
+      "skip_tls_verify_host": true,
+      "enable_http3": true
+    },
+    "transforms": [
+      {
+        "type": "optimized_html",
+        "content_types": ["text/html"],
+        "add_to_tags": [
+          {
+            "tag": "body",
+            "add_before_end_tag": false,
+            "content": "<div style='position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;z-index:9999;'>Proxied by SoapBucket</div>"
+          },
+          {
+            "tag": "head",
+            "content": "<script>console.log('Injected Script')</script>"
+          }
+        ]
+      },
+      {
+        "type": "replace_strings",
+        "replacements": [
+          {
+            "find": "Hacker News",
+            "replace": "SoapBucket News"
+          }
+        ]
+      }
+    ]
+  },
+  "api.localhost": {
+    "id": "api-demo",
+    "hostname": "api.localhost",
+    "workspace_id": "default",
+    "version": "1.0",
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com",
+      "skip_tls_verify_host": true,
+      "enable_http3": true
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Proxy-Auth": "demo-token"
+          }
+        }
+      }
+    ],
+    "transforms": [
+      {
+        "type": "json",
+        "content_types": ["application/json"],
+        "pretty_print": true,
+        "rules": [
+          {
+            "path": "$.headers.x-forwarded-proto",
+            "value": "REDACTED"
+          }
+        ]
+      }
+    ]
+  },
+  "router.localhost": {
+    "id": "router-demo",
+    "hostname": "router.localhost",
+    "workspace_id": "default",
+    "version": "1.0",
+    "forward_rules": [
+      {
+        "hostname": "backend-news",
+        "rules": [
+          { "path": { "prefix": "/news" } }
+        ]
+      },
+      {
+        "hostname": "backend-api",
+        "rules": [
+          { "path": { "prefix": "/api" } }
+        ]
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 404,
+      "body": "Not Found - Try /news or /api"
+    }
+  },
+  "backend-news": {
+    "id": "backend-news",
+    "hostname": "backend-news",
+    "workspace_id": "default",
+    "version": "1.0",
+    "action": {
+      "type": "proxy",
+      "url": "https://news.ycombinator.com",
+      "skip_tls_verify_host": true,
+      "enable_http3": true
+    },
+    "request_modifiers": [
+      {
+        "url": {
+          "path": {
+            "replace": { "old": "/news", "new": "/" }
+          }
+        }
+      }
+    ]
+  },
+  "backend-api": {
+    "id": "backend-api",
+    "hostname": "backend-api",
+    "workspace_id": "default",
+    "version": "1.0",
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com",
+      "skip_tls_verify_host": true,
+      "enable_http3": true
+    },
+    "request_modifiers": [
+      {
+        "url": {
+          "path": {
+            "replace": { "old": "/api", "new": "" }
+          }
+        }
+      }
+    ]
+  },
+  "secure.localhost": {
+    "id": "secure-demo",
+    "hostname": "secure.localhost",
+    "workspace_id": "default",
+    "version": "1.0",
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com/get",
+      "skip_tls_verify_host": true,
+      "enable_http3": true
+    },
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "algorithm": "sliding_window",
+        "requests_per_minute": 5,
+        "burst_size": 2,
+        "headers": {
+          "enabled": true,
+          "include_retry_after": true,
+          "include_remaining": true
+        }
+      },
+      {
+        "type": "waf",
+        "action_on_match": "block",
+        "owasp_crs": {
+          "enabled": true,
+          "paranoia_level": 1
+        },
+        "custom_rules": [
+          {
+            "id": "block-sql",
+            "action": "block",
+            "operator": "rx",
+            "pattern": "(?i)(union\\s+select|drop\\s+table)",
+            "variables": [{ "name": "ARGS" }]
+          }
+        ]
+      }
+    ]
+  },
+  "auth.localhost": {
+    "id": "auth-demo",
+    "hostname": "auth.localhost",
+    "workspace_id": "default",
+    "version": "1.0",
+    "authentication": {
+      "type": "jwt",
+      "secret": "my-super-secret-key-123",
+      "header_name": "Authorization",
+      "header_prefix": "Bearer ",
+      "algorithm": "HS256"
+    },
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com/get",
+      "skip_tls_verify_host": true,
+      "enable_http3": true
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-Subject": "{{auth.sub}}",
+            "X-Auth-Status": "Verified"
+          }
+        }
+      }
+    ]
+  },
+  "cached.localhost": {
+    "id": "cached-demo",
+    "hostname": "cached.localhost",
+    "workspace_id": "default",
+    "version": "1.0",
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com/get",
+      "skip_tls_verify_host": true,
+      "enable_http3": true
+    },
+    "response_cache": {
+      "enabled": true,
+      "ttl": "5m",
+      "key_template": "{{request.method}}:{{request.host}}:{{request.path}}",
+      "vary_headers": ["Accept", "Accept-Encoding"],
+      "cache_methods": ["GET", "HEAD"],
+      "cache_status_codes": [200, 301, 302]
+    }
+  },
+  "maintenance.localhost": {
+    "id": "maintenance-demo",
+    "hostname": "maintenance.localhost",
+    "workspace_id": "default",
+    "version": "1.0",
+    "action": {
+      "type": "static",
+      "status_code": 503,
+      "content_type": "text/html",
+      "body": "<!DOCTYPE html><html><body><h1>Under Maintenance</h1><p>We'll be back soon!</p></body></html>",
+      "headers": {
+        "Retry-After": "3600"
+      }
+    }
+  },
+  "old-site.localhost": {
+    "id": "redirect-demo",
+    "hostname": "old-site.localhost",
+    "workspace_id": "default",
+    "version": "1.0",
+    "action": {
+      "type": "redirect",
+      "url": "https://new-site.com",
+      "status_code": 301,
+      "strip_base_path": true,
+      "preserve_query": true
+    }
+  },
+  "internal-api.localhost": {
+    "id": "apikey-demo",
+    "hostname": "internal-api.localhost",
+    "workspace_id": "default",
+    "version": "1.0",
+    "authentication": {
+      "type": "api_key",
+      "api_keys": ["key-abc123", "key-xyz789"],
+      "header_name": "X-API-Key"
+    },
+    "action": {
+      "type": "proxy",
+      "url": "https://postman-echo.com/get",
+      "skip_tls_verify_host": true,
+      "enable_http3": true
+    }
+  },
+  "api.soapbucket.com": {
+    "id": "api-soapbucket-oauth",
+    "hostname": "api.soapbucket.com",
+    "workspace_id": "default",
+    "version": "1.0",
+    "authentication": {
+      "type": "oauth",
+      "provider": "google",
+      "client_id": "781990534849-t6v26s5v7blu48kgkocdluvjv0jvlrhk.apps.googleusercontent.com",
+      "client_secret": "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",
+      "redirect_url": "https://api.soapbucket.com/oauth/callback",
+      "session_secret": "Y2FzdGxlYXBwcm9wcmlhdGVnYXRlY29tcG9zaXRpb24=",
+      "session_cookie_name": "_sb.oauth",
+      "session_max_age": 3600,
+      "scopes": ["openid", "profile", "email"],
+      "callback_path": "/oauth/callback",
+      "login_path": "/oauth/login",
+      "logout_path": "/oauth/logout",
+      "force_authentication": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "https://news.ycombinator.com",
+      "skip_tls_verify_host": true,
+      "enable_http3": true
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-ID": "{{auth.sub}}",
+            "X-User-Email": "{{auth.email}}",
+            "X-User-Name": "{{auth.name}}"
+          }
+        }
+      }
+    ]
+  },
+  "api-v1.localhost": {
+    "id": "api-v1-backend",
+    "hostname": "api-v1.localhost",
+    "workspace_id": "default",
+    "version": "1.0",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "application/json",
+      "json_body": {
+        "user_id": 123,
+        "first_name": "John",
+        "last_name": "Doe",
+        "email_address": "john.doe@example.com",
+        "country_code": "UNITED_STATES",
+        "is_active": true,
+        "created_at": "2024-01-15T10:30:00Z",
+        "contact_info": {
+          "phone_number": "+1-555-0123",
+          "postal_code": "90210"
+        }
+      }
+    }
+  },
+  "api-v2.localhost": {
+    "id": "api-v2-migration",
+    "hostname": "api-v2.localhost",
+    "workspace_id": "default",
+    "version": "1.0",
+    "forward_rules": [
+      {
+        "hostname": "api-v1.localhost",
+        "rules": [{ "path": { "prefix": "/" } }]
+      }
+    ],
+    "action": {
+      "type": "static",
+      "status_code": 404,
+      "body": "Not Found"
+    },
+    "transforms": [
+      {
+        "type": "lua_json",
+        "content_types": ["application/json"],
+        "lua_script": "function modify_json(data, ctx)\n  -- Convert snake_case to camelCase\n  local function to_camel_case(str)\n    return str:gsub('_(%l)', function(c) return c:upper() end)\n  end\n  \n  -- Map country codes\n  local country_map = {\n    UNITED_STATES = 'US',\n    UNITED_KINGDOM = 'GB',\n    GERMANY = 'DE',\n    FRANCE = 'FR'\n  }\n  \n  local function transform_keys(obj)\n    if type(obj) ~= 'table' then return obj end\n    local result = {}\n    for k, v in pairs(obj) do\n      local new_key = to_camel_case(k)\n      local new_val = transform_keys(v)\n      -- Apply country code mapping\n      if new_key == 'countryCode' and country_map[new_val] then\n        new_val = country_map[new_val]\n      end\n      result[new_key] = new_val\n    end\n    return result\n  end\n  \n  return transform_keys(data)\nend",
+        "timeout": "100ms"
+      }
+    ]
+  },
+  "weather-mcp.localhost": {
+    "id": "weather-mcp-server",
+    "hostname": "weather-mcp.localhost",
+    "workspace_id": "default",
+    "version": "1.0",
+    "action": {
+      "type": "mcp",
+      "server_info": {
+        "name": "weather-mcp-server",
+        "version": "1.0.0"
+      },
+      "capabilities": {
+        "tools": { "listChanged": false },
+        "resources": { "subscribe": false, "listChanged": false }
+      },
+      "tools": [
+        {
+          "name": "get_alerts",
+          "description": "Get weather alerts for a US state. Returns current weather alerts and warnings.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "description": "Two-letter US state code (e.g., CA, NY, TX)"
+              }
+            },
+            "required": ["state"]
+          },
+          "handler": {
+            "type": "proxy",
+            "proxy": {
+              "url": "https://api.weather.gov/alerts/active?area={{ tool.arguments.state }}",
+              "method": "GET",
+              "headers": {
+                "User-Agent": "SoapBucket-MCP-Weather/1.0",
+                "Accept": "application/geo+json"
+              }
+            },
+            "lua_script": "function modify_json(data, ctx)\n  data.alert_count = data.features and #data.features or 0\n  data.has_alerts = data.alert_count > 0\n  return data\nend",
+            "response_template": "{{#has_alerts}}Found {{alert_count}} active alert(s) for {{tool.arguments.state}}:\n\n{{#features}}## {{properties.event}}\n**Severity:** {{properties.severity}}\n**Areas:** {{properties.areaDesc}}\n**Expires:** {{properties.expires}}\n\n{{properties.description}}\n\n---\n{{/features}}{{/has_alerts}}{{^has_alerts}}No active weather alerts for {{tool.arguments.state}}.{{/has_alerts}}"
+          },
+          "timeout": "10s"
+        },
+        {
+          "name": "get_forecast",
+          "description": "Get weather forecast for a specific location using latitude and longitude coordinates.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "latitude": {
+                "type": "number",
+                "description": "Latitude of the location (e.g., 37.7749 for San Francisco)"
+              },
+              "longitude": {
+                "type": "number",
+                "description": "Longitude of the location (e.g., -122.4194 for San Francisco)"
+              }
+            },
+            "required": ["latitude", "longitude"]
+          },
+          "handler": {
+            "type": "orchestration",
+            "orchestration": {
+              "steps": [
+                {
+                  "name": "get_grid",
+                  "callback": {
+                    "url": "https://api.weather.gov/points/{{ tool.arguments.latitude }},{{ tool.arguments.longitude }}",
+                    "method": "GET",
+                    "headers": {
+                      "User-Agent": "SoapBucket-MCP-Weather/1.0",
+                      "Accept": "application/geo+json"
+                    }
+                  }
+                },
+                {
+                  "name": "get_forecast",
+                  "depends_on": ["get_grid"],
+                  "callback": {
+                    "url": "{{ steps.get_grid.response.properties.forecast }}",
+                    "method": "GET",
+                    "headers": {
+                      "User-Agent": "SoapBucket-MCP-Weather/1.0",
+                      "Accept": "application/geo+json"
+                    }
+                  }
+                }
+              ]
+            },
+            "lua_script": "function modify_json(data, ctx)\n  local periods = data.steps and data.steps.get_forecast and data.steps.get_forecast.response and data.steps.get_forecast.response.properties and data.steps.get_forecast.response.properties.periods\n  local sliced = {}\n  if periods then\n    for i = 1, math.min(7, #periods) do sliced[i] = periods[i] end\n  end\n  data.forecast_periods = sliced\n  return data\nend",
+            "response_template": "# Weather Forecast\n**Location:** {{tool.arguments.latitude}}, {{tool.arguments.longitude}}\n\n{{#forecast_periods}}## {{name}}\n**Temperature:** {{temperature}} {{temperatureUnit}}\n**Wind:** {{windSpeed}} {{windDirection}}\n\n{{detailedForecast}}\n\n{{/forecast_periods}}"
+          },
+          "timeout": "30s"
+        }
+      ],
+      "resources": [
+        {
+          "uri": "weather://alerts/active",
+          "name": "Active Weather Alerts",
+          "description": "All currently active weather alerts across the United States",
+          "mime_type": "application/json",
+          "handler": {
+            "type": "proxy",
+            "proxy": {
+              "url": "https://api.weather.gov/alerts/active",
+              "headers": {
+                "User-Agent": "SoapBucket-MCP-Weather/1.0"
+              }
+            }
+          }
+        }
+      ],
+      "default_timeout": "30s",
+      "error_handling": {
+        "retry_upstream_errors": true,
+        "circuit_breaker": {
+          "enabled": true,
+          "failure_threshold": 5,
+          "reset_timeout": "30s"
+        }
+      }
+    }
+  }
+}

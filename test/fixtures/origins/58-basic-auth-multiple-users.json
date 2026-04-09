@@ -1,0 +1,33 @@
+{
+  "basic-auth-multiple.test": {
+    "id": "basic-auth-multiple",
+    "hostname": "basic-auth-multiple.test",
+    "authentication": {
+      "type": "basic_auth",
+      "disabled": false,
+      "realm": "Multiple Users Realm",
+      "users": [
+        {
+          "username": "user1",
+          "password": "pass1",
+          "roles": ["user"]
+        },
+        {
+          "username": "user2",
+          "password": "pass2",
+          "roles": ["user"]
+        },
+        {
+          "username": "admin1",
+          "password": "admin1",
+          "roles": ["admin", "user"]
+        }
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    }
+  }
+}
+

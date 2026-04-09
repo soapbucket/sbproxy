@@ -1,0 +1,28 @@
+{
+  "basic-auth.test": {
+    "id": "basic-auth",
+    "hostname": "basic-auth.test",
+    "authentication": {
+      "type": "basic_auth",
+      "disabled": false,
+      "realm": "Test Realm",
+      "users": [
+        {
+          "username": "testuser",
+          "password": "testpass",
+          "roles": ["user"]
+        },
+        {
+          "username": "admin",
+          "password": "adminpass",
+          "roles": ["admin", "user"]
+        }
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    }
+  }
+}
+

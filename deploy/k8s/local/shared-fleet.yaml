@@ -1,0 +1,89 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: proxy-shared-config
+  namespace: soapbucket
+data:
+  SB_WORKSPACE_MODE: "shared"
+  REDIS_URL: "redis://host.k3d.internal:6379"
+  STORAGE_DSN: "postgres://soapbucket:localdev@host.k3d.internal:5432/soapbucket?sslmode=disable"
+  CLICKHOUSE_DSN: "clickhouse://soapbucket:localdev@host.k3d.internal:9000/soapbucket"
+  VAULT_ADDR: "http://host.k3d.internal:8200"
+  VAULT_TOKEN: "dev-root-token"
+  LOG_LEVEL: "debug"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proxy-shared-fleet
+  namespace: soapbucket
+  labels:
+    app: proxy
+    tier: shared
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: proxy
+      tier: shared
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: proxy
+        tier: shared
+    spec:
+      containers:
+      - name: proxy
+        image: k3d-soapbucket-registry.localhost:5111/soapbucket/proxy:dev
+        ports:
+        - name: http
+          containerPort: 8080
+        - name: telemetry
+          containerPort: 8888
+        envFrom:
+        - configMapRef:
+            name: proxy-shared-config
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "1000m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: proxy-shared-fleet
+  namespace: soapbucket
+  labels:
+    app: proxy
+    tier: shared
+spec:
+  selector:
+    app: proxy
+    tier: shared
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+  - name: telemetry
+    port: 8888
+    targetPort: 8888

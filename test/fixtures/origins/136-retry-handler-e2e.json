@@ -1,0 +1,63 @@
+{
+  "retry-handler-e2e.test": {
+    "id": "retry-handler-e2e",
+    "hostname": "retry-handler-e2e.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "retry_config": {
+      "disabled": false,
+      "max_retries": 3,
+      "retry_on_status_codes": [502, 503, 504, 429],
+      "retry_on_timeout": true,
+      "retry_on_connection_error": true
+    }
+  },
+  "retry-handler-success-after-2.test": {
+    "id": "retry-handler-success-after-2",
+    "hostname": "retry-handler-success-after-2.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/retry/test-success?success_after=2&retryable_code=503&final_code=200"
+    },
+    "retry_config": {
+      "disabled": false,
+      "max_retries": 3,
+      "retry_on_status_codes": [502, 503, 504, 429],
+      "retry_on_timeout": true,
+      "retry_on_connection_error": true
+    }
+  },
+  "retry-handler-exhaust.test": {
+    "id": "retry-handler-exhaust",
+    "hostname": "retry-handler-exhaust.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/retry/test-exhaust?success_after=0&retryable_code=502&final_code=502"
+    },
+    "retry_config": {
+      "disabled": false,
+      "max_retries": 2,
+      "retry_on_status_codes": [502, 503, 504, 429],
+      "retry_on_timeout": true,
+      "retry_on_connection_error": true
+    }
+  },
+  "retry-handler-429.test": {
+    "id": "retry-handler-429",
+    "hostname": "retry-handler-429.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/retry/test-429?success_after=3&retryable_code=429&final_code=200"
+    },
+    "retry_config": {
+      "disabled": false,
+      "max_retries": 5,
+      "retry_on_status_codes": [429],
+      "retry_on_timeout": false,
+      "retry_on_connection_error": false
+    }
+  }
+}
+

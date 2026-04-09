@@ -1,0 +1,37 @@
+{
+  "html-transform-techmeme.test": {
+    "id": "html-transform-techmeme",
+    "hostname": "html-transform-techmeme.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://www.techmeme.com",
+      "skip_tls_verify_host": true
+    },
+    "transforms": [
+      {
+        "type": "optimized_html",
+        "content_types": ["text/html"],
+        "optimized_format_options": {
+          "strip_comments": true,
+          "remove_trailing_slashes": true,
+          "optimize_attributes": true
+        },
+        "add_to_tags": [
+          {
+            "tag": "head",
+            "add_before_end_tag": false,
+            "content": "<script>console.log('Techmeme proxied');</script>"
+          }
+        ],
+        "modify_tags": [
+          {
+            "selector": "title",
+            "action": "append",
+            "content": " | Proxied"
+          }
+        ]
+      }
+    ]
+  }
+}
+

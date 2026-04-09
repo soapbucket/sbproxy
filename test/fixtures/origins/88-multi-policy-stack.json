@@ -1,0 +1,72 @@
+{
+  "multi-policy.test": {
+    "id": "multi-policy",
+    "hostname": "multi-policy.test",
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "disabled": false,
+        "limit": 100,
+        "window": "1m",
+        "key_by": "ip"
+      },
+      {
+        "type": "ip_filtering",
+        "whitelist": ["127.0.0.1", "::1", "172.24.0.0/16"],
+        "action": "block"
+      },
+      {
+        "type": "waf",
+        "custom_rules": [
+          {
+            "id": "block-xss",
+            "name": "Block XSS",
+            "disabled": false,
+            "phase": 2,
+            "severity": "high",
+            "action": "block",
+            "variables": [
+              {
+                "name": "ARGS",
+                "collection": "ARGS"
+              }
+            ],
+            "operator": "rx",
+            "pattern": "(?i)(<script|javascript:|onerror=)",
+            "transformations": ["htmlEntityDecode", "urlDecode"]
+          }
+        ],
+        "default_action": "log",
+        "action_on_match": "block"
+      },
+      {
+        "type": "security_headers",
+        "disabled": false,
+        "x_frame_options": {
+          "disabled": false,
+          "mode": "DENY"
+        },
+        "x_content_type_options": {
+          "disabled": false
+        }
+      }
+    ],
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST",
+            "Access-Control-Allow-Headers": "Content-Type",
+            "Access-Control-Max-Age": "3600"
+          }
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/api/headers"
+    }
+  }
+}
+

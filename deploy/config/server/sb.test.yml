@@ -1,0 +1,143 @@
+# SoapBucket Proxy Configuration for E2E Testing
+# This configuration is optimized for local testing and development
+
+telemetry:
+  enabled: true  # Enable telemetry service
+  bind_port: 8888
+  bind_address: "0.0.0.0"  # Bind to all interfaces for Docker access
+  enable_profiler: true
+  certificate_file: ""
+  certificate_key_file: ""
+  min_tls_version: 13
+
+# OpenTelemetry configuration
+otel:
+  enabled: true
+  service_name: "soapbucket-proxy-test"
+  service_version: "test"
+  otlp_endpoint: "localhost:4317"
+  otlp_insecure: true
+  sample_rate: 1.0
+  environment: "test"
+
+proxy:
+  http_bind_port: 8080
+  https_bind_port: 8443
+  http3_bind_port: 8443
+  enable_http3: true
+  bind_address: ""
+  
+  read_timeout: "30s"
+  write_timeout: "30s"
+  idle_timeout: "60s"
+
+  compression_level: 5
+
+  certificate_settings:
+    certificate_dir: "./certs"
+    certificate_key_dir: "./certs"
+    min_tls_version: 13
+    tls_cipher_suites: []
+    use_acme: false
+    acme_email: ""
+    acme_domains: []
+    acme_cache_dir: "./certs"
+
+  origin_loader_settings:
+    max_origin_forward_depth: 10
+    origin_cache_ttl: "5m"
+    hostname_fallback: true
+
+  session_cacher_settings:
+    session_cookie_name: "_sb.s"
+    session_max_age: 3600
+    l2_cache_timeout: "5m"
+
+  sticky_cookie_settings:
+    sticky_cookie_name: "_sb.l"
+
+  debug_settings:
+    debug: true
+    display_headers: false
+
+# Caching
+l1_cache_settings:
+  driver: "memory"
+  params:
+    max_size: 1000000000
+    compression: true
+    cleanup_interval: "5m"
+    max_objects: 1000000
+    max_memory: 1000000000
+  enable_metrics: true
+  enable_tracing: true
+
+l2_cache_settings:
+  driver: "redis"
+  params:
+    dsn: "redis://redis:6379"
+  enable_metrics: true
+  enable_tracing: true
+
+l3_cache_settings:
+  driver: "pebble"
+  params:
+    path: "/app/data/pebble.db"
+  enable_metrics: true
+  enable_tracing: true
+
+# Session caching
+session_cacher_settings:
+  driver: "redis"
+  params:
+    dsn: "redis://redis:6379"
+  enable_metrics: true
+  enable_tracing: true
+
+# Security caching
+security_settings:
+  driver: "redis"
+  params:
+    dsn: "redis://redis:6379"
+  enable_metrics: true
+  enable_tracing: true
+
+# Origin configuration storage  
+# Using PostgreSQL for test environment (origins loaded via load_database.sh)
+storage_settings:
+  driver: "postgres"
+  params:
+    dsn: "postgres://proxy:proxy@postgres:5432/proxy?sslmode=disable"
+  enable_metrics: true
+  enable_tracing: true
+
+# Crypto configuration
+crypto_settings:
+  driver: "local"
+  params:
+    encryption_key: "7HUTUzLZyNueMtFG3TluG0UUUHUwIeYr8Gbx5+vxtE0="
+    signing_key: "dGVzdC1zaWduaW5nLWtleS0zMi1ieXRlcy1sb25n"
+  enable_metrics: true
+  enable_tracing: true
+
+maxmind_settings:
+  driver: "maxmind"
+  params:
+    path: "./data/ipinfo_lite.mmdb"
+  enable_metrics: true
+  enable_tracing: true
+
+uaparser_settings:
+  driver: "uaparser"
+  params:
+    path: "./data/regexes.yml"
+  enable_metrics: true
+  enable_tracing: true
+
+messenger_settings:
+  driver: "redis"
+  params:
+    dsn: "redis://localhost:6380"
+  enable_metrics: true
+  enable_tracing: true
+

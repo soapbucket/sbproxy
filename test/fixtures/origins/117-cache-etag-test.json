@@ -1,0 +1,17 @@
+{
+  "cache-etag.test": {
+    "id": "cache-etag",
+    "hostname": "cache-etag.test",
+    "cache_settings": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": "5s",
+      "use_conditional_requests": true,
+      "respect_etag": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/cache-test/etag-test"
+    }
+  }
+}

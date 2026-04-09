@@ -1,0 +1,30 @@
+{
+  "ddos.test": {
+    "id": "ddos",
+    "hostname": "ddos.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "policies": [
+      {
+        "type": "ddos_protection",
+        "disabled": false,
+        "detection": {
+          "request_rate_threshold": 100,
+          "connection_rate_threshold": 50,
+          "bandwidth_threshold": "10MB",
+          "detection_window": "10s"
+        },
+        "mitigation": {
+          "block_duration": "1h",
+          "challenge_response": true,
+          "challenge_type": "header",
+          "auto_block": true,
+          "block_after_attacks": 3
+        }
+      }
+    ]
+  }
+}
+

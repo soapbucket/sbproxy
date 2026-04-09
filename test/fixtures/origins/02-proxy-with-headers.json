@@ -1,0 +1,31 @@
+{
+  "proxy-headers.test": {
+    "id": "proxy-headers",
+    "hostname": "proxy-headers.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Proxy-Request-ID": "{{uuid}}",
+            "X-Forwarded-For": "{{request.ip}}"
+          }
+        }
+      }
+    ],
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Proxy-Response-Time": "{{response_time_ms}}ms"
+          }
+        }
+      }
+    ],
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  }
+}

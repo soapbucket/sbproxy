@@ -1,0 +1,22 @@
+{
+  "rate-limit-strict.test": {
+    "id": "rate-limit-strict",
+    "hostname": "rate-limit-strict.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "disabled": false,
+        "rate_limit": {
+          "requests_per_minute": 10,
+          "burst": 5
+        },
+        "action_on_limit": "block"
+      }
+    ]
+  }
+}
+

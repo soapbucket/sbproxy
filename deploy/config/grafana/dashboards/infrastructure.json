@@ -1,0 +1,161 @@
+{
+  "title": "SoapBucket Proxy - Infrastructure",
+  "tags": ["soapbucket", "infrastructure"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "panels": [
+      {
+        "id": 1,
+        "title": "Storage Operations",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+        "targets": [{
+          "expr": "sum by (storage_type, operation) (rate(sb_storage_operations_total[5m]))",
+          "legendFormat": "{{storage_type}} - {{operation}}"
+        }]
+      },
+      {
+        "id": 2,
+        "title": "Storage Quota Usage",
+        "type": "gauge",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+        "targets": [{
+          "expr": "sb_storage_quota_usage_bytes{storage_type!=\"\"} / 1073741824",
+          "legendFormat": "{{storage_type}}"
+        }],
+        "thresholds": {
+          "steps": [
+            {"value": 0, "color": "green"},
+            {"value": 80, "color": "yellow"},
+            {"value": 100, "color": "red"}
+          ]
+        },
+        "unit": "GB"
+      },
+      {
+        "id": 3,
+        "title": "Cache Operations",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+        "targets": [{
+          "expr": "sum by (cacher_type) (rate(sb_cacher_hits_total[5m]))",
+          "legendFormat": "{{cacher_type}} - Hits"
+        }, {
+          "expr": "sum by (cacher_type) (rate(sb_cacher_misses_total[5m]))",
+          "legendFormat": "{{cacher_type}} - Misses"
+        }]
+      },
+      {
+        "id": 4,
+        "title": "Cache Size",
+        "type": "stat",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+        "targets": [{
+          "expr": "sb_cacher_size{cacher_type!=\"\"}",
+          "legendFormat": "{{cacher_type}}"
+        }]
+      },
+      {
+        "id": 5,
+        "title": "Messenger Queue Depth",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+        "targets": [{
+          "expr": "sb_messenger_queue_depth{messenger_type!=\"\", channel!=\"\"}",
+          "legendFormat": "{{messenger_type}} - {{channel}}"
+        }]
+      },
+      {
+        "id": 6,
+        "title": "Message Processing Latency (P95)",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+        "targets": [{
+          "expr": "histogram_quantile(0.95, sum(rate(sb_message_processing_latency_seconds_bucket[5m])) by (le, messenger_type, channel))",
+          "legendFormat": "{{messenger_type}} - {{channel}}"
+        }],
+        "yaxes": [{"format": "s"}]
+      },
+      {
+        "id": 7,
+        "title": "Crypto Operations",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+        "targets": [{
+          "expr": "sum by (crypto_type, operation) (rate(sb_crypto_operations_total[5m]))",
+          "legendFormat": "{{crypto_type}} - {{operation}}"
+        }]
+      },
+      {
+        "id": 8,
+        "title": "MaxMind IP Lookups",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+        "targets": [{
+          "expr": "sum by (ip_version, country_code) (rate(sb_maxmind_lookups_total[5m]))",
+          "legendFormat": "{{ip_version}} - {{country_code}}"
+        }]
+      },
+      {
+        "id": 9,
+        "title": "UAParser Parses",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+        "targets": [{
+          "expr": "sum by (browser_family, os_family) (rate(sb_uaparser_parses_total[5m]))",
+          "legendFormat": "{{browser_family}} - {{os_family}}"
+        }]
+      },
+      {
+        "id": 10,
+        "title": "DNS Cache Hit Rate",
+        "type": "stat",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+        "targets": [{
+          "expr": "sum(rate(sb_dns_cache_hits_total[5m])) / (sum(rate(sb_dns_cache_hits_total[5m])) + sum(rate(sb_dns_cache_misses_total[5m])))"
+        }],
+        "thresholds": {
+          "steps": [
+            {"value": 0, "color": "red"},
+            {"value": 0.5, "color": "yellow"},
+            {"value": 0.7, "color": "green"}
+          ]
+        },
+        "unit": "percentunit"
+      },
+      {
+        "id": 11,
+        "title": "Configuration Cache Hit Rate",
+        "type": "stat",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 40},
+        "targets": [{
+          "expr": "sum(rate(sb_config_cache_hits_total[5m])) / (sum(rate(sb_config_cache_hits_total[5m])) + sum(rate(sb_config_cache_misses_total[5m])))"
+        }],
+        "thresholds": {
+          "steps": [
+            {"value": 0, "color": "red"},
+            {"value": 0.5, "color": "yellow"},
+            {"value": 0.7, "color": "green"}
+          ]
+        },
+        "unit": "percentunit"
+      },
+      {
+        "id": 12,
+        "title": "Configuration Loads",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 40},
+        "targets": [{
+          "expr": "sum by (type, result) (rate(sb_config_loads_total[5m]))",
+          "legendFormat": "{{type}} - {{result}}"
+        }]
+      }
+    ],
+    "schemaVersion": 27,
+    "version": 1
+}
+

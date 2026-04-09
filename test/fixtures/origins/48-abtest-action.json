@@ -1,0 +1,29 @@
+{
+  "abtest.test": {
+    "id": "abtest",
+    "hostname": "abtest.test",
+    "action": {
+      "type": "abtest",
+      "variants": [
+        {
+          "name": "variant-a",
+          "weight": 50,
+          "action": {
+            "type": "proxy",
+            "url": "http://e2e-test-server:8090"
+          }
+        },
+        {
+          "name": "variant-b",
+          "weight": 50,
+          "action": {
+            "type": "proxy",
+            "url": "http://e2e-test-server:8090"
+          }
+        }
+      ],
+      "cookie_name": "_ab_test"
+    }
+  }
+}
+

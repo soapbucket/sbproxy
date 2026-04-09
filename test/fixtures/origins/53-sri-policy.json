@@ -1,0 +1,19 @@
+{
+  "sri.test": {
+    "id": "sri",
+    "hostname": "sri.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "policies": [
+      {
+        "type": "sri",
+        "disabled": false,
+        "require_sri": true,
+        "algorithms": ["sha256", "sha384", "sha512"]
+      }
+    ]
+  }
+}
+

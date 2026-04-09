@@ -1,0 +1,16 @@
+{
+  "compression.test": {
+    "id": "compression",
+    "hostname": "compression.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "compression": {
+      "disabled": false,
+      "types": ["text/html", "text/css", "application/javascript", "application/json"],
+      "level": 6
+    }
+  }
+}
+

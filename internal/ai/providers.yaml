@@ -1,0 +1,420 @@
+version: 1
+providers:
+  openai:
+    display_name: OpenAI
+    base_url: https://api.openai.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://platform.openai.com/docs
+    models:
+      gpt-4o:
+        display_name: GPT-4o
+        tokenizer: o200k_base
+        context_window: 128000
+        supports_vision: true
+      gpt-4o-mini:
+        display_name: GPT-4o Mini
+        tokenizer: o200k_base
+        context_window: 128000
+        supports_vision: true
+      gpt-4-turbo:
+        display_name: GPT-4 Turbo
+        tokenizer: cl100k_base
+        context_window: 128000
+        supports_vision: true
+      gpt-4:
+        display_name: GPT-4
+        tokenizer: cl100k_base
+        context_window: 8192
+      gpt-3.5-turbo:
+        display_name: GPT-3.5 Turbo
+        tokenizer: cl100k_base
+        context_window: 16385
+      o1:
+        display_name: o1
+        tokenizer: o200k_base
+        context_window: 200000
+        is_reasoning: true
+      o1-mini:
+        display_name: o1 Mini
+        tokenizer: o200k_base
+        context_window: 128000
+        is_reasoning: true
+      o3-mini:
+        display_name: o3 Mini
+        tokenizer: o200k_base
+        context_window: 200000
+        is_reasoning: true
+      text-embedding-3-small:
+        display_name: Embedding 3 Small
+        tokenizer: cl100k_base
+        context_window: 8191
+      text-embedding-3-large:
+        display_name: Embedding 3 Large
+        tokenizer: cl100k_base
+        context_window: 8191
+      text-embedding-ada-002:
+        display_name: Embedding Ada 002
+        tokenizer: cl100k_base
+        context_window: 8191
+
+  anthropic:
+    display_name: Anthropic
+    base_url: https://api.anthropic.com/v1
+    auth_header: x-api-key
+    auth_prefix: ""
+    format: anthropic
+    requires:
+      - api_key
+    docs_url: https://docs.anthropic.com
+    models:
+      claude-opus-4-20250514:
+        display_name: Claude Opus 4
+        tokenizer: cl100k_base
+        context_window: 200000
+        supports_vision: true
+      claude-sonnet-4-20250514:
+        display_name: Claude Sonnet 4
+        tokenizer: cl100k_base
+        context_window: 200000
+        supports_vision: true
+      claude-sonnet-4-5-20250929:
+        display_name: Claude Sonnet 4.5
+        tokenizer: cl100k_base
+        context_window: 200000
+        supports_vision: true
+      claude-haiku-4-5-20251001:
+        display_name: Claude Haiku 4.5
+        tokenizer: cl100k_base
+        context_window: 200000
+        supports_vision: true
+      claude-3-5-sonnet-20241022:
+        display_name: Claude 3.5 Sonnet
+        tokenizer: cl100k_base
+        context_window: 200000
+        supports_vision: true
+      claude-3-5-haiku-20241022:
+        display_name: Claude 3.5 Haiku
+        tokenizer: cl100k_base
+        context_window: 200000
+
+  azure:
+    display_name: Azure OpenAI
+    base_url: ""
+    auth_header: api-key
+    auth_prefix: ""
+    format: azure
+    requires:
+      - api_key
+      - base_url
+    docs_url: https://learn.microsoft.com/en-us/azure/ai-services/openai/
+    models: {}
+
+  bedrock:
+    display_name: AWS Bedrock
+    base_url: ""
+    auth_header: ""
+    auth_prefix: ""
+    format: bedrock
+    requires:
+      - region
+    docs_url: https://docs.aws.amazon.com/bedrock/
+    models:
+      anthropic.claude-3-5-sonnet-20241022-v2:0:
+        display_name: Claude 3.5 Sonnet (Bedrock)
+        tokenizer: cl100k_base
+        context_window: 200000
+        supports_vision: true
+      anthropic.claude-3-haiku-20240307-v1:0:
+        display_name: Claude 3 Haiku (Bedrock)
+        tokenizer: cl100k_base
+        context_window: 200000
+      amazon.titan-text-express-v1:
+        display_name: Titan Text Express
+        context_window: 8000
+
+  google:
+    display_name: Google AI (Gemini)
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    auth_header: x-goog-api-key
+    auth_prefix: ""
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://ai.google.dev/docs
+    models:
+      gemini-2.0-flash:
+        display_name: Gemini 2.0 Flash
+        context_window: 1048576
+        supports_vision: true
+      gemini-1.5-pro:
+        display_name: Gemini 1.5 Pro
+        context_window: 2097152
+        supports_vision: true
+      gemini-1.5-flash:
+        display_name: Gemini 1.5 Flash
+        context_window: 1048576
+        supports_vision: true
+
+  groq:
+    display_name: Groq
+    base_url: https://api.groq.com/openai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://console.groq.com/docs
+    models:
+      llama-3.3-70b-versatile:
+        display_name: Llama 3.3 70B
+        context_window: 128000
+      llama-3.1-8b-instant:
+        display_name: Llama 3.1 8B
+        context_window: 128000
+      mixtral-8x7b-32768:
+        display_name: Mixtral 8x7B
+        context_window: 32768
+
+  together:
+    display_name: Together AI
+    base_url: https://api.together.xyz/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.together.ai
+    models: {}
+
+  deepseek:
+    display_name: DeepSeek
+    base_url: https://api.deepseek.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://platform.deepseek.com/api-docs
+    models:
+      deepseek-chat:
+        display_name: DeepSeek V3
+        context_window: 64000
+      deepseek-reasoner:
+        display_name: DeepSeek R1
+        context_window: 64000
+        is_reasoning: true
+
+  mistral:
+    display_name: Mistral AI
+    base_url: https://api.mistral.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.mistral.ai
+    models:
+      mistral-large-latest:
+        display_name: Mistral Large
+        context_window: 128000
+      mistral-small-latest:
+        display_name: Mistral Small
+        context_window: 32000
+      codestral-latest:
+        display_name: Codestral
+        context_window: 32000
+
+  deepinfra:
+    display_name: DeepInfra
+    base_url: https://api.deepinfra.com/v1/openai
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://deepinfra.com/docs
+    models:
+      meta-llama/Meta-Llama-3.1-70B-Instruct:
+        display_name: Llama 3.1 70B
+        context_window: 128000
+      meta-llama/Meta-Llama-3.1-8B-Instruct:
+        display_name: Llama 3.1 8B
+        context_window: 128000
+      mistralai/Mixtral-8x7B-Instruct-v0.1:
+        display_name: Mixtral 8x7B
+        context_window: 32768
+
+  nvidia:
+    display_name: NVIDIA NIM
+    base_url: https://integrate.api.nvidia.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://build.nvidia.com/docs
+    models:
+      meta/llama-3.1-405b-instruct:
+        display_name: Llama 3.1 405B
+        context_window: 128000
+      meta/llama-3.1-70b-instruct:
+        display_name: Llama 3.1 70B
+        context_window: 128000
+      nvidia/nemotron-4-340b-instruct:
+        display_name: Nemotron 4 340B
+        context_window: 4096
+
+  nebius:
+    display_name: Nebius AI Studio
+    base_url: https://api.studio.nebius.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://studio.nebius.ai/docs
+    models:
+      meta-llama/Meta-Llama-3.1-70B-Instruct:
+        display_name: Llama 3.1 70B
+        context_window: 128000
+      meta-llama/Meta-Llama-3.1-8B-Instruct:
+        display_name: Llama 3.1 8B
+        context_window: 128000
+
+  lambda:
+    display_name: Lambda
+    base_url: https://api.lambdalabs.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.lambdalabs.com
+    models:
+      hermes-3-llama-3.1-405b-fp8:
+        display_name: Hermes 3 Llama 3.1 405B
+        context_window: 128000
+
+  upstage:
+    display_name: Upstage
+    base_url: https://api.upstage.ai/v1/solar
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://developers.upstage.ai/docs
+    models:
+      solar-pro:
+        display_name: Solar Pro
+        context_window: 32768
+      solar-mini:
+        display_name: Solar Mini
+        context_window: 32768
+
+  minimax:
+    display_name: MiniMax
+    base_url: https://api.minimax.chat/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://platform.minimaxi.com/document
+    models:
+      abab6.5s-chat:
+        display_name: ABAB 6.5s
+        context_window: 245760
+
+  xai:
+    display_name: xAI (Grok)
+    base_url: https://api.x.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.x.ai
+    models:
+      grok-3:
+        display_name: Grok 3
+        context_window: 131072
+      grok-3-mini:
+        display_name: Grok 3 Mini
+        context_window: 131072
+        is_reasoning: true
+      grok-2:
+        display_name: Grok 2
+        context_window: 131072
+      grok-2-vision:
+        display_name: Grok 2 Vision
+        context_window: 32768
+        supports_vision: true
+
+  fireworks:
+    display_name: Fireworks AI
+    base_url: https://api.fireworks.ai/inference/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.fireworks.ai
+    models:
+      accounts/fireworks/models/llama-v3p3-70b-instruct:
+        display_name: Llama 3.3 70B
+        context_window: 131072
+      accounts/fireworks/models/llama-v3p1-8b-instruct:
+        display_name: Llama 3.1 8B
+        context_window: 131072
+      accounts/fireworks/models/mixtral-8x22b-instruct:
+        display_name: Mixtral 8x22B
+        context_window: 65536
+      accounts/fireworks/models/qwen2p5-72b-instruct:
+        display_name: Qwen 2.5 72B
+        context_window: 32768
+      accounts/fireworks/models/deepseek-r1:
+        display_name: DeepSeek R1
+        context_window: 65536
+        is_reasoning: true
+
+  perplexity:
+    display_name: Perplexity
+    base_url: https://api.perplexity.ai
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.perplexity.ai
+    models:
+      sonar:
+        display_name: Sonar
+        context_window: 128000
+      sonar-pro:
+        display_name: Sonar Pro
+        context_window: 200000
+      sonar-reasoning:
+        display_name: Sonar Reasoning
+        context_window: 128000
+        is_reasoning: true
+      sonar-reasoning-pro:
+        display_name: Sonar Reasoning Pro
+        context_window: 128000
+        is_reasoning: true
+
+  databricks:
+    display_name: Databricks
+    base_url: ""
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+      - base_url
+    docs_url: https://docs.databricks.com/en/machine-learning/model-serving/
+    models: {}

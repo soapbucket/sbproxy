@@ -1,0 +1,18 @@
+{
+  "ip-filter.test": {
+    "id": "ip-filter",
+    "hostname": "ip-filter.test",
+    "policies": [
+      {
+        "type": "ip_filtering",
+        "whitelist": ["127.0.0.1", "::1", "172.18.0.0/16", "172.24.0.0/16"],
+        "action": "block"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    }
+  }
+}
+

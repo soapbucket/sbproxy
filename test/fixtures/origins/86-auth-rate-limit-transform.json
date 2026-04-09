@@ -1,0 +1,51 @@
+{
+  "auth-rate-transform.test": {
+    "id": "auth-rate-transform",
+    "hostname": "auth-rate-transform.test",
+    "authentication": {
+      "type": "api_key",
+      "disabled": false,
+      "header_name": "X-API-Key",
+      "api_keys": [
+        "test-key-123"
+      ]
+    },
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "disabled": false,
+        "limit": 100,
+        "window": "1m",
+        "key_by": "ip",
+        "action": "block"
+      },
+      {
+        "type": "security_headers",
+        "disabled": false,
+        "strict_transport_security": {
+          "disabled": false,
+          "max_age": "1y",
+          "include_subdomains": true
+        }
+      }
+    ],
+    "transforms": [
+      {
+        "type": "json",
+        "content_types": [
+          "application/json"
+        ],
+        "json_transform": {
+          "set_fields": {
+            "processed_by_proxy": true,
+            "api_version": "v1"
+          }
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/api/headers"
+    }
+  }
+}

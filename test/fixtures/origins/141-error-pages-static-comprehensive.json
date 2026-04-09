@@ -1,0 +1,83 @@
+{
+  "error-pages-static-comprehensive.test": {
+    "id": "error-pages-static-comprehensive",
+    "hostname": "error-pages-static-comprehensive.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "error_pages": [
+      {
+        "status": [400],
+        "body": "<html><body><h1>400 - Bad Request</h1><p>Invalid request parameters</p></body></html>",
+        "content_type": "text/html"
+      },
+      {
+        "status": [401],
+        "body": "<html><body><h1>401 - Unauthorized</h1><p>Authentication required</p></body></html>",
+        "content_type": "text/html"
+      },
+      {
+        "status": [403],
+        "body": "<html><body><h1>403 - Forbidden</h1><p>Insufficient permissions</p></body></html>",
+        "content_type": "text/html"
+      },
+      {
+        "status": [408],
+        "body": "<html><body><h1>408 - Request Timeout</h1><p>The request timed out</p></body></html>",
+        "content_type": "text/html"
+      },
+      {
+        "status": [410],
+        "body": "<html><body><h1>410 - Gone</h1><p>Resource is no longer available</p></body></html>",
+        "content_type": "text/html"
+      },
+      {
+        "status": [413],
+        "body": "{\"error\":\"413 - Payload Too Large\",\"message\":\"Request payload exceeds size limit\"}",
+        "content_type": "application/json"
+      },
+      {
+        "status": [414],
+        "body": "<html><body><h1>414 - URI Too Long</h1><p>The request URI is too long</p></body></html>",
+        "content_type": "text/html"
+      },
+      {
+        "status": [415],
+        "body": "{\"error\":\"415 - Unsupported Media Type\",\"message\":\"The media type is not supported\"}",
+        "content_type": "application/json"
+      },
+      {
+        "status": [422],
+        "body": "{\"error\":\"422 - Unprocessable Entity\",\"message\":\"Validation failed\"}",
+        "content_type": "application/json"
+      },
+      {
+        "status": [451],
+        "body": "<html><body><h1>451 - Unavailable For Legal Reasons</h1><p>Content unavailable due to legal restrictions</p></body></html>",
+        "content_type": "text/html"
+      },
+      {
+        "status": [507],
+        "body": "{\"error\":\"507 - Insufficient Storage\",\"message\":\"Storage quota exceeded\"}",
+        "content_type": "application/json"
+      },
+      {
+        "status": [508],
+        "body": "<html><body><h1>508 - Loop Detected</h1><p>Infinite loop detected in request processing</p></body></html>",
+        "content_type": "text/html"
+      },
+      {
+        "status": [510],
+        "body": "{\"error\":\"510 - Not Extended\",\"message\":\"Further extensions required\"}",
+        "content_type": "application/json"
+      },
+      {
+        "status": [511],
+        "body": "<html><body><h1>511 - Network Authentication Required</h1><p>Network authentication is required</p></body></html>",
+        "content_type": "text/html"
+      }
+    ]
+  }
+}
+

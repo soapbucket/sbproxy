@@ -1,0 +1,11 @@
+{
+  "content-type-fix.test": {
+    "id": "content-type-fix",
+    "hostname": "content-type-fix.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    }
+  }
+}
+

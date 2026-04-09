@@ -1,0 +1,31 @@
+{
+  "callbacks.test": {
+    "id": "callbacks",
+    "hostname": "callbacks.test",
+    "on_load": [{
+      "type": "http",
+      "url": "http://e2e-test-server:8090/callback/config",
+      "method": "GET",
+      "timeout": 5
+    }],
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_sb.s",
+      "cookie_max_age": 3600,
+      "callbacks": [
+        {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_prefs",
+          "timeout": 5
+        }
+      ],
+      "allow_non_ssl": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    }
+  }
+}

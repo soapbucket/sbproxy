@@ -1,0 +1,50 @@
+{
+  "certificate-pinning.test": {
+    "id": "certificate-pinning",
+    "hostname": "certificate-pinning.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://e2e-test-server:9443",
+      "skip_tls_verify_host": true,
+      "certificate_pinning": {
+        "enabled": true,
+        "pin_sha256": "HaVHDKn4JbBIcLd39pq/ZqbNax+2GH7y7SKXyDuT76c=",
+        "backup_pins": [],
+        "pin_expiry": "2025-12-31T23:59:59Z"
+      }
+    }
+  },
+  "certificate-pinning-backup.test": {
+    "id": "certificate-pinning-backup",
+    "hostname": "certificate-pinning-backup.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://e2e-test-server:9443",
+      "skip_tls_verify_host": true,
+      "certificate_pinning": {
+        "enabled": true,
+        "pin_sha256": "HaVHDKn4JbBIcLd39pq/ZqbNax+2GH7y7SKXyDuT76c=",
+        "backup_pins": [
+          "HaVHDKn4JbBIcLd39pq/ZqbNax+2GH7y7SKXyDuT76c="
+        ],
+        "pin_expiry": "2025-12-31T23:59:59Z"
+      }
+    }
+  },
+  "certificate-pinning-expired.test": {
+    "id": "certificate-pinning-expired",
+    "hostname": "certificate-pinning-expired.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://e2e-test-server:9443",
+      "skip_tls_verify_host": true,
+      "certificate_pinning": {
+        "enabled": true,
+        "pin_sha256": "HaVHDKn4JbBIcLd39pq/ZqbNax+2GH7y7SKXyDuT76c=",
+        "backup_pins": [],
+        "pin_expiry": "2020-01-01T00:00:00Z"
+      }
+    }
+  }
+}
+

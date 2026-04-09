@@ -1,0 +1,131 @@
+# Docker Compose Configuration for Go Unit/Integration Tests
+# This file is used for running Go tests (unit tests, integration tests)
+# It is NOT used for E2E testing - use docker-compose.e2e-test.yml for that
+#
+# Usage:
+#   docker compose -f docker-compose.test.yml up test-runner
+#   docker compose -f docker-compose.test.yml up test-cacher
+#
+# Services:
+#   - test-runner: Runs all Go tests
+#   - test-cacher: Runs cacher-specific tests
+#   - redis: Redis service for testing
+
+services:
+  # Redis service for testing
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "6379:6379"
+    networks:
+      - test_net
+
+  # Test runner service
+  test-runner:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.test
+    image: soapbucket/proxy:test
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      # Redis connection for tests
+      REDIS_URL: "redis://redis:6379"
+      # Pebble URL for tests (using temp directory)
+      PEBBLE_URL: "/tmp/pebble-test"
+      # Go test environment
+      # Note: All storage drivers are pure Go (no CGO required)
+      CGO_ENABLED: "0"
+      GOOS: "linux"
+    volumes:
+      # Mount temp directory for Pebble and file manager testing
+      - test-temp:/tmp
+      # Mount source code for testing
+      - .:/app
+    working_dir: /app
+    command: >
+      sh -c "
+        echo 'Starting test environment...' &&
+        echo 'Redis URL: $$REDIS_URL' &&
+        echo 'Pebble URL: $$PEBBLE_URL' &&
+        echo 'Running all tests...' &&
+        go test -v ./... -coverprofile=coverage.out &&
+        echo 'Test coverage report:' &&
+        go tool cover -html=coverage.out -o coverage.html &&
+        echo 'Tests completed successfully!'
+      "
+    networks:
+      - test_net
+
+  # Alternative: Run specific test packages
+  test-cacher:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.test
+    image: soapbucket/proxy:test
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: "redis://redis:6379"
+      PEBBLE_URL: "/tmp/pebble-test"
+      CGO_ENABLED: "0"
+      GOOS: "linux"
+    volumes:
+      - test-temp:/tmp
+      - .:/app
+    working_dir: /app
+    command: >
+      sh -c "
+        echo 'Running cacher tests...' &&
+        go test -v ./internal/cacher/... -coverprofile=cacher-coverage.out
+      "
+    networks:
+      - test_net
+
+  # Alternative: Run tests with specific environment variables
+  test-with-env:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.test
+    image: soapbucket/proxy:test
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: "redis://redis:6379"
+      PEBBLE_URL: "/tmp/pebble-test"
+      CGO_ENABLED: "0"
+      GOOS: "linux"
+    volumes:
+      - test-temp:/tmp
+      - .:/app
+    working_dir: /app
+    command: >
+      sh -c "
+        echo 'Running tests with environment variables set...' &&
+        echo 'Testing Redis connection...' &&
+        go test -v ./internal/cacher/redis/... &&
+        echo 'Testing Pebble with temp directory...' &&
+        go test -v ./lib/cacher/... &&
+        echo 'Testing file manager...' &&
+        go test -v ./internal/cacher/file/... &&
+        echo 'All tests completed!'
+      "
+    networks:
+      - test_net
+
+volumes:
+  test-temp:
+    driver: local
+
+networks:
+  test_net:
+    driver: bridge

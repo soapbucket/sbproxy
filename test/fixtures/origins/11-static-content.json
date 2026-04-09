@@ -1,0 +1,16 @@
+{
+  "static.test": {
+    "id": "static",
+    "hostname": "static.test",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "text/html",
+      "headers": {
+        "X-Custom-Header": "static-content"
+      },
+      "body": "<!DOCTYPE html><html><head><title>Static Content</title></head><body><h1>This is static content served by the proxy</h1></body></html>"
+    }
+  }
+}
+

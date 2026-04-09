@@ -1,0 +1,25 @@
+{
+  "cors-comprehensive.test": {
+    "id": "cors-comprehensive",
+    "hostname": "cors-comprehensive.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "Access-Control-Allow-Origin": "https://example.com",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
+            "Access-Control-Expose-Headers": "X-Total-Count, X-Page-Count",
+            "Access-Control-Max-Age": "3600",
+            "Access-Control-Allow-Credentials": "true"
+          }
+        }
+      }
+    ]
+  }
+}
+

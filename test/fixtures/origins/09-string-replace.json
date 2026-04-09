@@ -1,0 +1,36 @@
+{
+  "string-replace.test": {
+    "id": "string-replace",
+    "hostname": "string-replace.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://example.com",
+      "skip_tls_verify_host": true
+    },
+    "transforms": [
+      {
+        "type": "replace_strings",
+        "content_types": [
+          "text/html",
+          "text/plain"
+        ],
+        "replace_strings": {
+          "replacements": [
+            {
+              "find": "Example Domain",
+              "replace": "Proxied Example Domain",
+              "regex": false
+            },
+            {
+              "find": "example\\.com",
+              "replace": "proxy.example.com",
+              "regex": true
+            }
+          ]
+        }
+      }
+    ],
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  }
+}

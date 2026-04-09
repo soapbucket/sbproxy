@@ -1,0 +1,6191 @@
+{
+  "basic-proxy.test.soapbucket.com": {
+    "id": "basic-proxy",
+    "hostname": "basic-proxy.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "proxy-headers.test.soapbucket.com": {
+    "id": "proxy-headers",
+    "hostname": "proxy-headers.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Proxy-Request-ID": "{{uuid}}",
+            "X-Forwarded-For": "{{request.ip}}"
+          }
+        }
+      }
+    ],
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Proxy-Response-Time": "{{response_time_ms}}ms"
+          }
+        }
+      }
+    ],
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "proxy-rewrite.test.soapbucket.com": {
+    "id": "proxy-rewrite",
+    "hostname": "proxy-rewrite.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "url": {
+          "path": {
+            "replace": {
+              "old": "/old-api",
+              "new": "/test"
+            }
+          }
+        },
+        "rules": [
+          {
+            "path": {
+              "contains": "/old-api"
+            }
+          }
+        ]
+      }
+    ],
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "proxy-query.test.soapbucket.com": {
+    "id": "proxy-query",
+    "hostname": "proxy-query.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "query": {
+          "add": {
+            "source": "proxy",
+            "timestamp": "{{timestamp}}"
+          }
+        }
+      }
+    ],
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "proxy-conditional.test.soapbucket.com": {
+    "id": "proxy-conditional",
+    "hostname": "proxy-conditional.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-API-Version": "v2"
+          }
+        },
+        "rules": [
+          {
+            "path": {
+              "contains": "/api"
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Admin-Request": "true"
+          }
+        },
+        "rules": [
+          {
+            "path": {
+              "contains": "/admin"
+            },
+            "headers": {
+              "exists": [
+                "Authorization"
+              ]
+            }
+          }
+        ]
+      }
+    ],
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "Cache-Control": "no-cache"
+          }
+        },
+        "rules": [
+          {
+            "status": {
+              "codes": [
+                200,
+                201
+              ]
+            }
+          }
+        ]
+      }
+    ],
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "html-transform.test.soapbucket.com": {
+    "id": "html-transform",
+    "hostname": "html-transform.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "https://news.ycombinator.com",
+      "skip_tls_verify_host": true
+    },
+    "transforms": [
+      {
+        "type": "optimized_html",
+        "content_types": [
+          "text/html"
+        ],
+        "optimized_format_options": {
+          "strip_comments": true,
+          "remove_trailing_slashes": true,
+          "optimize_attributes": true
+        },
+        "add_to_tags": [
+          {
+            "tag": "head",
+            "add_before_end_tag": false,
+            "content": "<script>console.log('Proxy injected script');</script>"
+          }
+        ]
+      }
+    ],
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "html-transform-advanced.test.soapbucket.com": {
+    "id": "html-transform-advanced",
+    "hostname": "html-transform-advanced.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "https://techmeme.com"
+    },
+    "transforms": [
+      {
+        "type": "optimized_html",
+        "content_types": [
+          "text/html"
+        ],
+        "optimized_format_options": {
+          "strip_comments": true,
+          "remove_boolean_attributes": true,
+          "remove_trailing_slashes": true,
+          "optimize_attributes": true,
+          "sort_attributes": true,
+          "strip_newlines": true,
+          "strip_space": true
+        },
+        "attribute_options": {
+          "add_unique_ids": true,
+          "unique_id_prefix": "proxy-id-",
+          "use_random_suffix": true
+        },
+        "add_to_tags": [
+          {
+            "tag": "head",
+            "add_before_end_tag": false,
+            "content": "<meta name=\"proxy\" content=\"enabled\">"
+          },
+          {
+            "tag": "body",
+            "add_before_end_tag": true,
+            "content": "<!-- Proxy injected content -->"
+          }
+        ]
+      }
+    ],
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "json-transform.test.soapbucket.com": {
+    "id": "json-transform",
+    "hostname": "json-transform.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "transforms": [
+      {
+        "type": "json",
+        "content_types": [
+          "application/json"
+        ],
+        "pretty_print": true,
+        "remove_empty_objects": true,
+        "remove_empty_arrays": false,
+        "rules": [
+          {
+            "path": "$.sensitive",
+            "value": "REDACTED"
+          }
+        ]
+      }
+    ],
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "string-replace.test.soapbucket.com": {
+    "id": "string-replace",
+    "hostname": "string-replace.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "https://example.com",
+      "skip_tls_verify_host": true
+    },
+    "transforms": [
+      {
+        "type": "replace_strings",
+        "content_types": [
+          "text/html",
+          "text/plain"
+        ],
+        "replace_strings": {
+          "replacements": [
+            {
+              "find": "Example Domain",
+              "replace": "Proxied Example Domain",
+              "regex": false
+            },
+            {
+              "find": "example\\.com",
+              "replace": "proxy.example.com",
+              "regex": true
+            }
+          ]
+        }
+      }
+    ],
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "redirect.test.soapbucket.com": {
+    "id": "redirect",
+    "hostname": "redirect.test.soapbucket.com",
+    "action": {
+      "type": "redirect",
+      "url": "https://example.com",
+      "status_code": 301,
+      "strip_base_path": true,
+      "preserve_query": true
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "static.test.soapbucket.com": {
+    "id": "static",
+    "hostname": "static.test.soapbucket.com",
+    "action": {
+      "type": "static",
+      "status_code": 200,
+      "content_type": "text/html",
+      "headers": {
+        "X-Custom-Header": "static-content"
+      },
+      "body": "<!DOCTYPE html><html><head><title>Static Content</title></head><body><h1>This is static content served by the proxy</h1></body></html>"
+    }
+  },
+  "graphql.test.soapbucket.com": {
+    "id": "graphql",
+    "hostname": "graphql.test.soapbucket.com",
+    "action": {
+      "type": "graphql",
+      "url": "http://localhost:8092/graphql",
+      "max_depth": 10,
+      "max_complexity": 100,
+      "enable_introspection": true,
+      "enable_query_batching": true,
+      "enable_query_deduplication": true
+    }
+  },
+  "websocket.test.soapbucket.com": {
+    "id": "websocket",
+    "hostname": "websocket.test.soapbucket.com",
+    "action": {
+      "type": "websocket",
+      "url": "ws://localhost:8091/echo",
+      "strip_base_path": true,
+      "preserve_query": true,
+      "ping_interval": "30s",
+      "pong_timeout": "10s"
+    }
+  },
+  "loadbalancer.test.soapbucket.com": {
+    "id": "loadbalancer",
+    "hostname": "loadbalancer.test.soapbucket.com",
+    "action": {
+      "type": "loadbalancer",
+      "targets": [
+        {
+          "url": "http://localhost:8090",
+          "weight": 50
+        },
+        {
+          "url": "http://localhost:8090",
+          "weight": 50
+        }
+      ],
+      "round_robin": true,
+      "disable_sticky": false,
+      "sticky_cookie_name": "_sb.l"
+    }
+  },
+  "jwt-auth.test.soapbucket.com": {
+    "id": "jwt-auth",
+    "hostname": "jwt-auth.test.soapbucket.com",
+    "authentication": {
+      "type": "jwt",
+      "secret": "test-secret-key-change-in-production",
+      "header_name": "Authorization",
+      "header_prefix": "Bearer ",
+      "issuer": "test-issuer",
+      "audience": "test-audience",
+      "algorithm": "HS256"
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-ID": "{{auth.sub}}",
+            "X-User-Email": "{{auth.email}}"
+          }
+        }
+      }
+    ]
+  },
+  "rate-limit.test.soapbucket.com": {
+    "id": "rate-limit",
+    "hostname": "rate-limit.test.soapbucket.com",
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "requests_per_minute": 10,
+        "burst_size": 5,
+        "algorithm": "sliding_window",
+        "headers": {
+          "enabled": true,
+          "include_limit": true,
+          "include_remaining": true,
+          "include_reset": true,
+          "include_used": true,
+          "include_retry_after": true
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    }
+  },
+  "waf.test.soapbucket.com": {
+    "id": "waf",
+    "hostname": "waf.test.soapbucket.com",
+    "policies": [
+      {
+        "type": "waf",
+        "custom_rules": [
+          {
+            "id": "block-sql-injection",
+            "name": "Block SQL Injection",
+            "disabled": false,
+            "phase": 2,
+            "severity": "critical",
+            "action": "block",
+            "variables": [
+              {
+                "name": "ARGS",
+                "collection": "ARGS"
+              }
+            ],
+            "operator": "rx",
+            "pattern": "(?i)(union\\s+select|select\\s+.*\\s+from|insert\\s+into|update\\s+.*\\s+set|delete\\s+from|drop\\s+table|truncate\\s+table|alter\\s+table|exec\\s*\\(|execute\\s*\\(|sp_executesql|\\bor\\s+['\"]?1\\s*=\\s*['\"]?1|\\band\\s+['\"]?1\\s*=\\s*['\"]?1|'or'1'='1|'and'1'='1|'\\s*or\\s*'1'\\s*=\\s*'1|'\\s*and\\s*'1'\\s*=\\s*'1|['\"]?1['\"]?\\s*or\\s*['\"]?1|['\"]?1['\"]?\\s*and\\s*['\"]?1)",
+            "transformations": [
+              "lowercase",
+              "urlDecode"
+            ]
+          },
+          {
+            "id": "block-xss",
+            "name": "Block XSS Attempts",
+            "disabled": false,
+            "phase": 2,
+            "severity": "critical",
+            "action": "block",
+            "variables": [
+              {
+                "name": "ARGS",
+                "collection": "ARGS"
+              },
+              {
+                "name": "REQUEST_URI",
+                "collection": "REQUEST_URI"
+              }
+            ],
+            "operator": "rx",
+            "pattern": "(?i)(<script[^>]*>|</script>|javascript\\s*:|on\\w+\\s*=|<iframe[^>]*>|<img[^>]*onerror)",
+            "transformations": [
+              "lowercase",
+              "htmlEntityDecode",
+              "urlDecode"
+            ]
+          }
+        ],
+        "default_action": "log",
+        "action_on_match": "block"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    }
+  },
+  "security-headers.test.soapbucket.com": {
+    "id": "security-headers",
+    "hostname": "security-headers.test.soapbucket.com",
+    "policies": [
+      {
+        "type": "security_headers",
+        "strict_transport_security": {
+          "disabled": false,
+          "max_age": 31536000,
+          "include_subdomains": true
+        },
+        "content_security_policy": {
+          "disabled": false,
+          "policy": "default-src 'self'",
+          "report_only": false
+        },
+        "x_frame_options": {
+          "disabled": false,
+          "value": "DENY"
+        },
+        "x_content_type_options": {
+          "disabled": false,
+          "no_sniff": true
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    }
+  },
+  "ip-filter.test.soapbucket.com": {
+    "id": "ip-filter",
+    "hostname": "ip-filter.test.soapbucket.com",
+    "policies": [
+      {
+        "type": "ip_filtering",
+        "whitelist": [
+          "127.0.0.1",
+          "::1",
+          "172.18.0.0/16",
+          "172.24.0.0/16"
+        ],
+        "action": "block"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    }
+  },
+  "cors.test.soapbucket.com": {
+    "id": "cors",
+    "hostname": "cors.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            "Access-Control-Max-Age": "3600"
+          }
+        }
+      }
+    ]
+  },
+  "https-proxy.test.soapbucket.com": {
+    "id": "https-proxy",
+    "hostname": "https-proxy.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "https://localhost:9443",
+      "skip_tls_verify_host": true
+    }
+  },
+  "https-proxy-bad-cert.test.soapbucket.com": {
+    "id": "https-proxy-bad-cert",
+    "hostname": "https-proxy-bad-cert.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "https://localhost:9443",
+      "skip_tls_verify_host": true
+    }
+  },
+  "forward-rules.test.soapbucket.com": {
+    "id": "forward-rules",
+    "hostname": "forward-rules.test.soapbucket.com",
+    "forward_rules": [
+      {
+        "hostname": "forward-rules-api.test.soapbucket.com",
+        "rules": [
+          {
+            "path": {
+              "contains": "/api"
+            }
+          }
+        ]
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    }
+  },
+  "forward-rules-api.test.soapbucket.com": {
+    "id": "forward-rules-api",
+    "hostname": "forward-rules-api.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-API-Version": "v2"
+          }
+        }
+      }
+    ]
+  },
+  "callbacks.test.soapbucket.com": {
+    "id": "callbacks",
+    "hostname": "callbacks.test.soapbucket.com",
+    "on_start": [
+      {
+        "type": "http",
+        "url": "http://localhost:8090/callback/config",
+        "method": "GET",
+        "timeout": 5
+      }
+    ],
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_sb.s",
+      "cookie_max_age": 3600,
+      "callbacks": [
+        {
+          "type": "http",
+          "url": "http://localhost:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_prefs",
+          "timeout": 5
+        }
+      ],
+      "allow_non_ssl": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    }
+  },
+  "complex.test.soapbucket.com": {
+    "id": "complex",
+    "hostname": "complex.test.soapbucket.com",
+    "force_ssl": true,
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "requests_per_minute": 60,
+        "burst_size": 10,
+        "headers": {
+          "enabled": true,
+          "include_limit": true,
+          "include_remaining": true,
+          "include_reset": true,
+          "include_used": true,
+          "include_retry_after": true
+        }
+      },
+      {
+        "type": "security_headers",
+        "strict_transport_security": {
+          "disabled": false,
+          "max_age": 31536000
+        }
+      }
+    ],
+    "authentication": {
+      "type": "jwt",
+      "secret": "test-secret-key-change-in-production",
+      "header_name": "Authorization",
+      "header_prefix": "Bearer "
+    },
+    "action": {
+      "type": "proxy",
+      "url": "https://news.ycombinator.com"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Proxy-Request-ID": "{{uuid}}",
+            "X-Forwarded-For": "{{request.ip}}"
+          }
+        }
+      },
+      {
+        "query": {
+          "add": {
+            "source": "proxy"
+          }
+        }
+      }
+    ],
+    "transforms": [
+      {
+        "type": "optimized_html",
+        "content_types": [
+          "text/html"
+        ],
+        "optimized_format_options": {
+          "strip_comments": true,
+          "optimize_attributes": true
+        },
+        "add_to_tags": [
+          {
+            "tag": "head",
+            "add_before_end_tag": false,
+            "content": "<script>console.log('Complex proxy');</script>"
+          }
+        ]
+      }
+    ],
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Proxy-Version": "1.0",
+            "Cache-Control": "public, max-age=3600"
+          }
+        },
+        "rules": [
+          {
+            "status": {
+              "codes": [
+                200
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "google-oauth.test.soapbucket.com": {
+    "id": "google-oauth",
+    "hostname": "google-oauth.test.soapbucket.com",
+    "authentication": {
+      "type": "oauth",
+      "disabled": false,
+      "provider": "google",
+      "client_id": "781990534849-t6v26s5v7blu48kgkocdluvjv0jvlrhk.apps.googleusercontent.com",
+      "client_secret": "local:kYZKjfsaegQg7UnWZyI8m+XD5KRF2xE8nKrNmME5q3oawxUVTCTpMU/TyhiDAVlwTFAHMZHEKUhHwK7S7A1n",
+      "redirect_url": "https://google-oauth.test:8443/oauth/callback",
+      "session_secret": "local:XtpHOiDGG8bircQZi6s7CdNSz6Y7CZ4nMBk0eHVLOBBIEg0haM5A5y2dbjEMZJxOoWmMrJJU2ehxfhDDaaThWUWs",
+      "session_cookie_name": "_sb.oauth",
+      "session_max_age": 3600,
+      "scopes": [
+        "openid",
+        "profile",
+        "email"
+      ],
+      "callback_path": "/oauth/callback",
+      "login_path": "/oauth/login",
+      "logout_path": "/oauth/logout",
+      "force_authentication": true,
+      "default_roles": {
+        "required": [
+          "user"
+        ],
+        "optional": [
+          "admin"
+        ]
+      }
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-ID": "{{auth.sub}}",
+            "X-User-Email": "{{auth.email}}",
+            "X-User-Name": "{{auth.name}}"
+          }
+        },
+        "rules": [
+          {
+            "auth_conditions": [
+              {
+                "auth_type": "oauth",
+                "auth_condition_rules": [
+                  {
+                    "path": "sub",
+                    "exists": true
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "jwt-encrypted.test.soapbucket.com": {
+    "id": "jwt-encrypted",
+    "hostname": "jwt-encrypted.test.soapbucket.com",
+    "authentication": {
+      "type": "jwt",
+      "disabled": false,
+      "secret": "local:Pwr9+SXpUxRaD6ZqYk2BZ1IyC1PlFqC8zZrkT/m0tuyZP1h4MtwU09BCg2xhINI5GcriS9zub1agbo8O",
+      "header_name": "Authorization",
+      "header_prefix": "Bearer ",
+      "issuer": "test-issuer",
+      "audience": "test-audience",
+      "algorithm": "HS256"
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-ID": "{{auth.sub}}",
+            "X-User-Email": "{{auth.email}}",
+            "X-User-Name": "{{auth.name}}"
+          }
+        }
+      }
+    ]
+  },
+  "basic-auth.test.soapbucket.com": {
+    "id": "basic-auth",
+    "hostname": "basic-auth.test.soapbucket.com",
+    "authentication": {
+      "type": "basic_auth",
+      "disabled": false,
+      "realm": "Test Realm",
+      "users": [
+        {
+          "username": "testuser",
+          "password": "testpass",
+          "roles": [
+            "user"
+          ]
+        },
+        {
+          "username": "admin",
+          "password": "adminpass",
+          "roles": [
+            "admin",
+            "user"
+          ]
+        }
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    }
+  },
+  "api-key.test.soapbucket.com": {
+    "id": "api-key",
+    "hostname": "api-key.test.soapbucket.com",
+    "authentication": {
+      "type": "api_key",
+      "disabled": false,
+      "header_name": "X-API-Key",
+      "query_param": "api_key",
+      "api_keys": [
+        "test-api-key-123",
+        "admin-api-key-456"
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    }
+  },
+  "bearer-token.test.soapbucket.com": {
+    "id": "bearer-token",
+    "hostname": "bearer-token.test.soapbucket.com",
+    "authentication": {
+      "type": "bearer_token",
+      "disabled": false,
+      "header_name": "Authorization",
+      "header_prefix": "Bearer ",
+      "tokens": [
+        "test-bearer-token-123",
+        "admin-bearer-token-456"
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    }
+  },
+  "html-transform-hn.test.soapbucket.com": {
+    "id": "html-transform-hn",
+    "hostname": "html-transform-hn.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "https://news.ycombinator.com",
+      "skip_tls_verify_host": true
+    },
+    "transforms": [
+      {
+        "type": "optimized_html",
+        "content_types": [
+          "text/html"
+        ],
+        "optimized_format_options": {
+          "strip_comments": true,
+          "remove_trailing_slashes": true,
+          "optimize_attributes": true,
+          "minify_css": true,
+          "minify_javascript": true
+        },
+        "add_to_tags": [
+          {
+            "tag": "head",
+            "add_before_end_tag": false,
+            "content": "<meta name=\"proxy\" content=\"soapbucket\">"
+          }
+        ],
+        "modify_tags": [
+          {
+            "selector": "title",
+            "action": "prepend",
+            "content": "[Proxied] "
+          }
+        ]
+      }
+    ]
+  },
+  "html-transform-example.test.soapbucket.com": {
+    "id": "html-transform-example",
+    "hostname": "html-transform-example.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "https://example.com",
+      "skip_tls_verify_host": true
+    },
+    "transforms": [
+      {
+        "type": "html",
+        "content_types": [
+          "text/html"
+        ],
+        "add_to_tags": [
+          {
+            "tag": "body",
+            "add_before_end_tag": true,
+            "content": "<div id=\"proxy-banner\">Proxied by SoapBucket</div>"
+          }
+        ],
+        "modify_tags": [
+          {
+            "selector": "h1",
+            "action": "wrap",
+            "content": "<div class=\"proxy-wrapper\">"
+          }
+        ],
+        "remove_tags": [
+          {
+            "selector": "script[src*='tracking']"
+          }
+        ]
+      }
+    ]
+  },
+  "html-transform-techmeme.test.soapbucket.com": {
+    "id": "html-transform-techmeme",
+    "hostname": "html-transform-techmeme.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "https://www.techmeme.com",
+      "skip_tls_verify_host": true
+    },
+    "transforms": [
+      {
+        "type": "optimized_html",
+        "content_types": [
+          "text/html"
+        ],
+        "optimized_format_options": {
+          "strip_comments": true,
+          "remove_trailing_slashes": true,
+          "optimize_attributes": true
+        },
+        "add_to_tags": [
+          {
+            "tag": "head",
+            "add_before_end_tag": false,
+            "content": "<script>console.log('Techmeme proxied');</script>"
+          }
+        ],
+        "modify_tags": [
+          {
+            "selector": "title",
+            "action": "append",
+            "content": " | Proxied"
+          }
+        ]
+      }
+    ]
+  },
+  "cache-l1.test.soapbucket.com": {
+    "id": "cache-l1",
+    "hostname": "cache-l1.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "cache": {
+      "disabled": false,
+      "level": "l1",
+      "ttl": 300,
+      "cache_control": true,
+      "etag": true,
+      "vary": [
+        "Accept",
+        "Accept-Language"
+      ]
+    }
+  },
+  "cache-l2.test.soapbucket.com": {
+    "id": "cache-l2",
+    "hostname": "cache-l2.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "cache": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": 600,
+      "cache_control": true,
+      "etag": true,
+      "stale_while_revalidate": 60
+    }
+  },
+  "signature-cache.test.soapbucket.com": {
+    "id": "signature-cache",
+    "hostname": "signature-cache.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "policies": [
+      {
+        "type": "request_signing",
+        "disabled": false,
+        "algorithm": "hmac-sha256",
+        "secret": "test-signing-secret",
+        "header_name": "X-Signature",
+        "include_headers": [
+          "Host",
+          "Content-Type"
+        ],
+        "include_body": true,
+        "cache_signatures": true,
+        "signature_cache_ttl": 300
+      }
+    ]
+  },
+  "error-pages.test.soapbucket.com": {
+    "id": "error-pages",
+    "hostname": "error-pages.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "error_pages": [
+      {
+        "status": [
+          404
+        ],
+        "body": "<html><body><h1>404 - Not Found</h1><p>Custom error page</p></body></html>",
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          500
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error",
+          "method": "GET"
+        }
+      },
+      {
+        "status": [
+          503
+        ],
+        "body": "{\"error\":\"Service Unavailable\"}",
+        "content_type": "application/json"
+      }
+    ]
+  },
+  "csrf.test.soapbucket.com": {
+    "id": "csrf",
+    "hostname": "csrf.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "policies": [
+      {
+        "type": "csrf",
+        "disabled": false,
+        "secret": "test-csrf-secret-key-12345678901234567890",
+        "cookie_name": "_csrf_token",
+        "header_name": "X-CSRF-Token",
+        "methods": [
+          "POST",
+          "PUT",
+          "DELETE",
+          "PATCH"
+        ],
+        "exempt_paths": [
+          "/api/webhook"
+        ]
+      }
+    ]
+  },
+  "ddos.test.soapbucket.com": {
+    "id": "ddos",
+    "hostname": "ddos.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "policies": [
+      {
+        "type": "ddos_protection",
+        "disabled": false,
+        "detection": {
+          "request_rate_threshold": 100,
+          "connection_rate_threshold": 50,
+          "bandwidth_threshold": "10MB",
+          "detection_window": "10s"
+        },
+        "mitigation": {
+          "block_duration": "1h",
+          "challenge_response": true,
+          "challenge_type": "header",
+          "auto_block": true,
+          "block_after_attacks": 3
+        }
+      }
+    ]
+  },
+  "threat-detection.test.soapbucket.com": {
+    "id": "threat-detection",
+    "hostname": "threat-detection.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "policies": [
+      {
+        "type": "threat_detection",
+        "disabled": false,
+        "patterns": {
+          "xss": {
+            "disabled": false,
+            "action": "block",
+            "log_level": "warn"
+          },
+          "path_traversal": {
+            "disabled": false,
+            "action": "log",
+            "log_level": "info"
+          }
+        }
+      }
+    ]
+  },
+  "javascript-transform.test.soapbucket.com": {
+    "id": "javascript-transform",
+    "hostname": "javascript-transform.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "transforms": [
+      {
+        "type": "javascript",
+        "content_types": [
+          "application/javascript",
+          "text/javascript"
+        ],
+        "number_precision": 2,
+        "change_variable_names": false,
+        "supported_version": 5
+      }
+    ]
+  },
+  "css-transform.test.soapbucket.com": {
+    "id": "css-transform",
+    "hostname": "css-transform.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "transforms": [
+      {
+        "type": "css",
+        "content_types": [
+          "text/css"
+        ],
+        "minify": true,
+        "add_rules": [
+          {
+            "selector": "body",
+            "rules": {
+              "background-color": "#f0f0f0"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "template-transform.test.soapbucket.com": {
+    "id": "template-transform",
+    "hostname": "template-transform.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "transforms": [
+      {
+        "type": "template",
+        "content_types": [
+          "text/html"
+        ],
+        "template": "<html><body><h1>{{.Title}}</h1><p>{{.Content}}</p></body></html>",
+        "data": {
+          "Title": "Proxied Content",
+          "Content": "This content is proxied"
+        }
+      }
+    ]
+  },
+  "markdown-transform.test.soapbucket.com": {
+    "id": "markdown-transform",
+    "hostname": "markdown-transform.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "transforms": [
+      {
+        "type": "markdown",
+        "content_types": [
+          "text/markdown",
+          "text/x-markdown"
+        ],
+        "extensions": [
+          "autolink",
+          "strikethrough",
+          "tables"
+        ],
+        "output_format": "html"
+      }
+    ]
+  },
+  "grpc.test.soapbucket.com": {
+    "id": "grpc",
+    "hostname": "grpc.test.soapbucket.com",
+    "action": {
+      "type": "grpc",
+      "url": "https://localhost:8093",
+      "skip_tls_verify_host": true,
+      "enable_grpc_web": true,
+      "max_call_recv_msg_size": 10485760,
+      "max_call_send_msg_size": 10485760
+    }
+  },
+  "storage.test.soapbucket.com": {
+    "id": "storage",
+    "hostname": "storage.test.soapbucket.com",
+    "action": {
+      "type": "storage",
+      "kind": "s3",
+      "bucket": "test-bucket",
+      "region": "us-east-1",
+      "key": "test-access-key",
+      "secret": "test-secret-key"
+    }
+  },
+  "abtest.test.soapbucket.com": {
+    "id": "abtest",
+    "hostname": "abtest.test.soapbucket.com",
+    "action": {
+      "type": "abtest",
+      "variants": [
+        {
+          "name": "variant-a",
+          "weight": 50,
+          "action": {
+            "type": "proxy",
+            "url": "http://localhost:8090"
+          }
+        },
+        {
+          "name": "variant-b",
+          "weight": 50,
+          "action": {
+            "type": "proxy",
+            "url": "http://localhost:8090"
+          }
+        }
+      ],
+      "cookie_name": "_ab_test"
+    }
+  },
+  "encoding-fix.test.soapbucket.com": {
+    "id": "encoding-fix",
+    "hostname": "encoding-fix.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    }
+  },
+  "content-type-fix.test.soapbucket.com": {
+    "id": "content-type-fix",
+    "hostname": "content-type-fix.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    }
+  },
+  "request-signing.test.soapbucket.com": {
+    "id": "request-signing",
+    "hostname": "request-signing.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "policies": [
+      {
+        "type": "request_signing",
+        "disabled": false,
+        "algorithm": "hmac-sha256",
+        "secret": "test-signing-secret-key-12345678901234567890",
+        "header_name": "X-Signature",
+        "include_headers": [
+          "Host",
+          "Content-Type",
+          "X-Request-ID"
+        ],
+        "include_body": true,
+        "cache_signatures": true,
+        "signature_cache_ttl": 300
+      }
+    ]
+  },
+  "geo-blocking.test.soapbucket.com": {
+    "id": "geo-blocking",
+    "hostname": "geo-blocking.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "policies": [
+      {
+        "type": "geo_blocking",
+        "disabled": false,
+        "allowed_countries": [
+          "US",
+          "CA",
+          "GB"
+        ],
+        "action": "block"
+      }
+    ]
+  },
+  "sri.test.soapbucket.com": {
+    "id": "sri",
+    "hostname": "sri.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "policies": [
+      {
+        "type": "sri",
+        "disabled": false,
+        "require_sri": true,
+        "algorithms": [
+          "sha256",
+          "sha384",
+          "sha512"
+        ]
+      }
+    ]
+  },
+  "expression-policy.test.soapbucket.com": {
+    "id": "expression-policy",
+    "hostname": "expression-policy.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "policies": [
+      {
+        "type": "expression",
+        "disabled": false,
+        "cel_expr": "request.method == 'GET' && request.path.startsWith('/api')"
+      }
+    ]
+  },
+  "rate-limit-strict.test.soapbucket.com": {
+    "id": "rate-limit-strict",
+    "hostname": "rate-limit-strict.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "disabled": false,
+        "rate_limit": {
+          "requests_per_minute": 10,
+          "burst": 5
+        },
+        "action_on_limit": "block",
+        "headers": {
+          "enabled": true
+        }
+      }
+    ]
+  },
+  "request-limiting.test.soapbucket.com": {
+    "id": "request-limiting",
+    "hostname": "request-limiting.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "policies": [
+      {
+        "type": "request_limiting",
+        "disabled": false,
+        "max_request_size": 1048576,
+        "max_header_size": 8192,
+        "max_query_size": 2048
+      }
+    ]
+  },
+  "jwt-jwks.test.soapbucket.com": {
+    "id": "jwt-jwks",
+    "hostname": "jwt-jwks.test.soapbucket.com",
+    "authentication": {
+      "type": "jwt",
+      "disabled": false,
+      "jwks_url": "https://example.com/.well-known/jwks.json",
+      "algorithm": "RS256",
+      "issuer": "test-issuer",
+      "audience": "test-audience"
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    }
+  },
+  "basic-auth-multiple.test.soapbucket.com": {
+    "id": "basic-auth-multiple",
+    "hostname": "basic-auth-multiple.test.soapbucket.com",
+    "authentication": {
+      "type": "basic_auth",
+      "disabled": false,
+      "realm": "Multiple Users Realm",
+      "users": [
+        {
+          "username": "user1",
+          "password": "pass1",
+          "roles": [
+            "user"
+          ]
+        },
+        {
+          "username": "user2",
+          "password": "pass2",
+          "roles": [
+            "user"
+          ]
+        },
+        {
+          "username": "admin1",
+          "password": "admin1",
+          "roles": [
+            "admin",
+            "user"
+          ]
+        }
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    }
+  },
+  "api-key-multiple.test.soapbucket.com": {
+    "id": "api-key-multiple",
+    "hostname": "api-key-multiple.test.soapbucket.com",
+    "authentication": {
+      "type": "api_key",
+      "disabled": false,
+      "header_name": "X-API-Key",
+      "api_keys": [
+        "key1",
+        "key2",
+        "key3",
+        "admin-key-1",
+        "admin-key-2"
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    }
+  },
+  "bearer-token-multiple.test.soapbucket.com": {
+    "id": "bearer-token-multiple",
+    "hostname": "bearer-token-multiple.test.soapbucket.com",
+    "authentication": {
+      "type": "bearer_token",
+      "disabled": false,
+      "header_name": "Authorization",
+      "header_prefix": "Bearer ",
+      "tokens": [
+        "token1",
+        "token2",
+        "token3",
+        "admin-token-1",
+        "admin-token-2"
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    }
+  },
+  "waf-multiple.test.soapbucket.com": {
+    "id": "waf-multiple",
+    "hostname": "waf-multiple.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "policies": [
+      {
+        "type": "waf",
+        "disabled": false,
+        "custom_rules": [
+          {
+            "id": "block-sql-injection",
+            "name": "Block SQL Injection",
+            "disabled": false,
+            "phase": 2,
+            "severity": "critical",
+            "action": "block",
+            "variables": [
+              {
+                "name": "ARGS",
+                "collection": "ARGS"
+              }
+            ],
+            "operator": "rx",
+            "pattern": "(?i)(union|select|insert|delete|update|drop|create|alter|or|and)",
+            "transformations": [
+              "lowercase",
+              "urlDecode"
+            ]
+          },
+          {
+            "id": "block-xss",
+            "name": "Block XSS",
+            "disabled": false,
+            "phase": 2,
+            "severity": "high",
+            "action": "block",
+            "variables": [
+              {
+                "name": "ARGS",
+                "collection": "ARGS"
+              }
+            ],
+            "operator": "rx",
+            "pattern": "(?i)(<script|javascript:|onerror=)",
+            "transformations": [
+              "lowercase",
+              "urlDecode"
+            ]
+          },
+          {
+            "id": "block-path-traversal",
+            "name": "Block Path Traversal",
+            "disabled": false,
+            "phase": 2,
+            "severity": "high",
+            "action": "block",
+            "variables": [
+              {
+                "name": "REQUEST_URI",
+                "collection": "REQUEST_URI"
+              }
+            ],
+            "operator": "rx",
+            "pattern": "(?i)(\\.\\./|\\.\\.\\\\\\\\)",
+            "transformations": [
+              "urlDecode"
+            ]
+          }
+        ],
+        "default_action": "log",
+        "action_on_match": "block"
+      }
+    ]
+  },
+  "security-headers-comprehensive.test.soapbucket.com": {
+    "id": "security-headers-comprehensive",
+    "hostname": "security-headers-comprehensive.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "policies": [
+      {
+        "type": "security_headers",
+        "disabled": false,
+        "strict_transport_security": {
+          "disabled": false,
+          "max_age": 31536000,
+          "include_subdomains": true,
+          "preload": true
+        },
+        "content_security_policy": {
+          "disabled": false,
+          "policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+        },
+        "x_frame_options": {
+          "disabled": false,
+          "value": "DENY"
+        },
+        "x_content_type_options": {
+          "disabled": false,
+          "no_sniff": true
+        },
+        "x_xss_protection": {
+          "disabled": false,
+          "mode": "block"
+        },
+        "referrer_policy": {
+          "disabled": false,
+          "policy": "strict-origin-when-cross-origin"
+        }
+      }
+    ]
+  },
+  "ip-blacklist.test.soapbucket.com": {
+    "id": "ip-blacklist",
+    "hostname": "ip-blacklist.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "policies": [
+      {
+        "type": "ip_filtering",
+        "disabled": false,
+        "blacklist": [
+          "192.168.1.100",
+          "10.0.0.50"
+        ],
+        "action": "block"
+      }
+    ]
+  },
+  "cors-comprehensive.test.soapbucket.com": {
+    "id": "cors-comprehensive",
+    "hostname": "cors-comprehensive.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "Access-Control-Allow-Origin": "https://example.com",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
+            "Access-Control-Expose-Headers": "X-Total-Count, X-Page-Count",
+            "Access-Control-Max-Age": "3600",
+            "Access-Control-Allow-Credentials": "true"
+          }
+        }
+      }
+    ]
+  },
+  "compression.test.soapbucket.com": {
+    "id": "compression",
+    "hostname": "compression.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "compression": {
+      "disabled": false,
+      "types": [
+        "text/html",
+        "text/css",
+        "application/javascript",
+        "application/json"
+      ],
+      "level": 6
+    }
+  },
+  "forward-rules-complex.test.soapbucket.com": {
+    "id": "forward-rules-complex",
+    "hostname": "forward-rules-complex.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "forward_rules": [
+      {
+        "hostname": "api-v1-backend.test.soapbucket.com",
+        "rules": [
+          {
+            "path": {
+              "prefix": "/api/v1"
+            }
+          }
+        ]
+      },
+      {
+        "hostname": "old-service-backend.test.soapbucket.com",
+        "rules": [
+          {
+            "path": {
+              "prefix": "/old"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "api-v1-backend.test.soapbucket.com": {
+    "id": "api-v1-backend",
+    "hostname": "api-v1-backend.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Forwarded-From": "api-v1"
+          }
+        }
+      }
+    ]
+  },
+  "old-service-backend.test.soapbucket.com": {
+    "id": "old-service-backend",
+    "hostname": "old-service-backend.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Forwarded-From": "old-service"
+          }
+        }
+      }
+    ]
+  },
+  "session-config.test.soapbucket.com": {
+    "id": "session-config",
+    "hostname": "session-config.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_sb_session",
+      "cookie_path": "/",
+      "cookie_domain": ".session-config.test.soapbucket.com",
+      "max_age": 3600,
+      "secure": true,
+      "http_only": true,
+      "same_site": "Lax",
+      "allow_non_ssl": true
+    }
+  },
+  "multiple-transforms.test.soapbucket.com": {
+    "id": "multiple-transforms",
+    "hostname": "multiple-transforms.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "transforms": [
+      {
+        "type": "replace_strings",
+        "content_types": [
+          "text/html"
+        ],
+        "replace_strings": {
+          "replacements": [
+            {
+              "find": "old",
+              "replace": "new",
+              "regex": false
+            }
+          ]
+        }
+      },
+      {
+        "type": "json",
+        "content_types": [
+          "application/json"
+        ],
+        "modify_json": {
+          "add_fields": {
+            "proxy": "soapbucket"
+          }
+        }
+      }
+    ]
+  },
+  "request-modifiers-complex.test.soapbucket.com": {
+    "id": "request-modifiers-complex",
+    "hostname": "request-modifiers-complex.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Forwarded-Proto": "https",
+            "X-Real-IP": "{{request.remote_addr}}",
+            "X-Request-ID": "{{request.id}}"
+          },
+          "remove": [
+            "X-Forwarded-For"
+          ]
+        },
+        "url": {
+          "path": {
+            "replace": {
+              "old": "/old",
+              "new": "/new"
+            }
+          },
+          "query": {
+            "add": {
+              "source": "proxy"
+            }
+          }
+        }
+      }
+    ]
+  },
+  "response-modifiers-complex.test.soapbucket.com": {
+    "id": "response-modifiers-complex",
+    "hostname": "response-modifiers-complex.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Proxy-Version": "1.0.0",
+            "X-Processed-By": "soapbucket"
+          },
+          "remove": [
+            "X-Powered-By"
+          ]
+        },
+        "status_code": {
+          "replace": {
+            "old": 200,
+            "new": 201
+          }
+        }
+      }
+    ]
+  },
+  "cel-callback-onstart.test.soapbucket.com": {
+    "id": "cel-callback-onstart",
+    "hostname": "cel-callback-onstart.test.soapbucket.com",
+    "on_start": [
+      {
+        "type": "http",
+        "url": "http://localhost:8090/callback/config",
+        "method": "GET",
+        "timeout": 5,
+        "cel_expr": "{\"modified_json\": {\"config_data\": {\"api_version\": string('version' in json ? json['version'] : 'v1'), \"environment\": 'env' in json ? json['env'] : 'production', \"features\": 'features' in json ? json['features'] : {}}}}"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-API-Version": "{{config.config_data.api_version}}",
+            "X-Environment": "{{config.config_data.environment}}"
+          }
+        }
+      }
+    ]
+  },
+  "lua-callback-onstart.test.soapbucket.com": {
+    "id": "lua-callback-onstart",
+    "hostname": "lua-callback-onstart.test.soapbucket.com",
+    "on_start": [
+      {
+        "type": "http",
+        "url": "http://localhost:8090/callback/config",
+        "method": "GET",
+        "timeout": 5,
+        "lua_script": "local result = {}\nresult.api_version = tostring(json['version'] or 'v1')\nresult.environment = json['env'] or 'production'\nresult.features = json['features'] or {}\nreturn result"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-API-Version": "{{config.api_version}}",
+            "X-Environment": "{{config.environment}}"
+          }
+        }
+      }
+    ]
+  },
+  "cel-callback-session.test.soapbucket.com": {
+    "id": "cel-callback-session",
+    "hostname": "cel-callback-session.test.soapbucket.com",
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_sb.session",
+      "cookie_max_age": 3600,
+      "callbacks": [
+        {
+          "type": "http",
+          "url": "http://localhost:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_prefs",
+          "timeout": 5,
+          "cel_expr": "{\"modified_json\": {\"theme\": json['user_preferences']['theme'], \"language\": json['user_preferences']['language'], \"is_premium\": json['subscription']['tier'] == 'premium'}}"
+        }
+      ],
+      "allow_non_ssl": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-Theme": "{{session_data.user_prefs.theme}}",
+            "X-User-Language": "{{session_data.user_prefs.language}}",
+            "X-Is-Premium": "{{session_data.user_prefs.is_premium}}"
+          }
+        },
+        "rules": [
+          {
+            "cel_expr": "session.data.user_prefs.is_premium == true"
+          }
+        ]
+      }
+    ]
+  },
+  "lua-callback-session.test.soapbucket.com": {
+    "id": "lua-callback-session",
+    "hostname": "lua-callback-session.test.soapbucket.com",
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_sb.session",
+      "cookie_max_age": 3600,
+      "callbacks": [
+        {
+          "type": "http",
+          "url": "http://localhost:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_prefs",
+          "timeout": 5,
+          "lua_script": "local result = {}\nresult.theme = json['user_preferences']['theme']\nresult.language = json['user_preferences']['language']\nresult.is_premium = json['subscription']['tier'] == 'premium'\nreturn result"
+        }
+      ],
+      "allow_non_ssl": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-Theme": "{{session_data.user_prefs.theme}}",
+            "X-User-Language": "{{session_data.user_prefs.language}}"
+          }
+        }
+      }
+    ]
+  },
+  "cel-callback-auth.test.soapbucket.com": {
+    "id": "cel-callback-auth",
+    "hostname": "cel-callback-auth.test.soapbucket.com",
+    "authentication": {
+      "type": "api_key",
+      "disabled": false,
+      "header_name": "X-API-Key",
+      "api_keys": [
+        "test-key-123"
+      ],
+      "authentication_callback": {
+        "type": "http",
+        "url": "http://localhost:8090/callback/auth",
+        "method": "POST",
+        "timeout": 5,
+        "cel_expr": "{\"modified_json\": {\"user_id\": string('user_id' in json ? json['user_id'] : 'unknown'), \"roles\": 'roles' in json ? json['roles'] : [], \"permissions\": 'permissions' in json ? json['permissions'] : {}}}"
+      }
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-ID": "{{auth_data.user_id}}",
+            "X-User-Roles": "{{auth_data.roles}}"
+          }
+        }
+      }
+    ]
+  },
+  "lua-callback-auth.test.soapbucket.com": {
+    "id": "lua-callback-auth",
+    "hostname": "lua-callback-auth.test.soapbucket.com",
+    "authentication": {
+      "type": "api_key",
+      "disabled": false,
+      "header_name": "X-API-Key",
+      "api_keys": [
+        "test-key-123"
+      ],
+      "authentication_callback": {
+        "type": "http",
+        "url": "http://localhost:8090/callback/auth",
+        "method": "POST",
+        "timeout": 5,
+        "lua_script": "local result = {}\nresult.user_id = tostring(json['user_id'] or 'unknown')\nresult.roles = json['roles'] or {}\nresult.permissions = json['permissions'] or {}\nreturn result"
+      }
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-ID": "{{auth_data.user_id}}"
+          }
+        }
+      }
+    ]
+  },
+  "cel-expression-policy-callback.test.soapbucket.com": {
+    "id": "cel-expression-policy-callback",
+    "hostname": "cel-expression-policy-callback.test.soapbucket.com",
+    "on_start": [
+      {
+        "type": "http",
+        "url": "http://localhost:8090/callback/config",
+        "method": "GET",
+        "timeout": 5,
+        "variable_name": "app_config"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "policies": [
+      {
+        "type": "expression",
+        "disabled": false,
+        "cel_expr": "'app_config' in config && config['app_config']['enabled'] == true && request.method == 'GET'"
+      }
+    ]
+  },
+  "lua-expression-policy-callback.test.soapbucket.com": {
+    "id": "lua-expression-policy-callback",
+    "hostname": "lua-expression-policy-callback.test.soapbucket.com",
+    "on_start": [
+      {
+        "type": "http",
+        "url": "http://localhost:8090/callback/config",
+        "method": "GET",
+        "timeout": 5,
+        "variable_name": "app_config"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "policies": [
+      {
+        "type": "expression",
+        "disabled": false,
+        "lua_script": "return config.app_config.enabled == true and request.method == 'GET'"
+      }
+    ]
+  },
+  "cel-rule-callback-data.test.soapbucket.com": {
+    "id": "cel-rule-callback-data",
+    "hostname": "cel-rule-callback-data.test.soapbucket.com",
+    "session_config": {
+      "disabled": false,
+      "allow_non_ssl": true,
+      "cookie_name": "_sb.session",
+      "cookie_max_age": 3600,
+      "callbacks": [
+        {
+          "type": "http",
+          "url": "http://localhost:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_data",
+          "timeout": 5
+        }
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-Tier": "{{session_data.user_data.subscription.tier}}",
+            "X-Feature-Flags": "{{session_data.user_data.feature_flags}}"
+          }
+        },
+        "rules": [
+          {
+            "cel_expr": "size(session) > 0 && size(session.data) > 0 && session.data.user_data.subscription.tier == 'premium' && 'beta_features' in session.data.user_data.feature_flags && session.data.user_data.feature_flags.beta_features == true"
+          }
+        ]
+      }
+    ]
+  },
+  "lua-rule-callback-data.test.soapbucket.com": {
+    "id": "lua-rule-callback-data",
+    "hostname": "lua-rule-callback-data.test.soapbucket.com",
+    "session_config": {
+      "disabled": false,
+      "allow_non_ssl": true,
+      "cookie_name": "_sb.session",
+      "cookie_max_age": 3600,
+      "callbacks": [
+        {
+          "type": "http",
+          "url": "http://localhost:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_data",
+          "timeout": 5
+        }
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-Tier": "{{session_data.user_data.subscription.tier}}"
+          }
+        },
+        "rules": [
+          {
+            "lua_script": "return session ~= nil and session.data ~= nil and session.data.user_data ~= nil and session.data.user_data.subscription ~= nil and session.data.user_data.subscription.tier == 'premium'"
+          }
+        ]
+      }
+    ]
+  },
+  "cel-multiple-callbacks.test.soapbucket.com": {
+    "id": "cel-multiple-callbacks",
+    "hostname": "cel-multiple-callbacks.test.soapbucket.com",
+    "on_start": [
+      {
+        "type": "http",
+        "url": "http://localhost:8090/callback/config",
+        "method": "GET",
+        "timeout": 5,
+        "variable_name": "app_config",
+        "cel_expr": "{\"modified_json\": {\"version\": string('version' in json ? json['version'] : 'v1'), \"features\": 'features' in json ? json['features'] : {}}}"
+      }
+    ],
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_sb.session",
+      "cookie_max_age": 3600,
+      "callbacks": [
+        {
+          "type": "http",
+          "url": "http://localhost:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_prefs",
+          "timeout": 5,
+          "cel_expr": "{\"modified_json\": {\"theme\": json['user_preferences']['theme'], \"subscription\": json['subscription']}}"
+        }
+      ],
+      "allow_non_ssl": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-App-Version": "{{config.app_config.version}}",
+            "X-User-Theme": "{{session_data.user_prefs.theme}}",
+            "X-Subscription-Tier": "{{session_data.user_prefs.subscription.tier}}"
+          }
+        },
+        "rules": [
+          {
+            "cel_expr": "config['app_config']['version'] == 'v2.1.0' && session.data.user_prefs.subscription.tier == 'premium'"
+          }
+        ]
+      }
+    ]
+  },
+  "lua-multiple-callbacks.test.soapbucket.com": {
+    "id": "lua-multiple-callbacks",
+    "hostname": "lua-multiple-callbacks.test.soapbucket.com",
+    "on_start": [
+      {
+        "type": "http",
+        "url": "http://localhost:8090/callback/config",
+        "method": "GET",
+        "timeout": 5,
+        "variable_name": "app_config",
+        "lua_script": "local result = {}\nresult.app_config = {}\nresult.app_config.version = tostring(json['version'] or 'v1')\nresult.app_config.features = json['features'] or {}\nreturn result"
+      }
+    ],
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_sb.session",
+      "cookie_max_age": 3600,
+      "callbacks": [
+        {
+          "type": "http",
+          "url": "http://localhost:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_prefs",
+          "timeout": 5,
+          "lua_script": "local result = {}\nresult.user_prefs = {}\nresult.user_prefs.theme = json['user_preferences']['theme']\nresult.user_prefs.subscription = json['subscription']\nreturn result"
+        }
+      ],
+      "allow_non_ssl": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-App-Version": "{{config.app_config.version}}",
+            "X-User-Theme": "{{session_data.user_prefs.theme}}"
+          }
+        }
+      }
+    ]
+  },
+  "auth-waf.test.soapbucket.com": {
+    "id": "auth-waf",
+    "hostname": "auth-waf.test.soapbucket.com",
+    "authentication": {
+      "type": "basic_auth",
+      "disabled": false,
+      "users": [
+        {
+          "username": "testuser",
+          "password": "testpass"
+        }
+      ]
+    },
+    "policies": [
+      {
+        "type": "waf",
+        "custom_rules": [
+          {
+            "id": "block-sql-injection",
+            "name": "Block SQL Injection",
+            "disabled": false,
+            "phase": 2,
+            "severity": "critical",
+            "action": "block",
+            "variables": [
+              {
+                "name": "ARGS",
+                "collection": "ARGS"
+              }
+            ],
+            "operator": "rx",
+            "pattern": "(?i)(union|select|insert|delete|update|drop|create|alter|or|and)",
+            "transformations": [
+              "lowercase",
+              "urlDecode"
+            ]
+          }
+        ],
+        "default_action": "log",
+        "action_on_match": "block"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/api/headers",
+      "strip_base_path": true
+    }
+  },
+  "auth-rate-transform.test.soapbucket.com": {
+    "id": "auth-rate-transform",
+    "hostname": "auth-rate-transform.test.soapbucket.com",
+    "authentication": {
+      "type": "api_key",
+      "disabled": false,
+      "header_name": "X-API-Key",
+      "api_keys": [
+        "test-key-123"
+      ]
+    },
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "disabled": false,
+        "limit": 100,
+        "window": "1m",
+        "key_by": "ip",
+        "action": "block",
+        "headers": {
+          "enabled": true
+        }
+      },
+      {
+        "type": "security_headers",
+        "disabled": false,
+        "strict_transport_security": {
+          "disabled": false,
+          "max_age": 31536000,
+          "include_subdomains": true
+        }
+      }
+    ],
+    "transforms": [
+      {
+        "type": "json",
+        "content_types": [
+          "application/json"
+        ],
+        "json_transform": {
+          "set_fields": {
+            "processed_by_proxy": true,
+            "api_version": "v1"
+          }
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/api/headers"
+    }
+  },
+  "cache-compress.test.soapbucket.com": {
+    "id": "cache-compress",
+    "hostname": "cache-compress.test.soapbucket.com",
+    "cache_settings": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": 60
+    },
+    "compression": {
+      "disabled": false,
+      "min_length": 100,
+      "content_types": [
+        "application/json",
+        "text/html"
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test/large-data"
+    }
+  },
+  "multi-policy.test.soapbucket.com": {
+    "id": "multi-policy",
+    "hostname": "multi-policy.test.soapbucket.com",
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "disabled": false,
+        "limit": 100,
+        "window": "1m",
+        "key_by": "ip",
+        "headers": {
+          "enabled": true
+        }
+      },
+      {
+        "type": "ip_filtering",
+        "whitelist": [
+          "127.0.0.1",
+          "::1",
+          "172.24.0.0/16"
+        ],
+        "action": "block"
+      },
+      {
+        "type": "waf",
+        "custom_rules": [
+          {
+            "id": "block-xss",
+            "name": "Block XSS",
+            "disabled": false,
+            "phase": 2,
+            "severity": "high",
+            "action": "block",
+            "variables": [
+              {
+                "name": "ARGS",
+                "collection": "ARGS"
+              }
+            ],
+            "operator": "rx",
+            "pattern": "(?i)(<script|javascript:|onerror=)",
+            "transformations": [
+              "htmlEntityDecode",
+              "urlDecode"
+            ]
+          }
+        ],
+        "default_action": "log",
+        "action_on_match": "block"
+      },
+      {
+        "type": "security_headers",
+        "disabled": false,
+        "x_frame_options": {
+          "disabled": false,
+          "mode": "DENY"
+        },
+        "x_content_type_options": {
+          "disabled": false
+        }
+      }
+    ],
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST",
+            "Access-Control-Allow-Headers": "Content-Type",
+            "Access-Control-Max-Age": "3600"
+          }
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/api/headers"
+    }
+  },
+  "session-auth-callbacks.test.soapbucket.com": {
+    "id": "session-auth-callbacks",
+    "hostname": "session-auth-callbacks.test.soapbucket.com",
+    "authentication": {
+      "type": "api_key",
+      "api_keys": [
+        "session-test-key"
+      ],
+      "authentication_callback": {
+        "type": "http",
+        "url": "http://localhost:8090/callback/auth",
+        "method": "POST",
+        "timeout": 5,
+        "cel_expr": "{\"modified_json\": {\"auth_data\": {\"user_id\": string('user_id' in json ? json['user_id'] : 'unknown'), \"roles\": 'roles' in json ? json['roles'] : []}}}"
+      }
+    },
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_session",
+      "cookie_max_age": 3600,
+      "callbacks": [
+        {
+          "type": "http",
+          "url": "http://localhost:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_data",
+          "timeout": 5,
+          "cel_expr": "{\"modified_json\": {\"user_data\": {\"theme\": json['user_preferences']['theme'], \"tier\": json['subscription']['tier']}}}"
+        }
+      ],
+      "allow_non_ssl": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/api/headers"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-ID": "{{auth.data.auth_data.user_id}}",
+            "X-User-Theme": "{{session.data.user_data.theme}}",
+            "X-User-Tier": "{{session.data.user_data.tier}}"
+          }
+        }
+      }
+    ]
+  },
+  "transform-chain.test.soapbucket.com": {
+    "id": "transform-chain",
+    "hostname": "transform-chain.test.soapbucket.com",
+    "transforms": [
+      {
+        "type": "json",
+        "content_types": [
+          "application/json"
+        ],
+        "json_transform": {
+          "set_fields": {
+            "transformed": true,
+            "stage": 1
+          }
+        }
+      },
+      {
+        "type": "json",
+        "content_types": [
+          "application/json"
+        ],
+        "json_transform": {
+          "set_fields": {
+            "double_transformed": true,
+            "stage": 2
+          }
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test/json-data"
+    }
+  },
+  "conditional-routing.test.soapbucket.com": {
+    "id": "conditional-routing",
+    "hostname": "conditional-routing.test.soapbucket.com",
+    "forward_rules": [
+      {
+        "hostname": "admin-backend.test.soapbucket.com",
+        "rules": [
+          {
+            "path": {
+              "prefix": "/admin"
+            }
+          }
+        ]
+      },
+      {
+        "hostname": "api-v2-backend.test.soapbucket.com",
+        "rules": [
+          {
+            "path": {
+              "prefix": "/api/v2"
+            }
+          }
+        ]
+      },
+      {
+        "hostname": "beta-backend.test.soapbucket.com",
+        "rules": [
+          {
+            "headers": {
+              "X-Beta": "true"
+            }
+          }
+        ]
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test/simple-200"
+    }
+  },
+  "admin-backend.test.soapbucket.com": {
+    "id": "admin-backend",
+    "hostname": "admin-backend.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    }
+  },
+  "api-v2-backend.test.soapbucket.com": {
+    "id": "api-v2-backend",
+    "hostname": "api-v2-backend.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    }
+  },
+  "beta-backend.test.soapbucket.com": {
+    "id": "beta-backend",
+    "hostname": "beta-backend.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test/beta-response",
+      "strip_base_path": true
+    }
+  },
+  "req-resp-modifiers.test.soapbucket.com": {
+    "id": "req-resp-modifiers",
+    "hostname": "req-resp-modifiers.test.soapbucket.com",
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Request-ID": "generated-{{uuid}}",
+            "X-Timestamp": "{{timestamp}}",
+            "X-Client-IP": "{{ip}}"
+          },
+          "add": {
+            "X-Forwarded-For": "1.2.3.4"
+          },
+          "delete": [
+            "Cookie",
+            "Authorization"
+          ]
+        }
+      },
+      {
+        "url": {
+          "query": {
+            "set": {
+              "proxy": "true",
+              "version": "v1"
+            }
+          }
+        }
+      }
+    ],
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Proxy-Version": "1.0",
+            "X-Response-Time": "{{response_time}}"
+          },
+          "add": {
+            "X-Powered-By": "SoapBucket"
+          },
+          "delete": [
+            "Server",
+            "X-Powered-By-Original"
+          ]
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/api/headers",
+      "strip_base_path": true
+    }
+  },
+  "lb-health.test.soapbucket.com": {
+    "id": "lb-health",
+    "hostname": "lb-health.test.soapbucket.com",
+    "action": {
+      "type": "loadbalancer",
+      "targets": [
+        {
+          "url": "http://localhost:8090",
+          "weight": 60
+        },
+        {
+          "url": "http://localhost:8090",
+          "weight": 40
+        }
+      ],
+      "round_robin": true,
+      "disable_sticky": false,
+      "sticky_cookie_name": "_lb_session",
+      "health_check": {
+        "disabled": false,
+        "interval": "10s",
+        "timeout": "5s",
+        "path": "/health",
+        "unhealthy_threshold": 3,
+        "healthy_threshold": 2
+      }
+    }
+  },
+  "circuit-breaker.test.soapbucket.com": {
+    "id": "circuit-breaker",
+    "hostname": "circuit-breaker.test.soapbucket.com",
+    "circuit_breaker": {
+      "disabled": false,
+      "failure_threshold": 5,
+      "success_threshold": 2,
+      "timeout": "30s",
+      "max_concurrent_requests": 100
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/circuit/test"
+    }
+  },
+  "retry-config.test.soapbucket.com": {
+    "id": "retry-config",
+    "hostname": "retry-config.test.soapbucket.com",
+    "retry_config": {
+      "disabled": false,
+      "max_retries": 3,
+      "retry_on_status_codes": [
+        502,
+        503,
+        504
+      ],
+      "retry_on_timeout": true,
+      "retry_on_connection_error": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test/flaky-endpoint"
+    }
+  },
+  "timeout-config.test.soapbucket.com": {
+    "id": "timeout-config",
+    "hostname": "timeout-config.test.soapbucket.com",
+    "timeout_config": {
+      "connect_timeout": "5s",
+      "read_timeout": "10s",
+      "write_timeout": "10s",
+      "idle_timeout": "30s"
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/api/delay?ms=2000"
+    }
+  },
+  "jwt-claims.test.soapbucket.com": {
+    "id": "jwt-claims",
+    "hostname": "jwt-claims.test.soapbucket.com",
+    "authentication": {
+      "type": "jwt",
+      "disabled": false,
+      "secret": "test-secret-key-1234567890123456",
+      "issuer": "test-issuer",
+      "audience": "test-audience",
+      "algorithm": "HS256",
+      "required_claims": {
+        "role": "admin",
+        "premium": true
+      }
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/api/headers"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-Role": "{{jwt.role}}",
+            "X-User-Sub": "{{jwt.sub}}",
+            "X-User-Email": "{{jwt.email}}"
+          }
+        }
+      }
+    ]
+  },
+  "webhook.test.soapbucket.com": {
+    "id": "webhook",
+    "hostname": "webhook.test.soapbucket.com",
+    "on_request": [
+      {
+        "type": "http",
+        "url": "http://localhost:8090/callback/webhook",
+        "method": "POST",
+        "timeout": 5,
+        "variable_name": "webhook_response"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/api/headers"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Webhook-Response": "{{request_data.webhook_response.status}}"
+          }
+        }
+      }
+    ]
+  },
+  "geo-routing.test.soapbucket.com": {
+    "id": "geo-routing",
+    "hostname": "geo-routing.test.soapbucket.com",
+    "forward_rules": [
+      {
+        "hostname": "us-backend.test.soapbucket.com",
+        "rules": [
+          {
+            "location": {
+              "country_codes": [
+                "US"
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "hostname": "uk-backend.test.soapbucket.com",
+        "rules": [
+          {
+            "location": {
+              "country_codes": [
+                "GB"
+              ]
+            }
+          }
+        ]
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090",
+      "strip_base_path": true
+    }
+  },
+  "us-backend.test.soapbucket.com": {
+    "id": "us-backend",
+    "hostname": "us-backend.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test/us-response",
+      "strip_base_path": true
+    }
+  },
+  "uk-backend.test.soapbucket.com": {
+    "id": "uk-backend",
+    "hostname": "uk-backend.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test/uk-response",
+      "strip_base_path": true
+    }
+  },
+  "feature-stack.test.soapbucket.com": {
+    "id": "feature-stack",
+    "hostname": "feature-stack.test.soapbucket.com",
+    "authentication": {
+      "type": "bearer_token",
+      "disabled": false,
+      "header_name": "Authorization",
+      "header_prefix": "Bearer ",
+      "tokens": [
+        "feature-test-token"
+      ]
+    },
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_feature_session",
+      "cookie_max_age": 3600,
+      "allow_non_ssl": true
+    },
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "disabled": false,
+        "limit": 100,
+        "window": "1m",
+        "key_by": "ip",
+        "headers": {
+          "enabled": true
+        }
+      },
+      {
+        "type": "security_headers",
+        "disabled": false,
+        "strict_transport_security": {
+          "disabled": false,
+          "max_age": 31536000
+        },
+        "content_security_policy": {
+          "disabled": false,
+          "directives": {
+            "default_src": [
+              "'self'"
+            ],
+            "script_src": [
+              "'self'",
+              "'unsafe-inline'"
+            ]
+          }
+        }
+      }
+    ],
+    "cache_settings": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": 60
+    },
+    "compression": {
+      "disabled": false,
+      "min_length": 100,
+      "content_types": [
+        "application/json"
+      ]
+    },
+    "transforms": [
+      {
+        "type": "json",
+        "content_types": [
+          "application/json"
+        ],
+        "json_transform": {
+          "set_fields": {
+            "processed": true,
+            "version": "v1"
+          }
+        }
+      }
+    ],
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Request-ID": "{{uuid}}",
+            "X-Timestamp": "{{timestamp}}"
+          }
+        }
+      }
+    ],
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Proxy-Version": "1.0",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization"
+          }
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/api/headers"
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "error-pages-callbacks.test.soapbucket.com": {
+    "id": "error-pages-callbacks",
+    "hostname": "error-pages-callbacks.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "error_pages": [
+      {
+        "status": [
+          404
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/404",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          500
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/500",
+          "method": "GET",
+          "cache_duration": "10m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          502,
+          503,
+          504
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/5xx",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          429
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/429?content_type=application/json",
+          "method": "GET"
+        },
+        "content_type": "application/json"
+      }
+    ],
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "error-pages-callback-template.test.soapbucket.com": {
+    "id": "error-pages-callback-template",
+    "hostname": "error-pages-callback-template.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "error_pages": [
+      {
+        "status": [
+          404,
+          500
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/template",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "template": true,
+        "content_type": "text/html"
+      }
+    ],
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "error-pages-callback-base64.test.soapbucket.com": {
+    "id": "error-pages-callback-base64",
+    "hostname": "error-pages-callback-base64.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "error_pages": [
+      {
+        "status": [
+          500
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/base64",
+          "method": "GET"
+        },
+        "decode_base64": true,
+        "content_type": "text/html"
+      }
+    ],
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "abtest-sessions.test.soapbucket.com": {
+    "id": "abtest-sessions",
+    "hostname": "abtest-sessions.test.soapbucket.com",
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_abtest_session",
+      "cookie_max_age": 86400,
+      "allow_non_ssl": true
+    },
+    "action": {
+      "type": "abtest",
+      "test_name": "landing_page_experiment",
+      "cookie_name": "_ab_landing",
+      "cookie_ttl": "24h",
+      "variants": [
+        {
+          "name": "control",
+          "weight": 40,
+          "action": {
+            "type": "proxy",
+            "url": "http://localhost:8090/test/simple-200?variant=control"
+          }
+        },
+        {
+          "name": "variant_a",
+          "weight": 30,
+          "action": {
+            "type": "proxy",
+            "url": "http://localhost:8090/test/simple-200?variant=variant_a"
+          }
+        },
+        {
+          "name": "variant_b",
+          "weight": 30,
+          "action": {
+            "type": "proxy",
+            "url": "http://localhost:8090/test/simple-200?variant=variant_b"
+          }
+        }
+      ]
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "nested-forward.test.soapbucket.com": {
+    "id": "nested-forward",
+    "hostname": "nested-forward.test.soapbucket.com",
+    "forward_rules": [
+      {
+        "hostname": "api-v1-router.test.soapbucket.com",
+        "rules": [
+          {
+            "path": {
+              "prefix": "/api/v1"
+            }
+          }
+        ]
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090",
+      "strip_base_path": true
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "api-v1-router.test.soapbucket.com": {
+    "id": "api-v1-router",
+    "hostname": "api-v1-router.test.soapbucket.com",
+    "forward_rules": [
+      {
+        "hostname": "users-service.test.soapbucket.com",
+        "rules": [
+          {
+            "path": {
+              "prefix": "/api/v1/users"
+            }
+          }
+        ]
+      },
+      {
+        "hostname": "products-service.test.soapbucket.com",
+        "rules": [
+          {
+            "path": {
+              "prefix": "/api/v1/products"
+            }
+          }
+        ]
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test/api-v1-default",
+      "strip_base_path": true
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "users-service.test.soapbucket.com": {
+    "id": "users-service",
+    "hostname": "users-service.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090",
+      "strip_base_path": true
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "products-service.test.soapbucket.com": {
+    "id": "products-service",
+    "hostname": "products-service.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test/products-api",
+      "strip_base_path": true
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "multi-auth.test.soapbucket.com": {
+    "id": "multi-auth",
+    "hostname": "multi-auth.test.soapbucket.com",
+    "authentication": {
+      "type": "noop",
+      "disabled": false
+    },
+    "policies": [
+      {
+        "type": "expression",
+        "disabled": false,
+        "cel_expr": "('authorization' in request.headers && request.headers['authorization'].startsWith('Bearer bearer-token-123')) || ('x-api-key' in request.headers && request.headers['x-api-key'] == 'api-key-456')"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/api/headers"
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "conditional-cache.test.soapbucket.com": {
+    "id": "conditional-cache",
+    "hostname": "conditional-cache.test.soapbucket.com",
+    "cache_settings": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": 60,
+      "cache_control": {
+        "respect_cache_control": true,
+        "respect_expires": true,
+        "cache_private": false
+      },
+      "vary_on_headers": [
+        "Accept-Language",
+        "Accept-Encoding"
+      ],
+      "cache_key_pattern": "{{hostname}}:{{path}}:{{query}}:{{headers.Accept-Language}}"
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/cache-test/conditional"
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "rate-limit-user.test.soapbucket.com": {
+    "id": "rate-limit-user",
+    "hostname": "rate-limit-user.test.soapbucket.com",
+    "authentication": {
+      "type": "api_key",
+      "disabled": false,
+      "header_name": "X-API-Key",
+      "api_keys": [
+        "user1-key",
+        "user2-key",
+        "user3-key"
+      ]
+    },
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "disabled": false,
+        "limit": 10,
+        "window": "1m",
+        "key_by": "auth_key",
+        "action": "block",
+        "headers": {
+          "enabled": true
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/api/headers"
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "dynamic-backend.test.soapbucket.com": {
+    "id": "dynamic-backend",
+    "hostname": "dynamic-backend.test.soapbucket.com",
+    "on_request": [
+      {
+        "type": "http",
+        "url": "http://localhost:8090/callback/backend-selector",
+        "method": "POST",
+        "timeout": 3,
+        "variable_name": "backend_info",
+        "cel_expr": "{\"modified_json\": {\"backend\": json['backend_url'], \"headers\": json['extra_headers']}}"
+      }
+    ],
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Backend-Selected": "{{request_data.backend_info.backend}}"
+          }
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/api/headers"
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "canary.test.soapbucket.com": {
+    "id": "canary",
+    "hostname": "canary.test.soapbucket.com",
+    "action": {
+      "type": "loadbalancer",
+      "targets": [
+        {
+          "url": "http://localhost:8090/test/stable",
+          "weight": 95
+        },
+        {
+          "url": "http://localhost:8090/test/canary",
+          "weight": 5
+        }
+      ],
+      "round_robin": true,
+      "disable_sticky": false,
+      "sticky_cookie_name": "_canary_session"
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Deployment-Type": "canary"
+          }
+        }
+      }
+    ],
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  },
+  "progressive-rate-limit.test.soapbucket.com": {
+    "id": "progressive-rate-limit",
+    "hostname": "progressive-rate-limit.test.soapbucket.com",
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "disabled": false,
+        "limit": 100,
+        "window": "1m",
+        "key_by": "ip",
+        "action": "throttle",
+        "throttle_delay": "100ms",
+        "headers": {
+          "enabled": true
+        }
+      },
+      {
+        "type": "rate_limiting",
+        "disabled": false,
+        "limit": 1000,
+        "window": "1h",
+        "key_by": "ip",
+        "action": "block",
+        "headers": {
+          "enabled": true
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/api/headers"
+    }
+  },
+  "failover-lb.test.soapbucket.com": {
+    "id": "failover-lb",
+    "hostname": "failover-lb.test.soapbucket.com",
+    "action": {
+      "type": "loadbalancer",
+      "targets": [
+        {
+          "url": "http://localhost:8090/test/primary",
+          "weight": 100,
+          "priority": 1
+        },
+        {
+          "url": "http://localhost:8090/test/secondary",
+          "weight": 100,
+          "priority": 2
+        },
+        {
+          "url": "http://localhost:8090/test/tertiary",
+          "weight": 100,
+          "priority": 3
+        }
+      ],
+      "round_robin": false,
+      "failover_mode": true,
+      "health_check": {
+        "disabled": false,
+        "interval": "10s",
+        "timeout": "5s",
+        "path": "/health",
+        "unhealthy_threshold": 2,
+        "healthy_threshold": 1
+      }
+    }
+  },
+  "content-negotiation.test.soapbucket.com": {
+    "id": "content-negotiation",
+    "hostname": "content-negotiation.test.soapbucket.com",
+    "transforms": [
+      {
+        "type": "json",
+        "content_types": [
+          "application/json"
+        ],
+        "json_transform": {
+          "set_fields": {
+            "format": "json"
+          }
+        },
+        "rules": [
+          {
+            "headers": {
+              "Accept": "application/json"
+            }
+          }
+        ]
+      },
+      {
+        "type": "template",
+        "content_types": [
+          "application/json"
+        ],
+        "template_transform": {
+          "template": "<html><body>{{.}}</body></html>",
+          "content_type": "text/html"
+        },
+        "rules": [
+          {
+            "headers": {
+              "Accept": "text/html"
+            }
+          }
+        ]
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test/json-data"
+    }
+  },
+  "ws-auth.test.soapbucket.com": {
+    "id": "ws-auth",
+    "hostname": "ws-auth.test.soapbucket.com",
+    "authentication": {
+      "type": "bearer_token",
+      "disabled": false,
+      "header_name": "Authorization",
+      "header_prefix": "Bearer ",
+      "tokens": [
+        "ws-token-123"
+      ]
+    },
+    "action": {
+      "type": "websocket",
+      "url": "ws://localhost:8091/ws",
+      "ping_interval": "30s",
+      "pong_timeout": "10s",
+      "handshake_timeout": "10s"
+    }
+  },
+  "graphql-rate-limit.test.soapbucket.com": {
+    "id": "graphql-rate-limit",
+    "hostname": "graphql-rate-limit.test.soapbucket.com",
+    "authentication": {
+      "type": "api_key",
+      "disabled": false,
+      "header_name": "X-API-Key",
+      "api_keys": [
+        "graphql-api-key"
+      ]
+    },
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "disabled": false,
+        "limit": 50,
+        "window": "1m",
+        "key_by": "auth_key",
+        "action": "block",
+        "headers": {
+          "enabled": true
+        }
+      }
+    ],
+    "action": {
+      "type": "graphql",
+      "url": "http://localhost:8092/graphql",
+      "max_depth": 10,
+      "max_complexity": 100,
+      "enable_introspection": true
+    }
+  },
+  "bot-detection.test.soapbucket.com": {
+    "id": "bot-detection",
+    "hostname": "bot-detection.test.soapbucket.com",
+    "policies": [
+      {
+        "type": "expression",
+        "disabled": false,
+        "cel_expr": "size(user_agent) > 0 && user_agent['family'] != 'scraperbot' && user_agent['family'] != 'evilbot'",
+        "action": "block",
+        "status_code": 403
+      },
+      {
+        "type": "threat_detection",
+        "disabled": false,
+        "patterns": {
+          "xss": {
+            "disabled": false,
+            "action": "log",
+            "log_level": "warn"
+          }
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/api/headers"
+    }
+  },
+  "smart-cache.test.soapbucket.com": {
+    "id": "smart-cache",
+    "hostname": "smart-cache.test.soapbucket.com",
+    "cache_settings": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": 300,
+      "stale_while_revalidate": 60,
+      "stale_if_error": 86400,
+      "cache_control": {
+        "respect_cache_control": true,
+        "min_fresh": 10
+      },
+      "conditional_rules": [
+        {
+          "match": {
+            "path": {
+              "prefix": "/api/static"
+            }
+          },
+          "ttl": 3600
+        },
+        {
+          "match": {
+            "path": {
+              "prefix": "/api/dynamic"
+            }
+          },
+          "ttl": 60
+        }
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/cache-test/smart"
+    }
+  },
+  "comprehensive-security.test.soapbucket.com": {
+    "id": "comprehensive-security",
+    "hostname": "comprehensive-security.test.soapbucket.com",
+    "authentication": {
+      "type": "jwt",
+      "disabled": false,
+      "secret": "comprehensive-secret-1234567890",
+      "issuer": "secure-issuer",
+      "audience": "secure-audience",
+      "algorithm": "HS256"
+    },
+    "policies": [
+      {
+        "type": "rate_limiting",
+        "disabled": false,
+        "limit": 100,
+        "window": "1m",
+        "key_by": "jwt_sub",
+        "headers": {
+          "enabled": true
+        }
+      },
+      {
+        "type": "waf",
+        "custom_rules": [
+          {
+            "id": "sql-injection",
+            "name": "SQL Injection",
+            "disabled": false,
+            "phase": 2,
+            "severity": "critical",
+            "action": "block",
+            "variables": [
+              {
+                "name": "ARGS",
+                "collection": "ARGS"
+              }
+            ],
+            "operator": "rx",
+            "pattern": "(?i)(union|select|insert|delete|update|drop)",
+            "transformations": [
+              "lowercase",
+              "urlDecode"
+            ]
+          },
+          {
+            "id": "xss",
+            "name": "XSS",
+            "disabled": false,
+            "phase": 2,
+            "severity": "high",
+            "action": "block",
+            "variables": [
+              {
+                "name": "ARGS",
+                "collection": "ARGS"
+              }
+            ],
+            "operator": "rx",
+            "pattern": "(?i)(<script|javascript:|onerror=)",
+            "transformations": [
+              "htmlEntityDecode"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "ip_filtering",
+        "whitelist": [
+          "127.0.0.1",
+          "::1",
+          "172.21.0.0/16",
+          "172.24.0.0/16"
+        ],
+        "action": "block"
+      },
+      {
+        "type": "threat_detection",
+        "disabled": false,
+        "patterns": {
+          "xss": {
+            "disabled": false,
+            "action": "block"
+          },
+          "path_traversal": {
+            "disabled": false,
+            "action": "block"
+          },
+          "command_injection": {
+            "disabled": false,
+            "action": "block"
+          }
+        }
+      },
+      {
+        "type": "csrf",
+        "disabled": false,
+        "secret": "csrf-secret-key-12345678901234567890",
+        "cookie_name": "_csrf",
+        "header_name": "X-CSRF-Token",
+        "methods": [
+          "POST",
+          "PUT",
+          "DELETE",
+          "PATCH"
+        ]
+      },
+      {
+        "type": "security_headers",
+        "disabled": false,
+        "strict_transport_security": {
+          "disabled": false,
+          "max_age": 31536000,
+          "include_subdomains": true,
+          "preload": true
+        },
+        "content_security_policy": {
+          "disabled": false,
+          "directives": {
+            "default_src": [
+              "'self'"
+            ],
+            "script_src": [
+              "'self'",
+              "'unsafe-inline'"
+            ],
+            "style_src": [
+              "'self'",
+              "'unsafe-inline'"
+            ],
+            "img_src": [
+              "'self'",
+              "data:",
+              "https:"
+            ],
+            "connect_src": [
+              "'self'"
+            ],
+            "font_src": [
+              "'self'"
+            ],
+            "object_src": [
+              "'none'"
+            ],
+            "frame_ancestors": [
+              "'none'"
+            ],
+            "base_uri": [
+              "'self'"
+            ],
+            "form_action": [
+              "'self'"
+            ]
+          }
+        },
+        "x_frame_options": {
+          "disabled": false,
+          "mode": "DENY"
+        },
+        "x_content_type_options": {
+          "disabled": false
+        },
+        "x_xss_protection": {
+          "disabled": false,
+          "mode": "block"
+        },
+        "referrer_policy": {
+          "disabled": false,
+          "policy": "strict-origin-when-cross-origin"
+        }
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/api/headers"
+    }
+  },
+  "cache-validation.test.soapbucket.com": {
+    "id": "cache-validation",
+    "hostname": "cache-validation.test.soapbucket.com",
+    "cache_settings": {
+      "disabled": false,
+      "level": "l1",
+      "ttl": 10,
+      "use_conditional_requests": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/cache/validation-test"
+    }
+  },
+  "cache-etag.test.soapbucket.com": {
+    "id": "cache-etag",
+    "hostname": "cache-etag.test.soapbucket.com",
+    "cache_settings": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": 5,
+      "use_conditional_requests": true,
+      "respect_etag": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/cache-test/etag-test"
+    }
+  },
+  "cache-last-modified.test.soapbucket.com": {
+    "id": "cache-last-modified",
+    "hostname": "cache-last-modified.test.soapbucket.com",
+    "cache_settings": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": 5,
+      "use_conditional_requests": true,
+      "respect_last_modified": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/cache-test/last-modified-test"
+    }
+  },
+  "cache-vary.test.soapbucket.com": {
+    "id": "cache-vary",
+    "hostname": "cache-vary.test.soapbucket.com",
+    "cache_settings": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": 60,
+      "vary_on_headers": [
+        "Accept-Language",
+        "Accept-Encoding"
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/cache/vary-test"
+    }
+  },
+  "cache-no-cache.test.soapbucket.com": {
+    "id": "cache-no-cache",
+    "hostname": "cache-no-cache.test.soapbucket.com",
+    "cache_settings": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": 60,
+      "cache_control": {
+        "respect_cache_control": true,
+        "respect_no_cache": true
+      }
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/cache-test/no-cache"
+    }
+  },
+  "cache-max-age.test.soapbucket.com": {
+    "id": "cache-max-age",
+    "hostname": "cache-max-age.test.soapbucket.com",
+    "cache_settings": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": 300,
+      "cache_control": {
+        "respect_cache_control": true,
+        "respect_max_age": true
+      }
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/cache-test/max-age?max_age=5"
+    }
+  },
+  "cache-stale-revalidate.test.soapbucket.com": {
+    "id": "cache-stale-revalidate",
+    "hostname": "cache-stale-revalidate.test.soapbucket.com",
+    "cache_settings": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": 5,
+      "stale_while_revalidate": 30,
+      "background_revalidation": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/cache/stale-test"
+    }
+  },
+  "cache-signature-detailed.test.soapbucket.com": {
+    "id": "cache-signature-detailed",
+    "hostname": "cache-signature-detailed.test.soapbucket.com",
+    "cache_settings": {
+      "disabled": false,
+      "level": "signature",
+      "ttl": 10,
+      "signature_method": "sha256"
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/cache/signature-test"
+    }
+  },
+  "cache-per-user.test.soapbucket.com": {
+    "id": "cache-per-user",
+    "hostname": "cache-per-user.test.soapbucket.com",
+    "authentication": {
+      "type": "api_key",
+      "disabled": false,
+      "header_name": "X-API-Key",
+      "api_keys": [
+        "user1-cache-key",
+        "user2-cache-key"
+      ]
+    },
+    "cache_settings": {
+      "disabled": false,
+      "level": "l2",
+      "ttl": 60,
+      "cache_key_pattern": "{{hostname}}:{{path}}:{{auth_key}}",
+      "private_cache": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/cache/user-data"
+    }
+  },
+  "request-matcher-comprehensive.test.soapbucket.com": {
+    "id": "request-matcher-comprehensive",
+    "hostname": "request-matcher-comprehensive.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.html"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Path": "true",
+            "X-Matched-Method": "true"
+          }
+        },
+        "rules": [
+          {
+            "path": {
+              "prefix": "/test-page"
+            },
+            "methods": [
+              "GET"
+            ]
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Header": "true"
+          }
+        },
+        "rules": [
+          {
+            "headers": {
+              "exact": {
+                "User-Agent": "TestAgent"
+              },
+              "exists": [
+                "Authorization"
+              ],
+              "not_exist": [
+                "X-Blocked"
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Query": "true"
+          }
+        },
+        "rules": [
+          {
+            "query": {
+              "exact": {
+                "version": "v2"
+              },
+              "exists": [
+                "api_key"
+              ],
+              "not_exist": [
+                "debug"
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-IP": "true"
+          }
+        },
+        "rules": [
+          {
+            "ip": {
+              "ips": [
+                "127.0.0.1",
+                "::1"
+              ],
+              "cidrs": [
+                "192.168.0.0/16",
+                "10.0.0.0/8"
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Content-Type": "true"
+          }
+        },
+        "rules": [
+          {
+            "content_types": [
+              "application/json",
+              "application/xml"
+            ]
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-CEL": "true"
+          }
+        },
+        "rules": [
+          {
+            "cel_expr": "request.method == 'POST' && 'Content-Type' in request.headers && request.headers['Content-Type'].contains('json')"
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Lua": "true"
+          }
+        },
+        "rules": [
+          {
+            "lua_script": "return request.method == 'PUT' and request.path:match('/api/') ~= nil"
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-URL": "true"
+          }
+        },
+        "rules": [
+          {
+            "url": {
+              "contains": "/api/v1"
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Scheme": "true"
+          }
+        },
+        "rules": [
+          {
+            "scheme": "https"
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Protocol": "true"
+          }
+        },
+        "rules": [
+          {
+            "protocol": "http"
+          }
+        ]
+      }
+    ]
+  },
+  "response-matcher-comprehensive.test.soapbucket.com": {
+    "id": "response-matcher-comprehensive",
+    "hostname": "response-matcher-comprehensive.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.html"
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Status": "true"
+          }
+        },
+        "rules": [
+          {
+            "status": {
+              "code": 200
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Status-Range": "true"
+          }
+        },
+        "rules": [
+          {
+            "status": {
+              "min": 200,
+              "max": 299
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Status-Codes": "true"
+          }
+        },
+        "rules": [
+          {
+            "status": {
+              "codes": [
+                200,
+                201,
+                204
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Content-Type": "true"
+          }
+        },
+        "rules": [
+          {
+            "content_types": [
+              "text/html",
+              "text/css",
+              "application/javascript"
+            ]
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Header": "true"
+          }
+        },
+        "rules": [
+          {
+            "headers": {
+              "exact": {
+                "Content-Type": "text/html"
+              },
+              "exists": [
+                "X-Test-Server"
+              ],
+              "not_exist": [
+                "X-Error"
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Body": "true"
+          }
+        },
+        "rules": [
+          {
+            "body_contains": "Proxy Test Page"
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-CEL": "true"
+          }
+        },
+        "rules": [
+          {
+            "cel_expr": "response.status_code == 200 && 'Content-Type' in response.headers && response.headers['Content-Type'].contains('html')"
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Matched-Lua": "true"
+          }
+        },
+        "rules": [
+          {
+            "lua_script": "return response.status_code >= 200 and response.status_code < 300 and response.headers['Content-Type'] ~= nil"
+          }
+        ]
+      }
+    ]
+  },
+  "forwarder-comprehensive.test.soapbucket.com": {
+    "id": "forwarder-comprehensive",
+    "hostname": "forwarder-comprehensive.test.soapbucket.com",
+    "forward_rules": [
+      {
+        "hostname": "forwarder-api.test.soapbucket.com",
+        "rules": [
+          {
+            "path": {
+              "prefix": "/api"
+            }
+          }
+        ]
+      },
+      {
+        "hostname": "forwarder-admin.test.soapbucket.com",
+        "rules": [
+          {
+            "path": {
+              "contains": "/admin"
+            },
+            "headers": {
+              "exact": {
+                "X-Admin-Auth": "true"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "hostname": "forwarder-static.test.soapbucket.com",
+        "rules": [
+          {
+            "path": {
+              "suffix": ".html"
+            }
+          },
+          {
+            "path": {
+              "suffix": ".css"
+            }
+          },
+          {
+            "path": {
+              "suffix": ".js"
+            }
+          }
+        ]
+      },
+      {
+        "hostname": "forwarder-json.test.soapbucket.com",
+        "rules": [
+          {
+            "path": {
+              "suffix": ".json"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ]
+      },
+      {
+        "hostname": "forwarder-cel.test.soapbucket.com",
+        "rules": [
+          {
+            "cel_expr": "request.path.contains('/cel') && request.method == 'GET'"
+          }
+        ]
+      },
+      {
+        "hostname": "forwarder-lua.test.soapbucket.com",
+        "rules": [
+          {
+            "lua_script": "return request.path:match('/lua') ~= nil and request.method == 'POST'"
+          }
+        ]
+      },
+      {
+        "hostname": "forwarder-query.test.soapbucket.com",
+        "rules": [
+          {
+            "query": {
+              "exact": {
+                "forward": "true"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "hostname": "forwarder-ip.test.soapbucket.com",
+        "rules": [
+          {
+            "ip": {
+              "ips": [
+                "127.0.0.1"
+              ]
+            }
+          }
+        ]
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.html"
+    }
+  },
+  "forwarder-api.test.soapbucket.com": {
+    "id": "forwarder-api",
+    "hostname": "forwarder-api.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.json"
+    }
+  },
+  "forwarder-admin.test.soapbucket.com": {
+    "id": "forwarder-admin",
+    "hostname": "forwarder-admin.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.html"
+    }
+  },
+  "forwarder-static.test.soapbucket.com": {
+    "id": "forwarder-static",
+    "hostname": "forwarder-static.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    }
+  },
+  "forwarder-json.test.soapbucket.com": {
+    "id": "forwarder-json",
+    "hostname": "forwarder-json.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.json"
+    }
+  },
+  "forwarder-cel.test.soapbucket.com": {
+    "id": "forwarder-cel",
+    "hostname": "forwarder-cel.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.html"
+    }
+  },
+  "forwarder-lua.test.soapbucket.com": {
+    "id": "forwarder-lua",
+    "hostname": "forwarder-lua.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.html"
+    }
+  },
+  "forwarder-query.test.soapbucket.com": {
+    "id": "forwarder-query",
+    "hostname": "forwarder-query.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.html"
+    }
+  },
+  "forwarder-ip.test.soapbucket.com": {
+    "id": "forwarder-ip",
+    "hostname": "forwarder-ip.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.html"
+    }
+  },
+  "response-modifier-comprehensive.test.soapbucket.com": {
+    "id": "response-modifier-comprehensive",
+    "hostname": "response-modifier-comprehensive.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.html"
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Proxy-Version": "1.0.0",
+            "X-Processed-By": "soapbucket-proxy",
+            "X-Response-Time": "{{response_time_ms}}ms"
+          },
+          "add": {
+            "X-Additional-Header": "added-value"
+          },
+          "remove": [
+            "X-Powered-By",
+            "Server"
+          ]
+        },
+        "status_code": {
+          "replace": {
+            "old": 200,
+            "new": 201
+          }
+        }
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Conditional-Header": "matched"
+          }
+        },
+        "rules": [
+          {
+            "status": {
+              "code": 200
+            },
+            "content_types": [
+              "text/html"
+            ]
+          }
+        ]
+      },
+      {
+        "body": {
+          "replace": [
+            {
+              "old": "Proxy Test Page",
+              "new": "Modified Proxy Test Page"
+            }
+          ]
+        },
+        "rules": [
+          {
+            "content_types": [
+              "text/html"
+            ]
+          }
+        ]
+      },
+      {
+        "body": {
+          "json": {
+            "set": {
+              "$.modified": true,
+              "$.proxy_version": "1.0.0"
+            },
+            "remove": [
+              "$.sensitive"
+            ]
+          }
+        },
+        "rules": [
+          {
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-CEL-Modified": "true"
+          }
+        },
+        "cel_expr": "response.headers['X-CEL-Modified'] = 'true'",
+        "rules": [
+          {
+            "status": {
+              "min": 200,
+              "max": 299
+            }
+          }
+        ]
+      },
+      {
+        "headers": {
+          "set": {
+            "X-Lua-Modified": "true"
+          }
+        },
+        "lua_script": "response.headers['X-Lua-Modified'] = 'true'",
+        "rules": [
+          {
+            "body_contains": "test"
+          }
+        ]
+      }
+    ]
+  },
+  "callback-onstart.test.soapbucket.com": {
+    "id": "callback-onstart",
+    "hostname": "callback-onstart.test.soapbucket.com",
+    "on_start": [
+      {
+        "type": "http",
+        "url": "http://localhost:8090/callback/config",
+        "method": "GET",
+        "timeout": 5
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.html"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Config-Version": "{{config.version}}",
+            "X-Config-Env": "{{config.env}}"
+          }
+        }
+      }
+    ]
+  },
+  "callback-onsession.test.soapbucket.com": {
+    "id": "callback-onsession",
+    "hostname": "callback-onsession.test.soapbucket.com",
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_sb.session",
+      "cookie_max_age": 3600,
+      "callbacks": [
+        {
+          "type": "http",
+          "url": "http://localhost:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_prefs",
+          "timeout": 5
+        }
+      ],
+      "allow_non_ssl": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.html"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-Theme": "{{session_data.user_prefs.user_preferences.theme}}",
+            "X-User-Language": "{{session_data.user_prefs.user_preferences.language}}",
+            "X-Is-Premium": "{{session_data.user_prefs.subscription.tier}}"
+          }
+        }
+      }
+    ]
+  },
+  "callback-cel.test.soapbucket.com": {
+    "id": "callback-cel",
+    "hostname": "callback-cel.test.soapbucket.com",
+    "on_start": [
+      {
+        "type": "http",
+        "url": "http://localhost:8090/callback/config",
+        "method": "GET",
+        "timeout": 5,
+        "cel_expr": "{\"modified_json\": {\"config_data\": {\"api_version\": string('version' in json ? json['version'] : 'v1'), \"environment\": 'env' in json ? json['env'] : 'production', \"features\": 'features' in json ? json['features'] : {}}}}"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.html"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-API-Version": "{{config.config_data.api_version}}",
+            "X-Environment": "{{config.config_data.environment}}"
+          }
+        }
+      }
+    ]
+  },
+  "callback-lua.test.soapbucket.com": {
+    "id": "callback-lua",
+    "hostname": "callback-lua.test.soapbucket.com",
+    "on_start": [
+      {
+        "type": "http",
+        "url": "http://localhost:8090/callback/config",
+        "method": "GET",
+        "timeout": 5,
+        "lua_script": "return {modified_json = {config_data = {api_version = json.version or 'v1', environment = json.env or 'production', features = json.features or {}}}}"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.html"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-API-Version": "{{config.config_data.api_version}}",
+            "X-Environment": "{{config.config_data.environment}}"
+          }
+        }
+      }
+    ]
+  },
+  "callback-jsonpath.test.soapbucket.com": {
+    "id": "callback-jsonpath",
+    "hostname": "callback-jsonpath.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.json"
+    },
+    "transforms": [
+      {
+        "type": "jsonpath",
+        "content_types": [
+          "application/json"
+        ],
+        "operations": [
+          {
+            "type": "extract",
+            "path": "$.status",
+            "target": "X-Response-Status"
+          },
+          {
+            "type": "extract",
+            "path": "$.data.metadata.total",
+            "target": "X-Total-Count"
+          },
+          {
+            "type": "set",
+            "path": "$.modified",
+            "value": true
+          },
+          {
+            "type": "set",
+            "path": "$.proxy_version",
+            "value": "1.0.0"
+          },
+          {
+            "type": "delete",
+            "path": "$.sensitive"
+          },
+          {
+            "type": "copy",
+            "path": "$.data.metadata.total",
+            "target": "$.total_users"
+          }
+        ]
+      }
+    ]
+  },
+  "html-transform-caching.test.soapbucket.com": {
+    "id": "html-transform-caching",
+    "hostname": "html-transform-caching.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.html"
+    },
+    "transforms": [
+      {
+        "type": "optimized_html",
+        "content_types": [
+          "text/html"
+        ],
+        "optimized_format_options": {
+          "strip_comments": true,
+          "remove_boolean_attributes": true,
+          "remove_trailing_slashes": true,
+          "optimize_attributes": true,
+          "sort_attributes": true,
+          "strip_newlines": true,
+          "strip_space": true
+        },
+        "attribute_options": {
+          "add_unique_ids": true,
+          "unique_id_prefix": "proxy-id-",
+          "use_random_suffix": true
+        },
+        "add_to_tags": [
+          {
+            "tag": "head",
+            "add_before_end_tag": false,
+            "content": "<meta name=\"proxy\" content=\"enabled\">"
+          }
+        ]
+      }
+    ]
+  },
+  "html-transform-fingerprint-caching.test.soapbucket.com": {
+    "id": "html-transform-fingerprint-caching",
+    "hostname": "html-transform-fingerprint-caching.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "https://news.ycombinator.com"
+    },
+    "chunk_cache": {
+      "signature_cache": {
+        "enabled": true,
+        "content_types": [
+          "text/html"
+        ],
+        "signatures": [
+          {
+            "name": "html_tag",
+            "pattern_type": "regex",
+            "regex_pattern": "<html",
+            "cache_ttl": "1h",
+            "max_examine_bytes": 512
+          }
+        ],
+        "max_examine_bytes": 1024,
+        "default_ttl": "1h"
+      }
+    },
+    "transforms": [
+      {
+        "type": "optimized_html",
+        "content_types": [
+          "text/html"
+        ],
+        "optimized_format_options": {
+          "strip_comments": true,
+          "remove_boolean_attributes": true,
+          "optimize_attributes": true
+        },
+        "attribute_options": {
+          "add_unique_ids": true,
+          "unique_id_prefix": "fp-id"
+        }
+      }
+    ]
+  },
+  "json-transform-comprehensive.test.soapbucket.com": {
+    "id": "json-transform-comprehensive",
+    "hostname": "json-transform-comprehensive.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.json"
+    },
+    "transforms": [
+      {
+        "type": "json",
+        "content_types": [
+          "application/json"
+        ],
+        "pretty_print": true,
+        "remove_empty_objects": true,
+        "remove_empty_arrays": false,
+        "rules": [
+          {
+            "path": "$.sensitive",
+            "value": "REDACTED"
+          },
+          {
+            "path": "$.data.users.0.email",
+            "value": "user1@redacted.com"
+          },
+          {
+            "path": "$.proxy_processed",
+            "value": true
+          },
+          {
+            "path": "$.processing_timestamp",
+            "value": "{{timestamp}}"
+          }
+        ]
+      }
+    ]
+  },
+  "css-transform-comprehensive.test.soapbucket.com": {
+    "id": "css-transform-comprehensive",
+    "hostname": "css-transform-comprehensive.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.css"
+    },
+    "transforms": [
+      {
+        "type": "css",
+        "content_types": [
+          "text/css"
+        ],
+        "minify": true,
+        "add_rules": [
+          {
+            "selector": "body",
+            "rules": {
+              "background-color": "#f0f0f0",
+              "font-family": "Arial, sans-serif"
+            }
+          },
+          {
+            "selector": ".test-section",
+            "rules": {
+              "border": "1px solid #ccc",
+              "padding": "10px",
+              "margin": "5px"
+            }
+          },
+          {
+            "selector": ".css-test",
+            "rules": {
+              "color": "#2196F3",
+              "font-weight": "bold",
+              "text-decoration": "underline"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "javascript-transform-comprehensive.test.soapbucket.com": {
+    "id": "javascript-transform-comprehensive",
+    "hostname": "javascript-transform-comprehensive.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.js"
+    },
+    "transforms": [
+      {
+        "type": "javascript",
+        "content_types": [
+          "application/javascript",
+          "text/javascript"
+        ],
+        "number_precision": 2,
+        "change_variable_names": false,
+        "supported_version": 5,
+        "minify": true
+      }
+    ]
+  },
+  "encoding-fix-comprehensive.test.soapbucket.com": {
+    "id": "encoding-fix-comprehensive",
+    "hostname": "encoding-fix-comprehensive.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.html"
+    }
+  },
+  "content-type-fix-comprehensive.test.soapbucket.com": {
+    "id": "content-type-fix-comprehensive",
+    "hostname": "content-type-fix-comprehensive.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/test-page.html"
+    }
+  },
+  "retry-handler-e2e.test.soapbucket.com": {
+    "id": "retry-handler-e2e",
+    "hostname": "retry-handler-e2e.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "retry_config": {
+      "disabled": false,
+      "max_retries": 3,
+      "retry_on_status_codes": [
+        502,
+        503,
+        504,
+        429
+      ],
+      "retry_on_timeout": true,
+      "retry_on_connection_error": true
+    }
+  },
+  "retry-handler-success-after-2.test.soapbucket.com": {
+    "id": "retry-handler-success-after-2",
+    "hostname": "retry-handler-success-after-2.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/retry/test-success?success_after=2&retryable_code=503&final_code=200"
+    },
+    "retry_config": {
+      "disabled": false,
+      "max_retries": 3,
+      "retry_on_status_codes": [
+        502,
+        503,
+        504,
+        429
+      ],
+      "retry_on_timeout": true,
+      "retry_on_connection_error": true
+    }
+  },
+  "retry-handler-exhaust.test.soapbucket.com": {
+    "id": "retry-handler-exhaust",
+    "hostname": "retry-handler-exhaust.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/retry/test-exhaust?success_after=0&retryable_code=502&final_code=502"
+    },
+    "retry_config": {
+      "disabled": false,
+      "max_retries": 2,
+      "retry_on_status_codes": [
+        502,
+        503,
+        504,
+        429
+      ],
+      "retry_on_timeout": true,
+      "retry_on_connection_error": true
+    }
+  },
+  "retry-handler-429.test.soapbucket.com": {
+    "id": "retry-handler-429",
+    "hostname": "retry-handler-429.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/retry/test-429?success_after=3&retryable_code=429&final_code=200"
+    },
+    "retry_config": {
+      "disabled": false,
+      "max_retries": 5,
+      "retry_on_status_codes": [
+        429
+      ],
+      "retry_on_timeout": false,
+      "retry_on_connection_error": false
+    }
+  },
+  "max-requests-handler-e2e.test.soapbucket.com": {
+    "id": "max-requests-handler-e2e",
+    "hostname": "max-requests-handler-e2e.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/max-requests/test?max_connections=2&delay=100",
+      "max_connections": 2
+    }
+  },
+  "max-requests-handler-5.test.soapbucket.com": {
+    "id": "max-requests-handler-5",
+    "hostname": "max-requests-handler-5.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/max-requests/test-5?max_connections=5&delay=50",
+      "max_connections": 5
+    }
+  },
+  "max-requests-handler-10.test.soapbucket.com": {
+    "id": "max-requests-handler-10",
+    "hostname": "max-requests-handler-10.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/max-requests/test-10?max_connections=10&delay=30",
+      "max_connections": 10
+    }
+  },
+  "max-requests-handler-with-error-page.test.soapbucket.com": {
+    "id": "max-requests-handler-with-error-page",
+    "hostname": "max-requests-handler-with-error-page.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/max-requests/test-limit?max_connections=3&delay=100",
+      "max_connections": 3
+    },
+    "error_pages": [
+      {
+        "status": [
+          503
+        ],
+        "body": "<html><head><title>Service Unavailable</title></head><body><h1>503 Service Unavailable</h1><p>Connection limit reached. Please try again later.</p></body></html>",
+        "content_type": "text/html"
+      }
+    ]
+  },
+  "error-pages-comprehensive.test.soapbucket.com": {
+    "id": "error-pages-comprehensive",
+    "hostname": "error-pages-comprehensive.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "error_pages": [
+      {
+        "status": [
+          400
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/400",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          401
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/401",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          403
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/403",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          408
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/408",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          410
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/410",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          413
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/413",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          414
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/414",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          415
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/415",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          422
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/422",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          451
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/451",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          507
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/507",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          508
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/508",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          510
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/510",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          511
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/511",
+          "method": "GET",
+          "cache_duration": "5m"
+        },
+        "content_type": "text/html"
+      }
+    ]
+  },
+  "error-pages-content-types.test.soapbucket.com": {
+    "id": "error-pages-content-types",
+    "hostname": "error-pages-content-types.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "error_pages": [
+      {
+        "status": [
+          404
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/404?content_type=application/json",
+          "method": "GET"
+        },
+        "content_type": "application/json"
+      },
+      {
+        "status": [
+          500
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/500?content_type=application/xml",
+          "method": "GET"
+        },
+        "content_type": "application/xml"
+      },
+      {
+        "status": [
+          503
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/503?content_type=text/plain",
+          "method": "GET"
+        },
+        "content_type": "text/plain"
+      }
+    ]
+  },
+  "error-pages-callback-failures.test.soapbucket.com": {
+    "id": "error-pages-callback-failures",
+    "hostname": "error-pages-callback-failures.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "error_pages": [
+      {
+        "status": [
+          404
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/404?fail=true",
+          "method": "GET"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          500
+        ],
+        "callback": {
+          "type": "http",
+          "url": "http://localhost:8090/error/500?fail=true",
+          "method": "GET"
+        },
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          503
+        ],
+        "body": "<html><body><h1>503 - Service Unavailable</h1><p>Fallback error page when callback fails</p></body></html>",
+        "content_type": "text/html"
+      }
+    ]
+  },
+  "error-pages-static-comprehensive.test.soapbucket.com": {
+    "id": "error-pages-static-comprehensive",
+    "hostname": "error-pages-static-comprehensive.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "error_pages": [
+      {
+        "status": [
+          400
+        ],
+        "body": "<html><body><h1>400 - Bad Request</h1><p>Invalid request parameters</p></body></html>",
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          401
+        ],
+        "body": "<html><body><h1>401 - Unauthorized</h1><p>Authentication required</p></body></html>",
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          403
+        ],
+        "body": "<html><body><h1>403 - Forbidden</h1><p>Insufficient permissions</p></body></html>",
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          408
+        ],
+        "body": "<html><body><h1>408 - Request Timeout</h1><p>The request timed out</p></body></html>",
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          410
+        ],
+        "body": "<html><body><h1>410 - Gone</h1><p>Resource is no longer available</p></body></html>",
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          413
+        ],
+        "body": "{\"error\":\"413 - Payload Too Large\",\"message\":\"Request payload exceeds size limit\"}",
+        "content_type": "application/json"
+      },
+      {
+        "status": [
+          414
+        ],
+        "body": "<html><body><h1>414 - URI Too Long</h1><p>The request URI is too long</p></body></html>",
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          415
+        ],
+        "body": "{\"error\":\"415 - Unsupported Media Type\",\"message\":\"The media type is not supported\"}",
+        "content_type": "application/json"
+      },
+      {
+        "status": [
+          422
+        ],
+        "body": "{\"error\":\"422 - Unprocessable Entity\",\"message\":\"Validation failed\"}",
+        "content_type": "application/json"
+      },
+      {
+        "status": [
+          451
+        ],
+        "body": "<html><body><h1>451 - Unavailable For Legal Reasons</h1><p>Content unavailable due to legal restrictions</p></body></html>",
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          507
+        ],
+        "body": "{\"error\":\"507 - Insufficient Storage\",\"message\":\"Storage quota exceeded\"}",
+        "content_type": "application/json"
+      },
+      {
+        "status": [
+          508
+        ],
+        "body": "<html><body><h1>508 - Loop Detected</h1><p>Infinite loop detected in request processing</p></body></html>",
+        "content_type": "text/html"
+      },
+      {
+        "status": [
+          510
+        ],
+        "body": "{\"error\":\"510 - Not Extended\",\"message\":\"Further extensions required\"}",
+        "content_type": "application/json"
+      },
+      {
+        "status": [
+          511
+        ],
+        "body": "<html><body><h1>511 - Network Authentication Required</h1><p>Network authentication is required</p></body></html>",
+        "content_type": "text/html"
+      }
+    ]
+  },
+  "websocket-pool.test.soapbucket.com": {
+    "id": "websocket-pool",
+    "hostname": "websocket-pool.test.soapbucket.com",
+    "action": {
+      "type": "websocket",
+      "url": "ws://localhost:8091/echo",
+      "disable_pool": false,
+      "pool_max_connections": 10,
+      "pool_max_idle_connections": 5,
+      "pool_max_lifetime": "1m",
+      "pool_max_idle_time": "1m",
+      "disable_pool_auto_reconnect": false,
+      "pool_reconnect_delay": "5s",
+      "pool_max_reconnect_attempts": 3,
+      "ping_interval": "30s",
+      "pong_timeout": "10s"
+    }
+  },
+  "certificate-pinning.test.soapbucket.com": {
+    "id": "certificate-pinning",
+    "hostname": "certificate-pinning.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "https://localhost:9443",
+      "skip_tls_verify_host": true,
+      "certificate_pinning": {
+        "enabled": true,
+        "pin_sha256": "HaVHDKn4JbBIcLd39pq/ZqbNax+2GH7y7SKXyDuT76c=",
+        "backup_pins": [],
+        "pin_expiry": "2025-12-31T23:59:59Z"
+      }
+    }
+  },
+  "certificate-pinning-backup.test.soapbucket.com": {
+    "id": "certificate-pinning-backup",
+    "hostname": "certificate-pinning-backup.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "https://localhost:9443",
+      "skip_tls_verify_host": true,
+      "certificate_pinning": {
+        "enabled": true,
+        "pin_sha256": "HaVHDKn4JbBIcLd39pq/ZqbNax+2GH7y7SKXyDuT76c=",
+        "backup_pins": [
+          "HaVHDKn4JbBIcLd39pq/ZqbNax+2GH7y7SKXyDuT76c="
+        ],
+        "pin_expiry": "2025-12-31T23:59:59Z"
+      }
+    }
+  },
+  "certificate-pinning-expired.test.soapbucket.com": {
+    "id": "certificate-pinning-expired",
+    "hostname": "certificate-pinning-expired.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "https://localhost:9443",
+      "skip_tls_verify_host": true,
+      "certificate_pinning": {
+        "enabled": true,
+        "pin_sha256": "HaVHDKn4JbBIcLd39pq/ZqbNax+2GH7y7SKXyDuT76c=",
+        "backup_pins": [],
+        "pin_expiry": "2020-01-01T00:00:00Z"
+      }
+    }
+  },
+  "mtls-proxy.test.soapbucket.com": {
+    "id": "mtls-proxy",
+    "hostname": "mtls-proxy.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "https://localhost:9444",
+      "skip_tls_verify_host": true,
+      "mtls_client_cert_file": "/app/certs/client-cert.pem",
+      "mtls_client_key_file": "/app/certs/client-key.pem",
+      "mtls_ca_cert_file": "/app/certs/ca-cert.pem"
+    }
+  },
+  "request-coalescing.test.soapbucket.com": {
+    "id": "request-coalescing",
+    "hostname": "request-coalescing.test.soapbucket.com",
+    "description": "Request coalescing test - deduplicates identical concurrent requests",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090",
+      "request_coalescing": {
+        "enabled": true,
+        "max_inflight": 1000,
+        "coalesce_window": "100ms",
+        "max_waiters": 100,
+        "key_strategy": "default"
+      }
+    }
+  },
+  "request-coalescing-method-url.test.soapbucket.com": {
+    "id": "request-coalescing-method-url",
+    "hostname": "request-coalescing-method-url.test.soapbucket.com",
+    "description": "Request coalescing with method_url key strategy - simpler key generation",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090",
+      "request_coalescing": {
+        "enabled": true,
+        "max_inflight": 2000,
+        "coalesce_window": "200ms",
+        "max_waiters": 200,
+        "key_strategy": "method_url"
+      }
+    }
+  },
+  "request-coalescing-disabled.test.soapbucket.com": {
+    "id": "request-coalescing-disabled",
+    "hostname": "request-coalescing-disabled.test.soapbucket.com",
+    "description": "Request coalescing disabled - per-origin override",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090",
+      "request_coalescing": {
+        "enabled": false,
+        "max_inflight": 1000,
+        "max_waiters": 100
+      }
+    }
+  },
+  "transport-wrappers-retry.test.soapbucket.com": {
+    "id": "transport-wrappers-retry",
+    "hostname": "transport-wrappers-retry.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090",
+      "transport_wrappers": {
+        "retry": {
+          "enabled": true,
+          "max_retries": 3,
+          "initial_delay": "100ms",
+          "max_delay": "10s",
+          "multiplier": 2.0,
+          "jitter": 0.1,
+          "retryable_status": [
+            502,
+            503,
+            504,
+            429
+          ]
+        }
+      }
+    }
+  },
+  "transport-wrappers-retry-success.test.soapbucket.com": {
+    "id": "transport-wrappers-retry-success",
+    "hostname": "transport-wrappers-retry-success.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/retry/test-success?success_after=2&retryable_code=503&final_code=200",
+      "transport_wrappers": {
+        "retry": {
+          "enabled": true,
+          "max_retries": 5,
+          "initial_delay": "50ms",
+          "max_delay": "5s",
+          "multiplier": 2.0,
+          "jitter": 0.1,
+          "retryable_status": [
+            502,
+            503,
+            504,
+            429
+          ]
+        }
+      }
+    }
+  },
+  "transport-wrappers-retry-exhaust.test.soapbucket.com": {
+    "id": "transport-wrappers-retry-exhaust",
+    "hostname": "transport-wrappers-retry-exhaust.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/retry/test-exhaust?success_after=0&retryable_code=502&final_code=502",
+      "transport_wrappers": {
+        "retry": {
+          "enabled": true,
+          "max_retries": 2,
+          "initial_delay": "50ms",
+          "max_delay": "1s",
+          "multiplier": 2.0,
+          "jitter": 0.1,
+          "retryable_status": [
+            502,
+            503,
+            504,
+            429
+          ]
+        }
+      }
+    }
+  },
+  "transport-wrappers-retry-429.test.soapbucket.com": {
+    "id": "transport-wrappers-retry-429",
+    "hostname": "transport-wrappers-retry-429.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090/retry/test-429?success_after=3&retryable_code=429&final_code=200",
+      "transport_wrappers": {
+        "retry": {
+          "enabled": true,
+          "max_retries": 5,
+          "initial_delay": "200ms",
+          "max_delay": "10s",
+          "multiplier": 2.0,
+          "jitter": 0.2,
+          "retryable_status": [
+            429
+          ]
+        }
+      }
+    }
+  },
+  "transport-wrappers-hedging.test.soapbucket.com": {
+    "id": "transport-wrappers-hedging",
+    "hostname": "transport-wrappers-hedging.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090",
+      "transport_wrappers": {
+        "hedging": {
+          "enabled": true,
+          "delay": "50ms",
+          "max_hedges": 1,
+          "max_cost_ratio": 0.5
+        }
+      }
+    }
+  },
+  "transport-wrappers-hedging-get.test.soapbucket.com": {
+    "id": "transport-wrappers-hedging-get",
+    "hostname": "transport-wrappers-hedging-get.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090",
+      "transport_wrappers": {
+        "hedging": {
+          "enabled": true,
+          "delay": "50ms",
+          "max_hedges": 2,
+          "methods": [
+            "GET",
+            "HEAD"
+          ],
+          "max_cost_ratio": 0.3
+        }
+      }
+    }
+  },
+  "transport-wrappers-hedging-disabled.test.soapbucket.com": {
+    "id": "transport-wrappers-hedging-disabled",
+    "hostname": "transport-wrappers-hedging-disabled.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090",
+      "transport_wrappers": {
+        "hedging": {
+          "enabled": false
+        }
+      }
+    }
+  },
+  "transport-wrappers-health-check.test.soapbucket.com": {
+    "id": "transport-wrappers-health-check",
+    "hostname": "transport-wrappers-health-check.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090",
+      "transport_wrappers": {
+        "health_check": {
+          "enabled": true,
+          "type": "http",
+          "endpoint": "/health",
+          "interval": "5s",
+          "timeout": "2s",
+          "healthy_threshold": 1,
+          "unhealthy_threshold": 1,
+          "expected_status": 200
+        }
+      }
+    }
+  },
+  "transport-wrappers-health-check-tcp.test.soapbucket.com": {
+    "id": "transport-wrappers-health-check-tcp",
+    "hostname": "transport-wrappers-health-check-tcp.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090",
+      "transport_wrappers": {
+        "health_check": {
+          "enabled": true,
+          "type": "tcp",
+          "interval": "10s",
+          "timeout": "3s",
+          "healthy_threshold": 1,
+          "unhealthy_threshold": 1
+        }
+      }
+    }
+  },
+  "transport-wrappers-health-check-unhealthy.test.soapbucket.com": {
+    "id": "transport-wrappers-health-check-unhealthy",
+    "hostname": "transport-wrappers-health-check-unhealthy.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090",
+      "transport_wrappers": {
+        "health_check": {
+          "enabled": true,
+          "type": "http",
+          "endpoint": "/health",
+          "interval": "5s",
+          "timeout": "2s",
+          "healthy_threshold": 2,
+          "unhealthy_threshold": 1,
+          "expected_status": 200
+        }
+      }
+    }
+  },
+  "transport-wrappers-combined.test.soapbucket.com": {
+    "id": "transport-wrappers-combined",
+    "hostname": "transport-wrappers-combined.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090",
+      "transport_wrappers": {
+        "health_check": {
+          "enabled": true,
+          "type": "http",
+          "endpoint": "/health",
+          "interval": "5s",
+          "timeout": "2s",
+          "healthy_threshold": 1,
+          "unhealthy_threshold": 1,
+          "expected_status": 200
+        },
+        "hedging": {
+          "enabled": true,
+          "delay": "50ms",
+          "max_hedges": 1,
+          "max_cost_ratio": 0.3
+        },
+        "retry": {
+          "enabled": true,
+          "max_retries": 3,
+          "initial_delay": "100ms",
+          "max_delay": "5s",
+          "multiplier": 2.0,
+          "jitter": 0.1,
+          "retryable_status": [
+            502,
+            503,
+            504,
+            429
+          ]
+        }
+      }
+    }
+  },
+  "transport-wrappers-combined-full.test.soapbucket.com": {
+    "id": "transport-wrappers-combined-full",
+    "hostname": "transport-wrappers-combined-full.test.soapbucket.com",
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090",
+      "transport_wrappers": {
+        "health_check": {
+          "enabled": true,
+          "type": "http",
+          "endpoint": "/health",
+          "interval": "10s",
+          "timeout": "3s",
+          "healthy_threshold": 2,
+          "unhealthy_threshold": 2,
+          "expected_status": 200
+        },
+        "hedging": {
+          "enabled": true,
+          "delay": "100ms",
+          "max_hedges": 2,
+          "methods": [
+            "GET"
+          ],
+          "max_cost_ratio": 0.2
+        },
+        "retry": {
+          "enabled": true,
+          "max_retries": 5,
+          "initial_delay": "200ms",
+          "max_delay": "10s",
+          "multiplier": 2.0,
+          "jitter": 0.2,
+          "retryable_status": [
+            502,
+            503,
+            504,
+            429,
+            500
+          ]
+        }
+      }
+    }
+  },
+  "multiple-onstart-callbacks.test.soapbucket.com": {
+    "id": "multiple-onstart-callbacks",
+    "hostname": "multiple-onstart-callbacks.test.soapbucket.com",
+    "on_start": [
+      {
+        "type": "http",
+        "url": "http://localhost:8090/callback/config",
+        "method": "GET",
+        "timeout": 5,
+        "variable_name": "app_config",
+        "cel_expr": "{\"modified_json\": {\"version\": string('version' in json ? json['version'] : 'v1'), \"environment\": 'env' in json ? json['env'] : 'production'}}"
+      },
+      {
+        "type": "http",
+        "url": "http://localhost:8090/callback/features",
+        "method": "GET",
+        "timeout": 5,
+        "variable_name": "feature_flags",
+        "cel_expr": "{\"modified_json\": {\"features\": 'features' in json ? json['features'] : {}}}"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-App-Version": "{{config.app_config.version}}",
+            "X-Environment": "{{config.app_config.environment}}",
+            "X-Features": "{{config.feature_flags}}"
+          }
+        }
+      }
+    ]
+  },
+  "session-on-session-start.test.soapbucket.com": {
+    "id": "session-on-session-start",
+    "hostname": "session-on-session-start.test.soapbucket.com",
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_sb.session",
+      "cookie_max_age": 3600,
+      "on_session_start": [
+        {
+          "type": "http",
+          "url": "http://localhost:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_prefs",
+          "timeout": 5,
+          "cel_expr": "{\"modified_json\": {\"theme\": json['user_preferences']['theme'], \"language\": json['user_preferences']['language'], \"is_premium\": json['subscription']['tier'] == 'premium'}}"
+        }
+      ],
+      "allow_non_ssl": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-Theme": "{{session_data.user_prefs.theme}}",
+            "X-User-Language": "{{session_data.user_prefs.language}}",
+            "X-Is-Premium": "{{session_data.user_prefs.is_premium}}"
+          }
+        }
+      }
+    ]
+  },
+  "auth-callback-cel-unwrap.test.soapbucket.com": {
+    "id": "auth-callback-cel-unwrap",
+    "hostname": "auth-callback-cel-unwrap.test.soapbucket.com",
+    "authentication": {
+      "type": "api_key",
+      "disabled": false,
+      "header_name": "X-API-Key",
+      "api_keys": [
+        "test-key-123"
+      ],
+      "authentication_callback": {
+        "type": "http",
+        "url": "http://localhost:8090/callback/auth",
+        "method": "POST",
+        "timeout": 5,
+        "cel_expr": "{\"modified_json\": {\"user_id\": string('user_id' in json ? json['user_id'] : 'unknown'), \"roles\": 'roles' in json ? json['roles'] : [], \"permissions\": 'permissions' in json ? json['permissions'] : {}, \"account_type\": string('account_type' in json ? json['account_type'] : 'standard')}}"
+      }
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-ID": "{{auth_data.user_id}}",
+            "X-User-Roles": "{{auth_data.roles}}",
+            "X-Account-Type": "{{auth_data.account_type}}"
+          }
+        }
+      }
+    ]
+  },
+  "comprehensive-callback-stack.test.soapbucket.com": {
+    "id": "comprehensive-callback-stack",
+    "hostname": "comprehensive-callback-stack.test.soapbucket.com",
+    "on_start": [
+      {
+        "type": "http",
+        "url": "http://localhost:8090/callback/config",
+        "method": "GET",
+        "timeout": 5,
+        "variable_name": "app_config",
+        "cel_expr": "{\"modified_json\": {\"api_version\": string('version' in json ? json['version'] : 'v1'), \"environment\": 'env' in json ? json['env'] : 'production'}}"
+      }
+    ],
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_sb.session",
+      "cookie_max_age": 3600,
+      "callbacks": [
+        {
+          "type": "http",
+          "url": "http://localhost:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_prefs",
+          "timeout": 5,
+          "cel_expr": "{\"modified_json\": {\"theme\": json['user_preferences']['theme'], \"language\": json['user_preferences']['language']}}"
+        }
+      ],
+      "allow_non_ssl": true
+    },
+    "authentication": {
+      "type": "api_key",
+      "disabled": false,
+      "header_name": "X-API-Key",
+      "api_keys": [
+        "test-key-123"
+      ],
+      "authentication_callback": {
+        "type": "http",
+        "url": "http://localhost:8090/callback/auth",
+        "method": "POST",
+        "timeout": 5,
+        "cel_expr": "{\"modified_json\": {\"user_id\": string('user_id' in json ? json['user_id'] : 'unknown'), \"roles\": 'roles' in json ? json['roles'] : []}}"
+      }
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-API-Version": "{{config.app_config.api_version}}",
+            "X-Environment": "{{config.app_config.environment}}",
+            "X-User-Theme": "{{session_data.user_prefs.theme}}",
+            "X-User-Language": "{{session_data.user_prefs.language}}",
+            "X-User-ID": "{{auth.data.user_id}}",
+            "X-User-Roles": "{{auth.data.roles}}"
+          }
+        },
+        "rules": [
+          {
+            "cel_expr": "config['app_config']['environment'] == 'production' && session.data.user_prefs.theme == 'dark' && size(auth.data.roles) > 0"
+          }
+        ]
+      }
+    ]
+  },
+  "onstart-without-variable-name.test.soapbucket.com": {
+    "id": "onstart-without-variable-name",
+    "hostname": "onstart-without-variable-name.test.soapbucket.com",
+    "on_start": [
+      {
+        "type": "http",
+        "url": "http://localhost:8090/callback/config",
+        "method": "GET",
+        "timeout": 5,
+        "cel_expr": "{\"modified_json\": {\"api_version\": string('version' in json ? json['version'] : 'v1'), \"environment\": 'env' in json ? json['env'] : 'production'}}"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://localhost:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-API-Version": "{{config.api_version}}",
+            "X-Environment": "{{config.environment}}"
+          }
+        }
+      }
+    ]
+  },
+  "hn-signature.test.soapbucket.com": {
+    "id": "hn-signature-cache",
+    "hostname": "hn-signature.test.soapbucket.com",
+    "description": "HackerNews with signature-based caching for HTML head",
+    "action": {
+      "proxy": {
+        "url": "https://news.ycombinator.com"      
+        }
+    },
+    "chunk_cache": {
+      "ignore_no_cache": false,
+      "signature_cache": {
+        "enabled": true,
+        "content_types": [
+          "text/html"
+        ],
+        "max_examine_bytes": 16384,
+        "default_ttl": "30m",
+        "signatures": [
+          {
+            "name": "html_doctype_to_body",
+            "pattern_type": "regex",
+            "regex_pattern": "<!DOCTYPE[^>]*>.*?<body[^>]*>",
+            "min_prefix_length": 100,
+            "max_prefix_length": 8192,
+            "cache_ttl": "1h"
+          }
+        ]
+      },
+      "url_cache": {
+        "enabled": false
+      }
+    }
+  },
+  "hn-url.test.soapbucket.com": {
+    "id": "hn-url-cache",
+    "hostname": "hn-url.test.soapbucket.com",
+    "description": "HackerNews with URL-based caching",
+    "action": {
+      "type": "proxy",
+      "url": "https://news.ycombinator.com"
+    },
+    "chunk_cache": {
+      "ignore_no_cache": false,
+      "signature_cache": {
+        "enabled": false
+      },
+      "url_cache": {
+        "enabled": true,
+        "ttl": "5m"
+      }
+    }
+  },
+  "hn-hybrid.test.soapbucket.com": {
+    "id": "hn-hybrid-cache",
+    "hostname": "hn-hybrid.test.soapbucket.com",
+    "description": "HackerNews with both signature and URL caching",
+    "action": {
+      "type": "proxy",
+      "url": "https://news.ycombinator.com"
+    },
+    "chunk_cache": {
+      "ignore_no_cache": false,
+      "signature_cache": {
+        "enabled": true,
+        "content_types": [
+          "text/html"
+        ],
+        "max_examine_bytes": 16384,
+        "default_ttl": "30m",
+        "signatures": [
+          {
+            "name": "html_head",
+            "pattern_type": "regex",
+            "regex_pattern": "<!DOCTYPE[^>]*>.*?</head>",
+            "min_prefix_length": 100,
+            "max_prefix_length": 8192,
+            "cache_ttl": "2h"
+          }
+        ]
+      },
+      "url_cache": {
+        "enabled": true,
+        "ttl": "10m"
+      }
+    }
+  },
+  "hn-ignore-nocache.test.soapbucket.com": {
+    "id": "hn-ignore-nocache",
+    "hostname": "hn-ignore-nocache.test.soapbucket.com",
+    "description": "HackerNews ignoring Cache-Control: no-cache from client",
+    "action": {
+      "proxy": {
+        "url": "https://news.ycombinator.com",
+        "preserve_host": false
+      }
+    },
+    "chunk_cache": {
+      "ignore_no_cache": true,
+      "signature_cache": {
+        "enabled": true,
+        "content_types": [
+          "text/html"
+        ],
+        "signatures": [
+          {
+            "name": "html_prefix",
+            "pattern_type": "regex",
+            "regex_pattern": "<!DOCTYPE[^>]*>.*?<body[^>]*>",
+            "cache_ttl": "1h"
+          }
+        ]
+      },
+      "url_cache": {
+        "enabled": true,
+        "ttl": "5m"
+      }
+    }
+  },
+  "hn-modifiers.test.soapbucket.com": {
+    "id": "hn-with-modifiers",
+    "hostname": "hn-modifiers.test.soapbucket.com",
+    "description": "HackerNews with cache control header modifications",
+    "action": {
+      "proxy": {
+        "url": "https://news.ycombinator.com",
+        "preserve_host": false
+      }
+    },
+    "response_modifiers": [
+      {
+        "type": "add_header",
+        "config": {
+          "name": "Cache-Control",
+          "value": "public, max-age=300"
+        }
+      },
+      {
+        "type": "remove_header",
+        "config": {
+          "name": "Set-Cookie"
+        }
+      }
+    ],
+    "chunk_cache": {
+      "ignore_no_cache": false,
+      "signature_cache": {
+        "enabled": true,
+        "content_types": [
+          "text/html"
+        ],
+        "signatures": [
+          {
+            "name": "html_head",
+            "pattern_type": "regex",
+            "regex_pattern": "<!DOCTYPE[^>]*>.*?</head>",
+            "cache_ttl": "10m"
+          }
+        ]
+      },
+      "url_cache": {
+        "enabled": true,
+        "ttl": "5m"
+      }
+    }
+  },
+  "hn-exact.test.soapbucket.com": {
+    "id": "hn-exact-signature",
+    "hostname": "hn-exact.test.soapbucket.com",
+    "description": "HackerNews with exact byte signature matching",
+    "action": {
+      "proxy": {
+        "url": "https://news.ycombinator.com",
+        "preserve_host": false
+      }
+    },
+    "chunk_cache": {
+      "ignore_no_cache": false,
+      "signature_cache": {
+        "enabled": true,
+        "content_types": [
+          "text/html"
+        ],
+        "max_examine_bytes": 8192,
+        "signatures": [
+          {
+            "name": "doctype_html",
+            "pattern_type": "exact",
+            "exact_bytes": "PCFET0NUWVBFIGh0bWw+",
+            "min_prefix_length": 50,
+            "cache_ttl": "30m"
+          }
+        ]
+      },
+      "url_cache": {
+        "enabled": false
+      }
+    }
+  },
+  "hn-hash.test.soapbucket.com": {
+    "id": "hn-hash-signature",
+    "hostname": "hn-hash.test.soapbucket.com",
+    "description": "HackerNews with hash-based signature detection",
+    "action": {
+      "proxy": {
+        "url": "https://news.ycombinator.com",
+        "preserve_host": false
+      }
+    },
+    "chunk_cache": {
+      "ignore_no_cache": false,
+      "signature_cache": {
+        "enabled": true,
+        "content_types": [
+          "text/html"
+        ],
+        "signatures": [
+          {
+            "name": "first_2kb_hash",
+            "pattern_type": "hash",
+            "hash_algorithm": "xxhash",
+            "hash_length": 2048,
+            "hash_pattern": "auto",
+            "cache_ttl": "1h"
+          }
+        ]
+      },
+      "url_cache": {
+        "enabled": false
+      }
+    }
+  }
+}

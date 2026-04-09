@@ -1,0 +1,18 @@
+apiVersion: proxy.soapbucket.com/v1alpha1
+kind: WorkspaceProxy
+metadata:
+  name: ws-alpha
+  namespace: soapbucket
+spec:
+  workspaceID: ws-alpha
+  clusterID: ws-alpha
+  tier: dedicated
+  region: local
+  configSyncMode: hybrid
+  ingressClassName: nginx
+  hostnames:
+    - ws-alpha.local
+  replicas:
+    min: 1
+    max: 5
+  proxyImage: localhost:5111/soapbucket/proxy:dev

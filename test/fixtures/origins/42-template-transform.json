@@ -1,0 +1,22 @@
+{
+  "template-transform.test": {
+    "id": "template-transform",
+    "hostname": "template-transform.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "transforms": [
+      {
+        "type": "template",
+        "content_types": ["text/html"],
+        "template": "<html><body><h1>{{.Title}}</h1><p>{{.Content}}</p></body></html>",
+        "data": {
+          "Title": "Proxied Content",
+          "Content": "This content is proxied"
+        }
+      }
+    ]
+  }
+}
+

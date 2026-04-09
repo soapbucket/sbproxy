@@ -1,0 +1,11 @@
+{
+  "content-type-fix-comprehensive.test": {
+    "id": "content-type-fix-comprehensive",
+    "hostname": "content-type-fix-comprehensive.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test-page.html"
+    }
+  }
+}
+

@@ -1,0 +1,346 @@
+# Example configuration file for Soapbucket Proxy
+# This file demonstrates the configuration options available
+
+telemetry:
+  bind_port: 8888                    # Telemetry server port
+  bind_address: "127.0.0.1"          # Listen address
+  enable_profiler: false              # Enable pprof endpoints
+  certificate_file: ""                # TLS certificate for HTTPS
+  certificate_key_file: ""            # TLS key for HTTPS
+  min_tls_version: 13                 # Minimum TLS version (13=TLS 1.3 [default, recommended], 12=TLS 1.2 [not recommended])
+
+# OpenTelemetry configuration
+otel:
+  enabled: false                      # Enable OpenTelemetry tracing
+  service_name: "soapbucket-proxy"    # Service name for tracing
+  service_version: ""                 # Service version (defaults to binary version)
+  otlp_endpoint: "localhost:4317"     # OTLP gRPC endpoint
+  otlp_insecure: true                 # Use insecure connection (disable TLS)
+  sample_rate: 1.0                    # Trace sampling rate (0.0 to 1.0)
+  environment: "development"          # Deployment environment (dev, staging, prod)
+
+proxy:
+  # Server binding settings
+  http_bind_port: 8080                # HTTP server port (0 to disable)
+  https_bind_port: 8443               # HTTPS server port (0 to disable)
+  http3_bind_port: 8443                # HTTP/3 server port (0 to use https_bind_port, or set custom port)
+  enable_http3: true                  # Enable HTTP/3 support (requires HTTPS)
+  bind_address: ""           # Listen address
+
+# HTTPS Proxy Port - Multi-tenant forward proxy with API key authentication
+https_proxy:
+  port: 3128                                    # Standard proxy port (RFC 1928)
+  hostname: "https-proxy.soapbucket.com"       # Reserved hostname for SNI
+  certificate_file: "test/certs/https-proxy.crt"    # Path to PEM certificate
+  certificate_key_file: "test/certs/https-proxy.key" # Path to PEM private key
+  auth_realm: "SoapBucket Proxy"                # Shown to clients on 407 response
+  read_timeout: "30s"                           # Timeout for proxy tunnels
+  write_timeout: "30s"                          # Timeout for proxy tunnels
+  
+  # Timeouts (these can be reloaded with SIGHUP)
+  read_timeout: "5s"                  # Request read timeout
+  write_timeout: "10s"                # Response write timeout
+  idle_timeout: "15s"                 # Connection idle timeout
+
+  compression_level: 5                   # Compression level (0-9)
+
+
+  # TLS settings
+  certificate_settings:
+    certificate_dir: "certs"            # Directory for TLS certificates
+    certificate_key_dir: "certs"     # Directory for TLS private keys
+    min_tls_version: 13                # Minimum TLS version (13=TLS 1.3 [default, recommended], 12=TLS 1.2 [not recommended])
+    tls_cipher_suites: []              # Custom TLS cipher suites (empty = use secure defaults)
+    use_acme: false                     # Enable automatic certificate management
+    acme_email: ""                      # Email for Let's Encrypt registration
+    acme_domains: []                    # Domains for certificate issuance
+    acme_cache_dir: "certs"        # Cache directory for ACME certificates
+
+
+      # Origin loader settings
+  origin_loader_settings:  
+    max_origin_forward_depth: 10         # Maximum depth for origin forwarding (0 uses default: 10)
+    origin_cache_ttl: "5m"               # Time-to-live for origin cache entries (0 uses default: 5m)
+    hostname_fallback: true            # Enable hostname fallback (localhost:8443 -> localhost)
+
+  session_cacher_settings:
+    session_cookie_name: "_sb.s"      # Default session cookie name
+    session_max_age: 3600                  # Default session max age in seconds (1 hour)
+    l2_cache_timeout: "5m"               # Time-to-live for session cache entries (0 uses default: 5m)
+
+  sticky_cookie_settings:
+    sticky_cookie_name: "_sb.l"            # Default sticky session cookie name
+
+  # Logging settings
+  logging:
+    format: "dev"                         # Log format: "dev" for human-readable colored output, "json" for JSON format
+
+    # Application logger (general application events)
+    application:
+      level: "info"                       # Log level: debug, info, warn, error
+      outputs:
+        - type: "stderr"                  # Output destination: "stderr" or "clickhouse"
+
+    # Request logger (per-request structured logs)
+    request:
+      enabled: true                       # Enable request logging
+      level: "info"                       # Independent log level (defaults to --log-level if not set)
+      slow_request_threshold: "5s"        # Log slow requests at WARN level when exceeding this threshold
+      error_detail_level: "standard"      # Error detail: "minimal", "standard", "verbose"
+      outputs:
+        - type: "stderr"
+      # Multi-output example (stderr + ClickHouse):
+      # outputs:
+      #   - type: "stderr"
+      #   - type: "clickhouse"
+      #     clickhouse:
+      #       host: "http://localhost:8123"
+      #       database: "logs"
+      #       table: "request_logs"
+      #       batch_size: 1000
+      #       max_batch_bytes: 5242880       # 5MB
+      #       flush_interval: "5s"
+      #       timeout: "10s"
+      #       async_insert: true
+      fields:
+        timestamps: true                  # Include request/response timestamps
+        headers: false                    # Include request/response headers
+        forwarded_headers: false          # Include X-Forwarded-For, X-Real-IP, X-Forwarded-Proto
+        query_string: false               # Include raw query string
+        cookies: false                    # Include cookie count
+        fingerprint: false                # Include request fingerprint data
+        original_request: false           # Include original request (before rewrites)
+        cache_info: false                 # Include cache hit/miss information
+        auth_info: false                  # Include authorization header presence
+        app_version: false                # Include app version and build hash
+        location: false                   # Include source IP geo information
+      sampling:
+        enabled: false                    # Enable request log sampling (1 in N requests)
+        rate: 1                           # Sample rate (log 1 in N requests; errors always logged)
+
+    # Security logger (authentication, authorization, threat events)
+    security:
+      level: "info"                       # Log level: debug, info, warn, error
+      outputs:
+        - type: "stderr"
+
+  # AI pricing file (LiteLLM format JSON) for cost-optimized routing
+  ai_pricing_file: "./data/model_pricing.json"
+
+  # AI providers file (YAML) for HTTPS proxy AI provider detection and auth patterns
+  ai_providers_file: "./data/ai_providers.yml"
+
+  # Debug settings
+  debug_settings:
+    debug: false                          # Enable debug mode
+    display_headers: false                 # Display request headers in response
+
+  # HTTP/2 connection coalescing (per OPTIMIZATIONS.md #14)
+  http2_coalescing:
+    disabled: false                        # Disable HTTP/2 coalescing (default: false, meaning enabled by default)
+    max_idle_conns_per_host: 20          # Max idle connections per coalescing group (default: 20)
+    idle_conn_timeout: "90s"              # Idle connection timeout (default: 90s)
+    max_conn_lifetime: "1h"               # Maximum connection lifetime (default: 1h)
+    allow_ip_based_coalescing: true       # Allow coalescing by IP address (default: true)
+    allow_cert_based_coalescing: true     # Allow coalescing by certificate SAN (default: true)
+    strict_cert_validation: false          # Strict certificate validation (default: false)
+
+  # Request coalescing (per OPTIMIZATIONS.md #10)
+  request_coalescing:
+    enabled: false                         # Enable request coalescing (default: false, opt-in)
+    max_inflight: 1000                    # Maximum in-flight coalesced requests (default: 1000)
+    coalesce_window: "100ms"              # Time window for coalescing (default: 100ms)
+    max_waiters: 100                      # Maximum waiters per request (default: 100)
+    cleanup_interval: "30s"                # Cleanup interval for stale entries (default: 30s)
+    key_strategy: "default"               # Key generation strategy: "default" or "method_url" (default: "default")
+
+# Caching
+l1_cache_settings:
+  driver: "memory"
+  params:
+    max_size: 1000000000                        # Maximum size of the cache in bytes
+    compression: true                           # Enable compression
+    cleanup_interval: "5m"                      # Cleanup interval
+    max_objects: 1000000                        # Maximum number of objects in the cache
+    max_memory: 1000000000                      # Maximum memory of the cache in bytes
+  enable_metrics: true
+  enable_tracing: true
+
+l2_cache_settings:
+  driver: "redis"
+  params:
+    dsn: "redis://localhost:6379"                        # Database connection string for caching (can be encrypted)
+    pool_size: 200                                       # Max number of socket connections (optimized from 100)
+    min_idle_conns: 20                                   # Minimum number of idle connections (optimized from 10)
+    pool_timeout: "10s"                                  # Amount of time client waits for connection (optimized from 4s)
+    max_retries: 5                                       # Maximum retry attempts (optimized from 3)
+    read_timeout: "5s"                                   # Read timeout (optimized from 3s)
+    write_timeout: "5s"                                  # Write timeout (optimized from 3s)
+  enable_metrics: true
+  enable_tracing: true
+
+l3_cache_settings:
+  driver: "pebble"
+  params:
+    path: "./tmp/pebble.db"                        # Path to Pebble database directory
+  enable_metrics: true
+  enable_tracing: true
+
+
+# Session caching (for OAuth sessions)
+session_cacher_settings:
+  driver: "redis"
+  params:
+    dsn: "redis://localhost:6379"                        # Database connection string for session caching (can be encrypted)
+    pool_size: 200                                       # Max number of socket connections (optimized from 100)
+    min_idle_conns: 20                                   # Minimum number of idle connections (optimized from 10)
+    pool_timeout: "10s"                                  # Amount of time client waits for connection (optimized from 4s)
+    max_retries: 5                                       # Maximum retry attempts (optimized from 3)
+    read_timeout: "5s"                                   # Read timeout (optimized from 3s)
+    write_timeout: "5s"                                  # Write timeout (optimized from 3s)
+  enable_metrics: true
+  enable_tracing: true
+
+# Security caching (for rate limiting and DDoS protection)
+security_settings:
+  driver: "redis"
+  params:
+    dsn: "redis://localhost:6379"                        # Database connection string for security data (can be encrypted)
+    pool_size: 200                                       # Max number of socket connections (optimized from 100)
+    min_idle_conns: 20                                   # Minimum number of idle connections (optimized from 10)
+    pool_timeout: "10s"                                  # Amount of time client waits for connection (optimized from 4s)
+    max_retries: 5                                       # Maximum retry attempts (optimized from 3)
+    read_timeout: "5s"                                   # Read timeout (optimized from 3s)
+    write_timeout: "5s"                                  # Write timeout (optimized from 3s)
+  enable_metrics: true
+  enable_tracing: true
+
+# Origin configuration storage
+# Option A: Use top-level storage_settings (below)
+# Option B: Use config section for unified config source (see config: examples)
+storage_settings:
+  driver: "file"
+  params:
+    path: "./config/sites/sites.json"                            # File path for origin configs
+  enable_metrics: true
+  enable_tracing: true
+
+# config: - Unified origin configuration (overrides storage_settings when present)
+# Option 1: Inline - define sites directly in sb.yml
+# config:
+#   origins:
+#     localhost:
+#       id: localhost-basic
+#       hostname: localhost
+#       action:
+#         type: proxy
+#         url: https://example.com
+# Option 2: External source - file, web, database, or cdb
+# config:
+#   source:
+#     path: ./config/sites/sites.json              # Shorthand for file driver
+# config:
+#   source:
+#     url: https://api.example.com/origins        # Shorthand for http driver
+# config:
+#   source:
+#     driver: file
+#     params:
+#       path: ./config/sites/sites.json
+# config:
+#   source:
+#     driver: postgres
+#     params:
+#       dsn: postgres://user:pass@localhost:5432/dbname?sslmode=disable
+
+# Alternative storage options (when not using config section):
+# storage_settings:
+#   driver: "cdb"
+#   params:
+#     path: "./conf/hosts.cdb"                           # CDB file path
+# storage_settings:
+#   driver: "sqlite"
+#   params:
+#     path: "./conf/origins.db"                          # SQLite database path
+# storage_settings:
+#   driver: "postgres"
+#   params:
+#     dsn: "postgres://user:pass@localhost:5432/dbname?sslmode=disable"  # PostgreSQL connection string               
+
+
+# Crypto configuration
+crypto_settings:
+  driver: "local"
+  params:
+    encryption_key: "Y2FzdGxlYXBwcm9wcmlhdGVnYXRlY29tcG9zaXRpb24="                 # Base64-encoded 32-byte encryption key (should be set via env variable)
+    signing_key: "Y2FzdGxlYXBwcm9wcmlhdGVnYXRlY29tcG9zaXRpb24="                    # Base64-encoded signing key (optional, uses encryption_key if not provided)
+  enable_metrics: true
+  enable_tracing: true
+
+# Alternative crypto options:
+# crypto_settings:
+#   driver: "gcp"
+#   params:
+#     project_id: "my-gcp-project"
+#     location: "global"
+#     key_ring: "my-keyring"
+#     key_id: "my-key"
+# crypto_settings:
+#   driver: "aws"
+#   params:
+#     region: "us-east-1"
+#     key_id: "arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012"
+
+maxmind_settings:
+  driver: "maxmind"
+  params:
+    path: "./data/ipinfo_lite.mmdb"                        # File path for MaxMind database
+  enable_metrics: true
+  enable_tracing: true
+
+uaparser_settings:
+  driver: "uaparser"
+  params:
+    path: "./data/regexes.yml"                        # File path for UAParser database
+  enable_metrics: true
+  enable_tracing: true
+
+messenger_settings:
+  driver: "redis"
+  params:
+    dsn: "redis://localhost:6379"                       # File path for Messenger database
+    pool_size: 200                                       # Max number of socket connections (optimized from 100)
+    min_idle_conns: 20                                   # Minimum number of idle connections (optimized from 10)
+    pool_timeout: "10s"                                  # Amount of time client waits for connection (optimized from 4s)
+    max_retries: 5                                       # Maximum retry attempts (optimized from 3)
+    read_timeout: "5s"                                   # Read timeout (optimized from 3s)
+    write_timeout: "5s"                                  # Write timeout (optimized from 3s)
+  enable_metrics: true
+  enable_tracing: true
+
+# Operator-defined server variables (available as {{server.name}} in templates)
+# Override via environment: SB_VAR__API_BASE_URL
+var:
+  api_base_url: "https://api.soapbucket.com/api/v1"
+
+# Feature flags (workspace-scoped, real-time via pub/sub)
+# feature_flags:
+#   enabled: true
+#   sync_topic: "sb:feature_flags"
+#   cache_ttl: 5m
+#   default_values:
+#     dark_mode: false
+#     max_requests: 1000
+
+# Alternative messenger options:
+# messenger_settings:
+#   driver: "gcp"
+#   params:
+#     project_id: "my-gcp-project"
+#     credentials: "/path/to/credentials.json"
+#   enable_metrics: true
+#   enable_tracing: true
+# messenger_settings:
+#   driver: "aws"
+#   params:
+#     region: "us-east-1"

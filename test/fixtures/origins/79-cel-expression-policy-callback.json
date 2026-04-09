@@ -1,0 +1,25 @@
+{
+  "cel-expression-policy-callback.test": {
+    "id": "cel-expression-policy-callback",
+    "hostname": "cel-expression-policy-callback.test",
+    "on_load": [{
+      "type": "http",
+      "url": "http://e2e-test-server:8090/callback/config",
+      "method": "GET",
+      "timeout": 5,
+      "variable_name": "app_config"
+    }],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "policies": [
+      {
+        "type": "expression",
+        "disabled": false,
+        "cel_expr": "'app_config' in config && config['app_config']['enabled'] == true && request.method == 'GET'"
+      }
+    ]
+  }
+}
+

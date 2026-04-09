@@ -1,0 +1,24 @@
+{
+  "bearer-token-multiple.test": {
+    "id": "bearer-token-multiple",
+    "hostname": "bearer-token-multiple.test",
+    "authentication": {
+      "type": "bearer_token",
+      "disabled": false,
+      "header_name": "Authorization",
+      "header_prefix": "Bearer ",
+      "tokens": [
+        "token1",
+        "token2",
+        "token3",
+        "admin-token-1",
+        "admin-token-2"
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    }
+  }
+}
+

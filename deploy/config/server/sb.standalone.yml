@@ -1,0 +1,130 @@
+# Standalone mode - minimal config for Docker with no external dependencies
+# Uses in-memory storage only. All paths are Docker container paths (/app/).
+#
+# Features enabled with in-memory drivers:
+#   - Traffic capture (SSE streaming + REST API via memory messenger/cacher)
+#   - Contract governance (OpenAPI validation via on_load + policies)
+#   - Traffic shadowing (async mirroring with circuit breaker)
+#   - All caching, sessions, and messaging work in-process
+#
+# Run: scripts/run_proxy_standalone.sh
+# Or:  docker run --rm -p 8080:8080 -p 8443:8443 -p 8888:8888 \
+#        -v $(pwd)/conf:/app/config:ro -v $(pwd)/certs:/app/certs:ro \
+#        -e SB_CONFIG_FILE=sb.standalone.yml soapbucket/proxy:local
+
+proxy:
+  http_bind_port: 8080
+  https_bind_port: 8443
+  http3_bind_port: 8443
+  bind_address: "0.0.0.0"
+  enable_http3: true
+
+  certificate_settings:
+    certificate_dir: "/app/certs"
+    certificate_key_dir: "/app/certs"
+    min_tls_version: 13
+
+  logging:
+    format: "dev"
+    application:
+      level: "debug"
+      outputs:
+        - type: "stderr"
+    request:
+      enabled: true
+      level: "debug"
+      slow_request_threshold: "5s"
+      outputs:
+        - type: "stderr"
+      fields:
+        timestamps: true
+        headers: true
+        forwarded_headers: true
+        query_string: true
+        cache_info: true
+        auth_info: true
+        app_version: true
+    security:
+      level: "debug"
+      outputs:
+        - type: "stderr"
+
+  debug_settings:
+    debug: true
+
+# Telemetry (metrics endpoint)
+telemetry:
+  bind_port: 8888
+  bind_address: "0.0.0.0"
+  enable_profiler: false
+
+# Site config storage (sites.setup.json has hn.local, example.local, api.local, etc.)
+storage_settings:
+  driver: "file"
+  params:
+    path: "/app/config/sites/sites.setup.json"
+
+# In-memory L1 cache
+l1_cache_settings:
+  driver: "memory"
+  params:
+    max_size: 100000000  # 100MB
+
+# L2 cache (distributed in prod, in-memory for standalone)
+# Used by: traffic capture buffered retention, callback cache, session cache
+l2_cache_settings:
+  driver: "memory"
+
+# L3 cache (disk-backed in prod, in-memory for standalone)
+# Used by: chunk cache, error page cache, response cache
+l3_cache_settings:
+  driver: "memory"
+
+session_cacher_settings:
+  driver: "memory"
+
+security_settings:
+  driver: "memory"
+
+# Messenger (Redis pub/sub in prod, in-memory for standalone)
+# Used by: traffic capture SSE streaming, config refresh, cache expiration
+messenger_settings:
+  driver: "memory"
+
+# Crypto configuration (required for session/auth features)
+crypto_settings:
+  driver: "local"
+  params:
+    encryption_key: "Y2FzdGxlYXBwcm9wcmlhdGVnYXRlY29tcG9zaXRpb24="
+    signing_key: "Y2FzdGxlYXBwcm9wcmlhdGVnYXRlY29tcG9zaXRpb24="
+
+# MaxMind GeoIP database
+maxmind_settings:
+  driver: "maxmind"
+  params:
+    path: "/app/data/ipinfo_lite.mmdb"
+
+# User-Agent parser
+uaparser_settings:
+  driver: "uaparser"
+  params:
+    path: "/app/data/regexes.yml"
+
+# Security - Server-level keys loaded once at startup
+# security:
+#   # AES-256-GCM key for OriginCache encryption at rest (base64-encoded 32 bytes)
+#   cache_encryption_key: ""
+#   # Session signing key for OAuth session middleware (base64-encoded 32 bytes)
+#   session_signing_key: ""
+
+# Vault - Named vault providers for centralized secret management
+# vault:
+#   system:
+#     type: local
+#   production:
+#     type: hashicorp
+#     address: "https://vault.internal:8200"
+#     credentials: "system:vault-token"
+
+# Debug: verbose logging for TLS handshake, config loading, etc.
+log_level: "debug"

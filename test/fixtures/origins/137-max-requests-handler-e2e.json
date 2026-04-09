@@ -1,0 +1,46 @@
+{
+  "max-requests-handler-e2e.test": {
+    "id": "max-requests-handler-e2e",
+    "hostname": "max-requests-handler-e2e.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/max-requests/test?max_connections=2&delay=100",
+      "max_connections": 2
+    }
+  },
+  "max-requests-handler-5.test": {
+    "id": "max-requests-handler-5",
+    "hostname": "max-requests-handler-5.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/max-requests/test-5?max_connections=5&delay=50",
+      "max_connections": 5
+    }
+  },
+  "max-requests-handler-10.test": {
+    "id": "max-requests-handler-10",
+    "hostname": "max-requests-handler-10.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/max-requests/test-10?max_connections=10&delay=30",
+      "max_connections": 10
+    }
+  },
+  "max-requests-handler-with-error-page.test": {
+    "id": "max-requests-handler-with-error-page",
+    "hostname": "max-requests-handler-with-error-page.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/max-requests/test-limit?max_connections=3&delay=100",
+      "max_connections": 3
+    },
+    "error_pages": [
+      {
+        "status": [503],
+        "body": "<html><head><title>Service Unavailable</title></head><body><h1>503 Service Unavailable</h1><p>Connection limit reached. Please try again later.</p></body></html>",
+        "content_type": "text/html"
+      }
+    ]
+  }
+}
+

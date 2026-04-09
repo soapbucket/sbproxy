@@ -1,0 +1,23 @@
+{
+  "generated_at": "2026-03-15T18:51:39Z",
+  "files": {
+    "ai_providers.yml": {
+      "sha256": "b0460bcb5ad594333cf1b8bf1aff0206503d27b218391486c7c6e27b61a99b68",
+      "size": 6227,
+      "compressed_size": 1363,
+      "updated_at": "2026-03-15"
+    },
+    "model_pricing.json": {
+      "sha256": "483790a3c01f838c35e476ec31785478c661f7be6a267edf1fae001aab602a5f",
+      "size": 1316067,
+      "compressed_size": 62686,
+      "updated_at": "2026-03-15"
+    },
+    "regexes.yml": {
+      "sha256": "ed076c48b53c7f9984b88b580985182cfb0edb18ea3f52a4395cf9e30ac249ab",
+      "size": 214497,
+      "compressed_size": 44042,
+      "updated_at": "2026-03-15"
+    }
+  }
+}

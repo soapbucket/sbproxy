@@ -1,0 +1,41 @@
+{
+  "cel-rule-callback-data.test": {
+    "id": "cel-rule-callback-data",
+    "hostname": "cel-rule-callback-data.test",
+    "session_config": {
+      "disabled": false,
+      "allow_non_ssl": true,
+      "cookie_name": "_sb.session",
+      "cookie_max_age": 3600,
+      "callbacks": [
+        {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_data",
+          "timeout": 5
+        }
+      ]
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-Tier": "{{session_data.user_data.subscription.tier}}",
+            "X-Feature-Flags": "{{session_data.user_data.feature_flags}}"
+          }
+        },
+        "rules": [
+          {
+            "cel_expr": "size(session) > 0 && size(session.data) > 0 && session.data.user_data.subscription.tier == 'premium' && 'beta_features' in session.data.user_data.feature_flags && session.data.user_data.feature_flags.beta_features == true"
+          }
+        ]
+      }
+    ]
+  }
+}
+

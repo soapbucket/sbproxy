@@ -1,0 +1,28 @@
+{
+  "response-modifiers-complex.test": {
+    "id": "response-modifiers-complex",
+    "hostname": "response-modifiers-complex.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Proxy-Version": "1.0.0",
+            "X-Processed-By": "soapbucket"
+          },
+          "remove": ["X-Powered-By"]
+        },
+        "status_code": {
+          "replace": {
+            "old": 200,
+            "new": 201
+          }
+        }
+      }
+    ]
+  }
+}
+

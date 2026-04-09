@@ -1,0 +1,52 @@
+{
+  "geo-routing.test": {
+    "id": "geo-routing",
+    "hostname": "geo-routing.test",
+    "forward_rules": [
+      {
+        "hostname": "us-backend.test",
+        "rules": [
+          {
+            "location": {
+              "country_codes": ["US"]
+            }
+          }
+        ]
+      },
+      {
+        "hostname": "uk-backend.test",
+        "rules": [
+          {
+            "location": {
+              "country_codes": ["GB"]
+            }
+          }
+        ]
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090",
+      "strip_base_path": true
+    }
+  },
+  "us-backend.test": {
+    "id": "us-backend",
+    "hostname": "us-backend.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test/us-response",
+      "strip_base_path": true
+    }
+  },
+  "uk-backend.test": {
+    "id": "uk-backend",
+    "hostname": "uk-backend.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/test/uk-response",
+      "strip_base_path": true
+    }
+  }
+}
+

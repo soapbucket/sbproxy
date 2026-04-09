@@ -1,0 +1,44 @@
+{
+  "lua-multiple-callbacks.test": {
+    "id": "lua-multiple-callbacks",
+    "hostname": "lua-multiple-callbacks.test",
+    "on_load": [{
+      "type": "http",
+      "url": "http://e2e-test-server:8090/callback/config",
+      "method": "GET",
+      "timeout": 5,
+      "variable_name": "app_config",
+      "lua_script": "local result = {}\nresult.app_config = {}\nresult.app_config.version = tostring(json['version'] or 'v1')\nresult.app_config.features = json['features'] or {}\nreturn result"
+    }],
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_sb.session",
+      "cookie_max_age": 3600,
+      "callbacks": [
+        {
+          "type": "http",
+          "url": "http://e2e-test-server:8090/callback/session",
+          "method": "POST",
+          "variable_name": "user_prefs",
+          "timeout": 5,
+          "lua_script": "local result = {}\nresult.user_prefs = {}\nresult.user_prefs.theme = json['user_preferences']['theme']\nresult.user_prefs.subscription = json['subscription']\nreturn result"
+        }
+      ],
+      "allow_non_ssl": true
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-App-Version": "{{config.app_config.version}}",
+            "X-User-Theme": "{{session_data.user_prefs.theme}}"
+          }
+        }
+      }
+    ]
+  }
+}

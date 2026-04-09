@@ -1,0 +1,23 @@
+{
+  "cors.test": {
+    "id": "cors",
+    "hostname": "cors.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "response_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            "Access-Control-Max-Age": "3600"
+          }
+        }
+      }
+    ]
+  }
+}
+

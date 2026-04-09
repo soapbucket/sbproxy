@@ -1,0 +1,25 @@
+{
+  "lua-expression-policy-callback.test": {
+    "id": "lua-expression-policy-callback",
+    "hostname": "lua-expression-policy-callback.test",
+    "on_load": [{
+      "type": "http",
+      "url": "http://e2e-test-server:8090/callback/config",
+      "method": "GET",
+      "timeout": 5,
+      "variable_name": "app_config"
+    }],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "policies": [
+      {
+        "type": "expression",
+        "disabled": false,
+        "lua_script": "return config.app_config.enabled == true and request.method == 'GET'"
+      }
+    ]
+  }
+}
+

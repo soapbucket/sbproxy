@@ -1,0 +1,8 @@
+{
+  "hostname": "localhost",
+  "pin_sha256": "ZR9kBZNNk6SgstNkcHfBI6CWWZMGa3U6PZ38ixDXaK4=",
+  "certificate": "/Users/rick/projects/proxy/certs/localhost.crt",
+  "private_key": "/Users/rick/projects/proxy/certs/localhost.key",
+  "generated_at": "2025-11-11T00:29:03Z",
+  "valid_until": "Nov 11 00:29:03 2026 GMT"
+}

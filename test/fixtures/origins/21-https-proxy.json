@@ -1,0 +1,21 @@
+{
+  "https-proxy.test": {
+    "id": "https-proxy",
+    "hostname": "https-proxy.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://e2e-test-server:9443",
+      "skip_tls_verify_host": true
+    }
+  },
+  "https-proxy-bad-cert.test": {
+    "id": "https-proxy-bad-cert",
+    "hostname": "https-proxy-bad-cert.test",
+    "action": {
+      "type": "proxy",
+      "url": "https://e2e-test-server:9443",
+      "skip_tls_verify_host": true
+    }
+  }
+}
+

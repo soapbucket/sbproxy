@@ -1,0 +1,17 @@
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o, gpt-4o-mini]
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          models: [claude-sonnet-4-20250514]
+      default_model: gpt-4o-mini
+      routing:
+        strategy: fallback_chain

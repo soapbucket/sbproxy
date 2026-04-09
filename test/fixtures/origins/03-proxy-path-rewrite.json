@@ -1,0 +1,31 @@
+{
+  "proxy-rewrite.test": {
+    "id": "proxy-rewrite",
+    "hostname": "proxy-rewrite.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "url": {
+          "path": {
+            "replace": {
+              "old": "/old-api",
+              "new": "/test"
+            }
+          }
+        },
+        "rules": [
+          {
+            "path": {
+              "contains": "/old-api"
+            }
+          }
+        ]
+      }
+    ],
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  }
+}

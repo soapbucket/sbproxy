@@ -1,0 +1,41 @@
+{
+  "mcp.soapbucket.com": {
+    "id": "mcp-hello-world",
+    "hostname": "mcp.soapbucket.com",
+    "workspace_id": "soapbucket",
+    "version": "1.0.0",
+    "action": {
+      "type": "mcp",
+      "server_info": {
+        "name": "hello-world-mcp",
+        "version": "1.0.0"
+      },
+      "capabilities": {
+        "tools": { "listChanged": false }
+      },
+      "tools": [
+        {
+          "name": "say_hello",
+          "description": "Returns a greeting for the provided name",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "The name to greet"
+              }
+            },
+            "required": ["name"]
+          },
+          "handler": {
+            "type": "static",
+            "static": { "content": "" },
+            "response_template": "Hello, {{ tool.arguments.name }}!"
+          },
+          "timeout": "5s"
+        }
+      ],
+      "default_timeout": "30s"
+    }
+  }
+}

@@ -1,0 +1,135 @@
+{
+  "title": "SoapBucket Proxy - Per-Origin Performance",
+  "tags": ["soapbucket", "performance", "per-origin"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+        {
+          "name": "origin",
+          "type": "query",
+          "label": "Origin",
+          "datasource": "Prometheus",
+          "query": "label_values(sb_requests_total, origin)",
+          "refresh": 1,
+          "regex": "",
+          "multi": false,
+          "includeAll": false
+        }
+      ]
+    },
+    "panels": [
+      {
+        "id": 1,
+        "title": "Request Rate by Status Code",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0},
+        "targets": [{
+          "expr": "sum(rate(sb_requests_total{origin=~\"$origin\"}[5m])) by (method, status_code)",
+          "legendFormat": "{{method}} - {{status_code}}"
+        }],
+        "yaxes": [{"format": "reqps"}]
+      },
+      {
+        "id": 2,
+        "title": "Request Latency (P50, P95, P99)",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, sum(rate(sb_request_latency_seconds_bucket{origin=~\"$origin\"}[5m])) by (le, method))",
+            "legendFormat": "P50 - {{method}}"
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(sb_request_latency_seconds_bucket{origin=~\"$origin\"}[5m])) by (le, method))",
+            "legendFormat": "P95 - {{method}}"
+          },
+          {
+            "expr": "histogram_quantile(0.99, sum(rate(sb_request_latency_seconds_bucket{origin=~\"$origin\"}[5m])) by (le, method))",
+            "legendFormat": "P99 - {{method}}"
+          }
+        ],
+        "yaxes": [{"format": "s"}]
+      },
+      {
+        "id": 3,
+        "title": "Upstream Response Time (P95)",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+        "targets": [{
+          "expr": "histogram_quantile(0.95, sum(rate(sb_upstream_response_time_seconds_bucket{origin=~\"$origin\"}[5m])) by (le, target))",
+          "legendFormat": "{{target}}"
+        }],
+        "yaxes": [{"format": "s"}]
+      },
+      {
+        "id": 4,
+        "title": "Cache Hit Rate",
+        "type": "gauge",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+        "targets": [{
+          "expr": "sb_cache_hit_rate{origin=~\"$origin\", cache_layer!=\"\"}",
+          "legendFormat": "{{cache_layer}}"
+        }],
+        "thresholds": {
+          "steps": [
+            {"value": 0, "color": "red"},
+            {"value": 0.5, "color": "yellow"},
+            {"value": 0.7, "color": "green"}
+          ]
+        }
+      },
+      {
+        "id": 5,
+        "title": "Bandwidth Usage",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+        "targets": [{
+          "expr": "sum(rate(sb_bandwidth_bytes_total{origin=~\"$origin\"}[5m])) by (direction)",
+          "legendFormat": "{{direction}}"
+        }],
+        "yaxes": [{"format": "bytes"}]
+      },
+      {
+        "id": 6,
+        "title": "Cache Efficiency",
+        "type": "gauge",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+        "targets": [{
+          "expr": "sb_cache_efficiency{origin=~\"$origin\", cache_layer!=\"\"}",
+          "legendFormat": "{{cache_layer}}"
+        }],
+        "thresholds": {
+          "steps": [
+            {"value": 0, "color": "red"},
+            {"value": 0.5, "color": "yellow"},
+            {"value": null, "color": "green"}
+          ]
+        }
+      },
+      {
+        "id": 7,
+        "title": "Request/Response Sizes (P95)",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 32},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(sb_request_body_size_bytes_bucket{origin=~\"$origin\"}[5m])) by (le))",
+            "legendFormat": "Request Body"
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(sb_response_body_size_bytes_bucket{origin=~\"$origin\"}[5m])) by (le))",
+            "legendFormat": "Response Body"
+          }
+        ],
+        "yaxes": [{"format": "bytes"}]
+      }
+    ],
+    "schemaVersion": 27,
+    "version": 1
+}
+

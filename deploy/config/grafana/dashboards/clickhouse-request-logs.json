@@ -1,0 +1,123 @@
+{
+  "title": "SoapBucket Proxy - ClickHouse Request Logs",
+  "tags": ["soapbucket", "clickhouse", "requests"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request Rate",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "clickhouse"},
+      "targets": [{
+        "rawSql": "SELECT $__timeInterval(timestamp) as time, count() as requests FROM proxy_logs.request_logs WHERE $__timeFilter(timestamp) GROUP BY time ORDER BY time",
+        "format": "time_series",
+        "refId": "A"
+      }],
+      "yaxes": [{"format": "short", "label": "requests/sec"}]
+    },
+    {
+      "id": 2,
+      "title": "Error Rate",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "clickhouse"},
+      "targets": [{
+        "rawSql": "SELECT $__timeInterval(timestamp) as time, countIf(response_status_code >= 400) as errors FROM proxy_logs.request_logs WHERE $__timeFilter(timestamp) GROUP BY time ORDER BY time",
+        "format": "time_series",
+        "refId": "A"
+      }],
+      "yaxes": [{"format": "short", "label": "errors/sec"}]
+    },
+    {
+      "id": 3,
+      "title": "Response Time (P50, P95, P99)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8},
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "clickhouse"},
+      "targets": [
+        {
+          "rawSql": "SELECT $__timeInterval(timestamp) as time, quantile(0.50)(response_duration_ms) as p50 FROM proxy_logs.request_logs WHERE $__timeFilter(timestamp) AND response_duration_ms IS NOT NULL GROUP BY time ORDER BY time",
+          "format": "time_series",
+          "refId": "A",
+          "legendFormat": "P50"
+        },
+        {
+          "rawSql": "SELECT $__timeInterval(timestamp) as time, quantile(0.95)(response_duration_ms) as p95 FROM proxy_logs.request_logs WHERE $__timeFilter(timestamp) AND response_duration_ms IS NOT NULL GROUP BY time ORDER BY time",
+          "format": "time_series",
+          "refId": "B",
+          "legendFormat": "P95"
+        },
+        {
+          "rawSql": "SELECT $__timeInterval(timestamp) as time, quantile(0.99)(response_duration_ms) as p99 FROM proxy_logs.request_logs WHERE $__timeFilter(timestamp) AND response_duration_ms IS NOT NULL GROUP BY time ORDER BY time",
+          "format": "time_series",
+          "refId": "C",
+          "legendFormat": "P99"
+        }
+      ],
+      "yaxes": [{"format": "ms", "label": "duration"}]
+    },
+    {
+      "id": 4,
+      "title": "Requests by Status Code",
+      "type": "bargauge",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "clickhouse"},
+      "targets": [{
+        "rawSql": "SELECT response_status_code as status, count() as count FROM proxy_logs.request_logs WHERE $__timeFilter(timestamp) AND response_status_code IS NOT NULL GROUP BY status ORDER BY status",
+        "format": "table",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"type": "value", "options": {"200": {"text": "2xx", "color": "green"}}, "value": "200"},
+            {"type": "value", "options": {"300": {"text": "3xx", "color": "blue"}}, "value": "300"},
+            {"type": "value", "options": {"400": {"text": "4xx", "color": "yellow"}}, "value": "400"},
+            {"type": "value", "options": {"500": {"text": "5xx", "color": "red"}}, "value": "500"}
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": 0, "color": "green"},
+              {"value": 100, "color": "yellow"},
+              {"value": 500, "color": "red"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Top Origins by Request Count",
+      "type": "table",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "clickhouse"},
+      "targets": [{
+        "rawSql": "SELECT origin_id, count() as requests, avg(response_duration_ms) as avg_duration_ms, countIf(response_status_code >= 400) as errors FROM proxy_logs.request_logs WHERE $__timeFilter(timestamp) GROUP BY origin_id ORDER BY requests DESC LIMIT 10",
+        "format": "table",
+        "refId": "A"
+      }]
+    },
+    {
+      "id": 6,
+      "title": "Recent Requests",
+      "type": "logs",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 24},
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "clickhouse"},
+      "targets": [{
+        "rawSql": "SELECT timestamp, request_method, request_path, response_status_code, response_duration_ms, origin_id, request_remote_addr FROM proxy_logs.request_logs WHERE $__timeFilter(timestamp) ORDER BY timestamp DESC LIMIT 100",
+        "format": "logs",
+        "refId": "A"
+      }]
+    }
+  ],
+  "schemaVersion": 38,
+  "version": 1
+}
+

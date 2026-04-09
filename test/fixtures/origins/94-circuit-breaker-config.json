@@ -1,0 +1,18 @@
+{
+  "circuit-breaker.test": {
+    "id": "circuit-breaker",
+    "hostname": "circuit-breaker.test",
+    "circuit_breaker": {
+      "disabled": false,
+      "failure_threshold": 5,
+      "success_threshold": 2,
+      "timeout": "30s",
+      "max_concurrent_requests": 100
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/circuit/test"
+    }
+  }
+}
+

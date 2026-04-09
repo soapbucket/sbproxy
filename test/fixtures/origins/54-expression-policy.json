@@ -1,0 +1,18 @@
+{
+  "expression-policy.test": {
+    "id": "expression-policy",
+    "hostname": "expression-policy.test",
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "policies": [
+      {
+        "type": "expression",
+        "disabled": false,
+        "cel_expr": "request.method == 'GET' && request.path.startsWith('/api')"
+      }
+    ]
+  }
+}
+

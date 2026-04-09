@@ -1,0 +1,46 @@
+{
+  "abtest-sessions.test": {
+    "id": "abtest-sessions",
+    "hostname": "abtest-sessions.test",
+    "session_config": {
+      "disabled": false,
+      "cookie_name": "_abtest_session",
+      "cookie_max_age": 86400,
+      "allow_non_ssl": true
+    },
+    "action": {
+      "type": "abtest",
+      "test_name": "landing_page_experiment",
+      "cookie_name": "_ab_landing",
+      "cookie_ttl": "24h",
+      "variants": [
+        {
+          "name": "control",
+          "weight": 40,
+          "action": {
+            "type": "proxy",
+            "url": "http://e2e-test-server:8090/test/simple-200?variant=control"
+          }
+        },
+        {
+          "name": "variant_a",
+          "weight": 30,
+          "action": {
+            "type": "proxy",
+            "url": "http://e2e-test-server:8090/test/simple-200?variant=variant_a"
+          }
+        },
+        {
+          "name": "variant_b",
+          "weight": 30,
+          "action": {
+            "type": "proxy",
+            "url": "http://e2e-test-server:8090/test/simple-200?variant=variant_b"
+          }
+        }
+      ]
+    },
+    "workspace_id": "test-tenant",
+    "version": "1.0-test"
+  }
+}

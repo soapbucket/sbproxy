@@ -1,0 +1,37 @@
+{
+  "tokens": {
+    "admin": {
+      "token": "eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9.eyJzdWIiOiAiYWRtaW4tMDAxIiwgImlzcyI6ICJ0ZXN0LWlzc3VlciIsICJhdWQiOiAidGVzdC1hdWRpZW5jZSIsICJpYXQiOiAxNzYyODIwOTQ0LCAiZW1haWwiOiAiYWRtaW5AdGVzdC5jb20iLCAibmFtZSI6ICJBZG1pbiBVc2VyIiwgInJvbGVzIjogWyJhZG1pbiIsICJzdXBlcnVzZXIiXSwgImV4cCI6IDE3NjI5MDczNDR9.B_O_NjJ8Bwcg8Rw4G4K1u31zCsEi-hcE_6JP9OHOs_c",
+      "description": "Admin user token with admin and superuser roles",
+      "claims": {
+        "sub": "admin-001",
+        "email": "admin@test.com",
+        "name": "Admin User",
+        "roles": ["admin", "superuser"]
+      }
+    },
+    "user": {
+      "token": "eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9.eyJzdWIiOiAidXNlci0xMjMiLCAiaXNzIjogInRlc3QtaXNzdWVyIiwgImF1ZCI6ICJ0ZXN0LWF1ZGllbmNlIiwgImlhdCI6IDE3NjI4MjA5NDQsICJlbWFpbCI6ICJ1c2VyQHRlc3QuY29tIiwgIm5hbWUiOiAiVGVzdCBVc2VyIiwgInJvbGVzIjogWyJ1c2VyIl0sICJleHAiOiAxNzYyOTA3MzQ0fQ.9iJajwOlO6Z9foMJeiyNIjIcN8mvrJ-X2xbRHi7X830",
+      "description": "Regular user token",
+      "claims": {
+        "sub": "user-123",
+        "email": "user@test.com",
+        "name": "Test User",
+        "roles": ["user"]
+      }
+    },
+    "service": {
+      "token": "eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9.eyJzdWIiOiAic2VydmljZS1hcGkiLCAiaXNzIjogInRlc3QtaXNzdWVyIiwgImF1ZCI6ICJ0ZXN0LWF1ZGllbmNlIiwgImlhdCI6IDE3NjI4MjA5NDQsICJlbWFpbCI6ICJzZXJ2aWNlQHRlc3QuY29tIiwgIm5hbWUiOiAiU2VydmljZSBBY2NvdW50IiwgInJvbGVzIjogWyJzZXJ2aWNlIl19.nMY5KgvBhPE7SOTDWfvgEsO-tpPL-Ff96BXP8uiXKKM",
+      "description": "Service account token (no expiry)",
+      "claims": {
+        "sub": "service-api",
+        "email": "service@test.com",
+        "name": "Service Account",
+        "roles": ["service"]
+      }
+    }
+  },
+  "secret": "NAH6qRKXqySmoir0A9/1ckCnO46Zo7H60XTif4YG5hw=",
+  "algorithm": "HS256",
+  "generated_at": "2025-11-11T00:29:04Z"
+}

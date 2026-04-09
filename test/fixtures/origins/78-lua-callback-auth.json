@@ -1,0 +1,33 @@
+{
+  "lua-callback-auth.test": {
+    "id": "lua-callback-auth",
+    "hostname": "lua-callback-auth.test",
+    "authentication": {
+      "type": "api_key",
+      "disabled": false,
+      "header_name": "X-API-Key",
+      "api_keys": ["test-key-123"],
+      "authentication_callback": {
+        "type": "http",
+        "url": "http://e2e-test-server:8090/callback/auth",
+        "method": "POST",
+        "timeout": 5,
+        "lua_script": "local result = {}\nresult.user_id = tostring(json['user_id'] or 'unknown')\nresult.roles = json['roles'] or {}\nresult.permissions = json['permissions'] or {}\nreturn result"
+      }
+    },
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-User-ID": "{{auth_data.user_id}}"
+          }
+        }
+      }
+    ]
+  }
+}
+

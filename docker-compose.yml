@@ -1,0 +1,17 @@
+services:
+  sbproxy:
+    build: .
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+      - "8443:8443/udp"
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    environment:
+      - SB_LOG_LEVEL=info
+    depends_on:
+      - redis
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"

@@ -1,0 +1,29 @@
+{
+  "webhook.test": {
+    "id": "webhook",
+    "hostname": "webhook.test",
+    "on_request": [
+      {
+        "type": "http",
+        "url": "http://e2e-test-server:8090/callback/webhook",
+        "method": "POST",
+        "timeout": 5,
+        "variable_name": "webhook_response"
+      }
+    ],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090/api/headers"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-Webhook-Response": "{{request_data.webhook_response.status}}"
+          }
+        }
+      }
+    ]
+  }
+}
+

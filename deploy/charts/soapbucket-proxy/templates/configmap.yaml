@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "soapbucket-proxy.fullname" . }}-config
+  labels:
+    {{- include "soapbucket-proxy.labels" . | nindent 4 }}
+data:
+  SB_WORKSPACE_MODE: {{ .Values.mode | quote }}
+  {{- if .Values.workspaceID }}
+  SB_WORKSPACE_ID: {{ .Values.workspaceID | quote }}
+  {{- end }}
+  {{- if .Values.config.redisURL }}
+  REDIS_URL: {{ .Values.config.redisURL | quote }}
+  {{- end }}
+  {{- if .Values.config.storageDSN }}
+  STORAGE_DSN: {{ .Values.config.storageDSN | quote }}
+  {{- end }}
+  {{- if .Values.config.clickhouseDSN }}
+  CLICKHOUSE_DSN: {{ .Values.config.clickhouseDSN | quote }}
+  {{- end }}
+  {{- if .Values.config.vaultAddr }}
+  VAULT_ADDR: {{ .Values.config.vaultAddr | quote }}
+  {{- end }}
+  {{- if .Values.config.vaultToken }}
+  VAULT_TOKEN: {{ .Values.config.vaultToken | quote }}
+  {{- end }}
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  {{- if .Values.config.proxySyncRemoteURL }}
+  PROXY_SYNC_REMOTE_URL: {{ .Values.config.proxySyncRemoteURL | quote }}
+  {{- end }}
+  {{- if .Values.config.proxySyncSharedSecret }}
+  PROXY_SYNC_SHARED_SECRET: {{ .Values.config.proxySyncSharedSecret | quote }}
+  {{- end }}
+  {{- if .Values.config.proxySyncClusterID }}
+  PROXY_SYNC_CLUSTER_ID: {{ .Values.config.proxySyncClusterID | quote }}
+  {{- end }}
+  {{- if .Values.config.configSyncMode }}
+  SB_CONFIG_SYNC_MODE: {{ .Values.config.configSyncMode | quote }}
+  {{- end }}
+  {{- if .Values.config.syncPollInterval }}
+  SB_SYNC_POLL_INTERVAL: {{ .Values.config.syncPollInterval | quote }}
+  {{- end }}
+  {{- range $key, $value := .Values.config.extraEnv }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}

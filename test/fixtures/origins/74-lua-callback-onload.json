@@ -1,0 +1,28 @@
+{
+  "lua-callback-onload.test": {
+    "id": "lua-callback-onload",
+    "hostname": "lua-callback-onload.test",
+    "on_load": [{
+      "type": "http",
+      "url": "http://e2e-test-server:8090/callback/config",
+      "method": "GET",
+      "timeout": 5,
+      "lua_script": "local result = {}\nresult.api_version = tostring(json['version'] or 'v1')\nresult.environment = json['env'] or 'production'\nresult.features = json['features'] or {}\nreturn result"
+    }],
+    "action": {
+      "type": "proxy",
+      "url": "http://e2e-test-server:8090"
+    },
+    "request_modifiers": [
+      {
+        "headers": {
+          "set": {
+            "X-API-Version": "{{config.api_version}}",
+            "X-Environment": "{{config.environment}}"
+          }
+        }
+      }
+    ]
+  }
+}
+
