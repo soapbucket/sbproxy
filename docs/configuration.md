@@ -168,7 +168,6 @@ proxy:
 | `compression_level` | int | 0 | Response compression level (0 = disabled, 1-9 = gzip) |
 | `max_recursion_depth` | int | 10 | Maximum depth for nested forward rules |
 | `config_sync_mode` | string | "hybrid" | Config sync mode: "push", "pull", or "hybrid" |
-| `ai_pricing_file` | string | | Path to LiteLLM-format JSON pricing file for cost routing |
 
 ### Certificate Settings
 

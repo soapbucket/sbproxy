@@ -56,9 +56,9 @@ curl -v -H "Host: ai.example.com" http://localhost:8080/v1/chat/completions \
   2>&1 | grep -i "x-sbproxy"
 ```
 
-### cost-routing.yml - Cost-Optimized Routing
+### cost-routing.yml - Token-Based Cost Routing
 
-Routes to the cheapest available provider. Premium users (identified by header) get higher rate limits.
+Routes to the provider with the most available token capacity. Providers with `max_tokens_per_minute` limits are scored by remaining capacity, favoring less-loaded providers. Premium users (identified by header) get higher rate limits.
 
 ```bash
 sbproxy serve -f examples/ai/cost-routing.yml

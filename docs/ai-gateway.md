@@ -61,7 +61,7 @@ routing:
 
 ### cost_optimized
 
-Routes to the cheapest provider that supports the requested model. Uses a built-in pricing catalog.
+Routes to the provider with the most available token capacity. Providers with `max_tokens_per_minute` configured are scored by remaining capacity and utilization. This favors cheaper, less-loaded providers. Falls back to provider priority order when no token limits are set.
 
 ```yaml
 routing:

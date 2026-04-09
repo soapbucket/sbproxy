@@ -5,13 +5,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"math"
 	"math/rand/v2"
 	"net/http"
 	"sync"
 	"sync/atomic"
 
-	"github.com/soapbucket/sbproxy/internal/ai/pricing"
 	"github.com/soapbucket/sbproxy/internal/request/classifier"
 	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
@@ -406,45 +404,44 @@ func (r *Router) tokenRate(candidates []routerProvider) *ProviderConfig {
 }
 
 func (r *Router) costOptimized(model string, candidates []routerProvider) *ProviderConfig {
-	// Route to provider with lowest cost based on pricing catalog
-	var cheapest *ProviderConfig
-	var minCost float64 = math.MaxFloat64
+	// Routes to the provider with the most remaining token capacity.
+	// Providers with lower MaxTokensPerMin are preferred when they have
+	// available capacity, as they typically represent cheaper tiers.
+	// Falls back to priority order when no token limits are configured.
+	var best *ProviderConfig
+	var bestScore float64 = -1
 
-	// Get global pricing source if available
-	pricingSource := pricing.Global()
-
-	for _, cfg := range candidates {
-		if !r.isHealthy(cfg.config) {
+	hasLimits := false
+	for _, c := range candidates {
+		if !r.isHealthy(c.config) {
 			continue
 		}
-
-		// If no pricing source, fall back to priority ordering
-		if pricingSource == nil {
+		limit := int64(c.config.MaxTokensPerMin)
+		if limit <= 0 {
 			continue
 		}
+		hasLimits = true
+		consumed := r.tracker.TokensConsumed(c.name)
+		remaining := float64(limit - consumed)
+		utilization := float64(consumed) / float64(limit)
 
-		pricingData := pricingSource.GetPricing(model)
-		if pricingData == nil {
-			continue
-		}
-
-		// Estimate cost based on reasonable defaults: 100 input tokens, 200 output tokens
-		estimatedTokens := (100 + 200) / 1000.0 // Convert to thousands for per-token calculation
-		cost := estimatedTokens * pricingData.InputPerMToken
-
-		slog.Debug("cost-optimized routing", "provider", cfg.name, "model", model, "estimated_cost", cost)
-
-		if cost < minCost {
-			minCost = cost
-			cheapest = cfg.config
+		// Prefer providers with low utilization and available capacity
+		score := remaining * (1.0 - utilization)
+		if score > bestScore {
+			bestScore = score
+			best = c.config
 		}
 	}
 
-	if cheapest != nil {
-		return cheapest
+	if best != nil {
+		return best
 	}
 
-	// Fallback to priority ordering if no pricing available
+	if !hasLimits {
+		return r.priorityOrder(candidates)
+	}
+
+	// All providers at capacity, use priority order
 	return r.priorityOrder(candidates)
 }
 

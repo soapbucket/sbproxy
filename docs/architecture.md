@@ -424,7 +424,7 @@ request serialization and response normalization.
 |-----------------|----------|
 | `round_robin`   | Distributes load evenly across all configured backends. |
 | `fallback_chain` | Tries each provider in order. Moves to next on error or timeout. |
-| `cost`          | Selects the cheapest provider that can satisfy the request given the pricing catalog. |
+| `cost_optimized` | Routes to the provider with the most available token capacity, favoring less-loaded providers. |
 | `latency`       | Selects the provider with the lowest observed p50 latency using an EWMA. |
 
 ### Streaming
