@@ -1,79 +1,173 @@
 # Examples
 
-Quick-start configurations for sbproxy. Each example is a self-contained config
-you can run immediately. See the [Manual](../docs/manual.md)
-for a step-by-step walkthrough.
+Quick-start configurations for sbproxy. Each example is a self-contained config you can run immediately.
 
-## Docker Compose Setup
+## Run Any Example
 
-For a full local environment with auto-TLS (via the Pebble ACME test server) and Redis-backed rate limiting, see the [`docker/`](../docker/) directory. The config used by that stack is also available as a standalone example:
+```bash
+sbproxy serve -f examples/minimal.yml
+```
 
-| Example | Description | Requirements |
-|---------|-------------|-------------|
-| [docker-redis-acme.yml](docker-redis-acme.yml) | Auto-TLS via Pebble ACME + Redis rate limiting | Docker Compose stack in `docker/` |
+Validate without starting:
 
-See [`docker/README.md`](../docker/README.md) for startup instructions, how to test certificate issuance, and how to verify Redis-backed rate limiting.
+```bash
+sbproxy validate -f examples/minimal.yml
+```
 
 ## Proxy Examples
 
-| Example | Description | Test Command |
-|---------|-------------|-------------|
-| [minimal.yml](minimal.yml) | Simplest reverse proxy | `curl -H "Host: api.example.com" http://localhost:8080/get` |
-| [with-auth.yml](with-auth.yml) | API key authentication | `curl -H "Host: api.example.com" -H "X-API-Key: my-secret-key" http://localhost:8080/get` |
-| [with-caching.yml](with-caching.yml) | Response caching (5 min TTL) | `curl -H "Host: api.example.com" http://localhost:8080/get` (second request is cached) |
-| [with-rate-limiting.yml](with-rate-limiting.yml) | Rate limiting (5 req/min) | Send 6 rapid requests - the 6th returns 429 |
-| [with-transforms.yml](with-transforms.yml) | Request/response header injection | `curl -v -H "Host: api.example.com" http://localhost:8080/get` (check response headers) |
-| [load-balancer.yml](load-balancer.yml) | Weighted load balancing (70/30) | `curl -H "Host: api.example.com" http://localhost:8080/get` |
-| [with-cel-routing.yml](with-cel-routing.yml) | Path-based routing with forward rules | `curl -H "Host: api.example.com" http://localhost:8080/api/users` |
-| [with-static-response.yml](with-static-response.yml) | Static JSON responses (no upstream) | `curl -H "Host: api.example.com" http://localhost:8080/` |
-| [with-websocket.yml](with-websocket.yml) | WebSocket proxy | `websocat ws://localhost:8080 -H "Host: ws.example.com"` |
+### minimal.yml - Simplest Reverse Proxy
+
+```bash
+sbproxy serve -f examples/minimal.yml
+curl -H "Host: api.example.com" http://localhost:8080/get
+```
+
+### with-auth.yml - API Key Authentication
+
+```bash
+sbproxy serve -f examples/with-auth.yml
+
+# Without key (returns 401)
+curl -H "Host: api.example.com" http://localhost:8080/get
+
+# With key
+curl -H "Host: api.example.com" -H "X-API-Key: my-secret-key" http://localhost:8080/get
+```
+
+### with-caching.yml - Response Caching
+
+```bash
+sbproxy serve -f examples/with-caching.yml
+
+# First request hits backend
+curl -v -H "Host: api.example.com" http://localhost:8080/get 2>&1 | grep -i x-cache
+# Second request served from cache
+curl -v -H "Host: api.example.com" http://localhost:8080/get 2>&1 | grep -i x-cache
+```
+
+### with-rate-limiting.yml - Rate Limiting
+
+```bash
+sbproxy serve -f examples/with-rate-limiting.yml
+
+# Send 6 requests (limit is 5/min, the 6th returns 429)
+for i in $(seq 1 6); do
+  code=$(curl -s -o /dev/null -w "%{http_code}" -H "Host: api.example.com" http://localhost:8080/get)
+  echo "Request $i: $code"
+done
+```
+
+### with-transforms.yml - Header Injection
+
+```bash
+sbproxy serve -f examples/with-transforms.yml
+curl -v -H "Host: api.example.com" http://localhost:8080/get 2>&1 | grep -i "x-proxy\|x-request"
+```
+
+### load-balancer.yml - Weighted Load Balancing
+
+```bash
+sbproxy serve -f examples/load-balancer.yml
+
+# Run multiple times to see weighted distribution
+for i in $(seq 1 10); do
+  curl -s -H "Host: api.example.com" http://localhost:8080/get | grep -o '"url":"[^"]*"'
+done
+```
+
+### with-cel-routing.yml - Path-Based Routing
+
+```bash
+sbproxy serve -f examples/with-cel-routing.yml
+
+curl -H "Host: api.example.com" http://localhost:8080/api/users
+curl -H "Host: api.example.com" http://localhost:8080/api/orders
+curl -H "Host: api.example.com" http://localhost:8080/anything-else
+```
+
+### with-static-response.yml - Static JSON Response
+
+```bash
+sbproxy serve -f examples/with-static-response.yml
+curl -H "Host: api.example.com" http://localhost:8080/
+```
+
+### with-websocket.yml - WebSocket Proxy
+
+```bash
+sbproxy serve -f examples/with-websocket.yml
+websocat ws://localhost:8080 -H "Host: ws.example.com"
+```
 
 ## AI Gateway Examples
 
-| Example | Description | Requirements |
-|---------|-------------|-------------|
-| [ai-proxy.yml](ai-proxy.yml) | AI gateway with OpenAI + Anthropic fallback | `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` env vars |
-| [with-scripting.yml](with-scripting.yml) | CEL model routing + guardrail expressions | `OPENAI_API_KEY` env var |
-| [with-failure-mode.yml](with-failure-mode.yml) | Fail-open/closed per subsystem | `OPENAI_API_KEY` env var |
+Requires provider API keys. See [examples/ai/README.md](ai/README.md) for detailed instructions.
 
-## Usage
+### ai-proxy.yml - Multi-Provider AI Gateway
 
-Run any example:
+```bash
+OPENAI_API_KEY=sk-... ANTHROPIC_API_KEY=sk-ant-... sbproxy serve -f examples/ai-proxy.yml
 
-    sbproxy serve -f examples/minimal.yml
+curl -H "Host: ai.example.com" http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Hello"}]}'
+```
 
-Validate config without starting:
+### with-scripting.yml - CEL Model Routing + Guardrails
 
-    sbproxy validate -f examples/minimal.yml
+```bash
+OPENAI_API_KEY=sk-... sbproxy serve -f examples/with-scripting.yml
 
-With Docker:
+curl -H "Host: ai.example.com" http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Tier: premium" \
+  -d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Hello"}]}'
+```
 
-    docker run -p 8080:8080 -v $(pwd)/examples/minimal.yml:/etc/sbproxy/sb.yml ghcr.io/soapbucket/sbproxy:latest
+### with-failure-mode.yml - Fail-Open/Closed
 
-For AI examples, pass your API key:
+```bash
+OPENAI_API_KEY=sk-... sbproxy serve -f examples/with-failure-mode.yml
 
-    OPENAI_API_KEY=sk-... sbproxy serve -f examples/ai-proxy.yml
+curl -H "Host: ai.example.com" http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Hello"}]}'
+```
 
-Test the AI gateway with curl:
+## More Examples
 
-    curl -X POST http://localhost:8080/v1/chat/completions \
-      -H "Host: ai.example.com" \
-      -H "Content-Type: application/json" \
-      -d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Hello"}]}'
+| Directory | Description |
+|-----------|-------------|
+| [ai/](ai/) | AI gateway configs: single provider, multi-provider, fallback, cost routing, guardrails |
+| [api/](api/) | API proxy configs: JWT auth, caching, rate limiting, transforms, microservice routing |
 
-Or with the OpenAI Python SDK:
+## OpenAI SDK Compatibility
 
-    from openai import OpenAI
-    client = OpenAI(base_url="http://localhost:8080/v1", api_key="unused")
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": "Hello"}]
-    )
-    print(response.choices[0].message.content)
+All AI examples return OpenAI-compatible responses:
 
-## Next Steps
+```python
+from openai import OpenAI
 
-- [Manual](../docs/manual.md)
-- [Configuration Reference](../docs/configuration.md)
-- [AI Gateway Guide](../docs/ai-gateway.md)
-- [Scripting Guide](../docs/scripting.md)
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="unused")
+response = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "Hello"}],
+    extra_headers={"Host": "ai.example.com"}
+)
+print(response.choices[0].message.content)
+```
+
+## Docker
+
+```bash
+docker run -p 8080:8080 \
+  -v $(pwd)/examples/minimal.yml:/etc/sbproxy/sb.yml \
+  ghcr.io/soapbucket/sbproxy:latest
+```
+
+For the full stack with Redis, Prometheus, Grafana, and Jaeger, see [docker/README.md](../docker/README.md).
+
+## Documentation
+
+[Manual](../docs/manual.md) | [Configuration](../docs/configuration.md) | [AI Gateway](../docs/ai-gateway.md) | [Scripting](../docs/scripting.md)
