@@ -8,7 +8,6 @@ builds:
     goos:
       - linux
       - darwin
-      - windows
     goarch:
       - amd64
       - arm64
@@ -17,14 +16,11 @@ builds:
       - -X github.com/soapbucket/sbproxy/internal/version.Version={{.Version}}
       - -X github.com/soapbucket/sbproxy/internal/version.BuildHash={{.ShortCommit}}
       - -X github.com/soapbucket/sbproxy/internal/version.BuildDate={{.Date}}
-      - -X github.com/soapbucket/sbproxy/internal/version.BuildNumber={{.Env.BUILD_NUMBER}}
 
 archives:
-  - format: tar.gz
+  - formats:
+      - tar.gz
     name_template: "sbproxy_{{ .Os }}_{{ .Arch }}"
-    format_overrides:
-      - goos: windows
-        format: zip
 
 dockers:
   - image_templates:
