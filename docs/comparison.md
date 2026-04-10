@@ -111,11 +111,21 @@ Caddy is a modern Go reverse proxy known for automatic HTTPS.
 | | sbproxy | Caddy |
 |---|---------|-------|
 | Automatic HTTPS | Yes (ACME) | Yes (ACME) |
-| AI gateway | Yes | No |
+| AI gateway | Yes (103+ providers) | No |
 | Config format | YAML | Caddyfile or JSON |
-| Rate limiting | Built-in | Community module |
+| Rate limiting | Built-in, distributed | Community module |
 | Scripting | CEL + Lua | Go modules |
 | HTTP/3 | Yes | Yes |
+| Compression | Gzip, Brotli, Zstd | Gzip, Brotli, Zstd |
+| Circuit breaker | Built-in (3-state) | Latency-based |
+| Health checks | Active + passive | Active + passive |
+| Retries | Configurable with backoff | Configurable |
+| PROXY protocol | Yes (v1/v2) | Yes (v1/v2) |
+| Service discovery | DNS SRV, Consul | SRV, A/AAAA |
+| Load balancing | 10 algorithms | 12+ algorithms |
+| WAF | Built-in (OWASP, SQLi, XSS) | Community module |
+| DDoS protection | Built-in | No |
+| Plugin system | CEL + Lua + WASM | Go modules (compile-time) |
 
 **Choose Caddy if** you want the simplest possible reverse proxy with
 automatic HTTPS and don't need AI features or scripting.

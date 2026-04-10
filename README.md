@@ -81,15 +81,18 @@ sbproxy returns an OpenAI-compatible response regardless of which provider handl
 
 - **Reverse proxy** with path-based routing, host matching, and WebSocket/gRPC support
 - **AI gateway** with 103+ native providers (OpenAI, Anthropic, Google, and more)
-- **Load balancing** - round-robin, weighted, least-connections
+- **Load balancing** - 10 algorithms (round-robin, weighted, least-connections, IP hash, URI hash, header hash, cookie hash, random, first)
 - **Authentication** - API keys, JWT, OAuth2, mTLS
 - **Response caching** with stale-while-revalidate
 - **Rate limiting** - local and distributed via Redis
+- **WAF** with OWASP rules, SQL injection, and XSS detection
+- **DDoS protection** with adaptive rate-based detection
+- **Compression** - Gzip, Brotli, Zstd
 - **Scripting** - CEL expressions and Lua for custom logic
 - **HTTP/3** with QUIC
+- **PROXY protocol** v1/v2 for L4 load balancer deployments
+- **Circuit breaker** with configurable thresholds and retries
 - **Observability** - Prometheus metrics and OpenTelemetry tracing
-
-Looking for WAF, DDoS protection, semantic caching, virtual keys, or budget enforcement? See [SOAPBUCKET Cloud](https://www.soapbucket.com).
 
 ## Documentation
 
