@@ -13,6 +13,7 @@ import (
 	"github.com/soapbucket/sbproxy/internal/config/callback"
 	"github.com/soapbucket/sbproxy/internal/config/modifier"
 	"github.com/soapbucket/sbproxy/internal/config/rule"
+	"github.com/soapbucket/sbproxy/internal/config/waf"
 
 	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/security/signature"
@@ -460,16 +461,36 @@ type StorageConfig struct {
 	TenantAuthURL string `json:"tenant_auth_url,omitempty"`
 }
 
+// DiscoveryConfig configures dynamic upstream resolution for load balancers.
+type DiscoveryConfig struct {
+	// Type is the discovery mechanism: "dns_srv" (OSS) or "consul" (enterprise).
+	Type string `json:"type"`
+	// Service is the DNS SRV service name (e.g., "_http._tcp.api.example.com").
+	Service string `json:"service,omitempty"`
+	// RefreshInterval is how often to re-resolve (default 30s).
+	RefreshInterval string `json:"refresh_interval,omitempty"`
+	// Resolver is an optional custom DNS resolver address (e.g., "8.8.8.8:53").
+	Resolver string `json:"resolver,omitempty"`
+}
+
 // LoadBalancerConfig represents load balancer configuration
 type LoadBalancerConfig struct {
 	BaseAction
 
 	Targets []Target `json:"targets"`
 
+	// Discovery enables dynamic upstream resolution. When set, Targets may be
+	// empty and backends are discovered at runtime.
+	Discovery *DiscoveryConfig `json:"discovery,omitempty"`
+
 	// Algorithm selects the load balancing strategy: "weighted_random" (default),
-	// "round_robin", "weighted_round_robin", or "least_connections".
+	// "round_robin", "weighted_round_robin", "least_connections", "ip_hash",
+	// "uri_hash", "header_hash", "cookie_hash", "random", or "first".
 	// When set, this takes precedence over the legacy RoundRobin/LeastConnections booleans.
 	Algorithm string `json:"algorithm,omitempty"`
+
+	// HashKey is the header name or cookie name used by the header_hash and cookie_hash algorithms.
+	HashKey string `json:"hash_key,omitempty"`
 
 	RoundRobin       bool `json:"round_robin,omitempty"`
 	LeastConnections bool `json:"least_connections,omitempty"`
@@ -1500,10 +1521,10 @@ type WAFPolicy struct {
 	ModSecurityRules []string `json:"modsecurity_rules,omitempty"` // Raw ModSecurity rule strings
 
 	// Custom rules
-	CustomRules []WAFRule `json:"custom_rules,omitempty"` // Custom rule definitions
+	CustomRules []waf.WAFRule `json:"custom_rules,omitempty"` // Custom rule definitions
 
 	// OWASP Core Rule Set (CRS) configuration
-	OWASPCRS *OWASPCRSConfig `json:"owasp_crs,omitempty"` // OWASP CRS configuration
+	OWASPCRS *waf.OWASPCRSConfig `json:"owasp_crs,omitempty"` // OWASP CRS configuration
 
 	// Rule sets
 	RuleSets []string `json:"rule_sets,omitempty"` // Rule set names to load (e.g., "owasp-top10", "sql-injection")
@@ -1521,53 +1542,6 @@ type WAFPolicy struct {
 
 	// Fail-open behavior
 	FailOpen bool `json:"fail_open,omitempty"` // If true, allow request on WAF evaluation errors; if false (default), block on errors
-}
-
-// WAFRule represents a WAF rule definition.
-type WAFRule struct {
-	ID          string             `json:"id,omitempty"`
-	Name        string             `json:"name,omitempty"`
-	Description string             `json:"description,omitempty"`
-	Enabled     bool               `json:"enabled,omitempty"`
-	Disabled    bool               `json:"disabled,omitempty"`
-	Phase       int                `json:"phase,omitempty"`
-	Severity    string             `json:"severity,omitempty"`
-	Action      string             `json:"action,omitempty"`
-	MatchConditions []WAFMatchCondition `json:"match_conditions,omitempty"`
-	Variables       []WAFVariable       `json:"variables,omitempty"`
-	Transformations []string            `json:"transformations,omitempty"`
-	Operator    string `json:"operator,omitempty"`
-	Pattern     string `json:"pattern,omitempty"`
-	CELExpr     string `json:"cel_expr,omitempty"`
-	LuaScript   string `json:"lua_script,omitempty"`
-	Negate      bool   `json:"negate,omitempty"`
-}
-
-// WAFMatchCondition represents a condition for WAF rule matching.
-type WAFMatchCondition struct {
-	Variable        string   `json:"variable,omitempty"`
-	Operator        string   `json:"operator,omitempty"`
-	Pattern         string   `json:"pattern,omitempty"`
-	Transformations []string `json:"transformations,omitempty"`
-	Negate          bool     `json:"negate,omitempty"`
-}
-
-// WAFVariable represents a variable to check in WAF rules.
-type WAFVariable struct {
-	Name            string   `json:"name,omitempty"`
-	Collection      string   `json:"collection,omitempty"`
-	Key             string   `json:"key,omitempty"`
-	Transformations []string `json:"transformations,omitempty"`
-}
-
-// OWASPCRSConfig configures the OWASP Core Rule Set.
-type OWASPCRSConfig struct {
-	Enabled               bool     `json:"enabled,omitempty"`
-	Version               string   `json:"version,omitempty"`
-	ParanoiaLevel         int      `json:"paranoia_level,omitempty"`
-	AnomalyScoreThreshold int      `json:"anomaly_score_threshold,omitempty"`
-	Categories            []string `json:"categories,omitempty"`
-	Exclusions            []string `json:"exclusions,omitempty"`
 }
 
 // SemanticCacheConfig configures semantic similarity-based response caching for the AI gateway.

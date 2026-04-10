@@ -115,6 +115,12 @@ func StartHTTP(p ProxyConfig, m manager.Manager, callbackCache *callback.Callbac
 	}
 	defer listener.Close()
 
+	// Wrap with PROXY protocol support (must be before TLS)
+	if p.HAProxyProtocol != nil && p.HAProxyProtocol.Enabled {
+		listener = newProxyProtocolListener(listener, p.HAProxyProtocol.TrustedCIDRs)
+		slog.Info("PROXY protocol enabled on HTTP listener", "trusted_cidrs", p.HAProxyProtocol.TrustedCIDRs)
+	}
+
 	// Wrap listener with connection timing tracker to track first byte reads
 	listener = tlsutil.NewTimingListener(listener)
 	slog.Debug("wrapped listener with connection timing")
@@ -235,6 +241,12 @@ func StartHTTPS(p ProxyConfig, m manager.Manager, callbackCache *callback.Callba
 		return fmt.Errorf("failed to listen on %s: %w", srv.Addr, err)
 	}
 	defer listener.Close()
+
+	// Wrap with PROXY protocol support (must be before TLS)
+	if p.HAProxyProtocol != nil && p.HAProxyProtocol.Enabled {
+		listener = newProxyProtocolListener(listener, p.HAProxyProtocol.TrustedCIDRs)
+		slog.Info("PROXY protocol enabled on HTTPS listener", "trusted_cidrs", p.HAProxyProtocol.TrustedCIDRs)
+	}
 
 	// Wrap listener with connection timing tracker to track first byte reads
 	listener = tlsutil.NewTimingListener(listener)

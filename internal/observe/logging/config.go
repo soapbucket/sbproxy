@@ -42,15 +42,24 @@ type SamplingConfig struct {
 	Rate    int  `mapstructure:"rate" json:"rate"` // Log 1 in N requests (errors always logged)
 }
 
+// IPMaskingConfig controls IP address anonymization in access logs.
+type IPMaskingConfig struct {
+	// Mode is the masking strategy: "none" (default), "truncate", "hash".
+	// truncate: zeros the last octet (IPv4) or last 80 bits (IPv6).
+	// hash: replaces IP with HMAC-SHA256 hash (first 16 hex chars).
+	Mode string `mapstructure:"mode" json:"mode,omitempty"`
+}
+
 // RequestLoggingConfig configures the request logger.
 type RequestLoggingConfig struct {
-	Enabled              bool           `mapstructure:"enabled" json:"enabled"`
-	Level                string         `mapstructure:"level" json:"level"`
-	Outputs              []OutputConfig `mapstructure:"outputs" json:"outputs"`
-	Fields               FieldsConfig   `mapstructure:"fields" json:"fields"`
-	Sampling             SamplingConfig `mapstructure:"sampling" json:"sampling"`
-	SlowRequestThreshold time.Duration  `mapstructure:"slow_request_threshold" json:"slow_request_threshold"`
-	ErrorDetailLevel     string         `mapstructure:"error_detail_level" json:"error_detail_level"`
+	Enabled              bool             `mapstructure:"enabled" json:"enabled"`
+	Level                string           `mapstructure:"level" json:"level"`
+	Outputs              []OutputConfig   `mapstructure:"outputs" json:"outputs"`
+	Fields               FieldsConfig     `mapstructure:"fields" json:"fields"`
+	Sampling             SamplingConfig   `mapstructure:"sampling" json:"sampling"`
+	SlowRequestThreshold time.Duration    `mapstructure:"slow_request_threshold" json:"slow_request_threshold"`
+	ErrorDetailLevel     string           `mapstructure:"error_detail_level" json:"error_detail_level"`
+	IPMasking            *IPMaskingConfig `mapstructure:"ip_masking" json:"ip_masking,omitempty"`
 }
 
 // ApplicationLoggingConfig configures the application logger.

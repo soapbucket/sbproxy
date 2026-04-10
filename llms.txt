@@ -11,6 +11,11 @@ sbproxy sits between your clients and backends, providing authentication, cachin
 - Path-based routing with hostname matching
 - CEL expressions and Lua scripting for custom logic
 - HTTP/3 with QUIC, WebSocket, and gRPC support
+- WAF with OWASP rules, SQL injection, and XSS detection
+- DDoS protection with adaptive rate-based detection
+- PROXY protocol v1/v2 for L4 load balancer deployments
+- 10 load balancing algorithms
+- Compression (Gzip, Brotli, Zstd)
 - Prometheus metrics and OpenTelemetry tracing
 - Apache License 2.0
 
@@ -82,7 +87,7 @@ Top-level structure:
 Each origin has:
 - `action` - what to do (proxy, ai_proxy, static, redirect, echo, loadbalancer, websocket, grpc, mcp)
 - `authentication` - who can access (api_key, basic_auth, jwt, oauth2, forward_auth, ip_filter)
-- `policies` - rules and limits (rate_limiting, concurrency, expression, security_headers, cors, csrf, circuit_breaker)
+- `policies` - rules and limits (rate_limiting, concurrency, expression, security_headers, cors, csrf, circuit_breaker, waf, ddos_protection)
 - `response_cache` - HTTP response caching with TTL
 - `request_modifiers` / `response_modifiers` - CEL or Lua scripts
 - `transforms` - response body transforms (json, html, css)

@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 )
 
 // compressedResponseWriter wraps http.ResponseWriter to compress response bodies.
@@ -35,6 +36,7 @@ var brotliWriterPool = sync.Pool{
 		return brotli.NewWriterLevel(io.Discard, brotli.DefaultCompression)
 	},
 }
+
 
 // shouldCompress checks if the response should be compressed based on content type and size.
 func shouldCompress(contentType string, cfg *CompressionConfig) bool {
@@ -79,7 +81,7 @@ func selectEncoding(acceptEncoding string, cfg *CompressionConfig) string {
 	// Parse Accept-Encoding and find the best match based on our preference order
 	for _, algo := range algorithms {
 		if containsEncoding(acceptEncoding, algo) {
-			if algo == "gzip" || algo == "br" {
+			if algo == "gzip" || algo == "br" || algo == "zstd" {
 				return algo
 			}
 		}
@@ -211,6 +213,24 @@ func (w *compressedResponseWriter) startCompression() error {
 		return err
 	}
 
+	if w.encoding == "zstd" {
+		w.Header().Set("Content-Encoding", "zstd")
+		w.Header().Del("Content-Length")
+		w.Header().Add("Vary", "Accept-Encoding")
+		w.ResponseWriter.WriteHeader(w.statusCode)
+		w.wroteHeader = true
+
+		zw, err := zstd.NewWriter(w.ResponseWriter, zstd.WithEncoderLevel(zstd.SpeedDefault))
+		if err != nil {
+			return err
+		}
+		w.writer = zw
+
+		_, err = zw.Write(w.buf)
+		w.buf = nil
+		return err
+	}
+
 	// No compression
 	w.ResponseWriter.WriteHeader(w.statusCode)
 	w.wroteHeader = true
@@ -247,6 +267,8 @@ func (w *compressedResponseWriter) Close() error {
 			gzipWriterPool.Put(v)
 		case *brotli.Writer:
 			brotliWriterPool.Put(v)
+		case *zstd.Encoder:
+			// zstd.Encoder is not pooled - created per response
 		}
 		return err
 	}
@@ -261,6 +283,8 @@ func (w *compressedResponseWriter) Flush() {
 			case *gzip.Writer:
 				v.Flush()
 			case *brotli.Writer:
+				v.Flush()
+			case *zstd.Encoder:
 				v.Flush()
 			}
 		}
