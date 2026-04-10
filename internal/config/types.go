@@ -461,11 +461,27 @@ type StorageConfig struct {
 	TenantAuthURL string `json:"tenant_auth_url,omitempty"`
 }
 
+// DiscoveryConfig configures dynamic upstream resolution for load balancers.
+type DiscoveryConfig struct {
+	// Type is the discovery mechanism: "dns_srv" (OSS) or "consul" (enterprise).
+	Type string `json:"type"`
+	// Service is the DNS SRV service name (e.g., "_http._tcp.api.example.com").
+	Service string `json:"service,omitempty"`
+	// RefreshInterval is how often to re-resolve (default 30s).
+	RefreshInterval string `json:"refresh_interval,omitempty"`
+	// Resolver is an optional custom DNS resolver address (e.g., "8.8.8.8:53").
+	Resolver string `json:"resolver,omitempty"`
+}
+
 // LoadBalancerConfig represents load balancer configuration
 type LoadBalancerConfig struct {
 	BaseAction
 
 	Targets []Target `json:"targets"`
+
+	// Discovery enables dynamic upstream resolution. When set, Targets may be
+	// empty and backends are discovered at runtime.
+	Discovery *DiscoveryConfig `json:"discovery,omitempty"`
 
 	// Algorithm selects the load balancing strategy: "weighted_random" (default),
 	// "round_robin", "weighted_round_robin", "least_connections", "ip_hash",

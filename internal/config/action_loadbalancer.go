@@ -698,8 +698,20 @@ func LoadLoadBalancerConfig(data []byte) (ActionConfig, error) {
 		}
 	}
 
-	// Validate targets
-	if len(lbCfg.Targets) == 0 {
+	// Validate discovery config
+	if lbCfg.Discovery != nil {
+		switch lbCfg.Discovery.Type {
+		case "dns_srv":
+			if lbCfg.Discovery.Service == "" {
+				return nil, fmt.Errorf("dns_srv discovery requires a service name")
+			}
+		default:
+			return nil, fmt.Errorf("unsupported discovery type %q in OSS: only dns_srv is supported", lbCfg.Discovery.Type)
+		}
+	}
+
+	// Validate targets - allow empty targets when discovery is configured
+	if len(lbCfg.Targets) == 0 && lbCfg.Discovery == nil {
 		return nil, ErrNoTargets
 	}
 
