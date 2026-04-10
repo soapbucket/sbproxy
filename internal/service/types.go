@@ -166,6 +166,17 @@ type HTTPSProxyConfig struct {
 	ConnectUDPTemplate   string      `yaml:"connect_udp_template" mapstructure:"connect_udp_template"`
 }
 
+// HAProxyProtocol configures HAProxy PROXY protocol support for L4 load balancers.
+// When enabled, the proxy parses PROXY protocol v1/v2 headers sent by upstream L4
+// load balancers (AWS NLB, HAProxy) to extract the real client IP address.
+type HAProxyProtocol struct {
+	// Enabled enables PROXY protocol parsing on all listeners.
+	Enabled bool `yaml:"enabled" mapstructure:"enabled"`
+	// TrustedCIDRs limits which source IPs are trusted to send PROXY protocol headers.
+	// If empty, all sources are trusted when enabled.
+	TrustedCIDRs []string `yaml:"trusted_cidrs" mapstructure:"trusted_cidrs"`
+}
+
 // NewProxyConfig represents the simplified proxy configuration from sb.yaml
 type ProxyConfig struct {
 	HTTPBindPort  int           `yaml:"http_bind_port" mapstructure:"http_bind_port"`
@@ -177,6 +188,11 @@ type ProxyConfig struct {
 	WriteTimeout  time.Duration `yaml:"write_timeout" mapstructure:"write_timeout"`
 	IdleTimeout   time.Duration `yaml:"idle_timeout" mapstructure:"idle_timeout"`
 	GraceTime     time.Duration `yaml:"grace_time" mapstructure:"grace_time"`
+
+	// HAProxyProtocol configures PROXY protocol v1/v2 parsing for L4 load balancers.
+	// When enabled, the real client IP is extracted from PROXY protocol headers sent
+	// by upstream load balancers (AWS NLB, HAProxy) before TLS termination.
+	HAProxyProtocol *HAProxyProtocol `yaml:"proxy_protocol" mapstructure:"proxy_protocol"`
 
 	TLSCert string `yaml:"tls_cert" mapstructure:"tls_cert"`
 	TLSKey  string `yaml:"tls_key" mapstructure:"tls_key"`
