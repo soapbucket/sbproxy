@@ -468,9 +468,13 @@ type LoadBalancerConfig struct {
 	Targets []Target `json:"targets"`
 
 	// Algorithm selects the load balancing strategy: "weighted_random" (default),
-	// "round_robin", "weighted_round_robin", or "least_connections".
+	// "round_robin", "weighted_round_robin", "least_connections", "ip_hash",
+	// "uri_hash", "header_hash", "cookie_hash", "random", or "first".
 	// When set, this takes precedence over the legacy RoundRobin/LeastConnections booleans.
 	Algorithm string `json:"algorithm,omitempty"`
+
+	// HashKey is the header name or cookie name used by the header_hash and cookie_hash algorithms.
+	HashKey string `json:"hash_key,omitempty"`
 
 	RoundRobin       bool `json:"round_robin,omitempty"`
 	LeastConnections bool `json:"least_connections,omitempty"`

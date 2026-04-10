@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"math/rand"
 	"net/http"
@@ -87,6 +88,7 @@ func (l *LoadBalancerTypedConfig) Init(cfg *Config) error {
 		healthCheckCtx:    healthCtx,
 		healthCheckCancel: healthCancel,
 		algorithm:         resolvedAlgorithm,
+		hashKey:           l.HashKey,
 		leastConnections:  l.LeastConnections,
 		disableSticky:     l.DisableSticky,
 		useRoundRobin:     l.RoundRobin,
@@ -684,10 +686,15 @@ func LoadLoadBalancerConfig(data []byte) (ActionConfig, error) {
 	// Validate algorithm if specified
 	if lbCfg.Algorithm != "" {
 		switch lbCfg.Algorithm {
-		case AlgorithmWeightedRandom, AlgorithmRoundRobin, AlgorithmWeightedRoundRobin, AlgorithmLeastConnections:
+		case AlgorithmWeightedRandom, AlgorithmRoundRobin, AlgorithmWeightedRoundRobin, AlgorithmLeastConnections,
+			AlgorithmIPHash, AlgorithmURIHash, AlgorithmRandom, AlgorithmFirst:
 			// valid
+		case AlgorithmHeaderHash, AlgorithmCookieHash:
+			if lbCfg.HashKey == "" {
+				return nil, fmt.Errorf("load balancer algorithm %q requires a non-empty hash_key", lbCfg.Algorithm)
+			}
 		default:
-			return nil, fmt.Errorf("invalid load balancer algorithm %q: must be one of weighted_random, round_robin, weighted_round_robin, least_connections", lbCfg.Algorithm)
+			return nil, fmt.Errorf("invalid load balancer algorithm %q: must be one of weighted_random, round_robin, weighted_round_robin, least_connections, ip_hash, uri_hash, header_hash, cookie_hash, random, first", lbCfg.Algorithm)
 		}
 	}
 
@@ -772,6 +779,9 @@ type loadBalancerTransport struct {
 	useRoundRobin    bool // legacy flag, used when algorithm is empty
 	stripBasePath    bool // If true, use request path; if false, use target URL path
 	preserveQuery    bool // If true, use only request query; if false, merge target URL query with request query
+
+	// hashKey is the header/cookie name used by header_hash and cookie_hash algorithms
+	hashKey string
 
 	// Weighted round-robin state
 	wrrIndex   int64 // atomic: current target index for weighted round-robin
@@ -1017,6 +1027,18 @@ func (lb *loadBalancerTransport) selectTarget(req *http.Request) int {
 		targetIndex = lb.selectRoundRobinHealthy()
 	case AlgorithmWeightedRoundRobin:
 		targetIndex = lb.selectWeightedRoundRobinHealthy()
+	case AlgorithmIPHash:
+		targetIndex = lb.selectIPHashHealthy(req)
+	case AlgorithmURIHash:
+		targetIndex = lb.selectURIHashHealthy(req)
+	case AlgorithmHeaderHash:
+		targetIndex = lb.selectHeaderHashHealthy(req)
+	case AlgorithmCookieHash:
+		targetIndex = lb.selectCookieHashHealthy(req)
+	case AlgorithmRandom:
+		targetIndex = lb.selectRandomHealthy()
+	case AlgorithmFirst:
+		targetIndex = lb.selectFirstHealthy()
 	default:
 		// Weighted random (default)
 		// Note: selectWeightedRandomHealthy() manages its own locks internally,
@@ -1209,6 +1231,128 @@ func (lb *loadBalancerTransport) selectWeightedRoundRobinHealthy() int {
 	}
 
 	// All targets unhealthy or circuit breakers open - return -1 to signal 503
+	slog.Warn("all targets unhealthy or circuit breakers open", "origin_id", lb.originID)
+	return -1
+}
+
+// fnvHashString hashes a string using FNV-1a and returns the index within n targets.
+func fnvHashString(s string, n int) int {
+	h := fnv.New32a()
+	h.Write([]byte(s))
+	return int(h.Sum32()) % n
+}
+
+// selectHashHealthy probes forward from baseIndex to find a healthy target.
+func (lb *loadBalancerTransport) selectHashHealthy(baseIndex int) int {
+	n := len(lb.targets)
+	for i := 0; i < n; i++ {
+		idx := (baseIndex + i) % n
+		target := lb.targets[idx]
+		isHealthy := target.health == nil || target.health.isHealthy()
+		circuitBreakerOk := target.circuitBreaker == nil || !target.circuitBreaker.isOpen()
+		if isHealthy && circuitBreakerOk {
+			return idx
+		}
+	}
+	slog.Warn("all targets unhealthy or circuit breakers open", "origin_id", lb.originID)
+	return -1
+}
+
+// selectIPHashHealthy hashes the client IP (port stripped) for consistent routing.
+// Same IP always routes to the same backend; falls back to the next healthy target.
+func (lb *loadBalancerTransport) selectIPHashHealthy(req *http.Request) int {
+	if len(lb.targets) == 0 {
+		return -1
+	}
+	ip := req.RemoteAddr
+	// Strip port if present
+	if host, _, found := strings.Cut(ip, ":"); found {
+		ip = host
+	}
+	baseIndex := fnvHashString(ip, len(lb.targets))
+	return lb.selectHashHealthy(baseIndex)
+}
+
+// selectURIHashHealthy hashes the request URL path for consistent routing.
+// Same path always routes to the same backend.
+func (lb *loadBalancerTransport) selectURIHashHealthy(req *http.Request) int {
+	if len(lb.targets) == 0 {
+		return -1
+	}
+	path := req.URL.Path
+	baseIndex := fnvHashString(path, len(lb.targets))
+	return lb.selectHashHealthy(baseIndex)
+}
+
+// selectHeaderHashHealthy hashes a specified request header value (lb.hashKey).
+// Falls back to hashing RemoteAddr if the header is absent.
+func (lb *loadBalancerTransport) selectHeaderHashHealthy(req *http.Request) int {
+	if len(lb.targets) == 0 {
+		return -1
+	}
+	value := req.Header.Get(lb.hashKey)
+	if value == "" {
+		value = req.RemoteAddr
+	}
+	baseIndex := fnvHashString(value, len(lb.targets))
+	return lb.selectHashHealthy(baseIndex)
+}
+
+// selectCookieHashHealthy hashes a specified cookie value (lb.hashKey).
+// Falls back to hashing RemoteAddr if the cookie is absent.
+func (lb *loadBalancerTransport) selectCookieHashHealthy(req *http.Request) int {
+	if len(lb.targets) == 0 {
+		return -1
+	}
+	value := req.RemoteAddr
+	if cookie, err := req.Cookie(lb.hashKey); err == nil {
+		value = cookie.Value
+	}
+	baseIndex := fnvHashString(value, len(lb.targets))
+	return lb.selectHashHealthy(baseIndex)
+}
+
+// selectRandomHealthy selects a random healthy target with equal probability (ignores weights).
+func (lb *loadBalancerTransport) selectRandomHealthy() int {
+	if len(lb.targets) == 0 {
+		return -1
+	}
+
+	// Collect indices of healthy targets
+	healthy := make([]int, 0, len(lb.targets))
+	for i, target := range lb.targets {
+		isHealthy := target.health == nil || target.health.isHealthy()
+		circuitBreakerOk := target.circuitBreaker == nil || !target.circuitBreaker.isOpen()
+		if isHealthy && circuitBreakerOk {
+			healthy = append(healthy, i)
+		}
+	}
+
+	if len(healthy) == 0 {
+		slog.Warn("all targets unhealthy or circuit breakers open", "origin_id", lb.originID)
+		return -1
+	}
+
+	lb.mu.Lock()
+	idx := lb.random.Intn(len(healthy))
+	lb.mu.Unlock()
+	return healthy[idx]
+}
+
+// selectFirstHealthy selects the first healthy target in list order (primary/failover pattern).
+func (lb *loadBalancerTransport) selectFirstHealthy() int {
+	if len(lb.targets) == 0 {
+		return -1
+	}
+
+	for i, target := range lb.targets {
+		isHealthy := target.health == nil || target.health.isHealthy()
+		circuitBreakerOk := target.circuitBreaker == nil || !target.circuitBreaker.isOpen()
+		if isHealthy && circuitBreakerOk {
+			return i
+		}
+	}
+
 	slog.Warn("all targets unhealthy or circuit breakers open", "origin_id", lb.originID)
 	return -1
 }

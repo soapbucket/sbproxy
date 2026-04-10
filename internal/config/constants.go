@@ -84,6 +84,18 @@ const (
 	AlgorithmWeightedRoundRobin = "weighted_round_robin"
 	// AlgorithmLeastConnections selects the target with the fewest active connections.
 	AlgorithmLeastConnections = "least_connections"
+	// AlgorithmIPHash hashes the client IP for consistent routing; same IP always goes to same backend.
+	AlgorithmIPHash = "ip_hash"
+	// AlgorithmURIHash hashes the request URL path for consistent routing; same path goes to same backend.
+	AlgorithmURIHash = "uri_hash"
+	// AlgorithmHeaderHash hashes a specified request header value (requires hash_key config field).
+	AlgorithmHeaderHash = "header_hash"
+	// AlgorithmCookieHash hashes a specified cookie value (requires hash_key config field).
+	AlgorithmCookieHash = "cookie_hash"
+	// AlgorithmRandom selects a target with equal probability (ignores weights).
+	AlgorithmRandom = "random"
+	// AlgorithmFirst selects the first healthy target in list order (primary/failover pattern).
+	AlgorithmFirst = "first"
 
 	// DefaultStickyCookieName is the default name for sticky session cookie
 	DefaultStickyCookieName = "_sb.l"
