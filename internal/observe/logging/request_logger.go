@@ -278,11 +278,19 @@ func buildZapRequestLogFields(r *http.Request, rw *responseWriter, duration time
 	}
 
 	// Base request fields (always included)
+	remoteAddr := r.RemoteAddr
+	if mode := ipMaskMode(cfg); mode != "" && mode != "none" {
+		if host, port, err := net.SplitHostPort(remoteAddr); err == nil {
+			remoteAddr = net.JoinHostPort(maskIP(host, mode), port)
+		} else {
+			remoteAddr = maskIP(remoteAddr, mode)
+		}
+	}
 	fields = append(fields,
 		zap.String("request_method", r.Method),
 		zap.String("request_path", r.URL.Path),
 		zap.String("request_host", r.Host),
-		zap.String("request_remote_addr", r.RemoteAddr),
+		zap.String("request_remote_addr", remoteAddr),
 		zap.String("request_user_agent", r.UserAgent()),
 	)
 
@@ -459,11 +467,16 @@ func buildZapRequestLogFields(r *http.Request, rw *responseWriter, duration time
 
 	// Source IP (optional)
 	if cfg.Fields.Location && r.RemoteAddr != "" {
+		var sourceIP string
 		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-			fields = append(fields, zap.String("source_ip", host))
+			sourceIP = host
 		} else {
-			fields = append(fields, zap.String("source_ip", r.RemoteAddr))
+			sourceIP = r.RemoteAddr
 		}
+		if mode := ipMaskMode(cfg); mode != "" && mode != "none" {
+			sourceIP = maskIP(sourceIP, mode)
+		}
+		fields = append(fields, zap.String("source_ip", sourceIP))
 	}
 
 	// Fingerprint (optional)
