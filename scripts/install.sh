@@ -8,15 +8,6 @@
 
 set -e
 
-BANNER='
- ███████╗██████╗ ██████╗ ██████╗  ██████╗ ██╗  ██╗██╗   ██╗
- ██╔════╝██╔══██╗██╔══██╗██╔══██╗██╔═══██╗╚██╗██╔╝╚██╗ ██╔╝
- ███████╗██████╔╝██████╔╝██████╔╝██║   ██║ ╚███╔╝  ╚████╔╝
- ╚════██║██╔══██╗██╔═══╝ ██╔══██╗██║   ██║ ██╔██╗   ╚██╔╝
- ███████║██████╔╝██║     ██║  ██║╚██████╔╝██╔╝ ██╗   ██║
- ╚══════╝╚═════╝ ╚═╝     ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝   ╚═╝
-'
-
 REPO="soapbucket/sbproxy"
 INSTALL_DIR="${SBPROXY_INSTALL:-$HOME/.local/bin}"
 
@@ -126,18 +117,18 @@ download_and_install() {
 verify_install() {
     if command -v sbproxy >/dev/null 2>&1; then
         INSTALLED_VERSION=$(sbproxy --version 2>/dev/null || echo "unknown")
-        echo "$BANNER"
-        echo "  Installed successfully!"
-        echo "  Version:  ${INSTALLED_VERSION}"
-        echo "  Location: $(command -v sbproxy)"
+        echo ""
+        echo "📦 sbproxy installed successfully!"
+        echo "   Version:  ${INSTALLED_VERSION}"
+        echo "   Location: $(command -v sbproxy)"
         echo ""
         echo "Get started:"
         echo "  sbproxy serve -f sb.yml"
         echo ""
         echo "Docs: https://github.com/${REPO}"
     else
-        echo "$BANNER"
-        echo "  Installed to ${INSTALL_DIR}/sbproxy"
+        echo ""
+        echo "📦 sbproxy installed to ${INSTALL_DIR}/sbproxy"
         echo ""
         if echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
             echo "Run: sbproxy --version"

@@ -15,7 +15,7 @@ const (
 	// VersionMinor is build minor version
 	VersionMinor = 1
 	// VersionPatch is build patch version
-	VersionPatch = 0
+	VersionPatch = 1
 )
 
 // Version is string representing current application version
