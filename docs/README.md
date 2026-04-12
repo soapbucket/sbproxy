@@ -16,6 +16,7 @@ Comprehensive documentation for SBproxy.
 | [Events](events.md) | Event system, subscriber types, filtering |
 | [Providers](providers.md) | 203+ supported AI providers with config names, formats, and documentation links |
 | [Comparison](comparison.md) | How SBproxy compares to LiteLLM, Kong, Caddy, Traefik, Nginx, Envoy |
+| [Performance](performance.md) | How to setup and run performance testing |
 
 ## Examples
 
@@ -23,4 +24,4 @@ See the [examples/](../examples/) directory for ready-to-use configuration files
 
 ## SBproxy Cloud
 
-For managed hosting with a dashboard, advanced security, and AI features, visit [www.soapbucket.com](https://www.soapbucket.com).
+For managed hosting with a dashboard, advanced security, and AI features, visit [cloud.sbproxy.dev](https://cloud.sbproxy.dev).
