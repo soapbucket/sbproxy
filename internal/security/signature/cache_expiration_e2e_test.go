@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/soapbucket/sbproxy/internal/loader/manager"
 	"github.com/soapbucket/sbproxy/internal/cache/store"
+	"github.com/soapbucket/sbproxy/internal/loader/manager"
 	"github.com/soapbucket/sbproxy/internal/platform/messenger"
 	"github.com/soapbucket/sbproxy/internal/platform/storage"
 )
@@ -37,7 +37,7 @@ func TestSignatureCacheExpiration_EndToEnd(t *testing.T) {
 	// Override GetCache to return mock cache
 	mgrWithCache := &mockManagerWithCache{
 		mockManagerWithMessenger: mgr,
-		cache:                     mockCacheWithListKeys,
+		cache:                    mockCacheWithListKeys,
 	}
 
 	// Step 1: Cache multiple signature-verified responses
@@ -282,4 +282,3 @@ func (m *mockManager) GetCachePool() manager.WorkerPool {
 func (m *mockManager) Close() error {
 	return nil
 }
-

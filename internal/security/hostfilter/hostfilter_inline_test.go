@@ -165,10 +165,10 @@ func TestHostFilterForwardRuleHostnames(t *testing.T) {
 
 	// Primary origins + hostnames used in forward rules
 	allHostnames := []string{
-		"api.example.com",          // primary origin
-		"fallback.example.com",     // forward rule target
-		"error-page.example.com",   // error handler origin
-		"auth.internal.service",    // internal auth service
+		"api.example.com",        // primary origin
+		"fallback.example.com",   // forward rule target
+		"error-page.example.com", // error handler origin
+		"auth.internal.service",  // internal auth service
 	}
 
 	hf := New(100, 0.001)

@@ -44,8 +44,8 @@ func TestSessionDataAccessInCEL(t *testing.T) {
 	req = req.WithContext(reqctx.SetRequestData(req.Context(), requestData))
 
 	tests := []struct {
-		name       string
-		celExpr    string
+		name        string
+		celExpr     string
 		shouldMatch bool
 	}{
 		{
@@ -424,10 +424,10 @@ func TestEndToEndSessionCallbackFlow(t *testing.T) {
 	// Step 1: Mock callback server
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		response := map[string]any{
-			"user_tier":   "premium",
-			"api_quota":   10000,
-			"rate_limit":  100,
-			"features": []string{"analytics", "export", "api_access"},
+			"user_tier":  "premium",
+			"api_quota":  10000,
+			"rate_limit": 100,
+			"features":   []string{"analytics", "export", "api_access"},
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
@@ -512,19 +512,19 @@ func TestEndToEndAuthCallbackFlow(t *testing.T) {
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var reqBody map[string]any
 		json.NewDecoder(r.Body).Decode(&reqBody)
-		
+
 		// Enrich based on email
 		response := map[string]any{
 			"roles":       []string{"user"},
 			"permissions": []string{"read"},
 		}
-		
+
 		if email, ok := reqBody["email"].(string); ok && email == "admin@example.com" {
 			response["roles"] = []string{"admin", "user"}
 			response["permissions"] = []string{"read", "write", "delete"}
 			response["can_manage_users"] = true
 		}
-		
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
 	}))
@@ -579,7 +579,7 @@ func TestEndToEndAuthCallbackFlow(t *testing.T) {
 
 	// Step 5: Use authorization rules with CEL
 	authCheckExpr := `"admin" in session['auth']['roles'] && session['auth']['can_manage_users'] == true`
-	
+
 	ruleJSON := fmt.Sprintf(`{"cel_expr": %q}`, authCheckExpr)
 	var ruleObj rule.RequestRule
 	if err := json.Unmarshal([]byte(ruleJSON), &ruleObj); err != nil {
@@ -601,10 +601,10 @@ func TestConfigDataAccessInCEL(t *testing.T) {
 		ID: "req-1",
 		OriginCtx: &reqctx.OriginContext{
 			Params: map[string]any{
-				"api_key":        "secret123",
+				"api_key":         "secret123",
 				"feature_enabled": true,
-				"max_requests":   1000,
-				"environment":    "production",
+				"max_requests":    1000,
+				"environment":     "production",
 			},
 		},
 		Data: map[string]any{},
@@ -675,10 +675,10 @@ func TestConfigDataAccessInLua(t *testing.T) {
 		ID: "req-1",
 		OriginCtx: &reqctx.OriginContext{
 			Params: map[string]any{
-				"api_key":        "secret123",
+				"api_key":         "secret123",
 				"feature_enabled": true,
-				"max_requests":   1000,
-				"environment":    "production",
+				"max_requests":    1000,
+				"environment":     "production",
 			},
 		},
 		Data: map[string]any{},
@@ -939,4 +939,3 @@ end
 		})
 	}
 }
-

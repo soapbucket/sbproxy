@@ -28,12 +28,12 @@ func TestHTTP3QUICTransport_Creation(t *testing.T) {
 		EnableMigration:         true,
 		MaxStreamsPerConnection: 100,
 	}
-	
+
 	transport, err := NewHTTP3QUICTransport(config, &tls.Config{})
 	if err != nil {
 		t.Fatalf("unexpected error creating transport: %v", err)
 	}
-	
+
 	if transport == nil {
 		t.Fatal("expected transport to be created")
 	}
@@ -46,12 +46,12 @@ func TestHTTP3QUICTransport_DefaultConfig(t *testing.T) {
 	config := HTTP3QUICConfig{
 		Enabled: true,
 	}
-	
+
 	transport, err := NewHTTP3QUICTransport(config, &tls.Config{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	
+
 	if transport.config.MaxIdleTimeout == 0 {
 		t.Error("expected default MaxIdleTimeout to be set")
 	}
@@ -74,12 +74,12 @@ func TestHTTP3QUICTransport_DisabledWithoutFallback(t *testing.T) {
 		Enabled:         false,
 		FallbackToHTTP2: false,
 	}
-	
+
 	transport, err := NewHTTP3QUICTransport(config, &tls.Config{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	
+
 	// Verify fallback client is nil when disabled
 	if transport.http2Client != nil {
 		t.Error("expected http2Client to be nil when fallback disabled")
@@ -93,14 +93,14 @@ func TestHTTP3QUICTransport_0RTTConfig(t *testing.T) {
 		InitialMaxData:       1024 * 1024,
 		InitialMaxStreamData: 512 * 1024,
 	}
-	
+
 	tlsConfig := &tls.Config{}
-	
+
 	transport, err := NewHTTP3QUICTransport(config, tlsConfig)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	
+
 	if transport.quicConfig.Allow0RTT != true {
 		t.Error("expected 0-RTT to be enabled in QUIC config")
 	}
@@ -113,12 +113,12 @@ func TestHTTP3QUICTransport_Statistics(t *testing.T) {
 	config := HTTP3QUICConfig{
 		Enabled: true,
 	}
-	
+
 	transport, err := NewHTTP3QUICTransport(config, &tls.Config{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	
+
 	// Stats should start at zero
 	stats := transport.GetStats()
 	if stats.TotalRequests != 0 {
@@ -136,12 +136,12 @@ func TestHTTP3QUICTransport_GetStats(t *testing.T) {
 	config := HTTP3QUICConfig{
 		Enabled: true,
 	}
-	
+
 	transport, err := NewHTTP3QUICTransport(config, &tls.Config{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	
+
 	// Initially empty
 	stats := transport.GetStats()
 	if stats.TotalRequests != 0 {
@@ -153,36 +153,36 @@ func TestHTTP3QUICTransport_CloseIdleConnections(t *testing.T) {
 	config := HTTP3QUICConfig{
 		Enabled: true,
 	}
-	
+
 	transport, err := NewHTTP3QUICTransport(config, &tls.Config{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	
+
 	// Should not panic
 	transport.CloseIdleConnections()
 }
 
 func TestHTTP3Stats_String(t *testing.T) {
 	stats := HTTP3Stats{
-		TotalRequests: 100,
-		HTTP3Requests: 80,
-		HTTP2Requests: 15,
-		FailedRequests: 5,
-		RetriedRequests: 3,
+		TotalRequests:    100,
+		HTTP3Requests:    80,
+		HTTP2Requests:    15,
+		FailedRequests:   5,
+		RetriedRequests:  3,
 		FallbackRequests: 15,
 	}
-	
+
 	str := stats.String()
 	if str == "" {
 		t.Error("expected non-empty string representation")
 	}
-	
+
 	// Check it contains key info
 	if len(str) < 20 {
 		t.Error("expected longer string representation")
 	}
-	
+
 	// Test with zero requests
 	emptyStats := HTTP3Stats{}
 	emptyStr := emptyStats.String()
@@ -196,12 +196,12 @@ func TestHTTP3QUICConfig_Timeout(t *testing.T) {
 		Enabled:        true,
 		MaxIdleTimeout: 60 * time.Second,
 	}
-	
+
 	transport, err := NewHTTP3QUICTransport(config, &tls.Config{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	
+
 	// Verify timeout is set correctly (should be 2x idle timeout)
 	expectedTimeout := config.MaxIdleTimeout * 2
 	if transport.http3Client.Timeout != expectedTimeout {
@@ -217,12 +217,12 @@ func TestHTTP3QUICConfig_ValidationFlow(t *testing.T) {
 	config := HTTP3QUICConfig{
 		Enabled: true,
 	}
-	
+
 	transport, err := NewHTTP3QUICTransport(config, &tls.Config{})
 	if err != nil {
 		t.Fatalf("unexpected error with minimal config: %v", err)
 	}
-	
+
 	// Verify defaults were applied
 	if transport.config.MaxIdleTimeout == 0 {
 		t.Error("expected default MaxIdleTimeout")
@@ -237,12 +237,12 @@ func TestHTTP3QUICTransport_FallbackConfig(t *testing.T) {
 		Enabled:         true,
 		FallbackToHTTP2: true,
 	}
-	
+
 	transport, err := NewHTTP3QUICTransport(config, &tls.Config{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	
+
 	if transport.http2Client == nil {
 		t.Error("expected HTTP/2 fallback client to be created")
 	}
@@ -253,12 +253,12 @@ func TestHTTP3QUICTransport_RetryConfig(t *testing.T) {
 		Enabled:      true,
 		RetryOnError: true,
 	}
-	
+
 	transport, err := NewHTTP3QUICTransport(config, &tls.Config{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	
+
 	if !transport.config.RetryOnError {
 		t.Error("expected RetryOnError to be enabled")
 	}
@@ -313,10 +313,10 @@ func TestHTTP3QUICTransport_RealRoundTrip(t *testing.T) {
 
 func TestHTTP3QUICTransport_HeaderForwarding(t *testing.T) {
 	customHeaders := map[string]string{
-		"X-Custom-One":   "value-one",
-		"X-Custom-Two":   "value-two",
-		"X-Request-Id":   "req-12345",
-		"Authorization":  "Bearer test-token",
+		"X-Custom-One":    "value-one",
+		"X-Custom-Two":    "value-two",
+		"X-Request-Id":    "req-12345",
+		"Authorization":   "Bearer test-token",
 		"Accept-Language": "en-US",
 	}
 
@@ -940,4 +940,3 @@ func reserveUDPAddr(t *testing.T) string {
 	_ = pc.Close()
 	return addr
 }
-

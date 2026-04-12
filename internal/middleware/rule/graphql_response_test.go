@@ -318,4 +318,3 @@ func createEmptyResponse(statusCode int, t *testing.T) *http.Response {
 	}
 	return resp
 }
-

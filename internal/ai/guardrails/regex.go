@@ -3,8 +3,8 @@ package guardrails
 
 import (
 	"context"
-	json "github.com/goccy/go-json"
 	"fmt"
+	json "github.com/goccy/go-json"
 	"regexp"
 	"strings"
 )
@@ -55,9 +55,10 @@ func NewRegexGuard(config json.RawMessage) (Guardrail, error) {
 }
 
 // Name performs the name operation on the regexGuard.
-func (g *regexGuard) Name() string  { return "regex_guard" }
+func (g *regexGuard) Name() string { return "regex_guard" }
+
 // Phase performs the phase operation on the regexGuard.
-func (g *regexGuard) Phase() Phase  { return PhaseInput }
+func (g *regexGuard) Phase() Phase { return PhaseInput }
 
 // Check performs the check operation on the regexGuard.
 func (g *regexGuard) Check(_ context.Context, content *Content) (*Result, error) {

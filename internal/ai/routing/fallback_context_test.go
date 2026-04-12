@@ -12,9 +12,9 @@ func makeTestRegistry() *ai.ProviderRegistry {
 			"openai": {
 				DisplayName: "OpenAI",
 				Models: map[string]ai.ModelDef{
-					"gpt-4": {ContextWindow: 8192},
-					"gpt-4-turbo": {ContextWindow: 128000},
-					"gpt-4o": {ContextWindow: 128000},
+					"gpt-4":         {ContextWindow: 8192},
+					"gpt-4-turbo":   {ContextWindow: 128000},
+					"gpt-4o":        {ContextWindow: 128000},
 					"gpt-3.5-turbo": {ContextWindow: 16384},
 				},
 			},

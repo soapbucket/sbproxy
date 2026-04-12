@@ -165,7 +165,7 @@ func TestHedgingTransport_HedgeWinsSlow(t *testing.T) {
 	start := time.Now()
 	resp, err := transport.RoundTrip(req)
 	duration := time.Since(start)
-	
+
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestHedgingTransport_HedgeWinsSlow(t *testing.T) {
 	if stats.PrimaryCanceled != 1 {
 		t.Errorf("expected 1 primary canceled, got %d", stats.PrimaryCanceled)
 	}
-	
+
 	// Response should arrive much faster than 200ms (primary delay)
 	if duration > 150*time.Millisecond {
 		t.Errorf("expected response in <150ms (hedge), got %v", duration)
@@ -213,7 +213,7 @@ func TestHedgingTransport_MethodFiltering(t *testing.T) {
 	resp.Body.Close()
 
 	time.Sleep(50 * time.Millisecond)
-	
+
 	if atomic.LoadInt32(&requestCount) != 1 {
 		t.Errorf("POST should not hedge, expected 1 request, got %d", requestCount)
 	}
@@ -407,7 +407,7 @@ func TestHedgingStats_String(t *testing.T) {
 	if str == "" {
 		t.Error("stats string should not be empty")
 	}
-	
+
 	// Check that string contains key metrics
 	if !stringContains(str, "100") { // Total
 		t.Error("stats should contain total requests")
@@ -449,9 +449,9 @@ func TestHedgingStats_EffectiveLatencyReduction(t *testing.T) {
 
 func TestHedgingStats_CostMultiplier(t *testing.T) {
 	stats := HedgingStats{
-		TotalRequests:  100,
-		HedgeWins:      10,
-		HedgeCanceled:  5,
+		TotalRequests: 100,
+		HedgeWins:     10,
+		HedgeCanceled: 5,
 	}
 
 	multiplier := stats.CostMultiplier()
@@ -564,4 +564,3 @@ func BenchmarkHedgingTransport_Disabled(b *testing.B) {
 		}
 	}
 }
-

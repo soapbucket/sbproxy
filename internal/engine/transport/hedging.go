@@ -14,20 +14,20 @@ import (
 // HedgingConfig configures request hedging behavior
 type HedgingConfig struct {
 	Enabled bool `json:"enabled"`
-	
+
 	// Delay before sending hedge request
 	Delay time.Duration `json:"delay"`
-	
+
 	// Maximum number of hedge requests (1-3 typical)
 	MaxHedges int `json:"max_hedges"`
-	
+
 	// Percentile threshold - only hedge if request is slower than this percentile
 	// Example: 0.95 means hedge if request is slower than 95% of historical requests
 	PercentileThreshold float64 `json:"percentile_threshold,omitempty"`
-	
+
 	// Only hedge on specific HTTP methods
 	Methods []string `json:"methods,omitempty"`
-	
+
 	// Cost tracking - warn if hedging is too expensive
 	MaxCostRatio float64 `json:"max_cost_ratio,omitempty"` // Max ratio of hedged/total requests
 }
@@ -41,13 +41,13 @@ type HedgingTransport struct {
 
 // HedgingStats tracks hedging statistics
 type HedgingStats struct {
-	TotalRequests    uint64 // Total requests
-	HedgedRequests   uint64 // Requests that triggered hedging
-	HedgeWins        uint64 // Times hedge request won
-	PrimaryWins      uint64 // Times primary request won
-	TotalTimeSaved   int64  // Total milliseconds saved (can be negative)
-	HedgeCanceled    uint64 // Hedge requests canceled
-	PrimaryCanceled  uint64 // Primary requests canceled (hedge won)
+	TotalRequests   uint64 // Total requests
+	HedgedRequests  uint64 // Requests that triggered hedging
+	HedgeWins       uint64 // Times hedge request won
+	PrimaryWins     uint64 // Times primary request won
+	TotalTimeSaved  int64  // Total milliseconds saved (can be negative)
+	HedgeCanceled   uint64 // Hedge requests canceled
+	PrimaryCanceled uint64 // Primary requests canceled (hedge won)
 }
 
 // NewHedgingTransport creates a new hedging transport
@@ -55,7 +55,7 @@ func NewHedgingTransport(base http.RoundTripper, config HedgingConfig) (*Hedging
 	if base == nil {
 		return nil, fmt.Errorf("base transport cannot be nil")
 	}
-	
+
 	// Validate config
 	if config.Delay == 0 {
 		config.Delay = 100 * time.Millisecond // Default 100ms
@@ -69,7 +69,7 @@ func NewHedgingTransport(base http.RoundTripper, config HedgingConfig) (*Hedging
 	if config.MaxCostRatio == 0 {
 		config.MaxCostRatio = 0.2 // Default: max 20% hedged requests
 	}
-	
+
 	return &HedgingTransport{
 		base:   base,
 		config: config,
@@ -79,16 +79,16 @@ func NewHedgingTransport(base http.RoundTripper, config HedgingConfig) (*Hedging
 // RoundTrip implements http.RoundTripper with request hedging
 func (t *HedgingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	atomic.AddUint64(&t.stats.TotalRequests, 1)
-	
+
 	if !t.config.Enabled {
 		return t.base.RoundTrip(req)
 	}
-	
+
 	// Check if method is eligible for hedging
 	if len(t.config.Methods) > 0 && !t.isMethodAllowed(req.Method) {
 		return t.base.RoundTrip(req)
 	}
-	
+
 	// Check cost ratio - if too many hedged requests, skip hedging
 	if t.shouldSkipDueToCost() {
 		slog.Debug("hedging: skipping due to cost ratio",
@@ -96,12 +96,12 @@ func (t *HedgingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 			"current_ratio", t.getCurrentCostRatio())
 		return t.base.RoundTrip(req)
 	}
-	
+
 	// Hedging requires replayable request bodies.
 	if req.Body != nil && req.GetBody == nil {
 		return t.base.RoundTrip(req)
 	}
-	
+
 	// Execute hedged request
 	return t.executeWithHedging(req)
 }
@@ -120,38 +120,38 @@ func cloneRequestWithContext(req *http.Request, ctx context.Context) (*http.Requ
 
 func (t *HedgingTransport) executeWithHedging(req *http.Request) (*http.Response, error) {
 	atomic.AddUint64(&t.stats.HedgedRequests, 1)
-	
+
 	// Create contexts for cancellation
 	primaryCtx, primaryCancel := context.WithCancel(req.Context())
 	hedgeCtx, hedgeCancel := context.WithCancel(req.Context())
-	
+
 	defer primaryCancel()
 	defer hedgeCancel()
-	
+
 	primaryReq, err := cloneRequestWithContext(req, primaryCtx)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	type result struct {
-		resp   *http.Response
-		err    error
+		resp      *http.Response
+		err       error
 		isPrimary bool
-		duration time.Duration
+		duration  time.Duration
 	}
-	
+
 	results := make(chan result, t.config.MaxHedges+1)
 	var wg sync.WaitGroup
-	
+
 	primaryStart := time.Now()
-	
+
 	// Send primary request
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		resp, err := t.base.RoundTrip(primaryReq)
 		duration := time.Since(primaryStart)
-		
+
 		select {
 		case results <- result{resp: resp, err: err, isPrimary: true, duration: duration}:
 			slog.Debug("hedging: primary request completed",
@@ -165,16 +165,16 @@ func (t *HedgingTransport) executeWithHedging(req *http.Request) (*http.Response
 			slog.Debug("hedging: primary request canceled", "duration", duration)
 		}
 	}()
-	
+
 	// Start hedge requests after configured delay
 	hedgeCount := 0
 	hedgeTimer := time.NewTimer(t.config.Delay)
 	defer hedgeTimer.Stop()
-	
+
 	// Variables to track which request wins
 	var firstResult result
 	var once sync.Once
-	
+
 	// Goroutine to send hedge requests
 	wg.Add(1)
 	go func() {
@@ -267,25 +267,25 @@ func (t *HedgingTransport) executeWithHedging(req *http.Request) (*http.Response
 			}
 		}
 	}()
-	
+
 	// Wait for first successful result
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
-	
+
 	// Process results as they arrive
 	for res := range results {
 		// Only use the first successful result
 		once.Do(func() {
 			firstResult = res
-			
+
 			// Cancel all other requests
 			if res.isPrimary {
 				hedgeCancel()
 				atomic.AddUint64(&t.stats.PrimaryWins, 1)
 				atomic.AddUint64(&t.stats.HedgeCanceled, uint64(hedgeCount))
-				
+
 				slog.Info("hedging: primary won",
 					"duration", res.duration,
 					"hedges_sent", hedgeCount)
@@ -293,24 +293,24 @@ func (t *HedgingTransport) executeWithHedging(req *http.Request) (*http.Response
 				primaryCancel()
 				atomic.AddUint64(&t.stats.HedgeWins, 1)
 				atomic.AddUint64(&t.stats.PrimaryCanceled, 1)
-				
+
 				// Calculate time saved
 				timeSaved := time.Since(primaryStart) - res.duration
 				atomic.AddInt64(&t.stats.TotalTimeSaved, timeSaved.Milliseconds())
-				
+
 				slog.Info("hedging: hedge won",
 					"duration", res.duration,
 					"time_saved", timeSaved,
 					"primary_duration_so_far", time.Since(primaryStart))
 			}
 		})
-		
+
 		// Close any additional responses
 		if res.resp != nil && res.resp.Body != nil && res != firstResult {
 			res.resp.Body.Close()
 		}
 	}
-	
+
 	return firstResult.resp, firstResult.err
 }
 
@@ -340,13 +340,13 @@ func (t *HedgingTransport) getCurrentCostRatio() float64 {
 // GetStats returns hedging statistics
 func (t *HedgingTransport) GetStats() HedgingStats {
 	return HedgingStats{
-		TotalRequests:    atomic.LoadUint64(&t.stats.TotalRequests),
-		HedgedRequests:   atomic.LoadUint64(&t.stats.HedgedRequests),
-		HedgeWins:        atomic.LoadUint64(&t.stats.HedgeWins),
-		PrimaryWins:      atomic.LoadUint64(&t.stats.PrimaryWins),
-		TotalTimeSaved:   atomic.LoadInt64(&t.stats.TotalTimeSaved),
-		HedgeCanceled:    atomic.LoadUint64(&t.stats.HedgeCanceled),
-		PrimaryCanceled:  atomic.LoadUint64(&t.stats.PrimaryCanceled),
+		TotalRequests:   atomic.LoadUint64(&t.stats.TotalRequests),
+		HedgedRequests:  atomic.LoadUint64(&t.stats.HedgedRequests),
+		HedgeWins:       atomic.LoadUint64(&t.stats.HedgeWins),
+		PrimaryWins:     atomic.LoadUint64(&t.stats.PrimaryWins),
+		TotalTimeSaved:  atomic.LoadInt64(&t.stats.TotalTimeSaved),
+		HedgeCanceled:   atomic.LoadUint64(&t.stats.HedgeCanceled),
+		PrimaryCanceled: atomic.LoadUint64(&t.stats.PrimaryCanceled),
 	}
 }
 
@@ -355,7 +355,7 @@ func (s HedgingStats) String() string {
 	if s.TotalRequests == 0 {
 		return "No requests"
 	}
-	
+
 	hedgedPct := float64(s.HedgedRequests) / float64(s.TotalRequests) * 100
 	hedgeWinRate := float64(0)
 	if s.HedgedRequests > 0 {
@@ -365,7 +365,7 @@ func (s HedgingStats) String() string {
 	if s.HedgeWins > 0 {
 		avgTimeSaved = float64(s.TotalTimeSaved) / float64(s.HedgeWins)
 	}
-	
+
 	return fmt.Sprintf(
 		"Total: %d, Hedged: %d (%.1f%%), Hedge Wins: %d (%.1f%%), Primary Wins: %d, Avg Time Saved: %.0fms, Total Time Saved: %dms",
 		s.TotalRequests,
@@ -409,4 +409,3 @@ func getHedgeStatusCode(resp *http.Response) int {
 	}
 	return resp.StatusCode
 }
-

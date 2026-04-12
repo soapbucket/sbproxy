@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/httpkit/zerocopy"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 // CaptureOriginalRequest captures the original request before any modifications
@@ -73,4 +73,3 @@ func CaptureOriginalRequest(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
-

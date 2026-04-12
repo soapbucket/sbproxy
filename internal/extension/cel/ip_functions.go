@@ -105,11 +105,11 @@ func ipParse(val ref.Val) ref.Val {
 	}
 
 	result := map[string]interface{}{
-		"valid":      true,
-		"ip":         ip.String(),
-		"is_ipv4":    ip.To4() != nil,
-		"is_ipv6":    ip.To4() == nil && ip.To16() != nil,
-		"is_private": isPrivateIP(ip),
+		"valid":       true,
+		"ip":          ip.String(),
+		"is_ipv4":     ip.To4() != nil,
+		"is_ipv6":     ip.To4() == nil && ip.To16() != nil,
+		"is_private":  isPrivateIP(ip),
 		"is_loopback": ip.IsLoopback(),
 	}
 
@@ -358,4 +358,3 @@ func getClientIP(remoteAddr string, headers map[string]string) string {
 
 	return ""
 }
-

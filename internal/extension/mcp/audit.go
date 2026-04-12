@@ -34,11 +34,11 @@ func (a *AuditLogger) LogToolCall(entry AuditEntry) {
 
 // AuditEntry represents a single audit log entry for a tool call.
 type AuditEntry struct {
-	ToolName  string
-	Roles     []string
-	KeyID     string
-	IsError   bool
-	Latency   time.Duration
-	Cached    bool
-	Upstream  string // Upstream server URL for gateway mode
+	ToolName string
+	Roles    []string
+	KeyID    string
+	IsError  bool
+	Latency  time.Duration
+	Cached   bool
+	Upstream string // Upstream server URL for gateway mode
 }

@@ -118,7 +118,7 @@ func TestRequestModifier_BodyModifications(t *testing.T) {
 			name: "ReplaceBase64 takes precedence over ReplaceJSON when both set",
 			modifier: RequestModifier{
 				Body: &BodyModifications{
-					ReplaceJSON:  json.RawMessage(`{"key":"value"}`),
+					ReplaceJSON:   json.RawMessage(`{"key":"value"}`),
 					ReplaceBase64: base64.StdEncoding.EncodeToString([]byte("base64 content")),
 				},
 			},
@@ -184,12 +184,12 @@ func TestRequestModifier_BodyModifications(t *testing.T) {
 
 func TestRequestModifier_FormModifications(t *testing.T) {
 	tests := []struct {
-		name            string
-		modifier        RequestModifier
-		req             *http.Request
-		expectedForm    map[string]string
-		shouldModify    bool
-		expectedError   bool
+		name          string
+		modifier      RequestModifier
+		req           *http.Request
+		expectedForm  map[string]string
+		shouldModify  bool
+		expectedError bool
 	}{
 		{
 			name: "Set form parameter (overwrites specified keys)",
@@ -532,4 +532,3 @@ func readResponseBody(resp *http.Response, t *testing.T) string {
 	resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	return string(bodyBytes)
 }
-

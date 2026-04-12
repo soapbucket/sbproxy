@@ -14,10 +14,10 @@ import (
 // CELRoutingRule defines a single CEL-based routing rule.
 type CELRoutingRule struct {
 	Name       string `json:"name"`
-	Expression string `json:"expression"`       // CEL expression that returns bool
-	Provider   string `json:"provider"`          // target provider if expression matches
-	Priority   int    `json:"priority"`          // lower number = higher priority (default 0)
-	Model      string `json:"model,omitempty"`   // optional model override
+	Expression string `json:"expression"`      // CEL expression that returns bool
+	Provider   string `json:"provider"`        // target provider if expression matches
+	Priority   int    `json:"priority"`        // lower number = higher priority (default 0)
+	Model      string `json:"model,omitempty"` // optional model override
 }
 
 // CELRoutingConfig holds CEL routing configuration.

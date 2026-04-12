@@ -6,9 +6,9 @@ import (
 	"log/slog"
 
 	"github.com/soapbucket/sbproxy/internal/cache/store"
-	"github.com/soapbucket/sbproxy/internal/security/crypto"
 	"github.com/soapbucket/sbproxy/internal/platform/messenger"
 	"github.com/soapbucket/sbproxy/internal/platform/storage"
+	"github.com/soapbucket/sbproxy/internal/security/crypto"
 )
 
 // validateSettings validates the provided settings
@@ -120,7 +120,7 @@ type managerImpl struct {
 	caches    map[CacheLevel]cacher.Cacher
 	crypto    crypto.Crypto
 	ctx       context.Context
-	
+
 	// Worker pools (optional - for goroutine management)
 	callbackPool WorkerPool
 	cachePool    WorkerPool
@@ -235,4 +235,3 @@ func initCrypto(settings crypto.Settings) (crypto.Crypto, error) {
 func initCacher(settings cacher.Settings) (cacher.Cacher, error) {
 	return cacher.NewCacher(settings)
 }
-

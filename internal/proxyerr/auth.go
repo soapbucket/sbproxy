@@ -29,4 +29,3 @@ func AuthUnauthorizedError(resource string) *ProxyError {
 	return New(ErrCodeAuthUnauthorized, "unauthorized access").
 		WithDetail("resource", resource)
 }
-

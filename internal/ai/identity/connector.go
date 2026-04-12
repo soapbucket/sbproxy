@@ -24,7 +24,7 @@ type ConnectorConfig struct {
 // StaticPermission defines a static permission entry.
 type StaticPermission struct {
 	Credential  string   `json:"credential"`
-	Type        string   `json:"type"`                  // "api_key", "jwt", etc.
+	Type        string   `json:"type"` // "api_key", "jwt", etc.
 	Principal   string   `json:"principal"`
 	Groups      []string `json:"groups,omitempty"`
 	Models      []string `json:"models,omitempty"`

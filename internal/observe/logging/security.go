@@ -4,8 +4,8 @@ package logging
 import (
 	"context"
 
-	"go.uber.org/zap"
 	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
 
 	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
@@ -13,53 +13,53 @@ import (
 // Security Event Types
 const (
 	// SecurityEventAuthSuccess is a constant for security event auth success.
-	SecurityEventAuthSuccess       = "authentication_success"
+	SecurityEventAuthSuccess = "authentication_success"
 	// SecurityEventAuthFailure is a constant for security event auth failure.
-	SecurityEventAuthFailure       = "authentication_failure"
+	SecurityEventAuthFailure = "authentication_failure"
 	// SecurityEventAuthzDenied is a constant for security event authz denied.
-	SecurityEventAuthzDenied       = "authorization_denied"
+	SecurityEventAuthzDenied = "authorization_denied"
 	// SecurityEventRateLimit is a constant for security event rate limit.
-	SecurityEventRateLimit         = "rate_limit_exceeded"
+	SecurityEventRateLimit = "rate_limit_exceeded"
 	// SecurityEventThreatDetected is a constant for security event threat detected.
-	SecurityEventThreatDetected    = "threat_detected"
+	SecurityEventThreatDetected = "threat_detected"
 	// SecurityEventSuspiciousPattern is a constant for security event suspicious pattern.
 	SecurityEventSuspiciousPattern = "suspicious_pattern_detected"
 	// SecurityEventConfigChange is a constant for security event config change.
-	SecurityEventConfigChange      = "configuration_change"
+	SecurityEventConfigChange = "configuration_change"
 	// SecurityEventAdminAction is a constant for security event admin action.
-	SecurityEventAdminAction       = "admin_action"
+	SecurityEventAdminAction = "admin_action"
 	// SecurityEventAccountLocked is a constant for security event account locked.
-	SecurityEventAccountLocked     = "account_locked"
+	SecurityEventAccountLocked = "account_locked"
 	// SecurityEventAccountUnlocked is a constant for security event account unlocked.
-	SecurityEventAccountUnlocked   = "account_unlocked"
+	SecurityEventAccountUnlocked = "account_unlocked"
 	// SecurityEventCSRFViolation is a constant for security event csrf violation.
-	SecurityEventCSRFViolation     = "csrf_validation_failure"
+	SecurityEventCSRFViolation = "csrf_validation_failure"
 	// SecurityEventInputValidation is a constant for security event input validation.
-	SecurityEventInputValidation   = "input_validation_failure"
+	SecurityEventInputValidation = "input_validation_failure"
 	// SecurityEventGeoBlock is a constant for security event geo block.
-	SecurityEventGeoBlock          = "geo_block_violation"
+	SecurityEventGeoBlock = "geo_block_violation"
 	// SecurityEventIPBlocked is a constant for security event ip blocked.
-	SecurityEventIPBlocked         = "ip_blocked"
+	SecurityEventIPBlocked = "ip_blocked"
 	// SecurityEventDDoSAttack is a constant for security event d do s attack.
-	SecurityEventDDoSAttack        = "ddos_attack_detected"
+	SecurityEventDDoSAttack = "ddos_attack_detected"
 	// SecurityEventAIGuardrail is a constant for AI safety guardrail violations.
-	SecurityEventAIGuardrail       = "ai_guardrail_triggered"
+	SecurityEventAIGuardrail = "ai_guardrail_triggered"
 	// SecurityEventAIPII is a constant for PII detected in AI requests.
-	SecurityEventAIPII             = "ai_pii_detected"
+	SecurityEventAIPII = "ai_pii_detected"
 	// SecurityEventAIInjection is a constant for prompt injection detected.
-	SecurityEventAIInjection       = "ai_prompt_injection"
+	SecurityEventAIInjection = "ai_prompt_injection"
 	// SecurityEventAIBudget is a constant for AI budget limit exceeded.
-	SecurityEventAIBudget          = "ai_budget_exceeded"
+	SecurityEventAIBudget = "ai_budget_exceeded"
 )
 
 // Security Event Severity Levels
 const (
 	// SeverityLow is a constant for severity low.
-	SeverityLow      = "low"
+	SeverityLow = "low"
 	// SeverityMedium is a constant for severity medium.
-	SeverityMedium   = "medium"
+	SeverityMedium = "medium"
 	// SeverityHigh is a constant for severity high.
-	SeverityHigh     = "high"
+	SeverityHigh = "high"
 	// SeverityCritical is a constant for severity critical.
 	SeverityCritical = "critical"
 )

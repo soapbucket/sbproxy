@@ -10,8 +10,8 @@ import (
 	"strings"
 
 	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 // ValidationConfig holds configuration for input validation middleware
@@ -75,7 +75,7 @@ func ValidationMiddleware(config *ValidationConfig) func(http.Handler) http.Hand
 					configID = id
 				}
 			}
-			
+
 			// Perform comprehensive security validation with config ID tracking
 			validationResult := httputil.ValidateRequestWithOrigin(r, configID)
 
@@ -88,12 +88,12 @@ func ValidationMiddleware(config *ValidationConfig) func(http.Handler) http.Hand
 						"method", r.Method,
 						"remote_addr", r.RemoteAddr,
 					)
-					
+
 					// Record input validation failure metric
 					validationType := "unknown"
 					fieldName := ""
 					errStr := err.Error()
-					
+
 					// Determine validation type from error
 					if strings.Contains(errStr, "path") || strings.Contains(errStr, "traversal") {
 						validationType = "path_traversal"
@@ -114,7 +114,7 @@ func ValidationMiddleware(config *ValidationConfig) func(http.Handler) http.Hand
 						validationType = "size_limit"
 						fieldName = "input"
 					}
-					
+
 					metric.InputValidationFailure(configID, validationType, fieldName)
 				}
 
@@ -122,7 +122,7 @@ func ValidationMiddleware(config *ValidationConfig) func(http.Handler) http.Hand
 				if config.StrictMode {
 					// Path traversal is an invalid request parameter, return 400 (Bad Request)
 					statusCode := http.StatusBadRequest
-					
+
 					httputil.HandleError(
 						statusCode,
 						fmt.Errorf("request validation failed: %v", validationResult.Errors[0]),
@@ -418,7 +418,7 @@ func SecurityHeadersMiddleware(config *SecurityHeadersConfig) func(http.Handler)
 					}
 					continue
 				}
-				
+
 				// Check if header already exists using http.Header.Get() for proper canonicalization
 				if responseHeaders.Get(key) == "" {
 					responseHeaders.Set(key, value)
@@ -479,4 +479,3 @@ func (s *SizeLimitedReader) Read(p []byte) (n int, err error) {
 func (s *SizeLimitedReader) Close() error {
 	return s.reader.Close()
 }
-

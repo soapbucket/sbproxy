@@ -21,11 +21,11 @@ func newTestEnforcer(t *testing.T, cfg *AgentSessionConfig) (*AgentSessionEnforc
 
 func TestAgentSessionEnforcer_MaxIterations(t *testing.T) {
 	tests := []struct {
-		name         string
-		maxIter      int
-		requests     int
-		wantErr      bool
-		wantErrCode  string
+		name        string
+		maxIter     int
+		requests    int
+		wantErr     bool
+		wantErrCode string
 	}{
 		{"under limit", 5, 3, false, ""},
 		{"at limit", 5, 5, true, "session_iteration_limit"},

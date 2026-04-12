@@ -2,11 +2,11 @@
 package transport
 
 import (
-	"github.com/soapbucket/sbproxy/internal/security/crypto"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/soapbucket/sbproxy/internal/security/crypto"
 	"hash"
 	"io"
 	"log/slog"
@@ -18,8 +18,8 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/pquerna/cachecontrol/cacheobject"
 
-	httputil "github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"github.com/soapbucket/sbproxy/internal/cache/store"
+	httputil "github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 )
 
 const (

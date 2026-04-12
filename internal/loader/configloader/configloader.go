@@ -21,18 +21,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/soapbucket/sbproxy/internal/cache/object"
 	"github.com/soapbucket/sbproxy/internal/config"
-	"github.com/soapbucket/sbproxy/internal/security/crypto"
-	"github.com/soapbucket/sbproxy/internal/platform/servervar"
-	"github.com/soapbucket/sbproxy/internal/vault"
-	"github.com/soapbucket/sbproxy/internal/observe/events"
 	"github.com/soapbucket/sbproxy/internal/loader/featureflags"
 	"github.com/soapbucket/sbproxy/internal/loader/manager"
+	"github.com/soapbucket/sbproxy/internal/observe/events"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
-	"github.com/soapbucket/sbproxy/internal/cache/object"
-	"github.com/soapbucket/sbproxy/internal/request/session"
+	"github.com/soapbucket/sbproxy/internal/platform/servervar"
 	"github.com/soapbucket/sbproxy/internal/platform/storage"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
+	"github.com/soapbucket/sbproxy/internal/request/session"
+	"github.com/soapbucket/sbproxy/internal/security/crypto"
+	"github.com/soapbucket/sbproxy/internal/vault"
 	"github.com/soapbucket/sbproxy/pkg/plugin"
 )
 
@@ -198,11 +198,11 @@ type HostChecker interface {
 // storage. The drainedWorkspaces map tracks workspaces being migrated off this
 // instance (operator-controlled via internal API).
 type Loader struct {
-	cache               *objectcache.ObjectCache
-	hostFilter          HostChecker
+	cache                *objectcache.ObjectCache
+	hostFilter           HostChecker
 	dedicatedWorkspaceID string
-	drainedWorkspaces   sync.Map
-	failsafeSnapshots   *failsafeSnapshotStore
+	drainedWorkspaces    sync.Map
+	failsafeSnapshots    *failsafeSnapshotStore
 }
 
 // Option configures a Loader.
@@ -250,8 +250,8 @@ func DefaultLoader() *Loader {
 //
 // Deprecated: Use NewLoader with functional options instead.
 type LoaderOptions struct {
-	HostFilter   HostChecker
-	WorkspaceID  string
+	HostFilter  HostChecker
+	WorkspaceID string
 }
 
 // Configure sets all loader options from the given struct.
@@ -499,11 +499,11 @@ func configToRawOrigin(cfg *config.Config) *config.RawOrigin {
 		Variables:      cfg.Variables,
 
 		// These are already json.RawMessage on Config.
-		Action:    cfg.Action,
-		Auth:      cfg.Auth,
-		Policies:  cfg.Policies,
+		Action:     cfg.Action,
+		Auth:       cfg.Auth,
+		Policies:   cfg.Policies,
 		Transforms: cfg.Transforms,
-		Secrets:   cfg.Secrets,
+		Secrets:    cfg.Secrets,
 	}
 
 	// Marshal typed struct fields to json.RawMessage for the compiler.

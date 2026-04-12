@@ -297,7 +297,7 @@ func TestSerializeDeserializeCachedResponse(t *testing.T) {
 	original := &CachedResponse{
 		StatusCode: 200,
 		Headers: map[string][]string{
-			"Content-Type": {"application/json"},
+			"Content-Type":  {"application/json"},
 			"Cache-Control": {"max-age=3600"},
 		},
 		Body:         []byte(`{"status":"ok"}`),
@@ -365,14 +365,14 @@ func TestActionResponseCache_GenerateCacheKey_WithNormalization(t *testing.T) {
 	}
 
 	req, _ := http.NewRequest("GET", "https://example.com/api?id=123&utm_source=google&name=test", nil)
-	
+
 	key := cache.GenerateCacheKey("test-action", req)
-	
+
 	// Should contain action name and normalized URL
 	if !containsSubstring(key, "test-action") {
 		t.Errorf("key should contain action name: %s", key)
 	}
-	
+
 	// utm_source should be removed
 	if containsSubstring(key, "utm_source") {
 		t.Errorf("key should not contain utm_source: %s", key)
@@ -385,9 +385,9 @@ func TestActionResponseCache_GenerateCacheKey_Legacy(t *testing.T) {
 	}
 
 	req, _ := http.NewRequest("POST", "https://example.com/api", nil)
-	
+
 	key := cache.GenerateCacheKey("test-action", req)
-	
+
 	if !containsSubstring(key, "test-action") {
 		t.Errorf("key should contain action name: %s", key)
 	}
@@ -485,4 +485,3 @@ func BenchmarkGenerateCacheKey(b *testing.B) {
 		_ = cache.GenerateCacheKey("test", req)
 	}
 }
-

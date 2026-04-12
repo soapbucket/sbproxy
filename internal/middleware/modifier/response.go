@@ -12,9 +12,9 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/soapbucket/sbproxy/internal/middleware/rule"
-	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"github.com/soapbucket/sbproxy/internal/extension/lua"
+	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
+	"github.com/soapbucket/sbproxy/internal/middleware/rule"
 )
 
 // StreamingConfigProvider provides access to streaming configuration
@@ -26,13 +26,13 @@ type StreamingConfigProvider interface {
 
 // StreamingConfig matches config.StreamingConfigValues to avoid import cycle
 type StreamingConfig struct {
-	Enabled              bool
-	MaxBufferedBodySize  int64
+	Enabled                bool
+	MaxBufferedBodySize    int64
 	MaxProcessableBodySize int64
-	ModifierThreshold    int64
-	TransformThreshold   int64
-	SignatureThreshold   int64
-	CallbackThreshold    int64
+	ModifierThreshold      int64
+	TransformThreshold     int64
+	SignatureThreshold     int64
+	CallbackThreshold      int64
 }
 
 // ResponseModifier represents a response modifier.
@@ -45,7 +45,7 @@ type ResponseModifier struct {
 
 	LuaScript string `json:"lua_script,omitempty"`
 
-	luamodifier       lua.ResponseModifier `json:"-"`
+	luamodifier lua.ResponseModifier `json:"-"`
 }
 
 // StatusModifications provides control over response status modifications
@@ -118,7 +118,7 @@ func (m *ResponseModifier) Apply(resp *http.Response) error {
 				req = resp.Request
 			}
 			resolvedText := resolveTemplateVariables(m.Status.Text, req)
-			
+
 			if m.Status.Code != 0 {
 				resp.Status = fmt.Sprintf("%d %s", m.Status.Code, resolvedText)
 			} else {
@@ -161,7 +161,7 @@ func applyResponseBodyModifications(resp *http.Response, mods *BodyModifications
 			// StreamingConfig already has int64 values, use them directly
 			if sc.Enabled {
 				threshold = sc.ModifierThreshold
-				
+
 				// Check Content-Length before reading
 				if resp.ContentLength > 0 && resp.ContentLength > threshold {
 					slog.Warn("Response body too large for modifications, skipping",
@@ -178,17 +178,17 @@ func applyResponseBodyModifications(resp *http.Response, mods *BodyModifications
 	if resp.Body != nil {
 		// Close body to ensure cleanup (even on error)
 		defer resp.Body.Close()
-		
+
 		// Wrap body with size tracker to monitor during read
 		sizeTracker := httputil.NewSizeTracker(resp.Body, threshold)
 		resp.Body = sizeTracker
-		
+
 		// Attempt to read (will detect if exceeds threshold)
 		body, err := io.ReadAll(sizeTracker)
 		if err != nil {
 			return err
 		}
-		
+
 		// Check if threshold was exceeded during read
 		if sizeTracker.Exceeded() {
 			slog.Warn("Response body exceeded threshold during read, skipping modifications",
@@ -200,7 +200,7 @@ func applyResponseBodyModifications(resp *http.Response, mods *BodyModifications
 			resp.ContentLength = int64(len(body))
 			return nil
 		}
-		
+
 		bodyBytes = body
 	}
 

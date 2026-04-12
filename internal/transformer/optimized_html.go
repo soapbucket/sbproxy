@@ -2,9 +2,9 @@
 package transformer
 
 import (
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"bytes"
 	"errors"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"io"
 	"log/slog"
 	"mime"
@@ -554,7 +554,7 @@ func ConvertToOptimizedModifyFn(fn ModifyFn) OptimizedModifyFn {
 		// In optimized HTML, end tags are represented by TagName starting with "/"
 		var tokenType html.TokenType
 		tagName := token.TagName
-		
+
 		if token.Type == reqctx.StateTagName {
 			if strings.HasPrefix(token.TagName, "/") {
 				// This is an end tag
@@ -568,7 +568,7 @@ func ConvertToOptimizedModifyFn(fn ModifyFn) OptimizedModifyFn {
 			// For non-tag tokens, use the type as-is
 			tokenType = html.TokenType(token.Type)
 		}
-		
+
 		htmlToken := html.Token{
 			Type: tokenType,
 			Data: tagName,

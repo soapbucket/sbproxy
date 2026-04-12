@@ -122,20 +122,20 @@ func TestNewAIEventStructs_Marshal(t *testing.T) {
 	}{
 		{"AIRequestStarted", &AIRequestStarted{
 			EventBase: NewBase("ai.request.started", SeverityInfo, "ws-1", "req-1"),
-			Model: "gpt-4", Streaming: true, KeyID: "k-1", UserID: "u-1", MessageCount: 3, HasTools: true,
+			Model:     "gpt-4", Streaming: true, KeyID: "k-1", UserID: "u-1", MessageCount: 3, HasTools: true,
 		}, "ai.request.started", SeverityInfo},
 		{"AIRequestFailed", &AIRequestFailed{
 			EventBase: NewBase("ai.request.failed", SeverityError, "ws-1", "req-1"),
-			Model: "gpt-4", Provider: "openai", ErrorCode: "rate_limit", ErrorType: "transient",
+			Model:     "gpt-4", Provider: "openai", ErrorCode: "rate_limit", ErrorType: "transient",
 			ErrorMessage: "rate limited", HTTPStatus: 429, LatencyMs: 150, Retries: 2,
 		}, "ai.request.failed", SeverityError},
 		{"AIProviderSelected", &AIProviderSelected{
 			EventBase: NewBase("ai.provider.selected", SeverityInfo, "ws-1", "req-1"),
-			Model: "gpt-4", Provider: "openai", Strategy: "round_robin",
+			Model:     "gpt-4", Provider: "openai", Strategy: "round_robin",
 		}, "ai.provider.selected", SeverityInfo},
 		{"AIProviderFallback", &AIProviderFallback{
 			EventBase: NewBase("ai.provider.fallback", SeverityWarning, "ws-1", "req-1"),
-			Model: "gpt-4", FromProvider: "openai", ToProvider: "anthropic", Reason: "provider_error",
+			Model:     "gpt-4", FromProvider: "openai", ToProvider: "anthropic", Reason: "provider_error",
 		}, "ai.provider.fallback", SeverityWarning},
 		{"AIFailureDegraded", &AIFailureDegraded{
 			EventBase: NewBase("ai.failure.degraded", SeverityWarning, "ws-1", "req-1"),
@@ -143,32 +143,32 @@ func TestNewAIEventStructs_Marshal(t *testing.T) {
 		}, "ai.failure.degraded", SeverityWarning},
 		{"AIHealthCheckFailed", &AIHealthCheckFailed{
 			EventBase: NewBase("ai.health.check_failed", SeverityCritical, "ws-1", "req-1"),
-			Provider: "openai", Error: "timeout", ConsecutiveFailures: 3, CircuitState: "open",
+			Provider:  "openai", Error: "timeout", ConsecutiveFailures: 3, CircuitState: "open",
 		}, "ai.health.check_failed", SeverityCritical},
 		{"AIHealthCheckRecovered", &AIHealthCheckRecovered{
 			EventBase: NewBase("ai.health.check_recovered", SeverityInfo, "ws-1", "req-1"),
-			Provider: "openai", DowntimeMs: 5000,
+			Provider:  "openai", DowntimeMs: 5000,
 		}, "ai.health.check_recovered", SeverityInfo},
 		{"AICacheHit", &AICacheHit{
 			EventBase: NewBase("ai.cache.hit", SeverityInfo, "ws-1", "req-1"),
-			Model: "gpt-4", CacheType: "semantic", KeyHash: "abc123",
+			Model:     "gpt-4", CacheType: "semantic", KeyHash: "abc123",
 		}, "ai.cache.hit", SeverityInfo},
 		{"AICacheMiss", &AICacheMiss{
 			EventBase: NewBase("ai.cache.miss", SeverityInfo, "ws-1", "req-1"),
-			Model: "gpt-4",
+			Model:     "gpt-4",
 		}, "ai.cache.miss", SeverityInfo},
 		{"AIAlertFired", &AIAlertFired{
 			EventBase: NewBase("ai.alert.fired", SeverityWarning, "ws-1", "req-1"),
-			RuleName: "high_latency", Message: "p99 > 5s", Condition: "latency_p99 > 5000",
+			RuleName:  "high_latency", Message: "p99 > 5s", Condition: "latency_p99 > 5000",
 			Tags: map[string]string{"team": "platform"}, Context: map[string]interface{}{"value": 6200},
 		}, "ai.alert.fired", SeverityWarning},
 		{"AIKeyRotated", &AIKeyRotated{
 			EventBase: NewBase("ai.key.rotated", SeverityInfo, "ws-1", "req-1"),
-			OldKeyID: "old-1", NewKeyID: "new-1", GraceEnds: "2026-04-07T00:00:00Z",
+			OldKeyID:  "old-1", NewKeyID: "new-1", GraceEnds: "2026-04-07T00:00:00Z",
 		}, "ai.key.rotated", SeverityInfo},
 		{"AIKeyRevoked", &AIKeyRevoked{
 			EventBase: NewBase("ai.key.revoked", SeverityWarning, "ws-1", "req-1"),
-			KeyID: "k-1", Reason: "compromised",
+			KeyID:     "k-1", Reason: "compromised",
 		}, "ai.key.revoked", SeverityWarning},
 	}
 

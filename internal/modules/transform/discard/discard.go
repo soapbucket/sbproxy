@@ -35,5 +35,5 @@ func New(data json.RawMessage) (plugin.TransformHandler, error) {
 	}, nil
 }
 
-func (d *discardTransform) Type() string                   { return "discard" }
+func (d *discardTransform) Type() string                    { return "discard" }
 func (d *discardTransform) Apply(resp *http.Response) error { return d.tr.Modify(resp) }

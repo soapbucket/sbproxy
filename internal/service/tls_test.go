@@ -114,10 +114,10 @@ func createTestConfig() Config {
 	return Config{
 		ProxyConfig: ProxyConfig{
 			CertificateSettings: CertificateSettings{
-				UseACME:     true,
-				ACMEEmail:   "test@example.com",
-				ACMEDomains: []string{"example.com", "test.example.com"},
-				MinTLSVersion: 13,
+				UseACME:         true,
+				ACMEEmail:       "test@example.com",
+				ACMEDomains:     []string{"example.com", "test.example.com"},
+				MinTLSVersion:   13,
 				TLSCipherSuites: []string{"TLS_AES_128_GCM_SHA256"},
 			},
 			EnableHTTP3: false,
@@ -545,4 +545,3 @@ func TestGetACMETLSConfig_HTTPChallengeDisabled(t *testing.T) {
 		t.Error("expected non-nil ACME HTTP handler")
 	}
 }
-

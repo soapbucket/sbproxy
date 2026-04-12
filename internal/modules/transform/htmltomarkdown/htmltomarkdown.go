@@ -16,11 +16,11 @@ func init() {
 
 // Config holds configuration for the html_to_markdown transform.
 type Config struct {
-	Type                    string `json:"type"`
-	TokenCounting           bool   `json:"token_counting,omitempty"`
-	AcceptHeaderNegotiation bool   `json:"accept_header_negotiation,omitempty"`
+	Type                    string  `json:"type"`
+	TokenCounting           bool    `json:"token_counting,omitempty"`
+	AcceptHeaderNegotiation bool    `json:"accept_header_negotiation,omitempty"`
 	TokenEstimate           float64 `json:"token_estimate,omitempty"`
-	MaxBodySize             int64  `json:"max_body_size,omitempty"`
+	MaxBodySize             int64   `json:"max_body_size,omitempty"`
 }
 
 // htmlToMarkdownTransform implements plugin.TransformHandler.

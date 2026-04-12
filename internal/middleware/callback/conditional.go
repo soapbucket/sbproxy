@@ -79,6 +79,3 @@ func ExtractConditionalHeaders(ctx context.Context, headers map[string]string) (
 
 	return ifNoneMatch, ifModifiedSince
 }
-
-
-

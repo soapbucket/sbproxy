@@ -13,11 +13,11 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	cfgpkg "github.com/soapbucket/sbproxy/internal/config"
-	"github.com/soapbucket/sbproxy/internal/middleware/callback"
-	"github.com/soapbucket/sbproxy/internal/security/tlsutil"
 	"github.com/soapbucket/sbproxy/internal/loader/manager"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
+	"github.com/soapbucket/sbproxy/internal/middleware/callback"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
+	"github.com/soapbucket/sbproxy/internal/security/tlsutil"
 	xhttp2 "golang.org/x/net/http2"
 
 	"github.com/go-chi/chi/v5"
@@ -49,7 +49,7 @@ func StartHTTP(p ProxyConfig, m manager.Manager, callbackCache *callback.Callbac
 	// Track active connections
 	var activeConnCount int64
 	var connMutex sync.Mutex
-	
+
 	srv := &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", p.BindAddress, p.HTTPBindPort),
 		Handler:      handler,
@@ -59,7 +59,7 @@ func StartHTTP(p ProxyConfig, m manager.Manager, callbackCache *callback.Callbac
 		ConnState: func(conn net.Conn, state http.ConnState) {
 			connMutex.Lock()
 			defer connMutex.Unlock()
-			
+
 			switch state {
 			case http.StateNew:
 				activeConnCount++
@@ -146,7 +146,7 @@ func StartHTTPS(p ProxyConfig, m manager.Manager, callbackCache *callback.Callba
 	// Track active HTTPS connections
 	var activeHTTPSConnCount int64
 	var httpsConnMutex sync.Mutex
-	
+
 	srv := &http.Server{
 		Addr: fmt.Sprintf("%s:%d", p.BindAddress, p.HTTPSBindPort),
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -163,7 +163,7 @@ func StartHTTPS(p ProxyConfig, m manager.Manager, callbackCache *callback.Callba
 		ConnState: func(conn net.Conn, state http.ConnState) {
 			httpsConnMutex.Lock()
 			defer httpsConnMutex.Unlock()
-			
+
 			switch state {
 			case http.StateNew:
 				activeHTTPSConnCount++

@@ -107,9 +107,10 @@ func NewInjectionDetector(config json.RawMessage) (Guardrail, error) {
 }
 
 // Name performs the name operation on the injectionDetector.
-func (d *injectionDetector) Name() string  { return "prompt_injection" }
+func (d *injectionDetector) Name() string { return "prompt_injection" }
+
 // Phase performs the phase operation on the injectionDetector.
-func (d *injectionDetector) Phase() Phase  { return PhaseInput }
+func (d *injectionDetector) Phase() Phase { return PhaseInput }
 
 // checkEncodedContent decodes common encodings and checks for injection patterns.
 func (d *injectionDetector) checkEncodedContent(text string) (float64, []string) {

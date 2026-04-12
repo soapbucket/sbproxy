@@ -6,8 +6,8 @@ import (
 	"net/http"
 
 	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 // FlagsMiddleware returns HTTP middleware for flags.

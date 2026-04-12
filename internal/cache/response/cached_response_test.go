@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"github.com/soapbucket/sbproxy/internal/cache/store"
+	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 )
 
 // MockKVStore implements cacher.Cacher for testing
@@ -69,37 +69,37 @@ func (m *MockKVStore) Delete(ctx context.Context, cType string, key string) erro
 func (m *MockKVStore) DeleteByPattern(ctx context.Context, cType string, pattern string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	// Parse pattern: {METHOD}:{URL}:*
 	// Since cache keys are hashed, we need to regenerate keys from the pattern to match them
 	parts := strings.Split(pattern, ":")
 	if len(parts) < 2 {
 		// Invalid pattern, try simple prefix matching
-	patternPrefix := pattern
-	if len(pattern) > 0 && pattern[len(pattern)-1] == '*' {
-		patternPrefix = pattern[:len(pattern)-1]
-	}
-	for key := range m.data {
-		if patternPrefix == "" || (len(key) >= len(patternPrefix) && key[:len(patternPrefix)] == patternPrefix) {
-			delete(m.data, key)
+		patternPrefix := pattern
+		if len(pattern) > 0 && pattern[len(pattern)-1] == '*' {
+			patternPrefix = pattern[:len(pattern)-1]
 		}
-	}
+		for key := range m.data {
+			if patternPrefix == "" || (len(key) >= len(patternPrefix) && key[:len(patternPrefix)] == patternPrefix) {
+				delete(m.data, key)
+			}
+		}
 		return nil
 	}
-	
+
 	method := parts[0]
 	urlPart := strings.Join(parts[1:len(parts)-1], ":") // Rejoin URL parts (may contain colons)
 	if len(parts) > 0 && parts[len(parts)-1] == "*" {
 		// Remove the wildcard
 		urlPart = strings.Join(parts[1:len(parts)-1], ":")
 	}
-	
+
 	// Try to regenerate keys from the pattern
 	// Create a test request to generate the cache key
 	testReq, err := http.NewRequest(method, urlPart, nil)
 	if err == nil {
 		testReq = testReq.WithContext(ctx)
-		
+
 		// Generate keys for common vary header combinations
 		// This handles the case where cache keys include vary headers (like Accept-Encoding)
 		varyCombinations := []map[string]string{
@@ -109,9 +109,9 @@ func (m *MockKVStore) DeleteByPattern(ctx context.Context, cType string, pattern
 			{"Accept-Encoding": "identity"},
 			{}, // No vary headers
 		}
-		
+
 		keysToDelete := make(map[string]bool)
-		
+
 		// Generate keys for each vary combination
 		for _, varyHeaders := range varyCombinations {
 			testReqWithVary := testReq.Clone(ctx)
@@ -121,7 +121,7 @@ func (m *MockKVStore) DeleteByPattern(ctx context.Context, cType string, pattern
 			key := httputil.GenerateCacheKey(testReqWithVary)
 			keysToDelete[key] = true
 		}
-		
+
 		// Delete all matching keys
 		for key := range keysToDelete {
 			delete(m.data, key)
@@ -138,7 +138,7 @@ func (m *MockKVStore) DeleteByPattern(ctx context.Context, cType string, pattern
 			}
 		}
 	}
-	
+
 	return nil
 }
 

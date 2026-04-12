@@ -25,7 +25,7 @@ import (
 // testEchoAction is a minimal action that writes "echo" with status 200.
 type testEchoAction struct{}
 
-func (testEchoAction) Type() string                                    { return "test_echo" }
+func (testEchoAction) Type() string                                     { return "test_echo" }
 func (testEchoAction) ServeHTTP(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("echo")) }
 
 // testAuth records that it was called and delegates to next.
@@ -81,22 +81,22 @@ func (a *testCleanableAction) Cleanup() error {
 // noopServiceProvider satisfies plugin.ServiceProvider with no-op implementations.
 type noopServiceProvider struct{}
 
-func (noopServiceProvider) KVStore() plugin.KVStore             { return noopKV{} }
-func (noopServiceProvider) Cache() plugin.CacheStore            { return noopCache{} }
-func (noopServiceProvider) Events() plugin.EventEmitter         { return noopEvents{} }
-func (noopServiceProvider) Logger() *slog.Logger                { return slog.Default() }
-func (noopServiceProvider) Metrics() plugin.Observer            { return plugin.NoopObserver() }
+func (noopServiceProvider) KVStore() plugin.KVStore     { return noopKV{} }
+func (noopServiceProvider) Cache() plugin.CacheStore    { return noopCache{} }
+func (noopServiceProvider) Events() plugin.EventEmitter { return noopEvents{} }
+func (noopServiceProvider) Logger() *slog.Logger        { return slog.Default() }
+func (noopServiceProvider) Metrics() plugin.Observer    { return plugin.NoopObserver() }
 func (noopServiceProvider) TransportFor(plugin.TransportConfig) http.RoundTripper {
 	return http.DefaultTransport
 }
-func (noopServiceProvider) ResolveOriginHandler(string) (http.Handler, error)           { return nil, nil }
+func (noopServiceProvider) ResolveOriginHandler(string) (http.Handler, error) { return nil, nil }
 func (noopServiceProvider) ResolveEmbeddedOriginHandler(json.RawMessage) (http.Handler, error) {
 	return nil, nil
 }
-func (noopServiceProvider) ResponseCache() plugin.ResponseCache         { return nil }
-func (noopServiceProvider) Sessions() plugin.SessionProvider            { return nil }
-func (noopServiceProvider) HealthStatus(string) plugin.HealthState      { return plugin.HealthState{} }
-func (noopServiceProvider) SetHealthStatus(string, plugin.HealthState)  {}
+func (noopServiceProvider) ResponseCache() plugin.ResponseCache        { return nil }
+func (noopServiceProvider) Sessions() plugin.SessionProvider           { return nil }
+func (noopServiceProvider) HealthStatus(string) plugin.HealthState     { return plugin.HealthState{} }
+func (noopServiceProvider) SetHealthStatus(string, plugin.HealthState) {}
 
 type noopKV struct{}
 
@@ -107,8 +107,8 @@ func (noopKV) Increment(context.Context, string, int64) (int64, error)  { return
 
 type noopCache struct{}
 
-func (noopCache) Get(context.Context, string) (interface{}, bool)              { return nil, false }
-func (noopCache) Set(context.Context, string, interface{}, time.Duration)      {}
+func (noopCache) Get(context.Context, string) (interface{}, bool)         { return nil, false }
+func (noopCache) Set(context.Context, string, interface{}, time.Duration) {}
 
 type noopEvents struct{}
 
@@ -348,9 +348,9 @@ func TestCompileOrigin_CompressionDisabled(t *testing.T) {
 	defer plugin.RegisterAction("test_echo", nil)
 
 	raw := &RawOrigin{
-		ID:       "comp2",
-		Hostname: "nocompress.example.com",
-		Action:   json.RawMessage(`{"type":"test_echo"}`),
+		ID:          "comp2",
+		Hostname:    "nocompress.example.com",
+		Action:      json.RawMessage(`{"type":"test_echo"}`),
 		Compression: json.RawMessage(`{"enable": false}`),
 	}
 
@@ -767,9 +767,9 @@ func TestCompileOrigin_RequestModifiers(t *testing.T) {
 	defer plugin.RegisterAction("test_header_echo", nil)
 
 	raw := &RawOrigin{
-		ID:       "rm1",
-		Hostname: "reqmod.example.com",
-		Action:   json.RawMessage(`{"type":"test_header_echo"}`),
+		ID:        "rm1",
+		Hostname:  "reqmod.example.com",
+		Action:    json.RawMessage(`{"type":"test_header_echo"}`),
 		Modifiers: json.RawMessage(`[{"headers":{"set":{"X-Custom":"injected-value"}}}]`),
 	}
 
@@ -794,9 +794,9 @@ func TestCompileOrigin_RequestModifiers_Empty(t *testing.T) {
 	defer plugin.RegisterAction("test_echo", nil)
 
 	raw := &RawOrigin{
-		ID:       "rm2",
-		Hostname: "reqmod-empty.example.com",
-		Action:   json.RawMessage(`{"type":"test_echo"}`),
+		ID:        "rm2",
+		Hostname:  "reqmod-empty.example.com",
+		Action:    json.RawMessage(`{"type":"test_echo"}`),
 		Modifiers: json.RawMessage(`[]`),
 	}
 
@@ -835,9 +835,9 @@ func TestCompileOrigin_ResponseModifiers(t *testing.T) {
 	defer plugin.RegisterAction("test_resp_header", nil)
 
 	raw := &RawOrigin{
-		ID:       "respmod1",
-		Hostname: "respmod.example.com",
-		Action:   json.RawMessage(`{"type":"test_resp_header"}`),
+		ID:                "respmod1",
+		Hostname:          "respmod.example.com",
+		Action:            json.RawMessage(`{"type":"test_resp_header"}`),
 		ResponseModifiers: json.RawMessage(`[{"headers":{"set":{"X-Modified":"true"}}}]`),
 	}
 
@@ -871,9 +871,9 @@ func TestCompileOrigin_ResponseModifiers_StatusOverride(t *testing.T) {
 	defer plugin.RegisterAction("test_resp_header", nil)
 
 	raw := &RawOrigin{
-		ID:       "respmod2",
-		Hostname: "respmod2.example.com",
-		Action:   json.RawMessage(`{"type":"test_resp_header"}`),
+		ID:                "respmod2",
+		Hostname:          "respmod2.example.com",
+		Action:            json.RawMessage(`{"type":"test_resp_header"}`),
 		ResponseModifiers: json.RawMessage(`[{"status":{"code":201},"headers":{"set":{"X-Modified":"yes"}}}]`),
 	}
 

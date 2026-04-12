@@ -47,9 +47,9 @@ func makeDropperTestRegistry() *ai.ProviderRegistry {
 			"ollama": {
 				Models: map[string]ai.ModelDef{
 					"llama3": {
-						SupportsVision:   false,
-						SupportsTools:    &supportsToolsFalse,
-						IsReasoning:      false,
+						SupportsVision:    false,
+						SupportsTools:     &supportsToolsFalse,
+						IsReasoning:       false,
 						SupportsStreaming: &supportsStreamingFalse,
 					},
 				},
@@ -120,7 +120,7 @@ func TestParamDropper_ToolsDroppedForNonToolProvider(t *testing.T) {
 	provider := &ai.ProviderConfig{Name: "ollama", Type: "ollama"}
 
 	req := &ai.ChatCompletionRequest{
-		Model: "llama3",
+		Model:    "llama3",
 		Messages: []ai.Message{makeTextMessage("hello")},
 		Tools: []ai.Tool{
 			{Type: "function", Function: ai.ToolFunction{Name: "get_weather"}},
@@ -141,7 +141,7 @@ func TestParamDropper_ToolsKeptForToolSupportingModel(t *testing.T) {
 	provider := &ai.ProviderConfig{Name: "openai", Type: "openai"}
 
 	req := &ai.ChatCompletionRequest{
-		Model: "gpt-4o",
+		Model:    "gpt-4o",
 		Messages: []ai.Message{makeTextMessage("hello")},
 		Tools: []ai.Tool{
 			{Type: "function", Function: ai.ToolFunction{Name: "get_weather"}},
@@ -268,8 +268,8 @@ func TestParamDropper_NoDropsWhenAllParamsSupported(t *testing.T) {
 	provider := &ai.ProviderConfig{Name: "openai", Type: "openai"}
 
 	req := &ai.ChatCompletionRequest{
-		Model:    "gpt-4o",
-		Messages: []ai.Message{makeTextMessage("hello")},
+		Model:          "gpt-4o",
+		Messages:       []ai.Message{makeTextMessage("hello")},
 		ResponseFormat: &ai.ResponseFormat{Type: "json_schema"},
 	}
 
@@ -352,9 +352,9 @@ func TestParamDropper_MultipleDrops(t *testing.T) {
 		Tools: []ai.Tool{
 			{Type: "function", Function: ai.ToolFunction{Name: "get_weather"}},
 		},
-		ToolChoice:     json.RawMessage(`"auto"`),
-		ResponseFormat: &ai.ResponseFormat{Type: "json_schema"},
-		Thinking:       &ai.ThinkingConfig{Type: "enabled", BudgetTokens: 5000},
+		ToolChoice:      json.RawMessage(`"auto"`),
+		ResponseFormat:  &ai.ResponseFormat{Type: "json_schema"},
+		Thinking:        &ai.ThinkingConfig{Type: "enabled", BudgetTokens: 5000},
 		ReasoningEffort: "high",
 	}
 

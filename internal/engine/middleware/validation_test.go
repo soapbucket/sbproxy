@@ -579,4 +579,3 @@ func BenchmarkContentTypeValidationMiddleware(b *testing.B) {
 		handler.ServeHTTP(rr, req)
 	}
 }
-

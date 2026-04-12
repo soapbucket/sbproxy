@@ -207,7 +207,7 @@ func TestHealthChecker_ExpectedBody(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	if !hc.IsHealthy() {
-		t.Errorf("expected healthy status with matching body, got: %v (error: %v)", 
+		t.Errorf("expected healthy status with matching body, got: %v (error: %v)",
 			hc.GetStatus(), hc.GetLastError())
 	}
 }
@@ -276,9 +276,9 @@ func TestHealthCheckTransport(t *testing.T) {
 
 	target := server.URL[7:]
 	hc := NewHealthChecker(target, config)
-	
+
 	// Don't start the health checker - status will be unknown/unhealthy
-	
+
 	transport := &HealthCheckTransport{
 		Base:          http.DefaultTransport,
 		HealthChecker: hc,
@@ -286,7 +286,7 @@ func TestHealthCheckTransport(t *testing.T) {
 
 	client := &http.Client{Transport: transport}
 	req, _ := http.NewRequest("GET", server.URL, nil)
-	
+
 	// Should fail because backend is not marked healthy
 	_, err := client.Do(req)
 	if err == nil {
@@ -296,7 +296,7 @@ func TestHealthCheckTransport(t *testing.T) {
 	// Now mark as healthy and try again
 	hc.Start()
 	defer hc.Stop()
-	
+
 	// Wait for health checks to mark backend as healthy (need 2 successful checks)
 	// With 1s interval and 2 healthy threshold, this needs at least 2s + some buffer
 	time.Sleep(2500 * time.Millisecond)
@@ -310,7 +310,7 @@ func TestHealthCheckTransport(t *testing.T) {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	
+
 	if err != nil {
 		t.Errorf("request should succeed with healthy backend: %v", err)
 	}
@@ -335,4 +335,3 @@ func TestDefaultHealthCheckConfig(t *testing.T) {
 		t.Errorf("expected status 200, got %d", config.ExpectedStatus)
 	}
 }
-

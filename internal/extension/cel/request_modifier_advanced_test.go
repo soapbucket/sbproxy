@@ -12,10 +12,10 @@ import (
 
 func TestRequestModifier_URLModifications(t *testing.T) {
 	tests := []struct {
-		name     string
-		expr     string
-		reqURL   string
-		wantURL  string
+		name    string
+		expr    string
+		reqURL  string
+		wantURL string
 	}{
 		{
 			name:    "scheme modification",
@@ -263,10 +263,10 @@ func TestRequestModifier_FormModifications(t *testing.T) {
 
 func TestRequestModifier_BodyModifications(t *testing.T) {
 	tests := []struct {
-		name        string
-		expr        string
-		wantBody    string
-		wantCT      string
+		name     string
+		expr     string
+		wantBody string
+		wantCT   string
 	}{
 		{
 			name:     "body remove",

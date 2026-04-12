@@ -105,8 +105,8 @@ func TestRequestModifier_ApplyWithTemplateVariables(t *testing.T) {
 	modifier := &RequestModifier{
 		Headers: &HeaderModifications{
 			Set: map[string]string{
-				"X-Request-ID":    "{{request.id}}",
-				"X-Real-IP":       "{{request.remote_addr}}",
+				"X-Request-ID":      "{{request.id}}",
+				"X-Real-IP":         "{{request.remote_addr}}",
 				"X-Forwarded-Proto": "https",
 			},
 		},
@@ -464,4 +464,3 @@ func TestResolveTemplateVariables_DefaultValue(t *testing.T) {
 		}
 	})
 }
-

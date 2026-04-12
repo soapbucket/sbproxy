@@ -203,5 +203,3 @@ func (v *SRIValidator) AddKnownHash(resourceURL, hash string) {
 func (v *SRIValidator) GetKnownHashes(resourceURL string) []string {
 	return v.knownHashes[resourceURL]
 }
-
-

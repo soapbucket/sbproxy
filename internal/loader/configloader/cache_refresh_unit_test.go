@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/soapbucket/sbproxy/internal/middleware/forward"
 	"github.com/soapbucket/sbproxy/internal/loader/manager"
+	"github.com/soapbucket/sbproxy/internal/middleware/forward"
 	"github.com/soapbucket/sbproxy/internal/platform/messenger"
 )
 
@@ -38,7 +38,7 @@ func TestPurgeOriginCache_Unit(t *testing.T) {
 	mockStore := &mockStorage{
 		data: map[string][]byte{
 			"parent.test":      parentConfig,
-			"child.test":        childConfig,
+			"child.test":       childConfig,
 			"grandparent.test": grandparentConfig,
 			"standalone.test":  standaloneConfig,
 		},
@@ -123,7 +123,7 @@ func TestFindRelatedHostnames(t *testing.T) {
 	mockStore := &mockStorage{
 		data: map[string][]byte{
 			"parent.test":      parentConfig,
-			"child.test":        childConfig,
+			"child.test":       childConfig,
 			"grandparent.test": grandparentConfig,
 		},
 	}
@@ -340,4 +340,3 @@ func TestStartOriginCacheRefreshSubscriber_MultipleTopics(t *testing.T) {
 		t.Fatalf("expected two active refresh subscribers, got %d", len(refreshSubscribers))
 	}
 }
-

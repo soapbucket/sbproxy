@@ -2,8 +2,8 @@
 package transport
 
 import (
-	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"encoding/binary"
+	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"net/http"
 	"sync"
 	"time"
@@ -29,7 +29,7 @@ type transportKey struct {
 	disableKeepAlives     bool
 	writeBufferSize       int
 	readBufferSize        int
-	forceAttemptHTTP2    bool
+	forceAttemptHTTP2     bool
 	enableHTTP3           bool
 	// mTLS configuration
 	mtlsClientCertFile string

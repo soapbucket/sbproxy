@@ -276,4 +276,3 @@ func createEmptyBodyRequest(method string, t *testing.T) *http.Request {
 	req.Header.Set("Content-Type", "application/json")
 	return req
 }
-

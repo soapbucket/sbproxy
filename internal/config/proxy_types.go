@@ -193,11 +193,11 @@ type TrustMode string
 
 const (
 	// TrustAll is a constant for trust all.
-	TrustAll            TrustMode = "trust_all"
+	TrustAll TrustMode = "trust_all"
 	// TrustTrustedProxies is a constant for trust trusted proxies.
 	TrustTrustedProxies TrustMode = "trust_trusted_proxies"
 	// TrustNone is a constant for trust none.
-	TrustNone           TrustMode = "trust_none"
+	TrustNone TrustMode = "trust_none"
 )
 
 // XFFMode defines X-Forwarded-For behavior
@@ -205,11 +205,11 @@ type XFFMode string
 
 const (
 	// XFFAppend is a constant for xff append.
-	XFFAppend  XFFMode = "append"  // Add to chain
+	XFFAppend XFFMode = "append" // Add to chain
 	// XFFReplace is a constant for xff replace.
 	XFFReplace XFFMode = "replace" // Overwrite with client IP
 	// XFFOff is a constant for xff off.
-	XFFOff     XFFMode = "off"     // Don't send
+	XFFOff XFFMode = "off" // Don't send
 )
 
 // XFPMode defines X-Forwarded-Proto behavior
@@ -217,11 +217,11 @@ type XFPMode string
 
 const (
 	// XFPSet is a constant for xfp set.
-	XFPSet      XFPMode = "set"      // Always set
+	XFPSet XFPMode = "set" // Always set
 	// XFPPreserve is a constant for xfp preserve.
 	XFPPreserve XFPMode = "preserve" // Keep if present
 	// XFPOff is a constant for xfp off.
-	XFPOff      XFPMode = "off"      // Don't send
+	XFPOff XFPMode = "off" // Don't send
 )
 
 // XFHMode defines X-Forwarded-Host behavior
@@ -229,11 +229,11 @@ type XFHMode string
 
 const (
 	// XFHSet is a constant for xfh set.
-	XFHSet      XFHMode = "set"
+	XFHSet XFHMode = "set"
 	// XFHPreserve is a constant for xfh preserve.
 	XFHPreserve XFHMode = "preserve"
 	// XFHOff is a constant for xfh off.
-	XFHOff      XFHMode = "off"
+	XFHOff XFHMode = "off"
 )
 
 // ProxyProtocolConfig controls RFC-level proxy protocol behavior.
@@ -482,9 +482,7 @@ const (
 	// TrailerChecksum is a constant for trailer checksum.
 	TrailerChecksum TrailerType = "checksum"
 	// TrailerTiming is a constant for trailer timing.
-	TrailerTiming   TrailerType = "timing"
+	TrailerTiming TrailerType = "timing"
 	// TrailerCustom is a constant for trailer custom.
-	TrailerCustom   TrailerType = "custom"
+	TrailerCustom TrailerType = "custom"
 )
-
-

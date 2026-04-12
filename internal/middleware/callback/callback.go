@@ -11,12 +11,12 @@
 package callback
 
 import (
-	"github.com/soapbucket/sbproxy/internal/security/crypto"
-	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
+	"github.com/soapbucket/sbproxy/internal/security/crypto"
 	"io"
 	"log/slog"
 	"maps"
@@ -32,11 +32,11 @@ import (
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 
-	"github.com/soapbucket/sbproxy/internal/platform/circuitbreaker"
 	celext "github.com/soapbucket/sbproxy/internal/extension/cel"
 	"github.com/soapbucket/sbproxy/internal/extension/lua"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/loader/settings"
+	"github.com/soapbucket/sbproxy/internal/platform/circuitbreaker"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/security/signature"
 )
 
@@ -62,7 +62,7 @@ var callbackFlight singleflight.Group
 // SignatureVerificationConfig configures webhook signature verification
 type SignatureVerificationConfig struct {
 	Enabled bool   `json:"enabled,omitempty"`
-	Header  string `json:"header,omitempty"` // Header name for signature (default: X-Signature)
+	Header  string `json:"header,omitempty"`               // Header name for signature (default: X-Signature)
 	Secret  string `json:"secret,omitempty" secret:"true"` // Secret for HMAC verification
 
 	// Algorithm: hmac-sha256 (default), hmac-sha512, rsa-sha256, rsa-sha512
@@ -167,10 +167,10 @@ type Callback struct {
 	Transforms []json.RawMessage `json:"transforms,omitempty"`
 
 	luaScript   lua.JSONModifier            `json:"-"`
-	celModifier *celext.JSONModifier       `json:"-"`
-	cacheKey   string                      `json:"-"`
-	verifier   *signature.ResponseVerifier `json:"-"`
-	transforms []TransformHandler          `json:"-"`
+	celModifier *celext.JSONModifier        `json:"-"`
+	cacheKey    string                      `json:"-"`
+	verifier    *signature.ResponseVerifier `json:"-"`
+	transforms  []TransformHandler          `json:"-"`
 }
 
 // TransformHandler applies a transform to an HTTP response.

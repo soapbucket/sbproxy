@@ -24,25 +24,25 @@ type ProviderRegistry struct {
 
 // ProviderDef describes a provider's connection and model catalog.
 type ProviderDef struct {
-	DisplayName string            `yaml:"display_name"`
-	BaseURL     string            `yaml:"base_url"`
-	AuthHeader  string            `yaml:"auth_header"`
-	AuthPrefix  string            `yaml:"auth_prefix"`
-	Format      string            `yaml:"format"`
-	Requires    []string          `yaml:"requires,omitempty"`
-	DocsURL     string            `yaml:"docs_url,omitempty"`
+	DisplayName string              `yaml:"display_name"`
+	BaseURL     string              `yaml:"base_url"`
+	AuthHeader  string              `yaml:"auth_header"`
+	AuthPrefix  string              `yaml:"auth_prefix"`
+	Format      string              `yaml:"format"`
+	Requires    []string            `yaml:"requires,omitempty"`
+	DocsURL     string              `yaml:"docs_url,omitempty"`
 	Models      map[string]ModelDef `yaml:"models"`
 }
 
 // ModelDef describes a model's capabilities (pricing is handled by the pricing package).
 type ModelDef struct {
-	DisplayName      string `yaml:"display_name,omitempty"`
-	Tokenizer        string `yaml:"tokenizer,omitempty"`
-	ContextWindow    int    `yaml:"context_window,omitempty"`
-	SupportsVision   bool   `yaml:"supports_vision,omitempty"`
-	IsReasoning      bool   `yaml:"is_reasoning,omitempty"`
+	DisplayName       string `yaml:"display_name,omitempty"`
+	Tokenizer         string `yaml:"tokenizer,omitempty"`
+	ContextWindow     int    `yaml:"context_window,omitempty"`
+	SupportsVision    bool   `yaml:"supports_vision,omitempty"`
+	IsReasoning       bool   `yaml:"is_reasoning,omitempty"`
 	SupportsStreaming *bool  `yaml:"supports_streaming,omitempty"`
-	SupportsTools    *bool  `yaml:"supports_tools,omitempty"`
+	SupportsTools     *bool  `yaml:"supports_tools,omitempty"`
 }
 
 // global registry

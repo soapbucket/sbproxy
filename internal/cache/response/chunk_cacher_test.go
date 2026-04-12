@@ -82,7 +82,7 @@ func TestChunkCacher_NoCache(t *testing.T) {
 	// Request with no-cache header
 	req := httptest.NewRequest("GET", "http://example.com/test", nil)
 	req.Header.Set("Cache-Control", "no-cache")
-	
+
 	// Set up request context with RequestData
 	requestData := reqctx.NewRequestData()
 	requestData.Config = map[string]any{

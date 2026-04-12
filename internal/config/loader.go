@@ -15,8 +15,8 @@ import (
 	"gopkg.in/yaml.v3"
 
 	httputil "github.com/soapbucket/sbproxy/internal/httpkit/httputil"
-	"github.com/soapbucket/sbproxy/internal/security/crypto"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/security/crypto"
 	"github.com/soapbucket/sbproxy/internal/vault"
 	"github.com/soapbucket/sbproxy/pkg/plugin"
 )
@@ -81,7 +81,7 @@ func LoadWithContext(ctx context.Context, data []byte) (*Config, error) {
 	// Secrets can be either a single provider object (old format, has "type" key)
 	// or a map[string]string of name->reference pairs (new vault format).
 	var preConfig struct {
-		Secrets json.RawMessage            `json:"secrets,omitempty"`
+		Secrets json.RawMessage                  `json:"secrets,omitempty"`
 		Vaults  map[string]vault.VaultDefinition `json:"vaults,omitempty"`
 	}
 	if err := json.Unmarshal(data, &preConfig); err != nil {
@@ -230,7 +230,6 @@ func LoadWithContext(ctx context.Context, data []byte) (*Config, error) {
 // ActionConfigLoaderFn is a function type for action config loader fn callbacks.
 type ActionConfigLoaderFn func(data []byte) (ActionConfig, error)
 
-
 // LoadActionConfig performs the load action config operation.
 // It uses the global Registry if set, otherwise falls back to plugin registry.
 func LoadActionConfig(data json.RawMessage) (ActionConfig, error) {
@@ -329,7 +328,6 @@ func (*BaseAction) ErrorHandler() ErrorHandlerFn {
 
 // ── authorization.go ──────────────────────────────────────────────────────────
 
-
 // AuthConfig defines the interface for auth config operations.
 type AuthConfig interface {
 	GetType() string
@@ -399,7 +397,6 @@ func (a Auth) MarshalJSON() ([]byte, error) {
 }
 
 // ── policy.go ─────────────────────────────────────────────────────────────────
-
 
 // PolicyConfig defines the interface for policy config operations.
 type PolicyConfig interface {
@@ -487,7 +484,6 @@ func (s Policy) MarshalJSON() ([]byte, error) {
 }
 
 // ── transform.go ──────────────────────────────────────────────────────────────
-
 
 // TransformConfig defines the interface for transform config operations.
 type TransformConfig interface {

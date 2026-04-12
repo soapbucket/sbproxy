@@ -32,9 +32,9 @@ func TestStreaming_FullPipeline_E2E(t *testing.T) {
 			w.Header().Set("Content-Type", "application/vnd.kafka.v2+json")
 			json.NewEncoder(w).Encode(restProduceResponse{
 				Offsets: []struct {
-					Partition int   `json:"partition"`
-					Offset    int64 `json:"offset"`
-					ErrorCode *int  `json:"error_code,omitempty"`
+					Partition int    `json:"partition"`
+					Offset    int64  `json:"offset"`
+					ErrorCode *int   `json:"error_code,omitempty"`
 					Error     string `json:"error,omitempty"`
 				}{
 					{Partition: 0, Offset: 100},
@@ -209,9 +209,9 @@ func TestStreaming_FullPipeline_E2E(t *testing.T) {
 			w.Header().Set("Content-Type", "application/vnd.kafka.v2+json")
 			json.NewEncoder(w).Encode(restProduceResponse{
 				Offsets: []struct {
-					Partition int   `json:"partition"`
-					Offset    int64 `json:"offset"`
-					ErrorCode *int  `json:"error_code,omitempty"`
+					Partition int    `json:"partition"`
+					Offset    int64  `json:"offset"`
+					ErrorCode *int   `json:"error_code,omitempty"`
 					Error     string `json:"error,omitempty"`
 				}{
 					{Partition: 0, Offset: 200},
@@ -294,9 +294,9 @@ func TestStreaming_FullPipeline_E2E(t *testing.T) {
 			w.Header().Set("Content-Type", "application/vnd.kafka.v2+json")
 			json.NewEncoder(w).Encode(restProduceResponse{
 				Offsets: []struct {
-					Partition int   `json:"partition"`
-					Offset    int64 `json:"offset"`
-					ErrorCode *int  `json:"error_code,omitempty"`
+					Partition int    `json:"partition"`
+					Offset    int64  `json:"offset"`
+					ErrorCode *int   `json:"error_code,omitempty"`
 					Error     string `json:"error,omitempty"`
 				}{
 					{Partition: 0, Offset: 1},
@@ -394,9 +394,9 @@ func TestStreaming_FullPipeline_E2E(t *testing.T) {
 
 				json.NewEncoder(w).Encode(restProduceResponse{
 					Offsets: []struct {
-						Partition int   `json:"partition"`
-						Offset    int64 `json:"offset"`
-						ErrorCode *int  `json:"error_code,omitempty"`
+						Partition int    `json:"partition"`
+						Offset    int64  `json:"offset"`
+						ErrorCode *int   `json:"error_code,omitempty"`
 						Error     string `json:"error,omitempty"`
 					}{
 						{Partition: 0, Offset: 500},

@@ -54,11 +54,11 @@ func TestCompileOrigin_FullPipeline(t *testing.T) {
 		Transforms: []json.RawMessage{
 			json.RawMessage(`{"type":"test_json_inject"}`),
 		},
-		ErrorPages:  json.RawMessage(`[{"status":[404],"content_type":"text/plain","body":"custom 404"}]`),
-		Compression: json.RawMessage(`{"enable":true,"algorithms":["gzip"],"min_size":1}`),
-		CORS:        json.RawMessage(`{"enable":true,"allow_origins":["*"]}`),
-		HSTS:        json.RawMessage(`{"enabled":true,"max_age":31536000}`),
-		OnRequest:   json.RawMessage(`[]`),
+		ErrorPages:     json.RawMessage(`[{"status":[404],"content_type":"text/plain","body":"custom 404"}]`),
+		Compression:    json.RawMessage(`{"enable":true,"algorithms":["gzip"],"min_size":1}`),
+		CORS:           json.RawMessage(`{"enable":true,"allow_origins":["*"]}`),
+		HSTS:           json.RawMessage(`{"enabled":true,"max_age":31536000}`),
+		OnRequest:      json.RawMessage(`[]`),
 		AllowedMethods: []string{"GET", "POST"},
 	}
 
@@ -243,11 +243,11 @@ func TestCompileOrigin_ExecutionOrder(t *testing.T) {
 	}()
 
 	raw := &RawOrigin{
-		ID:       "order-test",
-		Hostname: "order.example.com",
-		Action:   json.RawMessage(`{"type":"order_action"}`),
-		Auth:     json.RawMessage(`{"type":"order_auth"}`),
-		Policies: []json.RawMessage{json.RawMessage(`{"type":"order_policy"}`)},
+		ID:         "order-test",
+		Hostname:   "order.example.com",
+		Action:     json.RawMessage(`{"type":"order_action"}`),
+		Auth:       json.RawMessage(`{"type":"order_auth"}`),
+		Policies:   []json.RawMessage{json.RawMessage(`{"type":"order_policy"}`)},
 		Transforms: []json.RawMessage{json.RawMessage(`{"type":"order_transform"}`)},
 	}
 
@@ -358,10 +358,10 @@ func TestCompileOrigin_RequestModifierReachesAction(t *testing.T) {
 	defer plugin.RegisterAction("test_header_echo", nil)
 
 	raw := &RawOrigin{
-		ID:       "reqmod-pipeline",
-		Hostname: "reqmod-pipeline.example.com",
-		Action:   json.RawMessage(`{"type":"test_header_echo"}`),
-		Auth:     json.RawMessage(`{"type":"test_auth"}`),
+		ID:        "reqmod-pipeline",
+		Hostname:  "reqmod-pipeline.example.com",
+		Action:    json.RawMessage(`{"type":"test_header_echo"}`),
+		Auth:      json.RawMessage(`{"type":"test_auth"}`),
 		Modifiers: json.RawMessage(`[{"headers":{"set":{"X-Custom":"from-modifier"}}}]`),
 	}
 

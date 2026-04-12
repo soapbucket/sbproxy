@@ -9,11 +9,11 @@ import (
 // ChunkContinuationWriter is a response writer that continues writing after a cached chunk
 // It doesn't try to write headers (they've already been sent) and tracks the offset
 type ChunkContinuationWriter struct {
-	rw              http.ResponseWriter
-	offset          int // Bytes already written (cached chunk size)
-	flusher         http.Flusher
-	headersWritten  bool
-	bytesWritten    int
+	rw             http.ResponseWriter
+	offset         int // Bytes already written (cached chunk size)
+	flusher        http.Flusher
+	headersWritten bool
+	bytesWritten   int
 }
 
 // Header performs the header operation on the ChunkContinuationWriter.
@@ -48,19 +48,19 @@ func (c *ChunkContinuationWriter) Write(p []byte) (n int, err error) {
 	case c.offset > n:
 		// Entire chunk was already sent, just reduce offset
 		c.offset -= n
-		slog.Debug("chunk continuation: skipping bytes already sent", 
-			"bytes_to_skip", n, 
+		slog.Debug("chunk continuation: skipping bytes already sent",
+			"bytes_to_skip", n,
 			"offset_remaining", c.offset)
-		
+
 	case c.offset > 0:
 		// Partial overlap: skip the offset bytes, write the rest
 		index := c.offset
 		c.offset = 0
-		
-		slog.Debug("chunk continuation: partial overlap", 
-			"skipping", index, 
+
+		slog.Debug("chunk continuation: partial overlap",
+			"skipping", index,
 			"writing", n-index)
-		
+
 		// Write only the new bytes
 		if index < n {
 			n2, err2 := c.rw.Write(p[index:])
@@ -69,7 +69,7 @@ func (c *ChunkContinuationWriter) Write(p []byte) (n int, err error) {
 			}
 			c.bytesWritten += n2
 		}
-		
+
 	default:
 		// No overlap, write everything
 		n, err = c.rw.Write(p)
@@ -90,4 +90,3 @@ func (c *ChunkContinuationWriter) Flush() {
 func (c *ChunkContinuationWriter) Unwrap() http.ResponseWriter {
 	return c.rw
 }
-

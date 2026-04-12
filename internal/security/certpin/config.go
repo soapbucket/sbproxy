@@ -8,6 +8,3 @@ type CertificatePinningConfig struct {
 	BackupPins []string `json:"backup_pins"`          // Backup pins for rotation
 	PinExpiry  string   `json:"pin_expiry,omitempty"` // Optional expiry date (RFC3339 format)
 }
-
-
-

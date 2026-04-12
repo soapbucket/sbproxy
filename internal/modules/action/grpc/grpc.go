@@ -95,8 +95,8 @@ func New(raw json.RawMessage) (plugin.ActionHandler, error) {
 	baseTransport := internaltransport.NewTransportFromConfig(connCfg)
 
 	tr := &grpcTransport{
-		base:            baseTransport,
-		forwardMetadata: cfg.ForwardMetadata,
+		base:               baseTransport,
+		forwardMetadata:    cfg.ForwardMetadata,
 		disableCompression: cfg.DisableCompression,
 	}
 

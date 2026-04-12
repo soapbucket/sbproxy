@@ -19,13 +19,13 @@ type Config struct {
 
 	// Connection settings (mirrors BaseConnection).
 	// Duration fields accept human-readable strings ("30s", "5m").
-	SkipTLSVerifyHost  bool   `json:"skip_tls_verify_host,omitempty"`
-	MinTLSVersion      string `json:"min_tls_version,omitempty"`
-	HTTP11Only         bool   `json:"http11_only,omitempty"`
-	EnableHTTP3        bool   `json:"enable_http3,omitempty"`
-	DisableCompression bool   `json:"disable_compression,omitempty"`
-	DisableFollowRedirects bool `json:"disable_follow_redirects,omitempty"`
-	MaxRedirects       int    `json:"max_redirects,omitempty"`
+	SkipTLSVerifyHost      bool   `json:"skip_tls_verify_host,omitempty"`
+	MinTLSVersion          string `json:"min_tls_version,omitempty"`
+	HTTP11Only             bool   `json:"http11_only,omitempty"`
+	EnableHTTP3            bool   `json:"enable_http3,omitempty"`
+	DisableCompression     bool   `json:"disable_compression,omitempty"`
+	DisableFollowRedirects bool   `json:"disable_follow_redirects,omitempty"`
+	MaxRedirects           int    `json:"max_redirects,omitempty"`
 
 	Timeout             pkgconfig.Duration `json:"timeout,omitempty"`
 	Delay               pkgconfig.Duration `json:"delay,omitempty"`

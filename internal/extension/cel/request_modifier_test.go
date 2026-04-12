@@ -69,8 +69,8 @@ func TestNewModifier(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "syntax error",
-			expr: `{`,
+			name:    "syntax error",
+			expr:    `{`,
 			wantErr: true,
 		},
 	}
@@ -127,7 +127,7 @@ func TestModifierSetHeaders(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "http://example.com/test", nil)
 	req.Header.Set("Content-Type", "text/html")
-	
+
 	modifiedReq, err := modifier.Modify(req)
 	if err != nil {
 		t.Fatalf("Modify() error = %v", err)
@@ -151,7 +151,7 @@ func TestModifierDeleteHeaders(t *testing.T) {
 	req := httptest.NewRequest("GET", "http://example.com/test", nil)
 	req.Header.Set("X-Remove-Me", "value")
 	req.Header.Set("X-Keep-Me", "value")
-	
+
 	modifiedReq, err := modifier.Modify(req)
 	if err != nil {
 		t.Fatalf("Modify() error = %v", err)
@@ -503,4 +503,3 @@ func TestModifierCombined(t *testing.T) {
 		t.Errorf("Expected old_param to be deleted")
 	}
 }
-

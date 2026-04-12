@@ -8,27 +8,27 @@ import (
 
 // VirtualKey represents an AI virtual key for multi-tenant access control.
 type VirtualKey struct {
-	ID                string            `json:"id"`                              // "sk-sb-..." prefix
+	ID                string            `json:"id"` // "sk-sb-..." prefix
 	Name              string            `json:"name"`
-	HashedKey         string            `json:"hashed_key"`                      // SHA256 of raw key
+	HashedKey         string            `json:"hashed_key"` // SHA256 of raw key
 	WorkspaceID       string            `json:"workspace_id"`
 	TeamID            string            `json:"team_id,omitempty"`
 	CreatedBy         string            `json:"created_by,omitempty"`
 	CreatedAt         time.Time         `json:"created_at"`
 	ExpiresAt         *time.Time        `json:"expires_at,omitempty"`
-	Status            string            `json:"status"`                          // "active", "revoked", "expired"
+	Status            string            `json:"status"` // "active", "revoked", "expired"
 	AllowedModels     []string          `json:"allowed_models,omitempty"`
 	BlockedModels     []string          `json:"blocked_models,omitempty"`
 	AllowedProviders  []string          `json:"allowed_providers,omitempty"`
 	MaxTokensPerMin   int               `json:"max_tokens_per_min,omitempty"`
 	MaxRequestsPerMin int               `json:"max_requests_per_min,omitempty"`
 	MaxBudgetUSD      float64           `json:"max_budget_usd,omitempty"`
-	BudgetPeriod      string            `json:"budget_period,omitempty"`         // "daily", "monthly", "total"
-	MaxTokens         int64             `json:"max_tokens,omitempty"`            // Token-based budget limit
-	TokenBudgetAction string            `json:"token_budget_action,omitempty"`   // "block" (default) or "downgrade"
-	DowngradeMap      map[string]string `json:"downgrade_map,omitempty"`         // model -> cheaper model (when action="downgrade")
-	ProviderKeys      map[string]string `json:"provider_keys,omitempty"`         // provider_name -> API key
-	ModelAliases      map[string]string `json:"model_aliases,omitempty"`         // alias -> actual model (e.g., "fast" -> "gpt-4o-mini")
+	BudgetPeriod      string            `json:"budget_period,omitempty"`       // "daily", "monthly", "total"
+	MaxTokens         int64             `json:"max_tokens,omitempty"`          // Token-based budget limit
+	TokenBudgetAction string            `json:"token_budget_action,omitempty"` // "block" (default) or "downgrade"
+	DowngradeMap      map[string]string `json:"downgrade_map,omitempty"`       // model -> cheaper model (when action="downgrade")
+	ProviderKeys      map[string]string `json:"provider_keys,omitempty"`       // provider_name -> API key
+	ModelAliases      map[string]string `json:"model_aliases,omitempty"`       // alias -> actual model (e.g., "fast" -> "gpt-4o-mini")
 	Metadata          map[string]string `json:"metadata,omitempty"`
 
 	// Role controls access level: "admin" (all models, no limits), "user" (enforced), "readonly" (403).
@@ -103,15 +103,15 @@ type UsageStore interface {
 
 // KeyUsage tracks per-key resource consumption.
 type KeyUsage struct {
-	KeyID       string    `json:"key_id"`
-	Requests    int64     `json:"requests"`
-	InputTokens int64    `json:"input_tokens"`
-	OutputTokens int64   `json:"output_tokens"`
-	TotalTokens int64    `json:"total_tokens"`
-	CostUSD     float64  `json:"cost_usd"`
-	Errors      int64    `json:"errors"`
-	Period      string   `json:"period"`       // "daily", "monthly", "total"
-	PeriodStart time.Time `json:"period_start"`
+	KeyID        string    `json:"key_id"`
+	Requests     int64     `json:"requests"`
+	InputTokens  int64     `json:"input_tokens"`
+	OutputTokens int64     `json:"output_tokens"`
+	TotalTokens  int64     `json:"total_tokens"`
+	CostUSD      float64   `json:"cost_usd"`
+	Errors       int64     `json:"errors"`
+	Period       string    `json:"period"` // "daily", "monthly", "total"
+	PeriodStart  time.Time `json:"period_start"`
 }
 
 // ListOpts configures listing virtual keys.

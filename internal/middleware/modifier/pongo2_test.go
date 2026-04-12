@@ -5,8 +5,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/request/data"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 // TestRequestModifier_MustacheTemplates tests Mustache template resolution in modifiers

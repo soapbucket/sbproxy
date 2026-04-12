@@ -36,6 +36,7 @@ func NewMaxTokensGuard(config json.RawMessage) (Guardrail, error) {
 
 // Name performs the name operation on the maxTokensGuard.
 func (g *maxTokensGuard) Name() string { return "max_tokens" }
+
 // Phase performs the phase operation on the maxTokensGuard.
 func (g *maxTokensGuard) Phase() Phase { return PhaseInput }
 
@@ -88,6 +89,7 @@ func NewLengthLimitGuard(config json.RawMessage) (Guardrail, error) {
 
 // Name performs the name operation on the lengthLimitGuard.
 func (g *lengthLimitGuard) Name() string { return "length_limit" }
+
 // Phase performs the phase operation on the lengthLimitGuard.
 func (g *lengthLimitGuard) Phase() Phase { return PhaseInput }
 

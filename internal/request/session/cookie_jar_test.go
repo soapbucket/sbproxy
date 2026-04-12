@@ -109,7 +109,7 @@ func TestSessionDataCookieJar_PathMatching(t *testing.T) {
 		},
 		{
 			Name:  "root_cookie",
-			Value:  "value2",
+			Value: "value2",
 			Path:  "/",
 		},
 	}
@@ -145,7 +145,7 @@ func TestSessionDataCookieJar_ExpiredCookies(t *testing.T) {
 	jar := NewSessionDataCookieJar(sessionData)
 
 	targetURL, _ := url.Parse("https://example.com/")
-	
+
 	// Create expired cookie
 	expiredTime := time.Now().Add(-1 * time.Hour)
 	cookies := []*http.Cookie{
@@ -823,13 +823,13 @@ func TestSessionDataCookieJar_JSONRoundTrip(t *testing.T) {
 	}
 
 	jar.SetCookies(targetURL, originalCookies)
-	
+
 	t.Logf("After SetCookies: %d cookies in jar", jar.GetCookieCount())
 	if jar.GetCookieCount() > 0 {
 		t.Logf("Stored cookie: name=%s, domain=%s, path=%s, hostonly=%v",
 			jar.CookieJar[0].Name, jar.CookieJar[0].Domain, jar.CookieJar[0].Path, jar.CookieJar[0].HostOnly)
 	}
-	
+
 	jar.SyncToSessionData()
 
 	// Marshal to JSON and back (simulates storage)
@@ -837,7 +837,7 @@ func TestSessionDataCookieJar_JSONRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to marshal cookies: %v", err)
 	}
-	
+
 	t.Logf("JSON: %s", string(jsonData))
 
 	var unmarshaledCookies []interface{}
@@ -853,17 +853,17 @@ func TestSessionDataCookieJar_JSONRoundTrip(t *testing.T) {
 
 	// Create new jar from unmarshaled data
 	newJar := NewSessionDataCookieJar(newSessionData)
-	
+
 	t.Logf("After loading: %d cookies in new jar", newJar.GetCookieCount())
 	if newJar.GetCookieCount() > 0 {
 		t.Logf("Loaded cookie: name=%s, domain=%s, path=%s, hostonly=%v",
 			newJar.CookieJar[0].Name, newJar.CookieJar[0].Domain, newJar.CookieJar[0].Path, newJar.CookieJar[0].HostOnly)
 	}
-	
+
 	// Try to retrieve - must use URL matching the cookie's path
 	retrieveURL, _ := url.Parse("https://example.com/api/endpoint")
 	retrieved := newJar.Cookies(retrieveURL)
-	
+
 	t.Logf("Retrieved %d cookies", len(retrieved))
 	for _, c := range retrieved {
 		t.Logf("  Cookie: name=%s, domain=%s, path=%s", c.Name, c.Domain, c.Path)
@@ -1252,10 +1252,10 @@ func TestSessionDataCookieJar_MaxAgeVsExpires(t *testing.T) {
 	targetURL, _ := url.Parse("https://example.com/")
 
 	tests := []struct {
-		name          string
-		maxAge        int
-		expires       time.Time
-		expectStored  bool
+		name            string
+		maxAge          int
+		expires         time.Time
+		expectStored    bool
 		expectRetrieved bool
 	}{
 		{
@@ -1388,7 +1388,7 @@ func TestSessionDataCookieJar_ConcurrentReadOperations(t *testing.T) {
 	if len(retrieved) != 2 {
 		t.Errorf("Expected 2 cookies after concurrent reads, got %d", len(retrieved))
 	}
-	
+
 	// Note: SyncToSessionData should only be called from single goroutine
 	// in practice (when saving session), so we don't test concurrent syncs
 }
@@ -1473,7 +1473,7 @@ func TestSessionDataCookieJar_RemoveCookieDirectly(t *testing.T) {
 	}
 
 	jar := NewSessionDataCookieJar(sessionData)
-	
+
 	// Add cookies directly to jar
 	jar.mu.Lock()
 	jar.CookieJar = []SerializableCookie{
@@ -1580,4 +1580,3 @@ func TestSessionDataCookieJar_UpdateCookieValue(t *testing.T) {
 		t.Error("Cookie value not properly updated")
 	}
 }
-

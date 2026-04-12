@@ -77,11 +77,11 @@ func TestInstrumentedPipeline_Execution(t *testing.T) {
 
 func TestInstrumentedPipeline_VisualizationHeader(t *testing.T) {
 	stageA := NamedTransform{
-		Name:      "encoding",
+		Name:        "encoding",
 		Transformer: Func(func(*http.Response) error { return nil }),
 	}
 	stageB := NamedTransform{
-		Name:      "html",
+		Name:        "html",
 		Transformer: Func(func(*http.Response) error { return nil }),
 	}
 

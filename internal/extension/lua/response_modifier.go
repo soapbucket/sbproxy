@@ -8,16 +8,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
-	lua "github.com/yuin/gopher-lua"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
+	lua "github.com/yuin/gopher-lua"
 )
 
 // ErrNoResponseModifications is returned when a Lua script produces no modifications.
@@ -31,11 +31,11 @@ type ResponseModificationResult struct {
 	AddHeaders map[string]string
 	// DeleteHeaders contains header names to delete
 	DeleteHeaders []string
-	
+
 	// Status modifications
 	StatusCode int    // New status code to set (if not 0)
 	StatusText string // Custom status text (overrides default for status code)
-	
+
 	// Body modifications
 	Body              string // Simple body replacement (deprecated, use BodyReplace)
 	BodyRemove        bool   // Remove body entirely
@@ -309,7 +309,6 @@ func (m *responseModifier) newSandboxedState() *lua.LState {
 	return newSandboxedState()
 }
 
-
 // createResponseTable creates a Lua table with response data
 func createResponseTable(L *lua.LState, resp *http.Response) *lua.LTable {
 	respTable := L.NewTable()
@@ -488,8 +487,8 @@ func applyResponseModifications(resp *http.Response, mods *ResponseModificationR
 
 	// Apply body modifications
 	// Priority: BodyReplaceBase64 > BodyReplaceJSON > BodyReplace > Body (deprecated) > BodyRemove
-	if mods.BodyReplaceBase64 != "" || mods.BodyReplaceJSON != "" || 
-	   mods.BodyReplace != "" || mods.Body != "" || mods.BodyRemove {
+	if mods.BodyReplaceBase64 != "" || mods.BodyReplaceJSON != "" ||
+		mods.BodyReplace != "" || mods.Body != "" || mods.BodyRemove {
 		var bodyBytes []byte
 		var err error
 

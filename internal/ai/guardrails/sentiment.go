@@ -49,6 +49,7 @@ func NewSentimentGuard(config json.RawMessage) (Guardrail, error) {
 
 // Name performs the name operation on the sentimentGuard.
 func (g *sentimentGuard) Name() string { return "sentiment" }
+
 // Phase performs the phase operation on the sentimentGuard.
 func (g *sentimentGuard) Phase() Phase { return PhaseOutput }
 

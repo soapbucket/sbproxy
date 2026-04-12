@@ -69,8 +69,8 @@ type CircuitBreakerConfig struct {
 	SuccessThreshold       int `json:"success_threshold,omitempty"`
 	RequestVolumeThreshold int `json:"request_volume_threshold,omitempty"`
 
-	Timeout     string  `json:"timeout,omitempty"`
-	SleepWindow string  `json:"sleep_window,omitempty"`
+	Timeout     string `json:"timeout,omitempty"`
+	SleepWindow string `json:"sleep_window,omitempty"`
 
 	ErrorRateThreshold float64 `json:"error_rate_threshold,omitempty"`
 	HalfOpenRequests   int     `json:"half_open_requests,omitempty"`

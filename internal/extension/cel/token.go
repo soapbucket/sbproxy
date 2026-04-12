@@ -2,8 +2,8 @@
 package cel
 
 import (
-	json "github.com/goccy/go-json"
 	"errors"
+	json "github.com/goccy/go-json"
 	"log/slog"
 
 	"github.com/google/cel-go/cel"

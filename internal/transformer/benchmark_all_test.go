@@ -27,13 +27,13 @@ func init() {
 	} else {
 		benchmarkJS = `function add(a, b) { return a + b; } const multiply = function(x, y) { return x * y; }; let result = add(5, 10); console.log('Result:', result);`
 	}
-	
+
 	if cssData, err := os.ReadFile("fixtures/test.css"); err == nil {
 		benchmarkCSS = string(cssData)
 	} else {
 		benchmarkCSS = `body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #ffffff; } .container { width: 100%; max-width: 1200px; margin: 0 auto; }`
 	}
-	
+
 	if jsonData, err := os.ReadFile("fixtures/test.json"); err == nil {
 		benchmarkJSON = string(jsonData)
 	} else {
@@ -44,16 +44,16 @@ func init() {
 // BenchmarkMinifyJavascript benchmarks JavaScript minification
 func BenchmarkMinifyJavascript(b *testing.B) {
 	b.ReportAllocs()
-	
+
 	resp := &http.Response{
 		Body:    io.NopCloser(strings.NewReader(benchmarkJS)),
 		Header:  make(http.Header),
 		Request: httptest.NewRequest("GET", "http://example.com/test.js", nil),
 	}
 	resp.Header.Set("Content-Type", "application/javascript")
-	
+
 	transform := MinifyJavascript(MinifyJavascriptOptions{})
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		resp.Body = io.NopCloser(strings.NewReader(benchmarkJS))
@@ -68,20 +68,20 @@ func BenchmarkMinifyJavascript(b *testing.B) {
 // BenchmarkMinifyJavascript_WithOptions benchmarks JavaScript minification with options
 func BenchmarkMinifyJavascript_WithOptions(b *testing.B) {
 	b.ReportAllocs()
-	
+
 	resp := &http.Response{
 		Body:    io.NopCloser(strings.NewReader(benchmarkJS)),
 		Header:  make(http.Header),
 		Request: httptest.NewRequest("GET", "http://example.com/test.js", nil),
 	}
 	resp.Header.Set("Content-Type", "application/javascript")
-	
+
 	transform := MinifyJavascript(MinifyJavascriptOptions{
 		Precision:    2,
 		KeepVarNames: true,
 		Version:      5,
 	})
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		resp.Body = io.NopCloser(strings.NewReader(benchmarkJS))
@@ -96,16 +96,16 @@ func BenchmarkMinifyJavascript_WithOptions(b *testing.B) {
 // BenchmarkMinifyCSS benchmarks CSS minification
 func BenchmarkMinifyCSS(b *testing.B) {
 	b.ReportAllocs()
-	
+
 	resp := &http.Response{
 		Body:    io.NopCloser(strings.NewReader(benchmarkCSS)),
 		Header:  make(http.Header),
 		Request: httptest.NewRequest("GET", "http://example.com/test.css", nil),
 	}
 	resp.Header.Set("Content-Type", "text/css")
-	
+
 	transform := MinifyCSS(MinifyCSSOptions{})
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		resp.Body = io.NopCloser(strings.NewReader(benchmarkCSS))
@@ -120,20 +120,20 @@ func BenchmarkMinifyCSS(b *testing.B) {
 // BenchmarkMinifyCSS_WithOptions benchmarks CSS minification with options
 func BenchmarkMinifyCSS_WithOptions(b *testing.B) {
 	b.ReportAllocs()
-	
+
 	resp := &http.Response{
 		Body:    io.NopCloser(strings.NewReader(benchmarkCSS)),
 		Header:  make(http.Header),
 		Request: httptest.NewRequest("GET", "http://example.com/test.css", nil),
 	}
 	resp.Header.Set("Content-Type", "text/css")
-	
+
 	transform := MinifyCSS(MinifyCSSOptions{
 		Precision: 2,
 		Inline:    true,
 		Version:   3,
 	})
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		resp.Body = io.NopCloser(strings.NewReader(benchmarkCSS))
@@ -148,20 +148,20 @@ func BenchmarkMinifyCSS_WithOptions(b *testing.B) {
 // BenchmarkOptimizeHTML benchmarks HTML optimization
 func BenchmarkOptimizeHTML(b *testing.B) {
 	b.ReportAllocs()
-	
+
 	resp := &http.Response{
 		Body:    io.NopCloser(strings.NewReader(benchmarkHTML)),
 		Header:  make(http.Header),
 		Request: httptest.NewRequest("GET", "http://example.com/test.html", nil),
 	}
 	resp.Header.Set("Content-Type", "text/html")
-	
+
 	transform := ModifyHTML(OptimizeHTML(OptimizeHTMLOptions{
 		RemoveBooleanAttributes: true,
 		StripComments:           true,
 		OptimizeAttributes:      true,
 	}))
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		resp.Body = io.NopCloser(strings.NewReader(benchmarkHTML))
@@ -176,7 +176,7 @@ func BenchmarkOptimizeHTML(b *testing.B) {
 // BenchmarkOptimizeHTML_Lowercase benchmarks HTML optimization with lowercasing
 func BenchmarkOptimizeHTML_Lowercase(b *testing.B) {
 	b.ReportAllocs()
-	
+
 	htmlInput := `<DIV CLASS="test" ID="main">Content</DIV>`
 	resp := &http.Response{
 		Body:    io.NopCloser(strings.NewReader(htmlInput)),
@@ -184,12 +184,12 @@ func BenchmarkOptimizeHTML_Lowercase(b *testing.B) {
 		Request: httptest.NewRequest("GET", "http://example.com/test.html", nil),
 	}
 	resp.Header.Set("Content-Type", "text/html")
-	
+
 	transform := ModifyHTML(OptimizeHTML(OptimizeHTMLOptions{
 		LowercaseTags:       true,
 		LowercaseAttributes: true,
 	}))
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		resp.Body = io.NopCloser(strings.NewReader(htmlInput))
@@ -204,7 +204,7 @@ func BenchmarkOptimizeHTML_Lowercase(b *testing.B) {
 // BenchmarkStripSpace benchmarks whitespace stripping
 func BenchmarkStripSpace(b *testing.B) {
 	b.ReportAllocs()
-	
+
 	htmlInput := `<div>   Content   with   spaces   </div>`
 	resp := &http.Response{
 		Body:    io.NopCloser(strings.NewReader(htmlInput)),
@@ -212,12 +212,12 @@ func BenchmarkStripSpace(b *testing.B) {
 		Request: httptest.NewRequest("GET", "http://example.com/test.html", nil),
 	}
 	resp.Header.Set("Content-Type", "text/html")
-	
+
 	transform := ModifyHTML(StripSpace(StripSpaceOptions{
 		StripNewlines:    true,
 		StripExtraSpaces: true,
 	}))
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		resp.Body = io.NopCloser(strings.NewReader(htmlInput))
@@ -232,7 +232,7 @@ func BenchmarkStripSpace(b *testing.B) {
 // BenchmarkAddUniqueID benchmarks unique ID addition
 func BenchmarkAddUniqueID(b *testing.B) {
 	b.ReportAllocs()
-	
+
 	htmlInput := `<div>Content</div><p>Text</p><span>More</span>`
 	resp := &http.Response{
 		Body:    io.NopCloser(strings.NewReader(htmlInput)),
@@ -240,11 +240,11 @@ func BenchmarkAddUniqueID(b *testing.B) {
 		Request: httptest.NewRequest("GET", "http://example.com/test.html", nil),
 	}
 	resp.Header.Set("Content-Type", "text/html")
-	
+
 	transform := ModifyHTML(AddUniqueID(AddUniqueIDOptions{
 		Prefix: "test",
 	}))
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		resp.Body = io.NopCloser(strings.NewReader(htmlInput))
@@ -259,16 +259,16 @@ func BenchmarkAddUniqueID(b *testing.B) {
 // BenchmarkOptimizeJSON benchmarks JSON optimization
 func BenchmarkOptimizeJSON(b *testing.B) {
 	b.ReportAllocs()
-	
+
 	resp := &http.Response{
 		Body:    io.NopCloser(strings.NewReader(benchmarkJSON)),
 		Header:  make(http.Header),
 		Request: httptest.NewRequest("GET", "http://example.com/test.json", nil),
 	}
 	resp.Header.Set("Content-Type", "application/json")
-	
+
 	transform := OptimizeJSON(JSONOptions{})
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		resp.Body = io.NopCloser(strings.NewReader(benchmarkJSON))
@@ -283,14 +283,14 @@ func BenchmarkOptimizeJSON(b *testing.B) {
 // BenchmarkOptimizeJSON_WithPruning benchmarks JSON optimization with pruning
 func BenchmarkOptimizeJSON_WithPruning(b *testing.B) {
 	b.ReportAllocs()
-	
+
 	resp := &http.Response{
 		Body:    io.NopCloser(strings.NewReader(benchmarkJSON)),
 		Header:  make(http.Header),
 		Request: httptest.NewRequest("GET", "http://example.com/test.json", nil),
 	}
 	resp.Header.Set("Content-Type", "application/json")
-	
+
 	transform := OptimizeJSON(JSONOptions{
 		RemoveEmptyStrings:  true,
 		RemoveFalseBooleans: true,
@@ -298,7 +298,7 @@ func BenchmarkOptimizeJSON_WithPruning(b *testing.B) {
 		RemoveEmptyObjects:  true,
 		RemoveEmptyArrays:   true,
 	})
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		resp.Body = io.NopCloser(strings.NewReader(benchmarkJSON))
@@ -313,14 +313,14 @@ func BenchmarkOptimizeJSON_WithPruning(b *testing.B) {
 // BenchmarkDiscard benchmarks discarding bytes
 func BenchmarkDiscard(b *testing.B) {
 	b.ReportAllocs()
-	
+
 	input := strings.Repeat("Hello World ", 100)
 	resp := &http.Response{
 		Body: io.NopCloser(strings.NewReader(input)),
 	}
-	
+
 	transform := Discard(50)
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		resp.Body = io.NopCloser(strings.NewReader(input))
@@ -335,13 +335,13 @@ func BenchmarkDiscard(b *testing.B) {
 // BenchmarkNoop benchmarks no-op transform
 func BenchmarkNoop(b *testing.B) {
 	b.ReportAllocs()
-	
+
 	resp := &http.Response{
 		Body:    io.NopCloser(strings.NewReader(benchmarkHTML)),
 		Header:  make(http.Header),
 		Request: httptest.NewRequest("GET", "http://example.com/test.html", nil),
 	}
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		resp.Body = io.NopCloser(strings.NewReader(benchmarkHTML))
@@ -354,14 +354,14 @@ func BenchmarkNoop(b *testing.B) {
 // BenchmarkFixEncoding benchmarks encoding fix
 func BenchmarkFixEncoding(b *testing.B) {
 	b.ReportAllocs()
-	
+
 	// Create gzipped content
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	gz.Write([]byte(benchmarkHTML))
 	gz.Close()
 	gzipped := buf.Bytes()
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		resp := &http.Response{
@@ -370,7 +370,7 @@ func BenchmarkFixEncoding(b *testing.B) {
 			Request: httptest.NewRequest("GET", "http://example.com/test.html", nil),
 		}
 		resp.Header.Set("Content-Encoding", "gzip")
-		
+
 		transform := FixEncoding()
 		if err := transform.Modify(resp); err != nil {
 			b.Fatal(err)
@@ -383,12 +383,12 @@ func BenchmarkFixEncoding(b *testing.B) {
 // BenchmarkHTMLTokenizer_All benchmarks HTML tokenization
 func BenchmarkHTMLTokenizer_All(b *testing.B) {
 	b.ReportAllocs()
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		reader := strings.NewReader(benchmarkHTML)
 		tokenizer := html.NewTokenizer(reader)
-		
+
 		for {
 			tokenType := tokenizer.Next()
 			if tokenType == html.ErrorToken {
@@ -402,14 +402,14 @@ func BenchmarkHTMLTokenizer_All(b *testing.B) {
 // BenchmarkHTMLTransformer_WithMultipleModifiers benchmarks HTML transformer with multiple modifiers
 func BenchmarkHTMLTransformer_WithMultipleModifiers(b *testing.B) {
 	b.ReportAllocs()
-	
+
 	resp := &http.Response{
 		Body:    io.NopCloser(strings.NewReader(benchmarkHTML)),
 		Header:  make(http.Header),
 		Request: httptest.NewRequest("GET", "http://example.com/test.html", nil),
 	}
 	resp.Header.Set("Content-Type", "text/html")
-	
+
 	transform := ModifyHTML(
 		OptimizeHTML(OptimizeHTMLOptions{
 			LowercaseTags:       true,
@@ -423,7 +423,7 @@ func BenchmarkHTMLTransformer_WithMultipleModifiers(b *testing.B) {
 			Prefix: "test",
 		}),
 	)
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		resp.Body = io.NopCloser(strings.NewReader(benchmarkHTML))
@@ -438,7 +438,7 @@ func BenchmarkHTMLTransformer_WithMultipleModifiers(b *testing.B) {
 // BenchmarkLargeFile_JavaScript benchmarks minification of large JavaScript file
 func BenchmarkLargeFile_JavaScript(b *testing.B) {
 	b.ReportAllocs()
-	
+
 	// Wrap in block scopes {} so const/let declarations don't conflict when repeated
 	largeJS := strings.Repeat("{\n"+benchmarkJS+"\n}\n", 100)
 	resp := &http.Response{
@@ -447,9 +447,9 @@ func BenchmarkLargeFile_JavaScript(b *testing.B) {
 		Request: httptest.NewRequest("GET", "http://example.com/large.js", nil),
 	}
 	resp.Header.Set("Content-Type", "application/javascript")
-	
+
 	transform := MinifyJavascript(MinifyJavascriptOptions{})
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		resp.Body = io.NopCloser(strings.NewReader(largeJS))
@@ -464,7 +464,7 @@ func BenchmarkLargeFile_JavaScript(b *testing.B) {
 // BenchmarkLargeFile_CSS benchmarks minification of large CSS file
 func BenchmarkLargeFile_CSS(b *testing.B) {
 	b.ReportAllocs()
-	
+
 	largeCSS := strings.Repeat(benchmarkCSS+"\n", 100)
 	resp := &http.Response{
 		Body:    io.NopCloser(strings.NewReader(largeCSS)),
@@ -472,9 +472,9 @@ func BenchmarkLargeFile_CSS(b *testing.B) {
 		Request: httptest.NewRequest("GET", "http://example.com/large.css", nil),
 	}
 	resp.Header.Set("Content-Type", "text/css")
-	
+
 	transform := MinifyCSS(MinifyCSSOptions{})
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		resp.Body = io.NopCloser(strings.NewReader(largeCSS))
@@ -485,4 +485,3 @@ func BenchmarkLargeFile_CSS(b *testing.B) {
 		resp.Body.Close()
 	}
 }
-

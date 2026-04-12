@@ -83,6 +83,7 @@ func NewBrandMentionGuard(config json.RawMessage) (Guardrail, error) {
 
 // Name performs the name operation on the brandMentionGuard.
 func (g *brandMentionGuard) Name() string { return "brand_mention" }
+
 // Phase performs the phase operation on the brandMentionGuard.
 func (g *brandMentionGuard) Phase() Phase { return PhaseOutput }
 

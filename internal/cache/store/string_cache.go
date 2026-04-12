@@ -52,13 +52,13 @@ func getOptimalSize(requestedSize int) int {
 	if adaptivePoolGetter == nil {
 		return requestedSize
 	}
-	
+
 	// Try to get the adaptive pool
 	pool := adaptivePoolGetter()
 	if pool == nil {
 		return requestedSize
 	}
-	
+
 	// Track the size pattern with the adaptive pool
 	// This helps the pool learn optimal sizes for string building operations
 	// The pool's Get() method records the size in its history for future optimization
@@ -79,7 +79,7 @@ func getOptimalSize(requestedSize int) int {
 		// This helps align builder capacity with pool tier sizes
 		return optimalSize
 	}
-	
+
 	// Fallback to requested size if pool doesn't match expected interface
 	return requestedSize
 }
@@ -116,11 +116,11 @@ func PutBuilder(b *strings.Builder) {
 	if b == nil {
 		return
 	}
-	
+
 	// Reset the builder to clear its contents and length
 	// This is critical to prevent data leakage between uses
 	b.Reset()
-	
+
 	// Check capacity before returning to pool
 	// If the builder has grown too large, don't return it to prevent memory bloat
 	// This allows the GC to reclaim the memory for oversized builders
@@ -129,7 +129,7 @@ func PutBuilder(b *strings.Builder) {
 	if b.Cap() > 1024 {
 		return
 	}
-	
+
 	// Return the reset builder to the pool
 	// The builder is now clean and ready for the next use
 	BuilderPool.Put(b)
@@ -139,17 +139,17 @@ func PutBuilder(b *strings.Builder) {
 // Note: Some headers are already defined in constants.go
 var (
 	// HeaderContentLength is the HTTP header name for content length.
-	HeaderContentLength   = GetString("Content-Length")
+	HeaderContentLength = GetString("Content-Length")
 	// HeaderAuthorization is the HTTP header name for authorization.
-	HeaderAuthorization   = GetString("Authorization")
+	HeaderAuthorization = GetString("Authorization")
 	// HeaderAccept is the HTTP header name for accept.
-	HeaderAccept          = GetString("Accept")
+	HeaderAccept = GetString("Accept")
 	// HeaderXRequestID is the HTTP header name for x request id.
-	HeaderXRequestID      = GetString("X-Request-ID")
+	HeaderXRequestID = GetString("X-Request-ID")
 	// HeaderXForwardedFor is the HTTP header name for x forwarded for.
-	HeaderXForwardedFor   = GetString("X-Forwarded-For")
+	HeaderXForwardedFor = GetString("X-Forwarded-For")
 	// HeaderXRealIP is the HTTP header name for x real ip.
-	HeaderXRealIP         = GetString("X-Real-IP")
+	HeaderXRealIP = GetString("X-Real-IP")
 )
 
 // Additional common content types (cached to reduce allocations)
@@ -162,18 +162,17 @@ var (
 // Common HTTP methods (cached to reduce allocations)
 var (
 	// MethodGET is a variable for method get.
-	MethodGET    = GetString("GET")
+	MethodGET = GetString("GET")
 	// MethodPOST is a variable for method post.
-	MethodPOST   = GetString("POST")
+	MethodPOST = GetString("POST")
 	// MethodPUT is a variable for method put.
-	MethodPUT    = GetString("PUT")
+	MethodPUT = GetString("PUT")
 	// MethodDELETE is a variable for method delete.
 	MethodDELETE = GetString("DELETE")
 	// MethodPATCH is a variable for method patch.
-	MethodPATCH  = GetString("PATCH")
+	MethodPATCH = GetString("PATCH")
 	// MethodHEAD is a variable for method head.
-	MethodHEAD   = GetString("HEAD")
+	MethodHEAD = GetString("HEAD")
 	// MethodOPTIONS is a variable for method options.
 	MethodOPTIONS = GetString("OPTIONS")
 )
-

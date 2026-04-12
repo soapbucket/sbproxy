@@ -15,11 +15,11 @@ type State int
 
 const (
 	// StateClosed is a constant for state closed.
-	StateClosed   State = iota // Normal operation
+	StateClosed State = iota // Normal operation
 	// StateOpen is a constant for state open.
-	StateOpen                  // Failing, reject calls
+	StateOpen // Failing, reject calls
 	// StateHalfOpen is a constant for state half open.
-	StateHalfOpen              // Testing recovery
+	StateHalfOpen // Testing recovery
 )
 
 // String returns a human-readable representation of the State.

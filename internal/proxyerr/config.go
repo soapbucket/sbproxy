@@ -30,4 +30,3 @@ func ConfigValidationError(message string) *ProxyError {
 func ConfigValidationErrorf(format string, args ...interface{}) *ProxyError {
 	return Wrapf(ErrCodeConfigValidation, nil, format, args...)
 }
-

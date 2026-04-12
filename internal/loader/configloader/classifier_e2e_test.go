@@ -6,8 +6,8 @@ import (
 	"testing"
 
 	"github.com/soapbucket/sbproxy/internal/ai/guardrails"
-	"github.com/soapbucket/sbproxy/internal/request/classifier"
 	"github.com/soapbucket/sbproxy/internal/config"
+	"github.com/soapbucket/sbproxy/internal/request/classifier"
 )
 
 // TestClassifierTransformNormalizeConfigParsing tests that normalize transform config parses correctly.

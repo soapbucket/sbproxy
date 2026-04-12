@@ -335,4 +335,3 @@ func BenchmarkRouterLowestLatency(b *testing.B) {
 		r.Route(ctx, "", nil)
 	}
 }
-

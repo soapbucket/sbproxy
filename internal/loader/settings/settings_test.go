@@ -73,8 +73,8 @@ func TestSettingsEnvOverride(t *testing.T) {
 
 	// Read with overrides
 	s := ProcessSettings{
-		MaxCoalesceBodyBytes: getEnvInt64("SB_MAX_COALESCE_BODY", 10*1024*1024),
-		TrustedProxyCIDRs:    getEnvStringSlice("SB_TRUSTED_PROXIES", []string{}),
+		MaxCoalesceBodyBytes:      getEnvInt64("SB_MAX_COALESCE_BODY", 10*1024*1024),
+		TrustedProxyCIDRs:         getEnvStringSlice("SB_TRUSTED_PROXIES", []string{}),
 		WorkspaceMaxCachedConfigs: getEnvInt("SB_WS_MAX_CONFIGS", 1000),
 	}
 

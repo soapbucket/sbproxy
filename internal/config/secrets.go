@@ -14,11 +14,11 @@ type SecretsType string
 
 const (
 	// SecretsTypeAWS is a constant for secrets type aws.
-	SecretsTypeAWS       SecretsType = "aws"
+	SecretsTypeAWS SecretsType = "aws"
 	// SecretsTypeGCP is a constant for secrets type gcp.
-	SecretsTypeGCP       SecretsType = "gcp"
+	SecretsTypeGCP SecretsType = "gcp"
 	// SecretsTypeCallback is a constant for secrets type callback.
-	SecretsTypeCallback  SecretsType = "callback"
+	SecretsTypeCallback SecretsType = "callback"
 )
 
 var secretsLoaderFns = map[SecretsType]SecretsConfigConstructorFn{}
@@ -37,8 +37,8 @@ type SecretsConfig interface {
 
 // BaseSecretsConfig contains common fields for all secrets providers
 type BaseSecretsConfig struct {
-	Type          SecretsType  `json:"type"`
-	ID            string       `json:"id,omitempty"` // Unique identifier for this secrets provider
+	Type          SecretsType   `json:"type"`
+	ID            string        `json:"id,omitempty"`             // Unique identifier for this secrets provider
 	CacheDuration time.Duration `json:"cache_duration,omitempty"` // Duration to cache secrets before reloading
 
 	// Loaded secrets (populated after Load())
@@ -418,4 +418,3 @@ func (c *CallbackSecretsConfig) Load(_ context.Context) (map[string]string, erro
 func (c *CallbackSecretsConfig) SetCacheDuration(d time.Duration) {
 	c.CacheDuration = d
 }
-

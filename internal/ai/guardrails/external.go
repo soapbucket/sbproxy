@@ -28,8 +28,8 @@ type ExternalAPIConfig struct {
 	PassValue      any               `json:"pass_value,omitempty"`
 	InvertPass     bool              `json:"invert_pass,omitempty"`
 	ReasonField    string            `json:"reason_field,omitempty"`
-	BatchMode      bool              `json:"batch_mode,omitempty"`       // Send multiple messages in one call
-	AsyncMode      bool              `json:"async_mode,omitempty"`       // Log-only, don't block on response
+	BatchMode      bool              `json:"batch_mode,omitempty"`      // Send multiple messages in one call
+	AsyncMode      bool              `json:"async_mode,omitempty"`      // Log-only, don't block on response
 	FallbackAction string            `json:"fallback_action,omitempty"` // "allow" or "block" on timeout/error, default "block"
 }
 
@@ -74,6 +74,7 @@ func NewExternalAPIGuard(config json.RawMessage) (Guardrail, error) {
 
 // Name performs the name operation on the externalAPIGuard.
 func (g *externalAPIGuard) Name() string { return "external_api" }
+
 // Phase performs the phase operation on the externalAPIGuard.
 func (g *externalAPIGuard) Phase() Phase { return PhaseInput }
 

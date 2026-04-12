@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/cache/store"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 // =============================================================================

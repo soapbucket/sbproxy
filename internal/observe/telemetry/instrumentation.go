@@ -41,45 +41,45 @@ func SpanFromContext(ctx context.Context) trace.Span {
 // Common attribute keys
 var (
 	// Cache attributes
-	AttrCacheKey  = attribute.Key("cache.key")
+	AttrCacheKey = attribute.Key("cache.key")
 	// AttrCacheHit is a variable for attr cache hit.
-	AttrCacheHit  = attribute.Key("cache.hit")
+	AttrCacheHit = attribute.Key("cache.hit")
 	// AttrCacheTTL is a variable for attr cache ttl.
-	AttrCacheTTL  = attribute.Key("cache.ttl")
+	AttrCacheTTL = attribute.Key("cache.ttl")
 	// AttrCacheSize is a variable for attr cache size.
 	AttrCacheSize = attribute.Key("cache.size")
 	// AttrCacheType is a variable for attr cache type.
 	AttrCacheType = attribute.Key("cache.type")
 
 	// Transform attributes
-	AttrTransformType        = attribute.Key("transform.type")
+	AttrTransformType = attribute.Key("transform.type")
 	// AttrTransformInputSize is a variable for attr transform input size.
-	AttrTransformInputSize   = attribute.Key("transform.input_size")
+	AttrTransformInputSize = attribute.Key("transform.input_size")
 	// AttrTransformOutputSize is a variable for attr transform output size.
-	AttrTransformOutputSize  = attribute.Key("transform.output_size")
+	AttrTransformOutputSize = attribute.Key("transform.output_size")
 	// AttrTransformContentType is a variable for attr transform content type.
 	AttrTransformContentType = attribute.Key("transform.content_type")
 
 	// Origin attributes
-	AttrOriginURL      = attribute.Key("origin.url")
+	AttrOriginURL = attribute.Key("origin.url")
 	// AttrOriginHost is a variable for attr origin host.
-	AttrOriginHost     = attribute.Key("origin.host")
+	AttrOriginHost = attribute.Key("origin.host")
 	// AttrOriginStatus is a variable for attr origin status.
-	AttrOriginStatus   = attribute.Key("origin.status_code")
+	AttrOriginStatus = attribute.Key("origin.status_code")
 	// AttrOriginDuration is a variable for attr origin duration.
 	AttrOriginDuration = attribute.Key("origin.duration_ms")
 
 	// Proxy attributes
 	AttrProxyRecursion = attribute.Key("proxy.recursion_depth")
 	// AttrProxyBackend is a variable for attr proxy backend.
-	AttrProxyBackend   = attribute.Key("proxy.backend")
+	AttrProxyBackend = attribute.Key("proxy.backend")
 
 	// Middleware attributes
 	AttrMiddlewareName = attribute.Key("middleware.name")
 	// AttrUserAgentType is a variable for attr user agent type.
-	AttrUserAgentType  = attribute.Key("user_agent.type")
+	AttrUserAgentType = attribute.Key("user_agent.type")
 	// AttrFingerprint is a variable for attr fingerprint.
-	AttrFingerprint    = attribute.Key("fingerprint.ja3")
+	AttrFingerprint = attribute.Key("fingerprint.ja3")
 )
 
 // Helper functions for common operations

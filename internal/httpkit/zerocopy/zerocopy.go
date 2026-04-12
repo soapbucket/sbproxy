@@ -10,10 +10,10 @@ import (
 const (
 	// DefaultBufferSize is the default size for zero-copy buffers (64KB)
 	DefaultBufferSize = 64 * 1024
-	
+
 	// LargeBufferSize is for large responses (256KB)
 	LargeBufferSize = 256 * 1024
-	
+
 	// SmallBufferSize is for small operations (4KB)
 	SmallBufferSize = 4 * 1024
 )
@@ -169,7 +169,7 @@ func ReadAllToBufferList(r io.Reader) (*BufferList, error) {
 		} else {
 			PutBuffer(buf)
 		}
-		
+
 		if err == io.EOF {
 			break
 		}
@@ -395,4 +395,3 @@ func (l *LimitedReader) Read(p []byte) (n int, err error) {
 func NewLimitedReader(r io.Reader, n int64) *LimitedReader {
 	return &LimitedReader{R: r, N: n}
 }
-

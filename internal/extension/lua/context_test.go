@@ -28,7 +28,7 @@ function match_request(req, ctx)
 	return ctx.request_ip == "203.0.113.1"
 end
 			`,
-			want:   true,
+			want: true,
 		},
 		{
 			name: "request_ip from X-Forwarded-For",
@@ -43,7 +43,7 @@ function match_request(req, ctx)
 	return ctx.request_ip == "203.0.113.2"
 end
 			`,
-			want:   true,
+			want: true,
 		},
 	}
 
@@ -167,7 +167,7 @@ function match_request(req, ctx)
 	return ctx.variables.api_url == "https://api.example.com"
 end
 			`,
-			want:   true,
+			want: true,
 		},
 		{
 			name: "access nested variable",
@@ -181,7 +181,7 @@ function match_request(req, ctx)
 	return ctx.variables.endpoints.users == "/api/v2/users"
 end
 			`,
-			want:   true,
+			want: true,
 		},
 		{
 			name: "access numeric variable",
@@ -193,7 +193,7 @@ function match_request(req, ctx)
 	return ctx.variables.max_retries == 3
 end
 			`,
-			want:   true,
+			want: true,
 		},
 		{
 			name:      "nil variables returns empty table",
@@ -203,7 +203,7 @@ function match_request(req, ctx)
 	return type(ctx.variables) == "table"
 end
 			`,
-			want:      true,
+			want: true,
 		},
 	}
 
@@ -230,4 +230,3 @@ end
 		})
 	}
 }
-

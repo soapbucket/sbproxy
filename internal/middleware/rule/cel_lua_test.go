@@ -9,7 +9,7 @@ import (
 
 // TestRequestRule_CEL_Unmarshal tests that CEL expressions are properly loaded during JSON unmarshaling
 func TestRequestRule_CEL_Unmarshal(t *testing.T) {
-	
+
 	celJSON := `{
 		"cel_expr": "request.path == '/test'"
 	}`
@@ -51,7 +51,7 @@ func TestRequestRule_CEL_Unmarshal(t *testing.T) {
 
 // TestRequestRule_Lua_Unmarshal tests that Lua scripts are properly loaded during JSON unmarshaling
 func TestRequestRule_Lua_Unmarshal(t *testing.T) {
-	
+
 	luaJSON := `{
 		"lua_script": "return request.path == '/test'"
 	}`
@@ -93,7 +93,7 @@ func TestRequestRule_Lua_Unmarshal(t *testing.T) {
 
 // TestRequestRule_CEL_And_Lua_Combined tests that both CEL and Lua work together
 func TestRequestRule_CEL_And_Lua_Combined(t *testing.T) {
-	
+
 	jsonData := `{
 		"methods": ["GET"],
 		"cel_expr": "request.path.startsWith('/api/')",
@@ -217,4 +217,3 @@ func TestRequestRule_Invalid_Lua(t *testing.T) {
 		t.Error("Expected error for invalid Lua script, got nil")
 	}
 }
-

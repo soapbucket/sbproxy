@@ -2,14 +2,13 @@
 package transformer
 
 import (
-	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"context"
 	"encoding/json"
+	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
-
 
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"

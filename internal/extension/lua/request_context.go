@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/extension/scripting"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	lua "github.com/yuin/gopher-lua"
 )
 

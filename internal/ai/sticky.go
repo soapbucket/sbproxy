@@ -21,8 +21,8 @@ const (
 type StickySessionConfig struct {
 	Enabled     bool          `json:"enabled,omitempty"`
 	TTL         time.Duration `json:"ttl,omitempty"`
-	HashHeaders []string      `json:"hash_headers,omitempty"`  // Headers to hash for session key (default: ["Authorization", "X-API-Key"])
-	HashCookies []string      `json:"hash_cookies,omitempty"`  // Cookies to hash for session key
+	HashHeaders []string      `json:"hash_headers,omitempty"` // Headers to hash for session key (default: ["Authorization", "X-API-Key"])
+	HashCookies []string      `json:"hash_cookies,omitempty"` // Cookies to hash for session key
 }
 
 // stickyEntry holds a provider mapping with expiration.
@@ -231,4 +231,3 @@ func (m *StickySessionManager) Len() int {
 	}
 	return total
 }
-

@@ -4,9 +4,9 @@ package cel
 import (
 	"bytes"
 	"encoding/base64"
-	json "github.com/goccy/go-json"
 	"errors"
 	"fmt"
+	json "github.com/goccy/go-json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -18,8 +18,8 @@ import (
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/common/types/ref"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 // ErrNoModifications is returned when a CEL expression produces no modifications.
@@ -33,31 +33,31 @@ type ModificationResult struct {
 	AddHeaders map[string]string
 	// DeleteHeaders contains header names to delete
 	DeleteHeaders []string
-	
+
 	// URL modifications
 	Scheme   string // URL scheme (http, https)
 	Host     string // URL host (including port if needed)
 	Path     string // Full path replacement
 	Fragment string // URL fragment
-	
+
 	// Path modifications (applied if Path is empty)
-	PathPrefix  string // Prefix to add to path
-	PathSuffix  string // Suffix to add to path
+	PathPrefix  string            // Prefix to add to path
+	PathSuffix  string            // Suffix to add to path
 	PathReplace map[string]string // Replace old substring with new (map of old->new)
-	
+
 	// Method is the new HTTP method to set (if not empty)
 	Method string
-	
+
 	// Query parameter modifications
 	SetQuery    map[string]string // Query params to set (overwrites)
 	AddQuery    map[string]string // Query params to add (appends)
 	DeleteQuery []string          // Query param names to delete
-	
+
 	// Form parameter modifications
 	SetForm    map[string]string // Form params to set (overwrites)
 	AddForm    map[string]string // Form params to add (appends)
 	DeleteForm []string          // Form param names to delete
-	
+
 	// Body modifications
 	BodyRemove        bool   // Remove body entirely
 	BodyReplace       string // Replace body with string
@@ -79,12 +79,12 @@ type modifier struct {
 // Modify evaluates the CEL expression and applies modifications to the request
 func (m *modifier) Modify(req *http.Request) (*http.Request, error) {
 	vars := getModifierRequestVar(req)
-	
+
 	// Measure CEL execution time
 	startTime := time.Now()
 	out, _, err := m.Eval(vars)
 	duration := time.Since(startTime).Seconds()
-	
+
 	// Get origin from config context
 	origin := "unknown"
 	if req != nil {
@@ -99,10 +99,10 @@ func (m *modifier) Modify(req *http.Request) (*http.Request, error) {
 			origin = req.Host
 		}
 	}
-	
+
 	// Record CEL execution time
 	metric.CELExecutionTime(origin, "modifier", duration)
-	
+
 	if err != nil {
 		slog.Debug("error evaluating expression", "url", req.URL, "error", err)
 		return req, err
@@ -251,16 +251,16 @@ func extractModifications(out interface{ Value() interface{} }) (*ModificationRe
 	}
 
 	result := &ModificationResult{
-		SetHeaders:  make(map[string]string),
-		AddHeaders:  make(map[string]string),
+		SetHeaders:    make(map[string]string),
+		AddHeaders:    make(map[string]string),
 		DeleteHeaders: []string{},
-		PathReplace: make(map[string]string),
-		SetQuery:    make(map[string]string),
-		AddQuery:    make(map[string]string),
-		DeleteQuery: []string{},
-		SetForm:     make(map[string]string),
-		AddForm:     make(map[string]string),
-		DeleteForm:  []string{},
+		PathReplace:   make(map[string]string),
+		SetQuery:      make(map[string]string),
+		AddQuery:      make(map[string]string),
+		DeleteQuery:   []string{},
+		SetForm:       make(map[string]string),
+		AddForm:       make(map[string]string),
+		DeleteForm:    []string{},
 	}
 
 	// Extract headers
@@ -563,24 +563,24 @@ func applyModifications(req *http.Request, mods *ModificationResult) (*http.Requ
 	} else {
 		// Apply path transformations if no full replacement
 		currentPath := modifiedReq.URL.Path
-		
+
 		// Apply path replace operations
 		for old, new := range mods.PathReplace {
 			if old != "" {
 				currentPath = strings.ReplaceAll(currentPath, old, new)
 			}
 		}
-		
+
 		// Apply prefix
 		if mods.PathPrefix != "" {
 			currentPath = mods.PathPrefix + currentPath
 		}
-		
+
 		// Apply suffix
 		if mods.PathSuffix != "" {
 			currentPath = currentPath + mods.PathSuffix
 		}
-		
+
 		modifiedReq.URL.Path = currentPath
 	}
 

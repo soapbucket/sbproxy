@@ -119,7 +119,7 @@ func TestAuthCallbackDataStorage(t *testing.T) {
 
 		// Enrich with roles based on email
 		email, _ := authData["email"].(string)
-		
+
 		response := map[string]any{
 			"roles": []string{"user"},
 			"permissions": map[string]any{
@@ -131,8 +131,8 @@ func TestAuthCallbackDataStorage(t *testing.T) {
 		if email == "admin@example.com" {
 			response["roles"] = []string{"admin", "user"}
 			response["permissions"] = map[string]any{
-				"read":  true,
-				"write": true,
+				"read":   true,
+				"write":  true,
 				"delete": true,
 			}
 		}
@@ -256,7 +256,7 @@ func TestCallbackWithLuaTransform(t *testing.T) {
 		"method": "GET",
 		"lua_script": %q
 	}`, mockServer.URL, luaScript)
-	
+
 	var callback Callback
 	if err := json.Unmarshal([]byte(callbackJSON), &callback); err != nil {
 		t.Fatalf("Failed to unmarshal callback: %v", err)
@@ -338,7 +338,7 @@ func TestParallelCallbacks(t *testing.T) {
 
 	ctx := context.Background()
 	start := time.Now()
-	
+
 	result, err := callbacks.Do(ctx, nil)
 	if err != nil {
 		t.Fatalf("Parallel callbacks failed: %v", err)
@@ -400,8 +400,6 @@ func TestCallbackCaching(t *testing.T) {
 
 	// Note: Without actual cache setup in test, this will hit the server again
 	// In real usage with cache middleware, it would be cached
-	
+
 	t.Logf("Callback result: %+v, server calls: %d", result1, callCount)
 }
-
-

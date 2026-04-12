@@ -2,11 +2,11 @@
 package transport
 
 import (
-	"github.com/soapbucket/sbproxy/internal/security/crypto"
 	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"github.com/soapbucket/sbproxy/internal/security/crypto"
 	"hash"
 	"io"
 	"log/slog"
@@ -20,9 +20,9 @@ import (
 	"github.com/pquerna/cachecontrol/cacheobject"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/soapbucket/sbproxy/internal/cache/store"
 	httputil "github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"github.com/soapbucket/sbproxy/internal/observe/logging"
-	"github.com/soapbucket/sbproxy/internal/cache/store"
 )
 
 const (

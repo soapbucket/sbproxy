@@ -255,8 +255,8 @@ func TestCallbackTemplateVariables_E2EConfig_Auth(t *testing.T) {
 	requestData := reqctx.NewRequestData()
 	requestData.Data = map[string]any{
 		"auth_data": map[string]any{
-			"user_id":    "user-123",
-			"roles":      []string{"admin", "user"},
+			"user_id":     "user-123",
+			"roles":       []string{"admin", "user"},
 			"permissions": map[string]any{},
 		},
 	}
@@ -356,4 +356,3 @@ func TestCallbackTemplateVariables_ResolverDirectly(t *testing.T) {
 	assert.Equal(t, "dark", req2.Header.Get("X-User-Theme"))
 	assert.Equal(t, "en", req2.Header.Get("X-User-Language"))
 }
-

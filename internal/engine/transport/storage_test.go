@@ -5,8 +5,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/soapbucket/sbproxy/internal/engine/transport"
 	"github.com/soapbucket/sbproxy/internal/cache/store"
+	"github.com/soapbucket/sbproxy/internal/engine/transport"
 )
 
 func TestStorage(t *testing.T) {

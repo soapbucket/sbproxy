@@ -9,7 +9,7 @@ import (
 
 // mockCookieJar implements http.CookieJar for testing
 type mockCookieJar struct {
-	cookies map[string][]*http.Cookie
+	cookies  map[string][]*http.Cookie
 	setCalls int
 	getCalls int
 }
@@ -32,8 +32,8 @@ func (m *mockCookieJar) Cookies(u *url.URL) []*http.Cookie {
 
 // cookieJarMockRoundTripper implements http.RoundTripper for testing
 type cookieJarMockRoundTripper struct {
-	response *http.Response
-	err      error
+	response    *http.Response
+	err         error
 	lastRequest *http.Request
 }
 
@@ -46,7 +46,7 @@ func TestCookieJarTransport_InjectsCookies(t *testing.T) {
 	// Create mock backend
 	jar := newMockCookieJar()
 	targetURL, _ := url.Parse("https://backend.example.com/api")
-	
+
 	// Pre-populate jar with cookies
 	jar.SetCookies(targetURL, []*http.Cookie{
 		{Name: "session_id", Value: "abc123"},
@@ -196,4 +196,3 @@ func TestCookieJarTransport_ErrorHandling(t *testing.T) {
 		t.Errorf("SetCookies should not be called on error, got %d calls", jar.setCalls)
 	}
 }
-

@@ -21,14 +21,14 @@ type JSONRule struct {
 
 // Config holds configuration for the json transform.
 type Config struct {
-	Type                string    `json:"type"`
-	ContentTypes        []string  `json:"content_types,omitempty"`
-	RemoveEmptyObjects  bool      `json:"remove_empty_objects"`
-	RemoveEmptyArrays   bool      `json:"remove_empty_arrays"`
-	RemoveFalseBooleans bool      `json:"remove_false_booleans"`
-	RemoveEmptyStrings  bool      `json:"remove_empty_strings"`
-	RemoveZeroNumbers   bool      `json:"remove_zero_numbers"`
-	PrettyPrint         bool      `json:"pretty_print"`
+	Type                string     `json:"type"`
+	ContentTypes        []string   `json:"content_types,omitempty"`
+	RemoveEmptyObjects  bool       `json:"remove_empty_objects"`
+	RemoveEmptyArrays   bool       `json:"remove_empty_arrays"`
+	RemoveFalseBooleans bool       `json:"remove_false_booleans"`
+	RemoveEmptyStrings  bool       `json:"remove_empty_strings"`
+	RemoveZeroNumbers   bool       `json:"remove_zero_numbers"`
+	PrettyPrint         bool       `json:"pretty_print"`
 	Rules               []JSONRule `json:"rules"`
 	JSONTransform       *struct {
 		SetFields map[string]interface{} `json:"set_fields,omitempty"`

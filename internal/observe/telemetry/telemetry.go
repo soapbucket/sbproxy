@@ -2,13 +2,13 @@
 package telemetry
 
 import (
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
-	"github.com/soapbucket/sbproxy/internal/security/tlsutil"
-	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
+	"github.com/soapbucket/sbproxy/internal/security/tlsutil"
 	"io/fs"
 	"log"
 	"log/slog"
@@ -18,7 +18,6 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
-
 )
 
 const (

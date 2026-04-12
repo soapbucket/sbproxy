@@ -194,7 +194,7 @@ func TestNew_ConfigParsing(t *testing.T) {
 		RequestsPerDay:    10000,
 		Algorithm:         "token_bucket",
 		BurstSize:         20,
-		RefillRate:         1.5,
+		RefillRate:        1.5,
 		Headers: RateLimitHeadersConfig{
 			Enabled:           true,
 			IncludeRetryAfter: true,

@@ -14,8 +14,8 @@ import (
 	configpkg "github.com/soapbucket/sbproxy/internal/config"
 	"github.com/soapbucket/sbproxy/internal/loader/manager"
 	"github.com/soapbucket/sbproxy/internal/platform/messenger"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/platform/storage"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 // --- Mock infrastructure ---
@@ -33,7 +33,7 @@ func newFixationMockManager() *fixationMockManager {
 	}
 }
 
-func (m *fixationMockManager) EncryptString(s string) (string, error)              { return "enc:" + s, nil }
+func (m *fixationMockManager) EncryptString(s string) (string, error) { return "enc:" + s, nil }
 func (m *fixationMockManager) DecryptString(s string) (string, error) {
 	if len(s) > 4 && s[:4] == "enc:" {
 		return s[4:], nil
@@ -49,17 +49,19 @@ func (m *fixationMockManager) DecryptStringWithContext(data, ctx string) (string
 	}
 	return data, nil
 }
-func (m *fixationMockManager) SignString(s string) (string, error)        { return "sig:" + s, nil }
-func (m *fixationMockManager) VerifyString(s, sig string) (bool, error)   { return sig == "sig:"+s, nil }
-func (m *fixationMockManager) GetSessionCache() manager.SessionCache      { return m.cache }
-func (m *fixationMockManager) GetStorage() storage.Storage                { return nil }
-func (m *fixationMockManager) GetGlobalSettings() manager.GlobalSettings  { return manager.GlobalSettings{} }
-func (m *fixationMockManager) GetCache(manager.CacheLevel) cacher.Cacher  { return nil }
-func (m *fixationMockManager) GetMessenger() messenger.Messenger          { return nil }
-func (m *fixationMockManager) GetServerContext() context.Context           { return context.Background() }
-func (m *fixationMockManager) GetCallbackPool() manager.WorkerPool        { return nil }
-func (m *fixationMockManager) GetCachePool() manager.WorkerPool           { return nil }
-func (m *fixationMockManager) Close() error                               { return nil }
+func (m *fixationMockManager) SignString(s string) (string, error)      { return "sig:" + s, nil }
+func (m *fixationMockManager) VerifyString(s, sig string) (bool, error) { return sig == "sig:"+s, nil }
+func (m *fixationMockManager) GetSessionCache() manager.SessionCache    { return m.cache }
+func (m *fixationMockManager) GetStorage() storage.Storage              { return nil }
+func (m *fixationMockManager) GetGlobalSettings() manager.GlobalSettings {
+	return manager.GlobalSettings{}
+}
+func (m *fixationMockManager) GetCache(manager.CacheLevel) cacher.Cacher { return nil }
+func (m *fixationMockManager) GetMessenger() messenger.Messenger         { return nil }
+func (m *fixationMockManager) GetServerContext() context.Context         { return context.Background() }
+func (m *fixationMockManager) GetCallbackPool() manager.WorkerPool       { return nil }
+func (m *fixationMockManager) GetCachePool() manager.WorkerPool          { return nil }
+func (m *fixationMockManager) Close() error                              { return nil }
 
 type fixationMockSessionCache struct {
 	mu       sync.RWMutex

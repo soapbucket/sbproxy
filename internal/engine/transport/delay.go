@@ -71,4 +71,3 @@ func (t *DelayTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Execute request
 	return t.Base.RoundTrip(req)
 }
-

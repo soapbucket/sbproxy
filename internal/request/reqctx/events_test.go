@@ -79,11 +79,11 @@ func TestConfigParams_GetEvents(t *testing.T) {
 	}
 	got := cp.GetEvents()
 	want := []string{"a", "b"}
-	
+
 	if len(got) != len(want) {
 		t.Errorf("GetEvents() returned %d items, want %d", len(got), len(want))
 	}
-	
+
 	for i, v := range want {
 		if i < len(got) && got[i] != v {
 			t.Errorf("GetEvents()[%d] = %q, want %q", i, got[i], v)

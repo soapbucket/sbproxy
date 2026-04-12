@@ -66,4 +66,3 @@ func (d *Duration) UnmarshalJSON(data []byte) error {
 func (d Duration) MarshalJSON() ([]byte, error) {
 	return json.Marshal(d.Duration.String())
 }
-

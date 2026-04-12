@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/google/cel-go/cel"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 // ErrWrongType is returned when a CEL expression does not return a boolean type.
@@ -31,12 +31,12 @@ type matcher struct {
 func (m *matcher) Match(req *http.Request) bool {
 	rc := GetRequestContext(req)
 	vars := rc.ToVars()
-	
+
 	// Measure CEL execution time
 	startTime := time.Now()
 	out, _, err := m.Eval(vars)
 	duration := time.Since(startTime).Seconds()
-	
+
 	// Get origin from config context
 	origin := "unknown"
 	if req != nil {
@@ -51,10 +51,10 @@ func (m *matcher) Match(req *http.Request) bool {
 			origin = req.Host
 		}
 	}
-	
+
 	// Record CEL execution time
 	metric.CELExecutionTime(origin, "matcher", duration)
-	
+
 	if err != nil {
 		slog.Debug("error evaluating expression", "url", req.URL, "error", err)
 		return false

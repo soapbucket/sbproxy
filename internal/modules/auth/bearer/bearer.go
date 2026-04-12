@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"strings"
 
-
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
 	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/pkg/plugin"

@@ -13,11 +13,11 @@ const (
 	// AlgorithmSlidingWindow is a constant for algorithm sliding window.
 	AlgorithmSlidingWindow AlgorithmType = "sliding_window"
 	// AlgorithmTokenBucket is a constant for algorithm token bucket.
-	AlgorithmTokenBucket   AlgorithmType = "token_bucket"
+	AlgorithmTokenBucket AlgorithmType = "token_bucket"
 	// AlgorithmLeakyBucket is a constant for algorithm leaky bucket.
-	AlgorithmLeakyBucket   AlgorithmType = "leaky_bucket"
+	AlgorithmLeakyBucket AlgorithmType = "leaky_bucket"
 	// AlgorithmFixedWindow is a constant for algorithm fixed window.
-	AlgorithmFixedWindow   AlgorithmType = "fixed_window"
+	AlgorithmFixedWindow AlgorithmType = "fixed_window"
 )
 
 // Result contains rate limit check result
@@ -64,6 +64,5 @@ type Config struct {
 
 	// Storage configuration
 	Cache  interface{} // Cacher interface (avoiding circular import)
-	Prefix string       // Key prefix for storage
+	Prefix string      // Key prefix for storage
 }
-

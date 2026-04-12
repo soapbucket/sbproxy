@@ -277,4 +277,3 @@ func TestSmoke_FullPipeline(t *testing.T) {
 		t.Error("response modifier not applied in full pipeline")
 	}
 }
-

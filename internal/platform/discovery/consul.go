@@ -14,8 +14,8 @@ import (
 
 // ConsulConfig configures Consul-based service discovery.
 type ConsulConfig struct {
-	Address         string        `json:"address"`                    // Consul HTTP API address (default: "http://localhost:8500")
-	Token           string        `json:"token,omitempty"`            // ACL token
+	Address         string        `json:"address"`         // Consul HTTP API address (default: "http://localhost:8500")
+	Token           string        `json:"token,omitempty"` // ACL token
 	Datacenter      string        `json:"datacenter,omitempty"`
 	RefreshInterval time.Duration `json:"refresh_interval,omitempty"` // Default: 10s
 	PassingOnly     bool          `json:"passing_only"`               // Only return healthy services (default: true)

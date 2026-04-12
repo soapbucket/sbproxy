@@ -31,4 +31,3 @@ func TransportCircuitOpenError(target string) *ProxyError {
 		WithDetail("target", target).
 		WithRetryable(false)
 }
-

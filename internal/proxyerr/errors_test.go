@@ -117,4 +117,3 @@ func TestGetDetails(t *testing.T) {
 		t.Error("expected nil details for non-ProxyError")
 	}
 }
-

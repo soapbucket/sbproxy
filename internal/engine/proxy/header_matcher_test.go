@@ -55,12 +55,12 @@ func TestHeaderMatcher_StripMatchingHeaders(t *testing.T) {
 	matcher := NewHeaderMatcher([]string{"X-Internal-*", "X-Debug"})
 
 	headers := http.Header{
-		"X-Internal-Token":   []string{"secret"},
-		"X-Internal-Debug":   []string{"true"},
-		"X-Debug":            []string{"verbose"},
-		"X-Public-Header":    []string{"value"},
-		"Authorization":      []string{"Bearer token"},
-		"Content-Type":       []string{"application/json"},
+		"X-Internal-Token": []string{"secret"},
+		"X-Internal-Debug": []string{"true"},
+		"X-Debug":          []string{"verbose"},
+		"X-Public-Header":  []string{"value"},
+		"Authorization":    []string{"Bearer token"},
+		"Content-Type":     []string{"application/json"},
 	}
 
 	matcher.StripMatchingHeaders(headers)
@@ -106,4 +106,3 @@ func TestHeaderMatcher_EmptyPatterns(t *testing.T) {
 		t.Error("Authorization should remain")
 	}
 }
-

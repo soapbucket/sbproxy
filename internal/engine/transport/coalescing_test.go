@@ -406,4 +406,3 @@ func TestCoalescingTransport_ResponseCloning(t *testing.T) {
 		}
 	}
 }
-

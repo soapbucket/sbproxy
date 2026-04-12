@@ -15,17 +15,17 @@ import (
 // AgentCard describes an agent's capabilities and metadata.
 // Served at GET /.well-known/agent.json
 type AgentCard struct {
-	Name            string          `json:"name"`
-	Description     string          `json:"description,omitempty"`
-	URL             string          `json:"url"`
-	Version         string          `json:"version,omitempty"`
-	DocumentationURL string         `json:"documentationUrl,omitempty"`
-	Provider        *AgentProvider  `json:"provider,omitempty"`
-	Capabilities    AgentCapabilities `json:"capabilities"`
-	Authentication  *AuthConfig     `json:"authentication,omitempty"`
-	DefaultInputModes  []string     `json:"defaultInputModes,omitempty"`
-	DefaultOutputModes []string     `json:"defaultOutputModes,omitempty"`
-	Skills          []AgentSkill    `json:"skills,omitempty"`
+	Name               string            `json:"name"`
+	Description        string            `json:"description,omitempty"`
+	URL                string            `json:"url"`
+	Version            string            `json:"version,omitempty"`
+	DocumentationURL   string            `json:"documentationUrl,omitempty"`
+	Provider           *AgentProvider    `json:"provider,omitempty"`
+	Capabilities       AgentCapabilities `json:"capabilities"`
+	Authentication     *AuthConfig       `json:"authentication,omitempty"`
+	DefaultInputModes  []string          `json:"defaultInputModes,omitempty"`
+	DefaultOutputModes []string          `json:"defaultOutputModes,omitempty"`
+	Skills             []AgentSkill      `json:"skills,omitempty"`
 }
 
 // AgentProvider identifies the organization providing the agent.
@@ -36,8 +36,8 @@ type AgentProvider struct {
 
 // AgentCapabilities describes what the agent supports.
 type AgentCapabilities struct {
-	Streaming        bool `json:"streaming,omitempty"`
-	PushNotifications bool `json:"pushNotifications,omitempty"`
+	Streaming              bool `json:"streaming,omitempty"`
+	PushNotifications      bool `json:"pushNotifications,omitempty"`
 	StateTransitionHistory bool `json:"stateTransitionHistory,omitempty"`
 }
 
@@ -66,26 +66,26 @@ type TaskState string
 
 const (
 	// TaskStateSubmitted is a constant for task state submitted.
-	TaskStateSubmitted  TaskState = "submitted"
+	TaskStateSubmitted TaskState = "submitted"
 	// TaskStateWorking is a constant for task state working.
-	TaskStateWorking    TaskState = "working"
+	TaskStateWorking TaskState = "working"
 	// TaskStateInputNeeded is a constant for task state input needed.
 	TaskStateInputNeeded TaskState = "input-needed"
 	// TaskStateCompleted is a constant for task state completed.
-	TaskStateCompleted  TaskState = "completed"
+	TaskStateCompleted TaskState = "completed"
 	// TaskStateCanceled is a constant for task state canceled.
-	TaskStateCanceled   TaskState = "canceled"
+	TaskStateCanceled TaskState = "canceled"
 	// TaskStateFailed is a constant for task state failed.
-	TaskStateFailed     TaskState = "failed"
+	TaskStateFailed TaskState = "failed"
 )
 
 // Task represents an A2A task.
 type Task struct {
-	ID       string        `json:"id"`
-	Status   TaskStatus    `json:"status"`
-	Artifacts []Artifact   `json:"artifacts,omitempty"`
-	History  []Message     `json:"history,omitempty"`
-	Metadata map[string]any `json:"metadata,omitempty"`
+	ID        string         `json:"id"`
+	Status    TaskStatus     `json:"status"`
+	Artifacts []Artifact     `json:"artifacts,omitempty"`
+	History   []Message      `json:"history,omitempty"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
 }
 
 // TaskStatus represents the current status of a task.
@@ -97,8 +97,8 @@ type TaskStatus struct {
 
 // Message represents a message in the A2A protocol.
 type Message struct {
-	Role    string `json:"role"` // "user" or "agent"
-	Parts   []Part `json:"parts"`
+	Role     string         `json:"role"` // "user" or "agent"
+	Parts    []Part         `json:"parts"`
 	Metadata map[string]any `json:"metadata,omitempty"`
 }
 

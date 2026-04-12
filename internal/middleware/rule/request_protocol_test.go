@@ -244,4 +244,3 @@ func TestIsWebSocketRequest(t *testing.T) {
 		})
 	}
 }
-

@@ -24,13 +24,13 @@ type StreamingConfigProvider interface {
 
 // StreamingConfig matches config.StreamingConfigValues to avoid import cycle
 type StreamingConfig struct {
-	Enabled              bool
-	MaxBufferedBodySize  int64
+	Enabled                bool
+	MaxBufferedBodySize    int64
 	MaxProcessableBodySize int64
-	ModifierThreshold    int64
-	TransformThreshold   int64
-	SignatureThreshold   int64
-	CallbackThreshold    int64
+	ModifierThreshold      int64
+	TransformThreshold     int64
+	SignatureThreshold     int64
+	CallbackThreshold      int64
 }
 
 // Options defines the settings for the JSON optimization.
@@ -67,7 +67,7 @@ func optimizeJSON(resp *http.Response, opts JSONOptions) error {
 			// StreamingConfig already has int64 values, use them directly
 			if sc.Enabled {
 				threshold = sc.TransformThreshold
-				
+
 				// Check Content-Length before reading
 				if resp.ContentLength > 0 && resp.ContentLength > threshold {
 					slog.Debug("Response body too large for JSON transformation, skipping",

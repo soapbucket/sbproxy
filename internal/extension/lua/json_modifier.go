@@ -2,15 +2,15 @@
 package lua
 
 import (
-	"github.com/soapbucket/sbproxy/internal/util"
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/soapbucket/sbproxy/internal/util"
 	"log/slog"
 	"time"
 
-	lua "github.com/yuin/gopher-lua"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	lua "github.com/yuin/gopher-lua"
 )
 
 // Use global error from common package
@@ -33,10 +33,10 @@ type JSONModifier interface {
 }
 
 type jsonModifier struct {
-	script    string
-	wrapped   string // wrapped script with function definition
-	timeout   time.Duration
-	useFunc   bool   // true when script defines function modify_json(data, ctx)
+	script  string
+	wrapped string // wrapped script with function definition
+	timeout time.Duration
+	useFunc bool // true when script defines function modify_json(data, ctx)
 }
 
 // ModifyJSON evaluates the Lua script and applies modifications to the JSON object.

@@ -17,11 +17,11 @@ import (
 
 var (
 	// ErrPoolClosed is a sentinel error for pool closed conditions.
-	ErrPoolClosed    = errors.New("connection pool is closed")
+	ErrPoolClosed = errors.New("connection pool is closed")
 	// ErrPoolExhausted is a sentinel error for pool exhausted conditions.
 	ErrPoolExhausted = errors.New("connection pool exhausted")
 	// ErrConnClosed is a sentinel error for conn closed conditions.
-	ErrConnClosed    = errors.New("connection closed")
+	ErrConnClosed = errors.New("connection closed")
 	// ErrInvalidConfig is a sentinel error for invalid config conditions.
 	ErrInvalidConfig = errors.New("invalid pool configuration")
 )
@@ -435,23 +435,23 @@ func (p *WebSocketConnectionPool) Stats() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"target":                  p.target,
-		"origin":                  p.origin,
-		"total_created":           p.stats.totalCreated,
-		"total_closed":            p.stats.totalClosed,
-		"total_reconnects":        p.stats.totalReconnects,
-		"total_acquired":          p.stats.totalAcquired,
-		"total_released":          p.stats.totalReleased,
-		"total_exhausted":         p.stats.totalExhausted,
-		"current_size":            currentSize,
-		"idle_count":              idleCount,
-		"active_count":            activeCount,
-		"max_connections":         maxConnections,
-		"max_idle_connections":    maxIdleConnections,
-		"utilization_percent":     utilizationPercent,
+		"target":                   p.target,
+		"origin":                   p.origin,
+		"total_created":            p.stats.totalCreated,
+		"total_closed":             p.stats.totalClosed,
+		"total_reconnects":         p.stats.totalReconnects,
+		"total_acquired":           p.stats.totalAcquired,
+		"total_released":           p.stats.totalReleased,
+		"total_exhausted":          p.stats.totalExhausted,
+		"current_size":             currentSize,
+		"idle_count":               idleCount,
+		"active_count":             activeCount,
+		"max_connections":          maxConnections,
+		"max_idle_connections":     maxIdleConnections,
+		"utilization_percent":      utilizationPercent,
 		"idle_utilization_percent": idleUtilizationPercent,
-		"reuse_rate_percent":      reuseRate,
-		"closed":                  p.closed,
+		"reuse_rate_percent":       reuseRate,
+		"closed":                   p.closed,
 	}
 }
 

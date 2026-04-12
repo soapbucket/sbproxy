@@ -181,8 +181,8 @@ func TestMergeGrants_DenyWins(t *testing.T) {
 
 func TestMergeGrants_PriorityResolution(t *testing.T) {
 	grants := []ModelGrant{
-		{Model: "gpt-4o", Permission: "deny", Priority: 10},  // Lower priority
-		{Model: "gpt-4o", Permission: "allow", Priority: 0},  // Higher priority (wins)
+		{Model: "gpt-4o", Permission: "deny", Priority: 10}, // Lower priority
+		{Model: "gpt-4o", Permission: "allow", Priority: 0}, // Higher priority (wins)
 	}
 
 	allowed, denied, _ := MergeGrants(grants)

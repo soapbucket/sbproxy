@@ -42,21 +42,21 @@ func TestParseSize(t *testing.T) {
 
 func TestGetStreamingThresholds(t *testing.T) {
 	tests := []struct {
-		name                    string
-		enabled                 bool
-		maxBufferedBodySize     string
-		maxProcessableBodySize  string
-		modifierThreshold       string
-		transformThreshold      string
-		signatureThreshold      string
-		callbackThreshold       string
-		expectedEnabled         bool
-		expectedMaxBuffered     int64
-		expectedMaxProcessable  int64
-		expectedModifier        int64
-		expectedTransform       int64
-		expectedSignature       int64
-		expectedCallback        int64
+		name                   string
+		enabled                bool
+		maxBufferedBodySize    string
+		maxProcessableBodySize string
+		modifierThreshold      string
+		transformThreshold     string
+		signatureThreshold     string
+		callbackThreshold      string
+		expectedEnabled        bool
+		expectedMaxBuffered    int64
+		expectedMaxProcessable int64
+		expectedModifier       int64
+		expectedTransform      int64
+		expectedSignature      int64
+		expectedCallback       int64
 	}{
 		{
 			name:                   "All defaults",
@@ -86,7 +86,7 @@ func TestGetStreamingThresholds(t *testing.T) {
 			modifierThreshold:      "2MB",
 			transformThreshold:     "3MB",
 			signatureThreshold:     "20MB",
-			callbackThreshold:     "500KB",
+			callbackThreshold:      "500KB",
 			expectedEnabled:        true,
 			expectedMaxBuffered:    5 * 1024 * 1024,
 			expectedMaxProcessable: 50 * 1024 * 1024,
@@ -269,9 +269,9 @@ func TestSizeTracker(t *testing.T) {
 
 func TestShouldStream(t *testing.T) {
 	tests := []struct {
-		name        string
-		contentLen  int64
-		threshold   int64
+		name         string
+		contentLen   int64
+		threshold    int64
 		shouldStream bool
 	}{
 		{"Small body", 1000, 10000, false},
@@ -387,4 +387,3 @@ func TestWrapResponseWithSizeLimit(t *testing.T) {
 		}
 	})
 }
-

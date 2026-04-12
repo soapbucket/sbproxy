@@ -22,7 +22,7 @@ type AIContextVars struct {
 	MessageCount   int               // number of messages
 	TokenEstimate  int               // estimated input tokens
 	HasTools       bool              // whether request has tool calls
-	IsStreaming     bool              // whether request is streaming
+	IsStreaming    bool              // whether request is streaming
 	Tags           map[string]string // request tags
 	Budget         map[string]any    // budget utilization info
 	ProviderHealth map[string]any    // provider health status

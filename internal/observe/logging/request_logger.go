@@ -2,9 +2,9 @@
 package logging
 
 import (
-	"github.com/soapbucket/sbproxy/internal/cache/store"
 	"bufio"
 	"fmt"
+	"github.com/soapbucket/sbproxy/internal/cache/store"
 	"net"
 	"net/http"
 	"sync"

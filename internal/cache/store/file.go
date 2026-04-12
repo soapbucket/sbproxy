@@ -7,12 +7,12 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"strconv"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -638,7 +638,6 @@ func NewFileCacher(settings Settings) (Cacher, error) {
 
 	return cacher, nil
 }
-
 
 // Driver returns the driver name
 func (f *FileCacher) Driver() string {

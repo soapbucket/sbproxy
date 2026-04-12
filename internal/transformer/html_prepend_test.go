@@ -33,7 +33,7 @@ asdf
 
 	// Create a mock HTTP request
 	req, _ := http.NewRequest("GET", "http://example.com", nil)
-	
+
 	// Create a mock HTTP response
 	resp := &http.Response{
 		Request: req,
@@ -88,7 +88,7 @@ content
 
 	// Create a mock HTTP request
 	req, _ := http.NewRequest("GET", "http://example.com", nil)
-	
+
 	// Create a mock HTTP response
 	resp := &http.Response{
 		Request: req,
@@ -121,4 +121,3 @@ content
 	output := result.String()
 	assert.Equal(t, expectedOutput, output, "Regular HTML transform should add content before closing body tag")
 }
-

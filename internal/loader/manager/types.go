@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/soapbucket/sbproxy/internal/cache/store"
-	"github.com/soapbucket/sbproxy/internal/security/crypto"
 	"github.com/soapbucket/sbproxy/internal/platform/messenger"
 	"github.com/soapbucket/sbproxy/internal/platform/storage"
+	"github.com/soapbucket/sbproxy/internal/security/crypto"
 )
 
 // CacheLevel is a numeric type for cache level.

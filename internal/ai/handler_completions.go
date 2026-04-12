@@ -32,12 +32,12 @@ type LegacyCompletionRequest struct {
 
 // LegacyCompletionResponse matches the OpenAI /v1/completions response.
 type LegacyCompletionResponse struct {
-	ID      string                 `json:"id"`
-	Object  string                 `json:"object"`
-	Created int64                  `json:"created"`
-	Model   string                 `json:"model"`
+	ID      string                   `json:"id"`
+	Object  string                   `json:"object"`
+	Created int64                    `json:"created"`
+	Model   string                   `json:"model"`
 	Choices []LegacyCompletionChoice `json:"choices"`
-	Usage   *Usage                 `json:"usage,omitempty"`
+	Usage   *Usage                   `json:"usage,omitempty"`
 }
 
 // LegacyCompletionChoice represents a choice in a legacy completion response.
@@ -50,12 +50,12 @@ type LegacyCompletionChoice struct {
 
 // LegacyStreamChunk matches the OpenAI /v1/completions streaming chunk format.
 type LegacyStreamChunk struct {
-	ID      string                       `json:"id"`
-	Object  string                       `json:"object"`
-	Created int64                        `json:"created"`
-	Model   string                       `json:"model"`
+	ID      string                         `json:"id"`
+	Object  string                         `json:"object"`
+	Created int64                          `json:"created"`
+	Model   string                         `json:"model"`
 	Choices []LegacyStreamCompletionChoice `json:"choices"`
-	Usage   *Usage                       `json:"usage,omitempty"`
+	Usage   *Usage                         `json:"usage,omitempty"`
 }
 
 // LegacyStreamCompletionChoice represents a streaming choice in a legacy completion.

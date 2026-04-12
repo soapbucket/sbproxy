@@ -13,8 +13,8 @@ import (
 
 	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"github.com/soapbucket/sbproxy/internal/loader/manager"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/platform/messenger"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 const (
@@ -25,10 +25,10 @@ const (
 // ResponseCacheExpirationMessage represents a single cache expiration update
 type ResponseCacheExpirationMessage struct {
 	WorkspaceID string `json:"workspace_id,omitempty"` // Optional workspace ID for multi-tenant support
-	OriginID string `json:"origin_id"`
-	URL      string `json:"url"`       // URL to expire (will match all vary combinations)
-	Method   string `json:"method"`    // HTTP method (defaults to GET)
-	CacheKey string `json:"cache_key"` // Exact cache key to expire (optional, overrides URL)
+	OriginID    string `json:"origin_id"`
+	URL         string `json:"url"`       // URL to expire (will match all vary combinations)
+	Method      string `json:"method"`    // HTTP method (defaults to GET)
+	CacheKey    string `json:"cache_key"` // Exact cache key to expire (optional, overrides URL)
 }
 
 // ResponseCacheExpirationBatch represents a batch of cache expiration updates
@@ -38,15 +38,15 @@ type ResponseCacheExpirationBatch struct {
 
 // ResponseCacheExpirationConfig configures response cache expiration behavior
 type ResponseCacheExpirationConfig struct {
-	Enabled        bool
-	NormalizeURL   bool // Remove query parameters
-	NormalizePath  bool // Normalize trailing slashes
-	DefaultMethod  string
+	Enabled       bool
+	NormalizeURL  bool // Remove query parameters
+	NormalizePath bool // Normalize trailing slashes
+	DefaultMethod string
 }
 
 var (
 	expirationSubscriberOnce sync.Once
-	expirationSubscriber       *responseCacheExpirationSubscriber
+	expirationSubscriber     *responseCacheExpirationSubscriber
 )
 
 type responseCacheExpirationSubscriber struct {
@@ -264,26 +264,26 @@ func ExpireResponseCache(ctx context.Context, m manager.Manager, msg ResponseCac
 			testReq, err := http.NewRequest(method, normalizedURL, nil)
 			if err == nil {
 				testReq = testReq.WithContext(ctx)
-				
+
 				// Generate the expected cache key from the expiration message
 				// This will use empty workspace_id/config_id if not in context
 				expectedKey := httputil.GenerateCacheKey(testReq)
-				
+
 				// Match keys by comparing the generated key
 				// Since keys are deterministic, if we generate the same key, it will match
 				matchedKeys := make(map[string]bool, len(allKeys))
-				
+
 				// Check if any stored key matches the expected key
 				for _, storedKey := range allKeys {
 					if storedKey == expectedKey {
 						matchedKeys[storedKey] = true
 					}
 				}
-				
+
 				// Also need to handle vary headers - generate keys with different Accept-Encoding values
 				// This is a simplified approach - in reality, we'd need to know all vary header combinations
 				// For now, we'll delete the key we generated and hope the cache handles vary headers correctly
-				
+
 				// Delete all matched keys
 				deletedCount := 0
 				for key := range matchedKeys {
@@ -295,7 +295,7 @@ func ExpireResponseCache(ctx context.Context, m manager.Manager, msg ResponseCac
 							"error", err)
 					}
 				}
-				
+
 				if deletedCount > 0 {
 					slog.Debug("expired response cache entries by listing and matching keys",
 						"pattern", pattern,
@@ -349,7 +349,7 @@ func normalizeURLForCache(rawURL string, config ResponseCacheExpirationConfig) s
 
 	// Reconstruct URL (scheme + host + path only)
 	normalized := parsedURL.String()
-	
+
 	// If no scheme/host, return just the path
 	if parsedURL.Scheme == "" && parsedURL.Host == "" {
 		return parsedURL.Path
@@ -357,4 +357,3 @@ func normalizeURLForCache(rawURL string, config ResponseCacheExpirationConfig) s
 
 	return normalized
 }
-

@@ -43,4 +43,3 @@ type HTTPSProxyDestinationBlocked struct {
 	Target string `json:"target,omitempty"`
 	Reason string `json:"reason,omitempty"`
 }
-

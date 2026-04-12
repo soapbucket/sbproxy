@@ -12,12 +12,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/soapbucket/sbproxy/internal/cache/object"
 	"github.com/soapbucket/sbproxy/internal/cache/store"
+	"github.com/soapbucket/sbproxy/internal/loader/manager"
 	"github.com/soapbucket/sbproxy/internal/middleware/forward"
 	"github.com/soapbucket/sbproxy/internal/middleware/rule"
-	"github.com/soapbucket/sbproxy/internal/loader/manager"
 	"github.com/soapbucket/sbproxy/internal/platform/messenger"
-	"github.com/soapbucket/sbproxy/internal/cache/object"
 	"github.com/soapbucket/sbproxy/internal/platform/storage"
 )
 

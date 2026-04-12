@@ -2,9 +2,7 @@
 package transport
 
 import (
-	"io"
 	"net/http"
-	"strings"
 
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
 )
@@ -30,16 +28,7 @@ func (m *MaxConnections) RoundTrip(req *http.Request) (*http.Response, error) {
 		// acquired slot
 	case <-req.Context().Done():
 		metric.MaxConnectionsRejected()
-		return &http.Response{
-			StatusCode: http.StatusServiceUnavailable,
-			Status:     "503 Service Unavailable",
-			Header: http.Header{
-				"Content-Type": {"text/plain; charset=utf-8"},
-				"Retry-After":  {"1"},
-			},
-			Body:    io.NopCloser(strings.NewReader("503 Service Unavailable: connection limit reached\n")),
-			Request: req,
-		}, nil
+		return nil, req.Context().Err()
 	}
 	defer func() { <-m.connections }()
 

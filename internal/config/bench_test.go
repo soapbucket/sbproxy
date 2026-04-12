@@ -89,22 +89,22 @@ func (bn *benchNoop) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // benchServices implements plugin.ServiceProvider with no-ops.
 type benchServices struct{}
 
-func (benchServices) KVStore() plugin.KVStore             { return benchKV{} }
-func (benchServices) Cache() plugin.CacheStore            { return benchCache{} }
-func (benchServices) Events() plugin.EventEmitter         { return benchEvents{} }
-func (benchServices) Logger() *slog.Logger                { return slog.Default() }
-func (benchServices) Metrics() plugin.Observer            { return plugin.NoopObserver() }
+func (benchServices) KVStore() plugin.KVStore     { return benchKV{} }
+func (benchServices) Cache() plugin.CacheStore    { return benchCache{} }
+func (benchServices) Events() plugin.EventEmitter { return benchEvents{} }
+func (benchServices) Logger() *slog.Logger        { return slog.Default() }
+func (benchServices) Metrics() plugin.Observer    { return plugin.NoopObserver() }
 func (benchServices) TransportFor(plugin.TransportConfig) http.RoundTripper {
 	return http.DefaultTransport
 }
-func (benchServices) ResolveOriginHandler(string) (http.Handler, error)           { return nil, nil }
+func (benchServices) ResolveOriginHandler(string) (http.Handler, error) { return nil, nil }
 func (benchServices) ResolveEmbeddedOriginHandler(json.RawMessage) (http.Handler, error) {
 	return nil, nil
 }
-func (benchServices) ResponseCache() plugin.ResponseCache         { return nil }
-func (benchServices) Sessions() plugin.SessionProvider            { return nil }
-func (benchServices) HealthStatus(string) plugin.HealthState      { return plugin.HealthState{} }
-func (benchServices) SetHealthStatus(string, plugin.HealthState)  {}
+func (benchServices) ResponseCache() plugin.ResponseCache        { return nil }
+func (benchServices) Sessions() plugin.SessionProvider           { return nil }
+func (benchServices) HealthStatus(string) plugin.HealthState     { return plugin.HealthState{} }
+func (benchServices) SetHealthStatus(string, plugin.HealthState) {}
 
 type benchKV struct{}
 
@@ -115,8 +115,8 @@ func (benchKV) Increment(context.Context, string, int64) (int64, error)  { retur
 
 type benchCache struct{}
 
-func (benchCache) Get(context.Context, string) (interface{}, bool)              { return nil, false }
-func (benchCache) Set(context.Context, string, interface{}, time.Duration)      {}
+func (benchCache) Get(context.Context, string) (interface{}, bool)         { return nil, false }
+func (benchCache) Set(context.Context, string, interface{}, time.Duration) {}
 
 type benchEvents struct{}
 

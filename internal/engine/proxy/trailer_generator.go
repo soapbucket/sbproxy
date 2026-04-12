@@ -177,15 +177,15 @@ func (tg *TrailerGeneratorImpl) ApplyTrailers(w http.ResponseWriter, tw *trailer
 // Returns the result as a string.
 func (tg *TrailerGeneratorImpl) evalTrailerCEL(program cel.Program, tw *trailerWriter) (string, error) {
 	vars := map[string]interface{}{
-		"request":  map[string]interface{}{},
-		"response": map[string]interface{}{},
-		"session":  map[string]interface{}{},
-		"origin":   map[string]interface{}{},
-		"server":   map[string]interface{}{},
-		"vars":     map[string]interface{}{},
-		"features": map[string]interface{}{},
-		"client":   map[string]interface{}{},
-		"ctx":      map[string]interface{}{},
+		"request":    map[string]interface{}{},
+		"response":   map[string]interface{}{},
+		"session":    map[string]interface{}{},
+		"origin":     map[string]interface{}{},
+		"server":     map[string]interface{}{},
+		"vars":       map[string]interface{}{},
+		"features":   map[string]interface{}{},
+		"client":     map[string]interface{}{},
+		"ctx":        map[string]interface{}{},
 		"oauth_user": map[string]interface{}{},
 	}
 
@@ -233,4 +233,3 @@ func (tw *trailerWriter) Write(p []byte) (int, error) {
 
 	return n, err
 }
-

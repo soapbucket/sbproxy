@@ -30,12 +30,12 @@ func (e *CacheEntry) IsStale() bool {
 
 // CacheConfig configures DNS cache behavior
 type CacheConfig struct {
-	Enabled            bool
-	MaxEntries         int
-	DefaultTTL         time.Duration
-	NegativeTTL        time.Duration
-	ServeStaleOnError  bool
-	BackgroundRefresh  bool
+	Enabled           bool
+	MaxEntries        int
+	DefaultTTL        time.Duration
+	NegativeTTL       time.Duration
+	ServeStaleOnError bool
+	BackgroundRefresh bool
 }
 
 // DefaultCacheConfig returns default DNS cache configuration
@@ -55,9 +55,9 @@ type Cache struct {
 	config CacheConfig
 	mu     sync.RWMutex
 	cache  map[string]*CacheEntry
-	order  *list.List                   // Doubly-linked list for LRU eviction
-	index  map[string]*list.Element     // Map for O(1) element lookup
-	stopCh chan struct{}                // Signals background goroutines to stop
+	order  *list.List               // Doubly-linked list for LRU eviction
+	index  map[string]*list.Element // Map for O(1) element lookup
+	stopCh chan struct{}            // Signals background goroutines to stop
 }
 
 // NewCache creates a new DNS cache with the given configuration
@@ -332,18 +332,17 @@ func (c *Cache) refreshExpiringEntries() {
 			// Perform DNS lookup
 			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", h)
 			if err == nil && len(ips) > 0 {
-			// Update cache with new TTL
-			c.mu.RLock()
-			_, exists := c.cache[h]
-			c.mu.RUnlock()
+				// Update cache with new TTL
+				c.mu.RLock()
+				_, exists := c.cache[h]
+				c.mu.RUnlock()
 
-			if exists {
-				ttl := c.config.DefaultTTL
-				c.Put(h, ips, ttl, false)
-				slog.Debug("DNS cache entry refreshed", "hostname", h)
-			}
+				if exists {
+					ttl := c.config.DefaultTTL
+					c.Put(h, ips, ttl, false)
+					slog.Debug("DNS cache entry refreshed", "hostname", h)
+				}
 			}
 		}(hostname)
 	}
 }
-

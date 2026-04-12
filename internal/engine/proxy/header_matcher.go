@@ -63,4 +63,3 @@ func (hm *HeaderMatcher) StripMatchingHeaders(header http.Header) {
 		header.Del(name)
 	}
 }
-

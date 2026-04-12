@@ -5,10 +5,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"strconv"
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
@@ -22,13 +22,13 @@ type StreamingConfigProvider interface {
 
 // StreamingConfig matches config.StreamingConfigValues to avoid import cycle
 type StreamingConfig struct {
-	Enabled              bool
-	MaxBufferedBodySize  int64
+	Enabled                bool
+	MaxBufferedBodySize    int64
 	MaxProcessableBodySize int64
-	ModifierThreshold    int64
-	TransformThreshold   int64
-	SignatureThreshold   int64
-	CallbackThreshold    int64
+	ModifierThreshold      int64
+	TransformThreshold     int64
+	SignatureThreshold     int64
+	CallbackThreshold      int64
 }
 
 // ResponseVerifier is an interface for verifying HTTP response signatures
@@ -39,13 +39,13 @@ type ResponseVerifier interface {
 // ResponseVerificationConfig configures response signature verification
 type ResponseVerificationConfig struct {
 	Verifier ResponseVerifier
-	
+
 	// Optional: Skip verification for certain status codes
 	SkipStatusCodes []int
-	
+
 	// Optional: Only verify certain content types
 	ContentTypes []string
-	
+
 	// Optional: What to do on verification failure
 	FailureMode VerificationFailureMode
 }
@@ -55,11 +55,11 @@ type VerificationFailureMode string
 
 const (
 	// FailureModeReject is a constant for failure mode reject.
-	FailureModeReject   VerificationFailureMode = "reject"   // Return error to client
+	FailureModeReject VerificationFailureMode = "reject" // Return error to client
 	// FailureModeWarn is a constant for failure mode warn.
-	FailureModeWarn     VerificationFailureMode = "warn"     // Log warning, pass through
+	FailureModeWarn VerificationFailureMode = "warn" // Log warning, pass through
 	// FailureModeStrict is a constant for failure mode strict.
-	FailureModeStrict   VerificationFailureMode = "strict"   // Reject and close connection
+	FailureModeStrict VerificationFailureMode = "strict" // Reject and close connection
 )
 
 // ResponseVerificationTransport wraps an http.RoundTripper to verify response signatures
@@ -78,7 +78,7 @@ func (t *ResponseVerificationTransport) RoundTrip(req *http.Request) (*http.Resp
 
 	// Check if we should skip verification for this response
 	if t.shouldSkipVerification(resp) {
-		slog.Debug("skipping response verification", 
+		slog.Debug("skipping response verification",
 			"status_code", resp.StatusCode,
 			"content_type", resp.Header.Get("Content-Type"))
 		return resp, nil
@@ -179,7 +179,7 @@ func (t *ResponseVerificationTransport) handleVerificationFailure(resp *http.Res
 			"error", verifyErr,
 			"status_code", resp.StatusCode,
 			"failure_mode", failureMode)
-		
+
 		// Restore body and return response
 		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		return resp, nil
@@ -189,12 +189,12 @@ func (t *ResponseVerificationTransport) handleVerificationFailure(resp *http.Res
 		slog.Error("response signature verification failed, rejecting (strict mode)",
 			"error", verifyErr,
 			"status_code", resp.StatusCode)
-		
+
 		// Close the original body
 		if resp.Body != nil {
 			resp.Body.Close()
 		}
-		
+
 		// Return error
 		return nil, fmt.Errorf("response signature verification failed: %w", verifyErr)
 
@@ -203,7 +203,7 @@ func (t *ResponseVerificationTransport) handleVerificationFailure(resp *http.Res
 		slog.Error("response signature verification failed, rejecting",
 			"error", verifyErr,
 			"status_code", resp.StatusCode)
-		
+
 		// Create error response
 		errorMsg := fmt.Sprintf("Origin response signature verification failed: %v", verifyErr)
 		errorResp := &http.Response{
@@ -219,12 +219,12 @@ func (t *ResponseVerificationTransport) handleVerificationFailure(resp *http.Res
 		errorResp.Header.Set("Content-Type", "text/plain")
 		errorResp.Header.Set("X-Verification-Error", "signature-mismatch")
 		errorResp.Header.Set("X-Verification-Timestamp", strconv.FormatInt(time.Now().Unix(), 10))
-		
+
 		// Close the original body
 		if resp.Body != nil {
 			resp.Body.Close()
 		}
-		
+
 		return errorResp, nil
 	}
 }
@@ -234,7 +234,7 @@ func NewResponseVerificationTransport(base http.RoundTripper, config ResponseVer
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	
+
 	return &ResponseVerificationTransport{
 		Transport: base,
 		Config:    config,
@@ -249,7 +249,7 @@ func (t *ResponseVerificationTransport) verifyLargeResponse(resp *http.Response,
 	slog.Warn("Response body too large for signature verification, skipping verification",
 		"content_length", resp.ContentLength,
 		"threshold", maxSize)
-	
+
 	// Pass through without verification
 	// Note: This is a security trade-off - large bodies won't be verified
 	// In production, you may want to reject these or use a different verification strategy
@@ -282,4 +282,3 @@ func getStreamingConfigProviderFromContext(ctx context.Context) StreamingConfigP
 	}
 	return nil
 }
-

@@ -178,10 +178,10 @@ func TestMemoryStore_Revoke(t *testing.T) {
 	ctx := context.Background()
 
 	store.Create(ctx, &VirtualKey{
-		ID:        "vk-1",
-		HashedKey: "h1",
+		ID:          "vk-1",
+		HashedKey:   "h1",
 		WorkspaceID: "ws-1",
-		Status:    "active",
+		Status:      "active",
 	})
 
 	if err := store.Revoke(ctx, "vk-1"); err != nil {
@@ -199,10 +199,10 @@ func TestMemoryStore_Delete(t *testing.T) {
 	ctx := context.Background()
 
 	store.Create(ctx, &VirtualKey{
-		ID:        "vk-1",
-		HashedKey: "h1",
+		ID:          "vk-1",
+		HashedKey:   "h1",
 		WorkspaceID: "ws-1",
-		Status:    "active",
+		Status:      "active",
 	})
 
 	if err := store.Delete(ctx, "vk-1"); err != nil {
@@ -225,11 +225,11 @@ func TestMemoryStore_ReturnsCopies(t *testing.T) {
 	ctx := context.Background()
 
 	store.Create(ctx, &VirtualKey{
-		ID:        "vk-1",
-		HashedKey: "h1",
+		ID:          "vk-1",
+		HashedKey:   "h1",
 		WorkspaceID: "ws-1",
-		Name:      "original",
-		Status:    "active",
+		Name:        "original",
+		Status:      "active",
 	})
 
 	got1, _ := store.GetByID(ctx, "vk-1")

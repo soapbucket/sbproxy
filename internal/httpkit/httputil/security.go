@@ -15,38 +15,38 @@ import (
 // Security validation constants
 const (
 	// Maximum safe sizes to prevent DoS
-	MaxURLLength        = 8192     // 8KB for URL
+	MaxURLLength = 8192 // 8KB for URL
 	// MaxHeaderSize is the maximum allowed value for header size.
-	MaxHeaderSize       = 8192     // 8KB per header
+	MaxHeaderSize = 8192 // 8KB per header
 	// MaxHeaderCount is the maximum allowed value for header count.
-	MaxHeaderCount      = 100      // Maximum number of headers
+	MaxHeaderCount = 100 // Maximum number of headers
 	// MaxQueryParamLength is the maximum allowed value for query param length.
-	MaxQueryParamLength = 4096     // 4KB per query parameter
+	MaxQueryParamLength = 4096 // 4KB per query parameter
 	// MaxQueryParamCount is the maximum allowed value for query param count.
-	MaxQueryParamCount  = 100      // Maximum number of query parameters
+	MaxQueryParamCount = 100 // Maximum number of query parameters
 	// MaxPathLength is the maximum allowed value for path length.
-	MaxPathLength       = 2048     // 2KB for path
+	MaxPathLength = 2048 // 2KB for path
 	// MaxHostnameLength is the maximum allowed value for hostname length.
-	MaxHostnameLength   = 253      // RFC 1035
+	MaxHostnameLength = 253 // RFC 1035
 	// MaxCookieSize is the maximum allowed value for cookie size.
-	MaxCookieSize       = 4096     // 4KB per cookie
+	MaxCookieSize = 4096 // 4KB per cookie
 	// MaxFormFieldSize is the maximum allowed value for form field size.
-	MaxFormFieldSize    = 10485760 // 10MB per form field
+	MaxFormFieldSize = 10485760 // 10MB per form field
 
 	// Security patterns
-	PatternSQLInjection     = `(?i)(union\s+(all\s+)?select|;\s*(drop|delete|update|insert|create|alter|exec)\b|'\s*(or|and)\s+|--\s|/\*.*\*/|xp_|0x[0-9a-f]{8,})`
+	PatternSQLInjection = `(?i)(union\s+(all\s+)?select|;\s*(drop|delete|update|insert|create|alter|exec)\b|'\s*(or|and)\s+|--\s|/\*.*\*/|xp_|0x[0-9a-f]{8,})`
 	// PatternXSS is a constant for pattern xss.
-	PatternXSS              = `(?i)(<script|javascript:|onerror=|onload=|<iframe|eval\(|expression\()`
+	PatternXSS = `(?i)(<script|javascript:|onerror=|onload=|<iframe|eval\(|expression\()`
 	// PatternPathTraversal is a constant for pattern path traversal.
-	PatternPathTraversal    = `\.\.(/|\\)`
+	PatternPathTraversal = `\.\.(/|\\)`
 	// PatternNullByte is a constant for pattern null byte.
-	PatternNullByte         = `\x00`
+	PatternNullByte = `\x00`
 	// PatternCRLFInjection is a constant for pattern crlf injection.
-	PatternCRLFInjection    = `[\r\n]`
+	PatternCRLFInjection = `[\r\n]`
 	// PatternLDAPInjection is a constant for pattern ldap injection.
-	PatternLDAPInjection    = `(\)\s*\(|\(&|\(\||!\()`
+	PatternLDAPInjection = `(\)\s*\(|\(&|\(\||!\()`
 	// PatternXMLInjection is a constant for pattern xml injection.
-	PatternXMLInjection     = `(?i)(<!entity|<!doctype|<\?xml)`
+	PatternXMLInjection = `(?i)(<!entity|<!doctype|<\?xml)`
 	// PatternCommandInjection is a constant for pattern command injection.
 	PatternCommandInjection = `[;&|$<>` + "`" + `]`
 )
@@ -54,39 +54,39 @@ const (
 // Security error types
 var (
 	// ErrURLTooLong is a sentinel error for url too long conditions.
-	ErrURLTooLong         = fmt.Errorf("URL exceeds maximum length of %d bytes", MaxURLLength)
+	ErrURLTooLong = fmt.Errorf("URL exceeds maximum length of %d bytes", MaxURLLength)
 	// ErrHeaderTooLarge is a sentinel error for header too large conditions.
-	ErrHeaderTooLarge     = fmt.Errorf("header exceeds maximum size of %d bytes", MaxHeaderSize)
+	ErrHeaderTooLarge = fmt.Errorf("header exceeds maximum size of %d bytes", MaxHeaderSize)
 	// ErrTooManyHeaders is a sentinel error for too many headers conditions.
-	ErrTooManyHeaders     = fmt.Errorf("too many headers (max: %d)", MaxHeaderCount)
+	ErrTooManyHeaders = fmt.Errorf("too many headers (max: %d)", MaxHeaderCount)
 	// ErrTooManyQueryParams is a sentinel error for too many query params conditions.
 	ErrTooManyQueryParams = fmt.Errorf("too many query parameters (max: %d)", MaxQueryParamCount)
 	// ErrQueryParamTooLong is a sentinel error for query param too long conditions.
-	ErrQueryParamTooLong  = fmt.Errorf("query parameter exceeds maximum length of %d bytes", MaxQueryParamLength)
+	ErrQueryParamTooLong = fmt.Errorf("query parameter exceeds maximum length of %d bytes", MaxQueryParamLength)
 	// ErrPathTooLong is a sentinel error for path too long conditions.
-	ErrPathTooLong        = fmt.Errorf("path exceeds maximum length of %d bytes", MaxPathLength)
+	ErrPathTooLong = fmt.Errorf("path exceeds maximum length of %d bytes", MaxPathLength)
 	// ErrInvalidUTF8 is a sentinel error for invalid utf8 conditions.
-	ErrInvalidUTF8        = fmt.Errorf("invalid UTF-8 encoding detected")
+	ErrInvalidUTF8 = fmt.Errorf("invalid UTF-8 encoding detected")
 	// ErrSQLInjection is a sentinel error for sql injection conditions.
-	ErrSQLInjection       = fmt.Errorf("potential SQL injection detected")
+	ErrSQLInjection = fmt.Errorf("potential SQL injection detected")
 	// ErrXSSAttempt is a sentinel error for xss attempt conditions.
-	ErrXSSAttempt         = fmt.Errorf("potential XSS attempt detected")
+	ErrXSSAttempt = fmt.Errorf("potential XSS attempt detected")
 	// ErrPathTraversal is a sentinel error for path traversal conditions.
-	ErrPathTraversal      = fmt.Errorf("path traversal attempt detected")
+	ErrPathTraversal = fmt.Errorf("path traversal attempt detected")
 	// ErrNullByte is a sentinel error for null byte conditions.
-	ErrNullByte           = fmt.Errorf("null byte detected")
+	ErrNullByte = fmt.Errorf("null byte detected")
 	// ErrHeaderInjection is a sentinel error for header injection conditions.
-	ErrHeaderInjection    = fmt.Errorf("header injection attempt detected (CRLF)")
+	ErrHeaderInjection = fmt.Errorf("header injection attempt detected (CRLF)")
 	// ErrInvalidHostname is a sentinel error for invalid hostname conditions.
-	ErrInvalidHostname    = fmt.Errorf("invalid hostname")
+	ErrInvalidHostname = fmt.Errorf("invalid hostname")
 	// ErrInvalidScheme is a sentinel error for invalid scheme conditions.
-	ErrInvalidScheme      = fmt.Errorf("invalid URL scheme")
+	ErrInvalidScheme = fmt.Errorf("invalid URL scheme")
 	// ErrLDAPInjection is a sentinel error for ldap injection conditions.
-	ErrLDAPInjection      = fmt.Errorf("potential LDAP injection detected")
+	ErrLDAPInjection = fmt.Errorf("potential LDAP injection detected")
 	// ErrXMLInjection is a sentinel error for xml injection conditions.
-	ErrXMLInjection       = fmt.Errorf("potential XML injection detected")
+	ErrXMLInjection = fmt.Errorf("potential XML injection detected")
 	// ErrCommandInjection is a sentinel error for command injection conditions.
-	ErrCommandInjection   = fmt.Errorf("potential command injection detected")
+	ErrCommandInjection = fmt.Errorf("potential command injection detected")
 )
 
 // Compiled regex patterns for performance (cached at package init)

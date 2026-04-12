@@ -19,9 +19,9 @@ type KeyPool struct {
 }
 
 type poolKey struct {
-	value       string
-	failures    int
-	disabledAt  time.Time
+	value      string
+	failures   int
+	disabledAt time.Time
 }
 
 // NewKeyPool creates a pool from a list of API keys. If a single key is provided,

@@ -107,9 +107,10 @@ func NewToxicityFilter(config json.RawMessage) (Guardrail, error) {
 }
 
 // Name performs the name operation on the toxicityFilter.
-func (f *toxicityFilter) Name() string  { return "toxicity" }
+func (f *toxicityFilter) Name() string { return "toxicity" }
+
 // Phase performs the phase operation on the toxicityFilter.
-func (f *toxicityFilter) Phase() Phase  { return PhaseOutput }
+func (f *toxicityFilter) Phase() Phase { return PhaseOutput }
 
 // Check performs the check operation on the toxicityFilter.
 func (f *toxicityFilter) Check(_ context.Context, content *Content) (*Result, error) {

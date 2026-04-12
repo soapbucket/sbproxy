@@ -655,11 +655,11 @@ func TestRequestRule_JSON(t *testing.T) {
 			name: "Multiple fields",
 			json: `{"methods":["POST"],"path":{"exact":"/api/users"},"scheme":"https","headers":{"exact":{"Content-Type":"application/json"}},"query":{"exact":{"id":"123"}}}`,
 			want: RequestRule{
-				Methods:  []string{"POST"},
-				Path:     &PathConditions{Exact: "/api/users"},
-				Scheme:   "https",
-				Headers:  &HeaderConditions{Exact: map[string]string{"Content-Type": "application/json"}},
-				Query:    &QueryConditions{Exact: map[string]string{"id": "123"}},
+				Methods: []string{"POST"},
+				Path:    &PathConditions{Exact: "/api/users"},
+				Scheme:  "https",
+				Headers: &HeaderConditions{Exact: map[string]string{"Content-Type": "application/json"}},
+				Query:   &QueryConditions{Exact: map[string]string{"id": "123"}},
 			},
 		},
 		{
@@ -689,34 +689,34 @@ func TestRequestRule_JSON(t *testing.T) {
 		},
 		// Temporarily disabled due to refactoring - these should be updated to use Location and UserAgent
 		/*
-		{
-			name: "Location rule",
-			json: `{"location":{"country_codes":["US","GB"],"continent_codes":["NA","EU"]}}`,
-			want: RequestRule{
-				Location: &LocationConditions{
-					CountryCodes:   []string{"US", "GB"},
-					ContinentCodes: []string{"NA", "EU"},
+			{
+				name: "Location rule",
+				json: `{"location":{"country_codes":["US","GB"],"continent_codes":["NA","EU"]}}`,
+				want: RequestRule{
+					Location: &LocationConditions{
+						CountryCodes:   []string{"US", "GB"},
+						ContinentCodes: []string{"NA", "EU"},
+					},
 				},
 			},
-		},
-		{
-			name: "UserAgent rule",
-			json: `{"user_agent":{"families":["Chrome","Firefox"],"os_families":["Windows"]}}`,
-			want: RequestRule{
-				UserAgent: &UserAgentConditions{
-					Families:   []string{"Chrome", "Firefox"},
-					OSFamilies: []string{"Windows"},
+			{
+				name: "UserAgent rule",
+				json: `{"user_agent":{"families":["Chrome","Firefox"],"os_families":["Windows"]}}`,
+				want: RequestRule{
+					UserAgent: &UserAgentConditions{
+						Families:   []string{"Chrome", "Firefox"},
+						OSFamilies: []string{"Windows"},
+					},
 				},
 			},
-		},
-		{
-			name: "Location and UserAgent together",
-			json: `{"location":{"country_codes":["US"]},"user_agent":{"families":["Chrome"]}}`,
-			want: RequestRule{
-				Location:  &LocationConditions{CountryCodes: []string{"US"}},
-				UserAgent: &UserAgentConditions{Families: []string{"Chrome"}},
+			{
+				name: "Location and UserAgent together",
+				json: `{"location":{"country_codes":["US"]},"user_agent":{"families":["Chrome"]}}`,
+				want: RequestRule{
+					Location:  &LocationConditions{CountryCodes: []string{"US"}},
+					UserAgent: &UserAgentConditions{Families: []string{"Chrome"}},
+				},
 			},
-		},
 		*/
 	}
 
@@ -1338,9 +1338,9 @@ func mustCreateRequestWithRemoteAddr(method, rawURL, remoteAddr string, t *testi
 		t.Fatalf("Failed to parse URL %s: %v", rawURL, err)
 	}
 	req := &http.Request{
-		Method:    method,
-		URL:       parsedURL,
-		Header:    make(http.Header),
+		Method:     method,
+		URL:        parsedURL,
+		Header:     make(http.Header),
 		RemoteAddr: remoteAddr,
 	}
 	// Initialize request data
@@ -1353,7 +1353,7 @@ func mustCreateRequestWithRemoteAddr(method, rawURL, remoteAddr string, t *testi
 /*
 func mustCreateRequestWithUser(method, rawURL string, u *user.User, t testing.TB) *http.Request {
 	req := mustCreateRequest(method, rawURL, t)
-	
+
 	// Create session data with user
 	if u != nil {
 		// Use a local struct to avoid import cycle with session package
@@ -1395,7 +1395,7 @@ func mustCreateRequestWithUser(method, rawURL string, u *user.User, t testing.TB
 			Expires: sessionData.Expires,
 		}
 	}
-	
+
 	return req
 }
 
@@ -1555,4 +1555,3 @@ func uaParserRulesEqual(a, b *UAParserRule) bool {
 		stringSliceEqual(a.DeviceModels, b.DeviceModels)
 }
 */
-

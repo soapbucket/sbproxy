@@ -8,15 +8,15 @@ import (
 	"github.com/go-chi/chi/v5"
 	cmiddleware "github.com/go-chi/chi/v5/middleware"
 
+	"github.com/soapbucket/sbproxy/internal/app/debug"
 	"github.com/soapbucket/sbproxy/internal/config"
 	"github.com/soapbucket/sbproxy/internal/httpkit/compressor"
-	"github.com/soapbucket/sbproxy/internal/loader/configloader"
-	"github.com/soapbucket/sbproxy/internal/app/debug"
-	"github.com/soapbucket/sbproxy/internal/loader/featureflags"
-	"github.com/soapbucket/sbproxy/internal/platform/health"
 	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
-	"github.com/soapbucket/sbproxy/internal/observe/logging"
+	"github.com/soapbucket/sbproxy/internal/loader/configloader"
+	"github.com/soapbucket/sbproxy/internal/loader/featureflags"
 	"github.com/soapbucket/sbproxy/internal/loader/manager"
+	"github.com/soapbucket/sbproxy/internal/observe/logging"
+	"github.com/soapbucket/sbproxy/internal/platform/health"
 	"github.com/soapbucket/sbproxy/pkg/plugin"
 )
 
@@ -35,10 +35,10 @@ type CompiledOriginAdder interface {
 
 // RouterOptions holds optional dependencies for the router.
 type RouterOptions struct {
-	AdminKey    string                    // Admin API key for traffic inspector auth. Empty disables auth.
-	CompiledCfg CompiledOriginLookup     // Pre-compiled config for fast-path serving. May be nil.
-	Loader      *configloader.Loader     // Injected config loader. Falls back to configloader.DefaultLoader().
-	SvcProvider plugin.ServiceProvider    // Service provider for compile-on-demand. May be nil (disables compile-on-demand).
+	AdminKey    string                 // Admin API key for traffic inspector auth. Empty disables auth.
+	CompiledCfg CompiledOriginLookup   // Pre-compiled config for fast-path serving. May be nil.
+	Loader      *configloader.Loader   // Injected config loader. Falls back to configloader.DefaultLoader().
+	SvcProvider plugin.ServiceProvider // Service provider for compile-on-demand. May be nil (disables compile-on-demand).
 }
 
 // Router builds the global HTTP middleware stack and attaches the origin handler.
@@ -115,9 +115,9 @@ func Router(m manager.Manager, opts ...RouterOptions) *chi.Mux {
 //  3. Not found: return 421 Misdirected Request.
 type OriginHandler struct {
 	manager     manager.Manager
-	loader      *configloader.Loader     // injected config loader
-	compiledCfg CompiledOriginLookup     // fast path: pre-compiled handler chain
-	svcProvider plugin.ServiceProvider    // for compile-on-demand (may be nil)
+	loader      *configloader.Loader   // injected config loader
+	compiledCfg CompiledOriginLookup   // fast path: pre-compiled handler chain
+	svcProvider plugin.ServiceProvider // for compile-on-demand (may be nil)
 	opts        RouterOptions
 }
 

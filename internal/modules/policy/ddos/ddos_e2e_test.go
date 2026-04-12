@@ -21,8 +21,8 @@ func newTestEnforcer(t *testing.T, requestThreshold, connectionThreshold int) *d
 			"detection_window":          "60s",
 		},
 		"mitigation": map[string]interface{}{
-			"auto_block":         true,
-			"block_duration":     "1m",
+			"auto_block":          true,
+			"block_duration":      "1m",
 			"block_after_attacks": 1,
 		},
 	}

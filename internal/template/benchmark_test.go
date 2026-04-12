@@ -132,5 +132,3 @@ func BenchmarkBuildContextFull(b *testing.B) {
 		templateresolver.BuildContext(req)
 	}
 }
-
-

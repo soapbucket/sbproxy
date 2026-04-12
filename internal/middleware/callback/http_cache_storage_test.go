@@ -211,8 +211,8 @@ func TestHTTPCallbackCache(t *testing.T) {
 	t.Run("cache state - fresh", func(t *testing.T) {
 		now := time.Now()
 		cached := &HTTPCachedCallbackResponse{
-			ExpiresAt: now.Add(60 * time.Second),
-			StaleAt:   now.Add(180 * time.Second),
+			ExpiresAt:  now.Add(60 * time.Second),
+			StaleAt:    now.Add(180 * time.Second),
 			MaxStaleAt: now.Add(360 * time.Second),
 		}
 
@@ -229,8 +229,8 @@ func TestHTTPCallbackCache(t *testing.T) {
 	t.Run("cache state - stale", func(t *testing.T) {
 		now := time.Now()
 		cached := &HTTPCachedCallbackResponse{
-			ExpiresAt: now.Add(-30 * time.Second),
-			StaleAt:   now.Add(90 * time.Second),
+			ExpiresAt:  now.Add(-30 * time.Second),
+			StaleAt:    now.Add(90 * time.Second),
 			MaxStaleAt: now.Add(270 * time.Second),
 		}
 
@@ -251,8 +251,8 @@ func TestHTTPCallbackCache(t *testing.T) {
 	t.Run("cache state - stale-error", func(t *testing.T) {
 		now := time.Now()
 		cached := &HTTPCachedCallbackResponse{
-			ExpiresAt: now.Add(-120 * time.Second),
-			StaleAt:   now.Add(-30 * time.Second),
+			ExpiresAt:  now.Add(-120 * time.Second),
+			StaleAt:    now.Add(-30 * time.Second),
 			MaxStaleAt: now.Add(150 * time.Second),
 		}
 
@@ -376,13 +376,13 @@ func TestHTTPCallbackCache(t *testing.T) {
 
 		// Manually put in L3
 		cached := HTTPCachedCallbackResponse{
-			Data:      data,
-			Headers:   headers,
-			ExpiresAt: metadata.ExpiresAt,
-			StaleAt:   metadata.StaleAt,
+			Data:       data,
+			Headers:    headers,
+			ExpiresAt:  metadata.ExpiresAt,
+			StaleAt:    metadata.StaleAt,
 			MaxStaleAt: metadata.MaxStaleAt,
-			Size:      2 * 1024 * 1024,
-			Tier:      "l3",
+			Size:       2 * 1024 * 1024,
+			Tier:       "l3",
 		}
 
 		jsonData, _ := json.Marshal(cached)
@@ -401,4 +401,3 @@ func TestHTTPCallbackCache(t *testing.T) {
 		}
 	})
 }
-

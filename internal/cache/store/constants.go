@@ -6,19 +6,19 @@ import "time"
 // Driver names
 const (
 	// DriverMemory is a constant for driver memory.
-	DriverMemory    = "memory"
+	DriverMemory = "memory"
 	// DriverRedis is a constant for driver redis.
-	DriverRedis     = "redis"
+	DriverRedis = "redis"
 	// DriverPebble is a constant for driver pebble.
-	DriverPebble    = "pebble"
+	DriverPebble = "pebble"
 	// DriverFile is a constant for driver file.
-	DriverFile      = "file"
+	DriverFile = "file"
 	// DriverNoop is a constant for driver noop.
-	DriverNoop      = "noop"
+	DriverNoop = "noop"
 	// DriverMemcached is a constant for driver memcached.
 	DriverMemcached = "memcached"
 	// WrapperDSN is a constant for wrapper dsn.
-	WrapperDSN      = "wrapper"
+	WrapperDSN = "wrapper"
 )
 
 // DSN parameter key
@@ -37,9 +37,9 @@ const (
 	defaultBaseDir     = "/tmp/cache"
 	defaultCompression = false
 	// SettingBaseDir is a constant for setting base dir.
-	SettingBaseDir     = "base_dir"
+	SettingBaseDir = "base_dir"
 	// SettingMaxSize is a constant for setting max size.
-	SettingMaxSize     = "max_size"
+	SettingMaxSize = "max_size"
 	// SettingCompression is a constant for setting compression.
 	SettingCompression = "compression"
 )
@@ -51,25 +51,25 @@ const (
 	defaultCapacity        = 100000
 
 	// SettingDuration is a constant for setting duration.
-	SettingDuration        = "duration"
+	SettingDuration = "duration"
 	// SettingCapacity is a constant for setting capacity.
-	SettingCapacity        = "capacity"
+	SettingCapacity = "capacity"
 	// SettingCleanupInterval is a constant for setting cleanup interval.
 	SettingCleanupInterval = "cleanup_interval"
 	// SettingMaxObjects is a constant for setting max objects.
-	SettingMaxObjects      = "max_objects"
+	SettingMaxObjects = "max_objects"
 	// SettingMaxMemory is a constant for setting max memory.
-	SettingMaxMemory       = "max_memory"
+	SettingMaxMemory = "max_memory"
 )
 
 // Pebble cacher constants
 const (
 	// SettingPath is a constant for setting path.
-	SettingPath                  = "path"
+	SettingPath = "path"
 	// SettingBlockCacheSize is a constant for setting block cache size.
-	SettingBlockCacheSize        = "block_cache_size"
+	SettingBlockCacheSize = "block_cache_size"
 	// SettingMemTableSize is a constant for setting mem table size.
-	SettingMemTableSize          = "mem_table_size"
+	SettingMemTableSize = "mem_table_size"
 	// SettingL0CompactionThreshold is a constant for setting l0 compaction threshold.
 	SettingL0CompactionThreshold = "l0_compaction_threshold"
 	// SettingL0StopWritesThreshold is a constant for setting l0 stop writes threshold.
@@ -84,17 +84,17 @@ const (
 // Memcached cacher constants
 const (
 	// SettingServers is a constant for setting servers.
-	SettingServers        = "servers"
+	SettingServers = "servers"
 	// SettingPrefix is a constant for setting prefix.
-	SettingPrefix         = "prefix"
+	SettingPrefix = "prefix"
 	// SettingMaxItemSize is a constant for setting max item size.
-	SettingMaxItemSize    = "max_item_size"
+	SettingMaxItemSize = "max_item_size"
 	// SettingConnectTimeout is a constant for setting connect timeout.
 	SettingConnectTimeout = "connect_timeout"
 	// SettingTimeout is a constant for setting timeout.
-	SettingTimeout        = "timeout"
+	SettingTimeout = "timeout"
 	// SettingMaxIdleConns is a constant for setting max idle conns.
-	SettingMaxIdleConns   = "max_idle_conns"
+	SettingMaxIdleConns = "max_idle_conns"
 
 	defaultPrefix         = "sb"
 	defaultMaxItemSize    = 1 << 20 // 1MB
@@ -103,5 +103,3 @@ const (
 	defaultMaxIdleConns   = 10
 	maxMemcachedKeyLen    = 250
 )
-
-

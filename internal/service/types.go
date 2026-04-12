@@ -7,13 +7,13 @@ import (
 	"github.com/soapbucket/sbproxy/internal/app/billing"
 	"github.com/soapbucket/sbproxy/internal/vault"
 
+	"github.com/soapbucket/sbproxy/internal/cache/origin"
 	"github.com/soapbucket/sbproxy/internal/cache/store"
-	"github.com/soapbucket/sbproxy/internal/request/classifier"
-	"github.com/soapbucket/sbproxy/internal/security/crypto"
 	"github.com/soapbucket/sbproxy/internal/observe/logging"
 	"github.com/soapbucket/sbproxy/internal/platform/messenger"
-	"github.com/soapbucket/sbproxy/internal/cache/origin"
 	"github.com/soapbucket/sbproxy/internal/platform/storage"
+	"github.com/soapbucket/sbproxy/internal/request/classifier"
+	"github.com/soapbucket/sbproxy/internal/security/crypto"
 )
 
 // TelemetryConfig holds configuration for telemetry.
@@ -149,20 +149,20 @@ type RequestCoalescingSettings struct {
 
 // HTTPSProxyConfig represents HTTPS proxy port configuration
 type HTTPSProxyConfig struct {
-	Port               int           `yaml:"port" mapstructure:"port"`                                 // e.g., 3128
-	Hostname           string        `yaml:"hostname" mapstructure:"hostname"`                         // e.g., "https-proxy.soapbucket.com"
-	CertificateFile    string        `yaml:"certificate_file" mapstructure:"certificate_file"`         // Path to PEM certificate
-	CertificateKeyFile string        `yaml:"certificate_key_file" mapstructure:"certificate_key_file"` // Path to PEM key
-	AuthRealm          string        `yaml:"auth_realm" mapstructure:"auth_realm"`                     // e.g., "SoapBucket Proxy"
-	ReadTimeout        time.Duration `yaml:"read_timeout" mapstructure:"read_timeout"`                 // e.g., "30s"
-	WriteTimeout       time.Duration `yaml:"write_timeout" mapstructure:"write_timeout"`               // e.g., "30s"
-	IdleTimeout        time.Duration `yaml:"idle_timeout" mapstructure:"idle_timeout"`                 // e.g., "90s"
-	DisableHTTP2Connect bool         `yaml:"disable_http2_connect" mapstructure:"disable_http2_connect"`
-	DisableHTTP3Connect bool         `yaml:"disable_http3_connect" mapstructure:"disable_http3_connect"`
-	EnableRFC8441WebSocket bool      `yaml:"enable_rfc8441_websocket" mapstructure:"enable_rfc8441_websocket"`
-	EnableConnectUDP     bool        `yaml:"enable_connect_udp" mapstructure:"enable_connect_udp"`
-	EnableConnectIP      bool        `yaml:"enable_connect_ip" mapstructure:"enable_connect_ip"`
-	ConnectUDPTemplate   string      `yaml:"connect_udp_template" mapstructure:"connect_udp_template"`
+	Port                   int           `yaml:"port" mapstructure:"port"`                                 // e.g., 3128
+	Hostname               string        `yaml:"hostname" mapstructure:"hostname"`                         // e.g., "https-proxy.soapbucket.com"
+	CertificateFile        string        `yaml:"certificate_file" mapstructure:"certificate_file"`         // Path to PEM certificate
+	CertificateKeyFile     string        `yaml:"certificate_key_file" mapstructure:"certificate_key_file"` // Path to PEM key
+	AuthRealm              string        `yaml:"auth_realm" mapstructure:"auth_realm"`                     // e.g., "SoapBucket Proxy"
+	ReadTimeout            time.Duration `yaml:"read_timeout" mapstructure:"read_timeout"`                 // e.g., "30s"
+	WriteTimeout           time.Duration `yaml:"write_timeout" mapstructure:"write_timeout"`               // e.g., "30s"
+	IdleTimeout            time.Duration `yaml:"idle_timeout" mapstructure:"idle_timeout"`                 // e.g., "90s"
+	DisableHTTP2Connect    bool          `yaml:"disable_http2_connect" mapstructure:"disable_http2_connect"`
+	DisableHTTP3Connect    bool          `yaml:"disable_http3_connect" mapstructure:"disable_http3_connect"`
+	EnableRFC8441WebSocket bool          `yaml:"enable_rfc8441_websocket" mapstructure:"enable_rfc8441_websocket"`
+	EnableConnectUDP       bool          `yaml:"enable_connect_udp" mapstructure:"enable_connect_udp"`
+	EnableConnectIP        bool          `yaml:"enable_connect_ip" mapstructure:"enable_connect_ip"`
+	ConnectUDPTemplate     string        `yaml:"connect_udp_template" mapstructure:"connect_udp_template"`
 }
 
 // HAProxyProtocol configures HAProxy PROXY protocol support for L4 load balancers.
@@ -308,7 +308,7 @@ type ConfigSection struct {
 type ConfigSource struct {
 	Driver string            `yaml:"driver" mapstructure:"driver"`
 	Params map[string]string `yaml:"params" mapstructure:"params"`
-	Path   string            `yaml:"path" mapstructure:"path"`   // Shorthand: path -> driver=file
+	Path   string            `yaml:"path" mapstructure:"path"` // Shorthand: path -> driver=file
 	URL    string            `yaml:"url" mapstructure:"url"`   // Shorthand: url -> driver=http
 }
 

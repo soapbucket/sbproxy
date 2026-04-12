@@ -191,4 +191,3 @@ func TestTrailerWriter_WritesCorrectly(t *testing.T) {
 		t.Errorf("expected 'Hello, World!', got '%s'", written)
 	}
 }
-

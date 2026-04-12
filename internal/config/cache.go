@@ -745,12 +745,12 @@ func computeHash(cfg *Config) string {
 
 // ActionResponseCache provides action-level response caching configuration.
 type ActionResponseCache struct {
-	Enabled      bool            `json:"enabled"`
-	TTL          reqctx.Duration `json:"ttl"`
-	CacheKey     string          `json:"cache_key"`    // "method+url+headers[...]"
-	VaryBy       []string        `json:"vary_by"`      // Headers to vary by
-	VaryHeaders  []string        `json:"vary_headers"` // Alias for vary_by
-	Conditions   CacheConditions `json:"conditions"`
+	Enabled      bool              `json:"enabled"`
+	TTL          reqctx.Duration   `json:"ttl"`
+	CacheKey     string            `json:"cache_key"`    // "method+url+headers[...]"
+	VaryBy       []string          `json:"vary_by"`      // Headers to vary by
+	VaryHeaders  []string          `json:"vary_headers"` // Alias for vary_by
+	Conditions   CacheConditions   `json:"conditions"`
 	Invalidation CacheInvalidation `json:"invalidation"`
 
 	// Cache control overrides

@@ -42,11 +42,11 @@ func New(raw json.RawMessage) (plugin.ActionHandler, error) {
 
 	// Validate status code.
 	switch cfg.StatusCode {
-	case http.StatusMovedPermanently,  // 301
-		http.StatusFound,              // 302
-		http.StatusSeeOther,           // 303
-		http.StatusTemporaryRedirect,  // 307
-		http.StatusPermanentRedirect:  // 308
+	case http.StatusMovedPermanently, // 301
+		http.StatusFound,             // 302
+		http.StatusSeeOther,          // 303
+		http.StatusTemporaryRedirect, // 307
+		http.StatusPermanentRedirect: // 308
 		// valid
 	default:
 		return nil, fmt.Errorf("redirect: invalid status code %d (must be 301, 302, 303, 307, or 308)", cfg.StatusCode)

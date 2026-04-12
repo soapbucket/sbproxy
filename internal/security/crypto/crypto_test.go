@@ -127,9 +127,9 @@ func TestIsEncrypted(t *testing.T) {
 		{"local:AbCdEfGhIjKlMnOpQrSt", true},
 		{"gcp:XyZ789AbCdEfGhIjKlMnOp", true},
 		{"aws:DEF456AbCdEfGhIjKlMnOp", true},
-		{"local:abc123", false},       // too short after prefix (< 16 chars)
-		{"gcp:short", false},          // too short after prefix
-		{"local:development", false},  // not base64 (contains no valid pattern match for casual text)
+		{"local:abc123", false},      // too short after prefix (< 16 chars)
+		{"gcp:short", false},         // too short after prefix
+		{"local:development", false}, // not base64 (contains no valid pattern match for casual text)
 		{"plain-text", false},
 		{"", false},
 		{"invalid:prefix:value", false},

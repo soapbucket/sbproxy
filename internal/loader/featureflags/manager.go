@@ -23,9 +23,11 @@ type NoopManager struct{}
 
 // GetFlags returns the flags for the NoopManager.
 func (NoopManager) GetFlags(_ context.Context, _ string) map[string]any { return nil }
+
 // GetFlag returns the flag for the NoopManager.
 func (NoopManager) GetFlag(_ context.Context, _ string, _ string) (any, bool) {
 	return nil, false
 }
+
 // Close releases resources held by the NoopManager.
 func (NoopManager) Close() error { return nil }

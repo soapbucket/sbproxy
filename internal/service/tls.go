@@ -2,12 +2,12 @@
 package service
 
 import (
-	"github.com/soapbucket/sbproxy/internal/security/tlsutil"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"fmt"
+	"github.com/soapbucket/sbproxy/internal/security/tlsutil"
 	"io"
 	"log/slog"
 	"net"

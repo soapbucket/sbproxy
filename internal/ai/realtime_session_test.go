@@ -8,12 +8,12 @@ import (
 
 func TestRealtimeSessionManager_Create(t *testing.T) {
 	tests := []struct {
-		name        string
-		max         int
-		principal   string
-		provider    string
-		model       string
-		wantErr     bool
+		name      string
+		max       int
+		principal string
+		provider  string
+		model     string
+		wantErr   bool
 	}{
 		{
 			name:      "basic create",
@@ -97,9 +97,9 @@ func TestRealtimeSessionManager_Get(t *testing.T) {
 	s, _ := m.Create("u1", "openai", "gpt-4o")
 
 	tests := []struct {
-		name    string
-		id      string
-		wantOK  bool
+		name   string
+		id     string
+		wantOK bool
 	}{
 		{"existing", s.ID, true},
 		{"missing", "rt_nonexistent", false},
@@ -150,10 +150,10 @@ func TestRealtimeSessionManager_TrackTokens(t *testing.T) {
 	s, _ := m.Create("u1", "openai", "gpt-4o")
 
 	tests := []struct {
-		name       string
-		in, out    int64
-		wantIn     int64
-		wantOut    int64
+		name    string
+		in, out int64
+		wantIn  int64
+		wantOut int64
 	}{
 		{"first batch", 100, 200, 100, 200},
 		{"second batch", 50, 75, 150, 275},

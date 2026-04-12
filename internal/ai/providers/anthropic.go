@@ -4,8 +4,8 @@ package providers
 import (
 	"bytes"
 	"context"
-	json "github.com/goccy/go-json"
 	"fmt"
+	json "github.com/goccy/go-json"
 	"io"
 	"net/http"
 	"strings"
@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	anthropicDefaultBaseURL = "https://api.anthropic.com/v1"
-	anthropicAPIVersion     = "2023-06-01"
+	anthropicDefaultBaseURL   = "https://api.anthropic.com/v1"
+	anthropicAPIVersion       = "2023-06-01"
 	anthropicDefaultMaxTokens = 4096
 )
 
@@ -34,9 +34,11 @@ func NewAnthropic(client *http.Client) ai.Provider {
 }
 
 // Name performs the name operation on the Anthropic.
-func (a *Anthropic) Name() string            { return "anthropic" }
+func (a *Anthropic) Name() string { return "anthropic" }
+
 // SupportsStreaming performs the supports streaming operation on the Anthropic.
-func (a *Anthropic) SupportsStreaming() bool  { return true }
+func (a *Anthropic) SupportsStreaming() bool { return true }
+
 // SupportsEmbeddings performs the supports embeddings operation on the Anthropic.
 func (a *Anthropic) SupportsEmbeddings() bool { return false }
 
@@ -136,17 +138,17 @@ type anthropicMessage struct {
 }
 
 type anthropicContentBlock struct {
-	Type         string                  `json:"type"`
-	Text         string                  `json:"text,omitempty"`
-	ID           string                  `json:"id,omitempty"`
-	Name         string                  `json:"name,omitempty"`
-	Input        json.RawMessage         `json:"input,omitempty"`
-	Source       any                     `json:"source,omitempty"`
-	ToolUseID    string                  `json:"tool_use_id,omitempty"`
-	Content      any                     `json:"content,omitempty"`
-	CacheControl *ai.CacheControlConfig  `json:"cache_control,omitempty"`
-	Thinking     string                  `json:"thinking,omitempty"`
-	Signature    string                  `json:"signature,omitempty"`
+	Type         string                 `json:"type"`
+	Text         string                 `json:"text,omitempty"`
+	ID           string                 `json:"id,omitempty"`
+	Name         string                 `json:"name,omitempty"`
+	Input        json.RawMessage        `json:"input,omitempty"`
+	Source       any                    `json:"source,omitempty"`
+	ToolUseID    string                 `json:"tool_use_id,omitempty"`
+	Content      any                    `json:"content,omitempty"`
+	CacheControl *ai.CacheControlConfig `json:"cache_control,omitempty"`
+	Thinking     string                 `json:"thinking,omitempty"`
+	Signature    string                 `json:"signature,omitempty"`
 }
 
 type anthropicTool struct {
@@ -171,10 +173,10 @@ type anthropicResponse struct {
 }
 
 type anthropicUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens   int `json:"input_tokens"`
+	OutputTokens  int `json:"output_tokens"`
 	CacheCreation int `json:"cache_creation_input_tokens,omitempty"`
-	CacheRead    int `json:"cache_read_input_tokens,omitempty"`
+	CacheRead     int `json:"cache_read_input_tokens,omitempty"`
 }
 
 func (a *Anthropic) buildRequest(ctx context.Context, req *ai.ChatCompletionRequest, cfg *ai.ProviderConfig, stream bool) (*http.Request, error) {
@@ -432,15 +434,15 @@ type anthropicContentBlockStart struct {
 }
 
 type anthropicContentBlockDelta struct {
-	Type  string                     `json:"type"`
-	Index int                        `json:"index"`
+	Type  string                         `json:"type"`
+	Index int                            `json:"index"`
 	Delta anthropicContentBlockDeltaData `json:"delta"`
 }
 
 type anthropicContentBlockDeltaData struct {
-	Type        string          `json:"type"`
-	Text        string          `json:"text,omitempty"`
-	PartialJSON string          `json:"partial_json,omitempty"`
+	Type        string `json:"type"`
+	Text        string `json:"text,omitempty"`
+	PartialJSON string `json:"partial_json,omitempty"`
 }
 
 type anthropicMessageDelta struct {
@@ -486,9 +488,9 @@ func (r *anthropicStreamReader) Read() (*ai.StreamChunk, error) {
 			// Send initial chunk with role
 			role := "assistant"
 			return &ai.StreamChunk{
-				ID:      r.msgID,
-				Object:  "chat.completion.chunk",
-				Model:   r.model,
+				ID:     r.msgID,
+				Object: "chat.completion.chunk",
+				Model:  r.model,
 				Choices: []ai.StreamChoice{{
 					Index: 0,
 					Delta: ai.StreamDelta{Role: role},

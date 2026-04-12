@@ -17,12 +17,12 @@ import (
 
 // CoalescingConfig configures request coalescing behavior
 type CoalescingConfig struct {
-	Enabled         bool          // Enable request coalescing
-	MaxInflight     int           // Maximum in-flight coalesced requests (default: 1000)
-	CoalesceWindow  time.Duration // Time window for coalescing (default: 100ms)
+	Enabled         bool            // Enable request coalescing
+	MaxInflight     int             // Maximum in-flight coalesced requests (default: 1000)
+	CoalesceWindow  time.Duration   // Time window for coalescing (default: 100ms)
 	KeyFunc         CoalesceKeyFunc // Function to generate coalesce key
-	MaxWaiters      int           // Maximum waiters per request (default: 100)
-	CleanupInterval time.Duration // Cleanup interval for stale entries (default: 30s)
+	MaxWaiters      int             // Maximum waiters per request (default: 100)
+	CleanupInterval time.Duration   // Cleanup interval for stale entries (default: 30s)
 }
 
 // CoalesceKeyFunc generates a key for request coalescing
@@ -397,4 +397,3 @@ func (ct *CoalescingTransport) GetInflightCount() int64 {
 	defer ct.inflightMu.RUnlock()
 	return ct.inflightCount
 }
-

@@ -16,27 +16,27 @@ type Operation string
 
 const (
 	// OperationChatCompletions is a constant for operation chat completions.
-	OperationChatCompletions   Operation = "chat_completions"
+	OperationChatCompletions Operation = "chat_completions"
 	// OperationResponses is a constant for operation responses.
-	OperationResponses         Operation = "responses"
+	OperationResponses Operation = "responses"
 	// OperationEmbeddings is a constant for operation embeddings.
-	OperationEmbeddings        Operation = "embeddings"
+	OperationEmbeddings Operation = "embeddings"
 	// OperationModels is a constant for operation reqctx.
-	OperationModels            Operation = "models"
+	OperationModels Operation = "models"
 	// OperationModerations is a constant for operation moderations.
-	OperationModerations       Operation = "moderations"
+	OperationModerations Operation = "moderations"
 	// OperationBatches is a constant for operation batches.
-	OperationBatches           Operation = "batches"
+	OperationBatches Operation = "batches"
 	// OperationFiles is a constant for operation files.
-	OperationFiles             Operation = "files"
+	OperationFiles Operation = "files"
 	// OperationImagesGenerations is a constant for operation images generations.
 	OperationImagesGenerations Operation = "images_generations"
 	// OperationAudioSpeech is a constant for operation audio speech.
-	OperationAudioSpeech       Operation = "audio_speech"
+	OperationAudioSpeech Operation = "audio_speech"
 	// OperationAudioTranscribe is a constant for operation audio transcribe.
-	OperationAudioTranscribe   Operation = "audio_transcriptions"
+	OperationAudioTranscribe Operation = "audio_transcriptions"
 	// OperationRerank is a constant for reranking operations.
-	OperationRerank            Operation = "rerank"
+	OperationRerank Operation = "rerank"
 )
 
 // Provider translates between OpenAI-format requests and a specific LLM API.
@@ -75,27 +75,27 @@ type StreamReader interface {
 
 // ProviderConfig holds per-provider connection settings loaded from JSON config.
 type ProviderConfig struct {
-	Name        string            `json:"name"`
-	Type        string            `json:"type,omitempty"`
-	APIKey      string            `json:"api_key,omitempty" secret:"true"`
-	BaseURL     string            `json:"base_url,omitempty"`
-	Models      []string          `json:"models,omitempty"`
-	DefaultModel string           `json:"default_model,omitempty"`
-	ModelMap    map[string]string `json:"model_map,omitempty"`
-	Weight      int               `json:"weight,omitempty"`
-	Priority    int               `json:"priority,omitempty"`
-	MaxRetries  int               `json:"max_retries,omitempty"`
-	Timeout     reqctx.Duration   `json:"timeout,omitempty" validate:"max_value=5m,default_value=30s"`
-	Headers     map[string]string `json:"headers,omitempty"`
-	Organization string           `json:"organization,omitempty"`
-	ProjectID   string            `json:"project_id,omitempty"`
-	Region      string            `json:"region,omitempty"`
-	APIVersion  string            `json:"api_version,omitempty"`
+	Name          string            `json:"name"`
+	Type          string            `json:"type,omitempty"`
+	APIKey        string            `json:"api_key,omitempty" secret:"true"`
+	BaseURL       string            `json:"base_url,omitempty"`
+	Models        []string          `json:"models,omitempty"`
+	DefaultModel  string            `json:"default_model,omitempty"`
+	ModelMap      map[string]string `json:"model_map,omitempty"`
+	Weight        int               `json:"weight,omitempty"`
+	Priority      int               `json:"priority,omitempty"`
+	MaxRetries    int               `json:"max_retries,omitempty"`
+	Timeout       reqctx.Duration   `json:"timeout,omitempty" validate:"max_value=5m,default_value=30s"`
+	Headers       map[string]string `json:"headers,omitempty"`
+	Organization  string            `json:"organization,omitempty"`
+	ProjectID     string            `json:"project_id,omitempty"`
+	Region        string            `json:"region,omitempty"`
+	APIVersion    string            `json:"api_version,omitempty"`
 	DeploymentMap map[string]string `json:"deployment_map,omitempty"`
-	Format      string            `json:"format,omitempty"`      // "openai" (default), "anthropic", "passthrough"
-	AuthHeader  string            `json:"auth_header,omitempty"` // Custom auth header name (e.g., "X-Api-Key")
-	AuthPrefix  string            `json:"auth_prefix,omitempty"` // Custom auth prefix (e.g., "Token")
-	Enabled     *bool             `json:"enabled,omitempty"`
+	Format        string            `json:"format,omitempty"`      // "openai" (default), "anthropic", "passthrough"
+	AuthHeader    string            `json:"auth_header,omitempty"` // Custom auth header name (e.g., "X-Api-Key")
+	AuthPrefix    string            `json:"auth_prefix,omitempty"` // Custom auth prefix (e.g., "Token")
+	Enabled       *bool             `json:"enabled,omitempty"`
 
 	MaxTokensPerMin   int `json:"max_tokens_per_minute,omitempty"`
 	MaxRequestsPerMin int `json:"max_requests_per_minute,omitempty"`

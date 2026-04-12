@@ -4,8 +4,8 @@ package providers
 import (
 	"bytes"
 	"context"
-	json "github.com/goccy/go-json"
 	"fmt"
+	json "github.com/goccy/go-json"
 	"io"
 	"net/http"
 
@@ -27,9 +27,11 @@ func NewAzure(client *http.Client) ai.Provider {
 }
 
 // Name performs the name operation on the Azure.
-func (a *Azure) Name() string            { return "azure" }
+func (a *Azure) Name() string { return "azure" }
+
 // SupportsStreaming performs the supports streaming operation on the Azure.
-func (a *Azure) SupportsStreaming() bool  { return true }
+func (a *Azure) SupportsStreaming() bool { return true }
+
 // SupportsEmbeddings performs the supports embeddings operation on the Azure.
 func (a *Azure) SupportsEmbeddings() bool { return true }
 

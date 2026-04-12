@@ -142,7 +142,7 @@ func TestDelayTransport_NoDelay(t *testing.T) {
 	elapsed := time.Since(start)
 
 	if err != nil {
-	t.Fatalf("request failed: %v", err)
+		t.Fatalf("request failed: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -151,4 +151,3 @@ func TestDelayTransport_NoDelay(t *testing.T) {
 		t.Errorf("expected fast request with no delay, took %v", elapsed)
 	}
 }
-

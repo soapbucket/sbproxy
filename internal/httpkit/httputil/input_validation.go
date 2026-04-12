@@ -182,4 +182,3 @@ func ValidateEmail(fieldName, value string) error {
 
 	return nil
 }
-

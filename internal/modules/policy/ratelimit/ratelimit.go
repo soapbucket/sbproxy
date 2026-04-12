@@ -27,8 +27,8 @@ import (
 	"github.com/soapbucket/sbproxy/internal/observe/events"
 	"github.com/soapbucket/sbproxy/internal/observe/logging"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/request/ratelimit"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/pkg/plugin"
 )
 

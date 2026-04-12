@@ -158,7 +158,6 @@ func (m *RedisCacher) IncrementWithExpires(ctx context.Context, cType string, ke
 	return value, err
 }
 
-
 // ListKeys performs the list keys operation on the RedisCacher.
 func (r *RedisCacher) ListKeys(ctx context.Context, cType string, pattern string) ([]string, error) {
 	slog.Debug("list keys",
@@ -215,8 +214,8 @@ func NewRedisCacher(settings Settings) (Cacher, error) {
 
 	// Optimize connection pool for high throughput (per OPTIMIZATIONS.md #24)
 	// Default values optimized for high-throughput scenarios
-	options.PoolSize = getIntParam(settings.Params, "pool_size", 200)                // Max number of socket connections (increased from 100)
-	options.MinIdleConns = getIntParam(settings.Params, "min_idle_conns", 20)      // Minimum number of idle connections (increased from 10)
+	options.PoolSize = getIntParam(settings.Params, "pool_size", 200)                       // Max number of socket connections (increased from 100)
+	options.MinIdleConns = getIntParam(settings.Params, "min_idle_conns", 20)               // Minimum number of idle connections (increased from 10)
 	options.PoolTimeout = getDurationParam(settings.Params, "pool_timeout", 10*time.Second) // Amount of time client waits for connection (increased from 4s)
 
 	// Performance tuning
@@ -225,7 +224,7 @@ func NewRedisCacher(settings Settings) (Cacher, error) {
 	options.MaxRetryBackoff = 512 * time.Millisecond
 	options.DialTimeout = 5 * time.Second
 	options.ReadTimeout = getDurationParam(settings.Params, "read_timeout", 5*time.Second)   // Increased from 3s
-	options.WriteTimeout = getDurationParam(settings.Params, "write_timeout", 5*time.Second)  // Increased from 3s
+	options.WriteTimeout = getDurationParam(settings.Params, "write_timeout", 5*time.Second) // Increased from 3s
 
 	rdb := redis.NewClient(options)
 	return &RedisCacher{db: rdb, driver: settings.Driver}, nil

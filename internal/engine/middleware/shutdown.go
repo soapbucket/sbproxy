@@ -38,4 +38,3 @@ func ShutdownMiddleware(healthMgr *health.Manager) func(http.Handler) http.Handl
 		})
 	}
 }
-

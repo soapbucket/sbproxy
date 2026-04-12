@@ -57,21 +57,21 @@ func TestTokenMatcherMatchTagName(t *testing.T) {
 		wantMatch bool
 	}{
 		{
-			name:  "match anchor tag",
-			expr:  `token.data == 'a'`,
-			token: html.Token{Type: html.StartTagToken, Data: "a"},
+			name:      "match anchor tag",
+			expr:      `token.data == 'a'`,
+			token:     html.Token{Type: html.StartTagToken, Data: "a"},
 			wantMatch: true,
 		},
 		{
-			name:  "not match div when looking for a",
-			expr:  `token.data == 'a'`,
-			token: html.Token{Type: html.StartTagToken, Data: "div"},
+			name:      "not match div when looking for a",
+			expr:      `token.data == 'a'`,
+			token:     html.Token{Type: html.StartTagToken, Data: "div"},
 			wantMatch: false,
 		},
 		{
-			name:  "match div tag",
-			expr:  `token.data == 'div'`,
-			token: html.Token{Type: html.StartTagToken, Data: "div"},
+			name:      "match div tag",
+			expr:      `token.data == 'div'`,
+			token:     html.Token{Type: html.StartTagToken, Data: "div"},
 			wantMatch: true,
 		},
 	}
@@ -296,4 +296,3 @@ func TestTokenMatcherFormElements(t *testing.T) {
 		})
 	}
 }
-

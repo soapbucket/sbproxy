@@ -32,7 +32,7 @@ type TokenBucket struct {
 
 // tokenBucketState represents the state stored in cache
 type tokenBucketState struct {
-	Tokens   float64   `json:"tokens"`
+	Tokens     float64   `json:"tokens"`
 	LastRefill time.Time `json:"last_refill"`
 }
 
@@ -71,7 +71,7 @@ func (tb *TokenBucket) AllowN(ctx context.Context, key string, n int, limit int,
 	if n <= 0 {
 		return Result{
 			Allowed:   true,
-			Remaining:  limit,
+			Remaining: limit,
 			ResetTime: time.Now().Add(window),
 		}, nil
 	}
@@ -127,7 +127,7 @@ func (tb *TokenBucket) AllowN(ctx context.Context, key string, n int, limit int,
 	} else {
 		// Initialize new bucket
 		state = tokenBucketState{
-			Tokens:    float64(capacity),
+			Tokens:     float64(capacity),
 			LastRefill: now,
 		}
 	}
@@ -279,4 +279,3 @@ func (tb *TokenBucket) saveState(ctx context.Context, key string, state tokenBuc
 
 	return tb.cache.PutWithExpires(ctx, CacheTypeRateLimit, key, bytes.NewReader(data), ttl)
 }
-

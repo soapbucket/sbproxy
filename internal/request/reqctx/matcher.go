@@ -6,7 +6,6 @@ import (
 	"regexp"
 	"strings"
 
-
 	"golang.org/x/net/html"
 )
 
@@ -40,11 +39,11 @@ func GetTokenMatcherFactory() NewTokenMatcherFunc {
 
 // Matcher matches a tag
 type Matcher struct {
-	Tag     string           `json:"tag"`
-	Regex   string           `json:"regex,omitempty"`
+	Tag     string `json:"tag"`
+	Regex   string `json:"regex,omitempty"`
 	Attrs   []Attr `json:"attrs,omitempty"`
-	CELExpr string           `json:"celExpr,omitempty"`
-	LuaExpr string           `json:"luaExpr,omitempty"`
+	CELExpr string `json:"celExpr,omitempty"`
+	LuaExpr string `json:"luaExpr,omitempty"`
 
 	prg TokenMatcher
 	re  *regexp.Regexp
@@ -185,4 +184,3 @@ func NewMatcher(tag, re, expr string, attr map[string]string) (*Matcher, error) 
 	}
 	return matcher, nil
 }
-

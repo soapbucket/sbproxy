@@ -7,8 +7,8 @@ import (
 
 // mockStorage is a simple test storage implementation
 type mockStorage struct {
-	data   map[string][]byte
-	readOnly bool
+	data        map[string][]byte
+	readOnly    bool
 	listKeysErr bool
 }
 

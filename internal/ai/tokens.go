@@ -98,4 +98,3 @@ func EstimateMessagesTokens(messages []Message) int {
 	}
 	return total + 2
 }
-

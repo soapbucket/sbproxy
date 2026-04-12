@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"time"
 
-	lua "github.com/yuin/gopher-lua"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	lua "github.com/yuin/gopher-lua"
 )
 
 // CircuitBreakerFn determines if the circuit should break for a failure using Lua scripts.

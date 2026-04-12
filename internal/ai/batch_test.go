@@ -57,7 +57,6 @@ func successExecutor(_ context.Context, req *ChatCompletionRequest) (*ChatComple
 
 func batchStrPtr(s string) *string { return &s }
 
-
 func uploadTestFile(t *testing.T, h *Handler, filename string, content string) *FileObject {
 	t.Helper()
 	var body bytes.Buffer

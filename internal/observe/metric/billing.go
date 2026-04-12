@@ -55,8 +55,8 @@ var (
 	// BillingLatencyHistogram - request latency by origin
 	BillingLatencyHistogram = mustRegisterHistogramVec(prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name: "sb_billing_request_duration_seconds",
-			Help: "Request duration for billing audit",
+			Name:    "sb_billing_request_duration_seconds",
+			Help:    "Request duration for billing audit",
 			Buckets: []float64{0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0},
 		},
 		[]string{"workspace_id", "origin_id", "origin_hostname"},

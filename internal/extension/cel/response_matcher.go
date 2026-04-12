@@ -175,4 +175,3 @@ func NewResponseMatcher(expr string) (ResponseMatcher, error) {
 	}
 	return &responseMatcher{Program: program}, nil
 }
-

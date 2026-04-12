@@ -4,13 +4,13 @@ package basicauth
 import (
 	"crypto/subtle"
 	"encoding/json"
-	"log/slog"
-	"net/http"
-	"strings"
 	"github.com/soapbucket/sbproxy/internal/observe/logging"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
 	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/pkg/plugin"
+	"log/slog"
+	"net/http"
+	"strings"
 )
 
 func init() {

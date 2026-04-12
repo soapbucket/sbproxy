@@ -171,4 +171,3 @@ func (h *Handler) addVersion(w http.ResponseWriter, r *http.Request, id string) 
 	}
 	writeJSON(w, http.StatusCreated, p)
 }
-

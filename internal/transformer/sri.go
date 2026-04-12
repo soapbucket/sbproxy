@@ -14,12 +14,12 @@ import (
 
 // SRITransform generates Subresource Integrity hashes for responses
 type SRITransform struct {
-	algorithm           string
-	contentTypes        []string
-	addIntegrityHeader  bool
-	addIntegrityToHTML  bool
-	cacheHashes         bool
-	hashCache           map[string]string // URL -> hash cache
+	algorithm          string
+	contentTypes       []string
+	addIntegrityHeader bool
+	addIntegrityToHTML bool
+	cacheHashes        bool
+	hashCache          map[string]string // URL -> hash cache
 }
 
 // NewSRITransform creates a new SRI transform
@@ -39,7 +39,7 @@ func NewSRITransform(algorithm string, contentTypes []string, addIntegrityHeader
 		contentTypes:       contentTypes,
 		addIntegrityHeader: addIntegrityHeader,
 		addIntegrityToHTML: addIntegrityToHTML,
-		cacheHashes:         cacheHashes,
+		cacheHashes:        cacheHashes,
 		hashCache:          make(map[string]string),
 	}, nil
 }
@@ -70,8 +70,8 @@ func (t *SRITransform) Modify(resp *http.Response) error {
 	if t.cacheHashes && resp.Request != nil {
 		url := resp.Request.URL.String()
 		if cachedHash, exists := t.hashCache[url]; exists {
-	slog.Debug("Using cached SRI hash",
-		"url", url)
+			slog.Debug("Using cached SRI hash",
+				"url", url)
 			t.addIntegrityToResponse(resp, cachedHash)
 			return nil
 		}
@@ -139,11 +139,11 @@ func min(a, b int) int {
 
 // SRITransformConfig is the configuration for SRI transform
 type SRITransformConfig struct {
-	Algorithm          string   `json:"algorithm,omitempty"`          // sha256, sha384 (default), sha512
-	ContentTypes       []string `json:"content_types,omitempty"`      // Content types to generate SRI for
-	AddIntegrityHeader bool     `json:"add_integrity_header,omitempty"` // Add Integrity header
+	Algorithm          string   `json:"algorithm,omitempty"`             // sha256, sha384 (default), sha512
+	ContentTypes       []string `json:"content_types,omitempty"`         // Content types to generate SRI for
+	AddIntegrityHeader bool     `json:"add_integrity_header,omitempty"`  // Add Integrity header
 	AddIntegrityToHTML bool     `json:"add_integrity_to_html,omitempty"` // Add integrity attributes to HTML (future)
-	CacheHashes        bool     `json:"cache_hashes,omitempty"`       // Cache generated hashes
+	CacheHashes        bool     `json:"cache_hashes,omitempty"`          // Cache generated hashes
 }
 
 // NewSRITransformFromConfig creates a new SRI transform from config
@@ -156,4 +156,3 @@ func NewSRITransformFromConfig(cfg SRITransformConfig) (Transformer, error) {
 		cfg.CacheHashes,
 	)
 }
-

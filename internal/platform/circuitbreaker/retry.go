@@ -10,12 +10,12 @@ import (
 
 // RetryConfig configures retry behavior
 type RetryConfig struct {
-	MaxAttempts    int
-	InitialDelay   time.Duration
-	MaxDelay       time.Duration
-	Multiplier     float64
-	Jitter         float64
-	RetryableFunc  func(error) bool
+	MaxAttempts   int
+	InitialDelay  time.Duration
+	MaxDelay      time.Duration
+	Multiplier    float64
+	Jitter        float64
+	RetryableFunc func(error) bool
 }
 
 // DefaultRetryConfig returns a retry config with sensible defaults
@@ -97,4 +97,3 @@ func ExponentialBackoff(attempt int, initialDelay, maxDelay time.Duration, multi
 	}
 	return time.Duration(delay)
 }
-

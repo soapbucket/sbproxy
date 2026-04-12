@@ -171,27 +171,27 @@ func (c *Cohere) ListModels(ctx context.Context, cfg *ai.ProviderConfig) ([]ai.M
 // Cohere-specific types
 
 type cohereChatRequest struct {
-	Model       string           `json:"model"`
-	Messages    []cohereMessage  `json:"messages"`
-	Temperature *float64         `json:"temperature,omitempty"`
-	MaxTokens   *int             `json:"max_tokens,omitempty"`
-	TopP        *float64         `json:"p,omitempty"`
-	Stop        []string         `json:"stop_sequences,omitempty"`
-	Stream      bool             `json:"stream,omitempty"`
-	Tools       []cohereTool     `json:"tools,omitempty"`
-	Seed        *int64           `json:"seed,omitempty"`
+	Model       string          `json:"model"`
+	Messages    []cohereMessage `json:"messages"`
+	Temperature *float64        `json:"temperature,omitempty"`
+	MaxTokens   *int            `json:"max_tokens,omitempty"`
+	TopP        *float64        `json:"p,omitempty"`
+	Stop        []string        `json:"stop_sequences,omitempty"`
+	Stream      bool            `json:"stream,omitempty"`
+	Tools       []cohereTool    `json:"tools,omitempty"`
+	Seed        *int64          `json:"seed,omitempty"`
 }
 
 type cohereMessage struct {
-	Role      string          `json:"role"`
-	Content   any             `json:"content"`
-	ToolCalls []cohereToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string         `json:"tool_call_id,omitempty"`
+	Role       string           `json:"role"`
+	Content    any              `json:"content"`
+	ToolCalls  []cohereToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
 }
 
 type cohereToolCall struct {
-	ID       string               `json:"id"`
-	Type     string               `json:"type"`
+	ID       string                 `json:"id"`
+	Type     string                 `json:"type"`
 	Function cohereToolCallFunction `json:"function"`
 }
 
@@ -212,11 +212,11 @@ type cohereToolFunction struct {
 }
 
 type cohereResponse struct {
-	ID           string               `json:"id"`
+	ID           string                `json:"id"`
 	Message      cohereResponseMessage `json:"message"`
-	FinishReason string               `json:"finish_reason"`
-	Usage        cohereUsage          `json:"usage"`
-	Model        string               `json:"model,omitempty"`
+	FinishReason string                `json:"finish_reason"`
+	Usage        cohereUsage           `json:"usage"`
+	Model        string                `json:"model,omitempty"`
 }
 
 type cohereResponseMessage struct {
@@ -253,9 +253,9 @@ type cohereEmbeddingRequest struct {
 }
 
 type cohereEmbeddingResponse struct {
-	ID         string                 `json:"id"`
-	Embeddings cohereEmbeddingsData   `json:"embeddings"`
-	Meta       *cohereEmbeddingMeta   `json:"meta,omitempty"`
+	ID         string               `json:"id"`
+	Embeddings cohereEmbeddingsData `json:"embeddings"`
+	Meta       *cohereEmbeddingMeta `json:"meta,omitempty"`
 }
 
 type cohereEmbeddingsData struct {

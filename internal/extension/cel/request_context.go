@@ -203,7 +203,7 @@ func convertSessionDataToMap(sd *reqctx.SessionData, maps ...map[string]interfac
 // IMPORTANT: The caller MUST call Release() when finished with the RequestContext.
 func NewRequestContext(req *http.Request) *RequestContext {
 	rc := requestContextPool.Get().(*RequestContext)
-	
+
 	// Reset all pooling flags for the new request
 	rc.pooledFingerprint = false
 	rc.pooledUserAgent = false
@@ -218,7 +218,7 @@ func NewRequestContext(req *http.Request) *RequestContext {
 	} else {
 		clear(r.Headers)
 	}
-	
+
 	r.Path = req.URL.Path
 	r.Method = req.Method
 	r.Host = req.Host
@@ -347,7 +347,7 @@ func (rc *RequestContext) Release() {
 	if rc == nil {
 		return
 	}
-	
+
 	// Put maps back to their respective pools
 	if rc.req != nil {
 		protoReqPool.Put(rc.req)
@@ -384,7 +384,7 @@ func (rc *RequestContext) Release() {
 		clear(rc.cachedVars)
 		interfaceMapPool.Put(rc.cachedVars)
 	}
-	
+
 	// Clear fields to avoid memory leaks and ensure fresh state
 	rc.req = nil
 	rc.oauthUser = nil
@@ -400,13 +400,13 @@ func (rc *RequestContext) Release() {
 	rc.requestData = nil
 	rc.cachedVars = nil
 	rc.cachedRequestWrapper = nil
-	
+
 	// Reset pooling flags
 	rc.pooledFingerprint = false
 	rc.pooledUserAgent = false
 	rc.pooledLocation = false
 	rc.pooledSession = false
-	
+
 	requestContextPool.Put(rc)
 }
 
@@ -441,7 +441,7 @@ func (rc *RequestContext) createRequestWrapper() map[string]interface{} {
 
 	reqWrapper := interfaceMapPool.Get().(map[string]interface{})
 	clear(reqWrapper)
-	
+
 	// Copy all protobuf fields to the wrapper
 	reqWrapper["id"] = rc.req.Id
 	reqWrapper["method"] = rc.req.Method
@@ -453,7 +453,7 @@ func (rc *RequestContext) createRequestWrapper() map[string]interface{} {
 	reqWrapper["headers"] = rc.req.Headers
 	reqWrapper["size"] = rc.req.Size
 	reqWrapper["time"] = rc.req.Time
-	
+
 	// Add request.data field pointing to RequestData.Data
 	if rc.contextData != nil {
 		reqWrapper["data"] = rc.contextData

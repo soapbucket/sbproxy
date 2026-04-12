@@ -26,7 +26,7 @@ type PipelineResult struct {
 
 // NamedTransform wraps a Transformerer with a name for pipeline tracking.
 type NamedTransform struct {
-	Name      string
+	Name        string
 	Transformer Transformer
 }
 

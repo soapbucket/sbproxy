@@ -1,10 +1,10 @@
 package responsecache
 
 import (
-	"github.com/soapbucket/sbproxy/internal/engine/handler"
 	"bytes"
 	"context"
 	"encoding/gob"
+	"github.com/soapbucket/sbproxy/internal/engine/handler"
 	"io"
 	"net/http"
 	"net/http/httptest"

@@ -240,4 +240,3 @@ func createGraphQLContentTypeResponse(statusCode int, body string, t *testing.T)
 	resp.Header.Set("Content-Type", "application/graphql")
 	return resp
 }
-

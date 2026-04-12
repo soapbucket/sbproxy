@@ -95,12 +95,12 @@ func (r *ToolRegistry) Has(name string) bool {
 
 // ToolExecutor executes tools and transforms responses.
 type ToolExecutor struct {
-	registry            *ToolRegistry
-	validator           *SchemaValidator
-	httpClient          *http.Client
-	insecureHTTPClient  *http.Client
-	defaultTimeout      time.Duration
-	errorHandler        *ErrorHandler
+	registry           *ToolRegistry
+	validator          *SchemaValidator
+	httpClient         *http.Client
+	insecureHTTPClient *http.Client
+	defaultTimeout     time.Duration
+	errorHandler       *ErrorHandler
 }
 
 // NewToolExecutor creates a new tool executor.
@@ -682,8 +682,8 @@ func matchErrorMapping(
 
 	// Build template context for error message
 	ctx := map[string]interface{}{
-		"arguments":    execCtx.Arguments,
-		"status_code":  statusCode,
+		"arguments":     execCtx.Arguments,
+		"status_code":   statusCode,
 		"response_body": responseBody,
 	}
 

@@ -359,9 +359,9 @@ func TestReplayStreamingForceOff(t *testing.T) {
 	streamOn := true
 	req := ReplayRequest{
 		OriginalRequest: &ChatCompletionRequest{
-			Model:    "gpt-4",
-			Messages: []Message{{Role: "user", Content: json.RawMessage(`"Hi"`)}},
-			Stream:   &streamOn,
+			Model:         "gpt-4",
+			Messages:      []Message{{Role: "user", Content: json.RawMessage(`"Hi"`)}},
+			Stream:        &streamOn,
 			StreamOptions: &StreamOptions{IncludeUsage: true},
 		},
 		Mode: "execute",
@@ -379,7 +379,7 @@ func TestReplayStreamingForceOff(t *testing.T) {
 func TestBatchReplay(t *testing.T) {
 	callCount := 0
 	mp := &mockProvider{
-		name: "test",
+		name:     "test",
 		chatResp: testChatResponse("batch-1", "gpt-4", "Batch response"),
 	}
 	// Track calls by overriding chatResp per call isn't possible with this mock,

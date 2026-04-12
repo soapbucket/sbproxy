@@ -140,9 +140,9 @@ func TestGatewayHandler_Initialize(t *testing.T) {
 	defer upstream.Close()
 
 	config := &Config{
-		Mode:         ModeGateway,
-		ServerInfo:   ServerInfo{Name: "my-gateway", Version: "2.0"},
-		Capabilities: Capabilities{Tools: &ToolsCapability{}},
+		Mode:             ModeGateway,
+		ServerInfo:       ServerInfo{Name: "my-gateway", Version: "2.0"},
+		Capabilities:     Capabilities{Tools: &ToolsCapability{}},
 		FederatedServers: []FederatedServerConfig{{URL: upstream.URL}},
 	}
 
@@ -422,8 +422,8 @@ func TestToolResultCache_Nil(t *testing.T) {
 		t.Error("Expected miss on nil cache")
 	}
 	cache.Put("key", &ToolResult{}, time.Minute) // Should not panic
-	cache.Delete("key")                           // Should not panic
-	cache.Clear()                                  // Should not panic
+	cache.Delete("key")                          // Should not panic
+	cache.Clear()                                // Should not panic
 }
 
 func TestBuildCacheKey_Scopes(t *testing.T) {
@@ -620,9 +620,9 @@ func BenchmarkGatewayToolsList(b *testing.B) {
 	defer upstream.Close()
 
 	config := &Config{
-		Mode:         ModeGateway,
-		ServerInfo:   ServerInfo{Name: "bench", Version: "1.0"},
-		Capabilities: Capabilities{Tools: &ToolsCapability{}},
+		Mode:             ModeGateway,
+		ServerInfo:       ServerInfo{Name: "bench", Version: "1.0"},
+		Capabilities:     Capabilities{Tools: &ToolsCapability{}},
 		FederatedServers: []FederatedServerConfig{{URL: upstream.URL}},
 	}
 

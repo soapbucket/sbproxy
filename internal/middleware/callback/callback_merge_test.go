@@ -335,4 +335,3 @@ func TestCallbacks_AppendWithArrayResponse(t *testing.T) {
 		t.Errorf("Expected first result to have 2 tags, got %d", len(firstData))
 	}
 }
-

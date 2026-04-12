@@ -2,9 +2,9 @@ package zerocopy
 
 import (
 	"bytes"
+	"github.com/soapbucket/sbproxy/internal/httpkit/bufferpool"
 	"io"
 	"testing"
-	"github.com/soapbucket/sbproxy/internal/httpkit/bufferpool"
 )
 
 func init() {

@@ -23,8 +23,8 @@ type Notification struct {
 
 // LogMessageParams contains parameters for a notifications/message log notification.
 type LogMessageParams struct {
-	Level  string `json:"level"`  // debug, info, warning, error, critical, alert, emergency
-	Logger string `json:"logger,omitempty"`
+	Level  string      `json:"level"` // debug, info, warning, error, critical, alert, emergency
+	Logger string      `json:"logger,omitempty"`
 	Data   interface{} `json:"data,omitempty"`
 }
 

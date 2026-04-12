@@ -444,8 +444,8 @@ func TestExecuteCallbackWithResponse(t *testing.T) {
 		defer server.Close()
 
 		callback := &Callback{
-			URL:              server.URL,
-			Method:           "POST",
+			URL:                 server.URL,
+			Method:              "POST",
 			ExpectedStatusCodes: []int{http.StatusCreated},
 		}
 
@@ -498,7 +498,6 @@ func TestSkipTLSVerifyHost_UsesInsecureClient(t *testing.T) {
 		}
 	})
 }
-
 
 func TestURLTemplateRendering(t *testing.T) {
 	// Start a test server that echoes the request URL path

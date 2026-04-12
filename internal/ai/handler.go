@@ -3,13 +3,13 @@
 // TODO(maintainability): handleChatCompletion is ~560 lines and mixes 10+ concerns.
 // Decompose into a pipeline with explicit stages:
 //
-//   1. parseAndValidate    - body decode, model resolution, header controls
-//   2. inputGuardrails     - PII redaction, guardrail checks, RAG injection
-//   3. budgetEnforcement   - virtual key limits, budget checks, model downgrade
-//   4. contextValidation   - context window check, fallback model selection
-//   5. semanticCacheLookup - cache key computation, cache hit short-circuit
-//   6. providerDispatch    - routing loop, concurrency limiter, streaming/non-streaming dispatch
-//   7. postProcess         - output guardrails, usage recording, memory capture, degraded fallback
+//  1. parseAndValidate    - body decode, model resolution, header controls
+//  2. inputGuardrails     - PII redaction, guardrail checks, RAG injection
+//  3. budgetEnforcement   - virtual key limits, budget checks, model downgrade
+//  4. contextValidation   - context window check, fallback model selection
+//  5. semanticCacheLookup - cache key computation, cache hit short-circuit
+//  6. providerDispatch    - routing loop, concurrency limiter, streaming/non-streaming dispatch
+//  7. postProcess         - output guardrails, usage recording, memory capture, degraded fallback
 //
 // Each stage would be a method returning (continue bool, err) so the pipeline
 // can short-circuit on cache hits, guardrail blocks, or budget rejections.
@@ -31,12 +31,12 @@ import (
 	"time"
 
 	"github.com/soapbucket/sbproxy/internal/ai/keys"
-	"github.com/soapbucket/sbproxy/internal/ai/memory"
 	"github.com/soapbucket/sbproxy/internal/ai/limits"
+	"github.com/soapbucket/sbproxy/internal/ai/memory"
+	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"github.com/soapbucket/sbproxy/internal/observe/events"
 	"github.com/soapbucket/sbproxy/internal/observe/logging"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
-	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/security/pii"
 )

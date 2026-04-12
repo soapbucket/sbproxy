@@ -354,4 +354,3 @@ func BenchmarkResponseMatcher_Match(b *testing.B) {
 		matcher.Match(resp)
 	}
 }
-

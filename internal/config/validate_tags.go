@@ -105,7 +105,7 @@ func validateField(field reflect.Value, fieldType reflect.Type, tag *validateTag
 
 	// Check if field is zero - but don't skip if we have a value to validate
 	isZeroVal := isZero(field)
-	
+
 	// Skip validation for zero/empty values (unless we're validating min_value)
 	// Zero values will get defaults applied, then we validate
 	if tag.MinValue == "" && isZeroVal {
@@ -172,7 +172,7 @@ func getFieldValue(field reflect.Value, fieldType reflect.Type) interface{} {
 			}
 		}
 	}
-	
+
 	// For string fields that might be size strings, try to parse as size
 	// This allows comparing "20MB" > "10MB" correctly
 	if fieldType.Kind() == reflect.String {
@@ -191,7 +191,7 @@ func getFieldValue(field reflect.Value, fieldType reflect.Type) interface{} {
 			}
 		}
 	}
-	
+
 	return field.Interface()
 }
 
@@ -399,7 +399,7 @@ func compareValues(a, b interface{}) int {
 		if !ok {
 			return 0
 		}
-		
+
 		aSize, aErr := parseSizeToInt64WithError(aVal)
 		bSize, bErr := parseSizeToInt64WithError(bValStr)
 		if aErr == nil && bErr == nil {
@@ -596,4 +596,3 @@ func validateStruct(v interface{}, pathPrefix string) []string {
 
 	return errors
 }
-

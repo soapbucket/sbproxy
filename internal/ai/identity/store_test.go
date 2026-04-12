@@ -175,9 +175,9 @@ func TestMemoryStore_GroupsForPrincipal(t *testing.T) {
 		UpdatedAt: now,
 	})
 	_ = store.SaveGroup(ctx, &PermissionGroup{
-		ID:      "grp-ops",
-		Name:    "Operations",
-		Members: []string{"user-3"},
+		ID:        "grp-ops",
+		Name:      "Operations",
+		Members:   []string{"user-3"},
 		CreatedAt: now,
 		UpdatedAt: now,
 	})

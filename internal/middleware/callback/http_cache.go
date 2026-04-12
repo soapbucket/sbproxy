@@ -59,14 +59,14 @@ type CacheMetadata struct {
 	VaryHeaders  []string
 
 	// Cache-Control directives
-	MaxAge              time.Duration
+	MaxAge               time.Duration
 	StaleWhileRevalidate time.Duration
-	StaleIfError        time.Duration
-	MustRevalidate      bool
-	NoCache             bool
-	NoStore             bool
-	Private             bool
-	Public              bool
+	StaleIfError         time.Duration
+	MustRevalidate       bool
+	NoCache              bool
+	NoStore              bool
+	Private              bool
+	Public               bool
 
 	// Calculated expiration times
 	ExpiresAt  time.Time // Fresh until this time
@@ -77,7 +77,7 @@ type CacheMetadata struct {
 // HTTPCacheParser parses HTTP cache headers from responses
 type HTTPCacheParser struct {
 	defaultStaleWhileRevalidate time.Duration
-	defaultStaleIfError        time.Duration
+	defaultStaleIfError         time.Duration
 }
 
 // NewHTTPCacheParser creates a new HTTP cache parser
@@ -86,7 +86,7 @@ func NewHTTPCacheParser(swrDuration, sieDuration time.Duration) *HTTPCacheParser
 	if swr <= 0 {
 		swr = defaultStaleWhileRevalidate
 	}
-	
+
 	sie := sieDuration
 	if sie <= 0 {
 		sie = defaultStaleIfError
@@ -94,7 +94,7 @@ func NewHTTPCacheParser(swrDuration, sieDuration time.Duration) *HTTPCacheParser
 
 	return &HTTPCacheParser{
 		defaultStaleWhileRevalidate: swr,
-		defaultStaleIfError:        sie,
+		defaultStaleIfError:         sie,
 	}
 }
 
@@ -305,4 +305,3 @@ func (p *HTTPCacheParser) ShouldCache(metadata *CacheMetadata) bool {
 
 	return true
 }
-

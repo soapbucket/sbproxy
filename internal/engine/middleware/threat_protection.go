@@ -31,7 +31,7 @@ type XMLThreatConfig struct {
 
 // ThreatProtectionConfig holds both JSON and XML threat protection settings.
 type ThreatProtectionConfig struct {
-	Enabled bool             `json:"enabled"`
+	Enabled bool              `json:"enabled"`
 	JSON    *JSONThreatConfig `json:"json,omitempty"`
 	XML     *XMLThreatConfig  `json:"xml,omitempty"`
 }
@@ -41,9 +41,9 @@ func DefaultJSONThreatConfig() *JSONThreatConfig {
 	return &JSONThreatConfig{
 		MaxDepth:        20,
 		MaxKeys:         1000,
-		MaxStringLength: 200000,    // 200KB
+		MaxStringLength: 200000, // 200KB
 		MaxArraySize:    10000,
-		MaxTotalSize:    10485760,  // 10MB
+		MaxTotalSize:    10485760, // 10MB
 	}
 }
 

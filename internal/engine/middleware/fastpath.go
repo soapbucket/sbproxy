@@ -11,8 +11,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"github.com/soapbucket/sbproxy/internal/loader/manager"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/request/data"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 const (

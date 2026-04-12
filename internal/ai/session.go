@@ -4,8 +4,8 @@ package ai
 import (
 	"bytes"
 	"context"
-	json "github.com/goccy/go-json"
 	"fmt"
+	json "github.com/goccy/go-json"
 	"hash/fnv"
 	"io"
 	"sync"

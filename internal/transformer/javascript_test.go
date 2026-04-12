@@ -14,10 +14,10 @@ import (
 
 func TestMinifyJavascript_Basic(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		opts     MinifyJavascriptOptions
-		checkFn  func(t *testing.T, output string, err error)
+		name    string
+		input   string
+		opts    MinifyJavascriptOptions
+		checkFn func(t *testing.T, output string, err error)
 	}{
 		{
 			name:  "minify simple function",
@@ -70,7 +70,7 @@ func TestMinifyJavascript_Basic(t *testing.T) {
 
 			transform := MinifyJavascript(tt.opts)
 			err := transform.Modify(resp)
-			
+
 			var output string
 			if err == nil {
 				body, readErr := io.ReadAll(resp.Body)
@@ -192,7 +192,7 @@ func TestMinifyJavascript_ErrorHandling(t *testing.T) {
 
 	transform := MinifyJavascript(MinifyJavascriptOptions{})
 	err := transform.Modify(resp)
-	
+
 	// Minifier will error on invalid syntax - this is expected behavior
 	// We verify the transform handles errors gracefully
 	if err != nil {
@@ -206,4 +206,3 @@ func TestMinifyJavascript_ErrorHandling(t *testing.T) {
 		}
 	}
 }
-

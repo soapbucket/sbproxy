@@ -51,7 +51,7 @@ func NewCompiledOrigin(id, hostname, workspaceID, version string, handler http.H
 	}
 }
 
-func (co *CompiledOrigin) ID() string         { return co.id }
+func (co *CompiledOrigin) ID() string          { return co.id }
 func (co *CompiledOrigin) Hostname() string    { return co.hostname }
 func (co *CompiledOrigin) WorkspaceID() string { return co.workspaceID }
 func (co *CompiledOrigin) Version() string     { return co.version }

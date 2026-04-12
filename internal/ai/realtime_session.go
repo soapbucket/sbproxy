@@ -12,16 +12,16 @@ import (
 
 // RealtimeSession tracks a single WebSocket realtime session with a provider.
 type RealtimeSession struct {
-	ID           string    `json:"id"`
-	PrincipalID  string    `json:"principal_id"`
-	ProviderName string    `json:"provider_name"`
-	Model        string    `json:"model"`
-	StartTime    time.Time `json:"start_time"`
-	TokensIn     int64     `json:"tokens_in"`
-	TokensOut    int64     `json:"tokens_out"`
-	CostEstimate float64   `json:"cost_estimate"`
+	ID           string        `json:"id"`
+	PrincipalID  string        `json:"principal_id"`
+	ProviderName string        `json:"provider_name"`
+	Model        string        `json:"model"`
+	StartTime    time.Time     `json:"start_time"`
+	TokensIn     int64         `json:"tokens_in"`
+	TokensOut    int64         `json:"tokens_out"`
+	CostEstimate float64       `json:"cost_estimate"`
 	Duration     time.Duration `json:"duration"`
-	Active       bool      `json:"active"`
+	Active       bool          `json:"active"`
 
 	mu sync.Mutex `json:"-"`
 }

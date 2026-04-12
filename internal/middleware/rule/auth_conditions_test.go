@@ -394,7 +394,3 @@ func TestExtractValueFromPath(t *testing.T) {
 		})
 	}
 }
-
-
-
-

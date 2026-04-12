@@ -19,12 +19,12 @@ func newTestStickyManager(ttl time.Duration) *StickySessionManager {
 
 func TestComputeSessionKey(t *testing.T) {
 	tests := []struct {
-		name       string
-		headers    map[string]string
-		cookies    []*http.Cookie
+		name        string
+		headers     map[string]string
+		cookies     []*http.Cookie
 		hashCookies []string
-		wantEmpty  bool
-		desc       string
+		wantEmpty   bool
+		desc        string
 	}{
 		{
 			name:      "default headers present",

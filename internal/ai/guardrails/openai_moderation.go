@@ -53,6 +53,7 @@ func NewOpenAIModerationGuard(config json.RawMessage) (Guardrail, error) {
 
 // Name performs the name operation on the openAIModerationGuard.
 func (g *openAIModerationGuard) Name() string { return "openai_moderation" }
+
 // Phase performs the phase operation on the openAIModerationGuard.
 func (g *openAIModerationGuard) Phase() Phase { return PhaseInput }
 

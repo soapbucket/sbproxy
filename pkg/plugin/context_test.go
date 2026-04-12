@@ -12,11 +12,11 @@ var _ ServiceProvider = (*mockServiceProvider)(nil)
 
 type mockServiceProvider struct{}
 
-func (m *mockServiceProvider) KVStore() KVStore        { return nil }
-func (m *mockServiceProvider) Cache() CacheStore       { return nil }
-func (m *mockServiceProvider) Events() EventEmitter    { return nil }
-func (m *mockServiceProvider) Logger() *slog.Logger    { return slog.Default() }
-func (m *mockServiceProvider) Metrics() Observer       { return NoopObserver() }
+func (m *mockServiceProvider) KVStore() KVStore     { return nil }
+func (m *mockServiceProvider) Cache() CacheStore    { return nil }
+func (m *mockServiceProvider) Events() EventEmitter { return nil }
+func (m *mockServiceProvider) Logger() *slog.Logger { return slog.Default() }
+func (m *mockServiceProvider) Metrics() Observer    { return NoopObserver() }
 func (m *mockServiceProvider) TransportFor(_ TransportConfig) http.RoundTripper {
 	return nil
 }
@@ -26,9 +26,9 @@ func (m *mockServiceProvider) ResolveOriginHandler(_ string) (http.Handler, erro
 func (m *mockServiceProvider) ResolveEmbeddedOriginHandler(_ json.RawMessage) (http.Handler, error) {
 	return nil, nil
 }
-func (m *mockServiceProvider) ResponseCache() ResponseCache             { return nil }
-func (m *mockServiceProvider) Sessions() SessionProvider                { return nil }
-func (m *mockServiceProvider) HealthStatus(_ string) HealthState        { return HealthState{} }
+func (m *mockServiceProvider) ResponseCache() ResponseCache            { return nil }
+func (m *mockServiceProvider) Sessions() SessionProvider               { return nil }
+func (m *mockServiceProvider) HealthStatus(_ string) HealthState       { return HealthState{} }
 func (m *mockServiceProvider) SetHealthStatus(_ string, _ HealthState) {}
 
 func TestServiceProviderInterface(t *testing.T) {

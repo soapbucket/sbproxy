@@ -45,8 +45,8 @@ func newManagerServiceProvider(m manager.Manager, ccm *CompiledConfigManager) *m
 	}
 }
 
-func (sp *managerServiceProvider) KVStore() plugin.KVStore           { return nil }
-func (sp *managerServiceProvider) Cache() plugin.CacheStore          { return nil }
+func (sp *managerServiceProvider) KVStore() plugin.KVStore             { return nil }
+func (sp *managerServiceProvider) Cache() plugin.CacheStore            { return nil }
 func (sp *managerServiceProvider) ResponseCache() plugin.ResponseCache { return nil }
 func (sp *managerServiceProvider) Sessions() plugin.SessionProvider {
 	return &managerSessionProvider{m: sp.m}
@@ -99,8 +99,8 @@ func (s *sessionCacheKVStore) Delete(ctx context.Context, key string) error {
 func (s *sessionCacheKVStore) Increment(_ context.Context, _ string, _ int64) (int64, error) {
 	return 0, fmt.Errorf("increment not supported on session cache")
 }
-func (sp *managerServiceProvider) Logger() *slog.Logger      { return sp.logger }
-func (sp *managerServiceProvider) Metrics() plugin.Observer   { return plugin.NoopObserver() }
+func (sp *managerServiceProvider) Logger() *slog.Logger     { return sp.logger }
+func (sp *managerServiceProvider) Metrics() plugin.Observer { return plugin.NoopObserver() }
 
 func (sp *managerServiceProvider) Events() plugin.EventEmitter {
 	return &noopEventEmitter{}

@@ -179,7 +179,7 @@ func (s *SessionDataCookieJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
 			}
 			sc.Domain = domain
 		}
-		
+
 		// Set path if empty (default to /)
 		if sc.Path == "" {
 			sc.Path = "/"
@@ -233,7 +233,7 @@ func (s *SessionDataCookieJar) shouldSetCookie(u *url.URL, cookie *http.Cookie) 
 	if effectiveDomain == "" {
 		effectiveDomain = u.Host
 	}
-	
+
 	// Strip port from effectiveDomain (ports don't belong in cookie domains)
 	if colonIdx := len(effectiveDomain) - 1; colonIdx > 0 {
 		for i := colonIdx; i >= 0; i-- {
@@ -282,7 +282,7 @@ func (s *SessionDataCookieJar) shouldSendCookie(u *url.URL, cookie *http.Cookie)
 				}
 			}
 		}
-		
+
 		cookieHost := cookie.Domain
 		if colonIdx := len(cookieHost) - 1; colonIdx > 0 {
 			for i := colonIdx; i >= 0; i-- {
@@ -295,7 +295,7 @@ func (s *SessionDataCookieJar) shouldSendCookie(u *url.URL, cookie *http.Cookie)
 				}
 			}
 		}
-		
+
 		if requestHost != cookieHost {
 			return false
 		}

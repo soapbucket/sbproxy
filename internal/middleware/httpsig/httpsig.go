@@ -25,15 +25,15 @@ import (
 // Config configures RFC 9421 HTTP Message Signatures.
 type Config struct {
 	Enable            bool     `json:"enable,omitempty"`
-	VerifyInbound     bool     `json:"verify_inbound,omitempty"`     // Verify incoming request signatures
-	SignOutbound      bool     `json:"sign_outbound,omitempty"`      // Sign outgoing requests to upstream
-	KeyID             string   `json:"key_id,omitempty"`             // Key identifier
-	Algorithm         string   `json:"algorithm,omitempty"`          // hmac-sha256, rsa-pss-sha512, ecdsa-p256-sha256
-	Secret            string   `json:"secret,omitempty" secret:"true"` // HMAC secret
+	VerifyInbound     bool     `json:"verify_inbound,omitempty"`                // Verify incoming request signatures
+	SignOutbound      bool     `json:"sign_outbound,omitempty"`                 // Sign outgoing requests to upstream
+	KeyID             string   `json:"key_id,omitempty"`                        // Key identifier
+	Algorithm         string   `json:"algorithm,omitempty"`                     // hmac-sha256, rsa-pss-sha512, ecdsa-p256-sha256
+	Secret            string   `json:"secret,omitempty" secret:"true"`          // HMAC secret
 	PrivateKeyPEM     string   `json:"private_key_pem,omitempty" secret:"true"` // RSA/ECDSA private key
-	PublicKeyPEM      string   `json:"public_key_pem,omitempty"`     // RSA/ECDSA public key
-	CoveredComponents []string `json:"covered_components,omitempty"` // Components to sign
-	MaxAge            int      `json:"max_age,omitempty"`            // Signature max age in seconds
+	PublicKeyPEM      string   `json:"public_key_pem,omitempty"`                // RSA/ECDSA public key
+	CoveredComponents []string `json:"covered_components,omitempty"`            // Components to sign
+	MaxAge            int      `json:"max_age,omitempty"`                       // Signature max age in seconds
 
 	// Cached parsed keys
 	rsaPrivateKey   *rsa.PrivateKey

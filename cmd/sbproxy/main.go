@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/soapbucket/sbproxy/pkg/cli"
 	_ "github.com/soapbucket/sbproxy/internal/modules"
+	"github.com/soapbucket/sbproxy/pkg/cli"
 
 	"go.uber.org/automaxprocs/maxprocs"
 )

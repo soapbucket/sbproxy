@@ -35,14 +35,14 @@ func (s *sessionServiceImpl) Get(ctx context.Context, sessionID string) (*reqctx
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Decrypt the session data using a key derived from the session ID
 	// This ensures each session's data is encrypted with a unique key
 	decryptedJSON, err := s.m.DecryptStringWithContext(string(encryptedData), sessionID)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	obj := &reqctx.SessionData{}
 	if err := json.Unmarshal([]byte(decryptedJSON), obj); err != nil {
 		return nil, err
@@ -56,14 +56,14 @@ func (s *sessionServiceImpl) Save(ctx context.Context, session *reqctx.SessionDa
 	if err != nil {
 		return err
 	}
-	
+
 	// Encrypt the session data using a key derived from the session ID
 	// This ensures each session's data is encrypted with a unique key
 	encryptedData, err := s.m.EncryptStringWithContext(string(jsonData), session.ID)
 	if err != nil {
 		return err
 	}
-	
+
 	return s.m.GetSessionCache().Put(ctx, session.ID, bytes.NewReader([]byte(encryptedData)), expires)
 }
 

@@ -334,4 +334,3 @@ func BenchmarkCallback_JSONArray(b *testing.B) {
 		_, _ = callback.Do(ctx, nil)
 	}
 }
-

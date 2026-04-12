@@ -16,18 +16,18 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"strconv"
 	"hash"
 	"io"
 	"log/slog"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/soapbucket/sbproxy/internal/cache/store"
 	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"github.com/soapbucket/sbproxy/internal/request/reqctx"
-	"github.com/soapbucket/sbproxy/internal/cache/store"
 )
 
 const (
@@ -36,38 +36,38 @@ const (
 	// SignatureAlgorithmHMACSHA512 is a constant for signature algorithm hmacsha512.
 	SignatureAlgorithmHMACSHA512 = "hmac-sha512"
 	// SignatureAlgorithmRSASHA256 is a constant for signature algorithm rsasha256.
-	SignatureAlgorithmRSASHA256  = "rsa-sha256"
+	SignatureAlgorithmRSASHA256 = "rsa-sha256"
 	// SignatureAlgorithmRSASHA512 is a constant for signature algorithm rsasha512.
-	SignatureAlgorithmRSASHA512  = "rsa-sha512"
+	SignatureAlgorithmRSASHA512 = "rsa-sha512"
 
 	// Signature encoding
 	SignatureEncodingBase64 = "base64"
 	// SignatureEncodingHex is a constant for signature encoding hex.
-	SignatureEncodingHex    = "hex"
+	SignatureEncodingHex = "hex"
 
 	// Default headers
 	DefaultSignatureHeader = "X-Signature"
 	// DefaultTimestampHeader is the default value for timestamp header.
 	DefaultTimestampHeader = "X-Signature-Timestamp"
 	// DefaultNonceHeader is the default value for nonce header.
-	DefaultNonceHeader     = "X-Signature-Nonce"
+	DefaultNonceHeader = "X-Signature-Nonce"
 	// DefaultAlgorithmHeader is the default value for algorithm header.
 	DefaultAlgorithmHeader = "X-Signature-Algorithm"
 
 	// Signature components
-	SignatureComponentMethod    = "method"
+	SignatureComponentMethod = "method"
 	// SignatureComponentPath is a constant for signature component path.
-	SignatureComponentPath      = "path"
+	SignatureComponentPath = "path"
 	// SignatureComponentQuery is a constant for signature component query.
-	SignatureComponentQuery     = "query"
+	SignatureComponentQuery = "query"
 	// SignatureComponentHeaders is a constant for signature component headers.
-	SignatureComponentHeaders   = "headers"
+	SignatureComponentHeaders = "headers"
 	// SignatureComponentBody is a constant for signature component body.
-	SignatureComponentBody      = "body"
+	SignatureComponentBody = "body"
 	// SignatureComponentTimestamp is a constant for signature component timestamp.
 	SignatureComponentTimestamp = "timestamp"
 	// SignatureComponentNonce is a constant for signature component nonce.
-	SignatureComponentNonce     = "nonce"
+	SignatureComponentNonce = "nonce"
 
 	// Cache prefix for signature-verified responses
 	signatureCachePrefix = "sig_verified"
@@ -76,10 +76,10 @@ const (
 // SignatureConfig represents signature configuration for requests/responses
 type SignatureConfig struct {
 	// Core settings
-	Algorithm  string `json:"algorithm"`             // hmac-sha256, hmac-sha512, rsa-sha256, rsa-sha512
+	Algorithm  string `json:"algorithm"`                           // hmac-sha256, hmac-sha512, rsa-sha256, rsa-sha512
 	Secret     string `json:"secret,omitempty" secret:"true"`      // For HMAC
 	PrivateKey string `json:"private_key,omitempty" secret:"true"` // For RSA signing (PEM format)
-	PublicKey  string `json:"public_key,omitempty"`  // For RSA verification (PEM format)
+	PublicKey  string `json:"public_key,omitempty"`                // For RSA verification (PEM format)
 
 	// Signature placement
 	SignatureHeader string `json:"signature_header,omitempty"`
@@ -675,10 +675,10 @@ func NewCachedResponseVerifier(config CachedResponseVerifierConfig) (*CachedResp
 // Then it validates the signature in the background. If validation fails, the cache is invalidated.
 func (c *CachedResponseVerifier) VerifyResponseWithCache(req *http.Request, resp *http.Response) (*http.Response, error) {
 	ctx := req.Context()
-	
+
 	// Generate cache key based on request URL and signature header
 	cacheKey := c.generateCacheKey(req, resp)
-	
+
 	// Try to get cached response
 	if cachedResp := c.getCachedResponse(req, cacheKey); cachedResp != nil {
 		// Store cache key in RequestData for request logging
@@ -687,18 +687,18 @@ func (c *CachedResponseVerifier) VerifyResponseWithCache(req *http.Request, resp
 			requestData.SignatureCacheHit = true
 			requestData.AddDebugHeader(httputil.HeaderXSbCacheKey, cacheKey)
 		}
-		
+
 		slog.Debug("signature cache hit",
 			"method", req.Method,
 			"url", req.URL.String(),
 			"cache_key", cacheKey)
-		
+
 		// Serve cached response immediately, then validate in background
 		go c.validateAndUpdateCache(req, resp, cacheKey)
-		
+
 		return cachedResp, nil
 	}
-	
+
 	slog.Debug("signature cache miss",
 		"method", req.Method,
 		"url", req.URL.String(),
@@ -786,7 +786,7 @@ func (c *CachedResponseVerifier) getCachedResponse(req *http.Request, cacheKey s
 			"error", err)
 		return nil
 	}
-	
+
 	slog.Debug("signature cache retrieved",
 		"cache_key", cacheKey,
 		"size", len(data),
@@ -892,7 +892,7 @@ func (c *CachedResponseVerifier) validateAndUpdateCache(req *http.Request, resp 
 			"url", req.URL.String(),
 			"error", err,
 			"cache_key", cacheKey)
-		
+
 		// Invalidate cache
 		if err := c.cache.Delete(ctx, signatureCachePrefix, cacheKey); err != nil {
 			slog.Error("failed to invalidate signature cache",
@@ -909,7 +909,7 @@ func (c *CachedResponseVerifier) validateAndUpdateCache(req *http.Request, resp 
 	// Restore body again for caching
 	resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	c.cacheResponse(ctx, cacheKey, resp)
-	
+
 	slog.Debug("background signature validation succeeded, cache updated",
 		"method", req.Method,
 		"url", req.URL.String(),

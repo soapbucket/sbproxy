@@ -31,9 +31,9 @@ func TestKafkaRESTProducer_Publish(t *testing.T) {
 
 		resp := restProduceResponse{
 			Offsets: []struct {
-				Partition int   `json:"partition"`
-				Offset    int64 `json:"offset"`
-				ErrorCode *int  `json:"error_code,omitempty"`
+				Partition int    `json:"partition"`
+				Offset    int64  `json:"offset"`
+				ErrorCode *int   `json:"error_code,omitempty"`
 				Error     string `json:"error,omitempty"`
 			}{
 				{Partition: 0, Offset: 42},

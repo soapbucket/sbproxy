@@ -19,7 +19,7 @@ import (
 
 // Default bounds for cache size limits.
 const (
-	defaultMaxWorkspaces       = 10000
+	defaultMaxWorkspaces        = 10000
 	defaultMaxFlagsPerWorkspace = 1000
 )
 

@@ -42,7 +42,7 @@ func TestBuildAIActivation(t *testing.T) {
 		MessageCount:  5,
 		TokenEstimate: 1500,
 		HasTools:      true,
-		IsStreaming:    false,
+		IsStreaming:   false,
 		Tags:          map[string]string{"env": "prod"},
 		Budget: map[string]any{
 			"utilization":      0.6,

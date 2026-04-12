@@ -146,4 +146,3 @@ func TestTokenBucket_Reset(t *testing.T) {
 		t.Errorf("expected 10 remaining after reset, got %d", remaining)
 	}
 }
-

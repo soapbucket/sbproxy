@@ -56,26 +56,26 @@ func (b *CacheKeyBuilder) Build() string {
 	if len(b.parts) == 1 {
 		return b.parts[0]
 	}
-	
+
 	// Estimate capacity: sum of part lengths + separators
 	capacity := 0
 	for _, part := range b.parts {
 		capacity += len(part)
 	}
 	capacity += len(b.parts) - 1 // separators
-	
+
 	// Get builder from pool with pre-allocated capacity
 	// Uses adaptive pool sizing when available
 	builder := GetBuilderWithSize(capacity)
 	defer PutBuilder(builder)
-	
+
 	// Build the string
 	builder.WriteString(b.parts[0])
 	for i := 1; i < len(b.parts); i++ {
 		builder.WriteByte(':')
 		builder.WriteString(b.parts[i])
 	}
-	
+
 	return builder.String()
 }
 
@@ -86,25 +86,25 @@ func (b *CacheKeyBuilder) BuildHashed() string {
 		hash := sha256.Sum256(nil)
 		return hex.EncodeToString(hash[:])
 	}
-	
+
 	// Estimate capacity for hashing
 	capacity := 0
 	for _, part := range b.parts {
 		capacity += len(part)
 	}
 	capacity += len(b.parts) - 1 // separators
-	
+
 	// Get builder from pool with pre-allocated capacity
 	// Uses adaptive pool sizing when available
 	builder := GetBuilderWithSize(capacity)
 	defer PutBuilder(builder)
-	
+
 	builder.WriteString(b.parts[0])
 	for i := 1; i < len(b.parts); i++ {
 		builder.WriteByte(':')
 		builder.WriteString(b.parts[i])
 	}
-	
+
 	// Hash directly from builder's string
 	keyBytes := []byte(builder.String())
 	hash := sha256.Sum256(keyBytes)
@@ -162,4 +162,3 @@ func OriginCacheKey(hostname string) string {
 		Add(hostname).
 		Build()
 }
-

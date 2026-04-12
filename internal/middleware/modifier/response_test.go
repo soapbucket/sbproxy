@@ -27,11 +27,11 @@ func TestApplyResponseBodyModifications_SizeCheck(t *testing.T) {
 	}
 
 	tests := []struct {
-		name           string
-		bodySize       int
-		threshold      int64
-		shouldModify   bool
-		modification   *BodyModifications
+		name         string
+		bodySize     int
+		threshold    int64
+		shouldModify bool
+		modification *BodyModifications
 	}{
 		{
 			name:         "Small body - should modify",

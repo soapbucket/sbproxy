@@ -68,4 +68,3 @@ func GetHTTPCacheContext(ctx context.Context) *HTTPCallbackContext {
 
 	return httpCtx
 }
-

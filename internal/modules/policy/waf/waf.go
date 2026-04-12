@@ -31,18 +31,18 @@ func init() {
 
 // Config holds configuration for the waf policy.
 type Config struct {
-	Type                        string            `json:"type"`
-	Disabled                    bool              `json:"disabled,omitempty"`
-	ModSecurityRules            []string          `json:"modsecurity_rules,omitempty"`
-	CustomRules                 []waf.WAFRule     `json:"custom_rules,omitempty"`
+	Type                        string              `json:"type"`
+	Disabled                    bool                `json:"disabled,omitempty"`
+	ModSecurityRules            []string            `json:"modsecurity_rules,omitempty"`
+	CustomRules                 []waf.WAFRule       `json:"custom_rules,omitempty"`
 	OWASPCRS                    *waf.OWASPCRSConfig `json:"owasp_crs,omitempty"`
-	RuleSets                    []string          `json:"rule_sets,omitempty"`
-	DefaultAction               string            `json:"default_action,omitempty"`
-	ActionOnMatch               string            `json:"action_on_match,omitempty"`
-	MaxRuleExecutionTime        wafDuration       `json:"max_rule_execution_time,omitempty"`
-	EnablePerformanceMonitoring bool              `json:"enable_performance_monitoring,omitempty"`
-	TestMode                    bool              `json:"test_mode,omitempty"`
-	FailOpen                    bool              `json:"fail_open,omitempty"`
+	RuleSets                    []string            `json:"rule_sets,omitempty"`
+	DefaultAction               string              `json:"default_action,omitempty"`
+	ActionOnMatch               string              `json:"action_on_match,omitempty"`
+	MaxRuleExecutionTime        wafDuration         `json:"max_rule_execution_time,omitempty"`
+	EnablePerformanceMonitoring bool                `json:"enable_performance_monitoring,omitempty"`
+	TestMode                    bool                `json:"test_mode,omitempty"`
+	FailOpen                    bool                `json:"fail_open,omitempty"`
 }
 
 // wafDuration wraps time.Duration for JSON unmarshaling from string.
@@ -76,8 +76,8 @@ func New(data json.RawMessage) (plugin.PolicyEnforcer, error) {
 }
 
 type wafPolicy struct {
-	cfg         *Config
-	ruleEngine  *waf.RuleEngine
+	cfg        *Config
+	ruleEngine *waf.RuleEngine
 	// Fields populated from PluginContext.
 	originID    string
 	workspaceID string

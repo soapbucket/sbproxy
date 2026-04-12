@@ -67,9 +67,9 @@ func (n *noopCompressor) Compress(_ context.Context, messages []CompressMessage,
 		tokens += EstimateTokens(m.Content)
 	}
 	return messages, &CompressionStats{
-		OriginalTokens:   tokens,
-		CompressedTokens: tokens,
-		Ratio:            1.0,
+		OriginalTokens:    tokens,
+		CompressedTokens:  tokens,
+		Ratio:             1.0,
 		PreservedMessages: len(messages),
 	}, nil
 }

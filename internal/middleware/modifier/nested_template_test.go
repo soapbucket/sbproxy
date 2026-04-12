@@ -211,7 +211,6 @@ func TestNestedTemplateVariables_NonMapIntermediate(t *testing.T) {
 	// In practice, this means the header will contain the unresolved template
 	headerValue := req.Header.Get("X-User-Tier")
 	// Either empty string (if Mustache handles it gracefully) or the original template (if error)
-	assert.True(t, headerValue == "" || headerValue == "{{request.data.user_data.subscription.tier}}", 
+	assert.True(t, headerValue == "" || headerValue == "{{request.data.user_data.subscription.tier}}",
 		"should return empty string or original template when intermediate value is not a map, got: %s", headerValue)
 }
-

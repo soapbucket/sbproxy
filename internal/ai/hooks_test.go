@@ -11,11 +11,11 @@ import (
 
 // testHook is a configurable hook for testing.
 type testHook struct {
-	name      string
-	async     bool
-	onChunk   func(ctx context.Context, chunk *SSEEvent, meta *StreamMeta) error
+	name       string
+	async      bool
+	onChunk    func(ctx context.Context, chunk *SSEEvent, meta *StreamMeta) error
 	onComplete func(ctx context.Context, meta *StreamMeta) error
-	callCount int64
+	callCount  int64
 }
 
 func (h *testHook) Name() string  { return h.name }
@@ -114,12 +114,12 @@ func TestHookChainAsync(t *testing.T) {
 
 func TestTokenCounterHook(t *testing.T) {
 	tests := []struct {
-		name         string
-		data         string
-		wantTotal    int64
-		wantInput    int64
-		wantOutput   int64
-		wantChunks   int64
+		name       string
+		data       string
+		wantTotal  int64
+		wantInput  int64
+		wantOutput int64
+		wantChunks int64
 	}{
 		{
 			name:       "chunk with usage",

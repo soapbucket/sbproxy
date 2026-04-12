@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/soapbucket/sbproxy/internal/platform/circuitbreaker"
 	"github.com/soapbucket/sbproxy/internal/loader/settings"
+	"github.com/soapbucket/sbproxy/internal/platform/circuitbreaker"
 	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/pkg/plugin"
 )

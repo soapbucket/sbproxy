@@ -33,13 +33,13 @@ type Checker interface {
 
 // Manager manages health checks for the service
 type Manager struct {
-	mu             sync.RWMutex
-	checkers       map[string]Checker
-	ready          atomic.Bool
-	live           atomic.Bool
-	shuttingDown   atomic.Bool
-	inflightCount  atomic.Int64
-	startTime      time.Time
+	mu            sync.RWMutex
+	checkers      map[string]Checker
+	ready         atomic.Bool
+	live          atomic.Bool
+	shuttingDown  atomic.Bool
+	inflightCount atomic.Int64
+	startTime     time.Time
 
 	// Cached dependency status to avoid per-request overhead.
 	depCacheMu     sync.RWMutex

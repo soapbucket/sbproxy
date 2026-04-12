@@ -69,9 +69,9 @@ func (c *MemoryConfig) ShouldCaptureStreaming() bool {
 // Capture scope constants.
 const (
 	// ScopeFull is a constant for scope full.
-	ScopeFull     = "full"
+	ScopeFull = "full"
 	// ScopeMetadata is a constant for scope metadata.
 	ScopeMetadata = "metadata"
 	// ScopeSummary is a constant for scope summary.
-	ScopeSummary  = "summary"
+	ScopeSummary = "summary"
 )

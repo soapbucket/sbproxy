@@ -79,7 +79,7 @@ func TestTransformApply_AllowsBodyAtExactLimit(t *testing.T) {
 }
 
 func TestTransformApply_DefaultMaxBodySize(t *testing.T) {
-	bt, mock := newTestTransform(0)                                    // 0 = use default
+	bt, mock := newTestTransform(0)                                        // 0 = use default
 	resp := newTestResponse(int64(httputil.DefaultTransformThreshold) + 1) // just over 10MB
 
 	err := bt.Apply(resp)
@@ -105,7 +105,7 @@ func TestTransformApply_DefaultAllowsUnder10MB(t *testing.T) {
 }
 
 func TestTransformApply_UnlimitedMaxBodySize(t *testing.T) {
-	bt, mock := newTestTransform(-1)       // -1 = unlimited
+	bt, mock := newTestTransform(-1)           // -1 = unlimited
 	resp := newTestResponse(500 * 1024 * 1024) // 500MB
 
 	err := bt.Apply(resp)

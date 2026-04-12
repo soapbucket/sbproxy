@@ -17,7 +17,7 @@ type CompletionParams struct {
 
 // CompletionRef identifies what is being completed.
 type CompletionRef struct {
-	Type string `json:"type"` // "ref/prompt" or "ref/resource"
+	Type string `json:"type"`           // "ref/prompt" or "ref/resource"
 	Name string `json:"name,omitempty"` // Prompt name
 	URI  string `json:"uri,omitempty"`  // Resource URI
 }

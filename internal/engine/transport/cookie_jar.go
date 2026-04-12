@@ -17,52 +17,52 @@ type CookieJarTransport struct {
 func (t *CookieJarTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Get cookie jar for this request (from session)
 	jar := t.GetJarFn(req)
-	
+
 	if jar != nil {
 		// Get cookies for the target URL
 		cookies := jar.Cookies(req.URL)
-		
+
 		if len(cookies) > 0 {
 			// Add cookies to request
 			for _, cookie := range cookies {
 				req.AddCookie(cookie)
 			}
-			
+
 			slog.Debug("injected cookies into proxied request",
 				"url", req.URL.String(),
 				"host", req.URL.Host,
 				"cookie_count", len(cookies))
 		}
 	}
-	
+
 	// Execute request with base transport
 	resp, err := t.Base.RoundTrip(req)
-	
+
 	// Capture response cookies and store in jar
 	if err == nil && jar != nil {
 		if cookies := resp.Cookies(); len(cookies) > 0 {
 			jar.SetCookies(req.URL, cookies)
-			
+
 			slog.Debug("captured cookies from proxied response",
 				"url", req.URL.String(),
 				"host", req.URL.Host,
 				"cookie_count", len(cookies))
-			
+
 			// Sync jar back to session data if it supports the interface
 			// This avoids import cycle by using interface instead of concrete type
 			type sessionSyncer interface {
 				SyncToSessionData()
 			}
-			
+
 			if syncer, ok := jar.(sessionSyncer); ok {
 				syncer.SyncToSessionData()
-				
+
 				slog.Debug("synced cookie jar to session data",
 					"url", req.URL.String())
 			}
 		}
 	}
-	
+
 	return resp, err
 }
 
@@ -73,4 +73,3 @@ func NewCookieJarTransport(base http.RoundTripper, getJarFn func(*http.Request) 
 		GetJarFn: getJarFn,
 	}
 }
-

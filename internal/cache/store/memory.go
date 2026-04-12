@@ -122,7 +122,7 @@ func (m *MemoryCacher) DeleteByPattern(ctx context.Context, cType string, patter
 func (m *MemoryCacher) ListKeys(ctx context.Context, cType string, pattern string) ([]string, error) {
 	fullPrefix := makeKey(cType, pattern)
 	allKeys := m.manager.GetKeysByPrefix(fullPrefix)
-	
+
 	// Remove the cType prefix from keys and extract just the key part
 	prefixToRemove := cType + "/"
 	keys := make([]string, 0, len(allKeys))
@@ -132,7 +132,7 @@ func (m *MemoryCacher) ListKeys(ctx context.Context, cType string, pattern strin
 			keys = append(keys, key)
 		}
 	}
-	
+
 	return keys, nil
 }
 

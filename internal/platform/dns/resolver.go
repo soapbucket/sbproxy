@@ -67,7 +67,7 @@ func (r *Resolver) LookupIP(ctx context.Context, network, host string) ([]net.IP
 	startTime := time.Now()
 	ips, err := r.base.LookupIP(ctx, network, host)
 	duration := time.Since(startTime).Seconds()
-	
+
 	// Record DNS resolution time metric
 	result := "success"
 	if err != nil {
@@ -137,7 +137,7 @@ func (r *Resolver) LookupHost(ctx context.Context, host string) ([]string, error
 	startTime := time.Now()
 	addrs, err := r.base.LookupHost(ctx, host)
 	duration := time.Since(startTime).Seconds()
-	
+
 	// Record DNS resolution time metric
 	result := "success"
 	if err != nil {
@@ -228,4 +228,3 @@ func (r *Resolver) LookupPort(ctx context.Context, network, service string) (int
 func (r *Resolver) GetCache() *Cache {
 	return r.cache
 }
-

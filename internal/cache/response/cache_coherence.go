@@ -28,22 +28,22 @@ type InvalidationMessage struct {
 	Keys      []string `json:"keys,omitempty"`
 	Patterns  []string `json:"patterns,omitempty"`
 	Tags      []string `json:"tags,omitempty"`
-	Source    string   `json:"source"`    // Instance ID
+	Source    string   `json:"source"` // Instance ID
 	Timestamp int64    `json:"timestamp"`
 }
 
 // CacheCoherence manages cross-instance cache invalidation via the event bus.
 type CacheCoherence struct {
-	config  CacheCoherenceConfig
-	bus     events.EventBus
-	cache   cacher.Cacher
-	source  string // This instance's ID
+	config CacheCoherenceConfig
+	bus    events.EventBus
+	cache  cacher.Cacher
+	source string // This instance's ID
 
 	mu      sync.Mutex
 	pending []InvalidationMessage
 
-	stopCh  chan struct{}
-	wg      sync.WaitGroup
+	stopCh chan struct{}
+	wg     sync.WaitGroup
 
 	// Dedup: track recent invalidations to avoid loops
 	seen   map[string]time.Time
@@ -213,10 +213,10 @@ func (cc *CacheCoherence) flushLocked() {
 		Timestamp: time.Now(),
 		Source:    "cache_coherence",
 		Data: map[string]interface{}{
-			"payload":  string(data),
-			"key_count": len(merged.Keys),
+			"payload":       string(data),
+			"key_count":     len(merged.Keys),
 			"pattern_count": len(merged.Patterns),
-			"tag_count": len(merged.Tags),
+			"tag_count":     len(merged.Tags),
 		},
 	}); pubErr != nil {
 		slog.Error("cache_coherence: failed to publish invalidation", "error", pubErr)

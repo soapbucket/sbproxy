@@ -139,8 +139,8 @@ func New(raw json.RawMessage) (plugin.ActionHandler, error) {
 	}
 
 	h := &Handler{
-		cfg:       cfg,
-		targetURL: targetURL,
+		cfg:               cfg,
+		targetURL:         targetURL,
 		persistentQueries: make(map[string]string),
 		queryCache: &queryCache{
 			queries: make(map[string]*cachedQuery),

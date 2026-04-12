@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/soapbucket/sbproxy/internal/request/classifier/classifierpkg"
 	"github.com/soapbucket/sbproxy/internal/platform/circuitbreaker"
+	"github.com/soapbucket/sbproxy/internal/request/classifier/classifierpkg"
 	"golang.org/x/time/rate"
 )
 
@@ -20,11 +20,11 @@ type ManagedClient struct {
 	client         *classifierpkg.Client
 	breaker        *circuitbreaker.CircuitBreaker
 	embedCache     *EmbeddingCache
-	limiters       sync.Map       // workspaceID -> *rate.Limiter
+	limiters       sync.Map // workspaceID -> *rate.Limiter
 	defaultLimiter *rate.Limiter
 	settings       Settings
-	available      atomic.Bool  // false if sidecar never connected
-	embedSupported atomic.Bool  // false if sidecar has no embedding model
+	available      atomic.Bool // false if sidecar never connected
+	embedSupported atomic.Bool // false if sidecar has no embedding model
 }
 
 // NewManagedClient creates a ManagedClient by connecting to the sidecar.

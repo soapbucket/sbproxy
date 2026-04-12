@@ -15,8 +15,8 @@ import (
 
 // MetricsSnapshot represents a point-in-time snapshot of metrics
 type MetricsSnapshot struct {
-	Timestamp    time.Time            `json:"timestamp"`
-	Period       time.Time            `json:"period"`
+	Timestamp    time.Time              `json:"timestamp"`
+	Period       time.Time              `json:"period"`
 	Metrics      map[string]interface{} `json:"metrics"`
 	CacheStats   map[string]interface{} `json:"cache_stats,omitempty"`
 	BufferStats  map[string]interface{} `json:"buffer_stats,omitempty"`
@@ -25,13 +25,13 @@ type MetricsSnapshot struct {
 
 // SnapshotCollector gathers metrics and persists them to disk
 type SnapshotCollector struct {
-	snapshotDir   string
-	interval      time.Duration
-	retention     time.Duration // How long to keep snapshots
-	stopCh        chan struct{}
-	wg            sync.WaitGroup
-	collectors    []MetricCollector
-	mu            sync.RWMutex
+	snapshotDir string
+	interval    time.Duration
+	retention   time.Duration // How long to keep snapshots
+	stopCh      chan struct{}
+	wg          sync.WaitGroup
+	collectors  []MetricCollector
+	mu          sync.RWMutex
 }
 
 // MetricCollector defines an interface for collecting metrics

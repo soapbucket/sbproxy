@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"time"
 
-	lua "github.com/yuin/gopher-lua"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	lua "github.com/yuin/gopher-lua"
 )
 
 // RouteMatcher determines if a request should be routed to a specific target using Lua scripts.

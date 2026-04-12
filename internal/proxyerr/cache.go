@@ -26,4 +26,3 @@ func CacheExpiredError(key string) *ProxyError {
 	return New(ErrCodeCacheExpired, "cache entry expired").
 		WithDetail("key", key)
 }
-

@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	lua "github.com/yuin/gopher-lua"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
+	lua "github.com/yuin/gopher-lua"
 )
 
 const (
@@ -370,7 +370,6 @@ func ConvertGoToLua(L *lua.LState, value interface{}) lua.LValue {
 func ConvertLuaToGo(L *lua.LState, value lua.LValue) interface{} {
 	return convertLuaToGo(L, value)
 }
-
 
 // createRequestTable creates a Lua table with request data
 func createRequestTable(L *lua.LState, req *http.Request) *lua.LTable {

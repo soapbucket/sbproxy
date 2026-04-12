@@ -12,10 +12,10 @@ type PermissionGroup struct {
 	ID           string            `json:"id"`
 	Name         string            `json:"name"`
 	Description  string            `json:"description,omitempty"`
-	Members      []string          `json:"members"`              // Principal IDs
-	ModelGrants  []ModelGrant      `json:"model_grants"`         // Direct model grants
-	AccessGroups []string          `json:"access_groups"`        // Named model sets
-	Policies     []string          `json:"policies,omitempty"`   // Policy IDs applied to this group
+	Members      []string          `json:"members"`            // Principal IDs
+	ModelGrants  []ModelGrant      `json:"model_grants"`       // Direct model grants
+	AccessGroups []string          `json:"access_groups"`      // Named model sets
+	Policies     []string          `json:"policies,omitempty"` // Policy IDs applied to this group
 	Metadata     map[string]string `json:"metadata,omitempty"`
 	CreatedAt    time.Time         `json:"created_at"`
 	UpdatedAt    time.Time         `json:"updated_at"`
@@ -23,11 +23,11 @@ type PermissionGroup struct {
 
 // ModelGrant defines access to a specific model or pattern.
 type ModelGrant struct {
-	Model      string `json:"model"`                    // Exact name or glob pattern (e.g., "gpt-4*")
-	Permission string `json:"permission"`               // "allow" or "deny"
-	MaxTokens  int64  `json:"max_tokens,omitempty"`     // Per-request token limit for this model
-	RPM        int    `json:"rpm,omitempty"`             // Rate limit for this model
-	Priority   int    `json:"priority,omitempty"`        // Higher priority wins on conflict
+	Model      string `json:"model"`                // Exact name or glob pattern (e.g., "gpt-4*")
+	Permission string `json:"permission"`           // "allow" or "deny"
+	MaxTokens  int64  `json:"max_tokens,omitempty"` // Per-request token limit for this model
+	RPM        int    `json:"rpm,omitempty"`        // Rate limit for this model
+	Priority   int    `json:"priority,omitempty"`   // Higher priority wins on conflict
 }
 
 // AccessGroup is a reusable named set of reqctx.
@@ -41,12 +41,12 @@ type AccessGroup struct {
 
 // ResolvedPermissions is the final computed permissions for a principal.
 type ResolvedPermissions struct {
-	PrincipalID string                `json:"principal_id"`
-	AllowedModels []string            `json:"allowed_models"`
-	DeniedModels  []string            `json:"denied_models"`
+	PrincipalID   string                `json:"principal_id"`
+	AllowedModels []string              `json:"allowed_models"`
+	DeniedModels  []string              `json:"denied_models"`
 	ModelLimits   map[string]ModelLimit `json:"model_limits"`
-	Groups        []string            `json:"groups"`
-	Policies      []string            `json:"policies"`
+	Groups        []string              `json:"groups"`
+	Policies      []string              `json:"policies"`
 }
 
 // ModelLimit holds per-model rate and token limits.

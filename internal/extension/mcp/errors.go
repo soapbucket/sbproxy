@@ -15,26 +15,26 @@ import (
 
 const (
 	// Standard JSON-RPC 2.0 error codes
-	CodeParseError     = -32700 // Invalid JSON was received
+	CodeParseError = -32700 // Invalid JSON was received
 	// CodeInvalidRequest is a constant for code invalid request.
 	CodeInvalidRequest = -32600 // The JSON sent is not a valid Request object
 	// CodeMethodNotFound is a constant for code method not found.
 	CodeMethodNotFound = -32601 // The method does not exist / is not available
 	// CodeInvalidParams is a constant for code invalid params.
-	CodeInvalidParams  = -32602 // Invalid method parameter(s)
+	CodeInvalidParams = -32602 // Invalid method parameter(s)
 	// CodeInternalError is a constant for code internal error.
-	CodeInternalError  = -32603 // Internal JSON-RPC error
+	CodeInternalError = -32603 // Internal JSON-RPC error
 
 	// Server error codes (-32000 to -32099 reserved for implementation-defined server errors)
-	CodeToolNotFound     = -32000 // Tool not found
+	CodeToolNotFound = -32000 // Tool not found
 	// CodeToolExecError is a constant for code tool exec error.
-	CodeToolExecError    = -32001 // Tool execution error
+	CodeToolExecError = -32001 // Tool execution error
 	// CodeTimeoutError is a constant for code timeout error.
-	CodeTimeoutError     = -32002 // Operation timed out
+	CodeTimeoutError = -32002 // Operation timed out
 	// CodeUpstreamError is a constant for code upstream error.
-	CodeUpstreamError    = -32003 // Upstream API error
+	CodeUpstreamError = -32003 // Upstream API error
 	// CodeValidationError is a constant for code validation error.
-	CodeValidationError  = -32004 // Validation error
+	CodeValidationError = -32004 // Validation error
 	// CodeCircuitOpenError is a constant for code circuit open error.
 	CodeCircuitOpenError = -32005 // Circuit breaker is open
 )

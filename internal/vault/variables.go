@@ -53,4 +53,3 @@ func ValidateVariables(variables map[string]any) error {
 	}
 	return nil
 }
-

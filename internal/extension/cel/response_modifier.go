@@ -2,12 +2,12 @@
 package cel
 
 import (
-	"github.com/soapbucket/sbproxy/internal/cache/store"
 	"bytes"
 	"encoding/base64"
-	json "github.com/goccy/go-json"
 	"errors"
 	"fmt"
+	json "github.com/goccy/go-json"
+	"github.com/soapbucket/sbproxy/internal/cache/store"
 	"io"
 	"log/slog"
 	"net/http"
@@ -18,8 +18,8 @@ import (
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/common/types/ref"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 // ErrNoResponseModifications is returned when a CEL expression produces no modifications.
@@ -33,11 +33,11 @@ type ResponseModificationResult struct {
 	AddHeaders map[string]string
 	// DeleteHeaders contains header names to delete
 	DeleteHeaders []string
-	
+
 	// Status modifications
 	StatusCode int    // New status code to set (if not 0)
 	StatusText string // Custom status text (overrides default for status code)
-	
+
 	// Body modifications
 	Body              string // Simple body replacement (deprecated, use BodyReplace)
 	BodyRemove        bool   // Remove body entirely
@@ -60,12 +60,12 @@ type responseModifier struct {
 // ModifyResponse evaluates the CEL expression and applies modifications to the response
 func (m *responseModifier) ModifyResponse(resp *http.Response) error {
 	vars := getResponseModifierVars(resp)
-	
+
 	// Measure CEL execution time
 	startTime := time.Now()
 	out, _, err := m.Eval(vars)
 	duration := time.Since(startTime).Seconds()
-	
+
 	// Get origin from config context
 	origin := "unknown"
 	if resp != nil && resp.Request != nil {
@@ -80,10 +80,10 @@ func (m *responseModifier) ModifyResponse(resp *http.Response) error {
 			origin = resp.Request.Host
 		}
 	}
-	
+
 	// Record CEL execution time
 	metric.CELExecutionTime(origin, "response_modifier", duration)
-	
+
 	if err != nil {
 		slog.Debug("error evaluating response expression", "url", resp.Request.URL, "error", err)
 		return err
@@ -415,8 +415,8 @@ func applyResponseModifications(resp *http.Response, mods *ResponseModificationR
 
 	// Apply body modifications
 	// Priority: BodyReplaceBase64 > BodyReplaceJSON > BodyReplace > Body (deprecated) > BodyRemove
-	if mods.BodyReplaceBase64 != "" || mods.BodyReplaceJSON != "" || 
-	   mods.BodyReplace != "" || mods.Body != "" || mods.BodyRemove {
+	if mods.BodyReplaceBase64 != "" || mods.BodyReplaceJSON != "" ||
+		mods.BodyReplace != "" || mods.Body != "" || mods.BodyRemove {
 		var bodyBytes []byte
 		var err error
 

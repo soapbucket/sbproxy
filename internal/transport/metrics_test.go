@@ -17,9 +17,9 @@ func (s *stubTransport) RoundTrip(_ *http.Request) (*http.Response, error) {
 
 // stubHistogram records observations for test assertions.
 type stubHistogram struct {
-	calls       int
-	lastValue   float64
-	lastLabels  []string
+	calls      int
+	lastValue  float64
+	lastLabels []string
 }
 
 func (h *stubHistogram) Observe(value float64, labels ...string) {

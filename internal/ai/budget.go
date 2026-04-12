@@ -13,15 +13,15 @@ import (
 // BudgetConfig defines budget limits and behavior.
 type BudgetConfig struct {
 	Limits             []BudgetLimit     `json:"limits"`
-	OnExceed           string            `json:"on_exceed,omitempty"`        // "block", "log", "downgrade"
+	OnExceed           string            `json:"on_exceed,omitempty"` // "block", "log", "downgrade"
 	AlertThresholdPct  int               `json:"alert_threshold_pct,omitempty"`
-	DowngradeMap       map[string]string `json:"downgrade_map,omitempty"`    // model -> cheaper model
+	DowngradeMap       map[string]string `json:"downgrade_map,omitempty"`       // model -> cheaper model
 	DowngradeThreshold float64           `json:"downgrade_threshold,omitempty"` // 0.0-1.0 utilization ratio
 }
 
 // BudgetLimit defines a single budget constraint.
 type BudgetLimit struct {
-	Scope      string  `json:"scope"`       // "workspace", "api_key", "user", "model", "origin", "tag:<key>" (e.g. "tag:team")
+	Scope      string  `json:"scope"` // "workspace", "api_key", "user", "model", "origin", "tag:<key>" (e.g. "tag:team")
 	MaxCostUSD float64 `json:"max_cost_usd,omitempty"`
 	MaxTokens  int64   `json:"max_tokens,omitempty"`
 	Period     string  `json:"period"` // "hourly", "daily", "weekly", "monthly"

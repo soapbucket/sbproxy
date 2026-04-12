@@ -19,7 +19,7 @@ func init() {
 type SchemaConfig struct {
 	Schema          json.RawMessage `json:"schema"`
 	ExtractFromCode bool            `json:"extract_from_code,omitempty"` // Extract JSON from markdown code blocks
-	RecoverPartial  bool            `json:"recover_partial,omitempty"`  // Try to fix truncated JSON
+	RecoverPartial  bool            `json:"recover_partial,omitempty"`   // Try to fix truncated JSON
 }
 
 type schemaGuard struct {
@@ -55,9 +55,10 @@ func NewSchemaGuard(config json.RawMessage) (Guardrail, error) {
 }
 
 // Name performs the name operation on the schemaGuard.
-func (g *schemaGuard) Name() string  { return "json_schema" }
+func (g *schemaGuard) Name() string { return "json_schema" }
+
 // Phase performs the phase operation on the schemaGuard.
-func (g *schemaGuard) Phase() Phase  { return PhaseOutput }
+func (g *schemaGuard) Phase() Phase { return PhaseOutput }
 
 // extractJSONFromMarkdown extracts JSON content from markdown code blocks.
 func extractJSONFromMarkdown(text string) string {

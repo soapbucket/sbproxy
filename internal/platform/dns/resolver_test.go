@@ -140,4 +140,3 @@ func TestResolver_NegativeCache(t *testing.T) {
 		t.Log("DNS lookup succeeded after negative TTL expiration")
 	}
 }
-

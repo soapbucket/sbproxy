@@ -30,10 +30,10 @@ const (
 	GQLNext                = "next"
 	GQLError               = "error"
 	GQLComplete            = "complete"
-	GQLConnectionKeepAlive = "ka"         // Legacy protocol keep-alive
-	GQLStart               = "start"      // Legacy protocol subscribe
-	GQLStop                = "stop"       // Legacy protocol unsubscribe
-	GQLData                = "data"       // Legacy protocol data
+	GQLConnectionKeepAlive = "ka"                   // Legacy protocol keep-alive
+	GQLStart               = "start"                // Legacy protocol subscribe
+	GQLStop                = "stop"                 // Legacy protocol unsubscribe
+	GQLData                = "data"                 // Legacy protocol data
 	GQLConnectionTerminate = "connection_terminate" // Legacy protocol terminate
 )
 
@@ -66,7 +66,7 @@ func NewSubscriptionHandler(cfg SubscriptionConfig, backendURL string) *Subscrip
 	}
 
 	return &SubscriptionHandler{
-		config:  SubscriptionConfig{
+		config: SubscriptionConfig{
 			Enabled:  cfg.Enabled,
 			Protocol: protocol,
 		},

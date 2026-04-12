@@ -9,13 +9,13 @@ import (
 
 func TestNewSRITransform(t *testing.T) {
 	tests := []struct {
-		name            string
-		algorithm       string
-		contentTypes    []string
-		addHeader       bool
-		addToHTML       bool
-		cacheHashes     bool
-		wantErr         bool
+		name         string
+		algorithm    string
+		contentTypes []string
+		addHeader    bool
+		addToHTML    bool
+		cacheHashes  bool
+		wantErr      bool
 	}{
 		{"default", "", nil, true, false, false, false},
 		{"sha256", "sha256", []string{"application/javascript"}, true, false, true, false},
@@ -167,6 +167,3 @@ func TestNewSRITransformFromConfig(t *testing.T) {
 		t.Error("NewSRITransformFromConfig() returned nil transform")
 	}
 }
-
-
-

@@ -312,10 +312,9 @@ func TestStartHeartbeat(t *testing.T) {
 
 	result := w.Body.String()
 	count := strings.Count(result, "heartbeat")
-	
+
 	// Should have 2-3 heartbeats (100ms, 200ms, possibly 300ms)
 	if count < 2 || count > 3 {
 		t.Errorf("expected 2-3 heartbeats, got %d", count)
 	}
 }
-

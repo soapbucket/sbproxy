@@ -22,7 +22,7 @@ const (
 	// HealthCheckHTTPS is a constant for health check https.
 	HealthCheckHTTPS HealthCheckType = "https"
 	// HealthCheckTCP is a constant for health check tcp.
-	HealthCheckTCP  HealthCheckType = "tcp"
+	HealthCheckTCP HealthCheckType = "tcp"
 )
 
 // HealthStatus represents the health status of a backend
@@ -30,11 +30,11 @@ type HealthStatus string
 
 const (
 	// HealthStatusHealthy is a constant for health status healthy.
-	HealthStatusHealthy   HealthStatus = "healthy"
+	HealthStatusHealthy HealthStatus = "healthy"
 	// HealthStatusUnhealthy is a constant for health status unhealthy.
 	HealthStatusUnhealthy HealthStatus = "unhealthy"
 	// HealthStatusUnknown is a constant for health status unknown.
-	HealthStatusUnknown   HealthStatus = "unknown"
+	HealthStatusUnknown HealthStatus = "unknown"
 )
 
 // HealthCheckConfig configures health checking for a backend
@@ -85,12 +85,12 @@ type HealthChecker struct {
 	config *HealthCheckConfig
 	target string // Backend URL or address
 
-	mu               sync.RWMutex
-	status           HealthStatus
-	consecutiveSuccess int
+	mu                  sync.RWMutex
+	status              HealthStatus
+	consecutiveSuccess  int
 	consecutiveFailures int
-	lastCheck        time.Time
-	lastError        error
+	lastCheck           time.Time
+	lastError           error
 
 	stopCh chan struct{}
 	doneCh chan struct{}
@@ -253,7 +253,7 @@ func (hc *HealthChecker) checkHTTP(ctx context.Context) error {
 		body := make([]byte, 1024)
 		n, _ := resp.Body.Read(body)
 		bodyStr := string(body[:n])
-		
+
 		if !strings.Contains(bodyStr, hc.config.ExpectedBody) {
 			return fmt.Errorf("expected body substring not found: %q", hc.config.ExpectedBody)
 		}
@@ -325,7 +325,6 @@ func (hc *HealthChecker) updateStatus(err error) {
 	}
 }
 
-
 // HealthCheckTransport wraps a transport with health checking
 type HealthCheckTransport struct {
 	Base          http.RoundTripper
@@ -341,4 +340,3 @@ func (t *HealthCheckTransport) RoundTrip(req *http.Request) (*http.Response, err
 
 	return t.Base.RoundTrip(req)
 }
-

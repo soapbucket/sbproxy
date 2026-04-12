@@ -124,9 +124,9 @@ func TestRewrite_ForwardsClientAcceptEncoding(t *testing.T) {
 	rpa := h.(plugin.ReverseProxyAction)
 
 	tests := []struct {
-		name             string
-		clientAE         string
-		wantOutboundAE   string
+		name           string
+		clientAE       string
+		wantOutboundAE string
 	}{
 		{
 			name:           "client asks for gzip only",

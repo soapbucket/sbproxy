@@ -56,8 +56,8 @@ func TestNewResponseModifier(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "syntax error",
-			expr: `{`,
+			name:    "syntax error",
+			expr:    `{`,
 			wantErr: true,
 		},
 	}
@@ -239,7 +239,7 @@ func TestResponseModifierBody(t *testing.T) {
 
 func TestResponseModifierWithRequestContext(t *testing.T) {
 	req := httptest.NewRequest("GET", "http://example.com/test", nil)
-	
+
 	requestData := reqctx.NewRequestData()
 	req = req.WithContext(reqctx.SetRequestData(req.Context(), requestData))
 
@@ -322,7 +322,7 @@ func TestResponseModifierAppendToBody(t *testing.T) {
 
 func TestResponseModifierConditionalStatusCode(t *testing.T) {
 	req := httptest.NewRequest("GET", "http://example.com/test", nil)
-	
+
 	requestData := reqctx.NewRequestData()
 	req = req.WithContext(reqctx.SetRequestData(req.Context(), requestData))
 
@@ -361,7 +361,7 @@ func TestResponseModifierConditionalStatusCode(t *testing.T) {
 
 func TestResponseModifierCombined(t *testing.T) {
 	req := httptest.NewRequest("GET", "http://example.com/test", nil)
-	
+
 	requestData := reqctx.NewRequestData()
 	req = req.WithContext(reqctx.SetRequestData(req.Context(), requestData))
 
@@ -471,4 +471,3 @@ func TestResponseModifierAccessRequestFields(t *testing.T) {
 		t.Errorf("Expected X-Request-Content-Type = application/json, got %s", resp.Header.Get("X-Request-Content-Type"))
 	}
 }
-

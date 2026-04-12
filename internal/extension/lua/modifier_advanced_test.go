@@ -93,10 +93,10 @@ end
 
 func TestModifier_URLModifications(t *testing.T) {
 	tests := []struct {
-		name     string
-		script   string
-		reqURL   string
-		wantURL  string
+		name    string
+		script  string
+		reqURL  string
+		wantURL string
 	}{
 		{
 			name:    "scheme modification",

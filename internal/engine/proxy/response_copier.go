@@ -86,13 +86,13 @@ func (rc *ResponseCopier) Copy(w http.ResponseWriter, resp *http.Response, strat
 // copyWithImmediateFlushing flushes after every write
 func (rc *ResponseCopier) copyWithImmediateFlushing(w http.ResponseWriter, body io.Reader) error {
 	respController := http.NewResponseController(w)
-	
+
 	// Check if flushing is supported (once at the start)
 	flushSupported := true
 	if err := respController.Flush(); err != nil {
 		flushSupported = false
 	}
-	
+
 	bufPtr := rc.bufferPool.Get().(*[]byte)
 	defer rc.bufferPool.Put(bufPtr)
 	buf := *bufPtr
@@ -108,10 +108,10 @@ func (rc *ResponseCopier) copyWithImmediateFlushing(w http.ResponseWriter, body 
 				return io.ErrShortWrite
 			}
 
-		// Flush immediately after each write (only if supported)
-		if flushSupported {
-			respController.Flush() // Ignore errors after first check
-		}
+			// Flush immediately after each write (only if supported)
+			if flushSupported {
+				respController.Flush() // Ignore errors after first check
+			}
 		}
 
 		if er == io.EOF {
@@ -211,4 +211,3 @@ func (m *maxLatencyWriter) stop() {
 		m.flushPending = false
 	}
 }
-

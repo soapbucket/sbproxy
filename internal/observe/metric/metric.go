@@ -88,7 +88,6 @@ func mustRegisterHistogramVec(h *prometheus.HistogramVec) *prometheus.HistogramV
 	return h
 }
 
-
 var (
 	totalHTTPRequests = mustRegisterCounter(prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "http_req_total",

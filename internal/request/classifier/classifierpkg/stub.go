@@ -100,9 +100,9 @@ type VersionResponse struct {
 
 // TenantConfig holds the full tenant configuration for the sidecar.
 type TenantConfig struct {
-	Labels         []TenantLabel          `json:"labels,omitempty"`
-	Classification *TenantClassification  `json:"classification,omitempty"`
-	Normalization  *TenantNormalization   `json:"normalization,omitempty"`
+	Labels         []TenantLabel         `json:"labels,omitempty"`
+	Classification *TenantClassification `json:"classification,omitempty"`
+	Normalization  *TenantNormalization  `json:"normalization,omitempty"`
 }
 
 // TenantLabel defines a single label with patterns.
@@ -120,9 +120,9 @@ type TenantClassification struct {
 
 // TenantNormalization holds text normalization settings.
 type TenantNormalization struct {
-	UnicodeNFKC bool              `json:"unicode_nfkc,omitempty"`
-	Trim        bool              `json:"trim,omitempty"`
-	Rules       []TenantNormRule  `json:"rules,omitempty"`
+	UnicodeNFKC bool             `json:"unicode_nfkc,omitempty"`
+	Trim        bool             `json:"trim,omitempty"`
+	Rules       []TenantNormRule `json:"rules,omitempty"`
 }
 
 // TenantNormRule is a single normalization rule.

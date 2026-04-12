@@ -152,4 +152,3 @@ func (t *TestMessenger) SendOriginRefreshBatch(ctx context.Context, topic string
 		Params:  make(map[string]string),
 	})
 }
-

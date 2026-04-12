@@ -24,4 +24,3 @@ func NewRateLimiter(cache cacher.Cacher, algorithm AlgorithmType, prefix string,
 		return NewDistributedRateLimiter(cache, prefix)
 	}
 }
-

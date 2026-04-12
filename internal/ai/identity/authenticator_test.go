@@ -182,12 +182,12 @@ func TestJWTAuth_InvalidSignature(t *testing.T) {
 func TestJWTAuth_ClaimsMapping(t *testing.T) {
 	secret := []byte("mP7tK3mW9pL2vX5qJ8bN4mW6nY!!")
 	claims := map[string]any{
-		"user_id":    "custom-user",
-		"roles":      []string{"editor"},
-		"perms":      []string{"write", "delete"},
-		"models":     []string{"gpt-4o"},
-		"tenant_id":  "ws-123",
-		"exp":        float64(time.Now().Add(1 * time.Hour).Unix()),
+		"user_id":   "custom-user",
+		"roles":     []string{"editor"},
+		"perms":     []string{"write", "delete"},
+		"models":    []string{"gpt-4o"},
+		"tenant_id": "ws-123",
+		"exp":       float64(time.Now().Add(1 * time.Hour).Unix()),
 	}
 
 	token := buildTestJWT(t, secret, claims)

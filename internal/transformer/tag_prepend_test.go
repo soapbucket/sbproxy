@@ -194,4 +194,3 @@ content
 	output := result.String()
 	assert.Equal(t, expectedOutput, output, "Meta tag should be added after <head> tag even without explicit </head>")
 }
-

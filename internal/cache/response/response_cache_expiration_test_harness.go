@@ -155,4 +155,3 @@ func (t *TestMessengerForCacheExpiration) SendCacheExpirationBatch(ctx context.C
 		Params:  make(map[string]string),
 	})
 }
-

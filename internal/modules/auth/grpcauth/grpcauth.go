@@ -25,14 +25,14 @@ func init() {
 
 // Config holds configuration for the grpc_auth provider.
 type Config struct {
-	Type         string        `json:"type"`
-	Disabled     bool          `json:"disabled,omitempty"`
-	Address      string        `json:"address"`
-	TimeoutSecs  float64       `json:"timeout,omitempty"`
-	TLS          bool          `json:"tls,omitempty"`
-	TLSCACert    string        `json:"tls_ca_cert,omitempty"`
-	FailOpen     bool          `json:"fail_open,omitempty"`
-	TrustHeaders []string      `json:"trust_headers,omitempty"`
+	Type         string   `json:"type"`
+	Disabled     bool     `json:"disabled,omitempty"`
+	Address      string   `json:"address"`
+	TimeoutSecs  float64  `json:"timeout,omitempty"`
+	TLS          bool     `json:"tls,omitempty"`
+	TLSCACert    string   `json:"tls_ca_cert,omitempty"`
+	FailOpen     bool     `json:"fail_open,omitempty"`
+	TrustHeaders []string `json:"trust_headers,omitempty"`
 
 	// Parsed timeout (not from JSON directly - computed from TimeoutSecs).
 	timeout time.Duration

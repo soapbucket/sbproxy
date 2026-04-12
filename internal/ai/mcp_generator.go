@@ -2,8 +2,8 @@
 package ai
 
 import (
-	json "github.com/goccy/go-json"
 	"fmt"
+	json "github.com/goccy/go-json"
 	"strings"
 
 	"github.com/soapbucket/sbproxy/internal/extension/mcp"
@@ -67,7 +67,7 @@ type OriginRoute struct {
 // RouteParam describes a parameter on a route.
 type RouteParam struct {
 	Name        string `json:"name"`
-	Type        string `json:"type"`        // "string", "integer", "boolean"
+	Type        string `json:"type"` // "string", "integer", "boolean"
 	Description string `json:"description,omitempty"`
 	Required    bool   `json:"required,omitempty"`
 }
@@ -89,11 +89,11 @@ type openAPIInfo struct {
 }
 
 type openAPIPath struct {
-	Get     *openAPIOperation `json:"get,omitempty"`
-	Post    *openAPIOperation `json:"post,omitempty"`
-	Put     *openAPIOperation `json:"put,omitempty"`
-	Delete  *openAPIOperation `json:"delete,omitempty"`
-	Patch   *openAPIOperation `json:"patch,omitempty"`
+	Get    *openAPIOperation `json:"get,omitempty"`
+	Post   *openAPIOperation `json:"post,omitempty"`
+	Put    *openAPIOperation `json:"put,omitempty"`
+	Delete *openAPIOperation `json:"delete,omitempty"`
+	Patch  *openAPIOperation `json:"patch,omitempty"`
 }
 
 // Operations returns a map of method -> operation for non-nil methods.
@@ -118,10 +118,10 @@ func (p openAPIPath) Operations() map[string]*openAPIOperation {
 }
 
 type openAPIOperation struct {
-	OperationID string             `json:"operationId"`
-	Summary     string             `json:"summary"`
-	Description string             `json:"description"`
-	Parameters  []openAPIParameter `json:"parameters"`
+	OperationID string              `json:"operationId"`
+	Summary     string              `json:"summary"`
+	Description string              `json:"description"`
+	Parameters  []openAPIParameter  `json:"parameters"`
 	RequestBody *openAPIRequestBody `json:"requestBody"`
 }
 
@@ -134,8 +134,8 @@ type openAPIParameter struct {
 }
 
 type openAPIRequestBody struct {
-	Description string                     `json:"description"`
-	Required    bool                       `json:"required"`
+	Description string                      `json:"description"`
+	Required    bool                        `json:"required"`
 	Content     map[string]openAPIMediaType `json:"content"`
 }
 

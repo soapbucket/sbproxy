@@ -14,9 +14,9 @@ type WebSocketConnectionLifecycle struct {
 // WebSocketToolCall fires when an observed websocket message indicates a tool invocation lifecycle event.
 type WebSocketToolCall struct {
 	EventBase
-	ConnectionID string `json:"connection_id"`
-	Path         string `json:"path"`
-	Provider     string `json:"provider,omitempty"`
-	Direction    string `json:"direction"`
+	ConnectionID     string `json:"connection_id"`
+	Path             string `json:"path"`
+	Provider         string `json:"provider,omitempty"`
+	Direction        string `json:"direction"`
 	MessageEventType string `json:"event_type"`
 }

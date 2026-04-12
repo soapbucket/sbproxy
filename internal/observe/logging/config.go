@@ -10,7 +10,7 @@ import "time"
 
 // OutputConfig defines a log output destination.
 type OutputConfig struct {
-	Type       string               `mapstructure:"type" json:"type"`               // "stderr" | "clickhouse"
+	Type       string                  `mapstructure:"type" json:"type"` // "stderr" | "clickhouse"
 	ClickHouse *ClickHouseOutputConfig `mapstructure:"clickhouse" json:"clickhouse,omitempty"`
 }
 
@@ -28,17 +28,17 @@ type ClickHouseOutputConfig struct {
 
 // FieldsConfig controls which optional field groups are included in request logs.
 type FieldsConfig struct {
-	Timestamps      bool `mapstructure:"timestamps" json:"timestamps"`
-	Headers         bool `mapstructure:"headers" json:"headers"`
+	Timestamps       bool `mapstructure:"timestamps" json:"timestamps"`
+	Headers          bool `mapstructure:"headers" json:"headers"`
 	ForwardedHeaders bool `mapstructure:"forwarded_headers" json:"forwarded_headers"`
-	QueryString     bool `mapstructure:"query_string" json:"query_string"`
-	Cookies         bool `mapstructure:"cookies" json:"cookies"`
-	Fingerprint     bool `mapstructure:"fingerprint" json:"fingerprint"`
-	OriginalRequest bool `mapstructure:"original_request" json:"original_request"`
-	CacheInfo       bool `mapstructure:"cache_info" json:"cache_info"`
-	AuthInfo        bool `mapstructure:"auth_info" json:"auth_info"`
-	AppVersion      bool `mapstructure:"app_version" json:"app_version"`
-	Location        bool `mapstructure:"location" json:"location"`
+	QueryString      bool `mapstructure:"query_string" json:"query_string"`
+	Cookies          bool `mapstructure:"cookies" json:"cookies"`
+	Fingerprint      bool `mapstructure:"fingerprint" json:"fingerprint"`
+	OriginalRequest  bool `mapstructure:"original_request" json:"original_request"`
+	CacheInfo        bool `mapstructure:"cache_info" json:"cache_info"`
+	AuthInfo         bool `mapstructure:"auth_info" json:"auth_info"`
+	AppVersion       bool `mapstructure:"app_version" json:"app_version"`
+	Location         bool `mapstructure:"location" json:"location"`
 }
 
 // SamplingConfig controls request log sampling.

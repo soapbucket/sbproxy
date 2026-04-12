@@ -235,9 +235,9 @@ type geminiContent struct {
 }
 
 type geminiPart struct {
-	Text             string                `json:"text,omitempty"`
-	FunctionCall     *geminiFunctionCall   `json:"functionCall,omitempty"`
-	FunctionResponse *geminiToolResponse   `json:"functionResponse,omitempty"`
+	Text             string              `json:"text,omitempty"`
+	FunctionCall     *geminiFunctionCall `json:"functionCall,omitempty"`
+	FunctionResponse *geminiToolResponse `json:"functionResponse,omitempty"`
 }
 
 type geminiFunctionCall struct {
@@ -251,10 +251,10 @@ type geminiToolResponse struct {
 }
 
 type geminiGenerationCfg struct {
-	Temperature    *float64 `json:"temperature,omitempty"`
-	TopP           *float64 `json:"topP,omitempty"`
-	MaxOutputTokens *int    `json:"maxOutputTokens,omitempty"`
-	StopSequences  []string `json:"stopSequences,omitempty"`
+	Temperature     *float64 `json:"temperature,omitempty"`
+	TopP            *float64 `json:"topP,omitempty"`
+	MaxOutputTokens *int     `json:"maxOutputTokens,omitempty"`
+	StopSequences   []string `json:"stopSequences,omitempty"`
 }
 
 type geminiToolContainer struct {
@@ -268,7 +268,7 @@ type geminiFunctionDecl struct {
 }
 
 type geminiResponse struct {
-	Candidates    []geminiCandidate   `json:"candidates"`
+	Candidates    []geminiCandidate    `json:"candidates"`
 	UsageMetadata *geminiUsageMetadata `json:"usageMetadata,omitempty"`
 	ModelVersion  string               `json:"modelVersion,omitempty"`
 }

@@ -76,12 +76,12 @@ func (ms *MetricsStorage) Put(ctx context.Context, key string, data []byte) erro
 
 	metric.StorageOperation(ms.driver, "put", "success", duration)
 	metric.StorageDataSize(ms.driver, "put", int64(len(data)))
-	
+
 	// Update storage quota usage (approximate - tracks data size)
 	// Note: This is an approximation. For accurate quota tracking, storage implementations
 	// should implement a QuotaUsage() method or similar
 	metric.StorageQuotaUsageSet(ms.driver, int64(len(data)))
-	
+
 	return nil
 }
 

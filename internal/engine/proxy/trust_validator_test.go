@@ -45,11 +45,11 @@ func TestTrustValidator_TrustTrustedProxies(t *testing.T) {
 		ip       string
 		expected bool
 	}{
-		{"10.0.0.1", true},    // In 10.0.0.0/8
+		{"10.0.0.1", true},       // In 10.0.0.0/8
 		{"10.255.255.255", true}, // In 10.0.0.0/8
-		{"192.168.1.1", true}, // In 192.168.0.0/16
-		{"172.16.0.1", false}, // Not in trusted CIDRs
-		{"8.8.8.8", false},    // Public IP
+		{"192.168.1.1", true},    // In 192.168.0.0/16
+		{"172.16.0.1", false},    // Not in trusted CIDRs
+		{"8.8.8.8", false},       // Public IP
 	}
 
 	for _, tt := range tests {
@@ -122,4 +122,3 @@ func TestTrustValidator_InvalidCIDR(t *testing.T) {
 		t.Error("expected error for invalid CIDR")
 	}
 }
-

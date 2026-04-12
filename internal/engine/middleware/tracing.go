@@ -2,15 +2,15 @@
 package middleware
 
 import (
-	"github.com/soapbucket/sbproxy/internal/cache/store"
 	"bufio"
+	"github.com/soapbucket/sbproxy/internal/cache/store"
 	"net"
 	"net/http"
 	"sync"
 	"time"
 
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -88,10 +88,10 @@ func TracingMiddleware(next http.Handler) http.Handler {
 				semconv.HTTPRequestBodySize(int(r.ContentLength)),
 			),
 		)
-		
+
 		// Record trace coverage
 		updateTraceCoverage(configID, traceSampled)
-		
+
 		defer func() {
 			span.End()
 			duration := time.Since(spanStartTime).Seconds()

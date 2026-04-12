@@ -11,7 +11,7 @@ import (
 // WorkspaceMode constants for proxy deployment topology.
 const (
 	// WorkspaceModeShared is a constant for workspace mode shared.
-	WorkspaceModeShared    = "shared"
+	WorkspaceModeShared = "shared"
 	// WorkspaceModeDedicated is a constant for workspace mode dedicated.
 	WorkspaceModeDedicated = "dedicated"
 )
@@ -23,10 +23,10 @@ const (
 // manager.GlobalSettings, which holds per-config runtime settings (cacher, storage, etc.).
 type ProcessSettings struct {
 	// Body size limits (bytes)
-	MaxCoalesceBodyBytes  int64 // SB_MAX_COALESCE_BODY, default 10MB
-	MaxJWKSBodyBytes      int64 // SB_MAX_JWKS_BODY, default 1MB
-	MaxRetryBodyBytes     int64 // SB_MAX_RETRY_BODY, default 32MB
-	MaxCallbackBodyBytes  int64 // SB_MAX_CALLBACK_BODY, default 10MB
+	MaxCoalesceBodyBytes int64 // SB_MAX_COALESCE_BODY, default 10MB
+	MaxJWKSBodyBytes     int64 // SB_MAX_JWKS_BODY, default 1MB
+	MaxRetryBodyBytes    int64 // SB_MAX_RETRY_BODY, default 32MB
+	MaxCallbackBodyBytes int64 // SB_MAX_CALLBACK_BODY, default 10MB
 
 	// Trusted proxy CIDRs for IP spoofing prevention
 	TrustedProxyCIDRs []string // SB_TRUSTED_PROXIES (comma-separated), default []
@@ -61,10 +61,10 @@ var Global ProcessSettings
 func init() {
 	Global = ProcessSettings{
 		// Body size limits
-		MaxCoalesceBodyBytes:  getEnvInt64("SB_MAX_COALESCE_BODY", 10*1024*1024),       // 10 MB
-		MaxJWKSBodyBytes:      getEnvInt64("SB_MAX_JWKS_BODY", 1*1024*1024),             // 1 MB
-		MaxRetryBodyBytes:     getEnvInt64("SB_MAX_RETRY_BODY", 32*1024*1024),           // 32 MB
-		MaxCallbackBodyBytes:  getEnvInt64("SB_MAX_CALLBACK_BODY", 10*1024*1024),        // 10 MB
+		MaxCoalesceBodyBytes: getEnvInt64("SB_MAX_COALESCE_BODY", 10*1024*1024), // 10 MB
+		MaxJWKSBodyBytes:     getEnvInt64("SB_MAX_JWKS_BODY", 1*1024*1024),      // 1 MB
+		MaxRetryBodyBytes:    getEnvInt64("SB_MAX_RETRY_BODY", 32*1024*1024),    // 32 MB
+		MaxCallbackBodyBytes: getEnvInt64("SB_MAX_CALLBACK_BODY", 10*1024*1024), // 10 MB
 
 		// Trusted proxies
 		TrustedProxyCIDRs: getEnvStringSlice("SB_TRUSTED_PROXIES", []string{}),

@@ -45,10 +45,10 @@ func DeriveKey(masterKey []byte, salt []byte, info []byte, keyLength int) ([]byt
 func DeriveSessionKey(masterKey []byte, sessionID string) ([]byte, error) {
 	// Use session ID as salt
 	salt := []byte(sessionID)
-	
+
 	// Use "session-encryption" as context info
 	info := []byte("session-encryption")
-	
+
 	// Derive 32-byte key for AES-256
 	return DeriveKey(masterKey, salt, info, 32)
 }
@@ -58,10 +58,10 @@ func DeriveSessionKey(masterKey []byte, sessionID string) ([]byte, error) {
 func DeriveSessionSigningKey(masterKey []byte, sessionID string) ([]byte, error) {
 	// Use session ID as salt
 	salt := []byte(sessionID)
-	
+
 	// Use "session-signing" as context info
 	info := []byte("session-signing")
-	
+
 	// Derive 32-byte key for HMAC-SHA256
 	return DeriveKey(masterKey, salt, info, 32)
 }
@@ -135,4 +135,3 @@ func decryptWithDerivedKey(data []byte, derivedKey []byte) ([]byte, error) {
 
 	return plaintext, nil
 }
-

@@ -784,4 +784,3 @@ func WriteAnthropicError(w http.ResponseWriter, err *AIError) {
 	w.WriteHeader(err.StatusCode)
 	_ = json.NewEncoder(w).Encode(AnthropicErrorToResponse(err))
 }
-

@@ -2,19 +2,19 @@
 package responsecache
 
 import (
-	"github.com/soapbucket/sbproxy/internal/security/crypto"
-	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"bytes"
 	"context"
 	"encoding/gob"
+	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
+	"github.com/soapbucket/sbproxy/internal/security/crypto"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"sync"
 	"time"
 
-	"github.com/soapbucket/sbproxy/internal/observe/logging"
 	"github.com/soapbucket/sbproxy/internal/cache/store"
+	"github.com/soapbucket/sbproxy/internal/observe/logging"
 )
 
 // MaxCachedResponseSize is the maximum allowed value for cached response size.

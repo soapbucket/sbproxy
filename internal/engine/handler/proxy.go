@@ -135,7 +135,7 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 // LogRequestError logs a request error
 // Note: Request logging is handled by chi middleware, this is for additional error context
 func (p *Proxy) LogRequestError(req *http.Request, err error, retry int) {
-		requestID := req.Header.Get(sbhttp.HeaderXRequestID)
+	requestID := req.Header.Get(sbhttp.HeaderXRequestID)
 	slog.Error("Proxy request error",
 		"request_id", requestID,
 		"method", req.Method,
@@ -149,7 +149,7 @@ func (p *Proxy) LogRequestError(req *http.Request, err error, retry int) {
 
 // LogRequestSuccess logs a successful request
 func (p *Proxy) LogRequestSuccess(req *http.Request, statusCode int, responseTime time.Duration) {
-		requestID := req.Header.Get(sbhttp.HeaderXRequestID)
+	requestID := req.Header.Get(sbhttp.HeaderXRequestID)
 	slog.Debug("Proxy request successful",
 		"request_id", requestID,
 		"method", req.Method,
@@ -161,7 +161,7 @@ func (p *Proxy) LogRequestSuccess(req *http.Request, statusCode int, responseTim
 
 // LogRetryAttempt logs a retry attempt
 func (p *Proxy) LogRetryAttempt(req *http.Request, retry int, delay time.Duration) {
-		requestID := req.Header.Get(sbhttp.HeaderXRequestID)
+	requestID := req.Header.Get(sbhttp.HeaderXRequestID)
 	slog.Warn("Retrying proxy request",
 		"request_id", requestID,
 		"method", req.Method,
@@ -172,7 +172,7 @@ func (p *Proxy) LogRetryAttempt(req *http.Request, retry int, delay time.Duratio
 
 // LogMaxRetriesExceeded logs when max retries are exceeded
 func (p *Proxy) LogMaxRetriesExceeded(req *http.Request, maxRetries int) {
-		requestID := req.Header.Get(sbhttp.HeaderXRequestID)
+	requestID := req.Header.Get(sbhttp.HeaderXRequestID)
 	slog.Error("Max retries exceeded",
 		"request_id", requestID,
 		"method", req.Method,

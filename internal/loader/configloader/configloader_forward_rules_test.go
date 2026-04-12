@@ -7,9 +7,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/soapbucket/sbproxy/internal/loader/manager"
 	"github.com/soapbucket/sbproxy/internal/middleware/forward"
 	"github.com/soapbucket/sbproxy/internal/middleware/rule"
-	"github.com/soapbucket/sbproxy/internal/loader/manager"
 )
 
 // TestForwardRules_PathPrefixMatching tests that forward rules with path prefix conditions match correctly
@@ -22,17 +22,17 @@ func TestForwardRules_PathPrefixMatching(t *testing.T) {
 
 	// Create forward-rules-complex.test config with forward rules
 	forwardRulesConfig := map[string]interface{}{
-		"id":       "forward-rules-complex",
-		"hostname": "forward-rules-complex.test",
-			"workspace_id": "test-workspace",
+		"id":           "forward-rules-complex",
+		"hostname":     "forward-rules-complex.test",
+		"workspace_id": "test-workspace",
 		"action": map[string]interface{}{
 			"type": "proxy",
 			"url":  "http://e2e-test-server:8090",
 		},
 		"forward_rules": []map[string]interface{}{
 			{
-				"hostname": "api-v1-backend.test",
-			"workspace_id": "test-workspace",
+				"hostname":     "api-v1-backend.test",
+				"workspace_id": "test-workspace",
 				"rules": []map[string]interface{}{
 					{
 						"path": map[string]interface{}{
@@ -42,8 +42,8 @@ func TestForwardRules_PathPrefixMatching(t *testing.T) {
 				},
 			},
 			{
-				"hostname": "old-service-backend.test",
-			"workspace_id": "test-workspace",
+				"hostname":     "old-service-backend.test",
+				"workspace_id": "test-workspace",
 				"rules": []map[string]interface{}{
 					{
 						"path": map[string]interface{}{
@@ -57,9 +57,9 @@ func TestForwardRules_PathPrefixMatching(t *testing.T) {
 
 	// Create target configs
 	apiV1BackendConfig := map[string]interface{}{
-		"id":       "api-v1-backend",
-		"hostname": "api-v1-backend.test",
-			"workspace_id": "test-workspace",
+		"id":           "api-v1-backend",
+		"hostname":     "api-v1-backend.test",
+		"workspace_id": "test-workspace",
 		"action": map[string]interface{}{
 			"type": "proxy",
 			"url":  "http://e2e-test-server:8090",
@@ -67,9 +67,9 @@ func TestForwardRules_PathPrefixMatching(t *testing.T) {
 	}
 
 	oldServiceBackendConfig := map[string]interface{}{
-		"id":       "old-service-backend",
-		"hostname": "old-service-backend.test",
-			"workspace_id": "test-workspace",
+		"id":           "old-service-backend",
+		"hostname":     "old-service-backend.test",
+		"workspace_id": "test-workspace",
 		"action": map[string]interface{}{
 			"type": "proxy",
 			"url":  "http://e2e-test-server:8090",
@@ -179,17 +179,17 @@ func TestForwardRules_MissingTargetConfig(t *testing.T) {
 
 	// Create forward-rules-complex.test config with forward rules pointing to non-existent config
 	forwardRulesConfig := map[string]interface{}{
-		"id":       "forward-rules-complex",
-		"hostname": "forward-rules-complex.test",
-			"workspace_id": "test-workspace",
+		"id":           "forward-rules-complex",
+		"hostname":     "forward-rules-complex.test",
+		"workspace_id": "test-workspace",
 		"action": map[string]interface{}{
 			"type": "proxy",
 			"url":  "http://e2e-test-server:8090",
 		},
 		"forward_rules": []map[string]interface{}{
 			{
-				"hostname": "non-existent-backend.test",
-			"workspace_id": "test-workspace",
+				"hostname":     "non-existent-backend.test",
+				"workspace_id": "test-workspace",
 				"rules": []map[string]interface{}{
 					{
 						"path": map[string]interface{}{
@@ -241,17 +241,17 @@ func TestForwardRules_ForwardRulesLoaded(t *testing.T) {
 	}
 
 	forwardRulesConfig := map[string]interface{}{
-		"id":       "forward-rules-complex",
-		"hostname": "forward-rules-complex.test",
-			"workspace_id": "test-workspace",
+		"id":           "forward-rules-complex",
+		"hostname":     "forward-rules-complex.test",
+		"workspace_id": "test-workspace",
 		"action": map[string]interface{}{
 			"type": "proxy",
 			"url":  "http://e2e-test-server:8090",
 		},
 		"forward_rules": []map[string]interface{}{
 			{
-				"hostname": "api-v1-backend.test",
-			"workspace_id": "test-workspace",
+				"hostname":     "api-v1-backend.test",
+				"workspace_id": "test-workspace",
 				"rules": []map[string]interface{}{
 					{
 						"path": map[string]interface{}{
@@ -336,10 +336,10 @@ func TestForwardRules_Apply(t *testing.T) {
 	}
 
 	tests := []struct {
-		name           string
-		path           string
-		expectedHost   string
-		expectedMatch  bool
+		name          string
+		path          string
+		expectedHost  string
+		expectedMatch bool
 	}{
 		{
 			name:          "Path /api/v1/test should match first rule",
@@ -404,17 +404,17 @@ func TestForwardRules_ParentApplyEnabledByDefault(t *testing.T) {
 
 	// Create parent config with forward rules
 	parentConfig := map[string]interface{}{
-		"id":       "gateway",
-		"hostname": "gateway.test",
-			"workspace_id": "test-workspace",
+		"id":           "gateway",
+		"hostname":     "gateway.test",
+		"workspace_id": "test-workspace",
 		"action": map[string]interface{}{
 			"type": "proxy",
 			"url":  "http://e2e-test-server:8090",
 		},
 		"forward_rules": []map[string]interface{}{
 			{
-				"hostname": "backend.test",
-			"workspace_id": "test-workspace",
+				"hostname":     "backend.test",
+				"workspace_id": "test-workspace",
 				"rules": []map[string]interface{}{
 					{
 						"path": map[string]interface{}{
@@ -428,9 +428,9 @@ func TestForwardRules_ParentApplyEnabledByDefault(t *testing.T) {
 
 	// Create child config WITHOUT disable_apply_parent (should default to false)
 	childConfig := map[string]interface{}{
-		"id":       "backend",
-		"hostname": "backend.test",
-			"workspace_id": "test-workspace",
+		"id":           "backend",
+		"hostname":     "backend.test",
+		"workspace_id": "test-workspace",
 		"action": map[string]interface{}{
 			"type": "proxy",
 			"url":  "http://e2e-test-server:8091",
@@ -488,17 +488,17 @@ func TestForwardRules_DisableApplyParentOptOut(t *testing.T) {
 	}
 
 	parentConfig := map[string]interface{}{
-		"id":       "gateway",
-		"hostname": "gateway.test",
-			"workspace_id": "test-workspace",
+		"id":           "gateway",
+		"hostname":     "gateway.test",
+		"workspace_id": "test-workspace",
 		"action": map[string]interface{}{
 			"type": "proxy",
 			"url":  "http://e2e-test-server:8090",
 		},
 		"forward_rules": []map[string]interface{}{
 			{
-				"hostname": "isolated-backend.test",
-			"workspace_id": "test-workspace",
+				"hostname":     "isolated-backend.test",
+				"workspace_id": "test-workspace",
 				"rules": []map[string]interface{}{
 					{
 						"path": map[string]interface{}{
@@ -514,7 +514,7 @@ func TestForwardRules_DisableApplyParentOptOut(t *testing.T) {
 	childConfig := map[string]interface{}{
 		"id":                   "isolated-backend",
 		"hostname":             "isolated-backend.test",
-			"workspace_id": "test-workspace",
+		"workspace_id":         "test-workspace",
 		"disable_apply_parent": true,
 		"action": map[string]interface{}{
 			"type": "proxy",
@@ -569,17 +569,17 @@ func TestForwardRules_CachedConfig(t *testing.T) {
 	}
 
 	forwardRulesConfig := map[string]interface{}{
-		"id":       "forward-rules-complex",
-		"hostname": "forward-rules-complex.test",
-			"workspace_id": "test-workspace",
+		"id":           "forward-rules-complex",
+		"hostname":     "forward-rules-complex.test",
+		"workspace_id": "test-workspace",
 		"action": map[string]interface{}{
 			"type": "proxy",
 			"url":  "http://e2e-test-server:8090",
 		},
 		"forward_rules": []map[string]interface{}{
 			{
-				"hostname": "api-v1-backend.test",
-			"workspace_id": "test-workspace",
+				"hostname":     "api-v1-backend.test",
+				"workspace_id": "test-workspace",
 				"rules": []map[string]interface{}{
 					{
 						"path": map[string]interface{}{
@@ -592,9 +592,9 @@ func TestForwardRules_CachedConfig(t *testing.T) {
 	}
 
 	apiV1BackendConfig := map[string]interface{}{
-		"id":       "api-v1-backend",
-		"hostname": "api-v1-backend.test",
-			"workspace_id": "test-workspace",
+		"id":           "api-v1-backend",
+		"hostname":     "api-v1-backend.test",
+		"workspace_id": "test-workspace",
 		"action": map[string]interface{}{
 			"type": "proxy",
 			"url":  "http://e2e-test-server:8090",
@@ -645,4 +645,3 @@ func TestForwardRules_CachedConfig(t *testing.T) {
 	// Verify it was cached (check that storage.Get was only called once for forward-rules-complex.test)
 	// This is implicit - if it works, it's using the cache
 }
-

@@ -743,10 +743,10 @@ func TestResolveWithCacheStatus(t *testing.T) {
 			req := httptest.NewRequest("GET", "/test", nil)
 
 			rd := &reqctx.RequestData{
-				ID:               "test-id",
-				DebugHeaders:     make(map[string]string),
-				Data:             make(map[string]any),
-				ResponseCacheHit: tt.responseCacheHit,
+				ID:                "test-id",
+				DebugHeaders:      make(map[string]string),
+				Data:              make(map[string]any),
+				ResponseCacheHit:  tt.responseCacheHit,
 				SignatureCacheHit: tt.signatureCacheHit,
 			}
 			ctx := reqctx.SetRequestData(req.Context(), rd)

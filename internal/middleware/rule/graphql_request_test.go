@@ -333,4 +333,3 @@ func TestRequestRule_GraphQL_Match(t *testing.T) {
 		})
 	}
 }
-

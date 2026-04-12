@@ -28,4 +28,3 @@ func RateLimitedError(limit int, window string) *ProxyError {
 		WithDetail("window", window).
 		WithRetryable(true)
 }
-

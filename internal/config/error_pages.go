@@ -73,8 +73,8 @@ type errorPageResponseWriter struct {
 	pages       ErrorPages
 	request     *http.Request
 	statusCode  int
-	intercepted bool   // true when we are serving a custom error page
-	flushed     bool   // true after flush() has been called
+	intercepted bool // true when we are serving a custom error page
+	flushed     bool // true after flush() has been called
 	wroteHeader bool
 	body        []byte // buffered body from inner handler (discarded if intercepted)
 }

@@ -13,11 +13,11 @@
 package service
 
 import (
-	"github.com/soapbucket/sbproxy/internal/cache/response"
-	"github.com/soapbucket/sbproxy/internal/security/tlsutil"
 	"context"
 	"crypto/tls"
 	"fmt"
+	"github.com/soapbucket/sbproxy/internal/cache/response"
+	"github.com/soapbucket/sbproxy/internal/security/tlsutil"
 	"log/slog"
 	"net/http"
 	"os"
@@ -28,36 +28,36 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/soapbucket/sbproxy/internal/request/classifier"
 	"github.com/soapbucket/sbproxy/internal/cache/store"
+	"github.com/soapbucket/sbproxy/internal/request/classifier"
 
-	"github.com/soapbucket/sbproxy/internal/embedded"
-	"github.com/soapbucket/sbproxy/internal/extension/cel"
 	"github.com/soapbucket/sbproxy/internal/config"
-	"github.com/soapbucket/sbproxy/internal/httpkit/bufferpool"
-	"github.com/soapbucket/sbproxy/internal/platform/servervar"
-	"github.com/soapbucket/sbproxy/internal/vault"
-	"github.com/soapbucket/sbproxy/internal/middleware/callback"
-	"github.com/soapbucket/sbproxy/internal/loader/configloader"
-	"github.com/soapbucket/sbproxy/internal/platform/dns"
-	"github.com/soapbucket/sbproxy/internal/observe/events"
-	"github.com/soapbucket/sbproxy/internal/loader/featureflags"
-	"github.com/soapbucket/sbproxy/internal/platform/health"
-	"github.com/soapbucket/sbproxy/internal/security/hostfilter"
-	"github.com/soapbucket/sbproxy/internal/observe/logging"
-	luactx "github.com/soapbucket/sbproxy/internal/extension/lua"
-	"github.com/soapbucket/sbproxy/internal/loader/manager"
-	"github.com/soapbucket/sbproxy/internal/platform/messenger"
-	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/embedded"
 	"github.com/soapbucket/sbproxy/internal/engine/middleware"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
-	"github.com/soapbucket/sbproxy/internal/loader/settings"
-	"github.com/soapbucket/sbproxy/internal/security/signature"
-	_ "github.com/soapbucket/sbproxy/internal/platform/storage" // Register storage drivers
-	"github.com/soapbucket/sbproxy/internal/template"
 	"github.com/soapbucket/sbproxy/internal/engine/transport"
-	"github.com/soapbucket/sbproxy/internal/version"
+	"github.com/soapbucket/sbproxy/internal/extension/cel"
+	luactx "github.com/soapbucket/sbproxy/internal/extension/lua"
+	"github.com/soapbucket/sbproxy/internal/httpkit/bufferpool"
 	"github.com/soapbucket/sbproxy/internal/httpkit/zerocopy"
+	"github.com/soapbucket/sbproxy/internal/loader/configloader"
+	"github.com/soapbucket/sbproxy/internal/loader/featureflags"
+	"github.com/soapbucket/sbproxy/internal/loader/manager"
+	"github.com/soapbucket/sbproxy/internal/loader/settings"
+	"github.com/soapbucket/sbproxy/internal/middleware/callback"
+	"github.com/soapbucket/sbproxy/internal/observe/events"
+	"github.com/soapbucket/sbproxy/internal/observe/logging"
+	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/platform/dns"
+	"github.com/soapbucket/sbproxy/internal/platform/health"
+	"github.com/soapbucket/sbproxy/internal/platform/messenger"
+	"github.com/soapbucket/sbproxy/internal/platform/servervar"
+	_ "github.com/soapbucket/sbproxy/internal/platform/storage" // Register storage drivers
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
+	"github.com/soapbucket/sbproxy/internal/security/hostfilter"
+	"github.com/soapbucket/sbproxy/internal/security/signature"
+	"github.com/soapbucket/sbproxy/internal/template"
+	"github.com/soapbucket/sbproxy/internal/vault"
+	"github.com/soapbucket/sbproxy/internal/version"
 
 	"github.com/soapbucket/sbproxy/internal/observe/telemetry"
 	"golang.org/x/sync/errgroup"
@@ -78,31 +78,28 @@ type Service struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	manager        manager.Manager
-	callbackCache  *callback.CallbackCache
-	reloadManager  *ReloadManager
+	manager       manager.Manager
+	callbackCache *callback.CallbackCache
+	reloadManager *ReloadManager
 
-	hostFilter     *hostfilter.HostFilter
+	hostFilter *hostfilter.HostFilter
 
-	classifierMC   *classifier.ManagedClient   // Prompt classifier sidecar client
+	classifierMC *classifier.ManagedClient // Prompt classifier sidecar client
 
 	// compiledCfg manages the atomic pointer to the current CompiledConfig.
 	// The hot path (ServeHTTP) can use Load() for lock-free hostname lookup.
 	// Populated during startup; updated on config reload via atomic Swap.
-	compiledCfg    *CompiledConfigManager
+	compiledCfg *CompiledConfigManager
 
 	// svcProvider bridges the Manager to plugin.ServiceProvider for CompileOrigin.
 	// Created once and reused so health state persists across reloads.
-	svcProvider    *managerServiceProvider
+	svcProvider *managerServiceProvider
 
 	g errgroup.Group
 }
 
 // Option configures an optional service subsystem.
 type Option func(*Service)
-
-
-
 
 // WithClassifier enables the ML classifier sidecar.
 func WithClassifier(mc *classifier.ManagedClient) Option {
@@ -572,7 +569,6 @@ func (s *Service) initHostFilter() {
 	)
 }
 
-
 // initCompiledConfig initializes the CompiledConfigManager and populates it
 // with compiled inline origins from the configuration file (sb.yml).
 func (s *Service) initCompiledConfig() {
@@ -600,7 +596,6 @@ func (s *Service) initWorkspaceMode() {
 		slog.Info("proxy running in shared workspace mode")
 	}
 }
-
 
 // initCacheAdmin creates the CacheWarmer, CacheInvalidator, and CacheAdminAPI,
 // then registers the admin routes on the telemetry router so they are served on
@@ -1109,7 +1104,6 @@ func initTokenMatcherFactory() {
 	reqctx.SetTokenMatcherFactory(cel.NewTokenMatcher)
 	slog.Debug("token matcher factory initialized")
 }
-
 
 // getApplicationLoggingConfig builds ApplicationLoggingConfig from the service config.
 func (s *Service) getApplicationLoggingConfig() logging.ApplicationLoggingConfig {

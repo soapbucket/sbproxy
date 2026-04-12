@@ -11,17 +11,17 @@ type Protocol string
 
 const (
 	// ProtocolHTTP1 is a constant for protocol http1.
-	ProtocolHTTP1              Protocol = "http1"
+	ProtocolHTTP1 Protocol = "http1"
 	// ProtocolHTTP2 is a constant for protocol http2.
-	ProtocolHTTP2              Protocol = "http2"
+	ProtocolHTTP2 Protocol = "http2"
 	// ProtocolHTTP2Bidirectional is a constant for protocol http2 bidirectional.
 	ProtocolHTTP2Bidirectional Protocol = "http2_bidirectional"
 	// ProtocolHTTP3 is a constant for protocol http3.
-	ProtocolHTTP3              Protocol = "http3"
+	ProtocolHTTP3 Protocol = "http3"
 	// ProtocolWebSocket is a constant for protocol web socket.
-	ProtocolWebSocket          Protocol = "websocket"
+	ProtocolWebSocket Protocol = "websocket"
 	// ProtocolGRPC is a constant for protocol grpc.
-	ProtocolGRPC               Protocol = "grpc"
+	ProtocolGRPC Protocol = "grpc"
 )
 
 // ProtocolDetector detects the protocol from the request
@@ -75,4 +75,3 @@ func (pd *ProtocolDetector) Detect(r *http.Request) Protocol {
 
 	return ProtocolHTTP1
 }
-

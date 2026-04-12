@@ -156,20 +156,20 @@ func New(data json.RawMessage) (plugin.PolicyEnforcer, error) {
 }
 
 type ddosPolicy struct {
-	cfg              *Config
-	requestCounts    *lruMap
-	connectionCounts *lruMap
-	bandwidthCounts  *lruMap
-	blockedIPs       *lruMap
-	challengeIPs     *lruMap
-	attackHistory    *lruMap
-	baseline         *trafficBaseline
-	lastCleanupNano  int64 // atomic, unix nanos
+	cfg                *Config
+	requestCounts      *lruMap
+	connectionCounts   *lruMap
+	bandwidthCounts    *lruMap
+	blockedIPs         *lruMap
+	challengeIPs       *lruMap
+	attackHistory      *lruMap
+	baseline           *trafficBaseline
+	lastCleanupNano    int64 // atomic, unix nanos
 	customHTMLCallback *callback.Callback
-	cleanupMu        sync.Mutex   // protects cleanup only, not per-IP detection
-	mu               sync.RWMutex // protects baseline and handleAttack
-	ctx              context.Context
-	cancel           context.CancelFunc
+	cleanupMu          sync.Mutex   // protects cleanup only, not per-IP detection
+	mu                 sync.RWMutex // protects baseline and handleAttack
+	ctx                context.Context
+	cancel             context.CancelFunc
 	// Fields from PluginContext.
 	originID string
 }

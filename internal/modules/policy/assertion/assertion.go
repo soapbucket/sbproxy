@@ -30,7 +30,7 @@ type ResponseAssertion struct {
 	Name       string `json:"name"`
 	CELExpr    string `json:"cel_expr,omitempty"`
 	LuaScript  string `json:"lua_script,omitempty"`
-	Action     string `json:"action"`               // "block" or "flag"
+	Action     string `json:"action"`                // "block" or "flag"
 	StatusCode int    `json:"status_code,omitempty"` // default 403
 	Message    string `json:"message,omitempty"`
 }

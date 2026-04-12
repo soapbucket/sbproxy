@@ -122,7 +122,7 @@ func TestCELRouter_ToolsMatch(t *testing.T) {
 	tests := []struct {
 		name         string
 		hasTools     bool
-		isStreaming   bool
+		isStreaming  bool
 		wantProvider string
 		wantMatched  bool
 	}{
@@ -136,8 +136,8 @@ func TestCELRouter_ToolsMatch(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			req := &ChatCompletionRequest{Model: "gpt-4"}
 			vars := &cel.AIContextVars{
-				Model:      "gpt-4",
-				HasTools:   tt.hasTools,
+				Model:       "gpt-4",
+				HasTools:    tt.hasTools,
 				IsStreaming: tt.isStreaming,
 			}
 			provider, _, matched := router.Evaluate(context.Background(), req, vars)

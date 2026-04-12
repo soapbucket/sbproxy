@@ -220,7 +220,7 @@ func BenchmarkJSONModifierComplex(b *testing.B) {
 		b.Fatalf("compile error: %v", err)
 	}
 	input := map[string]any{
-		"env": "production",
+		"env":      "production",
 		"limits":   map[string]any{"rpm": 10000, "burst": 1000},
 		"backends": map[string]any{"primary": "https://api.example.com", "fallback": "https://fallback.example.com"},
 	}

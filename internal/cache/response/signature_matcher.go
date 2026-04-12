@@ -14,7 +14,7 @@ import (
 
 // SignatureMatcher matches response data against configured signature patterns
 type SignatureMatcher struct {
-	patterns       []config.SignaturePattern
+	patterns        []config.SignaturePattern
 	compiledRegexes map[int]*regexp.Regexp // Cache compiled regexes by pattern index
 }
 
@@ -197,4 +197,3 @@ func findLogicalBoundary(data []byte) int {
 	// No logical boundary found, return all examined data
 	return len(data)
 }
-

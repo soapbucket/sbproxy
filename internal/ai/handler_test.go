@@ -18,8 +18,8 @@ import (
 )
 
 type mockGuardrailRunner struct {
-	results []GuardrailCheckResult
-	err     error
+	results     []GuardrailCheckResult
+	err         error
 	outputBlock *GuardrailBlock
 	outputErr   error
 }
@@ -394,14 +394,14 @@ func TestProviderExclusions_FromEntitlements(t *testing.T) {
 	}
 	rd := reqctx.NewRequestData()
 	rd.SessionData = &reqctx.SessionData{
-			AuthData: &reqctx.AuthData{
-				Data: map[string]any{
-					"ai_entitlements": map[string]any{
-						"allowed_providers": []any{"openai"},
-						"blocked_providers": []any{"azure"},
-					},
+		AuthData: &reqctx.AuthData{
+			Data: map[string]any{
+				"ai_entitlements": map[string]any{
+					"allowed_providers": []any{"openai"},
+					"blocked_providers": []any{"azure"},
 				},
 			},
+		},
 	}
 	ctx := reqctx.SetRequestData(context.Background(), rd)
 

@@ -29,4 +29,3 @@ func TestNoop(t *testing.T) {
 	// Headers should be unchanged
 	assert.Equal(t, "text/plain", resp.Header.Get("Content-Type"))
 }
-

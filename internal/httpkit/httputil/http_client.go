@@ -21,9 +21,9 @@ import (
 
 	"github.com/quic-go/quic-go/http3"
 	"github.com/soapbucket/sbproxy/internal/loader/settings"
-	"github.com/soapbucket/sbproxy/internal/security/certpin"
-	"github.com/soapbucket/sbproxy/internal/platform/dns"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/platform/dns"
+	"github.com/soapbucket/sbproxy/internal/security/certpin"
 
 	"golang.org/x/net/http2"
 )
@@ -58,7 +58,7 @@ func NewHTTPClient(config HTTPClientConfig) *HTTPClient {
 // createHTTPTransport creates an optimized HTTP transport
 func createHTTPTransport(config HTTPClientConfig) http.RoundTripper {
 	slog.Debug("creating HTTP transport", "config", config)
-	
+
 	// Global TLS enforcement: if SB_ENFORCE_TLS_VERIFY is true, override per-origin skip_tls_verify.
 	// This prevents any origin from disabling certificate verification in production.
 	skipTLS := config.SkipTLSVerifyHost
@@ -103,23 +103,23 @@ func createHTTPTransport(config HTTPClientConfig) http.RoundTripper {
 			"recommendation", "enable TLS verification in production environments")
 		metric.TLSInsecureSkipVerifyEnabled(originName, "http_client")
 	}
-	
+
 	// Set up mutual TLS (mTLS) if configured
 	// Support both file paths and base64-encoded data (prefer base64 if both provided)
 	hasClientCert := (config.MTLSClientCertFile != "" || config.MTLSClientCertData != "") &&
 		(config.MTLSClientKeyFile != "" || config.MTLSClientKeyData != "")
-	
+
 	if hasClientCert {
 		originName := config.OriginName
 		if originName == "" {
 			originName = "unknown"
 		}
-		
+
 		// Load client certificate and key (prefer base64 data over file paths)
 		var cert tls.Certificate
 		var err error
 		var certSource string
-		
+
 		if config.MTLSClientCertData != "" && config.MTLSClientKeyData != "" {
 			// Load from base64-encoded data
 			certPEM, err := base64.StdEncoding.DecodeString(config.MTLSClientCertData)
@@ -160,17 +160,17 @@ func createHTTPTransport(config HTTPClientConfig) http.RoundTripper {
 			slog.Error("mTLS configuration incomplete: both certificate and key must be provided (either as files or base64 data)",
 				"origin", originName)
 		}
-		
+
 		if err == nil && certSource != "" {
 			baseTLSConfig.Certificates = []tls.Certificate{cert}
 			slog.Info("mTLS client certificate loaded",
 				"origin", originName,
 				"source", certSource)
-			
+
 			// Load CA certificate if provided for server verification (prefer base64 over file)
 			var caCertData []byte
 			var caCertSource string
-			
+
 			if config.MTLSCACertData != "" {
 				// Load from base64-encoded data
 				decoded, err := base64.StdEncoding.DecodeString(config.MTLSCACertData)
@@ -195,7 +195,7 @@ func createHTTPTransport(config HTTPClientConfig) http.RoundTripper {
 					caCertSource = fmt.Sprintf("file:%s", config.MTLSCACertFile)
 				}
 			}
-			
+
 			if len(caCertData) > 0 {
 				caCertPool := x509.NewCertPool()
 				if !caCertPool.AppendCertsFromPEM(caCertData) {
@@ -216,7 +216,7 @@ func createHTTPTransport(config HTTPClientConfig) http.RoundTripper {
 			}
 		}
 	}
-	
+
 	// Set up certificate pinning if configured
 	var certPinner *certpin.CertificatePinner
 	if config.CertificatePinning != nil && config.CertificatePinning.Enabled {
@@ -224,7 +224,7 @@ func createHTTPTransport(config HTTPClientConfig) http.RoundTripper {
 		if originName == "" {
 			originName = "unknown"
 		}
-		
+
 		// Validate certificate pinning configuration
 		if err := certpin.ValidateConfig(config.CertificatePinning); err != nil {
 			slog.Error("invalid certificate pinning configuration",
@@ -242,10 +242,10 @@ func createHTTPTransport(config HTTPClientConfig) http.RoundTripper {
 					"origin", originName,
 					"primary_pin", config.CertificatePinning.PinSHA256,
 					"backup_pins_count", len(config.CertificatePinning.BackupPins))
-				
+
 				// Record metrics
 				metric.CertPinEnabledSet(originName, true)
-				
+
 				// Check for pin expiration warnings (7 days) and record expiry metric
 				certPinner.WarnIfPinExpiringSoon(7)
 				if config.CertificatePinning.PinExpiry != "" {
@@ -255,13 +255,13 @@ func createHTTPTransport(config HTTPClientConfig) http.RoundTripper {
 						metric.CertPinExpiryDaysSet(originName, daysUntilExpiry)
 					}
 				}
-				
+
 				// Apply certificate pinning to TLS config
 				baseTLSConfig = certPinner.GetTLSConfig(baseTLSConfig)
 			}
 		}
 	}
-	
+
 	// If HTTP/3 is enabled, return an HTTP/3 Transport
 	if config.EnableHTTP3 && !config.HTTP11Only {
 		return &http3.Transport{
@@ -307,14 +307,14 @@ func createHTTPTransport(config HTTPClientConfig) http.RoundTripper {
 	if originName == "" {
 		originName = "unknown"
 	}
-	
+
 	dialTLS := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		// Dial the connection
 		conn, err := dial(config.DialTimeout, config.KeepAlive)(ctx, network, addr)
 		if err != nil {
 			return nil, err
 		}
-		
+
 		// Create a copy of TLS config for this connection
 		// Extract hostname from address for ServerName (required for SNI)
 		tlsConfig := baseTLSConfig
@@ -350,7 +350,7 @@ func createHTTPTransport(config HTTPClientConfig) http.RoundTripper {
 				tlsConfig = &tlsConfigCopy
 			}
 		}
-		
+
 		// Perform TLS handshake
 		tlsConn := tls.Client(conn, tlsConfig)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
@@ -368,7 +368,7 @@ func createHTTPTransport(config HTTPClientConfig) http.RoundTripper {
 					tlsVersion = "1.3"
 				}
 			}
-			
+
 			// Determine error type
 			errorType := "handshake_failed"
 			errStr := err.Error()
@@ -379,14 +379,14 @@ func createHTTPTransport(config HTTPClientConfig) http.RoundTripper {
 			} else if strings.Contains(errStr, "protocol") {
 				errorType = "protocol_error"
 			}
-			
+
 			// Record TLS handshake failure metric
 			metric.TLSHandshakeFailure(originName, errorType, tlsVersion)
-			
+
 			conn.Close()
 			return nil, err
 		}
-		
+
 		// Record successful TLS version usage
 		state := tlsConn.ConnectionState()
 		tlsVersion := "unknown"
@@ -401,7 +401,7 @@ func createHTTPTransport(config HTTPClientConfig) http.RoundTripper {
 			tlsVersion = "1.3"
 		}
 		metric.TLSVersionUsage(originName, tlsVersion)
-		
+
 		return tlsConn, nil
 	}
 
@@ -502,7 +502,7 @@ func (t *metricsTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 // Do makes an HTTP request with the given parameters
 func (c *HTTPClient) Do(ctx context.Context, req *http.Request) (*http.Response, error) {
 	slog.Debug("making request", "method", req.Method, "url", req.URL, "headers", req.Header)
-	
+
 	origin := c.config.OriginName
 	if origin == "" {
 		origin = "unknown"
@@ -511,20 +511,20 @@ func (c *HTTPClient) Do(ctx context.Context, req *http.Request) (*http.Response,
 	if targetHost == "" {
 		targetHost = "unknown"
 	}
-	
+
 	// Measure upstream response time
 	startTime := time.Now()
-	
+
 	// Make the request with context
 	resp, err := c.Client.Do(req.WithContext(ctx))
-	
+
 	// Calculate upstream response time
 	upstreamDuration := time.Since(startTime).Seconds()
-	
+
 	if err != nil {
 		// Record upstream response time with error status
 		metric.UpstreamResponseTime(origin, targetHost, 0, upstreamDuration)
-		
+
 		// Check if error is a timeout
 		if ctx.Err() == context.DeadlineExceeded || strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline") {
 			timeoutType := "request_timeout"
@@ -533,10 +533,10 @@ func (c *HTTPClient) Do(ctx context.Context, req *http.Request) (*http.Response,
 		slog.Error("failed to make HTTP request", "method", req.Method, "url", req.URL, "headers", req.Header, "error", err)
 		return nil, fmt.Errorf("failed to make HTTP request: %w", err)
 	}
-	
+
 	// Record upstream response time metric
 	metric.UpstreamResponseTime(origin, targetHost, resp.StatusCode, upstreamDuration)
-	
+
 	slog.Debug("request made", "method", req.Method, "url", req.URL, "headers", req.Header, "status", resp.StatusCode)
 
 	return resp, nil
@@ -617,7 +617,7 @@ func (c *HTTPClient) doJSONByMethod(ctx context.Context, method string, url stri
 			return nil, fmt.Errorf("failed to marshal object: %w", err)
 		}
 	}
-	
+
 	// Initialize header if nil
 	if header == nil {
 		header = make(http.Header)

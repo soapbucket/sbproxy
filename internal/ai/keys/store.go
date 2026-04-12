@@ -23,9 +23,9 @@ var ErrKeyNotFound = fmt.Errorf("virtual key not found")
 
 // MemoryStore is an in-memory, thread-safe virtual key store.
 type MemoryStore struct {
-	mu      sync.RWMutex
-	byID    map[string]*VirtualKey
-	byHash  map[string]*VirtualKey
+	mu     sync.RWMutex
+	byID   map[string]*VirtualKey
+	byHash map[string]*VirtualKey
 }
 
 // NewMemoryStore creates a new in-memory virtual key store.

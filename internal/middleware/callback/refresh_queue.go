@@ -10,8 +10,8 @@ import (
 
 	json "github.com/goccy/go-json"
 
-	"github.com/soapbucket/sbproxy/internal/platform/messenger"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/platform/messenger"
 )
 
 const (
@@ -40,10 +40,10 @@ type RefreshQueue struct {
 	httpCache *HTTPCallbackCache
 	callback  *Callback
 
-	workers     int
+	workers      int
 	maxQueueSize int
-	queue       chan *RevalidationTask
-	wg          sync.WaitGroup
+	queue        chan *RevalidationTask
+	wg           sync.WaitGroup
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -309,7 +309,7 @@ func (rq *RefreshQueue) SubscribeToInvalidations(topic string) error {
 
 	return rq.messenger.Subscribe(rq.ctx, topic, func(ctx context.Context, msg *messenger.Message) error {
 		var invalidationMsg struct {
-			Action   string   `json:"action"`   // "invalidate" or "invalidate_pattern"
+			Action   string   `json:"action"` // "invalidate" or "invalidate_pattern"
 			Keys     []string `json:"keys,omitempty"`
 			Pattern  string   `json:"pattern,omitempty"`
 			Callback string   `json:"callback,omitempty"`
@@ -361,4 +361,3 @@ func (rq *RefreshQueue) PublishInvalidation(ctx context.Context, topic string, k
 
 	return rq.messenger.Send(ctx, topic, msg)
 }
-

@@ -10,7 +10,7 @@ const (
 	// HeaderFlags is the HTTP header name for flags.
 	HeaderFlags = "x-sb-flags"
 	// MagicParam is a constant for magic param.
-	MagicParam  = "_sb."
+	MagicParam = "_sb."
 )
 
 // disabled controls whether X-Sb-Flags and _sb.* query params are processed.

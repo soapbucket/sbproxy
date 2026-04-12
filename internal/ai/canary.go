@@ -18,13 +18,13 @@ type CanaryConfig struct {
 	Name            string        `json:"name"`
 	Control         CanaryVariant `json:"control"`
 	Experiment      CanaryVariant `json:"experiment"`
-	TrafficPercent  float64       `json:"traffic_percent"`       // Initial % to experiment (e.g., 5.0)
-	RampSteps       []float64     `json:"ramp_steps,omitempty"`  // Auto-ramp percentages (e.g., [5, 10, 25, 50, 100])
+	TrafficPercent  float64       `json:"traffic_percent"`         // Initial % to experiment (e.g., 5.0)
+	RampSteps       []float64     `json:"ramp_steps,omitempty"`    // Auto-ramp percentages (e.g., [5, 10, 25, 50, 100])
 	RampInterval    time.Duration `json:"ramp_interval,omitempty"` // Time between ramp steps
-	MaxErrorRate    float64       `json:"max_error_rate"`        // Rollback if experiment error rate exceeds this
-	MaxLatencyRatio float64       `json:"max_latency_ratio"`     // Rollback if experiment latency > control * ratio
-	MinRequests     int64         `json:"min_requests"`          // Min requests before evaluating
-	EvalInterval    time.Duration `json:"eval_interval"`         // How often to evaluate metrics
+	MaxErrorRate    float64       `json:"max_error_rate"`          // Rollback if experiment error rate exceeds this
+	MaxLatencyRatio float64       `json:"max_latency_ratio"`       // Rollback if experiment latency > control * ratio
+	MinRequests     int64         `json:"min_requests"`            // Min requests before evaluating
+	EvalInterval    time.Duration `json:"eval_interval"`           // How often to evaluate metrics
 }
 
 // CanaryVariant represents one side of a canary experiment (control or experiment).

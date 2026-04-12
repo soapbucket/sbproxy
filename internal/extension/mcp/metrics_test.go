@@ -130,10 +130,10 @@ func TestToolMetrics_AverageLatency_ZeroCalls(t *testing.T) {
 
 func TestToolMetrics_ErrorRate(t *testing.T) {
 	tests := []struct {
-		name       string
-		total      int64
-		errors     int64
-		wantRate   float64
+		name     string
+		total    int64
+		errors   int64
+		wantRate float64
 	}{
 		{"no calls", 0, 0, 0},
 		{"no errors", 10, 0, 0},

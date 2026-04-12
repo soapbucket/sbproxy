@@ -293,4 +293,3 @@ func (lb *LeakyBucket) saveState(ctx context.Context, key string, state leakyBuc
 
 	return lb.cache.PutWithExpires(ctx, CacheTypeRateLimit, key, bytes.NewReader(data), ttl)
 }
-

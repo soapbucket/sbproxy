@@ -236,8 +236,8 @@ func TestModels_GatewayModelRegistryAddsModels(t *testing.T) {
 
 	registry := NewModelRegistry([]ModelRegistryEntry{
 		{ModelPattern: "claude-3-opus", Provider: "anthropic", Priority: 1},
-		{ModelPattern: "gpt-4", Provider: "openai", Priority: 2},       // overlaps, should be deduped
-		{ModelPattern: "gpt-*", Provider: "openai", Priority: 3},        // glob, should be skipped
+		{ModelPattern: "gpt-4", Provider: "openai", Priority: 2}, // overlaps, should be deduped
+		{ModelPattern: "gpt-*", Provider: "openai", Priority: 3}, // glob, should be skipped
 	})
 
 	h := newModelsTestHandler(t, providers, []*ProviderConfig{cfg}, registry, true)

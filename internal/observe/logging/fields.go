@@ -15,25 +15,25 @@ import (
 // Request-related fields
 const (
 	// FieldRequestID is a constant for field request id.
-	FieldRequestID     = "request_id"
+	FieldRequestID = "request_id"
 	// FieldMethod is a constant for field method.
-	FieldMethod        = "method"
+	FieldMethod = "method"
 	// FieldPath is a constant for field path.
-	FieldPath          = "path"
+	FieldPath = "path"
 	// FieldHost is a constant for field host.
-	FieldHost          = "host"
+	FieldHost = "host"
 	// FieldRemoteAddr is a constant for field remote addr.
-	FieldRemoteAddr    = "remote_addr"
+	FieldRemoteAddr = "remote_addr"
 	// FieldUserAgent is a constant for field user agent.
-	FieldUserAgent     = "user_agent"
+	FieldUserAgent = "user_agent"
 	// FieldContentLength is a constant for field content length.
 	FieldContentLength = "content_length"
 	// FieldContentType is a constant for field content type.
-	FieldContentType   = "content_type"
+	FieldContentType = "content_type"
 	// FieldReferer is a constant for field referer.
-	FieldReferer       = "referer"
+	FieldReferer = "referer"
 	// FieldScheme is a constant for field scheme.
-	FieldScheme        = "scheme"
+	FieldScheme = "scheme"
 )
 
 // Response-related fields
@@ -43,7 +43,7 @@ const (
 	// FieldDurationMs is a constant for field duration ms.
 	FieldDurationMs = "duration_ms"
 	// FieldBytes is a constant for field bytes.
-	FieldBytes      = "bytes"
+	FieldBytes = "bytes"
 )
 
 // User-related fields
@@ -51,25 +51,25 @@ const (
 	// FieldUserID is a constant for field user id.
 	FieldUserID = "user_id"
 	// FieldEmail is a constant for field email.
-	FieldEmail  = "email"
+	FieldEmail = "email"
 	// FieldRoles is a constant for field roles.
-	FieldRoles  = "roles"
+	FieldRoles = "roles"
 )
 
 // Origin-related fields
 const (
 	// FieldOriginID is a constant for field origin id.
-	FieldOriginID       = "origin_id"
+	FieldOriginID = "origin_id"
 	// FieldOriginHostname is a constant for field origin hostname.
 	FieldOriginHostname = "hostname"
 	// FieldOriginType is a constant for field origin type.
-	FieldOriginType     = "type"
+	FieldOriginType = "type"
 	// FieldWorkspaceID is a constant for field workspace id.
-	FieldWorkspaceID    = "workspace_id"
+	FieldWorkspaceID = "workspace_id"
 	// FieldConfigID is a constant for field config id.
-	FieldConfigID       = "config_id"
+	FieldConfigID = "config_id"
 	// FieldVersion is a constant for field version.
-	FieldVersion        = "version"
+	FieldVersion = "version"
 )
 
 // Session-related fields
@@ -81,11 +81,11 @@ const (
 // Error-related fields
 const (
 	// FieldError is a constant for field error.
-	FieldError      = "error"
+	FieldError = "error"
 	// FieldErrorType is a constant for field error type.
-	FieldErrorType  = "error_type"
+	FieldErrorType = "error_type"
 	// FieldErrorCode is a constant for field error code.
-	FieldErrorCode  = "error_code"
+	FieldErrorCode = "error_code"
 	// FieldStackTrace is a constant for field stack trace.
 	FieldStackTrace = "stack_trace"
 )
@@ -95,9 +95,9 @@ const (
 	// FieldTracingGroup is a constant for field tracing group.
 	FieldTracingGroup = "tracing"
 	// FieldTraceID is a constant for field trace id.
-	FieldTraceID      = "trace_id"
+	FieldTraceID = "trace_id"
 	// FieldSpanID is a constant for field span id.
-	FieldSpanID       = "span_id"
+	FieldSpanID = "span_id"
 	// FieldParentSpanID is a constant for field parent span id.
 	FieldParentSpanID = "parent_span_id"
 )
@@ -105,15 +105,15 @@ const (
 // Location-related fields
 const (
 	// FieldCountry is a constant for field country.
-	FieldCountry     = "country"
+	FieldCountry = "country"
 	// FieldCountryCode is a constant for field country code.
 	FieldCountryCode = "country_code"
 	// FieldASN is a constant for field asn.
-	FieldASN         = "asn"
+	FieldASN = "asn"
 	// FieldASName is a constant for field as name.
-	FieldASName      = "as_name"
+	FieldASName = "as_name"
 	// FieldSourceIP is a constant for field source ip.
-	FieldSourceIP    = "source_ip"
+	FieldSourceIP = "source_ip"
 )
 
 // Security-related fields
@@ -121,13 +121,13 @@ const (
 	// FieldSecurityEventType is a constant for field security event type.
 	FieldSecurityEventType = "event_type"
 	// FieldSeverity is a constant for field severity.
-	FieldSeverity          = "severity"
+	FieldSeverity = "severity"
 	// FieldAction is a constant for field action.
-	FieldAction            = "action"
+	FieldAction = "action"
 	// FieldResource is a constant for field resource.
-	FieldResource          = "resource"
+	FieldResource = "resource"
 	// FieldResult is a constant for field result.
-	FieldResult            = "result"
+	FieldResult = "result"
 )
 
 // Caller information
@@ -178,26 +178,26 @@ func UserAttrs(userID, email string, roles []string) []any {
 // OriginAttrs creates standard origin attributes
 func OriginAttrs(originID, hostname, originType, workspaceID, configID, version string) []any {
 	attrs := []any{
-			slog.String(FieldOriginID, originID),
-			slog.String(FieldOriginHostname, hostname),
-			slog.String(FieldOriginType, originType),
+		slog.String(FieldOriginID, originID),
+		slog.String(FieldOriginHostname, hostname),
+		slog.String(FieldOriginType, originType),
 	}
-	
+
 	// Add workspace_id if provided
 	if workspaceID != "" {
 		attrs = append(attrs, slog.String(FieldWorkspaceID, workspaceID))
 	}
-	
+
 	// Add config_id if provided (may be same as origin_id, but kept separate for clarity)
 	if configID != "" {
 		attrs = append(attrs, slog.String(FieldConfigID, configID))
 	}
-	
+
 	// Add version (should not be empty per user requirement)
 	if version != "" {
 		attrs = append(attrs, slog.String(FieldVersion, version))
 	}
-	
+
 	return []any{
 		slog.Group("origin", attrs...),
 	}

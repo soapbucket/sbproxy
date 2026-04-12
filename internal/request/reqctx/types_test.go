@@ -177,4 +177,3 @@ func BenchmarkOriginalRequestData_BodyAsJSON(b *testing.B) {
 		_ = orig.BodyAsJSON()
 	}
 }
-

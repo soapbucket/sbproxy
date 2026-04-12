@@ -24,9 +24,9 @@ type FederatedServerConfig struct {
 	// OriginConfig is an embedded inline origin config (like forward rules Mode B).
 	OriginConfig json.RawMessage `json:"origin_config,omitempty"`
 
-	Prefix      string `json:"prefix,omitempty"`       // Namespace prefix for tools
+	Prefix      string `json:"prefix,omitempty"` // Namespace prefix for tools
 	HealthCheck bool   `json:"health_check,omitempty"`
-	Timeout     string `json:"timeout,omitempty"`       // Default "30s"
+	Timeout     string `json:"timeout,omitempty"` // Default "30s"
 
 	// ToolFilter filters discovered tools by glob patterns.
 	ToolFilter *ToolFilter `json:"tool_filter,omitempty"`

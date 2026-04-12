@@ -42,7 +42,7 @@ func addToTagBeginning(tagName string, text string) ModifyFn {
 	// Track if we need to write content after the next token
 	var pendingWrite bool
 	var pendingContent string
-	
+
 	return func(token html.Token, writer io.Writer) error {
 		// If we have a pending write, write it now (after the previous token was written)
 		if pendingWrite {
@@ -50,13 +50,13 @@ func addToTagBeginning(tagName string, text string) ModifyFn {
 			pendingWrite = false
 			pendingContent = ""
 		}
-		
+
 		// If this is the start tag we're looking for, mark that we need to write after it
 		if token.Type == html.StartTagToken && strings.EqualFold(token.Data, tagName) {
 			pendingWrite = true
 			pendingContent = text
 		}
-		
+
 		return nil
 	}
 }
@@ -112,19 +112,19 @@ func addToHeadTagEnd(text string) ModifyFn {
 func addToHeadTagBeginning(text string) ModifyFn {
 	// Track if we need to write content after the next token
 	var pendingWrite bool
-	
+
 	return func(token html.Token, writer io.Writer) error {
 		// If we have a pending write, write it now (after the previous token was written)
 		if pendingWrite {
 			_, _ = writer.Write([]byte(text))
 			pendingWrite = false
 		}
-		
+
 		// If this is the head start tag, mark that we need to write after it
 		if token.Type == html.StartTagToken && strings.EqualFold(token.Data, "head") {
 			pendingWrite = true
 		}
-		
+
 		return nil
 	}
 }
@@ -148,8 +148,8 @@ var voidElements = map[string]interface{}{
 
 // Tag represents a tag.
 type Tag struct {
-	Name  string           `json:"name"`
-	Data  string           `json:"data"`
+	Name  string        `json:"name"`
+	Data  string        `json:"data"`
 	Attrs []reqctx.Attr `json:"attrs,omitempty"`
 
 	Type html.TokenType `json:"-"`

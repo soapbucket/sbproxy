@@ -15,9 +15,9 @@ const (
 	// MaxTimeoutDuration is the maximum allowed value for timeout duration.
 	MaxTimeoutDuration = 1 * time.Minute // Maximum timeout: 1 minute
 	// MaxBufferSize is the maximum allowed value for buffer size.
-	MaxBufferSize      = 10 * 1024 * 1024 // Maximum buffer size: 10MB (10 * 1024 * 1024 bytes)
+	MaxBufferSize = 10 * 1024 * 1024 // Maximum buffer size: 10MB (10 * 1024 * 1024 bytes)
 	// MaxRequestSize is the maximum allowed value for request size.
-	MaxRequestSize     = 100 * 1024 * 1024 // Maximum request size: 100MB
+	MaxRequestSize = 100 * 1024 * 1024 // Maximum request size: 100MB
 )
 
 // ValidateConfig validates all configuration settings for reasonable values
@@ -297,4 +297,3 @@ func parseSizeToInt64WithError(sizeStr string) (int64, error) {
 }
 
 // ValidateHTTPClientConfig validates HTTPClientConfig settings
-

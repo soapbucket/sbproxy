@@ -493,7 +493,6 @@ func (o *OriginalRequestData) MarshalJSON() ([]byte, error) {
 	})
 }
 
-
 // OriginalRequestDataPool is a pool of OriginalRequestData objects
 var OriginalRequestDataPool = sync.Pool{
 	New: func() interface{} {

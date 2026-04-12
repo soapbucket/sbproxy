@@ -124,4 +124,3 @@ func MonitorServerCertificates(ctx context.Context, tlsConfig *tls.Config, check
 	monitor.Start()
 	return monitor
 }
-

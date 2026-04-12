@@ -13,11 +13,11 @@ import (
 type VaultChecker struct {
 	mu sync.RWMutex
 
-	configured          bool
-	cachedSecretCount   int
-	lastResolutionTime  time.Time
-	oldestSecretTime    time.Time
-	maxSecretAge        time.Duration // secrets older than this trigger a degraded status
+	configured         bool
+	cachedSecretCount  int
+	lastResolutionTime time.Time
+	oldestSecretTime   time.Time
+	maxSecretAge       time.Duration // secrets older than this trigger a degraded status
 }
 
 // VaultCheckerOption is a functional option for configuring VaultChecker.
@@ -135,8 +135,8 @@ func (vc *VaultChecker) Details() map[string]any {
 	defer vc.mu.RUnlock()
 
 	details := map[string]any{
-		"configured":    vc.configured,
-		"cached_count":  vc.cachedSecretCount,
+		"configured":   vc.configured,
+		"cached_count": vc.cachedSecretCount,
 	}
 
 	if !vc.lastResolutionTime.IsZero() {

@@ -45,20 +45,20 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 type Config struct {
 	Type string `json:"type"` // always "websocket"
 
-	URL           string `json:"url"`                          // Backend WebSocket URL (ws:// or wss://)
-	StripBasePath bool   `json:"strip_base_path,omitempty"`    // Preserve client path on the backend URL
-	PreserveQuery bool   `json:"preserve_query,omitempty"`     // Preserve client query string
-	Provider      string `json:"provider,omitempty"`           // Optional provider hint (e.g. "openai")
+	URL           string `json:"url"`                       // Backend WebSocket URL (ws:// or wss://)
+	StripBasePath bool   `json:"strip_base_path,omitempty"` // Preserve client path on the backend URL
+	PreserveQuery bool   `json:"preserve_query,omitempty"`  // Preserve client query string
+	Provider      string `json:"provider,omitempty"`        // Optional provider hint (e.g. "openai")
 
 	PingInterval     Duration `json:"ping_interval,omitempty"`     // Send ping frames (default: 0 = disabled)
 	PongTimeout      Duration `json:"pong_timeout,omitempty"`      // Wait for pong response (default: 10s)
 	IdleTimeout      Duration `json:"idle_timeout,omitempty"`      // Close connections after read inactivity
 	HandshakeTimeout Duration `json:"handshake_timeout,omitempty"` // WebSocket handshake timeout (default: 10s)
 
-	ReadBufferSize    int  `json:"read_buffer_size,omitempty"`    // Buffer size for reads (default: 4096)
-	WriteBufferSize   int  `json:"write_buffer_size,omitempty"`   // Buffer size for writes (default: 4096)
-	MaxFrameSize      int  `json:"max_frame_size,omitempty"`      // Maximum size of a single message payload
-	EnableCompression bool `json:"enable_compression,omitempty"`  // Enable per-message compression
+	ReadBufferSize    int  `json:"read_buffer_size,omitempty"`   // Buffer size for reads (default: 4096)
+	WriteBufferSize   int  `json:"write_buffer_size,omitempty"`  // Buffer size for writes (default: 4096)
+	MaxFrameSize      int  `json:"max_frame_size,omitempty"`     // Maximum size of a single message payload
+	EnableCompression bool `json:"enable_compression,omitempty"` // Enable per-message compression
 
 	Subprotocols   []string `json:"subprotocols,omitempty"`    // Supported subprotocols
 	AllowedOrigins []string `json:"allowed_origins,omitempty"` // CORS origins (empty = all)

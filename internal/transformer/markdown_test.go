@@ -252,14 +252,14 @@ func TestExtractBodyMarkdown_ComplexMarkdown(t *testing.T) {
 
 	// Verify key elements are present
 	checks := map[string]bool{
-		"Main Title":  strings.Contains(result, "Main Title"),
-		"bold":        strings.Contains(result, "bold"),
-		"italic":      strings.Contains(result, "italic"),
-		"First item":  strings.Contains(result, "First item"),
-		"Quote":       strings.Contains(result, "quote"),
-		"Link":        strings.Contains(result, "Link text"),
-		"Image":       strings.Contains(result, "image.png"),
-		"No script":   !strings.Contains(result, "alert"),
+		"Main Title": strings.Contains(result, "Main Title"),
+		"bold":       strings.Contains(result, "bold"),
+		"italic":     strings.Contains(result, "italic"),
+		"First item": strings.Contains(result, "First item"),
+		"Quote":      strings.Contains(result, "quote"),
+		"Link":       strings.Contains(result, "Link text"),
+		"Image":      strings.Contains(result, "image.png"),
+		"No script":  !strings.Contains(result, "alert"),
 	}
 
 	for name, passed := range checks {

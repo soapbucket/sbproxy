@@ -12,30 +12,30 @@ import (
 	"math/big"
 	"net"
 	"net/http"
-	"strings"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
-	
+
 	"github.com/soapbucket/sbproxy/internal/security/certpin"
 )
 
 // generateTestCertificate generates a self-signed certificate for testing
 func generateTestCertificate(t *testing.T) ([]byte, []byte, string) {
 	t.Helper()
-	
+
 	// Generate private key
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatalf("failed to generate private key: %v", err)
 	}
-	
+
 	// Create certificate template
 	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
 		t.Fatalf("failed to generate serial number: %v", err)
 	}
-	
+
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
@@ -50,32 +50,32 @@ func generateTestCertificate(t *testing.T) ([]byte, []byte, string) {
 		DNSNames:              []string{"test.example.com", "localhost"},
 		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
 	}
-	
+
 	// Create self-signed certificate
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
 	if err != nil {
 		t.Fatalf("failed to create certificate: %v", err)
 	}
-	
+
 	// Encode certificate
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	
+
 	// Encode private key
 	privateKeyPEM := pem.EncodeToMemory(&pem.Block{
 		Type:  "RSA PRIVATE KEY",
 		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
 	})
-	
+
 	// Parse certificate to compute pin
 	cert, err := x509.ParseCertificate(certDER)
 	if err != nil {
 		t.Fatalf("failed to parse certificate: %v", err)
 	}
-	
+
 	// Compute SHA-256 pin of SPKI
 	spkiHash := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
 	pin := base64.StdEncoding.EncodeToString(spkiHash[:])
-	
+
 	return certPEM, privateKeyPEM, pin
 }
 
@@ -106,7 +106,7 @@ func TestValidatePinFormat(t *testing.T) {
 			wantErr: false,
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := ValidatePinFormat(tt.pin)
@@ -120,7 +120,7 @@ func TestValidatePinFormat(t *testing.T) {
 func TestValidateConfig(t *testing.T) {
 	validPin := base64.StdEncoding.EncodeToString(make([]byte, 32))
 	invalidPin := "invalid"
-	
+
 	tests := []struct {
 		name    string
 		config  *certpin.CertificatePinningConfig
@@ -182,7 +182,7 @@ func TestValidateConfig(t *testing.T) {
 			wantErr: false,
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := ValidateConfig(tt.config)
@@ -195,7 +195,7 @@ func TestValidateConfig(t *testing.T) {
 
 func TestNewCertificatePinner(t *testing.T) {
 	validPin := base64.StdEncoding.EncodeToString(make([]byte, 32))
-	
+
 	tests := []struct {
 		name       string
 		config     *certpin.CertificatePinningConfig
@@ -239,7 +239,7 @@ func TestNewCertificatePinner(t *testing.T) {
 			wantErr:    false,
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			pinner, err := NewCertificatePinner(tt.config, tt.originName)
@@ -255,20 +255,20 @@ func TestNewCertificatePinner(t *testing.T) {
 
 func TestVerifyPeerCertificate(t *testing.T) {
 	certPEM, _, pin := generateTestCertificate(t)
-	
+
 	// Parse the certificate
 	block, _ := pem.Decode(certPEM)
 	if block == nil {
 		t.Fatal("failed to decode certificate PEM")
 	}
-	
+
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
 		t.Fatalf("failed to parse certificate: %v", err)
 	}
-	
+
 	wrongPin := base64.StdEncoding.EncodeToString(make([]byte, 32)) // All zeros
-	
+
 	tests := []struct {
 		name     string
 		config   *certpin.CertificatePinningConfig
@@ -323,14 +323,14 @@ func TestVerifyPeerCertificate(t *testing.T) {
 			wantErr:  true,
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			pinner, err := NewCertificatePinner(tt.config, "test")
 			if err != nil {
 				t.Fatalf("NewCertificatePinner() error = %v", err)
 			}
-			
+
 			err = pinner.VerifyPeerCertificate(tt.rawCerts, nil)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("VerifyPeerCertificate() error = %v, wantErr %v", err, tt.wantErr)
@@ -342,29 +342,29 @@ func TestVerifyPeerCertificate(t *testing.T) {
 func TestCertificatePinningIntegration(t *testing.T) {
 	// Generate test certificate
 	certPEM, keyPEM, pin := generateTestCertificate(t)
-	
+
 	// Create TLS certificate
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		t.Fatalf("failed to create TLS certificate: %v", err)
 	}
-	
+
 	// Create test HTTPS server
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	}))
-	
+
 	server.TLS = &tls.Config{
 		Certificates: []tls.Certificate{cert},
 	}
 	server.StartTLS()
 	defer server.Close()
-	
+
 	tests := []struct {
-		name       string
-		config     *certpin.CertificatePinningConfig
-		wantErr    bool
+		name        string
+		config      *certpin.CertificatePinningConfig
+		wantErr     bool
 		errContains string
 	}{
 		{
@@ -392,7 +392,7 @@ func TestCertificatePinningIntegration(t *testing.T) {
 			wantErr: false,
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Create pinner
@@ -400,19 +400,19 @@ func TestCertificatePinningIntegration(t *testing.T) {
 			if err != nil && tt.config.Enabled {
 				t.Fatalf("NewCertificatePinner() error = %v", err)
 			}
-			
+
 			// Configure TLS client
 			baseTLSConfig := &tls.Config{
 				InsecureSkipVerify: true, // We're testing pinning, not standard TLS verification
 			}
-			
+
 			var tlsConfig *tls.Config
 			if pinner != nil {
 				tlsConfig = pinner.GetTLSConfig(baseTLSConfig)
 			} else {
 				tlsConfig = baseTLSConfig
 			}
-			
+
 			// Create HTTP client
 			client := &http.Client{
 				Transport: &http.Transport{
@@ -420,7 +420,7 @@ func TestCertificatePinningIntegration(t *testing.T) {
 				},
 				Timeout: 5 * time.Second,
 			}
-			
+
 			// Make request
 			resp, err := client.Get(server.URL)
 			if tt.wantErr {
@@ -431,14 +431,14 @@ func TestCertificatePinningIntegration(t *testing.T) {
 				}
 				return
 			}
-			
+
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
 				return
 			}
-			
+
 			defer resp.Body.Close()
-			
+
 			if resp.StatusCode != http.StatusOK {
 				t.Errorf("status code = %d, want %d", resp.StatusCode, http.StatusOK)
 			}
@@ -448,7 +448,7 @@ func TestCertificatePinningIntegration(t *testing.T) {
 
 func TestWarnIfPinExpiringSoon(t *testing.T) {
 	validPin := base64.StdEncoding.EncodeToString(make([]byte, 32))
-	
+
 	tests := []struct {
 		name        string
 		config      *certpin.CertificatePinningConfig
@@ -491,14 +491,14 @@ func TestWarnIfPinExpiringSoon(t *testing.T) {
 			warningDays: 7,
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			pinner, err := NewCertificatePinner(tt.config, "test")
 			if err != nil {
 				t.Fatalf("NewCertificatePinner() error = %v", err)
 			}
-			
+
 			// Should not panic
 			pinner.WarnIfPinExpiringSoon(tt.warningDays)
 		})
@@ -507,7 +507,7 @@ func TestWarnIfPinExpiringSoon(t *testing.T) {
 
 func TestGetTLSConfig(t *testing.T) {
 	validPin := base64.StdEncoding.EncodeToString(make([]byte, 32))
-	
+
 	tests := []struct {
 		name   string
 		config *certpin.CertificatePinningConfig
@@ -530,28 +530,28 @@ func TestGetTLSConfig(t *testing.T) {
 			},
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var pinner *CertificatePinner
 			var err error
-			
+
 			if tt.config != nil && tt.config.Enabled {
 				pinner, err = NewCertificatePinner(tt.config, "test")
 				if err != nil {
 					t.Fatalf("NewCertificatePinner() error = %v", err)
 				}
 			}
-			
+
 			baseTLSConfig := &tls.Config{
 				InsecureSkipVerify: true,
 			}
-			
+
 			tlsConfig := pinner.GetTLSConfig(baseTLSConfig)
 			if tlsConfig == nil {
 				t.Error("GetTLSConfig() returned nil")
 			}
-			
+
 			// Verify that VerifyPeerCertificate is set when pinning is enabled
 			if tt.config != nil && tt.config.Enabled {
 				if tlsConfig.VerifyPeerCertificate == nil {
@@ -561,4 +561,3 @@ func TestGetTLSConfig(t *testing.T) {
 		})
 	}
 }
-

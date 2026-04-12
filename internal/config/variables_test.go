@@ -17,9 +17,9 @@ func TestValidateVariables(t *testing.T) {
 		{
 			name: "valid simple variables",
 			variables: map[string]any{
-				"api_url":    "https://api.example.com",
+				"api_url":     "https://api.example.com",
 				"max_retries": 3,
-				"debug":      true,
+				"debug":       true,
 			},
 			wantErr: false,
 		},
@@ -155,4 +155,3 @@ func TestValidateVariables(t *testing.T) {
 		})
 	}
 }
-

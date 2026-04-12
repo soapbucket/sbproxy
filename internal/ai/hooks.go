@@ -27,14 +27,14 @@ type StreamChunkHook interface {
 
 // StreamMeta holds metadata about an in-progress stream, updated by hooks.
 type StreamMeta struct {
-	Model       string
-	Provider    string
-	StartTime   time.Time
-	TotalTokens int64
-	InputTokens int64
+	Model        string
+	Provider     string
+	StartTime    time.Time
+	TotalTokens  int64
+	InputTokens  int64
 	OutputTokens int64
-	ChunkCount  int64
-	RequestID   string
+	ChunkCount   int64
+	RequestID    string
 }
 
 // AddTotalTokens atomically adds to TotalTokens.
@@ -302,4 +302,3 @@ func (h LoggerHook) logger() *slog.Logger {
 	}
 	return slog.Default()
 }
-

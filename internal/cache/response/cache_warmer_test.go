@@ -14,21 +14,21 @@ func TestCacheWarmer_RecordAccess(t *testing.T) {
 		HotThreshold:  5,
 		MaxConcurrent: 2,
 	}
-	
+
 	warmer := NewCacheWarmer(config)
-	
+
 	// Record multiple accesses to same path
 	for i := 0; i < 10; i++ {
 		warmer.RecordAccess("/api/users")
 		time.Sleep(10 * time.Millisecond)
 	}
-	
+
 	stats := warmer.GetStats()
-	
+
 	if stats.TotalPatterns != 1 {
 		t.Errorf("expected 1 pattern, got %d", stats.TotalPatterns)
 	}
-	
+
 	if stats.HotPaths != 1 {
 		t.Errorf("expected 1 hot path, got %d", stats.HotPaths)
 	}
@@ -41,24 +41,24 @@ func TestCacheWarmer_GetHotPaths(t *testing.T) {
 		HotThreshold:  3,
 		MaxConcurrent: 2,
 	}
-	
+
 	warmer := NewCacheWarmer(config)
-	
+
 	// Access multiple paths with different frequencies
 	for i := 0; i < 5; i++ {
 		warmer.RecordAccess("/api/users")
 	}
-	
+
 	for i := 0; i < 2; i++ {
 		warmer.RecordAccess("/api/products")
 	}
-	
+
 	for i := 0; i < 10; i++ {
 		warmer.RecordAccess("/api/orders")
 	}
-	
+
 	hotPaths := warmer.GetHotPaths()
-	
+
 	// Should have 2 hot paths (users and orders, not products)
 	if len(hotPaths) != 2 {
 		t.Errorf("expected 2 hot paths, got %d", len(hotPaths))
@@ -72,17 +72,17 @@ func TestCacheWarmer_PredictivePattern(t *testing.T) {
 		HotThreshold:  3,
 		MaxConcurrent: 2,
 	}
-	
+
 	warmer := NewCacheWarmer(config)
-	
+
 	// Create predictable access pattern
 	for i := 0; i < 10; i++ {
 		warmer.RecordAccess("/api/scheduled")
 		time.Sleep(50 * time.Millisecond) // Consistent interval
 	}
-	
+
 	stats := warmer.GetStats()
-	
+
 	// After enough accesses with consistent interval, should be predictable
 	if stats.PredictablePaths == 0 {
 		t.Log("Pattern not yet detected as predictable (may need more accesses)")
@@ -92,23 +92,23 @@ func TestCacheWarmer_PredictivePattern(t *testing.T) {
 func TestCacheWarmer_WarmExpressions(t *testing.T) {
 	config := DefaultCacheWarmerConfig()
 	warmer := NewCacheWarmer(config)
-	
+
 	ctx := context.Background()
-	
+
 	expressions := []string{
 		"user.id == 123",
 		"request.path.startsWith('/api')",
 	}
-	
+
 	luaScripts := []string{
 		"return request.headers['User-Agent']",
 	}
-	
+
 	err := warmer.WarmExpressions(ctx, expressions, luaScripts, "v1")
 	if err != nil {
 		t.Errorf("WarmExpressions failed: %v", err)
 	}
-	
+
 	// Note: Without actual caches initialized, warmedCount will be 0
 	// This is expected behavior - the framework is there, integration happens
 	// when actual CEL and Lua caches are wired up
@@ -122,16 +122,16 @@ func TestCacheWarmer_Disabled(t *testing.T) {
 		HotThreshold:  5,
 		MaxConcurrent: 2,
 	}
-	
+
 	warmer := NewCacheWarmer(config)
-	
+
 	// Record accesses
 	for i := 0; i < 10; i++ {
 		warmer.RecordAccess("/api/users")
 	}
-	
+
 	stats := warmer.GetStats()
-	
+
 	// Should not track when disabled
 	if stats.TotalPatterns != 0 {
 		t.Errorf("expected 0 patterns when disabled, got %d", stats.TotalPatterns)
@@ -140,19 +140,19 @@ func TestCacheWarmer_Disabled(t *testing.T) {
 
 func TestCacheWarmerConfig_Defaults(t *testing.T) {
 	config := DefaultCacheWarmerConfig()
-	
+
 	if !config.Enabled {
 		t.Error("expected Enabled to be true")
 	}
-	
+
 	if !config.WarmOnReload {
 		t.Error("expected WarmOnReload to be true")
 	}
-	
+
 	if config.HotThreshold != 10 {
 		t.Errorf("expected HotThreshold 10, got %d", config.HotThreshold)
 	}
-	
+
 	if config.MaxConcurrent != 5 {
 		t.Errorf("expected MaxConcurrent 5, got %d", config.MaxConcurrent)
 	}
@@ -241,7 +241,7 @@ func BenchmarkCacheWarmer_RecordAccess(b *testing.B) {
 	b.ReportAllocs()
 	config := DefaultCacheWarmerConfig()
 	warmer := NewCacheWarmer(config)
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		warmer.RecordAccess("/api/test")
@@ -252,17 +252,16 @@ func BenchmarkCacheWarmer_GetHotPaths(b *testing.B) {
 	b.ReportAllocs()
 	config := DefaultCacheWarmerConfig()
 	warmer := NewCacheWarmer(config)
-	
+
 	// Pre-populate with hot paths
 	for i := 0; i < 100; i++ {
 		warmer.RecordAccess("/api/users")
 		warmer.RecordAccess("/api/products")
 		warmer.RecordAccess("/api/orders")
 	}
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		warmer.GetHotPaths()
 	}
 }
-

@@ -3,9 +3,9 @@ package featureflags
 
 const (
 	// FlagDebug is a constant for flag debug.
-	FlagDebug   = "debug"
+	FlagDebug = "debug"
 	// FlagTrace is a constant for flag trace.
-	FlagTrace   = "trace"
+	FlagTrace = "trace"
 	// FlagNoCache is a constant for flag no cache.
 	FlagNoCache = "no-cache"
 

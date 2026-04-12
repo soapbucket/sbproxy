@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/soapbucket/sbproxy/internal/observe/events"
 	"github.com/soapbucket/sbproxy/internal/loader/manager"
+	"github.com/soapbucket/sbproxy/internal/observe/events"
 	"github.com/soapbucket/sbproxy/internal/platform/messenger"
 )
 

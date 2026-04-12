@@ -386,9 +386,9 @@ func TestEnforce_MultipleHeaders(t *testing.T) {
 	cfg := Config{
 		Type:                    "security_headers",
 		StrictTransportSecurity: &HSTSConfig{Enabled: true, MaxAge: 3600},
-		XFrameOptions:          &XFrameOptionsConfig{Enabled: true, Value: "DENY"},
-		XContentTypeOptions:    &XContentTypeOptionsConfig{Enabled: true, NoSniff: true},
-		ReferrerPolicy:         &ReferrerPolicyConfig{Enabled: true, Policy: "no-referrer"},
+		XFrameOptions:           &XFrameOptionsConfig{Enabled: true, Value: "DENY"},
+		XContentTypeOptions:     &XContentTypeOptionsConfig{Enabled: true, NoSniff: true},
+		ReferrerPolicy:          &ReferrerPolicyConfig{Enabled: true, Policy: "no-referrer"},
 	}
 	data, _ := json.Marshal(cfg)
 

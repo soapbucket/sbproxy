@@ -45,9 +45,10 @@ func NewTopicFilter(config json.RawMessage) (Guardrail, error) {
 }
 
 // Name performs the name operation on the topicFilter.
-func (f *topicFilter) Name() string  { return "topic_filter" }
+func (f *topicFilter) Name() string { return "topic_filter" }
+
 // Phase performs the phase operation on the topicFilter.
-func (f *topicFilter) Phase() Phase  { return PhaseInput }
+func (f *topicFilter) Phase() Phase { return PhaseInput }
 
 // Check performs the check operation on the topicFilter.
 func (f *topicFilter) Check(_ context.Context, content *Content) (*Result, error) {

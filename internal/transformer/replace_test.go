@@ -92,7 +92,7 @@ func TestReplaceString3(t *testing.T) {
 func TestMultiStringReplacement(t *testing.T) {
 	const input = `<html><body><p>Hello World</p><p>Goodbye Universe</p><p>Hello World again</p></body></html>`
 	const expected = `<html><body><p>Hi Earth</p><p>Farewell Cosmos</p><p>Hi Earth again</p></body></html>`
-	
+
 	rdr := io.NopCloser(strings.NewReader(input))
 
 	resp := &http.Response{
@@ -116,7 +116,7 @@ func TestMultiStringReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error reading response body: %s", err)
 	}
-	
+
 	if string(data) != expected {
 		t.Errorf("Expected %s, got %s", expected, string(data))
 	}
@@ -147,7 +147,7 @@ func TestMultiStringReplacementOverlapping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error reading response body: %s", err)
 	}
-	
+
 	// Note: The first "abc" should be replaced first (earliest match wins)
 	// Then the algorithm continues and finds the next "abc"
 	result := string(data)
@@ -158,7 +158,7 @@ func TestMultiStringReplacementOverlapping(t *testing.T) {
 
 func TestMultiStringReplacementEmpty(t *testing.T) {
 	const input = `<html><body><p>Hello World</p></body></html>`
-	
+
 	rdr := io.NopCloser(strings.NewReader(input))
 
 	resp := &http.Response{
@@ -179,7 +179,7 @@ func TestMultiStringReplacementEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error reading response body: %s", err)
 	}
-	
+
 	// With no replacements, output should match input
 	if string(data) != input {
 		t.Errorf("Expected %s, got %s", input, string(data))

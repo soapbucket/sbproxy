@@ -10,11 +10,11 @@ import (
 
 // RerankRequest represents a reranking request in a normalized format.
 type RerankRequest struct {
-	Model           string            `json:"model"`
-	Query           string            `json:"query"`
-	Documents       json.RawMessage   `json:"documents"` // []string or []map[string]string
-	TopN            int               `json:"top_n,omitempty"`
-	ReturnDocuments bool              `json:"return_documents,omitempty"`
+	Model           string          `json:"model"`
+	Query           string          `json:"query"`
+	Documents       json.RawMessage `json:"documents"` // []string or []map[string]string
+	TopN            int             `json:"top_n,omitempty"`
+	ReturnDocuments bool            `json:"return_documents,omitempty"`
 }
 
 // Validate checks that the rerank request has required fields.
@@ -55,8 +55,8 @@ type RerankResponse struct {
 
 // RerankResult represents a single reranked document result.
 type RerankResult struct {
-	Index          int            `json:"index"`
-	RelevanceScore float64        `json:"relevance_score"`
+	Index          int             `json:"index"`
+	RelevanceScore float64         `json:"relevance_score"`
 	Document       *RerankDocument `json:"document,omitempty"`
 }
 

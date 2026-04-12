@@ -14,7 +14,7 @@ type Phase string
 
 const (
 	// PhaseInput is a constant for phase input.
-	PhaseInput  Phase = "input"
+	PhaseInput Phase = "input"
 	// PhaseOutput is a constant for phase output.
 	PhaseOutput Phase = "output"
 )
@@ -24,13 +24,13 @@ type Action string
 
 const (
 	// ActionAllow is a constant for action allow.
-	ActionAllow     Action = "allow"
+	ActionAllow Action = "allow"
 	// ActionBlock is a constant for action block.
-	ActionBlock     Action = "block"
+	ActionBlock Action = "block"
 	// ActionTransform is a constant for action transform.
 	ActionTransform Action = "transform"
 	// ActionFlag is a constant for action flag.
-	ActionFlag      Action = "flag"
+	ActionFlag Action = "flag"
 )
 
 // Guardrail processes content for safety, compliance, or quality.

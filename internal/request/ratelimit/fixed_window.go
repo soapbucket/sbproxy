@@ -185,4 +185,3 @@ func (fw *FixedWindow) GetStats() RateLimiterStats {
 		ErrorCount:   fw.errorCount,
 	}
 }
-

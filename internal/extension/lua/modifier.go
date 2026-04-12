@@ -8,17 +8,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
-	lua "github.com/yuin/gopher-lua"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
+	lua "github.com/yuin/gopher-lua"
 )
 
 // ErrNoModifications is returned when a Lua script produces no modifications.
@@ -32,31 +32,31 @@ type ModificationResult struct {
 	AddHeaders map[string]string
 	// DeleteHeaders contains header names to delete
 	DeleteHeaders []string
-	
+
 	// URL modifications
 	Scheme   string // URL scheme (http, https)
 	Host     string // URL host (including port if needed)
 	Path     string // Full path replacement
 	Fragment string // URL fragment
-	
+
 	// Path modifications (applied if Path is empty)
-	PathPrefix  string // Prefix to add to path
-	PathSuffix  string // Suffix to add to path
+	PathPrefix  string            // Prefix to add to path
+	PathSuffix  string            // Suffix to add to path
 	PathReplace map[string]string // Replace old substring with new (map of old->new)
-	
+
 	// Method is the new HTTP method to set (if not empty)
 	Method string
-	
+
 	// Query parameter modifications
 	SetQuery    map[string]string // Query params to set (overwrites)
 	AddQuery    map[string]string // Query params to add (appends)
 	DeleteQuery []string          // Query param names to delete
-	
+
 	// Form parameter modifications
 	SetForm    map[string]string // Form params to set (overwrites)
 	AddForm    map[string]string // Form params to add (appends)
 	DeleteForm []string          // Form param names to delete
-	
+
 	// Body modifications
 	BodyRemove        bool   // Remove body entirely
 	BodyReplace       string // Replace body with string
@@ -326,7 +326,6 @@ func (m *modifier) newSandboxedState() *lua.LState {
 	return newSandboxedState()
 }
 
-
 // extractModifications extracts ModificationResult from the Lua table
 func extractModifications(L *lua.LState, value lua.LValue) (*ModificationResult, error) {
 	table, ok := value.(*lua.LTable)
@@ -335,16 +334,16 @@ func extractModifications(L *lua.LState, value lua.LValue) (*ModificationResult,
 	}
 
 	result := &ModificationResult{
-		SetHeaders:  make(map[string]string),
-		AddHeaders:  make(map[string]string),
+		SetHeaders:    make(map[string]string),
+		AddHeaders:    make(map[string]string),
 		DeleteHeaders: []string{},
-		PathReplace: make(map[string]string),
-		SetQuery:    make(map[string]string),
-		AddQuery:    make(map[string]string),
-		DeleteQuery: []string{},
-		SetForm:     make(map[string]string),
-		AddForm:     make(map[string]string),
-		DeleteForm:  []string{},
+		PathReplace:   make(map[string]string),
+		SetQuery:      make(map[string]string),
+		AddQuery:      make(map[string]string),
+		DeleteQuery:   []string{},
+		SetForm:       make(map[string]string),
+		AddForm:       make(map[string]string),
+		DeleteForm:    []string{},
 	}
 
 	// Helper function to extract string from table
@@ -466,24 +465,24 @@ func applyModifications(req *http.Request, mods *ModificationResult) (*http.Requ
 	} else {
 		// Apply path transformations if no full replacement
 		currentPath := modifiedReq.URL.Path
-		
+
 		// Apply path replace operations
 		for old, new := range mods.PathReplace {
 			if old != "" {
 				currentPath = strings.ReplaceAll(currentPath, old, new)
 			}
 		}
-		
+
 		// Apply prefix
 		if mods.PathPrefix != "" {
 			currentPath = mods.PathPrefix + currentPath
 		}
-		
+
 		// Apply suffix
 		if mods.PathSuffix != "" {
 			currentPath = currentPath + mods.PathSuffix
 		}
-		
+
 		modifiedReq.URL.Path = currentPath
 	}
 

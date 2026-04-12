@@ -38,11 +38,11 @@ func TestLifecycle_Interfaces(t *testing.T) {
 
 type nullServices struct{}
 
-func (n *nullServices) KVStore() KVStore        { return nil }
-func (n *nullServices) Events() EventEmitter    { return nil }
-func (n *nullServices) Logger() *slog.Logger    { return slog.Default() }
-func (n *nullServices) Cache() CacheStore       { return nil }
-func (n *nullServices) Metrics() Observer        { return NoopObserver() }
+func (n *nullServices) KVStore() KVStore                                 { return nil }
+func (n *nullServices) Events() EventEmitter                             { return nil }
+func (n *nullServices) Logger() *slog.Logger                             { return slog.Default() }
+func (n *nullServices) Cache() CacheStore                                { return nil }
+func (n *nullServices) Metrics() Observer                                { return NoopObserver() }
 func (n *nullServices) TransportFor(_ TransportConfig) http.RoundTripper { return nil }
 func (n *nullServices) ResolveOriginHandler(_ string) (http.Handler, error) {
 	return nil, nil
@@ -50,9 +50,9 @@ func (n *nullServices) ResolveOriginHandler(_ string) (http.Handler, error) {
 func (n *nullServices) ResolveEmbeddedOriginHandler(_ json.RawMessage) (http.Handler, error) {
 	return nil, nil
 }
-func (n *nullServices) ResponseCache() ResponseCache             { return nil }
-func (n *nullServices) Sessions() SessionProvider                { return nil }
-func (n *nullServices) HealthStatus(_ string) HealthState        { return HealthState{} }
+func (n *nullServices) ResponseCache() ResponseCache            { return nil }
+func (n *nullServices) Sessions() SessionProvider               { return nil }
+func (n *nullServices) HealthStatus(_ string) HealthState       { return HealthState{} }
 func (n *nullServices) SetHealthStatus(_ string, _ HealthState) {}
 
 func TestPluginContext_WithServices(t *testing.T) {

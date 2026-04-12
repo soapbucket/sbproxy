@@ -141,16 +141,24 @@ func (s *HTTPStorage) ValidateProxyAPIKey(ctx context.Context, originID string, 
 
 // Put performs the put operation on the HTTPStorage.
 func (s *HTTPStorage) Put(ctx context.Context, key string, data []byte) error { return ErrReadOnly }
+
 // Delete performs the delete operation on the HTTPStorage.
-func (s *HTTPStorage) Delete(ctx context.Context, key string) error      { return ErrReadOnly }
+func (s *HTTPStorage) Delete(ctx context.Context, key string) error { return ErrReadOnly }
+
 // DeleteByPrefix performs the delete by prefix operation on the HTTPStorage.
 func (s *HTTPStorage) DeleteByPrefix(ctx context.Context, prefix string) error { return ErrReadOnly }
+
 // Close releases resources held by the HTTPStorage.
-func (s *HTTPStorage) Close() error                                     { return nil }
+func (s *HTTPStorage) Close() error { return nil }
+
 // Driver performs the driver operation on the HTTPStorage.
-func (s *HTTPStorage) Driver() string                                   { return s.driver }
+func (s *HTTPStorage) Driver() string { return s.driver }
+
 // ListKeys performs the list keys operation on the HTTPStorage.
-func (s *HTTPStorage) ListKeys(ctx context.Context) ([]string, error) { return nil, ErrListKeysNotSupported }
+func (s *HTTPStorage) ListKeys(ctx context.Context) ([]string, error) {
+	return nil, ErrListKeysNotSupported
+}
+
 // ListKeysByWorkspace performs the list keys by workspace operation on the HTTPStorage.
 func (s *HTTPStorage) ListKeysByWorkspace(ctx context.Context, workspaceID string) ([]string, error) {
 	return nil, ErrListKeysNotSupported

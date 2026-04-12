@@ -9,12 +9,12 @@ import (
 func TestWAFSQLInjectionDetection(t *testing.T) {
 	// Create the WAF rule from the config
 	rule := WAFRule{
-		ID:        "block-sql-injection",
-		Name:      "Block SQL Injection",
-		Enabled:   true,
-		Phase:     2,
-		Severity:  "critical",
-		Action:    "block",
+		ID:       "block-sql-injection",
+		Name:     "Block SQL Injection",
+		Enabled:  true,
+		Phase:    2,
+		Severity: "critical",
+		Action:   "block",
 		Variables: []WAFVariable{
 			{
 				Name:            "ARGS",

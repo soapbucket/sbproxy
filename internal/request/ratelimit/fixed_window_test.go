@@ -114,4 +114,3 @@ func TestFixedWindow_WindowReset(t *testing.T) {
 		t.Error("should be allowed after window reset")
 	}
 }
-

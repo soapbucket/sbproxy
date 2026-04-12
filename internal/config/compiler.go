@@ -29,15 +29,15 @@ import (
 	"time"
 
 	"github.com/soapbucket/sbproxy/internal/middleware/callback"
-	"github.com/soapbucket/sbproxy/internal/middleware/forward"
-	"github.com/soapbucket/sbproxy/pkg/plugin/memorycache"
 	"github.com/soapbucket/sbproxy/internal/middleware/compression"
 	"github.com/soapbucket/sbproxy/internal/middleware/cors"
+	"github.com/soapbucket/sbproxy/internal/middleware/forward"
 	"github.com/soapbucket/sbproxy/internal/middleware/hsts"
 	"github.com/soapbucket/sbproxy/internal/middleware/httpsig"
 	"github.com/soapbucket/sbproxy/internal/middleware/modifier"
 	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/pkg/plugin"
+	"github.com/soapbucket/sbproxy/pkg/plugin/memorycache"
 )
 
 // RawOrigin is the parsed but uncompiled origin configuration. Fields correspond
@@ -45,28 +45,28 @@ import (
 // json.RawMessage so that the compiler can pass it to the appropriate plugin
 // factory without knowing its internal structure.
 type RawOrigin struct {
-	ID          string              `json:"id"`
-	Hostname    string              `json:"hostname"`
-	WorkspaceID string              `json:"workspace_id"`
-	Version     string              `json:"version"`
-	Action      json.RawMessage     `json:"action"`
-	Auth        json.RawMessage     `json:"authentication,omitempty"`
-	Policies    []json.RawMessage   `json:"policies,omitempty"`
-	Transforms  []json.RawMessage   `json:"transforms,omitempty"`
-	Modifiers          json.RawMessage     `json:"request_modifiers,omitempty"`
-	ResponseModifiers  json.RawMessage     `json:"response_modifiers,omitempty"`
-	Cache              json.RawMessage     `json:"response_cache,omitempty"`
-	OnLoad      json.RawMessage     `json:"on_load,omitempty"`
-	OnRequest   json.RawMessage     `json:"on_request,omitempty"`
-	OnResponse  json.RawMessage     `json:"on_response,omitempty"`
-	Variables   map[string]any      `json:"variables,omitempty"`
-	Secrets     json.RawMessage     `json:"secrets,omitempty"`
-	Disabled    bool                `json:"disabled,omitempty"`
-	ForceSSL    bool                `json:"force_ssl,omitempty"`
-	Debug       bool                `json:"debug,omitempty"`
-	Events            json.RawMessage     `json:"events,omitempty"`
-	ErrorPages        json.RawMessage     `json:"error_pages,omitempty"`
-	MessageSignatures json.RawMessage     `json:"message_signatures,omitempty"`
+	ID                string            `json:"id"`
+	Hostname          string            `json:"hostname"`
+	WorkspaceID       string            `json:"workspace_id"`
+	Version           string            `json:"version"`
+	Action            json.RawMessage   `json:"action"`
+	Auth              json.RawMessage   `json:"authentication,omitempty"`
+	Policies          []json.RawMessage `json:"policies,omitempty"`
+	Transforms        []json.RawMessage `json:"transforms,omitempty"`
+	Modifiers         json.RawMessage   `json:"request_modifiers,omitempty"`
+	ResponseModifiers json.RawMessage   `json:"response_modifiers,omitempty"`
+	Cache             json.RawMessage   `json:"response_cache,omitempty"`
+	OnLoad            json.RawMessage   `json:"on_load,omitempty"`
+	OnRequest         json.RawMessage   `json:"on_request,omitempty"`
+	OnResponse        json.RawMessage   `json:"on_response,omitempty"`
+	Variables         map[string]any    `json:"variables,omitempty"`
+	Secrets           json.RawMessage   `json:"secrets,omitempty"`
+	Disabled          bool              `json:"disabled,omitempty"`
+	ForceSSL          bool              `json:"force_ssl,omitempty"`
+	Debug             bool              `json:"debug,omitempty"`
+	Events            json.RawMessage   `json:"events,omitempty"`
+	ErrorPages        json.RawMessage   `json:"error_pages,omitempty"`
+	MessageSignatures json.RawMessage   `json:"message_signatures,omitempty"`
 
 	// Observability
 	TrafficCapture   json.RawMessage `json:"traffic_capture,omitempty"`
@@ -421,11 +421,11 @@ func wrapTransform(next http.Handler, transform plugin.TransformHandler) http.Ha
 // transformResponseWriter captures the response produced by the next handler
 // so that a TransformHandler can process it before it reaches the client.
 type transformResponseWriter struct {
-	underlying http.ResponseWriter
-	header     http.Header
-	body       *bytes.Buffer
-	statusCode int
-	overflowed bool
+	underlying  http.ResponseWriter
+	header      http.Header
+	body        *bytes.Buffer
+	statusCode  int
+	overflowed  bool
 	wroteHeader bool
 }
 
@@ -1408,7 +1408,6 @@ func wrapTrafficCapture(next http.Handler, cfg json.RawMessage, services plugin.
 	slog.Info("traffic capture is an enterprise feature, ignoring traffic_capture config")
 	return next
 }
-
 
 // generateSessionID produces a random session identifier. It uses
 // crypto/rand to create a 16-byte random value encoded as hex.

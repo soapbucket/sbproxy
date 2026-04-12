@@ -16,11 +16,11 @@ import (
 // AutoUpdateConfig configures automatic CRS rule updates.
 type AutoUpdateConfig struct {
 	Enabled         bool          `json:"enabled,omitempty"`
-	Sources         []RuleSource  `json:"sources,omitempty"`           // External rule sources
-	CheckInterval   time.Duration `json:"check_interval,omitempty"`    // Default: 24h
-	MaxRules        int           `json:"max_rules,omitempty"`         // Max rules to load (default: 10000)
-	VerifySignature bool          `json:"verify_signature,omitempty"`  // Verify rule source signatures
-	OnUpdateAction  string        `json:"on_update_action,omitempty"`  // "reload" or "append" (default: "reload")
+	Sources         []RuleSource  `json:"sources,omitempty"`          // External rule sources
+	CheckInterval   time.Duration `json:"check_interval,omitempty"`   // Default: 24h
+	MaxRules        int           `json:"max_rules,omitempty"`        // Max rules to load (default: 10000)
+	VerifySignature bool          `json:"verify_signature,omitempty"` // Verify rule source signatures
+	OnUpdateAction  string        `json:"on_update_action,omitempty"` // "reload" or "append" (default: "reload")
 }
 
 // RuleSource defines an external source for WAF rules.

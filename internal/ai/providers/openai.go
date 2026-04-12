@@ -4,8 +4,8 @@ package providers
 import (
 	"bytes"
 	"context"
-	json "github.com/goccy/go-json"
 	"fmt"
+	json "github.com/goccy/go-json"
 	"io"
 	"net/http"
 
@@ -31,9 +31,11 @@ func NewOpenAI(client *http.Client) ai.Provider {
 }
 
 // Name performs the name operation on the OpenAI.
-func (o *OpenAI) Name() string            { return "openai" }
+func (o *OpenAI) Name() string { return "openai" }
+
 // SupportsStreaming performs the supports streaming operation on the OpenAI.
-func (o *OpenAI) SupportsStreaming() bool  { return true }
+func (o *OpenAI) SupportsStreaming() bool { return true }
+
 // SupportsEmbeddings performs the supports embeddings operation on the OpenAI.
 func (o *OpenAI) SupportsEmbeddings() bool { return true }
 

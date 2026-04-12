@@ -20,8 +20,8 @@ import (
 // HTTPCachedCallbackResponse represents a cached callback response with HTTP metadata
 type HTTPCachedCallbackResponse struct {
 	// Response data
-	Data       map[string]any `json:"data"`
-	StatusCode int            `json:"status_code"`
+	Data       map[string]any      `json:"data"`
+	StatusCode int                 `json:"status_code"`
 	Headers    map[string][]string `json:"headers"`
 
 	// HTTP cache metadata
@@ -30,18 +30,18 @@ type HTTPCachedCallbackResponse struct {
 	VaryHeaders  []string  `json:"vary_headers,omitempty"`
 
 	// Cache timing
-	CachedAt     time.Time `json:"cached_at"`
-	ExpiresAt    time.Time `json:"expires_at"`      // Fresh until
-	StaleAt      time.Time `json:"stale_at"`        // Stale but usable until
-	MaxStaleAt   time.Time `json:"max_stale_at"`    // Absolute expiry (stale-if-error)
+	CachedAt   time.Time `json:"cached_at"`
+	ExpiresAt  time.Time `json:"expires_at"`   // Fresh until
+	StaleAt    time.Time `json:"stale_at"`     // Stale but usable until
+	MaxStaleAt time.Time `json:"max_stale_at"` // Absolute expiry (stale-if-error)
 
 	// Cache directives
-	MaxAge              reqctx.Duration `json:"max_age"`
+	MaxAge               reqctx.Duration `json:"max_age"`
 	StaleWhileRevalidate reqctx.Duration `json:"stale_while_revalidate,omitempty"`
-	StaleIfError        reqctx.Duration `json:"stale_if_error,omitempty"`
-	MustRevalidate      bool          `json:"must_revalidate"`
-	NoCache              bool          `json:"no_cache"`
-	NoStore              bool          `json:"no_store"`
+	StaleIfError         reqctx.Duration `json:"stale_if_error,omitempty"`
+	MustRevalidate       bool            `json:"must_revalidate"`
+	NoCache              bool            `json:"no_cache"`
+	NoStore              bool            `json:"no_store"`
 
 	// Size and tier
 	Size int64  `json:"size"`
@@ -395,4 +395,3 @@ func (hcc *HTTPCallbackCache) Cleanup() {
 		}
 	}
 }
-

@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/soapbucket/sbproxy/internal/loader/manager"
 	"github.com/soapbucket/sbproxy/internal/cache/store"
+	"github.com/soapbucket/sbproxy/internal/loader/manager"
 	"github.com/soapbucket/sbproxy/internal/platform/messenger"
 	"github.com/soapbucket/sbproxy/internal/platform/storage"
 )
@@ -350,4 +350,3 @@ type mockManagerWithMessengerForTest struct {
 func (m *mockManagerWithMessengerForTest) GetMessenger() messenger.Messenger {
 	return m.messenger
 }
-

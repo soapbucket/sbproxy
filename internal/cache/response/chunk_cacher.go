@@ -15,11 +15,11 @@ import (
 	"time"
 
 	"github.com/pquerna/cachecontrol/cacheobject"
+	"github.com/soapbucket/sbproxy/internal/cache/store"
 	"github.com/soapbucket/sbproxy/internal/config"
 	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
-	"github.com/soapbucket/sbproxy/internal/cache/store"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 // ChunkCacher provides unified chunk caching middleware

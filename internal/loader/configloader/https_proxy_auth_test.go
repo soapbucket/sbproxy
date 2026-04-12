@@ -135,4 +135,3 @@ func TestLoadForProxyHostWorkspaceMismatch(t *testing.T) {
 		t.Fatalf("expected ErrNotFound on workspace mismatch, got %v", err)
 	}
 }
-

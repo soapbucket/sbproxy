@@ -22,9 +22,9 @@ const (
 	// FlushImmediate is a constant for flush immediate.
 	FlushImmediate FlushType = "immediate" // Flush after every write
 	// FlushPeriodic is a constant for flush periodic.
-	FlushPeriodic  FlushType = "periodic"  // Flush at intervals
+	FlushPeriodic FlushType = "periodic" // Flush at intervals
 	// FlushBuffered is a constant for flush buffered.
-	FlushBuffered  FlushType = "buffered"  // No explicit flushing
+	FlushBuffered FlushType = "buffered" // No explicit flushing
 )
 
 // FlushController determines optimal flush strategy
@@ -175,4 +175,3 @@ func (fc *FlushController) isStreamingContentType(ct string) bool {
 
 	return false
 }
-

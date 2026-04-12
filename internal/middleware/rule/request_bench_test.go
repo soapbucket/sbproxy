@@ -23,7 +23,7 @@ func BenchmarkRequestRule_Match_Complex(b *testing.B) {
 	rule := RequestRule{
 		Methods: []string{"GET", "POST"},
 		Path:    &PathConditions{Contains: "/api"},
-		Scheme:   "https",
+		Scheme:  "https",
 		Headers: &HeaderConditions{
 			Exact:  map[string]string{"Content-Type": "application/json"},
 			Exists: []string{"Authorization"},
@@ -64,7 +64,7 @@ func BenchmarkRequestRule_Match_Complex(b *testing.B) {
 // 		},
 // 	}
 // 	req := mustCreateRequest("GET", "https://example.com/path", b)
-// 
+//
 // 	b.ResetTimer()
 // 	for i := 0; i < b.N; i++ {
 // 		_ = rule.Match(req)
@@ -152,7 +152,7 @@ func BenchmarkRequestRules_Match(b *testing.B) {
 // 			"roles": []string{"admin", "editor", "viewer"},
 // 		},
 // 	}
-// 
+//
 // 	b.ResetTimer()
 // 	for i := 0; i < b.N; i++ {
 // 		_ = conditions.match(authData)
@@ -174,4 +174,3 @@ func BenchmarkMatchesIPOrCIDR(b *testing.B) {
 		_ = matchesIPOrCIDR(clientIP, ipOrCIDRs)
 	}
 }
-

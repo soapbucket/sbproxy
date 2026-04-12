@@ -239,7 +239,7 @@ func (g *GatewayHandler) forwardToolCall(ctx context.Context, ft *FederatedTool,
 
 	// Parse the upstream JSON-RPC response
 	var rpcResp struct {
-		Result *ToolResult  `json:"result"`
+		Result *ToolResult   `json:"result"`
 		Error  *JSONRPCError `json:"error"`
 	}
 	if err := json.Unmarshal(respBody, &rpcResp); err != nil {

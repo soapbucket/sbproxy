@@ -14,9 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
-	"github.com/soapbucket/sbproxy/internal/observe/metric"
 	"github.com/soapbucket/sbproxy/internal/loader/settings"
+	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 // retryLogLimiter limits retry log spam by tracking per-origin retry counts.
@@ -323,7 +323,7 @@ func (t *RetryTransport) calculateBackoff(attempt int) time.Duration {
 	if t.Jitter > 0 {
 		jitterAmount := delay * t.Jitter
 		// Random jitter between [-jitterAmount, +jitterAmount]
-		jitter := (float64(time.Now().UnixNano()%1000) / 1000.0 * 2.0 - 1.0) * jitterAmount
+		jitter := (float64(time.Now().UnixNano()%1000)/1000.0*2.0 - 1.0) * jitterAmount
 		delay += jitter
 	}
 
@@ -398,5 +398,3 @@ func MakeRequestRetryable(req *http.Request) error {
 
 	return nil
 }
-
-

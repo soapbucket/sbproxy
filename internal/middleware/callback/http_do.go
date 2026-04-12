@@ -2,10 +2,10 @@
 package callback
 
 import (
-	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"io"
 	"log/slog"
 	"mime"
@@ -453,4 +453,3 @@ func objToMap(obj any) map[string]any {
 	_ = json.Unmarshal(data, &result)
 	return result
 }
-

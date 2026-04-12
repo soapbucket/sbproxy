@@ -267,10 +267,10 @@ type ToolCacheEntry struct {
 
 // PromptConfig defines an MCP prompt template.
 type PromptConfig struct {
-	Name        string               `json:"name"`
-	Description string               `json:"description,omitempty"`
-	Arguments   []PromptArgument     `json:"arguments,omitempty"`
-	Messages    []PromptMessage      `json:"messages"`
+	Name        string           `json:"name"`
+	Description string           `json:"description,omitempty"`
+	Arguments   []PromptArgument `json:"arguments,omitempty"`
+	Messages    []PromptMessage  `json:"messages"`
 }
 
 // PromptArgument defines an argument for a prompt template.
@@ -282,7 +282,7 @@ type PromptArgument struct {
 
 // PromptMessage defines a message in a prompt template.
 type PromptMessage struct {
-	Role    string `json:"role"` // "user" or "assistant"
+	Role    string `json:"role"`    // "user" or "assistant"
 	Content string `json:"content"` // Mustache template
 }
 
@@ -307,7 +307,7 @@ type GetPromptParams struct {
 
 // GetPromptResult contains the result of prompts/get.
 type GetPromptResult struct {
-	Description string          `json:"description,omitempty"`
+	Description string                `json:"description,omitempty"`
 	Messages    []PromptResultMessage `json:"messages"`
 }
 
@@ -394,7 +394,7 @@ type OriginResolver func(hostname string, embeddedConfig json.RawMessage) (http.
 
 // ProxyHandler executes a single HTTP request.
 type ProxyHandler struct {
-	URL                string            `json:"url,omitempty"`
+	URL string `json:"url,omitempty"`
 
 	// OriginHost references an existing origin by hostname. The request is routed
 	// through the referenced origin's full pipeline (transforms, modifiers, policies).
@@ -410,11 +410,11 @@ type ProxyHandler struct {
 	// resolvedOriginHandler is the resolved http.Handler for origin routing.
 	// Set during initialization when OriginHost or OriginConfig is configured.
 	resolvedOriginHandler http.Handler
-	Method             string            `json:"method,omitempty"`
-	Headers            map[string]string `json:"headers,omitempty"`
-	Body               string            `json:"body,omitempty"`
-	Timeout            reqctx.Duration   `json:"timeout,omitempty" validate:"max_value=1m"`
-	SkipTLSVerifyHost  bool              `json:"skip_tls_verify_host,omitempty"`
+	Method                string            `json:"method,omitempty"`
+	Headers               map[string]string `json:"headers,omitempty"`
+	Body                  string            `json:"body,omitempty"`
+	Timeout               reqctx.Duration   `json:"timeout,omitempty" validate:"max_value=1m"`
+	SkipTLSVerifyHost     bool              `json:"skip_tls_verify_host,omitempty"`
 
 	// QueryParams are structured query parameters with automatic URL encoding.
 	// Values are Mustache templates. Appended to the base URL.

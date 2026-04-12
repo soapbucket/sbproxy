@@ -9,9 +9,9 @@ import (
 
 func TestGetConfigParams_VersionNotOverwritten(t *testing.T) {
 	parent := &Config{
-		ID:       "parent-config",
-		Hostname: "parent.example.com",
-		Version:  "2.0",
+		ID:          "parent-config",
+		Hostname:    "parent.example.com",
+		Version:     "2.0",
 		WorkspaceID: "tenant-1",
 	}
 	child := &Config{

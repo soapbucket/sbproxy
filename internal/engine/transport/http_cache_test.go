@@ -1,9 +1,9 @@
 package transport
 
 import (
-	"github.com/soapbucket/sbproxy/internal/security/crypto"
 	"bytes"
 	"context"
+	"github.com/soapbucket/sbproxy/internal/security/crypto"
 	"hash"
 	"io"
 	"net/http"

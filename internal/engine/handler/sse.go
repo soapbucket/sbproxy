@@ -32,14 +32,14 @@ type SSEEvent struct {
 
 // SSEConnection represents an active SSE connection
 type SSEConnection struct {
-	w          http.ResponseWriter
-	flusher    http.Flusher
-	ctx        context.Context
-	cancel     context.CancelFunc
-	filters    []SSEEventFilter
-	mu         sync.Mutex
+	w           http.ResponseWriter
+	flusher     http.Flusher
+	ctx         context.Context
+	cancel      context.CancelFunc
+	filters     []SSEEventFilter
+	mu          sync.Mutex
 	lastEventID string
-	closed     bool
+	closed      bool
 }
 
 // SSEEventFilter is a function that decides whether to forward an event
@@ -49,7 +49,7 @@ type SSEEventFilter func(event SSEEvent) bool
 type SSEConnectionManager struct {
 	connections map[string]*SSEConnection
 	mu          sync.RWMutex
-	
+
 	// Heartbeat configuration
 	heartbeatInterval time.Duration
 	heartbeatEnabled  bool
@@ -77,10 +77,10 @@ func (m *SSEConnectionManager) AddConnection(id string, conn *SSEConnection) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.connections[id] = conn
-	
+
 	// Update active connections metric
 	metric.ActiveConnectionsSet("server", "sse", int64(len(m.connections)))
-	
+
 	slog.Info("SSE connection added", "connection_id", id, "total_connections", len(m.connections))
 }
 
@@ -88,14 +88,14 @@ func (m *SSEConnectionManager) AddConnection(id string, conn *SSEConnection) {
 func (m *SSEConnectionManager) RemoveConnection(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	if conn, exists := m.connections[id]; exists {
 		conn.Close()
 		delete(m.connections, id)
-		
+
 		// Update active connections metric
 		metric.ActiveConnectionsSet("server", "sse", int64(len(m.connections)))
-		
+
 		slog.Info("SSE connection removed", "connection_id", id, "remaining_connections", len(m.connections))
 	}
 }
@@ -284,7 +284,7 @@ func NewSSEProxy(client *http.Client) *SSEProxy {
 			Timeout: 0, // No timeout for SSE
 		}
 	}
-	
+
 	return &SSEProxy{
 		client: client,
 	}
@@ -431,4 +431,3 @@ func StartHeartbeat(ctx context.Context, conn *SSEConnection, interval time.Dura
 		}
 	}
 }
-

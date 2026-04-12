@@ -40,7 +40,7 @@ type PebbleStorage struct {
 	redisClient       *redis.Client
 	syncClient        *http.Client
 	bloomFilter       interface{ Add(string) } // will be set by config loader
-	syncURL           string // pre-computed sync URL with cluster_id
+	syncURL           string                   // pre-computed sync URL with cluster_id
 	mu                sync.RWMutex
 	done              chan struct{}
 	driver            string

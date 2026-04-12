@@ -24,7 +24,7 @@ import (
 // exceeds the current model's limits. It supports both explicit user-configured
 // fallbacks and auto-generated fallbacks derived from the provider registry.
 type ContextFallbackMap struct {
-	configured map[string]string  // Explicit overrides, e.g. "gpt-4" -> "gpt-4-turbo-128k"
+	configured map[string]string    // Explicit overrides, e.g. "gpt-4" -> "gpt-4-turbo-128k"
 	registry   *ai.ProviderRegistry // Used to auto-generate fallbacks within the same provider
 }
 

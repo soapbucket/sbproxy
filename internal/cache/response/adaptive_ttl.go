@@ -20,12 +20,12 @@ type AdaptiveTTLConfig struct {
 
 // AdaptiveTTLStats holds per-key statistics for adaptive TTL.
 type AdaptiveTTLStats struct {
-	Key           string        `json:"key"`
-	CurrentTTL    time.Duration `json:"current_ttl"`
-	SampleCount   int           `json:"sample_count"`
+	Key            string        `json:"key"`
+	CurrentTTL     time.Duration `json:"current_ttl"`
+	SampleCount    int           `json:"sample_count"`
 	MedianInterval time.Duration `json:"median_interval"`
-	LastModified  time.Time     `json:"last_modified"`
-	LastChecked   time.Time     `json:"last_checked"`
+	LastModified   time.Time     `json:"last_modified"`
+	LastChecked    time.Time     `json:"last_checked"`
 }
 
 // AdaptiveTTL tracks content change frequency and computes optimal TTL.

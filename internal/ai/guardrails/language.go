@@ -45,6 +45,7 @@ func NewLanguageDetect(config json.RawMessage) (Guardrail, error) {
 
 // Name performs the name operation on the languageDetectGuard.
 func (g *languageDetectGuard) Name() string { return "language_detect" }
+
 // Phase performs the phase operation on the languageDetectGuard.
 func (g *languageDetectGuard) Phase() Phase { return PhaseInput }
 

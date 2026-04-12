@@ -26,4 +26,3 @@ func GetSecret(ctx context.Context, key string) (string, bool) {
 	value, exists := secrets[key]
 	return value, exists
 }
-

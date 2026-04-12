@@ -82,6 +82,7 @@ func NewCodeSafetyGuard(config json.RawMessage) (Guardrail, error) {
 
 // Name performs the name operation on the codeSafetyGuard.
 func (g *codeSafetyGuard) Name() string { return "code_safety" }
+
 // Phase performs the phase operation on the codeSafetyGuard.
 func (g *codeSafetyGuard) Phase() Phase { return PhaseOutput }
 

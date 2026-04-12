@@ -343,4 +343,3 @@ func createHTTP2BidirectionalRequest(t *testing.T) *http.Request {
 	req.Header.Set("Content-Type", "application/x-ndjson")
 	return req
 }
-

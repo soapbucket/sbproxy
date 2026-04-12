@@ -156,4 +156,3 @@ func (t *TestMessengerForSignatureCacheExpiration) SendSignatureCacheExpirationB
 		Params:  make(map[string]string),
 	})
 }
-

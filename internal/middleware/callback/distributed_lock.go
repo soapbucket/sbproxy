@@ -40,8 +40,8 @@ func (n *NoopDistributedLock) Release(_ context.Context, _ string) error {
 // The lock value is a unique instance ID (hostname:pid) so that only the
 // owner can release it via a Lua script.
 type RedisDistributedLock struct {
-	client    *redis.Client
-	keyPrefix string
+	client     *redis.Client
+	keyPrefix  string
 	instanceID string
 }
 

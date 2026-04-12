@@ -13,17 +13,17 @@ type VaultType string
 
 const (
 	// VaultTypeLocal is a constant for vault type local.
-	VaultTypeLocal     VaultType = "local"
+	VaultTypeLocal VaultType = "local"
 	// VaultTypeHashicorp is a constant for vault type hashicorp.
 	VaultTypeHashicorp VaultType = "hashicorp"
 	// VaultTypeAWS is a constant for vault type aws.
-	VaultTypeAWS       VaultType = "aws"
+	VaultTypeAWS VaultType = "aws"
 	// VaultTypeGCP is a constant for vault type gcp.
-	VaultTypeGCP       VaultType = "gcp"
+	VaultTypeGCP VaultType = "gcp"
 	// VaultTypeWebhook is a constant for vault type webhook.
-	VaultTypeWebhook   VaultType = "webhook"
+	VaultTypeWebhook VaultType = "webhook"
 	// VaultTypeFile is a constant for vault type file (local JSON/YAML file).
-	VaultTypeFile      VaultType = "file"
+	VaultTypeFile VaultType = "file"
 )
 
 // VaultProvider is the interface for vault backends that retrieve secrets by path.

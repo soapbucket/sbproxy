@@ -265,7 +265,7 @@ func TestE2E_MockLLMServer_RecordsRequests(t *testing.T) {
 		writeJSON(w, map[string]any{
 			"id": "chatcmpl-rec", "object": "chat.completion", "model": "gpt-4o-mini",
 			"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": "ok"}, "finish_reason": "stop"}},
-			"usage": map[string]any{"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+			"usage":   map[string]any{"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
 		})
 	}))
 	defer recordingServer.Close()
@@ -291,7 +291,7 @@ func TestE2E_MockLLMServer_CustomResponses(t *testing.T) {
 		writeJSON(w, map[string]any{
 			"id": "custom-resp", "object": "chat.completion", "model": "gpt-4o-mini",
 			"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": "Custom response!"}, "finish_reason": "stop"}},
-			"usage": map[string]any{"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+			"usage":   map[string]any{"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
 		})
 	}))
 	defer customServer.Close()

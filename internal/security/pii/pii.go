@@ -32,7 +32,7 @@ const (
 type CandidateFlags uint32
 
 const (
-	HasDigit      CandidateFlags = 1 << iota
+	HasDigit CandidateFlags = 1 << iota
 	HasDash
 	HasAt
 	HasDot
@@ -86,23 +86,23 @@ type noopDetector struct {
 	detectorType DetectorType
 }
 
-func (d *noopDetector) Type() DetectorType                                  { return d.detectorType }
-func (d *noopDetector) Detect(_ []byte, _ string) []Finding                 { return nil }
-func (d *noopDetector) DetectTo(_ []byte, _ string, _ *[]Finding)           {}
-func (d *noopDetector) Redact(_ string) string                              { return "[REDACTED]" }
-func (d *noopDetector) MatchesFlags(_ CandidateFlags) bool                  { return false }
+func (d *noopDetector) Type() DetectorType                        { return d.detectorType }
+func (d *noopDetector) Detect(_ []byte, _ string) []Finding       { return nil }
+func (d *noopDetector) DetectTo(_ []byte, _ string, _ *[]Finding) {}
+func (d *noopDetector) Redact(_ string) string                    { return "[REDACTED]" }
+func (d *noopDetector) MatchesFlags(_ CandidateFlags) bool        { return false }
 
 // Factory functions - all return no-op detectors.
 
-func NewSSNDetector() Detector              { return &noopDetector{detectorType: DetectorSSN} }
-func NewCreditCardDetector() Detector       { return &noopDetector{detectorType: DetectorCreditCard} }
-func NewEmailDetector() Detector            { return &noopDetector{detectorType: DetectorEmail} }
-func NewPhoneDetector() Detector            { return &noopDetector{detectorType: DetectorPhone} }
-func NewIPAddressDetector() Detector        { return &noopDetector{detectorType: DetectorIPAddress} }
-func NewAPIKeyDetector() Detector           { return &noopDetector{detectorType: DetectorAPIKey} }
-func NewJWTDetector() Detector              { return &noopDetector{detectorType: DetectorJWT} }
-func NewAWSKeyDetector() Detector           { return &noopDetector{detectorType: DetectorAWSKey} }
-func NewPrivateKeyDetector() Detector       { return &noopDetector{detectorType: DetectorPrivateKey} }
+func NewSSNDetector() Detector        { return &noopDetector{detectorType: DetectorSSN} }
+func NewCreditCardDetector() Detector { return &noopDetector{detectorType: DetectorCreditCard} }
+func NewEmailDetector() Detector      { return &noopDetector{detectorType: DetectorEmail} }
+func NewPhoneDetector() Detector      { return &noopDetector{detectorType: DetectorPhone} }
+func NewIPAddressDetector() Detector  { return &noopDetector{detectorType: DetectorIPAddress} }
+func NewAPIKeyDetector() Detector     { return &noopDetector{detectorType: DetectorAPIKey} }
+func NewJWTDetector() Detector        { return &noopDetector{detectorType: DetectorJWT} }
+func NewAWSKeyDetector() Detector     { return &noopDetector{detectorType: DetectorAWSKey} }
+func NewPrivateKeyDetector() Detector { return &noopDetector{detectorType: DetectorPrivateKey} }
 func NewDBConnectionStringDetector() Detector {
 	return &noopDetector{detectorType: DetectorDBConnectionString}
 }
@@ -248,8 +248,8 @@ func NewLuaDetector(name, _ string, _ interface{}) (*LuaDetector, error) {
 	return &LuaDetector{name: name}, nil
 }
 
-func (d *LuaDetector) Type() DetectorType                         { return DetectorCustom }
-func (d *LuaDetector) Detect(_ []byte, _ string) []Finding        { return nil }
-func (d *LuaDetector) DetectTo(_ []byte, _ string, _ *[]Finding)  {}
-func (d *LuaDetector) Redact(_ string) string                     { return "[REDACTED-" + d.name + "]" }
-func (d *LuaDetector) MatchesFlags(_ CandidateFlags) bool         { return false }
+func (d *LuaDetector) Type() DetectorType                        { return DetectorCustom }
+func (d *LuaDetector) Detect(_ []byte, _ string) []Finding       { return nil }
+func (d *LuaDetector) DetectTo(_ []byte, _ string, _ *[]Finding) {}
+func (d *LuaDetector) Redact(_ string) string                    { return "[REDACTED-" + d.name + "]" }
+func (d *LuaDetector) MatchesFlags(_ CandidateFlags) bool        { return false }

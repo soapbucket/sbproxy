@@ -33,26 +33,26 @@ func init() {
 
 // Algorithm constants match internal/config/constants.go.
 const (
-	AlgorithmWeightedRandom    = "weighted_random"
-	AlgorithmRoundRobin        = "round_robin"
+	AlgorithmWeightedRandom     = "weighted_random"
+	AlgorithmRoundRobin         = "round_robin"
 	AlgorithmWeightedRoundRobin = "weighted_round_robin"
-	AlgorithmLeastConnections  = "least_connections"
-	AlgorithmIPHash            = "ip_hash"
-	AlgorithmURIHash           = "uri_hash"
-	AlgorithmHeaderHash        = "header_hash"
-	AlgorithmCookieHash        = "cookie_hash"
-	AlgorithmRandom            = "random"
-	AlgorithmFirst             = "first"
-	AlgorithmConsistentHash    = "consistent_hash"
-	AlgorithmPriorityFailover  = "priority_failover"
+	AlgorithmLeastConnections   = "least_connections"
+	AlgorithmIPHash             = "ip_hash"
+	AlgorithmURIHash            = "uri_hash"
+	AlgorithmHeaderHash         = "header_hash"
+	AlgorithmCookieHash         = "cookie_hash"
+	AlgorithmRandom             = "random"
+	AlgorithmFirst              = "first"
+	AlgorithmConsistentHash     = "consistent_hash"
+	AlgorithmPriorityFailover   = "priority_failover"
 )
 
 // Sentinel errors.
 var (
-	ErrNoTargets            = errors.New("loadbalancer: no targets configured")
-	ErrInvalidTargetURL     = errors.New("loadbalancer: invalid target URL")
-	ErrAllTargetsUnhealthy  = errors.New("loadbalancer: all targets are unhealthy")
-	ErrTargetNotFound       = errors.New("loadbalancer: target index out of range")
+	ErrNoTargets           = errors.New("loadbalancer: no targets configured")
+	ErrInvalidTargetURL    = errors.New("loadbalancer: invalid target URL")
+	ErrAllTargetsUnhealthy = errors.New("loadbalancer: all targets are unhealthy")
+	ErrTargetNotFound      = errors.New("loadbalancer: target index out of range")
 )
 
 // parsedTarget holds runtime state for one backend.

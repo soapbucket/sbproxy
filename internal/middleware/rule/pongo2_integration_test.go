@@ -6,8 +6,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/request/data"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 // TestRequestRule_CELWithRequestVariable tests CEL expressions with request snapshot variable
@@ -25,9 +25,9 @@ func TestRequestRule_CELWithRequestVariable(t *testing.T) {
 				req := httptest.NewRequest("GET", "http://example.com", nil)
 				rd := requestdata.NewRequestData("test-123", 0)
 				rd.Snapshot = &reqctx.RequestSnapshot{
-					Method: "POST",
-					Body:   []byte(`{"action": "create"}`),
-					IsJSON: true,
+					Method:   "POST",
+					Body:     []byte(`{"action": "create"}`),
+					IsJSON:   true,
 					BodyJSON: map[string]any{"action": "create"},
 				}
 				ctx := reqctx.SetRequestData(req.Context(), rd)
@@ -42,9 +42,9 @@ func TestRequestRule_CELWithRequestVariable(t *testing.T) {
 				req := httptest.NewRequest("GET", "http://example.com", nil)
 				rd := requestdata.NewRequestData("test-123", 0)
 				rd.Snapshot = &reqctx.RequestSnapshot{
-					Method: "POST",
-					Body:   []byte(`{"action": "create", "user": "john"}`),
-					IsJSON: true,
+					Method:   "POST",
+					Body:     []byte(`{"action": "create", "user": "john"}`),
+					IsJSON:   true,
 					BodyJSON: map[string]any{"action": "create", "user": "john"},
 				}
 				ctx := reqctx.SetRequestData(req.Context(), rd)
@@ -59,9 +59,9 @@ func TestRequestRule_CELWithRequestVariable(t *testing.T) {
 				req := httptest.NewRequest("POST", "http://example.com", nil)
 				rd := requestdata.NewRequestData("test-123", 0)
 				rd.Snapshot = &reqctx.RequestSnapshot{
-					Method: "POST",
-					Body:   []byte(`{"data": "test"}`),
-					IsJSON: true,
+					Method:   "POST",
+					Body:     []byte(`{"data": "test"}`),
+					IsJSON:   true,
 					BodyJSON: map[string]any{"data": "test"},
 				}
 				ctx := reqctx.SetRequestData(req.Context(), rd)
@@ -76,9 +76,9 @@ func TestRequestRule_CELWithRequestVariable(t *testing.T) {
 				req := httptest.NewRequest("POST", "http://example.com", nil)
 				rd := requestdata.NewRequestData("test-123", 0)
 				rd.Snapshot = &reqctx.RequestSnapshot{
-					Method: "POST",
-					Body:   []byte(`{"user": "john", "id": 42}`),
-					IsJSON: true,
+					Method:   "POST",
+					Body:     []byte(`{"user": "john", "id": 42}`),
+					IsJSON:   true,
 					BodyJSON: map[string]any{"user": "john", "id": float64(42)},
 				}
 				ctx := reqctx.SetRequestData(req.Context(), rd)
@@ -126,9 +126,9 @@ func TestRequestRule_LuaWithRequestVariable(t *testing.T) {
 				req := httptest.NewRequest("GET", "http://example.com", nil)
 				rd := requestdata.NewRequestData("test-123", 0)
 				rd.Snapshot = &reqctx.RequestSnapshot{
-					Method: "POST",
-					Body:   []byte(`{"action": "create"}`),
-					IsJSON: true,
+					Method:   "POST",
+					Body:     []byte(`{"action": "create"}`),
+					IsJSON:   true,
 					BodyJSON: map[string]any{"action": "create"},
 				}
 				ctx := reqctx.SetRequestData(req.Context(), rd)
@@ -143,9 +143,9 @@ func TestRequestRule_LuaWithRequestVariable(t *testing.T) {
 				req := httptest.NewRequest("POST", "http://example.com", nil)
 				rd := requestdata.NewRequestData("test-123", 0)
 				rd.Snapshot = &reqctx.RequestSnapshot{
-					Method: "POST",
-					Body:   []byte(`{"action": "create"}`),
-					IsJSON: true,
+					Method:   "POST",
+					Body:     []byte(`{"action": "create"}`),
+					IsJSON:   true,
 					BodyJSON: map[string]any{"action": "create"},
 				}
 				ctx := reqctx.SetRequestData(req.Context(), rd)
@@ -160,9 +160,9 @@ func TestRequestRule_LuaWithRequestVariable(t *testing.T) {
 				req := httptest.NewRequest("POST", "http://example.com", nil)
 				rd := requestdata.NewRequestData("test-123", 0)
 				rd.Snapshot = &reqctx.RequestSnapshot{
-					Method: "POST",
-					Body:   []byte(`{}`),
-					IsJSON: true,
+					Method:   "POST",
+					Body:     []byte(`{}`),
+					IsJSON:   true,
 					BodyJSON: map[string]any{},
 				}
 				ctx := reqctx.SetRequestData(req.Context(), rd)

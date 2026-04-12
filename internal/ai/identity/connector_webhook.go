@@ -40,7 +40,7 @@ func NewWebhookConnector(url string, timeout time.Duration, retryCount int) *Web
 		httpClient: &http.Client{
 			Timeout: timeout,
 		},
-		timeout:   timeout,
+		timeout:    timeout,
 		retryCount: retryCount,
 		threshold:  5,
 		cooldown:   30 * time.Second,

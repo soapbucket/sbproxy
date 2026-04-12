@@ -2,11 +2,11 @@
 package transport
 
 import (
-	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
-	"github.com/soapbucket/sbproxy/internal/security/crypto"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
+	"github.com/soapbucket/sbproxy/internal/security/crypto"
 	"net/http"
 	"net/url"
 	"strings"
@@ -22,30 +22,30 @@ import (
 
 var (
 	// ErrInvalidURL is a sentinel error for invalid url conditions.
-	ErrInvalidURL         = errors.New("transport: invalid URL")
+	ErrInvalidURL = errors.New("transport: invalid URL")
 	// ErrUnknownStorageType is a sentinel error for unknown storage type conditions.
 	ErrUnknownStorageType = errors.New("transport: unknown storage type")
 )
 
 const (
 	// StorageSettingBucket is a constant for storage setting bucket.
-	StorageSettingBucket    = "bucket"
+	StorageSettingBucket = "bucket"
 	// StorageSettingSecret is a constant for storage setting secret.
-	StorageSettingSecret    = "secret"
+	StorageSettingSecret = "secret"
 	// StorageSettingKey is a constant for storage setting key.
-	StorageSettingKey       = "key"
+	StorageSettingKey = "key"
 	// StorageSettingAccount is a constant for storage setting account.
-	StorageSettingAccount   = "account"
+	StorageSettingAccount = "account"
 	// StorageSettingUsername is a constant for storage setting username.
-	StorageSettingUsername  = "username"
+	StorageSettingUsername = "username"
 	// StorageSettingProjectID is a constant for storage setting project id.
 	StorageSettingProjectID = "projectId"
 	// StorageSettingRegion is a constant for storage setting region.
-	StorageSettingRegion    = "region"
+	StorageSettingRegion = "region"
 	// StorageSettingScopes is a constant for storage setting scopes.
-	StorageSettingScopes    = "scopes"
+	StorageSettingScopes = "scopes"
 	// StorageSettingTenant is a constant for storage setting tenant.
-	StorageSettingTenant    = "tenant"
+	StorageSettingTenant = "tenant"
 	// StorageSettingTenantURL is a constant for storage setting tenant url.
 	StorageSettingTenantURL = "tenantAuthURL"
 

@@ -42,19 +42,19 @@ type restProduceRequest struct {
 // restProduceResponse is the response from a Kafka REST Proxy produce call.
 type restProduceResponse struct {
 	Offsets []struct {
-		Partition int   `json:"partition"`
-		Offset    int64 `json:"offset"`
-		ErrorCode *int  `json:"error_code,omitempty"`
+		Partition int    `json:"partition"`
+		Offset    int64  `json:"offset"`
+		ErrorCode *int   `json:"error_code,omitempty"`
 		Error     string `json:"error,omitempty"`
 	} `json:"offsets"`
 }
 
 // restConsumerCreateRequest is the body for creating a consumer instance.
 type restConsumerCreateRequest struct {
-	Name                     string `json:"name,omitempty"`
-	Format                   string `json:"format"`
-	AutoOffsetReset          string `json:"auto.offset.reset"`
-	AutoCommitEnable         string `json:"auto.commit.enable"`
+	Name             string `json:"name,omitempty"`
+	Format           string `json:"format"`
+	AutoOffsetReset  string `json:"auto.offset.reset"`
+	AutoCommitEnable string `json:"auto.commit.enable"`
 }
 
 // restConsumerCreateResponse is the response when creating a consumer instance.

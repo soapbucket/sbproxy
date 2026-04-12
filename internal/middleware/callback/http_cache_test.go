@@ -284,8 +284,8 @@ func TestHTTPCacheParser(t *testing.T) {
 	t.Run("get state - fresh", func(t *testing.T) {
 		now := time.Now()
 		metadata := &CacheMetadata{
-			ExpiresAt: now.Add(60 * time.Second),
-			StaleAt:   now.Add(180 * time.Second),
+			ExpiresAt:  now.Add(60 * time.Second),
+			StaleAt:    now.Add(180 * time.Second),
 			MaxStaleAt: now.Add(360 * time.Second),
 		}
 
@@ -298,8 +298,8 @@ func TestHTTPCacheParser(t *testing.T) {
 	t.Run("get state - stale", func(t *testing.T) {
 		now := time.Now()
 		metadata := &CacheMetadata{
-			ExpiresAt: now.Add(-30 * time.Second), // Expired 30s ago
-			StaleAt:   now.Add(90 * time.Second),  // Still usable for 90s
+			ExpiresAt:  now.Add(-30 * time.Second), // Expired 30s ago
+			StaleAt:    now.Add(90 * time.Second),  // Still usable for 90s
 			MaxStaleAt: now.Add(270 * time.Second),
 		}
 
@@ -312,9 +312,9 @@ func TestHTTPCacheParser(t *testing.T) {
 	t.Run("get state - stale-error", func(t *testing.T) {
 		now := time.Now()
 		metadata := &CacheMetadata{
-			ExpiresAt: now.Add(-120 * time.Second), // Expired 120s ago
-			StaleAt:   now.Add(-30 * time.Second), // Stale expired 30s ago
-			MaxStaleAt: now.Add(150 * time.Second), // Still usable for errors
+			ExpiresAt:  now.Add(-120 * time.Second), // Expired 120s ago
+			StaleAt:    now.Add(-30 * time.Second),  // Stale expired 30s ago
+			MaxStaleAt: now.Add(150 * time.Second),  // Still usable for errors
 		}
 
 		state := metadata.GetState(now)
@@ -326,8 +326,8 @@ func TestHTTPCacheParser(t *testing.T) {
 	t.Run("get state - expired", func(t *testing.T) {
 		now := time.Now()
 		metadata := &CacheMetadata{
-			ExpiresAt: now.Add(-300 * time.Second),
-			StaleAt:   now.Add(-240 * time.Second),
+			ExpiresAt:  now.Add(-300 * time.Second),
+			StaleAt:    now.Add(-240 * time.Second),
 			MaxStaleAt: now.Add(-60 * time.Second),
 		}
 
@@ -371,4 +371,3 @@ func TestNewHTTPCacheParser(t *testing.T) {
 		}
 	})
 }
-

@@ -138,8 +138,8 @@ func TestWebhookHook_CloseFlushesRemaining(t *testing.T) {
 
 	h, err := NewWebhookHook(WebhookConfig{
 		URL:             srv.URL,
-		BatchSize:       100,           // won't trigger batch flush
-		FlushIntervalMS: 60000,         // 60s, won't trigger timer flush during test
+		BatchSize:       100,   // won't trigger batch flush
+		FlushIntervalMS: 60000, // 60s, won't trigger timer flush during test
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

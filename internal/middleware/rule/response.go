@@ -64,7 +64,7 @@ type GraphQLResponseConditions struct {
 
 	// Data field matching
 	DataFields      []string `json:"data_fields,omitempty"`       // Match if response data contains any of these field names
-	DataFieldsAll   []string `json:"data_fields_all,omitempty"`    // Match if response data contains all of these field names
+	DataFieldsAll   []string `json:"data_fields_all,omitempty"`   // Match if response data contains all of these field names
 	DataFieldsRegex string   `json:"data_fields_regex,omitempty"` // Regex pattern to match data field names
 
 	// Response string matching
@@ -75,13 +75,13 @@ type GraphQLResponseConditions struct {
 type JSONResponseConditions struct {
 	// Field path matching (JSONPath-like notation)
 	Fields      []string `json:"fields,omitempty"`       // Match if JSON contains any of these field paths (e.g., "user.id", "data.items")
-	FieldsAll   []string `json:"fields_all,omitempty"`    // Match if JSON contains all of these field paths
+	FieldsAll   []string `json:"fields_all,omitempty"`   // Match if JSON contains all of these field paths
 	FieldsRegex string   `json:"fields_regex,omitempty"` // Regex pattern to match field paths
 
 	// Value matching
 	FieldValue      map[string]string   `json:"field_value,omitempty"`       // Match exact field values (e.g., {"user.role": "admin"})
 	FieldValueIn    map[string][]string `json:"field_value_in,omitempty"`    // Match if field value is in list
-	FieldValueRegex map[string]string    `json:"field_value_regex,omitempty"` // Match field values with regex
+	FieldValueRegex map[string]string   `json:"field_value_regex,omitempty"` // Match field values with regex
 
 	// Response string matching
 	ResponseContains string `json:"response_contains,omitempty"` // Response body must contain this substring
@@ -323,7 +323,7 @@ func (g *GraphQLResponseConditions) match(resp *http.Response) bool {
 	contentType := resp.Header.Get("Content-Type")
 	isGraphQL := strings.Contains(strings.ToLower(contentType), "application/json") ||
 		strings.Contains(strings.ToLower(contentType), "application/graphql")
-	
+
 	if !isGraphQL {
 		return false
 	}
@@ -495,7 +495,7 @@ func (j *JSONResponseConditions) match(resp *http.Response) bool {
 	contentType := resp.Header.Get("Content-Type")
 	isJSON := strings.Contains(strings.ToLower(contentType), "application/json") ||
 		strings.Contains(strings.ToLower(contentType), "application/graphql")
-	
+
 	if !isJSON {
 		return false
 	}
@@ -693,9 +693,9 @@ func matchRegexResponse(pattern, str string) (bool, error) {
 
 // GraphQLResponseError represents a GraphQL error
 type GraphQLResponseError struct {
-	Message    string                   `json:"message"`
-	Path       []interface{}            `json:"path,omitempty"`
-	Extensions map[string]interface{}   `json:"extensions,omitempty"`
+	Message    string                 `json:"message"`
+	Path       []interface{}          `json:"path,omitempty"`
+	Extensions map[string]interface{} `json:"extensions,omitempty"`
 }
 
 // extractDataFields extracts field names from GraphQL response data

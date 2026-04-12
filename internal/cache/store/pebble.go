@@ -288,7 +288,7 @@ func (p *PebbleCacher) ListKeys(ctx context.Context, cType string, pattern strin
 
 			keyBytes := iter.Key()
 			keyStr := string(keyBytes)
-			
+
 			// Extract just the key part (remove cType prefix)
 			// Key format is "cType/key"
 			if strings.HasPrefix(keyStr, cType+"/") {
@@ -315,7 +315,6 @@ func (p *PebbleCacher) ListKeys(ctx context.Context, cType string, pattern strin
 		return keys, err
 	}
 }
-
 
 // Increment performs the increment operation on the PebbleCacher.
 func (p *PebbleCacher) Increment(ctx context.Context, cType string, key string, count int64) (int64, error) {
@@ -358,13 +357,13 @@ func (p *PebbleCacher) increment(ctx context.Context, cType string, key string, 
 // Close releases resources held by the PebbleCacher.
 func (p *PebbleCacher) Close() error {
 	slog.Debug("closing pebble connection")
-	
+
 	// Close the database
 	if err := p.db.Close(); err != nil {
 		slog.Error("failed to close database", "error", err)
 		return err
 	}
-	
+
 	slog.Debug("pebble connection closed")
 	return nil
 }
@@ -400,18 +399,18 @@ func NewPebbleCacher(settings Settings) (Cacher, error) {
 	opt := &pebble.Options{
 		// Use slog for logging
 		Logger: &pebbleLogger{},
-		
+
 		// Cache settings (similar to Badger's block and index cache)
 		Cache: pebble.NewCache(defaultBlockCacheSize),
-		
+
 		// Memory table settings
 		MemTableSize:                64 << 20, // 64MB memtable
 		MemTableStopWritesThreshold: 4,        // Stop writes when 4 memtables
-		
+
 		// Compaction settings
 		L0CompactionThreshold: 4, // Similar to NumLevelZeroTables
 		L0StopWritesThreshold: 8, // Similar to NumLevelZeroTablesStall
-		
+
 		// Disable automatic compactions on close for faster shutdown
 		DisableAutomaticCompactions: false,
 	}
@@ -496,4 +495,3 @@ func keyUpperBound(b []byte) []byte {
 	}
 	return nil // no upper bound
 }
-

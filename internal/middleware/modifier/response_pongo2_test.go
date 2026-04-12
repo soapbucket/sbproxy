@@ -7,17 +7,17 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/request/data"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 // TestResponseModifier_Pongo2Templates tests Mustache template resolution in response modifiers
 func TestResponseModifier_Pongo2Templates(t *testing.T) {
 	tests := []struct {
-		name          string
-		statusText    string
-		setupRequest  func(*http.Request) *http.Request
-		expectedText  string
+		name         string
+		statusText   string
+		setupRequest func(*http.Request) *http.Request
+		expectedText string
 	}{
 		{
 			name:       "Simple variable in status text",
@@ -101,7 +101,7 @@ func TestResponseModifier_Pongo2Templates(t *testing.T) {
 // TestResponseModifier_BodyReplacePongo2 tests body replacement with Mustache templates
 func TestResponseModifier_BodyReplacePongo2(t *testing.T) {
 	req := httptest.NewRequest("GET", "http://example.com", nil)
-	
+
 	rd := requestdata.NewRequestData("req-123", 0)
 	rd.Data = map[string]any{
 		"on_request_1": map[string]any{
@@ -145,4 +145,3 @@ func TestResponseModifier_BodyReplacePongo2(t *testing.T) {
 		t.Errorf("Expected body '%s', got '%s'", expectedBody, bodyStr)
 	}
 }
-

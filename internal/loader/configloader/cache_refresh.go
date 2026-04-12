@@ -13,8 +13,8 @@ import (
 	"github.com/soapbucket/sbproxy/internal/config"
 	"github.com/soapbucket/sbproxy/internal/loader/manager"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/platform/messenger"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 const (
@@ -26,8 +26,8 @@ const (
 
 // OriginCacheRefreshMessage represents a single origin cache refresh update
 type OriginCacheRefreshMessage struct {
-	WorkspaceID      string `json:"workspace_id,omitempty"`       // Optional workspace ID for multi-tenant support
-	ConfigID      string `json:"config_id"`                 // Configuration ID
+	WorkspaceID    string `json:"workspace_id,omitempty"`    // Optional workspace ID for multi-tenant support
+	ConfigID       string `json:"config_id"`                 // Configuration ID
 	ConfigHostname string `json:"config_hostname,omitempty"` // Configuration hostname
 }
 
@@ -47,8 +47,8 @@ type OriginCacheRefreshBatch struct {
 }
 
 var (
-	refreshSubscribers    = make(map[string]*originCacheRefreshSubscriber)
-	refreshSubscriberMu   sync.Mutex
+	refreshSubscribers  = make(map[string]*originCacheRefreshSubscriber)
+	refreshSubscriberMu sync.Mutex
 )
 
 type originCacheRefreshSubscriber struct {
@@ -145,13 +145,13 @@ func (s *originCacheRefreshSubscriber) handleMessage(ctx context.Context, msg *m
 			if id, ok := msg.Params["config_id"]; ok && id != "" {
 				configID = id
 			}
-			
+
 			if configID != "" {
 				configHostname := ""
 				if hostname, ok := msg.Params["config_hostname"]; ok && hostname != "" {
 					configHostname = hostname
 				}
-				
+
 				updates = []OriginCacheRefreshMessage{
 					{
 						ConfigID:       configID,
@@ -280,9 +280,9 @@ func PurgeOriginCache(ctx context.Context, configID, hostname string) error {
 
 // cacheSnapshotWithIndexes returns a snapshot with reverse indexes for O(1) lookups
 type cacheSnapshotIndexes struct {
-	configs              map[string]*config.Config     // hostname -> config
-	configIDToHostname   map[string]string              // configID -> hostname
-	hostnameToChildren   map[string][]string            // hostname -> child hostnames
+	configs            map[string]*config.Config // hostname -> config
+	configIDToHostname map[string]string         // configID -> hostname
+	hostnameToChildren map[string][]string       // hostname -> child hostnames
 }
 
 // cacheSnapshot creates a snapshot with reverse indexes for efficient lookups

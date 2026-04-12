@@ -9,13 +9,13 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/soapbucket/sbproxy/internal/middleware/rule"
 	"github.com/soapbucket/sbproxy/internal/extension/lua"
+	"github.com/soapbucket/sbproxy/internal/middleware/rule"
 	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/template"
 )
@@ -39,7 +39,7 @@ type RequestModifier struct {
 
 	LuaScript string `json:"lua_script,omitempty"`
 
-	luamodifier     lua.Modifier       `json:"-"`
+	luamodifier     lua.Modifier        `json:"-"`
 	jsonTransformer lua.JSONTransformer `json:"-"`
 }
 
@@ -357,7 +357,7 @@ func resolveTemplateVariables(value string, req *http.Request) string {
 			"error", err)
 		return value
 	}
-	
+
 	return resolved
 }
 

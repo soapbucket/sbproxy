@@ -26,5 +26,5 @@ func New(_ json.RawMessage) (plugin.TransformHandler, error) {
 
 type noopTransform struct{}
 
-func (n *noopTransform) Type() string                    { return "noop" }
-func (n *noopTransform) Apply(_ *http.Response) error    { return nil }
+func (n *noopTransform) Type() string                 { return "noop" }
+func (n *noopTransform) Apply(_ *http.Response) error { return nil }

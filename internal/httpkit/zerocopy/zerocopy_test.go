@@ -415,4 +415,3 @@ func (m *mockResponseWriter) Write(b []byte) (int, error) {
 func (m *mockResponseWriter) WriteHeader(statusCode int) {
 	m.status = statusCode
 }
-

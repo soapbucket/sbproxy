@@ -17,36 +17,36 @@ import (
 var banner string
 
 const (
-	configDirFlag        = "config-dir"
-	configDirKey         = "config_dir"
-	configFileFlag       = "config-file"
-	configFileKey        = "config_file"
-	logLevelFlag         = "log-level"
-	logLevelKey          = "log_level"
-	requestLogLevelFlag  = "request-log-level"
-	requestLogLevelKey   = "request_log_level"
-	graceTimeFlag        = "grace-time"
-	graceTimeKey         = "grace_time"
-	disableHostFilterFlag = "disable-host-filter"
-	disableHostFilterKey  = "disable_host_filter"
-	disableSbFlagsFlag   = "disable-sb-flags"
-	disableSbFlagsKey    = "disable_sb_flags"
-	defaultConfigDir     = "."
-	defaultConfigFile    = ""
-	defaultLogLevel      = "info"
+	configDirFlag          = "config-dir"
+	configDirKey           = "config_dir"
+	configFileFlag         = "config-file"
+	configFileKey          = "config_file"
+	logLevelFlag           = "log-level"
+	logLevelKey            = "log_level"
+	requestLogLevelFlag    = "request-log-level"
+	requestLogLevelKey     = "request_log_level"
+	graceTimeFlag          = "grace-time"
+	graceTimeKey           = "grace_time"
+	disableHostFilterFlag  = "disable-host-filter"
+	disableHostFilterKey   = "disable_host_filter"
+	disableSbFlagsFlag     = "disable-sb-flags"
+	disableSbFlagsKey      = "disable_sb_flags"
+	defaultConfigDir       = "."
+	defaultConfigFile      = ""
+	defaultLogLevel        = "info"
 	defaultRequestLogLevel = ""
-	defaultGraceTime     = 0
+	defaultGraceTime       = 0
 )
 
 // Config holds all command-line configuration
 type Config struct {
-	ConfigDir          string
-	ConfigFile         string
-	LogLevel           string
-	RequestLogLevel    string
-	GraceTime          int
-	DisableHostFilter  bool
-	DisableSbFlags     bool
+	ConfigDir         string
+	ConfigFile        string
+	LogLevel          string
+	RequestLogLevel   string
+	GraceTime         int
+	DisableHostFilter bool
+	DisableSbFlags    bool
 }
 
 // NewRootCmd creates the root command

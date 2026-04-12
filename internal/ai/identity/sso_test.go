@@ -10,14 +10,14 @@ func TestSSOGroupSyncer(t *testing.T) {
 	ctx := context.Background()
 
 	tests := []struct {
-		name            string
-		config          *SSOConfig
-		idpGroups       []string
-		wantAdded       []string
-		wantRemoved     []string
-		wantPreserved   []string
+		name              string
+		config            *SSOConfig
+		idpGroups         []string
+		wantAdded         []string
+		wantRemoved       []string
+		wantPreserved     []string
 		wantAutoProvision bool
-		wantErr         bool
+		wantErr           bool
 	}{
 		{
 			name: "maps IdP groups to permission groups",

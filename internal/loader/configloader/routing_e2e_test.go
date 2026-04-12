@@ -111,10 +111,10 @@ func TestConcurrencyLimit_E2E(t *testing.T) {
 		},
 		"policies": []map[string]any{
 			{
-				"type":                "request_limiting",
-				"max_concurrent":      10,
-				"queue_size":          5,
-				"queue_timeout":       "5s",
+				"type":           "request_limiting",
+				"max_concurrent": 10,
+				"queue_size":     5,
+				"queue_timeout":  "5s",
 			},
 		},
 	})
@@ -165,8 +165,8 @@ func TestDropUnsupportedParams_E2E(t *testing.T) {
 	cfg := aiProxyOriginJSON(t, "drop-params.test", mock.URL, map[string]any{
 		"action": map[string]any{
 			"type":                    "ai_proxy",
-			"providers":              []map[string]any{{"name": "openai", "api_key": "test", "base_url": mock.URL + "/v1", "models": []string{"gpt-4o-mini"}}},
-			"default_model":          "gpt-4o-mini",
+			"providers":               []map[string]any{{"name": "openai", "api_key": "test", "base_url": mock.URL + "/v1", "models": []string{"gpt-4o-mini"}}},
+			"default_model":           "gpt-4o-mini",
 			"drop_unsupported_params": true,
 		},
 	})

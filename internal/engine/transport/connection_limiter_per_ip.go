@@ -377,4 +377,3 @@ func (l *PerIPConnectionLimiter) GetTotalTrackedIPs() int {
 	defer l.mutex.RUnlock()
 	return len(l.connectionMap)
 }
-

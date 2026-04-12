@@ -39,13 +39,13 @@ type Buffer interface {
 
 // Stats contains buffer statistics
 type Stats struct {
-	Size         int   // Current number of entries
-	Bytes        int64 // Current size in bytes
-	Capacity     int   // Max capacity
-	MaxBytes     int64 // Max bytes
-	Dropped      int64 // Total dropped due to overflow
-	Flushed      int64 // Total successfully flushed
-	FlushErrors  int64 // Total flush errors
+	Size          int   // Current number of entries
+	Bytes         int64 // Current size in bytes
+	Capacity      int   // Max capacity
+	MaxBytes      int64 // Max bytes
+	Dropped       int64 // Total dropped due to overflow
+	Flushed       int64 // Total successfully flushed
+	FlushErrors   int64 // Total flush errors
 	SpilledToDisk int64 // Times spilled to disk
 }
 

@@ -29,7 +29,7 @@ func BenchmarkCELRouterEvaluate_SingleRule(b *testing.B) {
 		MessageCount:  10,
 		TokenEstimate: 1500,
 		HasTools:      true,
-		IsStreaming:    false,
+		IsStreaming:   false,
 		Budget: map[string]any{
 			"utilization":      0.5,
 			"remaining_tokens": int64(50000),
@@ -75,7 +75,7 @@ func BenchmarkCELRouterEvaluate_TenRules(b *testing.B) {
 		MessageCount:  10,
 		TokenEstimate: 1500,
 		HasTools:      false,
-		IsStreaming:    false,
+		IsStreaming:   false,
 		Budget: map[string]any{
 			"utilization":      0.5,
 			"remaining_tokens": int64(50000),

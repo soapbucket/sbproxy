@@ -2,8 +2,8 @@
 package callback
 
 import (
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/platform/messenger"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 // HTTPCacheConfig configures HTTP-aware caching for callbacks
@@ -29,31 +29,28 @@ type HTTPCacheConfig struct {
 
 // StaleWhileRevalidateConfig configures stale-while-revalidate behavior
 type StaleWhileRevalidateConfig struct {
-	Enabled  bool          `json:"enabled,omitempty"`
+	Enabled  bool            `json:"enabled,omitempty"`
 	Duration reqctx.Duration `json:"duration,omitempty"` // Default duration if not in headers
 }
 
 // StaleIfErrorConfig configures stale-if-error behavior
 type StaleIfErrorConfig struct {
-	Enabled  bool          `json:"enabled,omitempty"`
+	Enabled  bool            `json:"enabled,omitempty"`
 	Duration reqctx.Duration `json:"duration,omitempty"` // Default duration if not in headers
 }
 
 // BackgroundRefreshConfig configures background refresh queue
 type BackgroundRefreshConfig struct {
-	Enabled     bool `json:"enabled,omitempty"`
-	Workers     int  `json:"workers,omitempty"`
-	MaxQueueSize int `json:"max_queue_size,omitempty"`
+	Enabled      bool `json:"enabled,omitempty"`
+	Workers      int  `json:"workers,omitempty"`
+	MaxQueueSize int  `json:"max_queue_size,omitempty"`
 }
 
 // HTTPCallbackContext provides HTTP cache context to callbacks
 type HTTPCallbackContext struct {
-	HTTPCache *HTTPCallbackCache
-	Parser    *HTTPCacheParser
+	HTTPCache    *HTTPCallbackCache
+	Parser       *HTTPCacheParser
 	RefreshQueue *RefreshQueue
-	Messenger messenger.Messenger
-	Config   *HTTPCacheConfig
+	Messenger    messenger.Messenger
+	Config       *HTTPCacheConfig
 }
-
-
-

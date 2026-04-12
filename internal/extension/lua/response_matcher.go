@@ -115,7 +115,6 @@ func (m *responseMatcher) Match(resp *http.Response) bool {
 	return false
 }
 
-
 // createResponseMatcherTable creates a Lua table with response data for matching
 func (m *responseMatcher) createResponseMatcherTable(L *lua.LState, resp *http.Response) *lua.LTable {
 	respTable := L.NewTable()

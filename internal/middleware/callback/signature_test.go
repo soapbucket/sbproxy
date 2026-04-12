@@ -76,7 +76,7 @@ func TestWebhookSignatureVerification(t *testing.T) {
 			// Fallback: check if it's unwrapped (shouldn't happen)
 			callbackData = result
 		}
-		
+
 		if status, ok := callbackData["status"]; !ok || status != "success" {
 			t.Errorf("expected status=success, got: %v", callbackData)
 		}
@@ -268,7 +268,7 @@ func TestWebhookSignatureVerification(t *testing.T) {
 		// Create server that returns signed response with custom header
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("X-Custom-Header", "custom-value")
-			
+
 			// Create signature including custom header: status_code\nheader\nbody\ntimestamp
 			signatureString := fmt.Sprintf("%d\nx-custom-header:custom-value\n%s\n%d", http.StatusOK, string(responseJSON), timestamp)
 			h := hmac.New(sha256.New, []byte(secret))
@@ -388,5 +388,3 @@ func TestSignatureVerificationConfig(t *testing.T) {
 		}
 	})
 }
-
-

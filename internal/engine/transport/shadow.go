@@ -61,14 +61,14 @@ type ShadowModifier struct {
 
 // ShadowConfig holds the parsed configuration for the shadow transport.
 type ShadowConfig struct {
-	UpstreamURL  string
-	SampleRate   float64
-	IgnoreErrors bool
-	HeadersOnly  bool // If true, shadow only headers (no body) to save bandwidth
-	Timeout      time.Duration
+	UpstreamURL   string
+	SampleRate    float64
+	IgnoreErrors  bool
+	HeadersOnly   bool // If true, shadow only headers (no body) to save bandwidth
+	Timeout       time.Duration
 	MaxConcurrent int
-	MaxBodySize  int64
-	Modifiers    []ShadowModifier
+	MaxBodySize   int64
+	Modifiers     []ShadowModifier
 
 	// Circuit breaker
 	CBFailureThreshold int

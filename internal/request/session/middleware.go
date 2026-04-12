@@ -12,8 +12,8 @@ import (
 	configpkg "github.com/soapbucket/sbproxy/internal/config"
 	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"github.com/soapbucket/sbproxy/internal/loader/manager"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 // SessionMiddleware returns HTTP middleware for session.

@@ -169,8 +169,9 @@ func (ls *LocalStorage) DeleteByPrefix(ctx context.Context, prefix string) error
 
 // Driver performs the driver operation on the LocalStorage.
 func (ls *LocalStorage) Driver() string { return DriverLocal }
+
 // Close releases resources held by the LocalStorage.
-func (ls *LocalStorage) Close() error   { return nil }
+func (ls *LocalStorage) Close() error { return nil }
 
 // ListKeysByWorkspace performs the list keys by workspace operation on the LocalStorage.
 func (ls *LocalStorage) ListKeysByWorkspace(ctx context.Context, workspaceID string) ([]string, error) {

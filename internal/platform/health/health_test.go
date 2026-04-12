@@ -506,4 +506,3 @@ func TestConcurrentAccess(t *testing.T) {
 
 	assert.Len(t, mgr.checkers, 10)
 }
-

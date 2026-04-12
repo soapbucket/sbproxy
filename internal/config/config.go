@@ -11,19 +11,20 @@
 //   - originCtxOnce (sync.Once)
 //
 // Recommendation: decompose into sub-configs when practical:
-//   1. IdentityConfig    - ID, Hostname, WorkspaceID, ClusterID, ClusterType, Version, Revision, Environment, Tags, OriginName
-//   2. SecurityConfig    - Auth, Policies, CORS, HSTS, CSRF, BotDetection, ThreatProtection, WAF, IPFilter, MessageSignatures
-//   3. TransportConfig   - Action, ForwardRules, FallbackOrigin, FailsafeOrigin, MaxConnections, FlushInterval, ProxyHeaders, ProxyProtocol, StreamingProxyConfig, Compression
-//   4. CachingConfig     - ResponseCache, ChunkCache, ErrorPages
-//   5. ObservabilityConfig - TrafficCapture, Events, Debug, ProxyStatus, RateLimitHeaders, ProblemDetails
-//   6. ExtensionsConfig  - Transforms, TransformChains, RequestModifiers, ResponseModifiers, OnLoad, OnRequest, APIVersioning
-//   7. SecretsConfig     - Vaults, SecretsMap, vaultManager, Secrets, Variables
+//  1. IdentityConfig    - ID, Hostname, WorkspaceID, ClusterID, ClusterType, Version, Revision, Environment, Tags, OriginName
+//  2. SecurityConfig    - Auth, Policies, CORS, HSTS, CSRF, BotDetection, ThreatProtection, WAF, IPFilter, MessageSignatures
+//  3. TransportConfig   - Action, ForwardRules, FallbackOrigin, FailsafeOrigin, MaxConnections, FlushInterval, ProxyHeaders, ProxyProtocol, StreamingProxyConfig, Compression
+//  4. CachingConfig     - ResponseCache, ChunkCache, ErrorPages
+//  5. ObservabilityConfig - TrafficCapture, Events, Debug, ProxyStatus, RateLimitHeaders, ProblemDetails
+//  6. ExtensionsConfig  - Transforms, TransformChains, RequestModifiers, ResponseModifiers, OnLoad, OnRequest, APIVersioning
+//  7. SecretsConfig     - Vaults, SecretsMap, vaultManager, Secrets, Variables
 //
 // Function pointer count for import-cycle avoidance: 4
 //   - FallbackLoader         (config -> configloader)
 //   - OriginConfigLoader     (config -> configloader)
 //   - EmbeddedConfigLoader   (config -> configloader)
 //   - ServerContextFn        (config -> server)
+//
 // These are set by configloader at init time to break config <-> configloader import cycles.
 // Consider introducing an interface (e.g., ConfigResolver) in a shared package to reduce coupling.
 package config
@@ -38,12 +39,12 @@ import (
 	"sync/atomic"
 
 	"github.com/soapbucket/sbproxy/internal/cache/store"
-	"github.com/soapbucket/sbproxy/internal/vault"
 	"github.com/soapbucket/sbproxy/internal/middleware/callback"
 	"github.com/soapbucket/sbproxy/internal/middleware/forward"
 	"github.com/soapbucket/sbproxy/internal/middleware/modifier"
 	"github.com/soapbucket/sbproxy/internal/middleware/rule"
 	"github.com/soapbucket/sbproxy/internal/request/reqctx"
+	"github.com/soapbucket/sbproxy/internal/vault"
 )
 
 // noCopy is embedded in structs that must not be copied after first use.
@@ -262,7 +263,6 @@ type Config struct {
 	// nil = disabled
 	BotDetection *BotDetectionConfig `json:"bot_detection,omitempty"`
 
-
 	// FallbackLoader loads a config for fallback origin resolution.
 	// Set by the configloader to avoid import cycles (config ↔ configloader).
 	FallbackLoader func(ctx context.Context, req *http.Request, fallback *FallbackOrigin) (*Config, error) `json:"-"`
@@ -291,7 +291,6 @@ type Config struct {
 	// Built once per config load, shared across requests.
 	originCtx     *reqctx.OriginContext `json:"-"`
 	originCtxOnce sync.Once             `json:"-"`
-
 }
 
 // Closeable is an optional interface that ActionConfig implementations can implement

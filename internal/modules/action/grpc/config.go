@@ -9,11 +9,11 @@ import (
 // Config holds the full configuration for the grpc action.
 type Config struct {
 	// gRPC-specific fields
-	URL           string `json:"url"`
-	StripBasePath bool   `json:"strip_base_path,omitempty"`
-	PreserveQuery bool   `json:"preserve_query,omitempty"`
-	EnableGRPCWeb bool   `json:"enable_grpc_web,omitempty"`
-	ForwardMetadata bool `json:"forward_metadata,omitempty"`
+	URL             string `json:"url"`
+	StripBasePath   bool   `json:"strip_base_path,omitempty"`
+	PreserveQuery   bool   `json:"preserve_query,omitempty"`
+	EnableGRPCWeb   bool   `json:"enable_grpc_web,omitempty"`
+	ForwardMetadata bool   `json:"forward_metadata,omitempty"`
 
 	MaxCallRecvMsgSize int `json:"max_call_recv_msg_size,omitempty"`
 	MaxCallSendMsgSize int `json:"max_call_send_msg_size,omitempty"`

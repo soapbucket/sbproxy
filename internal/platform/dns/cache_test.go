@@ -267,4 +267,3 @@ func TestCache_Disabled(t *testing.T) {
 		t.Error("cache should be nil when disabled")
 	}
 }
-

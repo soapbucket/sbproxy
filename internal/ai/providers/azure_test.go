@@ -151,7 +151,7 @@ func TestAzure_Embeddings(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(ai.EmbeddingResponse{
 			Object: "list",
-			Data: []ai.EmbeddingData{{Object: "embedding", Embedding: []float32{0.1, 0.2}, Index: 0}},
+			Data:   []ai.EmbeddingData{{Object: "embedding", Embedding: []float32{0.1, 0.2}, Index: 0}},
 			Model:  "text-embedding-3-small",
 		})
 	}))

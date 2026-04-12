@@ -11,8 +11,8 @@ import (
 	"sync"
 
 	"github.com/soapbucket/sbproxy/internal/loader/manager"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/platform/messenger"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 const (
@@ -22,12 +22,12 @@ const (
 
 // SignatureCacheExpirationMessage represents a single signature cache expiration update
 type SignatureCacheExpirationMessage struct {
-	WorkspaceID  string `json:"workspace_id,omitempty"` // Optional workspace ID for multi-tenant support
-	OriginID  string `json:"origin_id"`
-	URL       string `json:"url"`        // URL to expire (will match all signature combinations)
-	Method    string `json:"method"`     // HTTP method (defaults to GET)
-	CacheKey  string `json:"cache_key"`  // Exact cache key to expire (optional, overrides URL)
-	Signature string `json:"signature"`  // Optional: specific signature to expire
+	WorkspaceID string `json:"workspace_id,omitempty"` // Optional workspace ID for multi-tenant support
+	OriginID    string `json:"origin_id"`
+	URL         string `json:"url"`       // URL to expire (will match all signature combinations)
+	Method      string `json:"method"`    // HTTP method (defaults to GET)
+	CacheKey    string `json:"cache_key"` // Exact cache key to expire (optional, overrides URL)
+	Signature   string `json:"signature"` // Optional: specific signature to expire
 }
 
 // SignatureCacheExpirationBatch represents a batch of signature cache expiration updates
@@ -327,4 +327,3 @@ func normalizeURLForSignatureCache(rawURL string, config SignatureCacheExpiratio
 
 	return normalized
 }
-

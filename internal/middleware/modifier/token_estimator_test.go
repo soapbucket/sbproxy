@@ -166,7 +166,7 @@ func TestTokenEstimation_Generic(t *testing.T) {
 
 func TestEstimateTextTokens(t *testing.T) {
 	tests := []struct {
-		text     string
+		text      string
 		minTokens int
 	}{
 		{"", 0},

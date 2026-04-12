@@ -14,8 +14,8 @@ import (
 // added by downstream handlers (e.g., X-Sb-Origin) are included.
 type debugResponseWriter struct {
 	http.ResponseWriter
-	requestData  *reqctx.RequestData
-	headersSent  bool
+	requestData *reqctx.RequestData
+	headersSent bool
 }
 
 func (d *debugResponseWriter) injectDebugHeaders() {

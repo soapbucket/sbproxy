@@ -180,4 +180,3 @@ func matchValue(value any, exactValue string, values []string, contains, startsW
 	// No matching criteria specified
 	return false
 }
-

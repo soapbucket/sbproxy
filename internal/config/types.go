@@ -12,13 +12,13 @@ import (
 	"time"
 
 	"github.com/soapbucket/sbproxy/internal/ai"
-	"github.com/soapbucket/sbproxy/internal/security/certpin"
 	"github.com/soapbucket/sbproxy/internal/middleware/callback"
 	"github.com/soapbucket/sbproxy/internal/middleware/csp"
-	"github.com/soapbucket/sbproxy/internal/middleware/httpsig"
 	"github.com/soapbucket/sbproxy/internal/middleware/hsts"
+	"github.com/soapbucket/sbproxy/internal/middleware/httpsig"
 	"github.com/soapbucket/sbproxy/internal/middleware/modifier"
 	"github.com/soapbucket/sbproxy/internal/middleware/rule"
+	"github.com/soapbucket/sbproxy/internal/security/certpin"
 
 	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/transformer"
@@ -44,9 +44,9 @@ type SessionConfig struct {
 
 // CookieJarConfig configures the session-based cookie jar
 type CookieJarConfig struct {
-	MaxCookies      int  `json:"max_cookies,omitempty"`       // Maximum number of cookies to store per session (default: 100, max: 500)
-	MaxCookieSize   int  `json:"max_cookie_size,omitempty"`   // Maximum size of a single cookie value in bytes (default: 4096, max: 16384)
-	StoreSecureOnly bool `json:"store_secure_only,omitempty"` // Only store cookies with Secure flag set (default: false)
+	MaxCookies           int  `json:"max_cookies,omitempty"`             // Maximum number of cookies to store per session (default: 100, max: 500)
+	MaxCookieSize        int  `json:"max_cookie_size,omitempty"`         // Maximum size of a single cookie value in bytes (default: 4096, max: 16384)
+	StoreSecureOnly      bool `json:"store_secure_only,omitempty"`       // Only store cookies with Secure flag set (default: false)
 	DisableStoreHttpOnly bool `json:"disable_store_http_only,omitempty"` // If true, do not store cookies with HttpOnly flag (default: false, so HttpOnly cookies are stored)
 }
 
@@ -89,13 +89,13 @@ type BaseAction struct {
 type BaseConnection struct {
 	BaseAction
 
-	DisableFollowRedirects bool `sb_flag:"disable_follow_redirects" json:"disable_follow_redirects,omitempty"`
-	DisableCompression     bool `sb_flag:"disable_compression" json:"disable_compression,omitempty"`
-	SkipTLSVerifyHost      bool `sb_flag:"skip_tls_verify_host" json:"skip_tls_verify_host,omitempty"`
-	MinTLSVersion          string `json:"min_tls_version,omitempty"`                               // Minimum TLS version for outbound connections ("1.2" or "1.3")
-	HTTP11Only             bool `sb_flag:"http11_only" json:"http11_only,omitempty"`     // Force HTTP/1.1 (disables HTTP/2 and HTTP/3)
-	MaxRedirects           int  `json:"max_redirects,omitempty" validate:"max_value=20"` // Maximum redirects to follow (max: 20)
-	EnableHTTP3            bool `sb_flag:"enable_http3" json:"enable_http3,omitempty"`
+	DisableFollowRedirects bool   `sb_flag:"disable_follow_redirects" json:"disable_follow_redirects,omitempty"`
+	DisableCompression     bool   `sb_flag:"disable_compression" json:"disable_compression,omitempty"`
+	SkipTLSVerifyHost      bool   `sb_flag:"skip_tls_verify_host" json:"skip_tls_verify_host,omitempty"`
+	MinTLSVersion          string `json:"min_tls_version,omitempty"`                       // Minimum TLS version for outbound connections ("1.2" or "1.3")
+	HTTP11Only             bool   `sb_flag:"http11_only" json:"http11_only,omitempty"`     // Force HTTP/1.1 (disables HTTP/2 and HTTP/3)
+	MaxRedirects           int    `json:"max_redirects,omitempty" validate:"max_value=20"` // Maximum redirects to follow (max: 20)
+	EnableHTTP3            bool   `sb_flag:"enable_http3" json:"enable_http3,omitempty"`
 
 	FlushInterval       reqctx.Duration `json:"flush_interval,omitempty" validate:"max_value=1m"`
 	IdleConnTimeout     reqctx.Duration `json:"idle_conn_timeout,omitempty" validate:"max_value=1m,default_value=60s"`
@@ -236,7 +236,6 @@ type ProxyConfig struct {
 	Canary json.RawMessage `json:"canary,omitempty"` // Enterprise: canary routing
 }
 
-
 // DiscoveryConfig configures dynamic upstream resolution for load balancers.
 type DiscoveryConfig struct {
 	// Type is the discovery mechanism: "dns_srv" (OSS) or "consul" (enterprise).
@@ -376,24 +375,24 @@ type ErrorPages []ErrorPage
 type WebSocketConfig struct {
 	BaseConnection
 
-	URL               string          `json:"url"` // Backend WebSocket URL (ws:// or wss://)
-	StripBasePath     bool            `sb_flag:"strip_base_path" json:"strip_base_path,omitempty"`
-	PreserveQuery     bool            `sb_flag:"preserve_query" json:"preserve_query,omitempty"`
-	Provider          string          `json:"provider,omitempty"`                                                     // Optional provider hint (e.g. "openai")
-	PingInterval      reqctx.Duration `json:"ping_interval,omitempty" validate:"max_value=1m"`                          // Send ping frames (default: 0 = disabled)
-	PongTimeout       reqctx.Duration `json:"pong_timeout,omitempty" validate:"max_value=1m,default_value=10s"`         // Wait for pong response (default: 10s)
-	IdleTimeout       reqctx.Duration `json:"idle_timeout,omitempty" validate:"max_value=1h"`                           // Close connections after read inactivity
-	ReadBufferSize    int             `json:"read_buffer_size,omitempty" validate:"max_value=10MB,default_value=4096"`  // Buffer size for reads (default: 4096)
-	WriteBufferSize   int             `json:"write_buffer_size,omitempty" validate:"max_value=10MB,default_value=4096"` // Buffer size for writes (default: 4096)
-	MaxFrameSize      int             `json:"max_frame_size,omitempty" validate:"max_value=10MB"`                       // Maximum size of a single message payload
-	EnableCompression bool            `json:"enable_compression,omitempty"`                                             // Enable per-message compression
-	HandshakeTimeout  reqctx.Duration `json:"handshake_timeout,omitempty" validate:"max_value=1m,default_value=10s"`    // WebSocket handshake timeout (default: 10s)
-	Subprotocols      []string        `json:"subprotocols,omitempty"`                                                   // Supported subprotocols
-	AllowedOrigins    []string        `json:"allowed_origins,omitempty"`                                                // CORS origins (empty = all)
-	CheckOrigin       bool            `json:"check_origin,omitempty"`                                                   // Enable origin checking
-	Budget            *ai.BudgetConfig `json:"budget,omitempty"`                                                        // Optional token budget enforcement for provider-aware sessions
-	EnableRFC8441     bool            `json:"enable_rfc8441,omitempty"`                                                 // Enable websocket-over-HTTP/2 extended CONNECT handling
-	EnableRFC9220     bool            `json:"enable_rfc9220,omitempty"`                                                 // Enable websocket-over-HTTP/3 extended CONNECT handling (RFC 9220)
+	URL               string           `json:"url"` // Backend WebSocket URL (ws:// or wss://)
+	StripBasePath     bool             `sb_flag:"strip_base_path" json:"strip_base_path,omitempty"`
+	PreserveQuery     bool             `sb_flag:"preserve_query" json:"preserve_query,omitempty"`
+	Provider          string           `json:"provider,omitempty"`                                                       // Optional provider hint (e.g. "openai")
+	PingInterval      reqctx.Duration  `json:"ping_interval,omitempty" validate:"max_value=1m"`                          // Send ping frames (default: 0 = disabled)
+	PongTimeout       reqctx.Duration  `json:"pong_timeout,omitempty" validate:"max_value=1m,default_value=10s"`         // Wait for pong response (default: 10s)
+	IdleTimeout       reqctx.Duration  `json:"idle_timeout,omitempty" validate:"max_value=1h"`                           // Close connections after read inactivity
+	ReadBufferSize    int              `json:"read_buffer_size,omitempty" validate:"max_value=10MB,default_value=4096"`  // Buffer size for reads (default: 4096)
+	WriteBufferSize   int              `json:"write_buffer_size,omitempty" validate:"max_value=10MB,default_value=4096"` // Buffer size for writes (default: 4096)
+	MaxFrameSize      int              `json:"max_frame_size,omitempty" validate:"max_value=10MB"`                       // Maximum size of a single message payload
+	EnableCompression bool             `json:"enable_compression,omitempty"`                                             // Enable per-message compression
+	HandshakeTimeout  reqctx.Duration  `json:"handshake_timeout,omitempty" validate:"max_value=1m,default_value=10s"`    // WebSocket handshake timeout (default: 10s)
+	Subprotocols      []string         `json:"subprotocols,omitempty"`                                                   // Supported subprotocols
+	AllowedOrigins    []string         `json:"allowed_origins,omitempty"`                                                // CORS origins (empty = all)
+	CheckOrigin       bool             `json:"check_origin,omitempty"`                                                   // Enable origin checking
+	Budget            *ai.BudgetConfig `json:"budget,omitempty"`                                                         // Optional token budget enforcement for provider-aware sessions
+	EnableRFC8441     bool             `json:"enable_rfc8441,omitempty"`                                                 // Enable websocket-over-HTTP/2 extended CONNECT handling
+	EnableRFC9220     bool             `json:"enable_rfc9220,omitempty"`                                                 // Enable websocket-over-HTTP/3 extended CONNECT handling (RFC 9220)
 
 	// Connection pool settings
 	DisablePool              bool            `json:"disable_pool,omitempty"`                                                  // Disable connection pooling (default: false, so pooling is enabled when compatible)
@@ -401,7 +400,7 @@ type WebSocketConfig struct {
 	PoolMaxIdleConnections   int             `json:"pool_max_idle_connections,omitempty" validate:"max_value=100"`            // Maximum idle connections (default: 10, max: 100)
 	PoolMaxLifetime          reqctx.Duration `json:"pool_max_lifetime,omitempty" validate:"max_value=1m"`                     // Maximum connection lifetime (default: 1h)
 	PoolMaxIdleTime          reqctx.Duration `json:"pool_max_idle_time,omitempty" validate:"max_value=1m"`                    // Maximum idle time before closing (default: 5m)
-	DisablePoolAutoReconnect bool            `json:"disable_pool_auto_reconnect,omitempty"`                                  // Disable automatic reconnection (default: false, so auto reconnect is enabled)
+	DisablePoolAutoReconnect bool            `json:"disable_pool_auto_reconnect,omitempty"`                                   // Disable automatic reconnection (default: false, so auto reconnect is enabled)
 	PoolReconnectDelay       reqctx.Duration `json:"pool_reconnect_delay,omitempty" validate:"max_value=1m,default_value=5s"` // Reconnect delay (default: 5s)
 	PoolMaxReconnectAttempts int             `json:"pool_max_reconnect_attempts,omitempty" validate:"max_value=100"`          // Max reconnect attempts (default: 3, max: 100, 0 = unlimited)
 }
@@ -449,8 +448,8 @@ type Policy json.RawMessage
 
 // BasePolicy represents a base policy.
 type BasePolicy struct {
-	PolicyType string `json:"type"`
-	Disabled   bool   `json:"disabled,omitempty"`
+	PolicyType string       `json:"type"`
+	Disabled   bool         `json:"disabled,omitempty"`
 	Match      *PolicyMatch `json:"match,omitempty"`
 }
 
@@ -649,17 +648,17 @@ var (
 
 const (
 	// MessageProtocolWebSocket is a constant for message protocol web socket.
-	MessageProtocolWebSocket        = "websocket"
+	MessageProtocolWebSocket = "websocket"
 	// MessagePhaseUpgrade is a constant for message phase upgrade.
-	MessagePhaseUpgrade             = "upgrade"
+	MessagePhaseUpgrade = "upgrade"
 	// MessagePhaseMessage is a constant for message phase message.
-	MessagePhaseMessage             = "message"
+	MessagePhaseMessage = "message"
 	// MessageDirectionClientToBackend is a constant for message direction client to backend.
 	MessageDirectionClientToBackend = "client_to_backend"
 	// MessageDirectionBackendToClient is a constant for message direction backend to client.
 	MessageDirectionBackendToClient = "backend_to_client"
 	// WebSocketProviderOpenAI is a constant for web socket provider open ai.
-	WebSocketProviderOpenAI         = "openai"
+	WebSocketProviderOpenAI = "openai"
 )
 
 // PolicyMatch scopes policy execution across protocol and websocket message metadata.
@@ -895,7 +894,7 @@ var (
 		InterimResponses: &InterimResponseConfig{
 			Forward100Continue:   false,
 			Forward103EarlyHints: false,
-			ForwardOther:        false,
+			ForwardOther:         false,
 		},
 	}
 
@@ -916,8 +915,8 @@ var (
 		XForwardedPort: &XForwardedPortConfig{
 			Mode: XFPSet,
 		},
-		DisableXRealIP:             false,
-		Forwarded:                  nil, // Not sent by default
+		DisableXRealIP: false,
+		Forwarded:      nil, // Not sent by default
 		Via: &ViaHeaderConfig{
 			Disable: false,
 		},
@@ -1001,4 +1000,3 @@ var http2ExtendedConnectRuntimeEnabled atomic.Bool
 func HTTP2ExtendedConnectRuntimeEnabled() bool {
 	return http2ExtendedConnectRuntimeEnabled.Load()
 }
-

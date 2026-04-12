@@ -45,9 +45,10 @@ func NewPIIDetection(config json.RawMessage) (Guardrail, error) {
 }
 
 // Name performs the name operation on the piiDetection.
-func (p *piiDetection) Name() string  { return "pii_detection" }
+func (p *piiDetection) Name() string { return "pii_detection" }
+
 // Phase performs the phase operation on the piiDetection.
-func (p *piiDetection) Phase() Phase  { return PhaseInput }
+func (p *piiDetection) Phase() Phase { return PhaseInput }
 
 // Check performs the check operation on the piiDetection.
 func (p *piiDetection) Check(_ context.Context, content *Content) (*Result, error) {
@@ -116,9 +117,10 @@ func NewPIIRedaction(config json.RawMessage) (Guardrail, error) {
 }
 
 // Name performs the name operation on the piiRedaction.
-func (p *piiRedaction) Name() string  { return "pii_redaction" }
+func (p *piiRedaction) Name() string { return "pii_redaction" }
+
 // Phase performs the phase operation on the piiRedaction.
-func (p *piiRedaction) Phase() Phase  { return PhaseInput }
+func (p *piiRedaction) Phase() Phase { return PhaseInput }
 
 // Check performs the check operation on the piiRedaction.
 func (p *piiRedaction) Check(_ context.Context, content *Content) (*Result, error) {

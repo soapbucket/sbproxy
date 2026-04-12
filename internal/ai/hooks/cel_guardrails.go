@@ -41,10 +41,10 @@ type CELGuardrailConfig struct {
 // CELGuardrail is a compiled guardrail ready for evaluation.
 type CELGuardrail struct {
 	Name      string
-	Phase     string      // "input" or "output"
+	Phase     string        // "input" or "output"
 	Condition celgo.Program // Compiled CEL program returning bool
-	Action    string      // "block" or "flag"
-	Message   string      // Error message for block action
+	Action    string        // "block" or "flag"
+	Message   string        // Error message for block action
 }
 
 // CELGuardrailResult is the outcome of guardrail evaluation.

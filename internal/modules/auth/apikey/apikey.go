@@ -26,7 +26,6 @@ const (
 	openAIInsecureAPIKeySubprotocolPrefix = "openai-insecure-api-key."
 )
 
-
 // Config holds configuration for the api_key auth provider.
 type Config struct {
 	Type       string   `json:"type"`

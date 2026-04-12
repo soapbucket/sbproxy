@@ -198,10 +198,10 @@ func TestProxyTimeout_E2E(t *testing.T) {
 	cfg := originJSON(t, map[string]any{
 		"hostname": "proxy-timeout.test",
 		"action": map[string]any{
-			"type":                     "proxy",
-			"url":                      backend.URL,
-			"response_header_timeout":  "500ms",
-			"http11_only":              true,
+			"type":                    "proxy",
+			"url":                     backend.URL,
+			"response_header_timeout": "500ms",
+			"http11_only":             true,
 		},
 	})
 

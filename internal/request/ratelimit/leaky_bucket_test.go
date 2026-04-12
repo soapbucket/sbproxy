@@ -114,4 +114,3 @@ func TestLeakyBucket_GetRemaining(t *testing.T) {
 		t.Errorf("expected 7 remaining, got %d", remaining)
 	}
 }
-

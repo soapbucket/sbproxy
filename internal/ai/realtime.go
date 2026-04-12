@@ -204,7 +204,7 @@ func (h *RealtimeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 type relayDirection int
 
 const (
-	directionToProvider   relayDirection = iota
+	directionToProvider relayDirection = iota
 	directionFromProvider
 )
 

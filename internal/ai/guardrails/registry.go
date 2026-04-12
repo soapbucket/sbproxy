@@ -2,8 +2,8 @@
 package guardrails
 
 import (
-	json "github.com/goccy/go-json"
 	"fmt"
+	json "github.com/goccy/go-json"
 	"sync"
 )
 

@@ -47,9 +47,9 @@ type FeedStats struct {
 // ReputationResult holds the result of an IP reputation check.
 type ReputationResult struct {
 	IP          string   `json:"ip"`
-	Score       float64  `json:"score"`       // Combined reputation score (0-100)
-	Action      string   `json:"action"`      // "allow", "block", "challenge", "log"
-	Feeds       []string `json:"feeds"`       // Which feeds flagged this IP
+	Score       float64  `json:"score"`  // Combined reputation score (0-100)
+	Action      string   `json:"action"` // "allow", "block", "challenge", "log"
+	Feeds       []string `json:"feeds"`  // Which feeds flagged this IP
 	Whitelisted bool     `json:"whitelisted"`
 }
 

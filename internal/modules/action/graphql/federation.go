@@ -19,7 +19,7 @@ type FederationConfig struct {
 type SubgraphConfig struct {
 	Name    string            `json:"name"`
 	URL     string            `json:"url"`
-	Schema  string            `json:"schema,omitempty"`   // Schema can be provided inline or fetched via introspection
+	Schema  string            `json:"schema,omitempty"` // Schema can be provided inline or fetched via introspection
 	Headers map[string]string `json:"headers,omitempty"`
 }
 

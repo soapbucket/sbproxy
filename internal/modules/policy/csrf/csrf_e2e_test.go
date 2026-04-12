@@ -311,8 +311,8 @@ func TestCSRF_E2E_CustomMethods(t *testing.T) {
 		protected bool
 	}{
 		{http.MethodPost, true},
-		{http.MethodPut, false},     // not in custom methods list
-		{http.MethodDelete, false},  // not in custom methods list
+		{http.MethodPut, false},    // not in custom methods list
+		{http.MethodDelete, false}, // not in custom methods list
 		{http.MethodGet, false},
 	}
 

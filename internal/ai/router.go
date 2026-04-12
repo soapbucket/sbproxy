@@ -16,12 +16,12 @@ import (
 
 // RoutingConfig defines how requests are routed to providers.
 type RoutingConfig struct {
-	Strategy             string               `json:"strategy,omitempty"`              // round_robin, weighted, lowest_latency, cost_optimized, fallback_chain, least_connections, token_rate, sticky, semantic
-	FallbackOrder        []string             `json:"fallback_order,omitempty"`        // Provider names in priority order
-	Retry                *RetryConfig         `json:"retry,omitempty"`
-	SemanticRoutes       *SemanticRouteConfig `json:"semantic_routes,omitempty"`       // Semantic routing configuration (used when strategy is "semantic")
-	ContextWindowMargin  float64              `json:"context_window_margin,omitempty"` // Safety margin (0.0-0.5) for context window validation; default 0.05 (5%)
-	ContextFallbacks     map[string]string    `json:"context_fallbacks,omitempty"`     // Explicit model fallbacks for context window overflow, e.g. "gpt-4": "gpt-4-turbo-128k"
+	Strategy            string               `json:"strategy,omitempty"`       // round_robin, weighted, lowest_latency, cost_optimized, fallback_chain, least_connections, token_rate, sticky, semantic
+	FallbackOrder       []string             `json:"fallback_order,omitempty"` // Provider names in priority order
+	Retry               *RetryConfig         `json:"retry,omitempty"`
+	SemanticRoutes      *SemanticRouteConfig `json:"semantic_routes,omitempty"`       // Semantic routing configuration (used when strategy is "semantic")
+	ContextWindowMargin float64              `json:"context_window_margin,omitempty"` // Safety margin (0.0-0.5) for context window validation; default 0.05 (5%)
+	ContextFallbacks    map[string]string    `json:"context_fallbacks,omitempty"`     // Explicit model fallbacks for context window overflow, e.g. "gpt-4": "gpt-4-turbo-128k"
 
 	// CEL selector expressions for dynamic routing decisions. Compiled once at config load time.
 	ModelSelector    string `json:"model_selector,omitempty"`    // CEL expression returning string (model name override)
@@ -56,7 +56,7 @@ type Router struct {
 	config           *RoutingConfig
 	providers        []routerProvider
 	tracker          *ProviderTracker
-	counter          atomic.Uint64 // for round_robin
+	counter          atomic.Uint64   // for round_robin
 	healthyProviders map[string]bool // Track provider health
 	mu               sync.RWMutex
 	StickySession    *StickySessionManager // Optional sticky session affinity
@@ -592,4 +592,3 @@ func (r *Router) RouteWithClassification(ctx context.Context, prompt string, con
 	cfg, err := r.RouteOperation(ctx, op, model, exclude)
 	return cfg, model, err
 }
-

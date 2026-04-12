@@ -219,9 +219,9 @@ func TestModelRegistry_ModelOverride(t *testing.T) {
 	})
 
 	tests := []struct {
-		model         string
-		wantProvider  string
-		wantOverride  string
+		model        string
+		wantProvider string
+		wantOverride string
 	}{
 		{"our-gpt4", "openai", "gpt-4o"},
 		{"fast-claude", "anthropic", "claude-3-haiku-20240307"},

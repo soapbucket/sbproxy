@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/cache/store"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 func TestCallback_Fetch(t *testing.T) {
@@ -76,7 +76,7 @@ func TestCallback_Fetch(t *testing.T) {
 			},
 			expectedBody: "Not Found",
 			expectedCT:   "application/octet-stream", // Default when no Content-Type
-			expectError:  false,                       // Fetch allows non-200
+			expectError:  false,                      // Fetch allows non-200
 		},
 	}
 
@@ -273,4 +273,3 @@ func TestCallbackCache_GetFetch_PutFetch(t *testing.T) {
 		t.Errorf("expected header X-Custom=value, got %q", cachedResp.Headers.Get("X-Custom"))
 	}
 }
-

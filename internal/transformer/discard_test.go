@@ -64,7 +64,7 @@ func TestDiscard(t *testing.T) {
 				assert.Empty(t, body)
 			} else {
 				require.NoError(t, err)
-				
+
 				body, readErr := io.ReadAll(resp.Body)
 				if tt.n >= len(tt.input) {
 					// When discarding all or more, body will be empty
@@ -103,4 +103,3 @@ func TestDiscard_EmptyBody(t *testing.T) {
 		}
 	}
 }
-

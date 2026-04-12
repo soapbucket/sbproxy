@@ -28,8 +28,8 @@ type Authenticator interface {
 
 // APIKeyAuth validates API keys against a static map or an external connector.
 type APIKeyAuth struct {
-	keys      map[string]*Principal  // SHA-256(key) -> principal
-	connector PermissionConnector    // optional dynamic lookup
+	keys      map[string]*Principal // SHA-256(key) -> principal
+	connector PermissionConnector   // optional dynamic lookup
 }
 
 // NewAPIKeyAuth creates an API key authenticator with pre-loaded static keys.
@@ -128,8 +128,8 @@ func (m *JWTClaimsMapping) withDefaults() JWTClaimsMapping {
 type JWTAuthConfig struct {
 	Issuer    string
 	Audience  string
-	Secret    []byte             // HMAC-SHA256 secret
-	RSAKey    *rsa.PublicKey     // Optional RSA public key (not used yet)
+	Secret    []byte         // HMAC-SHA256 secret
+	RSAKey    *rsa.PublicKey // Optional RSA public key (not used yet)
 	ClaimsMap JWTClaimsMapping
 }
 

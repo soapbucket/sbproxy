@@ -38,7 +38,7 @@ func parseSize(sizeStr string, defaultSize int64) int64 {
 	}
 
 	sizeStr = strings.TrimSpace(strings.ToUpper(sizeStr))
-	
+
 	// Extract number and unit
 	var numStr string
 	var unit string
@@ -100,8 +100,8 @@ func GetStreamingThresholds(enabled bool, maxBufferedBodySize, maxProcessableBod
 		MaxProcessableBodySize: parseSize(maxProcessableBodySize, DefaultMaxProcessableBodySize),
 		ModifierThreshold:      parseSize(modifierThreshold, DefaultModifierThreshold),
 		TransformThreshold:     parseSize(transformThreshold, DefaultTransformThreshold),
-		SignatureThreshold:    parseSize(signatureThreshold, DefaultSignatureThreshold),
-		CallbackThreshold:     parseSize(callbackThreshold, DefaultCallbackThreshold),
+		SignatureThreshold:     parseSize(signatureThreshold, DefaultSignatureThreshold),
+		CallbackThreshold:      parseSize(callbackThreshold, DefaultCallbackThreshold),
 	}
 }
 
@@ -180,12 +180,12 @@ func ShouldStream(resp *http.Response, threshold int64) bool {
 	if resp == nil {
 		return false
 	}
-	
+
 	// Check Content-Length header
 	if resp.ContentLength > 0 {
 		return resp.ContentLength > threshold
 	}
-	
+
 	// If Content-Length is unknown, we'll need to check during read
 	// For now, default to not streaming if unknown
 	return false
@@ -219,4 +219,3 @@ func WrapResponseWithSizeLimit(resp *http.Response, maxSize int64) *http.Respons
 	resp.Body = tracker
 	return resp
 }
-

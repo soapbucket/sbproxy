@@ -174,4 +174,3 @@ func GetDetails(err error) map[string]interface{} {
 	}
 	return nil
 }
-

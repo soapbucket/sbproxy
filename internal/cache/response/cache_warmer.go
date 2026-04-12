@@ -10,10 +10,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/soapbucket/sbproxy/internal/extension/cel"
 	"github.com/soapbucket/sbproxy/internal/cache/store"
-	"github.com/soapbucket/sbproxy/internal/middleware/callback"
+	"github.com/soapbucket/sbproxy/internal/extension/cel"
 	"github.com/soapbucket/sbproxy/internal/extension/lua"
+	"github.com/soapbucket/sbproxy/internal/middleware/callback"
 )
 
 // CacheWarmer provides intelligent cache warming capabilities

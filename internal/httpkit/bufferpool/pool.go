@@ -81,14 +81,14 @@ var (
 		Name: "sb_bufferpool_size_requested_bytes",
 		Help: "Distribution of requested buffer sizes",
 		Buckets: []float64{
-			1024,      // 1KB
-			4096,      // 4KB
-			16384,     // 16KB
-			65536,     // 64KB
-			262144,    // 256KB
-			1048576,   // 1MB
-			4194304,   // 4MB
-			10485760,  // 10MB
+			1024,     // 1KB
+			4096,     // 4KB
+			16384,    // 16KB
+			65536,    // 64KB
+			262144,   // 256KB
+			1048576,  // 1MB
+			4194304,  // 4MB
+			10485760, // 10MB
 		},
 	})
 
@@ -114,7 +114,7 @@ type TieredBufferPool struct {
 	medium *sync.Pool // 4KB-64KB
 	large  *sync.Pool // 64KB-1MB
 	xlarge *sync.Pool // 1MB+
-	
+
 	// Metrics
 	smallGets  int64
 	mediumGets int64
@@ -124,11 +124,11 @@ type TieredBufferPool struct {
 
 const (
 	// SmallSize is a constant for small size.
-	SmallSize  = 4 * 1024      // 4KB
+	SmallSize = 4 * 1024 // 4KB
 	// MediumSize is a constant for medium size.
-	MediumSize = 64 * 1024     // 64KB
+	MediumSize = 64 * 1024 // 64KB
 	// LargeSize is a constant for large size.
-	LargeSize  = 1024 * 1024   // 1MB
+	LargeSize = 1024 * 1024 // 1MB
 	// XLargeSize is a constant for x large size.
 	XLargeSize = 10 * 1024 * 1024 // 10MB
 )
@@ -189,9 +189,9 @@ func (p *TieredBufferPool) Put(buf *[]byte) {
 	if buf == nil {
 		return
 	}
-	
+
 	size := cap(*buf)
-	
+
 	// Reset buffer to full capacity and zero contents
 	*buf = (*buf)[:cap(*buf)]
 	clear(*buf)
@@ -205,7 +205,7 @@ func (p *TieredBufferPool) Put(buf *[]byte) {
 		p.large.Put(buf)
 	case size <= XLargeSize:
 		p.xlarge.Put(buf)
-	// Don't pool buffers larger than XLarge
+		// Don't pool buffers larger than XLarge
 	}
 }
 
@@ -284,16 +284,16 @@ type AdaptiveBufferPool struct {
 type AdaptiveBufferPoolConfig struct {
 	// Initial tier sizes (optional, uses defaults if nil)
 	InitialSizes []int
-	
+
 	// Adjustment interval (default: 5 minutes)
 	AdjustInterval time.Duration
-	
+
 	// Target coverage: percentage of requests that should use optimal tier (default: 0.90)
 	TargetCoverage float64
-	
+
 	// Size history to keep for analysis (default: 10000)
 	HistorySize int
-	
+
 	// Min/max number of tiers (defaults: 3-8)
 	MinTiers int
 	MaxTiers int
@@ -303,9 +303,9 @@ type AdaptiveBufferPoolConfig struct {
 func DefaultAdaptiveConfig() AdaptiveBufferPoolConfig {
 	return AdaptiveBufferPoolConfig{
 		InitialSizes: []int{
-			4 * 1024,      // 4KB
-			64 * 1024,     // 64KB
-			1024 * 1024,   // 1MB
+			4 * 1024,         // 4KB
+			64 * 1024,        // 64KB
+			1024 * 1024,      // 1MB
 			10 * 1024 * 1024, // 10MB
 		},
 		AdjustInterval: 5 * time.Minute,
@@ -337,9 +337,9 @@ func NewAdaptiveBufferPool(config AdaptiveBufferPoolConfig) *AdaptiveBufferPool 
 	if config.InitialSizes == nil {
 		config.InitialSizes = DefaultAdaptiveConfig().InitialSizes
 	}
-	
+
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	pool := &AdaptiveBufferPool{
 		tiers:          make([]*BufferTier, 0, len(config.InitialSizes)),
 		sizeHistory:    make([]atomic.Int64, config.HistorySize),
@@ -351,20 +351,20 @@ func NewAdaptiveBufferPool(config AdaptiveBufferPoolConfig) *AdaptiveBufferPool 
 		ctx:            ctx,
 		cancel:         cancel,
 	}
-	
+
 	// Initialize tiers
 	for i, size := range config.InitialSizes {
 		tier := pool.createTier(size, getTierName(i))
 		pool.tiers = append(pool.tiers, tier)
-		
+
 		// Update metrics
 		bufferPoolTierSize.WithLabelValues(tier.name).Set(float64(size))
 	}
-	
+
 	// Start background adjustment goroutine
 	pool.wg.Add(1)
 	go pool.adjustSizesPeriodically()
-	
+
 	return pool
 }
 
@@ -374,7 +374,7 @@ func (p *AdaptiveBufferPool) createTier(size int, name string) *BufferTier {
 		size: size,
 		name: name,
 	}
-	
+
 	// Create pool with closure capturing tier pointer
 	tier.pool = &sync.Pool{
 		New: func() interface{} {
@@ -384,7 +384,7 @@ func (p *AdaptiveBufferPool) createTier(size int, name string) *BufferTier {
 			return &buf
 		},
 	}
-	
+
 	return tier
 }
 
@@ -392,25 +392,25 @@ func (p *AdaptiveBufferPool) createTier(size int, name string) *BufferTier {
 func (p *AdaptiveBufferPool) Get(size int) *[]byte {
 	// Record size for histogram analysis
 	bufferSizeRequested.Observe(float64(size))
-	
+
 	// Track size history for adjustment
 	p.recordSize(size)
-	
+
 	// Find appropriate tier (read lock for performance)
 	p.mu.RLock()
 	tier := p.findTier(size)
 	p.mu.RUnlock()
-	
+
 	if tier == nil {
 		// No suitable tier found, allocate directly
 		buf := make([]byte, size)
 		return &buf
 	}
-	
+
 	// Get from pool
 	atomic.AddInt64(&tier.gets, 1)
 	bufferPoolGets.WithLabelValues(tier.name).Inc()
-	
+
 	buf := tier.pool.Get().(*[]byte)
 	*buf = (*buf)[:size] // Resize to requested size
 	return buf
@@ -421,23 +421,23 @@ func (p *AdaptiveBufferPool) Put(buf *[]byte) {
 	if buf == nil {
 		return
 	}
-	
+
 	size := cap(*buf)
-	
+
 	// Find appropriate tier
 	p.mu.RLock()
 	tier := p.findTierExact(size)
 	p.mu.RUnlock()
-	
+
 	if tier == nil {
 		// Don't pool buffers that don't match our tiers
 		return
 	}
-	
+
 	// Reset buffer to full capacity and zero contents
 	*buf = (*buf)[:cap(*buf)]
 	clear(*buf)
-	
+
 	atomic.AddInt64(&tier.puts, 1)
 	bufferPoolPuts.WithLabelValues(tier.name).Inc()
 	tier.pool.Put(buf)
@@ -478,10 +478,10 @@ func (p *AdaptiveBufferPool) recordSize(size int) {
 // adjustSizesPeriodically runs periodic size adjustment
 func (p *AdaptiveBufferPool) adjustSizesPeriodically() {
 	defer p.wg.Done()
-	
+
 	ticker := time.NewTicker(p.adjustInterval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-p.ctx.Done():
@@ -502,25 +502,25 @@ func (p *AdaptiveBufferPool) AdjustSizes() {
 			sizes = append(sizes, int(v))
 		}
 	}
-	
+
 	if len(sizes) < 100 {
 		// Not enough data for adjustment
 		return
 	}
-	
+
 	// Sort sizes for percentile calculation
 	sort.Ints(sizes)
-	
+
 	// Calculate percentiles
 	p50 := percentile(sizes, 0.50)
 	p75 := percentile(sizes, 0.75)
 	p90 := percentile(sizes, 0.90)
 	p95 := percentile(sizes, 0.95)
 	p99 := percentile(sizes, 0.99)
-	
+
 	// Determine optimal tier sizes based on percentiles
 	newSizes := []int{}
-	
+
 	// Always include key percentiles
 	if p50 > 0 {
 		newSizes = append(newSizes, p50)
@@ -537,18 +537,18 @@ func (p *AdaptiveBufferPool) AdjustSizes() {
 	if p99 > p95*2 {
 		newSizes = append(newSizes, p99)
 	}
-	
+
 	// Ensure we have minimum tiers
 	if len(newSizes) < p.minTiers {
 		// Keep existing sizes if not enough distinct percentiles
 		return
 	}
-	
+
 	// Cap at maximum tiers
 	if len(newSizes) > p.maxTiers {
 		newSizes = newSizes[:p.maxTiers]
 	}
-	
+
 	// Check if sizes changed significantly (>10%)
 	p.mu.RLock()
 	currentSizes := make([]int, len(p.tiers))
@@ -556,16 +556,16 @@ func (p *AdaptiveBufferPool) AdjustSizes() {
 		currentSizes[i] = tier.size
 	}
 	p.mu.RUnlock()
-	
+
 	if !sizesChangedSignificantly(currentSizes, newSizes, 0.10) {
 		// No significant change, keep current tiers
 		return
 	}
-	
+
 	// Update tiers with write lock
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	// Create new tiers
 	newTiers := make([]*BufferTier, 0, len(newSizes))
 	for i, size := range newSizes {
@@ -577,7 +577,7 @@ func (p *AdaptiveBufferPool) AdjustSizes() {
 				break
 			}
 		}
-		
+
 		if tier == nil {
 			// Create new tier
 			tier = p.createTier(size, getTierName(i))
@@ -585,13 +585,13 @@ func (p *AdaptiveBufferPool) AdjustSizes() {
 			// Update tier name
 			tier.name = getTierName(i)
 		}
-		
+
 		newTiers = append(newTiers, tier)
-		
+
 		// Update metrics
 		bufferPoolTierSize.WithLabelValues(tier.name).Set(float64(size))
 	}
-	
+
 	p.tiers = newTiers
 }
 
@@ -599,40 +599,40 @@ func (p *AdaptiveBufferPool) AdjustSizes() {
 func (p *AdaptiveBufferPool) Stats() AdaptiveBufferPoolStats {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	
+
 	stats := AdaptiveBufferPoolStats{
 		TierCount: len(p.tiers),
 		Tiers:     make([]TierStats, 0, len(p.tiers)),
 	}
-	
+
 	for _, tier := range p.tiers {
 		gets := atomic.LoadInt64(&tier.gets)
 		puts := atomic.LoadInt64(&tier.puts)
 		allocs := atomic.LoadInt64(&tier.allocates)
-		
+
 		var utilization float64
 		if gets > 0 {
 			utilization = float64(puts) / float64(gets) * 100
 		}
-		
+
 		tierStats := TierStats{
-			Name:         tier.name,
-			Size:         tier.size,
-			Gets:         gets,
-			Puts:         puts,
-			Allocations:  allocs,
-			Utilization:  utilization,
+			Name:        tier.name,
+			Size:        tier.size,
+			Gets:        gets,
+			Puts:        puts,
+			Allocations: allocs,
+			Utilization: utilization,
 		}
-		
+
 		stats.Tiers = append(stats.Tiers, tierStats)
 		stats.TotalGets += gets
 		stats.TotalPuts += puts
 		stats.TotalAllocations += allocs
-		
+
 		// Update utilization metric
 		bufferPoolTierUtilization.WithLabelValues(tier.name).Set(utilization)
 	}
-	
+
 	return stats
 }
 
@@ -644,21 +644,21 @@ func (p *AdaptiveBufferPool) Shutdown() {
 
 // AdaptiveBufferPoolStats contains statistics about the adaptive buffer pool
 type AdaptiveBufferPoolStats struct {
-	TierCount         int
-	Tiers             []TierStats
-	TotalGets         int64
-	TotalPuts         int64
-	TotalAllocations  int64
+	TierCount        int
+	Tiers            []TierStats
+	TotalGets        int64
+	TotalPuts        int64
+	TotalAllocations int64
 }
 
 // TierStats contains statistics for a single tier
 type TierStats struct {
-	Name         string
-	Size         int
-	Gets         int64
-	Puts         int64
-	Allocations  int64
-	Utilization  float64 // Percentage
+	Name        string
+	Size        int
+	Gets        int64
+	Puts        int64
+	Allocations int64
+	Utilization float64 // Percentage
 }
 
 // Helper functions
@@ -668,7 +668,7 @@ func percentile(sortedData []int, p float64) int {
 	if len(sortedData) == 0 {
 		return 0
 	}
-	
+
 	index := int(float64(len(sortedData)-1) * p)
 	if index < 0 {
 		index = 0
@@ -676,7 +676,7 @@ func percentile(sortedData []int, p float64) int {
 	if index >= len(sortedData) {
 		index = len(sortedData) - 1
 	}
-	
+
 	return sortedData[index]
 }
 
@@ -685,14 +685,14 @@ func sizesChangedSignificantly(oldSizes, newSizes []int, threshold float64) bool
 	if len(oldSizes) != len(newSizes) {
 		return true
 	}
-	
+
 	for i := range oldSizes {
 		diff := float64(abs(newSizes[i]-oldSizes[i])) / float64(oldSizes[i])
 		if diff > threshold {
 			return true
 		}
 	}
-	
+
 	return false
 }
 
@@ -759,4 +759,3 @@ func PutAdaptive(buf *[]byte) {
 	}
 	DefaultAdaptivePool.Put(buf)
 }
-

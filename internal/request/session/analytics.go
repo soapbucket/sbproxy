@@ -47,9 +47,9 @@ type AnalyticsConfig struct {
 	Enabled          bool          `json:"enabled,omitempty"`
 	TrackPageFlow    bool          `json:"track_page_flow,omitempty"`   // Track page navigation paths
 	TrackConversions bool          `json:"track_conversions,omitempty"` // Track conversion events
-	ConversionPaths  []string      `json:"conversion_paths,omitempty"` // URL paths that count as conversions
-	SessionTimeout   time.Duration `json:"session_timeout,omitempty"`  // Inactivity timeout (default: 30m)
-	MaxFlowDepth     int           `json:"max_flow_depth,omitempty"`   // Max pages to track per session (default: 100)
+	ConversionPaths  []string      `json:"conversion_paths,omitempty"`  // URL paths that count as conversions
+	SessionTimeout   time.Duration `json:"session_timeout,omitempty"`   // Inactivity timeout (default: 30m)
+	MaxFlowDepth     int           `json:"max_flow_depth,omitempty"`    // Max pages to track per session (default: 100)
 }
 
 // SessionAnalytics tracks session-level analytics.

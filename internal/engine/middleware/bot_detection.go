@@ -18,21 +18,21 @@ import (
 // BotDetectionConfig configures the bot detection middleware.
 type BotDetectionConfig struct {
 	Enabled       bool     `json:"enabled"`
-	Mode          string   `json:"mode"`           // "block", "challenge", "log"
-	AllowList     []string `json:"allow_list"`     // Known good bots (e.g., "googlebot", "bingbot")
-	DenyList      []string `json:"deny_list"`      // Known bad bot patterns (matched case-insensitively against User-Agent)
-	ChallengeType string   `json:"challenge_type"` // "js" (default) or "captcha"
+	Mode          string   `json:"mode"`            // "block", "challenge", "log"
+	AllowList     []string `json:"allow_list"`      // Known good bots (e.g., "googlebot", "bingbot")
+	DenyList      []string `json:"deny_list"`       // Known bad bot patterns (matched case-insensitively against User-Agent)
+	ChallengeType string   `json:"challenge_type"`  // "js" (default) or "captcha"
 	VerifyGoodBot bool     `json:"verify_good_bot"` // Verify good bots via reverse DNS
 }
 
 // botDetectionState holds shared state for the bot detection middleware.
 type botDetectionState struct {
-	config          BotDetectionConfig
-	denyPatterns    []string // lowercased deny patterns
-	allowPatterns   []string // lowercased allow patterns
-	goodBotDomains  map[string][]string // user-agent substring -> expected DNS suffixes
-	dnsCache        sync.Map            // IP -> *dnsCacheEntry
-	dnsCacheTTL     time.Duration
+	config         BotDetectionConfig
+	denyPatterns   []string            // lowercased deny patterns
+	allowPatterns  []string            // lowercased allow patterns
+	goodBotDomains map[string][]string // user-agent substring -> expected DNS suffixes
+	dnsCache       sync.Map            // IP -> *dnsCacheEntry
+	dnsCacheTTL    time.Duration
 }
 
 // dnsCacheEntry caches reverse DNS lookup results.
@@ -43,16 +43,16 @@ type dnsCacheEntry struct {
 
 // Known good bot user-agent substrings and their expected reverse DNS domains.
 var defaultGoodBotDomains = map[string][]string{
-	"googlebot":    {".googlebot.com.", ".google.com."},
-	"bingbot":      {".search.msn.com."},
-	"yandexbot":    {".yandex.ru.", ".yandex.net.", ".yandex.com."},
-	"baiduspider":  {".baidu.com.", ".baidu.jp."},
-	"duckduckbot":  {".duckduckgo.com."},
-	"slurp":        {".crawl.yahoo.net."},
-	"facebot":      {".facebook.com.", ".fbsv.net."},
-	"twitterbot":   {".twttr.com."},
-	"applebot":     {".applebot.apple.com."},
-	"linkedinbot":  {".linkedin.com."},
+	"googlebot":   {".googlebot.com.", ".google.com."},
+	"bingbot":     {".search.msn.com."},
+	"yandexbot":   {".yandex.ru.", ".yandex.net.", ".yandex.com."},
+	"baiduspider": {".baidu.com.", ".baidu.jp."},
+	"duckduckbot": {".duckduckgo.com."},
+	"slurp":       {".crawl.yahoo.net."},
+	"facebot":     {".facebook.com.", ".fbsv.net."},
+	"twitterbot":  {".twttr.com."},
+	"applebot":    {".applebot.apple.com."},
+	"linkedinbot": {".linkedin.com."},
 }
 
 // Known bad bot user-agent patterns.
@@ -368,10 +368,10 @@ body { font-family: sans-serif; text-align: center; padding: 50px; background: #
 
 // BotDetectionResult holds the result for metrics and logging.
 type BotDetectionResult struct {
-	IsBot     bool
-	Category  string // "good_bot", "bad_bot", "impersonator", "unknown"
-	Pattern   string // matched pattern
-	Verified  bool   // DNS verification result (for good bots)
+	IsBot    bool
+	Category string // "good_bot", "bad_bot", "impersonator", "unknown"
+	Pattern  string // matched pattern
+	Verified bool   // DNS verification result (for good bots)
 }
 
 // SortedBotPatterns returns a sorted copy of patterns for deterministic output.

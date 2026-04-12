@@ -13,12 +13,12 @@ import (
 )
 
 type promptRenderResult struct {
-	Rendered     string   `json:"rendered"`
-	SystemPrompt string   `json:"system_prompt"`
-	Model        string   `json:"model"`
-	Temperature  *float64 `json:"temperature"`
-	MaxTokens    *int     `json:"max_tokens"`
-	VersionNumber int     `json:"version_number"`
+	Rendered      string   `json:"rendered"`
+	SystemPrompt  string   `json:"system_prompt"`
+	Model         string   `json:"model"`
+	Temperature   *float64 `json:"temperature"`
+	MaxTokens     *int     `json:"max_tokens"`
+	VersionNumber int      `json:"version_number"`
 }
 
 func (h *Handler) resolvePromptForChat(ctx context.Context, req *ChatCompletionRequest) error {

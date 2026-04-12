@@ -7,7 +7,7 @@ const (
 	// RequestDataKey is a constant for request data key.
 	RequestDataKey contextKey = "request_data"
 	// ManagerKey is a constant for manager key.
-	ManagerKey     contextKey = "manager"
+	ManagerKey contextKey = "manager"
 )
 
 // Typed context keys for request-scoped values.
@@ -27,29 +27,29 @@ const (
 // Config parameter keys used in RequestData.Config
 const (
 	// ConfigParamID is a constant for config param id.
-	ConfigParamID             = "config_id"
+	ConfigParamID = "config_id"
 	// ConfigParamHostname is a constant for config param hostname.
-	ConfigParamHostname       = "config_hostname"
+	ConfigParamHostname = "config_hostname"
 	// ConfigParamParentID is a constant for config param parent id.
-	ConfigParamParentID       = "parent_config_id"
+	ConfigParamParentID = "parent_config_id"
 	// ConfigParamParentHostname is a constant for config param parent hostname.
 	ConfigParamParentHostname = "parent_config_hostname"
 	// ConfigParamWorkspaceID is a constant for config param workspace id.
-	ConfigParamWorkspaceID    = "workspace_id"
+	ConfigParamWorkspaceID = "workspace_id"
 	// ConfigParamVersion is a constant for config param version.
-	ConfigParamVersion        = "version"
+	ConfigParamVersion = "version"
 	// ConfigParamRevision is a constant for config param revision.
-	ConfigParamRevision       = "revision"
+	ConfigParamRevision = "revision"
 	// ConfigParamParentVersion is a constant for config param parent version.
-	ConfigParamParentVersion  = "parent_version"
+	ConfigParamParentVersion = "parent_version"
 	// ConfigParamEnvironment is a constant for config param environment.
-	ConfigParamEnvironment    = "environment"
+	ConfigParamEnvironment = "environment"
 	// ConfigParamTags is a constant for config param tags.
-	ConfigParamTags           = "tags"
+	ConfigParamTags = "tags"
 	// ConfigParamEvents is a constant for config param events.
-	ConfigParamEvents         = "events"
+	ConfigParamEvents = "events"
 	// ConfigParamMode is a constant for config param mode.
-	ConfigParamMode           = "config_mode"
+	ConfigParamMode = "config_mode"
 	// ConfigParamReason is a constant for config param reason.
-	ConfigParamReason         = "config_reason"
+	ConfigParamReason = "config_reason"
 )

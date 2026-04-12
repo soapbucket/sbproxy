@@ -195,4 +195,3 @@ func (h *Handler) Validate() error {
 	}
 	return nil
 }
-

@@ -88,7 +88,7 @@ func createTransport(cfg plugin.TransportConfig) http.RoundTripper {
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: cfg.InsecureSkipVerify,
 		},
-		TLSHandshakeTimeout:   10 * time.Second,
+		TLSHandshakeTimeout:    10 * time.Second,
 		MaxIdleConns:           maxIdle,
 		MaxIdleConnsPerHost:    maxIdle,
 		IdleConnTimeout:        90 * time.Second,

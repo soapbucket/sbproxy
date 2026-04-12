@@ -16,10 +16,10 @@ import (
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
 
-	"github.com/soapbucket/sbproxy/internal/request/classifier"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/platform/storage"
+	"github.com/soapbucket/sbproxy/internal/request/classifier"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 )
 
 const (

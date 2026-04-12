@@ -10,11 +10,11 @@ const (
 	// SeverityCritical is a constant for severity critical.
 	SeverityCritical = "critical" // budget exceeded, circuit opened
 	// SeverityError is a constant for severity error.
-	SeverityError    = "error"    // provider error, upstream 5xx, guardrail block
+	SeverityError = "error" // provider error, upstream 5xx, guardrail block
 	// SeverityWarning is a constant for severity warning.
-	SeverityWarning  = "warning"  // budget warning, model downgrade, latency spike
+	SeverityWarning = "warning" // budget warning, model downgrade, latency spike
 	// SeverityInfo is a constant for severity info.
-	SeverityInfo     = "info"     // request completed, session started
+	SeverityInfo = "info" // request completed, session started
 )
 
 // Event is the interface all events must implement
@@ -33,7 +33,8 @@ type EventBase struct {
 }
 
 // EventType performs the event type operation on the EventBase.
-func (e EventBase) EventType() string     { return e.Type }
+func (e EventBase) EventType() string { return e.Type }
+
 // EventSeverity performs the event severity operation on the EventBase.
 func (e EventBase) EventSeverity() string { return e.Severity }
 

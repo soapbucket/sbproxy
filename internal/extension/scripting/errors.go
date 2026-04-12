@@ -72,7 +72,6 @@ func NewScriptTimeout(msg string) error {
 	return &ErrScriptTimeout{msg: msg}
 }
 
-
 // IsScriptError checks if an error is a scripting-related error
 func IsScriptError(err error) bool {
 	if err == nil {

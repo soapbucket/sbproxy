@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/soapbucket/sbproxy/internal/engine/transport"
 	"github.com/soapbucket/sbproxy/internal/cache/store"
+	"github.com/soapbucket/sbproxy/internal/engine/transport"
 )
 
 var TestTransport = transport.Wrap(transport.Null, func(resp *http.Response) error {

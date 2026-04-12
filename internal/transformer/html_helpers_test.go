@@ -27,7 +27,7 @@ func TestOptimizeHTML_LowercaseTags(t *testing.T) {
 
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	
+
 	// Check that tags are lowercase
 	assert.Contains(t, string(body), "<div")
 	assert.Contains(t, string(body), "</div>")
@@ -50,7 +50,7 @@ func TestOptimizeHTML_LowercaseAttributes(t *testing.T) {
 
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	
+
 	// Check that attributes are lowercase
 	assert.Contains(t, string(body), "class=")
 	assert.Contains(t, string(body), "id=")
@@ -73,7 +73,7 @@ func TestOptimizeHTML_RemoveBooleanAttributes(t *testing.T) {
 
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	
+
 	// Check that boolean attributes don't have values
 	assert.Contains(t, string(body), "checked")
 	assert.Contains(t, string(body), "disabled")
@@ -98,7 +98,7 @@ func TestOptimizeHTML_StripComments(t *testing.T) {
 
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	
+
 	// Comments should be removed
 	assert.NotContains(t, string(body), "<!--")
 	assert.NotContains(t, string(body), "-->")
@@ -121,13 +121,13 @@ func TestOptimizeHTML_SortAttributes(t *testing.T) {
 
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	
+
 	// Attributes should be sorted alphabetically
 	bodyStr := string(body)
 	aIdx := strings.Index(bodyStr, "a=")
 	mIdx := strings.Index(bodyStr, "m=")
 	zIdx := strings.Index(bodyStr, "z=")
-	
+
 	assert.True(t, aIdx < mIdx && mIdx < zIdx, "Attributes should be sorted")
 }
 
@@ -148,7 +148,7 @@ func TestStripSpace(t *testing.T) {
 
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	
+
 	// Multiple spaces should be reduced
 	bodyStr := string(body)
 	assert.NotContains(t, bodyStr, "   ")
@@ -171,11 +171,11 @@ func TestAddUniqueID(t *testing.T) {
 
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	
+
 	// IDs should be added (format: test1, test2, etc.)
 	bodyStr := string(body)
 	assert.Contains(t, bodyStr, `id="test`)
-	
+
 	// Count IDs (format: test1, test2, etc. - no hyphen)
 	idCount := strings.Count(bodyStr, `id="test`)
 	assert.GreaterOrEqual(t, idCount, 2, "Should add IDs to multiple elements")
@@ -199,7 +199,7 @@ func TestAddUniqueID_ReplaceExisting(t *testing.T) {
 
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	
+
 	// Existing ID should be replaced (format: test1, test2, etc. - no hyphen)
 	bodyStr := string(body)
 	assert.Contains(t, bodyStr, `id="test`)
@@ -226,7 +226,7 @@ func TestOptimizeHTML_CombinedOptions(t *testing.T) {
 
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	
+
 	bodyStr := string(body)
 	// All optimizations should be applied
 	assert.Contains(t, bodyStr, "<div")
@@ -234,4 +234,3 @@ func TestOptimizeHTML_CombinedOptions(t *testing.T) {
 	assert.Contains(t, bodyStr, "id=")
 	assert.NotContains(t, bodyStr, "<!--")
 }
-

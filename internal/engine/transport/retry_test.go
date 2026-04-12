@@ -307,4 +307,3 @@ func TestMakeRequestRetryable(t *testing.T) {
 		t.Errorf("body not retryable: got %q and %q, expected %q", body1, body2, body)
 	}
 }
-

@@ -46,15 +46,15 @@ func TestOpenAI_ChatCompletion(t *testing.T) {
 
 	p := NewOpenAI(server.Client())
 	cfg := &ai.ProviderConfig{
-		Name:   "openai",
-		APIKey: "test-key",
+		Name:    "openai",
+		APIKey:  "test-key",
 		BaseURL: server.URL + "/v1",
 	}
 
 	resp, err := p.ChatCompletion(t.Context(), &ai.ChatCompletionRequest{
-		Model: "gpt-4",
+		Model:    "gpt-4",
 		Messages: []ai.Message{{Role: "user", Content: json.RawMessage(`"Hi"`)}},
-		SBTags: map[string]string{"env": "test"},
+		SBTags:   map[string]string{"env": "test"},
 	}, cfg)
 
 	require.NoError(t, err)

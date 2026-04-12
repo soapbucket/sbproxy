@@ -118,7 +118,7 @@ func TestCallbackManager_BatchFlushing(t *testing.T) {
 func TestCallbackManager_TimerFlushing(t *testing.T) {
 	mock := &mockCallback{name: "timer"}
 	mgr := NewCallbackManager(100)
-	mgr.batchSize = 1000                     // large batch so timer triggers first
+	mgr.batchSize = 1000                      // large batch so timer triggers first
 	mgr.flushInterval = 50 * time.Millisecond // short interval
 	mgr.Register(mock, &CallbackConfig{Enabled: true, PrivacyMode: "full"})
 	mgr.Start()

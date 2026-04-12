@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"time"
 
-	lua "github.com/yuin/gopher-lua"
-	"github.com/soapbucket/sbproxy/internal/request/reqctx"
 	"github.com/soapbucket/sbproxy/internal/observe/metric"
+	"github.com/soapbucket/sbproxy/internal/request/reqctx"
+	lua "github.com/yuin/gopher-lua"
 )
 
 // CacheKeyGenerator generates cache keys for response caching using Lua scripts.

@@ -2,11 +2,11 @@
 package responsecache
 
 import (
-	"github.com/soapbucket/sbproxy/internal/security/crypto"
-	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"bytes"
 	"context"
 	"encoding/gob"
+	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
+	"github.com/soapbucket/sbproxy/internal/security/crypto"
 	"io"
 	"log/slog"
 	"net/http"

@@ -22,28 +22,28 @@ func (m *mockStreamingConfigProvider) GetStreamingConfig() StreamingConfig {
 func TestOptimizeJSON_SizeCheck(t *testing.T) {
 	provider := &mockStreamingConfigProvider{
 		config: StreamingConfig{
-			Enabled:           true,
+			Enabled:            true,
 			TransformThreshold: 1024, // 1KB
 		},
 	}
 
 	tests := []struct {
-		name         string
-		jsonSize     int
+		name            string
+		jsonSize        int
 		shouldTransform bool
-		jsonData     string
+		jsonData        string
 	}{
 		{
-			name:         "Small JSON - should transform",
-			jsonSize:     500,
+			name:            "Small JSON - should transform",
+			jsonSize:        500,
 			shouldTransform: true,
-			jsonData:     `{"key":"value","nested":{"a":1,"b":2}}`,
+			jsonData:        `{"key":"value","nested":{"a":1,"b":2}}`,
 		},
 		{
-			name:         "Large JSON - should skip",
-			jsonSize:     2000,
+			name:            "Large JSON - should skip",
+			jsonSize:        2000,
 			shouldTransform: false,
-			jsonData:     strings.Repeat(`{"key":"value"},`, 100),
+			jsonData:        strings.Repeat(`{"key":"value"},`, 100),
 		},
 	}
 
@@ -103,7 +103,7 @@ func TestOptimizeJSON_SizeCheck(t *testing.T) {
 func TestOptimizeJSON_ThresholdDuringRead(t *testing.T) {
 	provider := &mockStreamingConfigProvider{
 		config: StreamingConfig{
-			Enabled:           true,
+			Enabled:            true,
 			TransformThreshold: 1024, // 1KB
 		},
 	}
@@ -253,7 +253,7 @@ func TestGetStreamingConfigProviderFromRequest_Transform(t *testing.T) {
 	t.Run("With provider in context", func(t *testing.T) {
 		provider := &mockStreamingConfigProvider{
 			config: StreamingConfig{
-				Enabled:           true,
+				Enabled:            true,
 				TransformThreshold: 1024,
 			},
 		}

@@ -78,12 +78,12 @@ func TestJWTAuthenticator(t *testing.T) {
 	now := time.Now()
 
 	tests := []struct {
-		name      string
-		policy    *JWTPolicy
-		token     func() string
-		wantErr   string
-		wantSub   string
-		wantEmail string
+		name       string
+		policy     *JWTPolicy
+		token      func() string
+		wantErr    string
+		wantSub    string
+		wantEmail  string
 		wantGroups []string
 		wantExtra  map[string]string
 	}{

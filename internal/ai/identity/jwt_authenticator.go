@@ -18,14 +18,14 @@ import (
 
 // JWTPolicy defines the JWT verification policy for a workspace.
 type JWTPolicy struct {
-	WorkspaceID  string            `json:"workspace_id"`
-	JWKSURL      string            `json:"jwks_url"`
-	Issuer       string            `json:"issuer"`
-	Audience     string            `json:"audience"`
-	ClaimMapping map[string]string `json:"claim_mapping"` // JWT claim -> principal field
-	GroupsClaim  string            `json:"groups_claim"`  // claim containing groups array
-	AutoProvision bool            `json:"auto_provision"`
-	CacheTTL     time.Duration    `json:"cache_ttl"`
+	WorkspaceID   string            `json:"workspace_id"`
+	JWKSURL       string            `json:"jwks_url"`
+	Issuer        string            `json:"issuer"`
+	Audience      string            `json:"audience"`
+	ClaimMapping  map[string]string `json:"claim_mapping"` // JWT claim -> principal field
+	GroupsClaim   string            `json:"groups_claim"`  // claim containing groups array
+	AutoProvision bool              `json:"auto_provision"`
+	CacheTTL      time.Duration     `json:"cache_ttl"`
 }
 
 // JWKSEntry holds cached JWKS keys for a single URL.

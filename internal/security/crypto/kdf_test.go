@@ -65,19 +65,19 @@ func TestDeriveKey(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			derivedKey, err := DeriveKey(tt.masterKey, tt.salt, tt.info, tt.keyLength)
-			
+
 			if tt.wantErr {
 				if err == nil {
 					t.Errorf("DeriveKey() expected error, got nil")
 				}
 				return
 			}
-			
+
 			if err != nil {
 				t.Errorf("DeriveKey() unexpected error: %v", err)
 				return
 			}
-			
+
 			if len(derivedKey) != tt.keyLength {
 				t.Errorf("DeriveKey() key length = %d, want %d", len(derivedKey), tt.keyLength)
 			}
@@ -313,6 +313,3 @@ func TestEncryptWithDerivedKeyRandomness(t *testing.T) {
 		t.Errorf("decryptWithDerivedKey() failed to decrypt correctly")
 	}
 }
-
-
-

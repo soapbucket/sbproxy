@@ -15,19 +15,19 @@ import (
 
 // AIRequestLog is the structured log entry sent to observability hooks.
 type AIRequestLog struct {
-	RequestID   string            `json:"request_id"`
-	Timestamp   time.Time         `json:"timestamp"`
-	Provider    string            `json:"provider"`
-	Model       string            `json:"model"`
-	InputTokens int               `json:"input_tokens"`
-	OutputTokens int              `json:"output_tokens"`
-	CostUSD     float64           `json:"cost_usd,omitempty"`
-	LatencyMS   int64             `json:"latency_ms"`
-	TTFTMS      int64             `json:"ttft_ms,omitempty"`
-	CacheStatus string            `json:"cache_status,omitempty"`
-	StatusCode  int               `json:"status_code"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-	Streaming   bool              `json:"streaming"`
+	RequestID    string            `json:"request_id"`
+	Timestamp    time.Time         `json:"timestamp"`
+	Provider     string            `json:"provider"`
+	Model        string            `json:"model"`
+	InputTokens  int               `json:"input_tokens"`
+	OutputTokens int               `json:"output_tokens"`
+	CostUSD      float64           `json:"cost_usd,omitempty"`
+	LatencyMS    int64             `json:"latency_ms"`
+	TTFTMS       int64             `json:"ttft_ms,omitempty"`
+	CacheStatus  string            `json:"cache_status,omitempty"`
+	StatusCode   int               `json:"status_code"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
+	Streaming    bool              `json:"streaming"`
 }
 
 // Hook is an interface for observability destinations that receive AI request logs.

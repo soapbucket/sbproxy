@@ -257,4 +257,3 @@ func TestApplyTemplate_DataTypes(t *testing.T) {
 		})
 	}
 }
-

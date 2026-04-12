@@ -19,11 +19,11 @@ func TestChatCompletionRequest_JSONRoundtrip(t *testing.T) {
 			{Role: "system", Content: json.RawMessage(`"You are helpful."`)},
 			{Role: "user", Content: json.RawMessage(`"Hello"`)},
 		},
-		Temperature: &temp,
-		MaxTokens:   &maxTokens,
-		Stream:      &stream,
+		Temperature:   &temp,
+		MaxTokens:     &maxTokens,
+		Stream:        &stream,
 		StreamOptions: &StreamOptions{IncludeUsage: true},
-		SBTags:      map[string]string{"env": "test"},
+		SBTags:        map[string]string{"env": "test"},
 	}
 
 	data, err := json.Marshal(req)

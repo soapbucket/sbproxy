@@ -112,7 +112,7 @@ func TestRequestRule_Match_Location(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := mustCreateRequest("GET", "https://example.com/path", t)
-			
+
 			// Add location data to request context
 			reqData := reqctx.NewRequestData()
 			reqData.Location = tt.location
@@ -220,7 +220,7 @@ func TestRequestRule_Match_UserAgent(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := mustCreateRequest("GET", "https://example.com/path", t)
-			
+
 			// Add user agent data to request context
 			reqData := reqctx.NewRequestData()
 			reqData.UserAgent = tt.userAgent
@@ -357,7 +357,7 @@ func TestRequestRule_Match_AuthConditions(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := mustCreateRequest("GET", "https://example.com/path", t)
-			
+
 			// Add auth data to request context
 			reqData := reqctx.NewRequestData()
 			if tt.authData != nil {
@@ -483,7 +483,7 @@ func TestRequestRule_Match_Combined_Conditions(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := mustCreateRequest(tt.method, "https://example.com/path", t)
-			
+
 			// Add all data to request context
 			reqData := reqctx.NewRequestData()
 			reqData.Location = tt.location
@@ -502,4 +502,3 @@ func TestRequestRule_Match_Combined_Conditions(t *testing.T) {
 		})
 	}
 }
-

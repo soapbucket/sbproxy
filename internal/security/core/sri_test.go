@@ -39,7 +39,7 @@ func TestNewSRIGenerator(t *testing.T) {
 
 func TestSRIGenerator_GenerateHash(t *testing.T) {
 	data := []byte("test data")
-	
+
 	tests := []struct {
 		name      string
 		algorithm string
@@ -232,9 +232,9 @@ func TestSRIValidator_AddKnownHash(t *testing.T) {
 
 func TestExtractIntegrityFromLinkHeader(t *testing.T) {
 	tests := []struct {
-		name      string
+		name       string
 		linkHeader string
-		want      string
+		want       string
 	}{
 		{"valid link header", `<https://example.com/script.js>; rel="preload"; integrity="sha384-abc123"`, "sha384-abc123"},
 		{"no integrity", `<https://example.com/script.js>; rel="preload"`, ""},
@@ -250,4 +250,3 @@ func TestExtractIntegrityFromLinkHeader(t *testing.T) {
 		})
 	}
 }
-

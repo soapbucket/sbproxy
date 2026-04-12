@@ -255,4 +255,3 @@ func compareIPBytes(ip1, ip2 []byte) int {
 	}
 	return 0
 }
-

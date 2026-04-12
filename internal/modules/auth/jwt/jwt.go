@@ -58,10 +58,10 @@ var (
 )
 
 const (
-	DefaultHeaderName     = "Authorization"
-	DefaultHeaderPrefix   = "Bearer "
-	DefaultAlgorithm      = "RS256"
-	DefaultJWKSCacheDur   = 1 * time.Hour
+	DefaultHeaderName   = "Authorization"
+	DefaultHeaderPrefix = "Bearer "
+	DefaultAlgorithm    = "RS256"
+	DefaultJWKSCacheDur = 1 * time.Hour
 
 	maxTokenCacheEntries = 10000
 	tokenCacheTTL        = 30 * time.Second
@@ -79,13 +79,13 @@ type Config struct {
 	Disabled bool   `json:"disabled,omitempty"`
 
 	// Key material.
-	Secret            string `json:"secret,omitempty" secret:"true"`
-	PublicKey         string `json:"public_key,omitempty"`
+	Secret    string `json:"secret,omitempty" secret:"true"`
+	PublicKey string `json:"public_key,omitempty"`
 
 	// JWKS support.
-	JWKSURL                     string          `json:"jwks_url,omitempty"`
-	JWKSCacheDurationSeconds    float64         `json:"jwks_cache_duration,omitempty"`
-	DisableJWKSRefreshUnknownKID bool           `json:"disable_jwks_refresh_unknown_kid,omitempty"`
+	JWKSURL                      string  `json:"jwks_url,omitempty"`
+	JWKSCacheDurationSeconds     float64 `json:"jwks_cache_duration,omitempty"`
+	DisableJWKSRefreshUnknownKID bool    `json:"disable_jwks_refresh_unknown_kid,omitempty"`
 
 	// Validation.
 	Issuer    string   `json:"issuer,omitempty"`
@@ -146,14 +146,14 @@ func (c jwksCache) isExpired() bool { return c.expires.Before(time.Now()) }
 
 // provider is the runtime JWT auth provider.
 type provider struct {
-	cfg              *Config
-	jwksCacheDur     time.Duration
-	keyCacheDur      time.Duration
-	keyCache         map[string]publicKeyCache
-	tokenCache       *objectcache.ObjectCache
-	jwksCacheData    *jwksCache
-	mx               sync.RWMutex
-	httpClient       *http.Client
+	cfg           *Config
+	jwksCacheDur  time.Duration
+	keyCacheDur   time.Duration
+	keyCache      map[string]publicKeyCache
+	tokenCache    *objectcache.ObjectCache
+	jwksCacheData *jwksCache
+	mx            sync.RWMutex
+	httpClient    *http.Client
 }
 
 // New creates a new JWT auth provider from raw JSON configuration.

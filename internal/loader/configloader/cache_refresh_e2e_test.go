@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/soapbucket/sbproxy/internal/config"
-	"github.com/soapbucket/sbproxy/internal/middleware/forward"
 	"github.com/soapbucket/sbproxy/internal/loader/manager"
+	"github.com/soapbucket/sbproxy/internal/middleware/forward"
 	"github.com/soapbucket/sbproxy/internal/platform/messenger"
 )
 
@@ -57,8 +57,8 @@ func TestOriginCacheRefresh_EndToEnd(t *testing.T) {
 	mockStore := &mockStorage{
 		data: map[string][]byte{
 			"parent.test":      parentConfig,
-			"child1.test":       child1Config,
-			"child2.test":       child2Config,
+			"child1.test":      child1Config,
+			"child2.test":      child2Config,
 			"grandparent.test": grandparentConfig,
 			"standalone.test":  standaloneConfig,
 		},
@@ -302,4 +302,3 @@ type mockManagerWithMessenger struct {
 func (m *mockManagerWithMessenger) GetMessenger() messenger.Messenger {
 	return m.messenger
 }
-

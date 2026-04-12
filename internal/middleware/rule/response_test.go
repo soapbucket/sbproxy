@@ -460,7 +460,7 @@ func responseRulesEqual(a, b ResponseRule) bool {
 		return false
 	}
 
-	// Compare Header conditions  
+	// Compare Header conditions
 	// Note: headerConditionsEqual is defined in request_test.go (test helper)
 	// For now, just do a simple comparison
 	if (a.Headers == nil) != (b.Headers == nil) {
@@ -493,7 +493,7 @@ func intSliceEqual(a, b []int) bool {
 }
 
 func TestResponseRule_CEL_Integration(t *testing.T) {
-	
+
 	tests := []struct {
 		name       string
 		jsonRule   string
@@ -628,7 +628,7 @@ func TestResponseRule_CEL_Integration(t *testing.T) {
 }
 
 func TestResponseRule_Lua_Integration(t *testing.T) {
-	
+
 	tests := []struct {
 		name       string
 		jsonRule   string
@@ -770,7 +770,7 @@ func TestResponseRule_Lua_Integration(t *testing.T) {
 }
 
 func TestResponseRule_CEL_And_Lua_Combined(t *testing.T) {
-	
+
 	// Test that CEL and Lua can be combined in a single rule (both must match)
 	jsonRule := `{
 		"cel_expr": "response.status_code == 200",

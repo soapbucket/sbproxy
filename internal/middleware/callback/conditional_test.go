@@ -1,11 +1,10 @@
 package callback
 
 import (
-	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"context"
+	"github.com/soapbucket/sbproxy/internal/httpkit/httputil"
 	"testing"
 	"time"
-
 )
 
 func TestHandleConditionalRequest(t *testing.T) {
@@ -17,12 +16,12 @@ func TestHandleConditionalRequest(t *testing.T) {
 
 	now := time.Now()
 	cached := &HTTPCachedCallbackResponse{
-		Data: map[string]any{"test": "data"},
-		ETag: "abc123",
+		Data:         map[string]any{"test": "data"},
+		ETag:         "abc123",
 		LastModified: now.Add(-1 * time.Hour),
-		ExpiresAt: now.Add(60 * time.Second),
-		StaleAt: now.Add(180 * time.Second),
-		MaxStaleAt: now.Add(360 * time.Second),
+		ExpiresAt:    now.Add(60 * time.Second),
+		StaleAt:      now.Add(180 * time.Second),
+		MaxStaleAt:   now.Add(360 * time.Second),
 	}
 
 	t.Run("If-None-Match match - not modified", func(t *testing.T) {
@@ -122,9 +121,9 @@ func TestHandleConditionalRequest(t *testing.T) {
 
 	t.Run("no ETag in cached response", func(t *testing.T) {
 		cachedNoETag := &HTTPCachedCallbackResponse{
-			Data: map[string]any{"test": "data"},
+			Data:         map[string]any{"test": "data"},
 			LastModified: now.Add(-1 * time.Hour),
-			ExpiresAt: now.Add(60 * time.Second),
+			ExpiresAt:    now.Add(60 * time.Second),
 		}
 
 		result, handled, err := httpCache.HandleConditionalRequest(ctx, "test-key", cachedNoETag, "abc123", "")
@@ -141,8 +140,8 @@ func TestHandleConditionalRequest(t *testing.T) {
 
 	t.Run("no Last-Modified in cached response", func(t *testing.T) {
 		cachedNoLM := &HTTPCachedCallbackResponse{
-			Data: map[string]any{"test": "data"},
-			ETag: "abc123",
+			Data:      map[string]any{"test": "data"},
+			ETag:      "abc123",
 			ExpiresAt: now.Add(60 * time.Second),
 		}
 
@@ -200,4 +199,3 @@ func TestExtractConditionalHeaders(t *testing.T) {
 		}
 	})
 }
-

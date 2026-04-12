@@ -2,8 +2,8 @@
 package ai
 
 import (
-	json "github.com/goccy/go-json"
 	"fmt"
+	json "github.com/goccy/go-json"
 	"net/http"
 )
 

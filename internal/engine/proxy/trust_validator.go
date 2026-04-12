@@ -23,9 +23,9 @@ const (
 
 // TrustValidator validates proxy headers based on trust configuration
 type TrustValidator struct {
-	trustMode      TrustMode
-	trustedCIDRs   []*net.IPNet
-	trustedHops    int
+	trustMode    TrustMode
+	trustedCIDRs []*net.IPNet
+	trustedHops  int
 }
 
 // NewTrustValidator creates a new trust validator
@@ -144,4 +144,3 @@ func parseXFFChain(xff string) []string {
 func joinXFFChain(ips []string) string {
 	return strings.Join(ips, ", ")
 }
-

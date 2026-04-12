@@ -186,4 +186,3 @@ func TestCallbackOnLoad_Integration(t *testing.T) {
 	assert.Equal(t, "v2", req.Header.Get("X-API-Version"))
 	assert.Equal(t, "production", req.Header.Get("X-Environment"))
 }
-

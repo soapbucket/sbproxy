@@ -14,9 +14,9 @@ func BenchmarkRequestRule_Match_Location(b *testing.B) {
 			ContinentCodes: []string{"NA", "EU"},
 		},
 	}
-	
+
 	req := mustCreateRequest("GET", "https://example.com/path", b)
-	
+
 	// Add location data to request context
 	reqData := reqctx.NewRequestData()
 	reqData.Location = &reqctx.Location{
@@ -41,9 +41,9 @@ func BenchmarkRequestRule_Match_UserAgent(b *testing.B) {
 			OSFamilies:        []string{"Windows", "Mac OS X", "Linux"},
 		},
 	}
-	
+
 	req := mustCreateRequest("GET", "https://example.com/path", b)
-	
+
 	// Add user agent data to request context
 	reqData := reqctx.NewRequestData()
 	reqData.UserAgent = &reqctx.UserAgent{
@@ -79,9 +79,9 @@ func BenchmarkRequestRule_Match_AuthConditions(b *testing.B) {
 			},
 		},
 	}
-	
+
 	req := mustCreateRequest("GET", "https://example.com/path", b)
-	
+
 	// Add auth data to request context
 	reqData := reqctx.NewRequestData()
 	reqData.SessionData = &reqctx.SessionData{
@@ -120,9 +120,9 @@ func BenchmarkRequestRule_Match_Combined(b *testing.B) {
 			},
 		},
 	}
-	
+
 	req := mustCreateRequest("GET", "https://example.com/path", b)
-	
+
 	// Add all data to request context
 	reqData := reqctx.NewRequestData()
 	reqData.Location = &reqctx.Location{
@@ -146,4 +146,3 @@ func BenchmarkRequestRule_Match_Combined(b *testing.B) {
 		_ = rule.Match(req)
 	}
 }
-
