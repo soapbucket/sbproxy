@@ -8,8 +8,17 @@
 
 set -e
 
+BANNER='
+ ███████╗██████╗ ██████╗ ██████╗  ██████╗ ██╗  ██╗██╗   ██╗
+ ██╔════╝██╔══██╗██╔══██╗██╔══██╗██╔═══██╗╚██╗██╔╝╚██╗ ██╔╝
+ ███████╗██████╔╝██████╔╝██████╔╝██║   ██║ ╚███╔╝  ╚████╔╝
+ ╚════██║██╔══██╗██╔═══╝ ██╔══██╗██║   ██║ ██╔██╗   ╚██╔╝
+ ███████║██████╔╝██║     ██║  ██║╚██████╔╝██╔╝ ██╗   ██║
+ ╚══════╝╚═════╝ ╚═╝     ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝   ╚═╝
+'
+
 REPO="soapbucket/sbproxy"
-INSTALL_DIR="${SBPROXY_INSTALL:-/usr/local/bin}"
+INSTALL_DIR="${SBPROXY_INSTALL:-$HOME/.local/bin}"
 
 main() {
     detect_platform
@@ -89,12 +98,25 @@ download_and_install() {
         exit 1
     fi
 
+    # Ensure install directory exists
+    mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+
     # Install the binary
     if [ -w "$INSTALL_DIR" ]; then
         mv "${TMPDIR}/sbproxy" "${INSTALL_DIR}/sbproxy"
     else
-        echo "Installing to ${INSTALL_DIR} (requires sudo)..."
-        sudo mv "${TMPDIR}/sbproxy" "${INSTALL_DIR}/sbproxy"
+        echo ""
+        echo "Install directory ${INSTALL_DIR} requires elevated permissions."
+        printf "Install with sudo? [y/N] "
+        read -r REPLY
+        if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
+            sudo mv "${TMPDIR}/sbproxy" "${INSTALL_DIR}/sbproxy"
+        else
+            echo "Aborted. You can set a custom path with:"
+            echo "  SBPROXY_INSTALL=~/.local/bin curl -fsSL download.sbproxy.dev | sh"
+            rm -rf "$TMPDIR"
+            exit 1
+        fi
     fi
 
     chmod +x "${INSTALL_DIR}/sbproxy"
@@ -104,8 +126,8 @@ download_and_install() {
 verify_install() {
     if command -v sbproxy >/dev/null 2>&1; then
         INSTALLED_VERSION=$(sbproxy --version 2>/dev/null || echo "unknown")
-        echo ""
-        echo "sbproxy installed successfully!"
+        echo "$BANNER"
+        echo "  Installed successfully!"
         echo "  Version:  ${INSTALLED_VERSION}"
         echo "  Location: $(command -v sbproxy)"
         echo ""
@@ -114,8 +136,8 @@ verify_install() {
         echo ""
         echo "Docs: https://github.com/${REPO}"
     else
-        echo ""
-        echo "sbproxy installed to ${INSTALL_DIR}/sbproxy"
+        echo "$BANNER"
+        echo "  Installed to ${INSTALL_DIR}/sbproxy"
         echo ""
         if echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
             echo "Run: sbproxy --version"
