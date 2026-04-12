@@ -6,12 +6,8 @@ on:
     branches: [main]
 
 jobs:
-  changes:
+  build:
     runs-on: ubuntu-latest
-    permissions:
-      pull-requests: read
-    outputs:
-      code: ${{ steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -23,17 +19,12 @@ jobs:
               - '!docs/**'
               - '!LICENSE'
               - '!.gitignore'
-
-  build:
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
+        if: steps.filter.outputs.code == 'true'
         with:
           go-version: '1.25.5'
       - name: Build with version info
+        if: steps.filter.outputs.code == 'true'
         run: |
           VERSION=$(cat VERSION)
           GIT_HASH=$(git rev-parse --short HEAD)
@@ -43,10 +34,17 @@ jobs:
             -X github.com/soapbucket/sbproxy/internal/version.BuildHash=${GIT_HASH} \
             -X github.com/soapbucket/sbproxy/internal/version.BuildDate=${BUILD_DATE}" \
             ./...
-      - run: go vet ./...
-      - run: go test ./... -count=1 -timeout 300s -race
+      - name: Vet
+        if: steps.filter.outputs.code == 'true'
+        run: go vet ./...
+      - name: Test
+        if: steps.filter.outputs.code == 'true'
+        run: go test ./... -count=1 -timeout 300s -race
       - name: Install and run golangci-lint
+        if: steps.filter.outputs.code == 'true'
         run: |
           go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
           golangci-lint run ./...
-      - run: make check
+      - name: Check
+        if: steps.filter.outputs.code == 'true'
+        run: make check
