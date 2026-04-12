@@ -17,7 +17,7 @@ Most teams run separate systems for HTTP proxying and AI traffic. SBproxy handle
 
 - **Single binary** with zero external dependencies. Works without Redis, a database, or a sidecar.
 - **Sub-millisecond overhead** via compiled handler chains (no per-request config lookups).
-- **103+ native LLM providers** with OpenAI-compatible API.
+- **200+ native LLM providers** with OpenAI-compatible API. See [docs/providers.md](docs/providers.md).
 - **Hot reload** without restarts.
 
 ## Install
@@ -115,7 +115,7 @@ All 16 examples in [examples/](examples/) use [test.sbproxy.dev](https://test.sb
 | Reverse Proxy | Forward requests to upstream servers with configurable timeouts | [Config](https://sbproxy.dev/docs/config#proxy) |
 | Path-Based Routing | Route different paths to different backends via forward rules | [Config](https://sbproxy.dev/docs/config#forward-rules) |
 | Load Balancing | 10 algorithms (round-robin, weighted, least-connections, IP hash, and more) with health checks | [Config](https://sbproxy.dev/docs/config#loadbalancer) |
-| AI Gateway | OpenAI-compatible API with 103+ native providers, model routing, fallback chains | [AI Docs](https://sbproxy.dev/docs/ai) |
+| AI Gateway | OpenAI-compatible API with 200+ native providers, model routing, fallback chains | [AI Docs](https://sbproxy.dev/docs/ai) |
 | WebSocket | Full-duplex WebSocket proxying | [Config](https://sbproxy.dev/docs/config#websocket) |
 | gRPC | gRPC and gRPC-Web proxying | [Config](https://sbproxy.dev/docs/config#grpc) |
 | GraphQL | GraphQL-aware proxying | [Config](https://sbproxy.dev/docs/config#graphql) |

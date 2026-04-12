@@ -14,6 +14,7 @@ Comprehensive documentation for SBproxy.
 | [AI Gateway](ai-gateway.md) | Provider setup, routing strategies, streaming, CEL guardrails |
 | [Features](features.md) | Complete feature inventory with working examples |
 | [Events](events.md) | Event system, subscriber types, filtering |
+| [Providers](providers.md) | 203+ supported AI providers with config names, formats, and documentation links |
 | [Comparison](comparison.md) | How SBproxy compares to LiteLLM, Kong, Caddy, Traefik, Nginx, Envoy |
 
 ## Examples
