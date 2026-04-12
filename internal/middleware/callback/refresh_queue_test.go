@@ -126,33 +126,21 @@ func TestRefreshQueue(t *testing.T) {
 	})
 
 	t.Run("queue full", func(t *testing.T) {
-		// Create queue with size 1
+		// Create queue with size 1 but do NOT start workers.
+		// This ensures nothing drains the channel, so the queue stays full.
 		msgBus2 := newMockMessenger()
 		smallQueue := NewRefreshQueue(httpCache, callback, 1, 1, msgBus2)
-		smallQueue.Start()
-		defer smallQueue.Stop()
 
-		// Fill the queue - use a blocking callback to prevent worker from processing immediately
+		// Fill the single slot
 		task1 := &RevalidationTask{Key: "key1", CallbackURL: "http://example.com", Method: "POST", RequestData: map[string]any{}}
-		err1 := smallQueue.Enqueue(task1)
-		if err1 != nil {
-			t.Errorf("failed to enqueue first task: %v", err1)
+		if err := smallQueue.Enqueue(task1); err != nil {
+			t.Fatalf("failed to enqueue first task: %v", err)
 		}
 
-		// Immediately try to enqueue second task - queue should be full
-		// The worker might start processing, but with queue size 1, the second enqueue should fail
-		// if the queue is still full
+		// Second enqueue must fail because no worker is draining
 		task2 := &RevalidationTask{Key: "key2", CallbackURL: "http://example.com", Method: "POST", RequestData: map[string]any{}}
-		err2 := smallQueue.Enqueue(task2)
-		if err2 == nil {
-			// If no error, check if queue is actually full by checking queue length
-			// Give a tiny delay to see if worker processed task1
-			time.Sleep(10 * time.Millisecond)
-			// Try again - if queue is still full, this should fail
-			err3 := smallQueue.Enqueue(&RevalidationTask{Key: "key3", CallbackURL: "http://example.com", Method: "POST", RequestData: map[string]any{}})
-			if err3 == nil {
-				t.Error("expected error when queue is full")
-			}
+		if err := smallQueue.Enqueue(task2); err == nil {
+			t.Error("expected error when queue is full")
 		}
 	})
 
