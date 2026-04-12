@@ -35,6 +35,9 @@ dockers:
       - "--label=org.opencontainers.image.revision={{.FullCommit}}"
       - "--label=org.opencontainers.image.version={{.Version}}"
 
+release:
+  mode: replace
+
 changelog:
   sort: asc
   filters:
