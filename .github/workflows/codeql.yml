@@ -5,12 +5,16 @@ on:
     branches: [main]
 
 jobs:
-  changes:
+  analyze:
+    name: Analyze
     runs-on: ubuntu-latest
     permissions:
+      security-events: write
       pull-requests: read
-    outputs:
-      code: ${{ steps.filter.outputs.code }}
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [go, javascript-typescript]
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -22,25 +26,14 @@ jobs:
               - '!docs/**'
               - '!LICENSE'
               - '!.gitignore'
-
-  analyze:
-    name: Analyze
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      security-events: write
-    strategy:
-      fail-fast: false
-      matrix:
-        language: [go, javascript-typescript]
-    steps:
-      - uses: actions/checkout@v4
       - uses: github/codeql-action/init@v3
+        if: steps.filter.outputs.code == 'true'
         with:
           languages: ${{ matrix.language }}
           queries: +security-and-quality
       - uses: github/codeql-action/autobuild@v3
+        if: steps.filter.outputs.code == 'true'
       - uses: github/codeql-action/analyze@v3
+        if: steps.filter.outputs.code == 'true'
         with:
           category: '/language:${{ matrix.language }}'
