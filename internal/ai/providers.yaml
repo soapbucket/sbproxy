@@ -1657,3 +1657,1135 @@ providers:
     requires: []
     docs_url: https://github.com/bentoml/OpenLLM
     models: {}
+
+  # ---- Regional - Japan & Korea --------------------------------------------
+
+  elyza:
+    display_name: ELYZA
+    base_url: https://api.elyza.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://elyza.ai
+    models: {}
+
+  line_clova:
+    display_name: LINE CLOVA (HyperCLOVA X)
+    base_url: https://clovastudio.apigw.ntruss.com
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://clova.ai
+    models: {}
+
+  kakao:
+    display_name: Kakao Brain (KoGPT)
+    base_url: https://api.kakaobrain.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://kakaobrain.com
+    models: {}
+
+  sakura_internet:
+    display_name: Sakura Internet AI
+    base_url: https://api.sakura.ad.jp/ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://www.sakura.ad.jp
+    models: {}
+
+  preferred_networks:
+    display_name: Preferred Networks (PLaMo)
+    base_url: https://api.pfn.io/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://www.preferred.jp
+    models: {}
+
+  cyberagent:
+    display_name: CyberAgent AI (CALM)
+    base_url: https://api.cyberagent.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://www.cyberagent.co.jp
+    models: {}
+
+  nhn_cloud:
+    display_name: NHN Cloud AI
+    base_url: https://api-ai.nhncloudservice.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://www.nhncloud.com
+    models: {}
+
+  skelter_labs:
+    display_name: Skelter Labs
+    base_url: https://api.skelterlabs.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://www.skelterlabs.com
+    models: {}
+
+  # ---- Regional - India & South Asia ----------------------------------------
+
+  krutrim:
+    display_name: Krutrim AI (Ola)
+    base_url: https://api.krutrim.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://krutrim.com
+    models: {}
+
+  sarvam:
+    display_name: Sarvam AI
+    base_url: https://api.sarvam.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://www.sarvam.ai
+    models: {}
+
+  # ---- Regional - Middle East & Africa --------------------------------------
+
+  g42:
+    display_name: G42 AI (Jais)
+    base_url: https://api.g42cloud.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://g42.ai
+    models: {}
+
+  tii_falcon:
+    display_name: Technology Innovation Institute (Falcon)
+    base_url: https://api.falconllm.tii.ae/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://falconllm.tii.ae
+    models: {}
+
+  lelapa:
+    display_name: Lelapa AI
+    base_url: https://api.lelapa.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://lelapa.ai
+    models: {}
+
+  # ---- Regional - Latin America ---------------------------------------------
+
+  maritaca:
+    display_name: Maritaca AI (Sabia)
+    base_url: https://chat.maritaca.ai/api
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://maritaca.ai
+    models: {}
+
+  # ---- Regional - Southeast Asia --------------------------------------------
+
+  ai_singapore:
+    display_name: AI Singapore (SEA-LION)
+    base_url: https://api.aisingapore.org/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://aisingapore.org
+    models: {}
+
+  kata_ai:
+    display_name: Kata.ai
+    base_url: https://api.kata.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://kata.ai
+    models: {}
+
+  # ---- Regional - Europe ----------------------------------------------------
+
+  lighton:
+    display_name: LightOn
+    base_url: https://api.lighton.ai/muse/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://lighton.ai
+    models: {}
+
+  gilas:
+    display_name: Gilas AI
+    base_url: https://api.gilas.io/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://gilas.io
+    models: {}
+
+  # ---- Regional - China (additional) ----------------------------------------
+
+  kunlun_skywork:
+    display_name: Kunlun Tech (Skywork)
+    base_url: https://api.tiangong.cn/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://tiangong.cn
+    models: {}
+
+  modelscope:
+    display_name: ModelScope (Alibaba DAMO)
+    base_url: https://api.modelscope.cn/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://modelscope.cn
+    models: {}
+
+  dashscope:
+    display_name: DashScope (Alibaba Cloud)
+    base_url: https://dashscope.aliyuncs.com/api/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://dashscope.aliyun.com
+    models: {}
+
+  lingyi_wanwu:
+    display_name: Lingyiwanwu (01.AI)
+    base_url: https://api.lingyiwanwu.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://01.ai
+    models: {}
+
+  megrez:
+    display_name: Infinigence AI (Megrez)
+    base_url: https://api.infinigence.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://cloud.infini-ai.com
+    models: {}
+
+  baai:
+    display_name: BAAI (Beijing Academy of AI)
+    base_url: https://api.baai.ac.cn/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://www.baai.ac.cn
+    models: {}
+
+  qihoo_360:
+    display_name: 360 AI (Zhi Nao)
+    base_url: https://api.360.cn/v1/chat/completions
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://ai.360.cn
+    models: {}
+
+  megvii:
+    display_name: Megvii (Face++)
+    base_url: https://api.megvii.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://megvii.com
+    models: {}
+
+  # ---- GPU Cloud & Inference Infrastructure (additional) --------------------
+
+  crusoe:
+    display_name: Crusoe AI Cloud
+    base_url: https://inference.crusoecloud.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://crusoe.ai
+    models: {}
+
+  coreweave:
+    display_name: CoreWeave Inference
+    base_url: https://inference.coreweave.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://coreweave.com
+    models: {}
+
+  vast_ai:
+    display_name: Vast.ai
+    base_url: https://api.vast.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://vast.ai
+    models: {}
+
+  tensordock:
+    display_name: TensorDock
+    base_url: https://api.tensordock.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://tensordock.com
+    models: {}
+
+  shadeform:
+    display_name: Shadeform
+    base_url: https://api.shadeform.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://shadeform.ai
+    models: {}
+
+  massed_compute:
+    display_name: Massed Compute
+    base_url: https://api.massedcompute.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://massedcompute.com
+    models: {}
+
+  inference_net:
+    display_name: Inference.net
+    base_url: https://api.inference.net/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://inference.net
+    models: {}
+
+  beam:
+    display_name: Beam Cloud
+    base_url: https://api.beam.cloud/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://beam.cloud
+    models: {}
+
+  paperspace:
+    display_name: Paperspace (DigitalOcean)
+    base_url: https://api.paperspace.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://www.paperspace.com
+    models: {}
+
+  # ---- Code & Developer AI (additional) -------------------------------------
+
+  codestral:
+    display_name: Codestral (Mistral Code)
+    base_url: https://codestral.mistral.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.mistral.ai/capabilities/code_generation
+    models: {}
+
+  codeium:
+    display_name: Codeium (Windsurf)
+    base_url: https://api.codeium.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://codeium.com
+    models: {}
+
+  tabnine:
+    display_name: Tabnine
+    base_url: https://api.tabnine.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://www.tabnine.com
+    models: {}
+
+  poolside:
+    display_name: Poolside AI
+    base_url: https://api.poolside.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://poolside.ai
+    models: {}
+
+  replit:
+    display_name: Replit AI
+    base_url: https://api.replit.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://replit.com
+    models: {}
+
+  # ---- Emerging AI Startups -------------------------------------------------
+
+  arliai:
+    display_name: Arli AI
+    base_url: https://api.arliai.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://www.arliai.com
+    models: {}
+
+  shuttleai:
+    display_name: Shuttle AI
+    base_url: https://api.shuttleai.app/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://shuttleai.app
+    models: {}
+
+  chutes:
+    display_name: Chutes AI
+    base_url: https://api.chutes.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://chutes.ai
+    models: {}
+
+  unify:
+    display_name: Unify AI
+    base_url: https://api.unify.ai/v0
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://unify.ai
+    models: {}
+
+  not_diamond:
+    display_name: Not Diamond
+    base_url: https://api.notdiamond.ai/v2
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://notdiamond.ai
+    models: {}
+
+  predictionguard:
+    display_name: Prediction Guard
+    base_url: https://api.predictionguard.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://www.predictionguard.com
+    models: {}
+
+  telnyx:
+    display_name: Telnyx AI
+    base_url: https://api.telnyx.com/v2/ai
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://telnyx.com
+    models: {}
+
+  gradient:
+    display_name: Gradient AI
+    base_url: https://api.gradient.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://gradient.ai
+    models: {}
+
+  lamini:
+    display_name: Lamini
+    base_url: https://api.lamini.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://lamini.ai
+    models: {}
+
+  arcee:
+    display_name: Arcee AI
+    base_url: https://api.arcee.ai/v2
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://arcee.ai
+    models: {}
+
+  contextual_ai:
+    display_name: Contextual AI
+    base_url: https://api.contextual.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://contextual.ai
+    models: {}
+
+  coze:
+    display_name: Coze (ByteDance)
+    base_url: https://api.coze.com/open_api/v2
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://www.coze.com
+    models: {}
+
+  dify:
+    display_name: Dify.AI
+    base_url: https://api.dify.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://dify.ai
+    models: {}
+
+  # ---- Embedding & Retrieval Specialists (additional) -----------------------
+
+  pinecone:
+    display_name: Pinecone Inference
+    base_url: https://api.pinecone.io
+    auth_header: Api-Key
+    auth_prefix: ""
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://docs.pinecone.io
+    models: {}
+
+  vectara:
+    display_name: Vectara
+    base_url: https://api.vectara.io/v2
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://docs.vectara.com
+    models: {}
+
+  twelve_labs:
+    display_name: Twelve Labs
+    base_url: https://api.twelvelabs.io/v1.2
+    auth_header: x-api-key
+    auth_prefix: ""
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://docs.twelvelabs.io
+    models: {}
+
+  # ---- Speech & Audio (additional) ------------------------------------------
+
+  gladia:
+    display_name: Gladia
+    base_url: https://api.gladia.io/v2
+    auth_header: x-gladia-key
+    auth_prefix: ""
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://docs.gladia.io
+    models: {}
+
+  speechmatics:
+    display_name: Speechmatics
+    base_url: https://asr.api.speechmatics.com/v2
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://docs.speechmatics.com
+    models: {}
+
+  rev_ai:
+    display_name: Rev AI
+    base_url: https://api.rev.ai/speechtotext/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://docs.rev.ai
+    models: {}
+
+  # ---- Image & Video Generation (additional) --------------------------------
+
+  ideogram:
+    display_name: Ideogram
+    base_url: https://api.ideogram.ai/v1
+    auth_header: Api-Key
+    auth_prefix: ""
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://developer.ideogram.ai
+    models: {}
+
+  black_forest_labs:
+    display_name: Black Forest Labs (FLUX)
+    base_url: https://api.bfl.ml/v1
+    auth_header: x-key
+    auth_prefix: ""
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://docs.bfl.ml
+    models: {}
+
+  luma:
+    display_name: Luma AI (Dream Machine)
+    base_url: https://api.lumalabs.ai/dream-machine/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://docs.lumalabs.ai
+    models: {}
+
+  runway:
+    display_name: Runway ML
+    base_url: https://api.runwayml.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://docs.runwayml.com
+    models: {}
+
+  # ---- Enterprise Cloud AI --------------------------------------------------
+
+  oracle_genai:
+    display_name: Oracle Generative AI
+    base_url: https://inference.generativeai.us-chicago-1.oci.oraclecloud.com
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://docs.oracle.com/en-us/iaas/Content/generative-ai
+    models: {}
+
+  salesforce_einstein:
+    display_name: Salesforce Einstein AI
+    base_url: https://api.salesforce.com/einstein/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://developer.salesforce.com/docs/einstein
+    models: {}
+
+  sap_ai:
+    display_name: SAP AI Core
+    base_url: https://api.ai.prodeuwest.aws.ml.hana.ondemand.com/v2
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://help.sap.com/docs/sap-ai-core
+    models: {}
+
+  google_ai_studio:
+    display_name: Google AI Studio
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    auth_header: x-goog-api-key
+    auth_prefix: ""
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://ai.google.dev
+    models: {}
+
+  # ---- Additional Inference Providers ---------------------------------------
+
+  abeja:
+    display_name: ABEJA Platform
+    base_url: https://api.abeja.io/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://abeja.io
+    models: {}
+
+  ai21_studio:
+    display_name: AI21 Studio (Jamba)
+    base_url: https://api.ai21.com/studio/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://docs.ai21.com
+    models: {}
+
+  alibaba_eas:
+    display_name: Alibaba PAI-EAS
+    base_url: https://pai-eas.aliyuncs.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://www.alibabacloud.com/help/en/pai
+    models: {}
+
+  aliyun_bailian:
+    display_name: Aliyun Bailian
+    base_url: https://bailian.aliyuncs.com/v2
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://bailian.console.aliyun.com
+    models: {}
+
+  aws_comprehend:
+    display_name: AWS Comprehend
+    base_url: https://comprehend.us-east-1.amazonaws.com
+    auth_header: Authorization
+    auth_prefix: ""
+    format: custom
+    requires:
+      - api_key
+      - api_secret
+    docs_url: https://docs.aws.amazon.com/comprehend
+    models: {}
+
+  banana:
+    display_name: Banana.dev
+    base_url: https://api.banana.dev/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://docs.banana.dev
+    models: {}
+
+  character_ai:
+    display_name: Character.AI
+    base_url: https://beta.character.ai/api/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://character.ai
+    models: {}
+
+  corcel:
+    display_name: Corcel AI
+    base_url: https://api.corcel.io/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://corcel.io
+    models: {}
+
+  deepl:
+    display_name: DeepL
+    base_url: https://api.deepl.com/v2
+    auth_header: Authorization
+    auth_prefix: "DeepL-Auth-Key "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://developers.deepl.com
+    models: {}
+
+  empower:
+    display_name: Empower AI
+    base_url: https://api.empower.dev/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://empower.dev
+    models: {}
+
+  ernie:
+    display_name: Baidu ERNIE Bot
+    base_url: https://aip.baidubce.com/rpc/2.0/ai_custom/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://cloud.baidu.com/doc/WENXINWORKSHOP
+    models: {}
+
+  fal:
+    display_name: fal.ai
+    base_url: https://fal.run
+    auth_header: Authorization
+    auth_prefix: "Key "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://fal.ai/docs
+    models: {}
+
+  featherless_serverless:
+    display_name: Featherless Serverless
+    base_url: https://api.featherless.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://featherless.ai
+    models: {}
+
+  friendli_serverless:
+    display_name: FriendliAI Serverless
+    base_url: https://inference.friendli.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.friendli.ai
+    models: {}
+
+  gaianet:
+    display_name: GaiaNet
+    base_url: https://llama.us.gaianet.network/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires: []
+    docs_url: https://docs.gaianet.ai
+    models: {}
+
+  glhf:
+    display_name: GLHF Chat
+    base_url: https://glhf.chat/api/openai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://glhf.chat
+    models: {}
+
+  hunyuan:
+    display_name: Tencent Hunyuan
+    base_url: https://hunyuan.tencentcloudapi.com
+    auth_header: Authorization
+    auth_prefix: ""
+    format: custom
+    requires:
+      - api_key
+      - api_secret
+    docs_url: https://cloud.tencent.com/product/hunyuan
+    models: {}
+
+  ibm_granite:
+    display_name: IBM Granite
+    base_url: https://us-south.ml.cloud.ibm.com/ml/v1/text/generation
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://www.ibm.com/granite
+    models: {}
+
+  iflyrec:
+    display_name: iFlytek Spark
+    base_url: https://spark-api-open.xf-yun.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://www.xfyun.cn/doc/spark
+    models: {}
+
+  klarna:
+    display_name: Klarna AI
+    base_url: https://api.klarna.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://docs.klarna.com
+    models: {}
+
+  kornia:
+    display_name: Kornia AI
+    base_url: https://api.kornia.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://kornia.ai
+    models: {}
+
+  lightning:
+    display_name: Lightning AI
+    base_url: https://api.lightning.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://lightning.ai
+    models: {}
+
+  lmsys:
+    display_name: LMSYS (Chatbot Arena)
+    base_url: https://api.lmsys.org/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://lmsys.org
+    models: {}
+
+  neets:
+    display_name: Neets.ai
+    base_url: https://api.neets.ai/v1
+    auth_header: X-API-Key
+    auth_prefix: ""
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://neets.ai
+    models: {}
+
+  nim:
+    display_name: NVIDIA NIM
+    base_url: https://integrate.api.nvidia.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://build.nvidia.com
+    models: {}
+
+  openai_azure_ad:
+    display_name: Azure OpenAI (Entra ID)
+    base_url: https://{resource}.openai.azure.com
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://learn.microsoft.com/en-us/azure/ai-services/openai
+    models: {}
+
+  pawan:
+    display_name: PawanOsman API
+    base_url: https://api.pawan.krd/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://github.com/PawanOsman/ChatGPT
+    models: {}
+
+  qianfan:
+    display_name: Baidu Qianfan
+    base_url: https://qianfan.baidubce.com/v2
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://cloud.baidu.com/doc/WENXINWORKSHOP
+    models: {}
+
+  siliconflow:
+    display_name: SiliconFlow
+    base_url: https://api.siliconflow.cn/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.siliconflow.cn
+    models: {}
+
+  spark:
+    display_name: iFlytek Spark (Legacy)
+    base_url: https://spark-api.xf-yun.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://www.xfyun.cn
+    models: {}
+
+  symbl:
+    display_name: Symbl.ai
+    base_url: https://api.symbl.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    requires:
+      - api_key
+    docs_url: https://docs.symbl.ai
+    models: {}
+
+  titan:
+    display_name: Amazon Titan
+    base_url: https://bedrock-runtime.us-east-1.amazonaws.com
+    auth_header: Authorization
+    auth_prefix: ""
+    format: custom
+    requires:
+      - api_key
+      - api_secret
+    docs_url: https://docs.aws.amazon.com/bedrock/latest/userguide/titan-models.html
+    models: {}
+
+  zhipuai:
+    display_name: Zhipu AI (GLM-4)
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://open.bigmodel.cn
+    models: {}
