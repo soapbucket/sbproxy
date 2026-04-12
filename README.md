@@ -5,7 +5,7 @@
 [![Release](https://img.shields.io/github/v/release/soapbucket/sbproxy)](https://github.com/soapbucket/sbproxy/releases)
 [![CI](https://github.com/soapbucket/sbproxy/actions/workflows/ci.yml/badge.svg)](https://github.com/soapbucket/sbproxy/actions/workflows/ci.yml)
 
-A high-performance reverse proxy and AI gateway. One binary, one config file, sub-millisecond overhead.
+A high-performance reverse proxy and AI gateway. One binary, one config file, low request overhead.
 
 [Website](https://sbproxy.dev) | [Documentation](https://sbproxy.dev/docs) | [Quick Start](https://sbproxy.dev/docs/quick-start) | [Examples](examples/) | [E2E Tests](e2e/) | [Docs](docs/)
 
