@@ -1,0 +1,41 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "cors.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    cors:
+      enable: true
+      allow_origins:
+        - https://app.example.com
+      allow_methods:
+        - GET
+        - POST
+        - OPTIONS
+      allow_headers:
+        - Content-Type
+        - Authorization
+      expose_headers:
+        - X-Request-ID
+      max_age: 3600
+      allow_credentials: true
+    policies:
+      - type: security_headers
+        strict_transport_security:
+          enabled: true
+          max_age: 31536000
+          include_subdomains: true
+        content_security_policy:
+          enabled: true
+          policy: "default-src 'self'"
+        x_frame_options:
+          enabled: true
+          value: DENY
+        x_content_type_options:
+          enabled: true
+          no_sniff: true
+        referrer_policy:
+          enabled: true
+          policy: strict-origin-when-cross-origin

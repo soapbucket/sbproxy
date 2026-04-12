@@ -1,0 +1,5 @@
+# Generated artifacts
+sbproxy
+certs/
+logs/
+load-test-tmp/

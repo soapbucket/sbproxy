@@ -1,0 +1,24 @@
+# AI gateway - allowed/blocked model lists
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "ai-filter.test":
+    action:
+      type: ai_proxy
+      skip_tls_verify_host: true
+      default_model: gpt-4o-mini
+      allowed_models:
+        - gpt-4o-mini
+        - gpt-4o
+      blocked_models:
+        - gpt-3.5-turbo
+      providers:
+        - name: mock-openai
+          api_key: test-key
+          base_url: http://127.0.0.1:18889/v1
+          models:
+            - gpt-4o-mini
+            - gpt-4o
+            - gpt-4
+            - gpt-3.5-turbo

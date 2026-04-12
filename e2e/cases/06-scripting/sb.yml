@@ -1,0 +1,29 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "cel.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    policies:
+      - type: expression
+        cel_expr: |
+          request.headers["x-role"] == "admin" || request.headers["x-role"] == "editor"
+        status_code: 403
+
+  "lua.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    transforms:
+      - type: lua_json
+        content_types:
+          - application/json
+        timeout: 200ms
+        lua_script: |
+          function modify_json(data, ctx)
+            data.processed_by = "sbproxy-lua"
+            data.headers = nil
+            return data
+          end

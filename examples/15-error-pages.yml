@@ -1,0 +1,90 @@
+# 15-error-pages.yml - Custom error pages with template variables
+#
+# This example demonstrates custom error pages. When the backend returns an error
+# (or is unreachable), sbproxy intercepts the error and renders a custom page
+# instead of passing the raw backend error to the client.
+#
+# Error pages support Mustache-style template variables:
+#   {{ status_code }}     - HTTP status code (404, 500, etc.)
+#   {{ error }}           - Error message string
+#   {{ request.url }}     - Full request URL
+#   {{ request.method }}  - HTTP method
+#   {{ request.path }}    - Request path
+#
+# Start: sbproxy serve -f examples/15-error-pages.yml
+#
+# Trigger a 404 custom error page:
+#   curl -v -H "Host: errors.example.com" http://localhost:8080/status/404
+#
+# Trigger a 500 custom error page:
+#   curl -v -H "Host: errors.example.com" http://localhost:8080/status/500
+#
+# Trigger a 503 custom error page:
+#   curl -v -H "Host: errors.example.com" http://localhost:8080/status/503
+#
+# JSON error response (Accept: application/json):
+#   curl -H "Host: errors.example.com" -H "Accept: application/json" \
+#        http://localhost:8080/status/500
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "errors.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    # Default content type for error responses (when no Accept header matches)
+    default_content_type: text/html
+
+    # Custom error pages - matched by HTTP status code
+    error_pages:
+      # Custom 404 Not Found page
+      - status: [404]              # Apply this page to 404 responses
+        content_type: text/html
+        template: true             # Render body as a Mustache template
+        body: |
+          <!DOCTYPE html>
+          <html>
+          <head><title>Not Found</title></head>
+          <body>
+            <h1>404 - Page Not Found</h1>
+            <p>The page you requested (<code>{{ request.path }}</code>) does not exist.</p>
+            <p><a href="/">Go back home</a></p>
+          </body>
+          </html>
+
+      # Custom 500 Internal Server Error page
+      - status: [500, 502, 503, 504]  # Apply to all 5xx server errors
+        content_type: text/html
+        template: true
+        body: |
+          <!DOCTYPE html>
+          <html>
+          <head><title>Server Error</title></head>
+          <body>
+            <h1>{{ status_code }} - Server Error</h1>
+            <p>Something went wrong. Please try again later.</p>
+            <p><small>Error: {{ error }}</small></p>
+          </body>
+          </html>
+
+      # JSON error format for API clients
+      # When a client sends Accept: application/json, return JSON instead of HTML
+      - status: [400, 401, 403, 422, 429]
+        content_type: application/json
+        template: true
+        body: |
+          {
+            "error": true,
+            "status": {{ status_code }},
+            "message": "{{ error }}",
+            "path": "{{ request.path }}"
+          }
+
+    # Add headers to all error responses
+    response_modifiers:
+      - headers:
+          set:
+            X-Error-Source: sbproxy

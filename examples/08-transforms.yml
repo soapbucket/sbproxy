@@ -1,0 +1,123 @@
+# 08-transforms.yml - Request and response transforms
+#
+# This example demonstrates multiple transform types:
+#   - JSON projection: keep or remove specific fields from JSON responses
+#   - HTML: strip comments and reformat HTML responses
+#   - Markdown: convert Markdown responses to HTML
+#   - Template: render responses using a Mustache-style template
+#
+# Each transform type lives on its own origin for clarity.
+#
+# Start: sbproxy serve -f examples/08-transforms.yml
+#
+# JSON projection (only id and method fields are kept):
+#   curl -H "Host: json-transform.example.com" http://localhost:8080/echo
+#
+# HTML transform (minify HTML responses):
+#   curl -H "Host: html-transform.example.com" http://localhost:8080/
+#
+# Markdown to HTML conversion:
+#   curl -H "Host: markdown-transform.example.com" http://localhost:8080/?format=md
+#
+# Template rendering:
+#   curl -H "Host: template-transform.example.com" http://localhost:8080/echo
+#
+# Request/response header injection:
+#   curl -v -H "Host: modifiers.example.com" http://localhost:8080/echo
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  # --- JSON Projection: strip fields from JSON responses ---
+  "json-transform.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    transforms:
+      - type: json_projection      # Keep or remove specific JSON fields
+        include:                   # Only these top-level keys are kept in the output
+          - method                 # Include "method" field
+          - path                   # Include "path" field
+          - query                  # Include "query" field
+        # exclude:                 # Alternatively, specify fields to remove
+        #   - headers
+        #   - body
+
+  # --- HTML Minification ---
+  "html-transform.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    transforms:
+      - type: html                 # Process HTML responses
+        content_types:
+          - text/html              # Only transform HTML content
+        format_options:
+          strip_comments: true     # Remove HTML comments
+          strip_newlines: true     # Collapse newlines
+          strip_space: true        # Remove extra whitespace
+          lowercase_tags: true     # Normalize tag names to lowercase
+
+  # --- Markdown to HTML ---
+  "markdown-transform.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    transforms:
+      - type: markdown             # Convert Markdown to HTML
+        content_types:
+          - text/markdown          # Only transform Markdown content
+          - text/plain             # Also process plain text as Markdown
+        sanitize: true             # Strip dangerous HTML from the converted output
+        href_target_blank: true    # Open links in a new tab
+
+  # --- Template Rendering: wrap any response in a custom template ---
+  "template-transform.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    transforms:
+      - type: template             # Render the response body using a template
+        template: |
+          {
+            "wrapped": true,
+            "source": "sbproxy",
+            "data": {{ body }}
+          }
+        # Available template variables:
+        # {{ body }}            - raw response body (as-is)
+        # {{ status_code }}     - HTTP status code from backend
+        # {{ request.method }}  - HTTP method (GET, POST, etc.)
+        # {{ request.path }}    - request path
+
+  # --- Request and Response Modifiers (header injection) ---
+  "modifiers.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    # Modify the inbound request before forwarding to the backend
+    request_modifiers:
+      - headers:
+          set:                       # Add or overwrite these headers
+            X-Forwarded-By: sbproxy
+            X-Request-ID: "{{ request.id }}"
+            X-Custom-Header: hello-from-proxy
+          delete:                    # Remove these headers before forwarding
+            - X-Internal-Token
+            - Cookie
+
+    # Modify the outbound response before sending to the client
+    response_modifiers:
+      - headers:
+          set:
+            X-Powered-By: sbproxy
+            X-Cache-Status: miss
+          delete:
+            - Server                 # Hide backend server identity
+            - X-Powered-By-Backend   # Remove backend framework header

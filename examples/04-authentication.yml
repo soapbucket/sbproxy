@@ -1,0 +1,107 @@
+# 04-authentication.yml - All OSS authentication types
+#
+# This example shows the four OSS authentication methods on separate origins.
+# Each origin handles a different hostname with its own auth scheme.
+#
+# Start: sbproxy serve -f examples/04-authentication.yml
+#
+# --- api_key auth (X-API-Key header) ---
+#   curl -H "Host: apikey.example.com" -H "X-API-Key: aK7mR9pL2xQ4" http://localhost:8080/echo
+#   curl -H "Host: apikey.example.com" http://localhost:8080/echo         # 401 Unauthorized
+#
+# --- basic_auth (Username:Password) ---
+#   curl -H "Host: basic.example.com" -u alice:pX7mR9nK3wL5 http://localhost:8080/echo
+#   curl -H "Host: basic.example.com" http://localhost:8080/echo           # 401 Unauthorized
+#
+# --- bearer_token (Authorization: Bearer ...) ---
+#   curl -H "Host: bearer.example.com" -H "Authorization: Bearer my-token-abc" http://localhost:8080/echo
+#   curl -H "Host: bearer.example.com" http://localhost:8080/echo          # 401 Unauthorized
+#
+# --- jwt auth (Authorization: Bearer <JWT>) ---
+#   # Generate a test JWT at https://jwt.io with secret "jW7tN3mK9pR4xL2" and HS256
+#   curl -H "Host: jwt.example.com" -H "Authorization: Bearer <your-jwt>" http://localhost:8080/echo
+#
+# --- forward auth (delegate to external service) ---
+#   curl -H "Host: forward.example.com" -H "X-User-Token: valid" http://localhost:8080/echo
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  # --- API Key authentication ---
+  # Client must send the X-API-Key header with a valid key.
+  "apikey.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    authentication:
+      type: api_key                 # Check X-API-Key header
+      api_keys:                     # List of valid keys
+        - aK7mR9pL2xQ4
+        - aK7mR9pL2xQ5
+      # header_name: X-API-Key     # Default header; override here if needed
+      # query_param: api_key       # Also accept key as ?api_key= query param
+
+  # --- HTTP Basic authentication ---
+  # Client must send Authorization: Basic base64(username:password)
+  "basic.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    authentication:
+      type: basic_auth              # HTTP Basic Auth (RFC 7617)
+      users:
+        - username: alice
+          password: pX7mR9nK3wL5         # Stored in memory; use vault integration for production
+        - username: bob
+          password: qN4tV8rM2pK6wJ9
+
+  # --- Bearer token authentication ---
+  # Client must send Authorization: Bearer <token>
+  "bearer.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    authentication:
+      type: bearer_token            # Check Authorization: Bearer header
+      tokens:                       # Valid opaque tokens
+        - my-token-abc
+        - another-valid-token
+
+  # --- JWT authentication ---
+  # Client must send Authorization: Bearer <signed-JWT>
+  # The proxy validates the signature, expiry, issuer, and audience.
+  "jwt.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    authentication:
+      type: jwt
+      secret: jW7tN3mK9pR4xL2         # HMAC secret for HS256 tokens
+      algorithm: HS256              # Signing algorithm: HS256, RS256, ES256, etc.
+      issuer: my-app                # Optional: validate the iss claim
+      audience: api                 # Optional: validate the aud claim
+      # header_name: Authorization  # Default header
+      # header_prefix: "Bearer "    # Default prefix to strip
+      # cookie_name: jwt_token      # Alternative: accept token from cookie
+      # query_param: token          # Alternative: accept token from ?token=
+
+  # --- Forward authentication ---
+  # Delegates auth to an external service. The proxy sends a subrequest and
+  # only allows the original request if the auth service returns 2xx.
+  "forward.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    authentication:
+      type: forward
+      url: https://test.sbproxy.dev/health # Auth service to call (returns 200 = allowed)
+      method: GET                   # HTTP method for the subrequest
+      forward_headers:              # Headers to copy from client request to auth subrequest
+        - X-User-Token
+        - Authorization
+      trust_headers:                # Headers from auth response to inject into upstream request
+        - X-User-ID
+        - X-User-Role
+      timeout: 5s                   # Max wait time for auth service response
+      success_status: [200, 204]    # Auth service status codes that mean "allowed"

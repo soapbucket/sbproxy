@@ -1,0 +1,23 @@
+# AI gateway - output guardrails (flag content in responses)
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "ai-guard-out.test":
+    action:
+      type: ai_proxy
+      skip_tls_verify_host: true
+      default_model: gpt-4o-mini
+      providers:
+        - name: mock-openai
+          api_key: test-key
+          base_url: http://127.0.0.1:18889/v1
+          models:
+            - gpt-4o-mini
+      guardrails:
+        output:
+          - type: regex_guard
+            action: flag
+            config:
+              patterns:
+                - "SECRET_OUTPUT"

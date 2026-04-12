@@ -1,0 +1,18 @@
+# Lua scripts in callbacks
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "lua-callback.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    on_request:
+      - lua_script: |
+          local result = {}
+          result.method = request.method
+          result.path = request.path
+          result.user_agent = request.headers["user-agent"] or "unknown"
+          return result
+        variable_name: "request_meta"
+        on_error: ignore

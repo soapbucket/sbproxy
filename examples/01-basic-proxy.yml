@@ -1,0 +1,19 @@
+# 01-basic-proxy.yml - The simplest sbproxy configuration
+#
+# This example demonstrates a minimal reverse proxy that forwards all requests
+# to the test backend. Every other example builds on this foundation.
+#
+# Start:  sbproxy serve -f examples/01-basic-proxy.yml
+# Test:   curl -H "Host: api.example.com" http://localhost:8080/
+# JSON:   curl -H "Host: api.example.com" http://localhost:8080/?format=json
+# Echo:   curl -H "Host: api.example.com" http://localhost:8080/echo
+# Health: curl -H "Host: api.example.com" http://localhost:8080/health
+
+proxy:
+  http_bind_port: 8080 # Port the proxy listens on
+
+origins:
+  "api.example.com": # Hostname this origin handles
+    action:
+      type: proxy           # Forward requests to an upstream server
+      url: https://test.sbproxy.dev # Backend URL to proxy traffic to

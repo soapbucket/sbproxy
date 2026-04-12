@@ -1,0 +1,106 @@
+# 11-mcp-server.yml - MCP (Model Context Protocol) server
+#
+# This example demonstrates the mcp action, which turns sbproxy into an MCP server.
+# MCP is a protocol for exposing tools to AI models. Each tool is an HTTP endpoint
+# that the proxy wraps in the MCP protocol.
+#
+# The tools here use test.sbproxy.dev as the backend for demonstration.
+#
+# Start: sbproxy serve -f examples/11-mcp-server.yml
+#
+# Initialize MCP session:
+#   curl -X POST -H "Host: mcp.example.com" -H "Content-Type: application/json" \
+#        http://localhost:8080/ \
+#        -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
+#
+# List available tools:
+#   curl -X POST -H "Host: mcp.example.com" -H "Content-Type: application/json" \
+#        http://localhost:8080/ \
+#        -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+#
+# Call the echo tool:
+#   curl -X POST -H "Host: mcp.example.com" -H "Content-Type: application/json" \
+#        http://localhost:8080/ \
+#        -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"message":"Hello MCP"}}}'
+#
+# Call the health-check tool:
+#   curl -X POST -H "Host: mcp.example.com" -H "Content-Type: application/json" \
+#        http://localhost:8080/ \
+#        -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"health-check","arguments":{}}}'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp                  # MCP (Model Context Protocol) server action
+
+      mode: orchestrator         # "orchestrator" handles tool discovery and dispatch
+                                 # "gateway" proxies to an upstream MCP server
+
+      # Server metadata returned during MCP initialize handshake
+      server_info:
+        name: example-mcp-server
+        version: "1.0.0"
+
+      # Capabilities advertised to MCP clients
+      capabilities:
+        tools:
+          listChanged: false     # Set true if tool list can change dynamically
+
+      # Default timeout for all tool executions
+      default_timeout: 30s
+
+      # Tools exposed by this MCP server
+      tools:
+        # Tool 1: Echo - reflects the input message back
+        - name: echo
+          description: "Echo back the provided message. Useful for testing MCP connectivity."
+          input_schema: |
+            {
+              "type": "object",
+              "properties": {
+                "message": {
+                  "type": "string",
+                  "description": "The message to echo back"
+                }
+              },
+              "required": ["message"]
+            }
+          handler:
+            type: proxy          # Execute tool by calling an HTTP endpoint
+            proxy:
+              url: https://test.sbproxy.dev/echo # Backend endpoint for this tool
+              method: GET
+              query_params:
+                message: "{{ message }}" # Map the MCP input argument to a query param
+
+        # Tool 2: Health check - reports backend health status
+        - name: health-check
+          description: "Check the health status of the backend service."
+          input_schema: |
+            {
+              "type": "object",
+              "properties": {}
+            }
+          handler:
+            type: proxy
+            proxy:
+              url: https://test.sbproxy.dev/health
+              method: GET
+              response_mapping:
+                status: status   # Map "status" field from JSON response to tool output
+
+        # Tool 3: Static response - no HTTP call needed
+        - name: get-version
+          description: "Return the current proxy version information."
+          input_schema: |
+            {
+              "type": "object",
+              "properties": {}
+            }
+          handler:
+            type: static         # Return a fixed value without making an HTTP call
+            static:
+              content: '{"version": "1.0.0", "name": "sbproxy-example"}'

@@ -1,0 +1,15 @@
+groups:
+  - name: sbproxy_recording_rules
+    interval: 30s
+    rules:
+      - record: sbproxy:request_rate_5m
+        expr: sum(rate(sbproxy_requests_total[5m]))
+
+      - record: sbproxy:error_rate_5m
+        expr: sum(rate(sbproxy_requests_total{status=~"5.."}[5m])) / sum(rate(sbproxy_requests_total[5m]))
+
+      - record: sbproxy:ai_token_rate_5m
+        expr: sum(rate(sbproxy_ai_tokens_output_total[5m]))
+
+      - record: sbproxy:ai_latency_p95_5m
+        expr: histogram_quantile(0.95, sum(rate(sbproxy_ai_request_duration_seconds_bucket[5m])) by (le))

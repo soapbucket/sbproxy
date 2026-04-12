@@ -1,0 +1,90 @@
+# 17-observability.yml - Prometheus metrics and monitoring
+#
+# This example demonstrates sbproxy's observability features:
+#   - Prometheus metrics endpoint on a separate port
+#   - AI-specific metrics (token usage, latency, TTFT, cache hits)
+#   - Rate limiting with response headers
+#   - All metrics visible at http://localhost:9090/metrics
+#
+# Start: sbproxy serve -f examples/17-observability.yml
+#
+# View all metrics:
+#   curl http://localhost:9090/metrics
+#
+# View AI metrics only:
+#   curl -s http://localhost:9090/metrics | grep sbproxy_ai
+#
+# Send an AI request:
+#   curl -H "Host: ai.example.com" \
+#        -H "X-API-Key: dR7tN3mK9pL2vX5" \
+#        -H "Content-Type: application/json" \
+#        -X POST http://localhost:8080/v1/chat/completions \
+#        -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hello"}]}'
+#
+# Check token usage after request:
+#   curl -s http://localhost:9090/metrics | grep "sbproxy_ai_tokens"
+#
+# Check AI latency:
+#   curl -s http://localhost:9090/metrics | grep "sbproxy_ai_request_duration"
+#
+# Check rate limit headers:
+#   curl -v -H "Host: api.example.com" http://localhost:8080/echo 2>&1 | grep -i "ratelimit"
+#
+# Grafana setup:
+#   1. Add Prometheus data source pointing to your Prometheus instance
+#   2. Import dashboards from sbproxy/dashboards/grafana/*.json
+#   See dashboards/README.md for details
+
+proxy:
+  http_bind_port: 8080
+
+# Telemetry server exposes Prometheus metrics on a separate port.
+# This keeps metrics traffic isolated from proxy traffic.
+telemetry:
+  bind_port: 9090
+
+origins:
+  # AI gateway with metrics tracking
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai-mock
+          api_key: dR7tN3mK9pL2
+          base_url: https://test.sbproxy.dev/v1
+          models: [gpt-4o, gpt-4o-mini]
+      default_model: gpt-4o-mini
+      routing:
+        strategy: fallback_chain
+
+    authentication:
+      type: api_key
+      api_keys:
+        - dR7tN3mK9pL2vX5
+
+    policies:
+      - type: rate_limiting
+        requests_per_minute: 60
+        algorithm: sliding_window
+        headers:
+          enabled: true
+          include_limit: true
+          include_remaining: true
+          include_reset: true
+
+  # Standard API proxy with metrics
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    policies:
+      - type: rate_limiting
+        requests_per_minute: 100
+        algorithm: sliding_window
+        headers:
+          enabled: true
+
+    response_cache:
+      enabled: true
+      ttl: 30s

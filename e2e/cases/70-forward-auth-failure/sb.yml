@@ -1,0 +1,15 @@
+# Forward auth with dead auth service - should return 503
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "fwdauth-dead.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    authentication:
+      type: forward
+      url: http://127.0.0.1:19999/auth/dead
+      method: GET
+      timeout: 1
+      success_status: [200]

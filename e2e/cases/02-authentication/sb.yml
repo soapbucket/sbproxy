@@ -1,0 +1,41 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "apikey.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    authentication:
+      type: api_key
+      api_keys:
+        - test-key-1
+        - test-key-2
+
+  "basic.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    authentication:
+      type: basic_auth
+      users:
+        - username: alice
+          password: secret123
+
+  "bearer.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    authentication:
+      type: bearer_token
+      tokens:
+        - my-bearer-token-1
+
+  "jwt.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    authentication:
+      type: jwt
+      secret: jW7tN3mK9pR4xL2vX5qJ8bN4mW
+      algorithm: HS256

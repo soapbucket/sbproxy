@@ -1,0 +1,200 @@
+# 16-full-production.yml - Production-grade proxy configuration
+#
+# This example combines multiple features that are commonly used together in
+# production deployments:
+#   - API key authentication
+#   - Rate limiting (sliding window with headers)
+#   - WAF (OWASP CRS rules)
+#   - Response caching with stale-while-revalidate
+#   - Compression (brotli, gzip)
+#   - Security headers (HSTS, CSP, X-Frame-Options)
+#   - IP filtering (trusted proxies)
+#   - Path-based routing (forward rules)
+#   - Custom error pages
+#   - Request and response header injection
+#
+# Start: sbproxy serve -f examples/16-full-production.yml
+#
+# Authenticated request:
+#   curl -H "Host: api.example.com" -H "X-API-Key: prod-key-abc" http://localhost:8080/echo
+#
+# Missing API key:
+#   curl -H "Host: api.example.com" http://localhost:8080/echo        # 401
+#
+# Health endpoint (no auth required, not rate limited):
+#   curl -H "Host: api.example.com" http://localhost:8080/health
+#
+# Compressed response:
+#   curl -H "Host: api.example.com" -H "X-API-Key: prod-key-abc" \
+#        -H "Accept-Encoding: gzip,br" --compressed http://localhost:8080/echo
+#
+# Rate limit exceeded (send 11 rapid requests):
+#   for i in $(seq 1 12); do \
+#     curl -s -o /dev/null -w "%{http_code}\n" \
+#          -H "Host: api.example.com" -H "X-API-Key: prod-key-abc" \
+#          http://localhost:8080/echo; done
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.example.com":
+    # --- Primary action: reverse proxy to backend ---
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+      timeout: 30s                     # Abort backend requests after 30 seconds
+
+    # --- Authentication: require a valid API key ---
+    authentication:
+      type: api_key
+      api_keys:
+        - prod-key-abc                 # Production key (use ${API_KEY} for env var)
+        - staging-key-xyz              # Staging key for testing
+      header_name: X-API-Key          # Header to check (default)
+      query_param: api_key            # Also accept as ?api_key= query param
+
+    # --- Policies: run in order after authentication ---
+    policies:
+      # Rate limiting - 10 requests per minute per client IP
+      - type: rate_limiting
+        algorithm: sliding_window
+        requests_per_minute: 10
+        burst_size: 3                  # Allow small bursts above the limit
+        headers:
+          enabled: true                # Add X-RateLimit-* headers
+          include_limit: true
+          include_remaining: true
+          include_reset: true
+          include_retry_after: true
+        whitelist:
+          - 127.0.0.1                  # Localhost bypasses rate limiting
+        endpoint_limits:
+          "/health":
+            requests_per_minute: 600   # Health checks can poll freely
+
+      # WAF - OWASP Core Rule Set
+      - type: waf
+        owasp_crs:
+          enabled: true
+          paranoia_level: 1            # Balanced: blocks common attacks
+        action_on_match: block
+        fail_open: false               # Block on WAF errors (fail closed)
+
+      # IP filtering - block known bad ranges
+      - type: ip_filtering
+        whitelist:
+          - 127.0.0.1
+          - 10.0.0.0/8                 # Internal network always allowed
+          - 172.16.0.0/12              # Docker networks
+          - 192.168.0.0/16             # Local networks
+        trusted_proxy_cidrs:
+          - 10.0.0.0/8                 # Only trust X-Forwarded-For from these
+
+      # Security headers
+      - type: security_headers
+        strict_transport_security:
+          enabled: true
+          max_age: 31536000            # 1 year
+          include_subdomains: true
+        content_security_policy:
+          enabled: true
+          policy: "default-src 'self'; connect-src 'self' https://api.example.com"
+        x_frame_options:
+          enabled: true
+          value: DENY                  # Never render in a frame
+        x_content_type_options:
+          enabled: true
+          no_sniff: true
+        referrer_policy:
+          enabled: true
+          policy: strict-origin-when-cross-origin
+
+    # --- Response caching ---
+    response_cache:
+      enabled: true
+      ttl: 30s                         # Cache for 30 seconds
+      stale_while_revalidate: 10s      # Serve stale while refreshing
+      stale_if_error: 60s              # Serve stale if backend is down
+      cache_key_params:
+        - format                       # Cache separately per format
+      cacheable_methods: [GET, HEAD]
+      cacheable_status: [200, 301, 404]
+
+    # --- Compression ---
+    compression:
+      enable: true
+      algorithms: [br, gzip]           # Prefer brotli, fall back to gzip
+      min_size: 1024
+      level: 6
+      exclude_content_types:
+        - image/jpeg
+        - image/png
+        - image/gif
+        - application/zip
+
+    # --- CORS ---
+    cors:
+      enable: true
+      allow_origins:
+        - https://app.example.com
+      allow_methods: [GET, POST, PUT, DELETE, OPTIONS]
+      allow_headers: [Content-Type, Authorization, X-API-Key]
+      expose_headers: [X-Request-ID, X-RateLimit-Remaining]
+      max_age: 3600
+
+    # --- Path-based routing (forward rules) ---
+    forward_rules:
+      # Health endpoint bypasses auth and returns a static response
+      - rules:
+          - path:
+              exact: /health
+        origin:
+          id: health-check
+          hostname: health-check
+          workspace_id: production
+          version: "1.0.0"
+          action:
+            type: static
+            status_code: 200
+            content_type: application/json
+            json_body:
+              status: healthy
+              service: api.example.com
+
+    # --- Request modifiers: inject metadata headers ---
+    request_modifiers:
+      - headers:
+          set:
+            X-Forwarded-By: sbproxy
+            X-Request-Start: "{{ request.start_time }}"
+          delete:
+            - X-Internal-Secret      # Never forward internal headers to clients
+
+    # --- Response modifiers: clean up and inject response headers ---
+    response_modifiers:
+      - headers:
+          set:
+            X-Powered-By: sbproxy
+          delete:
+            - Server                 # Hide backend server identity
+            - X-Generator
+
+    # --- Custom error pages ---
+    error_pages:
+      - status: [401, 403]
+        content_type: application/json
+        template: true
+        body: |
+          {"error": true, "status": {{ status_code }}, "message": "{{ error }}"}
+
+      - status: [429]
+        content_type: application/json
+        body: |
+          {"error": true, "status": 429, "message": "Rate limit exceeded. Please slow down."}
+
+      - status: [500, 502, 503, 504]
+        content_type: application/json
+        template: true
+        body: |
+          {"error": true, "status": {{ status_code }}, "message": "Service temporarily unavailable"}

@@ -1,0 +1,77 @@
+# 06-waf-ddos.yml - WAF and DDoS protection policies
+#
+# This example demonstrates the waf and ddos_protection policies. The WAF blocks
+# common attack patterns (SQL injection, XSS, path traversal). DDoS protection
+# detects and mitigates traffic floods.
+#
+# Start: sbproxy serve -f examples/06-waf-ddos.yml
+#
+# Normal request (allowed):
+#   curl -H "Host: protected.example.com" http://localhost:8080/echo
+#
+# SQL injection attempt (blocked by WAF):
+#   curl -H "Host: protected.example.com" "http://localhost:8080/echo?q=1+OR+1%3D1"
+#
+# XSS attempt (blocked by WAF):
+#   curl -H "Host: protected.example.com" "http://localhost:8080/echo?q=<script>alert(1)</script>"
+#
+# Path traversal attempt (blocked by WAF):
+#   curl -H "Host: protected.example.com" "http://localhost:8080/echo?file=../../../etc/passwd"
+#
+# Simulate flood - send 200 rapid requests:
+#   for i in $(seq 1 200); do curl -s -o /dev/null -H "Host: protected.example.com" http://localhost:8080/echo & done; wait
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "protected.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    policies:
+      # --- Web Application Firewall ---
+      - type: waf
+
+        # Load the OWASP Core Rule Set (CRS) - covers OWASP Top 10
+        owasp_crs:
+          enabled: true             # Enable OWASP CRS
+          paranoia_level: 1         # Paranoia level 1-4 (1 = balanced, 4 = very strict)
+                                    # Higher levels reduce false negatives but increase false positives
+
+        # What to do when a rule fires
+        action_on_match: block      # "block" (return 403), "log" (log only), "pass" (allow)
+        default_action: log         # Action for rules without an explicit action
+
+        # Test mode: log matches but never block (safe for initial rollout)
+        test_mode: false
+
+        # Fail behavior: what to do if WAF itself errors
+        fail_open: false            # false = fail closed (block on WAF errors) - safer default
+
+        # Custom rules (ModSecurity-compatible rule strings)
+        # These run in addition to the OWASP CRS rules.
+        custom_rules:
+          - id: "1001"               # Rule ID (must be unique, string)
+            phase: request          # When to evaluate: "request" or "response" (also accepts 1 or 2)
+            operator: contains      # Matching operator: contains, equals, regex, etc.
+            pattern: "badbot"       # Pattern to match
+            variables:              # What to inspect
+              - name: REQUEST_HEADERS
+                key: User-Agent
+            action: block           # Block requests with "badbot" in User-Agent
+            message: "Bad bot detected"
+
+      # --- DDoS Protection ---
+      - type: ddos_protection
+
+        detection:
+          request_rate_threshold: 100  # Trigger if a single IP sends 100 req/s
+          connection_threshold: 50     # Trigger if a single IP holds 50 concurrent connections
+          window_seconds: 10           # Measurement window in seconds
+
+        mitigation:
+          action: block             # "block", "throttle", or "challenge"
+          block_duration: 60s       # How long to block an offending IP (1 minute)
+          # throttle_rate: 10       # If action is throttle: max req/s allowed during mitigation

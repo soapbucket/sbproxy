@@ -1,0 +1,76 @@
+# 14-compression.yml - Response compression (gzip, brotli, zstd)
+#
+# This example demonstrates proxy-level response compression. When enabled, the
+# proxy compresses upstream responses before sending them to clients. This reduces
+# bandwidth usage and improves perceived performance.
+#
+# The proxy negotiates the best algorithm based on the client's Accept-Encoding header.
+#
+# Start: sbproxy serve -f examples/14-compression.yml
+#
+# Request with gzip (most common):
+#   curl -H "Host: compressed.example.com" -H "Accept-Encoding: gzip" \
+#        --compressed http://localhost:8080/
+#
+# Request with brotli (smaller than gzip, supported by modern browsers):
+#   curl -H "Host: compressed.example.com" -H "Accept-Encoding: br" \
+#        --compressed http://localhost:8080/
+#
+# Request without compression (compare response sizes):
+#   curl -H "Host: compressed.example.com" http://localhost:8080/
+#
+# Check Content-Encoding header in response:
+#   curl -v -H "Host: compressed.example.com" -H "Accept-Encoding: gzip,br,zstd" \
+#        http://localhost:8080/ 2>&1 | grep -i "content-encoding\|content-length"
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "compressed.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    # Compression is configured at the origin level.
+    # The proxy compresses responses based on the client's Accept-Encoding header.
+    compression:
+      enable: true                 # Enable proxy-level compression
+
+      # Algorithms listed in preference order.
+      # The proxy uses the first algorithm the client supports.
+      # Supported: "gzip", "br" (brotli), "zstd" (zstandard), "deflate"
+      algorithms:
+        - zstd                     # Best compression ratio, modern clients only
+        - br                       # Brotli: better than gzip, widely supported
+        - gzip                     # Gzip: universal fallback, always supported
+
+      # Minimum response body size to compress.
+      # Smaller responses are not worth compressing (overhead > savings).
+      min_size: 1024               # Only compress responses larger than 1KB
+
+      # Compression level (1-9). Higher = smaller output but more CPU.
+      # 1 = fastest, 6 = balanced (default), 9 = best compression
+      level: 6
+
+      # Content types to skip compression (these are already compressed formats).
+      # Images, videos, archives, and already-compressed data should be excluded.
+      exclude_content_types:
+        - image/jpeg
+        - image/png
+        - image/gif
+        - image/webp
+        - image/avif
+        - video/mp4
+        - video/webm
+        - audio/mpeg
+        - application/zip
+        - application/gzip
+        - application/x-br
+
+    # Show compression info in response headers
+    response_modifiers:
+      - headers:
+          set:
+            X-Compression: "enabled"
+            Vary: Accept-Encoding    # Tell caches to vary responses by encoding

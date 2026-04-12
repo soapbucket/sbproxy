@@ -1,0 +1,20 @@
+# Transform chain - multiple transforms applied sequentially
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "txchain.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    transforms:
+      - type: replace_strings
+        replace_strings:
+          replacements:
+            - find: '"method"'
+              replace: '"http_method"'
+      - type: replace_strings
+        replace_strings:
+          replacements:
+            - find: '"path"'
+              replace: '"request_path"'

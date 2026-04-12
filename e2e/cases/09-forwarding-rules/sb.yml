@@ -1,0 +1,55 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "routing.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /api/
+        origin:
+          id: api-backend
+          hostname: api-backend
+          workspace_id: test
+          version: "1.0.0"
+          action:
+            type: proxy
+            url: http://127.0.0.1:18888/echo
+          request_modifiers:
+            - type: header
+              set:
+                X-Routed-To: api-backend
+
+      - rules:
+          - path:
+              exact: /health
+        origin:
+          id: health-static
+          hostname: health-static
+          workspace_id: test
+          version: "1.0.0"
+          action:
+            type: static
+            status_code: 200
+            content_type: application/json
+            json_body:
+              status: healthy
+              service: sbproxy-test
+
+      - rules:
+          - path:
+              prefix: /docs/
+        origin:
+          id: docs-redirect
+          hostname: docs-redirect
+          workspace_id: test
+          version: "1.0.0"
+          action:
+            type: redirect
+            url: http://127.0.0.1:18888
+            status_code: 302
+            preserve_query: true

@@ -1,0 +1,22 @@
+# AI gateway - budget/token limits
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "ai-budget.test":
+    action:
+      type: ai_proxy
+      skip_tls_verify_host: true
+      default_model: gpt-4o-mini
+      providers:
+        - name: mock-openai
+          api_key: test-key
+          base_url: http://127.0.0.1:18889/v1
+          models:
+            - gpt-4o-mini
+      budget:
+        limits:
+          - scope: workspace
+            max_tokens: 100
+            period: hourly
+        on_exceed: block

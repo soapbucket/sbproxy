@@ -1,0 +1,101 @@
+# 10-forwarding-rules.yml - Path-based routing with forwarding rules
+#
+# This example demonstrates forward_rules, which let a single origin handle
+# different paths by routing them to different backends (inline origins).
+#
+# Path routing map:
+#   /api/*  -> https://test.sbproxy.dev/echo  (API backend)
+#   /health -> static response {"status":"healthy"}
+#   /docs/* -> redirect to https://docs.example.com
+#   /*      -> https://test.sbproxy.dev       (default backend, catch-all)
+#
+# Start: sbproxy serve -f examples/10-forwarding-rules.yml
+#
+# Route to API backend:
+#   curl -H "Host: routing.example.com" http://localhost:8080/api/users
+#   curl -H "Host: routing.example.com" http://localhost:8080/api/orders
+#
+# Static health endpoint:
+#   curl -H "Host: routing.example.com" http://localhost:8080/health
+#
+# Redirect:
+#   curl -v -H "Host: routing.example.com" http://localhost:8080/docs/getting-started
+#
+# Default backend (catch-all):
+#   curl -H "Host: routing.example.com" http://localhost:8080/
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "routing.example.com":
+    # Default action - used when no forward_rule matches
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev  # Catch-all backend
+
+    # forward_rules are evaluated in order. The first matching rule wins.
+    forward_rules:
+      # Rule 1: Route /api/* to the echo backend
+      - rules:
+          - path:
+              prefix: /api/          # Match any path starting with /api/
+        origin:
+          id: api-backend            # Unique ID for this inline origin
+          hostname: api-backend      # Internal hostname for this origin
+          workspace_id: example
+          version: "1.0.0"
+          action:
+            type: proxy
+            url: https://test.sbproxy.dev/echo  # API backend
+          # Inline origins can have their own modifiers, policies, etc.
+          request_modifiers:
+            - headers:
+                set:
+                  X-Routed-To: api-backend
+
+      # Rule 2: Static health endpoint - no upstream needed
+      - rules:
+          - path:
+              exact: /health         # Match exactly /health (no trailing slash)
+        origin:
+          id: health-static
+          hostname: health-static
+          workspace_id: example
+          version: "1.0.0"
+          action:
+            type: static             # Return a fixed response without proxying
+            status_code: 200
+            content_type: application/json
+            json_body:
+              status: healthy
+              service: sbproxy-example
+
+      # Rule 3: Redirect /docs/* to external documentation site
+      - rules:
+          - path:
+              prefix: /docs/         # Match /docs/ and anything after it
+        origin:
+          id: docs-redirect
+          hostname: docs-redirect
+          workspace_id: example
+          version: "1.0.0"
+          action:
+            type: redirect
+            url: https://test.sbproxy.dev  # Redirect destination
+            status_code: 302              # Temporary redirect (use 301 for permanent)
+            preserve_query: true          # Keep ?query=string in the redirect URL
+
+      # Rule 4: Route by HTTP method - POST to /submit goes to a different backend
+      - rules:
+          - path:
+              exact: /submit
+            method: POST             # Only match POST requests
+        origin:
+          id: submit-backend
+          hostname: submit-backend
+          workspace_id: example
+          version: "1.0.0"
+          action:
+            type: proxy
+            url: https://test.sbproxy.dev/echo

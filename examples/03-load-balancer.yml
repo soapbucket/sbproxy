@@ -1,0 +1,65 @@
+# 03-load-balancer.yml - Load balancer with multiple backends and health checks
+#
+# This example demonstrates the loadbalancer action with three backends, health
+# checks, and round-robin distribution. Requests are distributed evenly across
+# healthy backends.
+#
+# Start:  sbproxy serve -f examples/03-load-balancer.yml
+#
+# Send a few requests and observe responses from different backends:
+#   for i in $(seq 1 6); do curl -s -H "Host: lb.example.com" http://localhost:8080/echo | head -3; echo; done
+#
+# Check which backend handled a request:
+#   curl -v -H "Host: lb.example.com" http://localhost:8080/health 2>&1 | grep X-Backend
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "lb.example.com":
+    action:
+      type: load_balancer     # Distribute requests across multiple backends
+
+      algorithm: round_robin   # Cycle through backends in order. Other options:
+                               # weighted_round_robin, least_connections, ip_hash,
+                               # uri_hash, random, weighted_random
+
+      targets:
+        - url: https://test.sbproxy.dev/echo   # Backend 1 - echoes request details
+          weight: 1                            # Weight used for weighted algorithms
+          health_check:
+            enabled: true                     # Monitor this backend
+            path: /health                     # Endpoint to probe
+            interval: 10s                     # Check every 10 seconds
+            timeout: 3s                       # Fail if no response within 3s
+            healthy_threshold: 2              # Need 2 successes to mark healthy
+            unhealthy_threshold: 3            # Need 3 failures to mark unhealthy
+            expected_status: [200]            # Accept these HTTP status codes as healthy
+
+        - url: https://test.sbproxy.dev/      # Backend 2 - hello page
+          weight: 1
+          health_check:
+            enabled: true
+            path: /health
+            interval: 10s
+            timeout: 3s
+            healthy_threshold: 2
+            unhealthy_threshold: 3
+            expected_status: [200]
+
+        - url: https://test.sbproxy.dev       # Backend 3 - same host, no path
+          weight: 1
+          health_check:
+            enabled: true
+            path: /health
+            interval: 10s
+            timeout: 3s
+            healthy_threshold: 2
+            unhealthy_threshold: 3
+            expected_status: [200]
+
+    # Add a response header showing which backend responded
+    response_modifiers:
+      - headers:
+          set:
+            X-Proxy: sbproxy-lb

@@ -1,0 +1,90 @@
+# 12-a2a-agent.yml - A2A (Agent-to-Agent) protocol server
+#
+# This example demonstrates the a2a action, which implements the Google Agent-to-Agent
+# protocol. A2A enables standardized communication between AI agents via HTTP+JSON.
+#
+# The agent exposes:
+#   GET  /.well-known/agent.json  - Agent Card (capabilities metadata)
+#   POST /tasks/send              - Submit a new task
+#   GET  /tasks/{id}              - Get task status
+#   POST /tasks/{id}/cancel       - Cancel a task
+#   GET  /tasks/{id}/stream       - SSE stream of task updates
+#
+# Start: sbproxy serve -f examples/12-a2a-agent.yml
+#
+# Discover agent capabilities:
+#   curl -H "Host: agent.example.com" http://localhost:8080/.well-known/agent.json
+#
+# Submit a task:
+#   curl -X POST -H "Host: agent.example.com" -H "Content-Type: application/json" \
+#        http://localhost:8080/tasks/send \
+#        -d '{"id":"task-001","message":{"role":"user","parts":[{"type":"text","text":"Summarize this document"}]}}'
+#
+# Check task status:
+#   curl -H "Host: agent.example.com" http://localhost:8080/tasks/task-001
+#
+# Stream task updates (SSE):
+#   curl -H "Host: agent.example.com" -H "Accept: text/event-stream" \
+#        http://localhost:8080/tasks/task-001/stream
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "agent.example.com":
+    action:
+      type: a2a                  # A2A (Agent-to-Agent) protocol action
+
+      # Timeout for task processing
+      task_timeout: 30s
+
+      # Agent Card: metadata about this agent, returned at /.well-known/agent.json
+      agent_card:
+        name: Example AI Agent             # Human-readable agent name
+        description: "A demonstration A2A agent that summarizes and analyzes content."
+        url: https://agent.example.com     # Public URL of this agent
+        version: "1.0.0"
+
+        # What this agent can do
+        capabilities:
+          streaming: true                  # Supports SSE task updates
+          push_notifications: false        # Does not push updates proactively
+          state_transition_history: true   # Tracks task state history
+
+        # Skills: specific tasks this agent can perform
+        skills:
+          - id: summarize
+            name: Summarize Text
+            description: "Condense long documents or text into concise summaries."
+            tags:
+              - text
+              - summarization
+            examples:
+              - "Summarize this article"
+              - "Give me the key points of this document"
+            input_modes:
+              - text/plain
+              - text/markdown
+            output_modes:
+              - text/plain
+
+          - id: analyze
+            name: Analyze Sentiment
+            description: "Determine the sentiment and tone of provided text."
+            tags:
+              - text
+              - analysis
+              - sentiment
+            examples:
+              - "What is the tone of this review?"
+              - "Is this message positive or negative?"
+            input_modes:
+              - text/plain
+            output_modes:
+              - application/json
+
+    # Optional: require authentication for task submission
+    authentication:
+      type: bearer_token
+      tokens:
+        - agent-bearer-token-abc

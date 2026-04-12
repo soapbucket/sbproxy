@@ -1,0 +1,41 @@
+# Transform fail_on_error: true vs false
+# Uses a JSON schema that won't match the response to trigger transform error
+proxy:
+  http_bind_port: 18080
+
+origins:
+  # fail_on_error: false (default) - transform error passes response unmodified
+  "tx-continue.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    transforms:
+      - type: json_schema
+        fail_on_error: false
+        content_types:
+          - application/json
+        schema:
+          type: object
+          required:
+            - nonexistent_required_field
+          properties:
+            nonexistent_required_field:
+              type: string
+
+  # fail_on_error: true - transform error returns error to client
+  "tx-fail.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    transforms:
+      - type: json_schema
+        fail_on_error: true
+        content_types:
+          - application/json
+        schema:
+          type: object
+          required:
+            - nonexistent_required_field
+          properties:
+            nonexistent_required_field:
+              type: string

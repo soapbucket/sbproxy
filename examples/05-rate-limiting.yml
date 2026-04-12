@@ -1,0 +1,77 @@
+# 05-rate-limiting.yml - Rate limiting policies
+#
+# This example demonstrates the rate_limiting policy with several algorithms
+# and configuration options. The origin uses the test.sbproxy.dev/echo backend
+# so you can see the original request reflected back when you are allowed through.
+#
+# Start: sbproxy serve -f examples/05-rate-limiting.yml
+#
+# Test rate limiting - send 6 rapid requests (5th should succeed, 6th = 429):
+#   for i in $(seq 1 10); do
+#     echo -n "Request $i: "
+#     curl -s -o /dev/null -w "%{http_code}" -H "Host: ratelimit.example.com" http://localhost:8080/echo
+#     echo
+#   done
+#
+# Test quota endpoint (limited to 3 requests per day):
+#   curl -H "Host: ratelimit.example.com" http://localhost:8080/quota
+#
+# Check rate limit headers in the response:
+#   curl -v -H "Host: ratelimit.example.com" http://localhost:8080/echo 2>&1 | grep -i "ratelimit\|retry"
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ratelimit.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    policies:
+      - type: rate_limiting
+
+        # Algorithm controls how the limit is enforced.
+        # sliding_window: most accurate, counts requests in a rolling time window
+        # fixed_window: resets the counter at fixed intervals (simpler, less accurate)
+        # token_bucket: allows short bursts while enforcing average rate
+        # leaky_bucket: smooths traffic by queuing and releasing at a steady rate
+        algorithm: sliding_window
+
+        # Default limits applied to all clients unless overridden
+        requests_per_minute: 5   # Allow 5 requests per minute per client IP
+
+        # Token bucket parameters (used when algorithm: token_bucket)
+        # burst_size: 10          # Max tokens in the bucket (burst capacity)
+        # refill_rate: 0.5        # Tokens added per second (0.5 = 30/min)
+
+        # Rate limit response headers - tells clients how many requests remain
+        headers:
+          enabled: true             # Add X-RateLimit-* headers to all responses
+          include_limit: true       # X-RateLimit-Limit: 5
+          include_remaining: true   # X-RateLimit-Remaining: 4
+          include_reset: true       # X-RateLimit-Reset: <seconds until window resets>
+          include_retry_after: true # Retry-After: <seconds> (only on 429 responses)
+          reset_format: delta_seconds # "delta_seconds" or "unix_timestamp"
+
+        # Throttle: queue requests instead of immediately returning 429.
+        # Useful for bursty traffic that can afford to wait briefly.
+        # throttle:
+        #   enabled: true
+        #   max_queue: 50           # Max queued requests before rejecting
+        #   max_wait: 2s            # Max time a queued request waits
+
+        # Per-endpoint overrides. The pattern is matched against the request path.
+        endpoint_limits:
+          "/echo":                  # Stricter limit on the echo endpoint
+            requests_per_minute: 3  # Only 3 requests/min to /echo
+          "/health":                # Relax limit on health check endpoint
+            requests_per_minute: 120
+
+        # Whitelist: these IPs bypass rate limiting entirely
+        whitelist:
+          - 127.0.0.1              # Localhost is never rate limited
+
+        # Blacklist: these IPs are always rejected (before rate limit check)
+        # blacklist:
+        #   - 10.0.0.0/8

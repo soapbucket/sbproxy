@@ -1,0 +1,26 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "waf.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    policies:
+      - type: waf
+        owasp_crs:
+          enabled: true
+          paranoia_level: 1
+        action_on_match: block
+        test_mode: false
+        fail_open: false
+        custom_rules:
+          - id: "9001"
+            phase: request
+            operator: contains
+            pattern: "badbot-test"
+            variables:
+              - name: REQUEST_HEADERS
+                key: User-Agent
+            action: block
+            message: "Custom rule: bad bot blocked"

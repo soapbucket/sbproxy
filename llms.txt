@@ -1,0 +1,203 @@
+# SBproxy
+
+> SBproxy is a high-performance reverse proxy and AI gateway in a single binary.
+
+SBproxy sits between your clients and backends, providing authentication, caching, rate limiting, request/response transforms, load balancing, and AI model routing. Single Go binary, sub-millisecond overhead, zero external dependencies required.
+
+## Key Facts
+
+- Written in Go, pure binary (CGO_ENABLED=0)
+- 103 native LLM providers (OpenAI, Anthropic, Google, Mistral, Cohere, and more)
+- Caddy-style plugin architecture with `init()` registration
+- 18-layer compiled handler chain per origin (compiled once, zero per-request allocation)
+- Apache License 2.0
+
+## Documentation
+
+- Website: https://sbproxy.dev
+- Full Docs: https://sbproxy.dev/docs
+- Configuration: https://sbproxy.dev/docs/config
+- AI Gateway: https://sbproxy.dev/docs/ai
+- Security: https://sbproxy.dev/docs/security
+- Scripting (CEL + Lua): https://sbproxy.dev/docs/scripting
+- Architecture: https://github.com/soapbucket/sbproxy/blob/main/docs/architecture.md
+- Examples: https://github.com/soapbucket/sbproxy/tree/main/examples
+
+## Quick Start
+
+```bash
+go install github.com/soapbucket/sbproxy/cmd/sbproxy@latest
+```
+
+Minimal config (sb.yml):
+```yaml
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+```
+
+```bash
+sbproxy serve -f sb.yml
+curl -H "Host: api.example.com" http://localhost:8080/echo
+```
+
+## AI Gateway
+
+Unified OpenAI-compatible API across all providers:
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o, gpt-4o-mini]
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          models: [claude-sonnet-4-20250514]
+      default_model: gpt-4o-mini
+      routing:
+        strategy: fallback_chain
+```
+
+Routing strategies: fallback_chain, round_robin, weighted, cost_optimized, latency, semantic.
+
+## Configuration Model
+
+Top-level keys in sb.yml:
+- `proxy:` - global settings (ports, TLS)
+- `origins:` - per-hostname routing. Map of hostname to origin config.
+
+Each origin has sibling fields (NOT nested inside action):
+- `action` - what to do: proxy, ai_proxy, static, redirect, echo, loadbalancer, websocket, grpc, graphql, mcp, a2a
+- `authentication` - who can access: api_key, basic_auth, bearer_token, jwt, forward, digest
+- `policies` - rules: rate_limiting, ip_filtering, waf, ddos_protection, csrf, expression (CEL), security_headers
+- `transforms` - response body transforms: json_projection, html, markdown, template, lua_json, and 15+ more
+- `request_modifiers` / `response_modifiers` - modify inbound/outbound (headers, URL, body)
+- `response_cache` - HTTP caching with TTL, stale-while-revalidate, stale-if-error
+- `forward_rules` - path-based routing to inline origins
+- `on_request` / `on_response` - lifecycle callbacks (sync or async)
+- `compression` - gzip, brotli, zstd
+- `cors` - CORS configuration
+- `error_pages` - custom error pages with Mustache templates
+- `session_config` - cookie-based sessions
+- `variables` - user-defined template variables
+
+## Actions
+
+| Type | Description |
+|------|-------------|
+| proxy | Reverse proxy to upstream URL |
+| ai_proxy | AI gateway with 103+ providers, model routing, fallback chains |
+| static | Static response (JSON or text) |
+| redirect | HTTP redirect (301/302) |
+| echo | Echo request as JSON (debugging) |
+| loadbalancer | 10 algorithms: round-robin, weighted, least-connections, IP hash, URI hash, header hash, cookie hash, random, weighted random, first |
+| websocket | WebSocket proxy |
+| grpc | gRPC and gRPC-Web proxy |
+| graphql | GraphQL-aware proxy |
+| mcp | Model Context Protocol server |
+| a2a | Agent-to-Agent protocol |
+
+## Authentication Types
+
+| Type | Description |
+|------|-------------|
+| api_key | X-API-Key header or query parameter |
+| basic_auth | HTTP Basic (RFC 7617) |
+| bearer_token | Authorization: Bearer tokens |
+| jwt | JWT validation (HS256, RS256, ES256) with JWKS |
+| forward | Delegate to external auth service |
+| digest | HTTP Digest auth |
+
+## Policies
+
+| Type | Description |
+|------|-------------|
+| rate_limiting | 4 algorithms: sliding window, fixed window, token bucket, leaky bucket. Local + Redis backends. |
+| ip_filtering | Allowlist/blocklist with CIDR notation. Supports IPv4 and IPv6. |
+| waf | OWASP CRS with paranoia levels 1-4 |
+| ddos_protection | Automatic DDoS mitigation |
+| csrf | Cross-site request forgery protection |
+| expression | CEL expressions for custom access control |
+| security_headers | HSTS, X-Frame-Options, CSP, and more |
+| bot_detection | TLS fingerprinting and behavioral analysis |
+| threat_protection | SQL injection, XSS, path traversal, SSRF detection |
+| http_message_signatures | RFC 9421 HTTP message signatures |
+
+## Transforms
+
+| Type | Description |
+|------|-------------|
+| json_projection | Select, rename, and reshape JSON fields |
+| json_schema | Validate response against JSON Schema |
+| html | HTML transformation |
+| markdown | Convert HTML to Markdown |
+| html_to_markdown | HTML to Markdown conversion |
+| css | CSS transformation |
+| javascript | JavaScript transformation |
+| template | Mustache/Go template rendering |
+| lua_json | Lua scripting for JSON manipulation |
+| encoding | Base64, hex, URL encoding/decoding |
+| format_convert | Convert between JSON, XML, YAML, CSV |
+| normalize | Normalize response structure |
+| replace_strings | String find and replace |
+| sse_chunking | Server-Sent Events chunking |
+| payload_limit | Limit response body size |
+| optimize_html | Minify and optimize HTML |
+| discard | Discard the response body |
+
+## Scripting
+
+Two engines:
+- **CEL**: compiled, microsecond evaluation. Headers: `request.headers["x-role"]` (bracket notation, hyphens preserved). Utility functions: sha256, hmacSHA256, uuid, now, IP functions.
+- **Lua**: interpreted, full scripting. Function: `function modify_json(data, ctx) return data end`. sb.* module: logging, base64, JSON, crypto, time, UUID.
+
+Nine context namespaces: request, session, origin, server, vars, features, client, ctx, response.
+
+Note: Mustache templates use different header normalization than CEL. Templates: `{{ request.headers.x_api_key }}` (underscores). CEL: `request.headers["x-api-key"]` (hyphens).
+
+## Observability
+
+- Prometheus metrics with AI-specific namespace (tokens, latency, TTFT, cache hits, guardrail triggers)
+- 4 pre-built Grafana dashboards with alert rules
+- OpenTelemetry tracing
+- Structured logging (stderr, ClickHouse)
+
+## Plugin System
+
+Five extension points:
+- `plugin.ActionHandler` - `plugin.RegisterAction(name, factory)`
+- `plugin.AuthProvider` - `plugin.RegisterAuth(name, factory)`
+- `plugin.PolicyEnforcer` - `plugin.RegisterPolicy(name, factory)`
+- `plugin.TransformHandler` - `plugin.RegisterTransform(name, factory)`
+- `plugin.RequestEnricher` - `plugin.RegisterEnricher(instance)`
+
+## Enterprise (SBproxy Cloud)
+
+Enterprise features at https://cloud.sbproxy.dev include:
+
+**AI Intelligence:** Cost-optimized routing, semantic routing, LLM-as-a-Judge evaluation, quality-based routing, AI guardrails (prompt injection, jailbreak, PII, toxicity, topic filter), semantic caching, budget enforcement, virtual keys with RBAC, conversation memory, orchestration pipelines.
+
+**Agent Infrastructure:** AI-Native API Management (OpenAPI to MCP), AI Traffic Mesh (distributed guardrails), agent discovery registry, MCP tool gateway (RBAC, audit), trace hierarchy for agent debugging.
+
+**Security:** OAuth 2.0 (authorization code, client credentials, introspection), geo-blocking (MaxMind), advanced threat detection, PII detection and redaction, SSO.
+
+**Traffic Management:** Canary deployments, traffic shadowing, A/B testing, API versioning (URL, header, query), traffic capture.
+
+**Platform:** WASM plugin runtime, secrets management, cloud dashboard, audit logging.
+
+## Links
+
+- Source: https://github.com/soapbucket/sbproxy
+- Website: https://sbproxy.dev
+- Docs: https://sbproxy.dev/docs
+- Docker: ghcr.io/soapbucket/sbproxy
+- License: Apache 2.0

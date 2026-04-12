@@ -1,0 +1,67 @@
+# 02-ai-gateway.yml - AI gateway with mock OpenAI-compatible backend
+#
+# This example demonstrates the ai_proxy action, which provides an OpenAI-compatible
+# API gateway. It supports provider routing, model selection, and fallback chains.
+#
+# The test backend at test.sbproxy.dev/v1 is a mock OpenAI server that accepts
+# standard chat completion requests and returns synthetic responses.
+#
+# Start:  sbproxy serve -f examples/02-ai-gateway.yml
+#
+# List models:
+#   curl -H "Host: ai.example.com" http://localhost:8080/v1/models
+#
+# Chat completion:
+#   curl -H "Host: ai.example.com" \
+#        -H "Content-Type: application/json" \
+#        -X POST http://localhost:8080/v1/chat/completions \
+#        -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hello"}]}'
+#
+# With API key auth (see the authentication block below):
+#   curl -H "Host: ai.example.com" \
+#        -H "X-API-Key: dR7tN3mK9pL2vX5" \
+#        -H "Content-Type: application/json" \
+#        -X POST http://localhost:8080/v1/chat/completions \
+#        -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hello"}]}'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy # AI gateway action - OpenAI-compatible API
+
+      # Providers are the upstream AI backends. sbproxy routes requests to
+      # the appropriate provider based on the requested model name.
+      providers:
+        - name: openai-mock         # Logical name for this provider
+          api_key: dR7tN3mK9pL2         # API key sent to the backend (use ${OPENAI_API_KEY} for real keys)
+          base_url: https://test.sbproxy.dev/v1 # Override endpoint - points to mock server
+          models:
+            - gpt-4o                # Models this provider handles
+            - gpt-4o-mini
+
+      default_model: gpt-4o-mini   # Fallback model when none is specified in the request
+
+      routing:
+        strategy: fallback_chain   # Try providers in order; fall back to next on failure
+
+    # Protect the AI gateway with an API key
+    authentication:
+      type: api_key                # Require X-API-Key header
+      api_keys:
+        - dR7tN3mK9pL2vX5             # Accepted key values
+        - another-valid-key
+
+    # Add rate limiting to control costs
+    policies:
+      - type: rate_limiting
+        requests_per_minute: 60    # Max 60 requests per minute per client IP
+        algorithm: sliding_window  # More accurate than fixed window
+
+    # Inject headers so clients can see which provider was used
+    response_modifiers:
+      - headers:
+          set:
+            X-AI-Gateway: sbproxy    # Identify this proxy in responses

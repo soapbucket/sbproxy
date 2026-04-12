@@ -1,0 +1,20 @@
+# Advanced CEL expressions - multiple assertions, complex logic
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "cel-multi.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    policies:
+      # First expression: require content-type for POST
+      - type: expression
+        cel_expr: |
+          request.method != "POST" || request.headers["content-type"].contains("application/json")
+        status_code: 415
+      # Second expression: block oversized query strings
+      - type: expression
+        cel_expr: |
+          size(request.query) < 5
+        status_code: 400

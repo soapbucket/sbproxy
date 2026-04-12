@@ -1,0 +1,26 @@
+# Variables used in modifiers and error pages
+# Syntax: {{vars.key}} for user-defined variables
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "varmod.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    variables:
+      service_name: "my-api"
+      version: "2.5.0"
+      team: "platform"
+    request_modifiers:
+      - headers:
+          set:
+            X-Service: "{{vars.service_name}}"
+            X-Version: "{{vars.version}}"
+            X-Team: "{{vars.team}}"
+    error_pages:
+      - status: [500, 502, 503]
+        content_type: application/json
+        template: true
+        body: |
+          {"error": true, "service": "{{vars.service_name}}", "version": "{{vars.version}}"}

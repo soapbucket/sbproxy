@@ -1,0 +1,77 @@
+# 07-caching.yml - Response caching with TTL and stale-while-revalidate
+#
+# This example demonstrates the response_cache block, which caches upstream
+# responses to reduce backend load and latency. Subsequent requests for the
+# same resource are served from cache without hitting the backend.
+#
+# Start: sbproxy serve -f examples/07-caching.yml
+#
+# First request (cache miss - goes to backend):
+#   curl -v -H "Host: cached.example.com" http://localhost:8080/echo 2>&1 | grep -i "x-cache\|age"
+#
+# Second request (cache hit - served from cache):
+#   curl -v -H "Host: cached.example.com" http://localhost:8080/echo 2>&1 | grep -i "x-cache\|age"
+#
+# Force cache bypass with Cache-Control:
+#   curl -H "Host: cached.example.com" -H "Cache-Control: no-cache" http://localhost:8080/echo
+#
+# Different query params = different cache entries:
+#   curl -H "Host: cached.example.com" "http://localhost:8080/echo?user=alice"
+#   curl -H "Host: cached.example.com" "http://localhost:8080/echo?user=bob"
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "cached.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    response_cache:
+      enabled: true               # Turn on response caching
+
+      ttl: 60s                    # Cache responses for 60 seconds
+
+      # stale_while_revalidate: serve stale cached content while refreshing in
+      # the background. Clients get a fast response; the cache is updated asynchronously.
+      stale_while_revalidate: 30s # Serve stale for 30s while revalidating
+
+      # stale_if_error: serve stale cached content if the backend is down
+      stale_if_error: 300s        # Serve stale for 5 minutes on backend errors
+
+      # cache_key_params: include these query parameters in the cache key.
+      # Requests with different values for these params are cached separately.
+      # If empty, the entire query string is included.
+      cache_key_params:
+        - user                    # Cache separately per user
+        - format                  # Cache separately per format
+
+      # Vary-by headers: include these request headers in the cache key.
+      # Different values produce different cache entries.
+      cache_key_headers:
+        - Accept-Language         # Cache per language preference
+        - X-App-Version           # Cache per app version
+
+      # HTTP methods to cache (GET and HEAD are cacheable by default)
+      cacheable_methods:
+        - GET
+        - HEAD
+
+      # HTTP status codes to cache
+      cacheable_status:
+        - 200                     # Cache successful responses
+        - 301                     # Cache permanent redirects
+        - 404                     # Cache not-found responses (negative caching)
+
+      # Maximum response body size to cache (default: 10MB)
+      max_size: 1048576           # 1MB - don't cache large responses
+
+      # Skip caching if the response contains Set-Cookie
+      respect_set_cookie: true
+
+    # Add cache status header so you can see hits vs misses
+    response_modifiers:
+      - headers:
+          set:
+            X-Cache-Config: "ttl=60s,swr=30s"

@@ -1,0 +1,82 @@
+# 09-scripting.yml - CEL expressions and Lua scripting
+#
+# This example demonstrates two scripting mechanisms:
+#   - CEL (Common Expression Language): a fast, compiled expression engine.
+#     Used for access control, request routing decisions, and policy conditions.
+#   - Lua: a full scripting language embedded in the proxy.
+#     Used for JSON body transformation in response transforms.
+#
+# Start: sbproxy serve -f examples/09-scripting.yml
+#
+# Allowed request (header present):
+#   curl -H "Host: cel.example.com" -H "X-Role: admin" http://localhost:8080/echo
+#
+# Blocked by CEL expression (wrong role):
+#   curl -H "Host: cel.example.com" -H "X-Role: guest" http://localhost:8080/echo
+#
+# Blocked by CEL expression (no role header):
+#   curl -H "Host: cel.example.com" http://localhost:8080/echo
+#
+# Lua JSON transform (only works on JSON responses from /echo):
+#   curl -H "Host: lua.example.com" http://localhost:8080/echo
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  # --- CEL expression policy ---
+  # CEL expressions are evaluated per request. When the expression returns true,
+  # the policy fires (allow or block depending on the policy type).
+  "cel.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    policies:
+      - type: expression           # Policy evaluated via CEL or Lua
+        # This CEL expression allows requests where X-Role is "admin" or "editor".
+        # The expression is an ALLOW condition: true = pass, false = block.
+        # CEL has access to:
+        #   request.method, request.path, request.query, request.headers
+        # Header names are lowercased with hyphens preserved. Use bracket notation.
+        cel_expr: |
+          request.headers["x-role"] == "admin" || request.headers["x-role"] == "editor"
+        status_code: 403           # HTTP status code returned when expression is false (blocks)
+
+      - type: expression           # Second expression: block requests to /admin
+        cel_expr: |
+          request.path.startsWith("/admin")
+        status_code: 403
+
+  # --- Lua JSON transform ---
+  # Lua scripts can reshape JSON response bodies. The script must define a
+  # function: modify_json(data, ctx) that returns the transformed data.
+  "lua.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    transforms:
+      - type: lua_json             # Transform JSON responses using a Lua script
+        content_types:
+          - application/json       # Only transform JSON responses
+        timeout: 200ms             # Abort Lua execution if it takes longer than 200ms
+        lua_script: |
+          function modify_json(data, ctx)
+            -- Add a new field to the response
+            data.processed_by = "sbproxy-lua"
+
+            -- Add a timestamp field
+            data.proxy_timestamp = ctx.request_time or "unknown"
+
+            -- Rename a field: copy "method" to "http_method" and remove original
+            if data.method then
+              data.http_method = data.method
+              data.method = nil
+            end
+
+            -- Filter: remove the headers table from the response
+            data.headers = nil
+
+            return data
+          end

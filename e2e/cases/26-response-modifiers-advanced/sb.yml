@@ -1,0 +1,50 @@
+# Tests response modifier types: status override, body, headers, lua
+proxy:
+  http_bind_port: 18080
+
+origins:
+  # Status code override
+  "statusmod.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    response_modifiers:
+      - status:
+          code: 201
+          text: "Created By Proxy"
+
+  # Response header set/add/delete
+  "respheader.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    response_modifiers:
+      - headers:
+          set:
+            X-Resp-Injected: "from-proxy"
+            X-Powered-By: "sbproxy-test"
+          delete:
+            - X-Remove-This
+
+  # Response body replacement
+  "respbody.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "original body content"
+    response_modifiers:
+      - body:
+          replace: "replaced by response modifier"
+
+  # Lua response modifier
+  "resplua.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    response_modifiers:
+      - lua_script: |
+          function match_response(resp, ctx)
+            resp:set_header("X-Lua-Response", "modified")
+            return true
+          end

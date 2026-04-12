@@ -1,0 +1,125 @@
+# 13-security-headers.yml - Security headers, CORS, CSRF, and IP filtering
+#
+# This example demonstrates:
+#   - security_headers policy: HSTS, CSP, X-Frame-Options, Referrer-Policy
+#   - CORS configuration at the origin level
+#   - CSRF protection policy
+#   - IP filtering policy (allowlist/blocklist)
+#
+# Start: sbproxy serve -f examples/13-security-headers.yml
+#
+# Check security headers in the response:
+#   curl -v -H "Host: secure.example.com" http://localhost:8080/echo 2>&1 | grep -i "strict\|content-security\|x-frame\|referrer"
+#
+# CORS preflight request:
+#   curl -v -H "Host: secure.example.com" \
+#        -H "Origin: https://app.example.com" \
+#        -H "Access-Control-Request-Method: POST" \
+#        -X OPTIONS http://localhost:8080/echo
+#
+# Blocked by IP filter (from localhost this will pass - add your IP to blacklist to test):
+#   curl -H "Host: secure.example.com" -H "X-Forwarded-For: 10.0.0.1" http://localhost:8080/echo
+#
+# CSRF-protected endpoint (GET passes, state-changing requests need CSRF token):
+#   curl -H "Host: csrf.example.com" http://localhost:8080/echo
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  # --- Security headers + CORS + IP filtering ---
+  "secure.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    # CORS is configured at the origin level (not as a policy)
+    cors:
+      enable: true                       # Enable CORS header injection
+      allow_origins:
+        - https://app.example.com        # Allowed origin (use ["*"] for any)
+        - https://admin.example.com
+      allow_methods:
+        - GET
+        - POST
+        - PUT
+        - DELETE
+        - OPTIONS
+      allow_headers:
+        - Content-Type
+        - Authorization
+        - X-Requested-With
+      expose_headers:
+        - X-Request-ID                   # Headers visible to browser JavaScript
+        - X-RateLimit-Remaining
+      max_age: 3600                      # Preflight cache duration (seconds)
+      allow_credentials: true            # Allow cookies and auth headers
+
+    policies:
+      # --- Security headers policy ---
+      - type: security_headers
+
+        # HTTP Strict Transport Security (HSTS) - RFC 6797
+        strict_transport_security:
+          enabled: true
+          max_age: 31536000              # 1 year in seconds
+          include_subdomains: true       # Apply to all subdomains
+          preload: false                 # Add to browser preload list (use with caution)
+
+        # Content Security Policy (CSP)
+        content_security_policy:
+          enabled: true
+          policy: "default-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self' 'unsafe-inline'"
+          report_only: false             # true = log violations but don't block
+
+        # X-Frame-Options: prevent clickjacking
+        x_frame_options:
+          enabled: true
+          value: SAMEORIGIN              # "DENY", "SAMEORIGIN", or "ALLOW-FROM <uri>"
+
+        # X-Content-Type-Options: prevent MIME sniffing
+        x_content_type_options:
+          enabled: true
+          no_sniff: true
+
+        # Referrer-Policy: control how much referrer info is sent
+        referrer_policy:
+          enabled: true
+          policy: strict-origin-when-cross-origin
+
+        # Permissions-Policy: control browser feature access
+        permissions_policy:
+          enabled: true
+          features:
+            camera: "()"               # Disallow camera access
+            microphone: "()"           # Disallow microphone access
+            geolocation: "()"          # Disallow geolocation
+
+      # --- IP filtering policy ---
+      - type: ip_filtering
+        whitelist:
+          - 127.0.0.1                  # Always allow localhost
+          - 192.168.0.0/16             # Allow private network range
+        blacklist:
+          - 0.0.0.0/8                  # Block "this" network (RFC 1122)
+        # trusted_proxy_cidrs:         # IPs allowed to set X-Forwarded-For
+        #   - 10.0.0.0/8
+
+  # --- CSRF protection ---
+  "csrf.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    policies:
+      - type: csrf
+        # The CSRF policy validates a token on state-changing requests (POST, PUT, DELETE, PATCH).
+        # The token is set as a cookie on the first GET request and must be included in
+        # subsequent state-changing requests via the X-CSRF-Token header.
+        secret_key: "change-this-to-a-random-32-byte-secret-in-production"
+        token_header: X-CSRF-Token    # Header name for the token in requests
+        token_cookie: csrf_token      # Cookie name where the token is stored
+        safe_methods:                 # These methods skip CSRF validation
+          - GET
+          - HEAD
+          - OPTIONS

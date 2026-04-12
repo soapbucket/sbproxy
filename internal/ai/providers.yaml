@@ -1,0 +1,1659 @@
+version: 1
+providers:
+  # ---- Major Proprietary Providers ----------------------------------------
+
+  openai:
+    display_name: OpenAI
+    base_url: https://api.openai.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://platform.openai.com/docs
+    models:
+      gpt-4o:
+        display_name: GPT-4o
+        tokenizer: o200k_base
+        context_window: 128000
+        supports_vision: true
+      gpt-4o-mini:
+        display_name: GPT-4o Mini
+        tokenizer: o200k_base
+        context_window: 128000
+        supports_vision: true
+      gpt-4-turbo:
+        display_name: GPT-4 Turbo
+        tokenizer: cl100k_base
+        context_window: 128000
+        supports_vision: true
+      gpt-4:
+        display_name: GPT-4
+        tokenizer: cl100k_base
+        context_window: 8192
+      gpt-3.5-turbo:
+        display_name: GPT-3.5 Turbo
+        tokenizer: cl100k_base
+        context_window: 16385
+      o1:
+        display_name: o1
+        tokenizer: o200k_base
+        context_window: 200000
+        is_reasoning: true
+      o1-mini:
+        display_name: o1 Mini
+        tokenizer: o200k_base
+        context_window: 128000
+        is_reasoning: true
+      o3-mini:
+        display_name: o3 Mini
+        tokenizer: o200k_base
+        context_window: 200000
+        is_reasoning: true
+      text-embedding-3-small:
+        display_name: Embedding 3 Small
+        tokenizer: cl100k_base
+        context_window: 8191
+      text-embedding-3-large:
+        display_name: Embedding 3 Large
+        tokenizer: cl100k_base
+        context_window: 8191
+      text-embedding-ada-002:
+        display_name: Embedding Ada 002
+        tokenizer: cl100k_base
+        context_window: 8191
+
+  anthropic:
+    display_name: Anthropic
+    base_url: https://api.anthropic.com/v1
+    auth_header: x-api-key
+    auth_prefix: ""
+    format: anthropic
+    requires:
+      - api_key
+    docs_url: https://docs.anthropic.com
+    models:
+      claude-opus-4-20250514:
+        display_name: Claude Opus 4
+        tokenizer: cl100k_base
+        context_window: 200000
+        supports_vision: true
+      claude-sonnet-4-20250514:
+        display_name: Claude Sonnet 4
+        tokenizer: cl100k_base
+        context_window: 200000
+        supports_vision: true
+      claude-sonnet-4-5-20250929:
+        display_name: Claude Sonnet 4.5
+        tokenizer: cl100k_base
+        context_window: 200000
+        supports_vision: true
+      claude-haiku-4-5-20251001:
+        display_name: Claude Haiku 4.5
+        tokenizer: cl100k_base
+        context_window: 200000
+        supports_vision: true
+      claude-3-5-sonnet-20241022:
+        display_name: Claude 3.5 Sonnet
+        tokenizer: cl100k_base
+        context_window: 200000
+        supports_vision: true
+      claude-3-5-haiku-20241022:
+        display_name: Claude 3.5 Haiku
+        tokenizer: cl100k_base
+        context_window: 200000
+
+  xai:
+    display_name: xAI (Grok)
+    base_url: https://api.x.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.x.ai
+    models:
+      grok-3:
+        display_name: Grok 3
+        context_window: 131072
+      grok-3-mini:
+        display_name: Grok 3 Mini
+        context_window: 131072
+        is_reasoning: true
+      grok-2:
+        display_name: Grok 2
+        context_window: 131072
+      grok-2-vision:
+        display_name: Grok 2 Vision
+        context_window: 32768
+        supports_vision: true
+
+  deepseek:
+    display_name: DeepSeek
+    base_url: https://api.deepseek.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://platform.deepseek.com/api-docs
+    models:
+      deepseek-chat:
+        display_name: DeepSeek V3
+        context_window: 64000
+      deepseek-reasoner:
+        display_name: DeepSeek R1
+        context_window: 64000
+        is_reasoning: true
+
+  mistral:
+    display_name: Mistral AI
+    base_url: https://api.mistral.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.mistral.ai
+    models:
+      mistral-large-latest:
+        display_name: Mistral Large
+        context_window: 128000
+      mistral-small-latest:
+        display_name: Mistral Small
+        context_window: 32000
+      codestral-latest:
+        display_name: Codestral
+        context_window: 32000
+
+  cohere:
+    display_name: Cohere
+    base_url: https://api.cohere.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.cohere.com
+    models:
+      command-r-plus:
+        display_name: Command R+
+        context_window: 128000
+      command-r:
+        display_name: Command R
+        context_window: 128000
+      command-light:
+        display_name: Command Light
+        context_window: 4096
+
+  # ---- Major Cloud Providers -----------------------------------------------
+
+  azure:
+    display_name: Azure OpenAI
+    base_url: ""
+    auth_header: api-key
+    auth_prefix: ""
+    format: azure
+    requires:
+      - api_key
+      - base_url
+    docs_url: https://learn.microsoft.com/en-us/azure/ai-services/openai/
+    models: {}
+
+  bedrock:
+    display_name: AWS Bedrock
+    base_url: ""
+    auth_header: ""
+    auth_prefix: ""
+    format: bedrock
+    requires:
+      - region
+    docs_url: https://docs.aws.amazon.com/bedrock/
+    models:
+      anthropic.claude-3-5-sonnet-20241022-v2:0:
+        display_name: Claude 3.5 Sonnet (Bedrock)
+        tokenizer: cl100k_base
+        context_window: 200000
+        supports_vision: true
+      anthropic.claude-3-haiku-20240307-v1:0:
+        display_name: Claude 3 Haiku (Bedrock)
+        tokenizer: cl100k_base
+        context_window: 200000
+      amazon.titan-text-express-v1:
+        display_name: Titan Text Express
+        context_window: 8000
+
+  google:
+    display_name: Google AI (Gemini)
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    auth_header: x-goog-api-key
+    auth_prefix: ""
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://ai.google.dev/docs
+    models:
+      gemini-2.0-flash:
+        display_name: Gemini 2.0 Flash
+        context_window: 1048576
+        supports_vision: true
+      gemini-1.5-pro:
+        display_name: Gemini 1.5 Pro
+        context_window: 2097152
+        supports_vision: true
+      gemini-1.5-flash:
+        display_name: Gemini 1.5 Flash
+        context_window: 1048576
+        supports_vision: true
+
+  vertex:
+    display_name: Google Vertex AI
+    base_url: ""
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+      - base_url
+    docs_url: https://cloud.google.com/vertex-ai/docs
+    models:
+      gemini-1.5-pro-001:
+        display_name: Gemini 1.5 Pro (Vertex)
+        context_window: 2097152
+        supports_vision: true
+      gemini-1.5-flash-001:
+        display_name: Gemini 1.5 Flash (Vertex)
+        context_window: 1048576
+        supports_vision: true
+
+  watsonx:
+    display_name: IBM watsonx
+    base_url: https://us-south.ml.cloud.ibm.com/ml/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+      - project_id
+    docs_url: https://www.ibm.com/docs/en/watsonx
+    models:
+      ibm/granite-34b-code-instruct:
+        display_name: Granite 34B Code
+        context_window: 8192
+      meta-llama/llama-3-70b-instruct:
+        display_name: Llama 3 70B (watsonx)
+        context_window: 8192
+      mistralai/mistral-large:
+        display_name: Mistral Large (watsonx)
+        context_window: 32768
+
+  alibaba:
+    display_name: Alibaba Cloud (DashScope)
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://help.aliyun.com/zh/dashscope/
+    models:
+      qwen-max:
+        display_name: Qwen Max
+        context_window: 32768
+      qwen-plus:
+        display_name: Qwen Plus
+        context_window: 131072
+      qwen-turbo:
+        display_name: Qwen Turbo
+        context_window: 131072
+      qwen2.5-72b-instruct:
+        display_name: Qwen 2.5 72B
+        context_window: 131072
+
+  volcengine:
+    display_name: Volcengine (ByteDance/Doubao)
+    base_url: https://ark.cn-beijing.volces.com/api/v3
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://www.volcengine.com/docs/82379
+    models:
+      doubao-pro-4k:
+        display_name: Doubao Pro 4K
+        context_window: 4096
+      doubao-pro-32k:
+        display_name: Doubao Pro 32K
+        context_window: 32768
+      doubao-lite-4k:
+        display_name: Doubao Lite 4K
+        context_window: 4096
+
+  tencent:
+    display_name: Tencent Cloud (Hunyuan)
+    base_url: https://hunyuan.tencentcloudapi.com
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://cloud.tencent.com/document/product/1729
+    models:
+      hunyuan-pro:
+        display_name: Hunyuan Pro
+        context_window: 32768
+      hunyuan-standard:
+        display_name: Hunyuan Standard
+        context_window: 32768
+      hunyuan-lite:
+        display_name: Hunyuan Lite
+        context_window: 4096
+
+  databricks:
+    display_name: Databricks
+    base_url: ""
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+      - base_url
+    docs_url: https://docs.databricks.com/en/machine-learning/model-serving/
+    models: {}
+
+  sagemaker:
+    display_name: Amazon SageMaker
+    base_url: ""
+    auth_header: ""
+    auth_prefix: ""
+    format: openai
+    requires:
+      - region
+      - base_url
+    docs_url: https://docs.aws.amazon.com/sagemaker/
+    models: {}
+
+  azure_ml:
+    display_name: Azure ML Endpoints
+    base_url: ""
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+      - base_url
+    docs_url: https://learn.microsoft.com/en-us/azure/machine-learning/
+    models: {}
+
+  # ---- Inference Platforms -------------------------------------------------
+
+  groq:
+    display_name: Groq
+    base_url: https://api.groq.com/openai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://console.groq.com/docs
+    models:
+      llama-3.3-70b-versatile:
+        display_name: Llama 3.3 70B
+        context_window: 128000
+      llama-3.1-8b-instant:
+        display_name: Llama 3.1 8B
+        context_window: 128000
+      mixtral-8x7b-32768:
+        display_name: Mixtral 8x7B
+        context_window: 32768
+
+  together:
+    display_name: Together AI
+    base_url: https://api.together.xyz/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.together.ai
+    models: {}
+
+  fireworks:
+    display_name: Fireworks AI
+    base_url: https://api.fireworks.ai/inference/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.fireworks.ai
+    models:
+      accounts/fireworks/models/llama-v3p3-70b-instruct:
+        display_name: Llama 3.3 70B
+        context_window: 131072
+      accounts/fireworks/models/llama-v3p1-8b-instruct:
+        display_name: Llama 3.1 8B
+        context_window: 131072
+      accounts/fireworks/models/mixtral-8x22b-instruct:
+        display_name: Mixtral 8x22B
+        context_window: 65536
+      accounts/fireworks/models/qwen2p5-72b-instruct:
+        display_name: Qwen 2.5 72B
+        context_window: 32768
+      accounts/fireworks/models/deepseek-r1:
+        display_name: DeepSeek R1
+        context_window: 65536
+        is_reasoning: true
+
+  deepinfra:
+    display_name: DeepInfra
+    base_url: https://api.deepinfra.com/v1/openai
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://deepinfra.com/docs
+    models:
+      meta-llama/Meta-Llama-3.1-70B-Instruct:
+        display_name: Llama 3.1 70B
+        context_window: 128000
+      meta-llama/Meta-Llama-3.1-8B-Instruct:
+        display_name: Llama 3.1 8B
+        context_window: 128000
+      mistralai/Mixtral-8x7B-Instruct-v0.1:
+        display_name: Mixtral 8x7B
+        context_window: 32768
+
+  nvidia:
+    display_name: NVIDIA NIM
+    base_url: https://integrate.api.nvidia.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://build.nvidia.com/docs
+    models:
+      meta/llama-3.1-405b-instruct:
+        display_name: Llama 3.1 405B
+        context_window: 128000
+      meta/llama-3.1-70b-instruct:
+        display_name: Llama 3.1 70B
+        context_window: 128000
+      nvidia/nemotron-4-340b-instruct:
+        display_name: Nemotron 4 340B
+        context_window: 4096
+
+  perplexity:
+    display_name: Perplexity
+    base_url: https://api.perplexity.ai
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.perplexity.ai
+    models:
+      sonar:
+        display_name: Sonar
+        context_window: 128000
+      sonar-pro:
+        display_name: Sonar Pro
+        context_window: 200000
+      sonar-reasoning:
+        display_name: Sonar Reasoning
+        context_window: 128000
+        is_reasoning: true
+      sonar-reasoning-pro:
+        display_name: Sonar Reasoning Pro
+        context_window: 128000
+        is_reasoning: true
+
+  cerebras:
+    display_name: Cerebras
+    base_url: https://api.cerebras.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://inference-docs.cerebras.ai
+    models:
+      llama3.1-8b:
+        display_name: Llama 3.1 8B
+        context_window: 8192
+      llama3.1-70b:
+        display_name: Llama 3.1 70B
+        context_window: 8192
+      llama-3.3-70b:
+        display_name: Llama 3.3 70B
+        context_window: 128000
+
+  sambanova:
+    display_name: SambaNova
+    base_url: https://api.sambanova.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.sambanova.ai
+    models:
+      Meta-Llama-3.1-405B-Instruct:
+        display_name: Llama 3.1 405B
+        context_window: 16384
+      Meta-Llama-3.1-70B-Instruct:
+        display_name: Llama 3.1 70B
+        context_window: 16384
+      Meta-Llama-3.1-8B-Instruct:
+        display_name: Llama 3.1 8B
+        context_window: 16384
+
+  lepton:
+    display_name: Lepton AI
+    base_url: https://llama3-1-405b.lepton.run/api/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://www.lepton.ai/docs
+    models: {}
+
+  octoai:
+    display_name: OctoAI
+    base_url: https://text.octoai.run/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://octoai.cloud/docs
+    models:
+      meta-llama-3.1-70b-instruct:
+        display_name: Llama 3.1 70B
+        context_window: 128000
+      meta-llama-3.1-8b-instruct:
+        display_name: Llama 3.1 8B
+        context_window: 128000
+
+  anyscale:
+    display_name: Anyscale
+    base_url: https://api.endpoints.anyscale.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.endpoints.anyscale.com
+    models:
+      meta-llama/Meta-Llama-3-70B-Instruct:
+        display_name: Llama 3 70B
+        context_window: 8192
+      mistralai/Mixtral-8x22B-Instruct-v0.1:
+        display_name: Mixtral 8x22B
+        context_window: 65536
+
+  replicate:
+    display_name: Replicate
+    base_url: https://api.replicate.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://replicate.com/docs
+    models: {}
+
+  baseten:
+    display_name: Baseten
+    base_url: ""
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+      - base_url
+    docs_url: https://docs.baseten.co
+    models: {}
+
+  runpod:
+    display_name: RunPod
+    base_url: ""
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+      - base_url
+    docs_url: https://docs.runpod.io
+    models: {}
+
+  modal:
+    display_name: Modal
+    base_url: ""
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+      - base_url
+    docs_url: https://modal.com/docs
+    models: {}
+
+  predibase:
+    display_name: Predibase
+    base_url: https://serving.app.predibase.com
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.predibase.com
+    models: {}
+
+  novita:
+    display_name: Novita AI
+    base_url: https://api.novita.ai/v3/openai
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://novita.ai/docs
+    models:
+      meta-llama/llama-3.1-70b-instruct:
+        display_name: Llama 3.1 70B
+        context_window: 131072
+      meta-llama/llama-3.1-8b-instruct:
+        display_name: Llama 3.1 8B
+        context_window: 131072
+
+  friendli:
+    display_name: Friendli AI
+    base_url: https://inference.friendli.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://friendli.ai/docs
+    models:
+      meta-llama-3.1-70b-instruct:
+        display_name: Llama 3.1 70B
+        context_window: 131072
+      meta-llama-3.1-8b-instruct:
+        display_name: Llama 3.1 8B
+        context_window: 131072
+
+  kluster:
+    display_name: Kluster AI
+    base_url: https://api.kluster.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://kluster.ai/docs
+    models: {}
+
+  centml:
+    display_name: CentML
+    base_url: https://api.centml.com/openai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://centml.ai/docs
+    models: {}
+
+  # ---- AI API Companies ---------------------------------------------------
+
+  ai21:
+    display_name: AI21 Labs
+    base_url: https://api.ai21.com/studio/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.ai21.com
+    models:
+      jamba-1.5-large:
+        display_name: Jamba 1.5 Large
+        context_window: 256000
+      jamba-1.5-mini:
+        display_name: Jamba 1.5 Mini
+        context_window: 256000
+      jamba-instruct:
+        display_name: Jamba Instruct
+        context_window: 256000
+
+  writer:
+    display_name: Writer
+    base_url: https://api.writer.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://dev.writer.com/api-guides
+    models:
+      palmyra-x-004:
+        display_name: Palmyra X 004
+        context_window: 128000
+      palmyra-x-003-instruct:
+        display_name: Palmyra X 003
+        context_window: 32768
+
+  reka:
+    display_name: Reka AI
+    base_url: https://api.reka.ai/v1
+    auth_header: x-api-key
+    auth_prefix: ""
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.reka.ai
+    models:
+      reka-core:
+        display_name: Reka Core
+        context_window: 128000
+      reka-flash:
+        display_name: Reka Flash
+        context_window: 128000
+      reka-edge:
+        display_name: Reka Edge
+        context_window: 128000
+
+  aleph_alpha:
+    display_name: Aleph Alpha
+    base_url: https://api.aleph-alpha.com
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.aleph-alpha.com
+    models:
+      luminous-supreme-control:
+        display_name: Luminous Supreme Control
+        context_window: 2048
+      luminous-base:
+        display_name: Luminous Base
+        context_window: 2048
+
+  zhipu:
+    display_name: Zhipu AI (GLM)
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://open.bigmodel.cn/dev/api
+    models:
+      glm-4:
+        display_name: GLM-4
+        context_window: 128000
+      glm-4-flash:
+        display_name: GLM-4 Flash
+        context_window: 128000
+      glm-4v:
+        display_name: GLM-4V
+        context_window: 2048
+        supports_vision: true
+
+  moonshot:
+    display_name: Moonshot AI (Kimi)
+    base_url: https://api.moonshot.cn/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://platform.moonshot.cn/docs
+    models:
+      moonshot-v1-8k:
+        display_name: Moonshot v1 8K
+        context_window: 8192
+      moonshot-v1-32k:
+        display_name: Moonshot v1 32K
+        context_window: 32768
+      moonshot-v1-128k:
+        display_name: Moonshot v1 128K
+        context_window: 131072
+
+  yi:
+    display_name: 01.AI (Yi)
+    base_url: https://api.lingyiwanwu.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://platform.lingyiwanwu.com/docs
+    models:
+      yi-large:
+        display_name: Yi Large
+        context_window: 32768
+      yi-medium:
+        display_name: Yi Medium
+        context_window: 16384
+      yi-spark:
+        display_name: Yi Spark
+        context_window: 16384
+
+  baichuan:
+    display_name: Baichuan AI
+    base_url: https://api.baichuan-ai.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://platform.baichuan-ai.com/docs
+    models:
+      Baichuan4:
+        display_name: Baichuan 4
+        context_window: 32768
+      Baichuan3-Turbo:
+        display_name: Baichuan 3 Turbo
+        context_window: 32768
+
+  sensetime:
+    display_name: SenseTime (SenseNova)
+    base_url: https://api.sensenova.cn/v1/llm
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://platform.sensenova.cn/doc
+    models:
+      nova-ptc-xl-v2:
+        display_name: SenseNova XL v2
+        context_window: 8192
+      nova-ptc-s-v2:
+        display_name: SenseNova S v2
+        context_window: 8192
+
+  iflytek:
+    display_name: iFlytek (Spark)
+    base_url: https://spark-api-open.xf-yun.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://xinghuo.xfyun.cn/sparkapi
+    models:
+      lite:
+        display_name: Spark Lite
+        context_window: 4096
+      generalv3:
+        display_name: Spark Pro
+        context_window: 8192
+      4.0Ultra:
+        display_name: Spark 4.0 Ultra
+        context_window: 8192
+
+  stepfun:
+    display_name: Stepfun
+    base_url: https://api.stepfun.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://platform.stepfun.com/docs
+    models:
+      step-1:
+        display_name: Step-1
+        context_window: 8192
+      step-1v:
+        display_name: Step-1V
+        context_window: 8192
+        supports_vision: true
+      step-2:
+        display_name: Step-2
+        context_window: 131072
+
+  internlm:
+    display_name: InternLM (Shanghai AI Lab)
+    base_url: https://internlm-chat.intern-ai.org.cn/puyu/api/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://internlm.intern-ai.org.cn/api/document
+    models:
+      internlm2.5-20b-chat:
+        display_name: InternLM 2.5 20B
+        context_window: 32768
+      internlm2-chat-20b:
+        display_name: InternLM 2 20B
+        context_window: 32768
+
+  baidu:
+    display_name: Baidu (ERNIE/Qianfan)
+    base_url: https://qianfan.baidubce.com/v2
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://cloud.baidu.com/doc/WENXINWORKSHOP/index.html
+    models:
+      ernie-4.0-8k:
+        display_name: ERNIE 4.0 8K
+        context_window: 8192
+      ernie-3.5-8k:
+        display_name: ERNIE 3.5 8K
+        context_window: 8192
+      ernie-speed-128k:
+        display_name: ERNIE Speed 128K
+        context_window: 131072
+
+  naver:
+    display_name: Naver HyperCLOVA X
+    base_url: https://clovastudio.stream.naver.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://api.ncloud-docs.com/docs/ai-naver-clovastudio
+    models:
+      HCX-003:
+        display_name: HyperCLOVA X 003
+        context_window: 4096
+      HCX-DASH-001:
+        display_name: HyperCLOVA X Dash
+        context_window: 4096
+
+  # ---- Search & Specialized -----------------------------------------------
+
+  minimax:
+    display_name: MiniMax
+    base_url: https://api.minimax.chat/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://platform.minimaxi.com/document
+    models:
+      abab6.5s-chat:
+        display_name: ABAB 6.5s
+        context_window: 245760
+
+  # ---- Inference Infrastructure -------------------------------------------
+
+  nebius:
+    display_name: Nebius AI Studio
+    base_url: https://api.studio.nebius.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://studio.nebius.ai/docs
+    models:
+      meta-llama/Meta-Llama-3.1-70B-Instruct:
+        display_name: Llama 3.1 70B
+        context_window: 128000
+      meta-llama/Meta-Llama-3.1-8B-Instruct:
+        display_name: Llama 3.1 8B
+        context_window: 128000
+
+  lambda:
+    display_name: Lambda
+    base_url: https://api.lambdalabs.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.lambdalabs.com
+    models:
+      hermes-3-llama-3.1-405b-fp8:
+        display_name: Hermes 3 Llama 3.1 405B
+        context_window: 128000
+
+  upstage:
+    display_name: Upstage
+    base_url: https://api.upstage.ai/v1/solar
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://developers.upstage.ai/docs
+    models:
+      solar-pro:
+        display_name: Solar Pro
+        context_window: 32768
+      solar-mini:
+        display_name: Solar Mini
+        context_window: 32768
+
+  # ---- Embedding / Reranking Specialists ----------------------------------
+
+  voyage:
+    display_name: Voyage AI
+    base_url: https://api.voyageai.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.voyageai.com
+    models:
+      voyage-3:
+        display_name: Voyage 3
+        context_window: 32000
+      voyage-3-lite:
+        display_name: Voyage 3 Lite
+        context_window: 32000
+      voyage-code-3:
+        display_name: Voyage Code 3
+        context_window: 32000
+
+  jina:
+    display_name: Jina AI
+    base_url: https://api.jina.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://jina.ai/docs
+    models:
+      jina-embeddings-v3:
+        display_name: Jina Embeddings v3
+        context_window: 8192
+      jina-reranker-v2-base-multilingual:
+        display_name: Jina Reranker v2
+        context_window: 1024
+
+  nomic:
+    display_name: Nomic AI
+    base_url: https://api-atlas.nomic.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.nomic.ai
+    models:
+      nomic-embed-text-v1.5:
+        display_name: Nomic Embed Text v1.5
+        context_window: 8192
+      nomic-embed-vision-v1.5:
+        display_name: Nomic Embed Vision v1.5
+        context_window: 8192
+
+  mixedbread:
+    display_name: Mixedbread AI
+    base_url: https://api.mixedbread.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://www.mixedbread.ai/docs
+    models:
+      mxbai-embed-large-v1:
+        display_name: mxbai Embed Large v1
+        context_window: 512
+      mxbai-rerank-large-v1:
+        display_name: mxbai Rerank Large v1
+        context_window: 512
+
+  # ---- Code / Developer AI ------------------------------------------------
+
+  phind:
+    display_name: Phind
+    base_url: https://https.extension.phind.com/agent/
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://www.phind.com
+    models:
+      Phind-70B:
+        display_name: Phind 70B
+        context_window: 128000
+
+  nlp_cloud:
+    display_name: NLP Cloud
+    base_url: https://api.nlpcloud.io/v1/gpu
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.nlpcloud.com
+    models: {}
+
+  forefront:
+    display_name: Forefront AI
+    base_url: https://api.forefront.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.forefront.ai
+    models: {}
+
+  goose_ai:
+    display_name: GooseAI
+    base_url: https://api.goose.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://goose.ai/docs
+    models: {}
+
+  textsynth:
+    display_name: TextSynth
+    base_url: https://api.textsynth.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://textsynth.com/documentation.html
+    models:
+      falcon_40b:
+        display_name: Falcon 40B
+        context_window: 2048
+      llama2_70B:
+        display_name: Llama 2 70B
+        context_window: 4096
+
+  avian:
+    display_name: Avian.io
+    base_url: https://api.avian.io/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://avian.io/docs
+    models: {}
+
+  # ---- Cloud & Edge Inference ---------------------------------------------
+
+  cloudflare_ai:
+    display_name: Cloudflare Workers AI
+    base_url: https://api.cloudflare.com/client/v4/accounts
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+      - account_id
+    docs_url: https://developers.cloudflare.com/workers-ai/
+    models:
+      "@cf/meta/llama-3.1-70b-instruct":
+        display_name: Llama 3.1 70B (CF)
+        context_window: 128000
+      "@cf/mistral/mistral-7b-instruct-v0.2-lora":
+        display_name: Mistral 7B (CF)
+        context_window: 32768
+
+  huggingface_api:
+    display_name: Hugging Face Inference API
+    base_url: https://api-inference.huggingface.co/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://huggingface.co/docs/api-inference
+    models: {}
+
+  huggingface_endpoints:
+    display_name: Hugging Face Inference Endpoints
+    base_url: ""
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+      - base_url
+    docs_url: https://huggingface.co/docs/inference-endpoints
+    models: {}
+
+  # ---- Aggregators / Routers ----------------------------------------------
+
+  openrouter:
+    display_name: OpenRouter
+    base_url: https://openrouter.ai/api/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://openrouter.ai/docs
+    models: {}
+
+  portkey:
+    display_name: Portkey
+    base_url: https://api.portkey.ai/v1
+    auth_header: x-portkey-api-key
+    auth_prefix: ""
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://portkey.ai/docs
+    models: {}
+
+  litellm_proxy:
+    display_name: LiteLLM Proxy
+    base_url: ""
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+      - base_url
+    docs_url: https://docs.litellm.ai/docs/proxy/quick_start
+    models: {}
+
+  martian:
+    display_name: Martian
+    base_url: https://withmartian.com/api/openai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.withmartian.com
+    models: {}
+
+  helicone:
+    display_name: Helicone
+    base_url: https://oai.helicone.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.helicone.ai
+    models: {}
+
+  braintrust:
+    display_name: Braintrust Proxy
+    base_url: https://api.braintrust.dev/v1/proxy
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://www.braintr.us/docs
+    models: {}
+
+  # ---- Speech & Audio ------------------------------------------------------
+
+  elevenlabs:
+    display_name: ElevenLabs
+    base_url: https://api.elevenlabs.io/v1
+    auth_header: xi-api-key
+    auth_prefix: ""
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://elevenlabs.io/docs
+    models:
+      eleven_multilingual_v2:
+        display_name: Eleven Multilingual v2
+        context_window: 0
+      eleven_turbo_v2:
+        display_name: Eleven Turbo v2
+        context_window: 0
+
+  assemblyai:
+    display_name: AssemblyAI
+    base_url: https://api.assemblyai.com/v2
+    auth_header: Authorization
+    auth_prefix: ""
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://www.assemblyai.com/docs
+    models: {}
+
+  # ---- Image Generation ----------------------------------------------------
+
+  stability:
+    display_name: Stability AI
+    base_url: https://api.stability.ai/v2beta
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://platform.stability.ai/docs/api-reference
+    models:
+      stable-diffusion-3-5-large:
+        display_name: Stable Diffusion 3.5 Large
+        context_window: 0
+      stable-image-ultra:
+        display_name: Stable Image Ultra
+        context_window: 0
+
+  leonardo:
+    display_name: Leonardo AI
+    base_url: https://cloud.leonardo.ai/api/rest/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.leonardo.ai
+    models: {}
+
+  # ---- Self-Hosted / Local Inference Servers ------------------------------
+
+  ollama:
+    display_name: Ollama
+    base_url: http://localhost:11434/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires: []
+    docs_url: https://ollama.ai/docs
+    models: {}
+
+  vllm:
+    display_name: vLLM
+    base_url: http://localhost:8000/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires: []
+    docs_url: https://docs.vllm.ai
+    models: {}
+
+  tgi:
+    display_name: Text Generation Inference (TGI)
+    base_url: http://localhost:8080/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires: []
+    docs_url: https://huggingface.co/docs/text-generation-inference
+    models: {}
+
+  localai:
+    display_name: LocalAI
+    base_url: http://localhost:8080/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires: []
+    docs_url: https://localai.io/docs
+    models: {}
+
+  lmstudio:
+    display_name: LM Studio
+    base_url: http://localhost:1234/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires: []
+    docs_url: https://lmstudio.ai/docs
+    models: {}
+
+  llamacpp:
+    display_name: llama.cpp Server
+    base_url: http://localhost:8080/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires: []
+    docs_url: https://github.com/ggerganov/llama.cpp/blob/master/examples/server/README.md
+    models: {}
+
+  jan:
+    display_name: Jan AI
+    base_url: http://localhost:1337/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires: []
+    docs_url: https://jan.ai/docs
+    models: {}
+
+  gpt4all:
+    display_name: GPT4All
+    base_url: http://localhost:4891/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires: []
+    docs_url: https://docs.gpt4all.io
+    models: {}
+
+  koboldai:
+    display_name: KoboldAI
+    base_url: http://localhost:5001/api/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires: []
+    docs_url: https://github.com/KoboldAI/KoboldAI-Client
+    models: {}
+
+  oobabooga:
+    display_name: Oobabooga (text-generation-webui)
+    base_url: http://localhost:5000/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires: []
+    docs_url: https://github.com/oobabooga/text-generation-webui
+    models: {}
+
+  tabbyml:
+    display_name: TabbyML
+    base_url: http://localhost:8080/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires: []
+    docs_url: https://tabby.tabbyml.com/docs
+    models: {}
+
+  # ---- Monster API / Banana / Pipeline ------------------------------------
+
+  monster_api:
+    display_name: Monster API
+    base_url: https://api.monsterapi.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://developer.monsterapi.ai
+    models:
+      meta-llama/Meta-Llama-3-70B-Instruct:
+        display_name: Llama 3 70B
+        context_window: 8192
+
+  # ---- Cerebrium / Mystic -------------------------------------------------
+
+  cerebrium:
+    display_name: Cerebrium
+    base_url: https://api.cerebrium.ai/v4
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.cerebrium.ai
+    models: {}
+
+  mystic:
+    display_name: Mystic AI (Pipeline)
+    base_url: https://www.mystic.ai/v4
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.mystic.ai
+    models: {}
+
+  # ---- BentoML / E2B ------------------------------------------------------
+
+  bentoml:
+    display_name: BentoML Cloud
+    base_url: ""
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+      - base_url
+    docs_url: https://docs.bentoml.com
+    models: {}
+
+  # ---- Other Providers ----------------------------------------------------
+
+  oracle_oci:
+    display_name: Oracle OCI Generative AI
+    base_url: https://inference.generativeai.us-chicago-1.oci.oraclecloud.com/20231130
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.oracle.com/en-us/iaas/Content/generative-ai/home.htm
+    models:
+      cohere.command-r-plus:
+        display_name: Command R+ (OCI)
+        context_window: 128000
+      meta.llama-3.1-70b-instruct:
+        display_name: Llama 3.1 70B (OCI)
+        context_window: 128000
+
+  exllamav2:
+    display_name: ExLlamaV2
+    base_url: http://localhost:5000/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires: []
+    docs_url: https://github.com/turboderp/exllamav2
+    models: {}
+
+  continue_dev:
+    display_name: Continue
+    base_url: http://localhost:65432/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires: []
+    docs_url: https://docs.continue.dev
+    models: {}
+
+  vercel_ai:
+    display_name: Vercel AI Gateway
+    base_url: https://sdk.vercel.ai/api
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://sdk.vercel.ai/docs
+    models: {}
+
+  snowflake:
+    display_name: Snowflake Arctic (Cortex)
+    base_url: ""
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+      - base_url
+    docs_url: https://docs.snowflake.com/en/user-guide/snowflake-cortex/llm-functions
+    models:
+      snowflake-arctic-instruct:
+        display_name: Snowflake Arctic Instruct
+        context_window: 4096
+
+  hyperbolic:
+    display_name: Hyperbolic
+    base_url: https://api.hyperbolic.xyz/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.hyperbolic.xyz
+    models:
+      meta-llama/Meta-Llama-3.1-70B-Instruct:
+        display_name: Llama 3.1 70B
+        context_window: 128000
+      Qwen/Qwen2.5-72B-Instruct:
+        display_name: Qwen 2.5 72B
+        context_window: 32768
+
+  nscale:
+    display_name: Nscale
+    base_url: https://inference.api.nscale.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://docs.nscale.com
+    models:
+      meta-llama/Llama-3.1-70B-Instruct:
+        display_name: Llama 3.1 70B
+        context_window: 131072
+
+  infomaniak:
+    display_name: Infomaniak AI Tools
+    base_url: https://api.infomaniak.com/1/ai/llm
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://developer.infomaniak.com/docs/api/get/1/ai
+    models: {}
+
+  featherless:
+    display_name: Featherless AI
+    base_url: https://api.featherless.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires:
+      - api_key
+    docs_url: https://featherless.ai/docs
+    models: {}
+
+  openllm:
+    display_name: OpenLLM (BentoML)
+    base_url: http://localhost:3000/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    requires: []
+    docs_url: https://github.com/bentoml/OpenLLM
+    models: {}

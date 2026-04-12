@@ -1,0 +1,30 @@
+# AI gateway - input guardrails (regex deny, secrets, jailbreak, injection)
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "ai-guard-in.test":
+    action:
+      type: ai_proxy
+      skip_tls_verify_host: true
+      default_model: gpt-4o-mini
+      providers:
+        - name: mock-openai
+          api_key: test-key
+          base_url: http://127.0.0.1:18889/v1
+          models:
+            - gpt-4o-mini
+      guardrails:
+        input:
+          - type: regex_guard
+            action: block
+            config:
+              deny:
+                - "BLOCKED_WORD"
+                - "\\b\\d{3}-\\d{2}-\\d{4}\\b"
+          - type: secrets
+            action: block
+          - type: prompt_injection
+            action: block
+          - type: jailbreak
+            action: block

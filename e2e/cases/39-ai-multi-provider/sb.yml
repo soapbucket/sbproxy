@@ -1,0 +1,27 @@
+# AI gateway - multi-provider round robin routing
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "ai-multi.test":
+    action:
+      type: ai_proxy
+      skip_tls_verify_host: true
+      default_model: gpt-4o-mini
+      routing:
+        strategy: round_robin
+      providers:
+        - name: provider-a
+          api_key: test-key-a
+          base_url: http://127.0.0.1:18889/v1
+          models:
+            - gpt-4o-mini
+          headers:
+            X-Provider-Name: provider-a
+        - name: provider-b
+          api_key: test-key-b
+          base_url: http://127.0.0.1:18890/v1
+          models:
+            - gpt-4o-mini
+          headers:
+            X-Provider-Name: provider-b

@@ -1,0 +1,42 @@
+# Tests text-based transforms: HTML minify, markdown to HTML, html_to_markdown
+proxy:
+  http_bind_port: 18080
+
+origins:
+  # HTML minification
+  "htmlmin.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    transforms:
+      - type: html
+        content_types:
+          - text/html
+        format_options:
+          strip_comments: true
+          strip_newlines: true
+          strip_space: true
+          lowercase_tags: true
+
+  # Markdown to HTML conversion
+  "md2html.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    transforms:
+      - type: markdown
+        content_types:
+          - text/markdown
+          - text/plain
+        sanitize: true
+        href_target_blank: true
+
+  # HTML to Markdown conversion
+  "html2md.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    transforms:
+      - type: html_to_markdown
+        content_types:
+          - text/html

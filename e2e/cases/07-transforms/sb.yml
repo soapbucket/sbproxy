@@ -1,0 +1,26 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "json-proj.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    transforms:
+      - type: json_projection
+        include:
+          - method
+          - path
+
+  "template.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    transforms:
+      - type: template
+        template: |
+          {
+            "wrapped": true,
+            "source": "sbproxy",
+            "data": {{ body }}
+          }
