@@ -2,7 +2,6 @@
 package cli
 
 import (
-	_ "embed"
 	"fmt"
 	"log"
 	"os"
@@ -12,9 +11,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
-
-//go:embed banner.txt
-var banner string
 
 const (
 	configDirFlag          = "config-dir"
@@ -55,7 +51,7 @@ func NewRootCmd() *cobra.Command {
 		Use:   "sb",
 		Short: "Soapbucket Proxy",
 		Run: func(cmd *cobra.Command, _ []string) {
-			fmt.Printf("%s  v%s\n", banner, version.Version)
+			fmt.Printf("\U0001F4E6 sbproxy v%s\n", version.Version)
 			_ = cmd.Usage()
 		},
 	}
