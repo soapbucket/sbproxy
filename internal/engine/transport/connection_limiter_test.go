@@ -154,22 +154,24 @@ func TestConnectionLimiter_WaitForAllConnections(t *testing.T) {
 
 	// Start 2 concurrent requests
 	var wg sync.WaitGroup
-	started := make(chan struct{}, 2)
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			started <- struct{}{}
 			client.Get(server.URL)
 		}()
 	}
 
-	// Ensure both requests have started
-	<-started
-	<-started
+	// Wait for both requests to become active
+	cl := limiter.(*ConnectionLimiter)
+	for {
+		if cl.GetActiveConnections() >= 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 
 	// Wait for all connections to complete
-	cl := limiter.(*ConnectionLimiter)
 	cl.WaitForAllConnections()
 
 	// Check that all connections are released
