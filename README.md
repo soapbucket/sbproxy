@@ -196,21 +196,6 @@ ResponseCache -> Transforms -> Action
 
 See [docs/architecture.md](docs/architecture.md) for the full startup flow, request flow, and package map.
 
-## Plugin System
-
-Caddy-style module architecture. Every component registers via `init()` into `pkg/plugin`:
-
-```go
-func init() {
-    plugin.RegisterAction("my_action", func(cfg json.RawMessage) (plugin.ActionHandler, error) {
-        return &myHandler{}, nil
-    })
-}
-```
-
-Five extension points: **ActionHandler**, **AuthProvider**, **PolicyEnforcer**, **TransformHandler**, **RequestEnricher**. New modules implement the interface, register in `init()`, and become available in config. See [docs/architecture.md](docs/architecture.md) for details.
-
----
 
 ## SBproxy Cloud
 
