@@ -103,9 +103,10 @@ AllowedMethods -> ForceSSL -> ErrorPages -> TrafficCapture -> MessageSignatures 
 ThreatProtection -> BotDetection -> RateLimitHeaders -> Policies -> OnRequest -> Auth ->
 RequestModifiers -> ResponseModifiers -> OnResponse -> ResponseCache -> Transforms -> Action
 ```
-See [docs/architecture.md](docs/architecture.md) for full startup flow, request lifecycle, and package map.
 
----
+See [docs/architecture.md](docs/architecture.md) for the full startup flow, request flow, and package map.
+
+
 ## SBproxy Cloud
 [cloud.sbproxy.dev](https://cloud.sbproxy.dev) provides managed hosting, a configuration dashboard, and enterprise capabilities including canary deployments, geo-blocking, AI guardrails, orchestration pipelines, and more.
 
