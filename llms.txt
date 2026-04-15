@@ -1,26 +1,37 @@
 # SBproxy
 
-> SBproxy is a high-performance reverse proxy and AI gateway in a single binary.
+> The reverse proxy and AI gateway, unified. One binary, one config file. Apache 2.0.
 
-SBproxy sits between your clients and backends, providing authentication, caching, rate limiting, request/response transforms, load balancing, and AI model routing. Single Go binary, sub-millisecond overhead, zero external dependencies required.
+Most teams run nginx or Traefik for HTTP traffic, then route AI requests through a separate LiteLLM or Portkey instance. SBproxy handles both in a single Go binary. One config file covers your entire traffic layer.
 
 ## Key Facts
 
 - Written in Go, pure binary (CGO_ENABLED=0)
-- 103 native LLM providers (OpenAI, Anthropic, Google, Mistral, Cohere, and more)
+- 203+ native LLM providers (OpenAI, Anthropic, Google, Mistral, Cohere, and more)
 - Caddy-style plugin architecture with `init()` registration
 - 18-layer compiled handler chain per origin (compiled once, zero per-request allocation)
 - Apache License 2.0
 
 ## Documentation
 
-- Website: https://sbproxy.dev
+### Website (sbproxy.dev/docs)
+- Getting Started: https://sbproxy.dev/docs/quick-start
+- Core Concepts: https://sbproxy.dev/docs/core-concepts
+- Your First Proxy: https://sbproxy.dev/docs/your-first-proxy
+- Your First AI Gateway: https://sbproxy.dev/docs/your-first-ai-gateway
+- Migrate from LiteLLM: https://sbproxy.dev/docs/replace-litellm
+- AI Guardrails: https://sbproxy.dev/docs/guardrails
+- CLI Reference: https://sbproxy.dev/docs/cli-reference
 - Full Docs: https://sbproxy.dev/docs
-- Configuration: https://sbproxy.dev/docs/config
-- AI Gateway: https://sbproxy.dev/docs/ai
-- Security: https://sbproxy.dev/docs/security
-- Scripting (CEL + Lua): https://sbproxy.dev/docs/scripting
+
+### Repo docs
 - Architecture: https://github.com/soapbucket/sbproxy/blob/main/docs/architecture.md
+- Comparison: https://github.com/soapbucket/sbproxy/blob/main/docs/comparison.md
+- Providers: https://github.com/soapbucket/sbproxy/blob/main/docs/providers.md
+- Troubleshooting: https://github.com/soapbucket/sbproxy/blob/main/docs/troubleshooting.md
+- Upgrade Guide: https://github.com/soapbucket/sbproxy/blob/main/docs/upgrade.md
+- Examples Index: https://github.com/soapbucket/sbproxy/blob/main/docs/examples.md
+- Changelog: https://github.com/soapbucket/sbproxy/blob/main/CHANGELOG.md
 - Examples: https://github.com/soapbucket/sbproxy/tree/main/examples
 
 ## Quick Start
@@ -95,7 +106,7 @@ Each origin has sibling fields (NOT nested inside action):
 | Type | Description |
 |------|-------------|
 | proxy | Reverse proxy to upstream URL |
-| ai_proxy | AI gateway with 103+ providers, model routing, fallback chains |
+| ai_proxy | AI gateway with 203+ providers, model routing, fallback chains |
 | static | Static response (JSON or text) |
 | redirect | HTTP redirect (301/302) |
 | echo | Echo request as JSON (debugging) |
