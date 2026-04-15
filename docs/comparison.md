@@ -1,6 +1,6 @@
 # How SBproxy Compares
 
-*Last modified: 2026-04-12*
+*Last modified: 2026-04-14*
 
 > **Open-source vs Enterprise:** Features marked *(enterprise)* are available
 > in sbproxy Cloud. Everything else ships in the open-source binary.
@@ -22,7 +22,21 @@ choose something else.
 | Nginx | Reverse proxy | No | Yes | Yes (C) | Lua (OpenResty) |
 | Envoy | Service mesh proxy | No | Yes | Yes (C++) | WASM |
 
-## When to Choose sbproxy
+## When to choose sbproxy
+
+SBproxy is the right choice when you need both a production-grade reverse proxy and
+an AI gateway in the same traffic layer. If you only need one or the other, there are
+tools that specialize:
+
+- **Only need an AI gateway with no HTTP routing?** LiteLLM is simpler to start with,
+  though note its current Business Source License restricts commercial self-hosting.
+- **Only need a reverse proxy with no AI features?** Traefik or Caddy are mature and
+  have larger communities.
+- **Need a managed platform with no self-hosting?** Portkey Cloud is worth evaluating.
+
+SBproxy's advantage is the unified traffic layer: one config file, one binary, one
+set of policies that apply to both your API traffic and your AI model traffic. Apache 2.0,
+no usage restrictions.
 
 **You need a proxy AND an AI gateway.** Most teams run Nginx/Traefik for HTTP
 traffic and LiteLLM/Portkey for LLM traffic. That's two systems to configure,
