@@ -1,0 +1,82 @@
+sbproxy
+Copyright 2026 Soap Bucket LLC
+
+This product includes software developed by third parties under the
+following licenses. In accordance with the Apache License 2.0 (Section 4),
+the original copyright notices and license terms are preserved below.
+
+===========================================================================
+
+Prometheus Go Client (prometheus/client_golang)
+Copyright 2012-2026 The Prometheus Authors
+Licensed under the Apache License, Version 2.0
+https://github.com/prometheus/client_golang
+
+===========================================================================
+
+Google CEL-Go (google/cel-go)
+Copyright 2018-2026 Google LLC
+Licensed under the Apache License, Version 2.0
+https://github.com/google/cel-go
+
+===========================================================================
+
+Google Cloud Go SDK (cloud.google.com/go)
+Copyright 2014-2026 Google LLC
+Licensed under the Apache License, Version 2.0
+https://github.com/googleapis/google-cloud-go
+
+===========================================================================
+
+CockroachDB Pebble (cockroachdb/pebble)
+Copyright 2019-2026 The Cockroach Authors
+Licensed under the BSD 3-Clause License
+https://github.com/cockroachdb/pebble
+
+===========================================================================
+
+CaddyServer CertMagic (caddyserver/certmagic)
+Copyright 2018-2026 Matthew Holt
+Licensed under the Apache License, Version 2.0
+https://github.com/caddyserver/certmagic
+
+===========================================================================
+
+QUIC-Go (quic-go/quic-go)
+Copyright 2016-2026 The QUIC-Go Authors
+Licensed under the MIT License
+https://github.com/quic-go/quic-go
+
+===========================================================================
+
+Go Redis (redis/go-redis)
+Copyright 2013-2026 The go-redis Authors
+Licensed under the BSD 2-Clause License
+https://github.com/redis/go-redis
+
+===========================================================================
+
+Cobra CLI Framework (spf13/cobra)
+Copyright 2013-2026 Steve Francia
+Licensed under the Apache License, Version 2.0
+https://github.com/spf13/cobra
+
+===========================================================================
+
+gopher-lua
+Copyright 2015-2026 Yusuke Inuzuka
+Licensed under the MIT License
+https://github.com/yuin/gopher-lua
+
+===========================================================================
+
+Additional dependencies are licensed under MIT, BSD, or dual
+MIT/Apache-2.0 licenses. A full list of dependencies can be found
+in go.mod and go.sum.
+
+===========================================================================
+
+CHANGES TO THIRD-PARTY CODE
+
+This project uses all third-party dependencies as-is via Go modules.
+No modifications have been made to any third-party source code.
