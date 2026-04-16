@@ -1,45 +1,72 @@
-# SBproxy
+<p align="center">
+  <img src="https://sbproxy.dev/logo.svg" alt="SBproxy" width="80" height="80">
+</p>
 
-**The reverse proxy and AI gateway, unified.**
+<h1 align="center">SBproxy</h1>
+<h3 align="center">The unified application gateway.</h3>
+<p align="center">Simplify your traffic layer. One gateway for every protocol and provider.</p>
 
-[![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev) [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) [![Release](https://img.shields.io/github/v/release/soapbucket/sbproxy)](https://github.com/soapbucket/sbproxy/releases) [![CI](https://github.com/soapbucket/sbproxy/actions/workflows/ci.yml/badge.svg)](https://github.com/soapbucket/sbproxy/actions/workflows/ci.yml)
+<p align="center">
+  <a href="https://github.com/soapbucket/sbproxy/releases"><img src="https://img.shields.io/github/v/release/soapbucket/sbproxy" alt="Release"></a>
+  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
+  <a href="https://github.com/soapbucket/sbproxy/actions/workflows/ci.yml"><img src="https://github.com/soapbucket/sbproxy/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/soapbucket/sbproxy/stargazers"><img src="https://img.shields.io/github/stars/soapbucket/sbproxy" alt="Stars"></a>
+</p>
 
-Most teams run nginx or Traefik for HTTP traffic, then route AI requests through a separate LiteLLM or Portkey instance. SBproxy handles both in a single Go binary. One config file covers your entire traffic layer.
-
-[Website](https://sbproxy.dev) | [Docs](https://sbproxy.dev/docs) | [Quick Start](https://sbproxy.dev/docs/quick-start) | [Examples](examples/)
+<p align="center">
+  <a href="#install">Install</a> &middot;
+  <a href="https://sbproxy.dev/docs">Docs</a> &middot;
+  <a href="examples/">Examples</a> &middot;
+  <a href="https://github.com/soapbucket/sbproxy/discussions">Community</a> &middot;
+  <a href="https://cloud.sbproxy.dev">Cloud</a>
+</p>
 
 ---
+
+## Why SBproxy
+
+- **One config file** replaces your reverse proxy, AI gateway, and a dozen middleware scripts.
+- **Add AI capabilities** to any existing API without changing your backend.
+- **Ship secure by default** with authentication, rate limiting, and caching already built in.
+- **Reload configuration** without dropping a single connection.
+
+---
+
 ## Install
+
 ```bash
 # Homebrew
 brew tap soapbucket/sbproxy && brew install sbproxy
-# Go
-go install github.com/soapbucket/sbproxy/cmd/sbproxy@latest
+
 # Docker
 docker pull ghcr.io/soapbucket/sbproxy:latest
+
 # Script
 curl -fsSL https://download.sbproxy.dev | sh
 ```
----
+
 ## Quick Start
-### Reverse proxy
+
+Create `sb.yml` and run:
+
 ```yaml
-# sb.yml
 proxy:
   http_bind_port: 8080
 origins:
   "api.example.com":
     action:
       type: proxy
-      url: https://test.sbproxy.dev
+      url: https://httpbin.org
 ```
+
 ```bash
 sbproxy serve -f sb.yml
-curl -H "Host: api.example.com" http://localhost:8080/echo
+curl -H "Host: api.example.com" http://localhost:8080/get
 ```
-### AI gateway
+
+That's a reverse proxy. Now add AI routing, auth, and rate limiting in the same file:
+
 ```yaml
-# sb.yml
 proxy:
   http_bind_port: 8080
 origins:
@@ -49,8 +76,8 @@ origins:
       providers:
         - name: openai
           api_key: ${OPENAI_API_KEY}
-          models: [gpt-4o, gpt-4o-mini]
-      default_model: gpt-4o-mini
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
       routing:
         strategy: fallback_chain
     authentication:
@@ -59,63 +86,50 @@ origins:
     policies:
       - type: rate_limiting
         requests_per_minute: 60
-        algorithm: sliding_window
 ```
-```bash
-sbproxy serve -f sb.yml
-curl -H "Host: ai.example.com" -H "X-API-Key: my-key" -H "Content-Type: application/json" \
-     http://localhost:8080/v1/chat/completions \
-     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hello"}]}'
-```
-Returns an OpenAI-compatible response regardless of which provider handled it. See [examples/16-full-production.yml](examples/16-full-production.yml) for a production config with auth, WAF, caching, and routing combined.
+
+One config file. Every protocol. Every provider.
+
+See [examples/](examples/) for 17 production-ready configurations.
 
 ---
-## Why SBproxy
-- **One binary, zero dependencies.** No Redis, no database, no sidecar required.
-- **Sub-millisecond overhead.** Compiled handler chains with zero per-request config lookups.
-- **Full HTTP stack.** Path routing, load balancing, WAF, rate limiting, JWT, gRPC, WebSocket, MCP, A2A.
-- **200+ native LLM providers.** OpenAI-compatible API. Model fallback chains, guardrails, semantic caching, budget enforcement.
-- **Hot reload** without restarts or dropped connections.
 
-See [docs/comparison.md](docs/comparison.md) for a side-by-side with LiteLLM, Portkey, Traefik, and Kong.
+## What Can You Build?
+
+**Reverse proxy** - Route HTTP, WebSocket, gRPC, and GraphQL traffic with path-based forwarding, load balancing, and automatic failover.
+
+**AI gateway** - Route requests across 200+ LLM providers with a single OpenAI-compatible API. Fallback chains, guardrails, spend tracking, and semantic caching.
+
+**API security layer** - Protect any backend with authentication, WAF, rate limiting, DDoS protection, and bot detection. No code changes required.
+
+**Protocol bridge** - Connect HTTP/1.1, HTTP/2, HTTP/3, WebSocket, gRPC, SSE, MCP, and A2A through one unified gateway.
 
 ---
+
 ## Features
-| Area | What's included |
+
+| Area | Capabilities |
 |---|---|
-| **Routing** | Reverse proxy, path-based forwarding, load balancing (10 algorithms), AI gateway (200+ providers), WebSocket, gRPC, GraphQL, MCP, A2A |
-| **Security** | API key, basic auth, bearer, JWT, forward auth, digest auth, WAF (OWASP CRS), DDoS protection, IP filtering, CORS, CSRF, HTTP signatures, bot detection, CEL expressions |
-| **Traffic** | Response caching (TTL, SWR, SIE), compression (gzip, brotli, zstd), request/response modifiers, 15+ transforms, error pages, webhooks, session management, feature flags, Lua scripting |
-| **Observability** | Structured logging, Prometheus metrics, OpenTelemetry tracing, event bus, PROXY protocol |
-| **Protocols** | HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, SSE streaming |
-
-Full reference at [sbproxy.dev/docs](https://sbproxy.dev/docs).
-
----
-## Architecture
-SBproxy compiles each origin config into an 18-layer handler chain at startup. Requests execute the pre-compiled chain with zero map lookups or config re-reads.
-```
-Request -> Global Middleware (14 layers) -> Host Routing (O(1) lookup) -> Origin Chain (18 layers) -> Action
-```
-Handler chain (execution order):
-```
-AllowedMethods -> ForceSSL -> ErrorPages -> TrafficCapture -> MessageSignatures -> Session ->
-ThreatProtection -> BotDetection -> RateLimitHeaders -> Policies -> OnRequest -> Auth ->
-RequestModifiers -> ResponseModifiers -> OnResponse -> ResponseCache -> Transforms -> Action
-```
-
-See [docs/architecture.md](docs/architecture.md) for the full startup flow, request flow, and package map.
-
-
-## SBproxy Cloud
-[cloud.sbproxy.dev](https://cloud.sbproxy.dev) provides managed hosting, a configuration dashboard, and enterprise capabilities including canary deployments, geo-blocking, AI guardrails, orchestration pipelines, and more.
+| **Traffic** | Reverse proxy, load balancing (10 algorithms), path routing, forwarding rules, WebSocket, gRPC, GraphQL, MCP, A2A |
+| **AI** | 200+ providers, OpenAI-compatible API, model fallback chains, guardrails, spend tracking, semantic caching, streaming |
+| **Security** | API key, JWT, basic auth, bearer, forward auth, digest auth, WAF, DDoS, IP filtering, CORS, CSRF, bot detection |
+| **Performance** | Response caching, compression (gzip, brotli, zstd), hot reload, zero-downtime config updates |
+| **Observability** | Structured logging, Prometheus metrics, OpenTelemetry tracing, event bus |
+| **Scripting** | CEL expressions, Lua scripting, request/response transforms, template engine |
+| **Protocols** | HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, SSE |
 
 ---
-## Contributing
-```bash
-git clone https://github.com/soapbucket/sbproxy.git && cd sbproxy
-go build ./... && go test ./...
-```
-See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+
+## Community
+
+- [GitHub Discussions](https://github.com/soapbucket/sbproxy/discussions) - questions and ideas
+- [Issue Tracker](https://github.com/soapbucket/sbproxy/issues) - bug reports and feature requests
+- [Contributing Guide](CONTRIBUTING.md) - how to contribute
+
+Need managed hosting and advanced analytics? See [SBproxy Cloud](https://cloud.sbproxy.dev).
+
+---
+
 ## License
+
 Apache 2.0. See [LICENSE](LICENSE). A [Soap Bucket LLC](https://www.soapbucket.org) project.
