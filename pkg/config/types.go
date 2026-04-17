@@ -83,7 +83,7 @@ type Origin struct {
 
 	// SessionConfig is the raw JSON configuration for session management,
 	// including cookie names, TTLs, and encryption settings.
-	SessionConfig json.RawMessage `json:"session_config,omitempty"`
+	SessionConfig json.RawMessage `json:"session,omitempty"`
 
 	// Variables is a map of user-defined template variables that can be interpolated
 	// into other configuration fields using the {{ .var_name }} syntax. Common uses

@@ -57,43 +57,32 @@ origins:
 
     policies:
       # --- Security headers policy ---
+      # Canonical format: `headers` is an array of name/value pairs. The
+      # optional `content_security_policy` block is used only when you need
+      # per-request nonce injection or per-URL-prefix policies.
       - type: security_headers
+        headers:
+          - name: Strict-Transport-Security
+            value: "max-age=31536000; includeSubDomains"
+          - name: X-Frame-Options
+            value: SAMEORIGIN
+          - name: X-Content-Type-Options
+            value: nosniff
+          - name: Referrer-Policy
+            value: strict-origin-when-cross-origin
+          - name: Permissions-Policy
+            value: "camera=(), microphone=(), geolocation=()"
 
-        # HTTP Strict Transport Security (HSTS) - RFC 6797
-        strict_transport_security:
-          enabled: true
-          max_age: 31536000              # 1 year in seconds
-          include_subdomains: true       # Apply to all subdomains
-          preload: false                 # Add to browser preload list (use with caution)
-
-        # Content Security Policy (CSP)
+        # Advanced CSP block. Leave this out for a simple static policy and
+        # put `Content-Security-Policy` in the `headers:` array instead.
         content_security_policy:
-          enabled: true
           policy: "default-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self' 'unsafe-inline'"
+          enable_nonce: false            # true to inject a per-request nonce
           report_only: false             # true = log violations but don't block
-
-        # X-Frame-Options: prevent clickjacking
-        x_frame_options:
-          enabled: true
-          value: SAMEORIGIN              # "DENY", "SAMEORIGIN", or "ALLOW-FROM <uri>"
-
-        # X-Content-Type-Options: prevent MIME sniffing
-        x_content_type_options:
-          enabled: true
-          no_sniff: true
-
-        # Referrer-Policy: control how much referrer info is sent
-        referrer_policy:
-          enabled: true
-          policy: strict-origin-when-cross-origin
-
-        # Permissions-Policy: control browser feature access
-        permissions_policy:
-          enabled: true
-          features:
-            camera: "()"               # Disallow camera access
-            microphone: "()"           # Disallow microphone access
-            geolocation: "()"          # Disallow geolocation
+          # report_uri: "/csp-report"    # optional report destination
+          # dynamic_routes:
+          #   "/admin":
+          #     policy: "default-src 'self' admin.example.com"
 
       # --- IP filtering policy ---
       - type: ip_filtering

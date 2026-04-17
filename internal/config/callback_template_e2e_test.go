@@ -107,10 +107,10 @@ func TestCallbackTemplateVariables_E2EConfig_Session(t *testing.T) {
 			"id": "lua-callback-session",
 			"hostname": "lua-callback-session.test",
 			"workspace_id": "test-workspace",
-			"session_config": {
+			"session": {
 				"enabled": true,
 				"cookie_name": "_sb.session",
-				"cookie_max_age": 3600,
+				"max_age": 3600,
 				"callbacks": [
 					{
 						"type": "http",

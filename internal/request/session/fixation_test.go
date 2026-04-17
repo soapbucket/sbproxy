@@ -106,7 +106,7 @@ func TestFixationPrevention_RegenerateSession(t *testing.T) {
 
 	sessionConfig := configpkg.SessionConfig{
 		CookieName:   "_sb.s",
-		CookieMaxAge: 3600,
+		MaxAge: 3600,
 	}
 
 	oldSessionID := "old-session-123"
@@ -400,7 +400,7 @@ func TestFixationPrevention_Middleware(t *testing.T) {
 
 	sessionConfig := configpkg.SessionConfig{
 		CookieName:   "_sb.s",
-		CookieMaxAge: 3600,
+		MaxAge: 3600,
 	}
 
 	handlerCalled := false
@@ -483,7 +483,7 @@ func TestFixationPrevention_Middleware_NoDuplicateRegeneration(t *testing.T) {
 
 	sessionConfig := configpkg.SessionConfig{
 		CookieName:   "_sb.s",
-		CookieMaxAge: 3600,
+		MaxAge: 3600,
 	}
 
 	regenCount := 0

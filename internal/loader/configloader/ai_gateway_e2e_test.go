@@ -314,7 +314,7 @@ func TestSecureTemplate_SecurityPolicies_E2E(t *testing.T) {
 		},
 		"policies": []map[string]any{
 			{"type": "rate_limiting", "requests_per_minute": 100},
-			{"type": "security_headers", "x_frame_options": map[string]any{"enabled": true, "value": "DENY"}},
+			{"type": "security_headers", "headers": []map[string]any{{"name": "X-Frame-Options", "value": "DENY"}}},
 		},
 	})
 

@@ -1,18 +1,27 @@
 // Package secheaders registers the security_headers policy.
+//
+// The policy has two configuration shapes that compose:
+//
+//   - `headers: [{name, value}]` - a list of static response headers to set.
+//   - `content_security_policy:` - an optional detailed CSP block that supports
+//     per-request nonce generation and per-URL-prefix policy overrides.
+//
+// When both are set and the CSP block has `enable_nonce` or `dynamic_routes`,
+// the CSP block takes precedence over any Content-Security-Policy entry in the
+// headers list. The headers list handles simple per-response injection; the
+// CSP block handles CSP features that cannot be expressed as a fixed string.
 package secheaders
 
 import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
-	"slices"
 	"strings"
 
 	"github.com/soapbucket/sbproxy/pkg/plugin"
@@ -22,107 +31,104 @@ func init() {
 	plugin.RegisterPolicy("security_headers", New)
 }
 
-// ---- Config types ----
-
-// HSTSConfig holds configuration for HSTS.
-type HSTSConfig struct {
-	Enabled           bool `json:"enabled,omitempty"`
-	MaxAge            int  `json:"max_age,omitempty"`
-	IncludeSubdomains bool `json:"include_subdomains,omitempty"`
-	Preload           bool `json:"preload,omitempty"`
+// SecurityHeader is a single response header name/value pair.
+type SecurityHeader struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
-// CSPDirectives holds structured CSP directives.
-type CSPDirectives struct {
-	DefaultSrc              []string `json:"default_src,omitempty"`
-	ScriptSrc               []string `json:"script_src,omitempty"`
-	StyleSrc                []string `json:"style_src,omitempty"`
-	ImgSrc                  []string `json:"img_src,omitempty"`
-	FontSrc                 []string `json:"font_src,omitempty"`
-	ConnectSrc              []string `json:"connect_src,omitempty"`
-	FrameSrc                []string `json:"frame_src,omitempty"`
-	ObjectSrc               []string `json:"object_src,omitempty"`
-	MediaSrc                []string `json:"media_src,omitempty"`
-	FrameAncestors          []string `json:"frame_ancestors,omitempty"`
-	BaseURI                 []string `json:"base_uri,omitempty"`
-	FormAction              []string `json:"form_action,omitempty"`
-	UpgradeInsecureRequests bool     `json:"upgrade_insecure_requests,omitempty"`
+// ContentSecurityPolicy is the detailed CSP configuration block.
+//
+// It supports a plain policy string (identical to setting a
+// Content-Security-Policy entry in `headers:`), plus two features that cannot
+// be expressed as a static string:
+//
+//   - `enable_nonce`: a per-request nonce is generated and injected into
+//     `script-src` and `style-src` directives of the resolved policy.
+//   - `dynamic_routes`: a map of URL path prefixes to alternate policies.
+//     Longest matching prefix wins.
+type ContentSecurityPolicy struct {
+	// Policy is the CSP header value (e.g. "default-src 'self'").
+	Policy string `json:"policy,omitempty"`
+	// EnableNonce generates a per-request nonce and injects it into the policy.
+	EnableNonce bool `json:"enable_nonce,omitempty"`
+	// ReportOnly emits `Content-Security-Policy-Report-Only` instead of
+	// `Content-Security-Policy`.
+	ReportOnly bool `json:"report_only,omitempty"`
+	// ReportURI is appended to the policy as `; report-uri <uri>`.
+	ReportURI string `json:"report_uri,omitempty"`
+	// DynamicRoutes maps URL path prefixes to alternate CSPs.
+	DynamicRoutes map[string]*ContentSecurityPolicy `json:"dynamic_routes,omitempty"`
 }
 
-// CSPConfig holds CSP configuration.
-type CSPConfig struct {
-	Enabled       bool                  `json:"enabled,omitempty"`
-	Policy        string                `json:"policy,omitempty"`
-	ReportOnly    bool                  `json:"report_only,omitempty"`
-	ReportURI     string                `json:"report_uri,omitempty"`
-	Directives    *CSPDirectives        `json:"directives,omitempty"`
-	EnableNonce   bool                  `json:"enable_nonce,omitempty"`
-	EnableHash    bool                  `json:"enable_hash,omitempty"`
-	DynamicRoutes map[string]*CSPConfig `json:"dynamic_routes,omitempty"`
+// UnmarshalJSON accepts either a plain policy string or a detailed object.
+// The string form is equivalent to `{"policy": "<s>"}`.
+func (c *ContentSecurityPolicy) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		c.Policy = s
+		return nil
+	}
+	type alias ContentSecurityPolicy
+	var tmp alias
+	if err := json.Unmarshal(data, &tmp); err != nil {
+		return err
+	}
+	*c = ContentSecurityPolicy(tmp)
+	return nil
 }
 
-// XFrameOptionsConfig holds X-Frame-Options configuration.
-type XFrameOptionsConfig struct {
-	Enabled bool   `json:"enabled,omitempty"`
-	Value   string `json:"value,omitempty"`
+// resolveForPath returns the CSP config that applies to path. An exact key
+// match wins; otherwise the longest-matching path prefix wins; otherwise
+// falls back to c itself.
+func (c *ContentSecurityPolicy) resolveForPath(path string) *ContentSecurityPolicy {
+	if len(c.DynamicRoutes) == 0 {
+		return c
+	}
+	if match, ok := c.DynamicRoutes[path]; ok && match != nil {
+		return match
+	}
+	var best *ContentSecurityPolicy
+	bestLen := 0
+	for route, route_csp := range c.DynamicRoutes {
+		if route_csp == nil {
+			continue
+		}
+		if strings.HasPrefix(path, route) && len(route) > bestLen {
+			best = route_csp
+			bestLen = len(route)
+		}
+	}
+	if best != nil {
+		return best
+	}
+	return c
 }
 
-// XContentTypeOptionsConfig holds X-Content-Type-Options configuration.
-type XContentTypeOptionsConfig struct {
-	Enabled bool `json:"enabled,omitempty"`
-	NoSniff bool `json:"no_sniff,omitempty"`
+// requiresPerRequest reports whether this CSP needs request-time processing
+// (nonce generation or dynamic-route resolution). A simple Policy string
+// with no nonce/routes can be emitted via the headers list and doesn't
+// require per-request work.
+func (c *ContentSecurityPolicy) requiresPerRequest() bool {
+	return c != nil && (c.EnableNonce || len(c.DynamicRoutes) > 0)
 }
 
-// XXSSProtectionConfig holds X-XSS-Protection configuration.
-type XXSSProtectionConfig struct {
-	Enabled bool   `json:"enabled,omitempty"`
-	Mode    string `json:"mode,omitempty"`
-}
-
-// ReferrerPolicyConfig holds Referrer-Policy configuration.
-type ReferrerPolicyConfig struct {
-	Enabled bool   `json:"enabled,omitempty"`
-	Policy  string `json:"policy,omitempty"`
-}
-
-// PermissionsPolicyConfig holds Permissions-Policy configuration.
-type PermissionsPolicyConfig struct {
-	Enabled  bool              `json:"enabled,omitempty"`
-	Features map[string]string `json:"features,omitempty"`
-}
-
-// COEPConfig holds Cross-Origin-Embedder-Policy configuration.
-type COEPConfig struct {
-	Enabled bool   `json:"enabled,omitempty"`
-	Value   string `json:"value,omitempty"`
-}
-
-// COOPConfig holds Cross-Origin-Opener-Policy configuration.
-type COOPConfig struct {
-	Enabled bool   `json:"enabled,omitempty"`
-	Value   string `json:"value,omitempty"`
-}
-
-// CORPConfig holds Cross-Origin-Resource-Policy configuration.
-type CORPConfig struct {
-	Enabled bool   `json:"enabled,omitempty"`
-	Value   string `json:"value,omitempty"`
-}
-
-// Config holds configuration for the security_headers policy.
+// Config is the security_headers policy configuration.
 type Config struct {
-	Type                      string                     `json:"type"`
-	Disabled                  bool                       `json:"disabled,omitempty"`
-	StrictTransportSecurity   *HSTSConfig                `json:"strict_transport_security,omitempty"`
-	ContentSecurityPolicy     *CSPConfig                 `json:"content_security_policy,omitempty"`
-	XFrameOptions             *XFrameOptionsConfig       `json:"x_frame_options,omitempty"`
-	XContentTypeOptions       *XContentTypeOptionsConfig `json:"x_content_type_options,omitempty"`
-	XXSSProtection            *XXSSProtectionConfig      `json:"x_xss_protection,omitempty"`
-	ReferrerPolicy            *ReferrerPolicyConfig      `json:"referrer_policy,omitempty"`
-	PermissionsPolicy         *PermissionsPolicyConfig   `json:"permissions_policy,omitempty"`
-	CrossOriginEmbedderPolicy *COEPConfig                `json:"cross_origin_embedder_policy,omitempty"`
-	CrossOriginOpenerPolicy   *COOPConfig                `json:"cross_origin_opener_policy,omitempty"`
-	CrossOriginResourcePolicy *CORPConfig                `json:"cross_origin_resource_policy,omitempty"`
+	Type     string `json:"type"`
+	Disabled bool   `json:"disabled,omitempty"`
+
+	// Headers is the canonical list of response headers to inject.
+	Headers []SecurityHeader `json:"headers,omitempty"`
+
+	// ContentSecurityPolicy is an optional detailed CSP block. When set with
+	// EnableNonce or DynamicRoutes, it takes precedence over any
+	// Content-Security-Policy entry in Headers.
+	ContentSecurityPolicy *ContentSecurityPolicy `json:"content_security_policy,omitempty"`
 }
 
 // New creates a new security_headers policy enforcer.
@@ -142,11 +148,9 @@ type secHeadersPolicy struct {
 func (p *secHeadersPolicy) Type() string { return "security_headers" }
 
 // CSPReportURI implements plugin.CSPReportURIProvider. It returns the CSP
-// violation report URI if Content-Security-Policy reporting is enabled.
+// violation report URI if the detailed CSP block configures one.
 func (p *secHeadersPolicy) CSPReportURI() string {
-	if p.cfg.ContentSecurityPolicy != nil &&
-		p.cfg.ContentSecurityPolicy.Enabled &&
-		p.cfg.ContentSecurityPolicy.ReportURI != "" {
+	if p.cfg.ContentSecurityPolicy != nil && p.cfg.ContentSecurityPolicy.ReportURI != "" {
 		return p.cfg.ContentSecurityPolicy.ReportURI
 	}
 	return ""
@@ -161,40 +165,23 @@ func (p *secHeadersPolicy) InitPlugin(ctx plugin.PluginContext) error {
 func (p *secHeadersPolicy) Enforce(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if p.cfg.Disabled {
-			slog.Debug("security headers policy disabled",
-				"config_id", p.originID,
-				"path", r.URL.Path)
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		if p.cfg.ContentSecurityPolicy != nil {
-			slog.Debug("security headers policy active",
-				"config_id", p.originID,
-				"path", r.URL.Path,
-				"csp_enabled", p.cfg.ContentSecurityPolicy.Enabled,
-				"csp_report_only", p.cfg.ContentSecurityPolicy.ReportOnly,
-				"csp_enable_nonce", p.cfg.ContentSecurityPolicy.EnableNonce,
-				"csp_has_directives", p.cfg.ContentSecurityPolicy.Directives != nil,
-				"csp_has_policy_string", p.cfg.ContentSecurityPolicy.Policy != "",
-				"csp_has_dynamic_routes", len(p.cfg.ContentSecurityPolicy.DynamicRoutes) > 0)
-		}
-
 		var cspNonce string
-		if p.cfg.ContentSecurityPolicy != nil && p.cfg.ContentSecurityPolicy.Enabled && p.cfg.ContentSecurityPolicy.EnableNonce {
-			var err error
-			cspNonce, err = generateNonce()
-			if err != nil {
-				slog.Warn("failed to generate CSP nonce",
-					"error", err,
-					"config_id", p.originID)
-			} else {
-				slog.Debug("CSP nonce generated",
-					"nonce", cspNonce[:8]+"...",
-					"config_id", p.originID,
-					"path", r.URL.Path)
-				r = r.WithContext(withCSPNonce(r.Context(), cspNonce))
-				w.Header().Set(cspNonceHeader, cspNonce)
+		if p.cfg.ContentSecurityPolicy != nil {
+			resolved := p.cfg.ContentSecurityPolicy.resolveForPath(r.URL.Path)
+			if resolved.EnableNonce {
+				if n, err := generateNonce(); err == nil {
+					cspNonce = n
+					r = r.WithContext(withCSPNonce(r.Context(), cspNonce))
+					w.Header().Set(cspNonceHeader, cspNonce)
+				} else {
+					slog.Warn("failed to generate CSP nonce",
+						"error", err,
+						"config_id", p.originID)
+				}
 			}
 		}
 
@@ -231,7 +218,6 @@ func (w *securityHeadersWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 func (w *securityHeadersWriter) WriteHeader(statusCode int) {
 	if !w.wroteHeader {
 		w.applySecurityHeaders()
-		w.deduplicateSecurityHeaders()
 		w.wroteHeader = true
 	}
 	w.ResponseWriter.WriteHeader(statusCode)
@@ -240,255 +226,66 @@ func (w *securityHeadersWriter) WriteHeader(statusCode int) {
 func (w *securityHeadersWriter) Write(b []byte) (int, error) {
 	if !w.wroteHeader {
 		w.applySecurityHeaders()
-		w.deduplicateSecurityHeaders()
 		w.wroteHeader = true
 	}
 	return w.ResponseWriter.Write(b)
 }
 
 func (w *securityHeadersWriter) applySecurityHeaders() {
-	p := w.policy.cfg
+	cfg := w.policy.cfg
 	h := w.ResponseWriter.Header()
 
-	if p.StrictTransportSecurity != nil && p.StrictTransportSecurity.Enabled {
-		applyHSTS(h, p.StrictTransportSecurity)
-	}
-	if p.ContentSecurityPolicy != nil && p.ContentSecurityPolicy.Enabled {
-		applyCSP(h, w.request, p.ContentSecurityPolicy, w.cspNonce)
-	}
-	if p.XFrameOptions != nil && p.XFrameOptions.Enabled {
-		applyXFrameOptions(h, p.XFrameOptions)
-	}
-	if p.XContentTypeOptions != nil && p.XContentTypeOptions.Enabled {
-		applyXContentTypeOptions(h)
-	}
-	if p.XXSSProtection != nil && p.XXSSProtection.Enabled {
-		applyXXSSProtection(h, p.XXSSProtection)
-	}
-	if p.ReferrerPolicy != nil && p.ReferrerPolicy.Enabled {
-		applyReferrerPolicy(h, p.ReferrerPolicy)
-	}
-	if p.PermissionsPolicy != nil && p.PermissionsPolicy.Enabled {
-		applyPermissionsPolicy(h, p.PermissionsPolicy)
-	}
-	if p.CrossOriginEmbedderPolicy != nil && p.CrossOriginEmbedderPolicy.Enabled {
-		applyCOEP(h, p.CrossOriginEmbedderPolicy)
-	}
-	if p.CrossOriginOpenerPolicy != nil && p.CrossOriginOpenerPolicy.Enabled {
-		applyCOOP(h, p.CrossOriginOpenerPolicy)
-	}
-	if p.CrossOriginResourcePolicy != nil && p.CrossOriginResourcePolicy.Enabled {
-		applyCORP(h, p.CrossOriginResourcePolicy)
-	}
-}
+	// When the detailed CSP block needs per-request processing, it owns the
+	// Content-Security-Policy header. We skip any CSP entry from the static
+	// headers list in that case to avoid conflicts.
+	cspOwnsHeader := cfg.ContentSecurityPolicy.requiresPerRequest()
 
-func (w *securityHeadersWriter) deduplicateSecurityHeaders() {
-	h := w.ResponseWriter.Header()
-
-	securityHeaderMap := map[string]bool{
-		"Content-Security-Policy":             true,
-		"Content-Security-Policy-Report-Only": true,
-		"Strict-Transport-Security":           true,
-		"X-Frame-Options":                     true,
-		"X-Content-Type-Options":              true,
-		"X-XSS-Protection":                    true,
-		"Referrer-Policy":                     true,
-		"Permissions-Policy":                  true,
-		"Cross-Origin-Embedder-Policy":        true,
-		"Cross-Origin-Opener-Policy":          true,
-		"Cross-Origin-Resource-Policy":        true,
-	}
-
-	for key, values := range h {
-		canonicalKey := http.CanonicalHeaderKey(key)
-		if securityHeaderMap[canonicalKey] {
-			if len(values) > 1 {
-				delete(h, key)
-				h[canonicalKey] = []string{values[0]}
-			} else if key != canonicalKey {
-				delete(h, key)
-				h[canonicalKey] = values
-			}
+	for _, hdr := range cfg.Headers {
+		if cspOwnsHeader && isCSPHeader(hdr.Name) {
+			continue
 		}
+		name := http.CanonicalHeaderKey(hdr.Name)
+		if h.Get(name) != "" {
+			continue
+		}
+		h.Set(name, hdr.Value)
 	}
 
-	if h.Get("Content-Security-Policy-Report-Only") != "" && h.Get("Content-Security-Policy") != "" {
-		h.Del("Content-Security-Policy")
+	if cfg.ContentSecurityPolicy != nil && cfg.ContentSecurityPolicy.Policy != "" {
+		w.applyCSPBlock(h)
 	}
 }
 
-// ---- Header application helpers ----
-
-func applyHSTS(h http.Header, hsts *HSTSConfig) {
-	if hsts.MaxAge <= 0 {
+func (w *securityHeadersWriter) applyCSPBlock(h http.Header) {
+	csp := w.policy.cfg.ContentSecurityPolicy.resolveForPath(w.request.URL.Path)
+	if csp.Policy == "" {
 		return
 	}
-	if h.Get("Strict-Transport-Security") != "" {
-		return
+	value := csp.Policy
+	if csp.EnableNonce && w.cspNonce != "" {
+		value = injectNonceIntoPolicy(value, w.cspNonce)
 	}
-	headerValue := fmt.Sprintf("max-age=%d", hsts.MaxAge)
-	if hsts.IncludeSubdomains {
-		headerValue += "; includeSubDomains"
+	if csp.ReportURI != "" {
+		value += "; report-uri " + csp.ReportURI
 	}
-	if hsts.Preload {
-		headerValue += "; preload"
+	name := "Content-Security-Policy"
+	if csp.ReportOnly {
+		name = "Content-Security-Policy-Report-Only"
 	}
-	h.Set("Strict-Transport-Security", headerValue)
-}
-
-func applyCSP(h http.Header, r *http.Request, csp *CSPConfig, nonce string) {
-	if csp == nil || !csp.Enabled {
-		return
-	}
-
-	routeCSP := csp.getCSPForRoute(r.URL.Path)
-	policy := routeCSP.buildPolicyString(r, nonce, nil)
-
-	if policy == "" {
-		return
-	}
-
-	headerName := "Content-Security-Policy"
-	if routeCSP.ReportOnly {
-		headerName = "Content-Security-Policy-Report-Only"
-	}
-
+	// Avoid double-set if something upstream already wrote a CSP header.
 	if h.Get("Content-Security-Policy") != "" || h.Get("Content-Security-Policy-Report-Only") != "" {
 		return
 	}
-
-	headerValue := policy
-	if routeCSP.ReportURI != "" {
-		headerValue += "; report-uri " + routeCSP.ReportURI
-	}
-	h.Set(headerName, headerValue)
+	h.Set(name, value)
 }
 
-func applyXFrameOptions(h http.Header, xfo *XFrameOptionsConfig) {
-	if xfo.Value == "" {
-		return
-	}
-	if h.Get("X-Frame-Options") != "" {
-		return
-	}
-	validValues := []string{"DENY", "SAMEORIGIN", "ALLOW-FROM"}
-	value := strings.ToUpper(xfo.Value)
-	if !slices.Contains(validValues, value) && !strings.HasPrefix(value, "ALLOW-FROM ") {
-		return
-	}
-	h.Set("X-Frame-Options", xfo.Value)
+func isCSPHeader(name string) bool {
+	canonical := http.CanonicalHeaderKey(name)
+	return canonical == "Content-Security-Policy" ||
+		canonical == "Content-Security-Policy-Report-Only"
 }
 
-func applyXContentTypeOptions(h http.Header) {
-	if h.Get("X-Content-Type-Options") != "" {
-		return
-	}
-	h.Set("X-Content-Type-Options", "nosniff")
-}
-
-func applyXXSSProtection(h http.Header, xxss *XXSSProtectionConfig) {
-	if xxss.Mode == "" {
-		return
-	}
-	if h.Get("X-XSS-Protection") != "" {
-		return
-	}
-	var headerValue string
-	switch xxss.Mode {
-	case "0":
-		headerValue = "0"
-	case "1":
-		headerValue = "1"
-	case "block":
-		headerValue = "1; mode=block"
-	case "report":
-		headerValue = "1; report="
-	default:
-		return
-	}
-	h.Set("X-XSS-Protection", headerValue)
-}
-
-func applyReferrerPolicy(h http.Header, rp *ReferrerPolicyConfig) {
-	if rp.Policy == "" {
-		return
-	}
-	if h.Get("Referrer-Policy") != "" {
-		return
-	}
-	validPolicies := []string{
-		"no-referrer", "no-referrer-when-downgrade", "origin",
-		"origin-when-cross-origin", "same-origin", "strict-origin",
-		"strict-origin-when-cross-origin", "unsafe-url",
-	}
-	if !slices.Contains(validPolicies, rp.Policy) {
-		return
-	}
-	h.Set("Referrer-Policy", rp.Policy)
-}
-
-func applyPermissionsPolicy(h http.Header, pp *PermissionsPolicyConfig) {
-	if len(pp.Features) == 0 {
-		return
-	}
-	if h.Get("Permissions-Policy") != "" {
-		return
-	}
-	var policies []string
-	for feature, value := range pp.Features {
-		if feature == "" {
-			continue
-		}
-		policies = append(policies, fmt.Sprintf("%s=(%s)", feature, value))
-	}
-	if len(policies) > 0 {
-		h.Set("Permissions-Policy", strings.Join(policies, ", "))
-	}
-}
-
-func applyCOEP(h http.Header, coep *COEPConfig) {
-	if coep.Value == "" {
-		return
-	}
-	if h.Get("Cross-Origin-Embedder-Policy") != "" {
-		return
-	}
-	validPolicies := []string{"unsafe-none", "require-corp"}
-	if !slices.Contains(validPolicies, coep.Value) {
-		return
-	}
-	h.Set("Cross-Origin-Embedder-Policy", coep.Value)
-}
-
-func applyCOOP(h http.Header, coop *COOPConfig) {
-	if coop.Value == "" {
-		return
-	}
-	if h.Get("Cross-Origin-Opener-Policy") != "" {
-		return
-	}
-	validPolicies := []string{"unsafe-none", "same-origin-allow-popups", "same-origin"}
-	if !slices.Contains(validPolicies, coop.Value) {
-		return
-	}
-	h.Set("Cross-Origin-Opener-Policy", coop.Value)
-}
-
-func applyCORP(h http.Header, corp *CORPConfig) {
-	if corp.Value == "" {
-		return
-	}
-	if h.Get("Cross-Origin-Resource-Policy") != "" {
-		return
-	}
-	validPolicies := []string{"same-site", "same-origin", "cross-origin"}
-	if !slices.Contains(validPolicies, corp.Value) {
-		return
-	}
-	h.Set("Cross-Origin-Resource-Policy", corp.Value)
-}
-
-// ---- CSP helpers (inlined from internal/config/csp.go) ----
+// ---- CSP helpers ----
 
 const cspNonceHeader = "X-CSP-Nonce"
 
@@ -508,128 +305,31 @@ func withCSPNonce(ctx context.Context, nonce string) context.Context {
 	return context.WithValue(ctx, cspNonceContextKeyVal, nonce)
 }
 
-func calculateHash(content string) string {
-	if content == "" {
-		return ""
-	}
-	hash := sha256.Sum256([]byte(content))
-	return base64.StdEncoding.EncodeToString(hash[:])
-}
-
-// keep calculateHash referenced
-var _ = calculateHash
-
-func (c *CSPConfig) getCSPForRoute(path string) *CSPConfig {
-	if c.DynamicRoutes == nil {
-		return c
-	}
-	if routeCSP, ok := c.DynamicRoutes[path]; ok {
-		return routeCSP
-	}
-	var bestMatch *CSPConfig
-	var bestMatchLen int
-	for route, routeCSP := range c.DynamicRoutes {
-		if strings.HasPrefix(path, route) && len(route) > bestMatchLen {
-			bestMatch = routeCSP
-			bestMatchLen = len(route)
-		}
-	}
-	if bestMatch != nil {
-		return bestMatch
-	}
-	return c
-}
-
-func (c *CSPConfig) buildPolicyString(r *http.Request, nonce string, hashes []string) string {
-	routeCSP := c.getCSPForRoute(r.URL.Path)
-	if routeCSP.Policy != "" {
-		policy := routeCSP.Policy
-		if routeCSP.EnableNonce && nonce != "" {
-			policy = injectNonceIntoPolicy(policy, nonce)
-		}
-		return policy
-	}
-	if routeCSP.Directives != nil {
-		return buildCSPPolicy(routeCSP.Directives, nonce, hashes)
+// CSPNonceFromContext returns the per-request CSP nonce if one was set by the
+// security_headers policy.
+func CSPNonceFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(cspNonceContextKeyVal).(string); ok {
+		return v
 	}
 	return ""
 }
 
+// injectNonceIntoPolicy appends `'nonce-<nonce>'` to `script-src` and
+// `style-src` directives that don't already contain a nonce. Other directives
+// are left unchanged.
 func injectNonceIntoPolicy(policy, nonce string) string {
+	if nonce == "" {
+		return policy
+	}
 	parts := strings.Split(policy, ";")
-	var result []string
+	result := make([]string, 0, len(parts))
 	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if strings.HasPrefix(part, "script-src") || strings.HasPrefix(part, "style-src") {
-			if !strings.Contains(part, "'nonce-") {
-				part += " 'nonce-" + nonce + "'"
-			}
+		trimmed := strings.TrimSpace(part)
+		if (strings.HasPrefix(trimmed, "script-src") || strings.HasPrefix(trimmed, "style-src")) &&
+			!strings.Contains(trimmed, "'nonce-") {
+			trimmed = trimmed + " 'nonce-" + nonce + "'"
 		}
-		result = append(result, part)
+		result = append(result, trimmed)
 	}
 	return strings.Join(result, "; ")
-}
-
-func buildCSPPolicy(directives *CSPDirectives, nonce string, hashes []string) string {
-	if directives == nil {
-		return ""
-	}
-	var parts []string
-
-	if len(directives.DefaultSrc) > 0 {
-		parts = append(parts, "default-src "+strings.Join(directives.DefaultSrc, " "))
-	}
-	if len(directives.ScriptSrc) > 0 {
-		scriptSrc := make([]string, len(directives.ScriptSrc))
-		copy(scriptSrc, directives.ScriptSrc)
-		if nonce != "" {
-			scriptSrc = append(scriptSrc, fmt.Sprintf("'nonce-%s'", nonce))
-		}
-		for _, hash := range hashes {
-			scriptSrc = append(scriptSrc, fmt.Sprintf("'sha256-%s'", hash))
-		}
-		parts = append(parts, "script-src "+strings.Join(scriptSrc, " "))
-	}
-	if len(directives.StyleSrc) > 0 {
-		styleSrc := make([]string, len(directives.StyleSrc))
-		copy(styleSrc, directives.StyleSrc)
-		if nonce != "" {
-			styleSrc = append(styleSrc, fmt.Sprintf("'nonce-%s'", nonce))
-		}
-		for _, hash := range hashes {
-			styleSrc = append(styleSrc, fmt.Sprintf("'sha256-%s'", hash))
-		}
-		parts = append(parts, "style-src "+strings.Join(styleSrc, " "))
-	}
-	if len(directives.ImgSrc) > 0 {
-		parts = append(parts, "img-src "+strings.Join(directives.ImgSrc, " "))
-	}
-	if len(directives.FontSrc) > 0 {
-		parts = append(parts, "font-src "+strings.Join(directives.FontSrc, " "))
-	}
-	if len(directives.ConnectSrc) > 0 {
-		parts = append(parts, "connect-src "+strings.Join(directives.ConnectSrc, " "))
-	}
-	if len(directives.FrameSrc) > 0 {
-		parts = append(parts, "frame-src "+strings.Join(directives.FrameSrc, " "))
-	}
-	if len(directives.ObjectSrc) > 0 {
-		parts = append(parts, "object-src "+strings.Join(directives.ObjectSrc, " "))
-	}
-	if len(directives.MediaSrc) > 0 {
-		parts = append(parts, "media-src "+strings.Join(directives.MediaSrc, " "))
-	}
-	if len(directives.FrameAncestors) > 0 {
-		parts = append(parts, "frame-ancestors "+strings.Join(directives.FrameAncestors, " "))
-	}
-	if len(directives.BaseURI) > 0 {
-		parts = append(parts, "base-uri "+strings.Join(directives.BaseURI, " "))
-	}
-	if len(directives.FormAction) > 0 {
-		parts = append(parts, "form-action "+strings.Join(directives.FormAction, " "))
-	}
-	if directives.UpgradeInsecureRequests {
-		parts = append(parts, "upgrade-insecure-requests")
-	}
-	return strings.Join(parts, "; ")
 }

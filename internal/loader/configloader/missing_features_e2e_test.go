@@ -187,12 +187,9 @@ func TestSecurityHeaders_E2E(t *testing.T) {
 		"policies": []map[string]any{
 			{
 				"type": "security_headers",
-				"x_frame_options": map[string]any{
-					"enabled": true,
-					"value":   "DENY",
-				},
-				"x_content_type_options": map[string]any{
-					"enabled": true,
+				"headers": []map[string]any{
+					{"name": "X-Frame-Options", "value": "DENY"},
+					{"name": "X-Content-Type-Options", "value": "nosniff"},
 				},
 			},
 		},
@@ -409,7 +406,7 @@ func TestSessionManagement_E2E(t *testing.T) {
 	cfg := originJSON(t, map[string]any{
 		"hostname": "session-mgmt.test",
 		"action":   map[string]any{"type": "echo"},
-		"session_config": map[string]any{
+		"session": map[string]any{
 			"cookie_name": "sb_session",
 			"ttl":         "1h",
 			"http_only":   true,

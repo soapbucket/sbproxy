@@ -29,8 +29,8 @@ type SessionConfig struct {
 	Disabled bool `sb_flag:"disabled" json:"disabled,omitempty"`
 
 	CookieName      string `json:"cookie_name,omitempty"`
-	CookieMaxAge    int    `json:"cookie_max_age,omitempty"`
-	CookieSameSite  string `json:"cookie_same_site,omitempty"`
+	MaxAge          int    `json:"max_age,omitempty"`
+	SameSite        string `json:"same_site,omitempty"`
 	DisableHttpOnly bool   `json:"disable_http_only,omitempty"` // If true, cookie HttpOnly flag is set to false (default: false, so HttpOnly is true by default)
 	AllowNonSSL     bool   `json:"allow_non_ssl,omitempty"`     // Allow sessions over HTTP (non-SSL) connections. If true and request is not TLS, cookie Secure flag is set to false.
 

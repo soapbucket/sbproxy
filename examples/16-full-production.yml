@@ -93,22 +93,17 @@ origins:
 
       # Security headers
       - type: security_headers
-        strict_transport_security:
-          enabled: true
-          max_age: 31536000            # 1 year
-          include_subdomains: true
-        content_security_policy:
-          enabled: true
-          policy: "default-src 'self'; connect-src 'self' https://api.example.com"
-        x_frame_options:
-          enabled: true
-          value: DENY                  # Never render in a frame
-        x_content_type_options:
-          enabled: true
-          no_sniff: true
-        referrer_policy:
-          enabled: true
-          policy: strict-origin-when-cross-origin
+        headers:
+          - name: Strict-Transport-Security
+            value: "max-age=31536000; includeSubDomains"
+          - name: Content-Security-Policy
+            value: "default-src 'self'; connect-src 'self' https://api.example.com"
+          - name: X-Frame-Options
+            value: DENY                  # Never render in a frame
+          - name: X-Content-Type-Options
+            value: nosniff
+          - name: Referrer-Policy
+            value: strict-origin-when-cross-origin
 
     # --- Response caching ---
     response_cache:

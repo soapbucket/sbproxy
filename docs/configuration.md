@@ -105,7 +105,7 @@ origins:
     variables: { ... }
     vaults: { ... }
     secrets: { ... }
-    session_config: { ... }
+    session: { ... }
     events: [ ... ]
     cors: { ... }
     compression: { ... }
@@ -258,7 +258,7 @@ origins:
     variables: { ... }           # Optional: template variables
     vaults: { ... }              # Optional: secret vault backends
     secrets: { ... }             # Optional: secret references
-    session_config: { ... }      # Optional: session/cookie settings
+    session: { ... }             # Optional: session/cookie settings
     on_load: [ ... ]             # Optional: startup callbacks
     on_request: [ ... ]          # Optional: per-request callbacks
     on_response: [ ... ]         # Optional: post-response callbacks
@@ -982,35 +982,34 @@ Inject security headers into every response. Use this to harden browser security
 ```yaml
 policies:
   - type: security_headers
-    strict_transport_security:
-      enabled: true
-      max_age: 31536000
-      include_subdomains: true
-      preload: true
+    headers:
+      - name: Strict-Transport-Security
+        value: "max-age=31536000; includeSubDomains; preload"
+      - name: X-Frame-Options
+        value: DENY
+      - name: X-Content-Type-Options
+        value: nosniff
+      - name: Referrer-Policy
+        value: strict-origin-when-cross-origin
+      - name: Permissions-Policy
+        value: "camera=(), microphone=(), geolocation=()"
+    # Optional: detailed CSP block for nonce / dynamic routes only.
     content_security_policy:
       policy: "default-src 'self'; script-src 'self' https://cdn.example.com"
-    x_frame_options:
-      value: DENY
-    x_content_type_options:
-      enabled: true
-    referrer_policy:
-      value: strict-origin-when-cross-origin
-    permissions_policy:
-      policy: "camera=(), microphone=(), geolocation=()"
+      enable_nonce: false     # true to inject per-request nonce in script-src/style-src
+      report_only: false
+      report_uri: ""
+      # dynamic_routes:
+      #   "/admin":
+      #     policy: "default-src 'self' admin.example.com"
 ```
+
+Use `headers` as a simple list of `{name, value}` pairs for any response header (HSTS, Cross-Origin-*, COEP/COOP/CORP, Referrer-Policy, Permissions-Policy, etc.). The optional `content_security_policy` block is for advanced CSP behavior only (per-request nonce injection, report-only mode, per-route overrides). For a plain CSP without nonce or dynamic routes, just add a `Content-Security-Policy` entry to `headers` directly.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `strict_transport_security` | object | | HSTS settings (max_age, include_subdomains, preload) |
-| `content_security_policy` | object | | CSP policy string |
-| `x_frame_options` | object | | Frame embedding control (DENY, SAMEORIGIN) |
-| `x_content_type_options` | object | | Prevent MIME type sniffing |
-| `x_xss_protection` | object | | XSS filter (legacy browsers) |
-| `referrer_policy` | object | | Controls Referer header |
-| `permissions_policy` | object | | Feature permissions |
-| `cross_origin_embedder_policy` | object | | COEP header |
-| `cross_origin_opener_policy` | object | | COOP header |
-| `cross_origin_resource_policy` | object | | CORP header |
+| `headers` | []object | | List of `{name, value}` response headers to inject |
+| `content_security_policy` | object | | Advanced CSP block (nonce injection, report-only, per-route policies) |
 
 ### csrf
 
@@ -1577,10 +1576,10 @@ Configure session behavior for an origin. Sessions are stored in encrypted cooki
 ```yaml
 origins:
   "app.example.com":
-    session_config:
+    session:
       cookie_name: sb_session
-      cookie_max_age: 3600
-      cookie_same_site: Strict
+      max_age: 3600
+      same_site: Strict
       disable_http_only: false
       allow_non_ssl: false
       enable_cookie_jar: true
@@ -1594,8 +1593,8 @@ origins:
 |-------|------|---------|-------------|
 | `disabled` | bool | false | Disable sessions entirely |
 | `cookie_name` | string | sb_session | Session cookie name |
-| `cookie_max_age` | int | 3600 | Cookie lifetime in seconds |
-| `cookie_same_site` | string | Lax | SameSite attribute (Strict, Lax, None) |
+| `max_age` | int | 3600 | Cookie lifetime in seconds |
+| `same_site` | string | Lax | SameSite attribute (Strict, Lax, None) |
 | `disable_http_only` | bool | false | If true, cookie is accessible to JavaScript |
 | `allow_non_ssl` | bool | false | Allow sessions over HTTP (not just HTTPS) |
 | `enable_cookie_jar` | bool | false | Store backend cookies in the session |
@@ -1905,7 +1904,7 @@ origins:
     variables: { ... }
     vaults: { ... }
     secrets: { ... }
-    session_config: { ... }
+    session: { ... }
     events: [ ... ]
     cors: { ... }
     compression: { ... }

@@ -77,7 +77,7 @@ type RawOrigin struct {
 	ThreatProtection json.RawMessage `json:"threat_protection,omitempty"`
 
 	// Session config
-	Session json.RawMessage `json:"session_config,omitempty"`
+	Session json.RawMessage `json:"session,omitempty"`
 
 	// Middleware configs
 	Compression    json.RawMessage `json:"compression,omitempty"`
@@ -1282,7 +1282,7 @@ func wrapSession(next http.Handler, cfg json.RawMessage, services plugin.Service
 	if cookieName == "" {
 		cookieName = "_sb.s"
 	}
-	cookieMaxAge := sessCfg.CookieMaxAge
+	cookieMaxAge := sessCfg.MaxAge
 	if cookieMaxAge == 0 {
 		cookieMaxAge = 3600
 	}
@@ -1356,7 +1356,7 @@ func wrapSession(next http.Handler, cfg json.RawMessage, services plugin.Service
 		cookieHttpOnly := !sessCfg.DisableHttpOnly
 
 		sameSite := http.SameSiteLaxMode
-		switch strings.ToLower(sessCfg.CookieSameSite) {
+		switch strings.ToLower(sessCfg.SameSite) {
 		case "strict":
 			sameSite = http.SameSiteStrictMode
 		case "none":
