@@ -101,3 +101,10 @@ The chain is compiled once per origin and cached. Requests execute the pre-compi
 - Do NOT include enterprise features in OSS code
 - Enterprise features are available via sbproxy Cloud (cloud.sbproxy.dev)
 - GeoIP and UA parser enrichers are enterprise-only (registered via `plugin.RegisterEnricher` in sbproxy-enterprise)
+
+## License & Attribution
+- This project is licensed under Apache 2.0 (see `LICENSE`)
+- **NOTICE file maintenance:** When adding or upgrading a dependency that is licensed under Apache 2.0 (not dual MIT/Apache-2.0), update the `NOTICE` file with the dependency's copyright notice and license. Apache 2.0 Section 4 requires this.
+- To check: run `go-licenses csv ./...` or inspect `go.mod` for Apache-only deps
+- Copyright holder: Soap Bucket LLC
+- Do NOT expose internal implementation details (language, libraries, algorithms) in user-facing content per the root CLAUDE.md anti-patterns
