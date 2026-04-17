@@ -23,19 +23,14 @@ origins:
       allow_credentials: true
     policies:
       - type: security_headers
-        strict_transport_security:
-          enabled: true
-          max_age: 31536000
-          include_subdomains: true
-        content_security_policy:
-          enabled: true
-          policy: "default-src 'self'"
-        x_frame_options:
-          enabled: true
-          value: DENY
-        x_content_type_options:
-          enabled: true
-          no_sniff: true
-        referrer_policy:
-          enabled: true
-          policy: strict-origin-when-cross-origin
+        headers:
+          - name: Strict-Transport-Security
+            value: "max-age=31536000; includeSubDomains"
+          - name: Content-Security-Policy
+            value: "default-src 'self'"
+          - name: X-Frame-Options
+            value: DENY
+          - name: X-Content-Type-Options
+            value: nosniff
+          - name: Referrer-Policy
+            value: strict-origin-when-cross-origin

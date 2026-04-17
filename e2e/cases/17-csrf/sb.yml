@@ -6,11 +6,11 @@ origins:
     action:
       type: proxy
       url: http://127.0.0.1:18888
-    session_config:
+    session:
       allow_non_ssl: true
       cookie_name: sbproxy_session
-      cookie_max_age: 3600
-      cookie_same_site: Lax
+      max_age: 3600
+      same_site: Lax
     policies:
       - type: csrf
         secret: "cR7tK3mW9pL2vX5qJ8bN4mW6nY3zA"
