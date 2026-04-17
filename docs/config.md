@@ -132,7 +132,7 @@ Each key in `origins:` is a hostname. The value is an origin config object.
 | `request_modifiers` | []object | — | Request modification rules (see section 8) |
 | `response_modifiers` | []object | — | Response modification rules (see section 8) |
 | `forward_rules` | []object | — | Path-based routing rules (see section 9) |
-| `session_config` | object | — | Session settings (see section 10) |
+| `session` | object | none | Session settings (see section 10) |
 | `error_pages` | []object | — | Custom error page definitions (see section 11) |
 | `variables` | object | — | Key-value variables for template use (see section 12) |
 | `secrets` | object | — | Secret references (see section 12) |
@@ -848,46 +848,42 @@ policies:
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `type` | string | — | `"security_headers"` |
-| `strict_transport_security` | object | — | HSTS policy |
-| `content_security_policy` | object | — | CSP policy |
-| `x_frame_options` | object | — | X-Frame-Options |
-| `x_content_type_options` | object | — | X-Content-Type-Options |
-| `x_xss_protection` | object | — | X-XSS-Protection |
-| `referrer_policy` | object | — | Referrer-Policy |
-| `permissions_policy` | object | — | Permissions-Policy |
-
-**HSTSConfig:**
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `enabled` | bool | false | Enable HSTS header |
-| `max_age` | int | 0 | `max-age` in seconds |
-| `include_subdomains` | bool | false | Include subdomains |
-| `preload` | bool | false | Include preload directive |
+| `headers` | []object | none | List of `{name, value}` response headers to set (HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, Cross-Origin-* etc.) |
+| `content_security_policy` | object | none | Advanced CSP block (nonce injection, report-only, per-route policies) |
 
 **CSPConfig:**
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | bool | false | Enable CSP header |
-| `policy` | string | `""` | Simple policy string |
+| `policy` | string | `""` | Base CSP policy string |
+| `enable_nonce` | bool | false | Inject per-request nonce in `script-src`/`style-src` |
 | `report_only` | bool | false | Use `Content-Security-Policy-Report-Only` |
 | `report_uri` | string | `""` | Violation report endpoint |
-| `directives` | object | — | Structured CSP directives |
+| `dynamic_routes` | map | none | Route-prefix to override CSP policy |
 
 ```yaml
 policies:
   - type: security_headers
-    strict_transport_security:
-      enabled: true
-      max_age: 31536000
-      include_subdomains: true
-    x_frame_options:
-      enabled: true
-      value: DENY
-    x_content_type_options:
-      enabled: true
-      no_sniff: true
+    headers:
+      - name: Strict-Transport-Security
+        value: "max-age=31536000; includeSubDomains"
+      - name: X-Frame-Options
+        value: DENY
+      - name: X-Content-Type-Options
+        value: nosniff
+      - name: Referrer-Policy
+        value: strict-origin-when-cross-origin
+      - name: Permissions-Policy
+        value: "camera=()"
+    # Optional: detailed CSP block for nonce / dynamic routes only.
+    content_security_policy:
+      policy: "default-src 'self'"
+      enable_nonce: false     # true to inject per-request nonce in script-src/style-src
+      report_only: false
+      report_uri: ""
+      # dynamic_routes:
+      #   "/admin":
+      #     policy: "default-src 'self' admin.example.com"
 ```
 
 ### 5.7 `request_limiting` - Request Size Limiting
@@ -1309,14 +1305,14 @@ forward_rules:
 
 ---
 
-## 10. Session Config (`session_config`)
+## 10. Session Config (`session`)
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `disabled` | bool | false | Disable session management |
 | `cookie_name` | string | `""` | Session cookie name |
-| `cookie_max_age` | int | 0 | Session cookie max age in seconds |
-| `cookie_same_site` | string | `""` | `Strict`, `Lax`, `None` |
+| `max_age` | int | 0 | Session cookie max age in seconds |
+| `same_site` | string | `""` | `Strict`, `Lax`, `None` |
 | `disable_http_only` | bool | false | Remove HttpOnly flag from cookie |
 | `allow_non_ssl` | bool | false | Allow sessions over HTTP |
 | `enable_cookie_jar` | bool | false | Proxy backend Set-Cookie headers via session |

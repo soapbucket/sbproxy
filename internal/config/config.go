@@ -88,7 +88,7 @@ type Config struct {
 	RequestModifiers  modifier.RequestModifiers  `json:"request_modifiers,omitempty"`
 	ResponseModifiers modifier.ResponseModifiers `json:"response_modifiers,omitempty"`
 
-	SessionConfig SessionConfig `json:"session_config"`
+	SessionConfig SessionConfig `json:"session"`
 
 	// ResponseCache configures action-level response caching
 	ResponseCache *ActionResponseCache `json:"response_cache,omitempty"`

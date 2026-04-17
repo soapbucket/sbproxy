@@ -8,17 +8,38 @@ import (
 	"testing"
 )
 
-// TestNew_ValidConfig verifies that valid configs create an enforcer.
+func mustBuild(t *testing.T, cfg Config) *secHeadersPolicy {
+	t.Helper()
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	enforcer, err := New(data)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return enforcer.(*secHeadersPolicy)
+}
+
+func runEnforce(t *testing.T, p *secHeadersPolicy, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	handler := p.Enforce(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	return w
+}
+
 func TestNew_ValidConfig(t *testing.T) {
 	cfg := Config{
 		Type: "security_headers",
-		StrictTransportSecurity: &HSTSConfig{
-			Enabled: true,
-			MaxAge:  31536000,
+		Headers: []SecurityHeader{
+			{Name: "X-Frame-Options", Value: "DENY"},
 		},
 	}
 	data, _ := json.Marshal(cfg)
-
 	enforcer, err := New(data)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
@@ -28,445 +49,228 @@ func TestNew_ValidConfig(t *testing.T) {
 	}
 }
 
-// TestNew_InvalidJSON verifies that invalid JSON returns an error.
 func TestNew_InvalidJSON(t *testing.T) {
-	_, err := New(json.RawMessage(`{invalid`))
-	if err == nil {
+	if _, err := New(json.RawMessage(`{invalid`)); err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
 }
 
-// TestType verifies the Type() method returns the correct string.
 func TestType(t *testing.T) {
-	cfg := Config{Type: "security_headers"}
-	data, _ := json.Marshal(cfg)
-
-	enforcer, err := New(data)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	sh := enforcer.(*secHeadersPolicy)
-	if sh.Type() != "security_headers" {
-		t.Errorf("expected type 'security_headers', got %q", sh.Type())
+	p := mustBuild(t, Config{Type: "security_headers"})
+	if p.Type() != "security_headers" {
+		t.Errorf("expected type 'security_headers', got %q", p.Type())
 	}
 }
 
-// TestEnforce_Disabled verifies that disabled policy passes through without headers.
 func TestEnforce_Disabled(t *testing.T) {
-	cfg := Config{
+	p := mustBuild(t, Config{
 		Type:     "security_headers",
 		Disabled: true,
-		StrictTransportSecurity: &HSTSConfig{
-			Enabled: true,
-			MaxAge:  31536000,
+		Headers: []SecurityHeader{
+			{Name: "Strict-Transport-Security", Value: "max-age=31536000"},
 		},
-	}
-	data, _ := json.Marshal(cfg)
-
-	enforcer, err := New(data)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	called := false
-	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
-		w.WriteHeader(http.StatusOK)
 	})
-
-	handler := enforcer.Enforce(next)
-
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	if !called {
-		t.Error("expected next handler to be called when policy is disabled")
-	}
+	w := runEnforce(t, p, "/")
 	if w.Header().Get("Strict-Transport-Security") != "" {
 		t.Error("expected no HSTS header when policy is disabled")
 	}
 }
 
-// TestEnforce_HSTS verifies HSTS header is applied.
-func TestEnforce_HSTS(t *testing.T) {
-	tests := []struct {
-		name     string
-		config   *HSTSConfig
-		expected string
-	}{
-		{
-			name:     "basic",
-			config:   &HSTSConfig{Enabled: true, MaxAge: 3600},
-			expected: "max-age=3600",
-		},
-		{
-			name:     "with subdomains",
-			config:   &HSTSConfig{Enabled: true, MaxAge: 3600, IncludeSubdomains: true},
-			expected: "max-age=3600; includeSubDomains",
-		},
-		{
-			name:     "with preload",
-			config:   &HSTSConfig{Enabled: true, MaxAge: 3600, IncludeSubdomains: true, Preload: true},
-			expected: "max-age=3600; includeSubDomains; preload",
-		},
-		{
-			name:     "disabled",
-			config:   &HSTSConfig{Enabled: false, MaxAge: 3600},
-			expected: "",
-		},
-		{
-			name:     "zero max age",
-			config:   &HSTSConfig{Enabled: true, MaxAge: 0},
-			expected: "",
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := Config{
-				Type:                    "security_headers",
-				StrictTransportSecurity: tc.config,
-			}
-			data, _ := json.Marshal(cfg)
-
-			enforcer, err := New(data)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusOK)
-			})
-
-			handler := enforcer.Enforce(next)
-			req := httptest.NewRequest(http.MethodGet, "/", nil)
-			w := httptest.NewRecorder()
-			handler.ServeHTTP(w, req)
-
-			got := w.Header().Get("Strict-Transport-Security")
-			if got != tc.expected {
-				t.Errorf("expected HSTS %q, got %q", tc.expected, got)
-			}
-		})
-	}
-}
-
-// TestEnforce_XFrameOptions verifies X-Frame-Options header.
-func TestEnforce_XFrameOptions(t *testing.T) {
-	tests := []struct {
-		name     string
-		config   *XFrameOptionsConfig
-		expected string
-	}{
-		{
-			name:     "DENY",
-			config:   &XFrameOptionsConfig{Enabled: true, Value: "DENY"},
-			expected: "DENY",
-		},
-		{
-			name:     "SAMEORIGIN",
-			config:   &XFrameOptionsConfig{Enabled: true, Value: "SAMEORIGIN"},
-			expected: "SAMEORIGIN",
-		},
-		{
-			name:     "disabled",
-			config:   &XFrameOptionsConfig{Enabled: false, Value: "DENY"},
-			expected: "",
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := Config{
-				Type:          "security_headers",
-				XFrameOptions: tc.config,
-			}
-			data, _ := json.Marshal(cfg)
-
-			enforcer, err := New(data)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusOK)
-			})
-
-			handler := enforcer.Enforce(next)
-			req := httptest.NewRequest(http.MethodGet, "/", nil)
-			w := httptest.NewRecorder()
-			handler.ServeHTTP(w, req)
-
-			got := w.Header().Get("X-Frame-Options")
-			if got != tc.expected {
-				t.Errorf("expected X-Frame-Options %q, got %q", tc.expected, got)
-			}
-		})
-	}
-}
-
-// TestEnforce_XContentTypeOptions verifies X-Content-Type-Options header.
-func TestEnforce_XContentTypeOptions(t *testing.T) {
-	cfg := Config{
+func TestEnforce_HeadersArray(t *testing.T) {
+	p := mustBuild(t, Config{
 		Type: "security_headers",
-		XContentTypeOptions: &XContentTypeOptionsConfig{
-			Enabled: true,
-			NoSniff: true,
+		Headers: []SecurityHeader{
+			{Name: "Strict-Transport-Security", Value: "max-age=31536000; includeSubDomains"},
+			{Name: "X-Frame-Options", Value: "DENY"},
+			{Name: "X-Content-Type-Options", Value: "nosniff"},
+			{Name: "Referrer-Policy", Value: "strict-origin-when-cross-origin"},
 		},
-	}
-	data, _ := json.Marshal(cfg)
-
-	enforcer, err := New(data)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
 	})
+	w := runEnforce(t, p, "/")
+	h := w.Header()
 
-	handler := enforcer.Enforce(next)
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	got := w.Header().Get("X-Content-Type-Options")
-	if got != "nosniff" {
-		t.Errorf("expected 'nosniff', got %q", got)
+	cases := map[string]string{
+		"Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+		"X-Frame-Options":           "DENY",
+		"X-Content-Type-Options":    "nosniff",
+		"Referrer-Policy":           "strict-origin-when-cross-origin",
+	}
+	for name, want := range cases {
+		if got := h.Get(name); got != want {
+			t.Errorf("%s: expected %q, got %q", name, want, got)
+		}
 	}
 }
 
-// TestEnforce_ReferrerPolicy verifies Referrer-Policy header.
-func TestEnforce_ReferrerPolicy(t *testing.T) {
-	validPolicies := []string{
-		"no-referrer",
-		"no-referrer-when-downgrade",
-		"origin",
-		"origin-when-cross-origin",
-		"same-origin",
-		"strict-origin",
-		"strict-origin-when-cross-origin",
-		"unsafe-url",
-	}
-
-	for _, policy := range validPolicies {
-		t.Run(policy, func(t *testing.T) {
-			cfg := Config{
-				Type:           "security_headers",
-				ReferrerPolicy: &ReferrerPolicyConfig{Enabled: true, Policy: policy},
-			}
-			data, _ := json.Marshal(cfg)
-
-			enforcer, err := New(data)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusOK)
-			})
-
-			handler := enforcer.Enforce(next)
-			req := httptest.NewRequest(http.MethodGet, "/", nil)
-			w := httptest.NewRecorder()
-			handler.ServeHTTP(w, req)
-
-			got := w.Header().Get("Referrer-Policy")
-			if got != policy {
-				t.Errorf("expected %q, got %q", policy, got)
-			}
-		})
-	}
-}
-
-// TestEnforce_ReferrerPolicy_Invalid verifies invalid policy is not set.
-func TestEnforce_ReferrerPolicy_Invalid(t *testing.T) {
-	cfg := Config{
-		Type:           "security_headers",
-		ReferrerPolicy: &ReferrerPolicyConfig{Enabled: true, Policy: "invalid-policy"},
-	}
-	data, _ := json.Marshal(cfg)
-
-	enforcer, err := New(data)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-
-	handler := enforcer.Enforce(next)
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	got := w.Header().Get("Referrer-Policy")
-	if got != "" {
-		t.Errorf("expected empty Referrer-Policy for invalid value, got %q", got)
-	}
-}
-
-// TestEnforce_CSP_FromDirectives verifies CSP from structured directives.
-func TestEnforce_CSP_FromDirectives(t *testing.T) {
-	cfg := Config{
+func TestEnforce_HeadersArray_CanonicalizesName(t *testing.T) {
+	// Lowercase input name should be canonicalized on the response.
+	p := mustBuild(t, Config{
 		Type: "security_headers",
-		ContentSecurityPolicy: &CSPConfig{
-			Enabled: true,
-			Directives: &CSPDirectives{
-				DefaultSrc: []string{"'self'"},
-				ScriptSrc:  []string{"'self'", "https://cdn.example.com"},
-				ImgSrc:     []string{"*"},
-			},
+		Headers: []SecurityHeader{
+			{Name: "x-frame-options", Value: "DENY"},
 		},
-	}
-	data, _ := json.Marshal(cfg)
-
-	enforcer, err := New(data)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
 	})
+	w := runEnforce(t, p, "/")
+	if got := w.Header().Get("X-Frame-Options"); got != "DENY" {
+		t.Errorf("expected DENY, got %q", got)
+	}
+}
 
-	handler := enforcer.Enforce(next)
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
+func TestEnforce_CSP_Simple_FromHeaders(t *testing.T) {
+	p := mustBuild(t, Config{
+		Type: "security_headers",
+		Headers: []SecurityHeader{
+			{Name: "Content-Security-Policy", Value: "default-src 'self'"},
+		},
+	})
+	w := runEnforce(t, p, "/")
+	if got := w.Header().Get("Content-Security-Policy"); got != "default-src 'self'" {
+		t.Errorf("expected simple CSP, got %q", got)
+	}
+}
 
+func TestCSP_UnmarshalString(t *testing.T) {
+	// The CSP block accepts a plain string as a shorthand for {"policy": "<s>"}.
+	raw := []byte(`{"type":"security_headers","content_security_policy":"default-src 'self'"}`)
+	enforcer, err := New(raw)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p := enforcer.(*secHeadersPolicy)
+	if p.cfg.ContentSecurityPolicy == nil {
+		t.Fatal("expected CSP block")
+	}
+	if p.cfg.ContentSecurityPolicy.Policy != "default-src 'self'" {
+		t.Errorf("expected policy string, got %q", p.cfg.ContentSecurityPolicy.Policy)
+	}
+
+	w := runEnforce(t, p, "/")
+	if got := w.Header().Get("Content-Security-Policy"); got != "default-src 'self'" {
+		t.Errorf("expected simple CSP emitted, got %q", got)
+	}
+}
+
+func TestEnforce_CSP_WithNonce(t *testing.T) {
+	p := mustBuild(t, Config{
+		Type: "security_headers",
+		ContentSecurityPolicy: &ContentSecurityPolicy{
+			Policy:      "default-src 'self'; script-src 'self'",
+			EnableNonce: true,
+		},
+	})
+	w := runEnforce(t, p, "/")
+	nonce := w.Header().Get("X-CSP-Nonce")
+	if nonce == "" {
+		t.Fatal("expected X-CSP-Nonce header to be set")
+	}
 	csp := w.Header().Get("Content-Security-Policy")
-	if csp == "" {
-		t.Fatal("expected Content-Security-Policy header to be set")
-	}
-	if !strings.Contains(csp, "default-src 'self'") {
-		t.Errorf("expected CSP to contain default-src, got %q", csp)
-	}
-	if !strings.Contains(csp, "script-src") {
-		t.Errorf("expected CSP to contain script-src, got %q", csp)
+	if !strings.Contains(csp, "'nonce-"+nonce+"'") {
+		t.Errorf("expected nonce %q injected into script-src; got %q", nonce, csp)
 	}
 }
 
-// TestEnforce_CSP_ReportOnly verifies CSP report-only mode.
 func TestEnforce_CSP_ReportOnly(t *testing.T) {
-	cfg := Config{
+	p := mustBuild(t, Config{
 		Type: "security_headers",
-		ContentSecurityPolicy: &CSPConfig{
-			Enabled:    true,
+		ContentSecurityPolicy: &ContentSecurityPolicy{
 			Policy:     "default-src 'self'",
 			ReportOnly: true,
+			ReportURI:  "/csp-report",
 		},
-	}
-	data, _ := json.Marshal(cfg)
-
-	enforcer, err := New(data)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
 	})
-
-	handler := enforcer.Enforce(next)
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	if w.Header().Get("Content-Security-Policy-Report-Only") == "" {
-		t.Error("expected Content-Security-Policy-Report-Only header")
+	w := runEnforce(t, p, "/")
+	h := w.Header()
+	if got := h.Get("Content-Security-Policy-Report-Only"); !strings.Contains(got, "report-uri /csp-report") {
+		t.Errorf("expected report-only CSP with report-uri, got %q", got)
+	}
+	if h.Get("Content-Security-Policy") != "" {
+		t.Error("expected no enforcing CSP when report_only=true")
 	}
 }
 
-// TestEnforce_MultipleHeaders verifies multiple security headers together.
-func TestEnforce_MultipleHeaders(t *testing.T) {
-	cfg := Config{
-		Type:                    "security_headers",
-		StrictTransportSecurity: &HSTSConfig{Enabled: true, MaxAge: 3600},
-		XFrameOptions:           &XFrameOptionsConfig{Enabled: true, Value: "DENY"},
-		XContentTypeOptions:     &XContentTypeOptionsConfig{Enabled: true, NoSniff: true},
-		ReferrerPolicy:          &ReferrerPolicyConfig{Enabled: true, Policy: "no-referrer"},
-	}
-	data, _ := json.Marshal(cfg)
-
-	enforcer, err := New(data)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+func TestEnforce_CSP_DynamicRoutes(t *testing.T) {
+	p := mustBuild(t, Config{
+		Type: "security_headers",
+		ContentSecurityPolicy: &ContentSecurityPolicy{
+			Policy: "default-src 'self'",
+			DynamicRoutes: map[string]*ContentSecurityPolicy{
+				"/admin":       {Policy: "default-src 'self' admin.example.com"},
+				"/admin/users": {Policy: "default-src 'self' admin.example.com users.example.com"},
+			},
+		},
 	})
 
-	handler := enforcer.Enforce(next)
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	if w.Header().Get("Strict-Transport-Security") == "" {
-		t.Error("expected HSTS header")
+	cases := map[string]string{
+		"/":               "default-src 'self'",
+		"/admin/settings": "default-src 'self' admin.example.com",
+		"/admin/users/42": "default-src 'self' admin.example.com users.example.com",
 	}
-	if w.Header().Get("X-Frame-Options") == "" {
-		t.Error("expected X-Frame-Options header")
-	}
-	if w.Header().Get("X-Content-Type-Options") == "" {
-		t.Error("expected X-Content-Type-Options header")
-	}
-	if w.Header().Get("Referrer-Policy") == "" {
-		t.Error("expected Referrer-Policy header")
+	for path, want := range cases {
+		w := runEnforce(t, p, path)
+		if got := w.Header().Get("Content-Security-Policy"); got != want {
+			t.Errorf("%s: expected %q, got %q", path, want, got)
+		}
 	}
 }
 
-// TestCSPReportURI verifies the CSPReportURI interface method.
+func TestEnforce_CSP_BlockOverridesHeadersList(t *testing.T) {
+	// When the CSP block requires per-request processing, any
+	// Content-Security-Policy entry in `headers` must be skipped.
+	p := mustBuild(t, Config{
+		Type: "security_headers",
+		Headers: []SecurityHeader{
+			{Name: "Content-Security-Policy", Value: "ignored-value"},
+			{Name: "X-Frame-Options", Value: "DENY"},
+		},
+		ContentSecurityPolicy: &ContentSecurityPolicy{
+			Policy:      "default-src 'self'",
+			EnableNonce: true,
+		},
+	})
+	w := runEnforce(t, p, "/")
+	csp := w.Header().Get("Content-Security-Policy")
+	if strings.Contains(csp, "ignored-value") {
+		t.Errorf("headers[] CSP should be skipped when block owns it, got %q", csp)
+	}
+	if !strings.HasPrefix(csp, "default-src 'self'") {
+		t.Errorf("expected block-authored CSP, got %q", csp)
+	}
+	if w.Header().Get("X-Frame-Options") != "DENY" {
+		t.Error("non-CSP headers from list should still apply")
+	}
+}
+
 func TestCSPReportURI(t *testing.T) {
-	tests := []struct {
-		name     string
-		config   *CSPConfig
-		expected string
+	cases := []struct {
+		name string
+		csp  *ContentSecurityPolicy
+		want string
 	}{
-		{
-			name:     "with report URI",
-			config:   &CSPConfig{Enabled: true, ReportURI: "https://report.example.com"},
-			expected: "https://report.example.com",
-		},
-		{
-			name:     "no report URI",
-			config:   &CSPConfig{Enabled: true},
-			expected: "",
-		},
-		{
-			name:     "disabled CSP",
-			config:   &CSPConfig{Enabled: false, ReportURI: "https://report.example.com"},
-			expected: "",
-		},
-		{
-			name:     "nil CSP",
-			config:   nil,
-			expected: "",
-		},
+		{"with report URI", &ContentSecurityPolicy{ReportURI: "https://report.example.com"}, "https://report.example.com"},
+		{"no report URI", &ContentSecurityPolicy{}, ""},
+		{"nil CSP", nil, ""},
 	}
-
-	for _, tc := range tests {
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := Config{
+			p := mustBuild(t, Config{
 				Type:                  "security_headers",
-				ContentSecurityPolicy: tc.config,
-			}
-			data, _ := json.Marshal(cfg)
-
-			enforcer, err := New(data)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			sh := enforcer.(*secHeadersPolicy)
-			got := sh.CSPReportURI()
-			if got != tc.expected {
-				t.Errorf("expected %q, got %q", tc.expected, got)
+				ContentSecurityPolicy: tc.csp,
+			})
+			if got := p.CSPReportURI(); got != tc.want {
+				t.Errorf("expected %q, got %q", tc.want, got)
 			}
 		})
+	}
+}
+
+func TestInjectNonceIntoPolicy_PreservesExisting(t *testing.T) {
+	out := injectNonceIntoPolicy("script-src 'self' 'nonce-fixed'; style-src 'self'", "new")
+	// script-src already has a nonce, must not be doubled.
+	if strings.Contains(out, "'nonce-new'") && strings.Count(out, "'nonce-") != 2 {
+		t.Errorf("unexpected nonce injection: %q", out)
+	}
+	// style-src had no nonce, should now have the new one.
+	if !strings.Contains(out, "style-src 'self' 'nonce-new'") {
+		t.Errorf("expected nonce on style-src, got %q", out)
 	}
 }

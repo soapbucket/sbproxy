@@ -136,7 +136,7 @@ func (fp *FixationPrevention) RegenerateSession(w http.ResponseWriter, r *http.R
 		cookieName = DefaultCookieName
 	}
 
-	cookieMaxAge := sessionConfig.CookieMaxAge
+	cookieMaxAge := sessionConfig.MaxAge
 	if cookieMaxAge == 0 {
 		cookieMaxAge = DefaultMaxAge
 	}
@@ -145,8 +145,8 @@ func (fp *FixationPrevention) RegenerateSession(w http.ResponseWriter, r *http.R
 	cookieHttpOnly := !sessionConfig.DisableHttpOnly
 
 	sameSite := http.SameSiteLaxMode
-	if sessionConfig.CookieSameSite != "" {
-		switch strings.ToLower(sessionConfig.CookieSameSite) {
+	if sessionConfig.SameSite != "" {
+		switch strings.ToLower(sessionConfig.SameSite) {
 		case "strict":
 			sameSite = http.SameSiteStrictMode
 		case "none":

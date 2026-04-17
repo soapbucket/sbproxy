@@ -7,7 +7,7 @@
 // The [Origin] struct is the primary type. It uses [json.RawMessage] for
 // plugin-specific fields (action, authentication, policies, transforms,
 // request_modifiers, response_modifiers, forward_rules, response_cache,
-// session_config, error_pages, message_signatures, compression, cors, hsts,
+// session, error_pages, message_signatures, compression, cors, hsts,
 // and callback hooks). This keeps the config package decoupled from plugin
 // implementations and allows new plugin types to be added without modifying
 // these structs.

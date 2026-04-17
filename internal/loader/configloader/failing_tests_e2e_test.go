@@ -306,9 +306,8 @@ func TestComprehensiveSecurity_E2E(t *testing.T) {
 			},
 			{
 				"type": "security_headers",
-				"x_frame_options": map[string]any{
-					"enabled": true,
-					"value":   "DENY",
+				"headers": []map[string]any{
+					{"name": "X-Frame-Options", "value": "DENY"},
 				},
 			},
 		},

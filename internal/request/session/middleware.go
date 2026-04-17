@@ -44,7 +44,7 @@ func SessionMiddleware(m manager.Manager, sessionConfig configpkg.SessionConfig)
 			var err error
 			var sessionIDStr string
 
-			cookieMaxAge := sessionConfig.CookieMaxAge
+			cookieMaxAge := sessionConfig.MaxAge
 			if cookieMaxAge == 0 {
 				cookieMaxAge = DefaultMaxAge
 			}
@@ -205,8 +205,8 @@ func SessionMiddleware(m manager.Manager, sessionConfig configpkg.SessionConfig)
 			cookieHttpOnly := !sessionConfig.DisableHttpOnly
 
 			sameSite := http.SameSiteLaxMode
-			if sessionConfig.CookieSameSite != "" {
-				switch strings.ToLower(sessionConfig.CookieSameSite) {
+			if sessionConfig.SameSite != "" {
+				switch strings.ToLower(sessionConfig.SameSite) {
 				case "strict":
 					sameSite = http.SameSiteStrictMode
 				case "none":

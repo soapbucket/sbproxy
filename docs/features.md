@@ -693,26 +693,26 @@ Inject security-oriented HTTP response headers.
 ```yaml
 policies:
   - type: security_headers
-    strict_transport_security:
-      enabled: true
-      max_age: 31536000
-      include_subdomains: true
-      preload: true
+    headers:
+      - name: Strict-Transport-Security
+        value: "max-age=31536000; includeSubDomains; preload"
+      - name: X-Frame-Options
+        value: DENY
+      - name: X-Content-Type-Options
+        value: nosniff
+      - name: Referrer-Policy
+        value: strict-origin-when-cross-origin
+      - name: Permissions-Policy
+        value: "camera=()"
+    # Optional: detailed CSP block for nonce / dynamic routes only.
     content_security_policy:
-      enabled: true
-      directives:
-        default_src: ["'self'"]
-        script_src: ["'self'", "'nonce-{generated}'"]
-        connect_src: ["'self'", "https://api.test.sbproxy.dev"]
-    x_frame_options:
-      enabled: true
-      value: DENY
-    x_content_type_options:
-      enabled: true
-      no_sniff: true
-    referrer_policy:
-      enabled: true
-      policy: strict-origin-when-cross-origin
+      policy: "default-src 'self'; script-src 'self' 'nonce-{generated}'; connect-src 'self' https://api.test.sbproxy.dev"
+      enable_nonce: true       # true to inject per-request nonce in script-src/style-src
+      report_only: false
+      report_uri: ""
+      # dynamic_routes:
+      #   "/admin":
+      #     policy: "default-src 'self' admin.example.com"
 ```
 
 ### Request Limiting
@@ -1276,10 +1276,10 @@ error_pages:
 sbproxy maintains a session layer for cookie-based state:
 
 ```yaml
-session_config:
+session:
   cookie_name: _sb_session
-  cookie_max_age: 3600          # 1 hour
-  cookie_same_site: Lax
+  max_age: 3600                 # 1 hour
+  same_site: Lax
   disable_http_only: false      # HttpOnly enabled by default
   allow_non_ssl: false          # Require HTTPS for session cookies
   enable_cookie_jar: true       # Proxy backend Set-Cookie via session
@@ -1307,7 +1307,7 @@ on_request:
     cache_duration: 60s
 
 # Session start callback
-session_config:
+session:
   on_session_start:
     - url: https://analytics.example.com/events
       method: POST
