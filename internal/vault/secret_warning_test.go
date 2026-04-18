@@ -42,9 +42,9 @@ func TestSecretWarner_DetectsKnownPatterns(t *testing.T) {
 			wantWarn:  true,
 		},
 		{
-			name:      "Stripe live secret key",
-			fieldName: "stripe_key",
-			value:     "sk_test_fake_not_real_placeholder_value",
+			name:      "long OpenAI-like key with extra chars",
+			fieldName: "another_key",
+			value:     "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ",
 			wantWarn:  true,
 		},
 		{

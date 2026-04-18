@@ -80,10 +80,10 @@ func TestMirror_ZeroPercentageDefaultsToFull(t *testing.T) {
 }
 
 func TestMirror_PreservesPath(t *testing.T) {
-	var receivedPath string
+	pathCh := make(chan string, 1)
 
 	mirrorServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedPath = r.URL.Path
+		pathCh <- r.URL.Path
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer mirrorServer.Close()
@@ -96,15 +96,19 @@ func TestMirror_PreservesPath(t *testing.T) {
 		Percentage: 1.0,
 	}, http.DefaultClient)
 
-	time.Sleep(500 * time.Millisecond)
-	assert.Equal(t, "/api/users", receivedPath)
+	select {
+	case path := <-pathCh:
+		assert.Equal(t, "/api/users", path)
+	case <-time.After(2 * time.Second):
+		t.Fatal("mirror request was not received")
+	}
 }
 
 func TestMirror_CopiesHeaders(t *testing.T) {
-	var receivedHeaders http.Header
+	headersCh := make(chan http.Header, 1)
 
 	mirrorServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedHeaders = r.Header.Clone()
+		headersCh <- r.Header.Clone()
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer mirrorServer.Close()
@@ -119,9 +123,13 @@ func TestMirror_CopiesHeaders(t *testing.T) {
 		Percentage: 1.0,
 	}, http.DefaultClient)
 
-	time.Sleep(500 * time.Millisecond)
-	assert.Equal(t, "test-value", receivedHeaders.Get("X-Custom-Header"))
-	assert.Equal(t, "Bearer token123", receivedHeaders.Get("Authorization"))
+	select {
+	case headers := <-headersCh:
+		assert.Equal(t, "test-value", headers.Get("X-Custom-Header"))
+		assert.Equal(t, "Bearer token123", headers.Get("Authorization"))
+	case <-time.After(2 * time.Second):
+		t.Fatal("mirror request was not received")
+	}
 }
 
 func TestMirror_CustomTimeout(t *testing.T) {
