@@ -228,3 +228,53 @@ func TestScrapeLimiter_RetryAfterHeader(t *testing.T) {
 		t.Errorf("expected Retry-After ~30, got %q", retryAfter)
 	}
 }
+
+// TestScrapeLimiter_SecurityHeaders verifies that the wrapper forces a
+// non-HTML Content-Type and nosniff so Prometheus label values cannot be
+// interpreted as HTML by a browser (mitigates CodeQL go/reflected-xss).
+func TestScrapeLimiter_SecurityHeaders(t *testing.T) {
+	t.Run("success response has nosniff and text/plain", func(t *testing.T) {
+		sl := NewScrapeLimiter(1*time.Second, 0)
+		handler := sl.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Attempt to set an HTML content type from the wrapped handler;
+			// the wrapper's early Set is what guards against label-based XSS,
+			// but legitimate downstream handlers may still refine to a more
+			// specific text/plain variant (e.g. Prometheus exposition format).
+			_, _ = w.Write([]byte(`<script>alert(1)</script>`))
+		}))
+
+		req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+
+		if got := rr.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("expected X-Content-Type-Options=nosniff, got %q", got)
+		}
+		if got := rr.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/plain") {
+			t.Errorf("expected text/plain Content-Type, got %q", got)
+		}
+	})
+
+	t.Run("rate-limited response also has security headers", func(t *testing.T) {
+		sl := NewScrapeLimiter(30*time.Second, 0)
+		handler := sl.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte("ok"))
+		}))
+
+		// Prime the limiter, then hit it again immediately.
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+		if rr.Code != http.StatusTooManyRequests {
+			t.Fatalf("expected 429, got %d", rr.Code)
+		}
+		if got := rr.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("expected X-Content-Type-Options=nosniff on 429, got %q", got)
+		}
+		if got := rr.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/plain") {
+			t.Errorf("expected text/plain Content-Type on 429, got %q", got)
+		}
+	})
+}

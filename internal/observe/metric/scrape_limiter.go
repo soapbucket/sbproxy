@@ -40,6 +40,14 @@ func NewScrapeLimiter(minInterval time.Duration, maxBodySize int64) *ScrapeLimit
 // Wrap wraps an http.Handler with rate limiting for the /metrics endpoint.
 // Requests arriving before minInterval has elapsed since the last scrape receive
 // a 429 Too Many Requests response with a Retry-After header.
+//
+// Security: Prometheus metric labels can echo user-controlled data (e.g. request
+// path or user agent from histogram labels). To neutralize any reflected-XSS
+// risk if the response body is ever rendered as HTML, Wrap forces
+// X-Content-Type-Options: nosniff and a text/plain Content-Type before the
+// downstream handler writes any bytes. The downstream handler may still refine
+// the Content-Type (e.g. to Prometheus' exposition format with a charset), but
+// browsers will no longer MIME-sniff HTML out of this response.
 func (sl *ScrapeLimiter) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sl.mu.Lock()
@@ -52,6 +60,8 @@ func (sl *ScrapeLimiter) Wrap(next http.Handler) http.Handler {
 
 			retrySeconds := int(retryAfter.Seconds()) + 1
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", retrySeconds))
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 			return
 		}
@@ -59,6 +69,12 @@ func (sl *ScrapeLimiter) Wrap(next http.Handler) http.Handler {
 		sl.lastScrape = now
 		maxBody := sl.maxBodySize
 		sl.mu.Unlock()
+
+		// Lock the response to plain text before the wrapped handler writes
+		// anything. This prevents any metric-label content from being
+		// interpreted as HTML by browsers (CodeQL go/reflected-xss).
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 
 		if maxBody > 0 {
 			lrw := &limitedResponseWriter{
