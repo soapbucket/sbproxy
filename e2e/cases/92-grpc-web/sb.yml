@@ -1,0 +1,10 @@
+# 92 - gRPC-Web: origin that accepts gRPC-Web requests
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "grpcweb.test":
+    action:
+      type: grpc
+      url: http://127.0.0.1:18888
+      enable_grpc_web: true

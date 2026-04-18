@@ -1,0 +1,13 @@
+# 87 - Secret References: env var interpolation for API key auth
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "secrets.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    authentication:
+      type: api_key
+      api_keys:
+        - "${TEST_API_KEY}"

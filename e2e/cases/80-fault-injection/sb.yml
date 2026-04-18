@@ -1,0 +1,27 @@
+# Fault injection using static action to simulate 100% abort at 503
+# Uses forwarding rules to inject faults on specific paths
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "fault.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888/echo
+
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /fault/
+        origin:
+          id: fault-inject
+          hostname: fault-inject
+          workspace_id: test
+          version: "1.0.0"
+          action:
+            type: static
+            status_code: 503
+            content_type: application/json
+            json_body:
+              error: "service_unavailable"
+              message: "Fault injected"

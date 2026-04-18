@@ -1,0 +1,23 @@
+# 90 - Custom Error Pages Negotiation: content type negotiation for error pages
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "errneg.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    authentication:
+      type: api_key
+      api_keys:
+        - valid-key-only
+    error_pages:
+      - status: [401]
+        content_type: application/json
+        body: '{"error":"unauthorized","code":401}'
+      - status: [401]
+        content_type: text/html
+        body: "<html><body><h1>401 Unauthorized</h1></body></html>"
+      - status: [401]
+        content_type: text/plain
+        body: "401 Unauthorized"

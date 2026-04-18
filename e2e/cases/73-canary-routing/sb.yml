@@ -1,0 +1,23 @@
+# Canary routing using weighted load balancer
+# 100% weight on stable, 0% on canary for deterministic testing
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "canary.test":
+    action:
+      type: load_balancer
+      algorithm: weighted_random
+      targets:
+        - url: http://127.0.0.1:18888/echo?variant=stable
+          weight: 100
+          request_modifiers:
+            - type: header
+              set:
+                X-Variant: stable
+        - url: http://127.0.0.1:18888/echo?variant=canary
+          weight: 0
+          request_modifiers:
+            - type: header
+              set:
+                X-Variant: canary
