@@ -53,8 +53,7 @@ func TestSSEClientTransport_Connect(t *testing.T) {
 }
 
 func TestSSEClientTransport_Connect_AbsoluteURL(t *testing.T) {
-	var postServer *httptest.Server
-	postServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	postServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer postServer.Close()
