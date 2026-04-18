@@ -168,6 +168,12 @@ func LoadWithContext(ctx context.Context, data []byte) (*Config, error) {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
+	// Validate config version early, before further processing
+	if err := ValidateConfigVersion(cfg.ConfigVersion); err != nil {
+		metric.ConfigError("unknown", "version_error")
+		return nil, err
+	}
+
 	// Note: Secrets config is already loaded and initialized in UnmarshalJSON
 	// If we loaded secrets earlier for substitution, the config should already have them
 	// We only need to ensure the secrets are loaded if they weren't loaded during UnmarshalJSON

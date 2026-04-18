@@ -1,0 +1,428 @@
+{
+  "$schema": "https://json-schema.org/draft/07/schema",
+  "$id": "https://soapbucket.io/schemas/sb.yml.schema.json",
+  "title": "SoapBucket Proxy Config (sb.yml)",
+  "description": "JSON Schema for the sbproxy configuration file (sb.yml). All field names match the YAML keys accepted by sbproxy.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+
+    "config_version": {
+      "type": "integer",
+      "description": "Schema version for this config file. Version 2 is the current release. Omitting defaults to v1 with a deprecation warning.",
+      "default": 2,
+      "enum": [1, 2],
+      "x-stability": "stable"
+    },
+
+    "proxy": {
+      "$ref": "#/definitions/ProxyServerConfig",
+      "description": "Server-level proxy settings. All fields are optional; defaults are applied when omitted.",
+      "x-stability": "stable"
+    },
+
+    "origins": {
+      "type": "object",
+      "description": "Map of hostname (or hostname:port) to origin configuration. Each key is a virtual hostname the proxy listens on.",
+      "additionalProperties": {
+        "$ref": "#/definitions/OriginConfig"
+      },
+      "x-stability": "stable"
+    }
+  },
+
+  "definitions": {
+
+    "ProxyServerConfig": {
+      "type": "object",
+      "description": "Server-level configuration for the proxy process itself.",
+      "additionalProperties": false,
+      "properties": {
+        "http_bind_port": {
+          "type": "integer",
+          "description": "TCP port to listen on for plain HTTP connections.",
+          "default": 8080,
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "https_bind_port": {
+          "type": "integer",
+          "description": "TCP port to listen on for TLS (HTTPS) connections. Omit to disable TLS.",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "bind_address": {
+          "type": "string",
+          "description": "IP address to bind the listener to.",
+          "default": "0.0.0.0"
+        },
+        "tls_cert_file": {
+          "type": "string",
+          "description": "Path to a PEM-encoded TLS certificate file."
+        },
+        "tls_key_file": {
+          "type": "string",
+          "description": "Path to a PEM-encoded TLS private key file."
+        }
+      }
+    },
+
+    "OriginConfig": {
+      "type": "object",
+      "description": "Configuration for a single origin (virtual host). Fields map directly to Go Config struct json tags.",
+      "properties": {
+        "action": {
+          "$ref": "#/definitions/ActionConfig",
+          "description": "The primary action handler for this origin."
+        },
+        "authentication": {
+          "$ref": "#/definitions/AuthConfig",
+          "description": "Authentication configuration. Sibling of action, not nested inside it."
+        },
+        "policies": {
+          "type": "array",
+          "description": "Ordered list of policy enforcers applied before the action handler.",
+          "items": {
+            "$ref": "#/definitions/PolicyConfig"
+          }
+        },
+        "transforms": {
+          "type": "array",
+          "description": "Response body transforms applied after the action handler responds.",
+          "items": {
+            "$ref": "#/definitions/TransformConfig"
+          }
+        },
+        "request_modifiers": {
+          "$ref": "#/definitions/ModifierConfig",
+          "description": "Modifications applied to the inbound request before proxying."
+        },
+        "response_modifiers": {
+          "$ref": "#/definitions/ModifierConfig",
+          "description": "Modifications applied to the response before sending to the client."
+        },
+        "response_cache": {
+          "type": "object",
+          "description": "Action-level response caching configuration.",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "ttl": { "type": "string", "description": "Cache TTL duration (e.g. '5m', '1h')." },
+            "stale_while_revalidate": { "type": "string" }
+          }
+        },
+        "forward_rules": {
+          "type": "array",
+          "description": "Path-based routing rules to inline or named origins.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": { "type": "string" },
+              "path_prefix": { "type": "string" },
+              "origin": { "type": "object", "description": "Inline origin config object for this rule." }
+            }
+          }
+        },
+        "on_load": {
+          "description": "Callbacks executed during config initialization (global, not per-request)."
+        },
+        "on_request": {
+          "description": "Callbacks executed after policies, before action (per-request)."
+        },
+        "on_response": {
+          "description": "Callbacks executed after the action handler responds (per-request)."
+        },
+        "variables": {
+          "type": "object",
+          "description": "User-defined key-value pairs available in template context as {{ variables.name }}.",
+          "additionalProperties": true
+        },
+        "secrets": {
+          "description": "Secrets configuration. Can be a provider object (legacy) or a map of name to vault:path references (new format)."
+        },
+        "vaults": {
+          "type": "object",
+          "description": "Named vault backends for secret resolution.",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "type": { "type": "string" },
+              "address": { "type": "string" }
+            }
+          }
+        },
+        "session": {
+          "$ref": "#/definitions/SessionConfig"
+        },
+        "cors": {
+          "type": "object",
+          "description": "Cross-Origin Resource Sharing configuration.",
+          "properties": {
+            "enable": { "type": "boolean" },
+            "allow_origins": { "type": "array", "items": { "type": "string" } },
+            "allow_methods": { "type": "array", "items": { "type": "string" } },
+            "allow_headers": { "type": "array", "items": { "type": "string" } },
+            "max_age": { "type": "integer" }
+          }
+        },
+        "hsts": {
+          "type": "object",
+          "description": "HTTP Strict Transport Security configuration."
+        },
+        "compression": {
+          "type": "object",
+          "description": "Proxy-level response compression configuration."
+        },
+        "force_ssl": {
+          "type": "boolean",
+          "description": "Redirect all HTTP requests to HTTPS.",
+          "default": false
+        },
+        "disabled": {
+          "type": "boolean",
+          "description": "When true, this origin returns 503 for all requests.",
+          "default": false
+        },
+        "debug": {
+          "type": "boolean",
+          "description": "Enable debug headers and logging for this origin.",
+          "default": false
+        },
+        "allowed_methods": {
+          "type": "array",
+          "description": "Restrict which HTTP methods are accepted. Empty means all methods allowed.",
+          "items": { "type": "string" }
+        },
+        "error_pages": {
+          "type": "array",
+          "description": "Custom error page definitions.",
+          "items": { "type": "object" }
+        },
+        "events": {
+          "type": "array",
+          "description": "Event types to emit via the messenger. Supports wildcards (e.g. 'ai.*').",
+          "items": { "type": "string" }
+        },
+        "traffic_capture": {
+          "type": "object",
+          "description": "Traffic exchange capture configuration."
+        },
+        "bot_detection": {
+          "type": "object",
+          "description": "Bot detection configuration."
+        },
+        "threat_protection": {
+          "type": "object",
+          "description": "JSON/XML structural validation to prevent payload-based attacks."
+        },
+        "fallback_origin": {
+          "type": "object",
+          "description": "Alternative origin that activates on error, timeout, or specific status codes.",
+          "properties": {
+            "hostname": { "type": "string" },
+            "origin": { "type": "object" },
+            "on_error": { "type": "boolean" },
+            "on_timeout": { "type": "boolean" },
+            "on_status": { "type": "array", "items": { "type": "integer" } }
+          }
+        },
+        "proxy_headers": {
+          "type": "object",
+          "description": "Proxy header behavior configuration (X-Forwarded-*, Via, security)."
+        },
+        "proxy_protocol": {
+          "type": "object",
+          "description": "RFC-level proxy protocol behavior configuration."
+        }
+      }
+    },
+
+    "ActionConfig": {
+      "type": "object",
+      "description": "The primary handler for this origin. The 'type' field selects the handler.",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Action handler type.",
+          "enum": [
+            "proxy",
+            "redirect",
+            "static",
+            "echo",
+            "loadbalancer",
+            "ai_proxy",
+            "mcp",
+            "a2a",
+            "websocket",
+            "grpc",
+            "graphql",
+            "mock",
+            "beacon",
+            "noop",
+            "storage"
+          ]
+        },
+        "url": {
+          "type": "string",
+          "description": "Backend URL to proxy traffic to (used by proxy, websocket, loadbalancer targets)."
+        },
+        "method": {
+          "type": "string",
+          "description": "Override the HTTP method sent to the backend."
+        },
+        "timeout": {
+          "type": "string",
+          "description": "Request timeout duration (e.g. '30s', '1m')."
+        },
+        "status_code": {
+          "type": "integer",
+          "description": "HTTP status code for redirect or static actions."
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "AuthConfig": {
+      "type": "object",
+      "description": "Authentication provider configuration.",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Authentication type.",
+          "enum": [
+            "api_key",
+            "basic_auth",
+            "bearer",
+            "jwt",
+            "forward_auth",
+            "digest",
+            "grpc_auth",
+            "noop"
+          ]
+        },
+        "disabled": {
+          "type": "boolean",
+          "description": "Disable this auth provider without removing it from config."
+        },
+        "api_keys": {
+          "type": "array",
+          "description": "Accepted API key values (for api_key auth type).",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "PolicyConfig": {
+      "type": "object",
+      "description": "A policy enforcer applied before the action handler.",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Policy type.",
+          "enum": [
+            "rate_limiting",
+            "ip_filtering",
+            "expression",
+            "waf",
+            "ddos",
+            "csrf",
+            "security_headers",
+            "request_limiting",
+            "assertion",
+            "sri"
+          ]
+        },
+        "disabled": {
+          "type": "boolean"
+        },
+        "requests_per_minute": {
+          "type": "integer",
+          "description": "Rate limit: max requests per minute."
+        },
+        "algorithm": {
+          "type": "string",
+          "description": "Rate limiting algorithm (e.g. 'sliding_window', 'token_bucket')."
+        },
+        "whitelist": {
+          "type": "array",
+          "description": "IP filter allow list (CIDR notation).",
+          "items": { "type": "string" }
+        },
+        "blacklist": {
+          "type": "array",
+          "description": "IP filter deny list (CIDR notation).",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "TransformConfig": {
+      "type": "object",
+      "description": "A response body transform.",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Transform type.",
+          "enum": [
+            "json",
+            "json_projection",
+            "json_schema",
+            "html",
+            "markdown",
+            "css",
+            "template",
+            "lua_json",
+            "encoding",
+            "format_convert",
+            "normalize",
+            "replace_strings",
+            "sse_chunking",
+            "payload_limit",
+            "discard",
+            "optimize_html",
+            "javascript",
+            "html_to_markdown",
+            "noop"
+          ]
+        },
+        "disabled": {
+          "type": "boolean"
+        },
+        "content_types": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "max_body_size": {
+          "type": "integer",
+          "description": "Max response body size to transform (bytes). 0 = default (10MB), -1 = unlimited."
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "ModifierConfig": {
+      "type": "object",
+      "description": "Request or response modifier block. Contains arrays of header/query/path modifications.",
+      "additionalProperties": true
+    },
+
+    "SessionConfig": {
+      "type": "object",
+      "description": "Session configuration for cookie-based sessions.",
+      "properties": {
+        "disabled": { "type": "boolean" },
+        "cookie_name": { "type": "string" },
+        "max_age": { "type": "integer" },
+        "same_site": { "type": "string", "enum": ["strict", "lax", "none"] },
+        "disable_http_only": { "type": "boolean" },
+        "allow_non_ssl": { "type": "boolean" },
+        "enable_cookie_jar": { "type": "boolean" }
+      }
+    }
+  }
+}

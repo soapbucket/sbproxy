@@ -33,6 +33,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -54,9 +55,27 @@ type noCopy struct{}
 func (*noCopy) Lock()   {}
 func (*noCopy) Unlock() {}
 
+// CurrentConfigVersion is the latest supported config version.
+const CurrentConfigVersion = 2
+
+// ValidateConfigVersion checks the config version and logs migration hints.
+func ValidateConfigVersion(version int) error {
+	if version == 0 {
+		slog.Warn("config_version not set, assuming v1 - consider adding config_version: 2")
+		return nil
+	}
+	if version < 1 || version > CurrentConfigVersion {
+		return fmt.Errorf("unsupported config_version: %d (supported: 1, %d)", version, CurrentConfigVersion)
+	}
+	return nil
+}
+
 // Config holds the complete origin configuration for a proxy endpoint.
 type Config struct {
 	_ noCopy // Config contains sync primitives and maps; copying is unsafe.
+
+	// ConfigVersion indicates the schema version of this config. Default 0 means v1 (legacy).
+	ConfigVersion int `json:"config_version,omitempty" yaml:"config_version"`
 
 	ID          string   `json:"id"`
 	Hostname    string   `json:"hostname"`
