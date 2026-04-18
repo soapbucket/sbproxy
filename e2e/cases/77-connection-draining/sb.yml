@@ -1,0 +1,13 @@
+# Connection draining - basic proxy with connection settings
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "drain.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888/echo
+      idle_conn_timeout: 30s
+      keep_alive: 15s
+      max_idle_conns: 100
+      max_idle_conns_per_host: 10

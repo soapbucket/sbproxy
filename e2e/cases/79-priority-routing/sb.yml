@@ -1,0 +1,37 @@
+# Priority-based routing using load balancer with header hash
+# X-Priority header determines which backend receives traffic
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "priority.test":
+    action:
+      type: load_balancer
+      algorithm: first
+      targets:
+        - url: http://127.0.0.1:18888/echo?priority=high
+          weight: 1
+          request_matchers:
+            - headers:
+                exact:
+                  X-Priority: high
+          request_modifiers:
+            - type: header
+              set:
+                X-Routed-To: high-priority
+        - url: http://127.0.0.1:18888/echo?priority=low
+          weight: 1
+          request_matchers:
+            - headers:
+                exact:
+                  X-Priority: low
+          request_modifiers:
+            - type: header
+              set:
+                X-Routed-To: low-priority
+        - url: http://127.0.0.1:18888/echo?priority=normal
+          weight: 1
+          request_modifiers:
+            - type: header
+              set:
+                X-Routed-To: normal-priority

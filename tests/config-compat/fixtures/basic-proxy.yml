@@ -1,0 +1,10 @@
+config_version: 2
+
+id: "basic-proxy-1"
+hostname: "api.example.com"
+workspace_id: "ws-test-001"
+version: "1.0"
+
+action:
+  type: proxy
+  url: https://test.sbproxy.dev

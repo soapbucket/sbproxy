@@ -1,0 +1,12 @@
+# 85 - Metrics Cardinality: proxy with telemetry endpoint
+proxy:
+  http_bind_port: 18080
+
+telemetry:
+  bind_port: 18089
+
+origins:
+  "cardinality.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888

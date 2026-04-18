@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 
 	templateresolver "github.com/soapbucket/sbproxy/internal/template"
 )
@@ -29,6 +30,116 @@ func (ep ErrorPages) FindErrorPage(statusCode int) (*ErrorPage, bool) {
 		}
 	}
 	return nil, false
+}
+
+// SelectErrorPage picks the best error page for the request's Accept header.
+// It first filters pages by status code, then selects the page whose ContentType
+// best matches the client's Accept header. If no content type match is found,
+// the first status-matching page is returned.
+func SelectErrorPage(pages []ErrorPage, statusCode int, acceptHeader string) *ErrorPage {
+	if len(pages) == 0 {
+		return nil
+	}
+
+	// Collect pages that match the status code.
+	var candidates []*ErrorPage
+	var catchAll []*ErrorPage
+	for i := range pages {
+		if len(pages[i].Status) > 0 && slices.Contains(pages[i].Status, statusCode) {
+			candidates = append(candidates, &pages[i])
+		} else if len(pages[i].Status) == 0 {
+			catchAll = append(catchAll, &pages[i])
+		}
+	}
+
+	// Fall back to catch-all pages if no specific match.
+	if len(candidates) == 0 {
+		candidates = catchAll
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	// If no Accept header, return the first candidate.
+	if acceptHeader == "" {
+		return candidates[0]
+	}
+
+	// Build a list of available content types from candidates.
+	available := make([]string, len(candidates))
+	for i, c := range candidates {
+		ct := c.ContentType
+		if ct == "" {
+			ct = "text/html"
+		}
+		available[i] = ct
+	}
+
+	// Parse Accept header and find the best match.
+	// Simple inline negotiation (does not import httpkit to avoid circular deps).
+	bestIdx := 0
+	bestQ := -1.0
+	for _, part := range splitAccept(acceptHeader) {
+		mt, q := parseMediaType(part)
+		if q <= bestQ {
+			continue
+		}
+		for i, avail := range available {
+			if acceptMatches(mt, avail) && q > bestQ {
+				bestQ = q
+				bestIdx = i
+			}
+		}
+	}
+
+	return candidates[bestIdx]
+}
+
+// splitAccept splits an Accept header value by commas.
+func splitAccept(header string) []string {
+	var parts []string
+	for _, p := range strings.Split(header, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			parts = append(parts, p)
+		}
+	}
+	return parts
+}
+
+// parseMediaType extracts the media type and quality from a single Accept entry.
+func parseMediaType(entry string) (string, float64) {
+	parts := strings.Split(entry, ";")
+	mt := strings.TrimSpace(parts[0])
+	q := 1.0
+	for _, param := range parts[1:] {
+		param = strings.TrimSpace(param)
+		if strings.HasPrefix(param, "q=") || strings.HasPrefix(param, "Q=") {
+			if v, err := strconv.ParseFloat(param[2:], 64); err == nil && v >= 0 && v <= 1 {
+				q = v
+			}
+		}
+	}
+	return mt, q
+}
+
+// acceptMatches checks whether a media type pattern matches a concrete type.
+func acceptMatches(pattern, concrete string) bool {
+	if pattern == "*/*" {
+		return true
+	}
+	pParts := strings.SplitN(pattern, "/", 2)
+	cParts := strings.SplitN(concrete, "/", 2)
+	if len(pParts) != 2 || len(cParts) != 2 {
+		return pattern == concrete
+	}
+	if pParts[0] != cParts[0] && pParts[0] != "*" {
+		return false
+	}
+	if pParts[1] != cParts[1] && pParts[1] != "*" {
+		return false
+	}
+	return true
 }
 
 // wrapErrorPages wraps the handler with custom error page interception.

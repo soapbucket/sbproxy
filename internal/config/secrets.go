@@ -370,6 +370,54 @@ func (c *Config) GetSecrets(ctx context.Context) map[string]string {
 	return secrets
 }
 
+// ── vault_secrets_config.go ──────────────────────────────────────────────────
+
+// VaultSecretsConfig holds global vault-based secrets management configuration.
+// This configures the secret:name resolver pipeline, including the secret map
+// (logical name to vault path), rotation behavior, fallback strategy, and
+// backend-specific settings.
+type VaultSecretsConfig struct {
+	// Backend selects the vault backend type: hashicorp, aws, gcp, local, env.
+	Backend string `json:"backend,omitempty" yaml:"backend"`
+
+	// Map maps logical secret names to vault paths (e.g., "stripe_key" -> "system:/kv/stripe").
+	Map map[string]string `json:"map,omitempty" yaml:"map"`
+
+	// Rotation configures secret refresh and grace period behavior.
+	Rotation RotationSecretsConfig `json:"rotation,omitempty" yaml:"rotation"`
+
+	// Fallback controls behavior when a secret cannot be resolved.
+	// Valid values: "cache" (return last cached value), "reject" (return error),
+	// "env" (fall back to environment variable).
+	Fallback string `json:"fallback,omitempty" yaml:"fallback"`
+
+	// Hashicorp holds HashiCorp Vault-specific configuration.
+	Hashicorp *HashicorpSecrets `json:"hashicorp,omitempty" yaml:"hashicorp"`
+}
+
+// RotationSecretsConfig configures secret rotation timing.
+type RotationSecretsConfig struct {
+	// GracePeriodSecs is how long old secret values remain valid after rotation.
+	GracePeriodSecs int `json:"grace_period_secs,omitempty" yaml:"grace_period_secs"`
+
+	// ReResolveIntervalSecs is how often the background goroutine polls for
+	// secret changes.
+	ReResolveIntervalSecs int `json:"re_resolve_interval_secs,omitempty" yaml:"re_resolve_interval_secs"`
+}
+
+// HashicorpSecrets holds HashiCorp Vault connection configuration.
+type HashicorpSecrets struct {
+	// Addr is the Vault server address (e.g., "https://vault.example.com:8200").
+	Addr string `json:"addr" yaml:"addr"`
+
+	// Token is the Vault authentication token. Should be a vault reference
+	// or environment variable rather than plaintext.
+	Token string `json:"token,omitempty" yaml:"token"`
+
+	// Mount is the secrets engine mount path (default: "secret").
+	Mount string `json:"mount,omitempty" yaml:"mount"`
+}
+
 // ── secrets_enterprise_stubs.go ───────────────────────────────────────────────
 
 // AWSSecretsConfig is a stub for the AWS Secrets Manager provider.
