@@ -122,7 +122,6 @@ See [examples/](examples/) for 17 production-ready configurations.
 
 ## Community
 
-- [GitHub Discussions](https://github.com/soapbucket/sbproxy/discussions) - questions and ideas
 - [Issue Tracker](https://github.com/soapbucket/sbproxy/issues) - bug reports and feature requests
 - [Contributing Guide](CONTRIBUTING.md) - how to contribute
 
