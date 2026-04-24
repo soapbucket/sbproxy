@@ -9,10 +9,18 @@ import (
 )
 
 const (
-	slidingWindowSize    = 1000
-	circuitOpenDuration  = 30 * time.Second
-	circuitFailThreshold = 5
-	circuitHalfOpenMax   = 3
+	slidingWindowSize = 1000
+	// Circuit-breaker thresholds. Tuned so transient connection churn
+	// (idle-pool cycling, momentary upstream hiccups) does not trip the
+	// breaker and take a provider out of rotation for an extended
+	// window. The previous defaults (5 consecutive failures, 30s open)
+	// were too aggressive for gateway workloads where concurrent
+	// requests to the same host can briefly exhaust ephemeral ports or
+	// produce a cluster of 1-2ms dial failures under load. See the
+	// regression analysis in docs/competitors/LOCAL_SMOKE_RESULTS.md.
+	circuitOpenDuration  = 10 * time.Second
+	circuitFailThreshold = 50
+	circuitHalfOpenMax   = 5
 )
 
 // ProviderTracker maintains real-time health and performance data per provider.
