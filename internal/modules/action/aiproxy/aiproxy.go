@@ -98,6 +98,23 @@ func (h *Handler) Provision(ctx plugin.PluginContext) error {
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// AI upstream calls are concentrated on a small set of provider hosts
+	// (typically 1-4 per origin). Go's stdlib defaults of
+	// MaxIdleConnsPerHost=2 / MaxIdleConns=100 are tuned for
+	// fan-out-to-many-hosts clients and cause severe connection churn
+	// under concurrent load to a single provider. Symptoms:
+	//   - Idle pool saturates in milliseconds
+	//   - Subsequent requests open + close new connections per call
+	//   - On macOS, ephemeral ports hit TIME_WAIT and new dials fail
+	//   - 5 consecutive dial errors trip the provider circuit breaker
+	//     (see internal/ai/health.go circuitFailThreshold) for 30s
+	//   - All in-flight requests during the open window return 502
+	//     "all configured providers are currently unavailable"
+	// Raise the per-host cap to match the concurrency level real AI
+	// traffic generates, and the global cap to accommodate workspaces
+	// with several providers.
+	transport.MaxIdleConns = 1000
+	transport.MaxIdleConnsPerHost = 256
 	if h.cfg.SkipTLSVerifyHost {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // user-configured for test backends
 	}

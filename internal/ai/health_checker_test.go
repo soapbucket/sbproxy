@@ -118,7 +118,9 @@ func TestHealthCheckHealthyProvider(t *testing.T) {
 
 func TestHealthCheckFailedOpensCircuit(t *testing.T) {
 	tracker := NewProviderTracker()
-	p := makeProvider("anthropic", true, 50*time.Millisecond, "claude-3-haiku")
+	// Run enough health checks to exceed circuitFailThreshold (50 as of
+	// the 2026-04 tuning). 2ms interval over 250ms = ~125 failures.
+	p := makeProvider("anthropic", true, 2*time.Millisecond, "claude-3-haiku")
 	router := NewRouter(&RoutingConfig{Strategy: "round_robin"}, []*ProviderConfig{p})
 
 	checkFn := func(_ context.Context, _ *ProviderConfig, _ string) error {
@@ -127,16 +129,17 @@ func TestHealthCheckFailedOpensCircuit(t *testing.T) {
 
 	hc := NewHealthChecker(tracker, router, []*ProviderConfig{p}, nil, "inst-1", checkFn)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 
 	hc.Start(ctx)
 	<-ctx.Done()
 	time.Sleep(20 * time.Millisecond)
 
-	// After multiple failures, circuit should open.
+	// After enough failures (>=circuitFailThreshold), circuit should open.
 	if !tracker.IsCircuitOpen("anthropic") {
-		t.Error("circuit should be open after repeated failures")
+		t.Errorf("circuit should be open after repeated failures (got %d consecutive failures)",
+			hc.ConsecutiveFailures("anthropic"))
 	}
 
 	if hc.ConsecutiveFailures("anthropic") < 2 {
