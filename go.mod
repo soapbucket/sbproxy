@@ -17,7 +17,7 @@ require (
 	github.com/go-viper/mapstructure/v2 v2.5.0
 	github.com/goccy/go-json v0.10.6
 	github.com/golang-jwt/jwt/v4 v4.5.2
-	github.com/gomarkdown/markdown v0.0.0-20260217112301-37c66b85d6ab
+	github.com/gomarkdown/markdown v0.0.0-20260411013819-759bbc3e3207
 	github.com/google/cel-go v0.28.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/graphql-go/graphql v0.8.1
