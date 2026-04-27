@@ -6,6 +6,22 @@
 <h3 align="center">The unified application gateway.</h3>
 <p align="center">Simplify your traffic layer. One gateway for every protocol and provider.</p>
 
+> [!IMPORTANT]
+> **The Go implementation is archived.** Every commit through `v1.0.0-go-final`
+> on this repository is the last release of the Go-based engine. The full Go
+> history is preserved at
+> [**`soapbucket/sbproxy-go`**](https://github.com/soapbucket/sbproxy-go) for
+> reference and reproducibility.
+>
+> The active implementation will land on this repository as `v2.0.0`, built on
+> Cloudflare's Pingora. Background and benchmark numbers behind the migration
+> are at [sbproxy.dev/benchmark](https://sbproxy.dev/benchmark). Existing
+> `sb.yml` config files run on the new engine unmodified.
+>
+> If you are pinning a Go-engine release, pin `v1.0.0-go-final` and depend on
+> `soapbucket/sbproxy-go`. New issues and pull requests should target the v2
+> tree once it lands.
+
 <p align="center">
   <a href="https://github.com/soapbucket/sbproxy/releases"><img src="https://img.shields.io/github/v/release/soapbucket/sbproxy" alt="Release"></a>
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
