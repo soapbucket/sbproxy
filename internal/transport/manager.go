@@ -69,10 +69,14 @@ func hashConfig(cfg plugin.TransportConfig) uint64 {
 
 // createTransport builds an *http.Transport from plugin.TransportConfig with
 // sensible defaults suitable for a reverse proxy workload.
+//
+// Pool sizing, idle timeout, and TCP keepalive are matched to the Rust
+// engine's tuned Pingora settings so benchmark results measure the engine,
+// not the defaults. See sbproxy-bench/docs/TUNING.md for the rationale.
 func createTransport(cfg plugin.TransportConfig) http.RoundTripper {
 	maxIdle := cfg.MaxIdleConns
 	if maxIdle <= 0 {
-		maxIdle = 100
+		maxIdle = 256
 	}
 
 	timeout := cfg.Timeout
@@ -82,8 +86,8 @@ func createTransport(cfg plugin.TransportConfig) http.RoundTripper {
 
 	return &http.Transport{
 		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
+			Timeout:   5 * time.Second,
+			KeepAlive: 60 * time.Second,
 		}).DialContext,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: cfg.InsecureSkipVerify,
@@ -91,6 +95,7 @@ func createTransport(cfg plugin.TransportConfig) http.RoundTripper {
 		TLSHandshakeTimeout:    10 * time.Second,
 		MaxIdleConns:           maxIdle,
 		MaxIdleConnsPerHost:    maxIdle,
+		MaxConnsPerHost:        maxIdle, // Cap concurrent sockets at pool size to mirror Pingora's upstream_keepalive_pool_size.
 		IdleConnTimeout:        90 * time.Second,
 		ResponseHeaderTimeout:  timeout,
 		ExpectContinueTimeout:  1 * time.Second,
