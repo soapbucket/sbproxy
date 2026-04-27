@@ -1,0 +1,10 @@
+# Excluded from docker build context. Only affects `docker build`,
+# not regular go workflows.
+.git/
+.github/
+bin/
+dist/
+*.log
+e2e/logs/
+e2e/load-test-tmp/
+e2e/sbproxy
