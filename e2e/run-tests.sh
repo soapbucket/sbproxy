@@ -755,11 +755,18 @@ run_18_ddos_protection() {
     # Normal request should pass
     assert_status "DDoS - normal request passes" 200 -H "Host: ddos.test" "$PROXY_URL/echo"
 
-    # Flood with rapid requests to trigger detection (threshold: 10 req in 5s)
+    # Flood with rapid requests to trigger detection (threshold: 10 req in 5s).
+    # Each curl is bounded with --max-time so a stuck connection cannot hang the
+    # test, and we collect the PIDs so `wait` only waits on the curls (not on
+    # the long-running proxy/test-server backgrounded by start_proxy()).
+    local flood_pids=()
     for _ in $(seq 1 15); do
-        curl -s -o /dev/null -H "Host: ddos.test" "$PROXY_URL/echo" 2>/dev/null &
+        curl -s -o /dev/null --max-time 5 -H "Host: ddos.test" "$PROXY_URL/echo" 2>/dev/null &
+        flood_pids+=($!)
     done
-    wait
+    for pid in "${flood_pids[@]}"; do
+        wait "$pid"
+    done
 
     # After flood, should be blocked or throttled
     local post_flood
