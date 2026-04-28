@@ -22,6 +22,6 @@ Comprehensive documentation for SBproxy.
 
 See the [examples/](../examples/) directory for ready-to-use configuration files.
 
-## SBproxy Cloud
+## SBproxy Enterprise
 
-For managed hosting with a dashboard, advanced security, and AI features, visit [cloud.sbproxy.dev](https://cloud.sbproxy.dev).
+For managed hosting with a dashboard, advanced security, and AI features, visit [sbproxy.dev/enterprise](https://sbproxy.dev/enterprise).
