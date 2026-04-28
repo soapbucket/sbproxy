@@ -25,7 +25,7 @@ require (
 	github.com/klauspost/compress v1.18.5
 	github.com/lib/pq v1.12.3
 	github.com/mholt/acmez/v3 v3.1.6
-	github.com/pires/go-proxyproto v0.11.0
+	github.com/pires/go-proxyproto v0.12.0
 	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/pquerna/cachecontrol v0.2.0
 	github.com/prometheus/client_golang v1.23.2
