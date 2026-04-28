@@ -72,7 +72,7 @@ jobs:
           VERSION=${{ steps.version.outputs.version }}
           cat > homebrew-sbproxy/sbproxy.rb << 'FORMULA'
           class Sbproxy < Formula
-            desc "High-performance reverse proxy and AI gateway"
+            desc "The AI gateway built like a real proxy"
             homepage "https://sbproxy.dev"
             license "Apache-2.0"
             version "VERSION_PLACEHOLDER"

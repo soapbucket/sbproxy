@@ -18,7 +18,7 @@
   <a href="https://sbproxy.dev/docs">Docs</a> &middot;
   <a href="examples/">Examples</a> &middot;
   <a href="https://github.com/soapbucket/sbproxy/discussions">Community</a> &middot;
-  <a href="https://cloud.sbproxy.dev">Cloud</a>
+  <a href="https://sbproxy.dev/enterprise">Enterprise</a>
 </p>
 
 ---
@@ -125,7 +125,7 @@ See [examples/](examples/) for 17 production-ready configurations.
 - [Issue Tracker](https://github.com/soapbucket/sbproxy/issues) - bug reports and feature requests
 - [Contributing Guide](CONTRIBUTING.md) - how to contribute
 
-Need managed hosting and advanced analytics? See [SBproxy Cloud](https://cloud.sbproxy.dev).
+Need managed hosting and advanced analytics? See [SBproxy Enterprise](https://sbproxy.dev/enterprise).
 
 ---
 

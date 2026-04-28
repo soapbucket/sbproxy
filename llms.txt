@@ -1,6 +1,6 @@
 # SBproxy
 
-> The reverse proxy and AI gateway, unified. One binary, one config file. Apache 2.0.
+> The AI gateway built like a real proxy. One binary, one config file. Apache 2.0.
 
 Most teams run nginx or Traefik for HTTP traffic, then route AI requests through a separate LiteLLM or Portkey instance. SBproxy handles both in a single Go binary. One config file covers your entire traffic layer.
 
