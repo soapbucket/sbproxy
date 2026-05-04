@@ -1,0 +1,40 @@
+# HTML transform.
+#
+# Rewrites HTML responses from httpbin.org/html (a public Moby-Dick excerpt page).
+# This config:
+#   - removes the upstream `<h1>` element
+#   - injects a stylesheet at the end of <head>
+#   - injects a banner at the start of <body>
+#   - rewrites every `<p>` to carry a `data-rewritten` attribute
+#
+# Run:
+#   make run CONFIG=examples/43-transform-html/sb.yml
+#
+# Test:
+#   # Original upstream response (Herman Melville HTML page)
+#   curl -s https://httpbin.org/html | head -20
+#
+#   # Proxied response: no h1, banner injected, paragraphs tagged
+#   curl -s -H 'Host: html.local' http://127.0.0.1:8080/html | head -20
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "html.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+    transforms:
+      - type: html
+        remove_selectors:
+          - h1
+        inject:
+          - position: head_end
+            content: '<link rel="stylesheet" href="https://cdn.example.com/sbproxy.css">'
+          - position: body_start
+            content: '<div id="sb-banner">Served via sbproxy</div>'
+        rewrite_attributes:
+          - selector: p
+            attribute: data-rewritten
+            value: "true"

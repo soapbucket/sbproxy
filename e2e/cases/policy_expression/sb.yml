@@ -1,0 +1,27 @@
+# Reference fixture for the policy_expression E2E suite.
+#
+# Two CEL expression policies stacked: a header-based admin gate
+# plus a path-prefix block. CEL header keys are normalized to
+# lowercase, so `request.headers["x-role"]` matches an inbound
+# `X-Role` header. The OSS CEL engine does not currently expose
+# `request.time`, so time-based rules are out of scope here.
+
+proxy:
+  http_bind_port: 0
+
+origins:
+  "cel.localhost":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: expression
+        expression: 'request.headers["x-role"] == "admin"'
+        deny_status: 403
+        deny_message: "role not permitted"
+      - type: expression
+        expression: '!request.path.startsWith("/admin")'
+        deny_status: 403
+        deny_message: "admin routes locked"

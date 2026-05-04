@@ -1,0 +1,16 @@
+# CEL expressions in callbacks - conditional callback execution
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "cel-callback.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    on_request:
+      - url: http://127.0.0.1:18888/callback/cel-fired
+        method: POST
+        cel_expr: |
+          request.headers["x-trigger"] == "fire"
+        timeout: 5
+        on_error: ignore

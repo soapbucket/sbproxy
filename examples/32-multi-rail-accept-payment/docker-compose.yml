@@ -1,0 +1,100 @@
+# Stack for the 32-multi-rail-accept-payment example.
+#
+# Reuses the mock x402 facilitator from example 30 and adds a
+# wiremock standing in for Stripe so both rails are exercisable
+# without external dependencies.
+#
+# Services:
+#
+#   sbproxy                  - the gateway, mounts ./sb.yml on :8080
+#   mock-x402-facilitator    - copy of example 30's facilitator stub
+#   mock-origin              - article server
+#   wiremock                 - Stripe API stand-in (PaymentIntents)
+#
+# Bring up:    docker compose up -d --wait
+# Tear down:   docker compose down -v
+
+services:
+
+  # --- sbproxy data plane ---
+  sbproxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cloudbuild
+    image: sbproxy:32-multi-rail
+    container_name: sbproxy_32_multi_rail
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    environment:
+      - SB_LOG_LEVEL=info
+    depends_on:
+      mock-x402-facilitator:
+        condition: service_healthy
+      mock-origin:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - multirailsb
+
+  # --- Mock x402 facilitator ---
+  #
+  # Identical to example 30's facilitator. We mount the same nginx
+  # config from the sibling example so there is one source of truth
+  # for the facilitator's wire shape.
+  mock-x402-facilitator:
+    image: nginx:1.27.3-alpine
+    container_name: sbproxy_32_multi_rail_facilitator
+    volumes:
+      - ../30-rail-x402-base-sepolia/mock-x402-facilitator/default.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost/__health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - multirailsb
+
+  # --- Mock origin (article server) ---
+  mock-origin:
+    image: nginx:1.27.3-alpine
+    container_name: sbproxy_32_multi_rail_origin
+    volumes:
+      - ./mock-origin/default.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost/__health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - multirailsb
+
+  # --- Wiremock (Stripe stand-in) ---
+  #
+  # Reuses the mappings from example 31 so the two examples share one
+  # PaymentIntents fixture. Always-on for this example because the
+  # test cases below exercise both rails by default.
+  wiremock:
+    image: wiremock/wiremock:3.10.1
+    container_name: sbproxy_32_multi_rail_wiremock
+    command: ["--port", "8080", "--root-dir", "/home/wiremock"]
+    volumes:
+      - ../31-rail-mpp-stripe-test/wiremock-stripe:/home/wiremock:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8080/__admin/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - multirailsb
+
+networks:
+  multirailsb:
+    driver: bridge

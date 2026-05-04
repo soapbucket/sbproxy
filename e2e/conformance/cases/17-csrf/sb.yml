@@ -1,0 +1,26 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "csrf.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    session:
+      allow_non_ssl: true
+      cookie_name: sbproxy_session
+      max_age: 3600
+      same_site: Lax
+    policies:
+      - type: csrf
+        secret: "cR7tK3mW9pL2vX5qJ8bN4mW6nY3zA"
+        header_name: X-CSRF-Token
+        cookie_name: csrf_token
+        cookie_path: /
+        cookie_same_site: Lax
+        methods:
+          - POST
+          - PUT
+          - DELETE
+        exempt_paths:
+          - /health

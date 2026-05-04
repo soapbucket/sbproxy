@@ -1,0 +1,47 @@
+# Fallback origin triggered by different failure conditions
+proxy:
+  http_bind_port: 18080
+
+origins:
+  # on_error: primary returns connection refused (dead port)
+  "fb-error.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:19999
+      timeout: 2s
+    fallback_origin:
+      on_error: true
+      add_debug_header: true
+      origin:
+        id: fb-error-fallback
+        hostname: fb-error-fallback
+        workspace_id: test
+        version: "1.0.0"
+        action:
+          type: static
+          status_code: 200
+          content_type: application/json
+          json_body:
+            source: fallback
+            trigger: error
+
+  # on_status: primary returns 503, fallback activates
+  "fb-status.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888/status/503
+    fallback_origin:
+      on_status: [502, 503, 504]
+      add_debug_header: true
+      origin:
+        id: fb-status-fallback
+        hostname: fb-status-fallback
+        workspace_id: test
+        version: "1.0.0"
+        action:
+          type: static
+          status_code: 200
+          content_type: application/json
+          json_body:
+            source: fallback
+            trigger: status

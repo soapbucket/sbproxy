@@ -1,0 +1,107 @@
+# Default values for the sbproxy operator chart.
+
+# Namespace the operator runs in. The chart does not create the namespace
+# itself; install with `--namespace <ns> --create-namespace`.
+namespace: sbproxy-system
+
+# Operator image. Override `tag` to pin a specific build.
+image:
+  repository: ghcr.io/soapbucket/sbproxy-k8s-operator
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+# Number of operator replicas. Two is the recommended default so leader
+# election is exercised on every install: only one replica reconciles at a
+# time, and the standby races for the lock when the leader steps down.
+replicaCount: 2
+
+# Leader election. When enabled, replicas race for a `coordination.k8s.io/v1`
+# Lease named `sbproxy-operator-leader` in the operator's namespace. Only the
+# holder runs the reconciler; standbys wait. Disable for single-replica
+# installs where the lock is overhead, or for `cargo run` against a kind
+# cluster.
+leaderElection:
+  enabled: true
+
+# Log level passed to the operator. Maps to the `--log-level` flag and the
+# `RUST_LOG` env var. Use `info`, `debug`, or per-target filters
+# (e.g. `kube=debug,sbproxy_k8s_operator=debug`).
+logLevel: info
+
+# If set, the operator only watches this namespace. If empty, it watches all
+# namespaces (cluster scope) and the RBAC granted is a ClusterRole.
+watchNamespace: ""
+
+# Resource requests and limits for the operator pod itself.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# Service account name. Created by the chart unless `serviceAccount.create` is
+# false (in which case the named SA must already exist).
+serviceAccount:
+  create: true
+  name: sbproxy-k8s-operator
+
+# Whether to install the SBProxy and SBProxyConfig CRDs. Set to false if
+# CRDs are managed out of band (e.g. via a separate flux/argo apply).
+installCrds: true
+
+# --- Wave 4 content shapes + licensing defaults (B4.3) ---
+#
+# These values surface the Wave 4 / B4.1 feature flags as
+# operator-friendly toggles. The chart pipes them through to the
+# operator's reconciliation loop, which stamps them onto every
+# SBProxy CRD instance that does not override the value at the
+# resource level.
+#
+# `contentSignal.default` is the cluster-wide default for the
+# `content_signal:` field on origins that do not set one explicitly.
+# Closed enum: empty string (no signal asserted, the default), or one
+# of `ai-train`, `search`, `ai-input`. The proxy stamps
+# `Content-Signal: <value>` on every 200 response when the field is
+# non-empty; an empty value means the proxy stamps `TDM-Reservation:
+# 1` instead, declaring a default-deny TDM reservation per the W3C
+# TDMRep specification.
+#
+# `licensing.rslEnabled` and `licensing.tdmrepEnabled` toggle the
+# RSL `/licenses.xml` and W3C `/.well-known/tdmrep.json` projection
+# emission. Both default-on; flip to false to skip the projection
+# render at config compile time. Disabling does not strip the feature
+# from the binary (use the `licensing-rsl` / `licensing-tdmrep` cargo
+# features for that), it just keeps the projection cache from
+# rendering the document. Operators who want both binary-stripped and
+# values-disabled belt-and-suspenders should set both.
+contentSignal:
+  default: ""
+licensing:
+  rslEnabled: true
+  tdmrepEnabled: true
+
+# --- Grafana dashboards (Wave 1, B1.6) ---
+#
+# The chart ships five Wave 1 dashboards (overview, per-agent,
+# policy-triggers, audit-log, traces-overview) as a single ConfigMap. The
+# Grafana sidecar (kiwigrid/k8s-sidecar) discovers the ConfigMap by label
+# and provisions each JSON file into Grafana's dashboard directory.
+#
+# Wire this up against the Grafana Helm chart with:
+#
+#   sidecar:
+#     dashboards:
+#       enabled: true
+#       label: grafana_dashboard
+#
+# The dashboard JSON files themselves live at deploy/dashboards/ in this
+# repo and are symlinked into deploy/helm/sbproxy/dashboards/ at chart
+# package time. Set `dashboards.enabled: false` to skip the ConfigMap if
+# dashboards are managed out of band.
+dashboards:
+  enabled: true
+  # Label key the Grafana sidecar watches. Default matches the kiwigrid
+  # sidecar default. Override if your sidecar uses a different label key.
+  sidecarLabel: grafana_dashboard

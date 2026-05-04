@@ -1,0 +1,87 @@
+# Docs CI (Wave 1, B1.10).
+#
+# Runs the documentation lint + executable-snippet harness on every PR
+# that touches docs (sbproxy-rust or sbproxy-enterprise) or the runner
+# script itself. The actual checks live in scripts/docs-ci.sh, owned by
+# the QA lane (Q1.10); this workflow only invokes it.
+#
+# Two passes happen inside scripts/docs-ci.sh:
+#
+#   1. Link check via lychee (broken external + relative links).
+#   2. Code-block exec via rust-script for ```rust,executable fences.
+#
+# We cache the lychee `.lycheecache/` directory between runs so the
+# external HTTP HEAD checks do not hammer upstream sites on every push.
+
+name: docs-ci
+
+on:
+  pull_request:
+    paths:
+      - 'sbproxy-rust/docs/**'
+      - 'sbproxy-enterprise/docs/**'
+      - 'scripts/docs-ci.sh'
+      - '.lycheeignore'
+      - '.github/workflows/docs-ci.yml'
+
+# Cancel superseded runs on the same ref so force-pushes do not
+# double-spend runner minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  docs-ci:
+    name: docs / lint + exec
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- Cache lychee link-check results ---
+      #
+      # Keyed off the .lycheeignore content plus a calendar-day suffix so
+      # the cache rolls over once a day; that prevents stale 200-cached
+      # entries from masking newly-broken links indefinitely while still
+      # avoiding per-PR upstream traffic.
+      - name: cache lychee
+        uses: actions/cache@v4
+        with:
+          path: .lycheecache
+          key: lychee-${{ hashFiles('.lycheeignore') }}-${{ github.run_id }}
+          restore-keys: |
+            lychee-${{ hashFiles('.lycheeignore') }}-
+
+      - name: install lychee
+        uses: lycheeverse/lychee-action@v2
+        with:
+          # We do not want the action to *run* lychee here; we just want
+          # the binary on PATH so scripts/docs-ci.sh can invoke it. The
+          # action's `args: '--version'` is the lightest no-op.
+          args: --version
+          fail: false
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: install rust-script
+        run: cargo install rust-script --locked
+
+      - name: run docs-ci
+        env:
+          # Honor CI=true inside the script so it can switch to
+          # GitHub-Actions-friendly output (problem matchers, no TTY
+          # colors, etc.).
+          CI: "true"
+        run: |
+          set -euo pipefail
+          if [ ! -x scripts/docs-ci.sh ]; then
+            echo "scripts/docs-ci.sh is not executable or not present yet."
+            echo "It is owned by Q1.10; this workflow waits for that to land."
+            echo "Failing closed."
+            exit 1
+          fi
+          bash scripts/docs-ci.sh

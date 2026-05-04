@@ -1,0 +1,57 @@
+# Bulk redirects.
+#
+# Each origin owns its own redirect list. Three sources are supported:
+# inline `rows:`, a local file via `path:`, or an HTTPS url via `url:`.
+# The proxy compiles the list once at config-load time into an O(1)
+# lookup table keyed on the request path.
+#
+# This example ships two origins:
+#
+#   marketing.local  -> file-backed list (redirects.csv next door)
+#   shop.local       -> inline list with per-row status overrides
+#
+# Run:
+#   make run CONFIG=examples/74-bulk-redirects/sb.yml
+#
+# Test marketing.local:
+#   curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
+#        -H 'Host: marketing.local' http://127.0.0.1:8080/old/about
+#   # => 301 https://example.com/about
+#
+# Test shop.local:
+#   curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
+#        -H 'Host: shop.local' http://127.0.0.1:8080/category/legacy
+#   # => 308 /category/2024
+#
+# Hitting an unmapped path on either origin falls through to the
+# action's default `url:` (or 404 when none is configured).
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "marketing.local":
+    action:
+      type: redirect
+      status_code: 301           # default for rows that don't override
+      preserve_query: true
+      bulk_list:
+        type: file
+        path: examples/74-bulk-redirects/redirects.csv
+
+  "shop.local":
+    action:
+      type: redirect
+      status_code: 302
+      url: https://shop.example.com/        # fallback for unmapped paths
+      bulk_list:
+        type: inline
+        rows:
+          - from: /category/legacy
+            to: /category/2024
+            status: 308
+          - from: /promo/black-friday-2024
+            to: /promo/cyber-monday-2024
+          - from: /docs/v1
+            to: https://docs.example.com/v2
+            preserve_query: false

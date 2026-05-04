@@ -1,0 +1,39 @@
+# Per-tenant rate limiting keyed on a JWT claim.
+#
+# The rate limit policy accepts a `key:` CEL expression that runs
+# against the request context. Two tenants signed with different
+# `tenant_id` claims get independent token buckets.
+#
+# Run:
+#   make run CONFIG=examples/79-ratelimit-by-claim/sb.yml
+#
+# Test (requires a JWT with a `tenant_id` claim in the body):
+#   curl -H 'Host: api.local' \
+#        -H 'Authorization: Bearer <jwt>' \
+#        http://127.0.0.1:8080/anything
+#
+# Expected: each tenant_id sees its own 100/min budget. Hammering one
+# tenant does not drain another tenant's bucket.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    policies:
+      - type: rate_limiting
+        requests_per_minute: 100
+        burst: 20
+        # CEL expression that resolves to the bucket key. `jwt.claims`
+        # is auto-populated from `Authorization: Bearer <jwt>` without
+        # signature verification (JwtAuth handles that on a separate
+        # path). When the expression returns empty, the policy falls
+        # back to client IP.
+        key: 'jwt.claims.tenant_id'
+        headers:
+          enabled: true
+          include_retry_after: true

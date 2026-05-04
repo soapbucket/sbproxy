@@ -1,0 +1,19 @@
+# AI gateway - upstream error handling (500, 429, timeout)
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "ai-errors.test":
+    action:
+      type: ai_proxy
+      skip_tls_verify_host: true
+      default_model: gpt-4o-mini
+      timeout: 3s
+      providers:
+        - name: mock-openai
+          api_key: test-key
+          base_url: http://127.0.0.1:18889/v1
+          models:
+            - gpt-4o-mini
+            - error-model
+            - rate-limited

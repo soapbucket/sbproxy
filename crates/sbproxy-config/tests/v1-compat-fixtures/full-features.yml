@@ -1,0 +1,73 @@
+config_version: 2
+
+id: "full-features-1"
+hostname: "full.example.com"
+workspace_id: "ws-test-002"
+version: "2.0"
+environment: "prod"
+tags:
+  - production
+  - api
+
+action:
+  type: proxy
+  url: https://test.sbproxy.dev
+  timeout: "30s"
+
+authentication:
+  type: api_key
+  api_keys:
+    - test-key-001
+    - test-key-002
+
+policies:
+  - type: rate_limiting
+    requests_per_minute: 120
+    algorithm: sliding_window
+  - type: ip_filtering
+    whitelist:
+      - "10.0.0.0/8"
+      - "192.168.0.0/16"
+
+request_modifiers:
+  - headers:
+      set:
+        X-Proxy: sbproxy
+
+response_modifiers:
+  - headers:
+      set:
+        X-Served-By: sbproxy
+
+variables:
+  app_name: "my-app"
+  tier: "premium"
+
+session:
+  cookie_name: "sb_session"
+  max_age: 3600
+
+cors:
+  enable: true
+  allow_origins:
+    - "https://app.example.com"
+  allow_methods:
+    - GET
+    - POST
+  max_age: 86400
+
+force_ssl: true
+debug: false
+
+allowed_methods:
+  - GET
+  - POST
+  - PUT
+  - DELETE
+
+forward_rules:
+  - path_prefix: "/api/v2"
+    origin:
+      action:
+        type: proxy
+        url: https://test.sbproxy.dev/v2

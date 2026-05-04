@@ -1,0 +1,36 @@
+[package]
+name = "synthetic-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Wave 1 / Q1.12 synthetic monitor harness.
+#
+# Wave 1 only ships the `--rail=none` probe: 402 challenge plus
+# redemption against a mock ledger. Other rails are stubbed with a
+# `unimplemented!()` plus TODO comment; Waves 2 (Stripe) and 3 (x402,
+# MPP) wire the real rails. Output is one JSON line per probe so
+# `synthetic-nightly.yml` (B1.9) can shovel the lines straight into a
+# log sink.
+#
+# This crate is self-contained: it does NOT depend on the main
+# sbproxy-rust workspace, which keeps the builder CI lane independent
+# of the proxy's release build. Once the harness moves to
+# `sbproxy-bench/harness/synthetic/` it inherits the same shape.
+
+[[bin]]
+name = "synthetic-probe"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+time = { version = "0.3", features = ["formatting", "macros"] }
+
+[workspace]
+# Self-contained workspace so this crate's deps resolve independently
+# of the rust workspace at `../`. Avoids dragging the sbproxy build
+# into the synthetic harness lane.

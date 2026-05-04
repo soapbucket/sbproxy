@@ -1,0 +1,58 @@
+# Pattern-aware PII redaction at the AI request boundary.
+#
+# When `pii.enabled: true` is set on an AI proxy origin the gateway
+# redacts well-known PII shapes (email, US SSN, credit card with Luhn
+# check, phone, IPv4, common API key shapes) from the parsed JSON
+# request body BEFORE forwarding to the upstream provider. Custom
+# regex rules layer on top of the defaults.
+#
+# This means an upstream provider never sees `alice@example.com`,
+# `4111-1111-1111-1111`, or `sk-...` keys in user-submitted prompts.
+#
+# Run:
+#   make run CONFIG=examples/97-pii-redaction/sb.yml
+#
+# Test (the upstream sees redacted PII; httpbin echoes it back):
+#   curl -s -H 'Host: ai.localhost' http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'content-type: application/json' \
+#     -d '{
+#       "model": "gpt-4o",
+#       "messages": [
+#         {"role":"user","content":"Email me at alice@example.com about card 4111-1111-1111-1111"}
+#       ]
+#     }' | jq .json
+#
+# Expected echoed body:
+#   "Email me at [REDACTED:EMAIL] about card [REDACTED:CARD]"
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: "${OPENAI_API_KEY:-stub-key}"
+          base_url: "https://httpbin.org/anything"
+      routing:
+        strategy: round_robin
+
+      # PII redaction config. `defaults: true` enables the built-in
+      # rule set (email, US SSN, credit card with Luhn, phone, IPv4,
+      # OpenAI/Anthropic/AWS/GitHub key shapes). `redact_request`
+      # rewrites every string leaf in the JSON request body before
+      # forwarding to the upstream provider.
+      pii:
+        enabled: true
+        defaults: true
+        redact_request: true
+        redact_response: false
+        # Custom rule layered on top: redact internal ticket
+        # references that the default catalogue would not catch.
+        rules:
+          - name: ticket
+            pattern: '\bTICKET-[0-9]{6}\b'
+            replacement: '[REDACTED:TICKET]'
+            anchor: 'TICKET-'

@@ -1,0 +1,3 @@
+The configure() function accepts a builder and returns a Handle bound to the runtime that called it.
+A Handle is cheap to clone and safe to send across threads; the underlying state is reference-counted.
+Calling configure() twice on the same builder panics; the builder is moved on the first call.

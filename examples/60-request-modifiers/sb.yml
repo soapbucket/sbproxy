@@ -1,0 +1,57 @@
+# Request modifiers.
+#
+# Demonstrates the full typed shape of request_modifiers: header set/add/remove,
+# URL path replace, query set/add/remove, method override, and JSON body
+# replacement. Upstream is httpbin.org, which echoes back the headers, path,
+# query, method, and JSON body it observed so you can verify each rewrite.
+#
+# Run:
+#   make run CONFIG=examples/60-request-modifiers/sb.yml
+#
+# Test:
+#   # See the rewritten headers, query string, method, and body.
+#   curl -s -H 'Host: api.local' -H 'X-Internal-Token: secret' \
+#        'http://127.0.0.1:8080/old/anything?debug=1&keep=yes' | jq
+#
+#   # The proxy rewrites:
+#   #   - path  /old/anything           -> /new/anything
+#   #   - query debug=1&keep=yes        -> tenant=prod&keep=yes&extra=1
+#   #   - method GET                    -> POST
+#   #   - body  empty                   -> {"injected":true,"source":"proxy"}
+#   #   - headers: drops X-Internal-Token, sets X-Source, adds X-Trace-Id
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    request_modifiers:
+      - headers:
+          set:
+            X-Source: sbproxy
+            Content-Type: application/json
+          add:
+            X-Trace-Id: "trace-001"
+          remove:
+            - X-Internal-Token
+        url:
+          path:
+            replace:
+              old: /old/
+              new: /new/
+        query:
+          set:
+            tenant: prod
+          add:
+            extra: "1"
+          remove:
+            - debug
+        method: POST
+        body:
+          replace_json:
+            injected: true
+            source: proxy

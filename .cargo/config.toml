@@ -1,0 +1,11 @@
+# Cargo build configuration.
+#
+# net.git-fetch-with-cli = true: use the system `git` binary for cargo's
+# registry and git-dep fetching rather than cargo's built-in libgit2 client.
+# We depend on private git repositories (sbproxy-classifier) via SSH. Cargo's
+# built-in fetcher does not reliably resolve SSH keys or honor
+# ~/.gitconfig / ssh-agent; delegating to the system git binary picks up the
+# same credentials developers already use for `git clone`.
+
+[net]
+git-fetch-with-cli = true

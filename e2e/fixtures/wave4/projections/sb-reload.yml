@@ -1,0 +1,40 @@
+# Reload-target fixture for `robots_txt_changes_after_config_reload`.
+# Same shape as sb.yml but with the GPTBot tier price bumped from
+# 1000 micros to 9999 micros so the projection body diff is unambiguous.
+
+proxy:
+  http_bind_port: 0  # overridden by the harness
+
+origins:
+  "blog.localhost":
+    extensions:
+      content_signal: ai-train
+    action:
+      type: static
+      status_code: 200
+      content_type: text/html
+      body: "<h1>article</h1>"
+    policies:
+      - type: ai_crawl_control
+        currency: USD
+        price: 0.001
+        tiers:
+          - route_pattern: /articles/*
+            agent_id: openai-gptbot
+            price:
+              amount_micros: 9999
+              currency: USD
+            content_shape: html
+          - route_pattern: /articles/*
+            agent_id: anthropic-claudebot
+            price:
+              amount_micros: 1500
+              currency: USD
+            content_shape: markdown
+          - route_pattern: /articles/*
+            price:
+              amount_micros: 1000
+              currency: USD
+            content_shape: html
+        valid_tokens:
+          - good-token-1

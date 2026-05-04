@@ -1,0 +1,11 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "methods.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    allowed_methods:
+      - GET
+      - HEAD

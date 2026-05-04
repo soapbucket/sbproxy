@@ -1,0 +1,50 @@
+# AI race strategy: fan out to every eligible provider in parallel,
+# return the first 2xx, cancel the losers.
+#
+# Trade-off: race minimizes p99 latency by always taking the fastest
+# provider for any given request; the cost is N times the API spend
+# (one paid completion per provider per request). Pair with
+# `resilience` so persistently slow providers fall out of the
+# eligible set instead of getting dialed for every request forever.
+#
+# Race is wired through the same `Router::eligible_indices` filter
+# the other strategies use, so circuit-breaker / outlier-detection
+# ejections continue to apply.
+#
+# Run:
+#   export OPENAI_API_KEY=sk-...
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   export GROQ_API_KEY=gsk-...
+#   make run CONFIG=examples/89-ai-race/sb.yml
+#
+# Test:
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing:
+        strategy: race
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          default_model: claude-3-5-haiku-latest
+        - name: groq
+          api_key: ${GROQ_API_KEY}
+          default_model: llama-3.1-8b-instant
+      resilience:
+        outlier_detection:
+          threshold: 0.5
+          window_secs: 60
+          min_requests: 5
+          ejection_duration_secs: 30

@@ -1,0 +1,102 @@
+# syntax=docker/dockerfile:1.7
+#
+# Cloud Build variant of images/Dockerfile.engine-rust.
+#
+# This file is identical in spirit to sbproxy-bench/images/Dockerfile.engine-rust
+# but lives inside the source context so `gcloud builds submit` can find
+# it. Cloud Build runs on native amd64 workers, which sidesteps the
+# aws-lc-sys qemu crash we hit when cross-compiling from arm64 macOS.
+#
+# Keep this file in lockstep with `Dockerfile.ci` (cargo-chef layout).
+#
+# Build-time wins (cold ~12min -> ~3-4min, warm <90s on Cloud Build amd64):
+#
+#   1. cargo-chef "recipe.json" extracts the dependency graph from
+#      Cargo.toml + Cargo.lock without any first-party source. The
+#      "cacher" stage cooks (= fetches + compiles) just the deps and
+#      hits Docker's layer cache as long as recipe.json is unchanged.
+#   2. The dep layer survives any change under crates/sbproxy*/src/.
+#      A warm rebuild (only first-party code touched) reuses the
+#      cacher layer wholesale and only re-runs the final binary link.
+#   3. BuildKit cache mounts on /root/.cargo/registry and /root/.cargo/git
+#      keep the cargo registry warm across distinct image builds even
+#      when the layer cache is cold (Cloud Build re-uses these mounts
+#      between successive runs of the same builder image). Note: we
+#      DO NOT mount target/ as a cache because the cooked artifacts
+#      must live in the cacher layer for the builder stage to COPY
+#      them.
+#
+# REQUIRES BuildKit (Cloud Build sets DOCKER_BUILDKIT=1 by default for
+# steps that use this Dockerfile, but if invoking via raw `docker build`
+# locally export `DOCKER_BUILDKIT=1` first or use `docker buildx build`).
+
+# --- Stage 1: chef-base ------------------------------------------------
+# Shared toolchain layer. Pins Rust + cargo-chef + apt deps so all
+# downstream stages start from the same base.
+FROM rust:1.94-bookworm AS chef-base
+WORKDIR /src
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      pkg-config libclang-dev \
+      build-essential cmake perl \
+ && rm -rf /var/lib/apt/lists/*
+# Pin cargo-chef so a registry republish cannot perturb the build.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo install --locked cargo-chef@0.1.71
+
+# --- Stage 2: planner --------------------------------------------------
+# Reads the workspace and emits recipe.json. The recipe is a digest of
+# every Cargo.toml / Cargo.lock in the tree; first-party source bodies
+# do not affect it, which is the property that makes warm rebuilds fast.
+FROM chef-base AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# --- Stage 3: cacher ---------------------------------------------------
+# Compiles every dependency in the workspace using only recipe.json.
+# This is the layer the warm path reuses. Touching anything under
+# crates/*/src/ does NOT invalidate this stage. target/ is a regular
+# directory here (no cache mount) so the cooked artifacts persist into
+# the layer for the builder stage to COPY.
+FROM chef-base AS cacher
+COPY --from=planner /src/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo chef cook --release --bin sbproxy --recipe-path recipe.json
+
+# --- Stage 4: builder --------------------------------------------------
+# Copies the cooked dep artifacts from the cacher stage, then the
+# first-party source, and links the final binary. The cargo registry
+# is cache-mounted so a stray `cargo update` between layers does not
+# force a full re-fetch.
+FROM chef-base AS builder
+COPY --from=cacher /src/target target
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo build --release --bin sbproxy --locked \
+ && cp /src/target/release/sbproxy /usr/local/bin/sbproxy
+
+# --- Stage 5: cert-gen -------------------------------------------------
+# Unchanged. Mints a self-signed loadtest cert so the bench stack has
+# something to terminate TLS with. Production images mount real certs
+# over /etc/sbproxy/ at runtime.
+FROM debian:bookworm-slim AS cert-gen
+RUN apt-get update && apt-get install -y --no-install-recommends openssl \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /out/etc/sbproxy \
+ && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+      -subj "/CN=loadtest.test" \
+      -keyout /out/etc/sbproxy/tls.key -out /out/etc/sbproxy/tls.crt \
+ && chmod 644 /out/etc/sbproxy/tls.crt /out/etc/sbproxy/tls.key
+
+# --- Stage 6: runtime --------------------------------------------------
+# Distroless cc image. Carries the binary, the loadtest cert pair, and
+# nothing else.
+FROM gcr.io/distroless/cc-debian12 AS runtime
+COPY --from=builder /usr/local/bin/sbproxy /usr/local/bin/sbproxy
+COPY --from=cert-gen /out/etc/sbproxy/tls.crt /etc/sbproxy/tls.crt
+COPY --from=cert-gen /out/etc/sbproxy/tls.key /etc/sbproxy/tls.key
+ENTRYPOINT ["/usr/local/bin/sbproxy"]
+CMD ["serve", "-f", "/etc/sbproxy/sb.yml"]

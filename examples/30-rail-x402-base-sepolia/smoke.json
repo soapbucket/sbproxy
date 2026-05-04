@@ -1,0 +1,23 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "feature_endpoints": [],
+  "audit_check": false,
+  "_notes": [
+    "This example does NOT enable the proxy admin listener, so",
+    "/healthz (which lives on the admin port, default 9090) is not",
+    "reachable. The data plane's built-in liveness path is /health,",
+    "served by every sbproxy instance regardless of admin config; we",
+    "use that as the smoke runner's liveness probe.",
+    "",
+    "feature_endpoints[] is empty: every interesting URL on this",
+    "stack is a 402 (the whole point of the example), and the smoke",
+    "runner asserts 2xx on each declared endpoint. Liveness alone is",
+    "the meaningful signal for CI; the Makefile's `make test` target",
+    "covers the 402 flow for hands-on validation.",
+    "",
+    "audit_check stays false until Wave 2 (R1.2) ships the OSS",
+    "/api/audit/recent endpoint."
+  ]
+}

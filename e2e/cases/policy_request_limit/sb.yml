@@ -1,0 +1,22 @@
+# Reference fixture for the policy_request_limit E2E suite.
+#
+# Tight defensive caps on body, header count, URL length, and query
+# string length. Anything past the cap returns 413 before the static
+# action runs.
+
+proxy:
+  http_bind_port: 0
+
+origins:
+  "limit.localhost":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: request_limit
+        max_body_size: 1048576
+        max_header_count: 20
+        max_url_length: 4000
+        max_query_string_length: 100

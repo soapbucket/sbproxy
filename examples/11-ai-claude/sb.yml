@@ -1,0 +1,55 @@
+# AI gateway: Anthropic Claude direct.
+#
+# Routes calls to api.anthropic.com. Clients send OpenAI-shaped chat
+# completion requests; sbproxy translates them to Anthropic's Messages
+# API on the upstream side and translates the response back to OpenAI
+# shape so OpenAI SDK clients work without changes.
+#
+# What's translated:
+#   * Request: `system` role hoisted to top-level, `max_tokens` defaulted
+#     when missing, OpenAI-only fields stripped (logit_bias, n,
+#     presence_penalty, frequency_penalty, response_format, seed, user),
+#     path rewritten from /v1/chat/completions to /v1/messages.
+#   * Response: text content blocks concatenated into `choices[].message.content`,
+#     tool_use blocks converted to `tool_calls`, stop_reason mapped to
+#     finish_reason, usage tokens renamed.
+#
+# Known limitation: streaming responses (`stream: true`) pass through in
+# Anthropic's native SSE shape today. Use the non-streaming form below
+# to exercise the translator end to end.
+#
+# Setup:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   make run CONFIG=examples/11-ai-claude/sb.yml
+#
+# Test (OpenAI-style request, Claude on the upstream):
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "claude-3-5-sonnet-latest",
+#       "messages": [
+#         {"role": "system", "content": "You write terse haiku."},
+#         {"role": "user", "content": "Write a haiku about caching."}
+#       ]
+#     }'
+#
+# The response comes back in OpenAI shape (`choices[0].message.content`,
+# `usage.prompt_tokens`, etc.) even though Claude served it.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          default_model: claude-3-5-sonnet-latest
+          models:
+            - claude-3-5-sonnet-latest
+            - claude-3-5-haiku-latest
+            - claude-3-opus-latest
+      routing: round_robin

@@ -1,0 +1,90 @@
+# Stack for the 30-rail-x402-base-sepolia example.
+#
+# Three containers on one bridge network:
+#
+#   sbproxy                  - the gateway, mounts ./sb.yml read-only on :8080
+#   mock-x402-facilitator    - tiny stub that always-200s on the
+#                              x402 facilitator endpoints; honours
+#                              `?reorg=depth=N` for chain-reorg sims.
+#   mock-origin              - nginx serving a single article HTML
+#
+# The mock facilitator lets the demo run in CI without testnet keys;
+# see sb-testnet.yml + the README for swapping in the real Base
+# Sepolia facilitator.
+#
+# Bring up:    docker compose up -d --wait
+# Validate:    docker compose config
+# Tear down:   docker compose down -v
+
+services:
+
+  # --- sbproxy data plane ---
+  sbproxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cloudbuild
+    image: sbproxy:30-rail-x402
+    container_name: sbproxy_30_x402
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    environment:
+      - SB_LOG_LEVEL=info
+    depends_on:
+      mock-x402-facilitator:
+        condition: service_healthy
+      mock-origin:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - x402sb
+
+  # --- Mock x402 facilitator ---
+  #
+  # Implements just the surface the demo needs:
+  #   GET  /supported              -> 200 (list of supported chains)
+  #   POST /verify                 -> 200 (always passes signature check)
+  #   POST /settle                 -> 200 (synthesises a `txhash`)
+  #   GET  /__health               -> 200 (compose health probe)
+  #
+  # The `?reorg=depth=N` query parameter on `/settle` causes the mock
+  # to reply with `{"reorg_depth": N}` so the README walkthrough can
+  # demonstrate how the proxy handles a transient reorg without a
+  # live testnet.
+  mock-x402-facilitator:
+    image: nginx:1.27.3-alpine
+    container_name: sbproxy_30_x402_facilitator
+    volumes:
+      - ./mock-x402-facilitator/default.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost/__health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - x402sb
+
+  # --- Mock origin (article server) ---
+  mock-origin:
+    image: nginx:1.27.3-alpine
+    container_name: sbproxy_30_x402_origin
+    volumes:
+      - ./mock-origin/default.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost/__health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - x402sb
+
+networks:
+  x402sb:
+    driver: bridge

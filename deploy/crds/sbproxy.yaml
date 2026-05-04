@@ -1,0 +1,146 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sbproxies.sbproxy.dev
+spec:
+  group: sbproxy.dev
+  names:
+    categories: []
+    kind: SBProxy
+    plural: sbproxies
+    shortNames:
+    - sbp
+    singular: sbproxy
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for SBProxySpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Desired state for a single sbproxy deployment.
+
+              The operator owns a Deployment + Service + ConfigMap triple per `SBProxy`. Spec changes drive reconciliation; status is reserved for future use.
+            properties:
+              adminAuthSecretRef:
+                description: |-
+                  Optional reference to a Kubernetes Secret holding the basic auth credentials for the proxy's `/admin/reload` endpoint.
+
+                  When set and the proxy exposes its admin port, the operator prefers a hot-reload (POST /admin/reload) over a rollout restart on `SBProxyConfig.spec.config` changes. The Secret at `secretRef.name` must contain a key whose value is the full basic-auth header value (e.g. `Basic YWRtaW46c2VjcmV0`). The operator falls back to rollout-restart if the reload endpoint returns anything other than 200.
+                nullable: true
+                properties:
+                  key:
+                    default: authorization
+                    description: 'Key inside the Secret whose value is the full basic-auth header (e.g. `Basic YWRtaW46c2VjcmV0`). Defaults to `authorization` so a Secret of shape `data: { authorization: <base64-of-Basic-...-> }` works out of the box.'
+                    type: string
+                  name:
+                    description: Secret name in the same namespace as the SBProxy.
+                    type: string
+                required:
+                - name
+                type: object
+              adminPort:
+                default: 9090
+                description: Optional admin server port the proxy exposes for `/admin/reload` and `/api/health/targets`. Defaults to 9090 when `admin_auth_secret_ref` is set; ignored otherwise. The operator never exposes the admin port through the public Service; it dials the pod IP directly via the cluster network.
+                format: int32
+                type: integer
+              configRef:
+                description: Name of an `SBProxyConfig` in the same namespace whose `spec.config` will be mounted as the proxy's `sb.yml`. Required.
+                type: string
+              image:
+                description: Container image (including tag) for the proxy pod. Required.
+                type: string
+              port:
+                default: 8080
+                description: Optional service port. Defaults to 8080.
+                format: int32
+                type: integer
+              replicas:
+                default: 1
+                description: Number of proxy replicas to run. Defaults to 1.
+                format: int32
+                type: integer
+              resources:
+                description: Optional Kubernetes-style resource requests/limits for the proxy container.
+                nullable: true
+                properties:
+                  limits:
+                    additionalProperties:
+                      type: string
+                    description: Resource limits. Keys are resource names (e.g. `cpu`, `memory`).
+                    type: object
+                  requests:
+                    additionalProperties:
+                      type: string
+                    description: Resource requests. Keys are resource names (e.g. `cpu`, `memory`).
+                    type: object
+                type: object
+            required:
+            - configRef
+            - image
+            type: object
+          status:
+            description: Status reported by the operator. Currently records the last reconciled config hash so operators can confirm a rollout happened.
+            nullable: true
+            properties:
+              configHash:
+                description: Hash of the last `SBProxyConfig.spec.config` rolled out. Empty if the referenced config has never been resolved.
+                type: string
+              lastError:
+                description: Last error observed during reconcile, if any. Cleared on successful runs.
+                type: string
+            type: object
+        required:
+        - spec
+        title: SBProxy
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sbproxyconfigs.sbproxy.dev
+spec:
+  group: sbproxy.dev
+  names:
+    categories: []
+    kind: SBProxyConfig
+    plural: sbproxyconfigs
+    shortNames:
+    - sbpc
+    singular: sbproxyconfig
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for SBProxyConfigSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              A versioned `sb.yml` document, mounted into pods owned by an [`SBProxy`] via a generated ConfigMap.
+
+              The operator does not deeply validate `spec.config`. The proxy parses it on reload and rejects malformed input there. Apply-time validation is limited to "is this a non-empty string".
+            properties:
+              config:
+                description: The full `sb.yml` document as a YAML string. Required.
+                type: string
+            required:
+            - config
+            type: object
+        required:
+        - spec
+        title: SBProxyConfig
+        type: object
+    served: true
+    storage: true
+    subresources: {}
+

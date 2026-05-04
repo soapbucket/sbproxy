@@ -1,0 +1,24 @@
+// Minimal echo service used by `tests/action_grpc.rs`.
+//
+// Kept intentionally tiny: a single unary RPC that echoes the input
+// message back to the caller. The e2e test spawns a tonic server with
+// this service, points the proxy at it via an `action: type: grpc`
+// origin, and asserts that the response payload survives the proxy
+// round-trip unchanged.
+
+syntax = "proto3";
+
+package sbproxy_e2e.echo;
+
+service Echo {
+  // Echo returns the message it received in the request.
+  rpc Hello(EchoRequest) returns (EchoResponse);
+}
+
+message EchoRequest {
+  string message = 1;
+}
+
+message EchoResponse {
+  string message = 1;
+}

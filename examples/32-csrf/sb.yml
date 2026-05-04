@@ -1,0 +1,45 @@
+# CSRF protection policy.
+#
+# State-changing methods (POST, PUT, DELETE, PATCH) must carry a valid
+# `X-CSRF-Token` header that matches the `csrf_token` cookie set on a prior
+# safe request. Safe methods (GET, HEAD, OPTIONS) are exempt and serve as
+# the channel for the proxy to issue the cookie. The action is `static` so
+# the example is self-contained: no upstream needed to demonstrate the
+# accept and reject paths.
+#
+# Run:
+#   make run CONFIG=examples/32-csrf/sb.yml
+#
+# Test:
+#   # 200 - safe method, sets the csrf_token cookie. Save it for the next call.
+#   curl -i -c cookies.txt -H 'Host: csrf.local' http://127.0.0.1:8080/
+#
+#   # 403 - POST without a CSRF token
+#   curl -i -X POST -H 'Host: csrf.local' http://127.0.0.1:8080/submit
+#
+#   # 200 - POST with the token from the cookie echoed in the header
+#   TOKEN=$(awk '/csrf_token/ {print $7}' cookies.txt)
+#   curl -i -X POST -b cookies.txt -H 'Host: csrf.local' \
+#        -H "X-CSRF-Token: $TOKEN" http://127.0.0.1:8080/submit
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "csrf.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        ok: true
+
+    policies:
+      - type: csrf
+        secret_key: dev-csrf-secret-change-me
+        cookie_name: csrf_token
+        header_name: X-CSRF-Token
+        methods: [POST, PUT, DELETE, PATCH]
+        safe_methods: [GET, HEAD, OPTIONS]
+        cookie_path: /
+        cookie_same_site: Lax

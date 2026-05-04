@@ -1,0 +1,16 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "redirect301.test":
+    action:
+      type: redirect
+      url: http://127.0.0.1:18888/echo
+      status_code: 301
+      preserve_query: true
+
+  "redirect302.test":
+    action:
+      type: redirect
+      url: http://127.0.0.1:18888
+      status_code: 302

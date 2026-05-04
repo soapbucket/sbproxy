@@ -1,0 +1,42 @@
+# Q4.12 bench harness for content-negotiate (Markdown conversion).
+#
+# Standalone Cargo manifest (NOT a workspace member). Mirrors the
+# layout of `sbproxy-bench/harness/ai_crawl_tiers/`. CI does not run
+# this; only the perf lab does.
+#
+# Run:
+#
+#     cd sbproxy-bench/harness/content_negotiate
+#     BENCH_ENABLE=1 cargo run --release -- \
+#         --target-url http://127.0.0.1:8080 \
+#         --rps 5000 \
+#         --duration-secs 30
+#
+# Target numbers (Wave 4 G4.3 acceptance):
+#
+#   - 5,000 rps sustained.
+#   - p99 latency < 50 ms for the full HTML -> Markdown conversion
+#     pipeline against the 8 KB synthetic article fixture.
+#   - 0 errored requests at steady state.
+
+[workspace]
+
+[package]
+name = "content-negotiate-bench"
+version = "0.0.1"
+edition = "2021"
+publish = false
+license = "BUSL-1.1"
+
+[[bin]]
+name = "content-negotiate-bench"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+hdrhistogram = "7"
+anyhow = "1"

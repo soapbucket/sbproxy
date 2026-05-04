@@ -1,0 +1,36 @@
+# Request limit policy.
+#
+# Caps body size at 1 KiB, header count at 20, and URL length at 256 chars.
+# Anything past those limits is rejected with a 4xx before httpbin.org is
+# contacted. Useful as a defensive default in front of any backend that
+# does not enforce its own limits.
+#
+# Run:
+#   make run CONFIG=examples/34-request-limit/sb.yml
+#
+# Test:
+#   # 200 - small request fits inside every limit
+#   curl -i -H 'Host: limit.local' \
+#        -H 'Content-Type: application/json' \
+#        -d '{"hello":"world"}' http://127.0.0.1:8080/post
+#
+#   # 4xx - body over 1 KiB trips max_body_size
+#   curl -i -H 'Host: limit.local' \
+#        -H 'Content-Type: application/octet-stream' \
+#        --data-binary "$(head -c 4096 /dev/urandom | base64)" \
+#        http://127.0.0.1:8080/post
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "limit.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    policies:
+      - type: request_limit
+        max_body_size: 1024
+        max_header_count: 20
+        max_url_length: 256

@@ -1,0 +1,99 @@
+# AI gateway: per-team virtual keys.
+#
+# Two virtual keys split traffic between teams. The frontend team is
+# capped to a Haiku-only allow-list, modest RPM, and a small budget.
+# The data team gets Sonnet plus Haiku, a higher RPM, and a larger
+# budget. Tags surface in the sbproxy_ai_key_* metrics so dashboards
+# can attribute spend per team. Clients send their virtual key in the
+# Authorization header; the proxy validates it locally before any
+# upstream call.
+#
+# Setup:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   export TEAM_FRONTEND_KEY=vk-frontend-...
+#   export TEAM_DATA_KEY=vk-data-...
+#
+# Run:
+#   make run CONFIG=examples/14-ai-virtual-keys/sb.yml
+#
+# Test (frontend team, allowed model):
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H "Authorization: Bearer ${TEAM_FRONTEND_KEY}" \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "claude-3-5-haiku-latest",
+#       "messages": [{"role": "user", "content": "Hello from frontend."}]
+#     }'
+#
+# Test (frontend team, blocked model, expect 403):
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H "Authorization: Bearer ${TEAM_FRONTEND_KEY}" \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "claude-3-5-sonnet-latest",
+#       "messages": [{"role": "user", "content": "Try Sonnet."}]
+#     }'
+#
+# Test (data team, allowed Sonnet):
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H "Authorization: Bearer ${TEAM_DATA_KEY}" \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "claude-3-5-sonnet-latest",
+#       "messages": [{"role": "user", "content": "Hello from data team."}]
+#     }'
+#
+# Expected behaviour:
+#   The frontend key is rejected for Sonnet (not in allowed_models) and
+#   for any path through OpenRouter (not in allowed_providers). Frontend
+#   throughput is capped at 30 RPM and 60k TPM with a $10 budget. The data
+#   key gets Sonnet plus Haiku at 120 RPM and 400k TPM with a $250 budget.
+#   Requests are tagged in the sbproxy_ai_key_* counters by name and tags.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+
+      providers:
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          default_model: claude-3-5-haiku-latest
+          models:
+            - claude-3-5-haiku-latest
+            - claude-3-5-sonnet-latest
+
+      virtual_keys:
+        - key: ${TEAM_FRONTEND_KEY}
+          name: team-frontend
+          enabled: true
+          allowed_providers: [anthropic]
+          allowed_models:
+            - claude-3-5-haiku-latest
+          max_requests_per_minute: 30
+          max_tokens_per_minute: 60000
+          budget:
+            max_tokens: 500000
+            max_cost_usd: 10
+          tags: [team-frontend, tier-haiku]
+
+        - key: ${TEAM_DATA_KEY}
+          name: team-data
+          enabled: true
+          allowed_providers: [anthropic]
+          allowed_models:
+            - claude-3-5-haiku-latest
+            - claude-3-5-sonnet-latest
+          max_requests_per_minute: 120
+          max_tokens_per_minute: 400000
+          budget:
+            max_tokens: 10000000
+            max_cost_usd: 250
+          tags: [team-data, tier-sonnet]

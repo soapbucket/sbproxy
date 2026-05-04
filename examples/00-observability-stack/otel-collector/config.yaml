@@ -1,0 +1,70 @@
+# OpenTelemetry collector config for the SBproxy reference stack.
+#
+# This is the single OTLP ingress that SBproxy points at. The collector
+# fans signals out: traces -> Tempo (OTLP), metrics -> Prometheus (remote
+# write), logs -> Loki (otlphttp). Each pipeline is written explicitly so
+# operators can disable one without affecting the others.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        # Listen on all interfaces inside the container; host port 4327
+        # forwards here. Safe inside the Compose network only.
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Bound queue depth so a slow downstream cannot OOM the collector.
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+exporters:
+  # Traces -> Tempo via OTLP gRPC inside the bridge network.
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+  # Metrics -> Prometheus via remote_write. Prometheus has
+  # `--web.enable-remote-write-receiver` set in docker-compose.yml so
+  # this is supported without a separate Push gateway.
+  prometheusremotewrite:
+    endpoint: http://prometheus:9090/api/v1/write
+    tls:
+      insecure: true
+
+  # Logs -> Loki via the otlphttp exporter. Loki 3.x accepts native OTLP
+  # at /otlp; no Promtail or Fluent Bit needed.
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+    tls:
+      insecure: true
+
+# The collector publishes its own self-metrics on :8888 so Prometheus can
+# scrape it directly (see prometheus.yml).
+service:
+  telemetry:
+    metrics:
+      address: 0.0.0.0:8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheusremotewrite]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/loki]

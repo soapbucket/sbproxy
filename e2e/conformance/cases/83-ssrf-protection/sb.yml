@@ -1,0 +1,27 @@
+# SSRF protection - proxy with request limiting and threat protection
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "ssrf.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888/echo
+
+    policies:
+      - type: request_limiting
+        size_limits:
+          max_url_length: 2048
+          max_query_string_length: 1024
+          max_headers_count: 50
+          max_header_size: 8KB
+          max_request_size: 1MB
+
+      - type: threat_protection
+        enabled: true
+        json:
+          max_depth: 10
+          max_keys: 100
+          max_string_length: 10000
+          max_array_size: 100
+          max_total_size: 1048576

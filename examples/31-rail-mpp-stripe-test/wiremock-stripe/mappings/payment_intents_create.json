@@ -1,0 +1,21 @@
+{
+  "request": {
+    "method": "POST",
+    "urlPath": "/v1/payment_intents"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "jsonBody": {
+      "id": "pi_test_wiremock_0001",
+      "object": "payment_intent",
+      "amount": 5000,
+      "currency": "usd",
+      "status": "requires_payment_method",
+      "client_secret": "pi_test_wiremock_0001_secret_wmoffline",
+      "livemode": false
+    }
+  }
+}

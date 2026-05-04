@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sbproxy-k8s-operator
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: sbproxy
+    app.kubernetes.io/component: operator
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sbproxy
+      app.kubernetes.io/component: operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sbproxy
+        app.kubernetes.io/component: operator
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            {{- if .Values.watchNamespace }}
+            - --namespace
+            - {{ .Values.watchNamespace }}
+            {{- end }}
+            - --log-level
+            - {{ .Values.logLevel | quote }}
+            {{- if not .Values.leaderElection.enabled }}
+            - --no-leader-election
+            {{- end }}
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+            # Namespace where the operator pod runs. Used as the Lease
+            # namespace for leader election. The downward API guarantees the
+            # value matches the actual pod namespace even when the chart's
+            # `.Values.namespace` is set to something different at install
+            # time.
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Pod name. Embedded in the Lease holderIdentity so `kubectl get
+            # lease sbproxy-operator-leader` shows which replica is leading.
+            - name: K8S_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # --- Wave 4 / B4.3 content-shape + licensing defaults ---
+            #
+            # The operator reads these env vars when reconciling an
+            # SBProxy resource and stamps them onto the generated
+            # config when the per-origin field is unset. Empty
+            # `SBPROXY_CONTENT_SIGNAL_DEFAULT` means "no signal
+            # asserted" - the proxy stamps `TDM-Reservation: 1` per
+            # W3C TDMRep instead. The two licensing toggles default
+            # on and gate the RSL `/licenses.xml` and W3C
+            # `/.well-known/tdmrep.json` projection rendering at
+            # config compile time.
+            - name: SBPROXY_CONTENT_SIGNAL_DEFAULT
+              value: {{ .Values.contentSignal.default | quote }}
+            - name: SBPROXY_LICENSING_RSL_ENABLED
+              value: {{ .Values.licensing.rslEnabled | quote }}
+            - name: SBPROXY_LICENSING_TDMREP_ENABLED
+              value: {{ .Values.licensing.tdmrepEnabled | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

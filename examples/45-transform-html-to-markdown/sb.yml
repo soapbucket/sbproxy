@@ -1,0 +1,32 @@
+# HTML to Markdown transform.
+#
+# Scrapes httpbin.org/html (a public Moby-Dick excerpt page) and converts the
+# HTML body into Markdown using ATX-style headings (`#`, `##`, ...). Useful for
+# feeding HTML pages into LLM pipelines that prefer Markdown, or for archiving
+# pages in a portable format.
+#
+# Run:
+#   make run CONFIG=examples/45-transform-html-to-markdown/sb.yml
+#
+# Test:
+#   # Original upstream is HTML
+#   curl -s https://httpbin.org/html | head -5
+#
+#   # Proxied response is Markdown
+#   curl -s -H 'Host: tomd.local' http://127.0.0.1:8080/html
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "tomd.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+    transforms:
+      - type: html_to_markdown
+        heading_style: atx
+    response_modifiers:
+      - headers:
+          set:
+            Content-Type: text/markdown; charset=utf-8

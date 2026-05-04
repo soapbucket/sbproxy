@@ -1,0 +1,67 @@
+# MCP (Model Context Protocol) gateway with federated upstreams.
+#
+# Aggregates two upstream MCP servers behind one virtual MCP endpoint
+# and exposes them at `mcp.example.com`. Each upstream gets a
+# namespace prefix, optional RBAC label, and optional per-server
+# timeout. A single `tool_allowlist` guardrail restricts which
+# (already-prefixed) tools the gateway will forward.
+#
+# Run:
+#   make run CONFIG=examples/97-mcp-federation/sb.yml
+#
+# List the federated tool catalogue:
+#   curl -s -X POST http://127.0.0.1:8080 \
+#     -H 'Host: mcp.example.com' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq .
+#
+# Initialize the MCP session (returns the configured server_info):
+#   curl -s -X POST http://127.0.0.1:8080 \
+#     -H 'Host: mcp.example.com' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | jq .
+#
+# Call a federated tool (routed to the upstream owning the namespace):
+#   curl -s -X POST http://127.0.0.1:8080 \
+#     -H 'Host: mcp.example.com' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "jsonrpc":"2.0",
+#       "id":2,
+#       "method":"tools/call",
+#       "params":{
+#         "name":"gh.search_repos",
+#         "arguments":{"q":"sbproxy"}
+#       }
+#     }' | jq .
+#
+# A `tools/call` for a tool not in the allowlist returns a JSON-RPC
+# error with code -32602 (`invalid params`) and a message naming the
+# blocked tool.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: my-mcp
+        version: "1.0.0"
+      federated_servers:
+        # Bare hostnames are normalised to https://<host>/mcp.
+        # Use a full https://... URL for any other path.
+        # NOTE: per-server `rbac:` and `timeout:` knobs are planned but
+        # not yet enforced. Use the `tool_allowlist` guardrail below for
+        # equivalent access control until per-server dispatch lands.
+        - origin: github.example.com
+          prefix: gh
+        - origin: postgres.example.com
+          prefix: db
+      guardrails:
+        - type: tool_allowlist
+          allow:
+            - gh.search_repos
+            - db.query

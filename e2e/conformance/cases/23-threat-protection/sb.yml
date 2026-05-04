@@ -1,0 +1,16 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "threat.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    threat_protection:
+      enabled: true
+      json:
+        max_depth: 3
+        max_keys: 5
+        max_string_length: 50
+        max_array_size: 3
+        max_total_size: 512

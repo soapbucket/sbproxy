@@ -1,0 +1,69 @@
+# 32 - multi-rail-accept-payment
+#
+# Both x402 and MPP rails configured at once. The example demonstrates
+# the `Accept-Payment` header negotiation: q-value semantics,
+# first-match-wins per A3.1, the multi-rail body shape, and the 406
+# fallback when no rail matches.
+#
+# Run:
+#   cd examples/32-multi-rail-accept-payment
+#   docker compose up -d --wait
+#
+# Tear down:
+#   docker compose down -v
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "blog.test.sbproxy.dev":
+    action:
+      type: proxy
+      url: http://mock-origin:80
+
+    policies:
+      - type: ai_crawl_control
+        # Default fallback price. Each rail in the multi-rail body
+        # quotes this same price (the rail negotiation is over how
+        # the agent settles, not how much it pays).
+        price: 0.001
+        currency: USD
+        header: crawler-payment
+
+        crawler_user_agents:
+          - GPTBot
+          - ChatGPT-User
+          - ClaudeBot
+          - anthropic-ai
+          - CCBot
+          - PerplexityBot
+          - Google-Extended
+
+        # Single tier; both rails inherit this price. We intentionally
+        # do not vary price per rail so the test cases focus on the
+        # negotiation shape, not the price-resolution path.
+        tiers:
+          - route_pattern: /article*
+            price:
+              amount_micros: 1000
+              currency: USD
+            content_shape: html
+            paywall_position: top_of_page
+
+        # Wave 3 multi-rail block. Both rails configured.
+        rails:
+          x402:
+            chain: base
+            facilitator: http://mock-x402-facilitator:80
+            asset: USDC
+            pay_to: "0x0000000000000000000000000000000000000000"
+            version: "2"
+          mpp:
+            version: "1"
+
+        quote_token:
+          key_id: multi-rail-demo-2026
+          # Demo seed only. Production deployments use `secret_ref:`.
+          seed_hex: "3333333333333333333333333333333333333333333333333333333333333333"
+          issuer: "https://blog.test.sbproxy.dev"
+          default_ttl_seconds: 300

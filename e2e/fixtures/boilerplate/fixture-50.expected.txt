@@ -1,0 +1,3 @@
+The Snell's window is the optical phenomenon by which an underwater observer sees the entire above-water hemisphere compressed into a roughly 97-degree cone.
+The compression follows from Snell's law of refraction at the air-water interface; light arriving from grazing angles is bent inward by the index difference.
+Outside the cone, the surface acts as a near-perfect mirror, reflecting the underwater scene back at the observer.

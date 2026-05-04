@@ -1,0 +1,15 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "ipfilter.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    policies:
+      - type: ip_filtering
+        whitelist:
+          - 127.0.0.1
+          - 192.168.0.0/16
+        blacklist:
+          - 10.99.99.0/24

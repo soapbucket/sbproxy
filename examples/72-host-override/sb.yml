@@ -1,0 +1,31 @@
+# Host header override.
+#
+# By default the proxy sends the upstream URL's hostname in the `Host`
+# header (so vhost-routed services like Vercel, Cloudflare-fronted
+# origins, S3 website endpoints, and AWS ALBs work without extra
+# configuration). When the upstream expects a different `Host` than
+# its DNS name (CDN-fronted services, multi-tenant SaaS), set
+# `host_override` to the value the upstream wants to see.
+#
+# Whenever the proxy rewrites `Host`, it also sets `X-Forwarded-Host`
+# to the client's original `Host` so the upstream can still observe
+# the public name. Suppress that with `disable_forwarded_host_header:
+# true` if needed.
+#
+# Run:
+#   make run CONFIG=examples/72-host-override/sb.yml
+#
+# Test:
+#   curl -H 'Host: localhost' http://127.0.0.1:8080/get
+#   # Upstream sees `Host: api.upstream.example` and
+#   # `X-Forwarded-Host: localhost`.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "localhost":
+    action:
+      type: proxy
+      url: https://httpbin.org
+      host_override: api.upstream.example

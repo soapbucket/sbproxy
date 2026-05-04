@@ -1,0 +1,44 @@
+# Q1.6 bench harness for ai_crawl_tiers.
+#
+# Standalone Cargo manifest (NOT a workspace member) so that
+# `cargo build --workspace` for the proxy does not pick it up by
+# default. The harness is invoked manually via:
+#
+#     cd sbproxy-bench/harness/ai_crawl_tiers
+#     SBPROXY_BENCH=1 cargo run --release -- \
+#         --rps 10000 --tiers 5 --duration 30s
+#
+# The `SBPROXY_BENCH` env var gate is enforced in main.rs so an
+# accidental local invocation cannot stomp on the proxy's loopback
+# port. CI does not run this; only the perf lab does.
+#
+# Existing reference: there is no in-tree criterion suite for this
+# axis, so this harness is bespoke (a `tokio` driver firing an HTTP
+# load against a running proxy). Once a `criterion` benches harness
+# lands elsewhere we'll consolidate.
+
+# Empty `[workspace]` block: cargo otherwise climbs the directory tree
+# until it finds the proxy's workspace root and complains we are not
+# a member. We are deliberately NOT a member; an empty table here
+# tells cargo to treat this manifest as a standalone workspace root.
+[workspace]
+
+[package]
+name = "ai-crawl-tiers-bench"
+version = "0.0.1"
+edition = "2021"
+publish = false
+license = "BUSL-1.1"
+
+[[bin]]
+name = "ai-crawl-tiers-bench"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+hdrhistogram = "7"
+anyhow = "1"

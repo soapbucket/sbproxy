@@ -1,0 +1,39 @@
+# IP whitelist policy.
+#
+# Only requests from loopback (127.0.0.0/8) and a private LAN range are
+# accepted. Everything else gets a 403 before httpbin.org is contacted.
+# When the proxy is run locally, requests from your shell will match the
+# loopback CIDR. To see the deny path, swap the whitelist for a range that
+# does not include your client IP.
+#
+# Run:
+#   make run CONFIG=examples/30-ip-filter/sb.yml
+#
+# Test:
+#   # 200 - request from 127.0.0.1 matches the whitelist
+#   curl -i -H 'Host: ipfilter.local' http://127.0.0.1:8080/get
+#
+#   # 403 - simulate a non-whitelisted client by trusting an X-Forwarded-For
+#   #       header. The proxy must be configured with TrustedProxyCIDRs for
+#   #       this header to take effect; in the default config below it does
+#   #       not, so this still returns 200. Edit the whitelist to a range
+#   #       that excludes your machine to observe the 403 path.
+#   curl -i -H 'Host: ipfilter.local' \
+#        -H 'X-Forwarded-For: 8.8.8.8' http://127.0.0.1:8080/get
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ipfilter.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    policies:
+      - type: ip_filter
+        whitelist:
+          - 127.0.0.0/8
+          - 10.0.0.0/8
+        blacklist:
+          - 10.0.0.99/32

@@ -1,0 +1,19 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "feature_endpoints": [
+    "/robots.txt",
+    "/llms.txt",
+    "/llms-full.txt"
+  ],
+  "audit_check": false,
+  "_notes": [
+    "feature_endpoints[] holds GETs the runner asserts return 2xx.",
+    "All three projection paths are served by the proxy itself off the",
+    "in-memory projection cache. They are safe to assert as 2xx for",
+    "any caller and any Host header.",
+    "",
+    "audit_check stays false until the OSS audit endpoint lands."
+  ]
+}

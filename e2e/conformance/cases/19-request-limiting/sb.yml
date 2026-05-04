@@ -1,0 +1,16 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "reqlimit.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    policies:
+      - type: request_limiting
+        size_limits:
+          max_url_length: 100
+          max_query_string_length: 50
+          max_headers_count: 20
+          max_header_size: 4KB
+          max_request_size: 1KB

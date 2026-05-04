@@ -1,0 +1,73 @@
+# AI gateway: cost-optimised routing with weighted scoring.
+#
+# The cost_optimized strategy scores each provider as
+# `in_flight_requests * 1000 + weight` and routes to the lowest score.
+# Cheaper providers get a lower weight so they win ties when load is
+# balanced; more expensive providers get a higher weight so they only
+# run once cheaper providers are saturated.
+#
+# Three providers are configured here:
+#   - openrouter (weight 1): the cheapest path to a Haiku-class model.
+#   - anthropic-haiku (weight 5): direct Anthropic Haiku, slightly
+#     pricier than OpenRouter resale but lower latency.
+#   - anthropic-sonnet (weight 50): direct Anthropic Sonnet, picked
+#     only when both Haiku routes are loaded.
+#
+# Setup:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   export OPENROUTER_API_KEY=sk-or-...
+#
+# Run:
+#   make run CONFIG=examples/18-ai-cost-optimized/sb.yml
+#
+# Test:
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "claude-3-5-haiku-latest",
+#       "messages": [{"role": "user", "content":
+#         "Hello! Which provider served this?"}]
+#     }'
+#
+# Expected behaviour:
+#   When traffic is light, openrouter wins every request. As OpenRouter
+#   in-flight requests climb, anthropic-haiku starts taking traffic. If
+#   both Haiku routes saturate, anthropic-sonnet is selected. The
+#   sbproxy_ai_requests_total counter, broken down by provider, makes
+#   the distribution visible.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing:
+        strategy: cost_optimized
+
+      providers:
+        - name: openrouter
+          api_key: ${OPENROUTER_API_KEY}
+          weight: 1
+          default_model: anthropic/claude-3-haiku
+          models:
+            - anthropic/claude-3-haiku
+            - anthropic/claude-3.5-sonnet
+
+        - name: anthropic-haiku
+          provider_type: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          weight: 5
+          default_model: claude-3-5-haiku-latest
+          models:
+            - claude-3-5-haiku-latest
+
+        - name: anthropic-sonnet
+          provider_type: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          weight: 50
+          default_model: claude-3-5-sonnet-latest
+          models:
+            - claude-3-5-sonnet-latest

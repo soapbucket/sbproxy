@@ -1,0 +1,20 @@
+{
+  "request": {
+    "method": "POST",
+    "urlPathPattern": "/v1/payment_intents/[^/]+/confirm"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "jsonBody": {
+      "id": "pi_test_wiremock_0001",
+      "object": "payment_intent",
+      "amount": 5000,
+      "currency": "usd",
+      "status": "succeeded",
+      "livemode": false
+    }
+  }
+}

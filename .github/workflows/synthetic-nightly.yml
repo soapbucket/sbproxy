@@ -1,0 +1,166 @@
+# Synthetic monitor (B1.9).
+#
+# Runs the `bench-synthetic` Wave 1 probe against the bundled
+# observability + proxy stack on a nightly cron. The probe issues the
+# 402 challenge + redemption flow against the mock ledger configured
+# in the local stack and emits one JSON line per probe on stdout.
+#
+# Wave 1 ships only the `--rail=none` probe. Other rails (Stripe test,
+# x402, MPP) are stubbed in `bench-synthetic/src/main.rs` and will be
+# wired in Waves 2 and 3 (B2.12, B3.4, B3.5).
+#
+# On failure the workflow opens a GitHub issue tagged `synthetic` with
+# the probe's stdout in the body. Operators page on that label per
+# `docs/runbooks/synthetic-monitor.md` (placeholder until R-runbooks
+# lane lands).
+
+name: synthetic-nightly
+
+on:
+  # 04:13 UTC daily. The odd minute spreads load away from the top of
+  # the hour where shared runner pools queue up. workflow_dispatch lets
+  # operators replay the probe without waiting for the next run.
+  schedule:
+    - cron: "13 4 * * *"
+  workflow_dispatch: {}
+
+# Only one nightly run at a time per branch. A second push to main
+# while the previous run is in flight just supersedes the older one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # Required for the failure-notification step to file a GH issue.
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  synthetic-probe:
+    name: synthetic probe (rail=none)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4.1.7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # `bench-synthetic` is its own workspace, so it gets a dedicated
+      # cache key. That keeps the proxy workspace cache from being
+      # invalidated by churn on the synthetic harness.
+      - uses: Swatinem/rust-cache@v2.7.3
+        with:
+          shared-key: synthetic
+          workspaces: bench-synthetic
+
+      # Boot the reference observability stack from
+      # examples/00-observability-stack and the bundled crawl-tiered
+      # example so the probe has a proxy to talk to with a real
+      # ai_crawl_control policy in front of a mock ledger.
+      - name: bring up observability stack
+        run: |
+          set -euo pipefail
+          ( cd examples/00-observability-stack && docker compose up -d --wait )
+
+      - name: bring up tiered crawl example
+        id: stack
+        run: |
+          set -euo pipefail
+          ( cd examples/24-ai-crawl-tiered && docker compose up -d --wait )
+          # The example publishes the proxy on host port 8080 by
+          # default. Expose it as a step output so the probe step
+          # below can interpolate it.
+          echo "proxy_port=8080" >> "${GITHUB_OUTPUT}"
+
+      - name: run synthetic probe
+        id: probe
+        run: |
+          set -euo pipefail
+          mkdir -p target/synthetic-logs
+          PORT="${{ steps.stack.outputs.proxy_port }}"
+          # `--target` is the proxy base URL. `--path` defaults inside
+          # the binary to /_synthetic/probe; we pass /article so the
+          # bundled crawl-tiered example's html-default tier matches.
+          if ! ( cd bench-synthetic && cargo run --release -- \
+                   --rail=none \
+                   --target="http://127.0.0.1:${PORT}" \
+                   --path="/article" \
+                   --iterations=1 ) | tee ../target/synthetic-logs/probe.jsonl ; then
+            echo "probe_failed=true" >> "${GITHUB_OUTPUT}"
+            exit 1
+          fi
+          # Defence in depth: parse the JSONL and explicitly fail if
+          # any line reports a non-`ok` result. The probe binary already
+          # exits 1 on any non-`ok`, but we re-check here so a future
+          # change that loosens the binary's exit policy still gets
+          # caught.
+          if grep -E '"result":"(error|timeout)"' target/synthetic-logs/probe.jsonl; then
+            echo "probe_failed=true" >> "${GITHUB_OUTPUT}"
+            exit 1
+          fi
+
+      - name: upload probe output
+        if: always()
+        uses: actions/upload-artifact@v4.4.0
+        with:
+          name: synthetic-probe-output
+          path: target/synthetic-logs/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: tear down stacks
+        if: always()
+        run: |
+          set -eu
+          ( cd examples/24-ai-crawl-tiered && docker compose down -v --remove-orphans ) || true
+          ( cd examples/00-observability-stack && docker compose down -v --remove-orphans ) || true
+
+      # Failure notification. Opens a GitHub issue with the probe
+      # output. Operator routing of that issue (Slack page, PagerDuty
+      # webhook) is documented in the runbook; this step is the
+      # first-line signal.
+      - name: failure-notification
+        if: failure()
+        uses: actions/github-script@v7.0.1
+        env:
+          PROBE_OUTPUT_FILE: target/synthetic-logs/probe.jsonl
+        with:
+          script: |
+            const fs = require('fs');
+            let body = '';
+            const path = process.env.PROBE_OUTPUT_FILE;
+            if (path && fs.existsSync(path)) {
+              body = fs.readFileSync(path, 'utf8');
+            } else {
+              body = '(probe produced no JSONL output - see workflow logs)';
+            }
+            const ts = new Date().toISOString();
+            const issueBody = [
+              'Wave 1 synthetic monitor failed.',
+              '',
+              '- run: ' + (process.env.GITHUB_RUN_ID || '(unknown)'),
+              '- ref: ' + (process.env.GITHUB_REF || '(unknown)'),
+              '- when: ' + ts,
+              '',
+              '### Probe stdout',
+              '',
+              '```jsonl',
+              body.trim(),
+              '```',
+              '',
+              'Operator runbook: `docs/runbooks/synthetic-monitor.md`.'
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Synthetic monitor failed (Wave 1)',
+              body: issueBody,
+              labels: ['synthetic', 'wave1', 'incident']
+            });

@@ -1,0 +1,73 @@
+[package]
+name = "sbproxy-k8s-operator"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "OSS Kubernetes operator scaffold for sbproxy. Reconciles SBProxy and SBProxyConfig CRDs into Deployments, Services, and ConfigMaps."
+publish = false
+
+[lib]
+name = "sbproxy_k8s_operator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sbproxy-k8s-operator"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+
+# Kubernetes client + controller-runtime + CRD derive.
+# `runtime` enables kube-runtime (Controller, watcher, finalizers).
+# `derive` enables the CustomResource macro from kube-derive.
+# `client` enables the Kubernetes API client.
+# `rustls-tls` keeps us off OpenSSL, consistent with the rest of the
+# workspace (rustls + ring).
+kube = { version = "0.95", default-features = false, features = [
+    "client",
+    "derive",
+    "runtime",
+    "rustls-tls",
+] }
+# k8s-openapi must match the Kubernetes API version we target. v1_30 is
+# Kubernetes 1.30+ (released April 2024) and is the lowest version most
+# managed providers (EKS / GKE / AKS) still support.
+k8s-openapi = { version = "0.23", default-features = false, features = ["v1_30", "schemars"] }
+schemars = "0.8"
+
+# CLI parsing
+clap = { version = "4", features = ["derive", "env"] }
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# HTTP client for `POST /admin/reload`. rustls-only to keep the
+# operator off OpenSSL.
+reqwest = { workspace = true }
+
+# Lease timestamps. The Kubernetes `coordination.k8s.io/v1.Lease`
+# resource carries `acquireTime` / `renewTime` as MicroTime values,
+# which k8s-openapi exposes as `chrono::DateTime<Utc>`. Used by the
+# manual leader-election loop in `src/leader.rs`.
+chrono = { workspace = true }
+
+# Random suffix in the leader holder identity so two pods on the same
+# node never collide when their hostnames are equal (replicas behind a
+# StatefulSet headless Service, kind multi-replica with shared host
+# name, etc.).
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util", "macros"] }

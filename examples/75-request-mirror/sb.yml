@@ -1,0 +1,41 @@
+# Shadow traffic with request mirroring.
+#
+# Every request matched by this origin is forwarded to the primary
+# upstream as normal AND a copy is fired at the mirror URL. The mirror
+# response is read and discarded; the client only sees the primary's
+# response. Useful for safe rollouts of a new backend, replay-style
+# testing, and capturing production traffic patterns.
+#
+# Method, path/query, and headers are mirrored. Body teeing is opt-in
+# via `mirror_body: true` (capped at `max_body_bytes`, default 1 MiB)
+# so POST/PUT/PATCH endpoints can be shadow-replayed when needed.
+# Hop-by-hop headers and `Host` are skipped on the mirror request so
+# vhost-routing on the mirror destination still works.
+#
+# `sample_rate: 0.1` mirrors ~10% of traffic; default `1.0` mirrors
+# every request. Mirror requests carry `X-Sbproxy-Mirror: 1` so the
+# shadow upstream can distinguish them from real traffic.
+#
+# Run:
+#   make run CONFIG=examples/75-request-mirror/sb.yml
+#
+# Test:
+#   curl -H 'Host: localhost' http://127.0.0.1:8080/get
+#   # Both `httpbin.org/get` (primary) and `httpbingo.org/get`
+#   # (mirror) are hit. The client only sees the httpbin.org body.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "localhost":
+    action:
+      type: proxy
+      url: https://httpbin.org
+    mirror:
+      url: https://httpbingo.org
+      sample_rate: 1.0
+      timeout_ms: 5000
+      # Uncomment to shadow-replay POST/PUT/PATCH bodies as well:
+      # mirror_body: true
+      # max_body_bytes: 1048576    # 1 MiB; bodies larger fire the mirror without a body

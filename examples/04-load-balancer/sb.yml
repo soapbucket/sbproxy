@@ -1,0 +1,30 @@
+# Load balancing across two targets.
+#
+# Round-robin across two upstreams. Both targets here point at httpbin.org;
+# in a real deployment you'd point each at a different replica address.
+# The example demonstrates the config shape and confirms the load balancer
+# successfully forwards requests; per-target traffic visibility requires
+# distinct upstreams.
+#
+# Run:
+#   make run CONFIG=examples/04-load-balancer/sb.yml
+#
+# Test:
+#   for i in $(seq 1 6); do
+#     curl -s -o /dev/null -w '%{http_code}\n' \
+#       -H 'Host: api.local' http://127.0.0.1:8080/get
+#   done
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: load_balancer
+      algorithm: round_robin
+      targets:
+        - url: https://httpbin.org
+          weight: 1
+        - url: https://httpbin.org
+          weight: 1

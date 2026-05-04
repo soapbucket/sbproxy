@@ -1,0 +1,10 @@
+# 88 - Config Version: origin with config_version: 2
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "cfgver.test":
+    config_version: 2
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888

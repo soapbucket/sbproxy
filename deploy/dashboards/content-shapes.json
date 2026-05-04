@@ -1,0 +1,283 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "id": null,
+  "title": "SBproxy Content Shapes (Wave 4)",
+  "description": "Wave 4 content negotiation + Markdown projection. Surfaces request volume by negotiated content shape, Markdown token-estimate distribution, Content-Signal stamping count, and the HTML-vs-Markdown shape split per route.",
+  "tags": [
+    "sbproxy",
+    "wave4",
+    "content-shapes"
+  ],
+  "style": "dark",
+  "timezone": "browser",
+  "editable": false,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "version": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "prometheus_datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "selected": false,
+          "text": "Prometheus",
+          "value": "Prometheus"
+        },
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "options": []
+      },
+      {
+        "name": "tenant_id",
+        "label": "Tenant",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${prometheus_datasource}"
+        },
+        "query": "label_values(sbproxy_requests_total, tenant_id)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2,
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      },
+      {
+        "name": "hostname",
+        "label": "Hostname",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${prometheus_datasource}"
+        },
+        "query": "label_values(sbproxy_requests_total{tenant_id=~\"$tenant_id\"}, hostname)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2,
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Requests by negotiated content shape",
+      "description": "Rate of requests per content_shape_transform value (markdown, html, json, pdf, other). Driven by the Wave 4 G4.2 content-negotiate action's Pass 2 resolver.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (content_shape_transform) (rate(sbproxy_requests_total{tenant_id=~\"$tenant_id\",hostname=~\"$hostname\"}[$__rate_interval]))",
+          "legendFormat": "{{content_shape_transform}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Markdown token estimate distribution",
+      "description": "Histogram of x-markdown-tokens response header values. Driven by the Wave 4 G4.3 Markdown projection. Tail values flag dense / multilingual content that may need a per-origin token_bytes_ratio override.",
+      "type": "histogram",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (le) (rate(sbproxy_markdown_token_estimate_bucket{tenant_id=~\"$tenant_id\",hostname=~\"$hostname\"}[$__rate_interval]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Content-Signal stamping count by value",
+      "description": "Rate of 200 responses stamped with each Content-Signal value. The `none` series counts responses with no Content-Signal asserted (the proxy stamps `TDM-Reservation: 1` instead per W3C TDMRep).",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (content_signal) (rate(sbproxy_requests_total{tenant_id=~\"$tenant_id\",hostname=~\"$hostname\",status_class=\"2xx\"}[$__rate_interval]))",
+          "legendFormat": "{{content_signal}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Top routes by Markdown vs HTML response shape",
+      "description": "Top 25 routes by request rate, broken down by content_shape_transform. Useful for spotting routes where agents heavily prefer Markdown so an operator can tune pricing or evict the Markdown projection cache.",
+      "type": "table",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "align": "auto",
+            "displayMode": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "footer": {
+          "enablePagination": false,
+          "show": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(25, sum by (route, content_shape_transform) (rate(sbproxy_requests_total{tenant_id=~\"$tenant_id\",hostname=~\"$hostname\"}[$__rate_interval])))",
+          "legendFormat": "{{route}} ({{content_shape_transform}})",
+          "format": "table",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        }
+      ]
+    }
+  ]
+}

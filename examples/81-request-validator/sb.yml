@@ -1,0 +1,67 @@
+# Request body schema validation.
+#
+# The `request_validator` policy validates inbound JSON request bodies
+# against a JSON Schema before they reach the upstream. Modelled on
+# Kong's request-validator and Envoy's JSON-schema filter: the schema
+# is compiled at config load time, so each request is a cheap
+# dispatch.
+#
+# Only requests whose `Content-Type` matches one of `content_types`
+# (default `application/json`) are validated. Requests of other
+# media types pass through untouched. Empty bodies and non-JSON bodies
+# are rejected.
+#
+# Remote `$ref` resolution is disabled at the workspace level so a
+# malicious schema cannot become an SSRF primitive. The rejection
+# response only includes the validation failure *location* (the JSON
+# path), never the offending value, because the body is attacker-
+# controlled.
+#
+# Run:
+#   make run CONFIG=examples/81-request-validator/sb.yml
+#
+# Test:
+#   # Valid payload - upstream sees it.
+#   curl -i -H 'Host: localhost' -H 'Content-Type: application/json' \
+#        -d '{"name":"alice","age":30}' \
+#        http://127.0.0.1:8080/anything
+#
+#   # Missing required field - rejected with 400.
+#   curl -i -H 'Host: localhost' -H 'Content-Type: application/json' \
+#        -d '{"age":30}' \
+#        http://127.0.0.1:8080/anything
+#
+#   # Non-JSON content type - validator skips, upstream sees it.
+#   curl -i -H 'Host: localhost' -H 'Content-Type: text/plain' \
+#        -d 'plaintext' \
+#        http://127.0.0.1:8080/anything
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "localhost":
+    action:
+      type: proxy
+      url: https://httpbin.org
+    policies:
+      - type: request_validator
+        content_types:
+          - application/json
+        status: 400
+        error_content_type: application/json
+        schema:
+          type: object
+          required:
+            - name
+            - age
+          properties:
+            name:
+              type: string
+              minLength: 1
+              maxLength: 100
+            age:
+              type: integer
+              minimum: 0
+              maximum: 150
+          additionalProperties: false

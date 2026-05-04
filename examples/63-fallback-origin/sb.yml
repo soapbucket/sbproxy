@@ -1,0 +1,53 @@
+# Fallback origin.
+#
+# The primary action proxies to httpbin.org/status/503, which always returns
+# 503 Service Unavailable. When the upstream URL has a path component, the
+# proxy joins it with the request path: a request to `/` here becomes
+# upstream `/status/503`. So drive the test with `/`.
+#
+# The fallback_origin block defines a backup origin that the proxy serves
+# when the primary upstream returns a status listed in `on_status`, or fails
+# at transport level when `on_error: true`.
+#
+# Schema notes:
+#   - `on_status: [...]` triggers the fallback for those upstream codes.
+#   - `on_error: true` triggers the fallback on transport-level upstream failures.
+#   - `origin:` wraps the actual fallback origin spec, including its `action`.
+#   - `add_debug_header` (optional) attaches a debug header that flags the
+#     response as having come from the fallback path.
+#
+# Run:
+#   make run CONFIG=examples/63-fallback-origin/sb.yml
+#
+# Test:
+#   # Primary upstream returns 503. The proxy substitutes the fallback's
+#   # static action: 200 OK with a friendly degraded response.
+#   curl -sv -H 'Host: api.local' http://127.0.0.1:8080/ 2>&1 \
+#     | grep -E '^< HTTP|degraded|temporarily|x-fallback'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://httpbin.org/status/503
+
+    fallback_origin:
+      on_error: true
+      on_status: [502, 503, 504]
+      add_debug_header: true
+      origin:
+        id: degraded-stub
+        hostname: degraded-stub
+        workspace_id: examples
+        version: "1.0.0"
+        action:
+          type: static
+          status: 200
+          content_type: application/json
+          json_body:
+            status: degraded
+            message: "primary upstream temporarily unavailable, serving degraded response"
+            retry_after_secs: 30

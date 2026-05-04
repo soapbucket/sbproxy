@@ -1,0 +1,21 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "ratelimit.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    policies:
+      - type: rate_limiting
+        algorithm: sliding_window
+        requests_per_minute: 3
+        headers:
+          enabled: true
+          include_limit: true
+          include_remaining: true
+          include_reset: true
+          include_retry_after: true
+          reset_format: delta_seconds
+        whitelist:
+          - 192.168.99.99

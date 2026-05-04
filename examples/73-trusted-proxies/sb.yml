@@ -1,0 +1,36 @@
+# Trusted proxy CIDR list.
+#
+# When sbproxy itself sits behind another load balancer or CDN
+# (Cloudflare, AWS ALB, Fly.io edge, internal LB), the immediate TCP
+# peer is that LB - not the real client. The real client IP is in the
+# inbound `X-Forwarded-For` chain. `proxy.trusted_proxies` is the
+# allowlist of source ranges whose forwarding headers the proxy
+# trusts; clients outside that list get their inbound `X-Forwarded-*`,
+# `X-Real-IP`, and `Forwarded` headers stripped on ingress, so
+# they cannot spoof their source identity.
+#
+# IPv6 CIDRs work the same way (e.g. `2001:db8::/32`).
+#
+# Run:
+#   make run CONFIG=examples/73-trusted-proxies/sb.yml
+#
+# Test (from a peer in 10.0.0.0/8 only):
+#   curl -H 'Host: localhost' \
+#        -H 'X-Forwarded-For: 203.0.113.7' \
+#        http://127.0.0.1:8080/headers
+#   # Upstream sees the recovered client IP via X-Forwarded-For
+#   # and X-Real-IP. Connections from outside the trust list have
+#   # the inbound XFF stripped before processing.
+
+proxy:
+  http_bind_port: 8080
+  trusted_proxies:
+    - 127.0.0.1/32
+    - 10.0.0.0/8
+    - 2001:db8::/32
+
+origins:
+  "localhost":
+    action:
+      type: proxy
+      url: https://httpbin.org

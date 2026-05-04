@@ -1,0 +1,39 @@
+# Advanced Lua - request modifier + response modifier + transform chain
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "lua-chain.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - lua_script: |
+          function modify_request(req, ctx)
+            return {
+              set_headers = {
+                ["X-Lua-Stage"] = "request",
+                ["X-Lua-Original-Path"] = req.path
+              }
+            }
+          end
+    response_modifiers:
+      - lua_script: |
+          function modify_response(resp, ctx)
+            return {
+              set_headers = {
+                ["X-Lua-Stage"] = "response",
+                ["X-Lua-Processed"] = "true"
+              }
+            }
+          end
+    transforms:
+      - type: lua_json
+        content_types:
+          - application/json
+        timeout: 200ms
+        lua_script: |
+          function modify_json(data, ctx)
+            data.lua_chain = "request+response+transform"
+            return data
+          end

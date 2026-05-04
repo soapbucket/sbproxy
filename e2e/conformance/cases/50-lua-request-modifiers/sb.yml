@@ -1,0 +1,28 @@
+# Lua scripts in request modifiers - uses modify_request returning a table
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "lua-reqmod.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - lua_script: |
+          function modify_request(req, ctx)
+            local result = {}
+            result.set_headers = {}
+            result.set_headers["X-Lua-Modified"] = "true"
+            result.set_headers["X-Lua-Method"] = req.method
+            result.set_headers["X-Lua-Path"] = req.path
+
+            -- Conditionally add header based on existing header
+            local role = req.headers["x-role"] or ""
+            if role == "admin" then
+              result.set_headers["X-Lua-Is-Admin"] = "true"
+            else
+              result.set_headers["X-Lua-Is-Admin"] = "false"
+            end
+
+            return result
+          end

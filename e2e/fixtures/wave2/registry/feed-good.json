@@ -1,0 +1,51 @@
+{
+  "entries": [
+    {
+      "agent_id": "anthropic-claudebot",
+      "aliases": [],
+      "contact_url": "https://docs.anthropic.com/claudebot",
+      "deprecated": false,
+      "expected_keyids": [],
+      "expected_reverse_dns_suffixes": [
+        ".claudebot.anthropic.com"
+      ],
+      "expected_user_agents": [
+        "(?i)\\bClaudeBot/\\d"
+      ],
+      "flags": [],
+      "purpose": "training",
+      "reputation_score": 92,
+      "robots_compliance_score": 99,
+      "vendor": "Anthropic"
+    },
+    {
+      "agent_id": "openai-gptbot",
+      "aliases": [],
+      "contact_url": "https://platform.openai.com/docs/gptbot",
+      "deprecated": false,
+      "expected_keyids": [],
+      "expected_reverse_dns_suffixes": [
+        ".gptbot.openai.com"
+      ],
+      "expected_user_agents": [
+        "(?i)\\bGPTBot/\\d"
+      ],
+      "flags": [
+        "throttled"
+      ],
+      "purpose": "training",
+      "reputation_score": 87,
+      "robots_compliance_score": 98,
+      "vendor": "OpenAI"
+    }
+  ],
+  "expires_at": "2026-08-01T00:00:00.000Z",
+  "format_version": 1,
+  "generated_at": "2026-05-01T00:00:00.000Z",
+  "issuer": "feed.sbproxy.dev",
+  "signature": {
+    "alg": "ed25519",
+    "kid": "sb-feed-2026-q2",
+    "value": "v8HKvqWE/GxiD8pD3Zrzb/KsG3cqiT0pMlCjhvjCAcX+MLCJNWaoNgo4AFDVxyjUwXzcs9lfmTtIrnZFOy/tCg=="
+  }
+}

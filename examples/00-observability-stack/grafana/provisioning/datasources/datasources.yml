@@ -1,0 +1,39 @@
+apiVersion: 1
+
+# Grafana datasource provisioning for the SBproxy reference stack.
+# All three datasources point at the in-network Compose service names so
+# nothing here needs to change when host ports are remapped.
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s
+      httpMethod: POST
+
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: false
+    jsonData:
+      # Trace-to-logs correlation via Loki. Wave 1 dashboards (B1.6) will
+      # rely on this to jump from a 402 challenge span to the audit-log
+      # entry that recorded it.
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: -1m
+        spanEndTimeShift: 1m
+      serviceMap:
+        datasourceUid: prometheus
+
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false

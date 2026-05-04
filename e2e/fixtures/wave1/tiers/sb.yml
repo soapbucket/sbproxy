@@ -1,0 +1,56 @@
+# Q1.1 fixture: ai_crawl_control with three pricing tiers, two content
+# shapes (HTML and Markdown), and one free-preview window.
+#
+# Schema is from the merged G1.2 implementation in
+# crates/sbproxy-modules/src/policy/ai_crawl.rs:
+#
+#   - tier.route_pattern: literal path or `/prefix/*` for wildcards
+#   - tier.price: { amount_micros, currency }
+#   - tier.content_shape: html | markdown | json | pdf | other (advisory)
+#   - tier.free_preview_bytes: u64 free-preview budget in bytes
+#   - tier.paywall_position: top_of_page | inline | bottom_of_page
+#
+# Tiers are evaluated top to bottom; the first whose route_pattern
+# matches wins. Free-preview is encoded by `free_preview_bytes` on the
+# matched tier (the resolver chooses the tier; the byte budget is just
+# advice surfaced in the challenge body).
+
+proxy:
+  http_bind_port: 0  # overridden by the harness
+
+origins:
+  "blog.localhost":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/html
+      body: "<h1>article</h1>"
+    policies:
+      - type: ai_crawl_control
+        currency: USD
+        # Top-level fallback price (used when no tier matches).
+        price: 0.001
+        tiers:
+          # /preview/* is the free-preview tier; price is zero with a
+          # 4 KiB byte budget.
+          - route_pattern: /preview/*
+            price:
+              amount_micros: 0
+              currency: USD
+            free_preview_bytes: 4096
+          # Markdown shape priced at $0.005.
+          - route_pattern: /*
+            price:
+              amount_micros: 5000
+              currency: USD
+            content_shape: markdown
+          # HTML / default shape priced at $0.001.
+          - route_pattern: /*
+            price:
+              amount_micros: 1000
+              currency: USD
+            content_shape: html
+        valid_tokens:
+          - good-token-1
+          - good-token-2
+          - good-token-3

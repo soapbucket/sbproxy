@@ -1,0 +1,16 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "static.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: application/json
+      json_body:
+        message: "Hello from static"
+        version: "1.0"
+
+  "echo.test":
+    action:
+      type: echo

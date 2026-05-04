@@ -1,0 +1,72 @@
+# sbproxy Docker Compose configuration
+# Demonstrates auto-TLS via the Pebble ACME test server, Redis-backed rate limiting,
+# Prometheus metrics scraping, and OpenTelemetry distributed tracing via Jaeger.
+#
+# Start with: docker compose up
+# See docker/README.md for full testing instructions.
+
+proxy:
+  http_bind_port: 8080
+  https_bind_port: 8443
+
+  # ACME auto-TLS via the Pebble test server running in the same Compose network.
+  # Pebble uses a self-signed CA, so acme_insecure_skip_verify is required for local testing.
+  certificate_settings:
+    use_acme: true
+    acme_email: test@example.com
+    acme_directory_url: https://pebble:14000/dir
+    acme_insecure_skip_verify: true
+    acme_cache_dir: /etc/sbproxy/certs
+
+  logging:
+    format: dev
+
+# Telemetry server exposes a Prometheus-compatible /metrics endpoint.
+# Prometheus scrapes this on port 8888 every 15 seconds (see prometheus.yml).
+telemetry:
+  enabled: true
+  bind_address: "0.0.0.0"
+  bind_port: 8888
+
+# OpenTelemetry tracing sends spans to Jaeger via OTLP/gRPC.
+# View traces at http://localhost:16686 after generating traffic.
+otel:
+  enabled: true
+  otlp_endpoint: jaeger:4317
+  otlp_protocol: grpc
+  otlp_insecure: true
+  service_name: sbproxy
+  sample_rate: 1.0
+
+# Distributed rate limiting counter store backed by Redis.
+# The L2 cache is shared across all sbproxy instances in the Compose network,
+# so rate limit counters are accurate even when running multiple replicas.
+l2_cache_settings:
+  driver: redis
+  params:
+    dsn: redis://redis:6379/0
+
+# Messenger for pub/sub config reloads and event delivery (also uses Redis).
+messenger_settings:
+  driver: redis
+  params:
+    addr: redis:6379
+
+origins:
+  # Example origin: proxies httpbin.org and applies a Redis-backed rate limit.
+  # Test with: curl -H "Host: demo.localhost" http://localhost:8080/get
+  "demo.localhost":
+    action:
+      type: proxy
+      url: https://httpbin.org
+    policies:
+      - type: rate_limit
+        limit: 10
+        window: 1m
+        key: client_ip
+
+  # Echo origin for quick connectivity and header inspection.
+  # Test with: curl -H "Host: echo.localhost" http://localhost:8080/
+  "echo.localhost":
+    action:
+      type: echo

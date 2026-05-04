@@ -1,0 +1,135 @@
+{{- if .Values.installCrds -}}
+# CRDs for the sbproxy OSS operator.
+#
+# Generated from `crates/sbproxy-k8s-operator/src/crd.rs` via:
+#   cargo run -p sbproxy-k8s-operator -- print-crds > deploy/crds/sbproxy.yaml
+# Refresh that file (and copy it back here) whenever the CRD types change.
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sbproxies.sbproxy.dev
+  labels:
+    app.kubernetes.io/name: sbproxy
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  group: sbproxy.dev
+  names:
+    kind: SBProxy
+    plural: sbproxies
+    shortNames:
+      - sbp
+    singular: sbproxy
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          description: A desired sbproxy deployment.
+          type: object
+          required:
+            - spec
+          properties:
+            spec:
+              type: object
+              required:
+                - configRef
+                - image
+              properties:
+                configRef:
+                  type: string
+                  description: Name of an SBProxyConfig in the same namespace.
+                image:
+                  type: string
+                  description: Container image (with tag) for the proxy pod.
+                port:
+                  type: integer
+                  format: int32
+                  default: 8080
+                replicas:
+                  type: integer
+                  format: int32
+                  default: 1
+                resources:
+                  type: object
+                  nullable: true
+                  properties:
+                    requests:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    limits:
+                      type: object
+                      additionalProperties:
+                        type: string
+                adminPort:
+                  type: integer
+                  format: int32
+                  default: 9090
+                  description: Admin server port for /admin/reload. Used by the operator to drive hot-reload over the cluster network.
+                adminAuthSecretRef:
+                  type: object
+                  nullable: true
+                  description: |
+                    Reference to a Kubernetes Secret in the same namespace whose value is
+                    the basic-auth header for /admin/reload. When set, the operator
+                    prefers a hot-reload over a rollout-restart on config changes.
+                  required:
+                    - name
+                  properties:
+                    name:
+                      type: string
+                      description: Secret name in the same namespace as the SBProxy.
+                    key:
+                      type: string
+                      default: authorization
+                      description: Key inside the Secret whose value is the full basic-auth header (e.g. `Basic YWRtaW46c2VjcmV0`).
+            status:
+              type: object
+              nullable: true
+              properties:
+                configHash:
+                  type: string
+                lastError:
+                  type: string
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sbproxyconfigs.sbproxy.dev
+  labels:
+    app.kubernetes.io/name: sbproxy
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  group: sbproxy.dev
+  names:
+    kind: SBProxyConfig
+    plural: sbproxyconfigs
+    shortNames:
+      - sbpc
+    singular: sbproxyconfig
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          description: A versioned sb.yml document mounted by an SBProxy.
+          type: object
+          required:
+            - spec
+          properties:
+            spec:
+              type: object
+              required:
+                - config
+              properties:
+                config:
+                  type: string
+                  description: The full sb.yml document as a YAML string.
+{{- end }}

@@ -1,0 +1,13 @@
+# Traffic mirroring (shadow) - primary proxy with shadow copy
+# Shadow is fire-and-forget; only primary response is returned
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "mirror.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888/echo
+      shadow:
+        url: http://127.0.0.1:18888/echo?shadow=true
+        sample_rate: 1.0

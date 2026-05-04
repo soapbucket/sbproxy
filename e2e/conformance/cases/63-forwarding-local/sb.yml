@@ -1,0 +1,56 @@
+# Forward rules using local callback server (avoids remote backend issues)
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "fwdlocal.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888/echo
+
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /api/
+        origin:
+          id: api-route
+          hostname: api-route
+          workspace_id: test
+          version: "1.0.0"
+          action:
+            type: proxy
+            url: http://127.0.0.1:18888/echo
+          request_modifiers:
+            - headers:
+                set:
+                  X-Routed-To: api-backend
+
+      - rules:
+          - path:
+              exact: /status
+        origin:
+          id: status-static
+          hostname: status-static
+          workspace_id: test
+          version: "1.0.0"
+          action:
+            type: static
+            status_code: 200
+            content_type: application/json
+            json_body:
+              status: healthy
+              service: sbproxy-e2e
+
+      - rules:
+          - path:
+              prefix: /redirect/
+        origin:
+          id: redirect-rule
+          hostname: redirect-rule
+          workspace_id: test
+          version: "1.0.0"
+          action:
+            type: redirect
+            url: http://127.0.0.1:18888/echo
+            status_code: 302
+            preserve_query: true

@@ -1,0 +1,23 @@
+# Tests basic request/response header modifiers using verified struct format
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "modifiers.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - headers:
+          set:
+            X-Forwarded-By: sbproxy
+            X-Custom-Injected: hello-from-proxy
+          delete:
+            - X-Remove-Me
+    response_modifiers:
+      - headers:
+          set:
+            X-Powered-By: sbproxy-test
+            X-Response-Modified: "true"
+          delete:
+            - Server

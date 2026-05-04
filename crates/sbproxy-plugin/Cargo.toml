@@ -1,0 +1,17 @@
+[package]
+name = "sbproxy-plugin"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+inventory = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+compact_str = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

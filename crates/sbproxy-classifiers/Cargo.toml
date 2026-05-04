@@ -1,0 +1,37 @@
+[package]
+name = "sbproxy-classifiers"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "Pure-Rust ONNX inference + tokenizer wrapper for sbproxy detectors."
+
+[dependencies]
+# Pure-Rust ONNX runtime. Avoids the C++ ONNX Runtime + system libs that
+# `ort` would pull in, which is critical for cross-compile and for
+# building on hosts without onnxruntime installed.
+tract-onnx = "0.21"
+# Hugging Face tokenizers. Pure Rust, supports BPE / WordPiece / etc.
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+
+# Cross-platform cache directory resolution. `dirs` is lighter than
+# `directories` (no extension-name machinery); we only need a cache
+# folder per user.
+dirs = "5"
+
+reqwest = { workspace = true, features = ["blocking"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+# Agent-class taxonomy (G1.1): regex compilation + YAML loader for the
+# embedded vendor catalog. `serde_yaml` is the workspace-aliased
+# `yaml_serde` fork; `serde_json` powers the `AgentPurpose` serialiser
+# tests and the public JSON-shaped wire format.
+regex = { workspace = true }
+serde_yaml = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

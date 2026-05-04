@@ -1,0 +1,35 @@
+# JSON projection transform (whitelist mode).
+#
+# Whitelists `id` and `title` from the upstream JSON and drops everything
+# else. Same shape used by GraphQL field selection or sparse fieldsets.
+# A self-contained `static` action seeds a four-field document so the
+# example runs offline.
+#
+# Run:
+#   make run CONFIG=examples/41-transform-json-projection/sb.yml
+#
+# Test:
+#   curl -s -H 'Host: project.local' http://127.0.0.1:8080/posts/1
+#
+# Expected (only id and title survive):
+#   {"id":1,"title":"first post"}
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "project.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        userId: 1
+        id: 1
+        title: "first post"
+        body: "the body is dropped by the projection"
+    transforms:
+      - type: json_projection
+        fields:
+          - id
+          - title

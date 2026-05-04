@@ -1,0 +1,77 @@
+# Stack for the 33-quote-token-replay-jwks example.
+#
+# Services:
+#
+#   sbproxy                  - the gateway, mounts ./sb.yml on :8080
+#                              and exposes the admin port on :9090
+#                              for the JWKS document.
+#   mock-x402-facilitator    - reused from example 30.
+#   mock-origin              - article server.
+#
+# Bring up:    docker compose up -d --wait
+# Tear down:   docker compose down -v
+
+services:
+
+  # --- sbproxy data plane + admin ---
+  sbproxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cloudbuild
+    image: sbproxy:33-jwks
+    container_name: sbproxy_33_jwks
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    ports:
+      - "8080:8080"
+      # Admin port carries the JWKS document. Demo basic-auth creds
+      # in sb.yml; the JWKS path itself is unauthenticated.
+      - "9090:9090"
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    environment:
+      - SB_LOG_LEVEL=info
+    depends_on:
+      mock-x402-facilitator:
+        condition: service_healthy
+      mock-origin:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - jwkssb
+
+  # --- Mock x402 facilitator (reused from example 30) ---
+  mock-x402-facilitator:
+    image: nginx:1.27.3-alpine
+    container_name: sbproxy_33_jwks_facilitator
+    volumes:
+      - ../30-rail-x402-base-sepolia/mock-x402-facilitator/default.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost/__health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - jwkssb
+
+  # --- Mock origin ---
+  mock-origin:
+    image: nginx:1.27.3-alpine
+    container_name: sbproxy_33_jwks_origin
+    volumes:
+      - ./mock-origin/default.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost/__health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - jwkssb
+
+networks:
+  jwkssb:
+    driver: bridge

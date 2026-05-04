@@ -1,0 +1,142 @@
+# Kind-based smoke test for the sbproxy OSS Kubernetes operator.
+#
+# Builds the proxy + operator release binaries on the host, packages each
+# into a tiny distroless image, loads them into a kind cluster, helm-installs
+# the chart, and runs deploy/helm/sbproxy/test/smoke.sh end to end.
+#
+# Triggers only on changes that could break the kind path so we do not
+# spend ~25 min per PR on unrelated edits. The path filter intentionally
+# does NOT include general `crates/sbproxy/**` because most proxy edits
+# do not change the operator surface; if a proxy change touches the
+# Helm chart or Dockerfile, the corresponding path entry below catches
+# it and re-runs this lane.
+#
+# ## Graduation rule
+#
+# This lane is informational (`continue-on-error: true`) until BOTH:
+#
+#   1. Three consecutive green runs land on PRs that touch the watched
+#      paths above, AND
+#   2. The Fail-7 acceptance items in `docs/CI.md` are closed (Pebble
+#      pinning, release-slug fix, e2e quarantine).
+#
+# When both gates are met, flip `continue-on-error` to `false` and add
+# this job to the required PR check set in branch protection. Until
+# then, treat failures as advisory: investigate, but do not block the
+# PR on a single flaky kind run.
+
+name: k8s-operator-smoke
+
+on:
+  pull_request:
+    paths:
+      - 'crates/sbproxy-k8s-operator/**'
+      - 'deploy/helm/sbproxy/**'
+      - '.github/workflows/k8s-operator-smoke.yml'
+      - 'Dockerfile.ci'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  k8s-operator-smoke:
+    name: k8s-operator-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # NOTE: temporary while the workflow stabilises. Flip to false once we
+    # have a green streak. See workflow header comment.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      # Free up disk space on the runner. The full release build for the
+      # workspace plus a kind cluster plus two docker images can blow past
+      # the default 14 GB free on `ubuntu-latest`. Mirrors the step the main
+      # ci.yml uses for the same reason.
+      - name: free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
+
+      # `large-packages: true` above removes the clang resource dir
+      # (`/usr/lib/clang/18/include`), which holds `stdbool.h` etc.
+      # `rquickjs-sys` runs `bindgen` over `quickjs.h` during the proxy
+      # build and falls over with a "fatal error: 'stdbool.h' file not
+      # found" if those headers are missing. Re-install the dev package
+      # to put them back. Costs ~120 MB.
+      - name: restore libclang dev headers
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libclang-18-dev clang-18 libc6-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: k8s-smoke
+
+      - name: build operator + proxy release binaries
+        run: |
+          set -euo pipefail
+          cargo build --release -p sbproxy-k8s-operator -p sbproxy --locked
+          test -x target/release/sbproxy
+          test -x target/release/sbproxy-k8s-operator
+
+      - name: build CI docker images
+        run: |
+          set -euo pipefail
+          docker build -t sbproxy:ci -f Dockerfile.ci .
+          docker build -t sbproxy-operator:ci \
+            -f crates/sbproxy-k8s-operator/Dockerfile.ci .
+
+      - name: create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: sbproxy-smoke
+          # Pin a known-good kind / kindest/node combo so a kind release
+          # surprise does not turn into a PR break.
+          version: v0.24.0
+          node_image: kindest/node:v1.30.0
+
+      - name: load images into kind
+        run: |
+          set -euo pipefail
+          kind load docker-image sbproxy:ci sbproxy-operator:ci \
+            --name sbproxy-smoke
+
+      - name: helm install + smoke
+        env:
+          # Tell the smoke script the cluster is already up so it does not
+          # try to recreate it.
+          SKIP_KIND_CREATE: "1"
+          NO_CLEANUP: "1"
+          PROXY_IMAGE: sbproxy:ci
+          OPERATOR_IMAGE: sbproxy-operator:ci
+        run: bash deploy/helm/sbproxy/test/smoke.sh
+
+      - name: dump diagnostics on failure
+        if: failure()
+        run: |
+          set +e
+          kubectl get nodes -o wide || true
+          kubectl get pods -A -o wide || true
+          kubectl get sbproxy,sbproxyconfig -A || true
+          kubectl get lease -A || true
+          kubectl describe deployment sbproxy-k8s-operator -n sbproxy-system || true
+          kubectl describe deployment demo-proxy -n default || true
+          kubectl logs -n sbproxy-system -l app.kubernetes.io/component=operator --all-containers --tail=200 || true
+          kubectl logs -n default -l app.kubernetes.io/instance=demo --all-containers --tail=200 || true

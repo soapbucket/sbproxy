@@ -1,0 +1,42 @@
+[package]
+name = "sbproxy-platform"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[features]
+default = ["redb-store", "sqlite-store"]
+redb-store = ["dep:redb"]
+sqlite-store = ["dep:rusqlite"]
+postgres-store = ["dep:postgres"]
+
+[dependencies]
+sbproxy-plugin.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+base64.workspace = true
+dashmap.workspace = true
+
+# Blocking HTTP client for SQS and GCP Pub/Sub backends
+ureq = { version = "2", features = ["json"] }
+
+# Async runtime bridge. `rt` supports spawn_blocking for sync backends;
+# `macros`+`net` are required by the async Redis client (AsyncRedisKVStore).
+tokio = { workspace = true, features = ["rt", "macros", "sync", "net"] }
+# Async Redis client for AsyncRedisKVStore. `default-features = false`
+# drops the TLS/native-client stack we don't need here.
+redis = { version = "0.25", default-features = false, features = ["tokio-comp"] }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+# Optional storage backends
+redb = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+postgres = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"

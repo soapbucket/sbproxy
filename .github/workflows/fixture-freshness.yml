@@ -1,0 +1,90 @@
+# Fixture freshness gate (Q2.13).
+#
+# Runs the fixture-refresh tool and asserts the resulting tree is
+# identical to what is checked in. A red signal here means either:
+#
+# - A developer changed `test/fixtures/refresh-tool/src/main.rs` (or
+#   one of the seed files) without rerunning `test/fixtures/refresh.sh`
+#   and committing the regenerated outputs.
+# - A non-determinism crept into the regenerator (timestamp drift,
+#   key randomness, JCS escaping bug).
+#
+# Either case wants a human eyeball before the change merges.
+#
+# Triggers on PRs that touch the fixture inputs or the regenerator
+# itself; main-branch pushes also run for the regression-floor.
+
+name: fixture-freshness
+
+on:
+  pull_request:
+    paths:
+      - 'test/fixtures/**'
+      - 'e2e/fixtures/**'
+      - '.github/workflows/fixture-freshness.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'test/fixtures/**'
+      - 'e2e/fixtures/**'
+      - '.github/workflows/fixture-freshness.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  fixture-freshness:
+    name: regen + diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4.1.7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Cache only the standalone tool's target dir; the parent
+      # workspace's cache is owned by other workflows.
+      - uses: Swatinem/rust-cache@v2.7.3
+        with:
+          shared-key: fixture-freshness
+          workspaces: test/fixtures/refresh-tool
+
+      - name: bash syntax check
+        run: bash -n test/fixtures/refresh.sh
+
+      - name: regenerate fixtures
+        run: bash test/fixtures/refresh.sh
+
+      - name: assert no diff
+        # If the regenerator produced different bytes than what is
+        # checked in, this fails with the diff visible in the log.
+        # A green run guarantees the fixtures match the seeds and
+        # the regenerator is deterministic.
+        run: |
+          if ! git diff --exit-code test/fixtures/ e2e/fixtures/; then
+            echo ""
+            echo "::error::Fixture-refresh produced different bytes than what is checked in."
+            echo "::error::Run 'bash test/fixtures/refresh.sh' locally and commit the diff."
+            exit 1
+          fi
+
+      - name: idempotence check
+        # Running the script a second time should also be a no-op.
+        # This catches a class of non-determinism bugs where the
+        # first run produces stable output but follow-up runs flap
+        # (e.g. ordering driven by a HashMap iteration order).
+        run: |
+          bash test/fixtures/refresh.sh
+          git diff --exit-code test/fixtures/ e2e/fixtures/

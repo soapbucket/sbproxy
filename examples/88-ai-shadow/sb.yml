@@ -1,0 +1,53 @@
+# AI shadow / side-by-side evaluation.
+#
+# Each request is forwarded to the primary provider as usual; a copy
+# is also sent to the shadow provider concurrently. The shadow
+# response is drained and never reaches the client; metadata is
+# logged at `target=sbproxy_ai_shadow` so it can be filtered into a
+# dedicated stream:
+#
+#   {provider, status, latency_ms, prompt_tokens, completion_tokens, finish_reason}
+#
+# Useful for:
+#   * Validating a model swap before flipping primary traffic.
+#   * Comparing finish_reason / token counts across providers.
+#   * Spot-checking guardrail or routing changes without exposing
+#     experimental output to users.
+#
+# `sample_rate: 0.1` mirrors 10% of traffic. Set to 1.0 to mirror
+# every request (doubles spend on the shadow leg).
+#
+# Run:
+#   export OPENAI_API_KEY=sk-...
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   make run CONFIG=examples/88-ai-shadow/sb.yml
+#
+# Test:
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"What is 2+2?"}]}'
+#
+# Then watch the proxy logs for `shadow response` events.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing:
+        strategy: round_robin
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          default_model: claude-3-5-haiku-latest
+      shadow:
+        provider: anthropic
+        sample_rate: 0.1
+        timeout_ms: 30000
+        # model: claude-3-5-haiku-latest   # uncomment to override

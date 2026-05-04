@@ -1,0 +1,23 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "feature_endpoints": [
+    "/.well-known/tdmrep.json",
+    "/licenses.xml",
+    "/robots.txt"
+  ],
+  "audit_check": false,
+  "_notes": [
+    "feature_endpoints[] holds GETs the runner asserts return 2xx.",
+    "The three projection paths are served by the proxy itself off the",
+    "in-memory projection cache, with no Host header or User-Agent",
+    "filtering. They are safe to assert as 2xx for any caller.",
+    "",
+    "The smoke runner does not currently parse the body, so XSD / JSON",
+    "schema validation is wired into the licensing-conformance CI",
+    "workflow (B4.5) instead.",
+    "",
+    "audit_check stays false until the OSS audit endpoint lands."
+  ]
+}

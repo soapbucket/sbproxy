@@ -1,0 +1,86 @@
+# 33 - quote-token-replay-jwks
+#
+# Demonstrates quote-token verification end-to-end:
+#   * The admin JWKS endpoint at /.well-known/sbproxy/quote-keys.json
+#   * A 402 multi-rail response carrying a quote-token JWS.
+#   * Single-use enforcement: redeeming the same token twice returns 409.
+#
+# The proxy enables its admin listener on :9090 so the JWKS document
+# is reachable from outside the docker network. The JWKS path itself
+# is unauthenticated (the keys are public); other admin routes still
+# require basic auth.
+#
+# Run:
+#   cd examples/33-quote-token-replay-jwks
+#   docker compose up -d --wait
+#
+# Probe:
+#   ./verify-quote.sh   # walks the full JWKS + 402 + verify flow
+#
+# Tear down:
+#   docker compose down -v
+
+proxy:
+  http_bind_port: 8080
+  # The JWKS endpoint lives on the admin listener; we enable it here
+  # so the example can demonstrate the JWKS document end-to-end.
+  # Basic-auth credentials are demo-only; rotate before exposing the
+  # admin port outside a trusted network.
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: changeme
+
+origins:
+  "blog.test.sbproxy.dev":
+    action:
+      type: proxy
+      url: http://mock-origin:80
+
+    policies:
+      - type: ai_crawl_control
+        price: 0.001
+        currency: USD
+        header: crawler-payment
+
+        crawler_user_agents:
+          - GPTBot
+          - ChatGPT-User
+          - ClaudeBot
+          - anthropic-ai
+          - CCBot
+          - PerplexityBot
+          - Google-Extended
+
+        tiers:
+          - route_pattern: /article*
+            price:
+              amount_micros: 1000
+              currency: USD
+            content_shape: html
+            paywall_position: top_of_page
+
+        # x402-only here so the verify-quote.sh helper has a single
+        # rail entry to pull a token from. The JWKS, signing, and
+        # nonce-store mechanics are identical regardless of which
+        # rails are configured.
+        rails:
+          x402:
+            chain: base
+            facilitator: http://mock-x402-facilitator:80
+            asset: USDC
+            pay_to: "0x0000000000000000000000000000000000000000"
+            version: "2"
+
+        quote_token:
+          # The kid lands in every JWS header AND every JWKS entry
+          # the admin endpoint publishes.
+          key_id: replay-demo-2026
+          # Demo seed only. Production deployments source from an env
+          # var via `secret_ref:`.
+          seed_hex: "4444444444444444444444444444444444444444444444444444444444444444"
+          issuer: "https://blog.test.sbproxy.dev"
+          # Five-minute TTL per A3.2 default. The verifier refuses
+          # tokens past `exp`; cooperative agents redeem promptly.
+          default_ttl_seconds: 300

@@ -1,0 +1,90 @@
+# Stack for the `24-ai-crawl-tiered` example. Three containers on
+# one bridge network:
+#
+#   sbproxy      - the gateway, mounts ./sb.yml read-only on :8080
+#   mock-ledger  - nginx returning a fixed redeem JSON on POST
+#                  /v1/ledger/redeem
+#   mock-origin  - nginx serving three article shapes (preview HTML,
+#                  feed Markdown, full HTML)
+#
+# Image tags are pinned to specific versions so a `:latest` rebase
+# upstream cannot change CI behavior. Bump deliberately.
+#
+# Bring up:    docker compose up -d --wait
+# Validate:    docker compose config
+# Tear down:   docker compose down -v
+
+services:
+
+  # --- sbproxy data plane ---
+  #
+  # Builds the proxy from the workspace source. Cloud Build's variant
+  # (`Dockerfile.cloudbuild`) is the reference Dockerfile; it builds a
+  # release binary and wraps it in distroless/cc-debian12. Operators
+  # who want to pin a specific release can swap `build:` for
+  # `image: ghcr.io/soapbucket/sbproxy:<tag>` once a public image tag
+  # is available.
+  sbproxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cloudbuild
+    image: sbproxy:24-ai-crawl-tiered
+    container_name: sbproxy_24_tiered
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    environment:
+      - SB_LOG_LEVEL=info
+    depends_on:
+      mock-ledger:
+        condition: service_healthy
+      mock-origin:
+        condition: service_healthy
+    healthcheck:
+      # The proxy data plane exposes `/health` on its main listener.
+      # `/healthz` (and `/readyz`) live on the admin port (default
+      # 9090), which this example does not enable; using `/health`
+      # keeps the example self-contained. wget-spider returns 0 only
+      # on 2xx. The proxy serves /health unconditionally regardless
+      # of Host header.
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - tieredsb
+
+  # --- Mock HTTP ledger ---
+  mock-ledger:
+    image: nginx:1.27.3-alpine
+    container_name: sbproxy_24_tiered_ledger
+    volumes:
+      - ./mock-ledger/default.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost/__ledger_health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - tieredsb
+
+  # --- Mock origin (article server) ---
+  mock-origin:
+    image: nginx:1.27.3-alpine
+    container_name: sbproxy_24_tiered_origin
+    volumes:
+      - ./mock-origin/default.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost/__origin_health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - tieredsb
+
+networks:
+  tieredsb:
+    driver: bridge

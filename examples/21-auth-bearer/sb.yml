@@ -1,0 +1,33 @@
+# Bearer token authentication.
+#
+# Accepts a fixed list of opaque service tokens in the Authorization header.
+# Pick this when your callers are services that already manage shared tokens
+# and you do not need the full JWT validation surface. Bad or missing tokens
+# get a 401 before httpbin.org is contacted.
+#
+# Run:
+#   make run CONFIG=examples/21-auth-bearer/sb.yml
+#
+# Test:
+#   # 401 - no token
+#   curl -i -H 'Host: bearer.local' http://127.0.0.1:8080/get
+#
+#   # 200 - valid token
+#   curl -i -H 'Host: bearer.local' \
+#        -H 'Authorization: Bearer svc-token-alpha' \
+#        http://127.0.0.1:8080/get
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "bearer.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    authentication:
+      type: bearer
+      tokens:
+        - svc-token-alpha
+        - svc-token-beta

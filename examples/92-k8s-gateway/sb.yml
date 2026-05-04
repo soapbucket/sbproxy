@@ -1,0 +1,88 @@
+# Kubernetes gateway pattern.
+#
+# Realistic config when sbproxy runs behind a K8s Ingress (or any
+# cluster-edge LB) and proxies to backend Pods that scale up/down
+# independently. Each piece addresses a specific failure mode of
+# this topology:
+#
+#   * trusted_proxies      - the immediate TCP peer is the Ingress
+#                            controller, not the real client. Honour
+#                            its X-Forwarded-For so rate limits and
+#                            audit logs see the right IP, but reject
+#                            spoofed XFF from any other source.
+#
+#   * service_discovery    - K8s `Service` endpoints rotate as Pods
+#                            scale. Re-resolve every refresh_secs and
+#                            round-robin the current IP set; the SNI
+#                            stays the Service hostname so TLS still
+#                            matches the cert.
+#
+#   * host_override        - upstream Pods route by Host header for
+#                            multi-tenant or vhost-based dispatch.
+#                            Send the Service hostname rather than the
+#                            client's public Host.
+#
+#   * correlation_id       - thread X-Request-Id through the proxy,
+#                            upstream, response, and webhooks so trace
+#                            IDs survive the cluster boundary.
+#
+#   * concurrent_limit     - protect upstream Pods from overload when
+#                            a slow path piles up faster than it
+#                            drains. Per-IP keying preserves headroom
+#                            for other clients during a thundering
+#                            herd from one source.
+#
+#   * forwarding headers   - default-on, but explicit here so the
+#                            shape is visible. The upstream sees
+#                            X-Forwarded-For, X-Real-IP, RFC 7239
+#                            Forwarded, etc. Suppress per-header with
+#                            disable_*_header on the proxy action.
+#
+# Run:
+#   make run CONFIG=examples/92-k8s-gateway/sb.yml
+#
+# Test (simulating the Ingress in front, IP 10.0.0.5):
+#   curl -H 'Host: api.example.com' \
+#        -H 'X-Forwarded-For: 203.0.113.7' \
+#        http://127.0.0.1:8080/headers
+#   # Upstream sees X-Forwarded-For: 203.0.113.7 (recovered) and
+#   # X-Request-Id: <uuid>. Echoed in the response.
+
+proxy:
+  http_bind_port: 8080
+
+  # Honour XFF only from cluster-internal source ranges. Anything
+  # else has its inbound forwarding headers stripped on ingress.
+  trusted_proxies:
+    - 10.0.0.0/8       # K8s Pod CIDR
+    - 172.16.0.0/12    # K8s Service CIDR
+    - 127.0.0.1/32     # localhost for local testing
+
+  correlation_id:
+    enabled: true
+    header: X-Request-Id
+    echo_response: true
+
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      # In production this is the K8s Service DNS name:
+      # url: http://backend.namespace.svc.cluster.local:8080
+      url: https://httpbin.org
+      host_override: backend.namespace.svc.cluster.local
+      service_discovery:
+        enabled: true
+        refresh_secs: 30
+        ipv6: true
+      retry:
+        max_attempts: 3
+        retry_on: [connect_error, timeout]
+        backoff_ms: 100
+
+    policies:
+      - type: concurrent_limit
+        max: 100
+        key: ip
+        status: 503
+        error_body: '{"error":"too many concurrent requests"}'

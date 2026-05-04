@@ -1,0 +1,45 @@
+# Concurrent connection limiter.
+#
+# Caps in-flight requests per key. Distinct from `rate_limiting`,
+# which throttles requests-per-second. Concurrent limits protect
+# backends with low concurrency budgets:
+#   * Legacy SOAP services that handle 4 sessions before serializing
+#   * Database-bound endpoints that need to limit pool exhaustion
+#   * GPU inference workers with a fixed slot count
+#   * Any backend where slow requests pile up faster than they drain
+#
+# Each accepted request takes a permit; the permit is released when
+# the request finishes (success, error, or client disconnect). When
+# `max` permits are already issued for a given key, new requests are
+# rejected with `status` (default 503) and the configured error body.
+#
+# Key strategies:
+#   * `origin` (default) - one global counter for this route
+#   * `ip`               - per-client-IP counter
+#   * `api_key`          - per-`X-Api-Key` (or Bearer token) counter
+#
+# Run:
+#   make run CONFIG=examples/82-concurrent-limit/sb.yml
+#
+# Test:
+#   # Open 5 slow requests in parallel; the 4th and 5th get 503.
+#   for i in 1 2 3 4 5; do
+#     curl -s -o /dev/null -w "%{http_code}\n" \
+#       -H 'Host: localhost' http://127.0.0.1:8080/delay/3 &
+#   done
+#   wait
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "localhost":
+    action:
+      type: proxy
+      url: https://httpbin.org
+    policies:
+      - type: concurrent_limit
+        max: 3
+        key: ip          # one counter per client IP; use 'origin' for global
+        status: 503
+        error_body: '{"error":"too many concurrent requests, retry shortly"}'

@@ -1,0 +1,20 @@
+# Sample SBProxyConfig.
+#
+# `spec.config` is a full sb.yml document. This example mocks a single origin
+# that returns a static response so the smoke test does not need a real
+# upstream service.
+apiVersion: sbproxy.dev/v1alpha1
+kind: SBProxyConfig
+metadata:
+  name: demo-config
+  namespace: default
+spec:
+  config: |
+    origins:
+      - host: "*"
+        action:
+          type: mock
+          status: 200
+          headers:
+            content-type: text/plain
+          body: "hello from sbproxy\n"

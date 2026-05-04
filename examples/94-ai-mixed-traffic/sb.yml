@@ -1,0 +1,109 @@
+# Mixed AI and non-AI traffic on a single hostname.
+#
+# Pure AI gateway libraries assume the host is "the AI gateway" and
+# everything that lands on it should hit a model. A real proxy can do
+# more: serve health checks, model catalog overrides, and SDK
+# probe endpoints alongside live AI traffic without spinning up a
+# second host or a sidecar.
+#
+# Path routing uses `forward_rules` evaluated in order. The default
+# `action` at the origin level is the AI proxy; specific paths peel
+# off into static, proxy, or other actions before they ever reach
+# the AI handler.
+#
+#   /healthz       -> static 200 (used by load balancers and uptime
+#                     probes; intentionally cheap, never bills tokens)
+#   /v1/models     -> static catalog override, lets a client see the
+#                     curated list this gateway exposes regardless of
+#                     each provider's full inventory
+#   /docs/*        -> proxy to a docs backend (private API reference)
+#   anything else  -> the AI proxy default action (chat completions,
+#                     embeddings, etc.)
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#
+# Run:
+#   make run CONFIG=examples/94-ai-mixed-traffic/sb.yml
+#
+# Test:
+#   # Cheap health probe; no AI provider contacted.
+#   curl -s -H 'Host: ai.local' http://127.0.0.1:8080/healthz
+#
+#   # Curated model list.
+#   curl -s -H 'Host: ai.local' http://127.0.0.1:8080/v1/models
+#
+#   # Docs passthrough.
+#   curl -s -H 'Host: ai.local' http://127.0.0.1:8080/docs/index.html
+#
+#   # Real AI call.
+#   curl -s -H 'Host: ai.local' \
+#        -H 'Content-Type: application/json' \
+#        -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}' \
+#        http://127.0.0.1:8080/v1/chat/completions
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    # Default action: AI proxy. Anything that doesn't match a
+    # forward_rule below ends up here.
+    action:
+      type: ai_proxy
+      routing: round_robin
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+
+    forward_rules:
+      # /healthz: cheap static OK so probes don't bill model tokens.
+      - rules:
+          - path:
+              prefix: /healthz
+        origin:
+          id: ai-health
+          hostname: ai-health
+          workspace_id: examples
+          version: "1.0.0"
+          action:
+            type: static
+            status: 200
+            content_type: application/json
+            json_body:
+              status: ok
+
+      # Curated /v1/models response. Skips the upstream so the gateway
+      # surfaces only the models actually wired here.
+      - rules:
+          - path:
+              exact: /v1/models
+        origin:
+          id: ai-models-catalog
+          hostname: ai-models-catalog
+          workspace_id: examples
+          version: "1.0.0"
+          action:
+            type: static
+            status: 200
+            content_type: application/json
+            json_body:
+              object: list
+              data:
+                - id: gpt-4o-mini
+                  object: model
+                  owned_by: openai
+
+      # Reverse-proxy a docs site behind the same hostname.
+      - rules:
+          - path:
+              prefix: /docs/
+        origin:
+          id: ai-docs
+          hostname: ai-docs
+          workspace_id: examples
+          version: "1.0.0"
+          action:
+            type: proxy
+            url: https://example.com

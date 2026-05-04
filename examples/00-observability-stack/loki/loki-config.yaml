@@ -1,0 +1,50 @@
+# Loki single-binary config for the SBproxy reference stack.
+#
+# Filesystem-backed, single-tenant (auth_enabled: false). Suitable for
+# evaluators, the operator runbook, and the examples-in-CI smoke lane.
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: info
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+# Keep the resource footprint tiny on a laptop. Production tenants live
+# in a different config; this one only has to make `docker compose up`
+# pass and serve a few demo log lines.
+limits_config:
+  retention_period: 24h
+  reject_old_samples: true
+  reject_old_samples_max_age: 1h
+  ingestion_rate_mb: 8
+  ingestion_burst_size_mb: 16
+  allow_structured_metadata: true
+
+ruler:
+  alertmanager_url: ""
+
+analytics:
+  reporting_enabled: false

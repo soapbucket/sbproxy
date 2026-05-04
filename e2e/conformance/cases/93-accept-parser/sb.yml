@@ -1,0 +1,16 @@
+# 93 - Accept Parser: content-negotiated error pages for unknown hosts
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "acceptparse.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    error_pages:
+      - status: [404]
+        content_type: application/json
+        body: '{"error":"not found","code":404}'
+      - status: [404]
+        content_type: text/html
+        body: "<html><body><h1>404 Not Found</h1></body></html>"

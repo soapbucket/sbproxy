@@ -1,0 +1,19 @@
+# Lua scripts in response modifiers - uses modify_response returning a table
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "lua-respmod.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    response_modifiers:
+      - lua_script: |
+          function modify_response(resp, ctx)
+            return {
+              set_headers = {
+                ["X-Lua-Response-Modified"] = "true",
+                ["X-Lua-Status"] = tostring(resp.status_code)
+              }
+            }
+          end

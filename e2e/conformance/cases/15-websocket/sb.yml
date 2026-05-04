@@ -1,0 +1,12 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "ws.test":
+    action:
+      type: websocket
+      url: wss://echo.websocket.org
+      ping_interval: 30s
+      pong_timeout: 10s
+      handshake_timeout: 10s
+      check_origin: false

@@ -1,0 +1,16 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "ddos.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    policies:
+      - type: ddos_protection
+        detection:
+          request_rate_threshold: 10
+          detection_window: 5s
+        mitigation:
+          block_duration: 10s
+          auto_block: true

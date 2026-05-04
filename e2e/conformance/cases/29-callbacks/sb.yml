@@ -1,0 +1,20 @@
+# Tests on_request and on_response callbacks hitting local Node server
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "callbacks.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    on_request:
+      - url: http://127.0.0.1:18888/callback/on-request
+        method: POST
+        timeout: 5
+        on_error: ignore
+    on_response:
+      - url: http://127.0.0.1:18888/callback/on-response
+        method: POST
+        timeout: 5
+        async: true
+        on_error: ignore

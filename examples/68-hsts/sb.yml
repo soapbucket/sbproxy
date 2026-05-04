@@ -1,0 +1,30 @@
+# HSTS (Strict-Transport-Security).
+#
+# The hsts block injects a `Strict-Transport-Security` response header on
+# every response from this origin. Browsers honor HSTS only over HTTPS, but
+# the header is emitted regardless of scheme so you can verify it on plain
+# HTTP locally.
+#
+# Run:
+#   make run CONFIG=examples/68-hsts/sb.yml
+#
+# Test:
+#   curl -sv -H 'Host: secure.local' http://127.0.0.1:8080/get 2>&1 \
+#     | grep -i 'strict-transport-security'
+#
+#   # Expected:
+#   # < strict-transport-security: max-age=31536000; includeSubDomains; preload
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "secure.local":
+    hsts:
+      max_age: 31536000
+      include_subdomains: true
+      preload: true
+
+    action:
+      type: proxy
+      url: https://httpbin.org

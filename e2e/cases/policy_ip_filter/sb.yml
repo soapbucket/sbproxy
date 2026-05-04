@@ -1,0 +1,26 @@
+# Reference fixture for the policy_ip_filter E2E suite.
+#
+# Tests connect from 127.0.0.1, so the loopback CIDR is in
+# `proxy.trusted_proxies`. That makes the proxy honour the
+# `X-Forwarded-For` header set by the test harness as the real
+# client IP for policy evaluation.
+
+proxy:
+  http_bind_port: 0
+  trusted_proxies:
+    - 127.0.0.1/32
+
+origins:
+  "ipfilter.localhost":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: ip_filter
+        whitelist:
+          - 10.0.0.0/8
+          - 192.168.5.42/32
+        blacklist:
+          - 203.0.113.0/24

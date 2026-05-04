@@ -1,0 +1,48 @@
+# Active health checks for load balancer targets.
+#
+# Each target with a `health_check` block gets a background probe
+# loop. Every `interval_secs` (the probe period), the proxy GETs the
+# probe URL and tracks consecutive success/failure counts:
+#   * `unhealthy_threshold` failures in a row marks the target unhealthy.
+#   * `healthy_threshold` successes in a row brings it back.
+#
+# Unhealthy targets are excluded from `select_target` until they
+# recover. Probe results also feed the outlier detector when one is
+# configured (so passive and active signals share state).
+#
+# IPv6 targets work too: `http://[2001:db8::1]:8080`. The probe URL
+# builder preserves bracketing.
+#
+# Run:
+#   make run CONFIG=examples/77-active-health-checks/sb.yml
+#
+# Test:
+#   curl -H 'Host: localhost' http://127.0.0.1:8080/get
+#   # While both targets respond 2xx on /healthz, traffic alternates
+#   # between them. Take one down: after 3 consecutive failed probes
+#   # (~30s with the defaults) it is excluded; bring it back, after
+#   # 2 consecutive 2xx probes it returns to rotation.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "localhost":
+    action:
+      type: load_balancer
+      algorithm: round_robin
+      targets:
+        - url: https://httpbin.org
+          health_check:
+            path: /status/200
+            interval_secs: 10        # probe period in seconds
+            timeout_ms: 2000
+            unhealthy_threshold: 3
+            healthy_threshold: 2
+        - url: https://httpbingo.org
+          health_check:
+            path: /status/200
+            interval_secs: 10
+            timeout_ms: 2000
+            unhealthy_threshold: 3
+            healthy_threshold: 2

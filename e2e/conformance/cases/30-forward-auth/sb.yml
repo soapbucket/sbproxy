@@ -1,0 +1,20 @@
+# Tests forward authentication delegating to local Node server
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "fwdauth.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    authentication:
+      type: forward
+      url: http://127.0.0.1:18888/auth/forward
+      method: GET
+      forward_headers:
+        - X-Auth-Token
+      trust_headers:
+        - X-User-ID
+        - X-User-Role
+      timeout: 5
+      success_status: [200]

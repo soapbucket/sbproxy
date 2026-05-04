@@ -1,0 +1,16 @@
+# Environment variable interpolation in config values
+# Uses ${ENV_VAR} syntax for values that should come from environment
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "envvar.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    variables:
+      test_value: "${TEST_ENV_VALUE}"
+    request_modifiers:
+      - headers:
+          set:
+            X-Env-Test: "${TEST_ENV_VALUE}"

@@ -1,0 +1,125 @@
+# AI Crawl Control with tiered pricing, ledger stub, and per-class
+# crawler matching. Three pricing tiers, each gated on a route pattern;
+# the policy returns 402 with the matched tier's price to a request
+# whose User-Agent matches one of the listed AI crawlers.
+#
+# Bundle layout:
+#   sb.yml              - this file
+#   docker-compose.yml  - sbproxy + mock-ledger + mock-origin
+#   mock-ledger/        - tiny static ledger stub (always-OK redeem)
+#   mock-origin/        - nginx serving fixed article HTML / Markdown
+#   Makefile            - up / down / logs / test convenience targets
+#
+# This example uses the OSS in-memory ledger seeded with three tokens.
+# The mock-ledger service in `docker-compose.yml` is included as a
+# realistic stand-in for the HTTP ledger client (Wave 2). The current
+# OSS build redeems against `valid_tokens`; pointing the policy at the
+# external service is gated behind the `http-ledger` cargo feature
+# (see docs/ai-crawl-control.md for that wiring).
+#
+# Run:
+#   cd examples/24-ai-crawl-tiered
+#   docker compose up -d --wait
+#
+# Test (HTML default tier, no token, expect 402):
+#   curl -s -o /dev/null -w '%{http_code}\n' \
+#        -H 'Host: blog.localhost' \
+#        -H 'User-Agent: GPTBot/1.0' \
+#        http://127.0.0.1:8080/article
+#   # => 402
+#
+# Test (preview path, free, expect 200):
+#   curl -s -o /dev/null -w '%{http_code}\n' \
+#        -H 'Host: blog.localhost' \
+#        -H 'User-Agent: GPTBot/1.0' \
+#        http://127.0.0.1:8080/preview/article
+#   # => 200
+#
+# Test (premium feed tier, paid token, expect 200):
+#   curl -s -H 'Host: blog.localhost' \
+#        -H 'User-Agent: ClaudeBot/1.0' \
+#        -H 'crawler-payment: token-premium-001' \
+#        http://127.0.0.1:8080/feed/articles/2026
+#
+# Test (browser UA, no token, expect 200 - never charged):
+#   curl -s -o /dev/null -w '%{http_code}\n' \
+#        -H 'Host: blog.localhost' \
+#        http://127.0.0.1:8080/article
+#   # => 200
+#
+# Tear down:
+#   docker compose down -v
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "blog.localhost":
+    # Mock origin running in the bundled compose stack. Serves a small
+    # HTML page on every path the tier list points at.
+    action:
+      type: proxy
+      url: http://mock-origin:80
+
+    policies:
+      - type: ai_crawl_control
+        # Default fallback price when no tier matches. Tier-matched
+        # routes override this value in the 402 challenge body.
+        price: 0.001
+        currency: USD
+        header: crawler-payment
+
+        # Crawler classes recognised by User-Agent substring. Matches
+        # are case-insensitive. Anything not in this list is treated as
+        # a regular browser and passes through without a charge. The
+        # comment-block below maps each substring to the conceptual
+        # "agent class" the request is bucketed into; today the policy
+        # stamps the same tier price regardless of UA, but the labels
+        # double as a pre-image for the per-agent metrics + audit
+        # entries (G1.4 / G1.6).
+        crawler_user_agents:
+          - GPTBot          # OpenAI training crawler
+          - ChatGPT-User    # OpenAI on-demand fetcher
+          - ClaudeBot       # Anthropic crawler
+          - anthropic-ai    # Anthropic legacy substring
+          - CCBot           # Common Crawl
+          - PerplexityBot   # Perplexity AI
+          - Google-Extended # Google AI training opt-in
+
+        # Three pricing tiers. The first whose `route_pattern` matches
+        # the request path wins. Tier 1 (free preview) ships a small
+        # window so cooperative crawlers can size up before paying;
+        # Tier 2 charges a markdown-shaped feed; Tier 3 charges full
+        # article HTML.
+        tiers:
+          - route_pattern: /preview/*
+            price:
+              amount_micros: 0
+              currency: USD
+            free_preview_bytes: 4096
+            paywall_position: bottom_of_page
+
+          - route_pattern: /feed/*
+            price:
+              amount_micros: 5000
+              currency: USD
+            content_shape: markdown
+            paywall_position: top_of_page
+
+          - route_pattern: /article*
+            price:
+              amount_micros: 1000
+              currency: USD
+            content_shape: html
+            paywall_position: top_of_page
+
+        # OSS in-memory ledger seed. Each token redeems exactly once.
+        # Tokens are namespaced by tier purely as a documentation aid;
+        # the policy treats any token in this list as valid.
+        valid_tokens:
+          - token-preview-001
+          - token-feed-001
+          - token-feed-002
+          - token-premium-001
+          - token-premium-002
+          - token-premium-003

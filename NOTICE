@@ -1,0 +1,176 @@
+sbproxy
+Copyright 2026 Soap Bucket LLC
+
+This product includes software developed by third parties under the
+following licenses. In accordance with the Apache License 2.0 (Section 4),
+the original copyright notices and license terms are preserved below.
+
+===========================================================================
+
+Pingora (pingora-core, pingora-proxy, pingora-http, pingora-error,
+         pingora-cache, pingora-pool, pingora-timeout, pingora-runtime,
+         pingora-header-serde, pingora-lru, pingora-rustls)
+Copyright 2024-2026 Cloudflare, Inc.
+Licensed under the Apache License, Version 2.0
+https://github.com/cloudflare/pingora
+
+===========================================================================
+
+ring
+Copyright 2015-2026 Brian Smith
+Licensed under ISC-style license AND Apache License, Version 2.0
+https://github.com/briansmith/ring
+
+===========================================================================
+
+prometheus (Rust client)
+Copyright 2014-2026 The Prometheus Authors
+Licensed under the Apache License, Version 2.0
+https://github.com/tikv/rust-prometheus
+
+===========================================================================
+
+minijinja
+Copyright 2021-2026 Armin Ronacher
+Licensed under the Apache License, Version 2.0
+https://github.com/mitsuhiko/minijinja
+
+===========================================================================
+
+rust-openssl (openssl crate)
+Copyright 2011-2026 The rust-openssl developers
+Licensed under the Apache License, Version 2.0
+https://github.com/sfackler/rust-openssl
+
+===========================================================================
+
+clang-sys
+Copyright 2018-2026 Kyle Mayes
+Licensed under the Apache License, Version 2.0
+https://github.com/KyleMayes/clang-sys
+
+===========================================================================
+
+memo-map
+Copyright 2022-2026 Armin Ronacher
+Licensed under the Apache License, Version 2.0
+https://github.com/mitsuhiko/memo-map
+
+===========================================================================
+
+sync_wrapper
+Copyright 2020-2026 Actyx AG
+Licensed under the Apache License, Version 2.0
+https://github.com/Actyx/sync_wrapper
+
+===========================================================================
+
+tokenizers
+Copyright 2018-2026 Hugging Face, Inc.
+Licensed under the Apache License, Version 2.0
+https://github.com/huggingface/tokenizers
+
+===========================================================================
+
+wasmtime, wasi-common, and the cap-std family (cap-fs-ext, cap-primitives,
+cap-rand, cap-std, cap-time-ext)
+Copyright 2019-2026 The Bytecode Alliance contributors
+Licensed under the Apache License, Version 2.0 with LLVM Exception
+https://github.com/bytecodealliance/wasmtime
+https://github.com/bytecodealliance/cap-std
+
+===========================================================================
+
+Cranelift code generator (cranelift-assembler-x64, cranelift-assembler-x64-meta,
+cranelift-bforest, cranelift-bitset, cranelift-codegen, cranelift-codegen-meta,
+cranelift-codegen-shared, cranelift-control, cranelift-entity, cranelift-frontend,
+cranelift-isle, cranelift-native, cranelift-srcgen), pulley-interpreter,
+pulley-macros, wast, wiggle, wiggle-generate, wiggle-macro, winch-codegen, witx,
+and the wasmtime-internal-* family
+Copyright 2017-2026 The Bytecode Alliance contributors
+Licensed under the Apache License, Version 2.0 with LLVM Exception
+https://github.com/bytecodealliance/wasmtime
+https://github.com/WebAssembly/WASI
+
+===========================================================================
+
+regalloc2
+Copyright 2021-2026 The Bytecode Alliance contributors
+Licensed under the Apache License, Version 2.0 with LLVM Exception
+https://github.com/bytecodealliance/regalloc2
+
+===========================================================================
+
+target-lexicon
+Copyright 2018-2026 The Bytecode Alliance contributors
+Licensed under the Apache License, Version 2.0 with LLVM Exception
+https://github.com/bytecodealliance/target-lexicon
+
+===========================================================================
+
+winx
+Copyright 2020-2026 Dan Gohman
+Licensed under the Apache License, Version 2.0 with LLVM Exception
+https://github.com/sunfishcode/winx
+
+===========================================================================
+
+OpenTelemetry Rust (opentelemetry, opentelemetry_sdk, opentelemetry-http,
+opentelemetry-otlp, opentelemetry-proto, opentelemetry-semantic-conventions)
+Copyright 2019-2026 The OpenTelemetry Authors
+Licensed under the Apache License, Version 2.0
+https://github.com/open-telemetry/opentelemetry-rust
+
+===========================================================================
+
+prost (prost, prost-derive, prost-build, prost-types)
+Copyright 2017-2026 Dan Burkert and the prost contributors
+Licensed under the Apache License, Version 2.0
+https://github.com/tokio-rs/prost
+
+===========================================================================
+
+kube-rs (kube, kube-client, kube-core, kube-derive, kube-runtime)
+Copyright 2019-2026 The kube-rs Authors
+Licensed under the Apache License, Version 2.0
+https://github.com/kube-rs/kube
+
+===========================================================================
+
+k8s-openapi
+Copyright 2018-2026 Arnav Singh
+Licensed under the Apache License, Version 2.0
+https://github.com/Arnavion/k8s-openapi
+
+===========================================================================
+
+esaxx-rs
+Copyright 2021-2026 Nicolas Patry
+Licensed under the Apache License, Version 2.0
+https://github.com/Narsil/esaxx-rs
+
+===========================================================================
+
+spm_precompiled
+Copyright 2021-2026 Hugging Face, Inc.
+Licensed under the Apache License, Version 2.0
+https://github.com/huggingface/spm_precompiled
+
+===========================================================================
+
+Additional dependencies are dual-licensed under MIT OR Apache-2.0. Under
+the terms of dual licensing, this project uses them under the MIT license
+where available. A full list of dependencies and their licenses can be
+generated with: cargo metadata --format-version 1
+
+===========================================================================
+
+CHANGES TO THIRD-PARTY CODE
+
+This project uses Pingora as a dependency via Cargo (crates.io v0.8.0).
+No modifications have been made to the Pingora source code. Pingora is
+used as-is through its public API.
+
+The yaml_serde crate (formerly serde_yaml) is used via Cargo package
+rename: serde_yaml = { package = "yaml_serde", version = "0.10" }.
+No modifications to the source.

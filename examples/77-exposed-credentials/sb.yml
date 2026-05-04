@@ -1,0 +1,43 @@
+# Exposed credentials check.
+#
+# When a request carries an Authorization: Basic header whose
+# password matches the configured exposure list, the proxy either
+# stamps the upstream request with a header (`tag` action, the
+# default) or rejects the request outright (`block` action).
+#
+# The OSS provider is `static`: operators ship a list of leaked
+# passwords (or SHA-1 hex hashes thereof) inline in YAML or via
+# `sha1_file`. Hash-only lists keep plaintext passwords out of
+# config, log files, and process memory dumps. The HIBP k-anonymity
+# adapter ships in the enterprise build.
+#
+# Run:
+#   make run CONFIG=examples/77-exposed-credentials/sb.yml
+#
+# Test (the canonical "password" appears on every leak list):
+#   curl -i -u alice:password http://127.0.0.1:8080/get \
+#        -H 'Host: api.local'
+#
+# Expected: the upstream sees `exposed-credential-check: leaked-password`.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    policies:
+      - type: exposed_credentials
+        # Default `tag` action stamps a header. Switch to `block`
+        # once the SecOps response loop is wired up.
+        action: tag
+        passwords:
+          - password
+          - password123
+          - letmein
+        sha1_hashes:
+          # SHA-1("hunter2") - lowercase or uppercase both work.
+          - F3BBBD66A63D4BF1747940578EC3D0103530E21D

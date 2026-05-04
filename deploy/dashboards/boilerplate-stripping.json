@@ -1,0 +1,259 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "id": null,
+  "title": "SBproxy Boilerplate Stripping (Wave 4)",
+  "description": "Wave 4 / G4.3 boilerplate transform metrics. Surfaces stripped-bytes throughput, top origins by stripped bytes per request, and Markdown projection latency.",
+  "tags": [
+    "sbproxy",
+    "wave4",
+    "boilerplate",
+    "markdown"
+  ],
+  "style": "dark",
+  "timezone": "browser",
+  "editable": false,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "version": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "prometheus_datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "selected": false,
+          "text": "Prometheus",
+          "value": "Prometheus"
+        },
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "options": []
+      },
+      {
+        "name": "tenant_id",
+        "label": "Tenant",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${prometheus_datasource}"
+        },
+        "query": "label_values(sbproxy_boilerplate_stripped_bytes_total, tenant_id)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2,
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      },
+      {
+        "name": "hostname",
+        "label": "Hostname",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${prometheus_datasource}"
+        },
+        "query": "label_values(sbproxy_boilerplate_stripped_bytes_total{tenant_id=~\"$tenant_id\"}, hostname)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2,
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Boilerplate stripped bytes (rate)",
+      "description": "Bytes-per-second stripped from upstream HTML by the Wave 4 G4.3 boilerplate transform. Computed as `rate(sbproxy_boilerplate_stripped_bytes_total[5m])`. A consistently zero series means the transform isn't matching; a sustained high value flags an upstream that ships a lot of navigation chrome.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (hostname) (rate(sbproxy_boilerplate_stripped_bytes_total{tenant_id=~\"$tenant_id\",hostname=~\"$hostname\"}[$__rate_interval]))",
+          "legendFormat": "{{hostname}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Top origins by stripped bytes per request",
+      "description": "Top 25 origins ranked by mean stripped bytes per request. Computed as `sbproxy_boilerplate_stripped_bytes_total / sbproxy_requests_total`. High values are candidates for an origin-specific boilerplate selector to keep the Markdown projection compact.",
+      "type": "table",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "align": "auto",
+            "displayMode": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "footer": {
+          "enablePagination": false,
+          "show": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(25, sum by (hostname) (increase(sbproxy_boilerplate_stripped_bytes_total{tenant_id=~\"$tenant_id\",hostname=~\"$hostname\"}[$__range])) / sum by (hostname) (increase(sbproxy_requests_total{tenant_id=~\"$tenant_id\",hostname=~\"$hostname\"}[$__range])))",
+          "legendFormat": "{{hostname}}",
+          "format": "table",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Markdown projection latency (p50, p95, p99)",
+      "description": "Histogram of Markdown projection time, in milliseconds. Driven by the Wave 4 G4.3 html_to_markdown transform. The p99 tail flags the largest documents; sustained drift here is the canary for token-bytes-ratio drift or unbounded HTML inputs.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le, hostname) (rate(sbproxy_markdown_projection_duration_seconds_bucket{tenant_id=~\"$tenant_id\",hostname=~\"$hostname\"}[$__rate_interval]))) * 1000",
+          "legendFormat": "p50 {{hostname}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le, hostname) (rate(sbproxy_markdown_projection_duration_seconds_bucket{tenant_id=~\"$tenant_id\",hostname=~\"$hostname\"}[$__rate_interval]))) * 1000",
+          "legendFormat": "p95 {{hostname}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le, hostname) (rate(sbproxy_markdown_projection_duration_seconds_bucket{tenant_id=~\"$tenant_id\",hostname=~\"$hostname\"}[$__rate_interval]))) * 1000",
+          "legendFormat": "p99 {{hostname}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        }
+      ]
+    }
+  ]
+}

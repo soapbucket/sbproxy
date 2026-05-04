@@ -1,0 +1,33 @@
+# Lua JSON transforms - modify JSON response bodies
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "lua-json.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    transforms:
+      - type: lua_json
+        content_types:
+          - application/json
+        timeout: 500ms
+        lua_script: |
+          function modify_json(data, ctx)
+            -- Add metadata
+            data.lua_processed = true
+
+            -- Rename a field
+            if data.method then
+              data.http_method = data.method
+              data.method = nil
+            end
+
+            -- Add computed field
+            data.path_length = string.len(data.path or "")
+
+            -- Remove sensitive fields
+            data.headers = nil
+
+            return data
+          end

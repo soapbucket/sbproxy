@@ -1,0 +1,49 @@
+# Q5.7 bench harness: TLS fingerprint capture overhead.
+#
+# Standalone Cargo manifest (NOT a workspace member). Mirrors the
+# layout of `sbproxy-bench/harness/content_negotiate/`. CI does not
+# run this; only the perf lab does.
+#
+# Run:
+#
+#     cd sbproxy-bench/harness/tls_fingerprint
+#     BENCH_ENABLE=1 cargo run --release -- \
+#         --baseline-url http://127.0.0.1:18080 \
+#         --capture-url  http://127.0.0.1:18081 \
+#         --rps 5000 \
+#         --duration-secs 30
+#
+# Target numbers (Wave 5 G5.3 / Q5.7 acceptance):
+#
+#   - Bench drives two proxies on the same host: one built without the
+#     `tls-fingerprint` cargo feature (baseline) and one built with it
+#     (capture).
+#   - p99 latency adder must be < 1% of baseline p99.
+#   - Throughput delta must be within noise (< 2%) at the same rps.
+#
+# The latency assertion lives in `tls_fingerprint_latency_bench.rs`
+# under `e2e/tests/`; this binary is the throughput driver that
+# produces the histograms the assertion reads back from
+# `/tmp/sbproxy_tls_fp_bench.json`.
+
+[workspace]
+
+[package]
+name = "tls-fingerprint-bench"
+version = "0.0.1"
+edition = "2021"
+publish = false
+license = "BUSL-1.1"
+
+[[bin]]
+name = "tls-fingerprint-bench"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+hdrhistogram = "7"
+anyhow = "1"

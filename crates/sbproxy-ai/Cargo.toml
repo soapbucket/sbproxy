@@ -1,0 +1,42 @@
+[package]
+name = "sbproxy-ai"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+sbproxy-plugin.workspace = true
+sbproxy-config.workspace = true
+sbproxy-cache.workspace = true
+sbproxy-security.workspace = true
+sbproxy-platform.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+smallvec.workspace = true
+regex.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+lru = "0.16"
+reqwest.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+hex.workspace = true
+prometheus.workspace = true
+rand.workspace = true
+futures.workspace = true
+base64.workspace = true
+
+# Embedded provider catalog: gzipped YAML at build time, decompressed
+# on first lookup. flate2 is the standard Rust gzip implementation;
+# serde_yaml is already in the workspace via the OSS config crate.
+flate2 = "1"
+serde_yaml.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

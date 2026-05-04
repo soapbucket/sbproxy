@@ -1,0 +1,79 @@
+# Production resilience stack on a load balancer.
+#
+# Combines four signals so a flaky backend gets isolated quickly and
+# recovers automatically without operator intervention:
+#
+#   * Active health checks - background probes mark a target unhealthy
+#     after `unhealthy_threshold` consecutive failures, healthy again
+#     after `healthy_threshold` successes. Catches "the pod is gone"
+#     without waiting for real traffic to fail.
+#
+#   * Outlier detection (passive) - tracks each target's error rate
+#     in a sliding window and ejects when it crosses `threshold`.
+#     Catches "the pod is up but answering 5xx under load."
+#
+#   * Circuit breaker - formal Closed -> Open -> HalfOpen state
+#     machine, one breaker per target. Trips on consecutive failures
+#     for fast isolation, recovers via probe successes. Catches
+#     "the pod is hard down right now."
+#
+#   * Connect-error retries - on TCP connect failure / timeout, the
+#     proxy automatically tries the next target in the LB pool. The
+#     failed target feeds outlier and breaker so subsequent requests
+#     skip it without paying the connect-fail latency again.
+#
+# Each signal is independent. Either of outlier, breaker, or active
+# health check ejects a target from `select_target`. With every
+# target ejected, the LB falls back to the unfiltered list rather
+# than 502'ing the client (better to send to a flaky peer than to
+# fail closed).
+#
+# Run:
+#   make run CONFIG=examples/90-resilience-stack/sb.yml
+#
+# Test (point httpbin.org / httpbingo.org at /status/<code> to
+# simulate failure):
+#   curl -H 'Host: localhost' http://127.0.0.1:8080/status/200
+#   for i in $(seq 1 20); do
+#     curl -s -o /dev/null -H 'Host: localhost' \
+#          http://127.0.0.1:8080/anything
+#   done
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "localhost":
+    action:
+      type: load_balancer
+      algorithm: round_robin
+      retry:
+        max_attempts: 3
+        retry_on:
+          - connect_error
+          - timeout
+        backoff_ms: 100
+      circuit_breaker:
+        failure_threshold: 5
+        success_threshold: 2
+        open_duration_secs: 30
+      outlier_detection:
+        threshold: 0.5
+        window_secs: 60
+        min_requests: 5
+        ejection_duration_secs: 30
+      targets:
+        - url: https://httpbin.org
+          health_check:
+            path: /status/200
+            interval_secs: 10
+            timeout_ms: 2000
+            unhealthy_threshold: 3
+            healthy_threshold: 2
+        - url: https://httpbingo.org
+          health_check:
+            path: /status/200
+            interval_secs: 10
+            timeout_ms: 2000
+            unhealthy_threshold: 3
+            healthy_threshold: 2

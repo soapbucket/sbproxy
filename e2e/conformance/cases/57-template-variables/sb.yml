@@ -1,0 +1,28 @@
+# Template variables in request/response modifiers
+# Uses Mustache syntax: {{vars.key}}, {{request.id}}, {{request.method}}, etc.
+# No spaces inside braces! {{vars.key}} not {{ vars.key }}
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "templates.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    variables:
+      app_name: "sbproxy-test"
+      app_version: "1.0.0"
+      environment: "testing"
+    request_modifiers:
+      - headers:
+          set:
+            X-Request-ID: "{{request.id}}"
+            X-App-Name: "{{vars.app_name}}"
+            X-App-Version: "{{vars.app_version}}"
+            X-Env: "{{vars.environment}}"
+    response_modifiers:
+      - headers:
+          set:
+            X-Served-By: "sbproxy"
+            X-Request-Method: "{{request.method}}"
+            X-Request-Path: "{{request.path}}"

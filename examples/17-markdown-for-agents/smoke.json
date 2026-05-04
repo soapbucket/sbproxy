@@ -1,0 +1,22 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "feature_endpoints": [
+    "/article"
+  ],
+  "audit_check": false,
+  "_notes": [
+    "feature_endpoints[] holds GETs the runner asserts return 2xx.",
+    "Without a User-Agent in the AI crawler list, /article passes",
+    "through the policy unaffected and returns 200 + HTML. Browsers",
+    "asking for Markdown also fall through (the policy keys on UA,",
+    "not Accept).",
+    "",
+    "The smoke runner does not currently set headers, so it can only",
+    "exercise the browser-passthrough leg. Use `make test` for the",
+    "full Accept + crawler-payment matrix.",
+    "",
+    "audit_check stays false until the OSS audit endpoint lands."
+  ]
+}

@@ -1,0 +1,34 @@
+# Per-origin connection pool tuning.
+#
+# The connection_pool block sizes the proxy's outbound HTTP client for this
+# origin. max_connections caps concurrent in-flight upstream connections,
+# idle_timeout_secs reaps idle keep-alive connections, and max_lifetime_secs
+# is the hard ceiling on any single connection's lifetime.
+#
+# Tune these when an upstream is sensitive to too many concurrent connections,
+# or when a load balancer aggressively terminates long-lived TCP sessions.
+#
+# Run:
+#   make run CONFIG=examples/69-connection-pool/sb.yml
+#
+# Test:
+#   # Send a small parallel burst. The pool reuses connections within
+#   # max_connections, and any over the cap queue briefly.
+#   for i in $(seq 1 10); do
+#     curl -s -H 'Host: api.local' http://127.0.0.1:8080/get \
+#       -o /dev/null -w '%{http_code} %{time_total}s\n' &
+#   done; wait
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    connection_pool:
+      max_connections: 32
+      idle_timeout_secs: 60
+      max_lifetime_secs: 300
+
+    action:
+      type: proxy
+      url: https://httpbin.org

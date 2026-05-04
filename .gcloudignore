@@ -1,0 +1,14 @@
+# Exclude Rust build artifacts from Cloud Build source upload.
+# target/ can be >10 GB for pingora/rustls and is rebuilt inside the
+# container anyway.
+target/
+**/target/
+
+# IDE / OS
+.git/
+.idea/
+.vscode/
+.DS_Store
+
+# Test data
+e2e/servers/node_modules/

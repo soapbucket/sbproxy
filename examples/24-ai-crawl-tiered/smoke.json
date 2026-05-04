@@ -1,0 +1,24 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "feature_endpoints": [
+    "/preview/article"
+  ],
+  "audit_check": false,
+  "_notes": [
+    "This example does NOT enable the proxy admin listener, so",
+    "/healthz (which lives on the admin port, default 9090) is not",
+    "reachable. The data plane's built-in liveness path is /health,",
+    "served by every sbproxy instance regardless of admin config; we",
+    "use that as the smoke runner's liveness probe.",
+    "",
+    "feature_endpoints[] holds GETs the runner asserts return 2xx.",
+    "Only the free-preview tier returns 200 without a payment token,",
+    "so it is the only path safe to assert on without also threading",
+    "a Host header + crawler-payment token through the smoke harness.",
+    "",
+    "audit_check stays false until Wave 2 (R1.2) ships the OSS",
+    "/api/audit/recent endpoint."
+  ]
+}

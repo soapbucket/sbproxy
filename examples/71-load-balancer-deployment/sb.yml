@@ -1,0 +1,43 @@
+# Blue-green load balancer deployment.
+#
+# Two targets carry `group: blue` and `group: green` tags. With deployment_mode
+# set to blue_green and active=green, every request is routed to the green
+# group. Flip `active` to `blue` and reload to send traffic to the other group
+# without touching the targets list.
+#
+# To make the active group visible without infrastructure, the two groups
+# point at distinct public APIs that produce different response shapes:
+#
+#   blue  -> reqres.in (Lorem-ipsum-style fake REST API)
+#   green -> dummyjson.com (alternative public test API)
+#
+# Run:
+#   make run CONFIG=examples/71-load-balancer-deployment/sb.yml
+#
+# Test:
+#   # All six requests land on the green group's upstream (dummyjson) because
+#   # active=green below. Switch active to blue and rerun to see them land on
+#   # reqres.in instead.
+#   for i in $(seq 1 6); do
+#     curl -s -H 'Host: api.local' http://127.0.0.1:8080/products/1 | head -c 80
+#     echo
+#   done
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: load_balancer
+      algorithm: round_robin
+      deployment_mode:
+        mode: blue_green
+        active: green
+      targets:
+        - url: https://reqres.in/api
+          group: blue
+          weight: 1
+        - url: https://dummyjson.com
+          group: green
+          weight: 1

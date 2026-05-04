@@ -1,0 +1,23 @@
+apiVersion: v2
+name: sbproxy
+description: |
+  OSS Kubernetes operator for sbproxy. Installs the SBProxy and SBProxyConfig
+  CustomResourceDefinitions plus an operator Deployment that reconciles them
+  into proxy Deployments, Services, and ConfigMaps.
+type: application
+# Chart version. Bump on every chart change.
+version: 0.1.0
+# App version. Tracks the operator binary's workspace version. Override the
+# image tag with `--set image.tag=...` when pushing a custom build.
+appVersion: "2.0.0"
+keywords:
+  - sbproxy
+  - proxy
+  - operator
+  - reverse-proxy
+home: https://github.com/soapbucket/sbproxy
+sources:
+  - https://github.com/soapbucket/sbproxy
+maintainers:
+  - name: Soap Bucket LLC
+    url: https://soapbucket.com

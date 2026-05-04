@@ -1,0 +1,19 @@
+# Tests replace_strings transform
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "replace.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "Hello World from the backend server"
+    transforms:
+      - type: replace_strings
+        replace_strings:
+          replacements:
+            - find: "World"
+              replace: "SBProxy"
+            - find: "backend server"
+              replace: "proxy"

@@ -1,0 +1,40 @@
+# Standalone fixture-refresh tool (Q2.13).
+#
+# Lives outside the main workspace so its crypto-heavy dependency tree
+# (ed25519-dalek + sha2 + base64) does not bloat the proxy's Cargo.lock.
+# The empty `[workspace]` table opts this crate out of the parent
+# workspace at `../../../Cargo.toml`.
+#
+# Run via the wrapper script:
+#
+#     bash test/fixtures/refresh.sh
+#
+# Or directly:
+#
+#     cargo run --release --manifest-path test/fixtures/refresh-tool/Cargo.toml
+
+[workspace]
+
+[package]
+name = "fixture-refresh"
+version = "0.1.0"
+edition = "2021"
+license = "BUSL-1.1"
+publish = false
+
+[[bin]]
+name = "fixture-refresh"
+path = "src/main.rs"
+
+[dependencies]
+# Ed25519 signing for the agent registry feed (G2.1) and the bot-auth
+# directory self-signature (A1.3). Pinned major matches the workspace's
+# `dev-dependencies` entry in `e2e/Cargo.toml` so a developer comparing
+# the two does not see a version drift surprise.
+ed25519-dalek = { version = "2", features = ["pkcs8"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
+anyhow = "1"
+hex = "0.4"

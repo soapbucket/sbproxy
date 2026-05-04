@@ -1,0 +1,33 @@
+# CEL expression policy.
+#
+# Allows requests only when the `X-Tenant` header equals `acme`. CEL header
+# keys are normalized to lowercase with hyphens converted to underscores,
+# so `X-Tenant` is read as `request.headers["x-tenant"]`. Anything else
+# gets a 403 before httpbin.org is contacted. This is the path to take for
+# custom access control beyond simple IP or key checks.
+#
+# Run:
+#   make run CONFIG=examples/35-cel-policy/sb.yml
+#
+# Test:
+#   # 403 - missing or wrong tenant header
+#   curl -i -H 'Host: cel.local' http://127.0.0.1:8080/get
+#   curl -i -H 'Host: cel.local' -H 'X-Tenant: other' http://127.0.0.1:8080/get
+#
+#   # 200 - matches the allowed tenant
+#   curl -i -H 'Host: cel.local' -H 'X-Tenant: acme' http://127.0.0.1:8080/get
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "cel.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    policies:
+      - type: expression
+        expression: 'request.headers["x-tenant"] == "acme"'
+        deny_status: 403
+        deny_message: "tenant not allowed"

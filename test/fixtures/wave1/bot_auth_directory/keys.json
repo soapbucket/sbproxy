@@ -1,0 +1,7 @@
+{
+  "_comment": "Test seed for the Web Bot Auth directory self-signature (A1.3). NOT a real production key; vendors run their own JWKS directories with their own keys. Rotating this seed regenerates the JWS sample fixtures via test/fixtures/refresh.sh.",
+  "directory_signing_seed": "deadbeefcafebabe0102030405060708090a0b0c0d0e0f10111213141516171f",
+  "agent": "openai-gptbot",
+  "valid_from": "2026-05-01T00:00:00.000Z",
+  "valid_until": "2026-08-01T00:00:00.000Z"
+}

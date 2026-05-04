@@ -1,0 +1,67 @@
+# AI gateway: budget enforcement with per-scope downgrade.
+#
+# Two budget limits are stacked: a workspace-wide monthly cost cap and a
+# per-API-key daily token cap. When either limit fires, the request is
+# downgraded to a cheaper model rather than blocked. The workspace cap
+# falls back to a Haiku-class model; the API key cap falls back to an
+# OpenRouter Haiku route. on_exceed: downgrade applies to whichever
+# limit fires first.
+#
+# Setup:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   export OPENROUTER_API_KEY=sk-or-...
+#
+# Run:
+#   make run CONFIG=examples/13-ai-budget/sb.yml
+#
+# Test:
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "claude-3-5-sonnet-latest",
+#       "messages": [{"role": "user", "content": "Summarise the budget config."}]
+#     }'
+#
+# Expected behaviour:
+#   Under the limits, requests run on claude-3-5-sonnet-latest. Once
+#   workspace monthly spend reaches $500, new requests are rewritten to
+#   claude-3-5-haiku-latest. Once an API key burns through 1M tokens in
+#   one day, that key is rewritten to anthropic/claude-3-haiku via
+#   OpenRouter. Each downgrade fires the sbproxy_ai_budget_utilization_ratio
+#   gauge.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+
+      providers:
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          default_model: claude-3-5-sonnet-latest
+          models:
+            - claude-3-5-sonnet-latest
+            - claude-3-5-haiku-latest
+        - name: openrouter
+          api_key: ${OPENROUTER_API_KEY}
+          default_model: anthropic/claude-3.5-sonnet
+          models:
+            - anthropic/claude-3.5-sonnet
+            - anthropic/claude-3-haiku
+
+      budget:
+        on_exceed: downgrade
+        limits:
+          - scope: workspace
+            max_cost_usd: 500
+            period: monthly
+            downgrade_to: claude-3-5-haiku-latest
+          - scope: api_key
+            max_tokens: 1000000
+            period: daily
+            downgrade_to: anthropic/claude-3-haiku

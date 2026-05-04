@@ -1,0 +1,33 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "lb.test":
+    action:
+      type: load_balancer
+      algorithm: round_robin
+      targets:
+        - url: http://127.0.0.1:18888/echo
+          weight: 1
+          health_check:
+            enabled: true
+            path: /health
+            interval: 10s
+            timeout: 3s
+            healthy_threshold: 2
+            unhealthy_threshold: 3
+            expected_status: [200]
+        - url: http://127.0.0.1:18888/
+          weight: 1
+          health_check:
+            enabled: true
+            path: /health
+            interval: 10s
+            timeout: 3s
+            healthy_threshold: 2
+            unhealthy_threshold: 3
+            expected_status: [200]
+    response_modifiers:
+      - headers:
+          set:
+            X-Proxy: sbproxy-lb

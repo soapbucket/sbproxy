@@ -1,0 +1,45 @@
+# JavaScript body transform.
+#
+# Runs a JavaScript function against the raw body string. The entrypoint is
+# the top-level `function transform(body)`, where `body` is a string. The
+# script parses the JSON, mutates it, and returns a new JSON string. A
+# `static` action seeds the input so the example runs offline.
+#
+# Run:
+#   make run CONFIG=examples/50-transform-javascript/sb.yml
+#
+# Test:
+#   curl -s -H 'Host: js.local' http://127.0.0.1:8080/
+#
+# Expected: title reversed, title_length added, body trimmed to 40 chars,
+# transformed_by tag added.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "js.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        id: 1
+        title: "javascript runs on the request path"
+        body: "this body is longer than forty characters so it will be trimmed by the script"
+        userId: 7
+    transforms:
+      - type: javascript
+        script: |
+          function transform(body) {
+            var data = JSON.parse(body);
+            if (typeof data.title === "string") {
+              data.title_length = data.title.length;
+              data.title_reversed = data.title.split("").reverse().join("");
+            }
+            if (typeof data.body === "string" && data.body.length > 40) {
+              data.body = data.body.slice(0, 40) + "...";
+            }
+            data.transformed_by = "javascript";
+            return JSON.stringify(data);
+          }

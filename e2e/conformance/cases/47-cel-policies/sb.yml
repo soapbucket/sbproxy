@@ -1,0 +1,54 @@
+# CEL expression policies - headers, path, method, query matching
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "cel-headers.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    policies:
+      - type: expression
+        cel_expr: |
+          request.headers["x-api-version"] == "v2"
+        status_code: 403
+
+  "cel-path.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    policies:
+      - type: expression
+        cel_expr: |
+          !request.path.startsWith("/internal")
+        status_code: 403
+
+  "cel-method.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    policies:
+      - type: expression
+        cel_expr: |
+          request.method == "GET" || request.method == "POST"
+        status_code: 405
+
+  "cel-query.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    policies:
+      - type: expression
+        cel_expr: |
+          request.query.contains("token=valid-token-123")
+        status_code: 401
+
+  "cel-combined.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    policies:
+      - type: expression
+        cel_expr: |
+          request.headers["x-role"] == "admin" && request.method == "POST"
+        status_code: 403

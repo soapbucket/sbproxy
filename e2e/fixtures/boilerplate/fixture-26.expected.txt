@@ -1,0 +1,3 @@
+GET /v1/widgets/{id} returns a single Widget resource keyed by its server-assigned identifier.
+The response is wrapped in an envelope with a top-level data field and a meta block carrying request_id.
+A 404 is returned when no widget exists for the supplied id; the body is the standard error envelope.

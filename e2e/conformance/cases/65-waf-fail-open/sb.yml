@@ -1,0 +1,32 @@
+# WAF fail_open vs fail_closed behavior
+# Two origins: one fail-open, one fail-closed
+# Both have a deliberately broken custom rule to trigger WAF engine error
+proxy:
+  http_bind_port: 18080
+
+origins:
+  # fail_open: true - WAF error should allow request through
+  "waf-open.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    policies:
+      - type: waf
+        owasp_crs:
+          enabled: true
+          paranoia_level: 1
+        action_on_match: block
+        fail_open: true
+
+  # fail_open: false (default) - WAF error should block request
+  "waf-closed.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    policies:
+      - type: waf
+        owasp_crs:
+          enabled: true
+          paranoia_level: 1
+        action_on_match: block
+        fail_open: false

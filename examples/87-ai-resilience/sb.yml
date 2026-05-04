@@ -1,0 +1,63 @@
+# AI gateway with per-provider resilience primitives.
+#
+# Three signals run independently. Any one can eject a provider from
+# the routing pool:
+#
+#   1. circuit_breaker: classic Closed -> Open -> HalfOpen state machine.
+#      Five consecutive 5xx or transport errors flip a provider Open
+#      for 30s; after that, two successful half-open probes close it
+#      again.
+#   2. outlier_detection: 60-second sliding window. Once a provider
+#      hits >= 50% failure rate over five or more requests it gets
+#      ejected for 30s.
+#   3. health_check: passive HTTP probe of GET /models every 30s.
+#      Three consecutive failures eject; two consecutive successes
+#      reinstate.
+#
+# When every provider is ejected, the router falls back to the
+# unfiltered enabled list rather than refusing the request, so a
+# misconfigured threshold never causes a total outage.
+#
+# Run:
+#   export OPENAI_API_KEY=sk-...
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   make run CONFIG=examples/87-ai-resilience/sb.yml
+#
+# Test:
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing:
+        strategy: round_robin
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          default_model: claude-3-5-haiku-latest
+      resilience:
+        circuit_breaker:
+          failure_threshold: 5
+          success_threshold: 2
+          open_duration_secs: 30
+        outlier_detection:
+          threshold: 0.5
+          window_secs: 60
+          min_requests: 5
+          ejection_duration_secs: 30
+        health_check:
+          path: /models
+          interval_secs: 30
+          timeout_ms: 5000
+          unhealthy_threshold: 3
+          healthy_threshold: 2

@@ -1,0 +1,78 @@
+# Observability budgets gate (B1.12).
+#
+# Runs the cardinality + redaction regression tests on PRs that touch
+# the observability crate or any policy/auth code that adds metric
+# labels. Cardinality budgets and redaction rules are easy to break
+# silently: a new label sneaks in, the cardinality limiter overflows
+# silently into `__other__`, or a redactor regex misses a new shape.
+# This lane is the canary.
+#
+# Tests live in `e2e/tests/cardinality.rs` and `e2e/tests/redaction.rs`
+# (the e2e crate's name is `sbproxy-e2e`; section 4.6 of
+# docs/AIGOVERNANCE-BUILD.md spelled it as `sbproxy-rust-e2e`).
+
+name: observability-budgets
+
+on:
+  pull_request:
+    paths:
+      - 'crates/sbproxy-observe/**'
+      - 'crates/sbproxy-modules/src/policy/**'
+      - '.github/workflows/observability-budgets.yml'
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  observability-budgets:
+    name: cardinality + redaction
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4.1.7
+
+      - name: free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2.7.3
+        with:
+          shared-key: observability-budgets
+
+      - name: install protoc and libclang
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang
+
+      # Build the proxy binary the harness spawns at runtime. Same
+      # rationale as e2e.yml: cargo cannot infer the ordering between
+      # `cargo test` on `sbproxy-e2e` and the `sbproxy` binary it
+      # references.
+      - name: build sbproxy binary (release)
+        run: cargo build --release -p sbproxy --locked
+
+      - name: cardinality + redaction tests
+        run: |
+          cargo test -p sbproxy-e2e --release --locked \
+            --test cardinality \
+            --test redaction \
+            -- --include-ignored

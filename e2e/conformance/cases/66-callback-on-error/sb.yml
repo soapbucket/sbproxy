@@ -1,0 +1,38 @@
+# Callback on_error settings: fail, warn, ignore
+# Uses a dead callback endpoint (port 19999) to trigger errors
+proxy:
+  http_bind_port: 18080
+
+origins:
+  # on_error: "fail" - callback error should propagate
+  "cb-fail.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    on_request:
+      - url: http://127.0.0.1:19999/dead-endpoint
+        method: POST
+        timeout: 1
+        on_error: fail
+
+  # on_error: "warn" - callback error logged, request continues
+  "cb-warn.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    on_request:
+      - url: http://127.0.0.1:19999/dead-endpoint
+        method: POST
+        timeout: 1
+        on_error: warn
+
+  # on_error: "ignore" - callback error silently ignored
+  "cb-ignore.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    on_request:
+      - url: http://127.0.0.1:19999/dead-endpoint
+        method: POST
+        timeout: 1
+        on_error: ignore

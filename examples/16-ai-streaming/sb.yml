@@ -1,0 +1,67 @@
+# AI gateway: SSE streaming.
+#
+# The proxy supports streaming responses end-to-end. Send a request with
+# "stream": true and the gateway opens a server-sent-events connection
+# to the upstream provider and forwards chunks as they arrive. Token
+# usage from the final chunk feeds the sbproxy_ai_tokens_total counter
+# and the streaming_analytics module records time-to-first-token, tokens
+# per second, and average inter-token latency for each request.
+#
+# No special configuration is required for streaming. This config is a
+# minimal Anthropic gateway with one provider and a default model; the
+# stream behaviour is driven entirely by the client request body.
+#
+# Setup:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#
+# Run:
+#   make run CONFIG=examples/16-ai-streaming/sb.yml
+#
+# Test (curl, OpenAI-compatible streaming body):
+#   curl --no-buffer http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "claude-3-5-sonnet-latest",
+#       "stream": true,
+#       "messages": [{"role": "user", "content":
+#         "Stream a short story about a lighthouse keeper, six sentences."}]
+#     }'
+#
+# Test (Python, OpenAI SDK):
+#   from openai import OpenAI
+#   client = OpenAI(
+#       base_url="http://127.0.0.1:8080/v1",
+#       api_key="unused",
+#       default_headers={"Host": "ai.local"},
+#   )
+#   stream = client.chat.completions.create(
+#       model="claude-3-5-sonnet-latest",
+#       messages=[{"role": "user", "content": "Count to ten."}],
+#       stream=True,
+#   )
+#   for chunk in stream:
+#       if chunk.choices[0].delta.content:
+#           print(chunk.choices[0].delta.content, end="", flush=True)
+#
+# Expected behaviour:
+#   The HTTP response is text/event-stream. Each line begins with
+#   "data: " followed by a JSON delta. The final chunk carries the
+#   full token usage and triggers the metrics writes.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+
+      providers:
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          default_model: claude-3-5-sonnet-latest
+          models:
+            - claude-3-5-sonnet-latest
+            - claude-3-5-haiku-latest

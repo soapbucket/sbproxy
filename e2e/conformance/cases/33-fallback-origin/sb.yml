@@ -1,0 +1,27 @@
+# Tests fallback origin when primary backend fails
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "fallback.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888/fail
+      timeout: 2s
+    fallback_origin:
+      hostname: fallback-backend
+      on_error: true
+      on_status: [502, 503]
+      add_debug_header: true
+      origin:
+        id: fallback-backend
+        hostname: fallback-backend
+        workspace_id: test
+        version: "1.0.0"
+        action:
+          type: static
+          status_code: 200
+          content_type: application/json
+          json_body:
+            source: fallback
+            message: "served from fallback origin"

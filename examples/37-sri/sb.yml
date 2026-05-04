@@ -1,0 +1,65 @@
+# Subresource Integrity (SRI) inspection.
+#
+# Watches text/html responses for `<script src="https://...">` and
+# `<link rel="stylesheet" href="https://...">` tags pointing at
+# external origins. Each external reference must carry an
+# `integrity="..."` attribute using one of the configured algorithms;
+# any reference that does not is logged at warn level and counted as
+# a violation in the `sbproxy_policy_triggers_total{policy_type="sri"}`
+# metric.
+#
+# SRI is observation-only by design: the proxy does not modify HTML
+# bodies and does not block responses with violations. The SRI spec
+# is a browser-side mechanism (the browser computes the hash and
+# rejects mismatches), so the proxy's value-add is alerting an
+# operator that a page is *missing* integrity coverage in the first
+# place.
+#
+# Same-origin references (relative URLs, protocol-relative `//host/`)
+# are skipped because browsers exempt them from SRI requirements by
+# default. Inline scripts and non-stylesheet `<link>` tags
+# (preconnect, dns-prefetch, icon, ...) are also out of scope.
+#
+# Run:
+#   make run CONFIG=examples/37-sri/sb.yml
+#
+# Test (any external script reference without integrity will log a
+# warning on the proxy and increment the violation counter):
+#
+#   curl -i -H 'Host: sri.local' http://127.0.0.1:8080/
+#
+#   # Inspect the metric:
+#   curl -s http://127.0.0.1:9091/api/metrics | grep sbproxy_policy_triggers_total
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "sri.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/html
+      body: |
+        <!doctype html>
+        <html>
+          <head>
+            <!-- This stylesheet has no integrity attribute. SRI logs a violation. -->
+            <link rel="stylesheet" href="https://cdn.example.com/theme.css">
+            <!-- This script has integrity. SRI is happy. -->
+            <script src="https://cdn.example.com/lib.js"
+                    integrity="sha384-OLBgp1GsljhM2TJ-sbHjaiH9txEUvgdDTAzHv2P24donTt6_529l+9Ua0vFImLlb"
+                    crossorigin="anonymous"></script>
+          </head>
+          <body>
+            <h1>SRI demo</h1>
+          </body>
+        </html>
+
+    policies:
+      - type: sri
+        # When false (default), the policy is a no-op.
+        enforce: true
+        # Acceptable hash algorithms. sha256 is allowed by the SRI
+        # spec but sha384 / sha512 are recommended for new deployments.
+        algorithms: [sha384, sha512]

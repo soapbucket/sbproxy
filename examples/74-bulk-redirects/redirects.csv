@@ -1,0 +1,15 @@
+from,to,status
+# Lines starting with `#` and blank lines are skipped.
+
+# Old marketing landing pages now consolidated into /about.
+/old/about,/about,301
+/old/team,/about/team,301
+/old/contact,/about/contact,301
+
+# Press archive: status defaults to the action's status_code (301).
+/press/2022/october-launch,/press/archive/2022-10
+/press/2022/q3-results,/press/archive/2022-09
+
+# Permanent moves to a separate hostname.
+/blog/announcement-2023,https://blog.example.com/announcements/2023,308
+/blog/changelog,https://changelog.example.com/,302

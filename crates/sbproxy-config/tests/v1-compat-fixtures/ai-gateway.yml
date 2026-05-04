@@ -1,0 +1,34 @@
+config_version: 2
+
+id: "ai-gateway-1"
+hostname: "ai.example.com"
+workspace_id: "ws-test-003"
+version: "1.0"
+
+action:
+  type: ai_proxy
+  providers:
+    - name: openai-mock
+      api_key: test-api-key
+      base_url: https://test.sbproxy.dev/v1
+      models:
+        - gpt-4o
+        - gpt-4o-mini
+  default_model: gpt-4o-mini
+  routing:
+    strategy: fallback_chain
+
+authentication:
+  type: api_key
+  api_keys:
+    - gateway-key-001
+
+policies:
+  - type: rate_limiting
+    requests_per_minute: 60
+    algorithm: sliding_window
+
+response_modifiers:
+  - headers:
+      set:
+        X-AI-Gateway: sbproxy

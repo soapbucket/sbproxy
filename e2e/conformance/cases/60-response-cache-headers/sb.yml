@@ -1,0 +1,19 @@
+# Response cache with X-Cache HIT/MISS headers
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "cachehdr.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    response_cache:
+      enabled: true
+      ttl: 30s
+      stale_while_revalidate: 10s
+      stale_if_error: 60s
+      cacheable_methods:
+        - GET
+      cacheable_status:
+        - 200
+      max_size: 1048576

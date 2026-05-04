@@ -1,0 +1,47 @@
+# E2E tests for SBproxy. Runs ONLY on tag pushes and on manual
+# dispatch. The PR-required CI lane (`ci.yml`) excludes
+# `sbproxy-e2e` because the harness spawns the proxy binary, listens
+# on real ports, and exercises the network stack; on shared GitHub
+# runners that pattern produces startup-timeout flakiness that does
+# not reflect a real regression. Gating e2e on tags keeps PR feedback
+# fast while still validating the full stack before a release ships.
+
+name: e2e
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  e2e:
+    name: e2e (workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: e2e
+
+      # The e2e harness spawns the proxy binary at runtime; cargo
+      # cannot infer the ordering between the e2e crate and the
+      # binary crate, so build it explicitly first.
+      - name: build sbproxy binary
+        run: cargo build -p sbproxy --locked
+
+      - name: e2e
+        run: cargo test -p sbproxy-e2e --locked

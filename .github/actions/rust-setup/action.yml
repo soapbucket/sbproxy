@@ -1,0 +1,66 @@
+# Shared Rust + system-package setup for SBproxy CI lanes.
+#
+# Bundles the four steps every Rust job in this repo otherwise
+# repeats: disk cleanup, stable toolchain, rust-cache, and the apt
+# packages the workspace's transitive deps need. Centralising them
+# means future runner-image churn (clang headers, protoc location,
+# disk policy) is fixed once instead of in every workflow.
+#
+# Usage from a workflow step:
+#
+#   - uses: ./.github/actions/rust-setup
+#     with:
+#       cache-key: ci          # short label that segregates caches
+#       free-disk: 'true'      # off when the job stays well under 14 GB
+#       install-system-deps: 'true'
+#
+# The composite intentionally does NOT run cargo. Each caller picks
+# its own `cargo fmt|clippy|build|test|doc` shape so this action
+# stays a setup primitive, not a workflow.
+
+name: rust-setup
+description: Stable Rust toolchain, rust-cache, and system packages for SBproxy CI.
+
+inputs:
+  cache-key:
+    description: 'shared-key passed to Swatinem/rust-cache. Distinct caches stay split; jobs that share a build matrix should pass the same value.'
+    required: false
+    default: ci
+  free-disk:
+    description: 'Run jlumbroso/free-disk-space before the build. Disable for jobs that fit comfortably under the default runner free space.'
+    required: false
+    default: 'true'
+  install-system-deps:
+    description: 'Install protobuf-compiler, clang, libclang-dev, libc6-dev. Required by the workspace transitive deps; disable only when the job does no Rust compilation.'
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: free disk space
+      if: inputs.free-disk == 'true'
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: false
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: false
+        docker-images: true
+        swap-storage: false
+
+    - name: install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: rust-cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.cache-key }}
+
+    - name: install system deps
+      if: inputs.install-system-deps == 'true'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler clang libclang-dev libc6-dev
