@@ -42,6 +42,23 @@ detect_platform() {
             ;;
     esac
 
+    # darwin/amd64 (Intel Mac) is not currently shipped: the macOS x86
+    # runner pool stalls every release, and Apple Silicon has been the
+    # default for new Macs since 2020. Intel Mac users have two options:
+    #   1. Run the linux/amd64 binary in Docker (recommended)
+    #   2. Build from source: cargo build --release --bin sbproxy
+    if [ "$OS" = "darwin" ] && [ "$ARCH" = "amd64" ]; then
+        echo "Error: pre-built sbproxy binaries are not published for darwin/amd64 (Intel Mac)."
+        echo ""
+        echo "Workarounds:"
+        echo "  1. Run the linux/amd64 binary under Docker:"
+        echo "       docker run --rm ghcr.io/soapbucket/sbproxy:latest --version"
+        echo "  2. Build from source:"
+        echo "       git clone https://github.com/soapbucket/sbproxy"
+        echo "       cd sbproxy && cargo build --release --bin sbproxy"
+        exit 1
+    fi
+
     echo "Detected platform: ${OS}/${ARCH}"
 }
 

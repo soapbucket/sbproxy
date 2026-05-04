@@ -54,13 +54,12 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-latest
             platform: darwin_arm64
-          # darwin_amd64 (Intel Mac) is intentionally not in this matrix.
-          # The GitHub macos-13 / macos-13-large pools have multi-hour
-          # queue times that stall the publish job. Intel Mac binaries
-          # ship via the side workflow `release-darwin-amd64.yml`, which
-          # runs on the same tag, builds asynchronously on the slow pool,
-          # and uploads to the already-published release with --clobber.
-          # The main release job no longer blocks on Intel Mac.
+          # darwin_amd64 (Intel Mac) is not built. The GitHub macos-13
+          # runner pools have multi-hour queue times that stalled
+          # every release attempt, and Apple Silicon has been the
+          # default for new Macs since 2020. Intel Mac users run the
+          # linux_amd64 binary under Docker or build from source. See
+          # `scripts/install.sh` for the same fallback message.
 
     steps:
       - uses: actions/checkout@v4
@@ -210,11 +209,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Tarballs are FLAT layout (built with `tar -C STAGE .`), so
+          # the archive's first entry is "./" which clashes with /tmp's
+          # sticky bit when we extract there directly. Stage each arch
+          # in its own subdirectory we own, then move just the binary.
           mkdir -p docker-ctx/linux/amd64 docker-ctx/linux/arm64
-          tar -xzf artifacts/bin-linux_amd64/sbproxy_linux_amd64.tar.gz -C /tmp/
-          tar -xzf artifacts/bin-linux_arm64/sbproxy_linux_arm64.tar.gz -C /tmp/
-          mv /tmp/sbproxy-${GITHUB_REF_NAME}-linux_amd64/sbproxy docker-ctx/linux/amd64/sbproxy
-          mv /tmp/sbproxy-${GITHUB_REF_NAME}-linux_arm64/sbproxy docker-ctx/linux/arm64/sbproxy
+          mkdir -p stage/amd64 stage/arm64
+          tar -xzf artifacts/bin-linux_amd64/sbproxy_linux_amd64.tar.gz -C stage/amd64/
+          tar -xzf artifacts/bin-linux_arm64/sbproxy_linux_arm64.tar.gz -C stage/arm64/
+          mv stage/amd64/sbproxy docker-ctx/linux/amd64/sbproxy
+          mv stage/arm64/sbproxy docker-ctx/linux/arm64/sbproxy
           chmod +x docker-ctx/linux/*/sbproxy
           cp artifacts/sbom/sbom.cyclonedx.json docker-ctx/sbom.cyclonedx.json
           cat > docker-ctx/Dockerfile <<'EOF'
