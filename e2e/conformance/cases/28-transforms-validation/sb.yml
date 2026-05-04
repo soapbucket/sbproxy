@@ -1,0 +1,42 @@
+# Tests validation/structural transforms: json_schema, payload_limit, discard
+proxy:
+  http_bind_port: 18080
+
+origins:
+  # JSON Schema validation
+  "jsonschema.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    transforms:
+      - type: json_schema
+        content_types:
+          - application/json
+        schema:
+          type: object
+          required:
+            - method
+            - path
+          properties:
+            method:
+              type: string
+            path:
+              type: string
+        action: block
+
+  # Payload limit
+  "paylimit.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    transforms:
+      - type: payload_limit
+        max_size: 128
+
+  # Discard response body
+  "discard.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    transforms:
+      - type: discard

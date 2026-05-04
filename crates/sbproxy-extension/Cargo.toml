@@ -1,0 +1,76 @@
+[package]
+name = "sbproxy-extension"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+sbproxy-plugin.workspace = true
+sbproxy-config.workspace = true
+
+# CEL expression engine
+cel.workspace = true
+
+# Lua scripting engine
+mlua.workspace = true
+
+# JavaScript scripting engine
+rquickjs.workspace = true
+
+# WebAssembly scripting engine (wasmtime + WASI).
+wasmtime.workspace = true
+wasi-common.workspace = true
+
+# Serialization
+serde = { workspace = true }
+serde_json.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# HTTP types
+http.workspace = true
+bytes.workspace = true
+
+# String types
+compact_str.workspace = true
+
+# Networking (for IP/CIDR functions)
+ipnetwork.workspace = true
+
+# Text processing (for regex functions)
+regex.workspace = true
+
+# Encoding
+base64.workspace = true
+
+# Crypto
+sha2.workspace = true
+hex.workspace = true
+
+# UUID
+uuid.workspace = true
+
+# Time
+chrono.workspace = true
+
+# Feature-flag store: process-wide handle.
+once_cell = "1"
+parking_lot.workspace = true
+
+# Async runtime (for federation background refresh task)
+tokio.workspace = true
+
+# HTTP client (for MCP upstream transports)
+reqwest.workspace = true
+
+# Lock-free atomic Arc swap (for federation tool registry)
+arc-swap.workspace = true
+
+# Logging
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

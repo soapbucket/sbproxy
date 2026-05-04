@@ -1,0 +1,43 @@
+# Session cookies.
+#
+# The session block configures the encrypted cookie used to carry session data
+# across requests on this origin. When unset, sessions are disabled. This
+# example uses a static action so you can see the cookie issuance directly
+# without a real backend.
+#
+# Run:
+#   make run CONFIG=examples/65-sessions/sb.yml
+#
+# Test:
+#   # First request: server issues the session cookie. Persist it to a jar.
+#   curl -sv -c /tmp/sb-session.jar -H 'Host: app.local' \
+#        http://127.0.0.1:8080/ 2>&1 \
+#     | grep -iE '^< set-cookie|sb_session'
+#
+#   # Subsequent request: client sends the cookie back; the proxy validates and
+#   # exposes session data to the static action's templating layer.
+#   curl -sv -b /tmp/sb-session.jar -H 'Host: app.local' \
+#        http://127.0.0.1:8080/ 2>&1 \
+#     | grep -iE '^< (HTTP|cookie)|sb_session'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "app.local":
+    session:
+      cookie_name: sb_session
+      max_age: 3600
+      http_only: true
+      secure: false
+      same_site: Lax
+      allow_non_ssl: true
+
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        message: "session cookie issued, see Set-Cookie response header"
+        cookie_name: sb_session
+        max_age_secs: 3600

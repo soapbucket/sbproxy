@@ -1,0 +1,54 @@
+# DDoS protection: per-IP rate ceiling + temporary block.
+#
+# Tracks a sliding 1-second window per source IP. When the rate
+# crosses request_rate_threshold, the IP is blocked for block_duration
+# and every request from it returns 429 with Retry-After until the
+# block expires. Whitelisted IPs and CIDR ranges bypass the check
+# entirely (useful for health checkers, internal monitoring, and
+# load testers in staging).
+#
+# Distinct from rate_limiting: rate_limiting throttles continuously
+# per request; ddos_protection trips a hard block once the threshold
+# is breached, then keeps the block in place for a fixed duration.
+# Use rate_limiting for fair-share quotas; use ddos_protection as a
+# cheap upstream-shielding circuit breaker for abusive bursts.
+#
+# Run:
+#   make run CONFIG=examples/36-ddos-protection/sb.yml
+#
+# Test:
+#   # 200 under threshold
+#   curl -i -H 'Host: ddos.local' http://127.0.0.1:8080/echo
+#
+#   # Burst past the threshold; later requests return 429 with Retry-After
+#   for i in $(seq 1 15); do
+#     curl -s -o /dev/null -w "%{http_code} " -H 'Host: ddos.local' \
+#       http://127.0.0.1:8080/echo
+#   done; echo
+#
+#   # The block clears automatically after block_duration. Watch it
+#   # recover with: sleep 11 && curl -i -H 'Host: ddos.local' \
+#   #   http://127.0.0.1:8080/echo
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ddos.local":
+    action:
+      type: echo
+
+    policies:
+      - type: ddos_protection
+        # Allow up to 10 requests per second from any single IP.
+        detection:
+          request_rate_threshold: 10
+          detection_window: 1s
+        # Once tripped, block the offending IP for 10 seconds.
+        mitigation:
+          block_duration: 10s
+          auto_block: true
+        # IPs and CIDRs that bypass the check entirely.
+        whitelist:
+          - 127.0.0.1
+          - 10.0.0.0/8

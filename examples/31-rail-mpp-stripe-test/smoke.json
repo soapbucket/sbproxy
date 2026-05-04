@@ -1,0 +1,31 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "feature_endpoints": [],
+  "audit_check": false,
+  "skip_unless_env": "STRIPE_SECRET_KEY",
+  "_notes": [
+    "This example does NOT enable the proxy admin listener, so",
+    "/healthz (which lives on the admin port, default 9090) is not",
+    "reachable. The data plane's built-in liveness path is /health,",
+    "served by every sbproxy instance regardless of admin config; we",
+    "use that as the smoke runner's liveness probe.",
+    "",
+    "feature_endpoints[] is empty: the real value of the example is",
+    "the 402 multi-rail body, which is not a 2xx. The Makefile's",
+    "`make test` target covers that path for hands-on validation.",
+    "",
+    "skip_unless_env is a soft hint to a future smoke runner that",
+    "respects environment-variable gating. Today's runner",
+    "(scripts/examples-smoke.sh) ignores unknown fields, so this",
+    "example will run liveness regardless. The real Stripe redemption",
+    "flow needs STRIPE_SECRET_KEY=sk_test_...; without it the proxy",
+    "still emits the 402 challenge body shape (the Wave 3 emission",
+    "path does not call Stripe), so liveness alone is a meaningful",
+    "CI signal.",
+    "",
+    "audit_check stays false until Wave 2 (R1.2) ships the OSS",
+    "/api/audit/recent endpoint."
+  ]
+}

@@ -1,0 +1,43 @@
+# Prometheus config for the SBproxy reference observability stack.
+#
+# Scrape interval and evaluation interval are deliberately matched so
+# every alerting rule sees the same sample frequency it was tuned against
+# (B1.7). 15s is the default for SBproxy dashboards and burn-rate alerts.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    deployment: sbproxy-obs-stack-reference
+
+scrape_configs:
+
+  # Prometheus self-monitoring. Useful when debugging the stack itself.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # SBproxy /metrics endpoint.
+  #
+  # In the reference stack we assume sbproxy is running on the host (not
+  # inside this compose project), with `--metrics-listen 127.0.0.1:9091`.
+  # `host.docker.internal` resolves to the host on Docker Desktop and on
+  # recent Linux Docker (with extra_hosts: host-gateway). When you wire a
+  # real sbproxy container into a shared compose network, replace the
+  # target with `sbproxy:9091` (or whatever port the binary's metrics
+  # listener uses) and remove `host.docker.internal`.
+  - job_name: sbproxy
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9091"]
+        labels:
+          service: sbproxy
+          # Per A1.6 / G1.6 we keep cardinality bounded; instance/host
+          # labels are added at scrape time, never at the application.
+
+  # OpenTelemetry collector self-metrics. The collector exposes its own
+  # Prometheus scrape endpoint on :8888 by default; useful for tracking
+  # dropped spans and queue health.
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8888"]

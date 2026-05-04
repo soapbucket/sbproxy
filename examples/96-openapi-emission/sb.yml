@@ -1,0 +1,132 @@
+# OpenAPI 3.0 emission from gateway config.
+#
+# The gateway publishes an OpenAPI document describing the routes it
+# exposes, derived from the live config. Three things land together:
+#
+#   1. Rich path matchers: `template` for /users/{id} style routes,
+#      `regex` as the escape hatch, plus the existing prefix / exact.
+#      Per-segment regex constraints are supported inline as
+#      `{id:[0-9]+}`.
+#   2. OpenAPI 3.0 Parameter Object declarations on each forward rule.
+#      Field names mirror the spec verbatim, so emission is a direct
+#      passthrough into `parameters[]`.
+#   3. Two emit surfaces:
+#        - admin: GET /api/openapi.{json,yaml} (basic auth, all hosts)
+#        - per-host: GET /.well-known/openapi.{json,yaml}, opt-in via
+#          the `expose_openapi: true` flag on the origin.
+#
+# Run:
+#   make run CONFIG=examples/96-openapi-emission/sb.yml
+#
+# Per-host (public, opt-in):
+#   curl -s -H 'Host: api.localhost' \
+#     http://127.0.0.1:8080/.well-known/openapi.json | jq
+#
+# Admin (basic auth, all hosts):
+#   curl -s -u admin:changeme http://127.0.0.1:9090/api/openapi.json | jq
+#
+# Exercise the templated route:
+#   curl -s -H 'Host: api.localhost' \
+#     http://127.0.0.1:8080/users/42/posts/abc | jq
+
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    port: 9090
+    # username/password default to admin / changeme; override in real configs.
+
+origins:
+  "api.localhost":
+    # Opting in publishes /.well-known/openapi.{json,yaml} for this host.
+    # Off by default so origins do not leak route shape unintentionally.
+    expose_openapi: true
+
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    # Restricting `allowed_methods` narrows the set of operations emitted
+    # per path. Empty = every standard verb.
+    allowed_methods: ["GET", "POST"]
+
+    forward_rules:
+      # Named segments + per-segment regex constraint. The constraint is
+      # validated at request time; non-numeric ids fall through to the
+      # next rule.
+      - rules:
+          - path:
+              template: /users/{id:[0-9]+}/posts/{post_id}
+        parameters:
+          - name: id
+            in: path
+            required: true
+            description: Numeric user identifier.
+            schema:
+              type: integer
+              format: int64
+          - name: post_id
+            in: path
+            required: true
+            description: Opaque post identifier.
+            schema:
+              type: string
+          - name: include
+            in: query
+            required: false
+            description: Comma-separated list of related resources to embed.
+            schema:
+              type: string
+        origin:
+          id: user-posts
+          action:
+            type: proxy
+            url: https://httpbin.org/anything
+
+      # Catch-all matcher: useful for static asset passthrough or
+      # arbitrary trailing paths.
+      - rules:
+          - path:
+              template: /static/{*rest}
+        origin:
+          id: static-passthrough
+          action:
+            type: proxy
+            url: https://httpbin.org/anything
+
+      # Whole-path regex for shapes the template DSL cannot express.
+      # Named captures (?P<version>...) are exposed as path params and
+      # round-trip into the emitted OpenAPI as an x-sbproxy-regex-path
+      # extension since regex is not a standard OpenAPI path syntax.
+      - rules:
+          - path:
+              regex: '^/v(?P<version>[0-9]+)/items'
+        origin:
+          id: versioned-items
+          action:
+            type: proxy
+            url: https://httpbin.org/anything
+
+      # Plain exact and prefix matchers continue to work unchanged. The
+      # prefix matcher is annotated with x-sbproxy-prefix-match in the
+      # emitted spec since OpenAPI has no native concept of "starts-with".
+      - rules:
+          - path:
+              exact: /health
+        origin:
+          id: healthcheck
+          action:
+            type: static
+            status_code: 200
+            content_type: application/json
+            json_body:
+              status: healthy
+
+      - rules:
+          - path:
+              prefix: /api/
+        origin:
+          id: api-passthrough
+          action:
+            type: proxy
+            url: https://httpbin.org/anything

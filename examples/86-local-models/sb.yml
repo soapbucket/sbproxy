@@ -1,0 +1,58 @@
+# Hybrid local + cloud AI gateway.
+#
+# Routes cheap traffic to a locally-hosted model (Ollama, vLLM, LM
+# Studio, Hugging Face TGI, or llama.cpp), and the long tail or
+# tougher prompts to a hosted provider. The proxy speaks
+# OpenAI-compatible to the client; each backend listed here also
+# speaks OpenAI-compatible (the local servers all expose
+# `/v1/chat/completions` directly), so no format translation is
+# needed and bytes pass through.
+#
+# Strategy is `fallback_chain`: try local first, fall through to
+# OpenAI if local is offline or returns an error. Switch to
+# `cost_optimized` to send cheaper traffic to local even when both
+# are healthy, or to `weighted` to mix at a fixed ratio.
+#
+# Run:
+#   ollama serve &
+#   ollama pull llama3.1
+#   make run CONFIG=examples/86-local-models/sb.yml
+#
+# Test:
+#   curl -H 'Host: localhost' -H 'Content-Type: application/json' \
+#        -d '{"model":"llama3.1","messages":[{"role":"user","content":"hi"}]}' \
+#        http://127.0.0.1:8080/v1/chat/completions
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "localhost":
+    action:
+      type: ai_proxy
+      routing:
+        strategy: fallback_chain
+      providers:
+        # Local model first. Default base URLs match each runtime's
+        # convention; override with `base_url` if you bind elsewhere.
+        - name: ollama
+          # base_url: http://localhost:11434/v1   # default
+          # api_key: not required
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+
+# --- Other local runtimes the registry knows about ---
+#
+# Replace the `ollama` provider above with one of these to switch
+# runtimes. All speak OpenAI-compatible so the rest of the config
+# is identical.
+#
+#   - name: vllm
+#     # default base_url: http://localhost:8000/v1
+#   - name: lmstudio
+#     # default base_url: http://localhost:1234/v1
+#   - name: tgi
+#     # default base_url: http://localhost:8080/v1
+#   - name: llamacpp
+#     # default base_url: http://localhost:8080/v1

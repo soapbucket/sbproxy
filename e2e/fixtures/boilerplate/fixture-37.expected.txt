@@ -1,0 +1,3 @@
+Foundry helps small teams ship API contracts faster by generating typed clients from OpenAPI in real time.
+Drop a spec into the Foundry CLI and the toolchain emits Go, TypeScript, and Python clients in seconds.
+Each generated client carries a stable version pin so downstream services can adopt the new contract on their own schedule.

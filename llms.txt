@@ -1,0 +1,257 @@
+# SBproxy
+
+> The AI gateway built like a real proxy. One binary, built on Pingora. Source available under BSL 1.1.
+
+Most teams run nginx or Traefik for HTTP traffic, then route AI requests through a separate LiteLLM or Portkey instance. sbproxy handles both in a single binary. One config file covers everything.
+
+## Key facts
+
+- 200+ LLM models reachable. 20 native provider adapters (OpenAI, Anthropic, Google, Mistral, Cohere, Groq, DeepSeek, and more) plus 200+ models through the OpenRouter aggregator.
+- Sub-millisecond p99 proxy overhead at 50k+ rps on commodity hardware
+- Hot reload with zero dropped connections
+- 14-phase compiled pipeline per origin (compiled once, zero per-request allocation)
+- Single binary, no required external dependencies. Redis is optional, only needed for distributed rate limiting and shared cache.
+- Built in Rust on Cloudflare's Pingora. Source available on GitHub.
+
+## Documentation
+
+### Repo docs
+- README: https://github.com/soapbucket/sbproxy/blob/main/README.md
+- Manual: https://github.com/soapbucket/sbproxy/blob/main/docs/manual.md
+- Configuration: https://github.com/soapbucket/sbproxy/blob/main/docs/configuration.md
+- Features: https://github.com/soapbucket/sbproxy/blob/main/docs/features.md
+- AI Gateway: https://github.com/soapbucket/sbproxy/blob/main/docs/ai-gateway.md
+- AI Crawl Control + Pay Per Crawl: https://github.com/soapbucket/sbproxy/blob/main/docs/ai-crawl-control.md
+- Payment rails: https://github.com/soapbucket/sbproxy/blob/main/docs/payment-rails.md
+- Content for agents: https://github.com/soapbucket/sbproxy/blob/main/docs/content-for-agents.md
+- RSL licensing cookbook: https://github.com/soapbucket/sbproxy/blob/main/docs/rsl.md
+- Providers: https://github.com/soapbucket/sbproxy/blob/main/docs/providers.md
+- Architecture: https://github.com/soapbucket/sbproxy/blob/main/docs/architecture.md
+- Performance: https://github.com/soapbucket/sbproxy/blob/main/docs/performance.md
+- Scripting: https://github.com/soapbucket/sbproxy/blob/main/docs/scripting.md
+- Comparison: https://github.com/soapbucket/sbproxy/blob/main/docs/comparison.md
+- Troubleshooting: https://github.com/soapbucket/sbproxy/blob/main/docs/troubleshooting.md
+- Upgrade Guide: https://github.com/soapbucket/sbproxy/blob/main/docs/upgrade.md
+- Operator runbook: https://github.com/soapbucket/sbproxy/blob/main/docs/operator-runbook.md
+- Manual testing payment rails: https://github.com/soapbucket/sbproxy/blob/main/docs/manual-testing-rails.md
+- Changelog: https://github.com/soapbucket/sbproxy/blob/main/CHANGELOG.md
+- Examples: https://github.com/soapbucket/sbproxy/tree/main/examples
+
+## Quick start
+
+```bash
+git clone https://github.com/soapbucket/sbproxy
+cd sbproxy
+make build-release
+```
+
+Minimal config (sb.yml):
+```yaml
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+```
+
+```bash
+make run CONFIG=sb.yml
+curl -H "Host: api.example.com" http://localhost:8080/echo
+```
+
+## AI gateway
+
+Clients send OpenAI-style chat completion requests. sbproxy translates to each provider's native format on the way out. Same client SDK, any provider:
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          models: [claude-3-5-sonnet-latest]
+        - name: openrouter
+          api_key: ${OPENROUTER_API_KEY}
+      default_model: claude-3-5-sonnet-latest
+      routing: fallback_chain
+```
+
+Routing strategies: round_robin, weighted, fallback_chain, random, lowest_latency, least_connections, cost_optimized, token_rate, sticky.
+
+Guardrails: pii, injection, jailbreak, toxicity, content_safety, schema, regex.
+
+## Configuration model
+
+Two top-level keys in sb.yml:
+- `proxy:` global settings (ports, TLS, ACME, HTTP/3)
+- `origins:` per-hostname routing, map of hostname to origin config
+
+Common pitfall: each origin has sibling fields, NOT fields nested inside `action`. If you put `policies` or `authentication` under `action`, the config will not parse the way you expect.
+
+Origin fields:
+- `action` what to do: proxy, ai_proxy, static, redirect, echo, mock, beacon, noop, load_balancer, websocket, grpc
+- `authentication` who can access: api_key, basic_auth, bearer, jwt, digest, forward_auth, noop
+- `policies` access rules: rate_limit, ip_filter, waf, ddos, csrf, security_headers, request_limit, sri, assertion, cel
+- `transforms` body transforms: json, json_projection, json_schema, html, markdown, css, template, encoding, lua, javascript, and 8 more
+- `request_modifiers` / `response_modifiers` rewrite headers, URL, or body inbound and outbound
+- `response_cache` HTTP caching with TTL, stale-while-revalidate, stale-if-error
+- `forward_rules` path-based routing to inline origins
+- `on_request` / `on_response` lifecycle callbacks (sync or async)
+- `compression` gzip, brotli, zstd
+- `cors` CORS settings
+- `error_pages` custom error pages
+- `session_config` cookie-based sessions
+- `variables` user-defined template variables
+
+## Actions
+
+| Type | Description |
+|------|-------------|
+| proxy | Reverse proxy to upstream URL |
+| ai_proxy | AI gateway with 200+ models (20 native adapters + OpenRouter aggregator), 9 routing strategies, guardrails, budgets |
+| static | Static response (JSON or text) |
+| redirect | HTTP redirect (301/302/307/308) |
+| echo | Echo request as JSON (debugging) |
+| mock | Configurable JSON response with optional delay |
+| beacon | 1x1 transparent GIF |
+| noop | Empty 200 response |
+| load_balancer | 7 algorithms: round-robin, weighted-random, least-connections, IP hash, URI hash, header hash, cookie hash |
+| websocket | WebSocket proxy |
+| grpc | gRPC and gRPC-Web proxy |
+
+## Authentication types
+
+| Type | Description |
+|------|-------------|
+| api_key | X-API-Key header or query parameter |
+| basic_auth | HTTP Basic (RFC 7617) |
+| bearer | Authorization: Bearer tokens |
+| jwt | JWT validation (HS256, RS256, ES256) with JWKS |
+| digest | HTTP Digest auth |
+| forward_auth | Delegate to external auth service |
+| noop | No-op (for testing) |
+
+## Policies
+
+| Type | Description |
+|------|-------------|
+| rate_limit | Token bucket and sliding window. Local in-memory or shared via Redis. |
+| ip_filter | Allowlist/blocklist with CIDR notation. IPv4 and IPv6. |
+| waf | OWASP CRS rules with paranoia levels |
+| ddos | Connection rate and burst limits |
+| csrf | Token-based CSRF protection (synchronizer pattern) for state-changing requests |
+| cel | Custom access control via CEL expressions |
+| security_headers | HSTS, X-Frame-Options, CSP, X-Content-Type-Options, Referrer-Policy |
+| request_limit | Body size and header count caps |
+| sri | Subresource integrity checks |
+| assertion | Match request shape against expected criteria |
+| ai_crawl_control | Pay-per-crawl 402 challenge with multi-rail negotiation, tiered pricing, content-shape pricing, and per-tier `content_signal` and `citation_required` |
+| aipref | Parse the inbound `aipref:` header into `request.aipref.{train,search,ai_input}`. Default-permissive when absent. |
+
+## Transforms
+
+| Type | Description |
+|------|-------------|
+| json | Set, get, and delete fields in a JSON body |
+| json_projection | Select, rename, and reshape JSON fields |
+| json_schema | Validate response against a JSON Schema |
+| html | Rewrite tags, attributes, and content with CSS selectors |
+| markdown | Render Markdown to HTML |
+| html_to_markdown | Convert HTML to Markdown (good for LLM input) |
+| css | Rewrite stylesheets |
+| template | Render a response from a minijinja template |
+| encoding | Base64, hex, URL encoding/decoding |
+| format_convert | Convert between JSON, XML, YAML, CSV |
+| normalize | Coerce a response into a consistent shape |
+| replace_strings | Find and replace inside a body |
+| sse_chunking | Reshape Server-Sent Events streams |
+| payload_limit | Cap response body size |
+| optimize_html | Minify HTML |
+| lua | Run a Lua script against the body |
+| javascript | Run JavaScript via QuickJS |
+| boilerplate | Strip nav, footer, aside, comment-section nodes before HTML to Markdown |
+| markup | HTML to Markdown via pulldown-cmark; stamps title + token estimate |
+| citation_block | Prepend source / license / fetched-at to Markdown when `citation_required` |
+| json_envelope | Wrap Markdown body in the JSON envelope (title, url, license URN, content_md, token_estimate, schema.org) |
+
+## Content shaping (Wave 4)
+
+Wave 4 adds the content-shaping pillar on top of Wave 3 payment rails. Agents that send `Accept: text/markdown` or `Accept: application/json` get their preferred shape with the right pricing tier, the right license posture, and machine-readable discovery documents.
+
+- **Two-pass `Accept` resolution.** Pass 1 (declaration order, q-values stripped) drives pricing-tier lookup; Pass 2 (q-value-aware) drives the body transformer. Operators control pricing via tier ordering; agents control transformation via q-values. Diverged outcomes are intentional under tie-breaks. See `docs/content-for-agents.md` and `docs/adr-content-negotiation-and-pricing.md`.
+- **JSON envelope.** Versioned `application/json; profile="https://sbproxy.dev/schema/json-envelope/v1"` body with `title`, `url`, `license` (RSL URN), `content_md`, `fetched_at`, `citation_required`, `schema_org`, `token_estimate`. See `docs/adr-json-envelope-schema.md`.
+- **`Content-Signal` header.** Per-route editorial signal stamped on 200 responses. Closed value set: `ai-train`, `ai-input`, `search`. Set at the origin or tier level via `content_signal:`.
+- **`x-markdown-tokens` header.** Approximate token count of the Markdown body. Same value as the JSON envelope's `token_estimate`. Computed once and shared.
+- **Boilerplate stripping.** Drops nav / footer / aside / comment-section nodes before the HTML to Markdown transform. Cuts token counts on news / blog pages by 30 to 60 percent.
+- **Citation block.** Prepends a source / license / fetched-at line to Markdown bodies when the matched tier asserts `citation_required: true`.
+
+## Projection routes (Wave 4)
+
+Four well-known documents served per origin, generated from the compiled `ai_crawl_control` policy and refreshed atomically on every config reload. Each refresh emits one `AdminAuditEvent` per (hostname, projection kind). Operator preview via `sbproxy projections render --kind <kind> --config ./sb.yml`.
+
+| Path | Format | Source |
+|------|--------|--------|
+| `/robots.txt` | IETF draft-koster-rep-ai (AI-extended robots.txt) | Walks `tiers[]`; emits a User-agent stanza per agent class with priced tiers |
+| `/llms.txt` and `/llms-full.txt` | Anthropic / Mistral convention | Site description + Markdown listing of priced routes |
+| `/licenses.xml` | RSL 1.0 | One `<license>` element per origin; URN format `urn:rsl:1.0:<hostname>:<config_version_hash>` |
+| `/.well-known/tdmrep.json` | W3C TDMRep | One entry per priced route; `right` derived from `Content-Signal` |
+
+See `docs/content-for-agents.md` for the cookbook, `docs/rsl.md` for RSL term recipes, and `docs/adr-policy-graph-projections.md` for the projection contract.
+
+## Scripting
+
+Four engines, picked per use case:
+
+- **CEL** via `cel-rust`. Compiled once, evaluates in microseconds. Best for routing decisions and quick predicates. Custom functions for HTTP request inspection, hashing, time, and IP utilities.
+- **Lua** via `mlua` with the Luau runtime. Sandboxed. Best for request and response body transforms.
+- **JavaScript** via QuickJS (`rquickjs`). V8-compatible API surface. Best for teams already invested in JS tooling.
+- **WebAssembly** via `wasmtime`. WASI networking with host allowlist. Best for sandboxed plugins from any source language.
+
+Every engine sees the same context namespaces: `request`, `session`, `origin`, `server`, `vars`, `ctx`, `response`.
+
+## Observability
+
+- Prometheus metrics with AI-specific namespace (tokens, latency, TTFT, cache hits, guardrail triggers)
+- Structured logging via `tracing`, with compile-stripped debug/trace at release
+- OpenTelemetry tracing across the phase pipeline
+- Typed event bus for callback hooks
+
+## Plugin system
+
+Third-party plugins register via the `inventory` crate. The proxy discovers them at link time. No central registration file to update.
+
+```rust
+inventory::submit! {
+    PluginRegistration {
+        kind: PluginKind::Policy,
+        name: "my_policy",
+        factory: |config| { /* ... */ },
+    }
+}
+```
+
+Five extension points: `ActionHandler`, `AuthProvider`, `PolicyEnforcer`, `TransformHandler`, `RequestEnricher`.
+
+## Performance
+
+Real numbers from a publishable benchmark run on c3-standard-8 GCE (LTO release build, 60s × 3 replicates, medians):
+
+- Passthrough: **77,758 rps** at 0.6 ms p99
+- Cache hit: **138,770 rps** at 0.3 ms p99
+- WAF rejection: **185,049 rps** at 0.17 ms p99
+- Full chain (auth + rate limit + cache + transforms): **50,713 rps** at 0.6 ms p99
+- AI gateway, non-streaming: **77,784 rps**
+
+These aren't synthetic ceilings. Most p99s land under 1 ms because the design priority is tight tail latency, not just headline rps. See https://github.com/soapbucket/sbproxy/blob/main/docs/performance.md for the full 12-scenario table, methodology, and the ones where numbers are weak.
+
+## Links
+
+- Source: https://github.com/soapbucket/sbproxy
+- Website: https://sbproxy.dev
+- Docker: ghcr.io/soapbucket/sbproxy
+- License: BSL 1.1 (see LICENSE)

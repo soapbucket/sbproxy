@@ -1,0 +1,39 @@
+# Upstream connect-error retries.
+#
+# When the proxy cannot establish a TCP/TLS connection to the upstream
+# (DNS failure, refused, unreachable, TLS handshake fail), Pingora
+# calls back into the proxy and we can mark the error retryable. With
+# `retry.max_attempts > 1` the proxy will run `upstream_peer` again
+# and try once more. For load_balancer actions, the failed target is
+# reported to the outlier detector so the next attempt picks a
+# different target.
+#
+# Status-code retries (e.g. retry on 502/503) are not yet wired
+# because they require buffering the upstream response. Connect-error
+# / timeout retries cover the common case (rolling restarts, transient
+# DNS failures, and momentarily unreachable targets).
+#
+# Backoff doubles with each attempt and is capped at 5s.
+#
+# Run:
+#   make run CONFIG=examples/76-upstream-retries/sb.yml
+#
+# Test:
+#   curl -H 'Host: localhost' http://127.0.0.1:8080/get
+#   # Try with the upstream temporarily down: the proxy retries
+#   # up to 3 attempts before returning a 502.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "localhost":
+    action:
+      type: proxy
+      url: http://127.0.0.1:9999
+      retry:
+        max_attempts: 3
+        retry_on:
+          - connect_error
+          - timeout
+        backoff_ms: 100

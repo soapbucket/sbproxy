@@ -1,0 +1,75 @@
+# sb-testnet.yml: Base Sepolia override for the 30-rail-x402-base-sepolia
+# example.
+#
+# Identical to sb.yml except:
+#
+# 1. The x402 facilitator URL points at the LF-stewarded Base Sepolia
+#    endpoint (https://, not the local mock).
+# 2. The merchant `pay_to` address is sourced from the
+#    `MERCHANT_ADDRESS` environment variable interpolation; the demo
+#    address in sb.yml never holds real funds.
+# 3. The quote-token signing key reads from `secret_ref.env` rather
+#    than the inline seed_hex so production keys never land in YAML.
+#
+# To run:
+#
+#   export MERCHANT_ADDRESS=0xYOUR_BASE_SEPOLIA_ADDRESS
+#   export SBPROXY_QUOTE_TOKEN_SEED_HEX=$(openssl rand -hex 32)
+#   docker compose --env-file .env.testnet up -d --wait
+#
+# Then point the proxy at this file by mounting it as
+# /etc/sbproxy/sb.yml inside the container (override
+# `volumes:` in docker-compose.yml or use an override file).
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "blog.test.sbproxy.dev":
+    action:
+      type: proxy
+      url: http://mock-origin:80
+
+    policies:
+      - type: ai_crawl_control
+        price: 0.001
+        currency: USD
+        header: crawler-payment
+        crawler_user_agents:
+          - GPTBot
+          - ChatGPT-User
+          - ClaudeBot
+          - anthropic-ai
+          - CCBot
+          - PerplexityBot
+          - Google-Extended
+
+        tiers:
+          - route_pattern: /article*
+            price:
+              amount_micros: 1000
+              currency: USD
+            content_shape: html
+            paywall_position: top_of_page
+
+        rails:
+          x402:
+            chain: base-sepolia
+            # LF-stewarded Base Sepolia facilitator. The proxy talks
+            # to this URL only when the agent posts a redemption; the
+            # 402 emission path itself does not contact the
+            # facilitator.
+            facilitator: https://facilitator.base-sepolia.x402.org
+            asset: USDC
+            pay_to: "${MERCHANT_ADDRESS}"
+            version: "2"
+
+        quote_token:
+          key_id: x402-base-sepolia-prod-2026
+          # Production key sourced from env. The variable holds a
+          # 64-char hex string (32 raw bytes). Use `openssl rand
+          # -hex 32` to mint a fresh seed.
+          secret_ref:
+            env: SBPROXY_QUOTE_TOKEN_SEED_HEX
+          issuer: "https://blog.test.sbproxy.dev"
+          default_ttl_seconds: 300

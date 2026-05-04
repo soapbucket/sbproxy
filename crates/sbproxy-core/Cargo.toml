@@ -1,0 +1,135 @@
+[package]
+name = "sbproxy-core"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+# --- Wave 1 AI Governance feature flags ---
+#
+# Library consumers opt in; the `sbproxy` binary turns these on via its own
+# `default` feature set. See docs/AIGOVERNANCE-BUILD.md task B1.1.
+#
+# Flags:
+#   - agent-class : `agent_class` resolver on `RequestContext` (G1.4). The
+#     resolver combines UA match, reverse-DNS verification, and bot-auth
+#     keyid; the resolved value is exposed to CEL, Lua, JS, and WASM.
+[features]
+default = []
+# Pulls the resolver in `sbproxy-modules::policy::agent_class` and the
+# reverse-DNS verifier in `sbproxy-security::agent_verify` into the
+# request pipeline. Off by default for library consumers; the
+# `sbproxy` binary turns it on via its own default feature set (B1.1).
+agent-class = [
+    "dep:sbproxy-classifiers",
+    "sbproxy-modules/agent-class",
+    "sbproxy-security/agent-class",
+]
+# `agent-classifier` adds the optional ML agent classifier verdict
+# field on `RequestContext` (per `docs/adr-ml-agent-classifier.md`).
+# The actual ONNX inference and feature builder live in the enterprise
+# crate `sbproxy-classifier`; this flag only widens the per-request
+# context to hold the verdict the enterprise classifier produces. The
+# OSS proxy does not run the classifier itself.
+agent-classifier = ["agent-class"]
+# Wave 5 / G5.3. Forwards through to `sbproxy-tls/tls-fingerprint`,
+# enabling JA3 / JA4 / JA4H capture in the request pipeline. The
+# `tls_fingerprint` and `headless_signal` fields on `RequestContext`
+# are present unconditionally (so types resolve either way) but stay
+# `None` when the feature is off.
+tls-fingerprint = [
+    "sbproxy-tls/tls-fingerprint",
+    "sbproxy-security/tls-fingerprint",
+    "dep:sbproxy-classifiers",
+]
+
+[dependencies]
+sbproxy-plugin.workspace = true
+sbproxy-config.workspace = true
+sbproxy-tls.workspace = true
+sbproxy-modules.workspace = true
+sbproxy-middleware.workspace = true
+sbproxy-httpkit.workspace = true
+sbproxy-observe.workspace = true
+sbproxy-extension.workspace = true
+sbproxy-ai.workspace = true
+sbproxy-cache.workspace = true
+sbproxy-platform.workspace = true
+sbproxy-openapi.workspace = true
+sbproxy-security.workspace = true
+# Optional: only pulled in when the `agent-class` feature is on. The
+# request context references `sbproxy_classifiers::AgentId` etc., and
+# the scripting bridges read those types to expose `request.agent_id`.
+sbproxy-classifiers = { workspace = true, optional = true }
+
+# Pingora
+pingora-core.workspace = true
+pingora-proxy.workspace = true
+pingora-http.workspace = true
+pingora-error.workspace = true
+
+# Bloom filter for hostname pre-check
+bloomfilter.workspace = true
+
+# CIDR matching for trusted_proxies / X-Forwarded-For trust boundary
+ipnetwork.workspace = true
+
+# Enterprise hook registration (link-time plugin pattern)
+inventory.workspace = true
+
+# Concurrency and data structures
+arc-swap.workspace = true
+compact_str.workspace = true
+smallvec.workspace = true
+bytes.workspace = true
+
+# URL parsing
+url.workspace = true
+
+# HTTP types (HeaderMap for auth checks)
+http.workspace = true
+
+# Async
+async-trait.workspace = true
+tokio.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# Hot reload
+notify.workspace = true
+
+# Observability
+tracing.workspace = true
+
+# Error handling
+anyhow.workspace = true
+
+# Serialization (for action_config access)
+serde_json.workspace = true
+serde.workspace = true
+# Wave 5 day-6 Item 3: TlsFingerprintConfig parses
+# proxy.extensions.tls_fingerprint from the operator YAML.
+serde_yaml.workspace = true
+
+# Regex for forward-rule path constraints and whole-path matchers
+regex.workspace = true
+
+# HTTP client (for AI proxy forwarding)
+reqwest.workspace = true
+futures.workspace = true
+
+# UUID generation (for session cookies)
+uuid.workspace = true
+# ULID parsing for Wave 8 P0 session_id / parent_session_id
+ulid.workspace = true
+
+# Identity / hashing for webhook envelope (instance_id tag, config_revision)
+rand.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"
+base64 = "0.22"

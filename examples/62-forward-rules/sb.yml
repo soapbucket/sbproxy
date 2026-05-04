@@ -1,0 +1,117 @@
+# Path-, header-, and query-based forward rules.
+#
+# A single origin dispatches to several inline child origins based on
+# request shape:
+#
+#   /api/*                              -> proxy to dummyjson.com (REST API)
+#   /admin/*                            -> static action returning a JSON banner
+#   X-Beta-User: true (any path)        -> static beta banner
+#   ?env=staging (any path)             -> static staging banner
+#   anything else                       -> default action proxies to httpbin.org/anything
+#
+# Each forward rule embeds a full child origin via the `origin:` field, which
+# may carry its own action and request_modifiers. Rules are evaluated in order;
+# first match wins. Within one matcher entry the present matchers (path /
+# header / query) are ANDed; entries inside a rule's `rules:` list are ORed.
+#
+# Run:
+#   make run CONFIG=examples/62-forward-rules/sb.yml
+#
+# Test:
+#   # Hits the /api/* rule, lands on dummyjson. Path is rewritten from
+#   # /api/products/1 to /products/1 by the child origin's request_modifier.
+#   curl -s -H 'Host: gateway.local' http://127.0.0.1:8080/api/products/1
+#
+#   # Hits the /admin/* rule, returns the static JSON banner.
+#   curl -sv -H 'Host: gateway.local' http://127.0.0.1:8080/admin/dashboard 2>&1 \
+#     | grep -E '^< HTTP|admin'
+#
+#   # Default action: anything else proxies to httpbin.org/anything.
+#   curl -s -H 'Host: gateway.local' http://127.0.0.1:8080/health
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "gateway.local":
+    action:
+      type: proxy
+      url: https://httpbin.org/anything
+
+    forward_rules:
+      # /api/* -> jsonplaceholder, with the /api prefix stripped by a modifier.
+      - rules:
+          - path:
+              prefix: /api/
+        origin:
+          id: api-backend
+          hostname: api-backend
+          workspace_id: examples
+          version: "1.0.0"
+          action:
+            type: proxy
+            url: https://dummyjson.com
+          request_modifiers:
+            - url:
+                path:
+                  replace:
+                    old: /api/
+                    new: /
+              headers:
+                set:
+                  X-Routed-By: forward-rule-api
+
+      # /admin/* -> static JSON. Demonstrates a non-proxy action inline.
+      - rules:
+          - path:
+              prefix: /admin/
+        origin:
+          id: admin-stub
+          hostname: admin-stub
+          workspace_id: examples
+          version: "1.0.0"
+          action:
+            type: static
+            status: 200
+            content_type: application/json
+            json_body:
+              section: admin
+              message: "admin area placeholder"
+              authenticated: false
+
+      # Header-based dispatch: any request with `X-Beta-User: true` lands on
+      # the beta banner regardless of path.
+      - rules:
+          - header:
+              name: X-Beta-User
+              value: "true"
+        origin:
+          id: beta-stub
+          hostname: beta-stub
+          workspace_id: examples
+          version: "1.0.0"
+          action:
+            type: static
+            status: 200
+            content_type: application/json
+            json_body:
+              tier: beta
+              message: "beta cohort routing"
+
+      # Query-based dispatch: `?env=staging` swaps the response.
+      - rules:
+          - query:
+              name: env
+              value: staging
+        origin:
+          id: staging-stub
+          hostname: staging-stub
+          workspace_id: examples
+          version: "1.0.0"
+          action:
+            type: static
+            status: 200
+            content_type: application/json
+            json_body:
+              env: staging
+              message: "staging routing via query param"

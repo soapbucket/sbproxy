@@ -1,0 +1,44 @@
+## Pebble ACME test environment for sbproxy
+##
+## Pebble is Let's Encrypt's miniature ACME server for integration testing.
+## It issues real-looking certs (signed by its own CA) without rate limits.
+##
+## Usage:
+##   docker compose up -d          # start Pebble + challtestsrv
+##   cargo test -p sbproxy-tls --test acme_integration -- --ignored
+##   docker compose down            # cleanup
+##
+## Pebble endpoints:
+##   ACME directory:    https://localhost:14000/dir
+##   Pebble mgmt API:   https://localhost:15000
+##   Challenge test srv: http://localhost:8055
+
+services:
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:latest
+    command: ["-strict"]
+    ports:
+      - "14000:14000"  # ACME directory
+      - "15000:15000"  # Management API
+    environment:
+      PEBBLE_VA_NOSLEEP: "1"
+      PEBBLE_VA_ALWAYS_VALID: "0"
+      PEBBLE_WFE_NONCEREJECT: "0"
+    networks:
+      acmenet:
+        aliases:
+          - pebble
+
+  challtestsrv:
+    image: ghcr.io/letsencrypt/pebble-challtestsrv:latest
+    command: ["-defaultIPv4", "host.docker.internal", "-http01", "", "-https01", "", "-tlsalpn01", ""]
+    ports:
+      - "8055:8055"  # Management API
+    networks:
+      acmenet:
+        aliases:
+          - challtestsrv
+
+networks:
+  acmenet:
+    driver: bridge

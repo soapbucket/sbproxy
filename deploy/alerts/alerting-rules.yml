@@ -1,0 +1,263 @@
+# SBproxy SLO alerting rules (Wave 1, B1.7)
+#
+# Tier mapping per adr-slo-alert-taxonomy.md:
+#   page   -> PagerDuty rotation, ack within 15 min.
+#   ticket -> oncall:ticket label, next business day.
+#   log    -> Alertmanager log-only route, no human notification.
+#
+# Burn-rate windows follow the SRE workbook chapter 5
+# (multiwindow / multi-burn-rate). Page tier fires the 14.4x and 6x
+# pairs; ticket tier fires the 3x pair; log tier records the 1x pair.
+#
+# Every alert has a runbook_url annotation pointing at
+# https://docs.sbproxy.dev/runbook#<alert-id>. The runbook stub format
+# is in adr-slo-alert-taxonomy.md; section ids match runbook_id labels.
+#
+# Wave 1 ships substrate, ledger, and audit alerts. Per-rail and
+# per-classifier alerts land with their pillars in later waves; the
+# placeholder comments below mark the integration points.
+
+groups:
+  # --- Substrate availability burn-rate alerts ---
+  - name: sbproxy_alerts_substrate_availability
+    rules:
+      # 14.4x burn over 1h (page) - 2% of 30d budget burned in 1h.
+      - alert: SBPROXY-SUBSTRATE-AVAIL-1H
+        expr: |
+          (1 - sbproxy:slo:substrate:availability:5m) > (14.4 * (1 - 0.999))
+          and
+          (1 - sbproxy:slo:substrate:availability:1h) > (14.4 * (1 - 0.999))
+        for: 2m
+        labels:
+          severity: page
+          slo_id: SLO-AVAIL-INBOUND
+          runbook_id: RB-SUBSTRATE-AVAIL
+          window: 1h
+          burn_rate: "14.4"
+        annotations:
+          summary: "Substrate availability burning fast (14.4x over 1h)"
+          description: |
+            Inbound 5xx ratio exceeds 14.4x of the 30d error budget over
+            the last 1h. At this rate the entire month's budget burns in
+            under 2 days. Page on-call.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-substrate-avail"
+
+      # 6x burn over 6h (page) - 5% of budget in 6h.
+      - alert: SBPROXY-SUBSTRATE-AVAIL-6H
+        expr: |
+          (1 - sbproxy:slo:substrate:availability:30m) > (6 * (1 - 0.999))
+          and
+          (1 - sbproxy:slo:substrate:availability:6h) > (6 * (1 - 0.999))
+        for: 15m
+        labels:
+          severity: page
+          slo_id: SLO-AVAIL-INBOUND
+          runbook_id: RB-SUBSTRATE-AVAIL
+          window: 6h
+          burn_rate: "6"
+        annotations:
+          summary: "Substrate availability burning (6x over 6h)"
+          description: |
+            Sustained 5xx ratio above 6x of error budget over the last
+            6h. Page on-call.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-substrate-avail"
+
+      # 3x burn over 24h (ticket).
+      - alert: SBPROXY-SUBSTRATE-AVAIL-24H
+        expr: |
+          (1 - sbproxy:slo:substrate:availability:1h) > (3 * (1 - 0.999))
+          and
+          (1 - sbproxy:slo:substrate:availability:24h) > (3 * (1 - 0.999))
+        for: 1h
+        labels:
+          severity: ticket
+          slo_id: SLO-AVAIL-INBOUND
+          runbook_id: RB-SUBSTRATE-AVAIL
+          window: 24h
+          burn_rate: "3"
+        annotations:
+          summary: "Substrate availability slow burn (3x over 24h)"
+          description: |
+            Sustained 5xx ratio above 3x of the 30d budget over the last
+            24h. File on-call ticket.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-substrate-avail"
+
+  # --- Substrate latency ---
+  - name: sbproxy_alerts_substrate_latency
+    rules:
+      - alert: SBPROXY-SUBSTRATE-LATENCY-P95
+        expr: sbproxy:slo:substrate:latency_p95:5m > 0.030
+        for: 5m
+        labels:
+          severity: ticket
+          slo_id: SLO-LATENCY-P95
+          runbook_id: RB-SUBSTRATE-LATENCY
+          window: 5m
+        annotations:
+          summary: "Inbound p95 latency above 30 ms (sustained)"
+          description: |
+            sbproxy:slo:substrate:latency_p95:5m exceeded 30 ms for the
+            last 5 minutes. Ticket tier per adr-slo-alert-taxonomy.md.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-substrate-latency"
+
+      - alert: SBPROXY-SUBSTRATE-LATENCY-P99
+        expr: sbproxy:slo:substrate:latency_p99:5m > 0.050
+        for: 5m
+        labels:
+          severity: page
+          slo_id: SLO-LATENCY-P99
+          runbook_id: RB-SUBSTRATE-LATENCY
+          window: 5m
+        annotations:
+          summary: "Inbound p99 latency above 50 ms (sustained)"
+          description: |
+            sbproxy:slo:substrate:latency_p99:5m exceeded 50 ms for the
+            last 5 minutes. Page tier per adr-slo-alert-taxonomy.md.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-substrate-latency"
+
+  # --- Ledger redeem ---
+  - name: sbproxy_alerts_ledger
+    rules:
+      # 14.4x burn against the 99.95% target.
+      - alert: SBPROXY-LEDGER-REDEEM-1H
+        expr: |
+          (1 - sbproxy:slo:ledger:redeem_success:5m) > (14.4 * (1 - 0.9995))
+          and
+          (1 - sbproxy:slo:ledger:redeem_success:1h) > (14.4 * (1 - 0.9995))
+        for: 2m
+        labels:
+          severity: page
+          slo_id: SLO-LEDGER-REDEEM
+          runbook_id: RB-LEDGER-REDEEM
+          window: 1h
+          burn_rate: "14.4"
+        annotations:
+          summary: "Ledger redeem failing fast (14.4x burn over 1h)"
+          description: |
+            sbproxy_ledger_redeem_total{result="success"} ratio dropped
+            below the burn threshold. Page ledger operator.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-ledger-redeem"
+
+      - alert: SBPROXY-LEDGER-REDEEM-6H
+        expr: |
+          (1 - sbproxy:slo:ledger:redeem_success:1h) > (6 * (1 - 0.9995))
+          and
+          (1 - sbproxy:slo:ledger:redeem_success:6h) > (6 * (1 - 0.9995))
+        for: 15m
+        labels:
+          severity: page
+          slo_id: SLO-LEDGER-REDEEM
+          runbook_id: RB-LEDGER-REDEEM
+          window: 6h
+          burn_rate: "6"
+        annotations:
+          summary: "Ledger redeem sustained burn (6x over 6h)"
+          description: |
+            Sustained ledger redeem failure above 6x burn over the last
+            6h. Page ledger operator.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-ledger-redeem"
+
+      - alert: SBPROXY-LEDGER-LATENCY-P99
+        expr: sbproxy:slo:ledger:redeem_latency_p99:5m > 0.200
+        for: 5m
+        labels:
+          severity: ticket
+          slo_id: SLO-LEDGER-LATENCY
+          runbook_id: RB-LEDGER-LATENCY
+          window: 5m
+        annotations:
+          summary: "Ledger redeem p99 latency above 200 ms"
+          description: |
+            sbproxy_ledger_redeem_duration_seconds p99 above 200 ms for
+            5 min. File ticket; investigate ledger backend latency.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-ledger-latency"
+
+  # --- Audit-log write ---
+  - name: sbproxy_alerts_audit
+    rules:
+      # SLO-AUDIT-WRITE is 100% over 24h. Any sustained failure pages
+      # immediately - durable audit is a compliance requirement
+      # (adr-admin-action-audit.md).
+      - alert: SBPROXY-AUDIT-WRITE-FAILURE
+        expr: |
+          increase(sbproxy_audit_emit_total{result="failure"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: page
+          slo_id: SLO-AUDIT-WRITE
+          runbook_id: RB-AUDIT-WRITE
+          window: 5m
+        annotations:
+          summary: "Audit-log write failures (immediate page)"
+          description: |
+            sbproxy_audit_emit_total{result="failure"} incremented in
+            the last 5 minutes. Audit emission must be 100%; sustained
+            failure breaks the SOC 2 compliance contract.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-audit-write"
+
+      - alert: SBPROXY-AUDIT-LATENCY-P99
+        expr: sbproxy:slo:audit:emit_latency_p99:1h > 5
+        for: 1h
+        labels:
+          severity: ticket
+          slo_id: SLO-AUDIT-LATENCY
+          runbook_id: RB-AUDIT-LATENCY
+          window: 1h
+        annotations:
+          summary: "Audit emit p99 latency above 5 s (sustained 1h)"
+          description: |
+            sbproxy_audit_emit_duration_seconds p99 above 5 s for 1h.
+            Backlog risk; investigate sink throughput.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-audit-latency"
+
+  # --- Cardinality and deprecation (log-only) ---
+  - name: sbproxy_alerts_log_only
+    rules:
+      - alert: SBPROXY-CARD-BUDGET-NEAR-CAP
+        expr: sbproxy:cardinality:requests_total > (50000 * 0.9)
+        for: 10m
+        labels:
+          severity: log
+          slo_id: SLO-CARD-BUDGET
+          runbook_id: RB-CARD-BUDGET
+          window: 10m
+        annotations:
+          summary: "sbproxy_requests_total cardinality at 90% of budget"
+          description: |
+            Cardinality of sbproxy_requests_total exceeds 90% of the
+            50k cap. CI gate (B1.12 / Q1.14) will fail PRs that push
+            past it. Log-only.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-card-budget"
+
+      - alert: SBPROXY-DEPRECATED-FLAG-USE
+        expr: |
+          increase(sbproxy_deprecated_flag_use_total[1h]) > 0
+        for: 1h
+        labels:
+          severity: log
+          slo_id: SLO-DEPRECATION
+          runbook_id: RB-DEPRECATION
+          window: 1h
+        annotations:
+          summary: "Deprecated config flag in use (log-only)"
+          description: |
+            sbproxy_deprecated_flag_use_total incremented in the last 1h.
+            Schedule a config sweep; flag will be removed at next major.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-deprecation"
+
+  # --- Forward stubs (Waves 2-5) ---
+  #
+  # The following placeholders are intentionally not yet wired:
+  #
+  # - SBPROXY-RAIL-QUORUM (page, immediate) - Wave 3 (G3.4 facilitator
+  #   quorum). Fires when fewer than one healthy facilitator per chain.
+  # - SBPROXY-DR-RESTORE-MISSED (page) - Wave 2 monthly restore-drill;
+  #   fires when the calendar window passes without a successful drill.
+  # - SBPROXY-KYA-ANCHOR-EXPIRED (page) - Wave 5 KYA trust-anchor
+  #   freshness.
+  # - SBPROXY-CLASSIFIER-DRIFT (ticket) - Wave 5 prompt-injection
+  #   classifier drift.
+  # - SBPROXY-ANOMALY-NOISE-BUDGET (ticket) - Wave 5 anomaly detector.
+  #
+  # These come online in their respective task waves and reuse the same
+  # severity / slo_id / runbook_id label conventions defined here.

@@ -1,0 +1,29 @@
+# Rate limiting policy.
+#
+# Caps each client IP at 5 requests per second with a small burst. Excess
+# requests get a 429 with a Retry-After header. Backed by a token bucket.
+# Upstream is httpbin.org, a free public HTTP testing service.
+#
+# Run:
+#   make run CONFIG=examples/02-rate-limiting/sb.yml
+#
+# Test (run a quick burst, expect 429s after the first ~10):
+#   for i in $(seq 1 20); do
+#     curl -s -o /dev/null -w '%{http_code}\n' \
+#       -H 'Host: api.local' http://127.0.0.1:8080/get
+#   done
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    policies:
+      - type: rate_limiting
+        requests_per_second: 5
+        burst: 10
+        key: ip

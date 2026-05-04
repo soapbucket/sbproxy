@@ -1,0 +1,85 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "timezone": "America/Los_Angeles",
+  "schedule": ["before 09:00 on Monday"],
+  "prHourlyLimit": 4,
+  "prConcurrentLimit": 12,
+  "labels": ["dependencies"],
+  "rangeStrategy": "bump",
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 09:00 on the first day of the month"]
+  },
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security", "dependencies"],
+    "schedule": ["at any time"],
+    "prCreation": "immediate"
+  },
+  "osvVulnerabilityAlerts": true,
+  "packageRules": [
+    {
+      "description": "Auto-merge patch and minor updates for dev dependencies and CI tooling",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["patch", "minor", "digest"],
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    },
+    {
+      "description": "Group all GitHub Actions updates into one PR per week",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions"
+    },
+    {
+      "description": "Group Cargo patch updates",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["patch"],
+      "groupName": "cargo-patch"
+    },
+    {
+      "description": "Group Cargo minor updates",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor"],
+      "groupName": "cargo-minor"
+    },
+    {
+      "description": "Major Cargo bumps require manual review",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "labels": ["dependencies", "review-required"]
+    },
+    {
+      "description": "Block crates with known supply-chain risk pending review",
+      "matchPackageNames": [],
+      "enabled": true
+    }
+  ],
+  "rust": {
+    "enabled": true
+  },
+  "cargo": {
+    "enabled": true,
+    "rangeStrategy": "bump"
+  },
+  "dockerfile": {
+    "enabled": true,
+    "pinDigests": true
+  },
+  "github-actions": {
+    "enabled": true,
+    "pinDigests": true,
+    "fileMatch": ["^\\.github/workflows/[^/]+\\.ya?ml$"]
+  },
+  "ignorePaths": [
+    "target/**",
+    "node_modules/**"
+  ]
+}

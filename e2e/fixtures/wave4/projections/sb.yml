@@ -1,0 +1,86 @@
+# Wave 4 Q4.4 - Q4.7 fixture for the policy-graph projections suite.
+#
+# Covers the four well-known documents projected from
+# `ai_crawl_control` policy graphs (per `adr-policy-graph-projections.md`):
+#
+#   - /robots.txt (G4.6, IETF draft-koster-rep-ai)
+#   - /llms.txt + /llms-full.txt (G4.7, Anthropic / Mistral convention)
+#   - /licenses.xml (G4.8, RSL 1.0)
+#   - /.well-known/tdmrep.json (G4.9, W3C TDMRep)
+#
+# The fixture declares an origin with:
+#   - per-agent tiers (openai-gptbot, anthropic-claudebot, perplexitybot,
+#     commoncrawl-ccbot)
+#   - a default-agent fallback tier (* / unrecognised UA)
+#   - one priced route (/articles/*) and one free route (/about)
+#   - an origin-level `content_signal: ai-train` extension so the RSL
+#     and TDMRep projections produce non-empty entries
+#
+# Schema notes:
+#   - `tier.agent_id` is the per-agent attribution. When G4.6 lands,
+#     tiers without an agent_id contribute to the User-agent: * stanza;
+#     tiers with an agent_id produce a dedicated stanza.
+#   - `tier.content_shape` is the offered shape (html | markdown | json
+#     | pdf), surfaced in the `# SBproxy-AI-Extension: shape=...` comment.
+#   - `extensions.content_signal` is the origin-level signal value used
+#     by /licenses.xml and /.well-known/tdmrep.json projections.
+
+proxy:
+  http_bind_port: 0  # overridden by the harness
+
+origins:
+  "blog.localhost":
+    extensions:
+      content_signal: ai-train
+    action:
+      type: static
+      status_code: 200
+      content_type: text/html
+      body: "<h1>article</h1>"
+    policies:
+      - type: ai_crawl_control
+        currency: USD
+        price: 0.001
+        tiers:
+          # OpenAI GPTBot
+          - route_pattern: /articles/*
+            agent_id: openai-gptbot
+            price:
+              amount_micros: 1000
+              currency: USD
+            content_shape: html
+          # Anthropic ClaudeBot
+          - route_pattern: /articles/*
+            agent_id: anthropic-claudebot
+            price:
+              amount_micros: 1500
+              currency: USD
+            content_shape: markdown
+          # Perplexity
+          - route_pattern: /articles/*
+            agent_id: perplexitybot
+            price:
+              amount_micros: 2000
+              currency: USD
+            content_shape: html
+          # Common Crawl
+          - route_pattern: /articles/*
+            agent_id: commoncrawl-ccbot
+            price:
+              amount_micros: 500
+              currency: USD
+            content_shape: html
+          # Default fallback (priced, contributes to User-agent: * stanza)
+          - route_pattern: /articles/*
+            price:
+              amount_micros: 1000
+              currency: USD
+            content_shape: html
+          # Free, public preview tier
+          - route_pattern: /about
+            price:
+              amount_micros: 0
+              currency: USD
+        valid_tokens:
+          - good-token-1
+          - good-token-2

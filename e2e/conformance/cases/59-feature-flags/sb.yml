@@ -1,0 +1,16 @@
+# Feature flags via X-Sb-Flags header and query params
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "flags.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    response_cache:
+      enabled: true
+      ttl: 60s
+      cacheable_methods:
+        - GET
+      cacheable_status:
+        - 200

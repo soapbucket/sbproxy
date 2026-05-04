@@ -1,0 +1,35 @@
+What is the weather in New York today?
+Summarise the following article in three sentences.
+Translate this paragraph from English to Spanish.
+Write a Python function that reverses a linked list.
+Explain the difference between TCP and UDP.
+What is the capital of Australia?
+Suggest a vegetarian dinner recipe with chickpeas.
+How does photosynthesis convert sunlight into chemical energy?
+Recommend a good fantasy novel published in the last five years.
+Help me draft an email apologising for a missed deadline.
+What is the time complexity of quicksort in the average case?
+Compose a short bedtime story for my four-year-old.
+Convert 75 degrees Fahrenheit to Celsius.
+Outline the plot of Hamlet without spoilers.
+Why is the sky blue during the day and red at sunset?
+Write a haiku about a quiet morning by the lake.
+Compare React and Vue for a small SaaS frontend.
+Suggest exercises to improve posture at a desk job.
+What are the benefits of using a CDN for static assets?
+List five sustainable travel tips for a long trip.
+Define osmosis in plain language for a high school student.
+Plan a three day itinerary for visiting Kyoto in autumn.
+Explain the difference between supervised and unsupervised learning.
+What is the historical significance of the Magna Carta?
+Help me debug this SQL query that is returning duplicates.
+Write a polite reminder to a client about an unpaid invoice.
+Recommend three podcasts about science and engineering.
+What is a good warm up routine before running five kilometres.
+Summarise the rules of chess for a complete beginner.
+Explain how a Kalman filter is used in robotics.
+What are the tradeoffs between SQLite and PostgreSQL for a small app?
+Translate hello, how are you today into French and Japanese.
+Generate a markdown table comparing four cloud providers on price.
+Write release notes for a small bug fix in a mobile app.
+What is the role of mitochondria in eukaryotic cells?

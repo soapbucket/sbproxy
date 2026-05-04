@@ -1,0 +1,7 @@
+{
+  "_comment": "Test seeds for the agent registry feed (G2.1) signing key. NOT real production keys; the production feed signing key lives in the publisher's KMS and rotates per adr-agent-registry-feed.md. Rotating the test seed regenerates the signed-feed fixtures via test/fixtures/refresh.sh.",
+  "feed_signing_seed": "1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff",
+  "kid": "sb-feed-2026-q2",
+  "valid_from": "2026-05-01T00:00:00.000Z",
+  "valid_until": "2026-08-01T00:00:00.000Z"
+}

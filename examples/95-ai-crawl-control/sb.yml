@@ -1,0 +1,63 @@
+# AI Crawl Control + Pay Per Crawl (HTTP 402).
+#
+# Returns 402 to known AI crawler User-Agents that arrive without
+# a `Crawler-Payment` token. The 402 response includes a JSON body
+# explaining the price and the header to retry with. The OSS ledger
+# is in-memory: every token in `valid_tokens` redeems once, then
+# the policy charges again.
+#
+# Run:
+#   make run CONFIG=examples/95-ai-crawl-control/sb.yml
+#
+# Test (a known crawler UA without payment, 402):
+#   curl -s -o /dev/null -w '%{http_code}\n' \
+#        -H 'Host: blog.local' \
+#        -H 'User-Agent: GPTBot/1.0' http://127.0.0.1:8080/article
+#   # => 402
+#
+# Test with a valid token (single-use - the second call 402s):
+#   curl -s -H 'Host: blog.local' \
+#        -H 'User-Agent: GPTBot/1.0' \
+#        -H 'crawler-payment: token-aaa-001' http://127.0.0.1:8080/article
+#
+# Test a normal browser UA (passes through without paying):
+#   curl -s -o /dev/null -w '%{http_code}\n' \
+#        -H 'Host: blog.local' http://127.0.0.1:8080/article
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "blog.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    policies:
+      - type: ai_crawl_control
+        price: 0.001              # USD per crawl
+        currency: USD
+        # Default header is `crawler-payment`. The policy reads it
+        # from the request and stamps a `Crawler-Payment realm=...`
+        # challenge on 402 responses.
+        header: crawler-payment
+
+        # User-Agent substrings (case-insensitive) that mark a
+        # crawler. The defaults cover the common AI crawler list;
+        # extend for your stack.
+        crawler_user_agents:
+          - GPTBot
+          - ChatGPT-User
+          - ClaudeBot
+          - anthropic-ai
+          - Google-Extended
+          - PerplexityBot
+          - CCBot
+
+        # In-memory ledger seed. Every token here redeems exactly
+        # once. Enterprise builds swap in an HTTP-callable ledger
+        # that talks to the payments backend.
+        valid_tokens:
+          - token-aaa-001
+          - token-aaa-002
+          - token-aaa-003

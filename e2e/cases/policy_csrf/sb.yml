@@ -1,0 +1,28 @@
+# Reference fixture for the policy_csrf E2E suite.
+#
+# Safe methods (GET, HEAD, OPTIONS) issue a `csrf_token` cookie that
+# protected methods (POST, PUT, DELETE, PATCH) must echo back via
+# `X-CSRF-Token`. Paths under `/webhooks/` bypass the check.
+
+proxy:
+  http_bind_port: 0
+
+origins:
+  "csrf.localhost":
+    # Real upstream URL goes here when running the suite. The CSRF
+    # cookie is appended in `response_filter`, which only runs on
+    # the proxy flow (static actions short-circuit before that).
+    action:
+      type: proxy
+      url: "http://127.0.0.1:18080"
+    policies:
+      - type: csrf
+        secret_key: "dev-csrf-secret-change-me"
+        cookie_name: csrf_token
+        header_name: X-CSRF-Token
+        methods: [POST, PUT, DELETE, PATCH]
+        safe_methods: [GET, HEAD, OPTIONS]
+        cookie_path: /
+        cookie_same_site: Lax
+        exempt_paths:
+          - /webhooks/

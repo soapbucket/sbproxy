@@ -1,0 +1,47 @@
+# Correlation ID propagation.
+#
+# The proxy mints a per-request correlation ID early in the request
+# lifecycle. With the default policy:
+#
+#   1. If the inbound request carries the configured header (default
+#      `X-Request-Id`), its value is adopted as the correlation ID.
+#      This lets upstream callers tie their traces to ours.
+#   2. Otherwise the proxy generates a 32-hex-character UUID v4.
+#   3. The chosen value is forwarded to the upstream under the same
+#      header name.
+#   4. The chosen value is echoed back to the client on the response,
+#      so the client can log it for support / debugging.
+#
+# The same value flows through `ctx.request_id`, so webhooks
+# (`X-Sbproxy-Request-Id`), the `Forwarded` header, access logs, and
+# the AI gateway's per-call records all share one identifier.
+#
+# Disable with `enabled: false`, or rename the header (some shops
+# prefer `X-Correlation-Id`) by setting `header`.
+#
+# Run:
+#   make run CONFIG=examples/80-correlation-id/sb.yml
+#
+# Test:
+#   # Inbound header missing - the proxy generates a fresh UUID.
+#   curl -i -H 'Host: localhost' http://127.0.0.1:8080/headers
+#   # Look for `X-Request-Id: <hex>` on the response and echoed in
+#   # the upstream's view of the request.
+#
+#   # Inbound header present - the proxy adopts it.
+#   curl -i -H 'Host: localhost' \
+#        -H 'X-Request-Id: my-trace-abc123' \
+#        http://127.0.0.1:8080/headers
+
+proxy:
+  http_bind_port: 8080
+  correlation_id:
+    enabled: true
+    header: X-Request-Id        # default; rename to e.g. X-Correlation-Id
+    echo_response: true         # default; set false to suppress on the response
+
+origins:
+  "localhost":
+    action:
+      type: proxy
+      url: https://httpbin.org

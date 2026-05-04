@@ -1,0 +1,53 @@
+# Stack for the `17-markdown-for-agents` example. Single container:
+#
+#   sbproxy - the gateway, mounts ./sb.yml read-only on :8080
+#
+# The `static` action serves the article body in-process so this
+# bundle has no upstream dependency. Compare with example 24, which
+# fronts a separate `mock-origin` to demonstrate the proxy mode.
+#
+# Bring up:    docker compose up -d --wait
+# Validate:    docker compose config
+# Tear down:   docker compose down -v
+
+services:
+
+  # --- sbproxy data plane ---
+  #
+  # Builds the proxy from the workspace source. Cloud Build's variant
+  # (`Dockerfile.cloudbuild`) is the reference Dockerfile; it builds a
+  # release binary and wraps it in distroless/cc-debian12. Operators
+  # who want to pin a specific release can swap `build:` for
+  # `image: ghcr.io/soapbucket/sbproxy:<tag>` once a public image tag
+  # is available.
+  sbproxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cloudbuild
+    image: sbproxy:17-markdown-for-agents
+    container_name: sbproxy_17_md
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    environment:
+      - SB_LOG_LEVEL=info
+    healthcheck:
+      # The proxy data plane exposes `/health` on its main listener.
+      # `/healthz` and `/readyz` live on the admin port (default
+      # 9090) which this example does not enable; using `/health`
+      # keeps the bundle self-contained. wget-spider returns 0 only
+      # on 2xx. The proxy serves /health unconditionally regardless
+      # of Host header.
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - mdsb
+
+networks:
+  mdsb:
+    driver: bridge

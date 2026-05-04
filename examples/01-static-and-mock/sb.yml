@@ -1,0 +1,45 @@
+# Static and mock responses.
+#
+# `static` returns a fixed body. `mock` returns a structured JSON response
+# with optional delay and custom headers. Useful for stubbing out backends
+# during local development.
+#
+# Run:
+#   make run CONFIG=examples/01-static-and-mock/sb.yml
+#
+# Test:
+#   curl -i -H 'Host: hello.local' http://127.0.0.1:8080/
+#   curl -i -H 'Host: api.local'   http://127.0.0.1:8080/users/42
+#   curl -i -H 'Host: health.local' http://127.0.0.1:8080/
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "hello.local":
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: "Hello from sbproxy\n"
+
+  "api.local":
+    action:
+      type: mock
+      status: 200
+      delay_ms: 50
+      headers:
+        X-Mock: "true"
+      body:
+        id: 42
+        name: "ada"
+        role: "admin"
+
+  "health.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        status: ok
+        version: "1.0"

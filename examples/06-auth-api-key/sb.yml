@@ -1,0 +1,31 @@
+# API key authentication.
+#
+# Requires every request to present a valid key in `X-Api-Key`. Unauthorized
+# requests get a 401 before the upstream is contacted.
+#
+# Run:
+#   make run CONFIG=examples/06-auth-api-key/sb.yml
+#
+# Test:
+#   # 401 - missing key
+#   curl -i -H 'Host: api.local' http://127.0.0.1:8080/get
+#
+#   # 200 - valid key
+#   curl -i -H 'Host: api.local' -H 'X-Api-Key: dev-key-1' \
+#        http://127.0.0.1:8080/get
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    authentication:
+      type: api_key
+      header_name: X-Api-Key
+      api_keys:
+        - dev-key-1
+        - dev-key-2

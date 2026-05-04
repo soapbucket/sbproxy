@@ -1,0 +1,3 @@
+Last weekend I rebuilt my home network from scratch and learned three things worth writing down.
+First, the cheapest managed switch is fine for a five-device home; the bottleneck is always the upstream link.
+Second, putting the router in the basement was the worst decision; signal degradation is wall-by-wall, not foot-by-foot.

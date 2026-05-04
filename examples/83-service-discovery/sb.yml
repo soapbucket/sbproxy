@@ -1,0 +1,48 @@
+# DNS-based service discovery.
+#
+# Without service discovery, Pingora resolves the upstream hostname
+# once when a connection is established and the connection pool then
+# reuses that connection (and that IP) for the lifetime of the pool.
+# When the upstream's IP set changes - K8s `Service` endpoints rotate,
+# ECS Cloud Map adds a new task, the backend behind a `Headless`
+# service scales horizontally - the proxy keeps hammering the stale
+# IP until the connection eventually closes.
+#
+# With `service_discovery: { enabled: true }` on a proxy action, the
+# proxy re-resolves the hostname every `refresh_secs` (default 30s)
+# and rotates the chosen upstream IP across the current A/AAAA set
+# round-robin. The hostname stays as the SNI/Host header so TLS
+# verification continues to match the certificate.
+#
+# Set `ipv6: false` to ignore AAAA records on dual-stack hosts.
+#
+# IPv6 hostnames work natively: the resolved IPv6 address is wrapped
+# in brackets (`[2001:db8::1]:8080`) when handed to Pingora.
+#
+# Run:
+#   make run CONFIG=examples/83-service-discovery/sb.yml
+#
+# Test:
+#   for i in 1 2 3 4; do
+#     curl -s -o /dev/null -H 'Host: localhost' http://127.0.0.1:8080/ip
+#   done
+#   # The proxy spreads requests across whatever IPs the host is
+#   # currently advertising.
+#
+# In production, point this at a K8s Service hostname (e.g.
+# `backend.namespace.svc.cluster.local:8080`) and watch the proxy
+# pick up new pods within `refresh_secs` of them entering the
+# Endpoints list.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "localhost":
+    action:
+      type: proxy
+      url: https://httpbin.org
+      service_discovery:
+        enabled: true
+        refresh_secs: 30        # default
+        ipv6: true              # default - drop to false to skip AAAA

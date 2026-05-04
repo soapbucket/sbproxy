@@ -1,0 +1,256 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sbproxy",
+    "crates/sbproxy-core",
+    "crates/sbproxy-config",
+    "crates/sbproxy-modules",
+    "crates/sbproxy-plugin",
+    "crates/sbproxy-httpkit",
+    "crates/sbproxy-security",
+    "crates/sbproxy-observe",
+    "crates/sbproxy-platform",
+    "crates/sbproxy-cache",
+    "crates/sbproxy-transport",
+    "crates/sbproxy-vault",
+    "crates/sbproxy-middleware",
+    "crates/sbproxy-extension",
+    "crates/sbproxy-ai",
+    "crates/sbproxy-tls",
+    "crates/sbproxy-openapi",
+    "crates/sbproxy-k8s-operator",
+    "crates/sbproxy-classifiers",
+    "e2e",
+]
+# The k8s operator pulls kube + k8s-openapi, which adds ~30-60s to a cold
+# `cargo build --workspace`. Exclude it from default-members so plain
+# `cargo build` and `cargo test` (no --workspace flag) skip it for
+# day-to-day proxy work. CI's `cargo build --workspace --locked` still
+# picks it up.
+default-members = [
+    "crates/sbproxy",
+    "crates/sbproxy-core",
+    "crates/sbproxy-config",
+    "crates/sbproxy-modules",
+    "crates/sbproxy-plugin",
+    "crates/sbproxy-httpkit",
+    "crates/sbproxy-security",
+    "crates/sbproxy-observe",
+    "crates/sbproxy-platform",
+    "crates/sbproxy-cache",
+    "crates/sbproxy-transport",
+    "crates/sbproxy-vault",
+    "crates/sbproxy-middleware",
+    "crates/sbproxy-extension",
+    "crates/sbproxy-ai",
+    "crates/sbproxy-tls",
+    "crates/sbproxy-openapi",
+    "crates/sbproxy-classifiers",
+    "e2e",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.82"
+authors = ["Soap Bucket LLC"]
+license = "BUSL-1.1"
+repository = "https://github.com/soapbucket/sbproxy"
+homepage = "https://sbproxy.dev"
+documentation = "https://github.com/soapbucket/sbproxy/tree/main/docs"
+readme = "README.md"
+
+[workspace.dependencies]
+# Internal crates
+sbproxy-core = { path = "crates/sbproxy-core" }
+sbproxy-config = { path = "crates/sbproxy-config" }
+sbproxy-modules = { path = "crates/sbproxy-modules" }
+sbproxy-plugin = { path = "crates/sbproxy-plugin" }
+sbproxy-httpkit = { path = "crates/sbproxy-httpkit" }
+sbproxy-security = { path = "crates/sbproxy-security" }
+sbproxy-observe = { path = "crates/sbproxy-observe" }
+sbproxy-platform = { path = "crates/sbproxy-platform" }
+sbproxy-cache = { path = "crates/sbproxy-cache" }
+sbproxy-transport = { path = "crates/sbproxy-transport" }
+sbproxy-vault = { path = "crates/sbproxy-vault" }
+sbproxy-middleware = { path = "crates/sbproxy-middleware" }
+sbproxy-extension = { path = "crates/sbproxy-extension" }
+sbproxy-ai = { path = "crates/sbproxy-ai" }
+sbproxy-tls = { path = "crates/sbproxy-tls" }
+sbproxy-openapi = { path = "crates/sbproxy-openapi" }
+sbproxy-classifiers = { path = "crates/sbproxy-classifiers" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# Bytes and buffers
+bytes = "1"
+bumpalo = { version = "3", features = ["collections"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = { package = "yaml_serde", version = "0.10" }
+
+# Concurrency and data structures
+arc-swap = "1"
+dashmap = "6"
+parking_lot = "0.12"
+smallvec = { version = "1", features = ["union"] }
+compact_str = "0.8"
+
+# Allocator (replaces system malloc on the binary crate)
+mimalloc = { version = "0.1", default-features = false }
+
+# Hot reload
+notify = "7"
+
+# Plugin system
+inventory = "0.3"
+
+# Observability
+# release_max_level_info compile-strips debug!/trace! calls from release
+# builds. Hot paths in server.rs / policy evaluation get their log macros
+# eliminated entirely rather than evaluating arguments and being filtered
+# at runtime. See docs/RUST_OPTIMIZATIONS.md B1.
+tracing = { version = "0.1", features = ["release_max_level_info"] }
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+prometheus = "0.13"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# HTTP
+http = "1"
+
+# Pingora
+pingora = "0.8"
+pingora-core = { version = "0.8", features = ["rustls"] }
+pingora-proxy = "0.8"
+pingora-http = "0.8"
+pingora-error = "0.8"
+
+# URL parsing
+url = "2"
+
+# Encoding
+base64 = "0.22"
+percent-encoding = "2"
+
+# Text processing
+regex = "1"
+minijinja = "2"
+pulldown-cmark = "0.12"
+
+# Networking
+ipnetwork = "0.20"
+
+# Async
+async-trait = "0.1"
+
+# CEL expressions
+cel = { version = "0.13", features = ["regex", "chrono", "json"] }
+
+# Lua scripting
+mlua = { version = "0.11", features = ["luau", "serialize", "vendored", "error-send"] }
+
+# JavaScript scripting
+rquickjs = { version = "0.11", features = ["bindgen", "classes", "properties", "parallel"] }
+
+# WebAssembly scripting (sandboxed module runtime).
+# wasmtime + wasi-common move in lockstep; bump both together. The version
+# floor is set by the cargo-deny advisory gate, which fails on any
+# unpatched RUSTSEC entry against wasmtime.
+wasmtime = { version = "44.0.1", default-features = false, features = ["cranelift", "runtime", "parallel-compilation"] }
+wasi-common = "44"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Background task tracking (graceful shutdown drains).
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# Redis client. Already used by sbproxy-platform; promoted to a workspace
+# dep so sbproxy-modules can drive XREAD directly for feature feeds (WAF
+# rule subscription) without going through the KVStore facade.
+# `streams` enables the XREAD typed reply parser (StreamReadReply).
+redis = { version = "0.25", default-features = false, features = ["tokio-comp", "streams"] }
+
+# Bloom filter
+bloomfilter = "1"
+
+# Crypto
+sha2 = "0.11"
+hex = "0.4"
+hmac = "0.13"
+# MD5 is intentionally bundled here only for JA3 fingerprint computation
+# (RFC-out, weak hash, but the JA3 spec mandates MD5). The `md-5` crate
+# is the RustCrypto family member and matches the `sha2` API.
+md-5 = "0.10"
+
+# JWT verification (HS*, RS*, ES* etc.).
+jsonwebtoken = "9"
+
+# JSON Schema validation.
+jsonschema = { version = "0.17", default-features = false }
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+# ULID (lexicographically sortable IDs). Wave 8 envelope uses ULIDs
+# for request_id / session_id / parent_session_id (per
+# docs/adr-event-envelope.md). The `serde` feature lets us
+# (de)serialize directly without a String intermediate.
+ulid = { version = "1", features = ["serde"] }
+
+# Random
+rand = "0.8"
+
+# Time
+chrono = "0.4"
+
+# Object storage (S3, GCS, Azure Blob, local filesystem). Used by the
+# storage action and the S3-backed enterprise cache. Features pulled
+# in cover all four backends so a single dep is enough for both.
+object_store = { version = "0.11", features = ["aws", "gcp", "azure"] }
+
+# Embedded databases
+redb = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+postgres = "0.19"
+
+# TLS / QUIC / HTTP3
+quinn = "0.11"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+rcgen = "0.13"
+# Default rustls features include the `aws-lc-rs` crypto provider, which
+# pulls aws-lc-sys and its x86 assembly build. We explicitly use `ring`
+# instead (installed via rustls::crypto::ring::default_provider() in
+# crates/sbproxy/src/main.rs), so aws-lc is unused overhead and breaks
+# cross-compilation under qemu. Opt into only the features we need.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+# PEM parsing is provided by rustls-pki-types directly via the PemObject
+# trait; replaces the unmaintained rustls-pemfile crate (RUSTSEC-2025-0134).
+rustls-pki-types = "1"
+ring = "0.17"
+x509-parser = "0.16"
+
+# ----------------------------------------------------------------------------
+# Release profile. LTO disabled for now: proc-macro2's build script fails
+# under qemu-emulated cross-compile when LTO is on. Once we have a native
+# amd64 builder (or switch to CI with a real x86 host), enable:
+#   lto = "fat"
+#   codegen-units = 1
+# These would add an additional 5-15% rps per RUST_OPTIMIZATIONS.md A1.
+# ----------------------------------------------------------------------------
+[profile.release]
+opt-level = 3
+strip = "symbols"
+# LTO + codegen-units=1: per RUST_OPTIMIZATIONS.md A1, +5-15% rps at
+# the tail. Landed 2026-04-24 for the publishable matrix-v7 run.
+# Build time jumps ~2x; only a concern on cold cargo caches.
+lto = "fat"
+codegen-units = 1

@@ -1,0 +1,82 @@
+# Q4.11 fuzz harnesses for Wave 4 parsers.
+#
+# Standalone Cargo manifest (NOT a workspace member) so that
+# `cargo build --workspace` for the proxy does not pick it up, and the
+# `libfuzzer-sys` link does not contaminate the proxy's release build
+# graph. Mirrors the pattern used by `sbproxy-bench/harness/`.
+#
+# Run from this directory:
+#
+#     cargo +nightly fuzz run rsl_xml_parser    -- -max_total_time=10
+#     cargo +nightly fuzz run robots_txt_parser -- -max_total_time=10
+#     cargo +nightly fuzz run llms_txt_parser   -- -max_total_time=10
+#
+# The 10-second smoke pass is what landed in the commit message for
+# this change. CI runs longer; see `.github/workflows/wave4-fuzz.yml`
+# (B4.5 / B4.6 fan-out).
+#
+# Once G4.5 (robots.txt parser), G4.6 (llms.txt projection), and G4.7
+# (RSL XML emitter / parser counterpart) merge, repoint each
+# fuzz_target to the public parser entry-point in the relevant Wave 4
+# crate. The current implementations call into in-file stubs that
+# exercise the harness machinery and document the contract; replace
+# the stubs once the production parsers are in tree.
+
+# Empty `[workspace]` block: tells cargo this manifest is a standalone
+# workspace root. Without it cargo would climb up to the proxy
+# workspace and complain we are not a member. We are deliberately not.
+[workspace]
+
+[package]
+name = "sbproxy-fuzz"
+version = "0.0.1"
+edition = "2021"
+publish = false
+license = "BUSL-1.1"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# `libfuzzer-sys` is the standard cargo-fuzz harness backend. Pinned
+# to the version range that builds against nightly rustc 1.82 which
+# is the workspace's MSRV (per Cargo.toml `rust-version`).
+libfuzzer-sys = "0.4"
+
+# `quick-xml` is the parser the production RSL `/licenses.xml`
+# emitter (G4.7) is expected to reuse. Pulled in here so the
+# `rsl_xml_parser` harness has something concrete to call until G4.7
+# lands. Pinned conservatively; the proxy's deny.toml will assert
+# the same version once B4.4 adds the dep to the workspace.
+quick-xml = { version = "0.36", features = ["serialize"] }
+
+[[bin]]
+name = "rsl_xml_parser"
+path = "fuzz_targets/rsl_xml_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "robots_txt_parser"
+path = "fuzz_targets/robots_txt_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "llms_txt_parser"
+path = "fuzz_targets/llms_txt_parser.rs"
+test = false
+doc = false
+
+# x402 challenge body fuzzer (Wave 3 substrate). Listed for symmetry
+# with the existing fuzz harness referenced in `Q4.11`'s task spec
+# ("match the existing `x402_challenge_parser.rs` shape"). The harness
+# itself is shipped here so the Wave 4 batch picks up x402 regression
+# coverage too. Once Wave 3's fuzz harness file lives in tree (W3
+# follow-up), this entry can be removed and the file moved into the
+# canonical W3 location.
+[[bin]]
+name = "x402_challenge_parser"
+path = "fuzz_targets/x402_challenge_parser.rs"
+test = false
+doc = false

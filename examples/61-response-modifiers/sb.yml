@@ -1,0 +1,62 @@
+# Response modifiers.
+#
+# Demonstrates the full typed shape of response_modifiers: header set/add/remove,
+# status code and reason text override, and body replacement (both string and
+# JSON). Two origins make the difference visible: api.local rewrites JSON,
+# text.local rewrites a plain text body and overrides the status line.
+#
+# Run:
+#   make run CONFIG=examples/61-response-modifiers/sb.yml
+#
+# Test:
+#   # JSON path: status untouched, headers rewritten, body replaced with JSON.
+#   curl -sv -H 'Host: api.local' http://127.0.0.1:8080/get 2>&1 \
+#     | grep -E '^< (HTTP|x-|cache-)|"ok"'
+#
+#   # Text path: 200 -> 418 "I am a teapot", body replaced with a string.
+#   curl -sv -H 'Host: text.local' http://127.0.0.1:8080/get 2>&1 \
+#     | grep -E '^< HTTP|teapot'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    response_modifiers:
+      - headers:
+          set:
+            X-Served-By: sbproxy
+            Cache-Control: "public, max-age=60"
+          add:
+            X-Trace-Id: "trace-002"
+          remove:
+            # Drop upstream Content-Length when rewriting the body so the
+            # response falls back to chunked transfer.
+            - Content-Length
+            - Server
+            - X-Powered-By
+        body:
+          replace_json:
+            ok: true
+            replaced_by: sbproxy
+
+  "text.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    response_modifiers:
+      - headers:
+          set:
+            Content-Type: "text/plain; charset=utf-8"
+          remove:
+            - Content-Length
+        status:
+          code: 418
+          text: "I am a teapot"
+        body:
+          replace: "short and stout"

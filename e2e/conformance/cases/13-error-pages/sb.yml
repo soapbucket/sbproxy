@@ -1,0 +1,18 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "errors.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    error_pages:
+      - status: [401, 403]
+        content_type: application/json
+        template: true
+        body: |
+          {"error": true, "status": {{ status_code }}, "path": "{{ request.path }}"}
+    authentication:
+      type: api_key
+      api_keys:
+        - valid-key-only

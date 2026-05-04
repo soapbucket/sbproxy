@@ -1,0 +1,48 @@
+# WebAssembly response-body transform.
+#
+# Pipes the upstream response body through a sandboxed WASI module
+# (the request body goes in on stdin, whatever the module writes to
+# stdout becomes the new response body). Any wasm32-wasi binary works
+# without custom glue; see docs/wasm-development.md for the authoring
+# contract and Rust + TinyGo example modules.
+#
+# The example uses the pre-built echo module checked in at
+# examples/wasm/echo-rust/echo.wasm. Replace the path with your own
+# .wasm to do real work; the runtime is the same.
+#
+# Sandbox limits below are conservative. Production deployments should
+# tune them to the workload (e.g. raise timeout_ms for compute-heavy
+# transforms, raise max_memory_pages for transforms that buffer large
+# bodies).
+#
+# Run:
+#   make run CONFIG=examples/38-wasm-transform/sb.yml
+#
+# Test (the static body is round-tripped through the WASM module
+# unchanged because echo just copies stdin to stdout):
+#   curl -i -H 'Host: wasm.local' http://127.0.0.1:8080/
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "wasm.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "hello from sbproxy"
+
+    transforms:
+      - type: wasm
+        # Path resolved relative to the working directory the proxy
+        # is started from. Use an absolute path in production.
+        module_path: examples/wasm/echo-rust/echo.wasm
+        # Hard ceiling on wall-clock execution per request. Modules
+        # that exceed this are aborted with an epoch-interruption
+        # trap; the response falls back to the unmodified upstream
+        # body via the standard transform fail_on_error path.
+        timeout_ms: 500
+        # 64 KiB per page. 256 = 16 MiB, plenty for most text
+        # transforms. Raise for transforms that read large bodies.
+        max_memory_pages: 256

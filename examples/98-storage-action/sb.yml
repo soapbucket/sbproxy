@@ -1,0 +1,56 @@
+# Storage action: serve files from object storage backends.
+#
+# The storage action is now backed by the `object_store` crate,
+# supporting S3, GCS, Azure Blob, and the local filesystem. This
+# example uses the local backend pointed at a temp directory so it
+# runs without any cloud setup; production configs swap `local`
+# for `s3` / `gcs` / `azure`.
+#
+# Features:
+#   - GET + HEAD with content-type, content-length, etag, last-modified
+#   - Range requests (206 Partial Content + content-range)
+#   - index_file fallback for directory paths
+#   - 405 for unsupported methods, 404 for missing objects
+#
+# Setup:
+#   mkdir -p /tmp/sbproxy-static
+#   echo '<h1>hello from storage</h1>' > /tmp/sbproxy-static/index.html
+#   echo 'body { background: #eee; }' > /tmp/sbproxy-static/site.css
+#
+# Run:
+#   make run CONFIG=examples/98-storage-action/sb.yml
+#
+# Test:
+#   # Directory request: index_file fallback serves index.html.
+#   curl -s -H 'Host: static.localhost' http://127.0.0.1:8080/
+#
+#   # Direct file request with content-type derived from extension.
+#   curl -i -H 'Host: static.localhost' http://127.0.0.1:8080/site.css
+#
+#   # Range request: returns the byte range only with 206 status.
+#   curl -i -H 'Host: static.localhost' \
+#     -H 'Range: bytes=0-9' \
+#     http://127.0.0.1:8080/site.css
+#
+#   # Missing file: 404.
+#   curl -i -H 'Host: static.localhost' http://127.0.0.1:8080/missing
+#
+# To switch to S3 (set AWS_REGION + AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY):
+#   action:
+#     type: storage
+#     backend: s3
+#     bucket: my-public-assets
+#     prefix: site/
+#     region: us-east-1
+#     index_file: index.html
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "static.localhost":
+    action:
+      type: storage
+      backend: local
+      path: /tmp/sbproxy-static
+      index_file: index.html

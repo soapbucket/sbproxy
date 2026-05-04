@@ -1,0 +1,18 @@
+# Retry configuration with transport wrappers
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "retry.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888/echo
+      transport_wrappers:
+        retry:
+          enabled: true
+          max_retries: 3
+          initial_delay: 100ms
+          max_delay: 1s
+          multiplier: 2.0
+          jitter: 0.1
+          retryable_status: [502, 503, 504]

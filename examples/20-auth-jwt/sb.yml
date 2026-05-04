@@ -1,0 +1,36 @@
+# JWT authentication with a static HMAC secret.
+#
+# Validates HS256 tokens signed with `dev-secret-change-me`. Tokens must carry
+# the configured issuer and audience claims. Clients pass the JWT in the
+# Authorization header as `Bearer <token>`. Bad or missing tokens get a 401
+# before httpbin.org is contacted.
+#
+# Run:
+#   make run CONFIG=examples/20-auth-jwt/sb.yml
+#
+# Test:
+#   # 401 - no token
+#   curl -i -H 'Host: jwt.local' http://127.0.0.1:8080/get
+#
+#   # 200 - valid token (header/payload signed with dev-secret-change-me).
+#   # Header  : {"alg":"HS256","typ":"JWT"}
+#   # Payload : {"iss":"https://issuer.local","aud":"sbproxy-demo","sub":"alice"}
+#   TOKEN='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci5sb2NhbCIsImF1ZCI6InNicHJveHktZGVtbyIsInN1YiI6ImFsaWNlIn0.AYI4MIxc70VQ8kxGmAHPJiV5KrYJFzFRZkAJC4ahXUQ'
+#   curl -i -H 'Host: jwt.local' -H "Authorization: Bearer $TOKEN" \
+#        http://127.0.0.1:8080/get
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "jwt.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    authentication:
+      type: jwt
+      secret: dev-secret-change-me
+      issuer: https://issuer.local
+      audience: sbproxy-demo
+      algorithms: [HS256]

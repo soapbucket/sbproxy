@@ -1,0 +1,62 @@
+# syntax=docker/dockerfile:1.7
+#
+# CI smoke-test image for the sbproxy data plane.
+#
+# Optimised for the kind-based GitHub Actions workflow at
+# `.github/workflows/k8s-operator-smoke.yml`. Uses the same cargo-chef
+# layered layout as `Dockerfile.cloudbuild` so warm rebuilds (only
+# first-party source changed) finish in under 90s.
+#
+# This is intentionally NOT the production / release image: the release
+# pipeline at `.github/workflows/release.yml` produces signed multi-arch
+# images via a different flow (cross-compile + cosign + SBOM). Keep the
+# two in sync only on the runtime base (distroless/cc-debian12).
+#
+# Usage in CI:
+#   DOCKER_BUILDKIT=1 docker build -t sbproxy:ci -f Dockerfile.ci .
+#
+# REQUIRES BuildKit. The cache mounts on /usr/local/cargo/{registry,git}
+# only take effect when BuildKit is the active builder. GitHub-hosted
+# runners enable BuildKit by default with docker >= 23, but if the
+# workflow ever falls back to the legacy builder, the cache mounts
+# silently no-op and the build still succeeds (just slower).
+
+# --- Stage 1: chef-base ------------------------------------------------
+FROM rust:1.94-bookworm AS chef-base
+WORKDIR /src
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      pkg-config libclang-dev \
+      build-essential cmake perl \
+ && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo install --locked cargo-chef@0.1.71
+
+# --- Stage 2: planner --------------------------------------------------
+FROM chef-base AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# --- Stage 3: cacher ---------------------------------------------------
+FROM chef-base AS cacher
+COPY --from=planner /src/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo chef cook --release --bin sbproxy --recipe-path recipe.json
+
+# --- Stage 4: builder --------------------------------------------------
+FROM chef-base AS builder
+COPY --from=cacher /src/target target
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo build --release --bin sbproxy --locked \
+ && cp /src/target/release/sbproxy /usr/local/bin/sbproxy
+
+# --- Stage 5: runtime --------------------------------------------------
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+COPY --from=builder /usr/local/bin/sbproxy /usr/local/bin/sbproxy
+EXPOSE 8080 9090
+ENTRYPOINT ["/usr/local/bin/sbproxy"]
+CMD ["serve", "-f", "/etc/sbproxy/sb.yml"]

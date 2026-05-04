@@ -1,0 +1,202 @@
+name: CI
+# --- Workflow shape (updated 2026-05-03) ---
+# 4 jobs run in parallel on every push/PR:
+#
+#   build / test  (≈9 min, 10 runner-mins)
+#     fmt -> clippy -> build sbproxy binary -> test -> doc.
+#     The standalone `cargo build --workspace` step was removed:
+#     `cargo clippy --all-targets` already builds all rlibs via the
+#     check machinery, and `cargo build -p sbproxy` (kept) then
+#     produces the binary the e2e harness spawns. `cargo test
+#     --workspace` reuses the compiled artifacts for all remaining
+#     steps. Without the explicit binary build, e2e tests that call
+#     ProxyHarness::start_with_yaml() would fail because cargo test
+#     does not guarantee binary-crate output files exist before the
+#     test harnesses that reference them at runtime start executing.
+#
+#   release-build  (≈8 min, 9 runner-mins) -- push to main only
+#     Release binary smoke test. Skipped on pull_request triggers so
+#     PRs don't burn 8-9 runner-minutes twice (PR run + merge push).
+#     Branch protection requires only `build / test`.
+#
+#   supply-chain  (≈40 s, 1 runner-min)
+#     cargo-deny advisories + bans + licenses + sources.
+#
+#   crate-graph  (≈30 s, 1 runner-min)
+#     Enforces the OSS-vs-enterprise crate-graph layering rule.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref so force-pushes don't burn
+# minutes finishing the obsolete commit's jobs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  # Force JS-based actions onto Node 24 ahead of GitHub's June 2026
+  # default flip. Silences the actions/checkout@v4 deprecation banner.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    name: build / test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - '!**.md'
+              - '!docs/**'
+              - '!examples/**'
+              - '!LICENSE'
+              - '!NOTICE'
+              - '!.gitignore'
+
+      # The workspace's full target/ + ~/.cargo/registry/ tops 14 GB on
+      # GitHub-hosted runners (tract-onnx, tokenizers, kube, pingora,
+      # opentelemetry, etc), which crashes the rust-cache post-step on
+      # `No space left on device`. Reclaim ~25 GB by removing
+      # pre-installed tooling we don't use.
+      - name: free disk space
+        if: steps.filter.outputs.code == 'true'
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.filter.outputs.code == 'true'
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.filter.outputs.code == 'true'
+
+      - name: install protoc and libclang
+        if: steps.filter.outputs.code == 'true'
+        # libclang-dev is needed for rquickjs-sys's bindgen build script.
+        # Without it, clang's bundled stdbool.h is missing from the include
+        # path and the build fails with `'stdbool.h' file not found`.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang
+
+      - name: fmt
+        if: steps.filter.outputs.code == 'true'
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        if: steps.filter.outputs.code == 'true'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # E2E tests are intentionally OUT OF SCOPE for the PR-required CI
+      # lane. They spin up the full proxy binary, listen on real ports,
+      # and exercise the network stack; on shared CI runners this leads
+      # to startup-timeout flakiness (mesh gossip, websocket upgrade)
+      # that does not signal a real regression. Run them locally with
+      # `cargo test --workspace` after building the binary, or run them
+      # nightly via the release-checks lane.
+      #
+      # The `--exclude sbproxy-e2e` flag keeps the rest of the
+      # workspace's unit and harness-free integration tests in the
+      # required lane so logic regressions still surface on every PR.
+      - name: test (excludes e2e)
+        if: steps.filter.outputs.code == 'true'
+        run: cargo test --workspace --exclude sbproxy-e2e --locked
+
+      - name: doc
+        if: steps.filter.outputs.code == 'true'
+        env:
+          RUSTDOCFLAGS: -D warnings -D missing_docs
+        run: cargo doc --workspace --no-deps --locked
+
+  release-build:
+    name: release build
+    # Only run on pushes to main, not on pull_request events. Release
+    # builds take 8-9 runner-minutes; skipping them on PRs saves those
+    # minutes and avoids double-billing when a squash-merge PR lands
+    # (the merge commit re-triggers on push anyway).
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+
+      - name: build release binary
+        run: cargo build --release -p sbproxy --locked
+
+      - name: smoke test the binary
+        run: |
+          test -x target/release/sbproxy
+          file target/release/sbproxy
+          ls -lh target/release/sbproxy
+          # Binary exits 1 with a usage banner when no args. Capture stderr,
+          # confirm the banner is present, and treat exit 1 as success.
+          ./target/release/sbproxy 2>&1 | tee /tmp/sb.out || true
+          grep -q 'Usage: sbproxy' /tmp/sb.out
+
+  supply-chain:
+    name: supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Runs advisories + bans + licenses + sources against deny.toml.
+      # See SUPPLY-CHAIN.md section 4.3 for the policy rationale.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+          log-level: warn
+
+  # --- Crate-graph layering gate ---
+  # Enforces docs/adr-billing-hot-path-vs-async.md Rule 1: no OSS
+  # workspace crate (sbproxy-rust/crates/*) may depend on any
+  # sbproxy-enterprise-* crate. The proxy speaks only to LedgerClient;
+  # rail-specific code (Stripe, MPP, x402, Lightning) lives behind
+  # BillingRail and is consumed only by async workers in the
+  # enterprise tree. A regression here breaks the PR.
+  crate-graph:
+    name: crate graph (hot/async layering)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: check crate graph
+        run: bash scripts/check-crate-graph.sh
+
+  # macOS regression coverage and single-threaded test-isolation runs
+  # live in release-checks.yml and run on tag pushes plus
+  # workflow_dispatch. Per-PR coverage is debug-test on Linux only.
+
+  # ACME integration against Pebble and single-threaded test isolation
+  # live in release-checks.yml and run on tag pushes plus
+  # workflow_dispatch. Per-PR coverage is debug-test on Linux only.
+  # macOS regression coverage is intentionally not in CI: developers
+  # working on Darwin catch portability issues locally before pushing.

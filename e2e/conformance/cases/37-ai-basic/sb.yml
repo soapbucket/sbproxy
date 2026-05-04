@@ -1,0 +1,18 @@
+# Basic AI gateway - chat completions and model listing
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "ai-basic.test":
+    action:
+      type: ai_proxy
+      skip_tls_verify_host: true
+      default_model: gpt-4o-mini
+      providers:
+        - name: mock-openai
+          api_key: test-key
+          base_url: http://127.0.0.1:18889/v1
+          models:
+            - gpt-4o-mini
+            - gpt-4o
+            - gpt-4

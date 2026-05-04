@@ -1,0 +1,30 @@
+# AI gateway - provider failover (primary fails, fallback succeeds)
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "ai-failover.test":
+    action:
+      type: ai_proxy
+      skip_tls_verify_host: true
+      default_model: gpt-4o-mini
+      routing:
+        strategy: fallback_chain
+        retry:
+          max_attempts: 2
+          retry_on_status: [500, 502, 503]
+      providers:
+        - name: failing-provider
+          api_key: test-key
+          base_url: http://127.0.0.1:18889/v1
+          models:
+            - error-model
+          priority: 0
+          model_map:
+            gpt-4o-mini: error-model
+        - name: healthy-provider
+          api_key: test-key
+          base_url: http://127.0.0.1:18889/v1
+          models:
+            - gpt-4o-mini
+          priority: 1

@@ -1,0 +1,114 @@
+name: release checks
+
+# Heavyweight regression checks that run before a release rather than
+# on every PR. Single-threaded test isolation reruns the full workspace
+# tests one-thread-at-a-time, and the ACME integration test stands up
+# a Pebble service container and exercises real cert issuance. Both
+# are gated on tag pushes plus workflow_dispatch so day-to-day CI
+# stays cheap while we still catch ordering and CA regressions before
+# we ship.
+#
+# macOS coverage is intentionally NOT in CI: macOS runners are billed
+# at 10x the Linux rate, sbproxy uses no platform-specific syscalls,
+# and developers running on Darwin catch portability issues locally
+# before pushing.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  test-isolation:
+    name: test isolation (single-threaded)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-isolation
+
+      - name: install protoc and libclang
+        # libclang-dev is needed for rquickjs-sys's bindgen build script.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang
+
+      # Build the standalone sbproxy binary BEFORE running tests. The
+      # e2e harness in `e2e/src/lib.rs` spawns `target/debug/sbproxy` at
+      # runtime; `cargo test --workspace` builds test binaries but does
+      # not necessarily build the `[[bin]]` target, so without this step
+      # every e2e test panics with "release binary missing at ...".
+      - name: build sbproxy binary (needed by e2e harness)
+        run: cargo build -p sbproxy --locked
+
+      - name: test (single thread)
+        run: cargo test --workspace --locked -- --test-threads=1
+
+  acme-pebble:
+    name: acme integration (pebble)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      # Pin Pebble to a specific tag rather than `:latest` so an
+      # upstream image change cannot break our release-readiness lane
+      # silently. Bump deliberately when we want to track a new
+      # Pebble revision.
+      pebble:
+        image: ghcr.io/letsencrypt/pebble:2.6.0
+        ports:
+          - 14000:14000
+          - 15000:15000
+        env:
+          PEBBLE_VA_ALWAYS_VALID: "1"
+          PEBBLE_VA_NOSLEEP: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: acme-pebble
+
+      - name: wait for pebble directory
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if curl -sk https://localhost:14000/dir >/dev/null; then
+              echo "Pebble is up."
+              exit 0
+            fi
+            echo "Waiting for Pebble (${i}/30)..."
+            sleep 2
+          done
+          echo "Pebble did not become reachable on https://localhost:14000/dir"
+          exit 1
+
+      - name: run acme integration tests
+        run: cargo test -p sbproxy-tls --test acme_integration --locked -- --ignored

@@ -1,0 +1,28 @@
+# Reference fixture for the policy_assertion E2E suite.
+#
+# AssertionPolicy is non-blocking by design: a failed CEL
+# expression is logged but never alters the response sent to the
+# client. The fixture pairs a pass-style and a fail-style assertion
+# to confirm the proxy boots cleanly with both shapes.
+
+proxy:
+  http_bind_port: 0
+
+origins:
+  "assert.localhost":
+    action:
+      type: static
+      status_code: 200
+      content_type: application/json
+      json_body:
+        ok: true
+    policies:
+      - type: assertion
+        expression: 'response.status == 200'
+        name: status-check
+      - type: response_assertion
+        assertions:
+          - name: body-not-empty
+            cel_expr: |
+              response.body_size > 0
+            action: pass

@@ -1,0 +1,56 @@
+# Data Loss Prevention catalog.
+#
+# The dlp policy scans the request URI and headers for matches
+# against the configured detector set and either tags the upstream
+# request (`action: tag`, default) or blocks the call
+# (`action: block`). Detectors are drawn from the built-in regex
+# catalogue with optional inline `rules:` layered on top.
+#
+# Body scanning is intentionally out of scope today. The existing
+# `pii:` block on `ai_proxy` origins handles request-body
+# redaction with the same regex catalogue.
+#
+# Run:
+#   make run CONFIG=examples/76-dlp-catalog/sb.yml
+#
+# Test (block path - request that smuggles an AWS key in the URL):
+#   curl -i -H 'Host: api.local' \
+#     'http://127.0.0.1:8080/build?key=AKIAIOSFODNN7EXAMPLE'
+#   # => 403; "dlp: detector aws_access matched"
+#
+# Test (tag path - upstream sees `dlp-detection` header):
+#   curl -i -H 'Host: tag.local' \
+#     -H 'X-Notes: leaked xoxb-1234567890-abc' http://127.0.0.1:8080/anything
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+    policies:
+      - type: dlp
+        action: block                    # 403 on any match
+        detectors:
+          - aws_access
+          - github_token
+          - slack_token
+          - iban
+
+  "tag.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+    policies:
+      - type: dlp
+        action: tag                      # forward, stamp dlp-detection header
+        detectors: []                    # empty = enable every default detector
+        # Custom rules layer on top of the defaults; detectors: [] still
+        # enables the defaults.
+        rules:
+          - name: internal_ticket
+            pattern: '\bTICKET-\d{6}\b'
+            replacement: '[REDACTED:TICKET]'
+            anchor: 'TICKET-'

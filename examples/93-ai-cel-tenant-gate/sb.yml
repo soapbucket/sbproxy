@@ -1,0 +1,69 @@
+# AI access control via CEL policy.
+#
+# This is a proxy-native pattern: the CEL expression runs at the
+# network layer, before any AI provider is contacted. Pure AI gateway
+# libraries can't reject a request based on the surrounding request
+# context (auth claims, tenant headers, IP, geo) without taking on
+# the proxy role themselves.
+#
+# Two CEL policies layer here:
+#
+#   1. Require a non-empty `X-Tenant` header. Anything without one
+#      gets a 403 before the AI handler even reads the body. This is
+#      a hard tenant boundary.
+#
+#   2. Require the tenant value to appear in an allow-list. Unknown
+#      tenants are rejected with a different message so the operator
+#      can spot misconfigured clients vs. unprovisioned ones.
+#
+# Both checks happen in the same place per-request rate limits and
+# WAF rules run, so a single denial path covers AI, REST, and any
+# other action behind the same hostname.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#
+# Run:
+#   make run CONFIG=examples/93-ai-cel-tenant-gate/sb.yml
+#
+# Test (no tenant -> 403):
+#   curl -i http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+#
+# Test (unknown tenant -> 403):
+#   curl -i http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' -H 'X-Tenant: stranger' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+#
+# Test (allowed tenant -> 200):
+#   curl -i http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' -H 'X-Tenant: acme' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+
+    policies:
+      - type: expression
+        expression: 'request.headers["x-tenant"] != ""'
+        deny_status: 403
+        deny_message: "X-Tenant header required for AI access"
+
+      - type: expression
+        expression: >
+          request.headers["x-tenant"] in ["acme", "globex", "initech"]
+        deny_status: 403
+        deny_message: "tenant not provisioned for AI access"

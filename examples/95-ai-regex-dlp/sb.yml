@@ -1,0 +1,94 @@
+# Custom regex DLP guardrail on AI traffic.
+#
+# Built-in PII detection covers the obvious patterns (email, phone,
+# SSN, credit card). Real organisations have their own confidential
+# vocabulary: project codenames, internal doc IDs, source-control
+# URLs, support ticket numbers. A regex guardrail extends the input
+# pipeline with arbitrary patterns so confidential data never leaves
+# the building, even if a developer accidentally pastes it into an
+# AI request.
+#
+# Three layers run on every prompt:
+#
+#   1. Built-in PII detection (block on hit) catches the standard
+#      identifiers.
+#   2. A `regex` guardrail (`action: block`) with operator-supplied
+#      patterns blocks project codenames, internal hostnames, and
+#      Jira / Confluence references.
+#   3. A second `regex` guardrail (`action: allow`) acts as a positive
+#      filter: requests must match at least one allow-pattern,
+#      reinforcing scope to product / engineering topics.
+#
+# All three run before the upstream provider is contacted; a hit
+# returns a 4xx with `sbproxy_ai_guardrail_blocks_total` incremented
+# under the matching category.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#
+# Run:
+#   make run CONFIG=examples/95-ai-regex-dlp/sb.yml
+#
+# Test (clean prompt -> 200):
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[
+#         {"role":"user","content":"Summarise the public release notes."}
+#     ]}'
+#
+# Test (codename leak -> 4xx):
+#   curl -i http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[
+#         {"role":"user","content":"Help me debug Project Bluebird."}
+#     ]}'
+#
+# Test (off-topic blocked by allow-list -> 4xx):
+#   curl -i http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[
+#         {"role":"user","content":"Tell me a joke about cats."}
+#     ]}'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+
+      guardrails:
+        input:
+          # Built-in PII detector for the standard identifiers.
+          - type: pii
+            patterns: [email, phone, ssn, credit_card]
+            action: block
+
+          # Operator-defined codenames, ticket IDs, and internal
+          # hostnames. Block on hit so the request never leaves the
+          # building.
+          - type: regex
+            patterns:
+              - "(?i)project\\s+(bluebird|kestrel|raven)"
+              - "JIRA-[0-9]{4,}"
+              - "CONFLUENCE-[A-Z]{2,}-[0-9]+"
+              - "[a-z0-9-]+\\.corp\\.local"
+              - "[a-z0-9-]+\\.internal\\.example\\.com"
+            action: block
+
+          # Positive scope filter: the prompt must mention at least
+          # one approved engineering keyword. Anything off-topic is
+          # rejected so the AI stays on-task.
+          - type: regex
+            patterns:
+              - "(?i)(release notes|deploy|build|test|spec|api|sdk|bug|incident)"
+            action: allow

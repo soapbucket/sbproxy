@@ -1,0 +1,34 @@
+# Encoding transform.
+#
+# Base64-encodes the response body. A `static` action returns a small JSON
+# document; the `encoding` transform converts the bytes to standard base64.
+# The other valid encoding values are `base64_decode`, `url_encode`, and
+# `url_decode`.
+#
+# Run:
+#   make run CONFIG=examples/48-transform-encoding/sb.yml
+#
+# Test:
+#   # Raw response is base64. Pipe through `base64 -d` to recover the JSON.
+#   curl -s -H 'Host: enc.local' http://127.0.0.1:8080/
+#   curl -s -H 'Host: enc.local' http://127.0.0.1:8080/ | base64 -d
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "enc.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        message: "encoded by sbproxy"
+        ok: true
+    transforms:
+      - type: encoding
+        encoding: base64_encode
+    response_modifiers:
+      - headers:
+          set:
+            Content-Type: text/plain; charset=utf-8

@@ -1,0 +1,53 @@
+# Circuit breaker for load balancer targets.
+#
+# A formal Closed -> Open -> HalfOpen -> Closed state machine, one
+# breaker per LB target. On `failure_threshold` consecutive failures
+# (5xx, connect error, timeout) the breaker trips Open: every
+# subsequent request to that target is rejected immediately and
+# routed to a healthy peer instead. After `open_duration_secs`, the
+# breaker enters HalfOpen and admits a small number of probe
+# requests; on `success_threshold` consecutive successes it closes
+# again, otherwise it re-opens.
+#
+# Distinct from `outlier_detection`, which ejects on a sliding-window
+# failure *rate* rather than a strict consecutive count. The two
+# signals are complementary and can be used together: outlier
+# detection catches "this target is bad in aggregate"; the circuit
+# breaker catches "this target is hard down right now."
+#
+# Either signal trips a target out of `select_target`. When every
+# target is tripped at once, the LB falls back to the unfiltered
+# list rather than 502'ing the client.
+#
+# Run:
+#   make run CONFIG=examples/84-circuit-breaker/sb.yml
+#
+# Test:
+#   # In production, point one target at an upstream that returns
+#   # 5xx and watch traffic shift to the healthy peer within the
+#   # first few requests after `failure_threshold` is crossed. Then
+#   # restart the bad upstream and watch the breaker re-close after
+#   # the open duration elapses and the success threshold is met.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "localhost":
+    action:
+      type: load_balancer
+      algorithm: round_robin
+      circuit_breaker:
+        failure_threshold: 5     # trip after 5 consecutive failures
+        success_threshold: 2     # close after 2 consecutive successes in HalfOpen
+        open_duration_secs: 30   # stay Open for 30s before trying probes
+      # Optional - run alongside outlier detection so both signals
+      # can eject a flaky target.
+      outlier_detection:
+        threshold: 0.5
+        window_secs: 60
+        min_requests: 5
+        ejection_duration_secs: 30
+      targets:
+        - url: https://httpbin.org
+        - url: https://httpbingo.org

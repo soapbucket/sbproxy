@@ -1,0 +1,96 @@
+# Examples-in-CI smoke runner (B1.8).
+#
+# For every example bundle that ships a `docker-compose.yml`,
+# `scripts/examples-smoke.sh` brings the stack up, polls `/healthz`,
+# hits any feature endpoints declared in `smoke.json`, asserts that
+# at least one audit-log entry was emitted, then tears the stack down.
+# The script ships from the Q1.11 lane; this workflow is the CI entry
+# point.
+#
+# Triggers narrowly so unrelated edits do not pay the smoke runtime.
+# Touching any example, the runner script, or the proxy crate
+# re-runs the lane. The proxy crate path is included because a binary
+# regression breaks every bundle, and we want that surfaced before
+# release.
+
+name: examples-smoke
+
+on:
+  pull_request:
+    paths:
+      - 'examples/**'
+      - 'scripts/examples-smoke.sh'
+      - 'crates/sbproxy/**'
+      - '.github/workflows/examples-smoke.yml'
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  examples-smoke:
+    name: examples / docker-compose smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4.1.7
+
+      # The ubuntu-latest runner ships with a working `docker compose`
+      # CLI as of mid-2024. We assert that up front so a future runner
+      # image change that drops it surfaces here, not deep inside the
+      # smoke script.
+      - name: assert docker compose is available
+        run: |
+          set -euo pipefail
+          docker version
+          docker compose version
+
+      # The smoke runner is owned by the Q1.11 lane. Fail closed if it
+      # is not present yet; the docs-ci.yml lane uses the same
+      # defensive shape.
+      - name: run examples-smoke
+        env:
+          # Honor CI=true inside the script so it can switch off TTY
+          # colour codes and emit GH-Actions-friendly output.
+          CI: "true"
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/examples-smoke.sh ]; then
+            echo "scripts/examples-smoke.sh is missing."
+            echo "It is owned by Q1.11; this workflow waits for that to land."
+            exit 1
+          fi
+          bash scripts/examples-smoke.sh
+
+      # Capture per-example logs on failure. The smoke script tears
+      # each stack down before moving on, so we cannot grab live
+      # container logs here. What survives is the script's own stdout
+      # and any per-example `compose-logs.txt` the script writes when
+      # COMPOSE_LOGS_DIR is set.
+      - name: collect failure artifacts
+        if: failure()
+        run: |
+          set -eu
+          mkdir -p target/examples-smoke-logs
+          if [ -d /tmp/examples-smoke-logs ]; then
+            cp -r /tmp/examples-smoke-logs/. target/examples-smoke-logs/ || true
+          fi
+          # Always include the docker daemon's recent log so a
+          # docker-side failure (OOM, disk-full) is debuggable.
+          docker info > target/examples-smoke-logs/docker-info.txt 2>&1 || true
+
+      - name: upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4.4.0
+        with:
+          name: examples-smoke-failure-logs
+          path: target/examples-smoke-logs/
+          retention-days: 7
+          if-no-files-found: ignore

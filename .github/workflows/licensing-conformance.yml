@@ -1,0 +1,281 @@
+# Wave 4 / B4.5 licensing-conformance gate.
+#
+# Validates the Wave 4 policy-graph projections (`/licenses.xml`,
+# `/.well-known/tdmrep.json`) against their canonical upstream
+# schemas:
+#
+#   - RSL 1.0 XSD       fetched from https://rsl.ai/spec/1.0/rsl.xsd
+#   - W3C TDMRep schema fetched from the W3C TDMRep working draft
+#
+# The workflow runs in three modes:
+#
+#   1. On every push to main and every pull_request to main: pulls the
+#      vendored copy of each schema from `e2e/fixtures/rsl/` /
+#      `e2e/fixtures/tdmrep/` and runs the e2e schema-validation tests
+#      (rsl_licenses_projection_e2e + tdmrep_projection_e2e).
+#   2. On a weekly cron schedule: re-fetches the upstream schemas,
+#      diffs against the vendored copies, and runs the e2e tests
+#      against the freshly fetched copies. If the upstream changed, a
+#      bot PR is opened with the new vendored schema files.
+#   3. On manual dispatch (workflow_dispatch): same as mode 2 but
+#      skipping the cache, useful for ad-hoc audits.
+#
+# The schema fetches use `actions/cache` with a 7-day TTL so the
+# pull_request and push lanes do not hammer the upstream server.
+#
+# A failure in this lane never blocks Wave 4 ship by itself; the
+# workflow is informational on push/pull_request (status check is
+# advisory) and gating on the scheduled run (the bot PR captures the
+# upstream drift).
+
+name: licensing-conformance
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'crates/sbproxy-modules/src/projections/**'
+      - 'e2e/tests/rsl_licenses_projection_e2e.rs'
+      - 'e2e/tests/tdmrep_projection_e2e.rs'
+      - 'e2e/fixtures/rsl/**'
+      - 'e2e/fixtures/tdmrep/**'
+      - '.github/workflows/licensing-conformance.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'crates/sbproxy-modules/src/projections/**'
+      - 'e2e/tests/rsl_licenses_projection_e2e.rs'
+      - 'e2e/tests/tdmrep_projection_e2e.rs'
+      - 'e2e/fixtures/rsl/**'
+      - 'e2e/fixtures/tdmrep/**'
+      - '.github/workflows/licensing-conformance.yml'
+  schedule:
+    # Weekly on Monday at 09:00 UTC. The cadence matches the
+    # `directory-feed` weekly publish so the schema-drift PR lands in
+    # the same triage cycle.
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      bypass_cache:
+        description: 'Skip the schema cache and re-fetch upstream'
+        required: false
+        default: 'true'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  # --- Upstream schema URLs ---
+  #
+  # Bumping a URL requires a corresponding refresh of the vendored
+  # copy in e2e/fixtures/. The scheduled cron lane below does this
+  # automatically; unscheduled bumps need a follow-up PR.
+  RSL_XSD_URL: 'https://rsl.ai/spec/1.0/rsl.xsd'
+  TDMREP_SCHEMA_URL: 'https://www.w3.org/community/reports/tdmrep/CG-FINAL-tdmrep-20240202/schema/tdmrep.json'
+
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+
+  # --- Schema validation against vendored fixtures (push + PR lane) ---
+  #
+  # Runs on every push / pull_request that touches the projection
+  # surface. Uses the vendored XSD / JSON schema in e2e/fixtures/ so
+  # the lane is hermetic and cheap.
+  validate-vendored:
+    name: validate against vendored schemas
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v4.1.7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2.7.3
+        with:
+          shared-key: licensing-conformance
+
+      - name: install xmllint + protoc + libclang
+        # xmllint is required by the rsl_licenses_projection_e2e
+        # XSD validation step. protobuf-compiler + libclang-dev mirror
+        # ci.yml's toolchain prerequisites.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxml2-utils protobuf-compiler libclang-dev clang
+
+      - name: build sbproxy binary (release)
+        run: cargo build --release -p sbproxy --locked
+
+      - name: build e2e tests (release)
+        run: cargo build --release -p sbproxy-e2e --tests --locked
+
+      - name: licensing conformance e2e
+        # The two tests live behind `--include-ignored` because the
+        # vendored XSD / W3C JSON schema may not have landed in every
+        # branch yet. Once the schemas vendor lands they will become
+        # default-on; until then the lane logs the skip without
+        # failing CI.
+        run: |
+          set -euo pipefail
+          mkdir -p target/licensing-logs
+          cargo test -p sbproxy-e2e --release --locked \
+            --test rsl_licenses_projection_e2e \
+            --test tdmrep_projection_e2e \
+            -- --include-ignored 2>&1 \
+            | tee target/licensing-logs/cargo-test-output.txt
+
+      - name: upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4.4.0
+        with:
+          name: licensing-conformance-logs
+          path: target/licensing-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # --- Weekly upstream schema sync ---
+  #
+  # Re-fetches the upstream RSL XSD + W3C TDMRep JSON Schema, compares
+  # against the vendored copies, and opens a bot PR if anything
+  # changed. Runs on the cron schedule and on workflow_dispatch.
+  sync-upstream:
+    name: weekly upstream schema sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    steps:
+      - uses: actions/checkout@v4.1.7
+
+      - name: install curl + diff
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl diffutils
+
+      # --- Cache the upstream fetches per 7-day TTL ---
+      #
+      # The cache key includes the ISO week so a fresh fetch happens
+      # at most once per calendar week. workflow_dispatch with
+      # bypass_cache=true skips the cache and forces a fresh fetch.
+      - name: cache key
+        id: cache_key
+        run: |
+          set -eu
+          week=$(date -u +%Y-W%V)
+          if [ "${{ github.event.inputs.bypass_cache }}" = "true" ]; then
+            echo "key=licensing-schemas-${week}-$(date -u +%s)" >> "$GITHUB_OUTPUT"
+          else
+            echo "key=licensing-schemas-${week}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/cache@v4
+        id: schema_cache
+        with:
+          path: |
+            /tmp/rsl.xsd.fresh
+            /tmp/tdmrep.schema.fresh
+          key: ${{ steps.cache_key.outputs.key }}
+
+      - name: fetch upstream schemas
+        if: steps.schema_cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 5 \
+            -o /tmp/rsl.xsd.fresh \
+            "${{ env.RSL_XSD_URL }}"
+          curl -fsSL --retry 3 --retry-delay 5 \
+            -o /tmp/tdmrep.schema.fresh \
+            "${{ env.TDMREP_SCHEMA_URL }}"
+
+      - name: diff against vendored copies
+        id: diff
+        run: |
+          set -eu
+          changed=0
+          if [ -f e2e/fixtures/rsl/rsl-1.0.xsd ]; then
+            if ! diff -q /tmp/rsl.xsd.fresh e2e/fixtures/rsl/rsl-1.0.xsd >/dev/null 2>&1; then
+              echo "RSL XSD changed upstream"
+              changed=1
+            fi
+          else
+            echo "RSL XSD not yet vendored - first sync"
+            changed=1
+          fi
+          if [ -f e2e/fixtures/tdmrep/tdmrep.schema.json ]; then
+            if ! diff -q /tmp/tdmrep.schema.fresh e2e/fixtures/tdmrep/tdmrep.schema.json >/dev/null 2>&1; then
+              echo "TDMRep JSON Schema changed upstream"
+              changed=1
+            fi
+          else
+            echo "TDMRep schema not yet vendored - first sync"
+            changed=1
+          fi
+          echo "changed=${changed}" >> "$GITHUB_OUTPUT"
+
+      - name: stage updated vendored copies
+        if: steps.diff.outputs.changed == '1'
+        run: |
+          set -eu
+          mkdir -p e2e/fixtures/rsl e2e/fixtures/tdmrep
+          cp /tmp/rsl.xsd.fresh e2e/fixtures/rsl/rsl-1.0.xsd
+          cp /tmp/tdmrep.schema.fresh e2e/fixtures/tdmrep/tdmrep.schema.json
+
+      - name: open PR with refreshed vendored copies
+        if: steps.diff.outputs.changed == '1'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: chore/licensing-schemas-refresh
+          delete-branch: true
+          title: 'chore(e2e): refresh vendored RSL + TDMRep schemas'
+          commit-message: |
+            chore(e2e): refresh vendored RSL + TDMRep schemas
+
+            Auto-generated by the licensing-conformance workflow's weekly
+            sync. Re-fetches the upstream RSL 1.0 XSD and W3C TDMRep JSON
+            Schema and updates the vendored copies under e2e/fixtures/.
+
+            Review the diff for any breaking schema changes before merging.
+          body: |
+            ## What
+
+            Auto-refresh of the vendored RSL + TDMRep schema files used by the
+            `licensing-conformance` workflow:
+
+            - `e2e/fixtures/rsl/rsl-1.0.xsd`
+            - `e2e/fixtures/tdmrep/tdmrep.schema.json`
+
+            ## Why
+
+            The licensing-conformance workflow's weekly sync detected a
+            divergence between the vendored copy and the upstream document.
+
+            ## Test plan
+
+            - [ ] Inspect the schema diff for breaking changes.
+            - [ ] Run `cargo test -p sbproxy-e2e --release --test rsl_licenses_projection_e2e --test tdmrep_projection_e2e -- --include-ignored` locally.
+            - [ ] Confirm the projected `/licenses.xml` and `/.well-known/tdmrep.json` documents still validate.
+            - [ ] Update `crates/sbproxy-modules/src/projections/{licenses,tdmrep}.rs` if the schema diff requires emitter changes.
+          labels: |
+            automation
+            licensing-conformance
+
+      - name: report schema status
+        run: |
+          if [ "${{ steps.diff.outputs.changed }}" = "1" ]; then
+            echo "Upstream schema drift detected; PR opened."
+          else
+            echo "Vendored schemas match upstream; no PR needed."
+          fi

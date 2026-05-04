@@ -1,0 +1,67 @@
+# Custom error pages.
+#
+# error_pages substitutes the body and content type when the proxy itself
+# generates an error response: auth failures (401, 403), policy denials,
+# the default 404 for unknown origins, etc. It does NOT intercept
+# upstream-returned status codes.
+#
+# This example has a single origin protected by API key authentication.
+# Any request without the `X-Api-Key` header gets a 401 from the proxy,
+# which then runs through error_pages. The example covers JSON and HTML
+# representations using Accept-header content negotiation, plus a templated
+# entry that interpolates `{{ status_code }}` and `{{ request.path }}`.
+#
+# Run:
+#   make run CONFIG=examples/64-error-pages/sb.yml
+#
+# Test:
+#   # Successful path: the upstream is reached when the API key is correct.
+#   curl -sv -H 'Host: api.local' -H 'X-Api-Key: secret-key' \
+#        http://127.0.0.1:8080/get 2>&1 | grep -E '^< HTTP'
+#
+#   # 401 with Accept: application/json - JSON entry wins.
+#   curl -s -H 'Host: api.local' -H 'Accept: application/json' \
+#        http://127.0.0.1:8080/get
+#
+#   # 401 with Accept: text/html - templated HTML entry wins.
+#   curl -s -H 'Host: api.local' -H 'Accept: text/html' \
+#        http://127.0.0.1:8080/get
+#
+#   # 401 with no Accept header - JSON wins by default.
+#   curl -s -H 'Host: api.local' http://127.0.0.1:8080/get
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    authentication:
+      type: api_key
+      header_name: X-Api-Key
+      api_keys:
+        - secret-key
+
+    error_pages:
+      - status: 401
+        content_type: application/json
+        template: true
+        body: '{"error":"unauthorized","status":{{ status_code }},"path":"{{ request.path }}"}'
+
+      - status: 401
+        content_type: text/html; charset=utf-8
+        template: true
+        body: |
+          <!doctype html>
+          <html><head><title>Unauthorized</title></head>
+          <body>
+            <h1>{{ status_code }} unauthorized</h1>
+            <p>The request to {{ request.path }} requires an X-Api-Key header.</p>
+          </body></html>
+
+      - status: [403]
+        content_type: application/json
+        body: '{"error":"forbidden"}'

@@ -1,0 +1,99 @@
+# Defense in depth: layered authn / authz / inspection.
+#
+# Production API gateway in front of an internal service. Each layer
+# answers a different question; together they look like:
+#
+#   1. ip_filter            - is this source even on the allow list?
+#   2. WAF                  - does the request body / URI look benign?
+#   3. rate_limiting        - is this IP within its RPS budget?
+#   4. concurrent_limit     - is this IP within its in-flight cap?
+#   5. JWT auth             - is this user authenticated?
+#   6. forward_auth         - does our auth service still trust this token?
+#   7. request_validator    - does the body match the contract?
+#   8. security_headers     - injected on the response (defence for browsers)
+#   9. CORS                 - cross-origin policy for browser clients
+#
+# The layers run in policy / auth / transform order. A failure in any
+# layer short-circuits with the configured status. The upstream only
+# sees requests that survived everything.
+#
+# This file does not enable mTLS. mTLS is shown standalone in 85; pair
+# the two by setting `proxy.mtls` here when the deployment requires
+# certificate-based service identity in addition to JWT user auth.
+#
+# Run:
+#   make run CONFIG=examples/91-defense-in-depth/sb.yml
+#
+# Test:
+#   curl -H 'Host: localhost' \
+#        -H 'Authorization: Bearer <jwt>' \
+#        -H 'Content-Type: application/json' \
+#        -d '{"name":"alice","age":30}' \
+#        http://127.0.0.1:8080/anything
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "localhost":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    authentication:
+      type: jwt
+      secret: "change-me-to-a-real-secret"
+      algorithms: [HS256]
+      audience: "api.example.com"
+      issuer: "https://auth.example.com"
+
+    policies:
+      - type: ip_filter
+        whitelist:
+          - 127.0.0.1/32
+          - 10.0.0.0/8
+
+      - type: waf
+        owasp_crs:
+          enabled: true
+        action_on_match: block
+        fail_open: false
+
+      - type: rate_limiting
+        # Keyed by client IP automatically (uses ctx.client_ip).
+        requests_per_second: 100
+        burst: 50
+
+      - type: concurrent_limit
+        max: 200
+        key: ip
+        status: 503
+
+      - type: request_validator
+        content_types: [application/json]
+        status: 400
+        schema:
+          type: object
+          required: [name, age]
+          properties:
+            name: { type: string, minLength: 1, maxLength: 100 }
+            age:  { type: integer, minimum: 0, maximum: 150 }
+          additionalProperties: false
+
+    cors:
+      allowed_origins:
+        - https://app.example.com
+      allowed_methods:
+        - GET
+        - POST
+        - PUT
+      allowed_headers:
+        - authorization
+        - content-type
+      max_age: 3600
+      allow_credentials: true
+
+    hsts:
+      max_age: 31536000
+      include_subdomains: true
+      preload: false

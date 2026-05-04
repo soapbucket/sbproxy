@@ -1,0 +1,82 @@
+# AI gateway: per-model rate limits.
+#
+# Different models have different cost and latency profiles, so they
+# also deserve different rate caps. The model_rate_limits map keys by
+# model name and applies sliding one-minute windows for both requests
+# and tokens. The cap fires regardless of which provider serves the
+# model, so an alias or fallback chain that lands on the same upstream
+# model still counts against the same window.
+#
+# Three models are governed here:
+#   - claude-3-5-sonnet-latest: 60 RPM, 200k TPM. The expensive route.
+#   - claude-3-5-haiku-latest: 240 RPM, 600k TPM. The cheap workhorse.
+#   - anthropic/claude-3.5-sonnet (OpenRouter passthrough): 30 RPM,
+#     100k TPM, kept low because the resale path is slower.
+#
+# Setup:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   export OPENROUTER_API_KEY=sk-or-...
+#
+# Run:
+#   make run CONFIG=examples/19-ai-model-rate-limits/sb.yml
+#
+# Test (within Sonnet cap):
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "claude-3-5-sonnet-latest",
+#       "messages": [{"role": "user", "content": "Quick check."}]
+#     }'
+#
+# Test (burst past the Sonnet cap):
+#   for i in $(seq 1 80); do
+#     curl -s -o /dev/null -w '%{http_code}\n' \
+#       http://127.0.0.1:8080/v1/chat/completions \
+#       -H 'Host: ai.local' \
+#       -H 'Content-Type: application/json' \
+#       -d '{
+#         "model": "claude-3-5-sonnet-latest",
+#         "messages": [{"role": "user", "content": "ping"}]
+#       }'
+#   done
+#
+# Expected behaviour:
+#   Calls inside each per-model window return 200. Calls past the cap
+#   for the requested model return 429 with a Retry-After header. Caps
+#   for other models are unaffected, so claude-3-5-haiku-latest
+#   continues to serve traffic even while Sonnet is throttled.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+
+      providers:
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          default_model: claude-3-5-haiku-latest
+          models:
+            - claude-3-5-sonnet-latest
+            - claude-3-5-haiku-latest
+        - name: openrouter
+          api_key: ${OPENROUTER_API_KEY}
+          default_model: anthropic/claude-3.5-sonnet
+          models:
+            - anthropic/claude-3.5-sonnet
+            - anthropic/claude-3-haiku
+
+      model_rate_limits:
+        claude-3-5-sonnet-latest:
+          requests_per_minute: 60
+          tokens_per_minute: 200000
+        claude-3-5-haiku-latest:
+          requests_per_minute: 240
+          tokens_per_minute: 600000
+        anthropic/claude-3.5-sonnet:
+          requests_per_minute: 30
+          tokens_per_minute: 100000

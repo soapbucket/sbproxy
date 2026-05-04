@@ -1,0 +1,12 @@
+# Tests noop and mock action handlers
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "noop.test":
+    action:
+      type: noop
+
+  "mock.test":
+    action:
+      type: mock

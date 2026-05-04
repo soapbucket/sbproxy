@@ -1,0 +1,51 @@
+# Lua JSON transform.
+#
+# Runs a Lua script against the parsed JSON body. The script entrypoint is
+# `modify_json(data, ctx)`. `data` is the decoded JSON value (a table), not a
+# string. A self-contained `static` action seeds the input so the example
+# runs offline. The script:
+#   - uppercases the title
+#   - adds a derived `word_count` field from the body
+#   - drops the original `body` field
+#   - returns the modified table, which is re-serialised to JSON
+#
+# Run:
+#   make run CONFIG=examples/49-transform-lua/sb.yml
+#
+# Test:
+#   curl -s -H 'Host: lua.local' http://127.0.0.1:8080/
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "lua.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        id: 1
+        title: "lua transforms keep their cool"
+        body: "the lua script will count these eight words"
+        userId: 7
+    transforms:
+      - type: lua_json
+        script: |
+          function modify_json(data, ctx)
+            if type(data) == "table" then
+              if data.title then
+                data.title = string.upper(data.title)
+              end
+              if data.body then
+                local count = 0
+                for _ in string.gmatch(data.body, "%S+") do
+                  count = count + 1
+                end
+                data.word_count = count
+                data.body = nil
+              end
+              data.transformed_by = "lua"
+            end
+            return data
+          end

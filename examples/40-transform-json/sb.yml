@@ -1,0 +1,40 @@
+# JSON field transform.
+#
+# Reshapes a JSON response body before returning it to the client. The
+# upstream is a self-contained `static` action that returns a canned post
+# document, so the example works without external services. The transform:
+#   - renames `userId` to `author_id`
+#   - removes the `body` field
+#   - sets a new `source` field marking the response as proxied
+#
+# Run:
+#   make run CONFIG=examples/40-transform-json/sb.yml
+#
+# Test:
+#   curl -s -H 'Host: json.local' http://127.0.0.1:8080/posts/1
+#
+# Expected (note `author_id` instead of `userId`, no `body`, `source` added):
+#   {"id":1,"title":"...","author_id":1,"source":"sbproxy"}
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "json.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        userId: 1
+        id: 1
+        title: "first post"
+        body: "this body field is removed by the transform"
+    transforms:
+      - type: json
+        rename:
+          userId: author_id
+        remove:
+          - body
+        set:
+          source: sbproxy

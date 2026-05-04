@@ -1,0 +1,63 @@
+# Web Bot Auth: cryptographic agent verification (RFC 9421 + IETF draft).
+#
+# AI agents (crawlers, indexers, research bots) sign each request
+# with an Ed25519 key under RFC 9421 HTTP Message Signatures and
+# advertise their key id in the `Signature-Input` header. The
+# gateway verifies the signature against a directory of agent
+# public keys; only agents with valid signatures pass through.
+#
+# OSS ships the inline directory shape below. Periodic refresh of a
+# hosted JWKS-style directory is a follow-up that wires onto the
+# same `Directory` trait.
+#
+# Run:
+#   make run CONFIG=examples/91-web-bot-auth/sb.yml
+#
+# Test (unsigned -> 401):
+#   curl -i -H 'Host: blog.local' http://127.0.0.1:8080/article
+#   # => 401 bot_auth: signature required
+#
+# Test (signed against the directory -> 200):
+#   # See the bot_auth unit tests for the shape of a signed request;
+#   # production setups generate Signature-Input + Signature client-side.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "blog.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    authentication:
+      type: bot_auth
+      clock_skew_seconds: 30          # default
+      agents:
+        # Agent's `keyid` parameter in Signature-Input maps to one
+        # entry below. Algorithms supported: ed25519, hmac_sha256.
+        - name: openai-gptbot
+          key_id: openai-2026-01
+          algorithm: ed25519
+          # Hex- or base64-encoded raw 32-byte ed25519 public key.
+          # Placeholder below makes the example boot; replace with the
+          # agent's real published key in production.
+          public_key: "0011223344556677889900112233445566778899001122334455667788990011"
+          # Optional: every accepted signature must cover these
+          # components. Defaults to ["@method", "@target-uri"] so
+          # a signature that only covers a header cannot be replayed
+          # against a different verb or URL.
+          required_components:
+            - "@method"
+            - "@target-uri"
+            - "@authority"
+
+        - name: anthropic-claudebot
+          key_id: anthropic-2026-01
+          algorithm: ed25519
+          public_key: "2233445566778899001122334455667788990011223344556677889900112233"
+
+        - name: perplexity-bot
+          key_id: perplexity-2026-01
+          algorithm: ed25519
+          public_key: "4455667788990011223344556677889900112233445566778899001122334455"

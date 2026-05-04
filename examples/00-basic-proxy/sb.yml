@@ -1,0 +1,25 @@
+# Basic reverse proxy.
+#
+# Forwards requests sent to `myapp.example.com` through the gateway to
+# https://test.sbproxy.dev, our public HTTP echo service that returns the
+# inbound request as JSON (similar to httpbin).
+#
+# `example.com` is RFC 2606 reserved, so the client-facing hostname here
+# never collides with a real domain. Replace it with whatever hostname your
+# app uses in production.
+#
+# Run:
+#   make run CONFIG=examples/00-basic-proxy/sb.yml
+#
+# Test:
+#   curl -H 'Host: myapp.example.com' http://127.0.0.1:8080/get
+#   curl -H 'Host: myapp.example.com' http://127.0.0.1:8080/headers
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "myapp.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev

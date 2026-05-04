@@ -1,0 +1,99 @@
+[package]
+name = "sbproxy-tls"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+# --- Wave 5 / G5.3 feature flag ---
+#
+# `tls-fingerprint` opts in JA3 / JA4 / JA4H ClientHello capture and
+# parsing. Default-off so library consumers do not pay the parse-and-
+# hash cost (50-100 microseconds per handshake, per A5.1) when they do
+# not need agent-fingerprinting. Operators turn it on via Helm value
+# `features.tlsFingerprint = true` (B5.4) which flows through the
+# binary's default feature set.
+[features]
+default = []
+tls-fingerprint = []
+
+[dependencies]
+sbproxy-config.workspace = true
+sbproxy-platform.workspace = true
+
+# CIDR matching for trustworthy / untrusted client IP ranges.
+# Used by the per-origin trustworthy classifier (G5.3).
+ipnetwork.workspace = true
+
+# Hex encoding for JA3/JA4 outputs.
+hex.workspace = true
+
+# TLS
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rcgen.workspace = true
+ring.workspace = true
+x509-parser.workspace = true
+
+# QUIC / HTTP3
+quinn.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+
+# HTTP types
+http.workspace = true
+bytes.workspace = true
+
+# Async
+tokio.workspace = true
+
+# Serialization (ACME JSON protocol)
+serde.workspace = true
+serde_json.workspace = true
+
+# HTTP client (ACME API calls)
+reqwest.workspace = true
+
+# Concurrency
+arc-swap.workspace = true
+parking_lot.workspace = true
+
+# Bounded LRU for the mTLS client-cert metadata cache. Workspace
+# dependents (sbproxy-ai, sbproxy-modules) all standardise on 0.16,
+# so keep the same line here for cargo's resolver.
+lru = "0.16"
+
+# Process-wide metrics registry. Used to publish the
+# `sbproxy_mtls_cert_cache_evictions_total` counter that tracks
+# when the bounded mTLS cert cache evicts an entry under pressure.
+sbproxy-observe.workspace = true
+prometheus = { workspace = true }
+
+# SHA-256 of client cert DER (matches Pingora's cert_digest computation
+# so request_filter can correlate verify-time metadata back to the
+# digest exposed via session.digest()).
+sha2.workspace = true
+
+# MD5 for JA3 fingerprint computation (mandated by the JA3 spec; not
+# used as a security primitive). Pulled in only when `tls-fingerprint`
+# is enabled, but the dep tree always has it because cargo features
+# do not gate dep entries cleanly without `optional`.
+md-5 = { workspace = true }
+
+# Observability
+tracing.workspace = true
+
+# Error handling
+anyhow.workspace = true
+
+# Base64 (ACME JWS encoding)
+base64.workspace = true
+
+# Regex (mTLS CN pattern matching)
+regex = "1"
+
+# Time
+chrono.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

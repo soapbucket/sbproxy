@@ -1,0 +1,144 @@
+# Multi-host stack for the 33-quote-token-replay-jwks example.
+#
+# Demonstrates that quote-token replay protection holds across two
+# proxy instances when they share a Postgres-backed `NonceStore`.
+# Without the shared store, both instances accept the same token
+# (per-host in-memory caches do not coordinate).
+#
+# Services:
+#
+#   postgres                    - Postgres 16 with the
+#                                 V20260501__009_quote_tokens.sql
+#                                 migration applied at startup. The
+#                                 nonce-store-postgres feature on
+#                                 sbproxy-enterprise points its
+#                                 connection pool here.
+#   sbproxy-1                   - data plane on :8080, admin on :9090.
+#   sbproxy-2                   - data plane on :8081, admin on :9091.
+#                                 Both run from the same sb.yml and
+#                                 share a Postgres-backed nonce store.
+#   mock-x402-facilitator       - reused from example 30. Keeps the
+#                                 stack runnable without reaching out
+#                                 to a real testnet facilitator.
+#   mock-origin                 - article server.
+#
+# Bring up:    docker compose -f docker-compose.multi-host.yml up -d --wait
+# Tear down:   docker compose -f docker-compose.multi-host.yml down -v
+#
+# Note: the sbproxy image must be built from the enterprise binary
+# with the `nonce-store-postgres` cargo feature enabled. The
+# Dockerfile.cloudbuild target does this when EE_FEATURES includes the
+# feature; see ../../docs/build.md.
+
+services:
+
+  # --- Postgres for the shared NonceStore ---
+  postgres:
+    image: postgres:16
+    container_name: sbproxy_33_jwks_pg
+    environment:
+      POSTGRES_USER: sbproxy
+      POSTGRES_PASSWORD: sbproxy_demo
+      POSTGRES_DB: sbproxy
+    ports:
+      - "5432:5432"
+    volumes:
+      - ../../../sbproxy-enterprise/crates/sbproxy-enterprise-billing/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sbproxy -d sbproxy"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - jwksmh
+
+  # --- Proxy instance 1 ---
+  sbproxy-1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cloudbuild
+      args:
+        EE_FEATURES: "billing-stripe,billing-x402,billing-mpp,nonce-store-postgres"
+    image: sbproxy-ee:33-jwks-mh
+    container_name: sbproxy_33_jwks_1
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    environment:
+      SB_LOG_LEVEL: info
+      SBPROXY_NONCE_STORE_POSTGRES_URL: postgres://sbproxy:sbproxy_demo@postgres:5432/sbproxy
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mock-x402-facilitator:
+        condition: service_healthy
+      mock-origin:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - jwksmh
+
+  # --- Proxy instance 2 (same config, different host port) ---
+  sbproxy-2:
+    image: sbproxy-ee:33-jwks-mh
+    container_name: sbproxy_33_jwks_2
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    ports:
+      - "8081:8080"
+      - "9091:9090"
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    environment:
+      SB_LOG_LEVEL: info
+      SBPROXY_NONCE_STORE_POSTGRES_URL: postgres://sbproxy:sbproxy_demo@postgres:5432/sbproxy
+    depends_on:
+      sbproxy-1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - jwksmh
+
+  # --- Mock x402 facilitator (reused from example 30) ---
+  mock-x402-facilitator:
+    image: nginx:1.27.3-alpine
+    container_name: sbproxy_33_jwks_mh_facilitator
+    volumes:
+      - ../30-rail-x402-base-sepolia/mock-x402-facilitator/default.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost/__health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - jwksmh
+
+  # --- Mock origin ---
+  mock-origin:
+    image: nginx:1.27.3-alpine
+    container_name: sbproxy_33_jwks_mh_origin
+    volumes:
+      - ./mock-origin/default.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost/__health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - jwksmh
+
+networks:
+  jwksmh:
+    driver: bridge

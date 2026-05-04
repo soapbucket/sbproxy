@@ -1,0 +1,42 @@
+[package]
+name = "sbproxy-middleware"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+sbproxy-plugin.workspace = true
+sbproxy-config.workspace = true
+sbproxy-security.workspace = true
+sbproxy-cache.workspace = true
+# Idempotency middleware (R3.2): KVStore trait used as the OSS-friendly
+# backend abstraction so the middleware doesn't pull a redis client of
+# its own. Redis-backed deployments wire RedisKVStore from the platform
+# crate; in-memory tests use the bundled InMemoryIdempotencyCache.
+sbproxy-platform.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+ureq = "2"
+
+# RFC 9421 signature verification crypto
+hmac = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = "2"
+hex = { workspace = true }
+bytes = { workspace = true }
+
+# Response compression backends
+flate2 = "1"
+brotli = "3"
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
+serde_yaml = { workspace = true }
+rand = { workspace = true }

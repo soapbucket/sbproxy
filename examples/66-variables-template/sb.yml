@@ -1,0 +1,42 @@
+# Origin variables and template interpolation.
+#
+# The variables block declares static, per-origin key-value pairs that are
+# available to the template engine as `{{ variables.<name> }}`. Environment
+# variables surface as `{{ env.<NAME> }}`. This example wires both into request
+# headers so httpbin.org echoes them back, demonstrating that interpolation
+# happens at request time.
+#
+# Run:
+#   # The proxy resolves env vars at config-load time. Export anything you want
+#   # the {{ env.* }} placeholders to pick up before launching:
+#   export DEPLOY_REGION=us-east-1
+#   make run CONFIG=examples/66-variables-template/sb.yml
+#
+# Test:
+#   # The X-Api-Version, X-Region, and X-Beta-Api headers below are filled in
+#   # from origin variables / env vars and echoed back in the JSON response.
+#   curl -s -H 'Host: api.local' http://127.0.0.1:8080/headers | jq
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    variables:
+      api_version: v2
+      region_label: edge
+      feature_flags:
+        new_ui: true
+        beta_api: false
+
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    request_modifiers:
+      - headers:
+          set:
+            X-Api-Version: "{{ variables.api_version }}"
+            X-Region-Label: "{{ variables.region_label }}"
+            X-Region-Env: "{{ env.DEPLOY_REGION }}"
+            X-Beta-Api: "{{ variables.feature_flags.beta_api }}"

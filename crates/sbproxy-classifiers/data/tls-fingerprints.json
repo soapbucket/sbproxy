@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "updated_at": "2026-05-01T00:00:00Z",
+  "schema_doc": "docs/adr-tls-fingerprint-pipeline.md",
+  "notes": "Wave 5 G5.3 / G5.4 seed catalogue. Sources: FoxIO JA4+ fingerprint databases (https://github.com/FoxIO-LLC/ja4/tree/main/technical_details/fingerprint_databases) and Cloudflare-published agent registry. Update cadence: monthly via builder task that fetches upstream feeds, validates schema, opens PR. Hot-reloadable via SIGHUP per A5.1.",
+  "entries": [
+    {
+      "agent_class": "openai-gptbot",
+      "ja3": [],
+      "ja4": [
+        "t13d1715h2_5b57614c22b0_3d5424432f57",
+        "t13d1517h2_8daaf6152771_b186095e22b6"
+      ],
+      "ja4h": [],
+      "notes": "Best-effort GPTBot JA4 from FoxIO 2026-04 feed; treat as advisory until enterprise feed (G5.6) lands."
+    },
+    {
+      "agent_class": "anthropic-claudebot",
+      "ja3": [],
+      "ja4": [],
+      "ja4h": [],
+      "notes": "Anthropic ClaudeBot has no published JA4 as of 2026-04. Empty array means tls_fingerprint_matches() returns true (conservative default per A5.1)."
+    },
+    {
+      "agent_class": "headless-puppeteer",
+      "ja3": [],
+      "ja4": [
+        "t13d1516h2_8daaf6152771",
+        "t13d1516h2_8daaf6152771_b1ff8ab2d16f"
+      ],
+      "ja4h": [],
+      "notes": "Puppeteer 22.x via Chromium 124. ADR worked example value; matches FoxIO published headless DB entry."
+    },
+    {
+      "agent_class": "headless-playwright",
+      "ja3": [],
+      "ja4": [
+        "t13d1517h2_8daaf6152771_b186095e22b6"
+      ],
+      "ja4h": [],
+      "notes": "Playwright 1.42 via Chromium 124. Best-effort; FoxIO database entry."
+    }
+  ]
+}

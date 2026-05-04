@@ -1,0 +1,26 @@
+# Reference fixture for the policy_waf E2E suite.
+#
+# OWASP-lite ruleset on a static origin so the test does not need an
+# upstream. The bundled SQLi, XSS, and path-traversal patterns live
+# in `crates/sbproxy-modules/src/policy/mod.rs`.
+#
+# Toggle `action_on_match` to `log` (or set `test_mode: true`) to
+# observe the non-blocking variants.
+
+proxy:
+  http_bind_port: 0
+
+origins:
+  "waf.localhost":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: waf
+        owasp_crs:
+          enabled: true
+        action_on_match: block
+        test_mode: false
+        fail_open: false

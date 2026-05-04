@@ -1,0 +1,31 @@
+# SBproxy code owners.
+#
+# Each line maps a file pattern to one or more owners. The last matching
+# pattern wins, so order matters. Owners listed here are auto-requested
+# for review on pull requests touching matching files.
+#
+# All review requests route to the @soapbucket/maintainers team.
+
+# Default: anything not matched below
+*                               @soapbucket/maintainers
+
+# Release pipeline and security-sensitive surface
+/.github/workflows/             @soapbucket/maintainers
+/SECURITY.md                    @soapbucket/maintainers
+/SUPPLY-CHAIN.md                @soapbucket/maintainers
+/CODE_OF_CONDUCT.md             @soapbucket/maintainers
+
+# Crypto, TLS, auth, identity
+/crates/sbproxy-tls/            @soapbucket/maintainers
+/crates/sbproxy-vault/          @soapbucket/maintainers
+/crates/sbproxy-modules/src/auth/ @soapbucket/maintainers
+/crates/sbproxy-security/       @soapbucket/maintainers
+
+# AI and gateway core
+/crates/sbproxy-ai/             @soapbucket/maintainers
+/crates/sbproxy-core/           @soapbucket/maintainers
+
+# Docs (lower bar; most changes are mechanical)
+/docs/                          @soapbucket/maintainers
+/README.md                      @soapbucket/maintainers
+/CHANGELOG.md                   @soapbucket/maintainers

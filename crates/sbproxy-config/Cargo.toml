@@ -1,0 +1,24 @@
+[package]
+name = "sbproxy-config"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+sbproxy-plugin.workspace = true
+sbproxy-httpkit.workspace = true
+sbproxy-platform.workspace = true
+sbproxy-observe.workspace = true
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+http = { workspace = true }
+compact_str = { workspace = true }
+smallvec = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

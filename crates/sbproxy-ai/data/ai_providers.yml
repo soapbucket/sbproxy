@@ -1,0 +1,439 @@
+# AI Provider Registry.
+#
+# Source of truth for known AI / LLM provider metadata. Loaded by the
+# AI gateway at startup; the embedded copy ships with the binary, and
+# operators may override via `proxy.ai_providers_file` in sb.yml to
+# point at a custom catalog on disk.
+#
+# Each entry maps to `sbproxy_ai::providers::ProviderInfo`. Fields:
+#   - name            : canonical identifier used in sb.yml
+#   - display_name    : human-readable label
+#   - aliases         : alternative names accepted by the lookup
+#   - default_base_url: upstream API base URL
+#   - auth_header     : HTTP header carrying the API key
+#   - auth_prefix     : prefix prepended to the key (e.g. "Bearer ")
+#   - format          : wire format - openai|anthropic|google|bedrock|custom
+#   - supports_streaming
+#   - supports_embeddings
+#
+# Adding providers: append an entry below; the registry will pick it up
+# automatically on next startup. Replacing the embedded set entirely:
+# point `proxy.ai_providers_file` at your own YAML.
+
+providers:
+  # --- Tier 1: Major cloud providers ---
+  - name: openai
+    display_name: OpenAI
+    default_base_url: https://api.openai.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: anthropic
+    display_name: Anthropic
+    default_base_url: https://api.anthropic.com/v1
+    auth_header: x-api-key
+    auth_prefix: ""
+    format: anthropic
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: gemini
+    display_name: Google Gemini
+    aliases: [google]
+    default_base_url: https://generativelanguage.googleapis.com/v1beta
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: google
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: azure
+    display_name: Azure OpenAI
+    aliases: [azure_openai]
+    default_base_url: https://{resource}.openai.azure.com/openai
+    auth_header: api-key
+    auth_prefix: ""
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: bedrock
+    display_name: AWS Bedrock
+    aliases: [aws_bedrock]
+    default_base_url: https://bedrock-runtime.{region}.amazonaws.com
+    auth_header: Authorization
+    auth_prefix: ""
+    format: bedrock
+    supports_streaming: true
+    supports_embeddings: true
+
+  # --- Tier 2: Dedicated AI providers ---
+  - name: cohere
+    display_name: Cohere
+    default_base_url: https://api.cohere.com/v2
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: mistral
+    display_name: Mistral AI
+    default_base_url: https://api.mistral.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: deepseek
+    display_name: DeepSeek
+    default_base_url: https://api.deepseek.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: xai
+    display_name: xAI
+    aliases: [grok]
+    default_base_url: https://api.x.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: perplexity
+    display_name: Perplexity
+    default_base_url: https://api.perplexity.ai
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  # --- Tier 3: Inference platforms ---
+  - name: groq
+    display_name: Groq
+    default_base_url: https://api.groq.com/openai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: together
+    display_name: Together AI
+    aliases: [together_ai]
+    default_base_url: https://api.together.xyz/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: fireworks
+    display_name: Fireworks AI
+    aliases: [fireworks_ai]
+    default_base_url: https://api.fireworks.ai/inference/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: openrouter
+    display_name: OpenRouter
+    default_base_url: https://openrouter.ai/api/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  # --- Tier 4: Self-hosted / local ---
+  - name: ollama
+    display_name: Ollama
+    default_base_url: http://localhost:11434/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: vllm
+    display_name: vLLM
+    default_base_url: http://localhost:8000/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: tgi
+    display_name: Hugging Face Text Generation Inference
+    aliases: [huggingface_tgi]
+    default_base_url: http://localhost:8080/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: lmstudio
+    display_name: LM Studio
+    aliases: [lm_studio]
+    default_base_url: http://localhost:1234/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: llamacpp
+    display_name: llama.cpp server
+    aliases: [llama_cpp, llama.cpp]
+    default_base_url: http://localhost:8080/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  # --- Tier 5: Enterprise cloud platforms ---
+  - name: sagemaker
+    display_name: AWS SageMaker
+    aliases: [aws_sagemaker]
+    default_base_url: https://runtime.sagemaker.{region}.amazonaws.com
+    auth_header: Authorization
+    auth_prefix: ""
+    format: custom
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: databricks
+    display_name: Databricks
+    default_base_url: https://{workspace}.cloud.databricks.com/serving-endpoints
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: oracle
+    display_name: Oracle Cloud GenAI
+    aliases: [oci]
+    default_base_url: https://inference.generativeai.{region}.oci.oraclecloud.com
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: watsonx
+    display_name: IBM Watsonx
+    aliases: [ibm]
+    default_base_url: https://us-south.ml.cloud.ibm.com/ml/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: custom
+    supports_streaming: true
+    supports_embeddings: true
+
+  # --- Tier 6: Inference platforms (OpenAI-compatible) ---
+  - name: anyscale
+    display_name: Anyscale Endpoints
+    default_base_url: https://api.endpoints.anyscale.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: cerebras
+    display_name: Cerebras Inference
+    default_base_url: https://api.cerebras.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: nvidia
+    display_name: NVIDIA NIM
+    aliases: [nim]
+    default_base_url: https://integrate.api.nvidia.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: hyperbolic
+    display_name: Hyperbolic
+    default_base_url: https://api.hyperbolic.xyz/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: lepton
+    display_name: Lepton AI
+    default_base_url: https://api.lepton.run/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: deepinfra
+    display_name: DeepInfra
+    default_base_url: https://api.deepinfra.com/v1/openai
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: novita
+    display_name: Novita AI
+    default_base_url: https://api.novita.ai/v3/openai
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: sambanova
+    display_name: SambaNova Cloud
+    default_base_url: https://api.sambanova.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: siliconflow
+    display_name: SiliconFlow
+    default_base_url: https://api.siliconflow.cn/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  # --- Tier 7: Regional and language-specialised providers ---
+  - name: moonshot
+    display_name: Moonshot AI (Kimi)
+    aliases: [kimi]
+    default_base_url: https://api.moonshot.cn/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: dashscope
+    display_name: Alibaba DashScope (Qwen)
+    aliases: [qwen, alibaba]
+    default_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: zhipu
+    display_name: Zhipu AI (GLM)
+    aliases: [glm, chatglm]
+    default_base_url: https://open.bigmodel.cn/api/paas/v4
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  # --- Tier 8: OpenAI-compatible inference platforms (Phase 1) ---
+  - name: cloudflare
+    display_name: Cloudflare Workers AI
+    aliases: [workers_ai, cf_workers_ai]
+    default_base_url: https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: vertex
+    display_name: Google Vertex AI
+    aliases: [vertex_ai, google_vertex]
+    default_base_url: https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/endpoints/openapi
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: runpod
+    display_name: RunPod Serverless
+    default_base_url: https://api.runpod.ai/v2/{endpoint_id}/openai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: crusoe
+    display_name: Crusoe Cloud Inference
+    default_base_url: https://managed-inference-api-proxy.crusoecloud.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: featherless
+    display_name: Featherless AI
+    default_base_url: https://api.featherless.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: reka
+    display_name: Reka AI
+    default_base_url: https://api.reka.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  # --- Tier 9: Embeddings-only providers ---
+  - name: voyage
+    display_name: Voyage AI
+    aliases: [voyageai]
+    default_base_url: https://api.voyageai.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: false
+    supports_embeddings: true
+    supports_chat: false
+
+  - name: jina
+    display_name: Jina AI
+    default_base_url: https://api.jina.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: false
+    supports_embeddings: true
+    supports_chat: false

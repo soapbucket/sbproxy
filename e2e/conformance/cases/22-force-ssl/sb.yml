@@ -1,0 +1,9 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "forcessl.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    force_ssl: true

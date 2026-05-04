@@ -1,0 +1,14 @@
+# Tests session cookie management
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "session.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    session:
+      cookie_name: sbproxy_sid
+      max_age: 3600
+      same_site: Lax
+      allow_non_ssl: true

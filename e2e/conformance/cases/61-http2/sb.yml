@@ -1,0 +1,13 @@
+# HTTP/2 proxy test - uses local backend for reliable header assertions
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "h2.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    response_modifiers:
+      - headers:
+          set:
+            X-H2-Test: "true"

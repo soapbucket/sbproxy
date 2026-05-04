@@ -1,0 +1,111 @@
+# 18 - RSL licensing (Wave 4 / G4.5 + G4.7 + G4.8).
+#
+# Demonstrates the policy-graph projections that surface an origin's
+# AI-licensing posture as machine-readable documents:
+#
+#   GET /robots.txt                 -> RFC 9309 + RSL crawler stanzas
+#   GET /licenses.xml               -> RSL 1.0 license document
+#   GET /.well-known/tdmrep.json    -> W3C TDMRep declaration
+#
+# All three are derived from the same `ai_crawl_control` policy block
+# plus the per-origin `content_signal` field. Editing the policy or the
+# signal regenerates all three projections atomically on the next
+# config reload.
+#
+# Bundle layout:
+#   sb.yml              - this file
+#   docker-compose.yml  - sbproxy alone (no upstream needed)
+#   Makefile            - up / down / logs / test convenience targets
+#   smoke.json          - hits used by scripts/examples-smoke.sh
+#
+# Run:
+#   cd examples/18-rsl-licensing
+#   docker compose up -d --wait
+#
+# Inspect each projection:
+#   curl -s http://127.0.0.1:8080/robots.txt              -H 'Host: shop.localhost'
+#   curl -s http://127.0.0.1:8080/licenses.xml            -H 'Host: shop.localhost'
+#   curl -s http://127.0.0.1:8080/.well-known/tdmrep.json -H 'Host: shop.localhost'
+#
+# Tear down:
+#   docker compose down -v
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "shop.localhost":
+    # The operator asserts the body is licensed for inference (RAG /
+    # tool-use), not for training. The projection cache renders this
+    # into:
+    #
+    #   licenses.xml -> <ai-use type="inference" licensed="true" />
+    #   tdmrep.json  -> {"reservation":"none","content_signal":"ai-input"}
+    #   robots.txt   -> standard crawler stanzas plus the `Content-Signal:
+    #                   ai-input` header on responses to /robots.txt
+    #
+    # Per the RSL 1.0 mapping in `docs/adr-policy-graph-projections.md`,
+    # `ai-input` declares "may be used as an inference input but not for
+    # training a model". Switch to `ai-train` to license training and to
+    # `search` to license search-index inclusion.
+    content_signal: ai-input
+
+    # In-process body so the demo runs without an upstream. Real
+    # deployments swap for `type: proxy` + `url:`.
+    action:
+      type: static
+      status: 200
+      content_type: text/html
+      body: |
+        <!doctype html>
+        <html>
+        <head><title>Shop home</title></head>
+        <body>
+          <h1>Shop home</h1>
+          <p>This page is licensed for AI inference under RSL 1.0.
+          See <code>/licenses.xml</code> for the full document.</p>
+        </body>
+        </html>
+
+    # The `ai_crawl_control` policy block. The projection cache walks
+    # this to produce robots.txt, licenses.xml, and tdmrep.json. Every
+    # tier becomes a row in robots.txt; `citation_required: true` per
+    # tier tells the projection to assert citation-required terms in
+    # the RSL document.
+    policies:
+      - type: ai_crawl_control
+        price: 0.001
+        currency: USD
+        header: crawler-payment
+
+        crawler_user_agents:
+          - GPTBot
+          - ChatGPT-User
+          - ClaudeBot
+          - anthropic-ai
+          - PerplexityBot
+          - Google-Extended
+          - CCBot
+
+        # Two tiers, both citation-required so the projected RSL
+        # document carries the citation-required licensing term.
+        tiers:
+          - route_pattern: /
+            content_shape: html
+            price:
+              amount_micros: 1000
+              currency: USD
+            citation_required: true
+            paywall_position: top_of_page
+
+          - route_pattern: /docs/*
+            content_shape: html
+            price:
+              amount_micros: 2000
+              currency: USD
+            citation_required: true
+            paywall_position: top_of_page
+
+        valid_tokens:
+          - token-shop-001
+          - token-docs-001

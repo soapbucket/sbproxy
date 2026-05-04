@@ -1,0 +1,170 @@
+# Wave 1 e2e gate (B1.2).
+#
+# Triggers on PRs that touch the Wave 1 surface: AI crawl-control
+# tiering, web-bot-auth providers, agent verifier, and the observability
+# crates that gained per-agent labels and the cardinality limiter. This
+# workflow runs the Wave 1 e2e subset, plus the cardinality and redaction
+# regression tests, against the release build of the proxy binary.
+#
+# This is a separate lane from the main `ci.yml` and the broad `e2e.yml`
+# (which runs only on tag pushes). The matrix below targets the exact
+# tests called out in `docs/AIGOVERNANCE-BUILD.md` section 4.6.
+#
+# Cache strategy: a dedicated `wave1-gates` rust-cache key so this lane
+# does not stomp on the per-PR `ci` cache or the tag-only `e2e` cache.
+
+name: wave1-gates
+
+on:
+  pull_request:
+    paths:
+      - 'crates/sbproxy-modules/src/policy/ai_crawl.rs'
+      - 'crates/sbproxy-modules/src/auth/bot_auth.rs'
+      - 'crates/sbproxy-modules/src/auth/bot_auth_directory.rs'
+      - 'crates/sbproxy-security/src/agent_verify.rs'
+      - 'crates/sbproxy-observe/src/notify.rs'
+      - 'crates/sbproxy-observe/src/exemplars.rs'
+      - 'crates/sbproxy-observe/src/health.rs'
+      - 'crates/sbproxy-observe/src/logging.rs'
+      - 'crates/sbproxy-observe/src/metrics.rs'
+      - 'crates/sbproxy-observe/src/redact.rs'
+      - 'crates/sbproxy-observe/src/agent_labels.rs'
+      - 'crates/sbproxy-observe/src/cardinality.rs'
+      - 'scripts/check-crate-graph.sh'
+      - 'Cargo.toml'
+      - '.github/workflows/wave1-gates.yml'
+
+# Cancel superseded runs on the same ref so force-pushes do not
+# double-spend runner minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  # --- Crate-graph layering gate (mirrored from ci.yml) ---
+  # Runs the same check as ci.yml on the wave1 lane so a layering
+  # regression that lands via a Wave 1 hot-path edit fails before the
+  # ~30 min e2e job spins up. Cheap (5 s) and guards the Rule 1
+  # invariant from docs/adr-billing-hot-path-vs-async.md.
+  crate-graph:
+    name: crate graph (hot/async layering)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4.1.7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: check crate graph
+        run: bash scripts/check-crate-graph.sh
+
+  wave1-e2e:
+    name: wave1 e2e + cardinality + redaction
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4.1.7
+
+      # The release build of the workspace plus the e2e harness fills
+      # the runner's default free space. Mirror ci.yml's cleanup.
+      - name: free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2.7.3
+        with:
+          shared-key: wave1-gates
+
+      - name: install protoc and libclang
+        # Same toolchain prerequisites as ci.yml. libclang-dev is
+        # required by rquickjs-sys's bindgen build script.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang
+
+      # The e2e harness spawns the proxy binary at runtime. Build the
+      # binary explicitly first so cargo test does not race the harness.
+      - name: build sbproxy binary (release)
+        run: cargo build --release -p sbproxy --locked
+
+      # Build the e2e crate's test binaries up front so failures in the
+      # build phase do not get attributed to a flaky test below.
+      - name: build e2e tests (release)
+        # The e2e crate is registered in Cargo.toml as `sbproxy-e2e`.
+        # Section 4.6 of docs/AIGOVERNANCE-BUILD.md spelled it as
+        # `sbproxy-rust-e2e`; the actual workspace name wins.
+        run: cargo build --release -p sbproxy-e2e --tests --locked
+
+      # The Wave 1 e2e set is selected by --test name, one entry per
+      # file under e2e/tests/. Keep this list in sync with section 4.6
+      # of docs/AIGOVERNANCE-BUILD.md.
+      - name: wave1 e2e
+        run: |
+          set -euo pipefail
+          mkdir -p target/wave1-logs
+          cargo test -p sbproxy-e2e --release --locked \
+            --test ai_crawl_tiers \
+            --test http_ledger \
+            --test agent_class \
+            --test auth_bot \
+            --test metrics_per_agent \
+            --test wba_conformance \
+            --test smoke_substrate \
+            --test redaction \
+            --test slo_burn_rate \
+            --test cardinality \
+            -- --include-ignored 2>&1 | tee target/wave1-logs/cargo-test-output.txt
+
+      # Cardinality + redaction regression run again in isolation: the
+      # observability budgets workflow (B1.12) does the same thing on
+      # observe-crate edits. Running them here too guards the Wave 1
+      # surface even when only the policy or auth modules change.
+      - name: cardinality + redaction regressions
+        run: |
+          set -euo pipefail
+          cargo test -p sbproxy-e2e --release --locked \
+            --test cardinality \
+            --test redaction \
+            -- --include-ignored 2>&1 | tee -a target/wave1-logs/cargo-test-output.txt
+
+      - name: collect failure artifacts
+        if: failure()
+        run: |
+          set -eu
+          mkdir -p target/wave1-logs
+          if [ -f target/wave1-logs/cargo-test-output.txt ]; then
+            tail -n 200 target/wave1-logs/cargo-test-output.txt \
+              > target/wave1-logs/cargo-test-output.tail.txt || true
+          fi
+          # The release build does not write a single combined log, so
+          # capture the most recent rustc stderr files cargo wrote out.
+          find target/release -maxdepth 4 -name 'output' -newer Cargo.toml \
+            -exec tail -n 200 {} \; > target/wave1-logs/build.log.tail.txt 2>/dev/null || true
+
+      - name: upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4.4.0
+        with:
+          name: wave1-gates-failure-logs
+          path: target/wave1-logs/
+          retention-days: 7
+          if-no-files-found: ignore

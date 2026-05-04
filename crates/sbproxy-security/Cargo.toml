@@ -1,0 +1,39 @@
+[package]
+name = "sbproxy-security"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+# --- Wave 1 AI Governance feature flags ---
+#
+# `agent-class` opts in `agent_verify`, the forward-confirmed reverse-DNS
+# verifier (G1.5). Off-by-default for library consumers; the `sbproxy`
+# binary turns it on via its own default feature set (B1.1).
+[features]
+default = []
+agent-class = []
+# Wave 5 / G5.4. Pulls the headless-browser detector
+# (`headless_detect.rs`) into the security pipeline. The detector
+# reads `RequestContext.tls_fingerprint.ja4` and compares it against
+# the vendored TLS-fingerprint catalogue. Off-by-default for library
+# consumers.
+tls-fingerprint = []
+
+[dependencies]
+anyhow.workspace = true
+ipnetwork.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
+url.workspace = true
+
+# PII detection & redaction
+regex.workspace = true
+aho-corasick = "1"
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]

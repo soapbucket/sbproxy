@@ -1,0 +1,52 @@
+# Origin overrides: SNI and resolve.
+#
+# Two siblings of `action.url` change how the proxy reaches the
+# upstream:
+#
+#   sni_override     - server name sent during the upstream TLS
+#                      handshake (and the cert verification target).
+#                      Use when the cert hostname differs from the URL
+#                      host (typical SaaS-fronting pattern).
+#
+#   resolve_override - pin the connect address. Equivalent to
+#                      `curl --connect-to`. Bypasses DNS for the URL
+#                      host; the request line still uses the URL.
+#
+# The two are independent. Pin the connect address with one and
+# change the SNI with the other; the existing `host_override` keeps
+# rewriting the upstream Host header.
+#
+# Run:
+#   make run CONFIG=examples/72-sni-resolve-override/sb.yml
+#
+# Test:
+#   curl -H 'Host: api.local' http://127.0.0.1:8080/get
+#
+# What the upstream sees:
+#   - TLS SNI: cdn.provider.net    (from sni_override)
+#   - TCP peer: 203.0.113.7:443    (from resolve_override)
+#   - HTTP Host: api.local          (default; would override here)
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://api.example.com
+
+      # Send "cdn.provider.net" in the TLS ClientHello SNI extension
+      # and validate the cert against that name. The URL still says
+      # api.example.com so the rest of the request shape (Host
+      # header, path, etc.) is unaffected unless host_override is
+      # also set.
+      sni_override: cdn.provider.net
+
+      # Connect to this address regardless of what DNS says about
+      # api.example.com. Accepts:
+      #   - "ip"            (uses the URL's port)
+      #   - "ip:port"
+      #   - "[ipv6]:port"
+      #   - "host:port"     (resolves "host" via DNS, ignores URL host)
+      resolve_override: 203.0.113.7:443

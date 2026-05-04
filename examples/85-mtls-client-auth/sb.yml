@@ -1,0 +1,51 @@
+# mTLS client certificate authentication.
+#
+# Verifies that incoming HTTPS clients present a certificate signed
+# by the configured CA bundle. Failed handshakes never reach
+# `request_filter`; the connection is dropped at the TLS layer.
+#
+# After a successful handshake, the proxy strips any inbound
+# `X-Client-Cert-*` headers (so a non-TLS client can't forge them)
+# and forwards the verified identity:
+#
+#   X-Client-Cert-Verified: 1
+#   X-Client-Cert-CN:           Subject Common Name
+#   X-Client-Cert-SAN:          DNS:..., IP:..., email:..., URI:...
+#   X-Client-Cert-Organization: Subject's O field
+#   X-Client-Cert-Serial:       hex serial
+#   X-Client-Cert-Fingerprint:  hex sha256 of the cert
+#
+# `require: true` (default) rejects anonymous clients at the
+# handshake. `require: false` admits them; the upstream then sees
+# no X-Client-Cert-* headers and can decide its own policy.
+#
+# First run:
+#   bash examples/85-mtls-client-auth/generate-certs.sh
+#   make run CONFIG=examples/85-mtls-client-auth/sb.yml
+#
+# Test (with the generated certs):
+#   curl --cacert examples/85-mtls-client-auth/certs/ca.pem \
+#        --cert  examples/85-mtls-client-auth/certs/client.pem \
+#        --key   examples/85-mtls-client-auth/certs/client.key \
+#        -H 'Host: localhost' \
+#        https://127.0.0.1:8443/headers
+#   # Upstream sees X-Client-Cert-CN: alice@example.com plus
+#   # X-Client-Cert-SAN containing alice.local and the email.
+#
+#   # Anonymous request rejected at TLS handshake:
+#   curl -k https://127.0.0.1:8443/headers
+
+proxy:
+  http_bind_port: 8080
+  https_bind_port: 8443
+  tls_cert_file: examples/85-mtls-client-auth/certs/server.pem
+  tls_key_file: examples/85-mtls-client-auth/certs/server.key
+  mtls:
+    client_ca_file: examples/85-mtls-client-auth/certs/ca.pem
+    require: true             # default; set false to allow anonymous TLS clients
+
+origins:
+  "localhost":
+    action:
+      type: proxy
+      url: https://httpbin.org

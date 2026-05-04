@@ -1,0 +1,62 @@
+# OpenAPI 3.0 schema validation policy.
+#
+# Loads an inline OpenAPI document at startup and validates each
+# request body against the matching operation's `requestBody` schema.
+# Requests whose path + method are not described in the spec, or
+# whose `Content-Type` has no schema, are passed through unchanged.
+#
+# Run:
+#   make run CONFIG=examples/97-openapi-validation/sb.yml
+#
+# Test (valid body, returns 200):
+#   curl -i -H 'Host: api.local' \
+#        -H 'Content-Type: application/json' \
+#        -d '{"name":"alice","age":30}' \
+#        http://127.0.0.1:8080/users/42
+#
+# Test (missing required field, returns 400):
+#   curl -i -H 'Host: api.local' \
+#        -H 'Content-Type: application/json' \
+#        -d '{"age":30}' \
+#        http://127.0.0.1:8080/users/42
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: application/json
+      body: '{"ok":true}'
+
+    policies:
+      - type: openapi_validation
+        mode: enforce              # `enforce` (default) or `log`
+        status: 400                # status code on validation failure
+        spec:
+          openapi: "3.0.3"
+          info:
+            title: example api
+            version: "1.0"
+          paths:
+            "/users/{id}":
+              post:
+                summary: update a user
+                requestBody:
+                  required: true
+                  content:
+                    application/json:
+                      schema:
+                        type: object
+                        required: [name]
+                        additionalProperties: false
+                        properties:
+                          name:
+                            type: string
+                            minLength: 1
+                          age:
+                            type: integer
+                            minimum: 0
+                            maximum: 150

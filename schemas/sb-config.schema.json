@@ -1,0 +1,988 @@
+{
+  "$schema": "https://json-schema.org/draft/07/schema",
+  "$id": "https://soapbucket.io/schemas/sb-config.schema.json",
+  "title": "SoapBucket Proxy Config (sb.yml)",
+  "description": "JSON Schema for the sbproxy configuration file (sb.yml). All field names match the YAML keys accepted by sbproxy.",
+  "type": "object",
+  "required": ["config_version"],
+  "additionalProperties": false,
+  "properties": {
+
+    "config_version": {
+      "type": "integer",
+      "description": "Schema version for this config file. Must be 1 for current releases. Increment signals a breaking change.",
+      "default": 1,
+      "const": 1,
+      "x-stability": "stable"
+    },
+
+    "proxy": {
+      "$ref": "#/definitions/ProxyServerConfig",
+      "description": "Server-level proxy settings. All fields are optional; defaults are applied when omitted.",
+      "x-stability": "stable"
+    },
+
+    "origins": {
+      "type": "object",
+      "description": "Map of hostname (or hostname:port) to origin configuration. Each key is a virtual hostname the proxy listens on.",
+      "additionalProperties": {
+        "$ref": "#/definitions/RawOriginConfig"
+      },
+      "x-stability": "stable",
+      "examples": [
+        {
+          "api.example.com": {
+            "action": { "type": "proxy", "url": "https://backend.internal" }
+          }
+        }
+      ]
+    }
+  },
+
+  "definitions": {
+
+    "ProxyServerConfig": {
+      "type": "object",
+      "description": "Server-level configuration for the proxy process itself.",
+      "additionalProperties": false,
+      "x-stability": "stable",
+      "properties": {
+        "http_bind_port": {
+          "type": "integer",
+          "description": "TCP port to listen on for plain HTTP connections.",
+          "default": 8080,
+          "minimum": 1,
+          "maximum": 65535,
+          "x-stability": "stable",
+          "examples": [80, 8080]
+        },
+        "https_bind_port": {
+          "type": "integer",
+          "description": "TCP port to listen on for TLS (HTTPS) connections. Omit to disable TLS.",
+          "minimum": 1,
+          "maximum": 65535,
+          "x-stability": "stable",
+          "examples": [443, 8443]
+        },
+        "tls_cert_file": {
+          "type": "string",
+          "description": "Path to a PEM-encoded TLS certificate file for manual TLS. Mutually exclusive with acme.",
+          "x-stability": "stable",
+          "examples": ["/etc/ssl/certs/server.crt"]
+        },
+        "tls_key_file": {
+          "type": "string",
+          "description": "Path to a PEM-encoded TLS private key file for manual TLS. Mutually exclusive with acme.",
+          "x-stability": "stable",
+          "examples": ["/etc/ssl/private/server.key"]
+        },
+        "acme": {
+          "$ref": "#/definitions/AcmeConfig",
+          "description": "Automatic TLS certificate management via ACME (e.g. Let's Encrypt). When present, sbproxy provisions and renews certificates automatically.",
+          "x-stability": "beta"
+        },
+        "http3": {
+          "$ref": "#/definitions/Http3Config",
+          "description": "HTTP/3 (QUIC) listener configuration. Requires https_bind_port to be set.",
+          "x-stability": "alpha"
+        }
+      }
+    },
+
+    "AcmeConfig": {
+      "type": "object",
+      "description": "ACME (Automatic Certificate Management Environment) configuration for automatic TLS certificate provisioning and renewal.",
+      "additionalProperties": false,
+      "x-stability": "beta",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable automatic certificate management. When false, the ACME block is parsed but inactive.",
+          "default": false,
+          "x-stability": "beta"
+        },
+        "email": {
+          "type": "string",
+          "description": "Contact email address registered with the ACME provider. Used for expiry warnings and account recovery.",
+          "format": "email",
+          "default": "",
+          "x-stability": "beta",
+          "examples": ["admin@example.com"]
+        },
+        "directory_url": {
+          "type": "string",
+          "description": "URL of the ACME directory endpoint. Defaults to Let's Encrypt production. Use the staging URL for testing.",
+          "format": "uri",
+          "default": "https://acme-v02.api.letsencrypt.org/directory",
+          "x-stability": "beta",
+          "examples": [
+            "https://acme-v02.api.letsencrypt.org/directory",
+            "https://acme-staging-v02.api.letsencrypt.org/directory"
+          ]
+        },
+        "challenge_types": {
+          "type": "array",
+          "description": "ACME challenge types to attempt, in preference order. Supported: tls-alpn-01, http-01.",
+          "items": {
+            "type": "string",
+            "enum": ["tls-alpn-01", "http-01", "dns-01"]
+          },
+          "default": ["tls-alpn-01", "http-01"],
+          "x-stability": "beta"
+        },
+        "storage_backend": {
+          "type": "string",
+          "description": "Backend used to persist ACME account keys and certificates between restarts.",
+          "default": "redb",
+          "enum": ["redb", "sqlite"],
+          "x-stability": "beta"
+        },
+        "storage_path": {
+          "type": "string",
+          "description": "Filesystem path where the storage backend writes certificate data.",
+          "default": "/var/lib/sbproxy/certs",
+          "x-stability": "beta",
+          "examples": ["/var/lib/sbproxy/certs", "/data/certs"]
+        },
+        "renew_before_days": {
+          "type": "integer",
+          "description": "Number of days before certificate expiry at which renewal is attempted.",
+          "default": 30,
+          "minimum": 1,
+          "maximum": 89,
+          "x-stability": "beta"
+        }
+      }
+    },
+
+    "Http3Config": {
+      "type": "object",
+      "description": "HTTP/3 (QUIC) protocol configuration. Enables the Alt-Svc advertisement and QUIC listener.",
+      "additionalProperties": false,
+      "x-stability": "alpha",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable the HTTP/3 QUIC listener alongside the TCP listener.",
+          "default": false,
+          "x-stability": "alpha"
+        },
+        "max_streams": {
+          "type": "integer",
+          "description": "Maximum number of concurrent bidirectional QUIC streams per connection.",
+          "default": 100,
+          "minimum": 1,
+          "x-stability": "alpha"
+        },
+        "idle_timeout_secs": {
+          "type": "integer",
+          "description": "Seconds of inactivity before a QUIC connection is closed.",
+          "default": 30,
+          "minimum": 1,
+          "x-stability": "alpha"
+        }
+      }
+    },
+
+    "RawOriginConfig": {
+      "type": "object",
+      "description": "Configuration for a single virtual origin (hostname). Controls proxying, authentication, policies, and middleware for all requests to this hostname.",
+      "required": ["action"],
+      "additionalProperties": false,
+      "x-stability": "stable",
+      "properties": {
+
+        "action": {
+          "type": "object",
+          "description": "Defines what the proxy does with matched requests. The `type` field selects the action plugin (proxy, static, redirect, ai, etc.). All other fields are plugin-specific.",
+          "required": ["type"],
+          "x-stability": "stable",
+          "properties": {
+            "type": {
+              "type": "string",
+              "description": "Action plugin name.",
+              "examples": ["proxy", "static", "redirect", "ai", "load_balancer", "demo"]
+            },
+            "url": {
+              "type": "string",
+              "description": "For type=proxy: upstream URL to forward requests to.",
+              "format": "uri",
+              "examples": ["https://backend.internal", "http://localhost:3000"]
+            }
+          },
+          "additionalProperties": true
+        },
+
+        "authentication": {
+          "type": "object",
+          "description": "Authentication configuration for this origin. Alias: `auth`. Plugin-specific; the `type` field selects the auth plugin (basic_auth, api_keys, oauth2, jwt, etc.).",
+          "x-stability": "stable",
+          "properties": {
+            "type": {
+              "type": "string",
+              "description": "Authentication plugin name.",
+              "examples": ["basic_auth", "api_keys", "oauth2", "jwt", "ip_filter"]
+            }
+          },
+          "additionalProperties": true
+        },
+
+        "policies": {
+          "type": "array",
+          "description": "List of policy plugins applied to requests. Each entry is a plugin config object with a `type` field. Evaluated in order. Common types: rate_limit, ip_filter, waf, cel, lua, ai_crawl_control. See the per-policy `definitions` (e.g. `AiCrawlControlPolicy`) for the full shape of each.",
+          "items": {
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+              "type": {
+                "type": "string",
+                "description": "Policy plugin name.",
+                "examples": ["rate_limit", "ip_filter", "waf", "cel", "lua", "ai_crawl_control"]
+              }
+            },
+            "additionalProperties": true
+          },
+          "default": [],
+          "x-stability": "stable"
+        },
+
+        "transforms": {
+          "type": "array",
+          "description": "List of transform plugins applied to the request or response body. Each entry is a plugin config object with a `type` field.",
+          "items": {
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+              "type": {
+                "type": "string",
+                "description": "Transform plugin name.",
+                "examples": ["json_projection", "xml_to_json"]
+              }
+            },
+            "additionalProperties": true
+          },
+          "default": [],
+          "x-stability": "beta"
+        },
+
+        "request_modifiers": {
+          "type": "array",
+          "description": "Ordered list of request modification steps applied before the request is forwarded upstream. Each step may modify headers, URL, query parameters, HTTP method, or body.",
+          "items": {
+            "$ref": "#/definitions/RequestModifierConfig"
+          },
+          "default": [],
+          "x-stability": "stable"
+        },
+
+        "response_modifiers": {
+          "type": "array",
+          "description": "Ordered list of response modification steps applied after the upstream response is received, before it is returned to the client.",
+          "items": {
+            "$ref": "#/definitions/ResponseModifierConfig"
+          },
+          "default": [],
+          "x-stability": "stable"
+        },
+
+        "cors": {
+          "$ref": "#/definitions/CorsConfig",
+          "description": "Cross-Origin Resource Sharing (CORS) settings. When present, sbproxy injects CORS headers on every response and handles preflight OPTIONS requests.",
+          "x-stability": "stable"
+        },
+
+        "hsts": {
+          "$ref": "#/definitions/HstsConfig",
+          "description": "HTTP Strict Transport Security (HSTS) settings. Injects the Strict-Transport-Security header on responses.",
+          "x-stability": "stable"
+        },
+
+        "compression": {
+          "$ref": "#/definitions/CompressionConfig",
+          "description": "Response body compression settings. When present, sbproxy compresses responses for clients that advertise supported encodings.",
+          "x-stability": "stable"
+        },
+
+        "session": {
+          "$ref": "#/definitions/SessionConfig",
+          "description": "Session cookie management. When present, sbproxy issues and validates session cookies for this origin.",
+          "x-stability": "beta"
+        },
+        "session_config": {
+          "$ref": "#/definitions/SessionConfig",
+          "description": "Deprecated alias for `session`. Use `session` instead.",
+          "x-stability": "deprecated"
+        },
+
+        "force_ssl": {
+          "type": "boolean",
+          "description": "When true, redirect all plain HTTP requests to HTTPS with a 301 response.",
+          "default": false,
+          "x-stability": "stable"
+        },
+
+        "allowed_methods": {
+          "type": "array",
+          "description": "Allowlist of HTTP methods accepted by this origin. Requests with other methods receive 405 Method Not Allowed. An empty list allows all methods.",
+          "items": {
+            "type": "string",
+            "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE"]
+          },
+          "default": [],
+          "x-stability": "stable",
+          "examples": [["GET", "POST", "OPTIONS"]]
+        },
+
+        "forward_rules": {
+          "type": "array",
+          "description": "Conditional routing rules evaluated in order. Each rule matches on request attributes (path, headers, method) and can forward to a different upstream or inline origin config.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "default": [],
+          "x-stability": "beta"
+        },
+
+        "fallback_origin": {
+          "type": "object",
+          "description": "A secondary origin config used when the primary action fails (e.g. upstream error or timeout). Follows the same structure as a top-level origin action.",
+          "additionalProperties": true,
+          "x-stability": "beta"
+        },
+
+        "response_cache": {
+          "type": "object",
+          "description": "Response caching configuration. When present, sbproxy caches upstream responses and serves them for subsequent matching requests.",
+          "additionalProperties": true,
+          "x-stability": "beta",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable response caching for this origin.",
+              "default": false
+            },
+            "ttl_seconds": {
+              "type": "integer",
+              "description": "Default cache entry lifetime in seconds.",
+              "minimum": 1
+            },
+            "cache_control": {
+              "type": "boolean",
+              "description": "Respect Cache-Control headers from the upstream when determining TTL.",
+              "default": true
+            }
+          }
+        },
+
+        "variables": {
+          "type": "object",
+          "description": "Named values injected into the template variable scope for this origin. Can be referenced in action configs and modifiers as `{{ config.var_name }}`.",
+          "additionalProperties": true,
+          "default": {},
+          "x-stability": "beta",
+          "examples": [
+            { "api_version": "v2", "timeout_ms": 5000 }
+          ]
+        },
+
+        "on_request": {
+          "type": "array",
+          "description": "Event hook plugins executed when a request arrives, before routing. Each entry is a plugin config object with a `type` field.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "default": [],
+          "x-stability": "alpha"
+        },
+
+        "on_response": {
+          "type": "array",
+          "description": "Event hook plugins executed after the upstream response is received, before sending to the client.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "default": [],
+          "x-stability": "alpha"
+        },
+
+        "bot_detection": {
+          "type": "object",
+          "description": "Bot traffic detection configuration. Inspects request signals to identify and optionally block automated clients.",
+          "additionalProperties": true,
+          "x-stability": "alpha"
+        },
+
+        "threat_protection": {
+          "type": "object",
+          "description": "Threat protection configuration integrating with dynamic blocklist and reputation feeds.",
+          "additionalProperties": true,
+          "x-stability": "alpha"
+        },
+
+        "rate_limit_headers": {
+          "type": "object",
+          "description": "Controls which rate limit headers are sent in responses (e.g. X-RateLimit-Limit, Retry-After).",
+          "additionalProperties": true,
+          "x-stability": "beta"
+        },
+
+        "error_pages": {
+          "type": "object",
+          "description": "Custom error page configuration. Maps HTTP status codes to static HTML content or redirect URLs.",
+          "additionalProperties": true,
+          "x-stability": "beta"
+        },
+
+        "traffic_capture": {
+          "type": "object",
+          "description": "Traffic mirroring and capture configuration. Sends a copy of requests to a secondary endpoint for debugging or analysis.",
+          "additionalProperties": true,
+          "x-stability": "alpha"
+        },
+
+        "message_signatures": {
+          "type": "object",
+          "description": "HTTP message signature (HMAC) configuration for request signing and verification.",
+          "additionalProperties": true,
+          "x-stability": "alpha"
+        }
+      }
+    },
+
+    "CorsConfig": {
+      "type": "object",
+      "description": "Cross-Origin Resource Sharing (CORS) policy. sbproxy adds the appropriate response headers and handles preflight OPTIONS requests on behalf of the upstream.",
+      "additionalProperties": false,
+      "x-stability": "stable",
+      "properties": {
+        "allowed_origins": {
+          "type": "array",
+          "description": "Origins permitted to make cross-origin requests. Use `*` to allow all origins. Alias: `allow_origins`.",
+          "items": { "type": "string" },
+          "default": [],
+          "x-stability": "stable",
+          "examples": [["https://app.example.com", "https://www.example.com"], ["*"]]
+        },
+        "allowed_methods": {
+          "type": "array",
+          "description": "HTTP methods permitted in cross-origin requests. Alias: `allow_methods`.",
+          "items": { "type": "string" },
+          "default": [],
+          "x-stability": "stable",
+          "examples": [["GET", "POST", "PUT", "DELETE", "OPTIONS"]]
+        },
+        "allowed_headers": {
+          "type": "array",
+          "description": "Request headers the browser is allowed to send in cross-origin requests. Alias: `allow_headers`.",
+          "items": { "type": "string" },
+          "default": [],
+          "x-stability": "stable",
+          "examples": [["Content-Type", "Authorization", "X-Request-ID"]]
+        },
+        "expose_headers": {
+          "type": "array",
+          "description": "Response headers that the browser JavaScript code is permitted to read.",
+          "items": { "type": "string" },
+          "default": [],
+          "x-stability": "stable"
+        },
+        "max_age": {
+          "type": "integer",
+          "description": "How long (seconds) the browser may cache a preflight response. Sent as the Access-Control-Max-Age header.",
+          "minimum": 0,
+          "x-stability": "stable",
+          "examples": [3600, 86400]
+        },
+        "allow_credentials": {
+          "type": "boolean",
+          "description": "Whether the browser should include cookies and HTTP authentication in cross-origin requests. Sets Access-Control-Allow-Credentials: true.",
+          "default": false,
+          "x-stability": "stable"
+        },
+        "enable": {
+          "type": "boolean",
+          "description": "Explicit enable toggle. Alias: `enabled`. The presence of the `cors` block is sufficient to enable CORS; this field is accepted for compatibility.",
+          "x-stability": "stable"
+        }
+      }
+    },
+
+    "HstsConfig": {
+      "type": "object",
+      "description": "HTTP Strict Transport Security policy. Instructs browsers to always use HTTPS for this origin.",
+      "additionalProperties": false,
+      "x-stability": "stable",
+      "properties": {
+        "max_age": {
+          "type": "integer",
+          "description": "Duration in seconds that the browser should enforce HTTPS-only access. Sent as the max-age directive in the Strict-Transport-Security header.",
+          "default": 31536000,
+          "minimum": 0,
+          "x-stability": "stable",
+          "examples": [31536000, 63072000]
+        },
+        "include_subdomains": {
+          "type": "boolean",
+          "description": "Whether the HSTS policy applies to all subdomains. Adds the includeSubDomains directive.",
+          "default": false,
+          "x-stability": "stable"
+        },
+        "preload": {
+          "type": "boolean",
+          "description": "Whether to include the preload directive. Required for submission to HSTS preload lists. Only enable when max_age >= 31536000 and include_subdomains is true.",
+          "default": false,
+          "x-stability": "stable"
+        }
+      }
+    },
+
+    "CompressionConfig": {
+      "type": "object",
+      "description": "Response body compression. sbproxy negotiates content encoding with the client and compresses eligible responses.",
+      "additionalProperties": false,
+      "x-stability": "stable",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable response compression. Alias: `enable`.",
+          "default": true,
+          "x-stability": "stable"
+        },
+        "algorithms": {
+          "type": "array",
+          "description": "Compression algorithms to offer, in preference order. sbproxy selects the best match from the client's Accept-Encoding.",
+          "items": {
+            "type": "string",
+            "enum": ["gzip", "br", "zstd", "deflate"]
+          },
+          "default": [],
+          "x-stability": "stable",
+          "examples": [["br", "gzip"]]
+        },
+        "min_size": {
+          "type": "integer",
+          "description": "Minimum response body size in bytes below which compression is skipped. Avoids overhead on tiny payloads.",
+          "default": 0,
+          "minimum": 0,
+          "x-stability": "stable",
+          "examples": [1024, 4096]
+        },
+        "level": {
+          "type": "integer",
+          "description": "Compression level passed to the codec. Interpretation is codec-specific (e.g. 1=fastest, 9=best compression for gzip).",
+          "minimum": 1,
+          "maximum": 22,
+          "x-stability": "beta"
+        }
+      }
+    },
+
+    "SessionConfig": {
+      "type": "object",
+      "description": "Session cookie settings. sbproxy issues a signed session cookie and validates it on subsequent requests.",
+      "additionalProperties": false,
+      "x-stability": "beta",
+      "properties": {
+        "cookie_name": {
+          "type": "string",
+          "description": "Name of the session cookie.",
+          "x-stability": "beta",
+          "examples": ["sb_session", "__Host-session"]
+        },
+        "max_age": {
+          "type": "integer",
+          "description": "Session lifetime in seconds. Alias: `cookie_max_age`. A value of 0 means session-duration (expires when the browser closes).",
+          "minimum": 0,
+          "x-stability": "beta",
+          "examples": [3600, 86400, 604800]
+        },
+        "http_only": {
+          "type": "boolean",
+          "description": "Set the HttpOnly flag on the session cookie, preventing JavaScript access.",
+          "default": false,
+          "x-stability": "beta"
+        },
+        "secure": {
+          "type": "boolean",
+          "description": "Set the Secure flag on the session cookie, restricting it to HTTPS connections.",
+          "default": false,
+          "x-stability": "beta"
+        },
+        "same_site": {
+          "type": "string",
+          "description": "SameSite attribute of the session cookie. Alias: `cookie_same_site`.",
+          "enum": ["Strict", "Lax", "None"],
+          "x-stability": "beta"
+        },
+        "allow_non_ssl": {
+          "type": "boolean",
+          "description": "Allow session cookies to be issued over plain HTTP connections. Use only in development.",
+          "default": false,
+          "x-stability": "beta"
+        }
+      }
+    },
+
+    "RequestModifierConfig": {
+      "type": "object",
+      "description": "A single request modification step. Any combination of sub-fields may be set; all present sub-fields are applied in declaration order within the step.",
+      "additionalProperties": false,
+      "x-stability": "stable",
+      "properties": {
+        "headers": {
+          "$ref": "#/definitions/HeaderModifiers",
+          "description": "Header set/add/remove operations applied to the outgoing request.",
+          "x-stability": "stable"
+        },
+        "url": {
+          "$ref": "#/definitions/UrlModifier",
+          "description": "URL path rewrite operations.",
+          "x-stability": "stable"
+        },
+        "query": {
+          "$ref": "#/definitions/QueryModifier",
+          "description": "Query parameter set/add/remove operations.",
+          "x-stability": "stable"
+        },
+        "method": {
+          "type": "string",
+          "description": "Override the HTTP method sent to the upstream.",
+          "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+          "x-stability": "stable"
+        },
+        "body": {
+          "$ref": "#/definitions/BodyModifier",
+          "description": "Replace the request body with a static string or JSON value.",
+          "x-stability": "stable"
+        },
+        "lua_script": {
+          "type": "string",
+          "description": "Inline Lua script for dynamic request modification. The script receives `req` and `ctx` arguments via `function match_request(req, ctx)`.",
+          "x-stability": "beta"
+        }
+      }
+    },
+
+    "ResponseModifierConfig": {
+      "type": "object",
+      "description": "A single response modification step applied to the upstream response before it is returned to the client.",
+      "additionalProperties": false,
+      "x-stability": "stable",
+      "properties": {
+        "headers": {
+          "$ref": "#/definitions/HeaderModifiers",
+          "description": "Header set/add/remove operations applied to the outgoing response.",
+          "x-stability": "stable"
+        },
+        "status": {
+          "$ref": "#/definitions/StatusOverride",
+          "description": "Override the HTTP status code (and optional reason phrase) of the response.",
+          "x-stability": "stable"
+        },
+        "body": {
+          "$ref": "#/definitions/ResponseBodyModifier",
+          "description": "Replace the response body with a static string or JSON value.",
+          "x-stability": "stable"
+        },
+        "lua_script": {
+          "type": "string",
+          "description": "Inline Lua script for dynamic response modification.",
+          "x-stability": "beta"
+        }
+      }
+    },
+
+    "HeaderModifiers": {
+      "type": "object",
+      "description": "Header modification operations. `set` overwrites, `add` appends (even if the header already exists), `remove`/`delete` deletes.",
+      "additionalProperties": false,
+      "x-stability": "stable",
+      "properties": {
+        "set": {
+          "type": "object",
+          "description": "Set (overwrite) headers. Key is the header name, value is the header value.",
+          "additionalProperties": { "type": "string" },
+          "default": {},
+          "x-stability": "stable",
+          "examples": [{ "X-Forwarded-By": "sbproxy", "Authorization": "Bearer token" }]
+        },
+        "add": {
+          "type": "object",
+          "description": "Add headers without removing existing values for the same name.",
+          "additionalProperties": { "type": "string" },
+          "default": {},
+          "x-stability": "stable"
+        },
+        "remove": {
+          "type": "array",
+          "description": "List of header names to remove. Alias: `delete`.",
+          "items": { "type": "string" },
+          "default": [],
+          "x-stability": "stable",
+          "examples": [["X-Internal-Token", "Cookie"]]
+        }
+      }
+    },
+
+    "UrlModifier": {
+      "type": "object",
+      "description": "URL modification operations targeting the request path.",
+      "additionalProperties": false,
+      "x-stability": "stable",
+      "properties": {
+        "path": {
+          "$ref": "#/definitions/PathRewrite",
+          "description": "Path rewrite rule.",
+          "x-stability": "stable"
+        }
+      }
+    },
+
+    "PathRewrite": {
+      "type": "object",
+      "description": "Path rewrite configuration.",
+      "additionalProperties": false,
+      "x-stability": "stable",
+      "properties": {
+        "replace": {
+          "$ref": "#/definitions/PathReplace",
+          "description": "Replace a substring in the URL path.",
+          "x-stability": "stable"
+        }
+      }
+    },
+
+    "PathReplace": {
+      "type": "object",
+      "description": "A simple find-and-replace operation on the URL path string.",
+      "required": ["old", "new"],
+      "additionalProperties": false,
+      "x-stability": "stable",
+      "properties": {
+        "old": {
+          "type": "string",
+          "description": "The substring to search for in the path.",
+          "x-stability": "stable",
+          "examples": ["/api/v1", "/old-path"]
+        },
+        "new": {
+          "type": "string",
+          "description": "The replacement string.",
+          "x-stability": "stable",
+          "examples": ["/api/v2", "/new-path"]
+        }
+      }
+    },
+
+    "QueryModifier": {
+      "type": "object",
+      "description": "Query string parameter modification operations.",
+      "additionalProperties": false,
+      "x-stability": "stable",
+      "properties": {
+        "set": {
+          "type": "object",
+          "description": "Set (overwrite) query parameters. Existing values for the key are replaced.",
+          "additionalProperties": { "type": "string" },
+          "default": {},
+          "x-stability": "stable",
+          "examples": [{ "version": "2", "format": "json" }]
+        },
+        "add": {
+          "type": "object",
+          "description": "Append query parameters without removing existing values.",
+          "additionalProperties": { "type": "string" },
+          "default": {},
+          "x-stability": "stable"
+        },
+        "remove": {
+          "type": "array",
+          "description": "Query parameter names to remove from the request. Alias: `delete`.",
+          "items": { "type": "string" },
+          "default": [],
+          "x-stability": "stable",
+          "examples": [["debug", "trace"]]
+        }
+      }
+    },
+
+    "BodyModifier": {
+      "type": "object",
+      "description": "Request body replacement. Exactly one of `replace` or `replace_json` should be set.",
+      "additionalProperties": false,
+      "x-stability": "stable",
+      "properties": {
+        "replace": {
+          "type": "string",
+          "description": "Replace the entire request body with this string. The Content-Type is not automatically changed.",
+          "x-stability": "stable"
+        },
+        "replace_json": {
+          "description": "Replace the entire request body with this JSON value. Sets Content-Type to application/json.",
+          "x-stability": "stable"
+        }
+      }
+    },
+
+    "ResponseBodyModifier": {
+      "type": "object",
+      "description": "Response body replacement. Exactly one of `replace` or `replace_json` should be set.",
+      "additionalProperties": false,
+      "x-stability": "stable",
+      "properties": {
+        "replace": {
+          "type": "string",
+          "description": "Replace the entire response body with this string.",
+          "x-stability": "stable",
+          "examples": ["Service temporarily unavailable"]
+        },
+        "replace_json": {
+          "description": "Replace the entire response body with this JSON value.",
+          "x-stability": "stable"
+        }
+      }
+    },
+
+    "StatusOverride": {
+      "type": "object",
+      "description": "Override the HTTP status code returned to the client.",
+      "required": ["code"],
+      "additionalProperties": false,
+      "x-stability": "stable",
+      "properties": {
+        "code": {
+          "type": "integer",
+          "description": "HTTP status code to set on the response.",
+          "minimum": 100,
+          "maximum": 599,
+          "x-stability": "stable",
+          "examples": [200, 201, 301, 403, 503]
+        },
+        "text": {
+          "type": "string",
+          "description": "Optional reason phrase appended to the status line (HTTP/1.1 only; informational in HTTP/2 and HTTP/3).",
+          "x-stability": "stable",
+          "examples": ["Created By Proxy", "Maintenance Mode"]
+        }
+      }
+    },
+
+    "AiCrawlMoney": {
+      "type": "object",
+      "description": "Currency-aware money amount for AI crawl pricing. Stored in micros (1e-6 of the currency unit) to avoid floating-point rounding on the payment path.",
+      "required": ["amount_micros", "currency"],
+      "additionalProperties": false,
+      "x-stability": "beta",
+      "properties": {
+        "amount_micros": {
+          "type": "integer",
+          "description": "Amount in micros of `currency`. 1 USD = 1000000 amount_micros.",
+          "minimum": 0,
+          "x-stability": "beta",
+          "examples": [1000, 5000, 1000000]
+        },
+        "currency": {
+          "type": "string",
+          "description": "ISO-4217 currency code.",
+          "examples": ["USD", "EUR", "GBP", "JPY"]
+        }
+      }
+    },
+
+    "AiCrawlTier": {
+      "type": "object",
+      "description": "Pricing tier for the AI crawl control policy. The first tier whose `route_pattern` matches the request path wins; later tiers act as fallbacks. Wave 1 supports literal paths and a single `*` suffix wildcard.",
+      "required": ["route_pattern", "price"],
+      "additionalProperties": false,
+      "x-stability": "beta",
+      "properties": {
+        "route_pattern": {
+          "type": "string",
+          "description": "Path matcher. Use a trailing `*` to match any suffix (e.g. `/articles/*`). An exact pattern matches only that one path.",
+          "examples": ["/articles/*", "/api/v1/search", "/*"]
+        },
+        "price": {
+          "$ref": "#/definitions/AiCrawlMoney",
+          "description": "Price for any request this tier matches."
+        },
+        "content_shape": {
+          "type": "string",
+          "description": "Optional shape selector. When set, the tier only applies for requests that resolve to this shape. Wave 1 treats this as advisory; per-shape routing lands in a follow-up wave.",
+          "enum": ["html", "markdown", "json", "pdf", "other"],
+          "x-stability": "beta"
+        },
+        "free_preview_bytes": {
+          "type": "integer",
+          "description": "Optional free-preview byte budget. Cooperative crawlers may read up to this many bytes of the response without paying. Surfaced in the 402 challenge body.",
+          "minimum": 0,
+          "x-stability": "beta",
+          "examples": [1024, 2048, 8192]
+        },
+        "paywall_position": {
+          "type": "string",
+          "description": "Where the paywall sits relative to the rendered response. Carried in the 402 challenge body so cooperative crawlers can decide whether to pay for the full document or accept the preview.",
+          "enum": ["top_of_page", "inline", "bottom_of_page"],
+          "x-stability": "beta"
+        }
+      }
+    },
+
+    "AiCrawlControlPolicy": {
+      "type": "object",
+      "description": "AI Crawl Control policy. Emits HTTP 402 challenges to AI crawlers that arrive without a valid `Crawler-Payment` token. The OSS build ships an in-memory ledger seeded by `valid_tokens`; enterprise deployments wire a network-callable ledger client. Set `tiers` to vary price by route, content shape, free preview, or paywall position.",
+      "required": ["type"],
+      "additionalProperties": false,
+      "x-stability": "beta",
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Policy plugin name. Must be `ai_crawl_control`.",
+          "const": "ai_crawl_control"
+        },
+        "price": {
+          "type": "number",
+          "description": "Default price (in major currency units) shown in the 402 challenge when no `tiers` entry matches.",
+          "minimum": 0,
+          "examples": [0.001, 0.01, 0.05]
+        },
+        "currency": {
+          "type": "string",
+          "description": "ISO-4217 currency code for the top-level `price`.",
+          "default": "USD",
+          "examples": ["USD", "EUR", "GBP"]
+        },
+        "header": {
+          "type": "string",
+          "description": "Header the crawler reads from the 402 response and writes back on its retry.",
+          "default": "crawler-payment"
+        },
+        "crawler_user_agents": {
+          "type": "array",
+          "description": "Substrings (case-insensitive) that mark a request as a crawler. Empty puts every GET / HEAD in scope, which is recommended only for routes that are exclusively for crawlers.",
+          "items": { "type": "string" },
+          "default": [
+            "GPTBot", "ChatGPT-User", "anthropic-ai", "ClaudeBot",
+            "Google-Extended", "PerplexityBot", "CCBot", "FacebookBot"
+          ]
+        },
+        "valid_tokens": {
+          "type": "array",
+          "description": "OSS in-memory ledger seed. Each token redeems exactly once. Leave empty when wiring a custom ledger from code (HTTP ledger, Stripe, x402, MPP).",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "tiers": {
+          "type": "array",
+          "description": "Optional list of pricing tiers. Each entry carries its own price, optional content shape, optional free-preview byte budget, and optional paywall position. The first tier whose `route_pattern` matches wins. When empty (or no tier matches), the policy falls back to the top-level `price` / `currency`. Requires the `tiered-pricing` Cargo feature.",
+          "items": { "$ref": "#/definitions/AiCrawlTier" },
+          "default": [],
+          "x-stability": "beta"
+        }
+      }
+    }
+
+  }
+}

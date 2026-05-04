@@ -1,0 +1,27 @@
+# Lua scripts in WAF custom rules
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "lua-waf.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    policies:
+      - type: waf
+        owasp_crs:
+          enabled: false
+        action_on_match: block
+        fail_open: false
+        custom_rules:
+          - id: "lua-9001"
+            phase: request
+            action: block
+            lua_script: |
+              function match(request)
+                local ua = request:header("User-Agent") or ""
+                if string.find(ua, "malicious%-bot") then
+                  return true
+                end
+                return false
+              end

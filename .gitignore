@@ -1,0 +1,10 @@
+target/
+*.swp
+.DS_Store
+
+# Generated test material under examples/ (cert generation scripts emit
+# real keys into these dirs; we keep the scripts in git but never the
+# keys themselves).
+examples/*/certs/
+
+.claude/

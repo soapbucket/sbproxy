@@ -1,0 +1,47 @@
+groups:
+  - name: sbproxy_alerts
+    rules:
+      - alert: SBProxyHighErrorRate
+        expr: rate(sbproxy_requests_total{status=~"5.."}[5m]) / rate(sbproxy_requests_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High 5xx error rate (> 5%)"
+          description: "The 5xx error rate has exceeded 5% for more than 2 minutes. Current value: {{ $value | humanizePercentage }}."
+
+      - alert: SBProxyHighLatency
+        expr: histogram_quantile(0.95, rate(sbproxy_request_duration_seconds_bucket[5m])) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P95 latency above 2 seconds"
+          description: "The P95 request latency has been above 2 seconds for 5 minutes. Current value: {{ $value | humanizeDuration }}."
+
+      - alert: SBProxyAIProviderDown
+        expr: rate(sbproxy_ai_requests_total{status="success"}[2m]) == 0 and rate(sbproxy_ai_requests_total{status="error"}[2m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AI provider {{ $labels.provider }} returning only errors"
+          description: "Provider {{ $labels.provider }} has had zero successful requests and non-zero errors for the last 2 minutes."
+
+      - alert: SBProxyGuardrailSpike
+        expr: rate(sbproxy_ai_guardrail_triggers_total{action="block"}[1m]) > 10
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High guardrail block rate (> 10/min)"
+          description: "Guardrail blocks are firing at a high rate. Type: {{ $labels.type }}. Current rate: {{ $value }}/sec."
+
+      - alert: SBProxyHighTokenUsage
+        expr: increase(sbproxy_ai_tokens_output_total[1h]) > 1000000
+        for: 0m
+        labels:
+          severity: info
+        annotations:
+          summary: "Over 1M output tokens in the last hour"
+          description: "Token output has exceeded 1 million in the past hour. Provider: {{ $labels.provider }}. Count: {{ $value }}."

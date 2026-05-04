@@ -1,0 +1,106 @@
+# 30 - rail-x402-base-sepolia
+#
+# x402 v2 paywall in front of an article origin. The bundled stack
+# wires the proxy at a local mock x402 facilitator so the demo runs
+# end-to-end without real testnet keys; flip to the Base Sepolia
+# facilitator (see sb-testnet.yml) when you want a live settlement.
+#
+# Bundle layout:
+#   sb.yml                      - this file (mock facilitator wiring)
+#   sb-testnet.yml              - Base Sepolia facilitator override
+#   docker-compose.yml          - sbproxy + mock-x402-facilitator + mock-origin
+#   mock-x402-facilitator/      - tiny stub; honours `?reorg=depth=N`
+#   mock-origin/                - nginx serving a single article
+#   Makefile                    - up / down / logs / test wrappers
+#   smoke.json                  - examples-smoke.sh probe schema
+#
+# Run:
+#   cd examples/30-rail-x402-base-sepolia
+#   docker compose up -d --wait
+#
+# Probe (multi-rail challenge):
+#   curl -i \
+#     -H 'Host: blog.test.sbproxy.dev' \
+#     -H 'User-Agent: GPTBot/1.0' \
+#     -H 'Accept-Payment: x402' \
+#     http://127.0.0.1:8080/article
+#   # => 402 with Content-Type: application/sbproxy-multi-rail+json
+#
+# Tear down:
+#   docker compose down -v
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "blog.test.sbproxy.dev":
+    # Article origin running in the bundled compose stack. The proxy
+    # forwards every paid request unchanged; the 402 challenge is
+    # produced by the ai_crawl_control policy below before the proxy
+    # would otherwise dial the upstream.
+    action:
+      type: proxy
+      url: http://mock-origin:80
+
+    policies:
+      - type: ai_crawl_control
+        # Default fallback price and currency. Tier-matched routes
+        # override this in the multi-rail challenge body. Wave 3
+        # operators typically advertise sub-cent x402 prices because
+        # EIP-3009 transferWithAuthorization is per-transfer cheap on
+        # an L2 chain.
+        price: 0.001
+        currency: USD
+        header: crawler-payment
+
+        # Crawler classes recognised by User-Agent substring. The
+        # default list ships GPTBot, ClaudeBot, PerplexityBot, etc.;
+        # we redeclare it here so the file is self-explanatory.
+        crawler_user_agents:
+          - GPTBot
+          - ChatGPT-User
+          - ClaudeBot
+          - anthropic-ai
+          - CCBot
+          - PerplexityBot
+          - Google-Extended
+
+        # Single tier so the demo path is obvious. Charges $0.001 USD
+        # per request to the article URL. Cooperative crawlers see
+        # the price up front and can decide whether to pay.
+        tiers:
+          - route_pattern: /article*
+            price:
+              amount_micros: 1000
+              currency: USD
+            content_shape: html
+            paywall_position: top_of_page
+
+        # Wave 3 multi-rail block. The x402 entry advertises Base
+        # Sepolia (chain `base`) routed at the local mock
+        # facilitator. Switch the facilitator URL to the LF-stewarded
+        # Base Sepolia endpoint for live settlement; see sb-testnet.yml
+        # for the override and the README for the broader walkthrough.
+        rails:
+          x402:
+            chain: base
+            facilitator: http://mock-x402-facilitator:80
+            asset: USDC
+            # Demo merchant address. Replace with the operator's own
+            # Base Sepolia receive address before pointing this at a
+            # real facilitator.
+            pay_to: "0x0000000000000000000000000000000000000000"
+            version: "2"
+
+        # Quote-token signing material. The active key_id ends up in
+        # every JWS header and in the JWKS document at
+        # /.well-known/sbproxy/quote-keys.json. Operators rotate by
+        # adding a second key alongside the first and bumping the
+        # `key_id` here once verifiers have caught up.
+        quote_token:
+          key_id: x402-base-sepolia-2026
+          # 32-byte Ed25519 seed, hex. Demo seed only; production
+          # configs read from `secret_ref:` (see sb-testnet.yml).
+          seed_hex: "1111111111111111111111111111111111111111111111111111111111111111"
+          issuer: "https://blog.test.sbproxy.dev"
+          default_ttl_seconds: 300

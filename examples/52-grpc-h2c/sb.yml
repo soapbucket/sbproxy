@@ -1,0 +1,34 @@
+# gRPC over HTTP/2 cleartext (h2c).
+#
+# Proxies plaintext gRPC clients to an upstream gRPC server. gRPC
+# requires HTTP/2 end-to-end; when the downstream client does not
+# negotiate TLS+ALPN (the common case for sidecars, in-cluster
+# traffic, and tonic Channels speaking `http://...`), the proxy
+# needs to detect the HTTP/2 connection preface on the unencrypted
+# port and serve the connection as h2. That is what
+# `proxy.http2_cleartext: true` does.
+#
+# Without `http2_cleartext`, the listener parses the h2 preface
+# (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`) as a malformed HTTP/1.1
+# request and tears the connection down with `FRAME_SIZE_ERROR`.
+# TLS-fronted gRPC over `https_bind_port` does not need this flag
+# because ALPN negotiates h2 during the TLS handshake.
+#
+# Run:
+#   make run CONFIG=examples/52-grpc-h2c/sb.yml
+#
+# Test (after starting any tonic-style gRPC server on :50051):
+#   grpcurl -plaintext -authority grpc.example.com \
+#       127.0.0.1:8080 your.Service/YourMethod
+
+proxy:
+  http_bind_port: 8080
+  # Opt in to HTTP/2 cleartext on the plain HTTP listener so
+  # plaintext gRPC clients can pass through.
+  http2_cleartext: true
+
+origins:
+  "grpc.example.com":
+    action:
+      type: grpc
+      url: "grpc://127.0.0.1:50051"

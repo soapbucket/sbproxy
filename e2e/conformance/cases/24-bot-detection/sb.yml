@@ -1,0 +1,16 @@
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "botdetect.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    bot_detection:
+      enabled: true
+      mode: block
+      deny_list:
+        - "badcrawler"
+        - "evilbot"
+      allow_list:
+        - "goodbot"

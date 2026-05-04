@@ -1,0 +1,34 @@
+# WAF policy with built-in OWASP rules.
+#
+# Enables the OWASP Core Rule Set patterns and blocks any request that
+# matches a known SQL injection, XSS, or path-traversal signature. The
+# upstream is httpbin.org. Switch `action_on_match` to `log` (or set
+# `test_mode: true`) to record matches without blocking.
+#
+# Run:
+#   make run CONFIG=examples/31-waf/sb.yml
+#
+# Test:
+#   # 200 - benign request
+#   curl -i -H 'Host: waf.local' http://127.0.0.1:8080/get
+#
+#   # 403 - SQL injection signature in the query string
+#   curl -i -H 'Host: waf.local' \
+#        "http://127.0.0.1:8080/get?id=1%27%20OR%20%271%27=%271"
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "waf.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    policies:
+      - type: waf
+        owasp_crs:
+          enabled: true
+        action_on_match: block
+        test_mode: false
+        fail_open: false

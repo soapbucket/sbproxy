@@ -1,0 +1,174 @@
+# SBproxy SLO recording rules (Wave 1, B1.7)
+#
+# Pre-computes the SLI series for the SLO catalog in
+# adr-slo-alert-taxonomy.md so that burn-rate alerts (alerting-rules.yml)
+# evaluate against compact, pre-aggregated time series. Naming follows
+# the catalog: sbproxy:slo:<pillar>:<sli>:<window>.
+#
+# Wave 1 ships the substrate SLOs (availability, latency, ledger,
+# audit). Per-rail / per-tenant / per-classifier-drift rules land with
+# their respective pillars in later waves.
+
+groups:
+  # --- Substrate availability ---
+  - name: sbproxy_slo_substrate_availability
+    interval: 30s
+    rules:
+      # Rolling success ratio over various windows. Burn-rate alerts use
+      # the short and long windows from the SRE workbook.
+      - record: sbproxy:slo:substrate:availability:5m
+        expr: |
+          sum(rate(sbproxy_requests_total{status_class!="5xx"}[5m]))
+          /
+          sum(rate(sbproxy_requests_total[5m]))
+
+      - record: sbproxy:slo:substrate:availability:30m
+        expr: |
+          sum(rate(sbproxy_requests_total{status_class!="5xx"}[30m]))
+          /
+          sum(rate(sbproxy_requests_total[30m]))
+
+      - record: sbproxy:slo:substrate:availability:1h
+        expr: |
+          sum(rate(sbproxy_requests_total{status_class!="5xx"}[1h]))
+          /
+          sum(rate(sbproxy_requests_total[1h]))
+
+      - record: sbproxy:slo:substrate:availability:6h
+        expr: |
+          sum(rate(sbproxy_requests_total{status_class!="5xx"}[6h]))
+          /
+          sum(rate(sbproxy_requests_total[6h]))
+
+      - record: sbproxy:slo:substrate:availability:24h
+        expr: |
+          sum(rate(sbproxy_requests_total{status_class!="5xx"}[24h]))
+          /
+          sum(rate(sbproxy_requests_total[24h]))
+
+      - record: sbproxy:slo:substrate:availability:30d
+        expr: |
+          sum(rate(sbproxy_requests_total{status_class!="5xx"}[30d]))
+          /
+          sum(rate(sbproxy_requests_total[30d]))
+
+      # Error budget remaining for the 30d SLO (target 99.9%).
+      - record: sbproxy:slo:substrate:availability:budget_remaining:30d
+        expr: |
+          (sbproxy:slo:substrate:availability:30d - 0.999) / (1 - 0.999)
+
+  # --- Substrate latency ---
+  - name: sbproxy_slo_substrate_latency
+    interval: 30s
+    rules:
+      - record: sbproxy:slo:substrate:latency_p95:5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(sbproxy_request_duration_seconds_bucket[5m]))
+          )
+
+      - record: sbproxy:slo:substrate:latency_p99:5m
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(sbproxy_request_duration_seconds_bucket[5m]))
+          )
+
+      - record: sbproxy:slo:substrate:latency_p99:1h
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(sbproxy_request_duration_seconds_bucket[1h]))
+          )
+
+  # --- Ledger redeem ---
+  - name: sbproxy_slo_ledger
+    interval: 30s
+    rules:
+      - record: sbproxy:slo:ledger:redeem_success:5m
+        expr: |
+          sum(rate(sbproxy_ledger_redeem_total{result="success"}[5m]))
+          /
+          sum(rate(sbproxy_ledger_redeem_total[5m]))
+
+      - record: sbproxy:slo:ledger:redeem_success:1h
+        expr: |
+          sum(rate(sbproxy_ledger_redeem_total{result="success"}[1h]))
+          /
+          sum(rate(sbproxy_ledger_redeem_total[1h]))
+
+      - record: sbproxy:slo:ledger:redeem_success:6h
+        expr: |
+          sum(rate(sbproxy_ledger_redeem_total{result="success"}[6h]))
+          /
+          sum(rate(sbproxy_ledger_redeem_total[6h]))
+
+      - record: sbproxy:slo:ledger:redeem_success:30d
+        expr: |
+          sum(rate(sbproxy_ledger_redeem_total{result="success"}[30d]))
+          /
+          sum(rate(sbproxy_ledger_redeem_total[30d]))
+
+      - record: sbproxy:slo:ledger:redeem_latency_p99:5m
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(sbproxy_ledger_redeem_duration_seconds_bucket[5m]))
+          )
+
+  # --- Audit-log emit ---
+  - name: sbproxy_slo_audit
+    interval: 30s
+    rules:
+      - record: sbproxy:slo:audit:write_success:5m
+        expr: |
+          sum(rate(sbproxy_audit_emit_total{result="success"}[5m]))
+          /
+          sum(rate(sbproxy_audit_emit_total[5m]))
+
+      - record: sbproxy:slo:audit:write_success:1h
+        expr: |
+          sum(rate(sbproxy_audit_emit_total{result="success"}[1h]))
+          /
+          sum(rate(sbproxy_audit_emit_total[1h]))
+
+      - record: sbproxy:slo:audit:write_success:24h
+        expr: |
+          sum(rate(sbproxy_audit_emit_total{result="success"}[24h]))
+          /
+          sum(rate(sbproxy_audit_emit_total[24h]))
+
+      - record: sbproxy:slo:audit:emit_latency_p99:5m
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(sbproxy_audit_emit_duration_seconds_bucket[5m]))
+          )
+
+      - record: sbproxy:slo:audit:emit_latency_p99:1h
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(sbproxy_audit_emit_duration_seconds_bucket[1h]))
+          )
+
+  # --- Outbound + cardinality (informational) ---
+  - name: sbproxy_slo_outbound
+    interval: 30s
+    rules:
+      - record: sbproxy:slo:outbound:success:5m
+        expr: |
+          sum by (target) (rate(sbproxy_outbound_request_total{result="success"}[5m]))
+          /
+          sum by (target) (rate(sbproxy_outbound_request_total[5m]))
+
+      # Cardinality budget headroom. Used by the log-only CARD-BUDGET
+      # alert and by the CI gate in B1.12 / Q1.14.
+      - record: sbproxy:cardinality:requests_total
+        expr: |
+          count(count by (route, status_class, agent_class, rail, tenant_id) (sbproxy_requests_total))
+
+      - record: sbproxy:cardinality:policy_triggers_total
+        expr: |
+          count(count by (policy, decision, route, tenant_id) (sbproxy_policy_triggers_total))

@@ -1,0 +1,253 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "id": null,
+  "title": "SBproxy Licensing Edits (Wave 4)",
+  "description": "Audit-driven view of policy-graph projection refreshes (PolicyProjectionRefresh events) for the four Wave 4 projections (robots, llms, llms-full, licenses, tdmrep). Reads the audit ClickHouse view; counts doc-hash changes per week; flags the default-deny rollout signal (an RSL ai-use entry asserting licensed=false).",
+  "tags": [
+    "sbproxy",
+    "wave4",
+    "licensing",
+    "audit"
+  ],
+  "style": "dark",
+  "timezone": "browser",
+  "editable": false,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "refresh": "5m",
+  "schemaVersion": 39,
+  "version": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "prometheus_datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "selected": false,
+          "text": "Prometheus",
+          "value": "Prometheus"
+        },
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "options": []
+      },
+      {
+        "name": "clickhouse_datasource",
+        "label": "ClickHouse",
+        "type": "datasource",
+        "query": "grafana-clickhouse-datasource",
+        "current": {
+          "selected": false,
+          "text": "ClickHouse",
+          "value": "ClickHouse"
+        },
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "options": []
+      },
+      {
+        "name": "tenant_id",
+        "label": "Tenant",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${prometheus_datasource}"
+        },
+        "query": "label_values(sbproxy_audit_emit_total, tenant_id)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2,
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      },
+      {
+        "name": "projection_kind",
+        "label": "Projection kind",
+        "type": "custom",
+        "query": "robots,llms,llms-full,licenses,tdmrep",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "includeAll": true,
+        "multi": true,
+        "options": [
+          { "selected": false, "text": "robots", "value": "robots" },
+          { "selected": false, "text": "llms", "value": "llms" },
+          { "selected": false, "text": "llms-full", "value": "llms-full" },
+          { "selected": false, "text": "licenses", "value": "licenses" },
+          { "selected": false, "text": "tdmrep", "value": "tdmrep" }
+        ]
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Recent PolicyProjectionRefresh events",
+      "description": "Per-event audit table. Shows the wall-clock time, hostname, projection_kind, doc_hash (SHA-256 of the rendered body), byte_len, and config_version. Reads from the audit ClickHouse view; one row per (hostname, projection_kind) emitted at config-reload time.",
+      "type": "table",
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${clickhouse_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "displayMode": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "footer": {
+          "enablePagination": true,
+          "show": true,
+          "fields": [],
+          "reducer": ["count"]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "rawSql": "SELECT toDateTime64(emitted_at, 3) AS time,\n       tenant_id,\n       hostname,\n       projection_kind,\n       config_version,\n       byte_len,\n       substring(doc_hash, 1, 12) AS doc_hash_short\n  FROM admin_audit_events\n WHERE action = 'PolicyProjectionRefresh'\n   AND tenant_id IN ($tenant_id)\n   AND projection_kind IN ($projection_kind)\n   AND emitted_at >= $__fromTime\n   AND emitted_at < $__toTime\n ORDER BY emitted_at DESC\n LIMIT 200"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "licenses.xml document hash changes per week",
+      "description": "Counter: number of distinct doc_hash values observed for the /licenses.xml projection per tenant per week. A non-zero value means the operator edited the licensing posture (content_signal + tier list) at least once that week.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${clickhouse_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "sum",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "timeseries",
+          "rawSql": "SELECT toStartOfWeek(emitted_at) AS time,\n       tenant_id AS metric,\n       count(DISTINCT doc_hash) AS hashes\n  FROM admin_audit_events\n WHERE action = 'PolicyProjectionRefresh'\n   AND projection_kind = 'licenses'\n   AND tenant_id IN ($tenant_id)\n   AND emitted_at >= $__fromTime\n   AND emitted_at < $__toTime\n GROUP BY time, metric\n ORDER BY time"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Default-deny rollout signal",
+      "description": "Counts hostnames whose latest licenses.xml asserts <ai-use type=training licensed=false>. Per A4.1 this is the default-deny posture: an origin without a content_signal value lands here. Watch this number when rolling out a global default-deny policy; it should climb monotonically as operators opt out.",
+      "type": "stat",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${clickhouse_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "table",
+          "rawSql": "SELECT count(DISTINCT hostname) AS default_deny_hostnames\n  FROM admin_audit_events\n WHERE action = 'PolicyProjectionRefresh'\n   AND projection_kind = 'licenses'\n   AND tenant_id IN ($tenant_id)\n   AND notLike(detail_json, '%\"licensed\":\"true\"%')\n   AND emitted_at >= now() - INTERVAL 7 DAY"
+        }
+      ]
+    }
+  ]
+}

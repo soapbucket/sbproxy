@@ -1,0 +1,37 @@
+# AI gateway: OpenRouter.
+#
+# Routes OpenAI-compatible chat-completion calls through OpenRouter, which
+# fronts a large catalog of models (Claude, Llama, Mistral, GPT-4, etc.)
+# with a single API key. The client just speaks the OpenAI protocol; the
+# proxy injects auth and forwards to https://openrouter.ai/api/v1.
+#
+# Setup:
+#   export OPENROUTER_API_KEY=sk-or-...
+#   make run CONFIG=examples/10-ai-openrouter/sb.yml
+#
+# Test:
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "anthropic/claude-3.5-sonnet",
+#       "messages": [{"role": "user", "content": "Hello!"}]
+#     }'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openrouter
+          api_key: ${OPENROUTER_API_KEY}
+          default_model: anthropic/claude-3.5-sonnet
+          models:
+            - anthropic/claude-3.5-sonnet
+            - anthropic/claude-3-haiku
+            - openai/gpt-4o-mini
+            - meta-llama/llama-3.1-70b-instruct
+      routing: fallback_chain

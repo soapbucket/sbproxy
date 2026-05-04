@@ -1,0 +1,281 @@
+# Release pipeline for SBproxy.
+#
+# Activates on tags matching v*.*.*. Produces signed binaries (4 platforms),
+# signed multi-arch Docker images on ghcr.io, a CycloneDX SBOM, and SLSA
+# build provenance attestations. All signing is keyless via Sigstore +
+# GitHub OIDC; the expected cert identity for tag vX.Y.Z is documented in
+# SUPPLY-CHAIN.md.
+#
+# Every publish-side job is guarded by
+# `if: github.repository == 'soapbucket/sbproxy-rust'` so the workflow stays
+# inert on forks.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: build artifacts but do not publish or sign'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    name: build / ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            platform: linux_amd64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            platform: linux_arm64
+          - target: x86_64-apple-darwin
+            # macos-13-large (paid larger runner) instead of macos-13.
+            # The standard macos-13 free pool is heavily contended; the
+            # -large pool typically picks up within a minute.
+            runner: macos-13-large
+            platform: darwin_amd64
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            platform: darwin_arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin sbproxy
+
+      - name: package tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          STAGE="sbproxy-${GITHUB_REF_NAME}-${{ matrix.platform }}"
+          mkdir -p "${STAGE}"
+          cp "target/${{ matrix.target }}/release/sbproxy" "${STAGE}/sbproxy"
+          cp LICENSE NOTICE README.md SECURITY.md SUPPLY-CHAIN.md "${STAGE}/" 2>/dev/null || true
+          # Pack the CONTENTS of the staging dir (binary, license, readme)
+          # so the tarball extracts to a flat layout: sbproxy + LICENSE etc.
+          # at root. Matches the Go v0.1.x convention so install.sh and
+          # the Homebrew formula find the binary at the expected path.
+          tar -czf "dist/sbproxy_${{ matrix.platform }}.tar.gz" -C "${STAGE}" .
+          (cd dist && shasum -a 256 "sbproxy_${{ matrix.platform }}.tar.gz" > "sbproxy_${{ matrix.platform }}.tar.gz.sha256")
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.platform }}
+          path: dist/
+          retention-days: 7
+
+  sbom:
+    name: sbom (cyclonedx)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: generate cyclonedx sbom
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          artifact-name: sbom.cyclonedx.json
+          output-file: sbom.cyclonedx.json
+
+      - name: upload sbom
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cyclonedx.json
+          retention-days: 7
+
+  release:
+    name: publish release
+    if: github.repository == 'soapbucket/sbproxy' && !inputs.dry_run
+    needs: [build, sbom]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: stage release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.sha256' -o -name 'sbom.cyclonedx.json' \) -exec cp {} dist/ \;
+          ls -la dist/
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: sign binaries with cosign (keyless)
+        shell: bash
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          set -euo pipefail
+          for tarball in dist/sbproxy_*.tar.gz; do
+            cosign sign-blob --yes \
+              --bundle "${tarball}.cosign.bundle" \
+              "${tarball}"
+          done
+          ls -la dist/
+
+      - name: attest build provenance for binaries
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist/sbproxy_*.tar.gz'
+
+      - name: create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file CHANGELOG.md \
+            --draft \
+            dist/*
+
+  image:
+    name: publish container image
+    if: github.repository == 'soapbucket/sbproxy' && !inputs.dry_run
+    needs: [build, sbom]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: bin-*
+
+      - name: download sbom
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: artifacts/sbom
+
+      - name: prepare docker context
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docker-ctx/linux/amd64 docker-ctx/linux/arm64
+          tar -xzf artifacts/bin-linux_amd64/sbproxy_linux_amd64.tar.gz -C /tmp/
+          tar -xzf artifacts/bin-linux_arm64/sbproxy_linux_arm64.tar.gz -C /tmp/
+          mv /tmp/sbproxy-${GITHUB_REF_NAME}-linux_amd64/sbproxy docker-ctx/linux/amd64/sbproxy
+          mv /tmp/sbproxy-${GITHUB_REF_NAME}-linux_arm64/sbproxy docker-ctx/linux/arm64/sbproxy
+          chmod +x docker-ctx/linux/*/sbproxy
+          cp artifacts/sbom/sbom.cyclonedx.json docker-ctx/sbom.cyclonedx.json
+          cat > docker-ctx/Dockerfile <<'EOF'
+          # syntax=docker/dockerfile:1.7
+          FROM gcr.io/distroless/cc-debian12:nonroot
+          ARG TARGETOS
+          ARG TARGETARCH
+          COPY ${TARGETOS}/${TARGETARCH}/sbproxy /usr/local/bin/sbproxy
+          EXPOSE 8080 9090
+          ENTRYPOINT ["/usr/local/bin/sbproxy"]
+          EOF
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: derive tag
+        id: meta
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "image=${REGISTRY}/${IMAGE_NAME}" >> "${GITHUB_OUTPUT}"
+
+      - name: build and push image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-ctx
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:latest
+          provenance: true
+          sbom: false
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: sign image with cosign (keyless)
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          cosign sign --yes \
+            "${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}"
+
+      - name: attach sbom attestation to image
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          cosign attest --yes \
+            --predicate docker-ctx/sbom.cyclonedx.json \
+            --type cyclonedx \
+            "${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}"
+
+      - name: attest build provenance for image
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.meta.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

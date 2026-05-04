@@ -1,0 +1,18 @@
+# Tests HTTP Digest authentication
+# Users map stores HA1 hashes: MD5(username:realm:password)
+# testuser/testpass with realm "test-realm":
+#   echo -n "testuser:test-realm:testpass" | md5
+#   = a08a2d645fc2bc82dfd69fd8b9c41f79
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "digest.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    authentication:
+      type: digest
+      realm: "test-realm"
+      users:
+        testuser: "a08a2d645fc2bc82dfd69fd8b9c41f79"

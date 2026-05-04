@@ -1,0 +1,21 @@
+# CI smoke-test image for the sbproxy Kubernetes operator.
+#
+# Built by `.github/workflows/k8s-operator-smoke.yml` after the operator
+# binary is produced on the host via:
+#
+#   cargo build --release -p sbproxy-k8s-operator --locked
+#
+# Usage in CI:
+#   docker build -t sbproxy-operator:ci \
+#     -f crates/sbproxy-k8s-operator/Dockerfile.ci \
+#     .
+#
+# The build context is the repository root so the COPY can reach
+# `target/release/sbproxy-k8s-operator` without a flat directory copy.
+# Keep this image small: kind only needs a one-shot binary that talks to
+# the in-cluster API server.
+#
+# syntax=docker/dockerfile:1.7
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY target/release/sbproxy-k8s-operator /usr/local/bin/sbproxy-k8s-operator
+ENTRYPOINT ["/usr/local/bin/sbproxy-k8s-operator"]

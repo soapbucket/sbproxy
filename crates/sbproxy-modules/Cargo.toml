@@ -1,0 +1,151 @@
+[package]
+name = "sbproxy-modules"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+# --- Wave 1 + Wave 4 AI Governance feature flags ---
+#
+# Library consumers opt in. The `sbproxy` binary turns these on via its own
+# `default` feature set so end users get the full governance surface out of
+# the box. See docs/AIGOVERNANCE-BUILD.md tasks B1.1 (Wave 1) and B4.1
+# (Wave 4) for the gating strategy.
+#
+# Wave 1 flags (each gates a real implementation):
+#   - tiered-pricing : multi-tier pricing in `policy/ai_crawl.rs` (G1.2)
+#   - http-ledger    : HTTP ledger client in `policy/ai_crawl.rs` (G1.3)
+#   - agent-class    : agent-class resolver chain (G1.4)
+#
+# Wave 4 flags (default-on; off-mode strips the surface for operators
+# who want a minimal binary):
+#   - content-negotiate : the `content_negotiate` action (G4.2)
+#   - licensing-rsl     : the `/licenses.xml` projection (G4.7)
+#   - licensing-tdmrep  : the `/.well-known/tdmrep.json` projection (G4.8)
+#   - llms-txt          : the `llms.txt` + `llms-full.txt` projections (G4.6)
+#
+# The Wave 4 flags are default-on so the existing default build keeps
+# working unchanged. Operators that want a stripped binary disable
+# `default-features` and re-enable only the flags they need.
+[features]
+default = ["content-negotiate", "licensing-rsl", "licensing-tdmrep", "llms-txt"]
+tiered-pricing = []
+http-ledger = []
+# Enables the `policy::agent_class` resolver (G1.4). Pulls the
+# `agent-class` feature on `sbproxy-security` so the reverse-DNS
+# verifier (G1.5) is available to the resolver chain.
+agent-class = ["sbproxy-security/agent-class"]
+# Wave 4 / G4.2: marker flag for the `content_negotiate` action. Code
+# is unconditionally compiled today; the flag exists so a future
+# stripped-binary build can `#[cfg]` it out without touching the
+# action's call sites. Tracked in B4.1.
+content-negotiate = []
+# Wave 4 / G4.7: marker flag for the `/licenses.xml` (RSL 1.0)
+# projection. Same compile-everywhere-for-now contract as
+# `content-negotiate`.
+licensing-rsl = []
+# Wave 4 / G4.8: marker flag for the `/.well-known/tdmrep.json` (W3C
+# TDMRep) projection. Same contract as `licensing-rsl`.
+licensing-tdmrep = []
+# Wave 4 / G4.6: marker flag for the `llms.txt` + `llms-full.txt`
+# projections. Same contract as `licensing-rsl`.
+llms-txt = []
+# Wave 6 / R6.1: opt-in wiring of the CAP verifier into the future
+# `sbproxy-rate-limit` middleware (R2.3). Off today because the crate
+# does not exist on this branch; see WATCH.md for the follow-up. CAP
+# verification still happens with the flag off; the bucket
+# registration is the only gated behaviour.
+rate-limit = []
+# Wave 7 / A7.2 A2A protocol envelope parsers. Detection and policy
+# enforcement run with these flags off (the proxy treats matched
+# requests as plain POSTs and applies route limits without parsed
+# fields). Each flag opts in one draft; the convenience `a2a` flag
+# enables both. See `docs/adr-a2a-protocol-envelope.md`.
+a2a-anthropic = []
+a2a-google = []
+a2a = ["a2a-anthropic", "a2a-google"]
+
+[dependencies]
+sbproxy-plugin.workspace = true
+sbproxy-config.workspace = true
+sbproxy-middleware.workspace = true
+sbproxy-extension.workspace = true
+sbproxy-ai.workspace = true
+sbproxy-transport.workspace = true
+sbproxy-security.workspace = true
+sbproxy-cache.workspace = true
+sbproxy-platform.workspace = true
+sbproxy-classifiers.workspace = true
+sbproxy-observe.workspace = true
+prometheus.workspace = true
+
+arc-swap.workspace = true
+bytes.workspace = true
+compact_str.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+url.workspace = true
+http.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+ring.workspace = true
+ipnetwork.workspace = true
+percent-encoding.workspace = true
+regex.workspace = true
+minijinja.workspace = true
+pulldown-cmark.workspace = true
+tracing.workspace = true
+md-5 = "0.10"
+sha2.workspace = true
+hex.workspace = true
+# HMAC-SHA256 for the WAF rule-feed signature verification path
+# and the HTTP ledger client request signing (G1.3).
+hmac.workspace = true
+# Ed25519 for the quote-token JWS signer / verifier (G3.6).
+# Pinned to 2.x to match the resolved version in sbproxy-middleware
+# and sbproxy-observe so the workspace builds with one copy.
+ed25519-dalek = "2"
+# ULID for ledger Idempotency-Key + envelope request_id (G1.3).
+ulid.workspace = true
+# Strongly typed LedgerError variants (G1.3).
+thiserror.workspace = true
+parking_lot.workspace = true
+jsonwebtoken.workspace = true
+jsonschema.workspace = true
+dashmap.workspace = true
+rand.workspace = true
+# Used by the prompt-injection v2 detector registry and the
+# RoutingStrategy plugin registry. Already a workspace dep used by
+# sbproxy-plugin and sbproxy-core; no new third-party dep.
+inventory.workspace = true
+lru = "0.16"
+
+# Needed for spawn_blocking when calling sync KVStore methods (Redis rate limiting).
+# Also: rt + time for active health-check probe loops on load_balancer targets.
+tokio = { workspace = true, features = ["rt", "time", "macros"] }
+
+# Active health-check probes (GETs against target URLs in a background task).
+# Blocking feature also used to load remote bulk-redirect lists at config compile.
+reqwest = { workspace = true, features = ["blocking"] }
+
+# Object storage backends (S3, GCS, Azure, local) for the storage action.
+object_store = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+
+# Background task lifecycle for the WAF rule-feed subscriber. Mirrors the
+# pattern used in sbproxy-core's WEBHOOK_TASKS / CACHE_REVALIDATE_TASKS so
+# graceful shutdown drains the polling / XREAD loop deterministically.
+tokio-util = { workspace = true }
+
+# Async Redis client driven directly so the WAF feed subscriber can call
+# XREAD with BLOCK; the AsyncKVStore facade in sbproxy-platform only
+# exposes GET/SET-shaped operations.
+redis = { workspace = true }
+
+[dev-dependencies]
+smallvec.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["full", "test-util"] }

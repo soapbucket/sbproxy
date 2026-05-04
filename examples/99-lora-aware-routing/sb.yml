@@ -1,0 +1,90 @@
+# LoRA-aware routing across three model-serving replicas.
+#
+# This example wires the `lora-aware` RoutingStrategy onto a three-target
+# load balancer pool. The strategy walks each target's `metadata` map,
+# looks for a `loaded_adapters` array, and prefers a healthy target that
+# already has the requested adapter warm. If none does, it returns None
+# and the configured `lb_method` (least_connections here) gets to pick.
+#
+# Forward-looking config notes:
+#
+#   - `lb_method: plugin` and `strategy: lora-aware` are how the
+#     LoadBalancerAction will dispatch into the trait once the wiring
+#     follow-up lands. The Fail-6 trait scaffold parses, registers, and
+#     unit-tests the strategy today; the load balancer does not yet
+#     consult `RoutingStrategy::select` on the request hot path. The
+#     follow-up that wires it through `LoadBalancerAction.custom_strategy`
+#     is tracked under Fail-6.
+#
+#   - The `metadata.loaded_adapters` array on each target is the
+#     metadata contract the strategy reads. Operators populate it for
+#     now (one of: hand-pinned in this YAML, generated from a sidecar's
+#     CRD reconciliation, fed in via a `clictl` command). The
+#     production live-feed path is GPU-aware's sibling work and is not
+#     in this PR.
+#
+#   - The strategy is fail-soft: missing or malformed `loaded_adapters`
+#     metadata is treated as "no adapters loaded" rather than an error,
+#     so a single misconfigured target cannot poison the pool.
+#
+# Run:
+#   make run CONFIG=examples/99-lora-aware-routing/sb.yml
+#
+# Test (once the wiring follow-up is in):
+#   curl -sS -H 'Host: ai.local' \
+#     'http://127.0.0.1:8080/v1/chat?adapter=alice-tone' \
+#     -d '{"prompt":"hello"}'
+#
+# Until then this example exercises the config schema and the
+# strategy registration; selection still runs through `least_connections`
+# (the configured `algorithm:`).
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: load_balancer
+
+      # Today's selector. Used both as the active selector and as the
+      # fallback once the trait wiring lands.
+      algorithm: least_connections
+
+      # Forward-looking: opt the trait dispatcher in.
+      # Ignored by the current LoadBalancerAction parser (unknown fields
+      # are skipped) but documented here so config reviewers see the
+      # intended shape.
+      lb_method: plugin
+      strategy: lora-aware
+
+      targets:
+        # Replica 0: warm for alice-tone and bob-style.
+        - url: https://upstream-0.ai.internal:8443
+          weight: 1
+          # The strategy reads `metadata.loaded_adapters`. Currently
+          # this metadata block is parsed loosely (forward-looking);
+          # the live-feed implementation will populate it from the
+          # upstream's adapter inventory automatically.
+          metadata:
+            loaded_adapters:
+              - alice-tone
+              - bob-style
+
+        # Replica 1: warm for carol-voice only. Cold for alice-tone.
+        - url: https://upstream-1.ai.internal:8443
+          weight: 1
+          metadata:
+            loaded_adapters:
+              - carol-voice
+
+        # Replica 2: warm for alice-tone (so it competes with replica 0
+        # for adapter=alice-tone requests). The strategy will pick
+        # whichever of {0, 2} has fewer in-flight requests; a tie breaks
+        # on the lower index.
+        - url: https://upstream-2.ai.internal:8443
+          weight: 1
+          metadata:
+            loaded_adapters:
+              - alice-tone
+              - dave-formal

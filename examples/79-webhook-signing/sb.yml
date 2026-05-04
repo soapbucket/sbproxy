@@ -1,0 +1,66 @@
+# Signed lifecycle webhooks (on_request / on_response).
+#
+# Every webhook the proxy fires carries an identifying envelope and
+# - when `secret` is set on the callback - an HMAC-SHA256 signature
+# so the receiver can verify it wasn't forged.
+#
+# Body shape:
+#   {
+#     "event": "on_request",
+#     "proxy": {
+#       "instance_id": "sbproxy-host-7c4d8b9a",
+#       "version": "0.1.0",
+#       "config_revision": "a7b3f9c11d80"
+#     },
+#     "request": {
+#       "id": "01j9x4...",                      // ulid/uuid (32 hex)
+#       "received_at": "2026-04-25T07:32:00Z"   // RFC 3339
+#     },
+#     "origin": { "name": "localhost" },
+#     "method": "GET",
+#     "path": "/api/users",
+#     "host": "localhost",
+#     "client_ip": "203.0.113.7",
+#     "headers": { ... }
+#   }
+#
+# Headers on the webhook request:
+#   User-Agent: sbproxy/<version>
+#   X-Sbproxy-Event: on_request
+#   X-Sbproxy-Instance: <instance_id>
+#   X-Sbproxy-Request-Id: <request.id>
+#   X-Sbproxy-Config-Revision: <config_revision>
+#   X-Sbproxy-Timestamp: <unix seconds>
+#   X-Sbproxy-Signature: v1=<hex>     (only when secret is set)
+#
+# Signature: HMAC-SHA256(secret, "<timestamp>.<body>") rendered as
+# `v1=<hex>`. Receivers should verify within a fixed time window
+# (e.g. 5 min) to reject replays.
+#
+# Run:
+#   make run CONFIG=examples/79-webhook-signing/sb.yml
+#
+# Test:
+#   curl -H 'Host: localhost' http://127.0.0.1:8080/get
+#   # The receiver at https://hooks.example.com/sbproxy will get one
+#   # POST per request with the envelope above and a verifiable
+#   # signature.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "localhost":
+    action:
+      type: proxy
+      url: https://httpbin.org
+    on_request:
+      - url: https://hooks.example.com/sbproxy
+        method: POST
+        secret: shared-webhook-secret-change-me
+        timeout: 5
+    on_response:
+      - url: https://hooks.example.com/sbproxy
+        method: POST
+        secret: shared-webhook-secret-change-me
+        timeout: 5

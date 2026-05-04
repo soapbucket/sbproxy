@@ -1,0 +1,408 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "id": null,
+  "title": "SBproxy Audit Log",
+  "description": "Admin-action audit envelope per adr-admin-action-audit.md (A1.7). Surfaces emit success rate, write failures, chain-position lag, action verb mix, and top subjects.",
+  "tags": [
+    "sbproxy",
+    "wave1",
+    "audit"
+  ],
+  "style": "dark",
+  "timezone": "browser",
+  "editable": false,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "version": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "prometheus_datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "selected": false,
+          "text": "Prometheus",
+          "value": "Prometheus"
+        },
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "options": []
+      },
+      {
+        "name": "tenant_id",
+        "label": "Tenant",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${prometheus_datasource}"
+        },
+        "query": "label_values(sbproxy_audit_emit_total, tenant_id)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2,
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Total audit events (24h)",
+      "description": "Count of AdminAuditEvent envelopes emitted in the last 24h. Should be non-zero on any active enterprise tenant.",
+      "type": "stat",
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "graphMode": "area",
+        "textMode": "auto",
+        "colorMode": "value",
+        "orientation": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(sbproxy_audit_emit_total{tenant_id=~\"$tenant_id\"}[24h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Audit write failures (24h)",
+      "description": "Count of failed AuditSink::append calls. Tracks SLO-AUDIT-WRITE (100%, paging on any sustained failure).",
+      "type": "stat",
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "graphMode": "area",
+        "textMode": "auto",
+        "colorMode": "value",
+        "orientation": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(sbproxy_audit_emit_total{result=\"failure\",tenant_id=~\"$tenant_id\"}[24h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Audit chain-position lag",
+      "description": "Wave 6 chain-position backlog (events not yet sealed into a Merkle batch). Reports zero in Wave 1 / Wave 2.",
+      "type": "stat",
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 100
+              },
+              {
+                "color": "red",
+                "value": 1000
+              }
+            ]
+          },
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "graphMode": "area",
+        "textMode": "auto",
+        "colorMode": "value",
+        "orientation": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(sbproxy_audit_chain_position_lag{tenant_id=~\"$tenant_id\"}) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Events by action verb",
+      "description": "AuditAction enum mix per the envelope spec (Create, Update, Delete, Approve, Revoke, RotateKey, Topup, Debit, Charge, ...). Drives compliance review.",
+      "type": "table",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "align": "auto",
+            "displayMode": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "footer": {
+          "enablePagination": true,
+          "show": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (action, result) (increase(sbproxy_audit_emit_total{tenant_id=~\"$tenant_id\"}[1h]))",
+          "format": "table",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Top audit subjects (1h)",
+      "description": "Top 20 subject_kind x action pairs. subject_kind is a coarse enum (user, service, agent, system); per-subject identity is a span attribute and log field per adr-admin-action-audit.md.",
+      "type": "table",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 15
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "align": "auto",
+            "displayMode": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "footer": {
+          "enablePagination": true,
+          "show": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(20, sum by (subject_kind, action) (increase(sbproxy_audit_emit_total{tenant_id=~\"$tenant_id\"}[1h])))",
+          "format": "table",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Audit emit latency p95 / p99",
+      "description": "Tail latency of the audit append path. Tracks SLO-AUDIT-LATENCY (< 5 s p99). Exemplars link to Tempo.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sbproxy_audit_emit_duration_seconds_bucket{tenant_id=~\"$tenant_id\"}[$__rate_interval])))",
+          "legendFormat": "p99",
+          "exemplar": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(sbproxy_audit_emit_duration_seconds_bucket{tenant_id=~\"$tenant_id\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "exemplar": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        }
+      ]
+    }
+  ]
+}

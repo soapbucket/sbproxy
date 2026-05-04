@@ -1,0 +1,33 @@
+{{- /*
+Grafana dashboards (Wave 1, B1.6) shipped as a sidecar-friendly ConfigMap.
+
+The Grafana sidecar (kiwigrid/k8s-sidecar) watches for ConfigMaps with the
+label `grafana_dashboard: "1"` and mounts each entry into Grafana's
+provisioning path. Operators running the Grafana Helm chart enable this with:
+
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+
+Disable this template by setting `dashboards.enabled: false` in values.yaml.
+*/ -}}
+{{- if .Values.dashboards.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sbproxy-grafana-dashboards
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: sbproxy
+    app.kubernetes.io/component: dashboards
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    {{- with .Values.dashboards.sidecarLabel }}
+    {{ . }}: "1"
+    {{- end }}
+data:
+  {{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+  {{ base $path }}: |
+{{ $.Files.Get $path | indent 4 }}
+  {{- end }}
+{{- end }}

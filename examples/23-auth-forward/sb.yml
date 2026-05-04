@@ -1,0 +1,38 @@
+# Forward auth: delegate the auth decision to an external service.
+#
+# Every incoming request triggers a subrequest to httpbin.org/status/200,
+# which always returns 200. The proxy treats 200 as "authenticated" and lets
+# the original request through. Swap the URL for /status/401 to see the
+# failure path; the original request will be rejected with the same status.
+# `headers_to_forward` copies the named headers from the original request
+# into the auth subrequest.
+#
+# Run:
+#   make run CONFIG=examples/23-auth-forward/sb.yml
+#
+# Test:
+#   # 200 - auth service responds 200
+#   curl -i -H 'Host: fwd.local' -H 'Authorization: Bearer demo' \
+#        http://127.0.0.1:8080/get
+#
+#   # To see the rejection path, change `url` below to
+#   # https://httpbin.org/status/401 and rerun. Every request will get a 401.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "fwd.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    authentication:
+      type: forward_auth
+      url: https://httpbin.org/status/200
+      method: GET
+      timeout: 5000
+      success_status: 200
+      headers_to_forward:
+        - Authorization
+        - Cookie

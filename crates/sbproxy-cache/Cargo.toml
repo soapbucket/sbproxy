@@ -1,0 +1,27 @@
+[package]
+name = "sbproxy-cache"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+sbproxy-plugin.workspace = true
+sbproxy-platform.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+rand = { workspace = true, features = ["small_rng"] }
+tracing.workspace = true
+tokio = { workspace = true, features = ["fs", "sync", "macros", "rt"] }
+redis = { workspace = true, features = ["connection-manager"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

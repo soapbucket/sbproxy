@@ -1,0 +1,64 @@
+# JSON Schema validation transform.
+#
+# Validates the upstream JSON response body against a JSON Schema. Schemas
+# are compiled once at config-load time. Remote `$ref` resolution is
+# disabled, so the schema must be self-contained.
+#
+# Two origins:
+#   - `schema-ok.local` returns a body that matches the schema, so the
+#     transform lets it through.
+#   - `schema-bad.local` returns a body that violates the schema, so the
+#     transform rejects it (proxy returns 502 / synthetic error).
+#
+# Run:
+#   make run CONFIG=examples/42-transform-json-schema/sb.yml
+#
+# Test:
+#   # Valid - body matches schema, transform passes through.
+#   curl -i -H 'Host: schema-ok.local' http://127.0.0.1:8080/
+#
+#   # Invalid - body violates schema, transform rejects with 502.
+#   curl -i -H 'Host: schema-bad.local' http://127.0.0.1:8080/
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "schema-ok.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        id: 1
+        title: "valid post"
+        userId: 1
+    transforms:
+      - type: json_schema
+        fail_on_error: true
+        schema:
+          type: object
+          required: [id, title, userId]
+          properties:
+            id: { type: integer }
+            title: { type: string }
+            userId: { type: integer }
+
+  "schema-bad.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        id: "should-be-int-but-is-string"
+        title: 42
+    transforms:
+      - type: json_schema
+        fail_on_error: true
+        schema:
+          type: object
+          required: [id, title, userId]
+          properties:
+            id: { type: integer }
+            title: { type: string }
+            userId: { type: integer }

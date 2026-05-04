@@ -1,0 +1,30 @@
+# Payload limit transform.
+#
+# Caps the response body to 256 bytes. With `truncate: true`, oversize bodies
+# are clipped to `max_size`. With `truncate: false` (the default), oversize
+# bodies cause the transform to error and the response fails. The upstream
+# httpbin.org/bytes/4096 returns 4096 random bytes, which is well over the
+# 256-byte cap.
+#
+# Run:
+#   make run CONFIG=examples/51-transform-payload-limit/sb.yml
+#
+# Test:
+#   # Original upstream returns 4096 bytes
+#   curl -s -o /dev/null -w '%{size_download}\n' https://httpbin.org/bytes/4096
+#
+#   # Proxied response is clipped to 256 bytes
+#   curl -s -o /dev/null -w '%{size_download}\n' -H 'Host: cap.local' http://127.0.0.1:8080/bytes/4096
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "cap.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+    transforms:
+      - type: payload_limit
+        max_size: 256
+        truncate: true

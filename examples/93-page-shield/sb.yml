@@ -1,0 +1,51 @@
+# Page Shield: client-side script monitoring via CSP report intake.
+#
+# Stamps a Content-Security-Policy-Report-Only header on every
+# response with the configured directives plus a `report-uri`
+# pointing at the proxy's intake endpoint. Browsers POST violation
+# reports to that endpoint; the proxy logs each report under the
+# `sbproxy::page_shield` tracing target so logpush sinks (or the
+# enterprise connection-monitor) can analyse them.
+#
+# Run:
+#   make run CONFIG=examples/93-page-shield/sb.yml
+#
+# Test (the response carries the CSP header):
+#   curl -i -H 'Host: app.local' http://127.0.0.1:8080/
+#
+# Test the intake (browsers POST application/csp-report or
+# application/reports+json; sbproxy accepts both):
+#   curl -X POST http://127.0.0.1:8080/__sbproxy/csp-report \
+#        -H 'content-type: application/csp-report' \
+#        -d '{"csp-report":{"document-uri":"http://app.local/","violated-directive":"script-src","blocked-uri":"https://evil.example/x.js"}}'
+#   # => 204 No Content; report logged by the proxy.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "app.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/html
+      body: |
+        <!doctype html><html><body><h1>page</h1></body></html>
+
+    policies:
+      - type: page_shield
+        # `report-only` (default) is the recommended starting point.
+        # Browsers report violations but do not block them. Watch the
+        # event stream until the policy reflects reality, then flip
+        # to `enforce`.
+        mode: report-only
+        directives:
+          - "default-src 'self'"
+          - "script-src 'self' https://cdn.example"
+          - "img-src 'self' https: data:"
+          - "connect-src 'self' https://api.example"
+          - "object-src 'none'"
+        # Optional: route reports to a named endpoint group via the
+        # newer Reporting API. When set, the policy emits a matching
+        # `report-to` directive in addition to `report-uri`.
+        # report_to_group: csp-endpoint

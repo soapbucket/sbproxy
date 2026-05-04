@@ -1,0 +1,36 @@
+# Reference fixture for the policy_security_headers E2E suite.
+#
+# Injects HSTS, X-Frame-Options, X-Content-Type-Options,
+# Referrer-Policy, Permissions-Policy, and a CSP with per-request
+# nonce. Flip `report_only: true` to emit the
+# `Content-Security-Policy-Report-Only` header instead of the
+# enforcing one.
+
+proxy:
+  http_bind_port: 0
+
+origins:
+  "sec.localhost":
+    # The headers are applied in `response_filter`, which only runs
+    # on the proxy flow. Point this at a real upstream when running
+    # the suite manually; the E2E tests inline a MockUpstream URL.
+    action:
+      type: proxy
+      url: "http://127.0.0.1:18080"
+    policies:
+      - type: security_headers
+        headers:
+          - name: Strict-Transport-Security
+            value: "max-age=31536000; includeSubDomains; preload"
+          - name: X-Frame-Options
+            value: DENY
+          - name: X-Content-Type-Options
+            value: nosniff
+          - name: Referrer-Policy
+            value: strict-origin-when-cross-origin
+          - name: Permissions-Policy
+            value: "camera=(), microphone=(), geolocation=()"
+        content_security_policy:
+          policy: "default-src 'self'; script-src 'self'; style-src 'self'"
+          enable_nonce: true
+          report_only: false

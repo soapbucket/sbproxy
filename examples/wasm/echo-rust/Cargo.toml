@@ -1,0 +1,16 @@
+[package]
+name = "echo-rust"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "echo"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"   # optimize for binary size
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

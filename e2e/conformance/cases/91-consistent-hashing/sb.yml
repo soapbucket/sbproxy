@@ -1,0 +1,19 @@
+# 91 - Consistent Hashing: load balancer with consistent_hash algorithm
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "conhash.test":
+    action:
+      type: load_balancer
+      algorithm: consistent_hash
+      hash_key: X-Hash-Key
+      targets:
+        - url: http://127.0.0.1:18888/echo
+          weight: 1
+        - url: http://127.0.0.1:18888/
+          weight: 1
+    response_modifiers:
+      - headers:
+          set:
+            X-Proxy: sbproxy-conhash

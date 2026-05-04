@@ -1,0 +1,33 @@
+# HTTP Basic authentication.
+#
+# Two users, plain passwords, custom realm. Useful for quick admin panels and
+# small internal tools. Missing or wrong credentials get a 401 with a
+# WWW-Authenticate challenge before httpbin.org is contacted.
+#
+# Run:
+#   make run CONFIG=examples/22-auth-basic/sb.yml
+#
+# Test:
+#   # 401 - no credentials
+#   curl -i -H 'Host: basic.local' http://127.0.0.1:8080/get
+#
+#   # 200 - valid credentials (admin / s3cret)
+#   curl -i -u admin:s3cret -H 'Host: basic.local' http://127.0.0.1:8080/get
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "basic.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    authentication:
+      type: basic_auth
+      realm: "sbproxy demo"
+      users:
+        - username: admin
+          password: s3cret
+        - username: readonly
+          password: viewonly

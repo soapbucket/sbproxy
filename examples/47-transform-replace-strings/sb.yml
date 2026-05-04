@@ -1,0 +1,40 @@
+# String replacement transform.
+#
+# Applies two find-and-replace rules to the upstream response body:
+#   1. A literal substring swap that rewrites internal hostnames to a public
+#      domain.
+#   2. A regex pattern that redacts anything that looks like a 16-digit card
+#      number.
+#
+# A `static` action seeds a JSON body that contains both patterns so the
+# example is self-contained.
+#
+# Run:
+#   make run CONFIG=examples/47-transform-replace-strings/sb.yml
+#
+# Test:
+#   curl -s -H 'Host: replace.local' http://127.0.0.1:8080/
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "replace.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      body: |
+        {
+          "endpoint": "https://internal.example.com/v1/charges",
+          "card": "4242424242424242",
+          "note": "internal.example.com is the source of truth"
+        }
+    transforms:
+      - type: replace_strings
+        replacements:
+          - find: "internal.example.com"
+            replace: "public.example.com"
+          - find: '\d{16}'
+            replace: "[REDACTED]"
+            regex: true

@@ -1,0 +1,19 @@
+# Sample SBProxy that runs two replicas of the proxy and mounts
+# `demo-config` as `sb.yml`.
+apiVersion: sbproxy.dev/v1alpha1
+kind: SBProxy
+metadata:
+  name: demo
+  namespace: default
+spec:
+  image: ghcr.io/soapbucket/sbproxy:0.1.0
+  configRef: demo-config
+  replicas: 2
+  port: 8080
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi

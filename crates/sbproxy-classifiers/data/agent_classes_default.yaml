@@ -1,0 +1,176 @@
+# Wave 1 default agent-class catalog.
+#
+# Embedded into the binary via include_str! and parsed into the
+# `AgentClassCatalog` type at startup. Operators can extend or override
+# entries inline in their own `sb.yml` (see ADR `adr-agent-class-taxonomy.md`).
+#
+# Field reference: see the `AgentClass` struct in
+# `crates/sbproxy-classifiers/src/agent_class.rs`.
+#
+# rDNS suffixes are case-insensitive and forward-confirmed by
+# `sbproxy-security::agent_verify::verify_reverse_dns` (G1.5).
+
+agent_classes:
+  - id: openai-gptbot
+    vendor: OpenAI
+    purpose: training
+    contact_url: https://platform.openai.com/docs/gptbot
+    expected_user_agent_pattern: "(?i)\\bGPTBot/\\d"
+    expected_reverse_dns_suffixes:
+      - .gptbot.openai.com
+    expected_keyids: []
+    robots_compliance_score: 0.95
+    aliases: []
+    deprecated: false
+
+  - id: openai-chatgpt-user
+    vendor: OpenAI
+    purpose: assistant
+    contact_url: https://platform.openai.com/docs/plugins/bot
+    expected_user_agent_pattern: "(?i)\\bChatGPT-User/\\d"
+    expected_reverse_dns_suffixes:
+      - .chatgpt.openai.com
+    expected_keyids: []
+    robots_compliance_score: 0.90
+    aliases: []
+    deprecated: false
+
+  - id: anthropic-claudebot
+    vendor: Anthropic
+    purpose: training
+    contact_url: https://www.anthropic.com/agents
+    expected_user_agent_pattern: "(?i)\\bClaude(Bot|-Web)/?"
+    expected_reverse_dns_suffixes:
+      - .anthropic.com
+      - .claude.ai
+    expected_keyids: []
+    robots_compliance_score: 0.90
+    aliases:
+      - claude-web
+    deprecated: false
+
+  - id: perplexity-perplexitybot
+    vendor: Perplexity
+    purpose: search
+    contact_url: https://docs.perplexity.ai/docs/perplexitybot
+    expected_user_agent_pattern: "(?i)\\bPerplexityBot/\\d"
+    expected_reverse_dns_suffixes:
+      - .perplexity.ai
+    expected_keyids: []
+    robots_compliance_score: 0.85
+    aliases: []
+    deprecated: false
+
+  - id: google-googlebot
+    vendor: Google
+    purpose: search
+    contact_url: https://developers.google.com/search/docs/crawling-indexing/googlebot
+    expected_user_agent_pattern: "(?i)\\bGooglebot/\\d"
+    expected_reverse_dns_suffixes:
+      - .googlebot.com
+      - .google.com
+    expected_keyids: []
+    robots_compliance_score: 0.99
+    aliases: []
+    deprecated: false
+
+  - id: google-extended
+    vendor: Google
+    purpose: training
+    contact_url: https://developers.google.com/search/docs/crawling-indexing/overview-google-crawlers
+    expected_user_agent_pattern: "(?i)\\bGoogle-Extended\\b"
+    expected_reverse_dns_suffixes: []
+    expected_keyids: []
+    robots_compliance_score: 0.95
+    aliases: []
+    deprecated: false
+
+  - id: microsoft-bingbot
+    vendor: Microsoft
+    purpose: search
+    contact_url: https://www.bing.com/webmasters/help/which-crawlers-does-bing-use-8c184ec0
+    expected_user_agent_pattern: "(?i)\\bbingbot/\\d"
+    expected_reverse_dns_suffixes:
+      - .search.msn.com
+    expected_keyids: []
+    robots_compliance_score: 0.95
+    aliases: []
+    deprecated: false
+
+  - id: duckduckgo-duckduckbot
+    vendor: DuckDuckGo
+    purpose: search
+    contact_url: https://duckduckgo.com/duckduckbot
+    expected_user_agent_pattern: "(?i)\\bDuckDuckBot/\\d"
+    expected_reverse_dns_suffixes:
+      - .duckduckgo.com
+    expected_keyids: []
+    robots_compliance_score: 0.95
+    aliases: []
+    deprecated: false
+
+  - id: apple-applebot
+    vendor: Apple
+    purpose: search
+    contact_url: https://support.apple.com/en-us/HT204683
+    expected_user_agent_pattern: "(?i)\\bApplebot/\\d"
+    expected_reverse_dns_suffixes:
+      - .applebot.apple.com
+    expected_keyids: []
+    robots_compliance_score: 0.90
+    aliases: []
+    deprecated: false
+
+  - id: commoncrawl-ccbot
+    vendor: Common Crawl
+    purpose: archival
+    contact_url: https://commoncrawl.org/ccbot
+    expected_user_agent_pattern: "(?i)\\bCCBot/\\d"
+    expected_reverse_dns_suffixes: []
+    expected_keyids: []
+    robots_compliance_score: 0.85
+    aliases: []
+    deprecated: false
+
+  # --- Wave 5 / G5.4: headless-browser detection ---
+  #
+  # These entries are emitted by the headless detector
+  # (`sbproxy-security/headless_detect.rs`) when a request's TLS
+  # fingerprint matches a published headless-library JA3/JA4. Their
+  # `expected_user_agent_pattern` is intentionally a sentinel that
+  # never matches a real header so the UA-matching path does not also
+  # claim them; the resolver entry-point is the TLS fingerprint
+  # signal, not the User-Agent string.
+
+  - id: headless-browser
+    vendor: Unknown
+    purpose: unknown
+    contact_url: https://github.com/soapbucket/sbproxy/blob/main/docs/adr-tls-fingerprint-pipeline.md
+    expected_user_agent_pattern: "^__sbproxy_never_matches__$"
+    expected_reverse_dns_suffixes: []
+    expected_keyids: []
+    robots_compliance_score: 0.10
+    aliases: []
+    deprecated: false
+
+  - id: headless-puppeteer
+    vendor: Puppeteer
+    purpose: unknown
+    contact_url: https://pptr.dev/
+    expected_user_agent_pattern: "^__sbproxy_never_matches__$"
+    expected_reverse_dns_suffixes: []
+    expected_keyids: []
+    robots_compliance_score: 0.10
+    aliases: []
+    deprecated: false
+
+  - id: headless-playwright
+    vendor: Playwright
+    purpose: unknown
+    contact_url: https://playwright.dev/
+    expected_user_agent_pattern: "^__sbproxy_never_matches__$"
+    expected_reverse_dns_suffixes: []
+    expected_keyids: []
+    robots_compliance_score: 0.10
+    aliases: []
+    deprecated: false

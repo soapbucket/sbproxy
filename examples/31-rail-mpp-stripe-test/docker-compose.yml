@@ -1,0 +1,93 @@
+# Stack for the 31-rail-mpp-stripe-test example.
+#
+# Services:
+#
+#   sbproxy        - the gateway, mounts ./sb.yml read-only on :8080
+#   mock-origin    - nginx serving a markdown feed entry on /feed/*
+#   wiremock       - optional: WireMock standing in for the Stripe
+#                    API when the operator can't get a Stripe test key.
+#                    Lives behind the `wiremock` profile so it does
+#                    not start by default.
+#
+# Bring up (real Stripe test mode):
+#   export STRIPE_SECRET_KEY=sk_test_...
+#   export STRIPE_WEBHOOK_SECRET=whsec_...
+#   docker compose up -d --wait
+#
+# Bring up (offline, wiremock):
+#   docker compose --profile wiremock up -d --wait
+#
+# Tear down: docker compose down -v
+
+services:
+
+  # --- sbproxy data plane ---
+  sbproxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cloudbuild
+    image: sbproxy:31-rail-mpp
+    container_name: sbproxy_31_mpp
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    environment:
+      - SB_LOG_LEVEL=info
+      # The proxy reads STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET
+      # from its environment when the worker (G3.3) lands; for the
+      # 402-emission path on Wave 3 these are unused but the README
+      # documents them so the env knob is stable.
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
+    depends_on:
+      mock-origin:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - mppsb
+
+  # --- Mock origin (markdown feed) ---
+  mock-origin:
+    image: nginx:1.27.3-alpine
+    container_name: sbproxy_31_mpp_origin
+    volumes:
+      - ./mock-origin/default.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost/__health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - mppsb
+
+  # --- Optional WireMock stand-in for the Stripe API ---
+  #
+  # Lives behind the `wiremock` profile so a `docker compose up`
+  # without `--profile wiremock` does not spin it up. Useful for CI
+  # environments that cannot fetch a Stripe test key but still need
+  # to exercise the redemption path against a Stripe-shaped wire.
+  wiremock:
+    image: wiremock/wiremock:3.10.1
+    container_name: sbproxy_31_mpp_wiremock
+    profiles: ["wiremock"]
+    command: ["--port", "8080", "--root-dir", "/home/wiremock"]
+    volumes:
+      - ./wiremock-stripe:/home/wiremock:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8080/__admin/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - mppsb
+
+networks:
+  mppsb:
+    driver: bridge

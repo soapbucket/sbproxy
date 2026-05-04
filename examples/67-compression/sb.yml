@@ -1,0 +1,35 @@
+# Response compression.
+#
+# Enables brotli, gzip, and zstd response compression for this origin. The
+# upstream is httpbin.org/anything, which returns plenty of text. min_size keeps
+# the proxy from compressing tiny payloads. The first algorithm in
+# `algorithms` that the client advertises in Accept-Encoding wins.
+#
+# Run:
+#   make run CONFIG=examples/67-compression/sb.yml
+#
+# Test:
+#   # Ask for brotli. The response should come back with Content-Encoding: br
+#   # and a smaller transfer size than the uncompressed body.
+#   curl -sv -H 'Host: api.local' -H 'Accept-Encoding: br' \
+#        http://127.0.0.1:8080/get -o /dev/null 2>&1 \
+#     | grep -iE 'content-encoding|content-length'
+#
+#   # gzip preference.
+#   curl -sv -H 'Host: api.local' -H 'Accept-Encoding: gzip' \
+#        http://127.0.0.1:8080/get -o /dev/null 2>&1 \
+#     | grep -iE 'content-encoding|content-length'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    compression:
+      enabled: true
+      algorithms: [br, gzip, zstd]
+      min_size: 512
+
+    action:
+      type: proxy
+      url: https://httpbin.org

@@ -1,0 +1,160 @@
+# 17 - Markdown for agents (Wave 4 / G4.2 + G4.3 + G4.5).
+#
+# Demonstrates the content-negotiate action and the Markdown projection.
+# A single origin serves an article. Browsers (Accept: text/html) get the
+# canned HTML body. Agents that ask for Markdown (Accept: text/markdown)
+# get the same article projected into Markdown with two response headers
+# attached:
+#
+#   x-markdown-tokens: <int>     # token estimate (bytes * token_bytes_ratio)
+#   Content-Signal:    ai-train  # operator's training-licensing assertion
+#
+# Pricing tiers split on the negotiated content shape:
+#
+#   Accept: text/html      -> $0.001 / request (html-default tier)
+#   Accept: text/markdown  -> $0.005 / request (markdown tier)
+#
+# The `static` action keeps the demo self-contained: no external upstream,
+# no real ledger. The same patterns work against any HTTP upstream by
+# swapping `action: type=static` for `type=proxy` and pointing at it.
+#
+# Bundle layout:
+#   sb.yml             - this file
+#   docker-compose.yml - sbproxy alone (no upstream needed)
+#   Makefile           - up / down / logs / test convenience targets
+#   smoke.json         - hits used by scripts/examples-smoke.sh
+#
+# Run:
+#   cd examples/17-markdown-for-agents
+#   docker compose up -d --wait
+#
+# Test (browser, expect HTML body, 200):
+#   curl -s -H 'Host: news.localhost' \
+#        -H 'Accept: text/html' \
+#        http://127.0.0.1:8080/article
+#
+# Test (agent asking for Markdown, expect 402 then paid 200):
+#   curl -i -H 'Host: news.localhost' \
+#        -H 'User-Agent: GPTBot/1.0' \
+#        -H 'Accept: text/markdown' \
+#        http://127.0.0.1:8080/article
+#   # => HTTP/1.1 402 Payment Required
+#
+#   curl -s -i -H 'Host: news.localhost' \
+#        -H 'User-Agent: GPTBot/1.0' \
+#        -H 'Accept: text/markdown' \
+#        -H 'crawler-payment: token-md-001' \
+#        http://127.0.0.1:8080/article
+#   # => HTTP/1.1 200 OK
+#   # => Content-Type: text/markdown
+#   # => x-markdown-tokens: 27
+#   # => Content-Signal: ai-train
+#
+# Tear down:
+#   docker compose down -v
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "news.localhost":
+    # Operator asserts the body is licensed for AI training. The proxy
+    # stamps `Content-Signal: ai-train` on 200 responses and reflects
+    # the same value into the licenses.xml + tdmrep.json projections.
+    content_signal: ai-train
+
+    # Per-origin override for the Markdown projection's tokens-per-byte
+    # ratio. Default is 0.25 (~four bytes per token, English prose).
+    # Documented here so operators see where to tune; remove the line
+    # to fall back to the default.
+    token_bytes_ratio: 0.25
+
+    # Static action: serves a canned HTML body in-process so the demo
+    # has no external dependencies. Swap for `type: proxy` + `url:` to
+    # front a real upstream.
+    action:
+      type: static
+      status: 200
+      content_type: text/html
+      body: |
+        <!doctype html>
+        <html>
+        <head><title>The Article</title></head>
+        <body>
+          <article>
+            <h1>The Article</h1>
+            <p>The first paragraph carries the lede. It is short on
+            purpose so the Markdown projection is small enough to read
+            in a smoke test.</p>
+            <p>The second paragraph adds context. Boilerplate stripping
+            removes navigation chrome but keeps the article body.</p>
+            <ul>
+              <li>Bullet one</li>
+              <li>Bullet two</li>
+            </ul>
+          </article>
+        </body>
+        </html>
+
+    # The Markdown projection. The first transform converts the HTML
+    # body into Markdown when the negotiated response shape is
+    # `markdown` (i.e. the agent sent `Accept: text/markdown` or the
+    # per-origin default is `markdown`). The token estimate lands in
+    # the `x-markdown-tokens` response header. The second transform
+    # appends a citation footer naming the original URL so cited
+    # Markdown is traceable back to the source. `citation_block`
+    # reads `RequestContext::citation_required` from the matched
+    # `ai_crawl_control` tier; setting `force_citation: true` here
+    # is the fallback for tiers that did not set the flag.
+    transforms:
+      - type: html_to_markdown
+        token_bytes_ratio: 0.25
+      - type: citation_block
+        force_citation: true
+
+    # Tiered pricing keyed on the agent's `Accept` header. The first
+    # tier matches Markdown shape and charges $0.005; the second is the
+    # HTML default at $0.001. Browsers without an AI-crawler User-Agent
+    # bypass the policy entirely and pay nothing.
+    policies:
+      - type: ai_crawl_control
+        # Default fallback. Tier matches override this in the 402 body.
+        price: 0.001
+        currency: USD
+        header: crawler-payment
+
+        # Recognised AI crawlers. Anything outside this list passes
+        # through unaffected.
+        crawler_user_agents:
+          - GPTBot
+          - ChatGPT-User
+          - ClaudeBot
+          - anthropic-ai
+          - PerplexityBot
+          - Google-Extended
+
+        tiers:
+          # Markdown shape. Charged at $0.005 / request because the
+          # projected document is more compact and more useful for
+          # training than raw HTML.
+          - route_pattern: /article
+            content_shape: markdown
+            price:
+              amount_micros: 5000
+              currency: USD
+            paywall_position: top_of_page
+
+          # HTML default. Charged at $0.001 / request as the fallback
+          # for agents that did not negotiate a different shape.
+          - route_pattern: /article
+            content_shape: html
+            price:
+              amount_micros: 1000
+              currency: USD
+            paywall_position: top_of_page
+
+        # OSS in-memory ledger seed. Each token redeems exactly once.
+        valid_tokens:
+          - token-md-001
+          - token-md-002
+          - token-html-001

@@ -1,0 +1,20 @@
+# Tests response_assertion policy
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "assertion.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: application/json
+      json_body:
+        status: "ok"
+        version: 2
+    policies:
+      - type: response_assertion
+        assertions:
+          - name: "status-check"
+            cel_expr: |
+              response.status_code == 200
+            action: pass

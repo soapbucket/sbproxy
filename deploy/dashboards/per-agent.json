@@ -1,0 +1,373 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "id": null,
+  "title": "SBproxy Per-Agent",
+  "description": "Per-agent traffic, error rate, and route breakdowns. Aggregates by agent_class and agent_vendor; agent_id is intentionally not a Prometheus label per adr-metric-cardinality.md (it is a span attribute and log field).",
+  "tags": [
+    "sbproxy",
+    "wave1",
+    "per-agent"
+  ],
+  "style": "dark",
+  "timezone": "browser",
+  "editable": false,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "version": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "prometheus_datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "selected": false,
+          "text": "Prometheus",
+          "value": "Prometheus"
+        },
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "options": []
+      },
+      {
+        "name": "tenant_id",
+        "label": "Tenant",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${prometheus_datasource}"
+        },
+        "query": "label_values(sbproxy_requests_total, tenant_id)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2,
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      },
+      {
+        "name": "agent_class",
+        "label": "Agent class",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${prometheus_datasource}"
+        },
+        "query": "label_values(sbproxy_requests_total{tenant_id=~\"$tenant_id\"}, agent_class)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2,
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      },
+      {
+        "name": "agent_vendor",
+        "label": "Agent vendor",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${prometheus_datasource}"
+        },
+        "query": "label_values(sbproxy_requests_total{tenant_id=~\"$tenant_id\",agent_class=~\"$agent_class\"}, agent_vendor)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2,
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      },
+      {
+        "name": "agent_id",
+        "label": "Agent id (logs/traces only)",
+        "type": "textbox",
+        "query": "",
+        "current": {
+          "selected": false,
+          "text": "",
+          "value": ""
+        },
+        "description": "agent_id is a span attribute / log field per adr-observability.md. Type a value to use in a Tempo or Loki query. Not available as a Prometheus label.",
+        "options": []
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Requests by agent class",
+      "description": "Rate of inbound requests per agent_class, filtered by tenant and vendor.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (agent_class) (rate(sbproxy_requests_total{tenant_id=~\"$tenant_id\",agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval]))",
+          "legendFormat": "{{agent_class}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Error rate by agent class",
+      "description": "5xx ratio per agent_class. Spikes here usually indicate a misbehaving integration vendor.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (agent_class) (rate(sbproxy_requests_total{status_class=\"5xx\",tenant_id=~\"$tenant_id\",agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval])) / sum by (agent_class) (rate(sbproxy_requests_total{tenant_id=~\"$tenant_id\",agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval]))",
+          "legendFormat": "{{agent_class}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Top routes for selected agents",
+      "description": "Top 20 routes for the selected agent class / vendor combo. Click a route to drill into Overview.",
+      "type": "table",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "align": "auto",
+            "displayMode": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "footer": {
+          "enablePagination": false,
+          "show": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(20, sum by (route, agent_class) (rate(sbproxy_requests_total{tenant_id=~\"$tenant_id\",agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval])))",
+          "legendFormat": "{{route}} ({{agent_class}})",
+          "format": "table",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Top tiers (rail) for selected agents",
+      "description": "Top 20 payment rails the selected agents flow through. Useful when triaging rail-quorum issues.",
+      "type": "table",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "align": "auto",
+            "displayMode": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "footer": {
+          "enablePagination": false,
+          "show": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(20, sum by (rail, agent_class) (rate(sbproxy_requests_total{tenant_id=~\"$tenant_id\",agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval])))",
+          "legendFormat": "{{rail}} ({{agent_class}})",
+          "format": "table",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Latency p95 by agent class",
+      "description": "Per-agent_class p95 latency. Catches single-vendor regressions that get washed out in the global p95.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${prometheus_datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, agent_class) (rate(sbproxy_request_duration_seconds_bucket{tenant_id=~\"$tenant_id\",agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval])))",
+          "legendFormat": "{{agent_class}} p95",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${prometheus_datasource}"
+          }
+        }
+      ]
+    }
+  ]
+}

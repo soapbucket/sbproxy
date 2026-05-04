@@ -1,0 +1,117 @@
+[package]
+name = "sbproxy-e2e"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+# This crate ships a small `ProxyHarness` library plus a suite of
+# integration tests that spawn the release `sbproxy` binary against
+# the example sb.yml files and exercise the documented HTTP
+# behaviour. Running it requires a release build of the binary:
+#
+#     cargo build --release -p sbproxy
+#     cargo test  --release -p sbproxy-e2e
+#
+# Each test owns its own ephemeral TCP port and writes a temp
+# config so the suite parallelises cleanly.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+sbproxy-config.workspace = true
+sbproxy-cache.workspace = true
+# Wave 1 Q1.9 (redaction.rs) calls into the legacy regex-based redactor
+# as a regression floor; the typed redactor lands in R1.2.
+sbproxy-observe.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+tempfile = "3"
+base64.workspace = true
+
+[dev-dependencies]
+# Wave 4 G4.10: boilerplate-stripping e2e calls into the production
+# transform's public `apply` method instead of the in-file reference
+# stub. Dev-only because no other harness path needs it.
+sbproxy-modules.workspace = true
+
+# JWT signing for auth_jwt.rs (replaces hand-encoded HS256 tokens with
+# real `jsonwebtoken::encode` calls so failure modes show up cleanly).
+jsonwebtoken = { workspace = true }
+
+# Ed25519 for auth_bot.rs - generates a fresh keypair, signs an RFC 9421
+# canonical base, and asserts the proxy accepts/rejects round-trips.
+ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
+rand = { workspace = true }
+
+# RFC 9421 signature base helpers re-used by auth_bot.rs to keep the
+# signing path byte-identical to the verifier.
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+
+# Wave 8 P0 e2e tests construct/validate ULIDs round-tripped through
+# the X-Sb-Session-Id header.
+ulid = { workspace = true }
+
+# WebSocket end-to-end coverage for action_websocket.rs - spawns a tiny
+# echo server and drives an upgrade through the proxy.
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+
+# gRPC end-to-end coverage for action_grpc.rs. Pin to 0.12 / prost 0.13
+# so the e2e crate uses the same major as opentelemetry-otlp's tonic
+# (already in the workspace lock), avoiding a duplicate compile of two
+# tonic majors.
+tonic = "0.12"
+prost = "0.13"
+
+# Compression decoders for compression.rs e2e assertions. Pinned to the
+# same versions sbproxy-middleware ships so the test bytes round-trip
+# through the same encoder/decoder pair the proxy uses at runtime.
+flate2 = "1"
+brotli = "3"
+zstd = "0.13"
+
+# Wave 1 Q1.x mock servers (HTTP ledger for Q1.2, Web Bot Auth directory
+# for Q1.4, WBA conformance for Q1.7) are tiny axum apps bound on
+# 127.0.0.1:0. Pin to the same axum major already in the workspace lock
+# so we do not pull two majors into the build graph.
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
+
+# Wave 2 cross-pillar e2e (Q2.11). Cargo's default test discovery
+# only picks up `tests/*.rs` files at the top level; the cross-pillar
+# matrix in `docs/AIGOVERNANCE-BUILD.md` § 17 puts these tests under
+# `tests/cross_pillar/` so the wave grouping is visible in the file
+# tree. Each cross-pillar test is registered explicitly here so the
+# subdirectory layout does not break test discovery.
+[[test]]
+name = "wave2_billing_audit"
+path = "tests/cross_pillar/wave2_billing_audit.rs"
+
+# Wave 4 cross-pillar e2e (Q4.13). Same explicit registration as
+# `wave2_billing_audit` above; lives under `tests/cross_pillar/` so
+# the wave grouping is visible in the file tree.
+[[test]]
+name = "wave4_shape_license_audit"
+path = "tests/cross_pillar/wave4_shape_license_audit.rs"
+
+# Wave 2 rate-limit budget e2e (Q2.12). Lives at the top level so
+# default discovery picks it up without an explicit registration;
+# this entry is present for symmetry with the cross_pillar one and
+# documents the test's name.
+[[test]]
+name = "rate_limit_budget"
+path = "tests/rate_limit_budget.rs"
+
+[build-dependencies]
+# Compiles the in-tree `proto/echo.proto` for the gRPC e2e test. Kept
+# pinned to the same major as `tonic` above.
+tonic-build = "0.12"

@@ -1,0 +1,47 @@
+# Template transform (minijinja).
+#
+# A `static` action returns a JSON document. The `template` transform parses
+# that JSON as the input context and renders a minijinja template that produces
+# a human-readable plaintext summary. The body the client receives is plain
+# text built from the structured data.
+#
+# Run:
+#   make run CONFIG=examples/46-transform-template/sb.yml
+#
+# Test:
+#   curl -s -H 'Host: tmpl.local' http://127.0.0.1:8080/
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "tmpl.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        order_id: "ORD-1042"
+        customer: "Ada Lovelace"
+        items:
+          - name: "Analytical Engine"
+            qty: 1
+            price: 9999.00
+          - name: "Punch Cards (1000-pack)"
+            qty: 3
+            price: 14.50
+        total: 10042.50
+    transforms:
+      - type: template
+        template: |
+          Order {{ order_id }} for {{ customer }}
+          ----
+          {%- for item in items %}
+          {{ item.qty }} x {{ item.name }} @ ${{ item.price }}
+          {%- endfor %}
+          ----
+          Total: ${{ total }}
+    response_modifiers:
+      - headers:
+          set:
+            Content-Type: text/plain; charset=utf-8

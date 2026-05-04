@@ -1,0 +1,20 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "feature_endpoints": [],
+  "audit_check": false,
+  "_notes": [
+    "This example does NOT enable the proxy admin listener, so",
+    "/healthz is unreachable. The data plane's /health endpoint is",
+    "the smoke runner's liveness probe.",
+    "",
+    "feature_endpoints[] is empty. Every URL in this example is",
+    "either a 402 (multi-rail challenge) or a 406 (no acceptable",
+    "rail); none of those are 2xx. The Makefile's `make test` target",
+    "covers the negotiation matrix for hands-on validation.",
+    "",
+    "audit_check stays false until Wave 2 (R1.2) ships the OSS",
+    "/api/audit/recent endpoint."
+  ]
+}

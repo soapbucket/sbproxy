@@ -1,0 +1,115 @@
+# 19 - robots.txt + llms.txt + llms-full.txt projections
+# (Wave 4 / G4.5 + G4.6).
+#
+# Demonstrates the three text-format policy-graph projections that
+# cooperative crawlers fetch to discover an origin's pricing posture
+# without hitting the actual content path:
+#
+#   GET /robots.txt       -> RFC 9309 + RSL stanzas, per-agent
+#   GET /llms.txt         -> concise YAML-ish header + summary
+#   GET /llms-full.txt    -> full header + priced-route listing
+#
+# The example carries pricing for two agent classes and bumps GPTBot
+# and ClaudeBot to $0.005 per request. Other recognised crawlers
+# (Common Crawl, Perplexity) get the default $0.001. Anything outside
+# the recognised set passes through unaffected and pays nothing.
+#
+# Bundle layout:
+#   sb.yml              - this file
+#   docker-compose.yml  - sbproxy alone (no upstream needed)
+#   Makefile            - up / down / logs / test convenience targets
+#   smoke.json          - hits used by scripts/examples-smoke.sh
+#
+# Run:
+#   cd examples/19-robots-llms-txt
+#   docker compose up -d --wait
+#
+# Inspect each projection:
+#   curl -s -H 'Host: news.localhost' http://127.0.0.1:8080/robots.txt
+#   curl -s -H 'Host: news.localhost' http://127.0.0.1:8080/llms.txt
+#   curl -s -H 'Host: news.localhost' http://127.0.0.1:8080/llms-full.txt
+#
+# Tear down:
+#   docker compose down -v
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "news.localhost":
+    # Operator's licensing assertion. Stamped on responses + reflected
+    # into licenses.xml + tdmrep.json (see example 18). For the text
+    # projections, this becomes the `# license:` header line.
+    content_signal: ai-train
+
+    action:
+      type: static
+      status: 200
+      content_type: text/html
+      body: |
+        <!doctype html>
+        <html>
+        <head><title>News home</title></head>
+        <body>
+          <h1>News home</h1>
+          <p>Browse the front page. Crawler pricing is published in
+          <code>/robots.txt</code>, <code>/llms.txt</code>, and
+          <code>/llms-full.txt</code>.</p>
+        </body>
+        </html>
+
+    policies:
+      - type: ai_crawl_control
+        # Default fallback price ($0.001). Tier matches override.
+        price: 0.001
+        currency: USD
+        header: crawler-payment
+
+        # Recognised AI crawlers. Anything outside this list is treated
+        # as a regular user agent and bypasses pricing.
+        crawler_user_agents:
+          - GPTBot
+          - ChatGPT-User
+          - ClaudeBot
+          - anthropic-ai
+          - PerplexityBot
+          - Google-Extended
+          - CCBot
+
+        # Pricing tiers. Wave 4's `ai_crawl_control` policy keys tiers
+        # on (route_pattern, content_shape); per-agent pricing lives
+        # in the tier's User-Agent stamping at projection time. Both
+        # the GPTBot / ClaudeBot premium and the default fallback are
+        # encoded as separate tiers; the projection cache renders one
+        # robots.txt stanza per agent class.
+        tiers:
+          # GPTBot / ClaudeBot: premium feed. $0.005 / request.
+          - route_pattern: /feed/*
+            content_shape: markdown
+            price:
+              amount_micros: 5000
+              currency: USD
+            paywall_position: top_of_page
+            citation_required: true
+
+          # Default fallback for the other agents on /feed/*.
+          - route_pattern: /feed/*
+            content_shape: html
+            price:
+              amount_micros: 1000
+              currency: USD
+            paywall_position: top_of_page
+
+          # Article path. $0.001 for everyone.
+          - route_pattern: /article/*
+            content_shape: html
+            price:
+              amount_micros: 1000
+              currency: USD
+            paywall_position: top_of_page
+
+        # OSS in-memory ledger seed. Each token redeems exactly once.
+        valid_tokens:
+          - token-feed-001
+          - token-feed-002
+          - token-article-001

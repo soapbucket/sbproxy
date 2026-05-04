@@ -1,0 +1,22 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 9090,
+  "health_path": "/healthz",
+  "feature_endpoints": [],
+  "audit_check": false,
+  "_notes": [
+    "Unlike examples 30 / 31 / 32 this example DOES enable the proxy",
+    "admin listener (port 9090). The admin listener serves /healthz",
+    "(liveness probe) and the JWKS document at",
+    "/.well-known/sbproxy/quote-keys.json.",
+    "",
+    "feature_endpoints[] is empty: the smoke runner's data-plane",
+    "probes hit data_plane_port (8080), and the JWKS endpoint lives",
+    "on the admin port (9090). The Makefile's `make jwks` target",
+    "covers the JWKS document for hands-on validation; full",
+    "round-trip verification lives in verify-quote.sh.",
+    "",
+    "audit_check stays false until Wave 2 (R1.2) ships the OSS",
+    "/api/audit/recent endpoint."
+  ]
+}

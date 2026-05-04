@@ -1,0 +1,43 @@
+# Passive outlier detection for load balancer targets.
+#
+# The proxy tracks each target's success/failure rate over a sliding
+# window. When the failure rate crosses `threshold` (default 0.5) and
+# the target has seen at least `min_requests` requests in the window,
+# the target is ejected from selection for `ejection_duration_secs`
+# before being eligible again.
+#
+# Failures are recorded from upstream 5xx responses and from
+# connect-error retries. Active health checks (see example 77) also
+# feed this same store when both are configured.
+#
+# Use this when a target starts failing under load: traffic
+# automatically shifts to healthy peers without manual intervention.
+#
+# Run:
+#   make run CONFIG=examples/78-outlier-detection/sb.yml
+#
+# Test:
+#   for i in $(seq 1 20); do
+#     curl -s -H 'Host: localhost' \
+#          http://127.0.0.1:8080/anything -o /dev/null
+#   done
+#   # If one target consistently 5xx's, after the threshold is
+#   # crossed (5 requests with >50% failures) it is ejected for
+#   # 30s and traffic shifts to the healthy peer.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "localhost":
+    action:
+      type: load_balancer
+      algorithm: round_robin
+      outlier_detection:
+        threshold: 0.5
+        window_secs: 60
+        min_requests: 5
+        ejection_duration_secs: 30
+      targets:
+        - url: https://httpbin.org
+        - url: https://httpbingo.org

@@ -1,0 +1,8 @@
+# Excluded from docker build context to keep builds fast and avoid
+# shipping 30+ GB of cargo artefacts to the daemon. Only affects `docker
+# build`, not regular cargo workflows.
+target/
+**/target/
+.git/
+.github/
+*.log

@@ -1,0 +1,52 @@
+# SBproxy capabilities
+
+A flat catalog of capabilities shipped by SBproxy. Each line is a single, AI-discoverable feature with a short tag and a one-sentence description. Optimized for AI assistants reading the codebase.
+
+For human-facing documentation, see `docs/architecture.md`, `docs/configuration.md`, `docs/operator-runbook.md`, and `docs/threat-model.md`. For the marketing-facing landing page, see the top-level `llms.txt` at the repo root.
+
+## Substrate
+
+- ai_crawl_control.tiers: per-route, per-shape, per-vendor pricing tiers configured under the existing `ai_crawl_control` policy with HTTP ledger redemption (see `docs/ai-crawl-control.md`).
+- http_ledger: HMAC-SHA256 signed JSON-over-HTTPS protocol with idempotency keys, exponential backoff, and circuit breaker for ledger redeem and authorize/capture/refund verbs (ADR `adr-http-ledger-protocol.md`).
+- agent_class: typed identity attribute on the request context carrying `agent_id`, `agent_class`, `agent_vendor`, `purpose`, `contact`, `robots_score`, and `crawl_to_refer`, populated by a resolver chain (ADR `adr-agent-class-taxonomy.md`).
+- agent_class.resolver: combines User-Agent match, reverse-DNS verification, and Web Bot Auth keyid before assigning an `agent_id`; UA match alone is non-authoritative.
+- agent_class.scripting: agent identity is exposed to CEL, Lua, JavaScript, and WASM scripting hooks via the `request.agent` namespace.
+- reverse_dns_verify: per-vendor PTR plus forward-confirm verification with vendor suffix table (GPTBot, ClaudeBot, PerplexityBot, GoogleBot, BingBot, DuckDuckBot, AppleBot) at `sbproxy-security/agent_verify.rs`.
+- bot_auth_directory: dynamic Web Bot Auth directory refresh from `/.well-known/http-message-signatures-directory`, with JWKS verification, TTL-based caching, negative caching, directory self-signature checks, and HTTPS-only enforcement (ADR `adr-bot-auth-directory.md`).
+- bot_auth_directory.signature_agent: resolves the `Signature-Agent` request header to a directory entry per `draft-meunier-http-message-signatures-directory-05`.
+
+## Observability
+
+- otel_traces: OpenTelemetry tracer with W3C TraceContext propagation on inbound and outbound HTTP, deterministic span names of the form `sbproxy.<pillar>.<verb>`, and a configurable OTLP gRPC exporter disabled by default (ADR `adr-observability.md`).
+- otel_exemplars: Prometheus histogram exemplars wired to the active trace and span IDs so Grafana "click an outlier" navigates from a metric to a trace.
+- structured_logs: JSON-line access, error, and audit logs with a fixed field allowlist, denylist-based redaction, per-sink override, and per-tenant sampling (ADR `adr-log-schema-redaction.md`).
+- redaction.per_sink: stricter redaction can be applied to external sinks (customer Loki, third-party trace exporter) than to internal sinks.
+- metrics.per_agent_labels: `agent_id`, `agent_class`, `agent_vendor`, `payment_rail`, and `content_shape` labels on `sbproxy_requests_total`, `sbproxy_policy_triggers_total`, and the access log; bounded by the cardinality budget in ADR `adr-metric-cardinality.md`.
+- cardinality_limiter: per-metric, per-label cap with an `__other__` sentinel for over-cap demotion; CI gate enforces the budget on every PR touching metric labels.
+- healthz: liveness endpoint at `/healthz` returning 200 when the proxy process is up.
+- readyz: readiness endpoint at `/readyz` returning 200 only when ledger reachability, bot-auth directory freshness, and agent registry load state all pass.
+- slo_catalog: per-pillar availability, latency p95/p99, error rate, and ledger redeem-success SLOs with burn-rate alert windows and a stable alert-ID-to-runbook mapping (ADR `adr-slo-alert-taxonomy.md`).
+- dashboards.grafana: provisioned JSON dashboards for overview, per-agent, policy triggers, audit log, and traces overview under `deploy/dashboards/`.
+- alerts.prometheus: PromQL recording and alerting rules under `deploy/alerts/`.
+- observability_stack: reference Compose stack (Prometheus, Grafana, Tempo, Loki, OTel collector) at `examples/00-observability-stack/`, pre-provisioned with the dashboards and alerts.
+
+## Audit
+
+- admin_audit_envelope: typed `AdminAuditEvent` carrying actor, action, target, before/after diff, reason, request_id, trace_id, ip, and user_agent; emitted by every state-mutating endpoint (ADR `adr-admin-action-audit.md`).
+- admin_audit_log_sink: OSS deployments emit audit events through the structured-log audit sink.
+- audit_envelope_versioning: the `AdminAuditEvent` schema is forward-compatible (ADR `adr-schema-versioning.md`).
+
+## Webhooks
+
+- webhook_outbound: signed delivery framework at `sbproxy-observe/notify.rs` with HMAC-SHA256 signing, signing key rotation, exponential-backoff retries, deadletter queue, and per-tenant subscription registry (ADR `adr-webhook-security.md`).
+- webhook_outbound.replay_protection: outbound deliveries carry a monotonically increasing nonce and a delivery timestamp so customer endpoints can reject replays inside a configurable window.
+
+## Schema and compatibility
+
+- schema_versioning_policy: deprecation windows, version negotiation rules, and a breaking-change checklist apply to `BillingProvider`, the HTTP ledger payload, the access-log schema, the registry feed, and the audit envelope (ADR `adr-schema-versioning.md`).
+
+## CI and release
+
+- doc_ci: lychee link checking and code-block syntax validation across `sbproxy-rust/docs/`; runs on every PR touching docs.
+- examples_smoke: every directory under `examples/` boots via `docker compose`, hits `/healthz`, and exercises one feature endpoint with an audit-log assertion.
+- observability_budgets_ci: SLO burn-rate regression and cardinality budget regression run on PRs touching `sbproxy-observe/` or metric labels.

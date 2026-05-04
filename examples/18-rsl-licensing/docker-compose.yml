@@ -1,0 +1,38 @@
+# Stack for the `18-rsl-licensing` example. Single container:
+#
+#   sbproxy - the gateway, mounts ./sb.yml read-only on :8080.
+#             Serves /robots.txt, /licenses.xml, and
+#             /.well-known/tdmrep.json off the in-memory projection
+#             cache built from the `ai_crawl_control` policy.
+#
+# Bring up:    docker compose up -d --wait
+# Validate:    docker compose config
+# Tear down:   docker compose down -v
+
+services:
+
+  sbproxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cloudbuild
+    image: sbproxy:18-rsl-licensing
+    container_name: sbproxy_18_rsl
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    environment:
+      - SB_LOG_LEVEL=info
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - rslsb
+
+networks:
+  rslsb:
+    driver: bridge

@@ -1,0 +1,41 @@
+# Security headers policy.
+#
+# Injects HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy,
+# and Permissions-Policy into every response. Adds a Content-Security-Policy
+# via the structured `content_security_policy` block so report-only mode and
+# nonce injection are available later if needed. Pairs naturally with any
+# upstream; this example uses httpbin.org.
+#
+# Run:
+#   make run CONFIG=examples/33-security-headers/sb.yml
+#
+# Test:
+#   # 200 with the new headers visible in the response
+#   curl -i -H 'Host: sec.local' http://127.0.0.1:8080/get
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "sec.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    policies:
+      - type: security_headers
+        headers:
+          - name: Strict-Transport-Security
+            value: "max-age=31536000; includeSubDomains; preload"
+          - name: X-Frame-Options
+            value: DENY
+          - name: X-Content-Type-Options
+            value: nosniff
+          - name: Referrer-Policy
+            value: strict-origin-when-cross-origin
+          - name: Permissions-Policy
+            value: "camera=(), microphone=(), geolocation=()"
+        content_security_policy:
+          policy: "default-src 'self'; script-src 'self'"
+          enable_nonce: false
+          report_only: false

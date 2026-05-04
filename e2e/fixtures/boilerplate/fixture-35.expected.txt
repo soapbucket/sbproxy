@@ -1,0 +1,3 @@
+I have been running the same Postgres replica for three years and the WAL replay lag finally caught up to me.
+Bumping max_wal_senders did nothing; the bottleneck was the receiving side's fsync cadence.
+The fix was switching the replica's filesystem from ext4 with default mount options to ext4 with data=writeback.

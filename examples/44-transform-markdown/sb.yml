@@ -1,0 +1,48 @@
+# Markdown to HTML transform.
+#
+# A `static` action returns a Markdown document; the `markdown` transform
+# converts it to HTML using pulldown-cmark. GitHub-style tables, strikethrough,
+# and smart punctuation are all enabled, so the rendered output includes a
+# table and curly quotes.
+#
+# Run:
+#   make run CONFIG=examples/44-transform-markdown/sb.yml
+#
+# Test:
+#   # Returns rendered HTML, not the Markdown source
+#   curl -s -H 'Host: md.local' http://127.0.0.1:8080/
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "md.local":
+    action:
+      type: static
+      status: 200
+      content_type: text/markdown
+      body: |
+        # sbproxy release notes
+
+        Welcome to the "April" build. Here's what shipped:
+
+        - Faster startup
+        - ~~Buggy retries~~ Retries now respect the budget
+        - New transform pipeline
+
+        ## Supported transforms
+
+        | Type         | Body shape |
+        |--------------|------------|
+        | json         | object     |
+        | markdown     | text       |
+        | html         | text       |
+    transforms:
+      - type: markdown
+        smart_punctuation: true
+        tables: true
+        strikethrough: true
+    response_modifiers:
+      - headers:
+          set:
+            Content-Type: text/html; charset=utf-8

@@ -1,0 +1,3 @@
+The Foundry-7 desk lamp uses a single warm-white LED panel with a continuous-dimming driver.
+At full brightness it draws nine watts and outputs roughly 800 lumens, comparable to a 60-watt incandescent.
+The included weighted base accommodates a workspace clamp via a hex insert on the underside.

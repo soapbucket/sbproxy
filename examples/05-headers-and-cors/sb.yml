@@ -1,0 +1,41 @@
+# Header injection and CORS.
+#
+# Demonstrates request_modifiers (rewrite outbound headers), response_modifiers
+# (rewrite inbound headers from the upstream), and CORS for browser clients.
+#
+# Run:
+#   make run CONFIG=examples/05-headers-and-cors/sb.yml
+#
+# Test:
+#   curl -v -H 'Host: api.local' http://127.0.0.1:8080/headers
+#   curl -v -H 'Host: api.local' -H 'Origin: https://example.com' \
+#        -X OPTIONS http://127.0.0.1:8080/headers
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    request_modifiers:
+      - headers:
+          set:
+            X-Forwarded-By: sbproxy
+            X-Trace-Id: "{{ uuid() }}"
+          delete:
+            - cookie
+
+    response_modifiers:
+      - headers:
+          set:
+            X-Served-By: sbproxy
+            Cache-Control: "public, max-age=60"
+
+    cors:
+      allow_origins: ["https://example.com"]
+      allow_methods: ["GET", "POST", "OPTIONS"]
+      allow_headers: ["Content-Type", "Authorization"]
+      max_age_seconds: 600

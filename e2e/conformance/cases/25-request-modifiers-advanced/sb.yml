@@ -1,0 +1,74 @@
+# Tests all request modifier types using the verified flat struct format
+# The echo backend reflects what headers/path/query the backend received
+proxy:
+  http_bind_port: 18080
+
+origins:
+  # URL path rewrite
+  "urlrewrite.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - url:
+          path:
+            replace:
+              old: "/old-path"
+              new: "/echo"
+
+  # Query parameter injection
+  "querymod.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - query:
+          set:
+            injected: "from-proxy"
+          add:
+            extra: "added"
+
+  # Method override
+  "methodmod.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - method: POST
+
+  # Body replacement
+  "bodymod.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - body:
+          replace_json: {"injected": true, "source": "proxy"}
+
+  # Header set/add/delete
+  "headermod.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - headers:
+          set:
+            X-Injected: "from-proxy"
+            X-Request-Source: "sbproxy"
+          add:
+            X-Extra: "added-value"
+          delete:
+            - X-Remove-Me
+
+  # Lua script modifier
+  "luamod.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    request_modifiers:
+      - lua_script: |
+          function match_request(req, ctx)
+            req:set_header("X-Lua-Modified", "true")
+            req:set_header("X-Lua-Method", req:method())
+            return true
+          end

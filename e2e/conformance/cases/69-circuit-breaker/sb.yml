@@ -1,0 +1,25 @@
+# Circuit breaker on load balancer targets
+# One healthy target, one failing target with circuit breaker
+proxy:
+  http_bind_port: 18080
+
+origins:
+  "cb.test":
+    action:
+      type: load_balancer
+      algorithm: round_robin
+      targets:
+        - url: http://127.0.0.1:18888/echo
+          weight: 1
+          circuit_breaker:
+            enabled: true
+            failure_threshold: 2
+            success_threshold: 1
+            timeout: 5s
+        - url: http://127.0.0.1:19999/dead
+          weight: 1
+          circuit_breaker:
+            enabled: true
+            failure_threshold: 2
+            success_threshold: 1
+            timeout: 5s

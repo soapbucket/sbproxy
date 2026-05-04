@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/soapbucket/sbproxy/security/advisories/new
+    about: Report security issues privately via GitHub Security Advisories. See SECURITY.md for the disclosure policy.
+  - name: Question or discussion
+    url: https://github.com/soapbucket/sbproxy/discussions
+    about: Ask a question, share a deployment story, or propose a design. Bug reports and feature requests go in Issues.
