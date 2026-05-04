@@ -5,6 +5,82 @@ Go implementation and now live in the archived
 [`soapbucket/sbproxy-go`](https://github.com/soapbucket/sbproxy-go)
 repository.
 
+## [Unreleased]
+
+Work that has merged to `main` since the v1.0.1 tag and is queued for
+the next version cut. No promises about backward compatibility for any
+of the new YAML fields below until the version that ships them.
+
+### Added
+
+- **WOR-114 Phase 2: CEL `features[...]` namespace.** Per-request
+  flags parsed from the `x-sb-flags` header and `?_sb.<key>` query
+  prefix are now exposed to CEL expressions. Built-in flags surface
+  as bools (`features.debug`, `features.trace`,
+  `features["no-cache"]`, `features.any_set`); free-form `k=v` extras
+  surface as strings (`features["env"]`). Wired into the rate-limit
+  CEL evaluator and `ExpressionPolicy::evaluate_with_views`.
+  ([crates/sbproxy-extension/src/cel/context.rs])
+
+- **`SB_WORKER_THREADS` env var.** Positive integer overrides the
+  auto-detected Pingora worker thread count
+  (`std::thread::available_parallelism()`). Useful for benchmarking
+  with a fixed worker count or capping the pool below a cgroup quota.
+  ([crates/sbproxy-core/src/server.rs])
+
+- **`/live`, `/livez`, `/ready`, `/health` admin endpoints.**
+  `/livez` returns `{"alive":true}` on every call and never 503s, so
+  K8s liveness probes don't trip on transient readiness failures.
+  `/live` is a bare alias. `/ready` is an alias for `/readyz`;
+  `/health` is an alias for `/healthz`. Existing endpoints unchanged.
+  ([crates/sbproxy-observe/src/health.rs],
+  [crates/sbproxy-core/src/admin.rs])
+
+- **OCSP stapling for the manual fallback cert.** `OcspStapler`
+  (which previously existed but was unwired) now does an immediate
+  fetch on startup, refreshes every 12 hours, and pushes the bytes
+  into `CertResolver::update_fallback_ocsp` so subsequent rustls
+  handshakes staple the response on the wire. No-op when no manual
+  cert is configured or when the cert lacks an AIA extension.
+  ([crates/sbproxy-tls/src/ocsp.rs],
+  [crates/sbproxy-tls/src/cert_resolver.rs])
+
+### Changed
+
+- **mTLS now wired on the ACME path.** Previously, an operator who
+  configured `mtls:` alongside `acme:` got plain TLS until they
+  noticed clients reaching the upstream without the expected cert
+  headers. The ACME branch now mirrors the manual-cert branch:
+  builds `TlsSettings` with the configured `ClientCertVerifier` and
+  falls back to plain TLS only when mTLS setup itself fails.
+  ([crates/sbproxy-core/src/server.rs])
+
+- **`docs/manual.md` rewrites** matching what actually ships:
+  - §6 Health checks: 3 endpoints (`/livez`, `/readyz`, `/healthz`)
+    each with a bare alias, replacing the old per-endpoint URL fork
+    diagram.
+  - §10 Feature flags: CEL accessor table, kill-switch note, and
+    a "planned, not yet wired" note for Lua / JS / WASM features
+    namespaces and workspace-level pub/sub flags.
+  - §3 CPU detection: documents the new `SB_WORKER_THREADS` knob.
+  - §13 env-var table: adds `SB_WORKER_THREADS` and
+    `SB_DISABLE_SB_FLAGS` rows.
+
+### Open follow-ups
+
+Tracked in Linear, not in this changeset:
+
+- [WOR-125](https://linear.app/12345r/issue/WOR-125) two-level log
+  config (`--request-log-level`, `SB_REQUEST_LOG_LEVEL`)
+- [WOR-126](https://linear.app/12345r/issue/WOR-126) `access_log`
+  `slow_request_threshold` forced-emit + `always_log_errors`
+- [WOR-127](https://linear.app/12345r/issue/WOR-127) `access_log`
+  file output + size-based rotation
+- [WOR-128](https://linear.app/12345r/issue/WOR-128) full `/health`
+  body with `version`, `build_hash`, `uptime_seconds`, `checks`
+- WOR-114 Phase 2.5: Lua / JS / WASM `features` namespace, plus
+  workspace-level flags via messenger pub/sub
+
 ## [1.0.1] - 2026-05-04
 
 Patch release. No runtime behavior changes.
