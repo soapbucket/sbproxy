@@ -10341,6 +10341,113 @@ fn install_agent_class_resolver(block: Option<&sbproxy_config::AgentClassesConfi
     );
 }
 
+/// Cached default-rule PII redactor for access-log header capture.
+/// Building the redactor compiles ~10 regexes plus an Aho-Corasick
+/// prefilter, so we keep one instance for the whole process lifetime.
+/// The scoped variant (`access_log.capture_headers.redact_pii_rules`)
+/// is built per-emit because it depends on operator config; the cost
+/// is bounded by the access-log sample rate in practice.
+fn default_pii_redactor() -> &'static sbproxy_security::pii::PiiRedactor {
+    static CELL: std::sync::OnceLock<sbproxy_security::pii::PiiRedactor> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(sbproxy_security::pii::PiiRedactor::defaults)
+}
+
+/// Build a PII redactor scoped to the named subset of the built-in
+/// default rules. Case-insensitive name match. Returns `None` when no
+/// names match, so the caller can fall back to no-redaction.
+fn build_scoped_pii_redactor(rule_names: &[String]) -> Option<sbproxy_security::pii::PiiRedactor> {
+    let scoped: Vec<sbproxy_security::pii::PiiRule> = sbproxy_security::pii::default_rules()
+        .into_iter()
+        .filter(|r| rule_names.iter().any(|n| n.eq_ignore_ascii_case(&r.name)))
+        .collect();
+    if scoped.is_empty() {
+        return None;
+    }
+    let cfg = sbproxy_security::pii::PiiConfig {
+        enabled: true,
+        defaults: false,
+        redact_request: true,
+        redact_response: true,
+        rules: scoped,
+    };
+    sbproxy_security::pii::PiiRedactor::from_config(&cfg).ok()
+}
+
+/// Capture the subset of `headers` that the compiled allowlist
+/// accepts, applying the configured truncation and (optional)
+/// PII redaction. Returns an empty map when the allowlist is empty
+/// (the common case).
+fn capture_headers_for_log(
+    headers: &http::HeaderMap,
+    allowlist: &sbproxy_config::CompiledHeaderAllowlist,
+    max_value_bytes: usize,
+    redact_pii: bool,
+    redact_pii_rules: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    if allowlist.is_empty() {
+        return std::collections::BTreeMap::new();
+    }
+    if redact_pii {
+        if redact_pii_rules.is_empty() {
+            let redactor = default_pii_redactor();
+            sbproxy_observe::capture::capture_headers(
+                headers,
+                |name| allowlist.matches(name),
+                max_value_bytes,
+                Some(|v: &str| redactor.redact(v).into_owned()),
+            )
+        } else if let Some(redactor) = build_scoped_pii_redactor(redact_pii_rules) {
+            sbproxy_observe::capture::capture_headers(
+                headers,
+                |name| allowlist.matches(name),
+                max_value_bytes,
+                Some(|v: &str| redactor.redact(v).into_owned()),
+            )
+        } else {
+            // No matching rules: fall through to no-redaction.
+            sbproxy_observe::capture::capture_headers(
+                headers,
+                |name| allowlist.matches(name),
+                max_value_bytes,
+                None::<fn(&str) -> String>,
+            )
+        }
+    } else {
+        sbproxy_observe::capture::capture_headers(
+            headers,
+            |name| allowlist.matches(name),
+            max_value_bytes,
+            None::<fn(&str) -> String>,
+        )
+    }
+}
+
+/// Emit one-shot WARN lines for sensitive headers an operator opted
+/// into capturing by exact name. Called from the config-load and
+/// config-reload paths so the warning surfaces once per reload, not
+/// per request.
+fn log_capture_header_warnings(cfg: &sbproxy_config::AccessLogConfig) {
+    let (_, req_warnings) =
+        sbproxy_config::CompiledHeaderAllowlist::compile(&cfg.capture_headers.request);
+    let (_, resp_warnings) =
+        sbproxy_config::CompiledHeaderAllowlist::compile(&cfg.capture_headers.response);
+    for header in &req_warnings {
+        tracing::warn!(
+            header = %header,
+            "access_log.capture_headers.request includes a sensitive header by exact match; \
+             values will be captured (redact_secrets still strips known token shapes)",
+        );
+    }
+    for header in &resp_warnings {
+        tracing::warn!(
+            header = %header,
+            "access_log.capture_headers.response includes a sensitive header by exact match; \
+             values will be captured (redact_secrets still strips known token shapes)",
+        );
+    }
+}
+
 /// Build and emit an access-log entry when the active pipeline has
 /// access-log emission enabled and the request passes the filter and
 /// sampler. A no-op when access-log is unconfigured or disabled.
@@ -10401,6 +10508,45 @@ fn emit_access_log(
         .as_ref()
         .map(|s| format!("{s:?}").to_ascii_lowercase());
 
+    // --- G6.4 captured-header stamping ---
+    //
+    // Compile the allowlists per emit. The allowlist is small (a
+    // handful of header names plus optional globs) so the compile cost
+    // is negligible relative to the JSON serialisation that follows.
+    // Caching the compiled form on the pipeline is a follow-up; doing
+    // so requires plumbing through the `CompiledPipeline` build path
+    // and is out of scope for the first cut.
+    let (request_headers, response_headers) =
+        if cfg.capture_headers.request.is_empty() && cfg.capture_headers.response.is_empty() {
+            (
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::new(),
+            )
+        } else {
+            let (req_allow, _) =
+                sbproxy_config::CompiledHeaderAllowlist::compile(&cfg.capture_headers.request);
+            let (resp_allow, _) =
+                sbproxy_config::CompiledHeaderAllowlist::compile(&cfg.capture_headers.response);
+            let req_headers = capture_headers_for_log(
+                &session.req_header().headers,
+                &req_allow,
+                cfg.capture_headers.max_value_bytes,
+                cfg.capture_headers.redact_pii,
+                &cfg.capture_headers.redact_pii_rules,
+            );
+            let resp_headers = match session.response_written() {
+                Some(written) => capture_headers_for_log(
+                    &written.headers,
+                    &resp_allow,
+                    cfg.capture_headers.max_value_bytes,
+                    cfg.capture_headers.redact_pii,
+                    &cfg.capture_headers.redact_pii_rules,
+                ),
+                None => std::collections::BTreeMap::new(),
+            };
+            (req_headers, resp_headers)
+        };
+
     let context = AccessLogContext {
         envelope_request_id: ctx.envelope_request_id.map(|u| u.to_string()),
         user_id: ctx.user_id.clone(),
@@ -10442,6 +10588,8 @@ fn emit_access_log(
         license_token_id: None,
         cap_token_id: None,
         upstream_host: None,
+        request_headers,
+        response_headers,
     };
 
     emit_access_log_entry(
@@ -10518,6 +10666,14 @@ struct AccessLogContext {
     cap_token_id: Option<String>,
     /// Resolved upstream host the request was proxied to.
     upstream_host: Option<String>,
+    /// G6.4 captured request headers (lowercased keys, truncated and
+    /// optionally PII-redacted values). Empty when capture is off or
+    /// no allowlisted header was present on the request.
+    request_headers: std::collections::BTreeMap<String, String>,
+    /// G6.4 captured response headers; same semantics as
+    /// `request_headers`. Empty when no response was written (early
+    /// abort) or no allowlisted header was set on the response.
+    response_headers: std::collections::BTreeMap<String, String>,
 }
 
 impl AccessLogContext {
@@ -10557,6 +10713,8 @@ impl AccessLogContext {
             license_token_id: None,
             cap_token_id: None,
             upstream_host: None,
+            request_headers: std::collections::BTreeMap::new(),
+            response_headers: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -10673,6 +10831,8 @@ fn emit_access_log_entry(
         license_token_id: context.license_token_id,
         cap_token_id: context.cap_token_id,
         upstream_host: context.upstream_host,
+        request_headers: context.request_headers,
+        response_headers: context.response_headers,
     };
     entry.emit();
 }
@@ -10705,6 +10865,9 @@ pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<()> {
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config file '{config_path}': {e}"))?;
     let compiled = sbproxy_config::compile_config(&yaml)?;
+    if let Some(al) = compiled.access_log.as_ref() {
+        log_capture_header_warnings(al);
+    }
     let mut new_pipeline = CompiledPipeline::from_config(compiled)?;
 
     // Invoke the enterprise reload hook (best-effort): the OSS reload
@@ -10862,6 +11025,9 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config file '{}': {}", config_path, e))?;
     let compiled = sbproxy_config::compile_config(&yaml)?;
+    if let Some(al) = compiled.access_log.as_ref() {
+        log_capture_header_warnings(al);
+    }
     let port = compiled.server.http_bind_port;
 
     // Extract TLS-relevant fields before compiled is consumed by from_config.
@@ -12290,6 +12456,7 @@ mod tests {
             sample_rate,
             status_codes: vec![],
             methods: vec![],
+            capture_headers: sbproxy_config::CaptureHeadersConfig::default(),
         }
     }
 
@@ -12338,6 +12505,7 @@ mod tests {
             sample_rate: 1.0,
             status_codes: vec![],
             methods: vec![],
+            capture_headers: sbproxy_config::CaptureHeadersConfig::default(),
         };
         let lines = run_with_capture(|| {
             emit_access_log_entry(
@@ -12363,6 +12531,7 @@ mod tests {
             sample_rate: 1.0,
             status_codes: vec![500],
             methods: vec![],
+            capture_headers: sbproxy_config::CaptureHeadersConfig::default(),
         };
         let lines = run_with_capture(|| {
             emit_access_log_entry(
@@ -12402,6 +12571,7 @@ mod tests {
             sample_rate: 1.0,
             status_codes: vec![],
             methods: vec!["POST".to_string()],
+            capture_headers: sbproxy_config::CaptureHeadersConfig::default(),
         };
         let lines = run_with_capture(|| {
             emit_access_log_entry(
