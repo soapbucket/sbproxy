@@ -5,6 +5,19 @@ Go implementation and now live in the archived
 [`soapbucket/sbproxy-go`](https://github.com/soapbucket/sbproxy-go)
 repository.
 
+## [1.0.1] - 2026-05-04
+
+Patch release. No runtime behavior changes.
+
+### Fixed
+
+- **Container image publish**: the `release.yml` workflow's docker
+  prepare step extracted the flat-layout tarballs into `/tmp/`
+  directly, which tripped a sticky-bit `Cannot utime` error on the
+  archive's `./` entry and caused `ghcr.io/soapbucket/sbproxy:1.0.0`
+  to never publish. Each platform tarball now extracts to a per-arch
+  staging dir before the binary moves into the docker context.
+
 ## [1.0.0] - 2026-05-03
 
 First Rust release of SBproxy on this repository.
