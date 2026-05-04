@@ -9,7 +9,7 @@ Each request is forwarded to the primary provider as usual; a copy is also sent 
 ```bash
 export OPENAI_API_KEY=sk-...
 export ANTHROPIC_API_KEY=sk-ant-...
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it
@@ -26,7 +26,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 ```bash
 # Tail the proxy logs to see shadow events. The fire-and-forget mirror
 # never affects the client response status or body.
-sb run -c sb.yml 2>&1 | grep sbproxy_ai_shadow
+sbproxy serve -f sb.yml 2>&1 | grep sbproxy_ai_shadow
 ```
 
 ```bash

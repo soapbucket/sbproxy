@@ -7,7 +7,7 @@ Demonstrates the `security_headers` policy. Every response from the `httpbin.org
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

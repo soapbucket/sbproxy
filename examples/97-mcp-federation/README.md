@@ -9,7 +9,7 @@ The wire format matches the schema published on `www.sbproxy.dev`. The action is
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it
@@ -69,9 +69,18 @@ curl -s -X POST http://127.0.0.1:8080 \
 - `server_info.name` / `server_info.version` - identity returned in MCP `initialize`
 - `federated_servers[].origin` - upstream MCP endpoint (bare hostname or full URL)
 - `federated_servers[].prefix` - namespace applied to the upstream's tools
-- `federated_servers[].rbac` - RBAC label captured for downstream policy enforcement
-- `federated_servers[].timeout` - per-server request budget (`10s`, `500ms`, ...)
 - `guardrails[].type: tool_allowlist` - inline allowlist that short-circuits `tools/call`
+
+### Planned but not yet enforced
+
+These knobs parse but the dispatch layer does not honour them yet. Tracked in [WOR-119](https://linear.app/12345r/issue/WOR-119).
+
+- `federated_servers[].rbac` - per-server RBAC label
+- `federated_servers[].timeout` - per-server request budget
+
+### Caveat: cannot be run end-to-end as-shipped
+
+The federated origins (`github.example.com`, `postgres.example.com`) are RFC 2606 placeholders, not live MCP servers. `tools/list` against this config hits DNS errors. A docker-compose stack with mock MCP servers is tracked in [WOR-123](https://linear.app/12345r/issue/WOR-123).
 
 ## See also
 

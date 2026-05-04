@@ -7,7 +7,7 @@ The gateway publishes an OpenAPI 3.0 document describing the routes it exposes, 
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 The example enables the admin listener on port 9090 (defaults `admin:changeme`) and opts the origin into per-host emission.

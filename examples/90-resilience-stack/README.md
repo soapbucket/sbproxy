@@ -7,7 +7,7 @@ Composes four signals on a single load balancer so a flaky backend gets isolated
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 No setup required. Targets are `httpbin.org` and `httpbingo.org`. Drive failures by hitting `/status/503`; healthy traffic via `/anything` and `/status/200`.

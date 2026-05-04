@@ -8,7 +8,7 @@ A proxy-native pattern: a CEL expression runs at the network layer before any AI
 
 ```bash
 export OPENAI_API_KEY=sk-...
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

@@ -7,7 +7,7 @@ Demonstrates the `sri` policy in observation mode. The proxy walks `text/html` r
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

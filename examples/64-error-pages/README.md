@@ -7,7 +7,7 @@ The origin on `api.local` is protected by API key authentication (`X-Api-Key: se
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

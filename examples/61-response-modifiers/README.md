@@ -7,7 +7,7 @@ Demonstrates the full typed shape of `response_modifiers` across two origins on 
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

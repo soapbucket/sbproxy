@@ -9,7 +9,7 @@ Forward-looking config notes: `lb_method: plugin` and `strategy: lora-aware` are
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 No setup required. The targets in this example are illustrative URLs (`upstream-{0,1,2}.ai.internal:8443`); swap them for your real model-serving replicas. The `metadata.loaded_adapters` arrays are hand-pinned in this YAML; the production live-feed path that populates them from a sidecar's adapter inventory is GPU-aware's sibling work.

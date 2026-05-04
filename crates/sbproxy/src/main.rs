@@ -68,12 +68,27 @@ fn main() {
         return;
     }
 
-    // --- `sbproxy validate <path>` subcommand ---
+    // --- `sbproxy validate <path>` subcommand (alias: `--check`) ---
     //
     // Parse and compile the config without starting the proxy. Useful in
     // CI to fail fast on a bad sb.yml before deploying.
-    if matches!(args.get(1).map(String::as_str), Some("validate")) {
-        match handle_validate_subcommand(&args[2..]) {
+    //
+    // The `--check` form is documented in SUPPLY-CHAIN.md as a CI-friendly
+    // verification step (`./sbproxy --config /path --check`); it dispatches
+    // to the same handler as `validate <path>`.
+    if matches!(args.get(1).map(String::as_str), Some("validate"))
+        || args.iter().any(|a| a == "--check")
+    {
+        // For the `--check` form, strip --check from the argv so the
+        // existing parser sees only `--config <path>` (or `-f <path>`,
+        // or a positional path).
+        let filtered: Vec<String> = args
+            .iter()
+            .skip(1)
+            .filter(|a| a.as_str() != "--check" && a.as_str() != "validate")
+            .cloned()
+            .collect();
+        match handle_validate_subcommand(&filtered) {
             Ok(()) => return,
             Err(e) => {
                 eprintln!("validate: {e:#}");
@@ -192,6 +207,7 @@ USAGE:
     sbproxy --config <path>
     sbproxy serve -f <path> [--log-level <level>]
     sbproxy validate <path>
+    sbproxy --config <path> --check
     sbproxy projections render --kind {robots|llms|llms-full|licenses|tdmrep} \\
                                --config <path> [--hostname <h>]
     sbproxy --version

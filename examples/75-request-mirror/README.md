@@ -7,7 +7,7 @@ Every request matched by `localhost` is forwarded to the primary upstream `httpb
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

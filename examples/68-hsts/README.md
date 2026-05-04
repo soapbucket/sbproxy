@@ -7,7 +7,7 @@ The `hsts` block on `secure.local` injects a `Strict-Transport-Security` header 
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

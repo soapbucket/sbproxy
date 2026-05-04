@@ -7,7 +7,7 @@ Per-tenant rate limiting keyed on a JWT claim. The `rate_limiting` policy on `ap
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 You can mint test JWTs with any HS256 toolchain. The signature is irrelevant here since this policy reads claims without verifying them.

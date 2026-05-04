@@ -7,7 +7,7 @@ When the proxy cannot establish a TCP/TLS connection to the upstream (DNS failur
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 The upstream URL `http://127.0.0.1:9999` deliberately points at a closed port so you can observe the retry behaviour.

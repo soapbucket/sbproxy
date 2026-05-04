@@ -7,7 +7,7 @@ Demonstrates the `html` transform on a real upstream. The proxy fetches `https:/
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

@@ -7,7 +7,7 @@ The successor to the v1 `prompt_injection` heuristic guardrail. The v2 policy sp
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 The example wires three hostnames (`tag.local`, `block.local`, `log.local`) so you can see all three actions side by side. To swap to a probabilistic detector that an enterprise build may register, set `detector: onnx-deberta` and provide the model via `SBPROXY_ONNX_MODEL` (see example 100).

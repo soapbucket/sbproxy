@@ -7,7 +7,7 @@ Every lifecycle webhook the proxy fires (`on_request`, `on_response`) carries a 
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 The receiver URL `https://hooks.example.com/sbproxy` is illustrative. Point it at your own server (e.g. RequestBin, ngrok, a Cloud Function) to inspect the envelope and verify the signature.

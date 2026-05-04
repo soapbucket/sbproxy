@@ -9,7 +9,7 @@ Three independent resilience signals run on the AI provider pool. Any one can ej
 ```bash
 export OPENAI_API_KEY=sk-...
 export ANTHROPIC_API_KEY=sk-ant-...
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it
@@ -26,8 +26,8 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 # Watch provider health metrics. With OpenAI returning 503s, the breaker
 # trips Open within 5 consecutive failures and traffic shifts entirely
 # to Anthropic until the open duration elapses.
-curl -s http://127.0.0.1:8080/__sbproxy/metrics 2>/dev/null \
-  | grep -E 'ai_provider_(state|requests|failures)'
+curl -s http://127.0.0.1:8080/metrics 2>/dev/null \
+  | grep -E 'sbproxy_ai_(requests|failovers|request_duration)'
 ```
 
 ```bash

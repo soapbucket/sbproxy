@@ -7,7 +7,7 @@ Demonstrates the `concurrent_limit` policy. The limiter caps the number of in-fl
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 No setup required. The example caps in-flight requests at 3 per client IP and routes overflow to a 503 with a JSON body.

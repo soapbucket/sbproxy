@@ -7,7 +7,7 @@ Each origin owns its own redirect list, compiled at config-load into an O(1) loo
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 The `redirects.csv` file lives next to `sb.yml`. Lines starting with `#` and blank lines are skipped.

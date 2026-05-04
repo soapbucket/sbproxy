@@ -7,7 +7,7 @@ Two siblings of `action.url` change how the proxy reaches the upstream without t
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 This config points at a synthetic IP (`203.0.113.7`) so the request will not actually succeed; the example documents the wire-level behaviour rather than a working roundtrip.

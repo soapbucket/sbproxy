@@ -7,7 +7,7 @@ The proxy mints a per-request correlation ID early in the request lifecycle. Wit
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

@@ -9,7 +9,7 @@ The `variables` block declares static, per-origin key-value pairs that the templ
 ```bash
 # Export the env var that the {{ env.* }} placeholder reads at config-load.
 export DEPLOY_REGION=us-east-1
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it
@@ -28,7 +28,7 @@ curl -s -H 'Host: api.local' http://127.0.0.1:8080/headers | jq .headers
 # }
 
 # Change DEPLOY_REGION and restart to see {{ env.DEPLOY_REGION }} pick up the new value.
-DEPLOY_REGION=eu-west-1 sb run -c sb.yml
+DEPLOY_REGION=eu-west-1 sbproxy serve -f sb.yml
 ```
 
 ## What this exercises

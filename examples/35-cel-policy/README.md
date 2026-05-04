@@ -7,7 +7,7 @@ Demonstrates the `expression` policy, which evaluates a CEL expression per reque
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

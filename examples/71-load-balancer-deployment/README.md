@@ -7,7 +7,7 @@ A blue-green deployment split across two LB targets. The targets carry `group: b
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

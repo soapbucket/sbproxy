@@ -7,7 +7,7 @@ Demonstrates the `circuit_breaker` block on a `load_balancer` action. The breake
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 No setup required. Targets are `httpbin.org` and `httpbingo.org`; you can simulate failures by directing `/status/<code>` paths through one of them.

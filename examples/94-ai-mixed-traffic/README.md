@@ -8,7 +8,7 @@ Pure AI gateway libraries assume the host is "the AI gateway" and that everythin
 
 ```bash
 export OPENAI_API_KEY=sk-...
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

@@ -14,39 +14,42 @@ No external services or env vars required. `test.sbproxy.dev` is a public endpoi
 
 ## Try it
 
+`test.sbproxy.dev` exposes three endpoints we can hit through the proxy: `/echo` (echoes the request back as JSON), `/health` (liveness), and `/status/<code>` (returns the requested HTTP status).
+
 ```bash
-$ curl -s -H 'Host: myapp.example.com' http://127.0.0.1:8080/get
+$ curl -s -H 'Host: myapp.example.com' http://127.0.0.1:8080/echo
 {
-  "args": {},
-  "headers": {
-    "Host": "test.sbproxy.dev",
-    "User-Agent": "curl/8.4.0",
-    "X-Forwarded-For": "127.0.0.1",
-    "X-Forwarded-Proto": "http"
-  },
   "method": "GET",
-  "url": "https://test.sbproxy.dev/get"
-}
-```
-
-```bash
-$ curl -s -H 'Host: myapp.example.com' http://127.0.0.1:8080/headers
-{
+  "url": "/echo",
   "headers": {
-    "Accept": "*/*",
-    "Host": "test.sbproxy.dev",
-    "User-Agent": "curl/8.4.0",
-    "X-Forwarded-For": "127.0.0.1"
-  }
+    "host": "test.sbproxy.dev",
+    "user-agent": "curl/8.4.0",
+    "x-forwarded-for": "127.0.0.1",
+    "x-forwarded-proto": "http"
+  },
+  "query": {},
+  "timestamp": "..."
 }
 ```
 
 ```bash
-$ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: unknown.example.com' http://127.0.0.1:8080/get
+$ curl -s -H 'Host: myapp.example.com' http://127.0.0.1:8080/health
+{"status":"ok","service":"test.sbproxy.dev","timestamp":"..."}
+```
+
+```bash
+$ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: myapp.example.com' http://127.0.0.1:8080/status/404
 404
 ```
 
-A `Host` header that does not match any configured origin is rejected with a 404.
+The proxy faithfully forwards whatever status the upstream emits, including 4xx/5xx.
+
+```bash
+$ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: unknown.example.com' http://127.0.0.1:8080/echo
+404
+```
+
+A `Host` header that does not match any configured origin is rejected by the proxy itself with a 404.
 
 ## What this exercises
 

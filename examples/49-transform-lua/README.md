@@ -7,7 +7,7 @@ Demonstrates the `lua_json` transform. The script entrypoint is `function modify
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

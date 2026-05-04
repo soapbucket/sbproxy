@@ -49,7 +49,7 @@ $ curl -is http://127.0.0.1:8080/v1/chat/completions \
 HTTP/1.1 400 Bad Request
 content-type: application/json
 
-{"error":{"message":"input guardrail blocked: injection","type":"guardrail_violation"}}
+{"error":{"message":"Prompt injection detected: matched pattern \"...\"","type":"guardrail_violation","code":"injection"}}
 ```
 
 PII in the prompt also blocks:

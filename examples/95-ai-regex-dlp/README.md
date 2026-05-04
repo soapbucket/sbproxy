@@ -8,7 +8,7 @@ Built-in PII detection covers the obvious patterns (email, phone, SSN, credit ca
 
 ```bash
 export OPENAI_API_KEY=sk-...
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

@@ -7,7 +7,7 @@ The `ai_crawl_control` policy returns HTTP 402 Payment Required to known AI craw
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 No setup required. Example seeds three single-use tokens and matches the standard AI crawler list (GPTBot, ChatGPT-User, ClaudeBot, anthropic-ai, Google-Extended, PerplexityBot, CCBot).
@@ -43,9 +43,12 @@ curl -i -H 'Host: blog.local' \
 ```
 
 ```bash
-# Normal browser UA - passes through without paying.
+# Normal browser UA - passes through without paying. We hit /get
+# rather than /article because the upstream (httpbin.org) only
+# implements the former; this confirms the proxy is forwarding
+# correctly when no payment challenge fires.
 curl -s -o /dev/null -w "%{http_code}\n" \
-     -H 'Host: blog.local' http://127.0.0.1:8080/article
+     -H 'Host: blog.local' http://127.0.0.1:8080/get
 # 200
 ```
 

@@ -10,7 +10,7 @@ Cryptographic agent verification under RFC 9421 HTTP Message Signatures and the 
 export OPENAI_BOT_PUBKEY=...        # 32-byte ed25519 pubkey, hex or base64
 export ANTHROPIC_BOT_PUBKEY=...
 export PERPLEXITY_BOT_PUBKEY=...
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 The directory is populated from environment variables here. Production deployments typically materialise these from a vault or a hosted directory.
@@ -25,22 +25,42 @@ curl -i -H 'Host: blog.local' http://127.0.0.1:8080/article
 ```
 
 ```bash
-# Signed request from a verified bot - 200. The Signature-Input
-# header names the keyid and the covered components; the Signature
-# header carries the base64 ed25519 signature. See the bot_auth unit
-# tests for the canonical request format.
+# Signed request from a verified bot - 200. Generate the signature
+# headers with the bundled signer (see ./bin/sign-request.sh):
+openssl genpkey -algorithm ed25519 -out openai-bot.pem
+# Paste the public key (as hex) into the matching `public_key:` field
+# in sb.yml so the directory entry verifies signatures from this key:
+openssl pkey -in openai-bot.pem -pubout -outform DER | tail -c 32 | xxd -p -c 64
+
+# Sign a request and pipe the headers into curl:
+eval $(./bin/sign-request.sh \
+        --key openai-bot.pem \
+        --keyid openai-2026-01 \
+        --method GET \
+        --target-uri http://127.0.0.1:8080/article \
+        --authority blog.local)
 curl -i -H 'Host: blog.local' \
-     -H 'Signature-Input: sig1=("@method" "@target-uri" "@authority");keyid="openai-2026-01";created=1710000000;alg="ed25519"' \
-     -H 'Signature: sig1=:BASE64_SIG_BYTES:' \
+     -H "Signature-Input: $SIG_INPUT" \
+     -H "Signature: $SIG" \
      http://127.0.0.1:8080/article
+# HTTP/1.1 200 OK
 ```
 
 ```bash
-# Signature with a keyid not in the directory - 401.
+# Signature with a keyid not in the directory - 401. Reuse the signer
+# but pass an unknown keyid; the verifier rejects on directory miss
+# before even checking the signature.
+eval $(./bin/sign-request.sh \
+        --key openai-bot.pem \
+        --keyid not-in-directory \
+        --method GET \
+        --target-uri http://127.0.0.1:8080/article \
+        --authority blog.local)
 curl -i -H 'Host: blog.local' \
-     -H 'Signature-Input: sig1=("@method" "@target-uri");keyid="unknown-key";created=1710000000;alg="ed25519"' \
-     -H 'Signature: sig1=:BASE64_SIG_BYTES:' \
+     -H "Signature-Input: $SIG_INPUT" \
+     -H "Signature: $SIG" \
      http://127.0.0.1:8080/article
+# HTTP/1.1 401 Unauthorized
 ```
 
 ## What this exercises

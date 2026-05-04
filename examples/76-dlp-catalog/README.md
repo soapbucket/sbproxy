@@ -7,7 +7,7 @@ The `dlp` policy scans the request URI and headers for matches against the confi
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

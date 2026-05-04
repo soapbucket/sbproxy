@@ -7,7 +7,7 @@ Demonstrates the `json` transform. The upstream is a `static` action that return
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

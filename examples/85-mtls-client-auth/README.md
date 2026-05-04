@@ -8,7 +8,7 @@ Demonstrates mutual TLS at the listener. Incoming HTTPS clients must present a c
 
 ```bash
 bash examples/85-mtls-client-auth/generate-certs.sh
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 The bootstrap script writes a self-signed CA, a server cert (CN=localhost, SAN includes 127.0.0.1), and a client cert (CN=alice@example.com, SAN includes alice.local) into `examples/85-mtls-client-auth/certs/`. Re-run it whenever the certs expire (one year by default).

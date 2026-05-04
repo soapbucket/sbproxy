@@ -7,7 +7,7 @@ Demonstrates the `request_limit` policy. Caps the request body at `1024` bytes, 
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

@@ -7,7 +7,7 @@ Layered authentication, authorisation, and inspection on a single origin. The ch
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 No setup required. The example uses an HMAC JWT with a placeholder secret; replace `secret`, `audience`, and `issuer` for a real deployment.

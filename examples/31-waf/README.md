@@ -7,7 +7,7 @@ Demonstrates the `waf` policy with the OWASP Core Rule Set enabled. Each request
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

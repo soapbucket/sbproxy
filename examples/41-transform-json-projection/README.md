@@ -7,7 +7,7 @@ Demonstrates the `json_projection` transform in whitelist mode. Only the listed 
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

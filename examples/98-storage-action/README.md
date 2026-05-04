@@ -10,7 +10,7 @@ The `storage` action serves files from object storage backends. It is backed by 
 mkdir -p /tmp/sbproxy-static
 echo '<h1>hello from storage</h1>' > /tmp/sbproxy-static/index.html
 echo 'body { background: #eee; }' > /tmp/sbproxy-static/site.css
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 To switch the example to an S3-style backend, set `AWS_REGION`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY`, then change the action to `backend: s3`, `bucket: <name>`, `prefix: <path>`, `region: <region>`.

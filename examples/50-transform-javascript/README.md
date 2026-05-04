@@ -7,7 +7,7 @@ Demonstrates the `javascript` transform via QuickJS. The entrypoint is `function
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

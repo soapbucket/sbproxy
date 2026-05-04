@@ -7,7 +7,7 @@ Demonstrates the `ddos_protection` policy. The proxy tracks a sliding 1-second w
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

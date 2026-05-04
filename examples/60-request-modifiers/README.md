@@ -7,7 +7,7 @@ Demonstrates the full typed shape of `request_modifiers`. On the way to the upst
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

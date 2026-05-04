@@ -7,7 +7,7 @@ Demonstrates the `encoding` transform. A `static` action returns a small JSON do
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

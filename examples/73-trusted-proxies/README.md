@@ -7,7 +7,7 @@ When sbproxy sits behind another LB or CDN (Cloudflare, AWS ALB, Fly.io edge, in
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

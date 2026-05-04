@@ -7,7 +7,7 @@ Demonstrates the `ip_filter` policy. Only requests from the loopback range `127.
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 No setup required. Local curl traffic always lands on `127.0.0.1`, which sits inside the whitelist, so the happy path works out of the box. To see the deny path, narrow the whitelist to a CIDR that excludes your client.

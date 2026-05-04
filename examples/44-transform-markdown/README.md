@@ -7,7 +7,7 @@ Demonstrates the `markdown` transform. A `static` action returns a Markdown rele
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

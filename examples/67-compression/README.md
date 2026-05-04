@@ -7,7 +7,7 @@ Enables response compression on `api.local` for brotli, gzip, and zstd. The firs
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

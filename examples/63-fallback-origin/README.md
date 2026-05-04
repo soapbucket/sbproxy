@@ -7,7 +7,7 @@ The primary action proxies to `httpbin.org/status/503`, which always returns 503
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 The primary upstream `httpbin.org/status/503` is reachable from the public internet, so no local backend is needed.

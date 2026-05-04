@@ -32,6 +32,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [config-stability.md](config-stability.md) - field stability guarantees and versioning.
 - [enterprise.md](enterprise.md) - what the enterprise tier adds on top of the OSS data plane and how to request access.
 - [glossary.md](glossary.md) - wave codes, work-stream prefixes, and SBproxy vocabulary.
+- [headers-reference.md](headers-reference.md) - every response header the proxy can emit, with the config that triggers it.
 - [metrics-stability.md](metrics-stability.md) - Prometheus metric naming and stability.
 - [comparison.md](comparison.md) - how SBproxy compares to other proxies and AI gateways.
 - [wave-history.md](wave-history.md) - retroactive narrative of the seven roadmap waves.

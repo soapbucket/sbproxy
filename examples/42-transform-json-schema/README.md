@@ -7,7 +7,7 @@ Demonstrates the `json_schema` transform. The upstream JSON response body is val
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

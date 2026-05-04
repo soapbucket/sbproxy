@@ -7,7 +7,7 @@ Demonstrates the `template` transform. A `static` action emits a JSON document d
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

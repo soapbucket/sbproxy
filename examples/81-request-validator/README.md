@@ -7,7 +7,7 @@ The `request_validator` policy on `localhost` validates inbound JSON request bod
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

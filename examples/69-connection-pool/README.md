@@ -7,7 +7,7 @@ The `connection_pool` block on `api.local` sizes the proxy's outbound HTTP clien
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

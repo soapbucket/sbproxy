@@ -8,7 +8,7 @@ When `pii.enabled: true` is set on an AI proxy origin, the gateway redacts well-
 
 ```bash
 export OPENAI_API_KEY=...
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 The example points the OpenAI provider at `https://httpbin.org/anything` so you can see the exact body the upstream would have received, with PII already redacted.

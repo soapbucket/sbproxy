@@ -7,7 +7,7 @@ The proxy injects a standard set of forwarding headers on every upstream request
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

@@ -7,7 +7,7 @@ Demonstrates the `replace_strings` transform. Two find-and-replace rules run aga
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

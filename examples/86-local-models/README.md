@@ -10,7 +10,7 @@ Routes cheap traffic to a locally-hosted model (Ollama, vLLM, LM Studio, Hugging
 ollama serve &
 ollama pull llama3.1
 export OPENAI_API_KEY=sk-...
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 Set `OPENAI_API_KEY` so the cloud fallback works. If you do not have a local runtime yet, the request still succeeds because the chain falls through to OpenAI on connect failure.

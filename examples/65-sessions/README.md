@@ -7,7 +7,7 @@ The `session` block on `app.local` configures the encrypted cookie used to carry
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

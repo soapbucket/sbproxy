@@ -7,7 +7,7 @@ Demonstrates the `payload_limit` transform. The proxy fetches `https://httpbin.o
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

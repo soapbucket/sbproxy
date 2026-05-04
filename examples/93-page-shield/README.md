@@ -7,7 +7,7 @@ Client-side script monitoring via Content Security Policy report intake. The `pa
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 The example serves a small static HTML page so you can see the CSP header without a real upstream.
@@ -32,7 +32,7 @@ curl -i -X POST http://127.0.0.1:8080/__sbproxy/csp-report \
 
 ```bash
 # Tail the proxy logs to see the structured report event.
-sb run -c sb.yml 2>&1 | grep sbproxy::page_shield
+sbproxy serve -f sb.yml 2>&1 | grep sbproxy::page_shield
 ```
 
 ## What this exercises

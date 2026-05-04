@@ -7,7 +7,7 @@ A single origin on `gateway.local` dispatches incoming requests to three differe
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 The proxy binds to `127.0.0.1:8080`. Use the `Host: gateway.local` header to land on this origin.

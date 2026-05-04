@@ -7,7 +7,7 @@ Demonstrates `service_discovery` on a `proxy` action. Without service discovery,
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 No setup required. The example points at `httpbin.org` so the rotation happens against whatever IPs that host advertises.

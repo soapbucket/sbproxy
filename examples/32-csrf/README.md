@@ -7,7 +7,7 @@ Demonstrates the `csrf` policy. Safe methods (`GET`, `HEAD`, `OPTIONS`) are exem
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

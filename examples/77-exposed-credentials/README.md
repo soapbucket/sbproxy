@@ -7,7 +7,7 @@ When a request carries `Authorization: Basic <base64>` whose password matches th
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

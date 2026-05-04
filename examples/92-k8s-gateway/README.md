@@ -7,7 +7,7 @@ Realistic config when SBproxy runs behind a Kubernetes Ingress (or any cluster-e
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 In a real K8s deployment the Operator generates this YAML from a `Gateway` and `HTTPRoute` pair. The example uses `httpbin.org` as a stand-in for the cluster Service so it runs locally; the inline comments show the Service DNS name (`backend.namespace.svc.cluster.local:8080`) that production configs use.

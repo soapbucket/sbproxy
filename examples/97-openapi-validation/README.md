@@ -7,7 +7,7 @@ The `openapi_validation` policy loads an inline OpenAPI document at startup and 
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 The example serves a static `{"ok":true}` response for any path that passes validation, so you can exercise the policy without a real backend.

@@ -7,7 +7,7 @@ By default the proxy sends the upstream URL's hostname in the upstream `Host` he
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

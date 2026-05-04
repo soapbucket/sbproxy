@@ -7,7 +7,7 @@ A round-robin load balancer with two targets: `httpbin.org` and `httpbingo.org`.
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it

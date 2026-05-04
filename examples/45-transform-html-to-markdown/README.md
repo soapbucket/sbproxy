@@ -7,7 +7,7 @@ Demonstrates the `html_to_markdown` transform. The proxy fetches `https://httpbi
 ## Run
 
 ```bash
-sb run -c sb.yml
+sbproxy serve -f sb.yml
 ```
 
 ## Try it
