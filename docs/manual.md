@@ -217,7 +217,13 @@ later wave but are not honoured by the v1.0 binary:
 
 ### CPU detection
 
-SBproxy sizes its Pingora worker pool to `std::thread::available_parallelism()`, which honours cgroup CPU quotas on Linux. In a container with a 2-CPU quota, the proxy spawns workers that match the actual available CPU capacity instead of getting throttled. There is no environment-variable override at v1.0; if you need to pin the worker count for benchmarking, build a fork that hard-codes `threads:` in `crates/sbproxy-core/src/server.rs`.
+SBproxy sizes its Pingora worker pool to `std::thread::available_parallelism()`, which honours cgroup CPU quotas on Linux. In a container with a 2-CPU quota, the proxy spawns workers that match the actual available CPU capacity instead of getting throttled. To override (pin a benchmark to a known worker count, or cap workers below the cgroup quota), set `SB_WORKER_THREADS` to a positive integer:
+
+```bash
+SB_WORKER_THREADS=4 sbproxy --config sb.yml
+```
+
+Values that are not positive integers are ignored and the auto-detected value is used. There is no equivalent CLI flag; this is an environment-only knob because it is rarely changed and its right value is deployment-shape-specific.
 
 In environments without cgroup CPU quotas (bare metal, macOS), the proxy falls back to the number of logical CPUs as reported by the OS.
 
@@ -468,73 +474,75 @@ otel:
 
 ## 6. Health checks
 
-SBproxy exposes multiple health endpoints. All responses are `application/json`.
+SBproxy exposes three probe endpoints, each with a bare alias. All
+responses are `application/json` and unauthenticated. Endpoints are
+served from the embedded admin listener, alongside `/metrics`.
 
 ### Endpoints
 
-| Endpoint | Purpose | Success | Failure |
-|----------|---------|---------|---------|
-| `/health` | Full status with component checks | `200` | `503` |
-| `/healthz` | Dependency status (cached 5s) | `200` | `503` |
-| `/ready` | Simple readiness flag | `200` | `503` |
-| `/readyz` | Readiness with dependency checks | `200` | `503` |
-| `/live` | Simple liveness flag | `200` | `503` |
-| `/livez` | Always-alive check for K8s | `200` | never |
+| Endpoint        | Aliases    | Purpose                | Success | Failure |
+|-----------------|-----------|-------------------------|---------|---------|
+| `/livez`        | `/live`   | Liveness; process is up  | `200`   | never   |
+| `/readyz`       | `/ready`  | Readiness; ready to serve | `200`   | `503`   |
+| `/healthz`      | `/health` | Liveness alias           | `200`   | never   |
 
-Health endpoints live on the main proxy port, alongside `/metrics`. In most deployments, point K8s readiness probes at `/readyz` and liveness probes at `/livez`.
+The bare aliases (`/live`, `/ready`, `/health`) return identical bodies
+to their `z`-suffixed counterparts. K8s readiness probes should hit
+`/readyz`; K8s liveness probes should hit `/livez`.
 
-### /health response
+### `/livez`
 
-```json
-{
-  "status": "ok",
-  "timestamp": "2026-04-08T12:00:00Z",
-  "version": "0.1.0",
-  "build_hash": "abc1234",
-  "uptime": "3h42m15s",
-  "checks": {
-    "redis": "ok",
-    "config_store": "ok"
-  }
-}
-```
-
-Status values: `"ok"`, `"degraded"` (200), `"error"` (503).
-
-### /readyz response
-
-Returns `200` with `{"ready": true}` when the service is fully initialized and all critical dependencies are reachable. Returns `503` during startup, during shutdown, or when a critical dependency is unreachable after the 30-second startup grace period.
-
-```json
-{"ready": true}
-```
-
-Failure:
-
-```json
-{
-  "ready": false,
-  "reason": "dependency_failure",
-  "failed_deps": {"redis": "error"}
-}
-```
-
-During shutdown:
-
-```json
-{
-  "ready": false,
-  "reason": "shutting_down"
-}
-```
-
-### /livez response
-
-Returns `200` as long as the process is running. Wire this up to K8s liveness probes; it never returns `503` under normal conditions.
+Returns `200` as long as the binary is running, regardless of registry
+state. Used for "should I restart this pod?". The body is intentionally
+a single field so a load balancer can pattern-match it cheaply.
 
 ```json
 {"alive": true}
 ```
+
+### `/healthz`
+
+Pure liveness. Returns `200` with body `{"status":"ok"}` whenever the
+binary is running.
+
+```json
+{"status": "ok"}
+```
+
+### `/readyz`
+
+Walks the registered component readiness probes (TLS, ACME, AI
+provider catalog, ML classifier, ledger client, etc.) and returns
+`200` only when every probe reports ready. The body carries a
+per-component breakdown so a dashboard can surface which component
+failed:
+
+```json
+{
+  "status": "ok",
+  "components": {
+    "tls": {"status": "ready"},
+    "acme": {"status": "ready"}
+  }
+}
+```
+
+When a component is not ready, the envelope's `status` flips to
+`"unready"` and the response is `503`:
+
+```json
+{
+  "status": "unready",
+  "components": {
+    "tls": {"status": "ready"},
+    "acme": {"status": "unready", "detail": "cert renewal pending"}
+  }
+}
+```
+
+The set of components depends on which features the live config
+enabled; an OSS deployment with no ACME has only the always-on probes
+in the registry.
 
 ### Load balancer target health checks
 
@@ -919,27 +927,36 @@ curl "https://api.example.com/endpoint?_sb.debug&_sb.no-cache"
 
 ### Using flags in CEL expressions
 
+The `features` namespace exposes the parsed flags. Built-ins are
+booleans; extra `key=value` pairs are strings. Hyphenated keys like
+`no-cache` need bracket access because hyphens are not valid CEL
+identifiers:
+
 ```yaml
-request_rules:
-  - match: 'features["debug"] == ""'
-    action: allow
+policies:
+  - type: expression
+    expression: 'features.debug == false'
+    deny_status: 403
 ```
 
-### Using flags in Lua scripts
+Available accessors:
 
-```lua
-function match_request(req, ctx)
-  local flags = ctx.features or {}
-  if flags["debug"] ~= nil then
-    ctx.log("debug mode active")
-  end
-  return true
-end
-```
+| CEL              | Type   | Meaning |
+|------------------|--------|---------|
+| `features.debug`     | bool   | `x-sb-flags: debug` or `?_sb.debug`. |
+| `features.trace`     | bool   | `x-sb-flags: trace` or `?_sb.trace`. |
+| `features["no-cache"]` | bool | `x-sb-flags: no-cache` or `?_sb.no-cache`. |
+| `features.any_set`   | bool   | True when any flag (built-in or extra) is set. |
+| `features["env"]`, etc. | string | Free-form `k=v` pairs from the header / query. Empty string when not provided. |
 
-### Workspace-level feature flags
+When the kill switch (`--disable-sb-flags` / `SB_DISABLE_SB_FLAGS=1`)
+is engaged, all built-ins read `false` and `extra` is empty.
 
-Workspace-level flags are managed via the messenger pub/sub system and cached in memory. They are distinct from per-request flags: they are persistent configuration toggles for a workspace, set and managed through the SBproxy management API, and not exposed to end clients.
+### Workspace-level feature flags (planned)
+
+Workspace-level flags via messenger pub/sub are documented in earlier
+release notes. They are not implemented in v1.0; only per-request
+header / query parsing is wired today.
 
 ---
 
@@ -1260,6 +1277,8 @@ Variables are applied at process start; changes require a restart.
 | `SB_CONFIG_FILE` | `-f`, `--config` | (empty) | Path to `sb.yml`. Required if no flag and no positional arg. |
 | `SB_LOG_LEVEL` | `--log-level` | `info` | Filter for `tracing-subscriber`. Wins over `RUST_LOG`. |
 | `SB_GRACE_TIME` | `--grace-time` | `0` | Pingora grace period and shutdown timeout in seconds. |
+| `SB_WORKER_THREADS` | (none) | (auto) | Override the auto-detected Pingora worker thread count. Positive integers only. |
+| `SB_DISABLE_SB_FLAGS` | `--disable-sb-flags` | `false` | Lock off the per-request `x-sb-flags` surface. Accepts `1`, `true`, `yes`, `on`. |
 
 In addition, the standard `RUST_LOG` env var is honoured when neither
 `--log-level` nor `SB_LOG_LEVEL` is set.

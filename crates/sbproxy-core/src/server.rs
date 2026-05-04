@@ -1762,7 +1762,8 @@ enum PolicyResult {
 /// caller can fall back to the default IP-based key.
 fn rate_limit_key_from_cel(session: &Session, ctx: &RequestContext, expr: &str) -> Option<String> {
     use sbproxy_extension::cel::context::{
-        build_request_context, populate_envelope_namespace, EnvelopeView,
+        build_request_context, populate_envelope_namespace, populate_features_namespace,
+        EnvelopeView, FeatureFlagsView,
     };
     use sbproxy_extension::cel::{CelEngine, CelValue};
 
@@ -1795,6 +1796,15 @@ fn rate_limit_key_from_cel(session: &Session, ctx: &RequestContext, expr: &str) 
         properties: Some(&ctx.properties),
     };
     populate_envelope_namespace(&mut cel_ctx, &envelope);
+    // WOR-114 Phase 2: expose `x-sb-flags` parsed flags so CEL
+    // rate-limit keys can branch on `features.debug` etc.
+    let features = FeatureFlagsView {
+        debug: ctx.flags.debug,
+        trace: ctx.flags.trace,
+        no_cache: ctx.flags.no_cache,
+        extra: &ctx.flags.extra,
+    };
+    populate_features_namespace(&mut cel_ctx, &features);
 
     let engine = CelEngine::new();
     let value = match engine.eval_source(expr, &cel_ctx) {
@@ -2595,10 +2605,17 @@ async fn check_policies(
                     sbproxy_extension::cel::context::MlClassificationView<'_>,
                 > = None;
 
+                let features_view = sbproxy_extension::cel::context::FeatureFlagsView {
+                    debug: ctx.flags.debug,
+                    trace: ctx.flags.trace,
+                    no_cache: ctx.flags.no_cache,
+                    extra: &ctx.flags.extra,
+                };
                 let views = sbproxy_modules::ExpressionViews {
                     aipref: ctx.aipref.as_ref(),
                     kya: kya_view,
                     ml: ml_view,
+                    features: Some(features_view),
                 };
                 if !p.evaluate_with_views(
                     method,
@@ -11255,10 +11272,22 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
+    // Worker thread count. `SB_WORKER_THREADS` (when a positive
+    // integer) overrides the auto-detected value; otherwise we use
+    // `std::thread::available_parallelism()`, which honours cgroup
+    // CPU quotas on Linux. Useful for benchmarks pinning to a known
+    // worker count, or for containers where the operator wants to
+    // cap the pool below the cgroup quota.
+    let auto_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let threads = std::env::var("SB_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(auto_threads);
     let conf = PingoraServerConf {
-        threads: std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
+        threads,
         upstream_keepalive_pool_size: 256,
         upstream_connect_offload_threadpools: Some(2),
         grace_period_seconds: Some(grace_seconds),
