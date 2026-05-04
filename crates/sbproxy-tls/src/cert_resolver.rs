@@ -138,6 +138,33 @@ impl CertResolver {
         self.fallback.store(Arc::new(Some(Arc::new(certified_key))));
     }
 
+    /// Replace the fallback cert's stapled OCSP response.
+    ///
+    /// Called by the OCSP refresh task on every successful fetch:
+    /// rebuilds the fallback `CertifiedKey` with `ocsp = Some(bytes)`
+    /// so the next TLS handshake staples the fresh response. No-op
+    /// when no fallback cert is loaded; the OCSP task should not
+    /// have started in that case, but we tolerate the race rather
+    /// than panic.
+    ///
+    /// Cost: clones `Vec<CertificateDer>` (typically 2-4 entries)
+    /// and `Arc<dyn SigningKey>` once per refresh (every 12h by
+    /// default). The hot resolve() path is untouched.
+    pub fn update_fallback_ocsp(&self, ocsp: Vec<u8>) {
+        let current = self.fallback.load_full();
+        let Some(arc_ck) = current.as_ref().as_ref() else {
+            // No fallback cert; nothing to staple to.
+            return;
+        };
+        let new_ck = CertifiedKey {
+            cert: arc_ck.cert.clone(),
+            key: arc_ck.key.clone(),
+            ocsp: Some(ocsp),
+        };
+        self.fallback.store(Arc::new(Some(Arc::new(new_ck))));
+        debug!("fallback cert OCSP response updated");
+    }
+
     /// Build a [`ServerConfig`] that uses this resolver for SNI-based cert selection.
     ///
     /// ALPN protocols are set to `["h3", "h2", "http/1.1"]` for HTTP/3 and HTTP/2 support.
@@ -360,5 +387,39 @@ mod tests {
             config.alpn_protocols.iter().any(|p| p == b"h3"),
             "h3 should be in ALPN protocols"
         );
+    }
+
+    #[test]
+    fn update_fallback_ocsp_writes_bytes_to_certified_key() {
+        let resolver = CertResolver::new();
+        let (cert_pem, key_pem) = generate_self_signed("ocsp.local");
+        let ck = load_certified_key(&cert_pem, &key_pem).unwrap();
+        resolver.set_fallback(ck);
+
+        // Before update: ocsp is None.
+        let before = resolver.fallback.load_full();
+        let before_ck = before.as_ref().as_ref().unwrap();
+        assert!(
+            before_ck.ocsp.is_none(),
+            "fresh fallback cert should have no OCSP response"
+        );
+
+        // After update: ocsp is Some(bytes).
+        let dummy = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        resolver.update_fallback_ocsp(dummy.clone());
+        let after = resolver.fallback.load_full();
+        let after_ck = after.as_ref().as_ref().unwrap();
+        assert_eq!(after_ck.ocsp.as_ref(), Some(&dummy));
+
+        // Cert chain and key are preserved (only ocsp changed).
+        assert_eq!(after_ck.cert.len(), before_ck.cert.len());
+    }
+
+    #[test]
+    fn update_fallback_ocsp_is_noop_without_fallback_cert() {
+        // No fallback set; update should not panic.
+        let resolver = CertResolver::new();
+        resolver.update_fallback_ocsp(vec![1, 2, 3]);
+        assert!(resolver.fallback.load_full().as_ref().is_none());
     }
 }

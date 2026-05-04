@@ -11380,13 +11380,53 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
                 // a real cert once issuance completes.
                 match tls.generate_self_signed_bootstrap_cert() {
                     Ok((cert_path, key_path)) => {
-                        proxy_service
-                            .add_tls(&format!("0.0.0.0:{https_port}"), &cert_path, &key_path)
-                            .map_err(|e| anyhow::anyhow!("failed to add TLS listener: {}", e))?;
-                        tracing::info!(
-                            port = %https_port,
-                            "HTTPS listener added (self-signed bootstrap, ACME will replace)"
-                        );
+                        // Wire mTLS through the ACME path too. Without
+                        // this branch, an operator who configured mTLS
+                        // alongside ACME would silently get plain TLS
+                        // until they noticed clients reaching the
+                        // upstream without the expected cert headers.
+                        if let Some(mtls_cfg) = server_config.mtls.as_ref() {
+                            let cache = crate::identity::mtls_cert_cache();
+                            match build_mtls_tls_settings(&cert_path, &key_path, mtls_cfg, cache) {
+                                Ok(settings) => {
+                                    proxy_service.add_tls_with_settings(
+                                        &format!("0.0.0.0:{https_port}"),
+                                        None,
+                                        settings,
+                                    );
+                                    tracing::info!(
+                                        port = %https_port,
+                                        require = %mtls_cfg.require,
+                                        "HTTPS listener added (ACME bootstrap + mTLS; ACME will replace cert)"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "mTLS setup failed on ACME path; falling back to non-mTLS HTTPS"
+                                    );
+                                    proxy_service
+                                        .add_tls(
+                                            &format!("0.0.0.0:{https_port}"),
+                                            &cert_path,
+                                            &key_path,
+                                        )
+                                        .map_err(|e| {
+                                            anyhow::anyhow!("failed to add TLS listener: {}", e)
+                                        })?;
+                                }
+                            }
+                        } else {
+                            proxy_service
+                                .add_tls(&format!("0.0.0.0:{https_port}"), &cert_path, &key_path)
+                                .map_err(|e| {
+                                    anyhow::anyhow!("failed to add TLS listener: {}", e)
+                                })?;
+                            tracing::info!(
+                                port = %https_port,
+                                "HTTPS listener added (self-signed bootstrap, ACME will replace)"
+                            );
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -11474,6 +11514,12 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
     // Start ACME renewal task if enabled.
     if let Some(ref tls) = tls_state {
         tls.start_acme_renewal_task();
+        // Kick off OCSP stapling for the manual fallback cert.
+        // No-op when no manual cert is loaded; otherwise the
+        // task does an immediate fetch and refreshes every 12h,
+        // calling back into the resolver to update the stapled
+        // bytes on the cert.
+        tls.start_ocsp_refresh_task();
     }
 
     // Start HTTP/3 listener if enabled.
