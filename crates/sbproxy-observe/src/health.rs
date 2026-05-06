@@ -16,10 +16,12 @@
 //! their backing service isn't wired yet.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+
+static PROCESS_STARTED_AT: OnceLock<Instant> = OnceLock::new();
 
 // --- Component status enum ---
 
@@ -74,6 +76,31 @@ pub struct ReadinessReport {
     /// Per-component reports. Order is stable (pillars first, then
     /// future-wave hooks) so dashboards can group by name.
     pub components: Vec<ComponentReport>,
+}
+
+/// Metadata included in the rich `/health` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthMetadata {
+    /// Crate version of the running binary.
+    pub version: String,
+    /// Git revision embedded at build time.
+    pub build_hash: String,
+    /// Current server-side timestamp.
+    pub timestamp: String,
+    /// Seconds since the process first served a health report.
+    pub uptime_seconds: u64,
+}
+
+/// Rich `/health` response for humans and monitoring systems.
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthReport {
+    /// Aggregate status. Mirrors readiness: `ok` or `unready`.
+    pub status: &'static str,
+    /// Version/build/time metadata.
+    #[serde(flatten)]
+    pub metadata: HealthMetadata,
+    /// Per-component readiness checks.
+    pub checks: Vec<ComponentReport>,
 }
 
 // --- Probe trait ---
@@ -302,6 +329,32 @@ pub fn handle_livez() -> (u16, &'static str, String) {
     (200, "application/json", r#"{"alive":true}"#.to_string())
 }
 
+/// Render the rich `/health` response body by walking the registry and
+/// adding build metadata. Unlike `/healthz`, this endpoint is meant for
+/// humans, dashboards, and SIEM ingestion rather than load-balancer
+/// liveness checks.
+pub fn handle_health(
+    registry: &HealthRegistry,
+    version: &str,
+    build_hash: &str,
+) -> (u16, &'static str, String) {
+    let report = registry.evaluate();
+    let status = if report.status == "ok" { 200 } else { 503 };
+    let started = PROCESS_STARTED_AT.get_or_init(Instant::now);
+    let body = serde_json::to_string(&HealthReport {
+        status: report.status,
+        metadata: HealthMetadata {
+            version: version.to_string(),
+            build_hash: build_hash.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            uptime_seconds: started.elapsed().as_secs(),
+        },
+        checks: report.components,
+    })
+    .unwrap_or_else(|_| r#"{"status":"unready","error":"serialize"}"#.to_string());
+    (status, "application/json", body)
+}
+
 /// Render the `/readyz` response body by walking the registry. Returns
 /// `200` when every component is ready and `503` otherwise; the body
 /// is the JSON-serialised [`ReadinessReport`] in either case so
@@ -339,6 +392,27 @@ mod tests {
         assert_eq!(ct, "application/json");
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["alive"], true);
+    }
+
+    #[test]
+    fn health_includes_build_metadata_and_checks() {
+        let recency = Recency::new(Duration::from_secs(60));
+        recency.mark_success();
+        let registry = HealthRegistry::new();
+        registry.register(Arc::new(RecencyProbe::new("ledger", recency)));
+
+        let (status, ct, body) = handle_health(&registry, "1.2.3", "abc123");
+
+        assert_eq!(status, 200);
+        assert_eq!(ct, "application/json");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["version"], "1.2.3");
+        assert_eq!(v["build_hash"], "abc123");
+        assert!(v["timestamp"].as_str().unwrap().contains('T'));
+        assert!(v["uptime_seconds"].as_u64().is_some());
+        assert_eq!(v["checks"][0]["name"], "ledger");
+        assert_eq!(v["checks"][0]["status"], "healthy");
     }
 
     #[test]

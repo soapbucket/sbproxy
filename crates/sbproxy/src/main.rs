@@ -27,8 +27,9 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     // Resolve the effective log filter before tracing init so --log-level
-    // and SB_LOG_LEVEL win over the default `info` and over RUST_LOG. The
-    // priority is documented in docs/manual.md §13:
+    // and SB_LOG_LEVEL win over the default `info` and over RUST_LOG. A
+    // separate request-log level appends an access_log target directive.
+    // The priority is documented in docs/manual.md §13:
     //   1. `--log-level <level>` CLI flag
     //   2. `SB_LOG_LEVEL` env var
     //   3. `RUST_LOG` env var (rustc-style filter syntax)
@@ -161,26 +162,55 @@ fn main() {
 }
 
 /// Resolve the effective log filter. CLI `--log-level <level>` wins;
-/// otherwise `SB_LOG_LEVEL`, then `RUST_LOG`, then `info`.
+/// otherwise `SB_LOG_LEVEL`, then `RUST_LOG`, then `info`. CLI
+/// `--request-log-level <level>` / `SB_REQUEST_LOG_LEVEL` append an
+/// `access_log=<level>` target directive.
 ///
 /// Accepted values are anything `tracing_subscriber::EnvFilter` parses:
 /// a bare level (`info`, `debug`, `trace`), a per-target filter
 /// (`sbproxy=debug,h2=warn`), or any combination thereof.
 fn resolve_log_filter(args: &[String]) -> String {
-    if let Some(v) = take_flag_value(args, "--log-level") {
-        return v;
-    }
-    if let Ok(v) = env::var("SB_LOG_LEVEL") {
+    let base = if let Some(v) = take_flag_value(args, "--log-level") {
+        v
+    } else if let Ok(v) = env::var("SB_LOG_LEVEL") {
         if !v.is_empty() {
-            return v;
+            v
+        } else if let Ok(v) = env::var("RUST_LOG") {
+            if !v.is_empty() {
+                v
+            } else {
+                "info".to_string()
+            }
+        } else {
+            "info".to_string()
+        }
+    } else if let Ok(v) = env::var("RUST_LOG") {
+        if !v.is_empty() {
+            v
+        } else {
+            "info".to_string()
+        }
+    } else {
+        "info".to_string()
+    };
+
+    if let Some(request_level) = resolve_request_log_level(args) {
+        format!("{base},access_log={request_level}")
+    } else {
+        base
+    }
+}
+
+fn resolve_request_log_level(args: &[String]) -> Option<String> {
+    if let Some(v) = take_flag_value(args, "--request-log-level") {
+        if !v.is_empty() {
+            return Some(v);
         }
     }
-    if let Ok(v) = env::var("RUST_LOG") {
-        if !v.is_empty() {
-            return v;
-        }
+    match env::var("SB_REQUEST_LOG_LEVEL").ok() {
+        Some(v) if !v.is_empty() => Some(v),
+        _ => None,
     }
-    "info".to_string()
 }
 
 /// Resolve `--grace-time <secs>` / `SB_GRACE_TIME`. Returns `None` when
@@ -251,7 +281,7 @@ fn parse_config_path(args: &[String]) -> Option<&str> {
                 i += 1;
                 continue;
             }
-            "--log-level" | "--log-format" | "--grace-time" => {
+            "--log-level" | "--request-log-level" | "--log-format" | "--grace-time" => {
                 i += 2; // skip flag + value
                 continue;
             }
@@ -307,7 +337,7 @@ fn general_usage_str() -> &'static str {
 
 USAGE:
     sbproxy --config <path>
-    sbproxy serve -f <path> [--log-level <level>] [--grace-time <secs>]
+    sbproxy serve -f <path> [--log-level <level>] [--request-log-level <level>] [--grace-time <secs>]
     sbproxy validate <path>
     sbproxy --config <path> --check
     sbproxy projections render --kind {robots|llms|llms-full|licenses|tdmrep} \\
@@ -319,6 +349,8 @@ FLAGS:
     --config <path>, -f <path>   Path to sb.yml. Falls back to SB_CONFIG_FILE.
     --log-level <level>          tracing-subscriber filter. Wins over
                                  SB_LOG_LEVEL and RUST_LOG. Default: info.
+    --request-log-level <level>  access_log target filter. Wins over
+                                 SB_REQUEST_LOG_LEVEL. Default: unset.
     --grace-time <secs>          Graceful-shutdown timeout. Wins over
                                  SB_GRACE_TIME. Default: 0 (instant).
     --disable-sb-flags           Lock off the per-request feature-flag
@@ -329,6 +361,7 @@ FLAGS:
 ENV:
     SB_CONFIG_FILE               --config fallback.
     SB_LOG_LEVEL                 --log-level fallback.
+    SB_REQUEST_LOG_LEVEL         --request-log-level fallback.
     SB_GRACE_TIME                --grace-time fallback.
     SB_DISABLE_SB_FLAGS          --disable-sb-flags fallback (1/true/yes/on).
     RUST_LOG                     tracing filter when --log-level and
@@ -516,8 +549,45 @@ mod tests {
     fn log_filter_default_info() {
         let _g = ENV_LOCK.lock().unwrap();
         env::remove_var("SB_LOG_LEVEL");
+        env::remove_var("SB_REQUEST_LOG_LEVEL");
         env::remove_var("RUST_LOG");
         assert_eq!(resolve_log_filter(&args(&["sbproxy"])), "info");
+    }
+
+    #[test]
+    fn request_log_level_cli_appends_access_log_target() {
+        let _g = ENV_LOCK.lock().unwrap();
+        env::remove_var("SB_LOG_LEVEL");
+        env::remove_var("SB_REQUEST_LOG_LEVEL");
+        env::remove_var("RUST_LOG");
+        let got = resolve_log_filter(&args(&[
+            "sbproxy",
+            "--log-level",
+            "warn",
+            "--request-log-level",
+            "debug",
+        ]));
+        assert_eq!(got, "warn,access_log=debug");
+    }
+
+    #[test]
+    fn request_log_level_env_appends_access_log_target() {
+        let _g = ENV_LOCK.lock().unwrap();
+        env::remove_var("SB_LOG_LEVEL");
+        env::remove_var("RUST_LOG");
+        env::set_var("SB_REQUEST_LOG_LEVEL", "trace");
+        let got = resolve_log_filter(&args(&["sbproxy"]));
+        env::remove_var("SB_REQUEST_LOG_LEVEL");
+        assert_eq!(got, "info,access_log=trace");
+    }
+
+    #[test]
+    fn request_log_level_cli_wins_over_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        env::set_var("SB_REQUEST_LOG_LEVEL", "trace");
+        let got = resolve_log_filter(&args(&["sbproxy", "--request-log-level", "debug"]));
+        env::remove_var("SB_REQUEST_LOG_LEVEL");
+        assert_eq!(got, "info,access_log=debug");
     }
 
     #[test]
@@ -551,6 +621,18 @@ mod tests {
             "sbproxy",
             "--grace-time",
             "30",
+            "--config",
+            "/etc/sbproxy/sb.yml",
+        ]);
+        assert_eq!(parse_config_path(&argv), Some("/etc/sbproxy/sb.yml"));
+    }
+
+    #[test]
+    fn parse_config_skips_request_log_level_value() {
+        let argv = args(&[
+            "sbproxy",
+            "--request-log-level",
+            "debug",
             "--config",
             "/etc/sbproxy/sb.yml",
         ]);

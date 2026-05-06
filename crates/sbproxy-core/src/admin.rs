@@ -757,7 +757,14 @@ pub fn handle_admin_request(
             // K8s-style canonical names plus their bare aliases. All
             // unauthenticated for the same reason as /healthz: load
             // balancers and orchestrators don't carry credentials.
-            "/healthz" | "/health" => return sbproxy_observe::handle_healthz(),
+            "/healthz" => return sbproxy_observe::handle_healthz(),
+            "/health" => {
+                return sbproxy_observe::handle_health(
+                    &state.health_registry,
+                    env!("CARGO_PKG_VERSION"),
+                    option_env!("SBPROXY_GIT_SHA").unwrap_or("unknown"),
+                )
+            }
             "/readyz" | "/ready" => return sbproxy_observe::handle_readyz(&state.health_registry),
             "/livez" | "/live" => return sbproxy_observe::handle_livez(),
             // Wave 3 closeout: quote-token JWKS publication.
@@ -1606,7 +1613,7 @@ origins:
     }
 
     #[test]
-    fn ready_and_health_aliases_match_canonical() {
+    fn ready_alias_matches_readyz_and_health_is_rich() {
         let state = make_state();
         let (rs, _, rb) = handle_admin_request("GET", "/readyz", &state, None);
         let (as_, _, ab) = handle_admin_request("GET", "/ready", &state, None);
@@ -1615,8 +1622,15 @@ origins:
 
         let (hs, _, hb) = handle_admin_request("GET", "/healthz", &state, None);
         let (ps, _, pb) = handle_admin_request("GET", "/health", &state, None);
-        assert_eq!(hs, ps, "/health must mirror /healthz status");
-        assert_eq!(hb, pb, "/health must mirror /healthz body");
+        assert_eq!(hs, 200, "/healthz remains trivial liveness: {hb}");
+        assert_eq!(ps, 200, "/health rich endpoint ready status: {pb}");
+        let rich: serde_json::Value = serde_json::from_str(&pb).unwrap();
+        assert_eq!(rich["status"], "ok");
+        assert!(rich["version"].as_str().is_some(), "body: {pb}");
+        assert!(rich["build_hash"].as_str().is_some(), "body: {pb}");
+        assert!(rich["timestamp"].as_str().is_some(), "body: {pb}");
+        assert!(rich["uptime_seconds"].as_u64().is_some(), "body: {pb}");
+        assert!(rich["checks"].as_array().is_some(), "body: {pb}");
     }
 
     #[test]
