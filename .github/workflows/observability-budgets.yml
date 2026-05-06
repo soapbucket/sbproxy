@@ -67,15 +67,12 @@ jobs:
       # rationale as e2e.yml: cargo cannot infer the ordering between
       # `cargo test` on `sbproxy-e2e` and the `sbproxy` binary it
       # references.
-      - name: build sbproxy binary (release-fast)
-        run: |
-          cargo build --profile release-fast -p sbproxy --locked
-          mkdir -p target/release
-          cp target/release-fast/sbproxy target/release/sbproxy
+      - name: build sbproxy binary
+        run: cargo build -p sbproxy --locked
 
       - name: cardinality + redaction tests
         run: |
-          cargo test -p sbproxy-e2e --release --locked \
+          cargo test -p sbproxy-e2e --locked \
             --test cardinality \
             --test redaction \
             -- --include-ignored
