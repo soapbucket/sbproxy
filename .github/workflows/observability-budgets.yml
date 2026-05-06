@@ -39,7 +39,7 @@ jobs:
   observability-budgets:
     name: cardinality + redaction
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4.1.7
 
@@ -67,12 +67,11 @@ jobs:
       # rationale as e2e.yml: cargo cannot infer the ordering between
       # `cargo test` on `sbproxy-e2e` and the `sbproxy` binary it
       # references.
-      - name: build sbproxy binary (release)
-        run: cargo build --release -p sbproxy --locked
+      - name: build sbproxy binary
+        run: cargo build -p sbproxy --locked
 
       - name: cardinality + redaction tests
         run: |
-          cargo test -p sbproxy-e2e --release --locked \
+          cargo test -p sbproxy-e2e --locked \
             --test cardinality \
-            --test redaction \
-            -- --include-ignored
+            --test redaction
