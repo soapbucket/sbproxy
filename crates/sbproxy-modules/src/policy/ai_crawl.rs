@@ -1056,7 +1056,26 @@ pub struct LedgerYamlConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct LedgerSecretRef {
     /// Environment variable name that holds the hex-encoded HMAC key.
-    pub env: String,
+    #[serde(default)]
+    pub env: Option<String>,
+    /// Logical `secret:<name>` reference resolved through sbproxy-vault.
+    #[serde(default)]
+    pub secret: Option<String>,
+}
+
+fn resolve_secret_ref(sref: &LedgerSecretRef, context: &str) -> anyhow::Result<String> {
+    if let Some(env) = sref.env.as_deref() {
+        return std::env::var(env)
+            .map_err(|_| anyhow::anyhow!("{context}.secret_ref.env: env var '{env}' not set"));
+    }
+    if let Some(secret) = sref.secret.as_deref() {
+        let resolver = sbproxy_vault::SecretResolver::new(None, std::collections::HashMap::new())
+            .with_fallback(sbproxy_vault::ResolveFallback::Env);
+        return resolver
+            .resolve(&format!("secret:{secret}"))
+            .map_err(|e| anyhow::anyhow!("{context}.secret_ref.secret: {e}"));
+    }
+    anyhow::bail!("{context}.secret_ref requires either env or secret")
 }
 
 /// Retry-policy override for the HTTP ledger client.
@@ -1879,17 +1898,12 @@ fn build_multi_rail_plan(
 
     // --- Quote-token signer ---
     let seed_hex = if let Some(sref) = &qt_yaml.secret_ref {
-        std::env::var(&sref.env).map_err(|_| {
-            anyhow::anyhow!(
-                "ai_crawl_control.quote_token.secret_ref.env: env var '{}' not set",
-                sref.env
-            )
-        })?
+        resolve_secret_ref(sref, "ai_crawl_control.quote_token")?
     } else if let Some(inline) = &qt_yaml.seed_hex {
         inline.clone()
     } else {
         anyhow::bail!(
-            "ai_crawl_control.quote_token requires either secret_ref.env or seed_hex (32-byte ed25519 seed, hex-encoded)"
+            "ai_crawl_control.quote_token requires either secret_ref.env, secret_ref.secret, or seed_hex (32-byte ed25519 seed, hex-encoded)"
         );
     };
     let seed_bytes = hex::decode(seed_hex.trim())
@@ -1949,17 +1963,12 @@ fn build_http_ledger(yaml: LedgerYamlConfig) -> anyhow::Result<HttpLedger> {
     use std::time::Duration;
 
     let key_hex = if let Some(ref sref) = yaml.secret_ref {
-        std::env::var(&sref.env).map_err(|_| {
-            anyhow::anyhow!(
-                "ai_crawl_control.ledger.secret_ref.env: env var '{}' not set",
-                sref.env
-            )
-        })?
+        resolve_secret_ref(sref, "ai_crawl_control.ledger")?
     } else if let Some(ref inline) = yaml.key_hex {
         inline.clone()
     } else {
         anyhow::bail!(
-            "ai_crawl_control.ledger requires either secret_ref.env or key_hex (hex-encoded HMAC key)"
+            "ai_crawl_control.ledger requires either secret_ref.env, secret_ref.secret, or key_hex (hex-encoded HMAC key)"
         );
     };
     let key = hex::decode(key_hex.trim())
@@ -3433,6 +3442,34 @@ mod tests {
             keys[0].get("kid").and_then(|v| v.as_str()),
             Some("test-kid")
         );
+    }
+
+    #[test]
+    fn quote_token_yaml_resolves_secret_ref_secret_via_env_fallback() {
+        std::env::set_var(
+            "SBPROXY_TEST_QUOTE_SEED",
+            "0001020304050607080910111213141516171819202122232425262728293031",
+        );
+        let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+            "price": 0.001,
+            "rails": {
+                "x402": {
+                    "chain": "base",
+                    "facilitator": "https://facilitator-base.x402.org",
+                    "asset": "USDC",
+                    "pay_to": "0xabc"
+                }
+            },
+            "quote_token": {
+                "key_id": "quote-kid",
+                "secret_ref": { "secret": "SBPROXY_TEST_QUOTE_SEED" }
+            }
+        }))
+        .expect("policy compiles with secret_ref.secret");
+
+        let jwks = policy.quote_token_jwks().expect("jwks");
+        assert_eq!(jwks["keys"][0]["kid"], "quote-kid");
+        std::env::remove_var("SBPROXY_TEST_QUOTE_SEED");
     }
 
     #[test]
