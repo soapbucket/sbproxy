@@ -63,7 +63,7 @@ The filter runs before any reserve I/O happens so a misconfigured admission wind
 
 The integration point for cold-tier backends is the async [`CacheReserveBackend`](../crates/sbproxy-cache/src/reserve/mod.rs) trait. Enterprise builds ship their own `impl CacheReserveBackend` (S3 + KMS, GCS, Azure Blob) without re-vendoring the OSS data plane.
 
-```rust
+```rust,no_run
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::time::SystemTime;
@@ -96,7 +96,7 @@ The trait is small on purpose. Admission control, sampling, and metric emission 
 
 `ReserveMetadata` carries the response shape needed to replay an entry verbatim:
 
-```rust
+```rust,no_run
 pub struct ReserveMetadata {
     pub created_at: SystemTime,
     pub expires_at: SystemTime,

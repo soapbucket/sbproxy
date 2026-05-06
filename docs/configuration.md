@@ -3188,7 +3188,7 @@ request_modifiers:
         X-Region:   "{{env.SBPROXY_REGION}}"
 ```
 
-```rust
+```rust,no_run
 // Inside the proxy runtime that builds TemplateContext per request.
 let mut tmpl = sbproxy_middleware::modifiers::TemplateContext::new();
 tmpl.allowed_env_vars.push("SBPROXY_BUILD_ID".to_string());

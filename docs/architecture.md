@@ -171,7 +171,7 @@ All extensible component types use a single pattern: register at compile time vi
 
 ### Registry traits (sbproxy-plugin)
 
-```rust
+```rust,no_run
 pub trait ActionHandler: Send + Sync + 'static {
     fn handler_type(&self) -> &'static str;
     fn handle(
@@ -188,7 +188,7 @@ return `Box<dyn Any + Send>`. The factory itself is the registration unit.
 
 ### Registration pattern
 
-```rust
+```rust,no_run
 inventory::submit! {
     PluginRegistration {
         kind: PluginKind::Policy,
@@ -222,7 +222,7 @@ branch-predicted jump that the compiler typically inlines. Third-party plugins g
 `Box<dyn Trait>` for dynamic dispatch. That costs one indirect call per phase but keeps
 the plugin ABI stable across compiler versions.
 
-```rust
+```rust,no_run
 enum Action {
     Proxy(ProxyAction),
     Static(StaticAction),

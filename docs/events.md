@@ -26,7 +26,7 @@ SBproxy has a small in-process event bus. The proxy publishes typed events from 
 
 ## Event shape
 
-```rust
+```rust,no_run
 pub struct ProxyEvent {
     pub event_type: EventType,
     pub hostname: String,
@@ -41,7 +41,7 @@ pub struct ProxyEvent {
 
 Each `EventBus::subscribe` call binds a closure to one event type. Publishers fan out to all bound closures synchronously, in the order they registered.
 
-```rust
+```rust,no_run
 use sbproxy_observe::events::{EventBus, EventType, ProxyEvent};
 
 let bus = EventBus::new();

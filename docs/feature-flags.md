@@ -20,7 +20,7 @@ Order: `block_list` → `allow_list` → `segments` → `rollout_percent` → `d
 
 Today the OSS path seeds flags from code in the embedding binary:
 
-```rust
+```rust,no_run
 use std::sync::Arc;
 use sbproxy_extension::flags::{set_global_store, FlagConfig, FlagRule, FlagStore};
 

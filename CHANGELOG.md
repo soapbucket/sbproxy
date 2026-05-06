@@ -130,6 +130,12 @@ of the new YAML fields below until the version that ships them.
   competing for CPU.
   ([e2e/src/lib.rs])
 
+- **Docs CI Rust snippet failures.** Workspace-dependent documentation
+  examples that cannot compile as standalone `rust-script` programs are
+  now tagged `rust,no_run`, keeping docs-ci focused on executable
+  snippets instead of illustrative API fragments.
+  ([docs/architecture.md], [docs/audit-log.md], [docs/cache-reserve.md])
+
 - **AI client retry resilience.** `MemoryBatchStore` now uses
   `parking_lot::Mutex` so a panic in one worker cannot poison the
   in-memory batch map for every later operation. Provider retries now

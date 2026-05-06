@@ -1945,7 +1945,7 @@ All plugin traits are exported from `sbproxy-plugin` and built for safe concurre
 
 Plugins register themselves via `inventory::submit!` with a `PluginRegistration` entry. The proxy discovers them at link time without any centralized registration call:
 
-```rust
+```rust,no_run
 use sbproxy_plugin::{PluginKind, PluginRegistration};
 
 inventory::submit! {
@@ -1964,7 +1964,7 @@ inventory::submit! {
 
 Implement `ActionHandler` and submit a registration entry:
 
-```rust
+```rust,no_run
 use std::future::Future;
 use std::pin::Pin;
 use anyhow::Result;
@@ -1995,7 +1995,7 @@ inventory::submit! {
 
 ### Implementing a policy
 
-```rust
+```rust,no_run
 use std::future::Future;
 use std::pin::Pin;
 use anyhow::Result;
@@ -2034,7 +2034,7 @@ impl PolicyEnforcer for MyPolicy {
 
 ### Implementing a transform
 
-```rust
+```rust,no_run
 use std::future::Future;
 use std::pin::Pin;
 use anyhow::Result;
