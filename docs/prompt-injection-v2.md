@@ -27,7 +27,7 @@ The v1 policy is unchanged. Operators upgrade by switching the policy
 
 ## The Detector trait
 
-```rust
+```rust,no_run
 pub trait Detector: Send + Sync + 'static {
     fn detect(&self, prompt: &str) -> DetectionResult;
     fn name(&self) -> &str;
@@ -60,7 +60,7 @@ Custom detectors register at module scope via the
 factory in an `inventory::submit!` so the registry picks it up at
 link time.
 
-```rust
+```rust,no_run
 use std::sync::Arc;
 use sbproxy_modules::{
     register_prompt_injection_detector, DetectionLabel, DetectionResult, Detector,

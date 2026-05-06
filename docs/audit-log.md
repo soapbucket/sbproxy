@@ -43,7 +43,7 @@ Every event is an `AdminAuditEvent`. Wire format is JSON; field order is signifi
 
 ### Subjects
 
-```rust
+```rust,no_run
 pub enum AuditSubject {
     User    { user_id: String, session_id: Option<Ulid> },
     Service { principal_id: String },
@@ -64,7 +64,7 @@ Closed enum. Adding a new variant is an ADR amendment. The current set:
 
 ### Targets
 
-```rust
+```rust,no_run
 pub enum AuditTarget {
     Agent         { agent_id: String },
     RegistryEntry { feed: String, entry_id: String },
@@ -98,7 +98,7 @@ Verifier CLIs and replay tooling MUST read the discriminator from `target_kind`.
 
 The storage backend MUST reject updates and deletes. The contract is enforced at the trait level:
 
-```rust
+```rust,no_run
 #[async_trait::async_trait]
 pub trait Emitter: Send + Sync {
     async fn emit(&self, event: AdminAuditEvent) -> Result<Ulid, AuditError>;
@@ -122,7 +122,7 @@ PII deletion (GDPR Article 17, CCPA right-to-delete) is handled by tombstoning, 
 
 Used for tests. Append to a `Vec`; no removal API.
 
-```rust
+```rust,no_run
 use sbproxy_audit::{InMemoryEmitter, AdminAuditEvent};
 use std::sync::Arc;
 
@@ -144,7 +144,7 @@ A Tower / Axum `Layer` wraps every state-mutating handler. The middleware:
 3. Pulls the `AuditDescriptor` the handler attached to the response extensions (action, target, before, after, optional reason).
 4. Builds the envelope, applies the length caps, redacts `before` and `after` per the internal profile, and emits.
 
-```rust
+```rust,no_run
 use axum::Router;
 use sbproxy_audit::{AuditLayer, EmitterArc, InMemoryEmitter};
 use std::sync::Arc;
@@ -157,7 +157,7 @@ let app: Router = Router::new()
 
 State-mutating handlers opt in by implementing `Auditable`:
 
-```rust
+```rust,no_run
 use sbproxy_audit::{
     AuditAction, AuditDescriptor, AuditTarget, Auditable,
 };

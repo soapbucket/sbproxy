@@ -142,7 +142,7 @@ Custom auth types can register their own mappers via the `AuthSchemeMapper` regi
 
 The emission engine is a library:
 
-```rust
+```rust,no_run
 use sbproxy_openapi::{build, render_json, render_yaml};
 
 let spec = build(&snapshot, None);                          // all hosts
