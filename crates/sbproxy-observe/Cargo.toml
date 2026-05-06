@@ -27,6 +27,7 @@ sha2.workspace = true
 hex.workspace = true
 base64.workspace = true
 thiserror.workspace = true
+flate2 = "1"
 
 # R1.4 outbound webhook framework: Ed25519 signing (preferred) with
 # HMAC-SHA256 fallback. Already used in
@@ -42,3 +43,6 @@ opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace"] }
 opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client", "grpc-tonic", "trace"] }
 opentelemetry-semantic-conventions = "0.27"
 tracing-opentelemetry = "0.28"
+
+[dev-dependencies]
+tempfile = "3"

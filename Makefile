@@ -5,9 +5,13 @@
 
 CARGO       ?= cargo
 DOCKER      ?= docker
+KIND        ?= kind
 CONFIG      ?= examples/00-basic-proxy/sb.yml
 LOG_LEVEL   ?= info
 BIND_PORT   ?= 8080
+KIND_CLUSTER ?= sbproxy-smoke
+PROXY_IMAGE ?= sbproxy:ci
+OPERATOR_IMAGE ?= sbproxy-operator:ci
 
 CYAN  := \033[36m
 RESET := \033[0m
@@ -17,6 +21,7 @@ RESET := \033[0m
         run run-release \
         test test-all \
         examples-smoke \
+        k8s-operator-smoke \
         bench \
         fmt fmt-check \
         lint lint-all \
@@ -67,6 +72,17 @@ test-all: ## Run the full workspace test suite
 
 examples-smoke: ## Run docker-compose example smoke tests
 	bash scripts/examples-smoke.sh
+
+k8s-operator-smoke: ## Run kind-based Kubernetes operator smoke test
+	$(CARGO) build --release -p sbproxy-k8s-operator -p sbproxy --locked
+	test -x target/release/sbproxy
+	test -x target/release/sbproxy-k8s-operator
+	$(DOCKER) build -t $(PROXY_IMAGE) -f Dockerfile.ci .
+	$(DOCKER) build -t $(OPERATOR_IMAGE) -f crates/sbproxy-k8s-operator/Dockerfile.ci .
+	$(KIND) create cluster --name $(KIND_CLUSTER) --image kindest/node:v1.30.0 || true
+	$(KIND) load docker-image $(PROXY_IMAGE) $(OPERATOR_IMAGE) --name $(KIND_CLUSTER)
+	SKIP_KIND_CREATE=1 NO_CLEANUP=1 PROXY_IMAGE=$(PROXY_IMAGE) OPERATOR_IMAGE=$(OPERATOR_IMAGE) \
+		bash deploy/helm/sbproxy/test/smoke.sh
 
 bench: ## Run benchmark suite (cargo bench)
 	$(CARGO) bench --workspace

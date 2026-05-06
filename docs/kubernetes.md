@@ -158,9 +158,9 @@ The Lease namespace is discovered in this order: `K8S_NAMESPACE` env var (the ch
 
 The lease timing matches client-go defaults: `leaseDurationSeconds=15`, renew every 5s, retry every 2s, abort the renew loop after a 10s API call timeout.
 
-## CI smoke test
+## Local smoke test
 
-`.github/workflows/k8s-operator-smoke.yml` runs the full install / hot-reload / leader-election flow against a kind cluster on every PR that touches `crates/sbproxy-k8s-operator/`, `deploy/helm/sbproxy/`, or the workflow itself.
+`make k8s-operator-smoke` runs the full install / hot-reload / leader-election flow against a local kind cluster. This is intentionally local-only because it builds release binaries, creates Docker images, and boots a kind cluster.
 
 The job:
 
@@ -169,7 +169,7 @@ The job:
 3. Wraps each binary in a tiny distroless image (`Dockerfile.ci` and `crates/sbproxy-k8s-operator/Dockerfile.ci`).
 4. Brings up a kind cluster via `helm/kind-action@v1`, loads both images with `kind load docker-image`, helm-installs the chart, and runs `deploy/helm/sbproxy/test/smoke.sh`.
 
-The smoke script is idempotent and CI-friendly. Run it locally against any kind cluster:
+The Make target wraps the manual sequence below:
 
 ```bash
 # from the repo root
@@ -181,6 +181,12 @@ kind load docker-image sbproxy:ci sbproxy-operator:ci --name sbproxy-smoke
 SKIP_KIND_CREATE=1 NO_CLEANUP=1 \
   PROXY_IMAGE=sbproxy:ci OPERATOR_IMAGE=sbproxy-operator:ci \
   bash deploy/helm/sbproxy/test/smoke.sh
+```
+
+Use the target directly for the common case:
+
+```bash
+make k8s-operator-smoke
 ```
 
 The script verifies, in order:

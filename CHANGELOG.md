@@ -28,13 +28,33 @@ of the new YAML fields below until the version that ships them.
   with a fixed worker count or capping the pool below a cgroup quota.
   ([crates/sbproxy-core/src/server.rs])
 
-- **`/live`, `/livez`, `/ready`, `/health` admin endpoints.**
+- **`/live`, `/livez`, `/ready`, `/healthz`, and rich `/health`
+  admin endpoints.**
   `/livez` returns `{"alive":true}` on every call and never 503s, so
   K8s liveness probes don't trip on transient readiness failures.
-  `/live` is a bare alias. `/ready` is an alias for `/readyz`;
-  `/health` is an alias for `/healthz`. Existing endpoints unchanged.
+  `/live` is a bare alias. `/ready` is an alias for `/readyz`.
+  `/healthz` stays a fixed liveness body, while `/health` now returns
+  version, build hash, timestamp, uptime, and readiness checks for
+  dashboards / SIEM ingestion. Existing `/readyz` behavior unchanged.
   ([crates/sbproxy-observe/src/health.rs],
   [crates/sbproxy-core/src/admin.rs])
+
+- **`--request-log-level` and `SB_REQUEST_LOG_LEVEL`.** Operators can
+  now tune request/access logging independently from application logs.
+  The setting appends an `access_log=<level>` target directive to the
+  effective `tracing-subscriber` filter while preserving the existing
+  per-target `RUST_LOG` escape hatch.
+  ([crates/sbproxy/src/main.rs])
+
+- **Access-log forced emission and file output.** `access_log` now
+  supports `slow_request_threshold_ms` and `always_log_errors` so slow
+  requests and 5xxs bypass sampling after status/method filters match.
+  It also supports `output: { type: file, path, max_size_mb,
+  max_backups, compress }` for direct JSON-line access-log files with
+  size-based rotation and optional gzip compression of rotated files.
+  ([crates/sbproxy-config/src/types.rs],
+  [crates/sbproxy-core/src/server.rs],
+  [crates/sbproxy-observe/src/access_log.rs])
 
 - **OCSP stapling for the manual fallback cert.** `OcspStapler`
   (which previously existed but was unwired) now does an immediate
@@ -55,31 +75,57 @@ of the new YAML fields below until the version that ships them.
   falls back to plain TLS only when mTLS setup itself fails.
   ([crates/sbproxy-core/src/server.rs])
 
+- **Examples and Kubernetes smoke checks are local-only.** The
+  Docker-backed examples smoke lane and kind-based Kubernetes operator
+  smoke lane no longer run automatically on pull requests. They remain
+  available as `make examples-smoke` and `make k8s-operator-smoke` for
+  explicit local / release validation.
+  ([Makefile], [docs/kubernetes.md])
+
+- **Reload drain state is now one coherent atomic snapshot.** The
+  drain flag and active request count are packed into one `AtomicU64`,
+  so `is_draining()` no longer combines two independent relaxed loads.
+  Added loom coverage for the last-request-finish interleaving.
+  ([crates/sbproxy-core/src/reload.rs])
+
 - **`docs/manual.md` rewrites** matching what actually ships:
-  - §6 Health checks: 3 endpoints (`/livez`, `/readyz`, `/healthz`)
-    each with a bare alias, replacing the old per-endpoint URL fork
-    diagram.
+  - §6 Health checks: `/livez`, `/readyz`, `/healthz`, and rich
+    `/health` semantics, replacing the old per-endpoint URL fork
+    diagram and stale `/health` alias wording.
   - §10 Feature flags: CEL accessor table, kill-switch note, and
     a "planned, not yet wired" note for Lua / JS / WASM features
     namespaces and workspace-level pub/sub flags.
   - §3 CPU detection: documents the new `SB_WORKER_THREADS` knob.
   - §13 env-var table: adds `SB_WORKER_THREADS` and
-    `SB_DISABLE_SB_FLAGS` rows.
+    `SB_DISABLE_SB_FLAGS`; later updates add
+    `SB_REQUEST_LOG_LEVEL` and access-log file/forced-emit examples.
+
+### Fixed
+
+- **JWKS unknown-`kid` key rotation.** JWTs that reference an unseen
+  `kid` now trigger one rate-limited JWKS refetch before failing
+  closed, with a Prometheus counter for success / failure /
+  rate-limited outcomes. This avoids requiring operator intervention
+  for routine IdP key rotation.
+  ([crates/sbproxy-modules/src/auth/jwks.rs],
+  [crates/sbproxy-modules/src/auth/mod.rs],
+  [crates/sbproxy-observe/src/metrics.rs])
+
+- **Rate-limit LRU pollution bypass.** Per-key local token buckets now
+  preserve deny state in a bounded cold tier after hot LRU eviction, so
+  a spray of attacker keys cannot reset an already-throttled
+  legitimate client.
+  ([crates/sbproxy-modules/src/policy/mod.rs])
 
 ### Open follow-ups
 
 Tracked in Linear, not in this changeset:
 
-- [WOR-125](https://linear.app/12345r/issue/WOR-125) two-level log
-  config (`--request-log-level`, `SB_REQUEST_LOG_LEVEL`)
-- [WOR-126](https://linear.app/12345r/issue/WOR-126) `access_log`
-  `slow_request_threshold` forced-emit + `always_log_errors`
-- [WOR-127](https://linear.app/12345r/issue/WOR-127) `access_log`
-  file output + size-based rotation
-- [WOR-128](https://linear.app/12345r/issue/WOR-128) full `/health`
-  body with `version`, `build_hash`, `uptime_seconds`, `checks`
 - WOR-114 Phase 2.5: Lua / JS / WASM `features` namespace, plus
   workspace-level flags via messenger pub/sub
+- [WOR-15](https://linear.app/12345r/issue/WOR-15) remaining
+  rate-limiter proptest coverage. The reload-drain loom portion has
+  landed.
 
 ## [1.0.1] - 2026-05-04
 

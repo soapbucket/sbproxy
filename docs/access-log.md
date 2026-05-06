@@ -68,6 +68,23 @@ access_log:
 `1.0` (the default) logs every match. `0.0` is equivalent to disabling
 emission entirely.
 
+### Forced emission
+
+Two knobs bypass `sample_rate` after the status/method filters match:
+
+```yaml
+access_log:
+  enabled: true
+  sample_rate: 0.05
+  slow_request_threshold_ms: 1000
+  always_log_errors: true
+```
+
+`slow_request_threshold_ms` logs every matching request whose end-to-end
+latency is at or above the threshold. `always_log_errors: true` logs
+every matching `5xx` response. Both knobs are off by default, preserving
+the sampler-only behavior for existing configs.
+
 ## Header capture
 
 Opt in by listing header names in `access_log.capture_headers.request`
@@ -158,3 +175,26 @@ patterns:
 * Use the JSON log subscriber (default in `sbproxy-observe`) and let
   your collector tag by `target`.
 * Pipe stdout through `vector` or `fluent-bit` to split on `target`.
+
+### File output
+
+To write access logs directly to disk instead of the tracing target:
+
+```yaml
+access_log:
+  enabled: true
+  output:
+    type: file
+    path: /var/log/sbproxy/access.log
+    max_size_mb: 100
+    max_backups: 7
+    compress: true
+```
+
+When the active file reaches `max_size_mb`, SBproxy rotates it before
+writing the next line. Rotated files use suffixes like
+`access.log.1` or `access.log.1.gz`; `max_backups` caps how many
+rotated files are retained. `compress: true` gzips rotated files.
+
+Omitting `output` keeps the default behavior: emit JSON through the
+`access_log` tracing target.

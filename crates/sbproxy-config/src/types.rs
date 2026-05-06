@@ -903,6 +903,16 @@ pub struct AccessLogConfig {
     /// emitted entry.
     #[serde(default)]
     pub capture_headers: CaptureHeadersConfig,
+    /// Log every request at or above this latency, regardless of
+    /// `sample_rate`. `None` preserves sampler-only behaviour.
+    #[serde(default)]
+    pub slow_request_threshold_ms: Option<f64>,
+    /// Log every 5xx response regardless of `sample_rate`.
+    #[serde(default)]
+    pub always_log_errors: bool,
+    /// Output sink. Defaults to stderr/tracing target.
+    #[serde(default)]
+    pub output: AccessLogOutputConfig,
 }
 
 impl AccessLogConfig {
@@ -910,6 +920,11 @@ impl AccessLogConfig {
     /// access log given this config's filters. Sampling is *not*
     /// applied here; callers run the sampler after this gate.
     pub fn should_emit(&self, status: u16, method: &str) -> bool {
+        self.matches_filters(status, method)
+    }
+
+    /// Decide whether a request passes non-sampling filters.
+    pub fn matches_filters(&self, status: u16, method: &str) -> bool {
         if !self.enabled {
             return false;
         }
@@ -922,10 +937,77 @@ impl AccessLogConfig {
         }
         true
     }
+
+    /// Return true when a matching request bypasses sampling.
+    pub fn forces_emit(&self, status: u16, latency_ms: f64) -> bool {
+        (self.always_log_errors && status >= 500)
+            || self
+                .slow_request_threshold_ms
+                .map(|threshold| latency_ms >= threshold)
+                .unwrap_or(false)
+    }
+
+    /// Decide whether a request should be sampled after filters.
+    pub fn should_sample(&self, status: u16, latency_ms: f64, roll: f64) -> bool {
+        if self.forces_emit(status, latency_ms) {
+            return true;
+        }
+        if self.sample_rate >= 1.0 {
+            return true;
+        }
+        if self.sample_rate <= 0.0 {
+            return false;
+        }
+        roll < self.sample_rate
+    }
 }
 
 fn default_access_log_sample_rate() -> f64 {
     1.0
+}
+
+/// Access-log output sink.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AccessLogOutputConfig {
+    /// Sink type: `stderr` (default) or `file`.
+    #[serde(default = "default_access_log_output_type", rename = "type")]
+    pub output_type: String,
+    /// File path when `type: file`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Rotate before writing when the file is at least this size.
+    #[serde(default = "default_access_log_max_size_mb")]
+    pub max_size_mb: u64,
+    /// Number of rotated backups to retain.
+    #[serde(default = "default_access_log_max_backups")]
+    pub max_backups: usize,
+    /// Gzip rotated files.
+    #[serde(default)]
+    pub compress: bool,
+}
+
+impl Default for AccessLogOutputConfig {
+    fn default() -> Self {
+        Self {
+            output_type: default_access_log_output_type(),
+            path: None,
+            max_size_mb: default_access_log_max_size_mb(),
+            max_backups: default_access_log_max_backups(),
+            compress: false,
+        }
+    }
+}
+
+fn default_access_log_output_type() -> String {
+    "stderr".to_string()
+}
+
+fn default_access_log_max_size_mb() -> u64 {
+    100
+}
+
+fn default_access_log_max_backups() -> usize {
+    7
 }
 
 /// Allowlist-driven header capture for the access log.
@@ -2507,6 +2589,14 @@ access_log:
   sample_rate: 0.25
   status_codes: [200, 500]
   methods: ["GET", "POST"]
+  slow_request_threshold_ms: 1000
+  always_log_errors: true
+  output:
+    type: file
+    path: /tmp/sbproxy-access.log
+    max_size_mb: 10
+    max_backups: 3
+    compress: true
 origins: {}
 "#;
         let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
@@ -2515,6 +2605,13 @@ origins: {}
         assert!((al.sample_rate - 0.25).abs() < f64::EPSILON);
         assert_eq!(al.status_codes, vec![200, 500]);
         assert_eq!(al.methods, vec!["GET".to_string(), "POST".to_string()]);
+        assert_eq!(al.slow_request_threshold_ms, Some(1000.0));
+        assert!(al.always_log_errors);
+        assert_eq!(al.output.output_type, "file");
+        assert_eq!(al.output.path.as_deref(), Some("/tmp/sbproxy-access.log"));
+        assert_eq!(al.output.max_size_mb, 10);
+        assert_eq!(al.output.max_backups, 3);
+        assert!(al.output.compress);
     }
 
     #[test]
@@ -2525,6 +2622,7 @@ origins: {}
             status_codes: vec![],
             methods: vec![],
             capture_headers: CaptureHeadersConfig::default(),
+            ..Default::default()
         };
         assert!(!cfg.should_emit(200, "GET"));
     }
@@ -2537,6 +2635,7 @@ origins: {}
             status_codes: vec![],
             methods: vec![],
             capture_headers: CaptureHeadersConfig::default(),
+            ..Default::default()
         };
         assert!(cfg.should_emit(200, "GET"));
         assert!(cfg.should_emit(500, "DELETE"));
@@ -2550,6 +2649,7 @@ origins: {}
             status_codes: vec![500, 502, 503],
             methods: vec![],
             capture_headers: CaptureHeadersConfig::default(),
+            ..Default::default()
         };
         assert!(cfg.should_emit(500, "GET"));
         assert!(cfg.should_emit(502, "POST"));
@@ -2565,6 +2665,7 @@ origins: {}
             status_codes: vec![],
             methods: vec!["POST".to_string(), "DELETE".to_string()],
             capture_headers: CaptureHeadersConfig::default(),
+            ..Default::default()
         };
         assert!(cfg.should_emit(200, "POST"));
         assert!(cfg.should_emit(204, "delete"));
@@ -2580,10 +2681,34 @@ origins: {}
             status_codes: vec![500],
             methods: vec!["POST".to_string()],
             capture_headers: CaptureHeadersConfig::default(),
+            ..Default::default()
         };
         assert!(cfg.should_emit(500, "POST"));
         assert!(!cfg.should_emit(500, "GET"));
         assert!(!cfg.should_emit(200, "POST"));
+    }
+
+    #[test]
+    fn access_log_forces_slow_and_error_after_filters() {
+        let cfg = AccessLogConfig {
+            enabled: true,
+            sample_rate: 0.0,
+            status_codes: vec![],
+            methods: vec!["GET".to_string()],
+            capture_headers: CaptureHeadersConfig::default(),
+            slow_request_threshold_ms: Some(1000.0),
+            always_log_errors: true,
+            output: AccessLogOutputConfig::default(),
+        };
+
+        assert!(cfg.matches_filters(200, "GET"));
+        assert!(cfg.should_sample(200, 1200.0, 0.99));
+        assert!(cfg.should_sample(503, 10.0, 0.99));
+        assert!(!cfg.should_sample(200, 10.0, 0.99));
+        assert!(
+            !cfg.matches_filters(503, "POST"),
+            "method filters still run before forced emission"
+        );
     }
 
     // --- capture_headers parsing + matching tests ---
