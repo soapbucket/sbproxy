@@ -522,6 +522,50 @@ impl AcmeClient {
         Ok(())
     }
 
+    /// Poll an authorization until it becomes valid.
+    ///
+    /// Some ACME servers update order state only after the authorization
+    /// object itself has progressed through validation. Polling the authz
+    /// first keeps Pebble and stricter CAs from leaving the order in
+    /// `pending` until the order poll times out.
+    pub async fn poll_authorization_valid(
+        &self,
+        key_pair: &EcdsaKeyPair,
+        kid: &str,
+        auth_url: &str,
+        timeout: Duration,
+    ) -> Result<Authorization> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut delay = Duration::from_millis(500);
+
+        loop {
+            let auth = self
+                .fetch_authorization(key_pair, kid, auth_url)
+                .await
+                .with_context(|| format!("poll authorization {auth_url}"))?;
+            debug!(auth_url, "poll authorization status: {}", auth.status);
+
+            match auth.status.as_str() {
+                "valid" => return Ok(auth),
+                "invalid" => {
+                    return Err(anyhow!("ACME authorization became invalid: {auth_url}"));
+                }
+                _ => {}
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "timed out polling authorization {auth_url} after {:?} (last status: {})",
+                    timeout,
+                    auth.status,
+                ));
+            }
+
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(5));
+        }
+    }
+
     // --- Order finalization ---
 
     /// Finalize an ACME order by sending a CSR.
@@ -529,14 +573,14 @@ impl AcmeClient {
     /// Generates a fresh P-256 key and CSR for `hostname`, then POSTs the
     /// base64url-encoded DER CSR to `finalize_url`.
     ///
-    /// Returns `(csr_key_pem, order_url_to_poll)`.
+    /// Returns `(csr_key_pem, updated_order)`.
     pub async fn finalize_order(
         &self,
         key_pair: &EcdsaKeyPair,
         kid: &str,
         finalize_url: &str,
         hostname: &str,
-    ) -> Result<(String, Vec<u8>)> {
+    ) -> Result<(Order, Vec<u8>)> {
         // Generate a fresh key pair for the certificate (separate from the account key).
         let cert_key = RcgenKeyPair::generate().context("generate cert key pair")?;
         let key_pem = cert_key.serialize_pem().into_bytes();
@@ -565,16 +609,10 @@ impl AcmeClient {
             return Err(anyhow!("finalize {finalize_url} returned {status}: {body}"));
         }
 
-        // The order URL for polling is in the Location header (may be missing if already valid).
-        let order_url = resp
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(finalize_url)
-            .to_owned();
+        let order: Order = resp.json().await.context("parse finalized order JSON")?;
 
-        debug!(hostname, "order finalized, polling {}", order_url);
-        Ok((order_url, key_pem))
+        debug!(hostname, "order finalized with status {}", order.status);
+        Ok((order, key_pem))
     }
 
     // --- Certificate download ---
@@ -772,7 +810,11 @@ impl AcmeClient {
             .await
             .context("respond to http-01 challenge")?;
 
-        // --- Step 6: poll until order is "ready" (challenges validated) ---
+        // --- Step 6: poll authorization, then order until "ready" ---
+        self.poll_authorization_valid(key_pair, &kid, auth_url, Duration::from_secs(120))
+            .await
+            .context("poll authorization to valid")?;
+
         // Accept "valid" too — some servers (incl. Pebble in some
         // configurations) finalize automatically once the challenge
         // is satisfied, in which case we skip step 7.
@@ -788,13 +830,13 @@ impl AcmeClient {
             .context("poll order to ready/valid")?;
 
         // --- Step 7: finalize with CSR (if not already valid) ---
-        let (final_poll_url, key_pem) = if order.status == "valid" {
+        let (maybe_final_order, key_pem) = if order.status == "valid" {
             // Already valid (e.g., cached by ACME server). Use order_url as-is.
             warn!(
                 hostname,
                 "order already valid before finalization (unexpected)"
             );
-            (order_url.clone(), {
+            (Some(order), {
                 // We still need a cert key; generate one and store separately.
                 // Normally this path is not taken.
                 let k = RcgenKeyPair::generate().context("generate fallback cert key")?;
@@ -802,22 +844,27 @@ impl AcmeClient {
             })
         } else {
             let finalize_url = order.finalize.clone();
-            self.finalize_order(key_pair, &kid, &finalize_url, hostname)
+            let (finalized_order, key_pem) = self
+                .finalize_order(key_pair, &kid, &finalize_url, hostname)
                 .await
-                .context("finalize order")?
+                .context("finalize order")?;
+            (Some(finalized_order), key_pem)
         };
 
         // --- Step 8: poll until order is "valid" ---
-        let final_order = self
-            .poll_order(
-                key_pair,
-                &kid,
-                &final_poll_url,
-                Duration::from_secs(120),
-                &["valid"],
-            )
-            .await
-            .context("poll order to valid after finalization")?;
+        let final_order = match maybe_final_order {
+            Some(order) if order.status == "valid" => order,
+            _ => self
+                .poll_order(
+                    key_pair,
+                    &kid,
+                    &order_url,
+                    Duration::from_secs(120),
+                    &["valid"],
+                )
+                .await
+                .context("poll order to valid after finalization")?,
+        };
 
         // --- Step 9: download certificate ---
         let cert_url = final_order
