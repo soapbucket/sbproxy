@@ -391,7 +391,16 @@ impl JwtAuth {
         } else if let Some(jwks_url) = &self.jwks_url {
             let header = self.header(token)?;
             let cache = jwks::get_or_init_cache(jwks_url, jwks::DEFAULT_REFRESH_SECS);
-            cache.lookup_decoding_key(header.kid.as_deref())?
+            if let Some(key) = cache.lookup_decoding_key(header.kid.as_deref()) {
+                key
+            } else {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .ok()?;
+                cache
+                    .lookup_decoding_key_with_unknown_kid_refresh(header.kid.as_deref(), &client)?
+            }
         } else {
             return None;
         };

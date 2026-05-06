@@ -99,6 +99,12 @@ pub struct JwksCache {
     last_refresh: Mutex<Instant>,
     /// Minimum time between refreshes.
     refresh_interval: Duration,
+    /// Last on-demand refresh caused by an unknown `kid`.
+    ///
+    /// This is separate from `last_refresh`: the normal refresh interval
+    /// can be minutes, but unknown-key probes need a short storm guard so
+    /// a bad actor cannot force a network fetch on every request.
+    last_unknown_kid_refresh: Mutex<Option<Instant>>,
 }
 
 impl JwksCache {
@@ -122,6 +128,7 @@ impl JwksCache {
                     .unwrap_or_else(Instant::now),
             ),
             refresh_interval: Duration::from_secs(refresh_secs),
+            last_unknown_kid_refresh: Mutex::new(None),
         }
     }
 
@@ -173,6 +180,44 @@ impl JwksCache {
         DecodingKey::from_jwk(jwk).ok()
     }
 
+    /// Look up a key, refetching once when a requested `kid` is absent.
+    ///
+    /// Identity providers rotate JWKS keys independently of this proxy's
+    /// refresh interval. If a token arrives with a previously unseen
+    /// `kid`, we do one immediate, per-endpoint rate-limited refresh and
+    /// try the lookup again before failing closed.
+    pub fn lookup_decoding_key_with_unknown_kid_refresh(
+        &self,
+        kid: Option<&str>,
+        client: &reqwest::blocking::Client,
+    ) -> Option<DecodingKey> {
+        let requested_kid = kid?;
+        if let Some(key) = self.lookup_decoding_key(Some(requested_kid)) {
+            return Some(key);
+        }
+        if !self.try_mark_unknown_kid_refresh() {
+            sbproxy_observe::metrics::record_jwks_unknown_kid_refetch("rate_limited");
+            return None;
+        }
+        if let Err(e) = self.refresh_blocking_with(client) {
+            sbproxy_observe::metrics::record_jwks_unknown_kid_refetch("failure");
+            tracing::warn!(
+                jwks_url = %self.jwks_url,
+                kid = requested_kid,
+                error = %e,
+                "JWKS unknown-kid refresh failed"
+            );
+            return None;
+        }
+        sbproxy_observe::metrics::record_jwks_unknown_kid_refetch("success");
+        tracing::info!(
+            jwks_url = %self.jwks_url,
+            kid = requested_kid,
+            "JWKS refreshed after unknown kid"
+        );
+        self.lookup_decoding_key(Some(requested_kid))
+    }
+
     /// Fetch the JWKS endpoint and replace the cached keys on success.
     ///
     /// Used by the background refresh task and by the lazy fallback in
@@ -199,6 +244,25 @@ impl JwksCache {
         Ok(())
     }
 
+    /// Blocking variant used by synchronous auth providers on the rare
+    /// unknown-`kid` path.
+    pub fn refresh_blocking_with(&self, client: &reqwest::blocking::Client) -> anyhow::Result<()> {
+        let resp = client
+            .get(&self.jwks_url)
+            .send()
+            .map_err(|e| anyhow::anyhow!("JWKS GET failed: {}", e))?;
+        if !resp.status().is_success() {
+            anyhow::bail!("JWKS GET returned status {}", resp.status());
+        }
+        let body = resp
+            .text()
+            .map_err(|e| anyhow::anyhow!("JWKS body read failed: {}", e))?;
+        let set: JwkSet =
+            serde_json::from_str(&body).map_err(|e| anyhow::anyhow!("JWKS parse failed: {}", e))?;
+        self.set_keys(set.keys);
+        Ok(())
+    }
+
     /// Ensure the cache has at least one key, blocking the current
     /// task on a fetch when the cache is empty.
     ///
@@ -210,6 +274,24 @@ impl JwksCache {
             return Ok(());
         }
         self.refresh_with(client).await
+    }
+
+    fn try_mark_unknown_kid_refresh(&self) -> bool {
+        const MIN_UNKNOWN_KID_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+        let now = Instant::now();
+        let mut last = self
+            .last_unknown_kid_refresh
+            .lock()
+            .expect("last_unknown_kid_refresh lock poisoned");
+        if last
+            .map(|previous| now.duration_since(previous) < MIN_UNKNOWN_KID_REFRESH_INTERVAL)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        *last = Some(now);
+        true
     }
 }
 
@@ -348,5 +430,44 @@ mod tests {
             .unwrap();
         let result = cache.refresh_with(&client).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn unknown_kid_refetches_before_lookup_fails() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let body = serde_json::json!({
+            "keys": [rsa_jwk("new-key")]
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(response.as_bytes());
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+            }
+        });
+
+        let cache = JwksCache::new(&format!("http://{}/jwks", addr), 3600);
+        cache.set_keys(vec![rsa_jwk("old-key")]);
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(cache
+            .lookup_decoding_key_with_unknown_kid_refresh(Some("new-key"), &client)
+            .is_some());
+        handle.join().unwrap();
     }
 }
