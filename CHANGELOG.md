@@ -13,6 +13,18 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **`GET /admin/drift` config drift endpoint (WOR-132).** Returns
+  whether the on-disk config file has diverged from what the running
+  proxy has loaded, without triggering a reload. Compares a
+  content-hash baseline captured at startup (and refreshed on every
+  `/admin/reload`) against a fresh hash of the current file. K8s
+  operators and dashboards scrape this so they can flag an edited
+  config that has not been hot-reloaded yet. Documented in
+  `docs/configuration.md` § Admin fields.
+  ([crates/sbproxy-core/src/admin.rs],
+  [crates/sbproxy-core/src/server.rs],
+  [docs/configuration.md])
+
 - **Deterministic clock-skew testing hooks.** `ClockSkewMonitor` now
   accepts an injected clock source for tests while production continues
   to use the system clock.
@@ -171,6 +183,17 @@ of the new YAML fields below until the version that ships them.
     `SB_REQUEST_LOG_LEVEL` and access-log file/forced-emit examples.
 
 ### Fixed
+
+- **Build under prometheus 0.14 type inference.** Sites in
+  `sbproxy-observe::metrics` and `sbproxy-core::server` that passed
+  heterogeneous `&[&String, &str]` arrays to
+  `prometheus::with_label_values` no longer compile on prometheus
+  0.14 because Rust unifies the array element type to `&String` and
+  rejects bare `&str` literals. Coerced all such call sites to
+  uniform `&[&str]` via `.as_str()` so the workspace builds clean
+  again. No behavioural change.
+  ([crates/sbproxy-observe/src/metrics.rs],
+  [crates/sbproxy-core/src/server.rs])
 
 - **WASM extension docs corrected.** `CLAUDE.md` previously labeled the
   WASM surface as "WASM stub" while marketing docs claimed
