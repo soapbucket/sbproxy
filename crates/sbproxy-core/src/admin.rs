@@ -248,6 +248,21 @@ pub struct AdminState {
     /// pipeline. `None` when the admin server is constructed without
     /// a known on-disk config (e.g. in unit tests).
     pub config_path: Option<PathBuf>,
+    /// 12-char hex prefix of SHA-256 of the raw YAML bytes that
+    /// produced the running pipeline (same format as
+    /// [`crate::identity::config_revision`]). Set by
+    /// [`AdminState::with_loaded_config_content_hash`] at startup
+    /// and refreshed by the reload handler on every successful swap.
+    /// `None` until the proxy has loaded a config from disk (which
+    /// means `/admin/drift` cannot make a determination yet).
+    ///
+    /// Tracked alongside `pipeline.config_revision`: the pipeline
+    /// revision is an origin-set identity hash and does not move when
+    /// only policies, transforms, or ports change, so it cannot
+    /// answer "has the on-disk file drifted from what is loaded?". The
+    /// raw-bytes SHA-256 moves on any byte-level edit, which is what
+    /// an operator means by drift.
+    pub loaded_config_content_hash: Mutex<Option<String>>,
     /// Single-flight guard for `/admin/reload`.
     ///
     /// We CAS this from `false` to `true` on entry; if the swap
@@ -276,6 +291,7 @@ impl AdminState {
             config,
             openapi_cache: Mutex::new(OpenApiCache::empty()),
             config_path: None,
+            loaded_config_content_hash: Mutex::new(None),
             reload_in_progress: AtomicBool::new(false),
             health_registry: sbproxy_observe::default_registry_optional(None, None),
         }
@@ -289,6 +305,21 @@ impl AdminState {
     /// idiom in `server::run` a single expression.
     pub fn with_config_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.config_path = Some(path.into());
+        self
+    }
+
+    /// Builder-style setter for the loaded-config SHA-256.
+    ///
+    /// Called by the binary at startup once the initial YAML has been
+    /// read so `/admin/drift` can compare the on-disk file's current
+    /// hash against the hash captured at load time. The reload
+    /// handler updates the same field on every successful swap so the
+    /// drift baseline tracks the live pipeline.
+    pub fn with_loaded_config_content_hash(self, hex: impl Into<String>) -> Self {
+        *self
+            .loaded_config_content_hash
+            .lock()
+            .expect("loaded config sha256 mutex poisoned") = Some(hex.into());
         self
     }
 
@@ -712,7 +743,12 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
     }
 
     let revision = new_pipeline.config_revision.clone();
+    let content_hash = crate::identity::config_revision(yaml.as_bytes());
     crate::reload::load_pipeline(new_pipeline);
+    *state
+        .loaded_config_content_hash
+        .lock()
+        .expect("loaded config content hash mutex poisoned") = Some(content_hash);
     let loaded_at = chrono::Utc::now().to_rfc3339();
     tracing::info!(
         config_revision = %revision,
@@ -729,6 +765,93 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
             loaded_at,
         ),
     )
+}
+
+// --- /admin/drift ---
+
+/// Compare the on-disk config file at [`AdminState::config_path`]
+/// against the content-hash captured the last time the proxy loaded
+/// a config (startup or [`AdminState::with_loaded_config_content_hash`]
+/// or `POST /admin/reload`).
+///
+/// Returns the loaded revision (origin-set identity hash), the loaded
+/// content hash, the current on-disk content hash, and a `drift`
+/// boolean. K8s + dashboards scrape this so an operator can see when
+/// the running proxy has diverged from the declared config without
+/// triggering a reload.
+///
+/// Failure modes:
+///
+/// * `503` - the admin server has no on-disk config path (test mode
+///   or non-file-backed configuration), or no content-hash baseline
+///   has been captured yet. Drift detection has nothing to compare
+///   against.
+/// * `500` - the on-disk file could not be read (permissions, ENOENT
+///   after start, etc.). The error message has the path scrubbed by
+///   [`sanitise_path_in_error`] so the response does not leak the
+///   absolute config path.
+fn handle_drift(state: &AdminState) -> (u16, &'static str, String) {
+    let pipeline = crate::reload::current_pipeline();
+    let loaded_revision = pipeline.config_revision.clone();
+
+    let config_path = match &state.config_path {
+        Some(p) => p.clone(),
+        None => {
+            return (
+                503,
+                "application/json",
+                r#"{"error":"admin server has no on-disk config path; drift detection unavailable"}"#
+                    .to_string(),
+            );
+        }
+    };
+
+    let loaded_content_hash = state
+        .loaded_config_content_hash
+        .lock()
+        .expect("loaded config content hash mutex poisoned")
+        .clone();
+    let loaded_content_hash = match loaded_content_hash {
+        Some(h) => h,
+        None => {
+            return (
+                503,
+                "application/json",
+                r#"{"error":"no loaded config content hash baseline; drift detection unavailable until first reload"}"#
+                    .to_string(),
+            );
+        }
+    };
+
+    let bytes = match std::fs::read(&config_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "admin drift: failed to read config file");
+            let msg = sanitise_path_in_error(&e.to_string(), &config_path);
+            return (
+                500,
+                "application/json",
+                format!(
+                    r#"{{"error":"failed to read config file: {}"}}"#,
+                    msg.replace('"', "'")
+                ),
+            );
+        }
+    };
+    let on_disk_content_hash = crate::identity::config_revision(&bytes);
+    let drift = on_disk_content_hash != loaded_content_hash;
+
+    let body = serde_json::json!({
+        "config_path": config_path.display().to_string(),
+        "loaded_revision": loaded_revision,
+        "loaded_content_hash": loaded_content_hash,
+        "on_disk_content_hash": on_disk_content_hash,
+        "drift": drift,
+        "on_disk_size_bytes": bytes.len(),
+        "checked_at": chrono::Utc::now().to_rfc3339(),
+    })
+    .to_string();
+    (200, "application/json", body)
 }
 
 // --- Request Handler ---
@@ -804,6 +927,19 @@ pub fn handle_admin_request(
     if path == "/admin/reload" {
         if method.eq_ignore_ascii_case("POST") {
             return handle_reload(state);
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+
+    // GET /admin/drift: compare loaded config against on-disk file.
+    // Read-only, idempotent, side-effect-free; only GET is accepted.
+    if path == "/admin/drift" {
+        if method.eq_ignore_ascii_case("GET") {
+            return handle_drift(state);
         }
         return (
             405,
@@ -1486,6 +1622,167 @@ origins:
             s1_status == 409 || s2_status == 409,
             "expected at least one 409, got {s1_status} and {s2_status}"
         );
+    }
+
+    // --- /admin/drift ---
+
+    #[test]
+    fn admin_drift_unauthorized_returns_401() {
+        let state = make_state();
+        let (status, _, _) = handle_admin_request("GET", "/admin/drift", &state, None);
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn admin_drift_rejects_post() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, _) = handle_admin_request("POST", "/admin/drift", &state, Some(&auth));
+        assert_eq!(status, 405);
+    }
+
+    #[test]
+    fn admin_drift_without_config_path_returns_503() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, body) = handle_admin_request("GET", "/admin/drift", &state, Some(&auth));
+        assert_eq!(status, 503);
+        assert!(body.contains("no on-disk config path"), "got: {body}");
+    }
+
+    #[test]
+    fn admin_drift_without_content_hash_baseline_returns_503() {
+        // config_path is set but no content-hash baseline yet (nothing
+        // has called `with_loaded_config_content_hash` and no reload
+        // has occurred). Drift cannot be determined.
+        let f = write_yaml(&reload_yaml("drift-no-baseline.example.com"));
+        let state = AdminState::new(AdminConfig {
+            enabled: true,
+            port: 9090,
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            max_log_entries: 5,
+        })
+        .with_config_path(f.path());
+        let auth = basic_auth("admin", "secret");
+        let (status, _, body) = handle_admin_request("GET", "/admin/drift", &state, Some(&auth));
+        assert_eq!(status, 503);
+        assert!(
+            body.contains("no loaded config content hash baseline"),
+            "got: {body}"
+        );
+    }
+
+    #[test]
+    fn admin_drift_missing_file_returns_500_with_sanitised_path() {
+        // Point at a file that does not exist. Seed the baseline so
+        // we get past the no-baseline 503 path. The handler should
+        // surface the I/O error but scrub the absolute path so the
+        // body does not leak the operator's filesystem layout.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bogus = dir.path().join("does-not-exist.yml");
+        let state = AdminState::new(AdminConfig {
+            enabled: true,
+            port: 9090,
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            max_log_entries: 5,
+        })
+        .with_config_path(&bogus)
+        .with_loaded_config_content_hash("deadbeefcafe");
+        let auth = basic_auth("admin", "secret");
+        let (status, ct, body) = handle_admin_request("GET", "/admin/drift", &state, Some(&auth));
+        assert_eq!(status, 500, "body: {body}");
+        assert_eq!(ct, "application/json");
+        let abs = bogus.to_string_lossy().to_string();
+        assert!(
+            !body.contains(&abs),
+            "absolute path leaked into error: {body}"
+        );
+    }
+
+    #[test]
+    fn admin_drift_after_reload_reports_no_drift() {
+        // Reload to make the loaded revision deterministic, then
+        // query drift against the same file: revisions match, drift
+        // is false.
+        let f = write_yaml(&reload_yaml("reload-drift-noop.example.com"));
+        let state = AdminState::new(AdminConfig {
+            enabled: true,
+            port: 9090,
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            max_log_entries: 5,
+        })
+        .with_config_path(f.path());
+        let auth = basic_auth("admin", "secret");
+        let (rstatus, _, _) = handle_admin_request("POST", "/admin/reload", &state, Some(&auth));
+        assert_eq!(rstatus, 200);
+
+        let (status, ct, body) = handle_admin_request("GET", "/admin/drift", &state, Some(&auth));
+        assert_eq!(status, 200, "body: {body}");
+        assert_eq!(ct, "application/json");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(parsed.get("drift").and_then(|v| v.as_bool()), Some(false));
+        let loaded = parsed
+            .get("loaded_content_hash")
+            .and_then(|v| v.as_str())
+            .expect("loaded_content_hash string");
+        let on_disk = parsed
+            .get("on_disk_content_hash")
+            .and_then(|v| v.as_str())
+            .expect("on_disk_content_hash string");
+        assert_eq!(loaded, on_disk, "content hashes should match after reload");
+        // The origin-set identity hash also surfaces; sanity-check
+        // that it's a 12-char hex string (matches config_revision()'s
+        // contract).
+        let origin_revision = parsed
+            .get("loaded_revision")
+            .and_then(|v| v.as_str())
+            .expect("loaded_revision string");
+        assert_eq!(origin_revision.len(), 12);
+        assert!(parsed.get("on_disk_size_bytes").is_some());
+        assert!(parsed.get("checked_at").is_some());
+    }
+
+    #[test]
+    fn admin_drift_after_file_change_reports_drift() {
+        // Reload, mutate the file, query drift: on-disk hash differs
+        // from the loaded revision.
+        let f = write_yaml(&reload_yaml("reload-drift-edit-a.example.com"));
+        let state = AdminState::new(AdminConfig {
+            enabled: true,
+            port: 9090,
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            max_log_entries: 5,
+        })
+        .with_config_path(f.path());
+        let auth = basic_auth("admin", "secret");
+        let (rstatus, _, _) = handle_admin_request("POST", "/admin/reload", &state, Some(&auth));
+        assert_eq!(rstatus, 200);
+
+        // Edit the file in place. The loaded pipeline still has the
+        // pre-edit revision; the on-disk file hashes differently.
+        std::fs::write(
+            f.path(),
+            reload_yaml("reload-drift-edit-b.example.com").as_bytes(),
+        )
+        .expect("rewrite yaml");
+
+        let (status, _, body) = handle_admin_request("GET", "/admin/drift", &state, Some(&auth));
+        assert_eq!(status, 200, "body: {body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(parsed.get("drift").and_then(|v| v.as_bool()), Some(true));
+        let loaded = parsed
+            .get("loaded_content_hash")
+            .and_then(|v| v.as_str())
+            .expect("loaded_content_hash string");
+        let on_disk = parsed
+            .get("on_disk_content_hash")
+            .and_then(|v| v.as_str())
+            .expect("on_disk_content_hash string");
+        assert_ne!(loaded, on_disk, "revisions should differ after file change");
     }
 
     // --- Rate Limiter ---

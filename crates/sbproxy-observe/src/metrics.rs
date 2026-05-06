@@ -588,23 +588,23 @@ pub fn record_request_with_labels(
     // affecting the per-origin views below.
     m.requests_total
         .with_label_values(&[
-            &hostname_san,
+            hostname_san.as_str(),
             method,
-            &status_str,
-            &agent_id,
-            &agent_class,
-            &agent_vendor,
-            &payment_rail,
-            &content_shape,
+            status_str.as_str(),
+            agent_id.as_str(),
+            agent_class.as_str(),
+            agent_vendor.as_str(),
+            payment_rail.as_str(),
+            content_shape.as_str(),
         ])
         .inc();
 
     // --- Per-origin views (unchanged label set; pre-existing) ---
     m.per_origin_requests_total
-        .with_label_values(&[&origin_san, method, &status_str])
+        .with_label_values(&[origin_san.as_str(), method, status_str.as_str()])
         .inc();
     m.per_origin_request_duration
-        .with_label_values(&[&origin_san, method, &status_str])
+        .with_label_values(&[origin_san.as_str(), method, status_str.as_str()])
         .observe(duration_secs);
     // Wave 1 exemplar: stamp the active trace_id onto the latency
     // histogram so Grafana's "click an outlier" path reaches the
@@ -634,12 +634,12 @@ pub fn record_request_with_labels(
     );
     if bytes_in > 0 {
         m.bytes_total
-            .with_label_values(&[&origin_san, "in"])
+            .with_label_values(&[origin_san.as_str(), "in"])
             .inc_by(bytes_in as f64);
     }
     if bytes_out > 0 {
         m.bytes_total
-            .with_label_values(&[&origin_san, "out"])
+            .with_label_values(&[origin_san.as_str(), "out"])
             .inc_by(bytes_out as f64);
     }
 }
@@ -652,7 +652,7 @@ pub fn record_auth(origin: &str, auth_type: &str, allowed: bool) {
     let result = if allowed { "allow" } else { "deny" };
     metrics()
         .auth_results
-        .with_label_values(&[&origin, auth_type, result])
+        .with_label_values(&[origin.as_str(), auth_type, result])
         .inc();
 }
 
@@ -684,7 +684,13 @@ pub fn record_policy_with_labels(
     );
     metrics()
         .policy_triggers
-        .with_label_values(&[&origin_san, policy_type, action, &agent_id, &agent_class])
+        .with_label_values(&[
+            origin_san.as_str(),
+            policy_type,
+            action,
+            agent_id.as_str(),
+            agent_class.as_str(),
+        ])
         .inc();
 }
 
@@ -705,7 +711,9 @@ pub fn record_capture_budget_drop(workspace_id: &str, dimension: &'static str) {
         .expect("capture budget counter registers")
     });
     let workspace = sanitize_label("workspace", workspace_id);
-    counter.with_label_values(&[&workspace, dimension]).inc();
+    counter
+        .with_label_values(&[workspace.as_str(), dimension])
+        .inc();
 }
 
 /// Record drop counters returned by the Wave 8 capture helpers.
@@ -737,7 +745,7 @@ pub fn record_capture_drop(
     });
     let workspace = sanitize_label("workspace", workspace_id);
     counter
-        .with_label_values(&[&workspace, dimension, reason])
+        .with_label_values(&[workspace.as_str(), dimension, reason])
         .inc_by(n);
 }
 
@@ -758,7 +766,9 @@ pub fn record_a2a_hop(route: &str, spec: &str, decision: &str) {
         .expect("a2a hops counter registers")
     });
     let route = sanitize_label("route", route);
-    counter.with_label_values(&[&route, spec, decision]).inc();
+    counter
+        .with_label_values(&[route.as_str(), spec, decision])
+        .inc();
 }
 
 /// Record an A2A chain depth observation (Wave 7 / A7.2). Surfaces
@@ -778,7 +788,7 @@ pub fn record_a2a_chain_depth(route: &str, spec: &str, depth: u32) {
         .expect("a2a chain depth histogram registers")
     });
     let route = sanitize_label("route", route);
-    hist.with_label_values(&[&route, spec])
+    hist.with_label_values(&[route.as_str(), spec])
         .observe(depth as f64);
 }
 
@@ -798,7 +808,7 @@ pub fn record_a2a_denied(route: &str, reason: &str) {
         .expect("a2a denied counter registers")
     });
     let route = sanitize_label("route", route);
-    counter.with_label_values(&[&route, reason]).inc();
+    counter.with_label_values(&[route.as_str(), reason]).inc();
 }
 
 /// Record a request blocked by the `http_framing` policy. The
@@ -845,7 +855,7 @@ pub fn record_cache(origin: &str, result: &str) {
     let origin = sanitize_label("origin", origin);
     metrics()
         .cache_results
-        .with_label_values(&[&origin, result])
+        .with_label_values(&[origin.as_str(), result])
         .inc();
 }
 
@@ -854,7 +864,7 @@ pub fn record_circuit_breaker(origin: &str, from_state: &str, to_state: &str) {
     let origin = sanitize_label("origin", origin);
     metrics()
         .circuit_breaker_transitions
-        .with_label_values(&[&origin, from_state, to_state])
+        .with_label_values(&[origin.as_str(), from_state, to_state])
         .inc();
 }
 
@@ -1030,14 +1040,20 @@ mod tests {
 
         let count = m
             .per_origin_requests_total
-            .with_label_values(&[&sanitized, "GET", "200"])
+            .with_label_values(&[sanitized.as_str(), "GET", "200"])
             .get();
         assert_eq!(count, 2.0, "expected 2 requests recorded");
 
-        let bytes_in = m.bytes_total.with_label_values(&[&sanitized, "in"]).get();
+        let bytes_in = m
+            .bytes_total
+            .with_label_values(&[sanitized.as_str(), "in"])
+            .get();
         assert_eq!(bytes_in, 3072.0, "bytes_in should be 1024 + 2048");
 
-        let bytes_out = m.bytes_total.with_label_values(&[&sanitized, "out"]).get();
+        let bytes_out = m
+            .bytes_total
+            .with_label_values(&[sanitized.as_str(), "out"])
+            .get();
         assert_eq!(bytes_out, 768.0, "bytes_out should be 512 + 256");
     }
 
@@ -1053,13 +1069,13 @@ mod tests {
 
         let allow_count = m
             .auth_results
-            .with_label_values(&[&sanitized, "api_key", "allow"])
+            .with_label_values(&[sanitized.as_str(), "api_key", "allow"])
             .get();
         assert_eq!(allow_count, 1.0);
 
         let deny_count = m
             .auth_results
-            .with_label_values(&[&sanitized, "api_key", "deny"])
+            .with_label_values(&[sanitized.as_str(), "api_key", "deny"])
             .get();
         assert_eq!(deny_count, 2.0);
     }
@@ -1079,19 +1095,19 @@ mod tests {
         // sentinel. Read back with the same label tuple.
         let rl = m
             .policy_triggers
-            .with_label_values(&[&sanitized, "rate_limit", "deny", "", ""])
+            .with_label_values(&[sanitized.as_str(), "rate_limit", "deny", "", ""])
             .get();
         assert_eq!(rl, 1.0);
 
         let ip = m
             .policy_triggers
-            .with_label_values(&[&sanitized, "ip_filter", "deny", "", ""])
+            .with_label_values(&[sanitized.as_str(), "ip_filter", "deny", "", ""])
             .get();
         assert_eq!(ip, 1.0);
 
         let waf = m
             .policy_triggers
-            .with_label_values(&[&sanitized, "waf", "allow", "", ""])
+            .with_label_values(&[sanitized.as_str(), "waf", "allow", "", ""])
             .get();
         assert_eq!(waf, 1.0);
     }
@@ -1221,14 +1237,14 @@ mod tests {
         let count = m
             .requests_total
             .with_label_values(&[
-                &origin_san,
+                origin_san.as_str(),
                 "GET",
                 "200",
-                &agent_id_san,
-                &agent_class_san,
-                &agent_vendor_san,
-                &payment_rail_san,
-                &content_shape_san,
+                agent_id_san.as_str(),
+                agent_class_san.as_str(),
+                agent_vendor_san.as_str(),
+                payment_rail_san.as_str(),
+                content_shape_san.as_str(),
             ])
             .get();
         assert!(count >= 1, "agent-labelled request must increment");
@@ -1245,7 +1261,7 @@ mod tests {
         // tuple, which is the "no agent context attached" series.
         let count = m
             .requests_total
-            .with_label_values(&[&origin_san, "POST", "201", "", "", "", "", ""])
+            .with_label_values(&[origin_san.as_str(), "POST", "201", "", "", "", "", ""])
             .get();
         assert_eq!(count, 1, "legacy record_request must use empty sentinel");
     }
@@ -1274,11 +1290,11 @@ mod tests {
         let count = m
             .policy_triggers
             .with_label_values(&[
-                &origin_san,
+                origin_san.as_str(),
                 "rate_limit",
                 "deny",
-                &agent_id_san,
-                &agent_class_san,
+                agent_id_san.as_str(),
+                agent_class_san.as_str(),
             ])
             .get();
         assert!(count >= 1.0, "policy trigger must stamp agent_id");

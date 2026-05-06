@@ -10228,7 +10228,7 @@ impl ProxyHttp for SbProxy {
         if duration > 0.0 {
             metrics()
                 .request_duration
-                .with_label_values(&[&hostname])
+                .with_label_values(&[hostname.as_str()])
                 .observe(duration);
         }
 
@@ -10244,7 +10244,7 @@ impl ProxyHttp for SbProxy {
         if _e.is_some() {
             metrics()
                 .errors_total
-                .with_label_values(&[&hostname, "proxy_error"])
+                .with_label_values(&[hostname.as_str(), "proxy_error"])
                 .inc();
         }
 
@@ -11136,6 +11136,7 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
     // Load and compile the config.
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config file '{}': {}", config_path, e))?;
+    let initial_content_hash = crate::identity::config_revision(yaml.as_bytes());
     let compiled = sbproxy_config::compile_config(&yaml)?;
     if let Some(al) = compiled.access_log.as_ref() {
         log_capture_header_warnings(al);
@@ -11535,7 +11536,9 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
         // the AdminState so a manual reload during a watcher reload
         // serialises cleanly.
         let admin_state = std::sync::Arc::new(
-            crate::admin::AdminState::new(admin_cfg).with_config_path(config_path),
+            crate::admin::AdminState::new(admin_cfg)
+                .with_config_path(config_path)
+                .with_loaded_config_content_hash(initial_content_hash.clone()),
         );
         // Pingora's `Server::run_forever` builds its own multi-thread
         // tokio runtime; spawning before run_forever installs the

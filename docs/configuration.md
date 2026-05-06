@@ -209,10 +209,54 @@ per-IP rate limit. Endpoints:
 | `GET /api/health` | Liveness check returning `{"status":"ok"}`. |
 | `GET /api/openapi.json` | Emitted OpenAPI 3.0 document for the running pipeline. |
 | `GET /api/openapi.yaml` | Same document in YAML. |
+| `POST /admin/reload` | Re-read the on-disk config file and hot-swap the pipeline. Single-flight; concurrent calls return 409. |
+| `GET /admin/drift` | Compare the on-disk config file against the loaded baseline. See below. |
 
 Unauthenticated requests get a 401 with a `WWW-Authenticate: Basic`
 header. Requests from outside `127.0.0.1` are dropped at the
 socket level.
+
+#### `GET /admin/drift`
+
+Returns whether the on-disk config file has diverged from what the
+running proxy has loaded, without triggering a reload. K8s
+operators and dashboards scrape this so they can flag a config that
+was edited on disk but not yet hot-reloaded.
+
+Response shape (200 OK):
+
+```json
+{
+  "config_path": "/etc/sbproxy/sb.yml",
+  "loaded_revision": "a3f5b1d829c4",
+  "loaded_content_hash": "8e1c5d4a9f7b",
+  "on_disk_content_hash": "8e1c5d4a9f7b",
+  "drift": false,
+  "on_disk_size_bytes": 4321,
+  "checked_at": "2026-05-06T15:42:00Z"
+}
+```
+
+* `loaded_revision` is the 12-char origin-set identity hash from the
+  running pipeline. Stable when only policies, transforms, or ports
+  change; moves when origins or hostnames are added or removed.
+* `loaded_content_hash` is the 12-char SHA-256 prefix of the raw YAML
+  bytes captured at load time (startup or last successful
+  `/admin/reload`).
+* `on_disk_content_hash` is the same hash recomputed against the
+  current file contents.
+* `drift` is `true` iff the two content hashes differ.
+
+Failure modes:
+
+* `503` - the admin server has no on-disk config path (constructed
+  without `with_config_path`, e.g. tests), or no content-hash
+  baseline has been captured yet (no startup load and no successful
+  reload).
+* `500` - the on-disk file could not be read. The error message has
+  the absolute path scrubbed so the response does not leak the
+  operator's filesystem layout.
+* `405` - any verb other than `GET`.
 
 ### Metrics fields
 
