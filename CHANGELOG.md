@@ -116,6 +116,13 @@ of the new YAML fields below until the version that ships them.
 
 ### Fixed
 
+- **E2E proxy startup flake under CPU contention.** The e2e
+  `ProxyHarness` keeps its HTTP-level readiness probe, but now gives
+  release/debug proxy boots a 10-second window instead of 5 seconds so
+  tests like `action_graphql` do not fail spuriously while cargo is
+  competing for CPU.
+  ([e2e/src/lib.rs])
+
 - **AI client retry resilience.** `MemoryBatchStore` now uses
   `parking_lot::Mutex` so a panic in one worker cannot poison the
   in-memory batch map for every later operation. Provider retries now
