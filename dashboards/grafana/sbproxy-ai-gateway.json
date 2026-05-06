@@ -45,7 +45,10 @@
   "uid": "sbproxy-ai-gateway",
   "title": "SBProxy AI Gateway",
   "description": "AI gateway metrics including provider performance, token usage, guardrails, and fallbacks.",
-  "tags": ["sbproxy", "ai-gateway"],
+  "tags": [
+    "sbproxy",
+    "ai-gateway"
+  ],
   "style": "dark",
   "timezone": "browser",
   "editable": true,
@@ -62,12 +65,22 @@
       "id": 1,
       "title": "AI Requests/sec by Provider",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "lineWidth": 2,
             "fillOpacity": 10,
@@ -80,28 +93,48 @@
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
           "refId": "A",
           "expr": "sum by (provider) (rate(sbproxy_ai_requests_total[5m]))",
           "legendFormat": "{{provider}}",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         }
-      ]
+      ],
+      "description": "Measures AI Requests/sec by Provider. Runbook: docs/operator-runbook.md#ai-gateway. When red, inspect the matching component, confirm healthy range, and follow the rollback guidance if the spike follows a config change."
     },
     {
       "id": 2,
       "title": "Token Usage (Input / Output)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "lineWidth": 2,
             "fillOpacity": 10,
@@ -114,34 +147,57 @@
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
           "refId": "A",
           "expr": "sum by (provider) (rate(sbproxy_ai_tokens_input_total[5m]))",
           "legendFormat": "Input - {{provider}}",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         },
         {
           "refId": "B",
           "expr": "sum by (provider) (rate(sbproxy_ai_tokens_output_total[5m]))",
           "legendFormat": "Output - {{provider}}",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         }
-      ]
+      ],
+      "description": "Measures Token Usage (Input / Output). Runbook: docs/operator-runbook.md#ai-gateway. When red, inspect the matching component, confirm healthy range, and follow the rollback guidance if the spike follows a config change."
     },
     {
       "id": 3,
       "title": "AI Latency P95 by Provider",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "lineWidth": 2,
             "fillOpacity": 10,
@@ -154,28 +210,48 @@
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
           "refId": "A",
           "expr": "histogram_quantile(0.95, sum by (le, provider) (rate(sbproxy_ai_request_duration_seconds_bucket[5m])))",
           "legendFormat": "P95 - {{provider}}",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         }
-      ]
+      ],
+      "description": "Measures AI Latency P95 by Provider. Runbook: docs/operator-runbook.md#ai-gateway. When red, inspect the matching component, confirm healthy range, and follow the rollback guidance if the spike follows a config change."
     },
     {
       "id": 4,
       "title": "Time to First Token P50 / P95",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "lineWidth": 2,
             "fillOpacity": 10,
@@ -188,38 +264,64 @@
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
           "refId": "A",
           "expr": "histogram_quantile(0.5, sum by (le) (rate(sbproxy_ai_ttft_seconds_bucket[5m])))",
           "legendFormat": "TTFT P50",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         },
         {
           "refId": "B",
           "expr": "histogram_quantile(0.95, sum by (le) (rate(sbproxy_ai_ttft_seconds_bucket[5m])))",
           "legendFormat": "TTFT P95",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         }
-      ]
+      ],
+      "description": "Measures Time to First Token P50 / P95. Runbook: docs/operator-runbook.md#ai-gateway. When red, inspect the matching component, confirm healthy range, and follow the rollback guidance if the spike follows a config change."
     },
     {
       "id": 5,
       "title": "AI Cache Hit Rate",
       "type": "stat",
-      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 16 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
-          "color": { "mode": "thresholds" },
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null }
+              {
+                "color": "green",
+                "value": null
+              }
             ]
           }
         },
@@ -227,7 +329,9 @@
       },
       "options": {
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": "",
           "values": false
         },
@@ -241,20 +345,34 @@
           "refId": "A",
           "expr": "sum(rate(sbproxy_ai_cache_hits_total[5m]))",
           "legendFormat": "Cache Hits/sec",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         }
-      ]
+      ],
+      "description": "Measures AI Cache Hit Rate. Runbook: docs/operator-runbook.md#ai-gateway. When red, inspect the matching component, confirm healthy range, and follow the rollback guidance if the spike follows a config change."
     },
     {
       "id": 6,
       "title": "Guardrail Triggers by Type",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 9, "x": 6, "y": 16 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 6,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "lineWidth": 2,
             "fillOpacity": 10,
@@ -267,28 +385,48 @@
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
           "refId": "A",
           "expr": "sum by (type) (rate(sbproxy_ai_guardrail_triggers_total[5m]))",
           "legendFormat": "{{type}}",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         }
-      ]
+      ],
+      "description": "Measures Guardrail Triggers by Type. Runbook: docs/operator-runbook.md#ai-gateway. When red, inspect the matching component, confirm healthy range, and follow the rollback guidance if the spike follows a config change."
     },
     {
       "id": 7,
       "title": "Provider Error Rate",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 9, "x": 15, "y": 16 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 15,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "lineWidth": 2,
             "fillOpacity": 10,
@@ -301,28 +439,48 @@
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
           "refId": "A",
           "expr": "sum by (provider) (rate(sbproxy_ai_provider_errors_total[5m]))",
           "legendFormat": "{{provider}}",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         }
-      ]
+      ],
+      "description": "Measures Provider Error Rate. Runbook: docs/operator-runbook.md#ai-gateway. When red, inspect the matching component, confirm healthy range, and follow the rollback guidance if the spike follows a config change."
     },
     {
       "id": 8,
       "title": "Fallback Rate",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "lineWidth": 2,
             "fillOpacity": 10,
@@ -335,17 +493,27 @@
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
           "refId": "A",
           "expr": "sum by (from_provider, to_provider) (rate(sbproxy_ai_fallbacks_total[5m]))",
           "legendFormat": "{{from_provider}} -> {{to_provider}}",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         }
-      ]
+      ],
+      "description": "Measures Fallback Rate. Runbook: docs/operator-runbook.md#ai-gateway. When red, inspect the matching component, confirm healthy range, and follow the rollback guidance if the spike follows a config change."
     }
   ],
   "templating": {
@@ -355,7 +523,10 @@
     "list": [
       {
         "builtIn": 1,
-        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
         "enable": true,
         "hide": true,
         "iconColor": "rgba(0, 211, 255, 1)",

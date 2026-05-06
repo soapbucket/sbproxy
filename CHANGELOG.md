@@ -18,6 +18,13 @@ of the new YAML fields below until the version that ships them.
   to use the system clock.
   ([crates/sbproxy-observe/src/clock_skew.rs])
 
+- **Operator runbook hooks and fast-track ADR template.** Added a
+  dashboard-oriented operator runbook, linked all Grafana panels to the
+  relevant triage sections, and added a fast-track ADR amendment
+  template for additive closed-enum values.
+  ([docs/operator-runbook.md], [docs/adr-fast-track-amendment.md],
+  [dashboards/grafana/])
+
 - **Operator first-24-hours quickstart.** Added a concise
   `docs/quickstart-operator.md` covering deploy, `/readyz`, metrics,
   Grafana, logs, and rollback, linked from the README and Kubernetes
