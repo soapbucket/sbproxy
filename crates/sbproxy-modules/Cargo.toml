@@ -144,6 +144,7 @@ tokio-util = { workspace = true }
 # XREAD with BLOCK; the AsyncKVStore facade in sbproxy-platform only
 # exposes GET/SET-shaped operations.
 redis = { workspace = true }
+sbproxy-vault = { version = "0.1.0", path = "../sbproxy-vault" }
 
 [dev-dependencies]
 smallvec.workspace = true

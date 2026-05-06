@@ -36,6 +36,12 @@ of the new YAML fields below until the version that ships them.
   ([crates/sbproxy-observe/src/alerting/burn_rate.rs],
   [e2e/tests/slo_burn_rate.rs])
 
+- **Vault-style quote-token seed references.** `ai_crawl_control.quote_token.secret_ref`
+  now accepts `secret:` references resolved through `sbproxy-vault`
+  with the existing environment fallback, in addition to the older
+  `secret_ref.env` and inline `seed_hex` paths.
+  ([crates/sbproxy-modules/src/policy/ai_crawl.rs])
+
 - **Operator first-24-hours quickstart.** Added a concise
   `docs/quickstart-operator.md` covering deploy, `/readyz`, metrics,
   Grafana, logs, and rollback, linked from the README and Kubernetes
