@@ -55,8 +55,9 @@ sbproxy-rust/
     sbproxy-cache/      - response cache, KV stores (memory/file/memcached/redis)
     sbproxy-ai/         - AI gateway path (providers, routing, guardrails,
                           streaming, budgets, cost tracking)
-    sbproxy-extension/  - scripting (CEL, Lua, JavaScript, WASM stub),
-                          MCP server, feature flags
+    sbproxy-extension/  - scripting (CEL, Lua, JavaScript, WASM via
+                          wasmtime + WASI preview-1), MCP server,
+                          feature flags
     sbproxy-observe/    - metrics (sbproxy_*), events, structured logging
     sbproxy-security/   - WAF, PII redactor, certpin, hostfilter
     sbproxy-tls/        - TLS config, mTLS

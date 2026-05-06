@@ -211,7 +211,7 @@ Four engines, picked per use case:
 - **CEL** via `cel-rust`. Compiled once, evaluates in microseconds. Best for routing decisions and quick predicates. Custom functions for HTTP request inspection, hashing, time, and IP utilities.
 - **Lua** via `mlua` with the Luau runtime. Sandboxed. Best for request and response body transforms.
 - **JavaScript** via QuickJS (`rquickjs`). V8-compatible API surface. Best for teams already invested in JS tooling.
-- **WebAssembly** via `wasmtime`. WASI networking with host allowlist. Best for sandboxed plugins from any source language.
+- **WebAssembly** via `wasmtime` against WASI preview-1. Modules read input on stdin and write output to stdout; no filesystem, no network. Memory and CPU bounded per-call. Best for response-body transforms in any language with a `wasm32-wasi` target (Rust, TinyGo, AssemblyScript, Zig).
 
 Every engine sees the same context namespaces: `request`, `session`, `origin`, `server`, `vars`, `ctx`, `response`.
 

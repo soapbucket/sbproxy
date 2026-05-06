@@ -172,6 +172,17 @@ of the new YAML fields below until the version that ships them.
 
 ### Fixed
 
+- **WASM extension docs corrected.** `CLAUDE.md` previously labeled the
+  WASM surface as "WASM stub" while marketing docs claimed
+  production-grade support; the runtime is real
+  (`wasmtime` + WASI preview-1 with sandboxed memory and CPU caps,
+  stderr capture, no FS or network). `llms.txt` also incorrectly
+  claimed "WASI networking with host allowlist" but `allowed_hosts` is
+  parsed-but-inert until WASI sockets land. CLAUDE.md and llms.txt now
+  match the shipped surface.
+  ([CLAUDE.md], [llms.txt],
+  [crates/sbproxy-extension/src/wasm/mod.rs])
+
 - **E2E proxy startup flake under CPU contention.** The e2e
   `ProxyHarness` keeps its HTTP-level readiness probe, but now gives
   release/debug proxy boots a 10-second window instead of 5 seconds so
