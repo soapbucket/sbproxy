@@ -14,7 +14,7 @@ cargo-chef layout:
 | File | Purpose | Consumer |
 |---|---|---|
 | `Dockerfile.cloudbuild` | Cloud Build / GCR amd64 image. | `gcloud builds submit`; bench loadtest stack. |
-| `Dockerfile.ci` | Kind-based smoke-test image. | `.github/workflows/k8s-operator-smoke.yml`. |
+| `Dockerfile.ci` | Kind-based smoke-test image. | `make k8s-operator-smoke`. |
 
 Both files have six stages:
 
