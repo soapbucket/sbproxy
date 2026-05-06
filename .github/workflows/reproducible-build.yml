@@ -1,0 +1,120 @@
+name: reproducible build probe
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/reproducible-build.yml'
+      - 'SUPPLY-CHAIN.md'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    name: independent build ${{ matrix.build_id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        build_id: [a, b]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: reproducible-build-${{ matrix.build_id }}
+
+      - name: install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang
+
+      - name: build release binary
+        env:
+          CARGO_TARGET_DIR: target/repro-${{ matrix.build_id }}
+        run: cargo build --release -p sbproxy --locked
+
+      - name: stage artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/repro-${{ matrix.build_id }}/release/sbproxy" "dist/sbproxy-${{ matrix.build_id }}"
+          sha256sum "dist/sbproxy-${{ matrix.build_id }}" | tee "dist/sbproxy-${{ matrix.build_id }}.sha256"
+
+      - name: upload independent build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reproducible-build-${{ matrix.build_id }}
+          path: dist/
+          retention-days: 14
+
+  compare:
+    name: compare independent builds
+    runs-on: ubuntu-latest
+    needs: [build]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: reproducible-build-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: compare binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "# Reproducible build probe"
+            echo
+            echo "Commit: ${GITHUB_SHA}"
+            echo "Workflow run: ${GITHUB_RUN_ID}"
+            echo
+            echo "## SHA-256"
+            cat artifacts/*.sha256
+            echo
+            if cmp -s artifacts/sbproxy-a artifacts/sbproxy-b; then
+              echo "## Result"
+              echo "The independent release binaries are bit-for-bit identical."
+            else
+              echo "## Result"
+              echo "The independent release binaries differ. This probe is informational until the reproducibility work reaches zero diff."
+              echo
+              echo "## First differing byte positions"
+              cmp -l artifacts/sbproxy-a artifacts/sbproxy-b | head -200 || true
+            fi
+          } | tee reproducible-build-report.md
+
+      - name: upload comparison report
+        uses: actions/upload-artifact@v4
+        with:
+          name: reproducible-build-report
+          path: reproducible-build-report.md
+          retention-days: 30

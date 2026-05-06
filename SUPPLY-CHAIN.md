@@ -268,7 +268,7 @@ This means: if you build from the same source, with the same toolchain, on a sim
 
 ### 6.2 What we do not yet guarantee
 
-- **Bit-for-bit identical binaries** across builders. Achieving this requires removing every source of nondeterminism (timestamp embeds, file ordering, codegen unit nondeterminism). It is a multi-week project. We have not done it yet. We will publish the result when we have, with a CI job that diffs two independent builds and fails if they differ.
+- **Bit-for-bit identical binaries** across builders. Achieving this requires removing every source of nondeterminism (timestamp embeds, file ordering, codegen unit nondeterminism). It is a multi-week project. We have not done it yet. The `reproducible build probe` workflow now builds the release binary twice on independent GitHub-hosted runners and uploads the SHA-256 comparison report as an artifact, but the probe is informational until the diff reaches zero.
 
 If your security policy requires bit-for-bit reproducibility today, talk to us. We will work with you on a bridge: independent rebuild from a tagged source, SBOM and dependency-graph comparison, and a written attestation that the dependency surface matches.
 

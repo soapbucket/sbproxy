@@ -20,6 +20,13 @@ of the new YAML fields below until the version that ships them.
   profile.
   ([Cargo.toml], [Dockerfile.ci], [Dockerfile.cloudbuild])
 
+- **Reproducible build probe workflow.** CI now has an informational
+  double-build lane that builds the release binary twice on independent
+  GitHub-hosted runners, uploads each binary and SHA-256, and publishes
+  a comparison report without yet treating non-identical output as a
+  failure.
+  ([.github/workflows/reproducible-build.yml], [SUPPLY-CHAIN.md])
+
 - **WOR-114 Phase 2: CEL `features[...]` namespace.** Per-request
   flags parsed from the `x-sb-flags` header and `?_sb.<key>` query
   prefix are now exposed to CEL expressions. Built-in flags surface
