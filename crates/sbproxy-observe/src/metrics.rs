@@ -557,7 +557,8 @@ pub fn record_request_with_labels(
     bytes_out: u64,
     agent: AgentLabels<'_>,
 ) {
-    let origin_san = sanitize_label("origin", origin);
+    let hostname_san = sanitize_label_budget("sbproxy_requests_total", "hostname", origin);
+    let origin_san = sanitize_label_budget("sbproxy_origin_requests_total", "origin", origin);
     let status_str = status.to_string();
 
     // --- Wave 1 / G1.6: per-agent labels on sbproxy_requests_total ---
@@ -582,11 +583,12 @@ pub fn record_request_with_labels(
 
     let m = metrics();
     // sbproxy_requests_total now carries the full Wave 1 label set.
-    // Sanitised hostname is reused via origin_san (cardinality cap
-    // 200 per ADR; same numeric cap, different label name).
+    // Sanitise with the metric's public label name (`hostname`) so
+    // `metrics.cardinality.hostname_cap` can lower this budget without
+    // affecting the per-origin views below.
     m.requests_total
         .with_label_values(&[
-            &origin_san,
+            &hostname_san,
             method,
             &status_str,
             &agent_id,
@@ -1143,7 +1145,10 @@ mod tests {
     #[test]
     fn test_cardinality_limiter_overflow_to_other() {
         // Use a fresh limiter with a tiny cap to test overflow.
-        let lim = CardinalityLimiter::new(CardinalityConfig { max_per_label: 3 });
+        let lim = CardinalityLimiter::new(CardinalityConfig {
+            max_per_label: 3,
+            hostname_cap: None,
+        });
 
         let a = lim.sanitize("origin", "a.com");
         let b = lim.sanitize("origin", "b.com");
@@ -1169,6 +1174,7 @@ mod tests {
         // via a dedicated limiter (we can't reset the global one safely in tests).
         let lim = CardinalityLimiter::new(CardinalityConfig {
             max_per_label: 1000,
+            hostname_cap: None,
         });
         for i in 0..1000 {
             lim.sanitize("origin", &format!("overflow-origin-{i}.example.com"));

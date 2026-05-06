@@ -20,15 +20,30 @@ pub fn log_demotion(label_name: &str, value: &str) {
 }
 
 /// Configuration for cardinality limiting.
+#[derive(Debug, Clone)]
 pub struct CardinalityConfig {
     /// Max unique values per label name. Default: 1000.
     pub max_per_label: usize,
+    /// Optional hostname-label override. Useful for tests and
+    /// deployments that need a tighter route-cardinality budget.
+    pub hostname_cap: Option<usize>,
 }
 
 impl Default for CardinalityConfig {
     fn default() -> Self {
         Self {
             max_per_label: 1000,
+            hostname_cap: None,
+        }
+    }
+}
+
+impl CardinalityConfig {
+    /// Return the effective cap for `label_name`.
+    pub fn cap_for_label(&self, label_name: &str) -> usize {
+        match (label_name, self.hostname_cap) {
+            ("hostname", Some(cap)) => cap,
+            _ => budget_for_label(label_name),
         }
     }
 }
@@ -111,7 +126,7 @@ impl CardinalityLimiter {
     /// callers of [`sanitize`](Self::sanitize) keep the workspace
     /// default.
     pub fn sanitize_budget(&self, label_name: &str, value: &str) -> String {
-        let cap = budget_for_label(label_name);
+        let cap = self.config.cap_for_label(label_name);
         self.sanitize_with_cap(label_name, value, cap)
     }
 
@@ -164,7 +179,10 @@ mod tests {
     use std::sync::Arc;
 
     fn limiter_with_max(max: usize) -> CardinalityLimiter {
-        CardinalityLimiter::new(CardinalityConfig { max_per_label: max })
+        CardinalityLimiter::new(CardinalityConfig {
+            max_per_label: max,
+            hostname_cap: None,
+        })
     }
 
     // --- log_demotion ---
@@ -300,11 +318,24 @@ mod tests {
     }
 
     #[test]
+    fn hostname_cap_override_wins_over_adr_budget() {
+        let config = CardinalityConfig {
+            max_per_label: 1_000_000,
+            hostname_cap: Some(2),
+        };
+        let lim = CardinalityLimiter::new(config);
+        assert_eq!(lim.sanitize_budget("hostname", "a.example"), "a.example");
+        assert_eq!(lim.sanitize_budget("hostname", "b.example"), "b.example");
+        assert_eq!(lim.sanitize_budget("hostname", "c.example"), OTHER_LABEL);
+    }
+
+    #[test]
     fn sanitize_budget_demotes_at_per_label_cap_for_agent_class() {
         // agent_class budget is 8 per ADR. Insert 8 distinct values,
         // then verify the 9th overflows to __other__.
         let lim = CardinalityLimiter::new(CardinalityConfig {
             max_per_label: 1_000_000,
+            hostname_cap: None,
         });
         for i in 0..8 {
             let v = format!("class-{i}");
@@ -321,6 +352,7 @@ mod tests {
     fn sanitize_budget_payment_rail_caps_at_six() {
         let lim = CardinalityLimiter::new(CardinalityConfig {
             max_per_label: 1_000_000,
+            hostname_cap: None,
         });
         for v in &[
             "none",
@@ -345,6 +377,7 @@ mod tests {
         // fallback path doesn't accidentally cap at zero.
         let lim = CardinalityLimiter::new(CardinalityConfig {
             max_per_label: 1_000_000,
+            hostname_cap: None,
         });
         assert_eq!(lim.sanitize_budget("oddball", "value-1"), "value-1");
         assert_eq!(lim.sanitize_budget("oddball", "value-2"), "value-2");
@@ -359,6 +392,7 @@ mod tests {
         // string or "__other__", and the accepted count must not exceed 500.
         let lim = Arc::new(CardinalityLimiter::new(CardinalityConfig {
             max_per_label: 500,
+            hostname_cap: None,
         }));
 
         let mut handles = Vec::new();

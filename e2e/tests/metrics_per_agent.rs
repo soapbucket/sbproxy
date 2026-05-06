@@ -25,6 +25,9 @@ use sbproxy_e2e::ProxyHarness;
 const FIXTURE: &str = r#"
 proxy:
   http_bind_port: 0  # overridden by the harness
+  metrics:
+    cardinality:
+      hostname_cap: 100
 origins:
   "blog.localhost":
     action:
@@ -132,7 +135,6 @@ fn cardinality_cap_keeps_series_count_bounded() {
 // --- Test 3: overflow sentinel + demotion counter ---
 
 #[test]
-#[ignore = "TODO(wave3): hostname cardinality cap is above 250 in default config; overflow sentinel + demotion counter wired but not triggered by this fixture. Needs either a higher-volume fixture or a config knob to lower the cap for tests."]
 fn cardinality_overflow_emits_sentinel_and_increments_demotion_counter() {
     let harness = ProxyHarness::start_with_yaml(FIXTURE).expect("start proxy");
 

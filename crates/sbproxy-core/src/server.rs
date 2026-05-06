@@ -11146,6 +11146,15 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
     let server_config = compiled.server.clone();
     let hostnames: Vec<String> = compiled.host_map.keys().map(|k| k.to_string()).collect();
 
+    if let Some(metrics_cfg) = server_config.metrics.as_ref() {
+        let _ = sbproxy_observe::metrics::init_cardinality_limiter(
+            sbproxy_observe::CardinalityConfig {
+                max_per_label: metrics_cfg.max_cardinality_per_label,
+                hostname_cap: metrics_cfg.cardinality.hostname_cap,
+            },
+        );
+    }
+
     // Initialise the AI provider catalog from the embedded YAML, with
     // an optional override path from `proxy.ai_providers_file`: use
     // the override file when readable, fall back to the embedded
