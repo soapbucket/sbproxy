@@ -291,6 +291,11 @@ pub struct RateLimitPolicy {
     buckets: Mutex<Option<lru::LruCache<String, TokenBucket>>>,
     #[serde(skip)]
     template_bucket: Mutex<TokenBucket>,
+    /// Cold tier for keys that were already rate-limited before their
+    /// hot bucket was evicted. This preserves deny state across LRU
+    /// pollution without storing every one-off attacker key.
+    #[serde(skip)]
+    cold_limited: Mutex<Option<lru::LruCache<String, Instant>>>,
 
     // --- Optional L2 (cluster-shared) state ---
     /// Shared counter backend (sync). When `Some`, requests are gated by
@@ -335,6 +340,7 @@ impl std::fmt::Debug for RateLimitPolicy {
             .field("key", &self.key)
             .field("max_keys", &self.max_keys)
             .field("template_bucket", &self.template_bucket)
+            .field("cold_limited_attached", &self.cold_limited.lock().is_some())
             .field("store_attached", &self.store.is_some())
             .field("async_store_attached", &self.async_store.is_some())
             .field("window_secs", &self.window_secs)
@@ -415,6 +421,13 @@ impl RateLimitPolicy {
         // Per-key buckets are only allocated when a `key:` expression is
         // configured. Cap defaults to 100k via `default_max_keys`.
         policy.buckets = if policy.key.is_some() {
+            let cap = policy.max_keys.max(1);
+            let cap = std::num::NonZeroUsize::new(cap).expect("cap is at least 1");
+            Mutex::new(Some(lru::LruCache::new(cap)))
+        } else {
+            Mutex::new(None)
+        };
+        policy.cold_limited = if policy.key.is_some() {
             let cap = policy.max_keys.max(1);
             let cap = std::num::NonZeroUsize::new(cap).expect("cap is at least 1");
             Mutex::new(Some(lru::LruCache::new(cap)))
@@ -535,10 +548,15 @@ impl RateLimitPolicy {
         let headers_enabled = self.headers_enabled();
         let include_retry_after = self.include_retry_after();
 
+        if let Some(info) = self.cold_limited_info(key, now, headers_enabled, include_retry_after) {
+            return info;
+        }
+
         // Resolve which bucket to act on. The per-key path uses the LRU
         // map and may insert a fresh bucket cloned from the template;
         // the legacy path operates on the shared template bucket.
         let mut buckets_guard = self.buckets.lock();
+        let keyed_path = buckets_guard.is_some();
         let mut template_guard;
         let bucket: &mut TokenBucket = if let Some(map) = buckets_guard.as_mut() {
             if !map.contains(key) {
@@ -587,6 +605,9 @@ impl RateLimitPolicy {
             } else {
                 0
             };
+            if keyed_path {
+                self.remember_cold_limited(key, now, full_reset);
+            }
             RateLimitInfo {
                 allowed: false,
                 limit,
@@ -595,6 +616,45 @@ impl RateLimitPolicy {
                 headers_enabled,
                 include_retry_after,
             }
+        }
+    }
+
+    fn cold_limited_info(
+        &self,
+        key: &str,
+        now: Instant,
+        headers_enabled: bool,
+        include_retry_after: bool,
+    ) -> Option<RateLimitInfo> {
+        let mut cold_guard = self.cold_limited.lock();
+        let cold = cold_guard.as_mut()?;
+        let until = cold.get(key).copied()?;
+        if now >= until {
+            cold.pop(key);
+            return None;
+        }
+
+        let limit = self.template_bucket.lock().max_tokens as u64;
+        Some(RateLimitInfo {
+            allowed: false,
+            limit,
+            remaining: 0,
+            reset_secs: until.duration_since(now).as_secs().max(1),
+            headers_enabled,
+            include_retry_after,
+        })
+    }
+
+    fn remember_cold_limited(&self, key: &str, now: Instant, reset_secs: u64) {
+        if reset_secs == 0 {
+            return;
+        }
+        let mut cold_guard = self.cold_limited.lock();
+        if let Some(cold) = cold_guard.as_mut() {
+            cold.put(
+                key.to_string(),
+                now + std::time::Duration::from_secs(reset_secs),
+            );
         }
     }
 
@@ -3595,6 +3655,30 @@ mod tests {
             }
         }
         assert_eq!(allowed, 3, "should not exceed burst capacity");
+    }
+
+    #[test]
+    fn evicted_limited_key_stays_limited_after_lru_pollution() {
+        let policy = RateLimitPolicy::from_config(serde_json::json!({
+            "requests_per_second": 0.001,
+            "burst": 1,
+            "key": "request.headers[\"x-api-key\"]",
+            "max_keys": 2
+        }))
+        .unwrap();
+
+        assert!(policy.allow_with_info_for("legit").allowed);
+        assert!(!policy.allow_with_info_for("legit").allowed);
+
+        for i in 0..20 {
+            let key = format!("attacker-{i}");
+            let _ = policy.allow_with_info_for(&key);
+        }
+
+        assert!(
+            !policy.allow_with_info_for("legit").allowed,
+            "LRU eviction must not reset an exhausted legitimate bucket"
+        );
     }
 
     // --- IpFilterPolicy tests ---

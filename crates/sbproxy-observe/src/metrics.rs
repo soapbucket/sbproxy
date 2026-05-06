@@ -819,6 +819,25 @@ pub fn record_http_framing_block(reason: &str) {
     counter.with_label_values(&[reason]).inc();
 }
 
+/// Count JWKS refreshes triggered synchronously by an unknown JWT `kid`.
+///
+/// `result` is intentionally closed by convention: `success`, `failure`,
+/// or `rate_limited`.
+pub fn record_jwks_unknown_kid_refetch(result: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_jwks_unknown_kid_refetch_total",
+            "JWKS refreshes triggered by tokens whose kid was absent from the local cache",
+            &["result"]
+        )
+        .expect("register sbproxy_jwks_unknown_kid_refetch_total")
+    });
+    counter.with_label_values(&[result]).inc();
+}
+
 /// Record a cache result (hit or miss) for an origin.
 pub fn record_cache(origin: &str, result: &str) {
     let origin = sanitize_label("origin", origin);
