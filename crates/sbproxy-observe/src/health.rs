@@ -220,6 +220,39 @@ impl NotConfiguredProbe {
     }
 }
 
+/// In-process synthetic readiness probe.
+///
+/// This is intentionally generic: callers register a closure that
+/// exercises the code path they care about and returns the same
+/// component-status shape as any other probe.
+pub struct SyntheticProbe {
+    name: String,
+    check_fn: Arc<dyn Fn() -> (ComponentStatus, Option<String>) + Send + Sync>,
+}
+
+impl SyntheticProbe {
+    /// Build a synthetic probe under `name`.
+    pub fn new(
+        name: impl Into<String>,
+        check_fn: impl Fn() -> (ComponentStatus, Option<String>) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            check_fn: Arc::new(check_fn),
+        }
+    }
+}
+
+impl Probe for SyntheticProbe {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn check(&self) -> (ComponentStatus, Option<String>) {
+        (self.check_fn)()
+    }
+}
+
 impl Probe for NotConfiguredProbe {
     fn name(&self) -> &str {
         &self.name
@@ -298,12 +331,26 @@ impl HealthRegistry {
 /// `facilitator_quorum` probes by calling `registry.register(...)`
 /// in their respective wave's startup hook.
 pub fn default_registry(ledger_recency: Recency, bot_auth_recency: Recency) -> HealthRegistry {
+    default_registry_optional(Some(ledger_recency), Some(bot_auth_recency))
+}
+
+/// Build the standard registry, treating absent optional services as
+/// `NotConfigured` so `/readyz` remains 200 when a feature is not wired.
+pub fn default_registry_optional(
+    ledger_recency: Option<Recency>,
+    bot_auth_recency: Option<Recency>,
+) -> HealthRegistry {
     let registry = HealthRegistry::new();
-    registry.register(Arc::new(RecencyProbe::new("ledger", ledger_recency)));
-    registry.register(Arc::new(RecencyProbe::new(
-        "bot_auth_directory",
-        bot_auth_recency,
-    )));
+    match ledger_recency {
+        Some(recency) => registry.register(Arc::new(RecencyProbe::new("ledger", recency))),
+        None => registry.register(Arc::new(NotConfiguredProbe::new("ledger"))),
+    }
+    match bot_auth_recency {
+        Some(recency) => {
+            registry.register(Arc::new(RecencyProbe::new("bot_auth_directory", recency)))
+        }
+        None => registry.register(Arc::new(NotConfiguredProbe::new("bot_auth_directory"))),
+    }
     registry.register(Arc::new(NotConfiguredProbe::new("agent_registry")));
     registry.register(Arc::new(NotConfiguredProbe::new("stripe")));
     registry.register(Arc::new(NotConfiguredProbe::new("facilitator_quorum")));
@@ -465,6 +512,31 @@ mod tests {
         let (status, _, body) = handle_readyz(&registry);
         assert_eq!(status, 200);
         assert!(body.contains("not_configured"));
+    }
+
+    #[test]
+    fn default_registry_optional_marks_absent_services_not_configured() {
+        let registry = default_registry_optional(None, None);
+        let (status, _, body) = handle_readyz(&registry);
+        assert_eq!(
+            status, 200,
+            "absent optional services should be ready: {body}"
+        );
+        assert!(body.contains("\"name\":\"ledger\""));
+        assert!(body.contains("\"name\":\"bot_auth_directory\""));
+        assert!(body.contains("\"status\":\"not_configured\""));
+    }
+
+    #[test]
+    fn synthetic_probe_participates_in_readyz() {
+        let registry = HealthRegistry::new();
+        registry.register(Arc::new(SyntheticProbe::new("synthetic_pipeline", || {
+            (ComponentStatus::Healthy, Some("ok".to_string()))
+        })));
+        let (status, _, body) = handle_readyz(&registry);
+        assert_eq!(status, 200);
+        assert!(body.contains("synthetic_pipeline"));
+        assert!(body.contains("\"status\":\"healthy\""));
     }
 
     #[test]
