@@ -16,6 +16,7 @@
 mod body_aware;
 mod detector;
 mod heuristic;
+#[cfg(feature = "onnx-classifiers")]
 mod onnx;
 
 pub use body_aware::{
@@ -27,6 +28,7 @@ pub use detector::{
     DetectorFactory,
 };
 pub use heuristic::{HeuristicDetector, HEURISTIC_DETECTOR_NAME};
+#[cfg(feature = "onnx-classifiers")]
 pub use onnx::{OnnxDetector, ONNX_DETECTOR_NAME};
 
 use std::sync::Arc;
@@ -127,6 +129,7 @@ struct RawConfig {
     /// detector when its constructor needs configuration (e.g. the
     /// ONNX detector's model URLs). Detectors that take no config
     /// ignore it.
+    #[cfg_attr(not(feature = "onnx-classifiers"), allow(dead_code))]
     #[serde(default)]
     detector_config: serde_json::Value,
     /// Run the body-aware scan inside the AI proxy hot path.
@@ -208,9 +211,25 @@ impl PromptInjectionV2Policy {
         // ONNX detector) go through their own constructor so we can
         // forward `detector_config` and apply graceful-degradation
         // policy. Everything else uses the zero-arg inventory factory.
+        #[cfg(feature = "onnx-classifiers")]
         let detector = if raw.detector == onnx::ONNX_DETECTOR_NAME {
             onnx::OnnxDetector::from_config(&raw.detector_config)
         } else {
+            lookup_detector(&raw.detector).ok_or_else(|| {
+                anyhow!(
+                    "prompt_injection_v2 detector {:?} not registered; available: {}",
+                    raw.detector,
+                    registered_detector_names().join(", ")
+                )
+            })?
+        };
+        #[cfg(not(feature = "onnx-classifiers"))]
+        let detector = {
+            if raw.detector == "onnx" {
+                return Err(anyhow!(
+                    "prompt_injection_v2 detector \"onnx\" requires the onnx-classifiers feature"
+                ));
+            }
             lookup_detector(&raw.detector).ok_or_else(|| {
                 anyhow!(
                     "prompt_injection_v2 detector {:?} not registered; available: {}",

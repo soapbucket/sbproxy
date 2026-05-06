@@ -64,6 +64,9 @@ rate-limit = []
 a2a-anthropic = []
 a2a-google = []
 a2a = ["a2a-anthropic", "a2a-google"]
+# Optional neural prompt-injection detector. Default-off so CI images
+# and minimal builds do not pull tract-onnx/tokenizers unless needed.
+onnx-classifiers = ["sbproxy-classifiers/onnx-classifiers"]
 
 [dependencies]
 sbproxy-plugin.workspace = true

@@ -50,6 +50,7 @@ llms-txt = ["sbproxy-modules/llms-txt"]
 # `features.tlsFingerprint = false` when running on a tightly-budgeted
 # free tier; on by default for the publishable matrix builds.
 tls-fingerprint = ["sbproxy-core/tls-fingerprint"]
+onnx-classifiers = ["sbproxy-modules/onnx-classifiers"]
 
 [dependencies]
 sbproxy-core.workspace = true

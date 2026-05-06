@@ -6,13 +6,17 @@ license.workspace = true
 publish = false
 description = "Pure-Rust ONNX inference + tokenizer wrapper for sbproxy detectors."
 
+[features]
+default = []
+onnx-classifiers = ["dep:tract-onnx", "dep:tokenizers"]
+
 [dependencies]
 # Pure-Rust ONNX runtime. Avoids the C++ ONNX Runtime + system libs that
 # `ort` would pull in, which is critical for cross-compile and for
 # building on hosts without onnxruntime installed.
-tract-onnx = "0.21"
+tract-onnx = { version = "0.21", optional = true }
 # Hugging Face tokenizers. Pure Rust, supports BPE / WordPiece / etc.
-tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.20", default-features = false, features = ["onig"], optional = true }
 
 # Cross-platform cache directory resolution. `dirs` is lighter than
 # `directories` (no extension-name machinery); we only need a cache

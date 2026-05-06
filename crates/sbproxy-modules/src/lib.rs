@@ -31,15 +31,16 @@ pub use policy::{
     ContentShape, ContentSignal, ContentSignalParseError, DdosCheckResult, DdosPolicy,
     DetectionLabel, DetectionResult, Detector, DlpAction, DlpDirection, DlpPolicy, DlpScanResult,
     ExposedCredsAction, ExposedCredsPolicy, ExposedCredsResult, ExpressionPolicy, ExpressionViews,
-    InMemoryLedger, LedgerError, Money, OnnxDetector, OpenApiValidationMode,
-    OpenApiValidationPolicy, OpenApiValidationResult, PageShieldMode, PageShieldPolicy,
-    PaywallPosition, Policy, PromptInjectionAction, PromptInjectionV2Outcome,
-    PromptInjectionV2Policy, RateLimitInfo, RateLimitPolicy, RedeemResult, SecHeadersPolicy,
-    SecurityHeader, SriCheckResult, SriPolicy, SriViolation, SriViolationReason, ThreatProtection,
-    Tier, WafResult, HEURISTIC_DETECTOR_NAME, ONNX_DETECTOR_NAME,
+    InMemoryLedger, LedgerError, Money, OpenApiValidationMode, OpenApiValidationPolicy,
+    OpenApiValidationResult, PageShieldMode, PageShieldPolicy, PaywallPosition, Policy,
+    PromptInjectionAction, PromptInjectionV2Outcome, PromptInjectionV2Policy, RateLimitInfo,
+    RateLimitPolicy, RedeemResult, SecHeadersPolicy, SecurityHeader, SriCheckResult, SriPolicy,
+    SriViolation, SriViolationReason, ThreatProtection, Tier, WafResult, HEURISTIC_DETECTOR_NAME,
 };
 #[cfg(feature = "http-ledger")]
 pub use policy::{HttpLedger, HttpLedgerConfig};
+#[cfg(feature = "onnx-classifiers")]
+pub use policy::{OnnxDetector, ONNX_DETECTOR_NAME};
 pub use projections::{
     current_projections, install_projections, render_projections, ProjectionDocs,
 };

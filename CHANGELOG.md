@@ -13,6 +13,13 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **Default-off ONNX classifier feature.** The heavy `tract-onnx` /
+  tokenizer runtime is now behind the `onnx-classifiers` cargo feature
+  so default CI builds keep the lightweight agent-class catalog without
+  compiling neural classifier dependencies.
+  ([crates/sbproxy-classifiers/Cargo.toml],
+  [crates/sbproxy-modules/Cargo.toml])
+
 - **Operator first-24-hours quickstart.** Added a concise
   `docs/quickstart-operator.md` covering deploy, `/readyz`, metrics,
   Grafana, logs, and rollback, linked from the README and Kubernetes

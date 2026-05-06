@@ -45,18 +45,26 @@ pub use agent_class::{
 pub use agent_classifier_types::{MlClass, MlClassification};
 pub use known_models::{lookup as lookup_known_model, KnownModel, KNOWN_MODELS};
 
+#[cfg(feature = "onnx-classifiers")]
 use std::fs;
+#[cfg(feature = "onnx-classifiers")]
 use std::io::{Read, Write};
+#[cfg(feature = "onnx-classifiers")]
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "onnx-classifiers")]
 use anyhow::{anyhow, Context, Result};
+#[cfg(feature = "onnx-classifiers")]
 use sha2::{Digest, Sha256};
+#[cfg(feature = "onnx-classifiers")]
 use tokenizers::Tokenizer;
+#[cfg(feature = "onnx-classifiers")]
 use tract_onnx::prelude::*;
 
 /// Type alias for the optimised, runnable tract graph held inside
 /// [`OnnxClassifier`]. The full path is unwieldy and trips
 /// `clippy::type_complexity`.
+#[cfg(feature = "onnx-classifiers")]
 type RunnableOnnxModel =
     SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
 
@@ -66,6 +74,7 @@ type RunnableOnnxModel =
 /// can take hundreds of milliseconds. `classify` itself is cheap
 /// enough to call on the request hot path for short prompts (a few
 /// hundred BPE tokens).
+#[cfg(feature = "onnx-classifiers")]
 pub struct OnnxClassifier {
     model: RunnableOnnxModel,
     tokenizer: Tokenizer,
@@ -75,6 +84,7 @@ pub struct OnnxClassifier {
 }
 
 /// Result of running [`OnnxClassifier::classify`] on a prompt.
+#[cfg(feature = "onnx-classifiers")]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ClassificationOutput {
     /// Human-readable label of the highest-scoring class.
@@ -83,6 +93,7 @@ pub struct ClassificationOutput {
     pub score: f32,
 }
 
+#[cfg(feature = "onnx-classifiers")]
 impl OnnxClassifier {
     /// Load a classifier from local files. Does not touch the network.
     ///
@@ -256,6 +267,7 @@ impl OnnxClassifier {
 
 /// Compute the softmax of `logits`. Stable: subtracts the max before
 /// exponentiating.
+#[cfg(feature = "onnx-classifiers")]
 fn softmax(logits: &[f32]) -> Vec<f32> {
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = logits.iter().map(|x| (x - max).exp()).collect();
@@ -270,6 +282,7 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
 /// `url` into it on first use. When `expected_sha256` is provided, the
 /// final file's hash is validated; on mismatch the file is removed and
 /// the function errors out so the caller can fall back.
+#[cfg(feature = "onnx-classifiers")]
 fn ensure_cached_file(
     cache_dir: &Path,
     prefix: &str,
@@ -333,6 +346,7 @@ fn ensure_cached_file(
     Ok(path)
 }
 
+#[cfg(feature = "onnx-classifiers")]
 fn validate_sha256(path: &Path, expected_hex: &str) -> Result<()> {
     let mut f =
         fs::File::open(path).with_context(|| format!("opening {path:?} for sha256 check"))?;
@@ -353,6 +367,7 @@ fn validate_sha256(path: &Path, expected_hex: &str) -> Result<()> {
 
 /// Default cache directory: `<user-cache-dir>/sbproxy/models/` when
 /// available, falling back to `./.sbproxy-cache/models/`.
+#[cfg(feature = "onnx-classifiers")]
 pub fn default_model_cache_dir() -> PathBuf {
     if let Some(cache) = dirs::cache_dir() {
         cache.join("sbproxy").join("models")
@@ -361,7 +376,7 @@ pub fn default_model_cache_dir() -> PathBuf {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "onnx-classifiers"))]
 mod tests {
     use super::*;
 
@@ -404,6 +419,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "onnx-classifiers")]
     fn softmax_sums_to_one() {
         let p = softmax(&[1.0, 2.0, 3.0]);
         let total: f32 = p.iter().sum();
@@ -413,6 +429,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "onnx-classifiers")]
     fn softmax_handles_empty_logits() {
         // Should not panic.
         let p = softmax(&[]);
