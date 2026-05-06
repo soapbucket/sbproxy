@@ -27,19 +27,10 @@
 //! that depend on it are `#[ignore]`d. The fixture-shape test runs
 //! today as a contract floor.
 
-use std::time::Duration;
+use sbproxy_observe::alerting::burn_rate::{replay_and_evaluate, slo_target, MinuteSample};
 
 /// One synthetic minute of traffic. Every fixture is built out of
 /// these so the test is self-contained and replay is deterministic.
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // p99_ms is read by the latency-side test once R1.1 lands.
-struct MinuteSample {
-    requests: u64,
-    errors: u64,
-    /// p99 latency observed in this minute, ms.
-    p99_ms: f64,
-}
-
 /// Fixture profile A: 105 requests over 60 minutes with 5 errors all
 /// concentrated in the last 15 minutes. Hits the 30m/6h burn pair but
 /// stays under the 5m/1h 14.4× threshold because the per-5m error
@@ -129,7 +120,6 @@ fn fixture_profile_b_above_threshold_for_short_window() {
 ///   sustained burn but the 24h window is not yet full; expected not
 ///   to fire on a 1h replay.
 #[test]
-#[ignore = "TODO(wave3): R1.1 alerting module landed in sbproxy-observe but the burn-rate (multiwindow) engine is not implemented; only `check_slo_violation(p99)` exists. `replay_and_evaluate` is still a no-op stub returning an empty AlertSnapshot."]
 fn slo_burn_rate_partial_burn_fires_six_hour_alert_only() {
     let prof = profile_5_errors_over_one_hour();
     let alerts = replay_and_evaluate(&prof, slo_target(0.99));
@@ -152,7 +142,6 @@ fn slo_burn_rate_partial_burn_fires_six_hour_alert_only() {
 
 /// Replay profile B (full burn) and assert the page-tier alert fires.
 #[test]
-#[ignore = "TODO(wave3): R1.1 alerting module landed in sbproxy-observe but the burn-rate (multiwindow) engine is not implemented; only `check_slo_violation(p99)` exists. `replay_and_evaluate` is still a no-op stub returning an empty AlertSnapshot."]
 fn slo_burn_rate_full_burn_fires_one_hour_page_alert() {
     let prof = profile_full_burn();
     let alerts = replay_and_evaluate(&prof, slo_target(0.99));
@@ -175,7 +164,6 @@ fn slo_burn_rate_full_burn_fires_one_hour_page_alert() {
 /// the SLO-LATENCY-P99 threshold (50 ms per ADR) for a sustained 5
 /// minutes. SBPROXY-SUBSTRATE-LATENCY-P99 page tier MUST fire.
 #[test]
-#[ignore = "TODO(wave3): R1.1 latency SLO check exists (`check_slo_violation`) but the multiwindow burn-rate engine + replay harness is not yet wired."]
 fn slo_latency_p99_breach_fires_page_alert() {
     let mut prof = vec![
         MinuteSample {
@@ -202,45 +190,4 @@ fn slo_latency_p99_breach_fires_page_alert() {
         "p99 latency breach MUST fire page-tier alert; alerts={:?}",
         alerts.fired_names()
     );
-}
-
-// --- Test-only stubs ---
-//
-// These wrap a future `sbproxy-observe::alerting::burn_rate` engine
-// the implementation lands in R1.1. The shape locked here:
-//
-//     pub struct AlertSnapshot { /* ... */ }
-//     impl AlertSnapshot {
-//         pub fn fired(&self, name: &str) -> bool;
-//         pub fn fired_names(&self) -> Vec<String>;
-//     }
-//     pub fn replay_and_evaluate(samples: &[MinuteSample], target: f64) -> AlertSnapshot;
-//     pub fn slo_target(s: f64) -> f64;
-//
-// Until then, the ignored tests above prove the contract review
-// surface; ungated tests assert fixture shape only.
-
-struct AlertSnapshot {
-    fired: Vec<String>,
-}
-
-impl AlertSnapshot {
-    fn fired(&self, name: &str) -> bool {
-        self.fired.iter().any(|n| n == name)
-    }
-    fn fired_names(&self) -> Vec<String> {
-        self.fired.clone()
-    }
-}
-
-fn slo_target(s: f64) -> f64 {
-    s
-}
-
-fn replay_and_evaluate(_samples: &[MinuteSample], _target: f64) -> AlertSnapshot {
-    // Stub: a real implementation drives a virtual clock at 1 minute
-    // tick over the samples, feeds them into a burn-rate evaluator,
-    // and returns the set of alerts that fired during the replay.
-    let _ = Duration::from_secs(60);
-    AlertSnapshot { fired: Vec::new() }
 }

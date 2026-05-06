@@ -18,6 +18,7 @@
 //! }
 //! ```
 
+pub mod burn_rate;
 pub mod channels;
 pub mod error_rate;
 pub mod rate_limit;
