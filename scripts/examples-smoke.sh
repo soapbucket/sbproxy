@@ -5,20 +5,18 @@
 # this script:
 #   1. `docker compose up -d --wait`
 #   2. Polls <admin_port><health_path> for liveness; expects 200.
-#   3. Hits each entry in `feature_endpoints[]` on <data_plane_port>;
-#      expects 2xx.
-#   4. Optionally asserts an audit-log entry exists (gated on the
+#   3. Runs each declarative `cases[]` assertion from smoke.json.
+#   4. Hits legacy `feature_endpoints[]` on <data_plane_port>; expects 2xx.
+#   5. Optionally asserts an audit-log entry exists (gated on the
 #      `audit_check` flag in smoke.json; defaults off until Wave 2
 #      lands the OSS admin endpoint).
-#   5. `docker compose down -v`.
+#   6. `docker compose down -v`.
 #
 # Examples without a docker-compose.yml are skipped silently. Examples
-# without a smoke.json fall back to safe defaults: data_plane_port is
-# discovered from docker-compose.yml's first published port,
-# admin_port is the same, health_path is /healthz. With those defaults
-# only the liveness probe is asserted.
+# with a docker-compose.yml must ship a smoke.json so new examples
+# cannot silently opt out of README/runtime drift coverage.
 #
-# Companion workflow: `.github/workflows/examples-smoke.yml` (B1.8).
+# Local entrypoint: `make examples-smoke`.
 #
 # Usage:
 #   scripts/examples-smoke.sh
@@ -29,6 +27,9 @@
 #   COMPOSE_BIN       docker-compose CLI (default: `docker compose`)
 #   CURL_TIMEOUT_S    per-curl timeout (default: 10)
 #   STARTUP_WAIT_S    healthz polling window (default: 60)
+#   SBPROXY_SMOKE_REQUIRE_MANIFEST
+#                     fail when a compose example has no smoke.json
+#                     (default: true)
 #
 # smoke.json schema (see scripts/README.md for the full reference):
 #   {
@@ -38,6 +39,22 @@
 #                                          #   admin.enabled is true.
 #     "data_plane_port":   8080,           # user traffic listener.
 #     "health_path":       "/healthz",     # admin liveness probe path.
+#     "cases": [{                          # status/header/body assertions.
+#       "name": "echo works",
+#       "request": {
+#         "method": "GET",
+#         "path": "/echo",
+#         "headers": { "Host": "app.localhost" }
+#       },
+#       "expect": {
+#         "status": 200,
+#         "headers": { "content-type": "application/json" },
+#         "body": {
+#           "type": "jsonShape",
+#           "shape": { "method": "GET" }
+#         }
+#       }
+#     }],
 #     "feature_endpoints": ["/preview/x"], # data-plane GETs to assert 2xx.
 #     "audit_check":       false           # Wave 1 OSS has no audit
 #                                          #   admin endpoint; flip to
@@ -53,6 +70,7 @@ RUST_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 COMPOSE_BIN="${COMPOSE_BIN:-docker compose}"
 CURL_TIMEOUT_S="${CURL_TIMEOUT_S:-10}"
 STARTUP_WAIT_S="${STARTUP_WAIT_S:-60}"
+SBPROXY_SMOKE_REQUIRE_MANIFEST="${SBPROXY_SMOKE_REQUIRE_MANIFEST:-true}"
 
 # --- Argument parsing ------------------------------------------------
 
@@ -96,7 +114,11 @@ if [ -n "$EXAMPLE_FILTER" ]; then
       $EXAMPLE_FILTER) filtered+=("$ex") ;;
     esac
   done
-  EXAMPLES=("${filtered[@]}")
+  if [ ${#filtered[@]} -eq 0 ]; then
+    EXAMPLES=()
+  else
+    EXAMPLES=("${filtered[@]}")
+  fi
 fi
 
 if [ ${#EXAMPLES[@]} -eq 0 ]; then
@@ -181,6 +203,25 @@ try:
         print(entry)
 except Exception:
     pass
+PY
+}
+
+smoke_cases_count() {
+  local dir="$1"
+  local sj="$dir/smoke.json"
+  [ -f "$sj" ] || { echo 0; return 0; }
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '(.cases // []) | length' "$sj"
+    return 0
+  fi
+  python3 - "$sj" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    print(len(data.get("cases") or []))
+except Exception:
+    print(0)
 PY
 }
 
@@ -269,9 +310,134 @@ assert_audit_emitted() {
   esac
 }
 
+run_declared_cases() {
+  local dir="$1" data_port="$2"
+  local sj="$dir/smoke.json"
+  [ -f "$sj" ] || return 0
+  python3 - "$sj" "$dir" "$data_port" "$CURL_TIMEOUT_S" <<'PY'
+import json
+import os
+import re
+import subprocess
+import sys
+
+smoke_path, label, data_port, timeout = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+with open(smoke_path) as f:
+    spec = json.load(f)
+
+cases = spec.get("cases") or []
+if not cases:
+    sys.exit(0)
+
+def fail(message):
+    print(f"[examples-smoke] {label}: FAIL - {message}", file=sys.stderr)
+    sys.exit(1)
+
+def deep_match(actual, expected, path="$"):
+    if isinstance(expected, dict):
+        if not isinstance(actual, dict):
+            return f"{path}: expected object, got {type(actual).__name__}"
+        for key, value in expected.items():
+            if key not in actual:
+                return f"{path}.{key}: missing"
+            mismatch = deep_match(actual[key], value, f"{path}.{key}")
+            if mismatch:
+                return mismatch
+        return None
+    if isinstance(expected, list):
+        if not isinstance(actual, list):
+            return f"{path}: expected array, got {type(actual).__name__}"
+        if len(actual) < len(expected):
+            return f"{path}: expected at least {len(expected)} items, got {len(actual)}"
+        for idx, value in enumerate(expected):
+            mismatch = deep_match(actual[idx], value, f"{path}[{idx}]")
+            if mismatch:
+                return mismatch
+        return None
+    if actual != expected:
+        return f"{path}: expected {expected!r}, got {actual!r}"
+    return None
+
+def parse_response(raw):
+    text = raw.replace("\r\n", "\n")
+    if not text.strip():
+        fail("curl returned an empty response")
+    head, _, body = text.partition("\n\n")
+    status_match = re.match(r"HTTP/\S+\s+(\d+)", head)
+    if not status_match:
+        fail(f"could not parse HTTP status from {head!r}")
+    headers = {}
+    for line in head.split("\n")[1:]:
+        if ":" in line:
+            key, value = line.split(":", 1)
+            headers[key.strip().lower()] = value.strip()
+    return int(status_match.group(1)), headers, body
+
+for case in cases:
+    name = case.get("name") or case.get("request", {}).get("path") or "unnamed"
+    required_env = case.get("requires_env") or []
+    if isinstance(required_env, str):
+        required_env = [required_env]
+    missing = [key for key in required_env if not os.environ.get(key)]
+    if missing:
+        print(f"[examples-smoke] {label}: case '{name}' skipped, missing env: {', '.join(missing)}")
+        continue
+
+    request = case.get("request") or {}
+    expect = case.get("expect") or {}
+    method = request.get("method", "GET")
+    path = request.get("path", "/")
+    if not path.startswith("/"):
+        fail(f"case '{name}' request.path must start with /")
+    url = f"http://127.0.0.1:{data_port}{path}"
+    cmd = ["curl", "-sS", "-i", "--max-time", timeout, "-X", method]
+    for key, value in (request.get("headers") or {}).items():
+        cmd.extend(["-H", f"{key}: {value}"])
+    cmd.append(url)
+
+    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        fail(f"case '{name}' curl failed: {proc.stderr.strip()}")
+    status, headers, body = parse_response(proc.stdout)
+
+    expected_status = expect.get("status")
+    if expected_status is not None and status != int(expected_status):
+        fail(f"case '{name}' returned {status}, expected {expected_status}")
+
+    for key, pattern in (expect.get("headers") or {}).items():
+        actual = headers.get(key.lower())
+        if actual is None:
+            fail(f"case '{name}' missing header {key}")
+        if not re.search(str(pattern), actual):
+            fail(f"case '{name}' header {key}={actual!r} did not match {pattern!r}")
+
+    body_expect = expect.get("body") or {}
+    if body_expect.get("type") == "jsonShape":
+        try:
+            actual_body = json.loads(body or "null")
+        except Exception as exc:
+            fail(f"case '{name}' body was not JSON: {exc}")
+        mismatch = deep_match(actual_body, body_expect.get("shape") or {})
+        if mismatch:
+            fail(f"case '{name}' JSON shape mismatch: {mismatch}")
+
+    print(f"[examples-smoke] {label}: case '{name}' -> {status} OK")
+PY
+}
+
 run_example() {
   local dir="$1"
   echo "[examples-smoke] === $dir ==="
+
+  if [ ! -f "$dir/smoke.json" ]; then
+    case "$SBPROXY_SMOKE_REQUIRE_MANIFEST" in
+      true|True|TRUE|1|yes)
+        echo "[examples-smoke] $dir: FAIL - missing smoke.json" >&2
+        return 1
+        ;;
+    esac
+  fi
 
   trap "cleanup_example '$dir'" EXIT INT TERM
 
@@ -300,6 +466,13 @@ run_example() {
     return 1
   fi
   echo "[examples-smoke] $dir: $health_path on :$admin_port -> OK"
+
+  # --- Declarative cases (preferred) ---
+  if [ "$(smoke_cases_count "$dir")" -gt 0 ]; then
+    if ! run_declared_cases "$dir" "$data_port"; then
+      return 1
+    fi
+  fi
 
   # --- Feature endpoints (optional per smoke.json) ---
   # Endpoints can be declared under `feature_endpoints[]` (preferred)

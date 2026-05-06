@@ -1,0 +1,24 @@
+{
+  "data_plane_port": 9090,
+  "admin_port": 9090,
+  "health_path": "/-/ready",
+  "cases": [
+    {
+      "name": "prometheus ready endpoint",
+      "request": {
+        "method": "GET",
+        "path": "/-/ready"
+      },
+      "expect": {
+        "status": 200
+      }
+    }
+  ],
+  "audit_check": false,
+  "_notes": [
+    "This bundle is an observability stack, not an sbproxy data-plane",
+    "example. The smoke runner uses Prometheus's readiness endpoint as",
+    "both liveness and the declarative case so the stack cannot silently",
+    "fall out of examples-smoke coverage."
+  ]
+}
