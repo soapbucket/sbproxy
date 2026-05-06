@@ -11,7 +11,7 @@
 //! returns true while any requests are still in-flight, allowing a graceful
 //! shutdown sequence.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
@@ -21,15 +21,26 @@ use sbproxy_tls::challenges::Http01ChallengeStore;
 
 // --- Connection draining ---
 
-/// Global counter of active in-flight requests.
-static ACTIVE_REQUESTS: AtomicU64 = AtomicU64::new(0);
+const DRAINING_BIT: u64 = 1 << 63;
+const ACTIVE_COUNT_MASK: u64 = !DRAINING_BIT;
 
-/// Set to `true` when a reload has been requested but in-flight requests remain.
-static DRAINING: AtomicBool = AtomicBool::new(false);
+/// Global drain state. The high bit records whether a drain is active;
+/// the remaining bits record active in-flight requests. Keeping both in
+/// one atomic gives readers a coherent snapshot.
+static DRAIN_STATE: AtomicU64 = AtomicU64::new(0);
 
 /// Increment the active request counter. Call when a request begins.
 pub fn increment_active() {
-    ACTIVE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    DRAIN_STATE
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            let active = state & ACTIVE_COUNT_MASK;
+            assert!(
+                active < ACTIVE_COUNT_MASK,
+                "active request counter overflow"
+            );
+            Some((state & DRAINING_BIT) | (active + 1))
+        })
+        .expect("increment update cannot fail");
 }
 
 /// Decrement the active request counter. Call when a request completes.
@@ -37,16 +48,24 @@ pub fn increment_active() {
 /// If draining is active and the count reaches zero, draining is automatically
 /// cleared.
 pub fn decrement_active() {
-    let prev = ACTIVE_REQUESTS.fetch_sub(1, Ordering::AcqRel);
-    // Clear draining flag when the last in-flight request finishes.
-    if prev == 1 && DRAINING.load(Ordering::Relaxed) {
-        DRAINING.store(false, Ordering::Release);
-    }
+    DRAIN_STATE
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            let active = state & ACTIVE_COUNT_MASK;
+            assert!(active > 0, "active request counter underflow");
+            let next_active = active - 1;
+            let next_draining = if next_active == 0 {
+                0
+            } else {
+                state & DRAINING_BIT
+            };
+            Some(next_draining | next_active)
+        })
+        .expect("decrement update cannot fail");
 }
 
 /// Return the current number of active in-flight requests.
 pub fn active_count() -> u64 {
-    ACTIVE_REQUESTS.load(Ordering::Relaxed)
+    DRAIN_STATE.load(Ordering::Acquire) & ACTIVE_COUNT_MASK
 }
 
 /// Check whether the server is currently draining connections.
@@ -55,7 +74,8 @@ pub fn active_count() -> u64 {
 /// is at least one in-flight request still in progress. Once `active_count()`
 /// drops to zero, `is_draining()` returns `false`.
 pub fn is_draining() -> bool {
-    DRAINING.load(Ordering::Relaxed) && ACTIVE_REQUESTS.load(Ordering::Relaxed) > 0
+    let state = DRAIN_STATE.load(Ordering::Acquire);
+    (state & DRAINING_BIT) != 0 && (state & ACTIVE_COUNT_MASK) > 0
 }
 
 /// Signal that a reload has been triggered and connection draining should begin.
@@ -63,7 +83,15 @@ pub fn is_draining() -> bool {
 /// Sets the draining flag; `is_draining()` will return `true` until all
 /// in-flight requests complete.
 pub fn begin_drain() {
-    DRAINING.store(true, Ordering::Release);
+    DRAIN_STATE
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            if (state & ACTIVE_COUNT_MASK) == 0 {
+                Some(0)
+            } else {
+                Some(state | DRAINING_BIT)
+            }
+        })
+        .expect("begin drain update cannot fail");
 }
 
 /// Global pipeline store. Initialized lazily on first access with an empty default.
@@ -255,12 +283,15 @@ mod tests {
     // `#[ignore]` to avoid interference in parallel test runs. Run with
     // `cargo test -- --ignored drain` to execute them individually.
 
+    fn reset_drain_state() {
+        DRAIN_STATE.store(0, Ordering::SeqCst);
+    }
+
     #[test]
     #[ignore = "manipulates global atomics; run in isolation"]
     fn active_count_increments_and_decrements() {
         // Reset state.
-        ACTIVE_REQUESTS.store(0, Ordering::SeqCst);
-        DRAINING.store(false, Ordering::SeqCst);
+        reset_drain_state();
 
         assert_eq!(active_count(), 0);
         increment_active();
@@ -276,8 +307,7 @@ mod tests {
     #[test]
     #[ignore = "manipulates global atomics; run in isolation"]
     fn is_draining_true_when_draining_and_active() {
-        ACTIVE_REQUESTS.store(2, Ordering::SeqCst);
-        DRAINING.store(true, Ordering::SeqCst);
+        DRAIN_STATE.store(DRAINING_BIT | 2, Ordering::SeqCst);
 
         assert!(is_draining());
     }
@@ -285,18 +315,16 @@ mod tests {
     #[test]
     #[ignore = "manipulates global atomics; run in isolation"]
     fn is_draining_false_when_no_active_requests() {
-        ACTIVE_REQUESTS.store(0, Ordering::SeqCst);
-        DRAINING.store(true, Ordering::SeqCst);
+        DRAIN_STATE.store(DRAINING_BIT, Ordering::SeqCst);
 
         assert!(!is_draining(), "no active requests means not draining");
-        DRAINING.store(false, Ordering::SeqCst);
+        reset_drain_state();
     }
 
     #[test]
     #[ignore = "manipulates global atomics; run in isolation"]
     fn drain_clears_when_last_request_finishes() {
-        ACTIVE_REQUESTS.store(1, Ordering::SeqCst);
-        DRAINING.store(true, Ordering::SeqCst);
+        DRAIN_STATE.store(DRAINING_BIT | 1, Ordering::SeqCst);
 
         assert!(is_draining());
 
@@ -313,16 +341,68 @@ mod tests {
     #[test]
     #[ignore = "manipulates global atomics; run in isolation"]
     fn begin_drain_sets_draining_flag() {
-        ACTIVE_REQUESTS.store(3, Ordering::SeqCst);
-        DRAINING.store(false, Ordering::SeqCst);
+        DRAIN_STATE.store(3, Ordering::SeqCst);
 
         assert!(!is_draining());
         begin_drain();
         assert!(is_draining());
 
         // Clean up.
-        ACTIVE_REQUESTS.store(0, Ordering::SeqCst);
-        DRAINING.store(false, Ordering::SeqCst);
+        reset_drain_state();
+    }
+
+    #[test]
+    fn loom_drain_state_clears_when_last_request_finishes() {
+        loom::model(|| {
+            use loom::sync::atomic::{AtomicU64 as LoomAtomicU64, Ordering as LoomOrdering};
+            use loom::sync::Arc as LoomArc;
+            use loom::thread;
+
+            let state = LoomArc::new(LoomAtomicU64::new(1));
+
+            let begin_state = state.clone();
+            let begin = thread::spawn(move || {
+                begin_state
+                    .fetch_update(LoomOrdering::AcqRel, LoomOrdering::Acquire, |current| {
+                        if (current & ACTIVE_COUNT_MASK) == 0 {
+                            Some(0)
+                        } else {
+                            Some(current | DRAINING_BIT)
+                        }
+                    })
+                    .expect("begin drain update cannot fail");
+            });
+
+            let finish_state = state.clone();
+            let finish = thread::spawn(move || {
+                finish_state
+                    .fetch_update(LoomOrdering::AcqRel, LoomOrdering::Acquire, |current| {
+                        let active = current & ACTIVE_COUNT_MASK;
+                        if active == 0 {
+                            return Some(current);
+                        }
+                        let next_active = active - 1;
+                        let next_draining = if next_active == 0 {
+                            0
+                        } else {
+                            current & DRAINING_BIT
+                        };
+                        Some(next_draining | next_active)
+                    })
+                    .expect("decrement update cannot fail");
+            });
+
+            begin.join().unwrap();
+            finish.join().unwrap();
+
+            let snapshot = state.load(LoomOrdering::Acquire);
+            assert_eq!(snapshot & ACTIVE_COUNT_MASK, 0);
+            assert_eq!(
+                snapshot & DRAINING_BIT,
+                0,
+                "draining flag must clear when active count reaches zero"
+            );
+        });
     }
 
     fn make_config(hostname: &str) -> CompiledConfig {
