@@ -4,6 +4,7 @@
 //! mimalloc allocator, parses CLI args, and hands the config path to
 //! [`sbproxy_core::run`]. All real work happens in the workspace crates.
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 use std::env;

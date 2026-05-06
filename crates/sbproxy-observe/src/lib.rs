@@ -1,5 +1,6 @@
 //! sbproxy-observe: Observability - logging, metrics, and events.
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod access_log;

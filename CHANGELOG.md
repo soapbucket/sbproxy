@@ -149,6 +149,12 @@ of the new YAML fields below until the version that ships them.
   snippets instead of illustrative API fragments.
   ([docs/architecture.md], [docs/audit-log.md], [docs/cache-reserve.md])
 
+- **Unsafe-code drift guardrails.** Crates that do not need unsafe now
+  forbid it at the crate root, while `sbproxy-vault` explicitly allows
+  its narrowly-scoped volatile zeroization unsafe with an inline
+  justification.
+  ([crates/sbproxy-*/src/lib.rs])
+
 - **AI client retry resilience.** `MemoryBatchStore` now uses
   `parking_lot::Mutex` so a panic in one worker cannot poison the
   in-memory batch map for every later operation. Provider retries now

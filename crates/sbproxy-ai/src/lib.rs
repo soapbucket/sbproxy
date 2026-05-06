@@ -1,5 +1,6 @@
 //! sbproxy-ai: AI gateway with provider routing, streaming, and guardrails.
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod ai_metrics;

@@ -4,6 +4,7 @@
 //! sbproxy for conditional logic in routing, access control, and policy
 //! enforcement.
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod cel;

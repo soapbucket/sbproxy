@@ -6,6 +6,7 @@
 //!
 //! See `docs/kubernetes.md` for end-user instructions.
 
+#![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 use std::sync::Arc;

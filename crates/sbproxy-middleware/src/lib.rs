@@ -1,5 +1,6 @@
 //! sbproxy-middleware: CORS, HSTS, compression, callback, and header modifier middleware.
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod callback;

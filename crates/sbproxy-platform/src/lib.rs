@@ -1,6 +1,7 @@
 //! sbproxy-platform: Storage, messenger, circuit breaker, DNS, health checks,
 //! and network protocol utilities.
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod adaptive_breaker;

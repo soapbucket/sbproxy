@@ -24,6 +24,7 @@
 //! triple and applies it server-side. Config changes trigger a rollout-restart
 //! by stamping `sbproxy.dev/config-hash` on the Deployment's pod template.
 
+#![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 /// CRD type definitions.

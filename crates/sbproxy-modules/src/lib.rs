@@ -5,6 +5,7 @@
 //! The `Plugin` variant on each enum is the only case that falls back to
 //! dynamic dispatch for third-party extensions.
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod action;

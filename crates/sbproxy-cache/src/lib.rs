@@ -1,5 +1,6 @@
 //! sbproxy-cache: Response cache and object cache management.
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod reserve;

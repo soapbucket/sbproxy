@@ -9,6 +9,7 @@
 //! - [`identity`] - Identity, classification, and anomaly hook surface.
 //! - [`audit`] - Admin-action audit emitter trait surface.
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod audit;

@@ -8,6 +8,7 @@
 //! - [`server::SbProxy`] - Pingora `ProxyHttp` implementation
 //! - [`server::run`] - Server entry point
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod admin;
