@@ -13,6 +13,12 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **Operator first-24-hours quickstart.** Added a concise
+  `docs/quickstart-operator.md` covering deploy, `/readyz`, metrics,
+  Grafana, logs, and rollback, linked from the README and Kubernetes
+  docs.
+  ([docs/quickstart-operator.md])
+
 - **`release-fast` build profile for CI images.** Docker-based CI and
   local kind smoke-test builds can now use `CARGO_PROFILE=release-fast`
   to skip fat LTO and use more codegen units, cutting link memory/time

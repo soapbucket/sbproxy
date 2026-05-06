@@ -29,6 +29,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [performance.md](performance.md) - tuning guide, benchmark methodology, profiling.
 - [degradation.md](degradation.md) - failure modes and graceful degradation behavior.
 - [upgrade.md](upgrade.md) - migration notes between releases.
+- [quickstart-operator.md](quickstart-operator.md) - first 24 hours running the Kubernetes operator.
 - [kubernetes.md](kubernetes.md) - the OSS Kubernetes operator and its CRDs.
 
 ### Reference

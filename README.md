@@ -96,7 +96,7 @@ That's a reverse proxy. Add AI routing, auth, and rate limiting in the same file
 
 ## Documentation
 
-The full documentation lives in [`docs/README.md`](docs/README.md): manual, configuration reference, AI gateway guide, scripting reference, performance, troubleshooting, architecture, and more.
+The full documentation lives in [`docs/README.md`](docs/README.md): manual, configuration reference, AI gateway guide, scripting reference, performance, troubleshooting, architecture, and more. Running the operator for the first time? Start with [`docs/quickstart-operator.md`](docs/quickstart-operator.md).
 
 For contributors: [CONTRIBUTING.md](CONTRIBUTING.md).
 
