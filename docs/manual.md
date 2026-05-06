@@ -100,7 +100,7 @@ config (log filter, shutdown timing, validation-only mode).
 
 ```
 sbproxy --config <path>
-sbproxy serve -f <path> [--log-level <level>] [--grace-time <secs>]
+sbproxy serve -f <path> [--log-level <level>] [--request-log-level <level>] [--grace-time <secs>]
 sbproxy validate <path>
 sbproxy --config <path> --check
 sbproxy projections render --kind <kind> --config <path> [--hostname <h>]
@@ -119,7 +119,7 @@ no path is given on the command line, the binary falls back to
 ```bash
 sbproxy --config /etc/sbproxy/sb.yml
 sbproxy serve -f /etc/sbproxy/sb.yml
-sbproxy serve -f /etc/sbproxy/sb.yml --log-level debug --grace-time 30
+sbproxy serve -f /etc/sbproxy/sb.yml --log-level debug --request-log-level info --grace-time 30
 SB_CONFIG_FILE=/etc/sbproxy/sb.yml sbproxy
 ```
 
@@ -168,6 +168,22 @@ sbproxy --config sb.yml --log-level debug
 SB_LOG_LEVEL=sbproxy=trace sbproxy --config sb.yml
 ```
 
+#### `--request-log-level` (string)
+
+Convenience filter for the `access_log` tracing target. This is appended
+to the effective `--log-level` / `SB_LOG_LEVEL` / `RUST_LOG` filter as
+`access_log=<level>`, so power users can still pass the full
+per-target filter themselves.
+
+- **Default:** unset; access logs inherit the effective global filter.
+- **Priority:** `--request-log-level` > `SB_REQUEST_LOG_LEVEL` > unset.
+- **Environment:** `SB_REQUEST_LOG_LEVEL`
+
+```bash
+sbproxy --config sb.yml --log-level warn --request-log-level debug
+SB_REQUEST_LOG_LEVEL=trace sbproxy --config sb.yml
+```
+
 #### `--grace-time` (seconds)
 
 Seconds Pingora waits for in-flight requests to complete on SIGTERM
@@ -204,9 +220,6 @@ later wave but are not honoured by the v1.0 binary:
   [WOR-114](https://linear.app/12345r/issue/WOR-114). The header and
   query-param surface itself is not yet implemented; see
   [§10. Feature flags](#10-feature-flags) for the planned shape.
-- `--request-log-level` / `SB_REQUEST_LOG_LEVEL`. Use `--log-level` in
-  the meantime; access logging is configured per-origin in `sb.yml`
-  (`access_log:` block).
 - `--config-dir` / `SB_CONFIG_DIR`. Pass an absolute or relative path
   to `--config`; the loader does not search a directory for known
   filenames.
@@ -484,11 +497,13 @@ served from the embedded admin listener, alongside `/metrics`.
 |-----------------|-----------|-------------------------|---------|---------|
 | `/livez`        | `/live`   | Liveness; process is up  | `200`   | never   |
 | `/readyz`       | `/ready`  | Readiness; ready to serve | `200`   | `503`   |
-| `/healthz`      | `/health` | Liveness alias           | `200`   | never   |
+| `/healthz`      | (none)    | Liveness; trivial body   | `200`   | never   |
+| `/health`       | (none)    | Rich operator health     | `200`   | `503`   |
 
-The bare aliases (`/live`, `/ready`, `/health`) return identical bodies
-to their `z`-suffixed counterparts. K8s readiness probes should hit
-`/readyz`; K8s liveness probes should hit `/livez`.
+The bare `/live` and `/ready` aliases return identical bodies to
+`/livez` and `/readyz`. `/health` is intentionally different: it is the
+rich operator/SIEM endpoint. K8s readiness probes should hit `/readyz`;
+K8s liveness probes should hit `/livez`.
 
 ### `/livez`
 
@@ -508,6 +523,30 @@ binary is running.
 ```json
 {"status": "ok"}
 ```
+
+### `/health`
+
+Rich health report for humans, dashboards, and SIEM ingestion. It
+includes the binary version, embedded git revision, current timestamp,
+process uptime, and the same component checks used by readiness:
+
+```json
+{
+  "status": "ok",
+  "version": "1.0.1",
+  "build_hash": "5e8cfa8",
+  "timestamp": "2026-05-04T18:30:00Z",
+  "uptime_seconds": 12345,
+  "checks": [
+    {"name": "ledger", "status": "healthy"},
+    {"name": "stripe", "status": "not_configured", "detail": "not yet wired in this wave"}
+  ]
+}
+```
+
+When any readiness component is unhealthy, `/health` returns `503` and
+the top-level `status` is `"unready"`. `/healthz` remains a fixed-size
+liveness response for load balancers.
 
 ### `/readyz`
 
@@ -569,7 +608,7 @@ Unhealthy targets drop out of rotation. The `sb_lb_target_healthy` metric tracks
 
 ### Component registration
 
-Subsystems register named health checkers with the health manager. The registered names appear in the `checks` map of the `/health` and `/healthz` responses. Components report `"ok"` or `"error"` status strings.
+Subsystems register named health checkers with the health manager. The registered names appear in `/readyz`'s `components` array and `/health`'s `checks` array. Components report `"healthy"`, `"degraded"`, `"unhealthy"`, or `"not_configured"` status strings.
 
 ---
 
@@ -1276,6 +1315,7 @@ Variables are applied at process start; changes require a restart.
 |----------|----------|---------|-------------|
 | `SB_CONFIG_FILE` | `-f`, `--config` | (empty) | Path to `sb.yml`. Required if no flag and no positional arg. |
 | `SB_LOG_LEVEL` | `--log-level` | `info` | Filter for `tracing-subscriber`. Wins over `RUST_LOG`. |
+| `SB_REQUEST_LOG_LEVEL` | `--request-log-level` | (unset) | Appends an `access_log=<level>` target filter for request/access logs. |
 | `SB_GRACE_TIME` | `--grace-time` | `0` | Pingora grace period and shutdown timeout in seconds. |
 | `SB_WORKER_THREADS` | (none) | (auto) | Override the auto-detected Pingora worker thread count. Positive integers only. |
 | `SB_DISABLE_SB_FLAGS` | `--disable-sb-flags` | `false` | Lock off the per-request `x-sb-flags` surface. Accepts `1`, `true`, `yes`, `on`. |
