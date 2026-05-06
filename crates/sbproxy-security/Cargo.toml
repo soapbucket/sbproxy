@@ -35,5 +35,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 tracing.workspace = true
+hickory-resolver = "0.26.1"
+tokio.workspace = true
 
 [dev-dependencies]

@@ -25,6 +25,11 @@ of the new YAML fields below until the version that ships them.
   ([docs/operator-runbook.md], [docs/adr-fast-track-amendment.md],
   [docs/threat-model.md], [dashboards/grafana/])
 
+- **Live reverse-DNS resolver for agent verification.** `SystemResolver`
+  now uses `hickory-resolver` for PTR and forward-confirmation lookups,
+  replacing the previous typed PTR stub.
+  ([crates/sbproxy-security/src/agent_verify.rs])
+
 - **Operator first-24-hours quickstart.** Added a concise
   `docs/quickstart-operator.md` covering deploy, `/readyz`, metrics,
   Grafana, logs, and rollback, linked from the README and Kubernetes
