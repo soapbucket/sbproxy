@@ -27,6 +27,7 @@ use acme::AcmeClient;
 use cert_resolver::{load_certified_key, CertResolver};
 use cert_store::{CertMeta, CertStore};
 use challenges::Http01ChallengeStore;
+use ocsp::OcspStapler;
 use sbproxy_config::ProxyServerConfig;
 use sbproxy_platform::MemoryKVStore;
 
@@ -44,6 +45,18 @@ pub struct TlsState {
     cert_store: Arc<CertStore<MemoryKVStore>>,
     /// Hostnames this proxy is responsible for.
     hostnames: Vec<String>,
+    /// OCSP stapler for the manual fallback cert. `None` when no
+    /// manual cert is configured or the cert lacks an AIA extension
+    /// pointing at an OCSP responder; in either case the proxy
+    /// serves TLS without stapling. Populated by [`Self::init`] and
+    /// kicked off by [`Self::start_ocsp_refresh_task`] once a tokio
+    /// runtime is available.
+    ocsp_stapler: Option<Arc<OcspStapler>>,
+    /// Manual cert PEM bytes, retained alongside the stapler so the
+    /// refresh task can re-fetch the OCSP response for the same
+    /// cert. Stored only when a manual cert was loaded; `None`
+    /// otherwise.
+    manual_cert_pem: Option<Vec<u8>>,
 }
 
 impl TlsState {
@@ -63,15 +76,24 @@ impl TlsState {
         let cert_store = Arc::new(CertStore::new(MemoryKVStore::new(0)));
 
         // --- Manual cert files ---
+        let mut ocsp_stapler: Option<Arc<OcspStapler>> = None;
+        let mut manual_cert_pem: Option<Vec<u8>> = None;
         if let (Some(cert_path), Some(key_path)) = (&config.tls_cert_file, &config.tls_key_file) {
-            match cert_resolver::load_certified_key(
-                &std::fs::read(cert_path)
-                    .with_context(|| format!("reading TLS cert: {cert_path}"))?,
-                &std::fs::read(key_path).with_context(|| format!("reading TLS key: {key_path}"))?,
-            ) {
+            let cert_bytes = std::fs::read(cert_path)
+                .with_context(|| format!("reading TLS cert: {cert_path}"))?;
+            let key_bytes =
+                std::fs::read(key_path).with_context(|| format!("reading TLS key: {key_path}"))?;
+            match cert_resolver::load_certified_key(&cert_bytes, &key_bytes) {
                 Ok(ck) => {
                     resolver.set_fallback(ck);
                     info!(cert = %cert_path, "loaded manual TLS certificate as fallback");
+                    // Stash the cert PEM and a stapler instance so
+                    // start_ocsp_refresh_task can wire them up once a
+                    // tokio runtime is available. We do not fetch the
+                    // OCSP response here because TlsState::init runs
+                    // before any runtime is spun up.
+                    ocsp_stapler = Some(Arc::new(OcspStapler::new()));
+                    manual_cert_pem = Some(cert_bytes);
                 }
                 Err(e) => {
                     warn!(
@@ -120,7 +142,33 @@ impl TlsState {
             acme_config: config.acme.clone(),
             cert_store,
             hostnames,
+            ocsp_stapler,
+            manual_cert_pem,
         })
+    }
+
+    /// Spawn the OCSP refresh task for the manual fallback cert.
+    ///
+    /// No-op when no manual cert was loaded. The task does an
+    /// initial OCSP fetch immediately, then refreshes every 12
+    /// hours; on every successful fetch it calls
+    /// [`CertResolver::update_fallback_ocsp`] so subsequent
+    /// handshakes staple the fresh response.
+    ///
+    /// Must be called from a tokio runtime. The Pingora server
+    /// installs its own runtime before any service starts, so this
+    /// is invoked from the proxy's startup hook.
+    pub fn start_ocsp_refresh_task(&self) {
+        let (Some(stapler), Some(cert_pem)) =
+            (self.ocsp_stapler.as_ref(), self.manual_cert_pem.as_ref())
+        else {
+            return;
+        };
+        let resolver = self.resolver.clone();
+        stapler.start_refresh_task(cert_pem.clone(), move |bytes| {
+            resolver.update_fallback_ocsp(bytes);
+        });
+        info!("OCSP refresh task started for manual fallback cert");
     }
 
     /// Spawn a background task that checks certificate expiry every 12 hours

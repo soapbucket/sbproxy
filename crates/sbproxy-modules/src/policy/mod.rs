@@ -2072,6 +2072,15 @@ impl ExpressionPolicy {
             sbproxy_extension::cel::context::populate_ml_namespace(&mut ctx, &ml);
         }
 
+        // WOR-114 Phase 2: stamp the per-request feature flags so
+        // policy expressions can read `features.debug` etc. Same
+        // opt-in shape as the other Wave 5 views; absent `features`
+        // means the flags namespace is not populated and any
+        // `features.*` access yields the engine's default.
+        if let Some(flags) = views.features.as_ref() {
+            sbproxy_extension::cel::context::populate_features_namespace(&mut ctx, flags);
+        }
+
         match engine.compile(&self.expression) {
             Ok(expr) => engine.eval_bool(&expr, &ctx).unwrap_or(false),
             Err(_) => true, // Fail open on compile error only
@@ -2095,6 +2104,12 @@ pub struct ExpressionViews<'a> {
     pub kya: Option<sbproxy_extension::cel::context::KyaVerdictView<'a>>,
     /// Wave 5 / A5.2 ML agent classifier verdict view.
     pub ml: Option<sbproxy_extension::cel::context::MlClassificationView<'a>>,
+    /// WOR-114 Phase 2 per-request feature flags view. When `Some`,
+    /// `populate_features_namespace` runs and CEL expressions can
+    /// branch on `features.debug`, `features["no-cache"]`, etc.
+    /// Default `None` keeps existing call sites that have not yet
+    /// threaded `RequestContext.flags` through compiling.
+    pub features: Option<sbproxy_extension::cel::context::FeatureFlagsView<'a>>,
 }
 
 // --- AssertionPolicy ---

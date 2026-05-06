@@ -293,6 +293,15 @@ pub fn handle_healthz() -> (u16, &'static str, String) {
     (200, "application/json", r#"{"status":"ok"}"#.to_string())
 }
 
+/// Render the `/livez` response body. Pure liveness: returns 200 as
+/// long as the binary is running, regardless of registry state. K8s
+/// uses `/livez` to decide whether to restart the pod; we never
+/// return 503 here so a transient readiness failure doesn't trigger
+/// a restart loop. (Use `/readyz` for "should I send traffic?".)
+pub fn handle_livez() -> (u16, &'static str, String) {
+    (200, "application/json", r#"{"alive":true}"#.to_string())
+}
+
 /// Render the `/readyz` response body by walking the registry. Returns
 /// `200` when every component is ready and `503` otherwise; the body
 /// is the JSON-serialised [`ReadinessReport`] in either case so
@@ -321,6 +330,15 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(ct, "application/json");
         assert!(body.contains("ok"));
+    }
+
+    #[test]
+    fn livez_is_always_200() {
+        let (status, ct, body) = handle_livez();
+        assert_eq!(status, 200);
+        assert_eq!(ct, "application/json");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["alive"], true);
     }
 
     #[test]

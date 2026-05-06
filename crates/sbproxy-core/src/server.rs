@@ -1762,7 +1762,8 @@ enum PolicyResult {
 /// caller can fall back to the default IP-based key.
 fn rate_limit_key_from_cel(session: &Session, ctx: &RequestContext, expr: &str) -> Option<String> {
     use sbproxy_extension::cel::context::{
-        build_request_context, populate_envelope_namespace, EnvelopeView,
+        build_request_context, populate_envelope_namespace, populate_features_namespace,
+        EnvelopeView, FeatureFlagsView,
     };
     use sbproxy_extension::cel::{CelEngine, CelValue};
 
@@ -1795,6 +1796,15 @@ fn rate_limit_key_from_cel(session: &Session, ctx: &RequestContext, expr: &str) 
         properties: Some(&ctx.properties),
     };
     populate_envelope_namespace(&mut cel_ctx, &envelope);
+    // WOR-114 Phase 2: expose `x-sb-flags` parsed flags so CEL
+    // rate-limit keys can branch on `features.debug` etc.
+    let features = FeatureFlagsView {
+        debug: ctx.flags.debug,
+        trace: ctx.flags.trace,
+        no_cache: ctx.flags.no_cache,
+        extra: &ctx.flags.extra,
+    };
+    populate_features_namespace(&mut cel_ctx, &features);
 
     let engine = CelEngine::new();
     let value = match engine.eval_source(expr, &cel_ctx) {
@@ -2595,10 +2605,17 @@ async fn check_policies(
                     sbproxy_extension::cel::context::MlClassificationView<'_>,
                 > = None;
 
+                let features_view = sbproxy_extension::cel::context::FeatureFlagsView {
+                    debug: ctx.flags.debug,
+                    trace: ctx.flags.trace,
+                    no_cache: ctx.flags.no_cache,
+                    extra: &ctx.flags.extra,
+                };
                 let views = sbproxy_modules::ExpressionViews {
                     aipref: ctx.aipref.as_ref(),
                     kya: kya_view,
                     ml: ml_view,
+                    features: Some(features_view),
                 };
                 if !p.evaluate_with_views(
                     method,
@@ -11255,10 +11272,22 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
+    // Worker thread count. `SB_WORKER_THREADS` (when a positive
+    // integer) overrides the auto-detected value; otherwise we use
+    // `std::thread::available_parallelism()`, which honours cgroup
+    // CPU quotas on Linux. Useful for benchmarks pinning to a known
+    // worker count, or for containers where the operator wants to
+    // cap the pool below the cgroup quota.
+    let auto_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let threads = std::env::var("SB_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(auto_threads);
     let conf = PingoraServerConf {
-        threads: std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
+        threads,
         upstream_keepalive_pool_size: 256,
         upstream_connect_offload_threadpools: Some(2),
         grace_period_seconds: Some(grace_seconds),
@@ -11351,13 +11380,53 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
                 // a real cert once issuance completes.
                 match tls.generate_self_signed_bootstrap_cert() {
                     Ok((cert_path, key_path)) => {
-                        proxy_service
-                            .add_tls(&format!("0.0.0.0:{https_port}"), &cert_path, &key_path)
-                            .map_err(|e| anyhow::anyhow!("failed to add TLS listener: {}", e))?;
-                        tracing::info!(
-                            port = %https_port,
-                            "HTTPS listener added (self-signed bootstrap, ACME will replace)"
-                        );
+                        // Wire mTLS through the ACME path too. Without
+                        // this branch, an operator who configured mTLS
+                        // alongside ACME would silently get plain TLS
+                        // until they noticed clients reaching the
+                        // upstream without the expected cert headers.
+                        if let Some(mtls_cfg) = server_config.mtls.as_ref() {
+                            let cache = crate::identity::mtls_cert_cache();
+                            match build_mtls_tls_settings(&cert_path, &key_path, mtls_cfg, cache) {
+                                Ok(settings) => {
+                                    proxy_service.add_tls_with_settings(
+                                        &format!("0.0.0.0:{https_port}"),
+                                        None,
+                                        settings,
+                                    );
+                                    tracing::info!(
+                                        port = %https_port,
+                                        require = %mtls_cfg.require,
+                                        "HTTPS listener added (ACME bootstrap + mTLS; ACME will replace cert)"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "mTLS setup failed on ACME path; falling back to non-mTLS HTTPS"
+                                    );
+                                    proxy_service
+                                        .add_tls(
+                                            &format!("0.0.0.0:{https_port}"),
+                                            &cert_path,
+                                            &key_path,
+                                        )
+                                        .map_err(|e| {
+                                            anyhow::anyhow!("failed to add TLS listener: {}", e)
+                                        })?;
+                                }
+                            }
+                        } else {
+                            proxy_service
+                                .add_tls(&format!("0.0.0.0:{https_port}"), &cert_path, &key_path)
+                                .map_err(|e| {
+                                    anyhow::anyhow!("failed to add TLS listener: {}", e)
+                                })?;
+                            tracing::info!(
+                                port = %https_port,
+                                "HTTPS listener added (self-signed bootstrap, ACME will replace)"
+                            );
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -11445,6 +11514,12 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
     // Start ACME renewal task if enabled.
     if let Some(ref tls) = tls_state {
         tls.start_acme_renewal_task();
+        // Kick off OCSP stapling for the manual fallback cert.
+        // No-op when no manual cert is loaded; otherwise the
+        // task does an immediate fetch and refreshes every 12h,
+        // calling back into the resolver to update the stapled
+        // bytes on the cert.
+        tls.start_ocsp_refresh_task();
     }
 
     // Start HTTP/3 listener if enabled.

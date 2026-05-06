@@ -754,8 +754,12 @@ pub fn handle_admin_request(
     // sensitive content.
     if method.eq_ignore_ascii_case("GET") {
         match path {
-            "/healthz" => return sbproxy_observe::handle_healthz(),
-            "/readyz" => return sbproxy_observe::handle_readyz(&state.health_registry),
+            // K8s-style canonical names plus their bare aliases. All
+            // unauthenticated for the same reason as /healthz: load
+            // balancers and orchestrators don't carry credentials.
+            "/healthz" | "/health" => return sbproxy_observe::handle_healthz(),
+            "/readyz" | "/ready" => return sbproxy_observe::handle_readyz(&state.health_registry),
+            "/livez" | "/live" => return sbproxy_observe::handle_livez(),
             // Wave 3 closeout: quote-token JWKS publication.
             //
             // External verifiers (the LedgerClient and any agent SDK
@@ -1588,6 +1592,31 @@ origins:
         assert_eq!(status, 200, "empty registry should be ready: {}", body);
         assert_eq!(ct, "application/json");
         assert!(body.contains("\"status\":\"ok\""));
+    }
+
+    #[test]
+    fn live_and_livez_return_alive_true() {
+        let state = make_state();
+        for path in ["/live", "/livez"] {
+            let (status, ct, body) = handle_admin_request("GET", path, &state, None);
+            assert_eq!(status, 200, "{} must not require auth", path);
+            assert_eq!(ct, "application/json");
+            assert!(body.contains("\"alive\":true"), "{} body: {}", path, body);
+        }
+    }
+
+    #[test]
+    fn ready_and_health_aliases_match_canonical() {
+        let state = make_state();
+        let (rs, _, rb) = handle_admin_request("GET", "/readyz", &state, None);
+        let (as_, _, ab) = handle_admin_request("GET", "/ready", &state, None);
+        assert_eq!(rs, as_, "/ready must mirror /readyz status");
+        assert_eq!(rb, ab, "/ready must mirror /readyz body");
+
+        let (hs, _, hb) = handle_admin_request("GET", "/healthz", &state, None);
+        let (ps, _, pb) = handle_admin_request("GET", "/health", &state, None);
+        assert_eq!(hs, ps, "/health must mirror /healthz status");
+        assert_eq!(hb, pb, "/health must mirror /healthz body");
     }
 
     #[test]

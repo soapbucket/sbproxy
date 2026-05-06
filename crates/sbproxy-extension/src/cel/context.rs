@@ -594,6 +594,69 @@ fn json_to_cel(value: &serde_json::Value) -> CelValue {
     }
 }
 
+/// View of per-request feature flags (WOR-114 Phase 2). Borrowed
+/// from `RequestContext.flags` so the CEL layer never clones.
+///
+/// The CEL `features` namespace exposes:
+/// * Built-in bools: `features.debug`, `features.trace`,
+///   `features["no-cache"]` (bracket access required because hyphens
+///   are not valid CEL identifiers).
+/// * Free-form k=v entries from
+///   `RequestContext.flags.extra` under the same `features[...]`
+///   accessor; values are strings.
+/// * `features.any_set` mirrors `RequestFlags::any_set()` so policy
+///   expressions can branch on "did the client opt into anything".
+///
+/// Unset built-in flags render as `false`; unset extra keys render
+/// as the empty string `""` so `size(features["env"]) > 0` is the
+/// idiomatic "was it provided" check.
+#[derive(Debug, Clone, Copy)]
+pub struct FeatureFlagsView<'a> {
+    /// Borrowed `debug` bool. Default `false`.
+    pub debug: bool,
+    /// Borrowed `trace` bool. Default `false`.
+    pub trace: bool,
+    /// Borrowed `no-cache` bool. Default `false`.
+    pub no_cache: bool,
+    /// Borrowed extra map from `RequestFlags::extra`. Empty when no
+    /// unknown k=v pairs were supplied.
+    pub extra: &'a std::collections::BTreeMap<String, String>,
+}
+
+impl<'a> FeatureFlagsView<'a> {
+    /// True when any flag (built-in or extra) is set; mirrors
+    /// `RequestFlags::any_set`.
+    pub fn any_set(&self) -> bool {
+        self.debug || self.trace || self.no_cache || !self.extra.is_empty()
+    }
+}
+
+/// Stamp the [`FeatureFlagsView`] under the top-level `features`
+/// namespace.
+///
+/// Idempotent: calling twice with the same view leaves the context
+/// in the same state. Always populates the namespace, even when no
+/// flags are set, so policy expressions can call
+/// `features.debug == false` without first probing existence.
+pub fn populate_features_namespace(ctx: &mut CelContext, view: &FeatureFlagsView<'_>) {
+    let mut features = HashMap::with_capacity(4 + view.extra.len());
+    features.insert("debug".to_string(), CelValue::Bool(view.debug));
+    features.insert("trace".to_string(), CelValue::Bool(view.trace));
+    features.insert("no-cache".to_string(), CelValue::Bool(view.no_cache));
+    features.insert("any_set".to_string(), CelValue::Bool(view.any_set()));
+    for (k, v) in view.extra.iter() {
+        // Skip keys that would shadow the built-ins; the built-in
+        // bool wins. This matches the parser's behaviour where the
+        // built-in path consumes `debug` / `trace` / `no-cache`
+        // before `extra` is touched.
+        if k == "debug" || k == "trace" || k == "no-cache" || k == "any_set" {
+            continue;
+        }
+        features.insert(k.clone(), CelValue::String(v.clone()));
+    }
+    ctx.set("features", CelValue::Map(features));
+}
+
 /// Build a CEL context from HTTP request and response data.
 ///
 /// Includes everything from [`build_request_context`] plus response-specific
@@ -1332,6 +1395,113 @@ mod tests {
             .unwrap());
         assert!(engine
             .eval_bool_source(r#"request.ml_classification.confidence == 0.0"#, &ctx)
+            .unwrap());
+    }
+
+    // --- WOR-114 Phase 2: features namespace tests ---
+
+    fn empty_extra() -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::new()
+    }
+
+    #[test]
+    fn features_namespace_exposes_all_three_builtins_as_bools() {
+        let mut ctx = build_request_context("GET", "/", &HeaderMap::new(), None, None, "h.com");
+        let extra = empty_extra();
+        let view = FeatureFlagsView {
+            debug: true,
+            trace: false,
+            no_cache: true,
+            extra: &extra,
+        };
+        populate_features_namespace(&mut ctx, &view);
+
+        let engine = CelEngine::new();
+        assert!(engine
+            .eval_bool_source(r#"features.debug == true"#, &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source(r#"features.trace == false"#, &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source(r#"features["no-cache"] == true"#, &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source(r#"features.any_set == true"#, &ctx)
+            .unwrap());
+    }
+
+    #[test]
+    fn features_namespace_renders_unset_flags_as_false() {
+        let mut ctx = build_request_context("GET", "/", &HeaderMap::new(), None, None, "h.com");
+        let extra = empty_extra();
+        let view = FeatureFlagsView {
+            debug: false,
+            trace: false,
+            no_cache: false,
+            extra: &extra,
+        };
+        populate_features_namespace(&mut ctx, &view);
+
+        let engine = CelEngine::new();
+        assert!(engine
+            .eval_bool_source(r#"features.debug == false"#, &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source(r#"features.any_set == false"#, &ctx)
+            .unwrap());
+    }
+
+    #[test]
+    fn features_namespace_exposes_extra_kv_as_strings() {
+        let mut ctx = build_request_context("GET", "/", &HeaderMap::new(), None, None, "h.com");
+        let mut extra = empty_extra();
+        extra.insert("env".to_string(), "staging".to_string());
+        extra.insert("region".to_string(), "us-east-1".to_string());
+        let view = FeatureFlagsView {
+            debug: false,
+            trace: false,
+            no_cache: false,
+            extra: &extra,
+        };
+        populate_features_namespace(&mut ctx, &view);
+
+        let engine = CelEngine::new();
+        assert!(engine
+            .eval_bool_source(r#"features["env"] == "staging""#, &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source(r#"features["region"] == "us-east-1""#, &ctx)
+            .unwrap());
+        // Extras count toward `any_set` even when no built-in is on.
+        assert!(engine
+            .eval_bool_source(r#"features.any_set == true"#, &ctx)
+            .unwrap());
+    }
+
+    #[test]
+    fn features_namespace_extra_cannot_shadow_builtins() {
+        // If a client sends `x-sb-flags: debug=lol`, the parser still
+        // sets the typed bool; the "lol" value must not overwrite the
+        // bool in the CEL namespace.
+        let mut ctx = build_request_context("GET", "/", &HeaderMap::new(), None, None, "h.com");
+        let mut extra = empty_extra();
+        extra.insert("debug".to_string(), "lol".to_string());
+        extra.insert("any_set".to_string(), "lol".to_string());
+        let view = FeatureFlagsView {
+            debug: true,
+            trace: false,
+            no_cache: false,
+            extra: &extra,
+        };
+        populate_features_namespace(&mut ctx, &view);
+
+        let engine = CelEngine::new();
+        assert!(engine
+            .eval_bool_source(r#"features.debug == true"#, &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source(r#"features.any_set == true"#, &ctx)
             .unwrap());
     }
 }

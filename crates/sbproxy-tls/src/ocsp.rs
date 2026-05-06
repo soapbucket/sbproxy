@@ -78,16 +78,62 @@ impl OcspStapler {
         self.response.load().as_ref().clone()
     }
 
-    /// Start a background task that refreshes the OCSP response every 12 hours.
+    /// Start a background task that fetches the OCSP response now and
+    /// refreshes it every 12 hours afterwards.
+    ///
+    /// On every successful fetch the task:
+    /// 1. Stores the bytes in the stapler's cache (so
+    ///    [`Self::get_response`] sees them).
+    /// 2. Calls `on_update` with a clone of the bytes so the caller
+    ///    (typically [`crate::cert_resolver::CertResolver`]) can
+    ///    replace its `CertifiedKey` with a new one whose `ocsp`
+    ///    field is populated, which is the only mechanism rustls
+    ///    0.23 uses to staple a response on the wire.
     ///
     /// The task is fire-and-forget; it logs errors but never panics.
-    pub fn start_refresh_task(&self, cert_pem: Vec<u8>) {
+    /// Failures (network blip, OCSP responder down, AIA extension
+    /// missing) leave the cached value alone, so a previously-valid
+    /// response keeps being stapled until the next successful refresh
+    /// or until it expires on the client side.
+    ///
+    /// `on_update` runs on the spawned task's tokio runtime; keep it
+    /// non-blocking and quick. The default 12h cadence matches what
+    /// most public CAs (Let's Encrypt, ZeroSSL) recommend; OCSP
+    /// responses are usually valid for 7 days but stapling them
+    /// fresh shortens the window an attacker has to exploit a
+    /// recently-compromised cert.
+    pub fn start_refresh_task<F>(&self, cert_pem: Vec<u8>, on_update: F)
+    where
+        F: Fn(Vec<u8>) + Send + 'static,
+    {
         let response_slot = self.response.clone();
 
         tokio::spawn(async move {
+            // --- Initial fetch ---
+            //
+            // Before the 12h interval, fetch once so the first
+            // handshake after startup already gets a stapled
+            // response.
+            match OcspStapler::fetch_ocsp_response(&cert_pem).await {
+                Ok(bytes) => {
+                    info!(bytes = bytes.len(), "initial OCSP response fetched");
+                    response_slot.store(Arc::new(Some(bytes.clone())));
+                    on_update(bytes);
+                }
+                Err(e) => {
+                    // Don't escalate; the proxy can still serve TLS,
+                    // just without stapling. Most clients never
+                    // validate OCSP-must-staple unless the cert
+                    // requested it.
+                    error!("initial OCSP fetch failed: {e:#}");
+                }
+            }
+
+            // --- 12h refresh loop ---
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(12 * 3600));
-            // Skip the first immediate tick; let the proxy warm up before
-            // contacting the OCSP responder.
+            // The first tick fires immediately under tokio's default
+            // policy; consume it so the loop sleeps 12h on the next
+            // call.
             interval.tick().await;
 
             loop {
@@ -96,7 +142,8 @@ impl OcspStapler {
                 match OcspStapler::fetch_ocsp_response(&cert_pem).await {
                     Ok(bytes) => {
                         info!(bytes = bytes.len(), "OCSP response refreshed");
-                        response_slot.store(Arc::new(Some(bytes)));
+                        response_slot.store(Arc::new(Some(bytes.clone())));
+                        on_update(bytes);
                     }
                     Err(e) => {
                         error!("failed to refresh OCSP response: {e:#}");
