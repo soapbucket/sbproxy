@@ -366,33 +366,33 @@ Example request log entry (JSON):
 
 ### Sampling
 
-Request logging supports 1-in-N sampling to reduce log volume on high-traffic origins. Errors (status >= 500) and slow requests are always logged, regardless of sampling rate.
+Access logging supports probabilistic sampling to reduce log volume on
+high-traffic origins. `always_log_errors` and
+`slow_request_threshold_ms` force matching requests through before the
+sampler runs.
 
 ```yaml
-proxy:
-  logging:
-    request:
-      sampling:
-        enabled: true
-        rate: 100  # log 1 in 100 requests; errors always logged
-      slow_request_threshold: 5s
+access_log:
+  enabled: true
+  sample_rate: 0.01
+  always_log_errors: true
+  slow_request_threshold_ms: 1000
 ```
 
 ### Log outputs
 
-Each stream can write to multiple outputs simultaneously:
+By default, access-log lines are emitted via the `access_log` tracing
+target. To write access logs directly to disk:
 
 ```yaml
-proxy:
-  logging:
-    request:
-      outputs:
-        - type: stderr
-        - type: file
-          file:
-            path: /var/log/sbproxy/requests.log
-            max_size: 100mb
-            max_backups: 5
+access_log:
+  enabled: true
+  output:
+    type: file
+    path: /var/log/sbproxy/access.log
+    max_size_mb: 100
+    max_backups: 5
+    compress: true
 ```
 
 ---

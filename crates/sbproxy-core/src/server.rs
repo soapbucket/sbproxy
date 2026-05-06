@@ -2330,6 +2330,10 @@ async fn check_policies(
                 let agent_id_param: Option<&str> = agent_id_str.as_deref();
                 #[cfg(not(feature = "agent-class"))]
                 let agent_id_param: Option<&str> = None;
+                #[cfg(feature = "agent-class")]
+                let agent_id_for_tier = agent_id_param.unwrap_or("");
+                #[cfg(not(feature = "agent-class"))]
+                let agent_id_for_tier = "";
                 // --- G4.4 + G4.10 closeout: resolve the matched tier's
                 // `citation_required` flag and stamp it into the
                 // request context so downstream transforms read a
@@ -2343,7 +2347,6 @@ async fn check_policies(
                         .headers
                         .get(http::header::ACCEPT)
                         .and_then(|v| v.to_str().ok());
-                    let agent_id_for_tier = agent_id_param.unwrap_or("");
                     if let Some(tier) = p.matched_tier_for_request(path, agent_id_for_tier, accept)
                     {
                         ctx.citation_required = Some(tier.citation_required);
@@ -10830,10 +10833,11 @@ fn emit_access_log_entry(
     trace_id: Option<String>,
     context: AccessLogContext,
 ) {
-    if !cfg.should_emit(status, method) {
+    let latency_ms = duration_secs * 1000.0;
+    if !cfg.matches_filters(status, method) {
         return;
     }
-    if cfg.sample_rate < 1.0 && rand::random::<f64>() >= cfg.sample_rate {
+    if !cfg.should_sample(status, latency_ms, rand::random::<f64>()) {
         return;
     }
 
@@ -10844,7 +10848,7 @@ fn emit_access_log_entry(
         method: method.to_string(),
         path: path.to_string(),
         status,
-        latency_ms: duration_secs * 1000.0,
+        latency_ms,
         bytes_in: context.bytes_in,
         bytes_out: context.bytes_out,
         client_ip,
@@ -10895,7 +10899,29 @@ fn emit_access_log_entry(
         request_headers: context.request_headers,
         response_headers: context.response_headers,
     };
-    entry.emit();
+    match cfg.output.output_type.as_str() {
+        "file" => {
+            if let Some(path) = cfg.output.path.as_deref() {
+                let max_size_bytes = cfg
+                    .output
+                    .max_size_mb
+                    .max(1)
+                    .saturating_mul(1024)
+                    .saturating_mul(1024);
+                if let Err(e) = entry.emit_to_file(
+                    path,
+                    max_size_bytes,
+                    cfg.output.max_backups,
+                    cfg.output.compress,
+                ) {
+                    tracing::warn!(error = %e, path = %path, "access log file write failed");
+                }
+            } else {
+                tracing::warn!("access_log.output.type=file configured without output.path");
+            }
+        }
+        _ => entry.emit(),
+    }
 }
 
 /// Start a file watcher that reloads the config on changes.
@@ -12582,6 +12608,7 @@ mod tests {
             status_codes: vec![],
             methods: vec![],
             capture_headers: sbproxy_config::CaptureHeadersConfig::default(),
+            ..Default::default()
         }
     }
 
@@ -12631,6 +12658,7 @@ mod tests {
             status_codes: vec![],
             methods: vec![],
             capture_headers: sbproxy_config::CaptureHeadersConfig::default(),
+            ..Default::default()
         };
         let lines = run_with_capture(|| {
             emit_access_log_entry(
@@ -12657,6 +12685,7 @@ mod tests {
             status_codes: vec![500],
             methods: vec![],
             capture_headers: sbproxy_config::CaptureHeadersConfig::default(),
+            ..Default::default()
         };
         let lines = run_with_capture(|| {
             emit_access_log_entry(
@@ -12697,6 +12726,7 @@ mod tests {
             status_codes: vec![],
             methods: vec!["POST".to_string()],
             capture_headers: sbproxy_config::CaptureHeadersConfig::default(),
+            ..Default::default()
         };
         let lines = run_with_capture(|| {
             emit_access_log_entry(
@@ -12777,6 +12807,78 @@ mod tests {
             }
         });
         assert!(lines.is_empty(), "sample_rate=0.0 should drop everything");
+    }
+
+    #[test]
+    fn access_log_slow_request_bypasses_sampler() {
+        let mut cfg = make_cfg(0.0);
+        cfg.slow_request_threshold_ms = Some(1000.0);
+        let lines = run_with_capture(|| {
+            emit_access_log_entry(
+                &cfg,
+                200,
+                "GET",
+                "api.example.com",
+                "/slow",
+                1.2,
+                "slow".to_string(),
+                "1.1.1.1".to_string(),
+                None,
+                AccessLogContext::empty(),
+            );
+        });
+        assert_eq!(lines.len(), 1, "slow request should force emit");
+    }
+
+    #[test]
+    fn access_log_error_bypasses_sampler() {
+        let mut cfg = make_cfg(0.0);
+        cfg.always_log_errors = true;
+        let lines = run_with_capture(|| {
+            emit_access_log_entry(
+                &cfg,
+                503,
+                "GET",
+                "api.example.com",
+                "/error",
+                0.001,
+                "err".to_string(),
+                "1.1.1.1".to_string(),
+                None,
+                AccessLogContext::empty(),
+            );
+        });
+        assert_eq!(lines.len(), 1, "5xx should force emit");
+    }
+
+    #[test]
+    fn access_log_file_output_writes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        let mut cfg = make_cfg(1.0);
+        cfg.output = sbproxy_config::AccessLogOutputConfig {
+            output_type: "file".to_string(),
+            path: Some(path.to_string_lossy().into_owned()),
+            max_size_mb: 1,
+            max_backups: 2,
+            compress: false,
+        };
+
+        emit_access_log_entry(
+            &cfg,
+            200,
+            "GET",
+            "api.example.com",
+            "/file",
+            0.001,
+            "file".to_string(),
+            "1.1.1.1".to_string(),
+            None,
+            AccessLogContext::empty(),
+        );
+
+        let contents = std::fs::read_to_string(path).unwrap();
+        assert!(contents.contains("\"request_id\":\"file\""));
     }
 
     #[test]

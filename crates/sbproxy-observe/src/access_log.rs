@@ -5,6 +5,8 @@
 //! Secrets in any field are redacted before emission.
 
 use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -242,10 +244,44 @@ impl AccessLogEntry {
     /// `access_log` allows log routers to separate access logs from
     /// application logs.
     pub fn emit(&self) {
-        if let Ok(json) = serde_json::to_string(self) {
-            let redacted = crate::redact::redact_secrets(&json);
+        if let Ok(redacted) = self.redacted_json_line() {
             tracing::info!(target: "access_log", "{}", redacted);
         }
+    }
+
+    /// Render this entry as one redacted JSON line.
+    pub fn redacted_json_line(&self) -> anyhow::Result<String> {
+        let json = serde_json::to_string(self)?;
+        Ok(crate::redact::redact_secrets(&json))
+    }
+
+    /// Append this entry to a file sink, rotating before write when the
+    /// active file is at or above `max_size_bytes`.
+    pub fn emit_to_file(
+        &self,
+        path: impl AsRef<Path>,
+        max_size_bytes: u64,
+        max_backups: usize,
+        compress: bool,
+    ) -> anyhow::Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if path
+            .metadata()
+            .map(|m| m.len() >= max_size_bytes.max(1))
+            .unwrap_or(false)
+        {
+            rotate_access_log(path, max_backups, compress)?;
+        }
+        let line = self.redacted_json_line()?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(file, "{line}")?;
+        Ok(())
     }
 
     /// Start an [`AccessLogEntryBuilder`] for incremental field
@@ -260,6 +296,55 @@ impl AccessLogEntry {
     pub fn builder() -> AccessLogEntryBuilder {
         AccessLogEntryBuilder::default()
     }
+}
+
+fn rotate_access_log(path: &Path, max_backups: usize, compress: bool) -> anyhow::Result<()> {
+    if max_backups == 0 {
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        return Ok(());
+    }
+
+    let oldest = rotated_path(path, max_backups, compress);
+    if oldest.exists() {
+        std::fs::remove_file(&oldest)?;
+    }
+    for idx in (1..max_backups).rev() {
+        let from = rotated_path(path, idx, compress);
+        if from.exists() {
+            std::fs::rename(&from, rotated_path(path, idx + 1, compress))?;
+        }
+    }
+    if !path.exists() {
+        return Ok(());
+    }
+    if compress {
+        gzip_file(path, &rotated_path(path, 1, true))?;
+        std::fs::remove_file(path)?;
+    } else {
+        std::fs::rename(path, rotated_path(path, 1, false))?;
+    }
+    Ok(())
+}
+
+fn rotated_path(path: &Path, idx: usize, compress: bool) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(format!(".{idx}"));
+    if compress {
+        s.push(".gz");
+    }
+    PathBuf::from(s)
+}
+
+fn gzip_file(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    let input = std::fs::File::open(src)?;
+    let output = std::fs::File::create(dest)?;
+    let mut encoder = flate2::write::GzEncoder::new(output, flate2::Compression::default());
+    let mut reader = std::io::BufReader::new(input);
+    std::io::copy(&mut reader, &mut encoder)?;
+    encoder.finish()?;
+    Ok(())
 }
 
 // --- Access log entry builder ---
@@ -656,6 +741,47 @@ mod tests {
 
         assert!(!redacted.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"));
         assert!(redacted.contains("Bearer [REDACTED]"));
+    }
+
+    #[test]
+    fn emit_to_file_writes_json_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        minimal_entry()
+            .emit_to_file(&path, 1024 * 1024, 7, false)
+            .unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = contents.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["request_id"], "abc123");
+    }
+
+    #[test]
+    fn emit_to_file_rotates_when_size_limit_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        std::fs::write(&path, "old line\n").unwrap();
+
+        minimal_entry().emit_to_file(&path, 1, 2, false).unwrap();
+
+        assert!(path.exists());
+        assert!(dir.path().join("access.log.1").exists());
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert!(current.contains("abc123"));
+    }
+
+    #[test]
+    fn emit_to_file_compresses_rotated_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        std::fs::write(&path, "old line\n").unwrap();
+
+        minimal_entry().emit_to_file(&path, 1, 2, true).unwrap();
+
+        assert!(path.exists());
+        assert!(dir.path().join("access.log.1.gz").exists());
     }
 
     #[test]
