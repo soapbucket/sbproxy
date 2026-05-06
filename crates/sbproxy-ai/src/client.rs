@@ -24,6 +24,9 @@ pub const DEFAULT_SHADOW_MAX_INFLIGHT: usize = 1024;
 /// Minimum interval between rate-limited shadow-overflow WARN log
 /// lines. Bursts above this rate are coalesced into a single line.
 const SHADOW_OVERFLOW_WARN_INTERVAL: Duration = Duration::from_secs(60);
+const PROVIDER_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+const PROVIDER_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+const PROVIDER_RETRY_JITTER_PCT: u64 = 25;
 
 /// Supervisor for shadow / side-by-side eval tasks.
 ///
@@ -296,28 +299,40 @@ impl AiClient {
             attempted_indices.push(provider_idx);
             let provider = &config.providers[provider_idx];
 
-            match self.forward_request(provider, path, body).await {
-                Ok(resp) if resp.status().is_server_error() => {
-                    router.record_provider_failure(provider_idx, provider.name.as_str());
-                    let status = resp.status();
-                    last_err = Some(anyhow::anyhow!(
-                        "provider {} returned {}",
-                        provider.name,
-                        status
-                    ));
-                    // Don't return the 5xx body to caller; try next provider.
-                    continue;
+            let per_provider_attempts = provider_retry_attempts(provider);
+            for provider_attempt in 0..per_provider_attempts {
+                match self.forward_request(provider, path, body).await {
+                    Ok(resp) if resp.status().is_server_error() => {
+                        let status = resp.status();
+                        last_err = Some(anyhow::anyhow!(
+                            "provider {} returned {}",
+                            provider.name,
+                            status
+                        ));
+                    }
+                    Ok(resp) => {
+                        router.record_provider_success(provider_idx, provider.name.as_str());
+                        return Ok(resp);
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                    }
                 }
-                Ok(resp) => {
-                    router.record_provider_success(provider_idx, provider.name.as_str());
-                    return Ok(resp);
-                }
-                Err(e) => {
-                    router.record_provider_failure(provider_idx, provider.name.as_str());
-                    last_err = Some(e);
-                    continue;
+
+                if provider_attempt + 1 < per_provider_attempts {
+                    let delay = provider_retry_backoff(provider_attempt + 1);
+                    debug!(
+                        provider = %provider.name,
+                        attempt = provider_attempt + 1,
+                        delay_ms = delay.as_millis(),
+                        "AI provider retry backoff"
+                    );
+                    tokio::time::sleep(delay).await;
                 }
             }
+
+            router.record_provider_failure(provider_idx, provider.name.as_str());
+            continue;
         }
 
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no providers attempted")))
@@ -399,6 +414,28 @@ impl AiClient {
 
         Ok(resp)
     }
+}
+
+fn provider_retry_attempts(provider: &ProviderConfig) -> usize {
+    provider.max_retries.unwrap_or(0).saturating_add(1).max(1) as usize
+}
+
+fn provider_retry_backoff(retry_number: usize) -> Duration {
+    provider_retry_backoff_with_jitter(retry_number, rand::random::<u64>())
+}
+
+fn provider_retry_backoff_with_jitter(retry_number: usize, jitter_seed: u64) -> Duration {
+    let exponent = retry_number.saturating_sub(1).min(10) as u32;
+    let base_ms = (PROVIDER_RETRY_BASE_DELAY.as_millis() as u64)
+        .saturating_mul(1_u64 << exponent)
+        .min(PROVIDER_RETRY_MAX_DELAY.as_millis() as u64);
+    let jitter_window = base_ms.saturating_mul(PROVIDER_RETRY_JITTER_PCT) / 100;
+    let jitter = if jitter_window == 0 {
+        0
+    } else {
+        jitter_seed % (jitter_window + 1)
+    };
+    Duration::from_millis(base_ms.saturating_add(jitter))
 }
 
 impl AiClient {
@@ -673,6 +710,31 @@ mod tests {
         // Edge case: no scheme, just concatenate
         let url = build_url("localhost:8080", "/v1/chat/completions");
         assert_eq!(url, "localhost:8080/v1/chat/completions");
+    }
+
+    #[test]
+    fn provider_retry_attempts_include_initial_try() {
+        let mut provider: ProviderConfig =
+            serde_json::from_value(serde_json::json!({"name": "openai", "max_retries": 2}))
+                .unwrap();
+        assert_eq!(provider_retry_attempts(&provider), 3);
+        provider.max_retries = None;
+        assert_eq!(provider_retry_attempts(&provider), 1);
+    }
+
+    #[test]
+    fn provider_retry_backoff_is_exponential_with_bounded_jitter() {
+        let first = provider_retry_backoff_with_jitter(1, 0);
+        let second = provider_retry_backoff_with_jitter(2, 0);
+        let second_max = provider_retry_backoff_with_jitter(2, u64::MAX);
+
+        assert_eq!(first, Duration::from_millis(100));
+        assert_eq!(second, Duration::from_millis(200));
+        assert!(
+            (Duration::from_millis(200)..=Duration::from_millis(250)).contains(&second_max),
+            "second retry should be 200ms plus <=25% jitter, got {second_max:?}"
+        );
+        assert!(provider_retry_backoff_with_jitter(99, u64::MAX) <= Duration::from_millis(2500));
     }
 
     // --- Shadow supervisor tests ---

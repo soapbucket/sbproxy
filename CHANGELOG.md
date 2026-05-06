@@ -116,6 +116,15 @@ of the new YAML fields below until the version that ships them.
 
 ### Fixed
 
+- **AI client retry resilience.** `MemoryBatchStore` now uses
+  `parking_lot::Mutex` so a panic in one worker cannot poison the
+  in-memory batch map for every later operation. Provider retries now
+  honor `provider.max_retries` as same-provider retry attempts with
+  bounded jittered exponential backoff before recording provider
+  failure and moving to the next eligible provider.
+  ([crates/sbproxy-ai/src/batch.rs],
+  [crates/sbproxy-ai/src/client.rs])
+
 - **ACME/Pebble order polling.** Certificate issuance now polls the
   authorization to `valid` after responding to the HTTP-01 challenge
   before polling the order to `ready`, matching Pebble's stricter state

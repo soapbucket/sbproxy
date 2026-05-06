@@ -2,7 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Mutex;
+
+use parking_lot::Mutex;
 
 /// Batch job status.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,24 +78,21 @@ impl Default for MemoryBatchStore {
 
 impl BatchStore for MemoryBatchStore {
     fn create(&self, job: BatchJob) -> anyhow::Result<()> {
-        self.jobs.lock().unwrap().insert(job.id.clone(), job);
+        self.jobs.lock().insert(job.id.clone(), job);
         Ok(())
     }
 
     fn get(&self, id: &str) -> anyhow::Result<Option<BatchJob>> {
-        Ok(self.jobs.lock().unwrap().get(id).cloned())
+        Ok(self.jobs.lock().get(id).cloned())
     }
 
     fn update(&self, job: &BatchJob) -> anyhow::Result<()> {
-        self.jobs
-            .lock()
-            .unwrap()
-            .insert(job.id.clone(), job.clone());
+        self.jobs.lock().insert(job.id.clone(), job.clone());
         Ok(())
     }
 
     fn list(&self, status: Option<BatchStatus>) -> anyhow::Result<Vec<BatchJob>> {
-        let jobs = self.jobs.lock().unwrap();
+        let jobs = self.jobs.lock();
         Ok(match status {
             Some(s) => jobs.values().filter(|j| j.status == s).cloned().collect(),
             None => jobs.values().cloned().collect(),
@@ -102,7 +100,7 @@ impl BatchStore for MemoryBatchStore {
     }
 
     fn delete(&self, id: &str) -> anyhow::Result<()> {
-        self.jobs.lock().unwrap().remove(id);
+        self.jobs.lock().remove(id);
         Ok(())
     }
 }
