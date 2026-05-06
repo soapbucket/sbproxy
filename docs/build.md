@@ -25,11 +25,12 @@ Both files have six stages:
    `recipe.json`. The recipe captures every `Cargo.toml` and
    `Cargo.lock` digest in the workspace; nothing under
    `crates/*/src/` affects it.
-3. **cacher**: `cargo chef cook --release --bin sbproxy
+3. **cacher**: `cargo chef cook --profile release-fast --bin sbproxy
    --recipe-path recipe.json`. Compiles every dependency from
    crates.io. This is the layer the warm-rebuild path reuses.
 4. **builder**: copies `/src/target` from cacher, then the workspace
-   source, then runs `cargo build --release --bin sbproxy --locked`.
+   source, then runs `cargo build --profile release-fast --bin sbproxy
+   --locked`.
    The dep `target/` from the cacher stage is the entire reason this
    step does not have to recompile crates like `pingora`,
    `aws-lc-sys`, or `tokio` again.
@@ -53,6 +54,11 @@ clearing the cache.
 The warm path's win comes from the `cacher` layer: as long as
 `recipe.json` is byte-identical to the previous build, Docker
 short-circuits stages 1-3 and only re-runs stages 4 + 6.
+The Dockerfiles default to `CARGO_PROFILE=release-fast`, which inherits
+the production release settings but disables fat LTO and raises
+`codegen-units` for lower link time and memory. Pass
+`--build-arg CARGO_PROFILE=release` when you intentionally want the
+full production release profile inside these Dockerfiles.
 
 The cold path's win comes from BuildKit `--mount=type=cache` on
 `/usr/local/cargo/{registry,git}`: even when the layer cache is cold

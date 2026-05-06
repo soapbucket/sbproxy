@@ -3,7 +3,7 @@
 # Built by `.github/workflows/k8s-operator-smoke.yml` after the operator
 # binary is produced on the host via:
 #
-#   cargo build --release -p sbproxy-k8s-operator --locked
+#   cargo build --profile release-fast -p sbproxy-k8s-operator --locked
 #
 # Usage in CI:
 #   docker build -t sbproxy-operator:ci \
@@ -11,11 +11,13 @@
 #     .
 #
 # The build context is the repository root so the COPY can reach
-# `target/release/sbproxy-k8s-operator` without a flat directory copy.
+# `target/${CARGO_PROFILE}/sbproxy-k8s-operator` without a flat directory copy.
 # Keep this image small: kind only needs a one-shot binary that talks to
 # the in-cluster API server.
 #
 # syntax=docker/dockerfile:1.7
+ARG CARGO_PROFILE=release-fast
 FROM gcr.io/distroless/cc-debian12:nonroot
-COPY target/release/sbproxy-k8s-operator /usr/local/bin/sbproxy-k8s-operator
+ARG CARGO_PROFILE=release-fast
+COPY target/${CARGO_PROFILE}/sbproxy-k8s-operator /usr/local/bin/sbproxy-k8s-operator
 ENTRYPOINT ["/usr/local/bin/sbproxy-k8s-operator"]
