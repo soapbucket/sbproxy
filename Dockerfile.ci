@@ -14,6 +14,7 @@
 #
 # Usage in CI:
 #   DOCKER_BUILDKIT=1 docker build -t sbproxy:ci -f Dockerfile.ci .
+#   DOCKER_BUILDKIT=1 docker build --build-arg CARGO_PROFILE=release -t sbproxy:release -f Dockerfile.ci .
 #
 # REQUIRES BuildKit. The cache mounts on /usr/local/cargo/{registry,git}
 # only take effect when BuildKit is the active builder. GitHub-hosted
@@ -40,19 +41,21 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # --- Stage 3: cacher ---------------------------------------------------
 FROM chef-base AS cacher
+ARG CARGO_PROFILE=release-fast
 COPY --from=planner /src/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo chef cook --release --bin sbproxy --recipe-path recipe.json
+    cargo chef cook --profile "${CARGO_PROFILE}" --bin sbproxy --recipe-path recipe.json
 
 # --- Stage 4: builder --------------------------------------------------
 FROM chef-base AS builder
+ARG CARGO_PROFILE=release-fast
 COPY --from=cacher /src/target target
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo build --release --bin sbproxy --locked \
- && cp /src/target/release/sbproxy /usr/local/bin/sbproxy
+    cargo build --profile "${CARGO_PROFILE}" --bin sbproxy --locked \
+ && cp "/src/target/${CARGO_PROFILE}/sbproxy" /usr/local/bin/sbproxy
 
 # --- Stage 5: runtime --------------------------------------------------
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime

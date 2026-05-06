@@ -74,9 +74,9 @@ examples-smoke: ## Run docker-compose example smoke tests
 	bash scripts/examples-smoke.sh
 
 k8s-operator-smoke: ## Run kind-based Kubernetes operator smoke test
-	$(CARGO) build --release -p sbproxy-k8s-operator -p sbproxy --locked
-	test -x target/release/sbproxy
-	test -x target/release/sbproxy-k8s-operator
+	$(CARGO) build --profile release-fast -p sbproxy-k8s-operator -p sbproxy --locked
+	test -x target/release-fast/sbproxy
+	test -x target/release-fast/sbproxy-k8s-operator
 	$(DOCKER) build -t $(PROXY_IMAGE) -f Dockerfile.ci .
 	$(DOCKER) build -t $(OPERATOR_IMAGE) -f crates/sbproxy-k8s-operator/Dockerfile.ci .
 	$(KIND) create cluster --name $(KIND_CLUSTER) --image kindest/node:v1.30.0 || true

@@ -13,6 +13,13 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **`release-fast` build profile for CI images.** Docker-based CI and
+  local kind smoke-test builds can now use `CARGO_PROFILE=release-fast`
+  to skip fat LTO and use more codegen units, cutting link memory/time
+  while leaving production release artifacts on the existing `release`
+  profile.
+  ([Cargo.toml], [Dockerfile.ci], [Dockerfile.cloudbuild])
+
 - **WOR-114 Phase 2: CEL `features[...]` namespace.** Per-request
   flags parsed from the `x-sb-flags` header and `?_sb.<key>` query
   prefix are now exposed to CEL expressions. Built-in flags surface

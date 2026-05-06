@@ -253,3 +253,11 @@ strip = "symbols"
 # Build time jumps ~2x; only a concern on cold cargo caches.
 lto = "fat"
 codegen-units = 1
+
+[profile.release-fast]
+inherits = "release"
+# CI smoke images and local Docker iterations care about link-time cost
+# more than the last few percent of tail latency. Production release
+# artifacts continue to use `[profile.release]`.
+lto = "off"
+codegen-units = 16

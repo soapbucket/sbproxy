@@ -165,7 +165,7 @@ The lease timing matches client-go defaults: `leaseDurationSeconds=15`, renew ev
 The job:
 
 1. Frees disk space on the runner.
-2. Builds the proxy and operator release binaries with `cargo build --release -p sbproxy -p sbproxy-k8s-operator --locked`.
+2. Builds the proxy and operator CI binaries with `cargo build --profile release-fast -p sbproxy -p sbproxy-k8s-operator --locked`.
 3. Wraps each binary in a tiny distroless image (`Dockerfile.ci` and `crates/sbproxy-k8s-operator/Dockerfile.ci`).
 4. Brings up a kind cluster via `helm/kind-action@v1`, loads both images with `kind load docker-image`, helm-installs the chart, and runs `deploy/helm/sbproxy/test/smoke.sh`.
 
@@ -173,7 +173,7 @@ The Make target wraps the manual sequence below:
 
 ```bash
 # from the repo root
-cargo build --release -p sbproxy -p sbproxy-k8s-operator
+cargo build --profile release-fast -p sbproxy -p sbproxy-k8s-operator
 docker build -t sbproxy:ci -f Dockerfile.ci .
 docker build -t sbproxy-operator:ci -f crates/sbproxy-k8s-operator/Dockerfile.ci .
 kind create cluster --name sbproxy-smoke
