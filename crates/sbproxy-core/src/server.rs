@@ -2330,6 +2330,10 @@ async fn check_policies(
                 let agent_id_param: Option<&str> = agent_id_str.as_deref();
                 #[cfg(not(feature = "agent-class"))]
                 let agent_id_param: Option<&str> = None;
+                #[cfg(feature = "agent-class")]
+                let agent_id_for_tier = agent_id_param.unwrap_or("");
+                #[cfg(not(feature = "agent-class"))]
+                let agent_id_for_tier = "";
                 // --- G4.4 + G4.10 closeout: resolve the matched tier's
                 // `citation_required` flag and stamp it into the
                 // request context so downstream transforms read a
@@ -2343,7 +2347,6 @@ async fn check_policies(
                         .headers
                         .get(http::header::ACCEPT)
                         .and_then(|v| v.to_str().ok());
-                    let agent_id_for_tier = agent_id_param.unwrap_or("");
                     if let Some(tier) = p.matched_tier_for_request(path, agent_id_for_tier, accept)
                     {
                         ctx.citation_required = Some(tier.citation_required);
