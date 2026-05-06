@@ -13,6 +13,11 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **Deterministic clock-skew testing hooks.** `ClockSkewMonitor` now
+  accepts an injected clock source for tests while production continues
+  to use the system clock.
+  ([crates/sbproxy-observe/src/clock_skew.rs])
+
 - **Operator first-24-hours quickstart.** Added a concise
   `docs/quickstart-operator.md` covering deploy, `/readyz`, metrics,
   Grafana, logs, and rollback, linked from the README and Kubernetes
