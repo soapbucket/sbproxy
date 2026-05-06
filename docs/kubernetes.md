@@ -4,6 +4,10 @@
 
 The OSS Kubernetes operator at `crates/sbproxy-k8s-operator/` reconciles two CustomResources into a running proxy: an `SBProxy` describes the deployment shape, and an `SBProxyConfig` carries the `sb.yml` document the proxy reads on startup. The operator owns a Deployment, Service, and ConfigMap per `SBProxy`.
 
+If this is your first production bring-up, start with
+[`quickstart-operator.md`](quickstart-operator.md). This page is the longer
+reference for CRDs, hot reload, leader election, and local smoke testing.
+
 ## Install the chart
 
 The Helm chart lives at `deploy/helm/sbproxy/`. It installs the CRDs, the operator Deployment, the ServiceAccount, and a ClusterRole/Binding granting the verbs the operator needs.
