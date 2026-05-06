@@ -1,5 +1,6 @@
 //! TLS, ACME auto-cert, and HTTP/3 support for sbproxy.
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod acme;

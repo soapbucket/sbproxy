@@ -4,6 +4,7 @@
 //! rate limiting, self-tuning connection pools, and request deduplication
 //! for the proxy transport layer.
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod auto_pool;

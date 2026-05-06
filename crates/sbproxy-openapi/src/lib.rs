@@ -26,6 +26,7 @@
 //! `x-sbproxy-auth-type` extension and skip the `security` requirement so
 //! the doc still validates.
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 use sbproxy_config::{CompiledConfig, RawForwardRule};

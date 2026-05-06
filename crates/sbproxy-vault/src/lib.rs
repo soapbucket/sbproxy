@@ -1,5 +1,7 @@
 //! sbproxy-vault: Secret management and secure variable interpolation.
 
+#![allow(unsafe_code)]
+// Volatile zeroization uses narrowly-scoped unsafe writes so secrets are not optimized away.
 #![warn(missing_docs)]
 
 pub mod convergent;

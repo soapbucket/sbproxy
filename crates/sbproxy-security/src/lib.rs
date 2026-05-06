@@ -1,5 +1,6 @@
 //! sbproxy-security: Cryptography, IP utilities, host filtering, PII masking, and SSRF protection.
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 #[cfg(feature = "agent-class")]

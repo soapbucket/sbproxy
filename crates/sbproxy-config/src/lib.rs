@@ -5,6 +5,7 @@
 //! - Intermediate representation ([`raw`])
 //! - Compiling configs into immutable, performance-optimized snapshots ([`snapshot`], [`compiler`])
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod compiler;

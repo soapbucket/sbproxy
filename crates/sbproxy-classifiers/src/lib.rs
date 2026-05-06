@@ -32,6 +32,7 @@
 //! place it behind an [`std::sync::Arc`] and share it across worker
 //! threads without an outer lock.
 
+#![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 pub mod agent_class;
