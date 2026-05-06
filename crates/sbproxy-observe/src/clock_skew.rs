@@ -50,6 +50,46 @@ pub const TOLERANCE_SECS: f64 = 120.0;
 /// is 70 years plus 17 leap days = 2_208_988_800 seconds.
 const NTP_UNIX_EPOCH_DIFF: u64 = 2_208_988_800;
 
+// --- Clock abstraction ---
+
+/// Clock source used by [`ClockSkewMonitor`] and SNTP sampling.
+pub trait Clock: Send + Sync + 'static {
+    /// Current wall-clock time.
+    fn now(&self) -> SystemTime;
+}
+
+/// Production wall-clock source.
+#[derive(Debug, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
+
+/// Test clock with a fixed wall-clock value.
+#[cfg(test)]
+#[derive(Debug)]
+pub struct MockClock {
+    now: SystemTime,
+}
+
+#[cfg(test)]
+impl MockClock {
+    /// Create a fixed test clock.
+    pub fn new(now: SystemTime) -> Self {
+        Self { now }
+    }
+}
+
+#[cfg(test)]
+impl Clock for MockClock {
+    fn now(&self) -> SystemTime {
+        self.now
+    }
+}
+
 // --- Configuration ---
 
 /// Clock-skew monitor configuration.
@@ -85,6 +125,7 @@ impl Default for ClockSkewConfig {
 /// [`HealthRegistry`](crate::health::HealthRegistry) for `/readyz`.
 pub struct ClockSkewMonitor {
     config: ClockSkewConfig,
+    clock: Arc<dyn Clock>,
     /// Latest skew in microseconds, stored as `i64` for atomic load /
     /// store. Microseconds give us ~292 000 years of headroom on
     /// `i64`, which is more than enough for any realistic skew.
@@ -110,6 +151,16 @@ impl ClockSkewMonitor {
         config: ClockSkewConfig,
         registry: Option<&Registry>,
     ) -> Result<Arc<Self>, prometheus::Error> {
+        Self::new_with_clock(config, registry, Arc::new(SystemClock))
+    }
+
+    /// Build a new monitor with an injected clock. Primarily used by
+    /// tests that need deterministic local time.
+    pub fn new_with_clock(
+        config: ClockSkewConfig,
+        registry: Option<&Registry>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Arc<Self>, prometheus::Error> {
         let metric = Gauge::with_opts(Opts::new(
             "sbproxy_clock_skew_seconds",
             "Local-clock minus NTP-clock in seconds; positive => local is ahead.",
@@ -123,6 +174,7 @@ impl ClockSkewMonitor {
         }
         Ok(Arc::new(Self {
             config,
+            clock,
             skew_micros: AtomicI64::new(0),
             has_synced: AtomicU64::new(0),
             metric,
@@ -193,7 +245,7 @@ impl ClockSkewMonitor {
     /// Perform a single SNTP exchange. Public for tests; production
     /// code drives this through [`Self::run`].
     pub async fn probe_once(&self) -> Result<f64, ProbeError> {
-        sntp_query(&self.config.ntp_source).await
+        sntp_query_with_clock(&self.config.ntp_source, self.clock.as_ref()).await
     }
 }
 
@@ -254,6 +306,10 @@ pub enum ProbeError {
 /// A3.5 the metric is "good enough to detect 60 s skew", not a
 /// precision time service.
 pub async fn sntp_query(addr: &str) -> Result<f64, ProbeError> {
+    sntp_query_with_clock(addr, &SystemClock).await
+}
+
+async fn sntp_query_with_clock(addr: &str, clock: &dyn Clock) -> Result<f64, ProbeError> {
     let target: SocketAddr = match tokio::net::lookup_host(addr).await {
         Ok(mut iter) => match iter.next() {
             Some(a) => a,
@@ -279,7 +335,8 @@ pub async fn sntp_query(addr: &str) -> Result<f64, ProbeError> {
     let mut req = [0u8; 48];
     req[0] = 0b00_100_011;
 
-    let send_local_unix = SystemTime::now()
+    let send_local_unix = clock
+        .now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| ProbeError::Io(format!("system clock pre-epoch: {e}")))?;
 
@@ -318,7 +375,8 @@ pub async fn sntp_query(addr: &str) -> Result<f64, ProbeError> {
     let server_nanos = (xmit_frac * 1_000_000_000) >> 32;
     let server_total_nanos = (server_unix_secs as i128) * 1_000_000_000 + server_nanos as i128;
 
-    let recv_local_unix = SystemTime::now()
+    let recv_local_unix = clock
+        .now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| ProbeError::Io(format!("system clock pre-epoch: {e}")))?;
     // Use the midpoint of send/recv as our local sample so half the
@@ -339,6 +397,17 @@ pub async fn sntp_query(addr: &str) -> Result<f64, ProbeError> {
 mod tests {
     use super::*;
     use crate::health::{handle_readyz, HealthRegistry};
+
+    #[test]
+    fn monitor_accepts_mock_clock_for_deterministic_tests() {
+        let clock = Arc::new(MockClock::new(
+            UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        ));
+        let monitor =
+            ClockSkewMonitor::new_with_clock(ClockSkewConfig::default(), None, clock).unwrap();
+        monitor.record_skew(0.5);
+        assert!(monitor.is_within_tolerance());
+    }
 
     #[test]
     fn clock_skew_monitor_returns_skew_within_tolerance_during_normal_run() {
