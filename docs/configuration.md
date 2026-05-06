@@ -153,6 +153,8 @@ proxy:
 
   metrics:
     max_cardinality_per_label: 1000
+    cardinality:
+      hostname_cap: 200
 
   admin:
     enabled: false
@@ -216,7 +218,8 @@ socket level.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_cardinality_per_label` | int | 1000 | Cap on unique label values per metric. New values are collapsed to `__other__`. |
+| `max_cardinality_per_label` | int | 1000 | Default cap on unique label values per metric. New values are collapsed to `__other__`. |
+| `cardinality.hostname_cap` | int | 200 | Optional override for the `hostname` label budget. Useful for high-tenant-count deployments and deterministic overflow tests. |
 
 ### access_log
 

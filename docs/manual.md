@@ -420,7 +420,7 @@ The proxy serves `/metrics` on its main HTTP port (`http_bind_port`, default `80
 GET http://localhost:8080/metrics
 ```
 
-Label cardinality is capped by `metrics.max_cardinality_per_label` (default `1000`). Values past the cap collapse into the literal `__other__`.
+Label cardinality is capped by `metrics.max_cardinality_per_label` (default `1000`). The `hostname` label uses its ADR budget by default and can be overridden with `metrics.cardinality.hostname_cap`. Values past the effective cap collapse into the literal `__other__`.
 
 #### Hostname-scoped metrics
 

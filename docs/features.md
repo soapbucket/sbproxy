@@ -1424,6 +1424,8 @@ proxy:
     port: 9090
   metrics:
     max_cardinality_per_label: 1000
+    cardinality:
+      hostname_cap: 200
 ```
 
 ```bash

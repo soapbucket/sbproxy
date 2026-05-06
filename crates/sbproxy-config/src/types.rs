@@ -849,18 +849,29 @@ pub struct MetricsConfig {
     /// collapsed to `__other__`. Defaults to 1 000.
     #[serde(default = "default_max_cardinality")]
     pub max_cardinality_per_label: usize,
+    /// Per-label cardinality overrides.
+    #[serde(default)]
+    pub cardinality: MetricsCardinalityConfig,
 }
 
 impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
             max_cardinality_per_label: default_max_cardinality(),
+            cardinality: MetricsCardinalityConfig::default(),
         }
     }
 }
 
 fn default_max_cardinality() -> usize {
     1000
+}
+
+/// Per-label metrics cardinality overrides.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct MetricsCardinalityConfig {
+    /// Optional override for the `hostname` label cap.
+    pub hostname_cap: Option<usize>,
 }
 
 // --- Access Log Config ---

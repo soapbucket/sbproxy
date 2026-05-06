@@ -19,6 +19,13 @@ of the new YAML fields below until the version that ships them.
   docs.
   ([docs/quickstart-operator.md])
 
+- **Hostname cardinality override for metrics.** `proxy.metrics.cardinality.hostname_cap`
+  can lower the `hostname` label budget independently from the default
+  per-label cap, enabling deterministic overflow tests and tighter
+  multi-tenant Prometheus budgets.
+  ([crates/sbproxy-config/src/types.rs],
+  [crates/sbproxy-observe/src/cardinality.rs])
+
 - **`release-fast` build profile for CI images.** Docker-based CI and
   local kind smoke-test builds can now use `CARGO_PROFILE=release-fast`
   to skip fat LTO and use more codegen units, cutting link memory/time
