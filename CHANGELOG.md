@@ -116,6 +116,15 @@ of the new YAML fields below until the version that ships them.
 
 ### Fixed
 
+- **ACME/Pebble order polling.** Certificate issuance now polls the
+  authorization to `valid` after responding to the HTTP-01 challenge
+  before polling the order to `ready`, matching Pebble's stricter state
+  progression. Finalization also parses the order returned by the
+  finalize response and falls back to polling the original order URL,
+  avoiding accidental POST-as-GET polling of the finalize URL when
+  `Location` is absent.
+  ([crates/sbproxy-tls/src/acme.rs])
+
 - **JWKS unknown-`kid` key rotation.** JWTs that reference an unseen
   `kid` now trigger one rate-limited JWKS refetch before failing
   closed, with a Prometheus counter for success / failure /
