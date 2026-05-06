@@ -25,6 +25,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [audit-log.md](audit-log.md) - tamper-evident audit log of admin actions.
 - [observability.md](observability.md) - metrics, logs, traces, and the bundled dashboards.
 - [operator-runbook.md](operator-runbook.md) - dashboard triage and rollback actions.
+- [threat-model.md](threat-model.md) - OSS trust boundaries and per-wave review checklist.
 - [events.md](events.md) - the event bus, callback hooks, and emitted event types.
 - [openapi-emission.md](openapi-emission.md) - publishing an OpenAPI 3.0 document from the live config.
 - [performance.md](performance.md) - tuning guide, benchmark methodology, profiling.

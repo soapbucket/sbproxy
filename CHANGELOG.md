@@ -21,9 +21,9 @@ of the new YAML fields below until the version that ships them.
 - **Operator runbook hooks and fast-track ADR template.** Added a
   dashboard-oriented operator runbook, linked all Grafana panels to the
   relevant triage sections, and added a fast-track ADR amendment
-  template for additive closed-enum values.
+  template plus OSS threat-model refresh checklist.
   ([docs/operator-runbook.md], [docs/adr-fast-track-amendment.md],
-  [dashboards/grafana/])
+  [docs/threat-model.md], [dashboards/grafana/])
 
 - **Operator first-24-hours quickstart.** Added a concise
   `docs/quickstart-operator.md` covering deploy, `/readyz`, metrics,
