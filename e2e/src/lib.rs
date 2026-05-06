@@ -33,9 +33,9 @@ use std::time::{Duration, Instant};
 use serde_yaml::Value as Yaml;
 use tempfile::NamedTempFile;
 
-/// Default startup wait window. Five seconds is generous; release
-/// builds typically bind within ~250 ms on a warm cargo cache.
-const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default startup wait window. Release builds usually bind quickly,
+/// but shared CI runners can be CPU-starved by concurrent cargo builds.
+const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Locate the `sbproxy` binary built by the workspace. Prefers the
 /// release build at `target/release/sbproxy`; falls back to
@@ -963,6 +963,11 @@ mod tests {
         // The OS may legitimately give us the same port twice
         // sequentially; just assert that both are non-zero.
         assert!(a > 0 && b > 0);
+    }
+
+    #[test]
+    fn default_startup_timeout_tolerates_busy_release_boots() {
+        assert_eq!(DEFAULT_STARTUP_TIMEOUT, Duration::from_secs(10));
     }
 
     #[test]
