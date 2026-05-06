@@ -277,7 +277,7 @@ impl AdminState {
             openapi_cache: Mutex::new(OpenApiCache::empty()),
             config_path: None,
             reload_in_progress: AtomicBool::new(false),
-            health_registry: sbproxy_observe::HealthRegistry::new(),
+            health_registry: sbproxy_observe::default_registry_optional(None, None),
         }
     }
 
@@ -1596,9 +1596,15 @@ origins:
     fn readyz_is_unauthenticated_and_returns_200_when_empty() {
         let state = make_state();
         let (status, ct, body) = handle_admin_request("GET", "/readyz", &state, None);
-        assert_eq!(status, 200, "empty registry should be ready: {}", body);
+        assert_eq!(
+            status, 200,
+            "default unconfigured registry should be ready: {}",
+            body
+        );
         assert_eq!(ct, "application/json");
         assert!(body.contains("\"status\":\"ok\""));
+        assert!(body.contains("\"name\":\"ledger\""));
+        assert!(body.contains("\"status\":\"not_configured\""));
     }
 
     #[test]

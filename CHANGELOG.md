@@ -65,6 +65,12 @@ of the new YAML fields below until the version that ships them.
   ([crates/sbproxy-tls/src/ocsp.rs],
   [crates/sbproxy-tls/src/cert_resolver.rs])
 
+- **Readiness synthetic probe primitive.** `sbproxy-observe` now ships a
+  `SyntheticProbe` type so startup or test wiring can register an
+  in-process readiness probe that exercises a caller-provided path and
+  reports through the same `/readyz` component model as built-in probes.
+  ([crates/sbproxy-observe/src/health.rs])
+
 ### Changed
 
 - **mTLS now wired on the ACME path.** Previously, an operator who
@@ -87,6 +93,14 @@ of the new YAML fields below until the version that ships them.
   so `is_draining()` no longer combines two independent relaxed loads.
   Added loom coverage for the last-request-finish interleaving.
   ([crates/sbproxy-core/src/reload.rs])
+
+- **Optional readiness dependencies no longer fail `/readyz` by
+  default.** The default admin health registry now registers absent
+  ledger and bot-auth-directory probes as `not_configured`, matching the
+  existing future-wave stubs and keeping `/readyz` green when those
+  optional services are not wired in a deployment.
+  ([crates/sbproxy-observe/src/health.rs],
+  [crates/sbproxy-core/src/admin.rs])
 
 - **`docs/manual.md` rewrites** matching what actually ships:
   - §6 Health checks: `/livez`, `/readyz`, `/healthz`, and rich
@@ -121,6 +135,10 @@ of the new YAML fields below until the version that ships them.
 
 Tracked in Linear, not in this changeset:
 
+- [WOR-27](https://linear.app/12345r/issue/WOR-27) full configurable
+  synthetic transaction through the live request pipeline. The
+  `SyntheticProbe` readiness primitive has landed; config and pipeline
+  execution remain.
 - WOR-114 Phase 2.5: Lua / JS / WASM `features` namespace, plus
   workspace-level flags via messenger pub/sub
 - [WOR-15](https://linear.app/12345r/issue/WOR-15) remaining

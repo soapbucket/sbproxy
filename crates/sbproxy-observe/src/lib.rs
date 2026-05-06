@@ -58,9 +58,9 @@ pub use clock_skew::{
 pub use events::{EventBus, EventType, ProxyEvent};
 pub use export::{WebhookConfig, WebhookExporter};
 pub use health::{
-    default_registry, handle_health, handle_healthz, handle_livez, handle_readyz, ComponentReport,
-    ComponentStatus, HealthMetadata, HealthRegistry, HealthReport, NotConfiguredProbe, Probe,
-    ReadinessReport, Recency, RecencyProbe,
+    default_registry, default_registry_optional, handle_health, handle_healthz, handle_livez,
+    handle_readyz, ComponentReport, ComponentStatus, HealthMetadata, HealthRegistry, HealthReport,
+    NotConfiguredProbe, Probe, ReadinessReport, Recency, RecencyProbe, SyntheticProbe,
 };
 pub use logging::{
     apply_redaction, emit as emit_structured, should_sample as should_sample_log,
