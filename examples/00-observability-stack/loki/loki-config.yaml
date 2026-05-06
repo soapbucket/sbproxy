@@ -1,7 +1,7 @@
 # Loki single-binary config for the SBproxy reference stack.
 #
 # Filesystem-backed, single-tenant (auth_enabled: false). Suitable for
-# evaluators, the operator runbook, and the examples-in-CI smoke lane.
+# evaluators, the operator runbook, and the local examples smoke runner.
 
 auth_enabled: false
 

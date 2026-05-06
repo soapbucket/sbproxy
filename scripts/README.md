@@ -18,17 +18,17 @@ script's header says otherwise.
 | `generate-certs.sh` | Mint a local CA + leaf cert for TLS tests. | local only |
 | `install.sh` | One-command install of `sbproxy` from a release archive. | end-user |
 | `docs-ci.sh` | Wave 1 / Q1.10 doc CI runner: lychee + code-block check. | `.github/workflows/docs-ci.yml` (B1.10) |
-| `examples-smoke.sh` | Wave 1 / Q1.11 examples-in-CI smoke runner. | `.github/workflows/examples-smoke.yml` (B1.8) |
+| `examples-smoke.sh` | Local examples smoke runner. | local only: `make examples-smoke` |
 
 Per-script usage and env knobs live in each script's leading comment
 header. Run `<script> --help` to dump the header.
 
 ## Cross-cutting runners
 
-`docs-ci.sh` and `examples-smoke.sh` are the runners the GitHub
-Actions workflows wrap. They are kept as plain shell so operators can
-reproduce CI locally without building anything Rust. Both exit
-non-zero on failure and print one line per checked artifact.
+`docs-ci.sh` is wrapped by GitHub Actions. `examples-smoke.sh` is a
+local-only runner because it builds Docker images for example stacks and
+is too expensive for the default CI lanes. Both scripts exit non-zero on
+failure and print one line per checked artifact.
 
 `docs-ci.sh` lints and link-checks every doc under `docs/`.
 

@@ -1,7 +1,7 @@
 # Reference observability stack for SBproxy.
 #
-# Operators, evaluators, and the examples-in-CI smoke lane (B1.8 / Q1.11)
-# all consume this exact compose file. Image tags are pinned to a specific
+# Operators, evaluators, and the local examples smoke runner consume this
+# exact compose file. Image tags are pinned to a specific
 # minor release so a `:latest` rebase upstream cannot change CI behavior.
 #
 # Bring up:    docker compose up -d

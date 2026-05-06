@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-30*
 
-A single `docker compose` command boots a complete metrics, logs, and traces stack pre-wired for SBproxy: Prometheus for metrics, Grafana for visualization, Tempo for traces, Loki for logs, and an OpenTelemetry collector as the single OTLP ingress. This is the canonical evaluator-friendly stack referenced by the operator runbook (`docs/observability.md`) and consumed by the examples-in-CI smoke lane in later waves. The real Wave 1 dashboards land in task B1.6 of `../../docs/AIGOVERNANCE-BUILD.md`; an empty placeholder dashboard is provisioned here so Grafana starts cleanly.
+A single `docker compose` command boots a complete metrics, logs, and traces stack pre-wired for SBproxy: Prometheus for metrics, Grafana for visualization, Tempo for traces, Loki for logs, and an OpenTelemetry collector as the single OTLP ingress. This is the canonical evaluator-friendly stack referenced by the operator runbook (`docs/observability.md`) and the local examples smoke runner. The real Wave 1 dashboards land in task B1.6 of `../../docs/AIGOVERNANCE-BUILD.md`; an empty placeholder dashboard is provisioned here so Grafana starts cleanly.
 
 ## How to run
 

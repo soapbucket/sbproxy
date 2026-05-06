@@ -16,7 +16,7 @@
 # with a docker-compose.yml must ship a smoke.json so new examples
 # cannot silently opt out of README/runtime drift coverage.
 #
-# Companion workflow: `.github/workflows/examples-smoke.yml` (B1.8).
+# Local entrypoint: `make examples-smoke`.
 #
 # Usage:
 #   scripts/examples-smoke.sh
