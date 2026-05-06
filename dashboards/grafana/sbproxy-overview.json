@@ -45,7 +45,10 @@
   "uid": "sbproxy-overview",
   "title": "SBProxy Overview",
   "description": "Overview of SBProxy request rates, latency, errors, connections, cache, and bandwidth.",
-  "tags": ["sbproxy", "overview"],
+  "tags": [
+    "sbproxy",
+    "overview"
+  ],
   "style": "dark",
   "timezone": "browser",
   "editable": true,
@@ -62,12 +65,22 @@
       "id": 1,
       "title": "Request Rate",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "lineWidth": 2,
             "fillOpacity": 10,
@@ -80,28 +93,48 @@
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
           "refId": "A",
           "expr": "rate(sbproxy_requests_total[5m])",
           "legendFormat": "{{instance}} - {{status}}",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         }
-      ]
+      ],
+      "description": "Measures Request Rate. Runbook: docs/operator-runbook.md#inbound-traffic. When red, inspect the matching component, confirm healthy range, and follow the rollback guidance if the spike follows a config change."
     },
     {
       "id": 2,
       "title": "Latency P50 / P95 / P99",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "lineWidth": 2,
             "fillOpacity": 10,
@@ -114,40 +147,66 @@
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
           "refId": "A",
           "expr": "histogram_quantile(0.5, rate(sbproxy_request_duration_seconds_bucket[5m]))",
           "legendFormat": "P50",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         },
         {
           "refId": "B",
           "expr": "histogram_quantile(0.95, rate(sbproxy_request_duration_seconds_bucket[5m]))",
           "legendFormat": "P95",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         },
         {
           "refId": "C",
           "expr": "histogram_quantile(0.99, rate(sbproxy_request_duration_seconds_bucket[5m]))",
           "legendFormat": "P99",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         }
-      ]
+      ],
+      "description": "Measures Latency P50 / P95 / P99. Runbook: docs/operator-runbook.md#inbound-traffic. When red, inspect the matching component, confirm healthy range, and follow the rollback guidance if the spike follows a config change."
     },
     {
       "id": 3,
       "title": "Error Rate (4xx + 5xx)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "lineWidth": 2,
             "fillOpacity": 10,
@@ -159,54 +218,104 @@
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "5xx" },
+            "matcher": {
+              "id": "byName",
+              "options": "5xx"
+            },
             "properties": [
-              { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
             ]
           },
           {
-            "matcher": { "id": "byName", "options": "4xx" },
+            "matcher": {
+              "id": "byName",
+              "options": "4xx"
+            },
             "properties": [
-              { "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
             ]
           }
         ]
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
           "refId": "A",
           "expr": "rate(sbproxy_requests_total{status=~\"4..\"}[5m])",
           "legendFormat": "4xx",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         },
         {
           "refId": "B",
           "expr": "rate(sbproxy_requests_total{status=~\"5..\"}[5m])",
           "legendFormat": "5xx",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         }
-      ]
+      ],
+      "description": "Measures Error Rate (4xx + 5xx). Runbook: docs/operator-runbook.md#inbound-traffic. When red, inspect the matching component, confirm healthy range, and follow the rollback guidance if the spike follows a config change."
     },
     {
       "id": 4,
       "title": "Active Connections",
       "type": "stat",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "color": { "mode": "thresholds" },
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 1000 },
-              { "color": "red", "value": 5000 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1000
+              },
+              {
+                "color": "red",
+                "value": 5000
+              }
             ]
           }
         },
@@ -214,7 +323,9 @@
       },
       "options": {
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": "",
           "values": false
         },
@@ -228,28 +339,51 @@
           "refId": "A",
           "expr": "sbproxy_active_connections",
           "legendFormat": "{{instance}}",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         }
-      ]
+      ],
+      "description": "Measures Active Connections. Runbook: docs/operator-runbook.md#inbound-traffic. When red, inspect the matching component, confirm healthy range, and follow the rollback guidance if the spike follows a config change."
     },
     {
       "id": 5,
       "title": "Cache Hit Ratio",
       "type": "gauge",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
           "min": 0,
           "max": 1,
-          "color": { "mode": "thresholds" },
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "red", "value": null },
-              { "color": "yellow", "value": 0.5 },
-              { "color": "green", "value": 0.8 }
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.5
+              },
+              {
+                "color": "green",
+                "value": 0.8
+              }
             ]
           }
         },
@@ -257,7 +391,9 @@
       },
       "options": {
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": "",
           "values": false
         },
@@ -269,20 +405,34 @@
           "refId": "A",
           "expr": "rate(sbproxy_cache_hits_total[5m]) / (rate(sbproxy_cache_hits_total[5m]) + rate(sbproxy_cache_misses_total[5m]))",
           "legendFormat": "Hit Ratio",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         }
-      ]
+      ],
+      "description": "Measures Cache Hit Ratio. Runbook: docs/operator-runbook.md#inbound-traffic. When red, inspect the matching component, confirm healthy range, and follow the rollback guidance if the spike follows a config change."
     },
     {
       "id": 6,
       "title": "Bandwidth In / Out",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "Bps",
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "lineWidth": 2,
             "fillOpacity": 10,
@@ -295,23 +445,36 @@
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
           "refId": "A",
           "expr": "rate(sbproxy_bandwidth_bytes_total{direction=\"in\"}[5m])",
           "legendFormat": "Inbound",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         },
         {
           "refId": "B",
           "expr": "rate(sbproxy_bandwidth_bytes_total{direction=\"out\"}[5m])",
           "legendFormat": "Outbound",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
         }
-      ]
+      ],
+      "description": "Measures Bandwidth In / Out. Runbook: docs/operator-runbook.md#inbound-traffic. When red, inspect the matching component, confirm healthy range, and follow the rollback guidance if the spike follows a config change."
     }
   ],
   "templating": {
@@ -321,7 +484,10 @@
     "list": [
       {
         "builtIn": 1,
-        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
         "enable": true,
         "hide": true,
         "iconColor": "rgba(0, 211, 255, 1)",
