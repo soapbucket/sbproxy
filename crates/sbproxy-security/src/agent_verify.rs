@@ -34,10 +34,9 @@
 //! trait object so:
 //!
 //! - tests can pass a deterministic in-memory resolver (no network),
-//! - the proxy binary can plug in `hickory-resolver` (a follow-up
-//!   slice; today the OSS proxy uses [`SystemResolver`] which performs
-//!   PTR + forward lookups via the host stub resolver via
-//!   `getaddrinfo`-style APIs).
+//! - the proxy binary uses [`SystemResolver`], which performs PTR and
+//!   forward lookups via `hickory-resolver` and the host DNS
+//!   configuration.
 //!
 //! # Caching
 //!
@@ -248,32 +247,71 @@ impl Resolver for StubResolver {
     }
 }
 
-// --- SystemResolver (host stub resolver) ---
+// --- SystemResolver (hickory resolver) ---
 
-/// [`Resolver`] backed by the host stub resolver via `getaddrinfo`.
-/// PTR lookups are performed by formatting the IP into an
-/// `in-addr.arpa` / `ip6.arpa` query string and... actually the host
-/// `std` API does not expose PTR. The OSS proxy ships this stub which
-/// returns [`Result::Err`] until a real DNS dependency is wired in
-/// (Wave 1 follow-up: switch to `hickory-resolver`).
+/// [`Resolver`] backed by the host DNS configuration through
+/// `hickory-resolver`.
 ///
 /// Used in production today only when an operator explicitly opts in;
-/// the resolver chain falls back to UA matching when this returns an
+/// the resolver chain falls back to UA matching when DNS returns an
 /// error verdict, which matches the ADR-defined ordering.
 #[derive(Debug, Default)]
 pub struct SystemResolver;
 
 impl Resolver for SystemResolver {
-    fn reverse(&self, _ip: IpAddr) -> Result<Vec<String>, String> {
-        Err("system resolver does not implement PTR; configure hickory-resolver via the platform layer".to_string())
+    fn reverse(&self, ip: IpAddr) -> Result<Vec<String>, String> {
+        run_hickory_lookup(move || async move {
+            let resolver = hickory_resolver::Resolver::builder_tokio()
+                .map_err(|e| format!("DNS resolver init: {e}"))?
+                .build()
+                .map_err(|e| format!("DNS resolver build: {e}"))?;
+            let lookup = resolver
+                .reverse_lookup(ip)
+                .await
+                .map_err(|e| format!("reverse lookup {ip}: {e}"))?;
+            let hosts = lookup
+                .answers()
+                .iter()
+                .filter_map(|record| match &record.data {
+                    hickory_resolver::proto::rr::RData::PTR(ptr) => {
+                        Some(ptr.0.to_utf8().trim_end_matches('.').to_string())
+                    }
+                    _ => None,
+                })
+                .collect();
+            Ok(hosts)
+        })
     }
+
     fn forward(&self, hostname: &str) -> Result<Vec<IpAddr>, String> {
-        // `std::net::ToSocketAddrs` requires a port; use 80 as a
-        // sentinel and discard it from the returned addresses.
-        let target = format!("{hostname}:80");
-        let iter = std::net::ToSocketAddrs::to_socket_addrs(&target).map_err(|e| e.to_string())?;
-        Ok(iter.map(|sa| sa.ip()).collect())
+        let hostname = hostname.to_string();
+        run_hickory_lookup(move || async move {
+            let resolver = hickory_resolver::Resolver::builder_tokio()
+                .map_err(|e| format!("DNS resolver init: {e}"))?
+                .build()
+                .map_err(|e| format!("DNS resolver build: {e}"))?;
+            let lookup = resolver
+                .lookup_ip(hostname.as_str())
+                .await
+                .map_err(|e| format!("forward lookup {hostname}: {e}"))?;
+            Ok(lookup.iter().collect())
+        })
     }
+}
+
+fn run_hickory_lookup<T, F, Fut>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::spawn(move || {
+        let runtime =
+            tokio::runtime::Runtime::new().map_err(|e| format!("DNS runtime init: {e}"))?;
+        runtime.block_on(f())
+    })
+    .join()
+    .map_err(|_| "DNS lookup thread panicked".to_string())?
 }
 
 // --- Verdict cache ---
