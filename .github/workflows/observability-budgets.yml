@@ -74,5 +74,4 @@ jobs:
         run: |
           cargo test -p sbproxy-e2e --locked \
             --test cardinality \
-            --test redaction \
-            -- --include-ignored
+            --test redaction
