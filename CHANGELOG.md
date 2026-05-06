@@ -30,6 +30,12 @@ of the new YAML fields below until the version that ships them.
   replacing the previous typed PTR stub.
   ([crates/sbproxy-security/src/agent_verify.rs])
 
+- **Multi-window SLO burn-rate replay harness.** `sbproxy-observe`
+  now includes a burn-rate evaluator and `AlertSnapshot` replay helper
+  for substrate availability and latency alert taxonomy tests.
+  ([crates/sbproxy-observe/src/alerting/burn_rate.rs],
+  [e2e/tests/slo_burn_rate.rs])
+
 - **Operator first-24-hours quickstart.** Added a concise
   `docs/quickstart-operator.md` covering deploy, `/readyz`, metrics,
   Grafana, logs, and rollback, linked from the README and Kubernetes
