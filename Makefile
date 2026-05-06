@@ -16,6 +16,7 @@ RESET := \033[0m
         build build-release build-all \
         run run-release \
         test test-all \
+        examples-smoke \
         bench \
         fmt fmt-check \
         lint lint-all \
@@ -63,6 +64,9 @@ test: ## Run unit and integration tests for default members
 
 test-all: ## Run the full workspace test suite
 	$(CARGO) test --workspace
+
+examples-smoke: ## Run docker-compose example smoke tests
+	bash scripts/examples-smoke.sh
 
 bench: ## Run benchmark suite (cargo bench)
 	$(CARGO) bench --workspace

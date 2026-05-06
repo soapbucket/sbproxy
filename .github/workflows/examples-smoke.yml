@@ -20,6 +20,9 @@ on:
     paths:
       - 'examples/**'
       - 'scripts/examples-smoke.sh'
+      - 'scripts/examples-smoke-selftest.sh'
+      - 'scripts/README.md'
+      - 'Makefile'
       - 'crates/sbproxy/**'
       - '.github/workflows/examples-smoke.yml'
 
@@ -67,7 +70,8 @@ jobs:
             echo "It is owned by Q1.11; this workflow waits for that to land."
             exit 1
           fi
-          bash scripts/examples-smoke.sh
+          bash scripts/examples-smoke-selftest.sh
+          make examples-smoke
 
       # Capture per-example logs on failure. The smoke script tears
       # each stack down before moving on, so we cannot grab live

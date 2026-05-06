@@ -44,6 +44,24 @@ declaring how to probe the running services.
   "admin_port":        9090,
   "data_plane_port":   8080,
   "health_path":       "/healthz",
+  "cases": [
+    {
+      "name": "echo works",
+      "request": {
+        "method": "GET",
+        "path": "/echo",
+        "headers": { "Host": "app.localhost" }
+      },
+      "expect": {
+        "status": 200,
+        "headers": { "content-type": "application/json" },
+        "body": {
+          "type": "jsonShape",
+          "shape": { "method": "GET" }
+        }
+      }
+    }
+  ],
   "feature_endpoints": ["/preview/x", "/api/v1/foo"],
   "audit_check":       false
 }
@@ -56,11 +74,13 @@ Field-by-field:
 | `admin_port` | same as `data_plane_port` | The port the runner polls for liveness. The proxy serves `/healthz` on its admin listener (default 9090) only when `proxy.admin.enabled: true`; examples that do not enable the admin listener can point this at the data-plane port and set `health_path: "/health"`. |
 | `data_plane_port` | discovered from the first `published:` port in `docker-compose.yml` | The port the runner hits for `feature_endpoints[]`. |
 | `health_path` | `/healthz` | The path used for the liveness probe. Use `/health` for examples that do not enable the admin listener. |
-| `feature_endpoints` | `[]` | Each entry is a path on the data-plane port that the runner GETs and asserts returns 2xx. |
+| `cases` | `[]` | Preferred assertion format. Each case can assert method, path, request headers, expected status, expected response headers as regexes, and `body.type: "jsonShape"` subset matches. Add `requires_env` to skip a case unless one or more env vars are set. |
+| `feature_endpoints` | `[]` | Legacy shorthand. Each entry is a path on the data-plane port that the runner GETs and asserts returns 2xx. |
 | `audit_check` | `false` | When `true`, the runner additionally hits `/api/audit/recent` on the admin port and asserts at least one entry. The OSS in-memory adapter does not ship this endpoint until Wave 2 (R1.2); leave `false` for Wave 1 examples. |
 
 Legacy fields `port` and `endpoints` are still accepted as aliases
 for `data_plane_port` and `feature_endpoints` respectively.
 
-Examples without `smoke.json` get the safe defaults: liveness only,
-no feature probes, no audit check.
+Examples with `docker-compose.yml` must ship `smoke.json`. This keeps new
+examples from silently skipping README/runtime drift coverage. Set
+`SBPROXY_SMOKE_REQUIRE_MANIFEST=false` only for local migration work.
