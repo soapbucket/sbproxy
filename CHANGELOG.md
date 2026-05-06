@@ -125,6 +125,13 @@ of the new YAML fields below until the version that ships them.
   ([crates/sbproxy-ai/src/batch.rs],
   [crates/sbproxy-ai/src/client.rs])
 
+- **Dynamic Web Bot Auth directory dispatch.** The main request auth
+  path now invokes `BotAuthProvider::verify_async` when a configured
+  hosted directory and `Signature-Agent` header are present, so dynamic
+  directory failures surface distinctly instead of falling through the
+  static inline-agent verifier.
+  ([crates/sbproxy-core/src/server.rs])
+
 - **ACME/Pebble order polling.** Certificate issuance now polls the
   authorization to `valid` after responding to the HTTP-01 challenge
   before polling the order to `ready`, matching Pebble's stricter state

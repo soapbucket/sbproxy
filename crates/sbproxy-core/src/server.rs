@@ -1501,7 +1501,20 @@ async fn check_auth(
                 Err(_) => return AuthResult::Deny(500, "bot_auth: bad request".to_string()),
             };
             *req.headers_mut() = headers.clone();
-            match b.verify(&req) {
+            let verdict = if b.has_directory()
+                && req
+                    .headers()
+                    .get("signature-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false)
+            {
+                b.verify_async(&req, &BOT_AUTH_DIRECTORY_CLIENT).await
+            } else {
+                b.verify(&req)
+            };
+
+            match verdict {
                 BotAuthVerdict::Verified { agent_name } => {
                     tracing::info!(agent = %agent_name, "bot_auth verified");
                     AuthResult::allow_anonymous()
@@ -1644,6 +1657,18 @@ static FORWARD_AUTH_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::La
         .build()
         .expect("forward-auth reqwest::Client build must succeed")
 });
+
+/// Lazily-initialized HTTP client for dynamic Web Bot Auth directory
+/// lookups. Directory fetches have their own 2s deadline inside
+/// `sbproxy-modules`; this client-level timeout is a conservative
+/// outer guard and shares connections across requests.
+static BOT_AUTH_DIRECTORY_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("bot-auth directory reqwest::Client build must succeed")
+    });
 
 /// Run forward auth by making an HTTP subrequest to the auth service.
 async fn check_forward_auth(
@@ -11729,6 +11754,18 @@ mod tests {
         sbproxy_modules::Auth::BotAuth(provider)
     }
 
+    fn build_directory_bot_auth_provider(directory_url: &str) -> sbproxy_modules::Auth {
+        let provider = sbproxy_modules::auth::BotAuthProvider::from_config(serde_json::json!({
+            "agents": [],
+            "directory": {
+                "url": directory_url,
+                "signature_agents_allow": [directory_url]
+            }
+        }))
+        .expect("directory provider builds");
+        sbproxy_modules::Auth::BotAuth(provider)
+    }
+
     fn sign_for_path(secret_hex: &str, key_id: &str, target_uri: &str) -> (String, String) {
         use base64::Engine;
         use hmac::{KeyInit, Mac};
@@ -11826,6 +11863,34 @@ mod tests {
         assert!(
             matches!(result, AuthResult::Allow { .. }),
             "expected Allow when path+query matches signed @target-uri"
+        );
+    }
+
+    #[tokio::test]
+    async fn bot_auth_signature_agent_uses_async_directory_path() {
+        let auth =
+            build_directory_bot_auth_provider("https://directory.example/.well-known/bot-auth");
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "signature-agent",
+            "https://other.example/.well-known/bot-auth"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert(
+            "signature-input",
+            "sig1=(\"@method\" \"@target-uri\");created=1700000000;keyid=\"dynamic-key\";alg=\"ed25519\""
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("signature", "sig1=:AAAA:".parse().unwrap());
+
+        let result = check_auth(&auth, &headers, None, "GET", "/api/foo").await;
+
+        assert!(
+            matches!(result, AuthResult::Deny(401, ref msg) if msg == "bot_auth: directory unavailable"),
+            "Signature-Agent should route through verify_async and surface directory unavailable; got {}",
+            auth_result_label(&result)
         );
     }
 
