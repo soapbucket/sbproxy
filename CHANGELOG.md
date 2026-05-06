@@ -155,6 +155,12 @@ of the new YAML fields below until the version that ships them.
   justification.
   ([crates/sbproxy-*/src/lib.rs])
 
+- **Outbound webhook delivery identity headers.** Signed customer
+  webhooks now include `Sbproxy-Subscription-Id`,
+  `Sbproxy-Delivery-Id`, and 1-based `Sbproxy-Attempt` headers, with a
+  fresh delivery ULID on every retry attempt.
+  ([crates/sbproxy-observe/src/notify.rs])
+
 - **AI client retry resilience.** `MemoryBatchStore` now uses
   `parking_lot::Mutex` so a panic in one worker cannot poison the
   in-memory batch map for every later operation. Provider retries now
