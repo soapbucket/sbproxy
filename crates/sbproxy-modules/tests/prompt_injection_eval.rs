@@ -32,13 +32,15 @@
 //! ```
 
 use std::path::PathBuf;
+#[cfg(feature = "onnx-classifiers")]
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(feature = "onnx-classifiers")]
+use sbproxy_modules::OnnxDetector;
 use sbproxy_modules::{
     classification_cache_stats, evaluate_body, reset_classification_cache, BodyAwareConfig,
-    BodyAwareOutcome, DetectionLabel, OnnxDetector, PromptInjectionV2Outcome,
-    PromptInjectionV2Policy,
+    BodyAwareOutcome, DetectionLabel, PromptInjectionV2Outcome, PromptInjectionV2Policy,
 };
 
 /// Locate the workspace `eval/prompt_injection` directory regardless of
@@ -194,6 +196,7 @@ fn heuristic_baseline_meets_precision_and_recall_thresholds() {
 /// Gate: precision and recall both >= 0.9 against the OWASP corpus,
 /// false-positive rate < 2% against the clean corpus.
 #[test]
+#[cfg(feature = "onnx-classifiers")]
 #[ignore = "requires SBPROXY_ONNX_MODEL + SBPROXY_ONNX_TOKENIZER env vars"]
 fn onnx_detector_meets_target() {
     let model = match std::env::var("SBPROXY_ONNX_MODEL") {
