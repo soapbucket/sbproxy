@@ -382,9 +382,10 @@ pub struct Tier {
     /// the registry feed (G2.1) returns. Empty string = wildcard.
     #[serde(default)]
     pub agent_id: Option<String>,
-    /// Optional free-preview byte budget. The crawler may read up to
-    /// this many bytes of the response without paying. Wired into the
-    /// challenge body so cooperative crawlers can decide up front.
+    /// Optional free-preview byte budget. Zero-price tiers with a
+    /// preview budget pass through without payment; paid tiers surface
+    /// the budget in the challenge body so cooperative crawlers can
+    /// decide up front.
     #[serde(default)]
     pub free_preview_bytes: Option<u64>,
     /// Optional paywall position hint surfaced to the crawler.
@@ -453,6 +454,12 @@ impl Tier {
                     .unwrap_or(false)
             }
         }
+    }
+
+    /// Returns true when this tier represents a free-preview lane the
+    /// request path can enter without presenting a payment token.
+    pub fn allows_free_preview(&self) -> bool {
+        self.free_preview_bytes.unwrap_or(0) > 0 && self.price.amount_micros == 0
     }
 }
 
@@ -1466,6 +1473,13 @@ impl AiCrawlControlPolicy {
         // intentional: the tier is already small and we want to drop the
         // borrow before we mutate the response decision.
         let matched_tier = self.matched_tier_for_request(path, "", accept).cloned();
+        if matched_tier
+            .as_ref()
+            .map(|tier| tier.allows_free_preview())
+            .unwrap_or(false)
+        {
+            return AiCrawlDecision::Allow;
+        }
         if let Some(token) = headers
             .get(self.header.as_str())
             .and_then(|v| v.to_str().ok())
@@ -2623,6 +2637,31 @@ mod tests {
         let h = ua_headers("GPTBot/1.0");
         assert_eq!(
             policy.check("POST", "x.com", "/", &h, None),
+            AiCrawlDecision::Allow
+        );
+    }
+
+    #[test]
+    fn zero_price_free_preview_tier_allows_without_payment() {
+        let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+            "valid_tokens": [],
+            "tiers": [
+                {
+                    "route_pattern": "/preview/*",
+                    "price": { "amount_micros": 0, "currency": "USD" },
+                    "free_preview_bytes": 4096
+                },
+                {
+                    "route_pattern": "/*",
+                    "price": { "amount_micros": 1000, "currency": "USD" },
+                    "content_shape": "html"
+                }
+            ]
+        }))
+        .unwrap();
+        let h = ua_headers("GPTBot/1.0");
+        assert_eq!(
+            policy.check("GET", "x.com", "/preview/snippet", &h, None),
             AiCrawlDecision::Allow
         );
     }
