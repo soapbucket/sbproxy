@@ -38,6 +38,8 @@ pub mod request_event;
 /// completed `RequestEvent` values. Default no-op; enterprise
 /// registers a NATS-backed implementation.
 pub mod request_sink;
+/// WOR-27 in-process synthetic probe state for `/readyz`.
+pub mod synthetic;
 pub mod telemetry;
 pub mod topology;
 pub mod trace_ctx;
@@ -76,6 +78,10 @@ pub use notify::{
 pub use request_event::{RequestEvent, UserIdSource};
 pub use request_sink::{
     dispatch_request_event, set_request_event_sink, LoggingSink, NoopSink, RequestEventSink,
+};
+pub use synthetic::{
+    SyntheticProbeRegistration, SyntheticProbeState, DEFAULT_SYNTHETIC_HOSTNAME,
+    DEFAULT_SYNTHETIC_INTERVAL_SECS, DEFAULT_SYNTHETIC_PATH, DEFAULT_SYNTHETIC_TIMEOUT_MS,
 };
 pub use telemetry::{
     extract_from_headers, init_otlp_pipeline, init_propagator, inject_into_headers,

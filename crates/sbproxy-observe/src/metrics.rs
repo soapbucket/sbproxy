@@ -215,6 +215,13 @@ pub struct ProxyMetrics {
     /// reserve deletions (invalidate-on-mutation, expired sweeps),
     /// labelled by origin.
     pub cache_reserve_evictions: IntCounterVec,
+
+    // --- Synthetic probe metrics (WOR-27) ---
+    /// Counter `sbproxy_synthetic_probe_failures_total` of synthetic
+    /// readiness probe failures, labelled by failure `reason`. Distinct
+    /// from `sbproxy_errors_total` so dashboards can keep synthetic
+    /// noise out of real-traffic SLO numerators.
+    pub synthetic_probe_failures: IntCounterVec,
 }
 
 impl ProxyMetrics {
@@ -383,6 +390,17 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        // --- Synthetic probe counters (WOR-27) ---
+
+        let synthetic_probe_failures = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_synthetic_probe_failures_total",
+                "Synthetic readiness probe failures by reason",
+            ),
+            &["reason"],
+        )
+        .unwrap();
+
         // --- Register all metrics ---
 
         registry.register(Box::new(requests_total.clone())).unwrap();
@@ -427,6 +445,9 @@ impl ProxyMetrics {
         registry
             .register(Box::new(cache_reserve_evictions.clone()))
             .unwrap();
+        registry
+            .register(Box::new(synthetic_probe_failures.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -448,6 +469,7 @@ impl ProxyMetrics {
             cache_reserve_misses,
             cache_reserve_writes,
             cache_reserve_evictions,
+            synthetic_probe_failures,
         }
     }
 

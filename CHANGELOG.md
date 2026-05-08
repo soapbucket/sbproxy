@@ -13,6 +13,22 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **Synthetic-transaction `/readyz` probe (WOR-27).** Optional
+  background driver that fires an in-process request through the
+  compiled handler chain on a fixed cadence and reports the verdict as
+  a `synthetic_pipeline` component on `/readyz`. Disabled by default;
+  opt in via `proxy.synthetic_probe.enabled: true` and define an origin
+  for the configured sentinel hostname (default `__synthetic.local`)
+  pointing at a non-network action (`static`, `mock`, `echo`, `noop`).
+  Failures bump the new
+  `sbproxy_synthetic_probe_failures_total{reason}` counter so they do
+  not pollute real-traffic error metrics.
+  ([crates/sbproxy-config/src/types.rs],
+  [crates/sbproxy-core/src/synthetic.rs],
+  [crates/sbproxy-observe/src/synthetic.rs],
+  [crates/sbproxy-observe/src/metrics.rs],
+  [e2e/tests/synthetic_probe.rs])
+
 - **`GET /admin/drift` config drift endpoint (WOR-132).** Returns
   whether the on-disk config file has diverged from what the running
   proxy has loaded, without triggering a reload. Compares a
