@@ -1,0 +1,80 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "cases": [
+    {
+      "name": "missing CAP token returns 401",
+      "request": {
+        "method": "GET",
+        "path": "/blog/article",
+        "headers": {
+          "Host": "cap.localhost"
+        }
+      },
+      "expect": {
+        "status": 401
+      }
+    },
+    {
+      "name": "tampered signature returns 401",
+      "request": {
+        "method": "GET",
+        "path": "/blog/article",
+        "headers": {
+          "Host": "cap.localhost",
+          "CAP-Token": "eyJhbGciOiJFZERTQSIsInR5cCI6ImNhcCtqd3QiLCJraWQiOiJjYXAtMjAyNi1xMi0wMDEifQ.eyJpc3MiOiJpc3N1ZXIuZXhhbXBsZS5jb20iLCJzdWIiOiJhZ2VudF9hY21lXzAwMSIsImF1ZCI6ImNhcC5sb2NhbGhvc3QiLCJjYXBfdiI6MSwicnBzIjoyLjAsImJ5dGVzIjoxMDczNzQxODI0MCwiZ2xvYiI6Ii9ibG9nLyoqIiwiaWF0IjoxNzc4MjEwNDUyLCJleHAiOjE3NzgyMTQwNTIsImp0aSI6IjAxSjdIWjhYOVIzQ0FQU0FNUEwifQ.AAAAtamperedSignatureBytesAreNotARealEd25519Signature"
+        }
+      },
+      "expect": {
+        "status": 401
+      }
+    },
+    {
+      "name": "wrong audience returns 403",
+      "request": {
+        "method": "GET",
+        "path": "/blog/article",
+        "headers": {
+          "Host": "cap.localhost",
+          "CAP-Token": "${SBPROXY_SMOKE_CAP_TOKEN_WRONG_AUD}"
+        }
+      },
+      "expect": {
+        "status": 403
+      }
+    },
+    {
+      "name": "valid token returns 200",
+      "request": {
+        "method": "GET",
+        "path": "/blog/article",
+        "headers": {
+          "Host": "cap.localhost",
+          "CAP-Token": "${SBPROXY_SMOKE_CAP_TOKEN_VALID}"
+        }
+      },
+      "expect": {
+        "status": 200
+      }
+    }
+  ],
+  "audit_check": false,
+  "_notes": [
+    "This example does not ship a docker-compose.yml, so the smoke",
+    "runner skips it silently. The cases[] block above documents the",
+    "four scenarios called out in the WOR-101 acceptance criteria so",
+    "that operators eyeballing the example see the full assertion",
+    "matrix without booting the proxy. The two ${...} placeholders",
+    "are intentional: the smoke runner does not currently mint CAP",
+    "tokens at run-time, so a host wiring the runner up against this",
+    "example would export those env vars after running mint.py.",
+    "",
+    "feature_endpoints[] is omitted because every data-plane path is",
+    "auth-gated; there is no path the runner can hit unauthenticated",
+    "and expect 2xx without a freshly-minted token in the header.",
+    "",
+    "audit_check stays false until the OSS /api/audit/recent admin",
+    "endpoint ships."
+  ]
+}
