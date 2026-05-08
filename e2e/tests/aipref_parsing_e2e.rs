@@ -13,10 +13,6 @@
 //! semantics: missing or malformed inputs leave every category at
 //! `true` (the proxy never silently downgrades a request because the
 //! caller emitted a malformed header).
-//!
-//! All tests in this file are `#[ignore]`'d with `TODO(wave4-G4.X)`
-//! markers until the parser in
-//! `crates/sbproxy-extension/src/scripting/context.rs` lands.
 
 use sbproxy_e2e::ProxyHarness;
 

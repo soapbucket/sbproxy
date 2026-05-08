@@ -22,9 +22,7 @@
 //! | absent         | training        | false    |
 //!
 //! The XSD validation step is `#[ignore]`'d pending vendoring of the
-//! RSL 1.0 spec (see `e2e/fixtures/rsl/README.md`). All other tests
-//! are `#[ignore]`'d with `TODO(wave4-G4.8)` until the projection
-//! engine in `crates/sbproxy-modules/src/projection/licenses.rs` lands.
+//! RSL 1.0 spec (see `e2e/fixtures/rsl/README.md`).
 
 use sbproxy_e2e::ProxyHarness;
 

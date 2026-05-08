@@ -20,12 +20,6 @@
 //! `tier.agent_id`; tiers without an `agent_id` contribute to the
 //! catch-all `User-agent: *` stanza. Pricing is surfaced via the
 //! non-standard `# SBproxy-AI-Extension:` comment line.
-//!
-//! All tests in this file are `#[ignore]`'d with a
-//! `TODO(wave4-G4.6)` marker until the projection engine in
-//! `crates/sbproxy-modules/src/projection/robots.rs` lands. The test
-//! suite type-checks today so a fixture or ProxyHarness regression
-//! is caught immediately when CI flips back to the non-ignored path.
 
 use sbproxy_e2e::ProxyHarness;
 

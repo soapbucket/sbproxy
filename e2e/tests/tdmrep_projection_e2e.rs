@@ -30,10 +30,6 @@
 //! For origins with no `content_signal`, the proxy stamps a
 //! `TDM-Reservation: 1` response header on every response (W3C TDMRep
 //! reservation-by-default semantics).
-//!
-//! All tests in this file are `#[ignore]`'d with `TODO(wave4-G4.9)`
-//! until the projection engine in
-//! `crates/sbproxy-modules/src/projection/tdmrep.rs` lands.
 
 use sbproxy_e2e::ProxyHarness;
 use serde_json::Value;
