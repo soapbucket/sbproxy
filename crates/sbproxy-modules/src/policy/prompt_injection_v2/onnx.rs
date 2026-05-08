@@ -15,13 +15,29 @@
 //!   detector_config:
 //!     model_url: https://example.com/model.onnx
 //!     tokenizer_url: https://example.com/tokenizer.json
-//!     model_sha256: <hex>           # optional, recommended
-//!     tokenizer_sha256: <hex>       # optional, recommended
-//!     cache_dir: /var/cache/sbproxy # optional, default cache dir
-//!     threshold: 0.5                # optional, default 0.5
-//!     labels: [benign, injection]   # optional
-//!     injection_label: injection    # optional, default "injection"
+//!     model_sha256: <hex>                # optional, recommended
+//!     tokenizer_sha256: <hex>            # optional, recommended
+//!     # Optional supply-chain hardening (WOR-146 land-now):
+//!     model_signature_url: https://...   # both URLs or neither
+//!     tokenizer_signature_url: https://...
+//!     model_pubkey: |                    # PEM SPKI inline, or
+//!       -----BEGIN PUBLIC KEY-----
+//!       ...
+//!       -----END PUBLIC KEY-----
+//!     model_pubkey_path: /etc/sbproxy/classifier.pub  # or a file path
+//!     max_model_bytes: 209715200         # optional, default 200 MiB
+//!     max_tokenizer_bytes: 209715200     # optional, default 200 MiB
+//!     cache_dir: /var/cache/sbproxy      # optional, default cache dir
+//!     threshold: 0.5                     # optional, default 0.5
+//!     labels: [benign, injection]        # optional
+//!     injection_label: injection         # optional, default "injection"
 //! ```
+//!
+//! Signature verification is opt-in. Today's SHA-256-only behaviour is
+//! preserved byte-for-byte when the signature fields are omitted. The
+//! signature URL pair is all-or-nothing (both set or neither) so a
+//! half-configured signature path can never silently degrade to no
+//! verification at all.
 //!
 //! # Offline fallback
 //!
@@ -84,6 +100,30 @@ struct OnnxDetectorConfig {
     model_sha256: Option<String>,
     #[serde(default)]
     tokenizer_sha256: Option<String>,
+    /// Optional URL of the detached Ed25519 signature for the model.
+    /// Set together with `tokenizer_signature_url` and one of
+    /// `model_pubkey` / `model_pubkey_path`. See the WOR-146 supply-
+    /// chain notes in `docs/onnx-classifier.md`.
+    #[serde(default)]
+    model_signature_url: Option<String>,
+    /// Optional URL of the detached Ed25519 signature for the
+    /// tokenizer.
+    #[serde(default)]
+    tokenizer_signature_url: Option<String>,
+    /// Inline PEM SPKI of the operator's Ed25519 verifying key, or a
+    /// 64-character hex of the raw 32-byte key.
+    #[serde(default)]
+    model_pubkey: Option<String>,
+    /// Path to a PEM file containing the operator's Ed25519 verifying
+    /// key. Mutually exclusive with `model_pubkey`.
+    #[serde(default)]
+    model_pubkey_path: Option<PathBuf>,
+    /// Override the 200 MiB default size budget for the ONNX file.
+    #[serde(default)]
+    max_model_bytes: Option<u64>,
+    /// Override the 200 MiB default size budget for the tokenizer.
+    #[serde(default)]
+    max_tokenizer_bytes: Option<u64>,
     #[serde(default)]
     cache_dir: Option<PathBuf>,
     #[serde(default = "default_threshold")]
@@ -200,11 +240,60 @@ impl OnnxDetector {
             (None, None) => None,
         };
 
-        let classifier = sbproxy_classifiers::OnnxClassifier::download_and_load(
+        // All-or-nothing on the signature URL pair, mirroring the
+        // hash-pin rule. A half-configured signature path is rejected
+        // so an operator who turned on signing can never silently
+        // degrade to "skip verification" by editing only one URL.
+        let signatures = match (
+            cfg.model_signature_url.as_deref(),
+            cfg.tokenizer_signature_url.as_deref(),
+        ) {
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(anyhow!(
+                    "onnx detector: either both or neither of model_signature_url / tokenizer_signature_url must be set"
+                ));
+            }
+            (None, None) => None,
+            (Some(m), Some(t)) => {
+                if cfg.model_pubkey.is_some() && cfg.model_pubkey_path.is_some() {
+                    return Err(anyhow!(
+                        "onnx detector: set either model_pubkey or model_pubkey_path, not both"
+                    ));
+                }
+                let pubkey_pem = if let Some(inline) = cfg.model_pubkey.as_deref() {
+                    inline.to_string()
+                } else if let Some(path) = cfg.model_pubkey_path.as_ref() {
+                    std::fs::read_to_string(path).with_context(|| {
+                        format!("reading onnx detector model_pubkey_path {path:?}")
+                    })?
+                } else {
+                    return Err(anyhow!(
+                        "onnx detector: model_signature_url is set but neither model_pubkey nor model_pubkey_path was provided"
+                    ));
+                };
+                let key = sbproxy_classifiers::parse_ed25519_pubkey(&pubkey_pem)
+                    .context("parsing onnx detector verifying key")?;
+                Some((m.to_string(), t.to_string(), key))
+            }
+        };
+
+        let mut load_opts = sbproxy_classifiers::LoadOptions::default();
+        if let Some(b) = cfg.max_model_bytes {
+            load_opts = load_opts.with_max_model_bytes(b);
+        }
+        if let Some(b) = cfg.max_tokenizer_bytes {
+            load_opts = load_opts.with_max_tokenizer_bytes(b);
+        }
+        if let Some((m_url, t_url, key)) = signatures {
+            load_opts = load_opts.with_signatures(m_url, t_url, key);
+        }
+
+        let classifier = sbproxy_classifiers::OnnxClassifier::download_and_load_with_options(
             &model_url,
             &tokenizer_url,
             pinned,
             &cache_dir,
+            &load_opts,
         )?;
         // Re-load with labels if the user provided a vocabulary.
         let classifier = if let Some(labels) = cfg.labels {
@@ -344,6 +433,60 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("model_sha256"));
+    }
+
+    #[test]
+    fn try_from_config_rejects_partial_signature_pinning() {
+        // model_signature_url set but tokenizer_signature_url omitted.
+        // Mirrors the all-or-nothing rule already applied to hash pins.
+        let cfg = serde_json::json!({
+            "model_url": "https://example.com/m.onnx",
+            "tokenizer_url": "https://example.com/t.json",
+            "model_signature_url": "https://example.com/m.onnx.sig",
+        });
+        let err = match OnnxDetector::try_from_config(&cfg) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("model_signature_url") || msg.contains("tokenizer_signature_url"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn try_from_config_rejects_signature_without_pubkey() {
+        let cfg = serde_json::json!({
+            "model_url": "https://example.com/m.onnx",
+            "tokenizer_url": "https://example.com/t.json",
+            "model_signature_url": "https://example.com/m.sig",
+            "tokenizer_signature_url": "https://example.com/t.sig",
+            // model_pubkey / model_pubkey_path missing on purpose.
+        });
+        let err = match OnnxDetector::try_from_config(&cfg) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("model_pubkey"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn try_from_config_rejects_both_pubkey_forms() {
+        let cfg = serde_json::json!({
+            "model_url": "https://example.com/m.onnx",
+            "tokenizer_url": "https://example.com/t.json",
+            "model_signature_url": "https://example.com/m.sig",
+            "tokenizer_signature_url": "https://example.com/t.sig",
+            "model_pubkey": "00".repeat(32),
+            "model_pubkey_path": "/etc/sbproxy/key.pem",
+        });
+        let err = match OnnxDetector::try_from_config(&cfg) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("not both"));
     }
 
     #[test]

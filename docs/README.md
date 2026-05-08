@@ -40,6 +40,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [glossary.md](glossary.md) - vocabulary used in this documentation set.
 - [headers-reference.md](headers-reference.md) - every response header the proxy can emit, with the config that triggers it.
 - [metrics-stability.md](metrics-stability.md) - Prometheus metric naming and stability.
+- [adr-classifier-supply-chain-oss.md](adr-classifier-supply-chain-oss.md) - operator-trusted model supply-chain decisions for the OSS classifier path.
 - [adr-fast-track-amendment.md](adr-fast-track-amendment.md) - template for additive closed-enum ADR changes.
 - [comparison.md](comparison.md) - how SBproxy compares to other proxies and AI gateways.
 
