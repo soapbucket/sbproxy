@@ -193,8 +193,8 @@ fn redaction_fixture_floor_no_secret_leaks_through_legacy_redactor() {
 /// type" rule (Authorization gets `<redacted:authorization>`, not a
 /// generic marker).
 #[test]
-#[ignore = "TODO(wave3): typed redactor lives in `sbproxy-observe::redact` but the fake-sink test harness (admin endpoints `/api/_test/sinks/reset` + `/api/_test/sinks/{name}`) was never built; the local stubs `reset_sink_buffers` / `read_sink_buffer` return empty so all sink-buffer assertions fail. Needs the test admin-endpoint scaffolding."]
 fn redaction_per_sink_fan_out() {
+    let _guard = enable_fake_sinks();
     let upstream = MockUpstream::start(json!({"ok": true})).expect("start mock upstream");
     let yaml = format!(
         r#"
@@ -281,8 +281,8 @@ origins:
 /// `smoke-bot/1.0`) MUST NOT be replaced with any redaction marker.
 /// Catches over-eager redactors that match too broadly.
 #[test]
-#[ignore = "TODO(wave3): negative coverage rides the same fake-sink harness which has not been built yet."]
 fn redaction_does_not_eat_non_secrets() {
+    let _guard = enable_fake_sinks();
     let upstream = MockUpstream::start(json!({"ok": true})).expect("start mock upstream");
     let yaml = format!(
         r#"
@@ -321,17 +321,55 @@ origins:
 
 // --- Test-only sink helpers ---
 //
-// These wrap the admin-side debug endpoints exposed by R1.2. The
+// These wrap the admin-side debug endpoints landed in WOR-87. The
 // returned strings are the raw concatenated lines of the named sink
-// since the last reset. The endpoints don't exist yet; the
-// implementation lands behind R1.2.
+// since the last reset. The endpoints are gated behind the
+// `SBPROXY_TEST_FAKE_SINKS=1` env var so production binaries never
+// expose them; [`enable_fake_sinks`] sets the var for the lifetime of
+// a single test, propagating it to the spawned proxy child.
 
-fn reset_sink_buffers(_h: &ProxyHarness) -> anyhow::Result<()> {
-    // POST /api/_test/sinks/reset
+fn reset_sink_buffers(h: &ProxyHarness) -> anyhow::Result<()> {
+    // POST /api/_test/sinks/reset against the proxy port. The
+    // endpoint clears every per-sink buffer and returns 204.
+    let url = format!("{}/api/_test/sinks/reset", h.base_url());
+    let resp = reqwest::blocking::Client::new()
+        .post(&url)
+        .header("host", "localhost")
+        .send()?;
+    if resp.status().as_u16() != 204 {
+        anyhow::bail!(
+            "unexpected status from /api/_test/sinks/reset: {}",
+            resp.status()
+        );
+    }
     Ok(())
 }
 
-fn read_sink_buffer(_h: &ProxyHarness, _sink: &str) -> anyhow::Result<String> {
-    // GET /api/_test/sinks/{name}
-    Ok(String::new())
+fn read_sink_buffer(h: &ProxyHarness, sink: &str) -> anyhow::Result<String> {
+    // GET /api/_test/sinks/{name} returns the named sink's buffer
+    // as `text/plain`, one redacted JSON line per record.
+    let url = format!("{}/api/_test/sinks/{sink}", h.base_url());
+    let resp = reqwest::blocking::Client::new()
+        .get(&url)
+        .header("host", "localhost")
+        .send()?;
+    Ok(resp.text()?)
+}
+
+/// Set `SBPROXY_TEST_FAKE_SINKS=1` for the duration of a single test
+/// so the harness-spawned proxy inherits it. Returns a guard that
+/// removes the var on drop. The two ignored-then-revived tests are
+/// gated on this; without the env var the proxy short-circuits the
+/// admin routes through to origin resolution.
+fn enable_fake_sinks() -> FakeSinksGuard {
+    std::env::set_var("SBPROXY_TEST_FAKE_SINKS", "1");
+    FakeSinksGuard
+}
+
+struct FakeSinksGuard;
+
+impl Drop for FakeSinksGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("SBPROXY_TEST_FAKE_SINKS");
+    }
 }

@@ -404,20 +404,35 @@ fn match_denylist(key: &str, sink: Sink) -> Option<&'static str> {
     if k == "x-stripe-signature" || k == "stripe-signature" {
         return Some("<redacted:stripe-signature>");
     }
-    // Stripe SK fields under any key.
-    if k.contains("stripe_sk") || k == "stripe_secret_key" {
+    // Stripe SK fields under any key. Includes the request-header
+    // shape `x-stripe-key` (and its underscore-normalised form
+    // `x_stripe_key`) so a typed inbound carrying the live secret in a
+    // bespoke header still hits the typed marker rather than falling
+    // through to the generic api-key catch-all.
+    if k.contains("stripe_sk")
+        || k == "stripe_secret_key"
+        || k == "x-stripe-key"
+        || k == "x_stripe_key"
+    {
         return Some("<redacted:stripe-secret-key>");
     }
     if k == "ledger_hmac_key" || k == "sbproxy_ledger_hmac_key" {
         return Some("<redacted:ledger-hmac-key>");
     }
-    if k == "kya_token" || k.starts_with("kya_") {
+    // KYA tokens. The historical match handled `kya_*` prefixed
+    // fields; the request-header shape is `x-kya` (so the lowercased
+    // / underscore-normalised key is `x_kya` or `x-kya`). Match both.
+    if k == "kya_token" || k.starts_with("kya_") || k == "x-kya" || k == "x_kya" {
         return Some("<redacted:kya-token>");
     }
     if k == "oauth_client_secret" {
         return Some("<redacted:oauth-client-secret>");
     }
-    if k == "payment_receipt_secret" {
+    // Receipt secrets. Request-header form is `x-sb-receipt-secret`
+    // (underscore-normalised: `x_sb_receipt_secret`). Without this
+    // explicit match, the generic `_secret` suffix would route the
+    // value through the wrong typed marker.
+    if k == "payment_receipt_secret" || k == "x-sb-receipt-secret" || k == "x_sb_receipt_secret" {
         return Some("<redacted:payment-receipt-secret>");
     }
     if k == "prompt" || k == "messages" {
@@ -432,7 +447,19 @@ fn match_denylist(key: &str, sink: Sink) -> Option<&'static str> {
         return Some("<redacted:ja-fingerprint>");
     }
     // Generic suffix match: *_secret / *_token / *_key / api_key.
-    if k == "api_key" || k.ends_with("_secret") || k.ends_with("_token") || k.ends_with("_key") {
+    // Also covers the hyphenated request-header form `x-api-key`
+    // (and any other `*-key` / `*-secret` / `*-token` shape) so an
+    // inbound header is redacted even before the underscore
+    // normalisation pass that the JSON renderer would do.
+    if k == "api_key"
+        || k == "x-api-key"
+        || k.ends_with("_secret")
+        || k.ends_with("_token")
+        || k.ends_with("_key")
+        || k.ends_with("-key")
+        || k.ends_with("-secret")
+        || k.ends_with("-token")
+    {
         return Some("<redacted:api-key>");
     }
     None

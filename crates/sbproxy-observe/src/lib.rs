@@ -20,6 +20,10 @@ pub mod events;
 /// onto the request-duration and ledger histograms.
 pub mod exemplars;
 pub mod export;
+/// WOR-87 test-only in-memory capture for the redaction fan-out e2e
+/// suite. Disabled by default; opted into via the
+/// `SBPROXY_TEST_FAKE_SINKS=1` environment variable.
+pub mod fake_sinks;
 pub mod golden_signals;
 /// `/healthz` and `/readyz` registry, probes, and HTTP handlers (R1.3).
 pub mod health;

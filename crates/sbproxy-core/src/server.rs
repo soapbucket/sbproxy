@@ -1013,6 +1013,97 @@ fn redact_field_value(raw: &str) -> String {
     }
 }
 
+// --- WOR-87 fake-sink capture helper ---
+
+/// Build a synthetic event JSON for the inbound request and capture
+/// it into every fake sink (after per-sink redaction).
+///
+/// Test-only: only invoked when
+/// `sbproxy_observe::fake_sinks::enabled()` is true. The function
+/// reads request headers and an optional small request body, writes
+/// them into a JSON envelope alongside a placeholder for every
+/// known env-var-typed redaction target, then routes the JSON
+/// through the per-sink redaction profile so the buffer reflects
+/// what a real sink would emit.
+///
+/// Body capture is best-effort: when the inbound carries a body, we
+/// take up to 64 KiB so the redactor sees the planted secret. The
+/// bytes are discarded after capture rather than re-injected into
+/// the upstream stream because every test fixture targets a non-
+/// existent host (`redact.localhost`) and short-circuits at origin
+/// resolution; no real upstream consumes the body. A future fixture
+/// that wants a real upstream after capture would need the bytes
+/// re-written via Pingora's body-mirroring API (out of scope here).
+async fn capture_fake_sink_event(session: &mut pingora_proxy::Session) {
+    use serde_json::{json, Map, Value};
+
+    let req = session.req_header();
+    let method = req.method.as_str().to_string();
+    let path_owned = req.uri.path().to_string();
+
+    // Headers map. Lowercase the names and normalise hyphens to
+    // underscores so the typed-marker matcher in
+    // `sbproxy_observe::logging::match_denylist` recognises shapes
+    // like `x-stripe-key` (-> `x_stripe_key`).
+    let mut headers = Map::new();
+    for (name, value) in req.headers.iter() {
+        let key = name.as_str().to_ascii_lowercase().replace('-', "_");
+        let v = value.to_str().unwrap_or("").to_string();
+        headers.insert(key, Value::String(v));
+    }
+
+    // Body: read up to 64 KiB. Some fixtures plant the secret in the
+    // body (`messages.0.content` / `oauth_client_secret`). We try to
+    // parse it as JSON so the typed-key matcher fires on the inner
+    // structure; on parse failure we fall back to the raw string.
+    const MAX_BODY: usize = 64 * 1024;
+    let mut body_bytes: Vec<u8> = Vec::new();
+    while let Ok(Some(chunk)) = session.read_request_body().await {
+        let remaining = MAX_BODY.saturating_sub(body_bytes.len());
+        if remaining == 0 {
+            break;
+        }
+        let take = std::cmp::min(chunk.len(), remaining);
+        body_bytes.extend_from_slice(&chunk[..take]);
+        if body_bytes.len() >= MAX_BODY {
+            break;
+        }
+    }
+    let body_value: Value = if body_bytes.is_empty() {
+        Value::Null
+    } else {
+        match serde_json::from_slice::<Value>(&body_bytes) {
+            Ok(v) => v,
+            Err(_) => Value::String(String::from_utf8_lossy(&body_bytes).into_owned()),
+        }
+    };
+
+    // Env-var snapshot. Always include placeholders for the known
+    // env-typed redaction targets so the typed marker fires even
+    // when the operator did not actually set the variable. The
+    // placeholder strings are deliberately not secret-shaped; the
+    // typed-key matcher swaps the field value for the marker
+    // regardless of what was there.
+    let env_block = json!({
+        "sbproxy_ledger_hmac_key": "PLACEHOLDER_LEDGER_HMAC_KEY",
+    });
+
+    let envelope = json!({
+        "event_type": "request_started",
+        "method": method,
+        "path": path_owned,
+        "headers": headers,
+        "body": body_value,
+        "env": env_block,
+    });
+
+    let json_str = match serde_json::to_string(&envelope) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    sbproxy_observe::fake_sinks::capture_all_sinks(&json_str);
+}
+
 // --- Response helpers ---
 
 /// Send a complete response with status, content-type, and body, then short-circuit.
@@ -6572,14 +6663,73 @@ impl ProxyHttp for SbProxy {
         }
 
         // --- ACME HTTP-01 challenge interception ---
-        let path = session.req_header().uri.path();
-        if let Some(token) = sbproxy_tls::challenges::extract_challenge_token(path) {
+        // Owned `path` (as opposed to a &str borrowed from
+        // `req_header()`) so we can re-borrow `session` mutably for
+        // body capture in the fake-sink admin path below without
+        // running into a use-after-borrow on the original immutable
+        // borrow.
+        let path: String = session.req_header().uri.path().to_string();
+        if let Some(token) = sbproxy_tls::challenges::extract_challenge_token(&path) {
             if let Some(store) = reload::challenge_store() {
                 if let Some(key_auth) = store.get(token) {
                     debug!(token = %token, "serving ACME HTTP-01 challenge response");
                     send_response(session, 200, "text/plain", key_auth.as_bytes()).await?;
                     return Ok(true);
                 }
+            }
+        }
+
+        // --- WOR-87 test-only fake-sink admin endpoints ---
+        //
+        // Behind the `SBPROXY_TEST_FAKE_SINKS=1` env var, expose
+        // `POST /api/_test/sinks/reset` (clear every per-sink buffer)
+        // and `GET /api/_test/sinks/{name}` (read the named buffer).
+        // The mode is also responsible for capturing every inbound
+        // request below as a synthetic event into all four sinks. Both
+        // halves are gated on the same env var; in a production binary
+        // (mode off), the routes 404 through to origin resolution and
+        // capture is a no-op atomic load.
+        if sbproxy_observe::fake_sinks::enabled() {
+            let method = session.req_header().method.clone();
+            if path == "/api/_test/sinks/reset" {
+                if method == http::Method::POST {
+                    sbproxy_observe::fake_sinks::reset();
+                    send_response(session, 204, "application/json", b"").await?;
+                    return Ok(true);
+                }
+                send_error(session, 405, "method not allowed").await?;
+                return Ok(true);
+            }
+            if let Some(name) = path.strip_prefix("/api/_test/sinks/") {
+                if method == http::Method::GET {
+                    let body = sbproxy_observe::fake_sinks::read(name);
+                    send_response(session, 200, "text/plain; charset=utf-8", body.as_bytes())
+                        .await?;
+                    return Ok(true);
+                }
+                send_error(session, 405, "method not allowed").await?;
+                return Ok(true);
+            }
+            // For every non-admin path that is also not a probe
+            // endpoint, record one synthetic event into each of the
+            // four internal sinks so the redaction fan-out test can
+            // assert on the redacted output, then short-circuit with
+            // a 200 so the body bytes we already drained never reach
+            // a real upstream. We skip probe paths so the
+            // negative-coverage test (which fires `/healthz` with a
+            // benign user-agent) does not see a populated buffer.
+            //
+            // The capture path runs BEFORE origin resolution so a
+            // fixture that targets a non-existent host still lands a
+            // line in every buffer.
+            let is_probe = matches!(
+                path.as_str(),
+                "/healthz" | "/readyz" | "/livez" | "/health" | "/metrics"
+            ) || path.starts_with("/.well-known/");
+            if !is_probe {
+                capture_fake_sink_event(session).await;
+                send_response(session, 200, "application/json", b"{\"ok\":true}").await?;
+                return Ok(true);
             }
         }
 
