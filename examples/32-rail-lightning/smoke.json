@@ -1,0 +1,32 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "feature_endpoints": [],
+  "audit_check": false,
+  "expected_multi_rail_kinds": ["lightning", "x402"],
+  "_notes": [
+    "This example is documentation-shaped and does not ship a",
+    "docker-compose.yml, so the smoke runner (which gates on a",
+    "compose file) does not pick it up. The fields above mirror the",
+    "30-rail-x402-base-sepolia and 31-rail-mpp-stripe-test schema so",
+    "the contract is in one place when a future revision adds a",
+    "Lightning regtest stand-in (mock-cln or mock-phoenixd).",
+    "",
+    "expected_multi_rail_kinds is the contract this example pins:",
+    "the 402 multi-rail body for /article* MUST include a `lightning`",
+    "rail entry when the proxy is built with one of the enterprise",
+    "lightning-cln / lightning-lnd / lightning-phoenixd features. The",
+    "OSS-default build emits the `x402` fallback only; the field",
+    "documents both kinds because the per-tier `rails:` override in",
+    "sb.yml lists both.",
+    "",
+    "feature_endpoints[] is empty: every interesting URL on this",
+    "stack is a 402 (the whole point of the example), and the smoke",
+    "runner asserts 2xx on each declared endpoint. Liveness alone is",
+    "the meaningful signal for CI.",
+    "",
+    "audit_check stays false until Wave 2 (R1.2) ships the OSS",
+    "/api/audit/recent endpoint."
+  ]
+}

@@ -1,0 +1,116 @@
+# 32 - rail-lightning
+#
+# Lightning rail in `Accept-Payment` negotiation alongside x402 + MPP.
+# The OSS proxy reserves the `lightning` token in the multi-rail
+# challenge contract; settlement is provided by the enterprise build's
+# `lightning-cln`, `lightning-lnd`, or `lightning-phoenixd` cargo
+# feature, each of which registers a `BillingRail` named `lightning`.
+#
+# This example exercises the negotiation path only:
+#
+#   - The top-level `rails:` block configures x402 + MPP so the policy
+#     enters multi-rail mode and signs per-rail quote tokens.
+#   - The per-tier `rails:` override on `/article*` advertises
+#     `lightning` (and `x402` as a fallback for OSS-only operators).
+#   - An agent that sends `Accept-Payment: lightning` participates in
+#     header negotiation against the operator's offered set.
+#
+# Run (compile-only check; this example is documentation-shaped and
+# does not ship a docker-compose.yml):
+#
+#   cargo test -p sbproxy-config --tests
+#
+# Probe shape (when the example is wired into a stack):
+#
+#   curl -i \
+#     -H 'Host: blog.test.sbproxy.dev' \
+#     -H 'User-Agent: GPTBot/1.0' \
+#     -H 'Accept-Payment: lightning, x402' \
+#     http://127.0.0.1:8080/article
+#   # => 402 with Content-Type: application/sbproxy-multi-rail+json
+#   # The `rails[]` array carries entries for each surviving offered
+#   # rail. The `lightning` entry surfaces only when the proxy is built
+#   # with one of the enterprise lightning-* features; otherwise the
+#   # OSS proxy emits the x402 fallback so the agent still has a path
+#   # to settlement.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "blog.test.sbproxy.dev":
+    # Article origin. The proxy emits a 402 multi-rail challenge before
+    # forwarding paid requests; the `ai_crawl_control` policy below is
+    # the only thing that intercepts the upstream dial.
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    policies:
+      - type: ai_crawl_control
+        # Default fallback price. Tier-matched routes override this in
+        # the multi-rail body; rail negotiation is over how the agent
+        # settles, not how much it pays.
+        price: 0.001
+        currency: USD
+        header: crawler-payment
+
+        crawler_user_agents:
+          - GPTBot
+          - ChatGPT-User
+          - ClaudeBot
+          - anthropic-ai
+          - CCBot
+          - PerplexityBot
+          - Google-Extended
+
+        # Per-tier `rails:` override. `lightning` is the headline rail
+        # for this example; `x402` is listed alongside it so the OSS
+        # default build still has a settle-able rail to emit when no
+        # Lightning backend is registered. Operators running the
+        # enterprise build with `lightning-cln`, `lightning-lnd`, or
+        # `lightning-phoenixd` enabled will see both entries in the
+        # multi-rail body in the order declared here (the operator's
+        # preference order breaks q-value ties).
+        tiers:
+          - route_pattern: /article*
+            price:
+              amount_micros: 1000
+              currency: USD
+            content_shape: html
+            paywall_position: top_of_page
+            rails:
+              - lightning
+              - x402
+
+        # Top-level `rails:` block. Configures the x402 backbone the
+        # OSS build can settle today and the MPP rail for parity with
+        # examples 30 and 31. The Lightning rail does not need a
+        # top-level entry here: it is registered out-of-band by the
+        # enterprise BillingRail trait impl, and the `Rail::Lightning`
+        # variant on the OSS side is what makes the per-tier
+        # `rails: [lightning]` filter parse cleanly.
+        rails:
+          x402:
+            chain: base
+            facilitator: https://facilitator-base.x402.org
+            asset: USDC
+            # Demo merchant address. Replace with the operator's own
+            # receive address before pointing at a real facilitator.
+            pay_to: "0x0000000000000000000000000000000000000000"
+            version: "2"
+          mpp:
+            version: "1"
+
+        # Quote-token signing material. The active key id ends up in
+        # every JWS header and in the JWKS document at
+        # /.well-known/sbproxy/quote-keys.json. Operators rotate by
+        # adding a second key alongside the first and bumping the
+        # `key_id` here once verifiers have caught up.
+        quote_token:
+          key_id: rail-lightning-demo-2026
+          # 32-byte Ed25519 seed, hex. Demo seed only; production
+          # configs read from `secret_ref:`.
+          seed_hex: "4444444444444444444444444444444444444444444444444444444444444444"
+          issuer: "https://blog.test.sbproxy.dev"
+          default_ttl_seconds: 300
