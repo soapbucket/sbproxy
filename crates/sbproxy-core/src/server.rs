@@ -11767,11 +11767,12 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
             .with_loaded_config_content_hash(initial_content_hash.clone());
 
         // WOR-27: register the synthetic-pipeline probe and spawn its
-        // driver loop when the operator opted in. The driver lives on
-        // Pingora's tokio runtime; the cached verdict it produces is
-        // what `/readyz` evaluates.
-        if let Some(synth_cfg) = server_config.synthetic_probe.as_ref() {
-            if synth_cfg.enabled {
+        // driver loop when the operator opted in. Registration runs
+        // sync; the driver loop calls `tokio::spawn` and therefore
+        // must be invoked from inside the admin thread's runtime
+        // (this `pub fn run` itself has no current tokio runtime).
+        let synthetic_driver = match server_config.synthetic_probe.as_ref() {
+            Some(synth_cfg) if synth_cfg.enabled => {
                 let state = sbproxy_observe::SyntheticProbeState::new();
                 let stale_after =
                     std::time::Duration::from_secs(synth_cfg.effective_stale_after_secs());
@@ -11783,9 +11784,10 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
                 admin_state_inner
                     .health_registry
                     .register(registration.into_probe());
-                crate::synthetic::spawn_loop(synth_cfg.clone(), state);
+                Some((synth_cfg.clone(), state))
             }
-        }
+            _ => None,
+        };
         let admin_state = std::sync::Arc::new(admin_state_inner);
         // Pingora's `Server::run_forever` builds its own multi-thread
         // tokio runtime; spawning before run_forever installs the
@@ -11798,6 +11800,9 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
                 .build()
                 .expect("admin runtime");
             rt.block_on(async move {
+                if let Some((synth_cfg, state)) = synthetic_driver {
+                    crate::synthetic::spawn_loop(synth_cfg, state);
+                }
                 // The admin server's listener task lives forever;
                 // run it inline on this dedicated thread.
                 if let Some(handle) = crate::admin::spawn_admin_server(admin_state) {
