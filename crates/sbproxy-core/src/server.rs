@@ -10463,6 +10463,71 @@ fn build_scoped_pii_redactor(rule_names: &[String]) -> Option<sbproxy_security::
     sbproxy_security::pii::PiiRedactor::from_config(&cfg).ok()
 }
 
+/// Apply the typed PII redactor to the access-log fields that can
+/// carry PII but are not request / response headers (those are covered
+/// by `capture_headers.redact_pii`). Currently scopes to `path`,
+/// `user_id`, `properties` values (keys are left intact since they are
+/// schema-defined names from the `X-Sb-Property-*` headers), and the
+/// AI `model` string. WOR-118.
+///
+/// `rule_names` follows the same shape as `redact_pii_rules`: empty
+/// uses the full default rule set; non-empty restricts to the listed
+/// rules. When no rule names match, this is a no-op so the caller
+/// degrades to the cheap `redact_secrets` pass that runs at emit time.
+fn redact_pii_other_fields(entry: &mut sbproxy_observe::AccessLogEntry, rule_names: &[String]) {
+    // Build (or borrow) the redactor first so we run a single
+    // compile per emit when a scoped rule list is configured.
+    enum RedactorRef<'a> {
+        Default(&'a sbproxy_security::pii::PiiRedactor),
+        Scoped(sbproxy_security::pii::PiiRedactor),
+    }
+    impl RedactorRef<'_> {
+        fn get(&self) -> &sbproxy_security::pii::PiiRedactor {
+            match self {
+                RedactorRef::Default(r) => r,
+                RedactorRef::Scoped(r) => r,
+            }
+        }
+    }
+
+    let redactor = if rule_names.is_empty() {
+        RedactorRef::Default(default_pii_redactor())
+    } else {
+        match build_scoped_pii_redactor(rule_names) {
+            Some(r) => RedactorRef::Scoped(r),
+            // No matching rule names: no-op so the caller falls back
+            // to the cheap `redact_secrets` pass alone, matching the
+            // header-scope behaviour in `capture_headers_for_log`.
+            None => return,
+        }
+    };
+    let redactor = redactor.get();
+
+    // Path: replace with the redacted form even when the rules drop
+    // the original wholesale (e.g. the entire path was an email);
+    // preserving structure via the [REDACTED:*] markers is intentional.
+    let new_path = redactor.redact(&entry.path).into_owned();
+    entry.path = new_path;
+
+    if let Some(user_id) = entry.user_id.as_ref() {
+        let redacted = redactor.redact(user_id).into_owned();
+        entry.user_id = Some(redacted);
+    }
+
+    if let Some(model) = entry.model.as_ref() {
+        let redacted = redactor.redact(model).into_owned();
+        entry.model = Some(redacted);
+    }
+
+    // Properties: redact each value in place; keys are intentionally
+    // left untouched since they are schema-defined names captured from
+    // `X-Sb-Property-*` request headers.
+    for value in entry.properties.values_mut() {
+        let redacted = redactor.redact(value).into_owned();
+        *value = redacted;
+    }
+}
+
 /// Capture the subset of `headers` that the compiled allowlist
 /// accepts, applying the configured truncation and (optional)
 /// PII redaction. Returns an empty map when the allowlist is empty
@@ -10866,7 +10931,7 @@ fn emit_access_log_entry(
         return;
     }
 
-    let entry = sbproxy_observe::AccessLogEntry {
+    let mut entry = sbproxy_observe::AccessLogEntry {
         timestamp: chrono::Utc::now().to_rfc3339(),
         request_id,
         origin: hostname.to_string(),
@@ -10924,6 +10989,18 @@ fn emit_access_log_entry(
         request_headers: context.request_headers,
         response_headers: context.response_headers,
     };
+
+    // WOR-118: extend the typed PII redactor to non-header fields when
+    // the operator opts in via `capture_headers.redact_pii_other_fields`.
+    // The cheap `redact_secrets` pass on the full JSON line still runs
+    // unconditionally inside `entry.emit()` / `emit_to_file()`; this
+    // step adds the broader email / phone / SSN / credit-card coverage
+    // to the typed slots that previously relied on `redact_secrets`
+    // alone (`path`, `user_id`, `properties` values, `model`).
+    if cfg.capture_headers.redact_pii_other_fields {
+        redact_pii_other_fields(&mut entry, &cfg.capture_headers.redact_pii_rules);
+    }
+
     match cfg.output.output_type.as_str() {
         "file" => {
             if let Some(path) = cfg.output.path.as_deref() {
@@ -12998,6 +13075,211 @@ mod tests {
         assert_eq!(lines.len(), 1);
         let parsed: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(parsed["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
+    }
+
+    // --- WOR-118: PII redaction across non-header fields ---
+
+    /// Build a context populated with PII payloads in every typed slot
+    /// the WOR-118 redactor touches: `user_id`, `model`, and a couple
+    /// of `properties` values (the keys are deliberately benign so we
+    /// can assert they survive untouched).
+    fn ctx_with_pii() -> AccessLogContext {
+        let mut ctx = AccessLogContext::empty();
+        ctx.user_id = Some("user alice@example.com".to_string());
+        ctx.model = Some("gpt-4 trained for jane@corp.com".to_string());
+        let mut props = std::collections::BTreeMap::new();
+        props.insert(
+            "contact".to_string(),
+            "reach me at bob@example.com".to_string(),
+        );
+        props.insert("ssn".to_string(), "id 123-45-6789".to_string());
+        ctx.properties = props;
+        ctx
+    }
+
+    #[test]
+    fn wor_118_redacts_path_when_other_fields_knob_is_on() {
+        let mut cfg = make_cfg(1.0);
+        cfg.capture_headers.redact_pii_other_fields = true;
+        let lines = run_with_capture(|| {
+            emit_access_log_entry(
+                &cfg,
+                200,
+                "GET",
+                "api.example.com",
+                "/users/alice@example.com/profile",
+                0.001,
+                "req-path".to_string(),
+                "10.0.0.1".to_string(),
+                None,
+                AccessLogContext::empty(),
+            );
+        });
+        assert_eq!(lines.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        let path = parsed["path"].as_str().unwrap().to_string();
+        assert!(
+            !path.contains("alice@example.com"),
+            "email leaked into path: {path}"
+        );
+        assert!(
+            path.contains("[REDACTED:EMAIL]"),
+            "redactor token marker missing from path: {path}"
+        );
+        // Surrounding path structure should survive so log analytics
+        // can still group by route shape.
+        assert!(path.starts_with("/users/"));
+        assert!(path.ends_with("/profile"));
+    }
+
+    #[test]
+    fn wor_118_redacts_user_id_model_and_properties_when_knob_is_on() {
+        let mut cfg = make_cfg(1.0);
+        cfg.capture_headers.redact_pii_other_fields = true;
+        let lines = run_with_capture(|| {
+            emit_access_log_entry(
+                &cfg,
+                200,
+                "POST",
+                "api.example.com",
+                "/v1/chat",
+                0.002,
+                "req-other".to_string(),
+                "10.0.0.1".to_string(),
+                None,
+                ctx_with_pii(),
+            );
+        });
+        assert_eq!(lines.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        let line = &lines[0];
+
+        // No raw PII anywhere on the line.
+        assert!(!line.contains("alice@example.com"), "user_id leaked");
+        assert!(!line.contains("jane@corp.com"), "model leaked");
+        assert!(!line.contains("bob@example.com"), "properties value leaked");
+        assert!(!line.contains("123-45-6789"), "SSN in properties leaked");
+
+        // Properties keys are intentionally untouched.
+        assert!(parsed["properties"].get("contact").is_some());
+        assert!(parsed["properties"].get("ssn").is_some());
+        // Properties values are scrubbed.
+        let contact = parsed["properties"]["contact"].as_str().unwrap();
+        let ssn = parsed["properties"]["ssn"].as_str().unwrap();
+        assert!(contact.contains("[REDACTED:EMAIL]"));
+        assert!(ssn.contains("[REDACTED:SSN]"));
+        // user_id and model carry the marker too.
+        assert!(parsed["user_id"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:EMAIL]"));
+        assert!(parsed["model"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:EMAIL]"));
+    }
+
+    #[test]
+    fn wor_118_default_off_leaves_typed_fields_alone() {
+        // Default behaviour: knob is false. The cheap `redact_secrets`
+        // pass still runs at emit time, but it does NOT match emails or
+        // bare SSNs, so the typed fields survive verbatim. This is the
+        // backward-compat regression case for WOR-118.
+        let cfg = make_cfg(1.0);
+        assert!(
+            !cfg.capture_headers.redact_pii_other_fields,
+            "default-off precondition for WOR-118"
+        );
+        let lines = run_with_capture(|| {
+            emit_access_log_entry(
+                &cfg,
+                200,
+                "POST",
+                "api.example.com",
+                "/users/alice@example.com/profile",
+                0.002,
+                "req-default".to_string(),
+                "10.0.0.1".to_string(),
+                None,
+                ctx_with_pii(),
+            );
+        });
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
+        // Email / SSN classes are NOT in the cheap secret-key regex
+        // set, so they should appear verbatim with the knob off.
+        assert!(line.contains("alice@example.com"));
+        assert!(line.contains("jane@corp.com"));
+        assert!(line.contains("bob@example.com"));
+        assert!(line.contains("123-45-6789"));
+    }
+
+    #[test]
+    fn wor_118_scoped_rules_only_redact_matching_fields() {
+        // With `redact_pii_rules: ["email"]`, emails are scrubbed but
+        // SSNs are not. Confirms the same rule list flows from the
+        // header-scope knob into the new other-fields scope.
+        let mut cfg = make_cfg(1.0);
+        cfg.capture_headers.redact_pii_other_fields = true;
+        cfg.capture_headers.redact_pii_rules = vec!["email".to_string()];
+        let lines = run_with_capture(|| {
+            emit_access_log_entry(
+                &cfg,
+                200,
+                "POST",
+                "api.example.com",
+                "/v1/chat",
+                0.002,
+                "req-scoped".to_string(),
+                "10.0.0.1".to_string(),
+                None,
+                ctx_with_pii(),
+            );
+        });
+        assert_eq!(lines.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        let line = &lines[0];
+        assert!(
+            !line.contains("alice@example.com"),
+            "email rule should fire"
+        );
+        // SSN should still appear: it is not in the scoped rule list.
+        assert!(
+            line.contains("123-45-6789"),
+            "ssn rule was not enabled but SSN was redacted: {line}"
+        );
+        assert!(parsed["user_id"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:EMAIL]"));
+    }
+
+    #[test]
+    fn wor_118_unknown_rule_names_are_a_safe_noop() {
+        // No rule name matches: the redactor is not built and the
+        // typed fields fall through unchanged. The cheap secret-key
+        // pass still runs at emit time (covered by `redact_secrets`).
+        let mut cfg = make_cfg(1.0);
+        cfg.capture_headers.redact_pii_other_fields = true;
+        cfg.capture_headers.redact_pii_rules = vec!["does_not_exist".to_string()];
+        let lines = run_with_capture(|| {
+            emit_access_log_entry(
+                &cfg,
+                200,
+                "POST",
+                "api.example.com",
+                "/v1/chat",
+                0.002,
+                "req-noop".to_string(),
+                "10.0.0.1".to_string(),
+                None,
+                ctx_with_pii(),
+            );
+        });
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
+        assert!(line.contains("alice@example.com"));
+        assert!(line.contains("123-45-6789"));
     }
 
     // --- Wave 4 day-5: stamp_content_negotiation ---
