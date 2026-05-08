@@ -260,6 +260,13 @@ pub struct ProxyServerConfig {
     /// keeps existing sb.yml files forward-compatible.
     #[serde(default)]
     pub device_parser_file: Option<String>,
+    /// Optional synthetic-transaction probe driving an in-process
+    /// request through the compiled handler chain on a fixed cadence
+    /// and reporting the verdict on `/readyz` (WOR-27). Disabled by
+    /// default; opt in for deployments that want `/readyz` to fail
+    /// when the proxy is unable to service its own requests.
+    #[serde(default)]
+    pub synthetic_probe: Option<SyntheticProbeConfig>,
     /// Opaque extensions for out-of-tree top-level config blocks.
     /// The compiler never parses these; extension consumers read
     /// their own keys.
@@ -289,9 +296,99 @@ impl Default for ProxyServerConfig {
             trusted_proxies: Vec::new(),
             correlation_id: CorrelationIdConfig::default(),
             mtls: None,
+            synthetic_probe: None,
             extensions: HashMap::new(),
         }
     }
+}
+
+// --- Synthetic probe config (WOR-27) ---
+
+/// Configuration for the in-process synthetic-transaction probe
+/// (WOR-27).
+///
+/// When enabled, a background task fires a request through the
+/// compiled pipeline against the configured `hostname` on a fixed
+/// cadence. The request never leaves the process: the synthetic
+/// origin is required to use a non-network action (typically
+/// `static`, `mock`, `echo`, or `noop`) so `/readyz` can verify the
+/// handler chain end to end without making the readiness check
+/// dependent on a real upstream.
+///
+/// The probe verdict is reported as a `synthetic_pipeline` component
+/// in the `/readyz` body and increments
+/// `sbproxy_synthetic_probe_failures_total{reason}` whenever the
+/// driver records a failure.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SyntheticProbeConfig {
+    /// Master switch. Disabled by default so operators with strict
+    /// request-cost budgets do not pay for a synthetic transaction
+    /// they did not opt into.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Sentinel hostname routed to the synthetic origin. Defaults to
+    /// `__synthetic.local` per the WOR-27 spec; pick another value if
+    /// it collides with an existing origin in your deployment.
+    #[serde(default = "default_synthetic_hostname")]
+    pub hostname: String,
+    /// Path issued on the synthetic request. Defaults to
+    /// `/readyz/synthetic`.
+    #[serde(default = "default_synthetic_path")]
+    pub path: String,
+    /// Cadence between synthetic runs.
+    #[serde(default = "default_synthetic_interval_secs")]
+    pub interval_secs: u64,
+    /// Per-run timeout budget. The driver records a `timeout`
+    /// failure if a single synthetic round trip exceeds this.
+    #[serde(default = "default_synthetic_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Maximum age (in seconds) the cached probe outcome can have
+    /// before the readiness probe reports `Unhealthy`. Set this to
+    /// roughly 3x `interval_secs`. Defaults to `interval_secs * 3`
+    /// when zero.
+    #[serde(default)]
+    pub stale_after_secs: u64,
+}
+
+impl Default for SyntheticProbeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hostname: default_synthetic_hostname(),
+            path: default_synthetic_path(),
+            interval_secs: default_synthetic_interval_secs(),
+            timeout_ms: default_synthetic_timeout_ms(),
+            stale_after_secs: 0,
+        }
+    }
+}
+
+impl SyntheticProbeConfig {
+    /// Effective staleness window in seconds, applying the default
+    /// of `interval_secs * 3` when the explicit value is zero.
+    pub fn effective_stale_after_secs(&self) -> u64 {
+        if self.stale_after_secs == 0 {
+            self.interval_secs.saturating_mul(3).max(1)
+        } else {
+            self.stale_after_secs
+        }
+    }
+}
+
+fn default_synthetic_hostname() -> String {
+    "__synthetic.local".to_string()
+}
+
+fn default_synthetic_path() -> String {
+    "/readyz/synthetic".to_string()
+}
+
+fn default_synthetic_interval_secs() -> u64 {
+    30
+}
+
+fn default_synthetic_timeout_ms() -> u64 {
+    1000
 }
 
 /// mTLS client certificate verification on the HTTPS listener.

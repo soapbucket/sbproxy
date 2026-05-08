@@ -31,6 +31,10 @@ pub mod router;
 /// pipeline reads to alter behavior on the current request only.
 pub mod sb_flags;
 pub mod server;
+/// WOR-27 synthetic-transaction probe driver. Background task that
+/// fires an in-process request through the compiled handler chain
+/// and feeds the verdict into the `/readyz` synthetic probe cache.
+pub mod synthetic;
 /// Wave 8 P0 edge capture wired into the request pipeline.
 pub mod wave8;
 

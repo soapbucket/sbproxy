@@ -11535,11 +11535,31 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
         // reload paths share the in-process single-flight guard on
         // the AdminState so a manual reload during a watcher reload
         // serialises cleanly.
-        let admin_state = std::sync::Arc::new(
-            crate::admin::AdminState::new(admin_cfg)
-                .with_config_path(config_path)
-                .with_loaded_config_content_hash(initial_content_hash.clone()),
-        );
+        let admin_state_inner = crate::admin::AdminState::new(admin_cfg)
+            .with_config_path(config_path)
+            .with_loaded_config_content_hash(initial_content_hash.clone());
+
+        // WOR-27: register the synthetic-pipeline probe and spawn its
+        // driver loop when the operator opted in. The driver lives on
+        // Pingora's tokio runtime; the cached verdict it produces is
+        // what `/readyz` evaluates.
+        if let Some(synth_cfg) = server_config.synthetic_probe.as_ref() {
+            if synth_cfg.enabled {
+                let state = sbproxy_observe::SyntheticProbeState::new();
+                let stale_after =
+                    std::time::Duration::from_secs(synth_cfg.effective_stale_after_secs());
+                let registration = sbproxy_observe::SyntheticProbeRegistration {
+                    name: "synthetic_pipeline".to_string(),
+                    state: state.clone(),
+                    stale_after,
+                };
+                admin_state_inner
+                    .health_registry
+                    .register(registration.into_probe());
+                crate::synthetic::spawn_loop(synth_cfg.clone(), state);
+            }
+        }
+        let admin_state = std::sync::Arc::new(admin_state_inner);
         // Pingora's `Server::run_forever` builds its own multi-thread
         // tokio runtime; spawning before run_forever installs the
         // task on that runtime via the global handle once Pingora
