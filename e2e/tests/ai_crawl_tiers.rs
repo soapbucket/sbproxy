@@ -5,17 +5,6 @@
 //!   - `free-preview` (zero price, capped at 4 KiB on a `/preview/` path)
 //!   - `markdown-shape` (charges when `Accept: text/markdown`)
 //!   - `html-default` (charges otherwise)
-//!
-//! Implementation is landing in parallel via the G1.2 branch (see
-//! `wave1/G1.2-G1.3-tiers-ledger`). Until those keys land in
-//! `crates/sbproxy-modules/src/policy/ai_crawl.rs`, every test in this
-//! file is `#[ignore]`d with a `TODO(wave1-G1.2)` marker so CI's
-//! `cargo test --workspace` stays green while the suite still
-//! type-checks.
-//!
-//! When the implementation lands, drop the `#[ignore]` attributes and
-//! the existing `cargo test -p sbproxy-e2e --test ai_crawl_tiers`
-//! invocation will exercise the full path.
 
 use sbproxy_e2e::ProxyHarness;
 

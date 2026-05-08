@@ -13,12 +13,6 @@
 //!      `agent_id="overflow"` (or `__other__` per the existing
 //!      `CardinalityLimiter`) demotion sentinel and the
 //!      `sbproxy_label_demotion_total` counter increments.
-//!
-//! G1.6 (the metric-label landing branch) and the new
-//! `sbproxy_label_cardinality_overflow_total` counter referenced in
-//! the QA brief have not landed yet, so each assertion is `#[ignore]`d
-//! with a `TODO(wave1-G1.6)` reason. The fixture and metric-fetch
-//! plumbing are in place.
 
 use sbproxy_e2e::ProxyHarness;
 

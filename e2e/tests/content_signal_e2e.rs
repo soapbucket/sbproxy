@@ -6,12 +6,6 @@
 //! the origin's `content_signal` config key is set. Closed enum:
 //! `ai-train`, `search`, `ai-input`. Any other value fails config
 //! compilation per A1.8 closed-enum rules.
-//!
-//! These tests exercise the implementation that lands via the rust-A
-//! branch (G4.5 `Content-Signal` header). Until that work is merged
-//! to main, every test here is `#[ignore]`d with a `TODO(wave4-G4.5)`
-//! marker so CI's `cargo test --workspace` stays green while the
-//! suite still type-checks.
 
 use sbproxy_e2e::ProxyHarness;
 
@@ -147,8 +141,7 @@ fn content_signal_invalid_value_rejected_at_config_load() {
 // --- Smoke: signal fixture compiles when value is valid ---
 
 /// Sanity check: a known-good `content_signal` value compiles
-/// without error. Runs by default; the rest are `#[ignore]`d until
-/// G4.5 lands.
+/// without error.
 #[test]
 fn signal_fixture_yaml_compiles() {
     let yaml = fixture_with_signal("ai-train");

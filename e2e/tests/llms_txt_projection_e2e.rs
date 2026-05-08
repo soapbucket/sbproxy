@@ -15,10 +15,6 @@
 //! Two endpoints:
 //!   - `/llms.txt` is the concise summary; no per-route table.
 //!   - `/llms-full.txt` includes the full priced-route table.
-//!
-//! All tests in this file are `#[ignore]`'d with a
-//! `TODO(wave4-G4.7)` marker until the projection engine in
-//! `crates/sbproxy-modules/src/projection/llms.rs` lands.
 
 use sbproxy_e2e::ProxyHarness;
 
