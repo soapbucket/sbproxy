@@ -49,7 +49,7 @@ pub use prompt_injection_v2::{
     HEURISTIC_DETECTOR_NAME, ONNX_DETECTOR_NAME,
 };
 pub use quote_token::{
-    InMemoryNonceStore, IssuedQuote, NonceCheck, NonceError, NonceStore, QuoteClaims,
+    InMemoryNonceStore, IssuedQuote, NonceCheck, NonceContext, NonceError, NonceStore, QuoteClaims,
     QuoteTokenSigner, QuoteTokenVerifier, SignError, VerifyError, MAX_IAT_SKEW,
 };
 pub use waf::{

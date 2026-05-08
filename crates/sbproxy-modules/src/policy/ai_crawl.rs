@@ -1671,7 +1671,15 @@ impl AiCrawlControlPolicy {
             // Pre-register the nonce so the verifier can later distinguish
             // "never seen" from "already consumed". Errors here are
             // logged (best-effort) but do not abort the response.
-            let _ = plan.nonce_store.register(&issued.claims.nonce);
+            //
+            // Thread the real route / rail / currency through; persistence
+            // backends (the enterprise Postgres-backed store) stamp these
+            // on the `quote_tokens` audit row so a recovery query can group
+            // replay attempts by route at the price they were issued at.
+            let _ = plan.nonce_store.register_with_context(
+                &issued.claims.nonce,
+                super::quote_token::NonceContext::new(path, rail_name, &price.currency),
+            );
             let expires_at = unix_seconds_to_rfc3339(issued.claims.exp);
             match cfg {
                 ConfiguredRail::X402 {

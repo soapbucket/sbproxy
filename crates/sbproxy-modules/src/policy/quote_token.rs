@@ -558,6 +558,53 @@ impl NonceError {
     }
 }
 
+/// Issuance metadata threaded through [`NonceStore::register_with_context`].
+///
+/// Backends that persist nonces (the enterprise Postgres-backed store writes
+/// to the `quote_tokens` table) use these fields as audit-trail dimensions
+/// so a recovery query can answer "which routes saw what replay attempts at
+/// what price". The OSS [`InMemoryNonceStore`] ignores them; replay
+/// protection only needs the nonce string.
+///
+/// The fields are borrowed because every issuer call site already owns the
+/// strings (route is the request path, rail is the configured rail name,
+/// currency is the [`Money::currency`] field on the price). Borrowing keeps
+/// the registration path allocation-free on the hot side.
+///
+/// [`Money::currency`]: super::ai_crawl::Money::currency
+#[derive(Debug, Clone, Copy)]
+pub struct NonceContext<'a> {
+    /// Route the nonce was issued under (the request path the 402
+    /// challenge fired on).
+    pub route: &'a str,
+    /// Payment rail identifier (`x402`, `mpp`, `lightning`, ...).
+    pub rail: &'a str,
+    /// Currency identifier from the quoted price (`USD`, `USDC`, `BTC`, ...).
+    pub currency: &'a str,
+}
+
+impl<'a> NonceContext<'a> {
+    /// Build a context from the three required fields.
+    pub fn new(route: &'a str, rail: &'a str, currency: &'a str) -> Self {
+        Self {
+            route,
+            rail,
+            currency,
+        }
+    }
+
+    /// Empty-sentinel context used by the backward-compat
+    /// [`NonceStore::register`] wrapper. Persistence-backed stores treat
+    /// these as "issuer did not supply context" rather than as real values.
+    pub fn empty() -> Self {
+        Self {
+            route: "",
+            rail: "",
+            currency: "",
+        }
+    }
+}
+
 /// Pluggable single-use nonce ledger.
 ///
 /// Implementations:
@@ -579,11 +626,30 @@ pub trait NonceStore: Send + Sync + std::fmt::Debug + 'static {
     ///   the agent re-quotes.
     fn check_and_consume(&self, nonce: &str) -> Result<NonceCheck, NonceError>;
 
-    /// Optional pre-registration hook. The issuer calls this when emitting
-    /// a 402 challenge so the verifier can later distinguish "never seen"
-    /// from "already consumed". The default impl is a no-op for stores
-    /// (like the in-memory ledger) that treat `Unknown` and `Fresh` as the
-    /// same case.
+    /// Pre-registration hook with full issuance context. The issuer calls
+    /// this when emitting a 402 challenge so the verifier can later
+    /// distinguish "never seen" from "already consumed", and so persistence
+    /// backends can stamp the route / rail / currency dimensions on the
+    /// audit row.
+    ///
+    /// The default impl forwards to [`NonceStore::register`] and discards
+    /// the context. Implementations that care about the context (the
+    /// enterprise Postgres-backed store) override this method directly.
+    fn register_with_context(
+        &self,
+        nonce: &str,
+        _context: NonceContext<'_>,
+    ) -> Result<(), NonceError> {
+        self.register(nonce)
+    }
+
+    /// Optional pre-registration hook (legacy, no context). Kept for
+    /// backward compatibility with implementations and call sites that
+    /// pre-date [`NonceStore::register_with_context`]. New issuer code
+    /// should call `register_with_context` so persistence backends see
+    /// the route / rail / currency. The default impl is a no-op for
+    /// stores (like the in-memory ledger) that treat `Unknown` and
+    /// `Fresh` as the same case.
     fn register(&self, _nonce: &str) -> Result<(), NonceError> {
         Ok(())
     }
@@ -636,6 +702,16 @@ impl NonceStore for InMemoryNonceStore {
     fn register(&self, nonce: &str) -> Result<(), NonceError> {
         self.issued.lock().insert(nonce.to_string());
         Ok(())
+    }
+
+    fn register_with_context(
+        &self,
+        nonce: &str,
+        _context: NonceContext<'_>,
+    ) -> Result<(), NonceError> {
+        // Replay protection only needs the nonce; the route / rail /
+        // currency dimensions are persistence-backend audit metadata.
+        self.register(nonce)
     }
 }
 
