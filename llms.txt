@@ -22,7 +22,7 @@ Most teams run nginx or Traefik for HTTP traffic, then route AI requests through
 - Features: https://github.com/soapbucket/sbproxy/blob/main/docs/features.md
 - AI Gateway: https://github.com/soapbucket/sbproxy/blob/main/docs/ai-gateway.md
 - AI Crawl Control + Pay Per Crawl: https://github.com/soapbucket/sbproxy/blob/main/docs/ai-crawl-control.md
-- Payment rails: https://github.com/soapbucket/sbproxy/blob/main/docs/payment-rails.md
+- 402 Challenge contract: https://github.com/soapbucket/sbproxy/blob/main/docs/402-challenge.md
 - Content for agents: https://github.com/soapbucket/sbproxy/blob/main/docs/content-for-agents.md
 - RSL licensing cookbook: https://github.com/soapbucket/sbproxy/blob/main/docs/rsl.md
 - Providers: https://github.com/soapbucket/sbproxy/blob/main/docs/providers.md
@@ -151,7 +151,7 @@ Origin fields:
 | request_limit | Body size and header count caps |
 | sri | Subresource integrity checks |
 | assertion | Match request shape against expected criteria |
-| ai_crawl_control | Pay-per-crawl 402 challenge with multi-rail negotiation, tiered pricing, content-shape pricing, and per-tier `content_signal` and `citation_required` |
+| ai_crawl_control | Pay-per-crawl 402 challenge with tiered pricing, content-shape pricing, and per-tier `content_signal` and `citation_required`. The OSS proxy emits the multi-rail challenge body (`application/sbproxy-multi-rail+json`) advertising x402, MPP, and Lightning entries; rail settlement requires the enterprise `stripe`, `x402`, `mpp`, `lightning-cln`, `lightning-lnd`, or `lightning-phoenixd` cargo features. |
 | aipref | Parse the inbound `aipref:` header into `request.aipref.{train,search,ai_input}`. Default-permissive when absent. |
 
 ## Transforms
@@ -180,9 +180,9 @@ Origin fields:
 | citation_block | Prepend source / license / fetched-at to Markdown when `citation_required` |
 | json_envelope | Wrap Markdown body in the JSON envelope (title, url, license URN, content_md, token_estimate, schema.org) |
 
-## Content shaping (Wave 4)
+## Content shaping
 
-Wave 4 adds the content-shaping pillar on top of Wave 3 payment rails. Agents that send `Accept: text/markdown` or `Accept: application/json` get their preferred shape with the right pricing tier, the right license posture, and machine-readable discovery documents.
+Agents that send `Accept: text/markdown` or `Accept: application/json` get their preferred shape with the right pricing tier, the right license posture, and machine-readable discovery documents. The pricing tier match is OSS; the underlying payment rail settlement is enterprise.
 
 - **Two-pass `Accept` resolution.** Pass 1 (declaration order, q-values stripped) drives pricing-tier lookup; Pass 2 (q-value-aware) drives the body transformer. Operators control pricing via tier ordering; agents control transformation via q-values. Diverged outcomes are intentional under tie-breaks. See `docs/content-for-agents.md`.
 - **JSON envelope.** Versioned `application/json; profile="https://sbproxy.dev/schema/json-envelope/v1"` body with `title`, `url`, `license` (RSL URN), `content_md`, `fetched_at`, `citation_required`, `schema_org`, `token_estimate`.
@@ -191,7 +191,7 @@ Wave 4 adds the content-shaping pillar on top of Wave 3 payment rails. Agents th
 - **Boilerplate stripping.** Drops nav / footer / aside / comment-section nodes before the HTML to Markdown transform. Cuts token counts on news / blog pages by 30 to 60 percent.
 - **Citation block.** Prepends a source / license / fetched-at line to Markdown bodies when the matched tier asserts `citation_required: true`.
 
-## Projection routes (Wave 4)
+## Projection routes
 
 Four well-known documents served per origin, generated from the compiled `ai_crawl_control` policy and refreshed atomically on every config reload. Each refresh emits one `AdminAuditEvent` per (hostname, projection kind). Operator preview via `sbproxy projections render --kind <kind> --config ./sb.yml`.
 

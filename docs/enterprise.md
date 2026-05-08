@@ -1,5 +1,5 @@
 # Enterprise
-*Last modified: 2026-05-04*
+*Last modified: 2026-05-08*
 
 What's in OSS, what the enterprise tier adds, and how to talk to us
 about it.
@@ -49,6 +49,28 @@ running offline evaluations against captured traffic.
 Five embedding providers (Bedrock, Cohere, OpenAI, Vertex, custom) and
 five vector stores (Chroma, Pinecone, Qdrant, Redis, Weaviate). Built-in
 chunking and a retrieval pipeline.
+
+### Payment-rail settlement
+
+The OSS proxy emits the multi-rail 402 challenge body and advertises
+rails (x402, MPP, Lightning) in `application/sbproxy-multi-rail+json`,
+but cannot settle a real-money payment on those rails. Settlement code
+ships in the enterprise build behind cargo features:
+
+- `stripe` for fiat card and ACH settlement.
+- `x402` for the x402 v2 stablecoin-on-chain rail (EIP-3009
+  `transferWithAuthorization` against a configured facilitator).
+- `mpp` for Stripe Multi-Party Payments (`2026-03-04.preview`).
+- `lightning-cln` for Core Lightning node settlement.
+- `lightning-lnd` for LND node settlement.
+- `lightning-phoenixd` for Phoenix self-custodial settlement.
+
+Each enterprise feature registers a `BillingRail` impl into the OSS
+plugin trait registry under the same canonical rail name the OSS schema
+already understands (`x402`, `mpp`, `lightning`). The OSS YAML schema
+in `sb.yml` is unchanged across enterprise backends; only the
+settlement code differs. See [`402-challenge.md`](402-challenge.md) for
+the wire-format contract that splits across the OSS / enterprise line.
 
 ### Operations layer
 
