@@ -1,0 +1,92 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "cases": [
+    {
+      "name": "allowed callee passes the policy",
+      "request": {
+        "method": "GET",
+        "path": "/agents/invoke",
+        "headers": {
+          "Host": "a2a.local",
+          "Content-Type": "application/a2a+json",
+          "X-A2A-Caller-Agent-Id": "agent:caller",
+          "X-A2A-Callee-Agent-Id": "agent:openai:gpt-5",
+          "X-A2A-Task-Id": "task-1",
+          "X-A2A-Chain-Depth": "1"
+        }
+      },
+      "expect": {
+        "status": 200
+      }
+    },
+    {
+      "name": "chain depth exceeded returns 429",
+      "request": {
+        "method": "GET",
+        "path": "/agents/invoke",
+        "headers": {
+          "Host": "a2a.local",
+          "Content-Type": "application/a2a+json",
+          "X-A2A-Caller-Agent-Id": "agent:caller",
+          "X-A2A-Callee-Agent-Id": "agent:openai:gpt-5",
+          "X-A2A-Chain-Depth": "7"
+        }
+      },
+      "expect": {
+        "status": 429,
+        "headers": {
+          "retry-after": "0",
+          "content-type": "application/json"
+        },
+        "body": {
+          "type": "jsonShape",
+          "shape": {
+            "error": "a2a_chain_depth_exceeded",
+            "limit": 3,
+            "depth": 7
+          }
+        }
+      }
+    },
+    {
+      "name": "caller on denylist returns 403",
+      "request": {
+        "method": "GET",
+        "path": "/agents/invoke",
+        "headers": {
+          "Host": "a2a.local",
+          "Content-Type": "application/a2a+json",
+          "X-A2A-Caller-Agent-Id": "agent:bad:actor",
+          "X-A2A-Callee-Agent-Id": "agent:openai:gpt-5",
+          "X-A2A-Chain-Depth": "1"
+        }
+      },
+      "expect": {
+        "status": 403,
+        "body": {
+          "type": "jsonShape",
+          "shape": {
+            "error": "a2a_caller_denied",
+            "caller": "agent:bad:actor"
+          }
+        }
+      }
+    }
+  ],
+  "audit_check": false,
+  "_notes": [
+    "This example does not ship a docker-compose.yml, so the",
+    "examples-smoke.sh runner skips it by default. The cases[] block",
+    "documents the assertions a hand-driven smoke run should pass:",
+    "one allowed flow plus two denial paths (depth 429 and caller",
+    "denylist 403). The allowed case targets test.sbproxy.dev, which",
+    "is the workspace's hostname placeholder; rewrite action.url in",
+    "sb.yml to a reachable upstream before driving the positive leg",
+    "end-to-end. The denial cases are evaluated by the policy before",
+    "any upstream contact and pass without a live upstream.",
+    "",
+    "audit_check stays false until the OSS audit endpoint lands."
+  ]
+}
