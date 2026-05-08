@@ -164,3 +164,62 @@ jobs:
               body: issueBody,
               labels: ['synthetic', 'wave1', 'incident']
             });
+
+  # Chaos test: rapid hot-reload under sustained traffic (WOR-28).
+  #
+  # The reload state machine has unit + loom coverage. This job
+  # exercises the integrated story: a live proxy serving real HTTP
+  # traffic while the operator reload path swaps the compiled
+  # pipeline out from under it. Asserts zero dropped connections,
+  # zero misrouted requests, and zero unexpected 5xx.
+  #
+  # Runs nightly (not per-PR) because the wall-clock budget plus
+  # 200-thread fan-out is too expensive for the per-PR e2e lane.
+  # The test is `#[ignore]` by default; this job runs it via
+  # `--ignored`, mirroring the pattern in licensing-conformance.yml.
+  chaos-hot-reload:
+    name: chaos hot-reload (WOR-28)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4.1.7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2.7.3
+        with:
+          shared-key: chaos-hot-reload
+
+      - name: install protoc + libclang
+        # Mirror ci.yml's toolchain prerequisites; the e2e crate
+        # transitively pulls in tonic-build for the gRPC test, which
+        # needs protoc on the build host.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libclang-dev clang
+
+      - name: build sbproxy binary
+        # The e2e harness spawns this binary at runtime; cargo cannot
+        # infer the ordering between the e2e crate and the binary
+        # crate, so build it explicitly first.
+        run: cargo build -p sbproxy --locked
+
+      - name: chaos hot-reload e2e
+        # `--ignored` rather than `--include-ignored` so this job
+        # only runs the chaos test, not every other e2e in the crate.
+        run: |
+          set -euo pipefail
+          mkdir -p target/chaos-logs
+          cargo test -p sbproxy-e2e --locked \
+            --test chaos_hot_reload \
+            -- --ignored --nocapture 2>&1 \
+            | tee target/chaos-logs/cargo-test-output.txt
+
+      - name: upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4.4.0
+        with:
+          name: chaos-hot-reload-logs
+          path: target/chaos-logs/
+          retention-days: 14
+          if-no-files-found: ignore
