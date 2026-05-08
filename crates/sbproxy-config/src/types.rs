@@ -1158,8 +1158,22 @@ pub struct CaptureHeadersConfig {
     /// listed rule names (`email`, `us_ssn`, `credit_card`, `phone_us`,
     /// `ipv4`, `openai_key`, `anthropic_key`, `aws_access`,
     /// `github_token`).
+    ///
+    /// The same rule list is shared by [`Self::redact_pii_other_fields`]
+    /// when that knob is on, so operators only configure one rule list
+    /// for both the header scope and the non-header scope.
     #[serde(default)]
     pub redact_pii_rules: Vec<String>,
+    /// Run the same `sbproxy-security` PII redactor over the non-header
+    /// access-log fields that can carry PII: `path`, `user_id`,
+    /// `properties` values (keys are left untouched), and `model`. Off
+    /// by default. Independent of [`Self::redact_pii`] so operators can
+    /// adopt header redaction first and the broader scope later (or
+    /// either alone). Reuses [`Self::redact_pii_rules`] for the rule
+    /// filter; the cheap `redact_secrets` pass over the full JSON line
+    /// still runs regardless of this knob.
+    #[serde(default)]
+    pub redact_pii_other_fields: bool,
 }
 
 impl Default for CaptureHeadersConfig {
@@ -1170,6 +1184,7 @@ impl Default for CaptureHeadersConfig {
             max_value_bytes: default_capture_max_value_bytes(),
             redact_pii: false,
             redact_pii_rules: Vec::new(),
+            redact_pii_other_fields: false,
         }
     }
 }
@@ -2834,6 +2849,10 @@ origins: {}
         assert!(al.capture_headers.response.is_empty());
         assert_eq!(al.capture_headers.max_value_bytes, 1024);
         assert!(!al.capture_headers.redact_pii);
+        assert!(
+            !al.capture_headers.redact_pii_other_fields,
+            "redact_pii_other_fields must default off (WOR-118)"
+        );
     }
 
     #[test]
@@ -2847,6 +2866,7 @@ access_log:
     max_value_bytes: 256
     redact_pii: true
     redact_pii_rules: ["email", "credit_card"]
+    redact_pii_other_fields: true
 origins: {}
 "#;
         let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
@@ -2856,6 +2876,10 @@ origins: {}
         assert_eq!(ch.max_value_bytes, 256);
         assert!(ch.redact_pii);
         assert_eq!(ch.redact_pii_rules, vec!["email", "credit_card"]);
+        assert!(
+            ch.redact_pii_other_fields,
+            "WOR-118 knob round-trips through the YAML"
+        );
     }
 
     #[test]
