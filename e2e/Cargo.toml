@@ -86,6 +86,19 @@ zstd = "0.13"
 # so we do not pull two majors into the build graph.
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
 
+# Wave 1 Q1.4 (WOR-85): the bot-auth directory loader enforces HTTPS at
+# config load, so the mock directory must terminate TLS. axum-server
+# wraps the axum Router with rustls termination; rcgen mints a fresh
+# self-signed CA + leaf per test run and the proxy trusts that root via
+# `directory.trust_roots`. This keeps production HTTPS enforcement on
+# while letting the e2e harness exercise the directory fetch path over
+# a real TLS transport. The `tls-rustls-no-provider` feature lets us
+# install the `ring` crypto provider explicitly to match the workspace
+# rustls configuration in `crates/sbproxy/src/main.rs`.
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+
 # Rate-limit budget e2e. Lives at the top level so default discovery
 # picks it up without an explicit registration; this entry documents
 # the test's name for grep-ability.

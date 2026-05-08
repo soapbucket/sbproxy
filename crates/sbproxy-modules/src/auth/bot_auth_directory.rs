@@ -85,6 +85,16 @@ pub struct DirectoryConfig {
     /// but should be set explicitly for single-origin policies.
     #[serde(default)]
     pub signature_agents_allow: Vec<String>,
+    /// Optional list of additional PEM-encoded CA certificates to
+    /// trust when fetching the directory over HTTPS. Each entry is a
+    /// PEM bundle (one or more `-----BEGIN CERTIFICATE-----` blocks).
+    /// These are layered on top of the system trust store, never
+    /// instead of it; HTTPS enforcement and certificate verification
+    /// remain on. Used to support private CAs in corporate
+    /// environments and to let the e2e suite trust an ephemeral
+    /// self-signed mock directory without weakening production trust.
+    #[serde(default)]
+    pub trust_roots: Vec<String>,
 }
 
 fn default_refresh_secs() -> u64 {
@@ -128,6 +138,35 @@ impl DirectoryConfig {
             self.refresh_interval_secs
                 .clamp(MIN_DIRECTORY_TTL_SECS, MAX_DIRECTORY_TTL_SECS),
         )
+    }
+
+    /// Build a `reqwest::Client` that trusts the system roots plus
+    /// any extra PEM bundles supplied in `trust_roots`. Returns
+    /// `Ok(None)` when no extra roots are configured (callers should
+    /// fall back to a shared global client). The returned client
+    /// reuses the same 5-second outer timeout the global directory
+    /// client uses, so per-request behaviour is unchanged.
+    ///
+    /// Each PEM bundle may carry one or more `-----BEGIN CERTIFICATE-----`
+    /// blocks; every parsed certificate is added to the trust set.
+    /// Invalid PEM in `trust_roots` is a config-load error.
+    pub fn build_client(&self) -> anyhow::Result<Option<reqwest::Client>> {
+        if self.trust_roots.is_empty() {
+            return Ok(None);
+        }
+        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(5));
+        for (idx, pem) in self.trust_roots.iter().enumerate() {
+            let certs = reqwest::Certificate::from_pem_bundle(pem.as_bytes()).map_err(|e| {
+                anyhow::anyhow!("bot_auth.directory.trust_roots[{idx}]: invalid PEM bundle: {e}")
+            })?;
+            for cert in certs {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+        let client = builder.build().map_err(|e| {
+            anyhow::anyhow!("bot_auth.directory.trust_roots: client build failed: {e}")
+        })?;
+        Ok(Some(client))
     }
 }
 
@@ -685,6 +724,7 @@ mod tests {
             stale_grace_secs: DEFAULT_STALE_GRACE_SECS,
             require_self_signature: true,
             signature_agents_allow: Vec::new(),
+            trust_roots: Vec::new(),
         }
     }
 
