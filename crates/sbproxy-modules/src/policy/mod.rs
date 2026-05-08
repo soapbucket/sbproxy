@@ -382,6 +382,42 @@ impl Default for TokenBucket {
     }
 }
 
+// Methods live on the struct (rather than duplicating the arithmetic in
+// the test module) so the proptest exercises exactly the math used by
+// `RateLimitPolicy::allow_with_info_for`.
+#[cfg(test)]
+impl TokenBucket {
+    pub(crate) fn for_test(capacity: f64, refill_rate: f64) -> Self {
+        Self {
+            tokens: capacity,
+            max_tokens: capacity,
+            refill_rate,
+            last_refill: Instant::now(),
+        }
+    }
+
+    pub(crate) fn current_tokens(&self) -> f64 {
+        self.tokens
+    }
+
+    pub(crate) fn capacity(&self) -> f64 {
+        self.max_tokens
+    }
+
+    pub(crate) fn refill_with_elapsed(&mut self, dt_secs: f64) {
+        self.tokens = (self.tokens + dt_secs * self.refill_rate).min(self.max_tokens);
+    }
+
+    pub(crate) fn try_acquire(&mut self, n: f64) -> bool {
+        if self.tokens >= n {
+            self.tokens -= n;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 fn default_max_keys() -> usize {
     100_000
 }
@@ -5443,5 +5479,114 @@ mod tests {
             result,
             "absent aipref signal must default-permissive (train == true)"
         );
+    }
+
+    // --- TokenBucket arithmetic property tests (WOR-15) ---
+    //
+    // These pair with the loom drain test that landed in PR #47. Loom
+    // covers the reload state machine; proptest covers the bucket math.
+    mod token_bucket_proptests {
+        use super::super::TokenBucket;
+        use proptest::prelude::*;
+
+        // Floating-point comparisons in this module use this slack to
+        // absorb the rounding error of repeated f64 add / multiply across
+        // long operation sequences. The bucket math is one add and one
+        // multiply per step, so error grows slowly; 1e-6 is comfortable.
+        const FP_EPS: f64 = 1e-6;
+
+        fn bucket_strategy() -> impl Strategy<Value = (f64, f64)> {
+            (1.0f64..1.0e6, 0.0f64..1.0e6)
+        }
+
+        proptest! {
+            #[test]
+            fn refill_never_exceeds_capacity(
+                (capacity, rate) in bucket_strategy(),
+                start_tokens in 0.0f64..1.0e6,
+                dt in 0.0f64..1.0e9,
+            ) {
+                let start = start_tokens.min(capacity);
+                let mut b = TokenBucket::for_test(capacity, rate);
+                b.tokens = start;
+                b.refill_with_elapsed(dt);
+                prop_assert!(b.current_tokens() <= capacity + FP_EPS,
+                    "refill must clamp at capacity even with huge dt");
+                prop_assert!(b.current_tokens() >= start - FP_EPS,
+                    "refill is monotone non-decreasing in tokens");
+            }
+
+            #[test]
+            fn refill_amount_is_min_of_headroom_and_dt_times_rate(
+                (capacity, rate) in bucket_strategy(),
+                start_tokens in 0.0f64..1.0e6,
+                dt in 0.0f64..1.0e6,
+            ) {
+                let start = start_tokens.min(capacity);
+                let mut b = TokenBucket::for_test(capacity, rate);
+                b.tokens = start;
+                let headroom = capacity - start;
+                let earned = dt * rate;
+                let expected = start + headroom.min(earned);
+                b.refill_with_elapsed(dt);
+                prop_assert!((b.current_tokens() - expected).abs() < FP_EPS + expected.abs() * 1e-9,
+                    "expected {} got {}", expected, b.current_tokens());
+            }
+
+            #[test]
+            fn try_acquire_succeeds_iff_tokens_at_least_n(
+                (capacity, _rate) in bucket_strategy(),
+                start_tokens in 0.0f64..1.0e6,
+                n in 0.0f64..1.0e6,
+            ) {
+                let start = start_tokens.min(capacity);
+                let mut b = TokenBucket::for_test(capacity, 0.0);
+                b.tokens = start;
+                let before = b.current_tokens();
+                let ok = b.try_acquire(n);
+                if ok {
+                    prop_assert!(before >= n);
+                    prop_assert!((b.current_tokens() - (before - n)).abs() < FP_EPS);
+                    prop_assert!(b.current_tokens() >= -FP_EPS,
+                        "successful acquire must not produce negative tokens");
+                } else {
+                    prop_assert!(before < n);
+                    prop_assert!((b.current_tokens() - before).abs() < FP_EPS,
+                        "failed acquire must leave tokens unchanged");
+                }
+            }
+
+            #[test]
+            fn arbitrary_op_sequence_keeps_tokens_in_bounds(
+                (capacity, rate) in bucket_strategy(),
+                ops in proptest::collection::vec(
+                    prop_oneof![
+                        (0.0f64..10.0).prop_map(Op::Advance),
+                        (0.0f64..10.0).prop_map(Op::Acquire),
+                    ],
+                    0..64,
+                ),
+            ) {
+                let mut b = TokenBucket::for_test(capacity, rate);
+                for op in ops {
+                    match op {
+                        Op::Advance(dt) => b.refill_with_elapsed(dt),
+                        Op::Acquire(n) => { let _ = b.try_acquire(n); }
+                    }
+                    prop_assert!(b.current_tokens().is_finite(),
+                        "tokens must never become NaN or infinite");
+                    prop_assert!(b.current_tokens() <= b.capacity() + FP_EPS,
+                        "tokens must never exceed capacity");
+                    prop_assert!(b.current_tokens() >= -FP_EPS,
+                        "tokens must never go negative");
+                }
+            }
+        }
+
+        #[derive(Debug, Clone)]
+        enum Op {
+            Advance(f64),
+            Acquire(f64),
+        }
     }
 }
