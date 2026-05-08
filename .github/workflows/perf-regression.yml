@@ -1,0 +1,239 @@
+# Performance regression CI (WOR-32).
+#
+# Runs the perf bench on PRs that touch the hot-path crates
+# (sbproxy-core, sbproxy-modules, sbproxy-cache, sbproxy-transport)
+# plus this workflow and its driver scripts. Compares the candidate
+# numbers against a freshly-collected main baseline and posts a comment
+# on the PR with the per-metric deltas.
+#
+# Gate: the check fails when one of {p99 latency, idle RSS, max RSS}
+# regresses by more than 5% vs the main baseline. Smaller regressions
+# and any improvement still post the comment but pass the check. RPS
+# and p50 / p95 are reported but informational.
+#
+# Override: a PR labelled `perf-regression-ok` skips the gate. The
+# comment still posts so reviewers see the regression in the PR thread.
+#
+# Baseline strategy: option 1 (run baseline inline). The script checks
+# out main into a sibling directory, builds, runs the bench, then does
+# the same for the PR head. Slower than pulling a nightly artifact, but
+# the nightly synthetic-monitor run is a 402-correctness probe, not a
+# perf bench, so there is no upstream artifact in the right shape. A
+# follow-up that publishes a nightly perf baseline can switch this lane
+# to option 2 without touching the comment-posting logic.
+
+name: perf-regression
+
+on:
+  pull_request:
+    paths:
+      - 'crates/sbproxy-core/**'
+      - 'crates/sbproxy-modules/**'
+      - 'crates/sbproxy-cache/**'
+      - 'crates/sbproxy-transport/**'
+      - 'bench-synthetic/**'
+      - 'scripts/perf-regression-run.sh'
+      - 'scripts/perf-regression-comment.py'
+      - '.github/workflows/perf-regression.yml'
+
+# Cancel superseded runs on the same ref so a force-push doesn't burn
+# minutes finishing the obsolete commit's bench.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # Required for actions/github-script to upsert the PR comment.
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  perf-regression:
+    name: bench delta vs main
+    # Pinned to ubuntu-latest to match the rest of the CI lanes; a future
+    # tightening (ubuntu-22.04 or self-hosted) can change just this line.
+    # Shared GitHub-hosted runners are noisy, which is why the gate is
+    # 5% rather than 1%.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      # --- Checkouts ---
+      # Two checkouts: one for `main` (baseline) into ./baseline-src,
+      # one for the PR head (candidate) at ./candidate-src. The script
+      # is the same for both, only the working directory differs.
+      - name: checkout candidate (PR head)
+        uses: actions/checkout@v4.1.7
+        with:
+          path: candidate-src
+          # The default fetch-depth of 1 is fine; this lane does not
+          # need history beyond the PR head.
+
+      - name: checkout baseline (main)
+        uses: actions/checkout@v4.1.7
+        with:
+          repository: ${{ github.event.pull_request.base.repo.full_name }}
+          ref: ${{ github.event.pull_request.base.ref }}
+          path: baseline-src
+
+      # --- Tooling ---
+      - name: free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Two cache scopes: candidate and baseline. Sharing the cache
+      # would let the second build trample the first's lockfile state
+      # and skew the bench.
+      - name: cache (candidate)
+        uses: Swatinem/rust-cache@v2.7.3
+        with:
+          shared-key: perf-regression-candidate
+          workspaces: candidate-src
+
+      - name: cache (baseline)
+        uses: Swatinem/rust-cache@v2.7.3
+        with:
+          shared-key: perf-regression-baseline
+          workspaces: baseline-src
+
+      - name: install protoc and libclang
+        # libclang-dev is needed for rquickjs-sys's bindgen build script,
+        # mirroring ci.yml. protoc is needed by the workspace too.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang
+
+      - name: install oha
+        # Pinned version. Updating this is a deliberate change; oha 1.x
+        # output shape is what perf-regression-run.sh's python parser
+        # expects. Bumping major versions may need a parser update.
+        run: |
+          set -euo pipefail
+          OHA_VERSION="1.4.5"
+          curl -sSL -o /tmp/oha "https://github.com/hatoo/oha/releases/download/v${OHA_VERSION}/oha-linux-amd64"
+          chmod +x /tmp/oha
+          sudo mv /tmp/oha /usr/local/bin/oha
+          oha --version
+
+      - name: self-test the comment script
+        # Catch a malformed scripts/perf-regression-comment.py before
+        # spending 20 minutes on the bench just to fail at the comment
+        # step. Runs in <1s.
+        run: python3 candidate-src/scripts/perf-regression-comment.py --self-test
+
+      # --- Bench: baseline first, then candidate ---
+      # Order matters for cache locality. Running baseline first lets
+      # the candidate inherit a warm cargo registry and rustc cache; the
+      # workspace target/ dirs are still distinct, so the build artifact
+      # cache does not cross-pollinate.
+      - name: bench baseline (main)
+        id: baseline
+        run: |
+          set -euo pipefail
+          mkdir -p "${GITHUB_WORKSPACE}/perf-out"
+          cd baseline-src
+          ./scripts/perf-regression-run.sh \
+            "${GITHUB_WORKSPACE}/perf-out/baseline.json" \
+            "main@${{ github.event.pull_request.base.sha }}"
+
+      - name: bench candidate (PR head)
+        id: candidate
+        run: |
+          set -euo pipefail
+          cd candidate-src
+          ./scripts/perf-regression-run.sh \
+            "${GITHUB_WORKSPACE}/perf-out/candidate.json" \
+            "pr@${{ github.event.pull_request.head.sha }}"
+
+      # --- Compare + render comment ---
+      - name: compute deltas
+        id: delta
+        run: |
+          set -euo pipefail
+          python3 candidate-src/scripts/perf-regression-comment.py compare \
+            --baseline "${GITHUB_WORKSPACE}/perf-out/baseline.json" \
+            --candidate "${GITHUB_WORKSPACE}/perf-out/candidate.json" \
+            --baseline-ref "main@${{ github.event.pull_request.base.sha }}" \
+            --candidate-ref "pr@${{ github.event.pull_request.head.sha }}" \
+            --out "${GITHUB_WORKSPACE}/perf-out/comment.md" \
+            --github-output
+
+      - name: upload bench artifacts
+        if: always()
+        uses: actions/upload-artifact@v4.4.0
+        with:
+          name: perf-regression-bench
+          path: perf-out/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      # --- PR comment ---
+      # actions/github-script matches the existing pattern in
+      # synthetic-nightly.yml. We upsert a single comment whose body
+      # starts with a known marker so re-runs replace the previous
+      # comment instead of stacking new ones.
+      - name: post PR comment
+        if: always() && github.event.pull_request != null
+        uses: actions/github-script@v7.0.1
+        env:
+          COMMENT_FILE: perf-out/comment.md
+        with:
+          script: |
+            const fs = require('fs');
+            const path = process.env.COMMENT_FILE;
+            if (!path || !fs.existsSync(path)) {
+              core.warning(`comment file ${path} missing; skipping`);
+              return;
+            }
+            const body = fs.readFileSync(path, 'utf8');
+            const marker = '### sbproxy perf-regression report';
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const existing = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            });
+            const prior = existing.find(c => c.body && c.body.startsWith(marker));
+            if (prior) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: prior.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body,
+              });
+            }
+
+      # --- Gate ---
+      # The comment posts unconditionally above (the override label only
+      # skips the gate, not the comment). This step is the failing-check
+      # half: if `regressed=true` and the PR is not labelled
+      # `perf-regression-ok`, exit 1 to fail the lane. The `if` clause
+      # tracks two conditions:
+      #   - the override label is absent
+      #   - earlier steps succeeded; if the bench itself failed, the
+      #     normal step status already fails the lane and we don't need
+      #     this step to redundantly fail too.
+      - name: enforce gate
+        if: ${{ success() && !contains(github.event.pull_request.labels.*.name, 'perf-regression-ok') }}
+        env:
+          REGRESSED: ${{ steps.delta.outputs.regressed }}
+          REGRESSED_METRICS: ${{ steps.delta.outputs.regressed_metrics }}
+        run: |
+          if [ "${REGRESSED}" = "true" ]; then
+            echo "::error::Performance regression over 5% detected on: ${REGRESSED_METRICS}."
+            echo "Add the \`perf-regression-ok\` label to the PR if this regression is intentional."
+            exit 1
+          fi
+          echo "No regression beyond gate."
