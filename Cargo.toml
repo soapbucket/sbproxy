@@ -207,6 +207,11 @@ ulid = { version = "1", features = ["serde"] }
 # Random
 rand = "0.8"
 
+# Property-based testing. Used by sbproxy-modules to fuzz the rate-limit
+# token-bucket arithmetic; pinned at the workspace level so downstream
+# crates pick up shrinker / regression-file improvements together.
+proptest = "1"
+
 # Time
 chrono = "0.4"
 
