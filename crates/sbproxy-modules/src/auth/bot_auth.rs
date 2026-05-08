@@ -126,6 +126,13 @@ pub struct BotAuthProvider {
     /// ignores this field and continues to use the inline `agents`
     /// list for backward compatibility.
     directory: Option<DirectoryConfig>,
+    /// Per-config HTTP client built when `directory.trust_roots` is
+    /// non-empty. Trusts the system roots plus the operator-supplied
+    /// PEM bundles. When `None`, the dispatcher's process-wide
+    /// `BOT_AUTH_DIRECTORY_CLIENT` is used instead. Built once at
+    /// config compile time so directory fetches reuse a pooled
+    /// connection across requests.
+    directory_client: Option<reqwest::Client>,
 }
 
 impl std::fmt::Debug for BotAuthProvider {
@@ -153,6 +160,10 @@ impl BotAuthProvider {
         if let Some(dir) = &cfg.directory {
             dir.validate()?;
         }
+        let directory_client = match &cfg.directory {
+            Some(dir) => dir.build_client()?,
+            None => None,
+        };
         let mut by_key_id = std::collections::HashMap::with_capacity(cfg.agents.len());
         for agent in cfg.agents {
             if by_key_id.contains_key(&agent.key_id) {
@@ -183,6 +194,7 @@ impl BotAuthProvider {
             by_key_id,
             clock_skew_seconds: cfg.clock_skew_seconds,
             directory: cfg.directory,
+            directory_client,
         })
     }
 
@@ -228,13 +240,22 @@ impl BotAuthProvider {
             };
         };
 
-        let keys =
-            match bot_auth_directory::resolve_signature_agent(sig_agent, directory, client).await {
-                Ok(k) => k,
-                Err(reason) => {
-                    return BotAuthVerdict::DirectoryUnavailable { reason };
-                }
-            };
+        // Prefer the per-provider client when the directory was
+        // configured with `trust_roots`; otherwise reuse the shared
+        // process-wide client the dispatcher passed in.
+        let effective_client = self.directory_client.as_ref().unwrap_or(client);
+        let keys = match bot_auth_directory::resolve_signature_agent(
+            sig_agent,
+            directory,
+            effective_client,
+        )
+        .await
+        {
+            Ok(k) => k,
+            Err(reason) => {
+                return BotAuthVerdict::DirectoryUnavailable { reason };
+            }
+        };
 
         // Pull the keyid the request advertised. We need to find a
         // matching key in the resolved directory snapshot.

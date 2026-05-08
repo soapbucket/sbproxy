@@ -455,6 +455,7 @@ mod directory_q1_4 {
         routing::get,
         Json, Router,
     };
+    use axum_server::tls_rustls::RustlsConfig;
     use serde_json::{json, Value};
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -492,7 +493,29 @@ mod directory_q1_4 {
         pub last_headers: Mutex<HeaderMap>,
     }
 
-    pub async fn spawn_mock_directory(knobs: DirKnobs) -> (SocketAddr, Arc<DirState>) {
+    /// Handle to a running TLS mock directory. Holds the listener
+    /// address plus the PEM-encoded leaf certificate the tests must
+    /// thread into `directory.trust_roots` so the proxy trusts the
+    /// ephemeral self-signed cert.
+    pub struct MockDirectory {
+        pub addr: SocketAddr,
+        pub state: Arc<DirState>,
+        pub cert_pem: String,
+    }
+
+    /// Spawn a TLS-equipped mock directory on `127.0.0.1:0`. Mints a
+    /// fresh self-signed leaf cert covering `127.0.0.1` per call so
+    /// each test owns an independent CA root and the suite can run
+    /// in parallel without trust-set bleed-through.
+    pub async fn spawn_mock_directory(knobs: DirKnobs) -> MockDirectory {
+        // Install the rustls `ring` crypto provider once. axum-server
+        // is built with `tls-rustls-no-provider` so the provider is
+        // not auto-installed at link time; matching the workspace
+        // crypto provider here keeps the e2e suite consistent with
+        // `crates/sbproxy/src/main.rs`. Concurrent test threads race
+        // here; ignore "already installed" errors.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let state = Arc::new(DirState {
             knobs,
             ..Default::default()
@@ -503,12 +526,43 @@ mod directory_q1_4 {
                 get(handler),
             )
             .with_state(state.clone());
+
+        // Mint the self-signed leaf. SAN covers `127.0.0.1` so reqwest
+        // accepts the host the tests connect to. rcgen 0.13 emits
+        // PKCS#8 keys by default, which `RustlsConfig::from_pem` parses
+        // unchanged.
+        let key = rcgen::KeyPair::generate().expect("rcgen keypair");
+        let mut params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("rcgen params");
+        params
+            .subject_alt_names
+            .push(rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap()));
+        let cert = params.self_signed(&key).expect("self-signed cert");
+        let cert_pem = cert.pem();
+        let key_pem = key.serialize_pem();
+
+        // Pin a port up front so the caller can publish a stable URL
+        // before `axum_server::Server::bind` starts the accept loop.
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+
+        let tls_config =
+            RustlsConfig::from_pem(cert_pem.clone().into_bytes(), key_pem.into_bytes())
+                .await
+                .expect("rustls config");
+
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app.into_make_service()).await;
+            let _ = axum_server::bind_rustls(addr, tls_config)
+                .serve(app.into_make_service())
+                .await;
         });
-        (addr, state)
+
+        MockDirectory {
+            addr,
+            state,
+            cert_pem,
+        }
     }
 
     async fn handler(State(state): State<Arc<DirState>>, headers: HeaderMap) -> impl IntoResponse {
@@ -532,21 +586,35 @@ mod directory_q1_4 {
         (status, Json(body))
     }
 
-    /// Tokio runtime helper. Each test owns its own current-thread
-    /// runtime so the mock directory and the proxy harness live in
-    /// independent process-local schedulers.
+    /// Tokio runtime helper. Each test owns its own multi-thread
+    /// runtime so the TLS accept loop on the mock directory makes
+    /// progress while the test thread blocks in
+    /// `ProxyHarness::start_with_yaml`. axum-server's TLS handshake
+    /// runs inside `tokio::spawn`, so a current-thread runtime would
+    /// stall waiting for the test thread to yield.
     pub fn rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
             .expect("runtime")
     }
 
     /// Origin config that wires bot_auth's directory at `directory.url`.
-    /// G1.7 will lock the exact YAML keys; the names below mirror the
-    /// ADR text so a maintainer dropping `#[ignore]` can also rename
-    /// in one place.
-    pub fn bot_auth_directory_config(directory_url: &str) -> String {
+    /// `cert_pem` is the self-signed leaf the mock just minted; the
+    /// proxy carries it as a `trust_roots` entry so directory fetches
+    /// succeed without weakening the system trust store.
+    pub fn bot_auth_directory_config(directory_url: &str, cert_pem: &str) -> String {
+        // YAML block scalar ('|') preserves newlines verbatim. Every
+        // body line must be indented strictly more than the opening
+        // dash. The `- |` line below sits at column 11 (10 leading
+        // spaces); we pad each PEM line with 12 spaces so the scanner
+        // accepts the multi-line bundle.
+        let indented_pem = cert_pem
+            .lines()
+            .map(|l| format!("            {l}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         format!(
             r#"
 proxy:
@@ -569,33 +637,33 @@ origins:
         signature_agents:
           allow:
             - "{directory_url}"
+        trust_roots:
+          - |
+{indented_pem}
 "#
         )
     }
 }
 
 #[test]
-#[ignore = "TODO(wave3): G1.7 directory cache landed and now correctly enforces HTTPS at config load. Test still uses an http:// URL on a mock axum directory; proxy refuses to start. Needs a TLS-equipped mock directory or a `directory.allow_insecure_for_tests` knob."]
 fn directory_first_fetch_caches_jwks_and_verifies_signed_request() {
     let runtime = directory_q1_4::rt();
-    let (addr, state) = runtime.block_on(directory_q1_4::spawn_mock_directory(
+    let mock = runtime.block_on(directory_q1_4::spawn_mock_directory(
         directory_q1_4::DirKnobs::default(),
     ));
     let url = format!(
-        "http://127.0.0.1:{}/.well-known/http-message-signatures-directory",
-        addr.port()
+        "https://127.0.0.1:{}/.well-known/http-message-signatures-directory",
+        mock.addr.port()
     );
 
-    // Per ADR HTTPS-only requirement, the proxy must reject this
-    // config at load time. Until G1.7 lands the assertion shape is
-    // wrong by design (the test is ignored). Once G1.7 lands, the
-    // fixture binary regenerates a self-signed CA + leaf so the URL
-    // can be `https://` and TLS is verifiable.
-    let config = directory_q1_4::bot_auth_directory_config(&url);
+    // The proxy trusts the mock's self-signed leaf via the
+    // `trust_roots` config entry, so the HTTPS-only enforcement at
+    // config load passes and the directory fetch path actually runs.
+    let config = directory_q1_4::bot_auth_directory_config(&url, &mock.cert_pem);
     let _harness = ProxyHarness::start_with_yaml(&config).expect("start proxy");
     // First request triggers a fetch; second request must be served
     // from cache and the directory's fetch counter must stay at 1.
-    let _ = state.fetches.load(std::sync::atomic::Ordering::SeqCst);
+    let _ = mock.state.fetches.load(std::sync::atomic::Ordering::SeqCst);
 }
 
 #[test]
@@ -618,20 +686,19 @@ fn directory_unreachable_serves_stale_within_grace_then_fails_closed() {
 }
 
 #[test]
-#[ignore = "TODO(wave3): G1.7 directory cache landed and now enforces HTTPS at config load. Test uses an http:// mock directory URL, proxy refuses to start. Needs a TLS-equipped mock directory."]
 fn directory_invalid_self_signature_is_rejected() {
     let runtime = directory_q1_4::rt();
-    let (addr, _state) = runtime.block_on(directory_q1_4::spawn_mock_directory(
+    let mock = runtime.block_on(directory_q1_4::spawn_mock_directory(
         directory_q1_4::DirKnobs {
             self_signature_invalid: true,
             ..Default::default()
         },
     ));
     let url = format!(
-        "http://127.0.0.1:{}/.well-known/http-message-signatures-directory",
-        addr.port()
+        "https://127.0.0.1:{}/.well-known/http-message-signatures-directory",
+        mock.addr.port()
     );
-    let config = directory_q1_4::bot_auth_directory_config(&url);
+    let config = directory_q1_4::bot_auth_directory_config(&url, &mock.cert_pem);
     let harness = ProxyHarness::start_with_yaml(&config).expect("start proxy");
     let resp = harness
         .get_with_headers(
@@ -682,23 +749,22 @@ origins:
 }
 
 #[test]
-#[ignore = "TODO(wave3): G1.7 directory cache landed with negative caching, but test uses http:// mock directory URL and proxy refuses to start. Needs a TLS-equipped mock directory."]
 fn directory_404_negative_cached_for_5_minutes() {
     // ADR §Negative caching: a 404 caches for `negative_cache_ttl`
     // (5 minutes default). After one 404, subsequent requests must
     // not refetch within the window.
     let runtime = directory_q1_4::rt();
-    let (addr, state) = runtime.block_on(directory_q1_4::spawn_mock_directory(
+    let mock = runtime.block_on(directory_q1_4::spawn_mock_directory(
         directory_q1_4::DirKnobs {
             status: Some(404),
             ..Default::default()
         },
     ));
     let url = format!(
-        "http://127.0.0.1:{}/.well-known/http-message-signatures-directory",
-        addr.port()
+        "https://127.0.0.1:{}/.well-known/http-message-signatures-directory",
+        mock.addr.port()
     );
-    let config = directory_q1_4::bot_auth_directory_config(&url);
+    let config = directory_q1_4::bot_auth_directory_config(&url, &mock.cert_pem);
     let harness = ProxyHarness::start_with_yaml(&config).expect("start proxy");
     for _ in 0..5 {
         let _ = harness.get_with_headers(
@@ -710,7 +776,7 @@ fn directory_404_negative_cached_for_5_minutes() {
             ],
         );
     }
-    let n = state.fetches.load(std::sync::atomic::Ordering::SeqCst);
+    let n = mock.state.fetches.load(std::sync::atomic::Ordering::SeqCst);
     assert!(
         n <= 1,
         "404 directory must be negative-cached; got {n} fetches across 5 requests"
