@@ -2,15 +2,9 @@ name: reproducible build probe
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-    paths:
-      - '.github/workflows/reproducible-build.yml'
-      - 'SUPPLY-CHAIN.md'
-      - 'Cargo.lock'
-      - 'Cargo.toml'
-      - 'crates/**'
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
   workflow_dispatch:
 
 concurrency:
