@@ -14,9 +14,16 @@ pub mod plan;
 pub mod raw;
 pub mod snapshot;
 pub mod types;
+pub mod validate;
 
 pub use compiler::*;
-pub use plan::{plan, render_text, BlastRadius, PlanEntry, PlanKind, PlanReport, PlanSummary};
+pub use plan::{
+    plan, plan_with_options, render_text, BlastRadius, PlanEntry, PlanKind, PlanReport, PlanSummary,
+};
 pub use raw::*;
 pub use snapshot::*;
 pub use types::*;
+pub use validate::{
+    validate, PlanFinding, Severity, ValidationOptions, KNOWN_ACTION_TYPES, KNOWN_AUTH_TYPES,
+    KNOWN_POLICY_TYPES, KNOWN_TRANSFORM_TYPES,
+};
