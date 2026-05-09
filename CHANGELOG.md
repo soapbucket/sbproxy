@@ -200,6 +200,34 @@ of the new YAML fields below until the version that ships them.
 
 ### Fixed
 
+- **Licensing-projection wire formats now match the canonical specs
+  (WOR-179) [BREAKING].** Two projection emitters were producing
+  document shapes that didn't match their cited specifications.
+  `/licenses.xml` previously declared the namespace
+  `https://rsl.ai/spec/1.0` and emitted a flat
+  `<rsl><license urn=...>...</license></rsl>` document. The canonical
+  RSL Collective spec at <https://rslstandard.org/rsl> uses the
+  namespace `https://rslstandard.org/rsl` and a nested
+  `<rsl><content url="..."><license>...</license></content></rsl>`
+  shape; the `<content>` `url` attribute is the canonical wildcard
+  `https://<hostname>/*` for the origin-wide license. `/.well-known/tdmrep.json`
+  previously wrapped its policies in a `{"version", "generated", "policies": [...]}`
+  envelope; the W3C TDMRep CG-FINAL spec mandates a bare JSON array
+  at the document root with `location`, `tdm-reservation`
+  (integer 0 or 1), and `tdm-policy` (URL of the policy document)
+  fields per entry. Both emitters now produce the canonical shapes.
+  Operators consuming `/licenses.xml` or `/.well-known/tdmrep.json`
+  programmatically must update their parsers to the new shapes; the
+  in-process JSON envelope and the response middleware that stamps
+  `TDM-Reservation: 1` and the URN-bearing `license` field are
+  unaffected. The schema-validation e2e tests remain `#[ignore]`'d
+  per WOR-178 (no canonical XSD or JSON Schema has been vendored yet);
+  the structure-shape tests are now updated and active.
+  ([crates/sbproxy-modules/src/projections/licenses.rs],
+  [crates/sbproxy-modules/src/projections/tdmrep.rs],
+  [e2e/tests/rsl_licenses_projection_e2e.rs],
+  [e2e/tests/tdmrep_projection_e2e.rs])
+
 - **Build under prometheus 0.14 type inference.** Sites in
   `sbproxy-observe::metrics` and `sbproxy-core::server` that passed
   heterogeneous `&[&String, &str]` arrays to

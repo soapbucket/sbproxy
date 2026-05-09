@@ -1,31 +1,28 @@
 //! Wave 4 / Q4.7: `/.well-known/tdmrep.json` (W3C TDMRep) projection.
 //!
 //! Validates the W3C TDMRep document projected by the Wave 4 G4.9
-//! build agent. Per :
+//! build agent against the canonical
+//! CG-FINAL-tdmrep-20240510 spec. The document is a bare JSON array
+//! at the root, where each entry has three fields:
 //!
 //! ```json
-//! {
-//!   "version": "1.0",
-//!   "generated": "<RFC3339 timestamp>",
-//!   "policies": [
-//!     {
-//!       "location": "/articles/*",
-//!       "mine-type": ["text/html", "text/markdown"],
-//!       "right": "research",
-//!       "license": "https://sbproxy.dev/licenses/<origin_hostname>"
-//!     }
-//!   ]
-//! }
+//! [
+//!   {
+//!     "location": "/articles/*",
+//!     "tdm-reservation": 1,
+//!     "tdm-policy": "https://blog.localhost/licenses.xml"
+//!   }
+//! ]
 //! ```
 //!
-//! Mapping table from `Content-Signal` to TDMRep `right`:
+//! Mapping table from `Content-Signal` to TDMRep entry:
 //!
-//! | content_signal | TDMRep right | entry behaviour |
-//! |----------------|--------------|------------------|
-//! | ai-train       | train        | entry present    |
-//! | ai-input       | research     | entry present    |
-//! | search         | research     | entry present    |
-//! | absent         | (none)       | entry omitted    |
+//! | content_signal | tdm-reservation | entry behaviour |
+//! |----------------|-----------------|------------------|
+//! | ai-train       | 1               | entry present    |
+//! | ai-input       | 1               | entry present    |
+//! | search         | 1               | entry present    |
+//! | absent         | (none)          | entry omitted    |
 //!
 //! For origins with no `content_signal`, the proxy stamps a
 //! `TDM-Reservation: 1` response header on every response (W3C TDMRep
@@ -94,7 +91,7 @@ fn tdmrep_json_validates_against_w3c_schema() {
 // --- Test 3: one entry per priced route ---
 
 #[test]
-fn tdmrep_json_emits_policies_per_priced_route() {
+fn tdmrep_json_emits_one_entry_per_priced_route() {
     let harness = start_projections().expect("start proxy");
     let body = harness
         .get("/.well-known/tdmrep.json", "blog.localhost")
@@ -102,55 +99,70 @@ fn tdmrep_json_emits_policies_per_priced_route() {
         .json()
         .expect("JSON body");
 
-    let policies = body
-        .get("policies")
-        .and_then(|v| v.as_array())
-        .expect("policies[] array");
+    let entries = body
+        .as_array()
+        .expect("TDMRep document must be a bare JSON array");
 
     assert!(
-        !policies.is_empty(),
-        "fixture has at least one priced route; policies must be non-empty"
+        !entries.is_empty(),
+        "fixture has at least one priced route; entries must be non-empty"
     );
 
     // /articles/* must be present.
-    let has_articles = policies.iter().any(|p| {
+    let has_articles = entries.iter().any(|p| {
         p.get("location")
             .and_then(|v| v.as_str())
             .is_some_and(|s| s.starts_with("/articles"))
     });
     assert!(
         has_articles,
-        "/articles/* priced route must appear in policies[]; got {body}"
+        "/articles/* priced route must appear in the TDMRep array; got {body}"
     );
 }
 
-// --- Test 4: Content-Signal mapping ---
+// --- Test 4: canonical bare-array shape with hyphenated keys ---
 
 #[test]
-fn tdmrep_json_maps_content_signal_to_right() {
+fn tdmrep_json_uses_canonical_bare_array_shape() {
     let harness = start_projections().expect("start proxy");
-    let body = harness
+    let resp = harness
         .get("/.well-known/tdmrep.json", "blog.localhost")
-        .expect("GET")
-        .json()
-        .expect("JSON body");
+        .expect("GET");
+    let raw = resp.text().expect("utf-8 body");
+    let body: Value = serde_json::from_str(&raw).expect("valid JSON");
 
-    let policies = body
-        .get("policies")
-        .and_then(|v| v.as_array())
-        .expect("policies[] array");
+    // The W3C CG-FINAL spec mandates a bare JSON array at the root.
+    assert!(
+        body.is_array(),
+        "TDMRep root must be a bare JSON array (no envelope); got {raw}"
+    );
+    // No legacy envelope keys.
+    assert!(
+        !raw.contains("\"policies\""),
+        "legacy {{policies: [...]}} envelope must not appear; got {raw}"
+    );
+    assert!(!raw.contains("\"version\""));
+    assert!(!raw.contains("\"generated\""));
 
-    // Fixture origin has content_signal: ai-train, so every entry's
-    // right must be "train".
-    for entry in policies {
-        let right = entry
-            .get("right")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        assert_eq!(
-            right, "train",
-            "ai-train signal must project to right=train; entry was {entry}"
+    // Every entry must use canonical hyphenated keys: `location`,
+    // `tdm-reservation`, `tdm-policy`.
+    for entry in body.as_array().unwrap() {
+        assert!(entry.get("location").is_some(), "missing location: {entry}");
+        let reservation = entry
+            .get("tdm-reservation")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(|| panic!("missing tdm-reservation: {entry}"));
+        assert!(
+            reservation == 0 || reservation == 1,
+            "tdm-reservation must be 0 or 1; got {reservation}"
         );
+        assert!(
+            entry.get("tdm-policy").is_some(),
+            "missing tdm-policy: {entry}"
+        );
+        // Snake-case variants must not leak.
+        assert!(entry.get("tdm_reservation").is_none());
+        assert!(entry.get("tdm_policy").is_none());
     }
 }
 
