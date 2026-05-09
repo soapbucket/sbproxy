@@ -1,6 +1,6 @@
 # Metrics stability
 
-*Last modified: 2026-04-24*
+*Last modified: 2026-05-09*
 
 Naming conventions, stability guarantees, and the full catalogue of metrics emitted by SBproxy.
 
@@ -280,6 +280,40 @@ All metrics below are currently `stable`.
 | Label | Description | Example values |
 |---|---|---|
 | `category` | Guardrail category that triggered | `pii`, `toxicity`, `off_topic`, `prompt_injection` |
+
+---
+
+#### `sbproxy_ai_ttft_seconds`
+
+| Property | Value |
+|---|---|
+| Type | Histogram |
+| Stability | **stable** |
+| Description | Streaming time to first token, in seconds. Recorded once per streaming response when the first token arrives. Buckets cover the typical 50ms to 30s range. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `provider` | AI provider name | `openai`, `anthropic` |
+| `model` | Model identifier | `gpt-4o`, `claude-3-5-sonnet` |
+
+---
+
+#### `sbproxy_ai_provider_errors_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **stable** |
+| Description | Total per-provider error events. Incremented at each site where an upstream interaction fails or returns a non-success status. The label set is intentionally narrow so the dashboard can group by provider; raw upstream error strings are mapped to a small stable set of `error_kind` values before recording. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `provider` | AI provider name | `openai`, `anthropic` |
+| `error_kind` | Stable error class | `transport`, `timeout`, `http_4xx`, `http_5xx`, `parse` |
 
 ---
 

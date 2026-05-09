@@ -403,7 +403,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "rate(sbproxy_cache_hits_total[5m]) / (rate(sbproxy_cache_hits_total[5m]) + rate(sbproxy_cache_misses_total[5m]))",
+          "expr": "rate(sbproxy_cache_hits_total{result=\"hit\"}[5m]) / (rate(sbproxy_cache_hits_total{result=\"hit\"}[5m]) + rate(sbproxy_cache_hits_total{result=\"miss\"}[5m]))",
           "legendFormat": "Hit Ratio",
           "datasource": {
             "type": "prometheus",
@@ -457,7 +457,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "rate(sbproxy_bandwidth_bytes_total{direction=\"in\"}[5m])",
+          "expr": "rate(sbproxy_bytes_total{direction=\"inbound\"}[5m])",
           "legendFormat": "Inbound",
           "datasource": {
             "type": "prometheus",
@@ -466,7 +466,7 @@
         },
         {
           "refId": "B",
-          "expr": "rate(sbproxy_bandwidth_bytes_total{direction=\"out\"}[5m])",
+          "expr": "rate(sbproxy_bytes_total{direction=\"outbound\"}[5m])",
           "legendFormat": "Outbound",
           "datasource": {
             "type": "prometheus",

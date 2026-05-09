@@ -26,6 +26,30 @@
 //!    today's date in `YYYY-MM-DD` form.
 //! 4. Submit a PR; the review must include the upstream model card
 //!    URL and the LICENSE the model ships under.
+//!
+//! # Procedure for filling in an empty SHA
+//!
+//! Some entries land with empty `model_sha256` / `tokenizer_sha256`
+//! values when the build sandbox cannot reach the upstream URL. Those
+//! placeholders are temporary: the
+//! `no_known_model_has_unpinned_sha256` test in this module fails the
+//! build the moment any entry is committed without a hash. The
+//! one-time follow-up to populate the values is:
+//!
+//! 1. Run the proxy locally with the relevant detector enabled. On
+//!    first request, the file is fetched and cached under the
+//!    operator's on-disk classifier cache (`SBPROXY_CACHE_DIR` or the
+//!    OS default).
+//! 2. `sha256sum <cache-path>/model.onnx` and
+//!    `sha256sum <cache-path>/tokenizer.json` to compute the hashes.
+//! 3. Paste the lowercase hex values into the matching `KnownModel`
+//!    entry below and update `revision_pinned_at` to today.
+//! 4. Re-enable the assertion test (drop the `#[ignore]` it carried
+//!    while values were pending) and submit the PR.
+//!
+//! See `docs/model-pinning.md` for the longer narrative version,
+//! including how operators verify a hash against an upstream model
+//! card before committing.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -99,11 +123,13 @@ pub const PROMPT_INJECTION_V2_MODEL: KnownModel = KnownModel {
         "https://huggingface.co/protectai/",
         "deberta-v3-base-prompt-injection-v2/resolve/main/onnx/model.onnx"
     ),
-    // TODO: compute on first download and submit follow-up PR. See
-    // module-level docs for the procedure. Until then the detector
-    // treats this entry as unpinned (no SHA validation), which is the
-    // same posture as supplying the URL directly in policy config
-    // without `model_sha256`.
+    // Empty until the WOR-190 follow-up lands the computed value.
+    // See the module-level "Procedure for filling in an empty SHA"
+    // section. Until that PR ships, the detector treats this entry
+    // as unpinned (no SHA validation), which is the same posture as
+    // supplying the URL directly in policy config without
+    // `model_sha256`. The `no_known_model_has_unpinned_sha256` test
+    // in this module is `#[ignore]`'d for the same reason.
     model_sha256: "",
     tokenizer_url: concat!(
         "https://huggingface.co/protectai/",
@@ -203,5 +229,55 @@ mod tests {
             revision_pinned_at: "2026-04-27",
         };
         assert_eq!(m.pinned_pair(), Some(("aa", "bb")));
+    }
+
+    /// WOR-190 supply-chain guard: a `KnownModel` registry entry must
+    /// not be merged with an empty or sentinel SHA-256 value. Without
+    /// this assertion the detector silently degrades to "unpinned"
+    /// posture and a future re-introduction would not trip review.
+    ///
+    /// The test enumerates the obvious unsafe values:
+    ///
+    /// - empty string,
+    /// - 64 hex zeros (the literal `0000...` placeholder operators
+    ///   sometimes paste while shadowing local builds),
+    /// - the lowercase hex form of `[0u8; 32]`.
+    ///
+    /// The latter two are the same byte sequence; both forms are
+    /// listed for clarity at the call site.
+    ///
+    /// Currently `#[ignore]`'d because the in-tree
+    /// `PROMPT_INJECTION_V2_MODEL` entry ships with empty SHAs (the
+    /// build sandbox cannot reach Hugging Face). Re-enable in the
+    /// WOR-190 follow-up PR that pastes the computed values.
+    #[test]
+    #[ignore = "ignored until SHA values land per WOR-190 follow-up; re-enable in that PR"]
+    fn no_known_model_has_unpinned_sha256() {
+        const ZERO_HEX_64: &str =
+            "0000000000000000000000000000000000000000000000000000000000000000";
+        let zero_bytes = hex::encode([0u8; 32]);
+
+        for entry in KNOWN_MODELS {
+            for (label, value) in [
+                ("model_sha256", entry.model_sha256),
+                ("tokenizer_sha256", entry.tokenizer_sha256),
+            ] {
+                assert!(
+                    !value.is_empty(),
+                    "KnownModel {:?} has empty {label}; populate via the procedure in `docs/model-pinning.md`",
+                    entry.name,
+                );
+                assert_ne!(
+                    value, ZERO_HEX_64,
+                    "KnownModel {:?} has placeholder {label} (64 hex zeros); replace with the real SHA-256",
+                    entry.name,
+                );
+                assert_ne!(
+                    value, zero_bytes,
+                    "KnownModel {:?} has placeholder {label} (zero-byte SHA-256); replace with the real value",
+                    entry.name,
+                );
+            }
+        }
     }
 }

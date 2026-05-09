@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use crate::ai_metrics;
+
 // --- StreamTracker ---
 
 /// Track streaming performance for an active stream.
@@ -39,10 +41,19 @@ impl StreamTracker {
     }
 
     /// Called when the first token arrives.
+    ///
+    /// On the first call this also emits a `sbproxy_ai_ttft_seconds`
+    /// histogram observation with the per-provider, per-model labels
+    /// the AI gateway dashboard uses. Subsequent calls only update
+    /// `token_count` and `last_token` (the `first_token` instant is
+    /// pinned to the first call).
     pub fn record_first_token(&mut self) {
         let now = Instant::now();
-        if self.first_token.is_none() {
+        let was_first = self.first_token.is_none();
+        if was_first {
             self.first_token = Some(now);
+            let ttft_secs = now.duration_since(self.start).as_secs_f64();
+            ai_metrics::record_ttft(&self.provider, &self.model, ttft_secs);
         }
         self.token_count += 1;
         self.last_token = Some(now);
