@@ -3140,6 +3140,8 @@ This catches:
 
 Validate every config change before deploying to production. Metrics are exposed via the embedded admin server: set `proxy.admin.enabled: true`, `proxy.admin.port: 9090`, and tune `proxy.metrics.max_cardinality_per_label` for high-traffic deployments.
 
+For production deployments, the planned `sbproxy plan` and `sbproxy apply` subcommands give a Terraform-style diff-and-confirm path on top of `validate`. The audit and design for those subcommands lives in [adr-config-plan-apply.md](adr-config-plan-apply.md); they are not implemented in this release.
+
 ---
 
 ## CORS
