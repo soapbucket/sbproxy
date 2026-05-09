@@ -1,21 +1,19 @@
-//! WAF subscribed rule feed (OSS subscriber side).
+//! Web Application Firewall policy and supporting machinery.
 //!
-//! The legacy WAF policy struct, paranoia gate, OWASP-lite built-in
-//! signatures, and custom-rule evaluators continue to live alongside
-//! the rest of the policies in [`crate::policy`] (`policy/mod.rs`).
-//! This `waf` subdirectory is the new home for *additions* that are
-//! large enough to warrant their own file.
-//!
-//! Today that is [`feed`], which subscribes the OSS proxy to a signed
-//! remote rule feed. The publisher side ships separately; everything
-//! in this module is the subscriber.
+//! The [`policy`] submodule holds the [`WafPolicy`] struct itself,
+//! the OWASP-lite paranoia gate, the built-in signature corpus, and
+//! the custom-rule evaluator. The [`feed`] submodule subscribes the
+//! OSS proxy to a signed remote rule feed for hot-loaded signatures;
+//! the publisher side ships separately.
 
 pub mod feed;
+pub mod policy;
 
 pub use feed::{
     FeedRule, FeedRuleAction, FeedRuleSeverity, RuleSet, WafFeedConfig, WafFeedSubscriber,
     WafFeedTransport, WAF_FEED_TASKS,
 };
+pub use policy::{WafPolicy, WafResult};
 
 /// Drain in-flight WAF rule-feed background tasks. Intended for the
 /// graceful-shutdown driver: call this from the same async context the
