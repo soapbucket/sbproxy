@@ -196,6 +196,11 @@ jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_r
 # JSON Schema validation.
 jsonschema = { version = "0.17", default-features = false }
 
+# File locking (cross-platform flock(2)/LockFileEx wrapper). Used by
+# `sbproxy apply` to take an exclusive lock at the config-path's
+# applylock companion so two operators do not race the same reload.
+fs2 = "0.4"
+
 # UUID
 uuid = { version = "1", features = ["v4"] }
 

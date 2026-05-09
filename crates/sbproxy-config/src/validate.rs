@@ -27,7 +27,7 @@
 
 use std::collections::BTreeSet;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::types::{ConfigFile, RawOriginConfig};
 
@@ -35,7 +35,7 @@ use crate::types::{ConfigFile, RawOriginConfig};
 
 /// Severity of a single [`PlanFinding`]. `Error` blocks apply; `Warn`
 /// surfaces in the report but does not change the exit code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     /// Validator-level error. CLI exits 3 when any `Error` finding is
@@ -48,7 +48,7 @@ pub enum Severity {
 
 /// One semantic-validation finding emitted by [`validate`]. See the
 /// module-level docs for the full rule list.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanFinding {
     /// Severity. See [`Severity`].
     pub severity: Severity,

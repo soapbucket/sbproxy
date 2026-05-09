@@ -70,3 +70,9 @@ bytes.workspace = true
 # and emits the plan envelope as pretty-printed JSON.
 serde_yaml.workspace = true
 serde_json.workspace = true
+
+# WOR-180 step 5: `apply` takes an exclusive flock(2) on
+# <yaml_path>.applylock so two concurrent operators do not race the
+# same reload. fs2 is the cross-platform flock wrapper used by
+# rustup, cargo, and others.
+fs2.workspace = true

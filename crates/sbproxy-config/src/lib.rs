@@ -18,7 +18,8 @@ pub mod validate;
 
 pub use compiler::*;
 pub use plan::{
-    plan, plan_with_options, render_text, BlastRadius, PlanEntry, PlanKind, PlanReport, PlanSummary,
+    compute_baseline_revision, plan, plan_with_options, render_text, BlastRadius, BlastRadiusRule,
+    PlanEntry, PlanFile, PlanKind, PlanReport, PlanSummary, BLAST_RADIUS_MATRIX,
 };
 pub use raw::*;
 pub use snapshot::*;
