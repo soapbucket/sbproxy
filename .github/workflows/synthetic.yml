@@ -1,7 +1,8 @@
 # Synthetic monitor (B1.9).
 #
 # Runs the `bench-synthetic` Wave 1 probe against the bundled
-# observability + proxy stack on a nightly cron. The probe issues the
+# observability + proxy stack on demand: add the `run-synthetic`
+# label to a PR or fire via workflow_dispatch. The probe issues the
 # 402 challenge + redemption flow against the mock ledger configured
 # in the local stack and emits one JSON line per probe on stdout.
 #
@@ -14,14 +15,11 @@
 # `docs/runbooks/synthetic-monitor.md` (placeholder until R-runbooks
 # lane lands).
 
-name: synthetic-nightly
+name: synthetic
 
 on:
-  # 04:13 UTC daily. The odd minute spreads load away from the top of
-  # the hour where shared runner pools queue up. workflow_dispatch lets
-  # operators replay the probe without waiting for the next run.
-  schedule:
-    - cron: "13 4 * * *"
+  pull_request:
+    types: [labeled, synchronize]
   workflow_dispatch: {}
 
 # Only one nightly run at a time per branch. A second push to main
@@ -44,6 +42,9 @@ env:
 
 jobs:
   synthetic-probe:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'run-synthetic')
     name: synthetic probe (rail=none)
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -173,11 +174,15 @@ jobs:
   # pipeline out from under it. Asserts zero dropped connections,
   # zero misrouted requests, and zero unexpected 5xx.
   #
-  # Runs nightly (not per-PR) because the wall-clock budget plus
-  # 200-thread fan-out is too expensive for the per-PR e2e lane.
-  # The test is `#[ignore]` by default; this job runs it via
-  # `--ignored`, mirroring the pattern in licensing-conformance.yml.
+  # Runs on demand (label or workflow_dispatch) because the
+  # wall-clock budget plus 200-thread fan-out is too expensive for
+  # the per-PR e2e lane. The test is `#[ignore]` by default; this
+  # job runs it via `--ignored`, mirroring the pattern in
+  # licensing-conformance.yml.
   chaos-hot-reload:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'run-synthetic')
     name: chaos hot-reload (WOR-28)
     runs-on: ubuntu-latest
     timeout-minutes: 20
