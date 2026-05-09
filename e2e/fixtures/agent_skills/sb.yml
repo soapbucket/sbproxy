@@ -1,0 +1,39 @@
+# WOR-193 / WOR-194 / WOR-195 fixture for the Agent Skills v0.2.0
+# discovery projection. The fixture declares one origin with two
+# skill entries (one public, one authenticated). Bodies are inlined
+# via `body:` so the e2e harness does not need to read files relative
+# to a working directory the test runner cannot predict.
+
+proxy:
+  http_bind_port: 0  # overridden by the harness
+
+origins:
+  "skills.localhost":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/html
+      body: "<h1>skills</h1>"
+
+    agent_skills:
+      - name: "deploy-via-pr"
+        type: skill-md
+        description: "Open a PR to deploy a config change."
+        url: "/skills/deploy-via-pr.md"
+        visibility: public
+        body: |
+          # deploy-via-pr
+
+          1. Identify the YAML file the change applies to.
+          2. Apply the edit on a fresh branch.
+          3. Open a PR.
+
+      - name: "internal-rotate-secret"
+        type: skill-md
+        description: "Rotate a service credential via vault."
+        url: "/skills/internal-rotate-secret.md"
+        visibility: authenticated
+        body: |
+          # internal-rotate-secret
+
+          Rotate a credential held in vault. Authenticated only.

@@ -231,6 +231,15 @@ pub struct ProxyMetrics {
     /// counter surfaces how often the previously-panicking path is
     /// taken so the drift can be diagnosed in production.
     pub mirror_state_drift: prometheus::IntCounter,
+
+    // --- Agent Skills (WOR-194) ---
+    /// Counter `sbproxy_agent_skill_digest_mismatch_total` of artifact
+    /// `GET`s where the served body re-hash did not match the manifest
+    /// digest. Labelled by `skill` so operators can dedupe alerts and
+    /// pinpoint which entry diverged. The data-plane handler returns
+    /// HTTP 503 to the client and emits a structured audit event on
+    /// every increment.
+    pub agent_skill_digest_mismatch: IntCounterVec,
 }
 
 impl ProxyMetrics {
@@ -418,6 +427,17 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        // --- Agent Skills counters (WOR-194) ---
+
+        let agent_skill_digest_mismatch = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_agent_skill_digest_mismatch_total",
+                "Agent Skills artifact digest mismatches detected at serve time",
+            ),
+            &["skill"],
+        )
+        .unwrap();
+
         // --- Register all metrics ---
 
         registry.register(Box::new(requests_total.clone())).unwrap();
@@ -468,6 +488,9 @@ impl ProxyMetrics {
         registry
             .register(Box::new(mirror_state_drift.clone()))
             .unwrap();
+        registry
+            .register(Box::new(agent_skill_digest_mismatch.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -491,6 +514,7 @@ impl ProxyMetrics {
             cache_reserve_evictions,
             synthetic_probe_failures,
             mirror_state_drift,
+            agent_skill_digest_mismatch,
         }
     }
 

@@ -315,3 +315,81 @@ fn handler_notification_returns_none() {
     let req = rpc("notifications/initialized", None, None);
     assert!(h.handle_request(&req).is_none());
 }
+
+// --- WOR-195: Agent Skills advertising in MCP initialize ---
+
+#[test]
+fn mcp_initialize_omits_field_when_unconfigured() {
+    let h = make_handler();
+    let req = rpc("initialize", None, Some(serde_json::json!(100)));
+    // Default context: no agent skills configured. The capability
+    // field must be absent (not null) so legacy clients ignore it.
+    let resp = h
+        .handle_request_with_context(&req, &InitializeContext::default())
+        .unwrap();
+    let result = resp.result.unwrap();
+    let caps = &result["capabilities"];
+    assert!(
+        caps.get("experimental").is_none(),
+        "experimental field must be omitted when origin has no agent_skills; got {caps:?}"
+    );
+}
+
+#[test]
+fn mcp_initialize_advertises_agent_skills_url_when_configured() {
+    let h = make_handler();
+    let req = rpc("initialize", None, Some(serde_json::json!(101)));
+    let ctx = InitializeContext {
+        has_agent_skills: true,
+        request_authority: Some("api.example.com".to_string()),
+        request_scheme: "https".to_string(),
+    };
+    let resp = h.handle_request_with_context(&req, &ctx).unwrap();
+    let result = resp.result.unwrap();
+    let url = result["capabilities"]["experimental"]["agentSkillsUrl"]
+        .as_str()
+        .expect("agentSkillsUrl must be advertised");
+    assert_eq!(
+        url, "https://api.example.com/.well-known/agent-skills/index.json",
+        "advertised URL must point at the v0.2.0 manifest endpoint"
+    );
+}
+
+#[test]
+fn mcp_initialize_advertises_authenticated_index_for_authenticated_caller() {
+    // The advertised URL is the same path for anonymous and
+    // authenticated callers; the manifest filters visibility at
+    // serve time. This test pins the contract so a future change to
+    // emit a different path for authenticated callers (which would
+    // break Cache-Control by varying on auth) is caught early.
+    let h = make_handler();
+    let req = rpc("initialize", None, Some(serde_json::json!(102)));
+    let ctx = InitializeContext {
+        has_agent_skills: true,
+        request_authority: Some("api.example.com".to_string()),
+        request_scheme: "https".to_string(),
+    };
+    let resp = h.handle_request_with_context(&req, &ctx).unwrap();
+    let url = resp.result.unwrap()["capabilities"]["experimental"]["agentSkillsUrl"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(url.ends_with("/.well-known/agent-skills/index.json"));
+}
+
+#[test]
+fn mcp_initialize_emits_path_only_url_without_authority() {
+    let h = make_handler();
+    let req = rpc("initialize", None, Some(serde_json::json!(103)));
+    let ctx = InitializeContext {
+        has_agent_skills: true,
+        request_authority: None,
+        request_scheme: "https".to_string(),
+    };
+    let resp = h.handle_request_with_context(&req, &ctx).unwrap();
+    let url = resp.result.unwrap()["capabilities"]["experimental"]["agentSkillsUrl"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(url, "/.well-known/agent-skills/index.json");
+}

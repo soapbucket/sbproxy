@@ -2068,6 +2068,7 @@ origins:
                 auto_content_negotiate: None,
                 content_signal: None,
                 token_bytes_ratio: None,
+                agent_skills: Vec::new(),
             }
         };
 

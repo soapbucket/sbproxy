@@ -13,9 +13,9 @@ use sbproxy_platform::storage::KVStore;
 use smallvec::SmallVec;
 
 use crate::types::{
-    AccessLogConfig, AgentClassesConfig, CompressionConfig, CorsConfig, HstsConfig, MirrorConfig,
-    OriginRateLimitsConfig, ProxyServerConfig, RequestModifierConfig, ResponseCacheConfig,
-    ResponseModifierConfig, SessionConfig,
+    AccessLogConfig, AgentClassesConfig, AgentSkillEntry, CompressionConfig, CorsConfig,
+    HstsConfig, MirrorConfig, OriginRateLimitsConfig, ProxyServerConfig, RequestModifierConfig,
+    ResponseCacheConfig, ResponseModifierConfig, SessionConfig,
 };
 
 /// Fully compiled, immutable origin ready for request processing.
@@ -135,6 +135,11 @@ pub struct CompiledOrigin {
     /// JSON envelope's `token_estimate`, and any downstream synthetic
     /// projection all share one source of truth.
     pub token_bytes_ratio: Option<f32>,
+    /// Per-origin Agent Skills v0.2.0 advertisement (WOR-193).
+    /// Empty when the origin does not opt in. Carried verbatim from
+    /// the YAML so the projection module can resolve artifact bytes,
+    /// stamp digests, and cache the manifest body.
+    pub agent_skills: Vec<AgentSkillEntry>,
 }
 
 /// The complete compiled config: all origins plus host-based routing.

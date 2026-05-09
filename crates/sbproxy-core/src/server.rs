@@ -5814,7 +5814,14 @@ async fn handle_action(
         }
 
         Action::Mcp(mcp) => {
-            handle_mcp_action(session, mcp, ctx).await?;
+            // WOR-195: thread the origin's `agent_skills:` posture into
+            // the MCP handler so `initialize` can advertise the
+            // discovery URL via `experimental.agentSkillsUrl`.
+            let has_skills = origin_idx
+                .and_then(|idx| pipeline.config.origins.get(idx))
+                .map(|o| !o.agent_skills.is_empty())
+                .unwrap_or(false);
+            handle_mcp_action(session, mcp, ctx, has_skills).await?;
             Ok(true)
         }
 
@@ -5844,6 +5851,7 @@ async fn handle_mcp_action(
     session: &mut Session,
     mcp: &sbproxy_modules::action::McpAction,
     ctx: &RequestContext,
+    has_agent_skills: bool,
 ) -> Result<()> {
     use sbproxy_extension::mcp::types::{
         InitializeResult, JsonRpcRequest, JsonRpcResponse, ServerCapabilities, ServerInfo,
@@ -5912,12 +5920,40 @@ async fn handle_mcp_action(
 
     let response = match request.method.as_str() {
         "initialize" => {
+            // WOR-195: when the origin opts into Agent Skills, surface
+            // `experimental.agentSkillsUrl` so MCP clients that have
+            // learned to fetch the manifest can discover skills
+            // without out-of-band configuration. Anonymous callers
+            // and authenticated callers see the same path; the
+            // manifest itself filters by visibility at serve time.
+            let experimental = if has_agent_skills {
+                let listener_is_tls = session
+                    .digest()
+                    .and_then(|d| d.ssl_digest.as_ref())
+                    .is_some();
+                let scheme = if listener_is_tls { "https" } else { "http" };
+                let url = match session
+                    .req_header()
+                    .headers
+                    .get("host")
+                    .and_then(|v| v.to_str().ok())
+                {
+                    Some(authority) => {
+                        format!("{scheme}://{authority}/.well-known/agent-skills/index.json")
+                    }
+                    None => "/.well-known/agent-skills/index.json".to_string(),
+                };
+                Some(serde_json::json!({ "agentSkillsUrl": url }))
+            } else {
+                None
+            };
             let result = InitializeResult {
                 protocol_version: "2025-06-18".to_string(),
                 capabilities: ServerCapabilities {
                     tools: Some(serde_json::json!({})),
                     resources: None,
                     prompts: None,
+                    experimental,
                 },
                 server_info: ServerInfo {
                     name: mcp.server_name.clone(),
@@ -7062,6 +7098,146 @@ impl ProxyHttp for SbProxy {
 
         // Increment per-origin active connections after successful resolution.
         sbproxy_observe::metrics::inc_active(ctx.hostname.as_str());
+
+        // --- WOR-193 / WOR-194 wire: Agent Skills v0.2.0 projection ---
+        //
+        // Origins with `agent_skills:` configured serve a discovery
+        // manifest at `/.well-known/agent-skills/index.json` plus the
+        // artifact bodies the manifest points at. The manifest schema
+        // is `https://schemas.agentskills.io/discovery/0.2.0/schema.json`;
+        // every artifact `GET` re-hashes the served body and returns
+        // 503 with an audit event on a digest mismatch (WOR-194). The
+        // proxy never executes any pre-/post-hooks or scripts shipped
+        // inside an artifact - artifacts are opaque bytes per spec.
+        {
+            let req_path = session.req_header().uri.path().to_string();
+            let docs = sbproxy_modules::projections::current_projections();
+            let host_key = pipeline.config.origins[origin_idx].hostname.as_str();
+            if let Some(idx) = docs.agent_skills.get(host_key) {
+                if req_path == "/.well-known/agent-skills/index.json" {
+                    // Resolve the request scheme so relative URLs in
+                    // the manifest emit the right `https://` vs
+                    // `http://` prefix. Listener TLS is the
+                    // authoritative signal; spoofable proxy headers
+                    // are honoured only when the immediate peer is in
+                    // `proxy.trusted_proxies`.
+                    let listener_is_tls = session
+                        .digest()
+                        .and_then(|d| d.ssl_digest.as_ref())
+                        .is_some();
+                    let scheme = if listener_is_tls { "https" } else { "http" };
+                    // Visibility: anonymous callers see the public-only
+                    // manifest. Authenticated callers see the full
+                    // manifest. The proxy's auth pipeline runs after
+                    // this handler, so we infer "authenticated" from
+                    // the presence of an Authorization header. This
+                    // is a conservative heuristic; the manifest still
+                    // ships SHA-256 digests so a downstream agent
+                    // verifies integrity even without the gate.
+                    let authenticated = session.req_header().headers.get("authorization").is_some();
+                    let host_authority = session
+                        .req_header()
+                        .headers
+                        .get("host")
+                        .and_then(|v| v.to_str().ok());
+                    let body = sbproxy_modules::projections::agent_skills::render_manifest(
+                        idx,
+                        authenticated,
+                        host_authority,
+                        scheme,
+                    );
+                    send_response(session, 200, "application/json", body.as_bytes()).await?;
+                    return Ok(true);
+                }
+                // Path-absolute artifact body. Re-hash on every serve
+                // (WOR-194); on mismatch return 503 + audit + counter.
+                if let Some(body) = idx.artifacts.get(req_path.as_str()) {
+                    if let Some(expected_hex) = idx.digests.get(req_path.as_str()) {
+                        let observed_hex =
+                            sbproxy_modules::projections::agent_skills::sha256_hex(body);
+                        if &observed_hex != expected_hex {
+                            // Pinpoint the entry so the audit row and
+                            // metric label carry the same skill name.
+                            let skill_name = idx
+                                .entries
+                                .iter()
+                                .find(|e| {
+                                    let cmp = if e.url.starts_with('/') {
+                                        e.url.clone()
+                                    } else if !e.url.starts_with("http") {
+                                        format!("/{}", e.url)
+                                    } else {
+                                        String::new()
+                                    };
+                                    cmp == req_path
+                                })
+                                .map(|e| e.name.clone())
+                                .unwrap_or_else(|| req_path.clone());
+                            sbproxy_observe::metrics::metrics()
+                                .agent_skill_digest_mismatch
+                                .with_label_values(&[skill_name.as_str()])
+                                .inc();
+                            // Caller identity surface: presence of an
+                            // Authorization header. The audit row keeps
+                            // the actual credential out of the log; the
+                            // operator's audit pipeline correlates with
+                            // request id and access-log to recover the
+                            // full identity if needed.
+                            let caller =
+                                if session.req_header().headers.get("authorization").is_some() {
+                                    "authenticated"
+                                } else {
+                                    "anonymous"
+                                };
+                            tracing::error!(
+                                target: "sbproxy::audit",
+                                event = "agent_skill.digest_mismatch",
+                                skill_name = %skill_name,
+                                hostname = %host_key,
+                                expected_digest = %expected_hex,
+                                observed_digest = %observed_hex,
+                                caller = %caller,
+                                request_id = %ctx.request_id,
+                                "agent skill artifact body diverged from manifest digest"
+                            );
+                            send_error(session, 503, "service unavailable").await?;
+                            return Ok(true);
+                        }
+                    }
+                    // Pick a sensible content type per artifact kind.
+                    // `skill-md` is `text/markdown`; `archive` defaults
+                    // to `application/octet-stream` because callers
+                    // sniff the magic bytes themselves.
+                    let ct = if let Some(entry) = idx.entries.iter().find(|e| {
+                        let cmp = if e.url.starts_with('/') {
+                            e.url.clone()
+                        } else if !e.url.starts_with("http") {
+                            format!("/{}", e.url)
+                        } else {
+                            String::new()
+                        };
+                        cmp == req_path
+                    }) {
+                        match entry.kind.as_str() {
+                            "skill-md" => "text/markdown; charset=utf-8",
+                            "archive" => "application/octet-stream",
+                            _ => "application/octet-stream",
+                        }
+                    } else {
+                        "application/octet-stream"
+                    };
+                    send_response(session, 200, ct, body.as_ref()).await?;
+                    return Ok(true);
+                }
+            } else if req_path == "/.well-known/agent-skills/index.json" {
+                // Origin without `agent_skills:` 404s the well-known
+                // URL rather than falling through to the upstream so
+                // the agent gets a clean signal that no manifest is
+                // advertised on this hostname.
+                send_error(session, 404, "agent-skills not configured").await?;
+                return Ok(true);
+            }
+        }
 
         // --- Wave 4 / G4.5..G4.8 wire: policy-graph projections ---
         //
