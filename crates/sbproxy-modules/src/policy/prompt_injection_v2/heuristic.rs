@@ -12,61 +12,21 @@
 //!   `Suspicious`, and the matched pattern in `reason`.
 //! - No match yields `score = 0.0`, label `Clean`, no reason.
 //!
-//! The high-confidence list is the same vocabulary used by the v1
-//! `injection` guardrail in `sbproxy-ai`. Once both detectors are
-//! stable we will collapse them into a single shared helper. For now
-//! the rules are duplicated so the OSS scaffold lands without
-//! reaching across crates for a private constant.
-//
-// TODO: collapse with v1 (sbproxy-ai::guardrails::injection) once
-// both are stable. Today the v1 module keeps the pattern list private
-// and emits boolean blocks; v2 needs scored output and a clean
-// `Detector` interface, so we copy the rules here for now.
+//! WOR-191: pattern lists are imported from
+//! [`sbproxy_ai::guardrails::injection`] so v1 (boolean block) and
+//! v2 (scored `Detector`) can never drift. The canonical lists live
+//! in `sbproxy-ai` because the workspace dep graph runs
+//! `sbproxy-modules` -> `sbproxy-ai`; placing the constants here
+//! would force a cycle.
 
 use std::sync::Arc;
+
+use sbproxy_ai::guardrails::injection as v1_patterns;
 
 use super::detector::{DetectionLabel, DetectionResult, Detector};
 
 /// Stable name reported by [`HeuristicDetector::name`].
 pub const HEURISTIC_DETECTOR_NAME: &str = "heuristic-v1";
-
-/// High-confidence injection patterns. Mirrors the v1 list verbatim.
-///
-/// A match returns `score = 1.0` and label `Injection`.
-const INJECTION_PATTERNS: &[&str] = &[
-    "ignore previous instructions",
-    "ignore all previous",
-    "disregard all previous",
-    "disregard your instructions",
-    "forget everything",
-    "forget your instructions",
-    "system prompt",
-    "you are now",
-    "new instructions",
-    "override your",
-    "act as if you",
-    "pretend you are",
-    "from now on you",
-    "your new role",
-    "reveal your prompt",
-    "show me your prompt",
-    "what are your instructions",
-    "repeat your system",
-];
-
-/// Lower-confidence "suspicious" cues. These often appear in benign
-/// prompts so we do not return `Injection` on a single match. A hit
-/// returns `score = 0.6` and label `Suspicious`.
-const SUSPICIOUS_PATTERNS: &[&str] = &[
-    "developer mode",
-    "do anything now",
-    "dan mode",
-    "bypass your",
-    "without restrictions",
-    "without any restrictions",
-    "unfiltered response",
-    "jailbreak",
-];
 
 /// Heuristic detector. Stateless; constructed once and shared.
 #[derive(Debug, Default)]
@@ -85,7 +45,7 @@ impl Detector for HeuristicDetector {
         let lower = prompt.to_lowercase();
 
         // High-confidence pass first: any match short-circuits.
-        for pattern in INJECTION_PATTERNS {
+        for pattern in v1_patterns::COMMON_INJECTION_PATTERNS {
             if lower.contains(pattern) {
                 return DetectionResult {
                     score: 1.0,
@@ -96,7 +56,7 @@ impl Detector for HeuristicDetector {
         }
 
         // Suspicious pass: weaker signal.
-        for pattern in SUSPICIOUS_PATTERNS {
+        for pattern in v1_patterns::SUSPICIOUS_PATTERNS {
             if lower.contains(pattern) {
                 return DetectionResult {
                     score: 0.6,
