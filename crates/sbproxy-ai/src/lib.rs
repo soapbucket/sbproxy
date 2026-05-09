@@ -68,7 +68,10 @@ pub use multimodal::{
 pub use prompt_cache::{check_cache, has_cache_control, prompt_cache_key};
 pub use provider::ProviderConfig;
 pub use provider_ratelimit::{ProviderRateLimitTracker, ProviderRateState};
-pub use providers::{get_provider_info, list_providers, ProviderFormat, ProviderInfo};
+pub use providers::{
+    get_provider_info, init_provider_registry, list_providers, reload_provider_registry,
+    ProviderFormat, ProviderInfo,
+};
 pub use ratelimit::{ModelRateConfig, ModelRateLimiter};
 pub use response_dedup::ResponseDedup;
 pub use routing::{Router, RoutingStrategy};

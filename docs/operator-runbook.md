@@ -52,6 +52,19 @@ When red:
 - For budget alerts, decide whether to raise the configured budget or block the
   caller.
 
+### Hot-reload behavior
+
+A `SIGHUP`, an admin reload, or a watched edit of `sb.yml` rebuilds the AI
+provider catalog, the live AI client, and the compiled handler chain in place
+and swaps them atomically. Adding a provider, rotating a `default_base_url`, or
+fixing a typo in `ai_providers.yml` no longer requires a restart, and in-flight
+requests are not shed. The process-wide AI budget tracker is deliberately not
+part of the swap: per-scope token and cost accumulators must survive reloads
+because budget windows are wall-clock-relative (daily, monthly), and wiping
+them on reload would let already-spent budget through twice. To zero a budget
+intentionally, restart the process or call the per-scope reset path on the
+admin surface.
+
 ## Origins
 
 Healthy range: origin latency and errors stay within SLO; circuit breakers

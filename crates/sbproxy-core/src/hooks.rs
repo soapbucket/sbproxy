@@ -38,8 +38,7 @@ use std::sync::Arc;
 /// Names are matched case-insensitively against
 /// `pingora_http::HeaderName::as_str()`, which is already lower-cased on
 /// HTTP/2 and HTTP/3 and folded by Pingora on HTTP/1.1.
-pub const REDACTED_REQUEST_HEADERS: &[&str] =
-    &["authorization", "cookie", "proxy-authorization"];
+pub const REDACTED_REQUEST_HEADERS: &[&str] = &["authorization", "cookie", "proxy-authorization"];
 
 // ============================================================================
 // Startup hook

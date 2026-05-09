@@ -27,14 +27,50 @@ use sbproxy_modules::action::ForwardingHeaderControls;
 use sbproxy_modules::{Action, Auth, Policy, RateLimitInfo, WafResult};
 use sbproxy_observe::metrics;
 
-/// Lazily-initialized global AI client (shared across all requests).
-static AI_CLIENT: std::sync::LazyLock<AiClient> = std::sync::LazyLock::new(AiClient::new);
+/// Lazily-initialized, hot-reloadable AI client.
+///
+/// Wrapped in `ArcSwap` so the SIGHUP / file-watcher / admin reload
+/// path can rebuild the client alongside the AI provider registry
+/// (see [`reload_ai_client`] and `sbproxy_ai::reload_provider_registry`).
+/// In-flight requests that already cloned the previous `Arc<AiClient>`
+/// continue against their snapshot until they complete; subsequent
+/// requests pick up the new client transparently.
+static AI_CLIENT: std::sync::LazyLock<arc_swap::ArcSwap<AiClient>> =
+    std::sync::LazyLock::new(|| arc_swap::ArcSwap::from_pointee(AiClient::new()));
 
-/// Process-wide AI budget tracker. Accumulates token and cost usage
-/// across every AI proxy request and is consulted before each
-/// upstream dispatch to enforce the configured budget limits.
+/// Atomically replace the live AI client with a freshly built one.
+///
+/// Called from the reload paths in tandem with
+/// `sbproxy_ai::reload_provider_registry` so a SIGHUP that adds or
+/// edits providers picks up the new catalog without a process
+/// restart. In-flight requests are unaffected; the next request after
+/// the swap sees the new client.
+pub fn reload_ai_client() {
+    AI_CLIENT.store(std::sync::Arc::new(AiClient::new()));
+}
+
+/// Process-wide AI budget tracker.
+///
+/// Accumulates token and cost usage across every AI proxy request
+/// and is consulted before each upstream dispatch to enforce the
+/// configured budget limits. Deliberately a `LazyLock` (and not an
+/// `ArcSwap`) so SIGHUP / file-watcher / admin reload do *not* reset
+/// the tracker: budget windows are wall-clock-relative (e.g. daily,
+/// monthly) and must survive config reloads. A reload that wiped the
+/// tracker would silently roll the counters back to zero and let
+/// already-spent budget through a second time. See WOR-173.
 static BUDGET_TRACKER: std::sync::LazyLock<sbproxy_ai::BudgetTracker> =
     std::sync::LazyLock::new(sbproxy_ai::BudgetTracker::new);
+
+/// Borrow the process-wide AI budget tracker.
+///
+/// Exposed so reload-path integration tests (and any future admin
+/// surface that needs to inspect per-scope accumulators) can read
+/// the live counters without a second source of truth. Hot path
+/// callers inside this crate use the static directly.
+pub fn budget_tracker() -> &'static sbproxy_ai::BudgetTracker {
+    &BUDGET_TRACKER
+}
 
 /// Tracks fire-and-forget webhook callback tasks so graceful shutdown
 /// can drain them. `tokio_util::task::TaskTracker` provides the
@@ -4112,10 +4148,7 @@ fn snapshot_request_headers_from(
     let mut out = std::collections::HashMap::with_capacity(raw.len());
     for (name, value) in raw.iter() {
         let lname = name.as_str().to_ascii_lowercase();
-        if crate::hooks::REDACTED_REQUEST_HEADERS
-            .iter()
-            .any(|drop| *drop == lname.as_str())
-        {
+        if crate::hooks::REDACTED_REQUEST_HEADERS.contains(&lname.as_str()) {
             continue;
         }
         if let Ok(v) = value.to_str() {
@@ -4157,6 +4190,7 @@ async fn handle_ai_proxy(
         let provider = &config.providers[provider_idx];
 
         let resp = AI_CLIENT
+            .load()
             .forward_get_request(provider, &path)
             .await
             .map_err(|e| {
@@ -4538,6 +4572,7 @@ async fn handle_ai_proxy(
         }
 
         match AI_CLIENT
+            .load()
             .forward_request(provider, &path, &attempt_body)
             .await
         {
@@ -11427,6 +11462,31 @@ pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<()> {
     if let Some(al) = compiled.access_log.as_ref() {
         log_capture_header_warnings(al);
     }
+
+    // WOR-173: refresh the AI provider catalog and rebuild the AI
+    // client alongside the pipeline. Both globals live behind an
+    // `ArcSwap`, so this is a lock-free atomic swap from the reload
+    // thread's perspective. Failures fall back to the embedded
+    // catalog with a warn-level log inside `reload_provider_registry`,
+    // matching the startup behaviour. Note: `BUDGET_TRACKER` is
+    // deliberately *not* refreshed - in-memory accumulators must
+    // survive reload, see the doc comment on the static.
+    {
+        let override_path = compiled
+            .server
+            .ai_providers_file
+            .as_deref()
+            .map(std::path::Path::new);
+        if let Err(e) = sbproxy_ai::reload_provider_registry(override_path) {
+            tracing::error!(
+                error = %e,
+                "AI provider registry reload failed; serving with the previous catalog",
+            );
+        } else {
+            reload_ai_client();
+        }
+    }
+
     let mut new_pipeline = CompiledPipeline::from_config(compiled)?;
 
     // Invoke the enterprise reload hook (best-effort): the OSS reload
@@ -11606,9 +11666,10 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
     // Initialise the AI provider catalog from the embedded YAML, with
     // an optional override path from `proxy.ai_providers_file`: use
     // the override file when readable, fall back to the embedded
-    // gzipped catalog otherwise. The init is idempotent so a config
-    // hot-reload does not need to revisit it; reloads to swap the
-    // catalog require a process restart.
+    // gzipped catalog otherwise. The registry lives behind an
+    // `ArcSwap` so SIGHUP / file-watcher / admin reload paths can
+    // swap in a fresh catalog via `reload_provider_registry` without
+    // restarting the process (WOR-173).
     {
         let override_path = server_config
             .ai_providers_file
@@ -12273,7 +12334,10 @@ mod tests {
         ]);
         let snap = snapshot_request_headers_from(&req);
         // Names land lower-cased to match HTTP/2 + HTTP/3 framing.
-        assert_eq!(snap.get("x-request-id").map(String::as_str), Some("req-123"));
+        assert_eq!(
+            snap.get("x-request-id").map(String::as_str),
+            Some("req-123")
+        );
         assert_eq!(
             snap.get("content-type").map(String::as_str),
             Some("application/json")
@@ -12302,7 +12366,10 @@ mod tests {
             !snap.contains_key("Authorization"),
             "no mixed-case Authorization survives either"
         );
-        assert_eq!(snap.get("x-request-id").map(String::as_str), Some("req-123"));
+        assert_eq!(
+            snap.get("x-request-id").map(String::as_str),
+            Some("req-123")
+        );
     }
 
     #[test]

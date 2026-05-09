@@ -15,14 +15,17 @@
 //! 2. The first call to [`get_provider_info`] before init succeeds
 //!    triggers a lazy initialisation against the embedded YAML so
 //!    binaries that never call init still work.
-//! 3. The parsed registry lives in a process-wide `OnceLock` and is
-//!    never reloaded; reloads happen by restarting the process (the
-//!    YAML is configuration, not runtime state).
+//! 3. The parsed registry lives behind a process-wide `ArcSwap` so
+//!    SIGHUP / file-watcher / admin reload paths can swap in a fresh
+//!    catalog (`reload_provider_registry`) without restarting the
+//!    process. In-flight `get_provider_info` lookups continue against
+//!    their snapshot until they complete.
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
 /// Embedded gzipped catalog. The build copies the file at
@@ -131,28 +134,77 @@ struct Registry {
     canonical_names: Vec<String>,
 }
 
-static REGISTRY: OnceLock<Registry> = OnceLock::new();
+/// Lazily-initialised, swap-on-reload registry slot.
+///
+/// `OnceLock` holds the `ArcSwap` itself (so the slot pointer is
+/// stable for the life of the process); `ArcSwap` holds the live
+/// `Arc<Registry>` and gives readers a lock-free snapshot.
+/// `reload_provider_registry` calls `store` with a freshly built
+/// registry and existing readers continue against their snapshot.
+static REGISTRY: OnceLock<ArcSwap<Registry>> = OnceLock::new();
+
+fn registry_slot() -> &'static ArcSwap<Registry> {
+    REGISTRY.get_or_init(|| {
+        // Lazy fall-back when init_provider_registry was not called
+        // explicitly. We deliberately panic on failure: the embedded
+        // catalog is a build artefact, so a parse failure here is a
+        // bug we want surfaced loudly rather than silently masked.
+        let initial = build_registry(None).expect("embedded ai_providers.yml.gz must parse");
+        ArcSwap::from_pointee(initial)
+    })
+}
 
 /// Initialise the provider registry from an optional override YAML
 /// path.
 ///
 /// Should be called once at process startup before any
-/// `get_provider_info` lookups; subsequent calls are no-ops because
-/// the registry is wrapped in a `OnceLock`. When `override_path` is
-/// `None` or the file cannot be read, the embedded gzipped catalog
-/// is used instead.
+/// `get_provider_info` lookups. When `override_path` is `None` or
+/// the file cannot be read, the embedded gzipped catalog is used
+/// instead.
+///
+/// Behaviour on a second call: the new registry replaces the live
+/// one atomically (so this entrypoint can also drive an explicit
+/// reload). For SIGHUP / file-watcher / admin reload paths, prefer
+/// [`reload_provider_registry`] for clarity.
 ///
 /// Returns `Err` only when the embedded catalog itself fails to
 /// parse - that is a build-time bug, never a runtime configuration
 /// issue. A missing or malformed override file is logged at `warn`
 /// level and the embedded fallback takes over.
 pub fn init_provider_registry(override_path: Option<&Path>) -> anyhow::Result<()> {
-    if REGISTRY.get().is_some() {
-        return Ok(());
-    }
     let registry = build_registry(override_path)?;
-    let _ = REGISTRY.set(registry);
+    install_registry(registry);
     Ok(())
+}
+
+/// Atomically replace the live provider registry with one built
+/// from the override file at `override_path` (or the embedded
+/// catalog when `override_path` is `None`).
+///
+/// Used by the hot-reload paths (SIGHUP handler, file watcher,
+/// admin API) to pick up new providers, alias renames, and
+/// `default_base_url` changes without restarting the process.
+/// In-flight `get_provider_info` lookups continue to see their
+/// previous snapshot until they finish.
+///
+/// Returns `Err` only when the embedded catalog itself fails to
+/// parse (a build-time bug). A missing or malformed override falls
+/// back to the embedded set with a warn-level log, exactly as in
+/// [`init_provider_registry`].
+pub fn reload_provider_registry(override_path: Option<&Path>) -> anyhow::Result<()> {
+    let registry = build_registry(override_path)?;
+    install_registry(registry);
+    tracing::info!("AI provider registry reloaded");
+    Ok(())
+}
+
+fn install_registry(registry: Registry) {
+    // `registry_slot()` populates the OnceLock with an `ArcSwap`
+    // pointing at the embedded catalog on first call. We then
+    // overwrite that snapshot with the freshly built one. The slot
+    // pointer itself is stable for the life of the process; only the
+    // `Arc<Registry>` inside swaps.
+    registry_slot().store(Arc::new(registry));
 }
 
 fn build_registry(override_path: Option<&Path>) -> anyhow::Result<Registry> {
@@ -232,28 +284,25 @@ fn decompress_embedded() -> anyhow::Result<String> {
     Ok(text)
 }
 
-fn registry() -> &'static Registry {
-    REGISTRY.get_or_init(|| {
-        // Lazy fall-back when init_provider_registry was not called
-        // explicitly. We deliberately panic on failure: the embedded
-        // catalog is a build artefact, so a parse failure here is a
-        // bug we want surfaced loudly rather than silently masked.
-        build_registry(None).expect("embedded ai_providers.yml.gz must parse")
-    })
+/// Snapshot the current registry. The returned guard derefs to
+/// `Arc<Registry>` and is valid even if a reload swaps the slot
+/// while the snapshot is alive.
+fn registry_snapshot() -> arc_swap::Guard<Arc<Registry>> {
+    registry_slot().load()
 }
 
 /// Look up provider info by name. Returns `None` for unknown
 /// providers. Lookups are case-insensitive and accept any alias
 /// declared in the YAML.
 pub fn get_provider_info(name: &str) -> Option<ProviderInfo> {
-    let reg = registry();
-    let idx = reg.by_name.get(name.to_ascii_lowercase().as_str())?;
-    reg.providers.get(*idx).cloned()
+    let snap = registry_snapshot();
+    let idx = snap.by_name.get(name.to_ascii_lowercase().as_str())?;
+    snap.providers.get(*idx).cloned()
 }
 
 /// List canonical provider names in YAML declaration order.
 pub fn list_providers() -> Vec<String> {
-    registry().canonical_names.clone()
+    registry_snapshot().canonical_names.clone()
 }
 
 // --- Tests ---

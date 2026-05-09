@@ -21,6 +21,7 @@ smallvec.workspace = true
 regex.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
+arc-swap.workspace = true
 lru = "0.16"
 reqwest.workspace = true
 tracing.workspace = true
