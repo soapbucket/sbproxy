@@ -17,19 +17,34 @@
 //!       server_info:
 //!         name: my-mcp
 //!         version: "1.0.0"
+//!       rbac_policies:
+//!         read_only:
+//!           key_permissions:
+//!             "alice": ["gh.search_repos", "db.query"]
+//!         admin:
+//!           key_permissions:
+//!             "ops": []  # empty list = allow all tools
 //!       federated_servers:
 //!         - origin: github.example.com
 //!           prefix: gh
+//!           rbac: read_only
+//!           timeout: 10s
 //!         - origin: postgres.example.com
 //!           prefix: db
+//!           rbac: admin
+//!           timeout: 5s
 //!       guardrails:
 //!         - type: tool_allowlist
 //!           allow: [gh.search_repos, db.query]
 //! ```
 //!
-//! The `rbac:` and `timeout:` per-server fields are reserved for a
-//! future cut: they parse but the federation dispatcher does not yet
-//! enforce them. Setting either is a hard config error today.
+//! The `rbac:` field on each `federated_servers[]` references a key
+//! in the top-level `rbac_policies` map. The matching
+//! `ToolAccessPolicy` is consulted for every `tools/call` against
+//! that upstream, using the caller's resolved virtual key (auth
+//! `sub`) as the policy key. The `timeout:` field caps each upstream
+//! `tools/call` at the request layer (not just the connection layer)
+//! via `tokio::time::timeout`.
 //!
 //! The action is a thin adapter on top of
 //! [`sbproxy_extension::mcp::McpFederation`]. Tool aggregation, name
@@ -37,10 +52,11 @@
 //! library; this module only translates YAML into library API calls
 //! and applies a small allowlist guardrail at request time.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sbproxy_extension::mcp::{McpFederation, McpServerConfig};
+use sbproxy_extension::mcp::{McpFederation, McpServerConfig, ToolAccessPolicy};
 use serde::Deserialize;
 
 // --- Wire format ---
@@ -56,6 +72,11 @@ pub struct McpActionConfig {
     /// Identity returned by the gateway in MCP `initialize` responses.
     #[serde(default)]
     pub server_info: Option<McpServerInfoConfig>,
+    /// Named tool-access policies (RBAC labels). Each entry maps a
+    /// label to a [`ToolAccessPolicy`]; per-server `rbac` fields
+    /// reference a label in this table. WOR-186.
+    #[serde(default)]
+    pub rbac_policies: HashMap<String, ToolAccessPolicy>,
     /// List of upstream MCP servers to federate.
     #[serde(default)]
     pub federated_servers: Vec<McpFederatedServerConfig>,
@@ -88,17 +109,16 @@ pub struct McpFederatedServerConfig {
     /// instead of `<tool>`.
     #[serde(default)]
     pub prefix: Option<String>,
-    /// Optional RBAC label for the upstream. Stored on the action and
-    /// available to downstream policy enforcement, but not yet wired
-    /// through the federation library at the per-request layer.
-    /// TODO: thread through `ToolAccessPolicy` once virtual-key
-    /// resolution lands at the action boundary.
+    /// Optional RBAC label for the upstream. References a key in the
+    /// top-level `rbac_policies` map; the matching
+    /// [`ToolAccessPolicy`] is consulted at request time using the
+    /// caller's auth subject as the virtual key. WOR-186.
     #[serde(default)]
     pub rbac: Option<String>,
     /// Optional per-server request timeout. Accepts Go duration syntax
-    /// (`10s`, `500ms`). Stored on the action; the federation client
-    /// shares one `reqwest::Client` so per-server enforcement is a
-    /// TODO: switch to a per-server client builder.
+    /// (`10s`, `500ms`). Wraps the `tools/call` dispatch in
+    /// `tokio::time::timeout` so a hung upstream cannot stall the
+    /// request layer. WOR-186.
     #[serde(default, with = "duration_str")]
     pub timeout: Option<Duration>,
     /// Transport name. Defaults to `streamable_http`; alternative is `sse`.
@@ -139,6 +159,9 @@ pub struct McpAction {
     pub server_version: String,
     /// Per-server prefix table, keyed by upstream `name`.
     pub prefixes: Vec<McpServerPrefix>,
+    /// Named RBAC policies declared at the top level. Looked up by
+    /// the per-server `rbac` label at `tools/call` time. WOR-186.
+    pub rbac_policies: HashMap<String, ToolAccessPolicy>,
     /// Underlying federation handle from `sbproxy-extension`.
     pub federation: Arc<McpFederation>,
     /// Collapsed allowlist (union of every `tool_allowlist` guardrail).
@@ -154,9 +177,10 @@ pub struct McpServerPrefix {
     pub name: String,
     /// Optional namespace prefix applied to the upstream's tools.
     pub prefix: Option<String>,
-    /// Optional RBAC label (TODO at the dispatch layer).
+    /// Optional RBAC label. Resolved against `rbac_policies` at
+    /// request time. WOR-186.
     pub rbac: Option<String>,
-    /// Optional per-server timeout (TODO at the dispatch layer).
+    /// Optional per-server request timeout. WOR-186.
     pub timeout: Option<Duration>,
 }
 
@@ -180,28 +204,20 @@ impl McpAction {
             anyhow::bail!("mcp action: federated_servers must not be empty");
         }
 
-        // Reject the unimplemented `rbac:` and `timeout:` per-server
-        // fields at compile time. Accepting them silently would let an
-        // operator believe an RBAC-bound or timeout-bound upstream is
-        // actually enforced when the federation library currently
-        // ignores both. Better to fail loudly until the dispatcher
-        // wires these through.
+        // WOR-186: every per-server `rbac` label must reference a key
+        // declared in the top-level `rbac_policies` map. A missing
+        // entry would otherwise silently fall through to "no policy
+        // = allow everything", which is the exact failure mode the
+        // ticket is closing.
         for upstream in &cfg.federated_servers {
-            if upstream.rbac.is_some() {
-                anyhow::bail!(
-                    "mcp action: federated_servers[].rbac is not yet enforced; \
-                     remove the field until per-server RBAC dispatch lands \
-                     (origin '{}')",
-                    upstream.origin
-                );
-            }
-            if upstream.timeout.is_some() {
-                anyhow::bail!(
-                    "mcp action: federated_servers[].timeout is not yet enforced; \
-                     remove the field until per-server timeout dispatch lands \
-                     (origin '{}')",
-                    upstream.origin
-                );
+            if let Some(label) = upstream.rbac.as_deref() {
+                if !cfg.rbac_policies.contains_key(label) {
+                    anyhow::bail!(
+                        "mcp action: federated_servers[].rbac '{}' is not declared in rbac_policies (origin '{}')",
+                        label,
+                        upstream.origin
+                    );
+                }
             }
         }
 
@@ -260,9 +276,27 @@ impl McpAction {
             server_name,
             server_version,
             prefixes,
+            rbac_policies: cfg.rbac_policies,
             federation,
             tool_allowlist,
         })
+    }
+
+    /// Resolve the [`ToolAccessPolicy`] that governs a given upstream.
+    /// Returns `None` when the upstream has no `rbac` label set;
+    /// in that case the dispatcher treats every tool as allowed,
+    /// which preserves backwards compatibility with existing configs.
+    /// WOR-186.
+    pub fn policy_for_server(&self, server_name: &str) -> Option<&ToolAccessPolicy> {
+        let label = self.prefix_for(server_name)?.rbac.as_deref()?;
+        self.rbac_policies.get(label)
+    }
+
+    /// Per-server timeout for `tools/call`. `None` when not configured;
+    /// the dispatcher uses an unbounded await in that case (matching
+    /// pre-WOR-186 behaviour for upstreams that don't opt in).
+    pub fn timeout_for_server(&self, server_name: &str) -> Option<Duration> {
+        self.prefix_for(server_name)?.timeout
     }
 
     /// Returns true when the named tool is allowed by the configured
@@ -436,23 +470,38 @@ mod tests {
 
     #[test]
     fn parses_full_marketing_shape() {
-        // Note: `rbac` and `timeout` are intentionally omitted here.
-        // Both fields parse but currently fall through the federation
-        // dispatcher, so we reject them at compile time (see
-        // `rejects_unwired_rbac` / `rejects_unwired_timeout`). Restore
-        // them in this fixture once the dispatch layer enforces them.
+        // WOR-186: `rbac` and `timeout` are now part of the
+        // happy-path fixture. The dispatcher enforces both fields at
+        // request time, so the wire shape that ships in marketing
+        // copy must compile end-to-end.
         let value = json!({
             "type": "mcp",
             "mode": "gateway",
             "server_info": { "name": "my-mcp", "version": "1.0.0" },
+            "rbac_policies": {
+                "read_only": {
+                    "key_permissions": {
+                        "alice": ["gh.search_repos", "db.query"]
+                    }
+                },
+                "admin": {
+                    "key_permissions": {
+                        "ops": []
+                    }
+                }
+            },
             "federated_servers": [
                 {
                     "origin": "github.example.com",
-                    "prefix": "gh"
+                    "prefix": "gh",
+                    "rbac": "read_only",
+                    "timeout": "10s"
                 },
                 {
                     "origin": "postgres.example.com",
-                    "prefix": "db"
+                    "prefix": "db",
+                    "rbac": "admin",
+                    "timeout": "5s"
                 }
             ],
             "guardrails": [
@@ -468,11 +517,32 @@ mod tests {
         assert_eq!(action.prefixes.len(), 2);
 
         let gh = action.prefix_for("gh").expect("gh prefix entry");
-        assert!(gh.rbac.is_none());
-        assert!(gh.timeout.is_none());
+        assert_eq!(gh.rbac.as_deref(), Some("read_only"));
+        assert_eq!(gh.timeout, Some(Duration::from_secs(10)));
 
         let db = action.prefix_for("db").expect("db prefix entry");
-        assert!(db.timeout.is_none());
+        assert_eq!(db.rbac.as_deref(), Some("admin"));
+        assert_eq!(db.timeout, Some(Duration::from_secs(5)));
+
+        // RBAC labels resolve to the correct policy.
+        let read_only = action.policy_for_server("gh").expect("gh policy");
+        assert!(read_only.is_tool_allowed("alice", "gh.search_repos"));
+        assert!(!read_only.is_tool_allowed("alice", "gh.delete_repo"));
+
+        let admin = action.policy_for_server("db").expect("db policy");
+        // Empty allowlist on the admin key means "allow all".
+        assert!(admin.is_tool_allowed("ops", "db.query"));
+        assert!(admin.is_tool_allowed("ops", "db.drop_table"));
+
+        // Per-server timeout helper.
+        assert_eq!(
+            action.timeout_for_server("gh"),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            action.timeout_for_server("db"),
+            Some(Duration::from_secs(5))
+        );
 
         let allow = action.tool_allowlist.as_ref().expect("allowlist");
         assert!(allow.iter().any(|t| t == "gh.search_repos"));
@@ -481,12 +551,31 @@ mod tests {
         assert!(!action.is_tool_allowed("gh.delete_repo"));
     }
 
+    /// WOR-186: per-server `rbac` must reference a declared label.
+    /// A typo in the upstream config silently allowing every tool is
+    /// the exact failure mode this guard prevents.
     #[test]
-    fn rejects_unwired_rbac() {
-        // WOR-42: per-server `rbac` is parsed but not yet enforced
-        // by the federation dispatcher. Until it is, accept it as a
-        // hard config error so operators do not believe an RBAC-bound
-        // upstream is actually constrained.
+    fn rejects_undeclared_rbac_label() {
+        let value = json!({
+            "type": "mcp",
+            "rbac_policies": {
+                "read_only": { "key_permissions": {} }
+            },
+            "federated_servers": [
+                { "origin": "github.example.com", "rbac": "admin" }
+            ]
+        });
+        let err = McpAction::from_config(value).unwrap_err().to_string();
+        assert!(
+            err.contains("admin"),
+            "error should call out the missing label, got: {err}",
+        );
+    }
+
+    /// WOR-186: an action that only sets `rbac` but no `rbac_policies`
+    /// table at all must not silently fall through.
+    #[test]
+    fn rejects_rbac_without_policy_table() {
         let value = json!({
             "type": "mcp",
             "federated_servers": [
@@ -495,26 +584,25 @@ mod tests {
         });
         let err = McpAction::from_config(value).unwrap_err().to_string();
         assert!(
-            err.contains("rbac"),
-            "error should mention the rbac field, got: {err}"
+            err.contains("rbac_policies") || err.contains("read_only"),
+            "error must mention the missing policy or the rbac_policies table, got: {err}",
         );
     }
 
+    /// WOR-186: a valid `timeout:` field is now stored on the action
+    /// (no longer a hard config error).
     #[test]
-    fn rejects_unwired_timeout() {
-        // WOR-42: per-server `timeout` is parsed but not yet enforced
-        // by the federation dispatcher (it shares one HTTP client
-        // across all upstreams). Same fail-loud pattern as `rbac`.
+    fn timeout_field_is_stored_on_action() {
         let value = json!({
             "type": "mcp",
             "federated_servers": [
-                { "origin": "github.example.com", "timeout": "10s" }
+                { "origin": "github.example.com", "prefix": "gh", "timeout": "250ms" }
             ]
         });
-        let err = McpAction::from_config(value).unwrap_err().to_string();
-        assert!(
-            err.contains("timeout"),
-            "error should mention the timeout field, got: {err}"
+        let action = McpAction::from_config(value).expect("compile");
+        assert_eq!(
+            action.timeout_for_server("gh"),
+            Some(Duration::from_millis(250)),
         );
     }
 
