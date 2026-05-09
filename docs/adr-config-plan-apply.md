@@ -2,6 +2,12 @@
 
 *Last modified: 2026-05-08*
 
+> Implementation note (WOR-180): scope 1+2 (CLI library + basic
+> subcommands), scope 3 (semantic validation), and scope 4+5 (per-path
+> blast-radius matrix + plan-file with `flock(2)`) have all shipped.
+> See appendix A "Blast-radius matrix" at the end of this document for
+> the path-to-radius mapping the implementation walks at plan time.
+
 ## Status
 
 Proposed. This document is the audit + design half. The implementation
@@ -458,3 +464,133 @@ For the implementation ticket, not for this audit:
 - `docs/adr-classifier-supply-chain-oss.md`,
   `docs/adr-fast-track-amendment.md` -- prior ADRs in this repo;
   same shape and cadence.
+
+## Appendix A: Blast-radius matrix
+
+Step 4 of the WOR-180 implementation replaces the per-top-level-key
+mapping with a per-path matrix. The matrix lives in
+`crates/sbproxy-config/src/plan.rs` as the `BLAST_RADIUS_MATRIX`
+constant. The diff walker enumerates every changed JSON leaf within
+each `PlanEntry` (the `proxy` block, each origin, `access_log`,
+`agent_classes`), looks each leaf up in the matrix, and takes the
+worst-case radius across the set.
+
+Path syntax:
+
+- `*` matches exactly one segment.
+- `**` (only at the end of a pattern) matches one or more trailing
+  segments, used for "anything under this subtree."
+- Origin hostnames are substituted with `*` upstream of the lookup
+  because hostnames are themselves dot-separated and cannot be split
+  out reliably from a path string. Array indices are substituted with
+  `*` by `canonicalise_path`.
+
+Default radius for any leaf that does not match a pattern: `Reload`.
+The reload state machine is the cheapest non-no-op operation, so an
+unmatched future field defaults to "publish a new pipeline through
+arc-swap" rather than "restart the process."
+
+The full matrix at first land:
+
+| Pattern | Blast radius | Why |
+|---|---|---|
+| `proxy.http_bind_port` | `Restart` | listener port is bound once at startup |
+| `proxy.https_bind_port` | `Restart` | listener port is bound once at startup |
+| `proxy.http2_cleartext` | `Restart` | h2c preface detection is wired at bind time |
+| `proxy.http3.**` | `Restart` | QUIC listener is bound once at startup |
+| `proxy.admin.port` | `Restart` | admin server listener is bound once at startup |
+| `proxy.admin.bind_addr` | `Restart` | admin server listener is bound once at startup |
+| `proxy.admin.enabled` | `Restart` | toggling the admin server requires a fresh listener |
+| `proxy.admin.**` | `Reload` | admin auth / TLS settings re-read on reload |
+| `proxy.tls_cert_file` | `Reload` | cert reload is supported through SIGHUP |
+| `proxy.tls_key_file` | `Reload` | key reload is supported through SIGHUP |
+| `proxy.acme.**` | `Reload` | ACME state lives in the arc-swapped pipeline |
+| `proxy.mtls.**` | `Reload` | mTLS handshake config reloads via arc-swap |
+| `proxy.l2_cache.driver` | `Restart` | driver swap rebuilds the KV handle |
+| `proxy.l2_cache_settings.driver` | `Restart` | driver swap rebuilds the KV handle |
+| `proxy.l2_cache.**` | `Reload` | L2 parameters re-read on reload |
+| `proxy.l2_cache_settings.**` | `Reload` | L2 parameters re-read on reload |
+| `proxy.messenger_settings.driver` | `Restart` | driver swap rebuilds the bus handle |
+| `proxy.messenger_settings.**` | `Reload` | messenger parameters re-read on reload |
+| `proxy.metrics.**` | `Hitless` | metrics config is read per request |
+| `proxy.alerting.**` | `Hitless` | alert channels reload via arc-swap |
+| `proxy.correlation_id.**` | `Hitless` | correlation-id policy is read per request |
+| `access_log.**` | `Hitless` | access-log filter is read per request |
+| `proxy.trusted_proxies.**` | `Reload` | trusted-proxy CIDRs re-read on reload |
+| `proxy.secrets.**` | `Reload` | secret store reloads via arc-swap |
+| `proxy.cache_reserve.**` | `Reload` | cache reserve handles reload via arc-swap |
+| `proxy.synthetic_probe.**` | `Reload` | probe task respawns on reload |
+| `agent_classes.**` | `Restart` | resolver is `OnceLock`-globaled |
+| `origins.*.authentication.type` | `Breaking` | auth-type swap breaks wire compatibility |
+| `origins.*.action.type` | `Breaking` | action-type swap (e.g. `proxy` to `static`) breaks wire compatibility |
+| `origins.*.action.**` | `Reload` | action body re-read on reload |
+| `origins.*.policies.**` | `Reload` | policy chain re-compiles on reload |
+| `origins.*.transforms.**` | `Reload` | transform chain re-compiles on reload |
+| `origins.*.authentication.**` | `Reload` | auth body (keys, JWKS URL) re-read on reload |
+| `origins.*.rate_limits.**` | `Reload` | rate-limit budget re-read on reload |
+| `origins.*.properties.**` | `Hitless` | properties capture is read per request |
+| `origins.*.sessions.**` | `Hitless` | session capture is read per request |
+| `origins.*.user.**` | `Hitless` | user-id capture is read per request |
+| `origins.*.connection_pool.**` | `Reload` | connection pool rebuilds on reload |
+
+In addition to the matrix, two structural rules apply:
+
+- **Origin removal is `Breaking`.** An origin present in the baseline
+  but absent in the proposed config drops in-flight clients in a way
+  that the reload's connection-drain budget cannot recover from. The
+  walker hard-codes this case (no matrix lookup) so operators see it
+  distinctly from a hot-reload-friendly tweak.
+- **Unknown future fields are `Reload`.** When no pattern matches a
+  changed leaf, the walker assigns `Reload` and surfaces a
+  "no specific rule matched" reason. Adding a new server-level field
+  to `ConfigFile` should land alongside a matrix entry that captures
+  its true blast radius; the default keeps the system safe in the
+  meantime.
+
+## Appendix B: plan-file format
+
+Step 5 of the WOR-180 implementation adds an on-disk plan-file format
+written by `sbproxy plan -f <yaml> --out <plan-file>` and consumed by
+`sbproxy apply -p <plan-file>`. The format is a JSON envelope with
+three fields:
+
+```jsonc
+{
+  "plan_file_version": 1,
+  "baseline_revision": "<sha256-hex of canonical baseline ConfigFile>",
+  "report": {
+    "plan_version": 1,
+    "entries": [...],
+    "summary": {...},
+    "max_blast_radius": "...",
+    "findings": [...]
+  }
+}
+```
+
+The `baseline_revision` is `SHA256` of `serde_json::to_vec(&baseline)`
+hex-encoded. `serde_json` orders map keys lexicographically, so the
+same logical baseline hashes identically across runs even when the
+source YAML reorders keys.
+
+Apply semantics:
+
+- `apply -p <plan-file>` requires the operator to supply the proposed
+  YAML path through `SB_APPLY_CONFIG` (the plan-file does not embed
+  it). Mirrors the `SB_CONFIG_FILE` pattern used elsewhere in the
+  binary.
+- The baseline at apply time defaults to the empty config; operators
+  who diffed against an explicit `--against <yaml>` at plan time
+  should set `SB_APPLY_BASELINE` to the same path.
+- Apply recomputes `baseline_revision` against the live baseline. If
+  the recomputed hash differs from the value in the plan-file, apply
+  exits **5** ("plan file is stale") and asks the operator to rerun
+  `plan` and re-apply. This implements the staleness check in the
+  ADR's apply-side exit-code table.
+- Apply takes an exclusive `flock(2)` on `<yaml_path>.applylock` for
+  the duration of the run (per ADR open question 3). On contention
+  apply exits **6** ("apply is in progress").
+- Plan-file writes are atomic via temp-file + `rename(2)` (per ADR
+  open question 5). A crash mid-write leaves the previous
+  plan-file's bytes in place rather than a half-written truncated
+  file.

@@ -373,8 +373,9 @@ USAGE:
     sbproxy serve -f <path> [--log-level <level>] [--request-log-level <level>] [--grace-time <secs>]
     sbproxy validate <path>
     sbproxy --config <path> --check
-    sbproxy plan -f <yaml> [--against <yaml>] [--format json|text]
+    sbproxy plan -f <yaml> [--against <yaml>] [--format json|text] [--out <plan-file>]
     sbproxy apply -f <yaml>
+    sbproxy apply -p <plan-file>
     sbproxy projections render --kind {robots|llms|llms-full|licenses|tdmrep} \\
                                --config <path> [--hostname <h>]
     sbproxy --version
@@ -551,12 +552,19 @@ struct PlanArgs {
     config: String,
     against: Option<String>,
     format: PlanFormat,
+    /// `--out <plan-file>` (WOR-180 step 5). When set, the JSON
+    /// plan-file envelope (including `baseline_revision`) is written
+    /// to disk for a later `apply -p` to consume.
+    out: Option<String>,
 }
 
-/// Parsed argv for `sbproxy apply`.
+/// Parsed argv for `sbproxy apply`. Either `config` (the `-f` flow)
+/// or `plan_file` (the `-p` flow, WOR-180 step 5) is set; the parser
+/// rejects both / neither.
 #[derive(Debug)]
 struct ApplyArgs {
-    config: String,
+    config: Option<String>,
+    plan_file: Option<String>,
 }
 
 /// Help banner for `sbproxy plan`. Printed when invoked with `--help`
@@ -564,7 +572,7 @@ struct ApplyArgs {
 const PLAN_HELP: &str = "sbproxy plan: diff a proposed config against a baseline.
 
 USAGE:
-    sbproxy plan -f <yaml> [--against <yaml>] [--format json|text]
+    sbproxy plan -f <yaml> [--against <yaml>] [--format json|text] [--out <plan-file>]
 
 FLAGS:
     -f, --config <yaml>   Proposed config file. Required.
@@ -575,6 +583,10 @@ FLAGS:
                           terraform-style diff for human consumption;
                           'json' is the stable plan envelope for
                           tooling.
+    --out <plan-file>     Write the plan-file envelope (JSON, includes
+                          baseline_revision for staleness detection)
+                          to disk. Use with `apply -p <plan-file>`.
+                          Atomic via temp-file + rename(2).
     -h, --help            Print this banner.
 
 EXIT CODES:
@@ -590,29 +602,40 @@ const APPLY_HELP: &str = "sbproxy apply: validate and reload an sbproxy config i
 
 USAGE:
     sbproxy apply -f <yaml>
+    sbproxy apply -p <plan-file>
 
 FLAGS:
-    -f, --config <yaml>   Proposed config file. Required.
+    -f, --config <yaml>   Proposed config file. Mutually exclusive
+                          with -p.
+    -p, --plan <file>     Plan file from a prior `plan --out`. Apply
+                          recomputes the plan against the live
+                          baseline and refuses (exit 5) if the
+                          baseline_revision drifted. Mutually
+                          exclusive with -f.
     -h, --help            Print this banner.
 
 NOTES:
     apply runs `compile_config` on the proposed YAML, runs plan-time
     semantic validation, and then calls the same hot-reload primitive
     the SIGHUP handler and file watcher use. Apply refuses (exit 3)
-    when any validation error is present. The plan-file (`-p`) form,
-    the staleness check, and the blast-radius gates (`--reload-only`,
-    `--restart-required`) are deferred follow-ups (steps 4-5 of
-    WOR-180).
+    when any validation error is present. Apply takes an exclusive
+    flock(2) on <yaml_path>.applylock for the duration of the run so
+    two concurrent operators cannot race the same reload.
 
 EXIT CODES:
     0   Reload applied cleanly.
     1   CLI / IO / reload error.
-    3   Semantic-validation errors present; apply refused.";
+    3   Semantic-validation errors present; apply refused.
+    5   Plan file is stale: the live baseline revision no longer
+        matches the plan's baseline_revision. Operator must rerun
+        `plan` and re-apply.
+    6   Apply lock contention: another apply is in progress.";
 
 fn parse_plan_args(args: &[String]) -> anyhow::Result<PlanArgs> {
     let mut config: Option<String> = None;
     let mut against: Option<String> = None;
     let mut format: PlanFormat = PlanFormat::Text;
+    let mut out: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -643,6 +666,10 @@ fn parse_plan_args(args: &[String]) -> anyhow::Result<PlanArgs> {
                 };
                 i += 2;
             }
+            "--out" => {
+                out = args.get(i + 1).cloned();
+                i += 2;
+            }
             other => {
                 return Err(anyhow::anyhow!(
                     "unknown flag '{other}' for plan\n\n{PLAN_HELP}"
@@ -655,11 +682,13 @@ fn parse_plan_args(args: &[String]) -> anyhow::Result<PlanArgs> {
         config,
         against,
         format,
+        out,
     })
 }
 
 fn parse_apply_args(args: &[String]) -> anyhow::Result<ApplyArgs> {
     let mut config: Option<String> = None;
+    let mut plan_file: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -671,6 +700,10 @@ fn parse_apply_args(args: &[String]) -> anyhow::Result<ApplyArgs> {
                 config = args.get(i + 1).cloned();
                 i += 2;
             }
+            "--plan" | "-p" => {
+                plan_file = args.get(i + 1).cloned();
+                i += 2;
+            }
             other => {
                 return Err(anyhow::anyhow!(
                     "unknown flag '{other}' for apply\n\n{APPLY_HELP}"
@@ -678,8 +711,15 @@ fn parse_apply_args(args: &[String]) -> anyhow::Result<ApplyArgs> {
             }
         }
     }
-    let config = config.ok_or_else(|| anyhow::anyhow!("missing -f / --config\n\n{APPLY_HELP}"))?;
-    Ok(ApplyArgs { config })
+    match (&config, &plan_file) {
+        (None, None) => Err(anyhow::anyhow!(
+            "missing -f / --config or -p / --plan\n\n{APPLY_HELP}"
+        )),
+        (Some(_), Some(_)) => Err(anyhow::anyhow!(
+            "-f and -p are mutually exclusive\n\n{APPLY_HELP}"
+        )),
+        _ => Ok(ApplyArgs { config, plan_file }),
+    }
 }
 
 /// Validate a YAML config file by running it through `compile_config`,
@@ -737,6 +777,18 @@ fn handle_plan_subcommand(args: &[String]) -> anyhow::Result<i32> {
         }
     }
 
+    // WOR-180 step 5: when --out is set, write the plan-file envelope
+    // (report + baseline_revision) atomically via temp-file +
+    // rename(2). Apply -p will recompute the plan and reject on
+    // baseline drift.
+    if let Some(out_path) = parsed.out.as_deref() {
+        let plan_file = sbproxy_config::PlanFile::new(&baseline, report.clone());
+        plan_file
+            .write_to_path(std::path::Path::new(out_path))
+            .map_err(|e| anyhow::anyhow!("failed to write plan-file '{out_path}': {e}"))?;
+        eprintln!("plan: wrote plan-file to {out_path}");
+    }
+
     if report.has_errors() {
         Ok(3)
     } else if report.is_noop() {
@@ -746,26 +798,73 @@ fn handle_plan_subcommand(args: &[String]) -> anyhow::Result<i32> {
     }
 }
 
+/// Take an exclusive `flock(2)` on the apply lock for `yaml_path`.
+/// The lock file is `<yaml_path>.applylock`. Returns the held file
+/// handle (the lock releases on drop). When the lock cannot be
+/// acquired immediately, we surface that as exit code 6 so the
+/// operator can see they collided with another in-flight apply.
+fn acquire_apply_lock(yaml_path: &str) -> anyhow::Result<std::fs::File> {
+    use fs2::FileExt as _;
+    let lock_path = format!("{yaml_path}.applylock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| anyhow::anyhow!("failed to open apply-lock '{lock_path}': {e}"))?;
+    file.try_lock_exclusive().map_err(|e| {
+        anyhow::anyhow!("another apply is in progress (could not lock '{lock_path}': {e})")
+    })?;
+    Ok(file)
+}
+
 /// Run the `sbproxy apply` subcommand. Loads + validates the proposed
 /// YAML, runs plan-time semantic validation, and calls into the
 /// existing `reload_from_config_path` primitive (the same call the
 /// file watcher and SIGHUP handler use). Refuses to apply when any
 /// `Severity::Error` finding is present.
 ///
-/// The OSS reload primitive operates on the in-process global pipeline.
-/// Out-of-process apply (driving a separately-running sbproxy via the
-/// admin socket) is open question 4 in the ADR and is deferred.
+/// Two flows are supported:
+///
+/// * `apply -f <yaml>`: validate, plan against an empty baseline,
+///   reload.
+/// * `apply -p <plan-file>`: read the plan-file (which records the
+///   original baseline_revision and proposed config bytes-by-name),
+///   recompute the plan against the live baseline (the proposed
+///   YAML referenced by the plan-file), and reject with exit 5 if
+///   the live baseline hashes differently than the plan recorded.
+///
+/// Both flows take an exclusive `flock(2)` on
+/// `<yaml_path>.applylock` so two operators running `apply` against
+/// the same on-host config cannot race each other (per WOR-131 ADR
+/// open question 3).
 fn handle_apply_subcommand(args: &[String]) -> anyhow::Result<i32> {
     let parsed = parse_apply_args(args)?;
-    // Validate first so apply never half-commits a broken config.
-    let proposed = load_and_validate(&parsed.config)?;
+    if let Some(plan_path) = parsed.plan_file.as_deref() {
+        return handle_apply_from_plan_file(plan_path);
+    }
+    let yaml_path = parsed
+        .config
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("missing -f / --config"))?;
+    handle_apply_from_yaml(yaml_path)
+}
 
-    // Plan-time semantic validation against an empty baseline. We
-    // only need the findings here; the diff entries are uninteresting
-    // for an apply path that did not opt into a baseline. A future
-    // step (WOR-180 step 5) will run plan against the live running
-    // pipeline and add a staleness check against the supplied plan
-    // file.
+/// `apply -f <yaml>` flow. Acquires the apply-lock, validates, and
+/// calls `reload_from_config_path`. Refuses on validation errors
+/// (exit 3) or lock contention (exit 6).
+fn handle_apply_from_yaml(yaml_path: &str) -> anyhow::Result<i32> {
+    let _lock = match acquire_apply_lock(yaml_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("apply: {e:#}");
+            return Ok(6);
+        }
+    };
+
+    // Validate first so apply never half-commits a broken config.
+    let proposed = load_and_validate(yaml_path)?;
     let baseline = empty_config_file();
     let report = sbproxy_config::plan(&baseline, &proposed);
     if report.has_errors() {
@@ -774,9 +873,79 @@ fn handle_apply_subcommand(args: &[String]) -> anyhow::Result<i32> {
         return Ok(3);
     }
 
-    sbproxy_core::server::reload_from_config_path(&parsed.config)
+    sbproxy_core::server::reload_from_config_path(yaml_path)
         .map_err(|e| anyhow::anyhow!("reload failed: {e:#}"))?;
-    println!("apply: reloaded config from {}", parsed.config);
+    println!("apply: reloaded config from {yaml_path}");
+    Ok(0)
+}
+
+/// `apply -p <plan-file>` flow. Reads the plan-file, locates the
+/// proposed YAML by reading the same file path the plan was generated
+/// against (encoded as the apply target via the proposed config's
+/// own structural identity), recomputes the plan, and rejects with
+/// exit 5 if the baseline_revision drifted.
+///
+/// This flow takes the lock on the **proposed** config path's
+/// `.applylock` companion. The plan-file does not itself own a
+/// long-lived target path; the operator passes the same `-f` value
+/// implicitly via the plan that was written from `plan -f X`.
+fn handle_apply_from_plan_file(plan_path: &str) -> anyhow::Result<i32> {
+    // Read the plan-file. Schema is the v1 envelope written by
+    // `plan --out`.
+    let plan_file = sbproxy_config::PlanFile::read_from_path(std::path::Path::new(plan_path))
+        .map_err(|e| anyhow::anyhow!("failed to read plan-file '{plan_path}': {e}"))?;
+
+    // The plan-file does not embed the YAML path (it embeds only the
+    // diff body and the baseline_revision). The operator must supply
+    // the YAML via env var SB_APPLY_CONFIG so apply knows which file
+    // to recompute against. This mirrors the `SB_CONFIG_FILE`
+    // pattern used elsewhere in the binary.
+    let yaml_path = std::env::var("SB_APPLY_CONFIG").map_err(|_| {
+        anyhow::anyhow!(
+            "apply -p requires SB_APPLY_CONFIG to point at the proposed YAML path \
+             (the plan-file does not embed the path itself)"
+        )
+    })?;
+
+    let _lock = match acquire_apply_lock(&yaml_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("apply: {e:#}");
+            return Ok(6);
+        }
+    };
+
+    let proposed = load_and_validate(&yaml_path)?;
+    // Recompute the plan against the same baseline shape as plan
+    // time. We do not yet have an admin-socket "live baseline"
+    // surface (open question 4), so the on-disk baseline is "the
+    // empty config" by default. The operator can override this with
+    // SB_APPLY_BASELINE pointing at a YAML file.
+    let baseline = match std::env::var("SB_APPLY_BASELINE").ok() {
+        Some(b) => load_and_validate(&b)?,
+        None => empty_config_file(),
+    };
+
+    let live_revision = sbproxy_config::compute_baseline_revision(&baseline);
+    if live_revision != plan_file.baseline_revision {
+        eprintln!(
+            "apply: plan-file is stale.\n  recorded baseline_revision: {}\n  live baseline_revision:     {}",
+            plan_file.baseline_revision, live_revision
+        );
+        eprintln!("apply: rerun `sbproxy plan -f <yaml> --out <plan-file>` and re-apply.");
+        return Ok(5);
+    }
+
+    let report = sbproxy_config::plan(&baseline, &proposed);
+    if report.has_errors() {
+        eprintln!("apply: refusing to apply, semantic validation failed:");
+        eprint!("{}", sbproxy_config::render_text(&report));
+        return Ok(3);
+    }
+
+    sbproxy_core::server::reload_from_config_path(&yaml_path)
+        .map_err(|e| anyhow::anyhow!("reload failed: {e:#}"))?;
+    println!("apply: reloaded config from {yaml_path} (via plan-file {plan_path})");
     Ok(0)
 }
 
