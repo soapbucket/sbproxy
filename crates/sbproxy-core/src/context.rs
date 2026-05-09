@@ -223,6 +223,17 @@ pub struct RequestContext {
     /// pipeline at `apply_transform_with_ctx` time.
     pub cel_response_header_mutations: Vec<CelHeaderMutation>,
 
+    // --- WOR-168 transform-error attribution ---
+    /// Set by the body-buffer transform pipeline when a transform
+    /// returns a `TransformError` shape that must surface as a 500
+    /// with attribution. The value is the human-readable transform
+    /// name (e.g. `"cel"` or `"my-plugin"`) and is stamped onto the
+    /// outgoing response as `x-sbproxy-transform-error`. Distinct
+    /// from `validator_failed` (which carries the request-validator
+    /// rejection body) so the two failure surfaces stay independently
+    /// observable.
+    pub transform_error_attribution: Option<String>,
+
     // --- AI Crawl Control challenge ---
     /// Set by an `ai_crawl_control` policy when a request must be
     /// charged. Tuple is `(header_name, challenge_value, json_body)`.
@@ -623,6 +634,7 @@ impl RequestContext {
             trust_headers: None,
             callback_inject_headers: None,
             cel_response_header_mutations: Vec::new(),
+            transform_error_attribution: None,
             crawl_challenge: None,
             trace_ctx: None,
             cache_key: None,

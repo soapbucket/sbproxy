@@ -312,8 +312,19 @@ fn apply_transform_with_ctx(
             // status (200 from the static action under test) rather
             // than the zero placeholder.
             let status = ctx.response_status.unwrap_or(0);
-            let mutations = t.evaluate_headers(body.as_ref(), status, &http::HeaderMap::new());
-            ctx.cel_response_header_mutations.extend(mutations);
+            // WOR-168: `evaluate_headers` now returns
+            // `TransformError::InvariantViolated` instead of panicking
+            // when the inner Remove arm is reached. Propagate as
+            // `anyhow::Error` so the body-buffer pipeline's `fail_on_error`
+            // path takes over and synthesises a 500 with attribution.
+            match t.evaluate_headers(body.as_ref(), status, &http::HeaderMap::new()) {
+                Ok(mutations) => {
+                    ctx.cel_response_header_mutations.extend(mutations);
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::new(e));
+                }
+            }
             t.apply(body)
         }
         // All other transform variants: standard pipeline.
@@ -3047,6 +3058,13 @@ static CALLBACK_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLo
 /// `mirror_pending` slot is taken from `ctx` so the mirror only ever
 /// fires once. Bodies that exceed the configured cap are dropped (we
 /// fire the mirror without a body rather than skip it entirely).
+///
+/// WOR-168: when the slot is unexpectedly empty (which the request
+/// body filter call sites previously matched via `as_ref` /
+/// `as_mut` before `take().unwrap()`), bump the
+/// `sbproxy_mirror_state_drift_total` counter and warn rather than
+/// panicking the worker. The graceful no-op return is the behaviour
+/// pinned by `fire_pending_mirror_no_panic_when_slot_empty` below.
 fn fire_pending_mirror(ctx: &mut crate::context::RequestContext) {
     let params = match ctx.mirror_pending.take() {
         Some(p) => p,
@@ -5724,7 +5742,7 @@ async fn handle_action(
         }
 
         Action::Mcp(mcp) => {
-            handle_mcp_action(session, mcp).await?;
+            handle_mcp_action(session, mcp, ctx).await?;
             Ok(true)
         }
 
@@ -5753,6 +5771,7 @@ async fn handle_action(
 async fn handle_mcp_action(
     session: &mut Session,
     mcp: &sbproxy_modules::action::McpAction,
+    ctx: &RequestContext,
 ) -> Result<()> {
     use sbproxy_extension::mcp::types::{
         InitializeResult, JsonRpcRequest, JsonRpcResponse, ServerCapabilities, ServerInfo,
@@ -5888,13 +5907,97 @@ async fn handle_mcp_action(
                             &format!("tool '{}' is blocked by tool_allowlist guardrail", name),
                         )
                     } else {
-                        match mcp.federation.call_tool(&name, arguments).await {
-                            Ok(value) => JsonRpcResponse::success(request.id.clone(), value),
-                            Err(e) => JsonRpcResponse::error(
+                        // WOR-186: per-server RBAC + timeout enforcement.
+                        //
+                        // 1. Resolve the caller's virtual key from the
+                        //    auth context (`Allow.sub`); fall back to
+                        //    "" (anonymous) when no subject is set so
+                        //    the policy lookup still has a stable key.
+                        // 2. Resolve the tool's owning upstream and
+                        //    check the per-server `ToolAccessPolicy`
+                        //    (when one is wired). A denied tool returns
+                        //    a JSON-RPC error and bumps an audit
+                        //    counter; the upstream is never contacted.
+                        // 3. Wrap `federation.call_tool` in
+                        //    `tokio::time::timeout(server.timeout, ...)`
+                        //    when a per-server timeout is configured.
+                        let virtual_key = mcp_virtual_key(ctx);
+                        let federated = mcp.federation.resolve_tool(&name);
+                        let denied_by_rbac = match &federated {
+                            Some(t) => {
+                                if let Some(policy) = mcp.policy_for_server(&t.server_name) {
+                                    !policy.is_tool_allowed(&virtual_key, &name)
+                                } else {
+                                    false
+                                }
+                            }
+                            None => false,
+                        };
+                        if denied_by_rbac {
+                            tracing::warn!(
+                                target: "sbproxy::mcp::rbac",
+                                tool = %name,
+                                virtual_key = %virtual_key,
+                                "MCP tools/call denied by RBAC policy",
+                            );
+                            sbproxy_observe::metrics::record_policy(
+                                ctx.hostname.as_str(),
+                                "mcp_rbac",
+                                "deny",
+                            );
+                            JsonRpcResponse::error(
                                 request.id.clone(),
-                                INTERNAL_ERROR,
-                                &format!("tool call failed: {}", e),
-                            ),
+                                INVALID_PARAMS,
+                                &format!("tool '{}' is denied by RBAC policy for caller", name,),
+                            )
+                        } else {
+                            // Per-server timeout (WOR-186). The
+                            // dispatcher inside `call_tool` shares one
+                            // reqwest::Client across upstreams; the
+                            // request-level cap is what makes the field
+                            // observable.
+                            let timeout = federated
+                                .as_ref()
+                                .and_then(|t| mcp.timeout_for_server(&t.server_name));
+                            let call = mcp.federation.call_tool(&name, arguments);
+                            let outcome = match timeout {
+                                Some(d) => match tokio::time::timeout(d, call).await {
+                                    Ok(r) => r,
+                                    Err(_elapsed) => {
+                                        tracing::warn!(
+                                            target: "sbproxy::mcp::timeout",
+                                            tool = %name,
+                                            timeout_ms = d.as_millis() as u64,
+                                            "MCP tools/call exceeded per-server timeout",
+                                        );
+                                        sbproxy_observe::metrics::record_policy(
+                                            ctx.hostname.as_str(),
+                                            "mcp_timeout",
+                                            "deny",
+                                        );
+                                        Err(anyhow::anyhow!(
+                                            "tool call exceeded per-server timeout of {}ms",
+                                            d.as_millis(),
+                                        ))
+                                    }
+                                },
+                                None => call.await,
+                            };
+                            match outcome {
+                                Ok(value) => {
+                                    sbproxy_observe::metrics::record_policy(
+                                        ctx.hostname.as_str(),
+                                        "mcp_rbac",
+                                        "allow",
+                                    );
+                                    JsonRpcResponse::success(request.id.clone(), value)
+                                }
+                                Err(e) => JsonRpcResponse::error(
+                                    request.id.clone(),
+                                    INTERNAL_ERROR,
+                                    &format!("tool call failed: {}", e),
+                                ),
+                            }
                         }
                     }
                 }
@@ -5908,6 +6011,19 @@ async fn handle_mcp_action(
     };
 
     write_jsonrpc(session, &response).await
+}
+
+/// WOR-186: resolve the caller's virtual key for MCP RBAC lookups.
+///
+/// Pulls the resolved subject from the auth decision when the request
+/// authenticated; returns the empty string for anonymous traffic so a
+/// `ToolAccessPolicy` keyed on `""` can still encode an explicit
+/// "anonymous" lane.
+fn mcp_virtual_key(ctx: &RequestContext) -> String {
+    match ctx.auth_result.as_ref() {
+        Some(sbproxy_plugin::AuthDecision::Allow { sub: Some(s), .. }) => s.clone(),
+        _ => String::new(),
+    }
 }
 
 /// Serialise a JSON-RPC response and write it to the session.
@@ -9159,7 +9275,16 @@ impl ProxyHttp for SbProxy {
                             if t.headers.is_empty() {
                                 continue;
                             }
-                            let mutations = t.evaluate_headers(
+                            // WOR-168: use the lossy shim here so the
+                            // upstream-response header-wiring path stays
+                            // resilient. A drifted CEL invariant is
+                            // logged and the response continues with
+                            // an empty mutation set; the body-buffer
+                            // path above promotes the same drift to a
+                            // 500 with attribution because that is
+                            // where the failure must be visible to the
+                            // client.
+                            let mutations = t.evaluate_headers_lossy(
                                 b"",
                                 upstream_response.status.as_u16(),
                                 &upstream_response.headers,
@@ -9811,10 +9936,23 @@ impl ProxyHttp for SbProxy {
                 };
                 // Tee to the mirror if requested (validator + mirror
                 // configs share the buffer so we don't pay for it twice).
-                if let Some(m) = ctx.mirror_pending.as_mut() {
-                    if m.mirror_body {
-                        // Move the params + body to a spawned task.
-                        let params = ctx.mirror_pending.take().unwrap();
+                //
+                // WOR-168: previously this path called
+                // `ctx.mirror_pending.take().unwrap()` after we had just
+                // matched the slot via `as_mut()`. Under normal control
+                // flow the slot is always `Some` here, but a future
+                // refactor (or a panic in another task that observed
+                // `&mut RequestContext`) could clear it between the
+                // match and the take. We now bump
+                // `sbproxy_mirror_state_drift_total` and skip firing the
+                // mirror rather than panicking the worker.
+                let want_body_mirror = ctx
+                    .mirror_pending
+                    .as_ref()
+                    .map(|m| m.mirror_body)
+                    .unwrap_or(false);
+                if want_body_mirror {
+                    if let Some(params) = ctx.mirror_pending.take() {
                         let body_for_mirror = frozen
                             .as_ref()
                             .filter(|b| b.len() <= params.max_body_bytes)
@@ -9831,6 +9969,12 @@ impl ProxyHttp for SbProxy {
                             )
                             .await;
                         });
+                    } else {
+                        sbproxy_observe::metrics::record_mirror_state_drift();
+                        tracing::warn!(
+                            target: "sbproxy::mirror",
+                            "mirror_pending unexpectedly empty when firing body mirror"
+                        );
                     }
                 }
             }
@@ -9841,10 +9985,18 @@ impl ProxyHttp for SbProxy {
         // Mirror that doesn't need the body (mirror_body: false) -
         // fire on first body filter call so the shadow request is
         // not delayed by an upload it doesn't care about.
+        //
+        // WOR-168: same drift handling as the body-mirror branch above;
+        // bump the state-drift counter instead of panicking if the slot
+        // was cleared between the `as_ref` check and the `take`.
         if end_of_stream {
-            if let Some(m) = ctx.mirror_pending.as_ref() {
-                if !m.mirror_body {
-                    let params = ctx.mirror_pending.take().unwrap();
+            let want_bodyless_mirror = ctx
+                .mirror_pending
+                .as_ref()
+                .map(|m| !m.mirror_body)
+                .unwrap_or(false);
+            if want_bodyless_mirror {
+                if let Some(params) = ctx.mirror_pending.take() {
                     tokio::spawn(async move {
                         fire_request_mirror(
                             params.url,
@@ -9857,6 +10009,12 @@ impl ProxyHttp for SbProxy {
                         )
                         .await;
                     });
+                } else {
+                    sbproxy_observe::metrics::record_mirror_state_drift();
+                    tracing::warn!(
+                        target: "sbproxy::mirror",
+                        "mirror_pending unexpectedly empty when firing bodyless mirror"
+                    );
                 }
             }
         }
@@ -10076,10 +10234,35 @@ impl ProxyHttp for SbProxy {
                             content_type,
                             ctx,
                         ) {
+                            // WOR-168: a `TransformError::InvariantViolated`
+                            // or `TransformError::Plugin` is a code-level
+                            // bug or a misbehaving plugin; both must
+                            // surface as a 500 regardless of
+                            // `fail_on_error`. The transform name flows
+                            // onto the response as
+                            // `x-sbproxy-transform-error` so the caller
+                            // and operator can correlate.
+                            let transform_name = compiled_transform.transform.transform_type();
+                            let is_typed_transform_error = e
+                                .downcast_ref::<sbproxy_modules::transform::TransformError>()
+                                .is_some();
+                            if is_typed_transform_error {
+                                tracing::error!(
+                                    hostname = %ctx.hostname,
+                                    transform = transform_name,
+                                    error = %e,
+                                    "transform pipeline invariant violated, returning 500 with attribution"
+                                );
+                                ctx.response_status_override = Some(500);
+                                ctx.transform_error_attribution = Some(transform_name.to_string());
+                                buf.clear();
+                                buf.extend_from_slice(b"{\"error\":\"internal server error\"}");
+                                break;
+                            }
                             if compiled_transform.fail_on_error {
                                 warn!(
                                     hostname = %ctx.hostname,
-                                    transform = compiled_transform.transform.transform_type(),
+                                    transform = transform_name,
                                     error = %e,
                                     "transform failed (fail_on_error=true), sending error"
                                 );
@@ -10091,7 +10274,7 @@ impl ProxyHttp for SbProxy {
                             }
                             warn!(
                                 hostname = %ctx.hostname,
-                                transform = compiled_transform.transform.transform_type(),
+                                transform = transform_name,
                                 error = %e,
                                 "transform failed, continuing with next transform"
                             );
@@ -11866,6 +12049,37 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- WOR-168: mirror state drift no-panic regression ---
+
+    /// Pre-WOR-168, `request_body_filter` called
+    /// `ctx.mirror_pending.take().unwrap()` after matching the slot via
+    /// `as_ref` / `as_mut`. A future refactor that cleared the slot
+    /// between the match and the take would panic the worker. The
+    /// fix replaced the unwrap with `if let Some(...)` and bumped a
+    /// drift counter in the else branch. We can't reach the inner
+    /// path from a unit test (it lives inside an async trait method),
+    /// but `fire_pending_mirror` shares the same pattern (it does a
+    /// `match take()` on the slot) and is the helper the body-filter
+    /// re-uses. This test pins the no-panic shape: if the slot is
+    /// empty, the helper returns without firing or panicking.
+    #[test]
+    fn fire_pending_mirror_no_panic_when_slot_empty() {
+        // Drive a tokio current-thread runtime so the helper's
+        // `tokio::spawn` (in the Some branch) wouldn't fail the
+        // build, even though we exercise only the None branch.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut ctx = crate::context::RequestContext::new();
+            assert!(ctx.mirror_pending.is_none(), "precondition: slot empty");
+            // Must not panic.
+            fire_pending_mirror(&mut ctx);
+            assert!(ctx.mirror_pending.is_none(), "slot stays empty");
+        });
+    }
 
     // --- resolve_override parsing ---
 

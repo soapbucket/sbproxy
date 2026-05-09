@@ -73,6 +73,13 @@ sbproxy-config = { path = "../crates/sbproxy-config" }
 sbproxy-core = { path = "../crates/sbproxy-core" }
 sbproxy-observe = { path = "../crates/sbproxy-observe" }
 
+# WOR-168 cel_script fuzz target: drives `CelScriptTransform` with
+# arbitrary bytes so the Remove arm (which used to be `unreachable!()`)
+# is exercised under adversarial input.
+sbproxy-modules = { path = "../crates/sbproxy-modules" }
+http = "1"
+serde_json = "1"
+
 [[bin]]
 name = "rsl_xml_parser"
 path = "fuzz_targets/rsl_xml_parser.rs"
@@ -112,5 +119,15 @@ doc = false
 [[bin]]
 name = "stateful_proxy"
 path = "fuzz_targets/stateful_proxy.rs"
+test = false
+doc = false
+
+# WOR-168 CEL response-body transform fuzzer. Drives
+# `CelScriptTransform::from_config` and `evaluate_headers` with
+# adversarial bytes so the Remove arm (the panic path the WOR-168
+# fix replaced) is exercised end-to-end.
+[[bin]]
+name = "cel_script"
+path = "fuzz_targets/cel_script.rs"
 test = false
 doc = false

@@ -1,7 +1,11 @@
 //! AI guardrails pipeline - input/output content safety checks.
 
 mod content_safety;
-mod injection;
+// WOR-191: `injection` is `pub` so the v2 detector in
+// `sbproxy-modules::policy::prompt_injection_v2` can re-use the
+// canonical `COMMON_INJECTION_PATTERNS` and `SUSPICIOUS_PATTERNS`
+// constants without duplicating the lists.
+pub mod injection;
 mod jailbreak;
 mod pii;
 mod regex_guard;

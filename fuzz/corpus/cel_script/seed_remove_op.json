@@ -1,0 +1,1 @@
+{"type":"cel","headers":[{"op":"remove","name":"x-internal-trace"},{"op":"set","name":"x-foo","value_expr":"\"bar\""}]}
