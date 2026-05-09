@@ -159,7 +159,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (provider) (rate(sbproxy_ai_tokens_input_total[5m]))",
+          "expr": "sum by (provider) (rate(sbproxy_ai_tokens_total{direction=\"input\"}[5m]))",
           "legendFormat": "Input - {{provider}}",
           "datasource": {
             "type": "prometheus",
@@ -168,7 +168,7 @@
         },
         {
           "refId": "B",
-          "expr": "sum by (provider) (rate(sbproxy_ai_tokens_output_total[5m]))",
+          "expr": "sum by (provider) (rate(sbproxy_ai_tokens_total{direction=\"output\"}[5m]))",
           "legendFormat": "Output - {{provider}}",
           "datasource": {
             "type": "prometheus",
@@ -343,7 +343,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(sbproxy_ai_cache_hits_total[5m]))",
+          "expr": "sum(rate(sbproxy_ai_cache_results_total{result=\"hit\"}[5m]))",
           "legendFormat": "Cache Hits/sec",
           "datasource": {
             "type": "prometheus",
@@ -397,8 +397,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (type) (rate(sbproxy_ai_guardrail_triggers_total[5m]))",
-          "legendFormat": "{{type}}",
+          "expr": "sum by (category) (rate(sbproxy_ai_guardrail_blocks_total[5m]))",
+          "legendFormat": "{{category}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
@@ -505,7 +505,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (from_provider, to_provider) (rate(sbproxy_ai_fallbacks_total[5m]))",
+          "expr": "sum by (from_provider, to_provider) (rate(sbproxy_ai_failovers_total[5m]))",
           "legendFormat": "{{from_provider}} -> {{to_provider}}",
           "datasource": {
             "type": "prometheus",

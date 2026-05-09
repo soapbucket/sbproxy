@@ -45,6 +45,38 @@ static AI_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+// Time to first token, in seconds. Recorded once per streaming
+// response when the first token arrives. The Prometheus client
+// auto-derives the `_bucket`, `_sum`, and `_count` series referenced
+// by the AI gateway dashboard.
+static AI_TTFT: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        HistogramOpts::new(
+            "sbproxy_ai_ttft_seconds",
+            "AI streaming time to first token"
+        )
+        .buckets(vec![0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0]),
+        &["provider", "model"]
+    )
+    .unwrap()
+});
+
+// Per-provider error counter. Incremented at every site that maps a
+// non-success outcome back to a named provider (transport error,
+// timeout, upstream 4xx/5xx, parse failure). The dashboard groups by
+// `provider`; `error_kind` is intended for ad-hoc drill-downs and
+// should stay low cardinality (handful of stable strings).
+static AI_PROVIDER_ERRORS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_provider_errors_total",
+            "Per-provider AI error events"
+        ),
+        &["provider", "error_kind"]
+    )
+    .unwrap()
+});
+
 static AI_FAILOVERS: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new("sbproxy_ai_failovers_total", "Provider failover events"),
@@ -213,6 +245,29 @@ pub fn record_failover(from: &str, to: &str, reason: &str) {
     AI_FAILOVERS.with_label_values(&[from, to, reason]).inc();
 }
 
+/// Record a streaming time-to-first-token observation, in seconds.
+///
+/// Call sites: the streaming relay's first-token hook, after the
+/// per-request `StreamTracker::record_first_token` has captured the
+/// instant. Convert with `tracker.ttft_ms().map(|ms| ms / 1000.0)`.
+pub fn record_ttft(provider: &str, model: &str, ttft_seconds: f64) {
+    AI_TTFT
+        .with_label_values(&[provider, model])
+        .observe(ttft_seconds);
+}
+
+/// Record a per-provider error.
+///
+/// `error_kind` is a short, low-cardinality label (e.g. `transport`,
+/// `timeout`, `http_4xx`, `http_5xx`, `parse`). Free-form upstream
+/// strings should be mapped to one of these stable buckets before
+/// being passed in.
+pub fn record_provider_error(provider: &str, error_kind: &str) {
+    AI_PROVIDER_ERRORS
+        .with_label_values(&[provider, error_kind])
+        .inc();
+}
+
 /// Record a guardrail block.
 pub fn record_guardrail_block(category: &str) {
     AI_GUARDRAIL_BLOCKS.with_label_values(&[category]).inc();
@@ -305,5 +360,26 @@ mod tests {
     #[test]
     fn test_key_usage() {
         record_key_usage("vk-test-123", "openai", "gpt-4o", 100, 50, 0.003);
+    }
+
+    #[test]
+    fn test_record_ttft() {
+        record_ttft("openai", "gpt-4o", 0.42);
+        let families = prometheus::gather();
+        let ttft = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_ttft_seconds");
+        assert!(ttft.is_some(), "ttft histogram must be registered");
+    }
+
+    #[test]
+    fn test_record_provider_error() {
+        record_provider_error("openai", "timeout");
+        record_provider_error("anthropic", "http_5xx");
+        let families = prometheus::gather();
+        let errs = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_provider_errors_total");
+        assert!(errs.is_some(), "provider errors counter must be registered");
     }
 }

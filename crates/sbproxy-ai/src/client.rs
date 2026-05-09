@@ -569,14 +569,26 @@ async fn run_shadow_request(
         Ok(r) => r,
         Err(e) => {
             warn!(provider = %provider.name, error = %e, "shadow request transport error");
+            ai_metrics::record_provider_error(&provider.name, "transport");
             return;
         }
     };
     let status = resp.status();
+    if !status.is_success() {
+        let kind = if status.is_server_error() {
+            "http_5xx"
+        } else if status.is_client_error() {
+            "http_4xx"
+        } else {
+            "http_other"
+        };
+        ai_metrics::record_provider_error(&provider.name, kind);
+    }
     let raw_bytes = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
             warn!(provider = %provider.name, error = %e, "shadow body drain failed");
+            ai_metrics::record_provider_error(&provider.name, "transport");
             return;
         }
     };

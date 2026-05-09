@@ -115,7 +115,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(sbproxy_waf_blocks_total[5m]))",
+          "expr": "sum(rate(sbproxy_policy_triggers_total{policy_type=\"waf\"}[5m]))",
           "legendFormat": "WAF Blocks",
           "datasource": {
             "type": "prometheus",
@@ -124,8 +124,8 @@
         },
         {
           "refId": "B",
-          "expr": "sum by (rule) (rate(sbproxy_waf_blocks_total[5m]))",
-          "legendFormat": "Rule: {{rule}}",
+          "expr": "sum by (action) (rate(sbproxy_policy_triggers_total{policy_type=\"waf\"}[5m]))",
+          "legendFormat": "Action: {{action}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
@@ -194,7 +194,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(sbproxy_rate_limit_hits_total[5m]))",
+          "expr": "sum(rate(sbproxy_policy_triggers_total{policy_type=\"rate_limit\"}[5m]))",
           "legendFormat": "Rate Limited",
           "datasource": {
             "type": "prometheus",
@@ -203,7 +203,7 @@
         },
         {
           "refId": "B",
-          "expr": "sum by (origin) (rate(sbproxy_rate_limit_hits_total[5m]))",
+          "expr": "sum by (origin) (rate(sbproxy_policy_triggers_total{policy_type=\"rate_limit\"}[5m]))",
           "legendFormat": "Origin: {{origin}}",
           "datasource": {
             "type": "prometheus",
@@ -257,8 +257,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (type) (rate(sbproxy_auth_failures_total[5m]))",
-          "legendFormat": "{{type}}",
+          "expr": "sum by (auth_type) (rate(sbproxy_auth_results_total{result=\"failure\"}[5m]))",
+          "legendFormat": "{{auth_type}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
@@ -327,7 +327,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(sbproxy_ip_filter_blocks_total[5m]))",
+          "expr": "sum(rate(sbproxy_policy_triggers_total{policy_type=\"ip_filter\"}[5m]))",
           "legendFormat": "IP Blocks",
           "datasource": {
             "type": "prometheus",
@@ -336,8 +336,8 @@
         },
         {
           "refId": "B",
-          "expr": "sum by (list_type) (rate(sbproxy_ip_filter_blocks_total[5m]))",
-          "legendFormat": "{{list_type}}",
+          "expr": "sum by (action) (rate(sbproxy_policy_triggers_total{policy_type=\"ip_filter\"}[5m]))",
+          "legendFormat": "{{action}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
@@ -390,7 +390,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(sbproxy_bot_detections_total[5m]))",
+          "expr": "sum(rate(sbproxy_policy_triggers_total{policy_type=\"bot_detection\"}[5m]))",
           "legendFormat": "Total Bot Detections",
           "datasource": {
             "type": "prometheus",
@@ -399,8 +399,8 @@
         },
         {
           "refId": "B",
-          "expr": "sum by (category) (rate(sbproxy_bot_detections_total[5m]))",
-          "legendFormat": "{{category}}",
+          "expr": "sum by (action) (rate(sbproxy_policy_triggers_total{policy_type=\"bot_detection\"}[5m]))",
+          "legendFormat": "{{action}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
