@@ -40,6 +40,15 @@ of each implementation wave.
   Operators who need stricter assurance for sensitive upstreams should
   compensate via network-egress allowlists, mTLS to the upstream, or a
   forward-proxy layer that performs the pinning itself.
+- **Agent Skills v0.2.0 (WOR-194):** every artifact `GET` re-hashes the served
+  body and compares to the manifest digest. A mismatch returns 503 with a
+  generic "service unavailable" body and emits an `agent_skill.digest_mismatch`
+  audit event so the operator notices a hot-swap or memory corruption.
+  Archive entries (`type: archive`) are validated for path traversal,
+  external symlinks, and decompression bombs at config-load time. The proxy
+  never executes any pre-/post-hooks or scripts shipped inside an artifact;
+  artifacts are served as opaque bytes. See [`agent-skills.md`](agent-skills.md)
+  for the full integrity and archive-safety contract.
 
 ## Review Checklist
 

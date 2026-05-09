@@ -1302,6 +1302,27 @@ origins:
 
 For the full guide (concept map, two-pass `Accept` resolution, the four projection cookbook, JSON envelope schema, aipref scripting surface, PDF transform teaser), read [content-for-agents.md](content-for-agents.md). For the RSL 1.0 cookbook (license-term recipes, URN format, validation), read [rsl.md](rsl.md).
 
+### Agent Skills v0.2.0 discovery
+
+A fifth projection sibling lives at `/.well-known/agent-skills/index.json` for any origin that opts in via `agent_skills:`. The proxy serves a v0.2.0 manifest, re-hosts the skill bodies the manifest pins, and re-hashes every artifact body on every serve so a tampered body returns 503 with an `agent_skill.digest_mismatch` audit event. Archive entries (`type: archive`) are sniffed for tar.gz or zip and validated for path traversal, external symlinks, and decompression bombs. The proxy never executes any pre-/post-hooks or scripts shipped inside an artifact. When the origin's action is the MCP gateway, the manifest URL is also advertised on the `initialize` response under `capabilities.experimental.agentSkillsUrl`.
+
+```yaml
+origins:
+  "test.sbproxy.dev":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    agent_skills:
+      - name: "deploy-via-pr"
+        type: skill-md
+        description: "Open a PR to deploy a config change."
+        url: "/skills/deploy-via-pr.md"
+        visibility: public
+```
+
+Full guide in [agent-skills.md](agent-skills.md). Manifest schema:
+`https://schemas.agentskills.io/discovery/0.2.0/schema.json`.
+
 ---
 
 ## 9. Scripting

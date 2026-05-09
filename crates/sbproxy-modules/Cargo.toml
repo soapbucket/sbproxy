@@ -149,6 +149,14 @@ tokio-util = { workspace = true }
 redis = { workspace = true }
 sbproxy-vault = { version = "0.1.0", path = "../sbproxy-vault" }
 
+# WOR-194: archive parsing for the Agent Skills v0.2.0 projection.
+# `tar` plus `flate2` cover `.tar.gz` bundles; `zip` covers `.zip`.
+# The parser is defensive: it caps decompression ratio, entry count,
+# and expanded byte budget per the spec's archive-safety contract.
+tar = "0.4"
+flate2 = "1"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+
 [dev-dependencies]
 smallvec.workspace = true
 tempfile = "3"

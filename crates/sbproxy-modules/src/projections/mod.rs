@@ -8,7 +8,14 @@
 //! - `/licenses.xml` (G4.7) per RSL 1.0
 //! - `/.well-known/tdmrep.json` (G4.8) per W3C TDMRep
 //!
-//! All four are derived from the same compiled-policy graph
+//! WOR-193 adds a fifth sibling:
+//!
+//! - `/.well-known/agent-skills/index.json` per the Agent Skills v0.2.0
+//!   discovery RFC (`https://github.com/cloudflare/agent-skills-discovery-rfc`).
+//!   Manifest schema:
+//!   `https://schemas.agentskills.io/discovery/0.2.0/schema.json`.
+//!
+//! All five are derived from the same compiled-policy graph
 //! (`CompiledConfig`); they share an in-memory cache so the data plane
 //! pays one atomic load and one hash-map lookup per request. Cache
 //! refresh runs once per config reload, atomically.
@@ -36,6 +43,7 @@ use sbproxy_config::CompiledConfig;
 use sbproxy_plugin::{current_admin_audit_emitter, ProjectionRefreshEvent};
 use sha2::{Digest, Sha256};
 
+pub mod agent_skills;
 pub mod licenses;
 pub mod llms;
 pub mod robots;
@@ -81,6 +89,10 @@ pub struct ProjectionDocs {
     /// proxy can stamp the optional `TDM-Reservation: 1` header per
     /// A4.1 § "TDMRep" when an origin asserts no `Content-Signal`.
     pub content_signals: HashMap<CompactString, Option<CompactString>>,
+    /// Per-hostname Agent Skills v0.2.0 index (WOR-193). Origins
+    /// without `agent_skills:` produce no entries; the data-plane
+    /// handler 404s the well-known URL for those hostnames.
+    pub agent_skills: HashMap<CompactString, agent_skills::AgentSkillsIndex>,
 }
 
 /// Compute all four projection bodies for every origin in `config`.
@@ -98,6 +110,18 @@ pub fn render_projections(config: &CompiledConfig, config_version: u64) -> Proje
         config_version,
         ..ProjectionDocs::default()
     };
+
+    // WOR-193: Agent Skills index. Walk every origin with `agent_skills:`
+    // configured, resolve artifact bytes, hash them, and stash the
+    // result on the projection cache. Workspace root defaults to the
+    // current working directory; operators that author `path:` fields
+    // in their YAML get filesystem reads relative to where the proxy
+    // was started, matching the convention the other projection
+    // modules use for any local-file resolution.
+    docs.agent_skills = agent_skills::render_indices(
+        config,
+        &std::env::current_dir().unwrap_or_else(|_| ".".into()),
+    );
 
     for origin in &config.origins {
         // --- Discover the ai_crawl_control entry, if any ---
@@ -208,6 +232,48 @@ pub fn install_projections(docs: ProjectionDocs) {
         cv,
     );
     emit_for_kind(emitter.as_ref(), &emit_snapshot.tdmrep_json, "tdmrep", cv);
+
+    // WOR-193: emit one ProjectionRefreshEvent per (hostname, agent_skill)
+    // pair so audit sinks see a stable record of the manifest digests
+    // that were live for this config version. Each entry's `doc_hash`
+    // is the SHA-256 of the artifact body the manifest pinned, so a
+    // verifier can check the served bytes match the audit row.
+    for (hostname, idx) in &emit_snapshot.agent_skills {
+        for entry in &idx.entries {
+            // Strip the `sha256:` prefix the manifest carries to match
+            // the existing audit-event hex contract.
+            let hex_only = entry
+                .digest
+                .strip_prefix("sha256:")
+                .unwrap_or(&entry.digest);
+            emitter.record_projection_refresh(ProjectionRefreshEvent {
+                hostname: hostname.to_string(),
+                projection_kind: format!("agent-skill:{}", entry.name),
+                config_version: cv,
+                doc_hash: hex_only.to_string(),
+                byte_len: idx
+                    .artifacts
+                    .get(&CompactString::new(canonical_path_from_url(&entry.url)))
+                    .map(|b| b.len())
+                    .unwrap_or(0),
+            });
+        }
+    }
+}
+
+/// Strip the URL down to the canonical path key used by the artifact
+/// cache, mirroring the crate-private `canonical_path_key` helper in
+/// `agent_skills`. Used by the audit emitter to look up byte-lengths
+/// for fully-qualified URLs (which return an empty path key here).
+fn canonical_path_from_url(url: &str) -> String {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return String::new();
+    }
+    if url.starts_with('/') {
+        url.to_string()
+    } else {
+        format!("/{url}")
+    }
 }
 
 fn emit_for_kind(
@@ -289,6 +355,7 @@ mod tests {
                 auto_content_negotiate: None,
                 content_signal: None,
                 token_bytes_ratio: None,
+                agent_skills: Vec::new(),
             }],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),

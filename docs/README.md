@@ -19,6 +19,8 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [ai-gateway.md](ai-gateway.md) - providers, routing strategies, guardrails, budgets, streaming.
 - [providers.md](providers.md) - the catalog of supported LLM providers.
 - [scripting.md](scripting.md) - CEL, Lua, JavaScript, and WASM scripting reference.
+- [mcp.md](mcp.md) - the MCP gateway: wire shape, capabilities, and `experimental.agentSkillsUrl` advertising.
+- [agent-skills.md](agent-skills.md) - Agent Skills v0.2.0 well-known projection: schema, integrity, archive safety, no-script-execution contract.
 
 ### Operations
 - [access-log.md](access-log.md) - structured JSON access log: filters, sampling, header capture, redaction.

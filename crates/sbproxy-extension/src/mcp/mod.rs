@@ -39,7 +39,7 @@ pub use code_mode::{compress_tool_schema, estimate_token_reduction};
 pub use context_opt::ToolUsageTracker;
 pub use federation::{FederatedTool, McpFederation, McpServerConfig};
 pub use guardrails::{check_tool_invocation, McpGuardrailConfig};
-pub use handler::McpHandler;
+pub use handler::{InitializeContext, McpHandler};
 pub use openapi_convert::openapi_to_mcp_tools;
 pub use registry::{ToolHandlerType, ToolRegistry};
 pub use rest_to_mcp::{create_mcp_handler, execute_tool_as_rest, RestToMcpConfig};

@@ -709,6 +709,38 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
 
     let token_bytes_ratio = config.token_bytes_ratio;
 
+    // --- WOR-193: validate agent_skills entries at config-load ---
+    //
+    // Reject unknown `type:` discriminators eagerly so a typo cannot
+    // silently turn a `skill-md` entry into an unhandled bucket. The
+    // closed enum is `{skill-md, archive}` per the v0.2.0 spec.
+    // Visibility is `{public, authenticated}`; absent (or any other
+    // value) falls back to public at the call site.
+    for skill in &config.agent_skills {
+        match skill.kind.as_str() {
+            "skill-md" | "archive" => {}
+            other => {
+                anyhow::bail!(
+                    "invalid agent_skills entry {:?} for origin {}: type must be one of skill-md, archive (got {:?})",
+                    skill.name,
+                    hostname,
+                    other
+                );
+            }
+        }
+        match skill.visibility.as_str() {
+            "public" | "authenticated" => {}
+            other => {
+                anyhow::bail!(
+                    "invalid agent_skills visibility {:?} for origin {} entry {:?}: must be public or authenticated",
+                    other,
+                    hostname,
+                    skill.name
+                );
+            }
+        }
+    }
+
     Ok(CompiledOrigin {
         hostname: CompactString::new(hostname),
         origin_id: CompactString::new(hostname),
@@ -763,6 +795,8 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         // projection. None falls back to DEFAULT_TOKEN_BYTES_RATIO at
         // the call site.
         token_bytes_ratio,
+        // WOR-193: per-origin Agent Skills v0.2.0 advertisement.
+        agent_skills: config.agent_skills,
     })
 }
 
@@ -2175,6 +2209,108 @@ origins:
         let compiled = compile_config(yaml).expect("compile");
         let origin = compiled.resolve_origin("signal.example.com").unwrap();
         assert!(origin.content_signal.is_none());
+    }
+
+    // --- WOR-193: agent_skills schema validation ---
+
+    #[test]
+    fn agent_skills_invalid_type_fails_config_load() {
+        let yaml = r#"
+origins:
+  skills.example.com:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/html
+      body: "ok"
+    agent_skills:
+      - name: bad
+        type: not-a-real-kind
+        description: nope
+        url: /skills/foo.md
+        body: "x"
+"#;
+        let result = compile_config(yaml);
+        let err = match result {
+            Ok(_) => panic!("compile must reject unknown agent_skills type"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("agent_skills") && err.contains("type"),
+            "error must reference agent_skills type; got: {err}"
+        );
+    }
+
+    #[test]
+    fn agent_skills_invalid_visibility_fails_config_load() {
+        let yaml = r#"
+origins:
+  skills.example.com:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/html
+      body: "ok"
+    agent_skills:
+      - name: ok
+        type: skill-md
+        description: nope
+        url: /skills/foo.md
+        body: "x"
+        visibility: secret
+"#;
+        let result = compile_config(yaml);
+        let err = match result {
+            Ok(_) => panic!("compile must reject unknown visibility"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("visibility"),
+            "error must reference visibility; got: {err}"
+        );
+    }
+
+    #[test]
+    fn agent_skills_absent_compiles_with_empty_list() {
+        // v1-compat: existing configs without `agent_skills:` keep
+        // working unchanged (the field defaults to an empty Vec).
+        let yaml = r#"
+origins:
+  noskills.example.com:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/html
+      body: "ok"
+"#;
+        let compiled = compile_config(yaml).expect("compile");
+        let origin = compiled.resolve_origin("noskills.example.com").unwrap();
+        assert!(origin.agent_skills.is_empty());
+    }
+
+    #[test]
+    fn agent_skills_skill_md_compiles_cleanly() {
+        let yaml = r##"
+origins:
+  skills.example.com:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/html
+      body: "ok"
+    agent_skills:
+      - name: deploy-via-pr
+        type: skill-md
+        description: "Open a PR"
+        url: /skills/deploy-via-pr.md
+        body: "# deploy-via-pr"
+"##;
+        let compiled = compile_config(yaml).expect("compile");
+        let origin = compiled.resolve_origin("skills.example.com").unwrap();
+        assert_eq!(origin.agent_skills.len(), 1);
+        assert_eq!(origin.agent_skills[0].name, "deploy-via-pr");
+        assert_eq!(origin.agent_skills[0].kind, "skill-md");
+        assert_eq!(origin.agent_skills[0].visibility, "public");
     }
 
     // --- Wave 4 / A4.2 follow-up: token_bytes_ratio override ---

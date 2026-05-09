@@ -1519,6 +1519,98 @@ pub struct RawOriginConfig {
     /// `DEFAULT_TOKEN_BYTES_RATIO` (0.25).
     #[serde(default)]
     pub token_bytes_ratio: Option<f32>,
+    /// Per-origin Agent Skills v0.2.0 advertisement (WOR-193). When
+    /// non-empty, the proxy serves `GET /.well-known/agent-skills/index.json`
+    /// for this origin and re-hosts each path-absolute or relative
+    /// artifact at the URL declared in the entry. Empty (or absent)
+    /// keeps the well-known endpoint disabled for the origin so v1
+    /// configs compile unchanged.
+    #[serde(default)]
+    pub agent_skills: Vec<AgentSkillEntry>,
+}
+
+// --- Agent Skills v0.2.0 ---
+
+/// One entry in an origin's `agent_skills:` advertisement (WOR-193).
+///
+/// The shape mirrors the v0.2.0 manifest entry described at
+/// `https://schemas.agentskills.io/discovery/0.2.0/schema.json`:
+/// every entry carries a stable name, a kind discriminator, a human
+/// description, and the URL the agent fetches to retrieve the artifact.
+/// A `digest` field is computed at config-load time by hashing the
+/// resolved artifact bytes; the per-request handler re-hashes the body
+/// on every serve and refuses to ship a tampered artifact (WOR-194).
+///
+/// The optional safety knobs (`max_decompression_ratio`, `max_entries`,
+/// `max_expanded_bytes`, `max_clock_skew_secs`) cap archive parsing so
+/// a malicious origin cannot zip-bomb a downstream agent. All four
+/// have sensible defaults, and v1 configs that omit `agent_skills:`
+/// pay nothing for the new schema field.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentSkillEntry {
+    /// Stable identifier (used as the manifest `name` and as the
+    /// audit-event subject). Must be unique within the origin's
+    /// `agent_skills:` list.
+    pub name: String,
+    /// Discriminator: `skill-md` for a single Markdown body or
+    /// `archive` for a `.tar.gz` / `.zip` bundle. The v0.2.0 spec
+    /// reserves these two values; any other input is rejected at
+    /// config-load time.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Human-readable description surfaced in the manifest. Reads
+    /// like a one-line capability summary.
+    pub description: String,
+    /// URL the agent fetches to retrieve the artifact. May be:
+    ///
+    /// - A path-absolute reference (`/skills/foo.md`) re-hosted by
+    ///   the proxy on the same origin.
+    /// - A fully-qualified URL fetched once at config-load and
+    ///   re-emitted verbatim in the manifest (the proxy does not
+    ///   re-host external artifacts).
+    /// - A relative reference (`skills/foo.md`) resolved per RFC 3986
+    ///   against the request authority at serve time.
+    pub url: String,
+    /// Visibility gate. `public` (default) returns the entry to every
+    /// caller. `authenticated` filters the entry out of the manifest
+    /// served to anonymous callers; the proxy still recomputes the
+    /// digest per request so caching does not leak filtered entries.
+    #[serde(default = "default_agent_skill_visibility")]
+    pub visibility: String,
+    /// Local filesystem path to the artifact body, when the operator
+    /// hosts the file alongside the config. Used for `skill-md`
+    /// entries with a path-absolute or relative `url`. When neither
+    /// `path` nor `body` is set and `url` is path-absolute, the
+    /// compiler resolves the path relative to the workspace root.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Inline literal body. Useful for short skill files without
+    /// having to commit a separate Markdown file. Mutually exclusive
+    /// with `path`; when both are set the compiler prefers `path`.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Maximum decompression ratio (compressed:expanded) tolerated for
+    /// `archive` entries. Default 100. Refuses to extract archives
+    /// whose total expanded size exceeds the cap.
+    #[serde(default)]
+    pub max_decompression_ratio: Option<u32>,
+    /// Maximum entry count per archive. Default 1000.
+    #[serde(default)]
+    pub max_entries: Option<u32>,
+    /// Maximum expanded byte budget per archive. Default 10 MiB.
+    #[serde(default)]
+    pub max_expanded_bytes: Option<u64>,
+    /// Per-entry clock-skew tolerance in seconds for any time-sensitive
+    /// header attached to the artifact response. Default 60. Reserved:
+    /// the v0.2.0 ship attaches no such header today; the field exists
+    /// so a follow-up that signs each artifact body can wire its own
+    /// freshness check without a config-schema break.
+    #[serde(default)]
+    pub max_clock_skew_secs: Option<u32>,
+}
+
+fn default_agent_skill_visibility() -> String {
+    "public".to_string()
 }
 
 // --- Per-origin rate limits ---

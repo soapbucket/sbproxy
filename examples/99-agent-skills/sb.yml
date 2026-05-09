@@ -1,0 +1,77 @@
+# 99 - Agent Skills v0.2.0 well-known projection
+# (WOR-193 + WOR-194 + WOR-195).
+#
+# Demonstrates the Agent Skills v0.2.0 discovery endpoint at
+# `GET /.well-known/agent-skills/index.json`. Cooperative agents fetch
+# the manifest to discover the skills the origin advertises, then fetch
+# each artifact at the URL the manifest pins. Every artifact body is
+# hashed (SHA-256) at config-load time and re-hashed on every serve;
+# tampered bodies return 503 with an audit event.
+#
+# Reference:
+#   - Schema:  https://schemas.agentskills.io/discovery/0.2.0/schema.json
+#   - RFC:     https://github.com/cloudflare/agent-skills-discovery-rfc
+#
+# Bundle layout:
+#   sb.yml                              - this file
+#   skills/deploy-via-pr.md             - the public Markdown skill body
+#   skills/internal-rotate-secret.md    - authenticated-only skill body
+#
+# Run:
+#   cd examples/99-agent-skills
+#   sbproxy serve -f sb.yml
+#
+# Inspect the manifest (anonymous):
+#   curl -s -H 'Host: test.sbproxy.dev' \
+#     http://127.0.0.1:8080/.well-known/agent-skills/index.json | jq
+#
+# Inspect the manifest (authenticated, full set):
+#   curl -s -H 'Host: test.sbproxy.dev' \
+#     -H 'Authorization: Bearer demo' \
+#     http://127.0.0.1:8080/.well-known/agent-skills/index.json | jq
+#
+# Fetch a re-hosted skill body:
+#   curl -s -H 'Host: test.sbproxy.dev' \
+#     http://127.0.0.1:8080/skills/deploy-via-pr.md
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "test.sbproxy.dev":
+    action:
+      type: static
+      status: 200
+      content_type: text/html
+      body: |
+        <!doctype html>
+        <html>
+        <body>
+          <h1>SBproxy demo - Agent Skills</h1>
+          <p>The Agent Skills manifest is at
+          <code>/.well-known/agent-skills/index.json</code>.</p>
+        </body>
+        </html>
+
+    # WOR-193: Agent Skills v0.2.0 advertisement. Each entry becomes
+    # one row in the served manifest, with a SHA-256 digest pinned at
+    # config-load time and re-verified on every artifact GET.
+    agent_skills:
+      - name: "deploy-via-pr"
+        type: skill-md
+        description: "Open a pull request to deploy a config change."
+        # Path-absolute URL: the proxy re-hosts the artifact at this
+        # path on the same origin. Path-relative or fully-qualified
+        # URLs also work; see the v0.2.0 spec for the resolution
+        # contract.
+        url: "/skills/deploy-via-pr.md"
+        visibility: public
+
+      - name: "internal-rotate-secret"
+        type: skill-md
+        description: "Rotate a service credential using vault."
+        url: "/skills/internal-rotate-secret.md"
+        # WOR-193: authenticated-only entry. Anonymous callers receive
+        # the public-only manifest; callers that present an
+        # `Authorization` header see this entry too.
+        visibility: authenticated

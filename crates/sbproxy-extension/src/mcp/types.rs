@@ -193,6 +193,14 @@ pub struct ServerCapabilities {
     /// Capability descriptor for prompt methods, when supported.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompts: Option<serde_json::Value>,
+    /// Experimental, non-stable capability descriptors. WOR-195 uses
+    /// this slot to advertise an Agent Skills v0.2.0 manifest URL via
+    /// the `agentSkillsUrl` key, so MCP clients that have learned how
+    /// to fetch and verify the manifest can discover skills without
+    /// out-of-band configuration. Omitted when the origin does not
+    /// configure `agent_skills`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<serde_json::Value>,
 }
 
 /// "initialize" response result body.
