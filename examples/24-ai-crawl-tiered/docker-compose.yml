@@ -64,10 +64,18 @@ services:
     volumes:
       - ./mock-ledger/default.conf:/etc/nginx/conf.d/default.conf:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost/__ledger_health || exit 1"]
+      # `wget -q -O /dev/null` (GET, discard body) plus 127.0.0.1
+      # explicit. The default `localhost` resolves to ::1 (IPv6) under
+      # BusyBox in this image, but nginx only listens on IPv4 because
+      # the upstream entrypoint script `10-listen-on-ipv6-by-default.sh`
+      # cannot modify the read-only-mounted /etc/nginx/conf.d/default.conf.
+      # 127.0.0.1 forces IPv4 resolution and avoids the mismatch.
+      # See WOR-187 for the regression history.
+      test: ["CMD-SHELL", "wget -q -O /dev/null --tries=1 http://127.0.0.1/__ledger_health"]
       interval: 5s
       timeout: 3s
       retries: 5
+      start_period: 5s
     networks:
       - tieredsb
 
@@ -78,10 +86,18 @@ services:
     volumes:
       - ./mock-origin/default.conf:/etc/nginx/conf.d/default.conf:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost/__origin_health || exit 1"]
+      # `wget -q -O /dev/null` (GET, discard body) plus 127.0.0.1
+      # explicit. The default `localhost` resolves to ::1 (IPv6) under
+      # BusyBox in this image, but nginx only listens on IPv4 because
+      # the upstream entrypoint script `10-listen-on-ipv6-by-default.sh`
+      # cannot modify the read-only-mounted /etc/nginx/conf.d/default.conf.
+      # 127.0.0.1 forces IPv4 resolution and avoids the mismatch.
+      # See WOR-187 for the regression history.
+      test: ["CMD-SHELL", "wget -q -O /dev/null --tries=1 http://127.0.0.1/__origin_health"]
       interval: 5s
       timeout: 3s
       retries: 5
+      start_period: 5s
     networks:
       - tieredsb
 
