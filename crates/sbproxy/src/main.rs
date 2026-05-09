@@ -159,7 +159,7 @@ fn main() {
     }
     if matches!(args.get(1).map(String::as_str), Some("apply")) {
         match handle_apply_subcommand(&args[2..]) {
-            Ok(()) => return,
+            Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("apply: {e:#}");
                 std::process::exit(1);
@@ -580,7 +580,10 @@ FLAGS:
 EXIT CODES:
     0   No changes between baseline and proposed.
     1   CLI / IO error.
-    2   Changes present (informational, not an error).";
+    2   Changes present (informational, not an error).
+    3   Semantic-validation errors present (orphan ref, missing
+        secret, unknown module type). See the report's findings
+        section for details.";
 
 /// Help banner for `sbproxy apply`.
 const APPLY_HELP: &str = "sbproxy apply: validate and reload an sbproxy config in place.
@@ -593,11 +596,18 @@ FLAGS:
     -h, --help            Print this banner.
 
 NOTES:
-    apply runs `compile_config` on the proposed YAML and then calls
-    the same hot-reload primitive the SIGHUP handler and file watcher
-    use. The plan-file (`-p`) form, the staleness check, and the
-    blast-radius gates (`--reload-only`, `--restart-required`) are
-    deferred follow-ups (steps 3-5 of WOR-180).";
+    apply runs `compile_config` on the proposed YAML, runs plan-time
+    semantic validation, and then calls the same hot-reload primitive
+    the SIGHUP handler and file watcher use. Apply refuses (exit 3)
+    when any validation error is present. The plan-file (`-p`) form,
+    the staleness check, and the blast-radius gates (`--reload-only`,
+    `--restart-required`) are deferred follow-ups (steps 4-5 of
+    WOR-180).
+
+EXIT CODES:
+    0   Reload applied cleanly.
+    1   CLI / IO / reload error.
+    3   Semantic-validation errors present; apply refused.";
 
 fn parse_plan_args(args: &[String]) -> anyhow::Result<PlanArgs> {
     let mut config: Option<String> = None;
@@ -701,8 +711,9 @@ fn empty_config_file() -> sbproxy_config::ConfigFile {
 /// Run the `sbproxy plan` subcommand. Returns the desired process
 /// exit code:
 ///
-/// * `0` no changes,
-/// * `2` changes present.
+/// * `0` no changes and no validation errors,
+/// * `2` changes present and no validation errors,
+/// * `3` semantic-validation errors present (per the WOR-131 ADR).
 ///
 /// Per-flavour CLI / IO errors short-circuit out of the caller via
 /// `anyhow::Result::Err` and exit 1.
@@ -726,24 +737,47 @@ fn handle_plan_subcommand(args: &[String]) -> anyhow::Result<i32> {
         }
     }
 
-    Ok(if report.is_noop() { 0 } else { 2 })
+    if report.has_errors() {
+        Ok(3)
+    } else if report.is_noop() {
+        Ok(0)
+    } else {
+        Ok(2)
+    }
 }
 
 /// Run the `sbproxy apply` subcommand. Loads + validates the proposed
-/// YAML and calls into the existing `reload_from_config_path`
-/// primitive (the same call the file watcher and SIGHUP handler use).
+/// YAML, runs plan-time semantic validation, and calls into the
+/// existing `reload_from_config_path` primitive (the same call the
+/// file watcher and SIGHUP handler use). Refuses to apply when any
+/// `Severity::Error` finding is present.
 ///
 /// The OSS reload primitive operates on the in-process global pipeline.
 /// Out-of-process apply (driving a separately-running sbproxy via the
 /// admin socket) is open question 4 in the ADR and is deferred.
-fn handle_apply_subcommand(args: &[String]) -> anyhow::Result<()> {
+fn handle_apply_subcommand(args: &[String]) -> anyhow::Result<i32> {
     let parsed = parse_apply_args(args)?;
     // Validate first so apply never half-commits a broken config.
-    let _ = load_and_validate(&parsed.config)?;
+    let proposed = load_and_validate(&parsed.config)?;
+
+    // Plan-time semantic validation against an empty baseline. We
+    // only need the findings here; the diff entries are uninteresting
+    // for an apply path that did not opt into a baseline. A future
+    // step (WOR-180 step 5) will run plan against the live running
+    // pipeline and add a staleness check against the supplied plan
+    // file.
+    let baseline = empty_config_file();
+    let report = sbproxy_config::plan(&baseline, &proposed);
+    if report.has_errors() {
+        eprintln!("apply: refusing to apply, semantic validation failed:");
+        eprint!("{}", sbproxy_config::render_text(&report));
+        return Ok(3);
+    }
+
     sbproxy_core::server::reload_from_config_path(&parsed.config)
         .map_err(|e| anyhow::anyhow!("reload failed: {e:#}"))?;
     println!("apply: reloaded config from {}", parsed.config);
-    Ok(())
+    Ok(0)
 }
 
 #[cfg(test)]

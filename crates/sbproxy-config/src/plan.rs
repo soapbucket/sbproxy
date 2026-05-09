@@ -8,7 +8,7 @@
 //! (the K8s operator, future admin-socket plan-export) per ADR open
 //! question 7.
 //!
-//! Scope today (WOR-180 steps 1 and 2):
+//! Scope today (WOR-180 steps 1 through 3):
 //!
 //! * Diff granularity is per top-level key of [`ConfigFile`]:
 //!   each origin (keyed by hostname) plus a single `proxy` entry that
@@ -17,11 +17,14 @@
 //! * Blast-radius mapping is the simple top-level mapping documented in
 //!   the ADR and in `top_level_blast_radius` below; per-path
 //!   refinement is step 4 of the WOR-180 sequence and is deferred.
-//! * Plan-time semantic validation (orphan refs, missing secrets,
-//!   unknown module types) is step 3 and is also deferred. This module
-//!   only diffs; it never rejects.
+//! * Plan-time semantic validation runs against the **proposed**
+//!   config and surfaces orphan refs, missing secrets, and unknown
+//!   module types as [`PlanFinding`] entries on [`PlanReport`]. The
+//!   CLI maps any [`Severity::Error`] finding to exit code `3`. See
+//!   [`mod@crate::validate`] for the full rule list.
 
 use crate::types::ConfigFile;
+use crate::validate::{validate, PlanFinding, Severity, ValidationOptions};
 use serde::Serialize;
 use std::collections::BTreeSet;
 
@@ -45,13 +48,29 @@ pub struct PlanReport {
     /// The largest blast radius across all entries. `Hitless` when
     /// there are no changes (matches the "no-op plan" exit-zero case).
     pub max_blast_radius: BlastRadius,
+    /// Plan-time semantic-validation findings. See [`PlanFinding`]
+    /// and the [`mod@crate::validate`] module for the full rule list.
+    /// Empty when the proposed config passes every rule. Defaults
+    /// to `vec![]` on deserialise so older plan envelopes parse
+    /// unchanged.
+    #[serde(default)]
+    pub findings: Vec<PlanFinding>,
 }
 
 impl PlanReport {
     /// True when no entries are present (a no-op plan). The CLI maps
-    /// this to exit code 0; `false` maps to exit code 2.
+    /// this to exit code 0; `false` maps to exit code 2 (or to 3
+    /// when [`Self::has_errors`] returns true).
     pub fn is_noop(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// True when any finding has [`Severity::Error`]. The CLI maps
+    /// this to exit code 3 and refuses to apply.
+    pub fn has_errors(&self) -> bool {
+        self.findings
+            .iter()
+            .any(|f| matches!(f.severity, Severity::Error))
     }
 }
 
@@ -167,7 +186,25 @@ impl PlanSummary {
 /// The function is sync, allocation-bounded, and never panics: every
 /// `serde_json::to_value` failure is converted to a string-encoded
 /// fallback so the CLI never sees a `Result::Err`.
+///
+/// Plan-time semantic validation runs against `proposed` (not
+/// `baseline`) using [`ValidationOptions::default()`]. Callers that
+/// link extra plugin crates should use [`plan_with_options`] to pass
+/// their extended type catalogs.
 pub fn plan(baseline: &ConfigFile, proposed: &ConfigFile) -> PlanReport {
+    plan_with_options(baseline, proposed, &ValidationOptions::default())
+}
+
+/// Diff two parsed config files and run plan-time semantic
+/// validation with the supplied [`ValidationOptions`]. Use this
+/// entry point in builds that link auth / action / policy /
+/// transform plugin crates beyond the OSS catalog so the unknown-type
+/// rule does not falsely flag those module names.
+pub fn plan_with_options(
+    baseline: &ConfigFile,
+    proposed: &ConfigFile,
+    opts: &ValidationOptions,
+) -> PlanReport {
     let mut entries: Vec<PlanEntry> = Vec::new();
     let mut summary = PlanSummary::default();
 
@@ -317,11 +354,17 @@ pub fn plan(baseline: &ConfigFile, proposed: &ConfigFile) -> PlanReport {
         .max()
         .unwrap_or(BlastRadius::Hitless);
 
+    // Plan-time semantic validation runs against the proposed
+    // config. Findings ride alongside the diff entries; the CLI
+    // maps any `Severity::Error` finding to exit code 3.
+    let findings = validate(proposed, opts);
+
     PlanReport {
         plan_version: 1,
         entries,
         summary,
         max_blast_radius,
+        findings,
     }
 }
 
@@ -396,12 +439,20 @@ fn origin_change_reason(host: &str, old: &serde_json::Value, new: &serde_json::V
 /// Render a [`PlanReport`] as a Terraform-style human-readable text
 /// block. The format is deliberately stable but not promised; tooling
 /// should consume `--format json` instead.
+///
+/// When the report carries [`PlanFinding`] entries (semantic
+/// validation), they print after the diff under a `Validation:`
+/// header so an operator sees errors and warnings in the same place
+/// as the change list.
 pub fn render_text(report: &PlanReport) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
-    if report.is_noop() {
+    if report.is_noop() && report.findings.is_empty() {
         out.push_str("No changes. sbproxy config is in sync.\n");
         return out;
+    }
+    if report.is_noop() {
+        out.push_str("No changes. sbproxy config is in sync.\n");
     }
     for e in &report.entries {
         let sigil = match e.kind {
@@ -417,19 +468,47 @@ pub fn render_text(report: &PlanReport) -> String {
         };
         let _ = writeln!(&mut out, "  {sigil} {} [{label}] {}", e.path, e.reason);
     }
-    let _ = writeln!(
-        &mut out,
-        "\nPlan: {} added, {} changed, {} removed. max-blast-radius: {}",
-        report.summary.added,
-        report.summary.changed,
-        report.summary.removed,
-        match report.max_blast_radius {
-            BlastRadius::Hitless => "hitless",
-            BlastRadius::Reload => "reload",
-            BlastRadius::Restart => "restart",
-            BlastRadius::Breaking => "breaking",
+    if !report.entries.is_empty() {
+        let _ = writeln!(
+            &mut out,
+            "\nPlan: {} added, {} changed, {} removed. max-blast-radius: {}",
+            report.summary.added,
+            report.summary.changed,
+            report.summary.removed,
+            match report.max_blast_radius {
+                BlastRadius::Hitless => "hitless",
+                BlastRadius::Reload => "reload",
+                BlastRadius::Restart => "restart",
+                BlastRadius::Breaking => "breaking",
+            }
+        );
+    }
+    if !report.findings.is_empty() {
+        let _ = writeln!(&mut out, "\nValidation:");
+        let mut errors = 0usize;
+        let mut warns = 0usize;
+        for f in &report.findings {
+            let label = match f.severity {
+                Severity::Error => {
+                    errors += 1;
+                    "ERROR"
+                }
+                Severity::Warn => {
+                    warns += 1;
+                    "WARN "
+                }
+            };
+            let _ = writeln!(
+                &mut out,
+                "  [{label}] {} ({}): {}",
+                f.path, f.rule_id, f.message
+            );
         }
-    );
+        let _ = writeln!(
+            &mut out,
+            "\nValidation: {errors} error(s), {warns} warning(s)."
+        );
+    }
     out
 }
 
@@ -498,7 +577,7 @@ origins:
       type: proxy
       url: https://upstream.example.com
     transforms:
-      - type: gzip
+      - type: noop
 "#;
 
     #[test]
