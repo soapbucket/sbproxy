@@ -93,11 +93,11 @@ jobs:
         # libclang-dev is needed for rquickjs-sys's bindgen build script.
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang
 
+      - name: install cargo-binstall
+        uses: cargo-bins/cargo-binstall@v1
+
       - name: install cargo-fuzz
-        # No --locked: cargo-fuzz's published Cargo.lock pins rustix 0.36.5,
-        # which uses reserved rustc_attrs that current stable rustc rejects.
-        # Letting cargo resolve fresh picks a patched rustix in the 0.36 line.
-        run: cargo install cargo-fuzz
+        run: cargo binstall -y cargo-fuzz
 
       - name: run ${{ matrix.target }}
         # Smoke pass only: -max_total_time bounds the libfuzzer
