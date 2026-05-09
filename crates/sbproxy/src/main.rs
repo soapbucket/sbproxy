@@ -135,6 +135,38 @@ fn main() {
         }
     }
 
+    // --- WOR-180 (steps 1+2): `sbproxy plan` and `sbproxy apply` ---
+    //
+    // `plan` runs `compile_config` on the proposed YAML (and optionally
+    // a `--against` baseline YAML) for validation, parses both into
+    // typed `ConfigFile` values, and calls `sbproxy_config::plan` to
+    // emit a structured diff. Exit codes follow the ADR
+    // (`docs/adr-config-plan-apply.md`): 0 no-op, 2 changes present.
+    //
+    // `apply` runs `compile_config` for validation and then calls into
+    // `sbproxy_core::reload_from_config_path`, the same primitive the
+    // SIGHUP handler and file watcher use. The `-p plan-file` form,
+    // staleness check, and admin-socket `--running` baseline are
+    // out-of-scope follow-ups (steps 3 through 5 of WOR-180).
+    if matches!(args.get(1).map(String::as_str), Some("plan")) {
+        match handle_plan_subcommand(&args[2..]) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("plan: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if matches!(args.get(1).map(String::as_str), Some("apply")) {
+        match handle_apply_subcommand(&args[2..]) {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("apply: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // CLI > SB_CONFIG_FILE env. The env fallback lets containerised
     // deployments set SB_CONFIG_FILE in the pod spec without templating
     // a CMD line.
@@ -341,6 +373,8 @@ USAGE:
     sbproxy serve -f <path> [--log-level <level>] [--request-log-level <level>] [--grace-time <secs>]
     sbproxy validate <path>
     sbproxy --config <path> --check
+    sbproxy plan -f <yaml> [--against <yaml>] [--format json|text]
+    sbproxy apply -f <yaml>
     sbproxy projections render --kind {robots|llms|llms-full|licenses|tdmrep} \\
                                --config <path> [--hostname <h>]
     sbproxy --version
@@ -500,6 +534,216 @@ fn lookup_projection<'a>(
         "tdmrep" => docs.tdmrep_json.get(hostname),
         _ => None,
     }
+}
+
+// --- WOR-180 plan / apply handlers (steps 1+2 of `docs/adr-config-plan-apply.md`) ---
+
+/// Output format for `sbproxy plan`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanFormat {
+    Text,
+    Json,
+}
+
+/// Parsed argv for `sbproxy plan`.
+#[derive(Debug)]
+struct PlanArgs {
+    config: String,
+    against: Option<String>,
+    format: PlanFormat,
+}
+
+/// Parsed argv for `sbproxy apply`.
+#[derive(Debug)]
+struct ApplyArgs {
+    config: String,
+}
+
+/// Help banner for `sbproxy plan`. Printed when invoked with `--help`
+/// or `-h`; also referenced from argv-error messages.
+const PLAN_HELP: &str = "sbproxy plan: diff a proposed config against a baseline.
+
+USAGE:
+    sbproxy plan -f <yaml> [--against <yaml>] [--format json|text]
+
+FLAGS:
+    -f, --config <yaml>   Proposed config file. Required.
+    --against <yaml>      Baseline config file. Default: empty (every
+                          origin in the proposed config surfaces as
+                          'added'). The --running baseline is deferred.
+    --format json|text    Output format. 'text' (default) is a
+                          terraform-style diff for human consumption;
+                          'json' is the stable plan envelope for
+                          tooling.
+    -h, --help            Print this banner.
+
+EXIT CODES:
+    0   No changes between baseline and proposed.
+    1   CLI / IO error.
+    2   Changes present (informational, not an error).";
+
+/// Help banner for `sbproxy apply`.
+const APPLY_HELP: &str = "sbproxy apply: validate and reload an sbproxy config in place.
+
+USAGE:
+    sbproxy apply -f <yaml>
+
+FLAGS:
+    -f, --config <yaml>   Proposed config file. Required.
+    -h, --help            Print this banner.
+
+NOTES:
+    apply runs `compile_config` on the proposed YAML and then calls
+    the same hot-reload primitive the SIGHUP handler and file watcher
+    use. The plan-file (`-p`) form, the staleness check, and the
+    blast-radius gates (`--reload-only`, `--restart-required`) are
+    deferred follow-ups (steps 3-5 of WOR-180).";
+
+fn parse_plan_args(args: &[String]) -> anyhow::Result<PlanArgs> {
+    let mut config: Option<String> = None;
+    let mut against: Option<String> = None;
+    let mut format: PlanFormat = PlanFormat::Text;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!("{PLAN_HELP}");
+                std::process::exit(0);
+            }
+            "--config" | "-f" => {
+                config = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--against" => {
+                against = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--format" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("--format requires a value (json|text)"))?;
+                format = match v.as_str() {
+                    "json" => PlanFormat::Json,
+                    "text" => PlanFormat::Text,
+                    other => {
+                        return Err(anyhow::anyhow!(
+                            "invalid --format '{other}'; expected 'json' or 'text'"
+                        ));
+                    }
+                };
+                i += 2;
+            }
+            other => {
+                return Err(anyhow::anyhow!(
+                    "unknown flag '{other}' for plan\n\n{PLAN_HELP}"
+                ));
+            }
+        }
+    }
+    let config = config.ok_or_else(|| anyhow::anyhow!("missing -f / --config\n\n{PLAN_HELP}"))?;
+    Ok(PlanArgs {
+        config,
+        against,
+        format,
+    })
+}
+
+fn parse_apply_args(args: &[String]) -> anyhow::Result<ApplyArgs> {
+    let mut config: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!("{APPLY_HELP}");
+                std::process::exit(0);
+            }
+            "--config" | "-f" => {
+                config = args.get(i + 1).cloned();
+                i += 2;
+            }
+            other => {
+                return Err(anyhow::anyhow!(
+                    "unknown flag '{other}' for apply\n\n{APPLY_HELP}"
+                ));
+            }
+        }
+    }
+    let config = config.ok_or_else(|| anyhow::anyhow!("missing -f / --config\n\n{APPLY_HELP}"))?;
+    Ok(ApplyArgs { config })
+}
+
+/// Validate a YAML config file by running it through `compile_config`,
+/// then return the parsed `ConfigFile` for the diff walker.
+///
+/// `compile_config` runs env-var interpolation and the schema +
+/// semantic checks the proxy already enforces at startup. The diff
+/// itself runs over the parsed `ConfigFile` (per the ADR's
+/// "diff operates over the raw `ConfigFile`" rule), so we re-parse the
+/// file with `serde_yaml::from_str` after `compile_config` has signed
+/// it off.
+fn load_and_validate(path: &str) -> anyhow::Result<sbproxy_config::ConfigFile> {
+    let yaml = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read config '{path}': {e}"))?;
+    sbproxy_config::compile_config(&yaml)
+        .map_err(|e| anyhow::anyhow!("config '{path}' did not compile:\n{e:#}"))?;
+    serde_yaml::from_str::<sbproxy_config::ConfigFile>(&yaml)
+        .map_err(|e| anyhow::anyhow!("failed to parse '{path}' as ConfigFile: {e}"))
+}
+
+/// Empty baseline used when `--against` is not supplied. Mirrors the
+/// "no prior config" branch of the ADR's baseline-resolution table; the
+/// proposed config's origins all surface as `Added`.
+fn empty_config_file() -> sbproxy_config::ConfigFile {
+    serde_yaml::from_str::<sbproxy_config::ConfigFile>("")
+        .expect("empty YAML parses to default ConfigFile")
+}
+
+/// Run the `sbproxy plan` subcommand. Returns the desired process
+/// exit code:
+///
+/// * `0` no changes,
+/// * `2` changes present.
+///
+/// Per-flavour CLI / IO errors short-circuit out of the caller via
+/// `anyhow::Result::Err` and exit 1.
+fn handle_plan_subcommand(args: &[String]) -> anyhow::Result<i32> {
+    let parsed = parse_plan_args(args)?;
+    let proposed = load_and_validate(&parsed.config)?;
+    let baseline = match parsed.against.as_deref() {
+        Some(p) => load_and_validate(p)?,
+        None => empty_config_file(),
+    };
+    let report = sbproxy_config::plan(&baseline, &proposed);
+
+    match parsed.format {
+        PlanFormat::Json => {
+            let body = serde_json::to_string_pretty(&report)
+                .map_err(|e| anyhow::anyhow!("failed to serialise plan: {e}"))?;
+            println!("{body}");
+        }
+        PlanFormat::Text => {
+            print!("{}", sbproxy_config::render_text(&report));
+        }
+    }
+
+    Ok(if report.is_noop() { 0 } else { 2 })
+}
+
+/// Run the `sbproxy apply` subcommand. Loads + validates the proposed
+/// YAML and calls into the existing `reload_from_config_path`
+/// primitive (the same call the file watcher and SIGHUP handler use).
+///
+/// The OSS reload primitive operates on the in-process global pipeline.
+/// Out-of-process apply (driving a separately-running sbproxy via the
+/// admin socket) is open question 4 in the ADR and is deferred.
+fn handle_apply_subcommand(args: &[String]) -> anyhow::Result<()> {
+    let parsed = parse_apply_args(args)?;
+    // Validate first so apply never half-commits a broken config.
+    let _ = load_and_validate(&parsed.config)?;
+    sbproxy_core::server::reload_from_config_path(&parsed.config)
+        .map_err(|e| anyhow::anyhow!("reload failed: {e:#}"))?;
+    println!("apply: reloaded config from {}", parsed.config);
+    Ok(())
 }
 
 #[cfg(test)]

@@ -64,3 +64,9 @@ mimalloc.workspace = true
 # walk the projection cache directly.
 anyhow.workspace = true
 bytes.workspace = true
+
+# WOR-180 plan / apply: the CLI parses YAML into `ConfigFile` for the
+# diff walker (`sbproxy-config` runs `compile_config` for validation),
+# and emits the plan envelope as pretty-printed JSON.
+serde_yaml.workspace = true
+serde_json.workspace = true

@@ -10,11 +10,13 @@
 
 pub mod compiler;
 pub mod duration;
+pub mod plan;
 pub mod raw;
 pub mod snapshot;
 pub mod types;
 
 pub use compiler::*;
+pub use plan::{plan, render_text, BlastRadius, PlanEntry, PlanKind, PlanReport, PlanSummary};
 pub use raw::*;
 pub use snapshot::*;
 pub use types::*;
