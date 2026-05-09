@@ -84,5 +84,5 @@ can audit.
 
 ## See also
 
-- [configuration.md](configuration.md#redirect-action) - full action schema.
+- [configuration.md](configuration.md#redirect) - full action schema.
 - `examples/74-bulk-redirects/` - runnable CSV + inline example.

@@ -1,7 +1,7 @@
 # Routing Strategies
 *Last modified: 2026-04-27*
 
-The `RoutingStrategy` trait is an opt-in extension point for plugging custom upstream selection logic into a `load_balancer` action. It lives in `sbproxy-modules::action::routing` and is the OSS scaffold that production work in [Fail-6](roadmap.md) (LoRA-aware, GPU-aware, contextual-bandit routing) will build against. The trait runs on the request hot path, so it is synchronous, takes a borrowed slice of already-projected target state, and returns the index of the chosen target or `None` to fall through to the configured `lb_method`.
+The `RoutingStrategy` trait is an opt-in extension point for plugging custom upstream selection logic into a `load_balancer` action. It lives in `sbproxy-modules::action::routing` and is the OSS scaffold that production work (LoRA-aware, GPU-aware, contextual-bandit routing) will build against. The trait runs on the request hot path, so it is synchronous, takes a borrowed slice of already-projected target state, and returns the index of the chosen target or `None` to fall through to the configured `lb_method`.
 
 The existing built-in algorithms (`round_robin`, `weighted`, `least_connections`, `consistent_hash`, `random`, `priority`, ...) are unchanged and are not yet behind this trait. They continue to handle every request the way they always have. Strategies plug in alongside them: when a `RoutingStrategy` returns `None`, the configured built-in `lb_method` runs as the fall-back. The migration of the built-ins to live behind the trait, plus the three concrete production strategies, is tracked separately under Fail-6 in the roadmap.
 

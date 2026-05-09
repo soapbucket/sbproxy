@@ -85,4 +85,4 @@ The store does not currently emit metrics. Wire a metric of your choice around t
 ## See also
 
 - `crates/sbproxy-extension/src/flags.rs` - source.
-- [scripting.md](scripting.md#cel-functions) - full CEL surface.
+- [scripting.md](scripting.md#3-cel-expressions) - full CEL surface.
