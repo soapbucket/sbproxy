@@ -10,7 +10,7 @@ use std::collections::HashMap;
 // --- Top-Level Config ---
 
 /// Top-level config file structure (sb.yml).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ConfigFile {
     /// Server-wide settings parsed from the top-level `proxy:` block.
     #[serde(default)]
@@ -43,7 +43,7 @@ pub struct ConfigFile {
 /// The block is fully optional: when absent the binary builds the
 /// resolver from `AgentClassCatalog::defaults()` plus the default
 /// resolver tuning. Most operators leave it untouched.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentClassesConfig {
     /// Catalog source. `builtin` (default) loads the embedded YAML
     /// catalog. `hosted-feed` fetches from `hosted_feed.url`. `merged`
@@ -81,7 +81,7 @@ fn default_agent_classes_catalog() -> String {
 /// The fetch loop is not implemented in this crate; the field is
 /// reserved here so YAML written against the merged or hosted-feed
 /// shapes parses cleanly.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HostedFeedConfig {
     /// Feed URL. Plain `http://` is allowed only against `127.0.0.1`
     /// and `localhost` for local development; the registry crate
@@ -100,7 +100,7 @@ pub struct HostedFeedConfig {
 /// keyid lookup on, 10 000-entry verdict cache. Operators set fields
 /// only when they need to disable a specific signal (typically rDNS
 /// in environments without a working PTR resolver).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentClassResolverConfig {
     /// Run forward-confirmed reverse-DNS as resolver step 2. Default
     /// `true`. Disable when the runtime has no working DNS resolver.
@@ -151,7 +151,7 @@ fn default_resolver_cache_size() -> usize {
 /// resolution, and the optional shared-state backends (L2 cache +
 /// messenger). Out-of-tree top-level blocks live in
 /// [`Self::extensions`] and are ignored by the compiler.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProxyServerConfig {
     /// HTTP listener port. Defaults to 8080.
     #[serde(default = "default_http_port")]
@@ -407,7 +407,7 @@ fn default_synthetic_timeout_ms() -> u64 {
 /// `SslDigest` does not expose the parsed Subject CN directly. When
 /// `require: true`, requests without a valid client cert are rejected
 /// during the TLS handshake and never reach `request_filter`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MtlsListenerConfig {
     /// Path to a PEM-encoded CA bundle used to verify client certs.
     pub client_ca_file: String,
@@ -439,7 +439,7 @@ fn default_mtls_require() -> bool {
 ///    the proxy used in its logs / webhooks.
 /// 4. The chosen value is echoed back to the client on the response,
 ///    unless `echo_response` is `false`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CorrelationIdConfig {
     /// Master switch. Default: `true`.
     #[serde(default = "default_correlation_id_enabled")]
@@ -530,7 +530,7 @@ mod correlation_id_tests {
 /// each request at `url` and discards the response. The primary
 /// upstream is never blocked by mirror delivery. Useful for safe
 /// rollouts of new backends and replay-driven testing.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MirrorConfig {
     /// Mirror upstream URL (http:// or https://). IPv6 hosts must be
     /// bracketed in the URL (e.g. `http://[2001:db8::1]:8080`) per RFC
@@ -1371,7 +1371,7 @@ impl Default for ConnectionPoolConfig {
 
 /// A single origin config as it appears in YAML.
 /// Plugin-specific fields are kept as `serde_json::Value` for deferred parsing.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RawOriginConfig {
     /// Action describing what the origin does (proxy, redirect, static, etc.).
     pub action: serde_json::Value,
@@ -1528,7 +1528,7 @@ pub struct RawOriginConfig {
 /// Per-tenant and per-route token buckets, with an optional
 /// `route_overrides:` map that lets an operator pin a specific route
 /// to a tighter ceiling than the origin default.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OriginRateLimitsConfig {
     /// Tenant-level burst. Effective ceiling that a single tenant
     /// may briefly exceed when arriving in bursts.
