@@ -1,0 +1,94 @@
+# Content-shape negotiation (Wave 4 day-5 wiring).
+#
+# Same URL, three response shapes. The proxy reads the agent's
+# `Accept` header and resolves a single content shape (`markdown`,
+# `json`, `html`, or pass-through) per request. The four-transform
+# default chain handles the rewrite:
+#
+#   boilerplate -> html_to_markdown -> citation_block -> json_envelope.
+#
+# When the chain runs in front of the response body filter, the proxy
+# also rewrites `Content-Type` and stamps an `x-markdown-tokens`
+# header so the agent can see the negotiated shape and the projected
+# Markdown's token estimate without parsing the body.
+#
+# Authoring `transforms:` with one of the Wave 4 entries
+# (`json_envelope` here) opts the origin into the negotiation
+# pipeline; the compiler synthesises an `auto_content_negotiate`
+# config that the runtime mounts as the resolver. The other three
+# transforms in the chain (`boilerplate`, `html_to_markdown`,
+# `citation_block`) are listed explicitly so the order is visible to
+# operators eyeballing the file. Origins that pair the chain with an
+# `ai_crawl_control` policy can leave `transforms:` empty and the
+# compiler auto-prepends the same four entries; example
+# 17-markdown-for-agents shows that path end-to-end.
+#
+# `default_content_shape: html` is the explicit fallback for
+# wildcard `Accept: */*` (and missing-header) requests so a browser
+# request with no Accept gets the raw HTML pass-through. Set it to
+# `markdown` if your audience is mostly agents.
+#
+# Run:
+#   sbproxy serve -f sb.yml
+#
+# Test (markdown shape, expect Content-Type: text/markdown +
+# x-markdown-tokens header):
+#   curl -i -H 'Host: shape.local' \
+#        -H 'Accept: text/markdown' \
+#        http://127.0.0.1:8080/article
+#
+# Test (json envelope shape, expect Content-Type: application/json
+# with the v1 schema profile parameter):
+#   curl -i -H 'Host: shape.local' \
+#        -H 'Accept: application/json' \
+#        http://127.0.0.1:8080/article
+#
+# Test (html pass-through, expect Content-Type: text/html with the
+# upstream body unchanged):
+#   curl -i -H 'Host: shape.local' \
+#        -H 'Accept: text/html' \
+#        http://127.0.0.1:8080/article
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "shape.local":
+    # Wildcard Accept (*/*) and absent Accept headers resolve to
+    # this shape. `html` is the safe default for mixed audiences;
+    # set it to `markdown` if most callers are agents and you want
+    # them to get the projected body without setting a header.
+    default_content_shape: html
+
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    # The four-transform default chain in declared order. The
+    # presence of `json_envelope` (a Wave 4 transform) is what tells
+    # the compiler to synthesise `auto_content_negotiate` and mount
+    # the resolver. The other three are listed explicitly so the
+    # order is documented in the YAML; the runtime applies them in
+    # this sequence regardless.
+    transforms:
+      # Strips nav, footer, sidebar, and other boilerplate from HTML
+      # bodies so the Markdown projection sees mainly the article
+      # body. No-op when the negotiated transform shape is `html`.
+      - type: boilerplate
+
+      # Projects the (boilerplate-stripped) HTML into Markdown when
+      # the negotiated shape is `markdown` or `json`. The token
+      # estimate it computes lands on `x-markdown-tokens` and on the
+      # JSON envelope's `token_estimate` field.
+      - type: html_to_markdown
+
+      # Prepends a citation footer naming the upstream URL so cited
+      # Markdown is traceable back to its source. Reads
+      # `RequestContext::citation_required` from the matched
+      # `ai_crawl_control` tier when one is configured.
+      - type: citation_block
+
+      # Wraps the projected Markdown in the v1 JSON envelope schema
+      # when the negotiated shape is `json`. No-op for the Markdown
+      # and Html shapes; the Markdown body passes through unchanged.
+      - type: json_envelope
