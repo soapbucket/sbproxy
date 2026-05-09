@@ -138,8 +138,11 @@ When you deploy SBproxy:
 The gateway terminates and originates TLS as configured. Defaults:
 
 - TLS 1.3 minimum for all configured listeners
-- Certificate pinning is supported per upstream (`certpin` module); enable it for sensitive upstreams
 - mTLS is supported for both client-to-gateway and gateway-to-upstream
+
+### Upstream TLS posture
+
+The gateway verifies upstream certificates using the rustls verifier defaults that ship with Pingora, against the system CA bundle in the runtime image. Per-upstream pin-by-SPKI is **not** implemented in the OSS build today. Operators who require stricter assurance for sensitive upstreams should compensate through network-egress allowlists, mTLS to the upstream, or a forward-proxy layer that performs the pinning itself. If pin-by-SPKI is a requirement for your deployment, please open an issue describing the use case so we can prioritise it.
 
 Specifics, including cipher suites and curve preferences, are documented in the configuration reference.
 

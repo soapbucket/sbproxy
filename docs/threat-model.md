@@ -34,6 +34,12 @@ of each implementation wave.
   allow.
 - **Build supply chain:** the reproducible-build probe is informational until
   binary diffs are driven to zero.
+- **Upstream TLS verification:** the OSS build relies on the rustls verifier
+  defaults that ship with Pingora, validating upstream certificates against
+  the system CA bundle in the runtime image. Pin-by-SPKI is not implemented.
+  Operators who need stricter assurance for sensitive upstreams should
+  compensate via network-egress allowlists, mTLS to the upstream, or a
+  forward-proxy layer that performs the pinning itself.
 
 ## Review Checklist
 

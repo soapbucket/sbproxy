@@ -2,8 +2,8 @@
 #
 # scripts/check-doc-drift.sh
 #
-# Guard against regression of provider-count and routing-strategy claims
-# in user-facing docs. Code reality:
+# Guard against regression of provider-count, routing-strategy, and
+# unimplemented-feature claims in user-facing docs. Code reality:
 #
 #   - crates/sbproxy-ai/data/ai_providers.yml has 43 entries.
 #   - crates/sbproxy-ai/src/routing.rs defines 10 routing strategies
@@ -11,6 +11,10 @@
 #     LeastConnections, CostOptimized, TokenRate, Sticky, Race).
 #   - crates/sbproxy-modules/src/action/routing/ ships two built-in
 #     RoutingStrategy implementations: first-healthy and lora-aware.
+#   - crates/sbproxy-security/ exposes crypto, hostfilter, ip, pii, ssrf,
+#     and the optional headless_detect / agent_verify modules. There is
+#     no certpin module: per-upstream SPKI pinning is not implemented
+#     (WOR-166). Do not reintroduce the claim without code.
 #
 # The strings below previously appeared in docs and went stale. If any
 # reappears, this check fails so the offending PR can fix the count
@@ -45,6 +49,8 @@ TARGETS=(
   "$ROOT_DIR/docs"
   "$ROOT_DIR/llms.txt"
   "$ROOT_DIR/README.md"
+  "$ROOT_DIR/SECURITY.md"
+  "$ROOT_DIR/CLAUDE.md"
 )
 
 # Substrings that must never reappear. Each entry is a fixed (-F) string
@@ -54,6 +60,7 @@ STALE_STRINGS=(
   "9 routing strategies"
   "one trivial built-in strategy"
   "36 OpenAI-compatible"
+  "certpin"
 )
 
 rc=0
