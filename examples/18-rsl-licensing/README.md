@@ -1,5 +1,5 @@
 # 18 - RSL licensing
-*Last modified: 2026-05-02*
+*Last modified: 2026-05-08*
 
 Demonstrates the Wave 4 policy-graph projections. A single
 `ai_crawl_control` policy plus the per-origin `content_signal` field
@@ -8,8 +8,8 @@ drives three machine-readable documents:
 | Path                          | Format            | Spec                      |
 |-------------------------------|-------------------|---------------------------|
 | `/robots.txt`                 | RFC 9309 stanzas  | IETF draft-koster-rep-ai  |
-| `/licenses.xml`               | RSL 1.0 XML       | rsl.ai/spec/1.0           |
-| `/.well-known/tdmrep.json`    | W3C TDMRep JSON   | w3c.github.io/tdm-reservation-protocol |
+| `/licenses.xml`               | RSL 1.0 XML       | rslstandard.org/rsl       |
+| `/.well-known/tdmrep.json`    | W3C TDMRep JSON   | W3C TDMRep CG-FINAL-tdmrep-20240510 |
 
 All three are derived from the same compiled config, refreshed
 atomically on every config reload, and signed with a `doc_hash` audit
@@ -52,33 +52,56 @@ The `Makefile` wraps the same calls (`make up`, `make down`,
 
 ### 1. `/.well-known/tdmrep.json`
 
-The W3C TDMRep declaration for the origin. Parses as JSON; the body
-includes the `content_signal` value set in `sb.yml`.
+The W3C TDMRep declaration for the origin. Per the W3C TDMRep
+CG-FINAL spec, the document is a bare JSON array at the root (no
+envelope object), with one entry per priced route. Each entry carries
+three hyphenated keys: `location`, `tdm-reservation`, `tdm-policy`.
 
 ```bash
 curl -s -H 'Host: shop.localhost' \
      http://127.0.0.1:8080/.well-known/tdmrep.json | jq .
-# {
-#   "tdm-reservation": "0",
-#   "tdm-policy": "https://shop.localhost/licenses.xml",
-#   ...
-# }
+# [
+#   {
+#     "location": "/",
+#     "tdm-reservation": 1,
+#     "tdm-policy": "https://shop.localhost/licenses.xml"
+#   },
+#   {
+#     "location": "/docs/*",
+#     "tdm-reservation": 1,
+#     "tdm-policy": "https://shop.localhost/licenses.xml"
+#   }
+# ]
 ```
+
+When the origin asserts a recognised `Content-Signal` (`ai-train`,
+`ai-input`, or `search`), each priced tier in the policy emits an
+entry with `tdm-reservation: 1`. When the signal is absent, the array
+is empty and the proxy stamps a `TDM-Reservation: 1` response header
+on origin traffic instead.
 
 ### 2. `/licenses.xml`
 
-The RSL 1.0 license document. Parses as XML; the body contains a
-`urn:rsl:1.0:<hostname>:<config_version>` URN and one `<ai-use>`
-assertion per `Content-Signal` value.
+The RSL 1.0 license document. Parses as XML; the root element is
+`<rsl xmlns="https://rslstandard.org/rsl">` and wraps the license
+body in a `<content url="...">` element scoped to the origin. The
+inner `<license>` carries the `urn:rsl:1.0:<hostname>:<config_version>`
+URN and the `<ai-use>` assertion derived from the `Content-Signal`
+value.
 
 ```bash
 curl -s -H 'Host: shop.localhost' \
-     http://127.0.0.1:8080/licenses.xml | head -20
+     http://127.0.0.1:8080/licenses.xml
 # <?xml version="1.0" encoding="UTF-8"?>
-# <licenses xmlns="https://rsl.ai/spec/1.0">
-#   <license id="urn:rsl:1.0:shop.localhost:42">
-#     <ai-use type="inference" licensed="true" />
-#     ...
+# <rsl xmlns="https://rslstandard.org/rsl" version="1.0">
+#   <content url="https://shop.localhost/*">
+#     <license urn="urn:rsl:1.0:shop.localhost:42">
+#       <origin hostname="shop.localhost" />
+#       <ai-use type="inference" licensed="true" />
+#       <content-signal>ai-input</content-signal>
+#     </license>
+#   </content>
+# </rsl>
 ```
 
 If `xmllint` is available, a sanity check that the document is
@@ -90,10 +113,12 @@ curl -s -H 'Host: shop.localhost' \
 # (no output means it parsed cleanly)
 ```
 
-Strict RSL XSD validation is wired into the
-`licensing-conformance` CI workflow (B4.5), which fetches the upstream
-RSL XSD weekly and runs the e2e schema tests against the projected
-document.
+The RSL 1.0 spec at https://rslstandard.org/rsl is prose-only; the
+RSL Collective does not publish a canonical XSD, so there is no
+schema-validation step beyond well-formedness. The projection-engine
+snapshot tests in `crates/sbproxy-modules/src/projections/licenses.rs`
+pin the byte-for-byte output, so any drift from the canonical wire
+shape fails the CI gate.
 
 ### 3. `/robots.txt`
 

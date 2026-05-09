@@ -40,7 +40,11 @@ origins:
     # into:
     #
     #   licenses.xml -> <ai-use type="inference" licensed="true" />
-    #   tdmrep.json  -> {"reservation":"none","content_signal":"ai-input"}
+    #                   nested under <rsl xmlns="https://rslstandard.org/rsl">
+    #   tdmrep.json  -> bare JSON array of
+    #                   {"location":"/...","tdm-reservation":1,
+    #                    "tdm-policy":"https://shop.localhost/licenses.xml"}
+    #                   per W3C TDMRep CG-FINAL.
     #   robots.txt   -> standard crawler stanzas plus the `Content-Signal:
     #                   ai-input` header on responses to /robots.txt
     #
