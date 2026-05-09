@@ -1,0 +1,107 @@
+# Wave 4 fuzz harnesses.
+#
+# Runs the standalone `fuzz/` cargo-fuzz crate's targets as short
+# smoke passes on every push and pull request. Each target gets a
+# bounded `-max_total_time` budget so the CI lane stays under a
+# couple of minutes total; nightly / longer fuzz campaigns are
+# tracked separately and not in this workflow.
+#
+# The crate is intentionally NOT a workspace member (see
+# `fuzz/Cargo.toml` for the rationale: the libfuzzer-sys cdylib link
+# would contaminate the proxy's release graph). Cargo-fuzz is also
+# nightly-only, so this lane installs the nightly toolchain and
+# `cargo-fuzz` separately rather than reusing the workspace's stable
+# toolchain.
+
+name: wave4-fuzz
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs so a force-push doesn't burn minutes
+# finishing the obsolete commit's fuzz pass.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  fuzz:
+    name: fuzz / ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each target is a bin in `fuzz/Cargo.toml`. Adding a new
+        # target means appending its name here so it runs alongside
+        # the rest. Time budgets are per-target; the matrix lane
+        # parallelises across them.
+        include:
+          - target: rsl_xml_parser
+            time: 30
+          - target: robots_txt_parser
+            time: 30
+          - target: llms_txt_parser
+            time: 30
+          - target: x402_challenge_parser
+            time: 30
+          # WOR-34 stateful proxy fuzzer (v1). Each iteration
+          # compiles + applies a config and walks several invariant
+          # checks, so it's heavier per-iteration than the
+          # parser-level targets. The 30s budget lands on the same
+          # smoke-pass tier as the rest.
+          - target: stateful_proxy
+            time: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reclaim disk: the fuzz crate pulls the full proxy graph
+      # (pingora, tract-onnx, tokenizers) so target/ tops several
+      # gigabytes and CI runners run out of space without trimming.
+      - name: free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+
+      # Cargo-fuzz needs nightly. Installing here rather than at the
+      # workspace level keeps stable as the default toolchain
+      # everywhere else.
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          # Distinct key so the fuzz cache doesn't poison the main
+          # workspace cache used by ci.yml.
+          shared-key: fuzz
+
+      - name: install protoc and libclang
+        # libclang-dev is needed for rquickjs-sys's bindgen build script.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang
+
+      - name: install cargo-fuzz
+        # No --locked: cargo-fuzz's published Cargo.lock pins rustix 0.36.5,
+        # which uses reserved rustc_attrs that current stable rustc rejects.
+        # Letting cargo resolve fresh picks a patched rustix in the 0.36 line.
+        run: cargo install cargo-fuzz
+
+      - name: run ${{ matrix.target }}
+        # Smoke pass only: -max_total_time bounds the libfuzzer
+        # campaign so the lane stays predictable. Longer campaigns
+        # belong in a nightly cron, not on every PR.
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ matrix.time }}
+        working-directory: fuzz

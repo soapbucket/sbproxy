@@ -50,6 +50,29 @@ libfuzzer-sys = "0.4"
 # the same version once B4.4 adds the dep to the workspace.
 quick-xml = { version = "0.36", features = ["serialize"] }
 
+# `arbitrary` powers the WOR-34 stateful fuzzer's typed corpus. The
+# `derive` feature is what lets us put `#[derive(Arbitrary)]` on
+# the `Op` enum so libfuzzer feeds the target a `Vec<Op>` directly
+# rather than raw bytes the harness would have to hand-decode.
+arbitrary = { version = "1", features = ["derive"] }
+
+# Tokio is the runtime the WOR-34 stateful fuzzer uses to enforce
+# a per-op deadlock budget via `tokio::time::timeout`. The
+# `current_thread` flavour of the runtime is deliberately the only
+# scheduler enabled here; the fuzz target wants minimum overhead per
+# iteration, not a full thread-pool-per-iteration.
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+
+# Workspace crates the WOR-34 stateful fuzzer drives in-process.
+# Path deps work fine even though this crate is intentionally not
+# a workspace member (per the file-top comment), and keeping the
+# fuzz crate out of the proxy workspace stops `cargo build
+# --workspace` from picking up the libfuzzer-sys cdylib edge that
+# breaks linking outside `cargo fuzz`.
+sbproxy-config = { path = "../crates/sbproxy-config" }
+sbproxy-core = { path = "../crates/sbproxy-core" }
+sbproxy-observe = { path = "../crates/sbproxy-observe" }
+
 [[bin]]
 name = "rsl_xml_parser"
 path = "fuzz_targets/rsl_xml_parser.rs"
@@ -78,5 +101,16 @@ doc = false
 [[bin]]
 name = "x402_challenge_parser"
 path = "fuzz_targets/x402_challenge_parser.rs"
+test = false
+doc = false
+
+# WOR-34 stateful proxy fuzzer (v1). Drives a sequence of typed ops
+# (config_apply, request, advance_time, reload, ...) against an
+# in-process `sbproxy-core` instance and asserts global proxy
+# invariants after each op. Existing fuzz harnesses in this crate
+# are parser-level; this target is one layer up.
+[[bin]]
+name = "stateful_proxy"
+path = "fuzz_targets/stateful_proxy.rs"
 test = false
 doc = false

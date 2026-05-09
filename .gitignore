@@ -2,6 +2,12 @@ target/
 *.swp
 .DS_Store
 
+# The fuzz crate is a standalone (non-workspace) Cargo project with
+# its own lockfile. Keeping the lockfile out of git mirrors the
+# convention for the rest of the workspace (Cargo.lock at the root
+# is tracked; standalone helper crates lock their own deps locally).
+fuzz/Cargo.lock
+
 # Generated test material under examples/ (cert generation scripts emit
 # real keys into these dirs; we keep the scripts in git but never the
 # keys themselves).
