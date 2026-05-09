@@ -7,55 +7,24 @@
 #   - RSL 1.0 XSD       fetched from https://rsl.ai/spec/1.0/rsl.xsd
 #   - W3C TDMRep schema fetched from the W3C TDMRep working draft
 #
-# The workflow runs in three modes:
+# The workflow runs in two modes:
 #
-#   1. On every push to main and every pull_request to main: pulls the
-#      vendored copy of each schema from `e2e/fixtures/rsl/` /
-#      `e2e/fixtures/tdmrep/` and runs the e2e schema-validation tests
-#      (rsl_licenses_projection_e2e + tdmrep_projection_e2e).
-#   2. On a weekly cron schedule: re-fetches the upstream schemas,
-#      diffs against the vendored copies, and runs the e2e tests
-#      against the freshly fetched copies. If the upstream changed, a
-#      bot PR is opened with the new vendored schema files.
-#   3. On manual dispatch (workflow_dispatch): same as mode 2 but
-#      skipping the cache, useful for ad-hoc audits.
-#
-# The schema fetches use `actions/cache` with a 7-day TTL so the
-# pull_request and push lanes do not hammer the upstream server.
-#
-# A failure in this lane never blocks Wave 4 ship by itself; the
-# workflow is informational on push/pull_request (status check is
-# advisory) and gating on the scheduled run (the bot PR captures the
-# upstream drift).
+#   1. On tag push (v*): re-fetches the upstream schemas, diffs
+#      against the vendored copies in e2e/fixtures/rsl/ /
+#      e2e/fixtures/tdmrep/, and runs the e2e schema-validation tests
+#      against the freshly fetched copies. If the upstream changed,
+#      a bot PR is opened with the new vendored schema files. This
+#      gates the release.
+#   2. On manual dispatch (workflow_dispatch): same as mode 1,
+#      skipping any cache, useful for ad-hoc audits.
 
 name: licensing-conformance
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - 'crates/sbproxy-modules/src/projections/**'
-      - 'e2e/tests/rsl_licenses_projection_e2e.rs'
-      - 'e2e/tests/tdmrep_projection_e2e.rs'
-      - 'e2e/fixtures/rsl/**'
-      - 'e2e/fixtures/tdmrep/**'
-      - '.github/workflows/licensing-conformance.yml'
-  pull_request:
-    branches:
-      - main
-    paths:
-      - 'crates/sbproxy-modules/src/projections/**'
-      - 'e2e/tests/rsl_licenses_projection_e2e.rs'
-      - 'e2e/tests/tdmrep_projection_e2e.rs'
-      - 'e2e/fixtures/rsl/**'
-      - 'e2e/fixtures/tdmrep/**'
-      - '.github/workflows/licensing-conformance.yml'
-  schedule:
-    # Weekly on Monday at 09:00 UTC. The cadence matches the
-    # `directory-feed` weekly publish so the schema-drift PR lands in
-    # the same triage cycle.
-    - cron: '0 9 * * 1'
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
   workflow_dispatch:
     inputs:
       bypass_cache:
@@ -87,75 +56,16 @@ env:
 
 jobs:
 
-  # --- Schema validation against vendored fixtures (push + PR lane) ---
-  #
-  # Runs on every push / pull_request that touches the projection
-  # surface. Uses the vendored XSD / JSON schema in e2e/fixtures/ so
-  # the lane is hermetic and cheap.
-  validate-vendored:
-    name: validate against vendored schemas
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
-    steps:
-      - uses: actions/checkout@v4.1.7
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2.7.3
-        with:
-          shared-key: licensing-conformance
-
-      - name: install xmllint + protoc + libclang
-        # xmllint is required by the rsl_licenses_projection_e2e
-        # XSD validation step. protobuf-compiler + libclang-dev mirror
-        # ci.yml's toolchain prerequisites.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxml2-utils protobuf-compiler libclang-dev clang
-
-      - name: build sbproxy binary (release)
-        run: cargo build --release -p sbproxy --locked
-
-      - name: build e2e tests (release)
-        run: cargo build --release -p sbproxy-e2e --tests --locked
-
-      - name: licensing conformance e2e
-        # The two tests live behind `--include-ignored` because the
-        # vendored XSD / W3C JSON schema may not have landed in every
-        # branch yet. Once the schemas vendor lands they will become
-        # default-on; until then the lane logs the skip without
-        # failing CI.
-        run: |
-          set -euo pipefail
-          mkdir -p target/licensing-logs
-          cargo test -p sbproxy-e2e --release --locked \
-            --test rsl_licenses_projection_e2e \
-            --test tdmrep_projection_e2e \
-            -- --include-ignored 2>&1 \
-            | tee target/licensing-logs/cargo-test-output.txt
-
-      - name: upload failure artifacts
-        if: failure()
-        uses: actions/upload-artifact@v4.4.0
-        with:
-          name: licensing-conformance-logs
-          path: target/licensing-logs/
-          retention-days: 7
-          if-no-files-found: ignore
-
-  # --- Weekly upstream schema sync ---
+  # --- Upstream schema sync (tag push + dispatch) ---
   #
   # Re-fetches the upstream RSL XSD + W3C TDMRep JSON Schema, compares
   # against the vendored copies, and opens a bot PR if anything
-  # changed. Runs on the cron schedule and on workflow_dispatch.
+  # changed. Runs on tag push (gating the release) and on
+  # workflow_dispatch (ad-hoc audits).
   sync-upstream:
-    name: weekly upstream schema sync
+    name: upstream schema sync
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v4.1.7
 
