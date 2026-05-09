@@ -26,6 +26,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUST_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# ENTERPRISE_ROOT is optional. The OSS repo has no companion enterprise
+# tree; we still let an outer caller set it (e.g. for a combined CI run
+# in a meta-repo) but default to empty so `set -u` does not trip on the
+# unset case.
+ENTERPRISE_ROOT="${ENTERPRISE_ROOT:-}"
+
 LYCHEE_BIN="${LYCHEE_BIN:-lychee}"
 RUST_SCRIPT="${RUST_SCRIPT:-rust-script}"
 
@@ -55,7 +61,7 @@ if [ -z "$TREE_FILTER" ] || [ "$TREE_FILTER" = "rust" ]; then
   TREES+=("$RUST_ROOT/docs")
 fi
 if [ -z "$TREE_FILTER" ] || [ "$TREE_FILTER" = "enterprise" ]; then
-  if [ -d "$ENTERPRISE_ROOT/docs" ]; then
+  if [ -n "$ENTERPRISE_ROOT" ] && [ -d "$ENTERPRISE_ROOT/docs" ]; then
     TREES+=("$ENTERPRISE_ROOT/docs")
   fi
 fi

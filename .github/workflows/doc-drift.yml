@@ -1,0 +1,38 @@
+# Guards against regression of the provider-count and routing-strategy
+# claims in user-facing docs. Lives separately from docs-ci.yml so the
+# lychee link-check (which is currently failing on pre-existing
+# fragments outside this PR's scope) does not block this lighter check.
+
+name: doc-drift
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'llms.txt'
+      - 'README.md'
+      - 'scripts/check-doc-drift.sh'
+      - '.github/workflows/doc-drift.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    name: doc-drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: check doc drift
+        run: |
+          set -euo pipefail
+          if [ ! -x scripts/check-doc-drift.sh ]; then
+            chmod +x scripts/check-doc-drift.sh
+          fi
+          bash scripts/check-doc-drift.sh
