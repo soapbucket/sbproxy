@@ -764,7 +764,47 @@ fn handle_plan_subcommand(args: &[String]) -> anyhow::Result<i32> {
         Some(p) => load_and_validate(p)?,
         None => empty_config_file(),
     };
-    let report = sbproxy_config::plan(&baseline, &proposed);
+    let mut report = sbproxy_config::plan(&baseline, &proposed);
+
+    // WOR-136: pick up `listings/*.yaml` from the same Repo (the
+    // directory the proposed `sb.yml` lives in) and fold the
+    // plan-step validation findings into the existing stream. The
+    // OSS revision resolver is the no-op resolver: existence checks
+    // require a git-aware caller (the future k8s controller, the
+    // hosted-Catalog surface).
+    let repo_root = std::path::Path::new(&parsed.config)
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let mut listing_load_errors: Vec<sbproxy_config::ListingLoadError> = Vec::new();
+    let loaded = sbproxy_config::load_listings_from_repo(&repo_root, &mut listing_load_errors);
+    for err in &listing_load_errors {
+        report.findings.push(sbproxy_config::PlanFinding {
+            severity: sbproxy_config::Severity::Error,
+            rule_id: "listing-load-error".to_string(),
+            path: "listings".to_string(),
+            message: err.to_string(),
+        });
+    }
+    if !loaded.is_empty() {
+        let registry = sbproxy_config::ListingRegistry::from_loaded(loaded, &mut report.findings);
+        // Emit a load summary on stderr in the same idiom the rest
+        // of the CLI uses for plan / apply progress.  `sbproxy plan`
+        // is the entry point a future hosted-Catalog surface and the
+        // k8s controller will share, so logging the count here keeps
+        // operator feedback consistent across surfaces.
+        eprintln!(
+            "plan: sbproxy.listings.loaded count={} root={}",
+            registry.len(),
+            repo_root.display()
+        );
+        sbproxy_config::validate_listings(
+            &registry,
+            &proposed,
+            &sbproxy_config::NoopRevisionResolver,
+            &mut report.findings,
+        );
+    }
 
     match parsed.format {
         PlanFormat::Json => {

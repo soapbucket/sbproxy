@@ -1815,6 +1815,33 @@ origins:
 
 The action speaks JSON-RPC 2.0: `initialize` returns the configured `server_info`, `tools/list` aggregates the federated catalogue, `tools/call` enforces the allowlist guardrail and routes to the upstream that owns the prefix. Tool aggregation, name-collision handling, and the upstream transports (`streamable_http`, `sse`) live in the federation library at `crates/sbproxy-extension/src/mcp/`. See [examples/97-mcp-federation/](../examples/97-mcp-federation/) for a runnable config.
 
+### Listings
+
+A `Listing` is a published, versioned view of an existing Resource (an origin, an MCP server, or a docs surface). Listings live in `listings/*.yaml` alongside `sb.yml`, are version-controlled with the rest of the Repo, and validate through `sbproxy plan`. Each Listing pins its underlying Resource via one of three pinning modes (`pin` for a commit SHA, `track-branch` for a moving branch, `tag` for a release tag).
+
+```yaml
+# listings/example-api.yaml
+apiVersion: sbproxy.dev/v1
+kind: Listing
+metadata:
+  name: example-api
+spec:
+  type: api
+  status: published
+  resources:
+    - ref: origins/api.example.com
+      revision:
+        mode: pin
+        value: "abc1234"
+  auth:
+    strategies: [jwt]
+  publish:
+    visibility: public
+    docsUrl: "/docs/example-api"
+```
+
+See [listings.md](listings.md) for the full schema reference, the loader behaviour, the plan-validation rules, and a runnable example at [examples/101-listing-primitive/](../examples/101-listing-primitive/).
+
 ---
 
 ## 12. Reference: less common building blocks
