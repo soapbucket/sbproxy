@@ -26,6 +26,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUST_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# ENTERPRISE_ROOT is optional. The OSS repo has no companion enterprise
+# tree; we still let an outer caller set it (e.g. for a combined CI run
+# in a meta-repo) but default to empty so `set -u` does not trip on the
+# unset case.
+ENTERPRISE_ROOT="${ENTERPRISE_ROOT:-}"
+
 LYCHEE_BIN="${LYCHEE_BIN:-lychee}"
 RUST_SCRIPT="${RUST_SCRIPT:-rust-script}"
 
@@ -55,7 +61,7 @@ if [ -z "$TREE_FILTER" ] || [ "$TREE_FILTER" = "rust" ]; then
   TREES+=("$RUST_ROOT/docs")
 fi
 if [ -z "$TREE_FILTER" ] || [ "$TREE_FILTER" = "enterprise" ]; then
-  if [ -d "$ENTERPRISE_ROOT/docs" ]; then
+  if [ -n "$ENTERPRISE_ROOT" ] && [ -d "$ENTERPRISE_ROOT/docs" ]; then
     TREES+=("$ENTERPRISE_ROOT/docs")
   fi
 fi
@@ -231,31 +237,29 @@ run_lang_pass() {
   rm -rf "$block_dir"
 }
 
-# Rust block checker. Tries rust-script first (full type-check via a
-# scripted crate), falls back to `rustc --emit=metadata` for syntax
-# only. Returns 0 on success, 1 on failure.
+# Rust block checker. Type-checks via `rustc --emit=metadata`. Returns
+# 0 on success, 1 on failure.
 #
-# The rustc fallback tries two shapes in order: first the block as-is
-# (which works for top-level items: structs, impls, fn defs, use
-# statements), then wrapped in a `fn _docs_ci_block() { ... }` (which
-# rescues blocks that contain bare statements / expressions). A block
-# is considered "valid" if either shape compiles. This avoids the
-# false-negative pattern where a code block has a top-level `use`
-# followed by a struct, which the wrapped form rejects.
+# We tried `rust-script --check` here first, but rust-script v0.36.0
+# does not implement `--check`; it errors with "unexpected argument
+# '--check' found" and exit code 2, which would fail every block on
+# CI. The rustc path covers what we actually need (parse + type-check
+# for any top-level Rust shape) and runs in tens of milliseconds per
+# block, so the rust-script call wasn't worth retaining.
+#
+# The checker tries two shapes in order: first the block as-is (which
+# works for top-level items: structs, impls, fn defs, use statements),
+# then wrapped in a `fn _docs_ci_block() { ... }` (which rescues blocks
+# that contain bare statements / expressions). A block is considered
+# "valid" if either shape compiles. This avoids the false-negative
+# pattern where a code block has a top-level `use` followed by a
+# struct, which the wrapped form rejects.
 check_rust_block() {
   local body_path="$1" info="$2" md="$3"
 
-  if command -v "$RUST_SCRIPT" >/dev/null 2>&1; then
-    if ! "$RUST_SCRIPT" --check "$body_path" >/dev/null 2>&1; then
-      echo "  rust block FAILED in $md (info: $info)" >&2
-      return 1
-    fi
-    return 0
-  fi
-
-  # rustc fallback. We emit metadata to a real temp dir; rustc's
-  # `-o /dev/null` mode tries to write a sibling .rmeta which fails
-  # on macOS / linux because /dev is unwriteable.
+  # rustc emits metadata into a real temp dir; rustc's `-o /dev/null`
+  # mode tries to write a sibling .rmeta which fails on macOS / linux
+  # because /dev is unwriteable.
   local tmp_dir
   tmp_dir="$(mktemp -d -t docs-ci-rust-XXXXXX)"
 

@@ -70,7 +70,7 @@ inventory::submit! {
 
 Once the crate is linked into the proxy binary, the strategy is discoverable by name. Configuration consumes it the same way an enterprise auth plugin would: by referencing the registered name in the load-balancer config and letting `build_routing_strategy` resolve it to an `Arc<dyn RoutingStrategy>`.
 
-The OSS tree ships one trivial built-in strategy, `first-healthy` (`AlwaysFirstHealthyStrategy`), purely as a reference implementation for tests and documentation. Production deployments should continue to use the existing `lb_method` algorithms until the Fail-6 follow-up lands the real LoRA-aware, GPU-aware, and contextual-bandit strategies.
+The OSS tree ships two built-in strategies: `first-healthy` (`AlwaysFirstHealthyStrategy`), a reference implementation that always picks the first healthy target, and `lora-aware` (`LoraAwareStrategy`), a production strategy described in detail below. The remaining production strategies (GPU-aware, contextual-bandit) are tracked under Fail-6; until they land, deployments that do not need LoRA affinity should continue to use the existing `lb_method` algorithms.
 
 ## LoRA-aware routing
 
