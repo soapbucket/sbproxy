@@ -1,15 +1,18 @@
-//! Wave 4 / Q4.6: `/licenses.xml` (RSL 1.0) projection conformance.
+//! Wave 4 / Q4.6: `/licenses.xml` (RSL Collective) projection
+//! conformance.
 //!
-//! Validates the RSL 1.0 document projected by the Wave 4 G4.8 build
-//! agent. Per :
+//! Validates the RSL document projected by the Wave 4 G4.8 build
+//! agent against the canonical RSL Collective spec at
+//! <https://rslstandard.org/rsl>:
 //!
 //! ```xml
-//! <licenses xmlns="https://rsl.ai/spec/1.0">
-//!   <license>
-//!     <urn>urn:rsl:1.0:blog.localhost:<config_version_hash></urn>
-//!     <ai-use type="training" licensed="true" />
-//!   </license>
-//! </licenses>
+//! <rsl xmlns="https://rslstandard.org/rsl" version="1.0">
+//!   <content url="https://blog.localhost/*">
+//!     <license urn="urn:rsl:1.0:blog.localhost:<config_version>">
+//!       <ai-use type="training" licensed="true" />
+//!     </license>
+//!   </content>
+//! </rsl>
 //! ```
 //!
 //! Mapping table from `Content-Signal` to `<ai-use>`:
@@ -22,7 +25,7 @@
 //! | absent         | training        | false    |
 //!
 //! The XSD validation step is `#[ignore]`'d pending vendoring of the
-//! RSL 1.0 spec (see `e2e/fixtures/rsl/README.md`).
+//! RSL spec (see `e2e/fixtures/rsl/README.md`).
 
 use sbproxy_e2e::ProxyHarness;
 
@@ -151,6 +154,46 @@ fn licenses_xml_maps_content_signal_to_ai_use() {
     assert!(
         body.contains("licensed=\"true\""),
         "ai-use licensed=true expected; got:\n{body}"
+    );
+}
+
+// --- Test 5: canonical RSL Collective shape ---
+
+#[test]
+fn licenses_xml_uses_canonical_rsl_collective_shape() {
+    let harness = start_projections().expect("start proxy");
+    let body = harness
+        .get("/licenses.xml", "blog.localhost")
+        .expect("GET")
+        .text()
+        .expect("utf-8 body");
+
+    // Namespace must be the canonical RSL Collective URI, not the
+    // legacy rsl.ai/spec/1.0 namespace.
+    assert!(
+        body.contains(r#"xmlns="https://rslstandard.org/rsl""#),
+        "must use canonical RSL Collective namespace; got:\n{body}"
+    );
+    assert!(
+        !body.contains("rsl.ai/spec/1.0"),
+        "legacy rsl.ai/spec/1.0 namespace must not appear; got:\n{body}"
+    );
+
+    // Document shape: <rsl> -> <content url="..."> -> <license>.
+    let rsl_idx = body.find("<rsl ").expect("<rsl> root");
+    let content_idx = body
+        .find("<content ")
+        .expect("<content> wrapper around license");
+    let license_idx = body.find("<license ").expect("<license> child");
+    assert!(
+        rsl_idx < content_idx && content_idx < license_idx,
+        "ordering must be <rsl> -> <content> -> <license>; got:\n{body}"
+    );
+
+    // The wildcard URL convention for "every URL on this origin".
+    assert!(
+        body.contains(r#"url="https://blog.localhost/*""#),
+        "<content> must carry the canonical wildcard url for the origin; got:\n{body}"
     );
 }
 
