@@ -188,23 +188,44 @@ jobs:
             /tmp/tdmrep.schema.fresh
           key: ${{ steps.cache_key.outputs.key }}
 
+      # Both upstreams have proven unreliable: rsl.ai/spec/1.0/rsl.xsd
+      # serves an HTML JS-redirect, the W3C TDMRep CG-FINAL URL has
+      # 404'd through several path renames, and there is no canonical
+      # XSD or JSON Schema published for either standard at the time
+      # of this writing (see WOR-178 closure for the audit). The fetch
+      # step is best-effort: a 404 must NOT fail the job. Downstream
+      # diff / PR steps gate on the fetched files being non-empty XSD
+      # or JSON, so a redirect-page or empty body is treated the same
+      # as a 404.
       - name: fetch upstream schemas
         if: steps.schema_cache.outputs.cache-hit != 'true'
+        continue-on-error: true
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          rm -f /tmp/rsl.xsd.fresh /tmp/tdmrep.schema.fresh
           curl -fsSL --retry 3 --retry-delay 5 \
             -o /tmp/rsl.xsd.fresh \
-            "${{ env.RSL_XSD_URL }}"
+            "${{ env.RSL_XSD_URL }}" \
+            || echo "WARN: RSL XSD fetch failed (URL may be unreliable, see WOR-178)"
           curl -fsSL --retry 3 --retry-delay 5 \
             -o /tmp/tdmrep.schema.fresh \
-            "${{ env.TDMREP_SCHEMA_URL }}"
+            "${{ env.TDMREP_SCHEMA_URL }}" \
+            || echo "WARN: TDMRep schema fetch failed (URL may be unreliable, see WOR-178)"
 
       - name: diff against vendored copies
         id: diff
         run: |
           set -eu
           changed=0
-          if [ -f e2e/fixtures/rsl/rsl-1.0.xsd ]; then
+          rsl_skipped=0
+          tdmrep_skipped=0
+          # An empty file or a body that does not look like an XSD
+          # (e.g. the rsl.ai HTML JS-redirect) is treated the same as
+          # a 404: skip the diff for that schema and report.
+          if [ ! -s /tmp/rsl.xsd.fresh ] || ! grep -q "<xs:schema" /tmp/rsl.xsd.fresh; then
+            echo "RSL upstream unavailable or non-XSD body; skipping diff for RSL"
+            rsl_skipped=1
+          elif [ -f e2e/fixtures/rsl/rsl-1.0.xsd ]; then
             if ! diff -q /tmp/rsl.xsd.fresh e2e/fixtures/rsl/rsl-1.0.xsd >/dev/null 2>&1; then
               echo "RSL XSD changed upstream"
               changed=1
@@ -213,7 +234,12 @@ jobs:
             echo "RSL XSD not yet vendored - first sync"
             changed=1
           fi
-          if [ -f e2e/fixtures/tdmrep/tdmrep.schema.json ]; then
+          # Same shape: skip if the body is missing or does not look
+          # like JSON Schema.
+          if [ ! -s /tmp/tdmrep.schema.fresh ] || ! grep -q "\$schema\|\"type\"" /tmp/tdmrep.schema.fresh; then
+            echo "TDMRep upstream unavailable or non-JSON-Schema body; skipping diff for TDMRep"
+            tdmrep_skipped=1
+          elif [ -f e2e/fixtures/tdmrep/tdmrep.schema.json ]; then
             if ! diff -q /tmp/tdmrep.schema.fresh e2e/fixtures/tdmrep/tdmrep.schema.json >/dev/null 2>&1; then
               echo "TDMRep JSON Schema changed upstream"
               changed=1
@@ -222,7 +248,15 @@ jobs:
             echo "TDMRep schema not yet vendored - first sync"
             changed=1
           fi
+          # If both upstreams skipped, force changed=0 so the open-PR
+          # step does not fire on an empty diff.
+          if [ "$rsl_skipped" = "1" ] && [ "$tdmrep_skipped" = "1" ]; then
+            changed=0
+            echo "Both upstreams unavailable; nothing to diff."
+          fi
           echo "changed=${changed}" >> "$GITHUB_OUTPUT"
+          echo "rsl_skipped=${rsl_skipped}" >> "$GITHUB_OUTPUT"
+          echo "tdmrep_skipped=${tdmrep_skipped}" >> "$GITHUB_OUTPUT"
 
       - name: stage updated vendored copies
         if: steps.diff.outputs.changed == '1'
@@ -274,8 +308,14 @@ jobs:
 
       - name: report schema status
         run: |
+          if [ "${{ steps.diff.outputs.rsl_skipped }}" = "1" ] || [ "${{ steps.diff.outputs.tdmrep_skipped }}" = "1" ]; then
+            echo "Upstream schema availability:"
+            echo "  RSL:    $([ "${{ steps.diff.outputs.rsl_skipped }}" = "1" ] && echo unavailable || echo ok)"
+            echo "  TDMRep: $([ "${{ steps.diff.outputs.tdmrep_skipped }}" = "1" ] && echo unavailable || echo ok)"
+            echo "See WOR-178 for the upstream-availability audit."
+          fi
           if [ "${{ steps.diff.outputs.changed }}" = "1" ]; then
             echo "Upstream schema drift detected; PR opened."
           else
-            echo "Vendored schemas match upstream; no PR needed."
+            echo "No schema drift; nothing to do."
           fi
