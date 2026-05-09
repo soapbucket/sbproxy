@@ -27,14 +27,50 @@ use sbproxy_modules::action::ForwardingHeaderControls;
 use sbproxy_modules::{Action, Auth, Policy, RateLimitInfo, WafResult};
 use sbproxy_observe::metrics;
 
-/// Lazily-initialized global AI client (shared across all requests).
-static AI_CLIENT: std::sync::LazyLock<AiClient> = std::sync::LazyLock::new(AiClient::new);
+/// Lazily-initialized, hot-reloadable AI client.
+///
+/// Wrapped in `ArcSwap` so the SIGHUP / file-watcher / admin reload
+/// path can rebuild the client alongside the AI provider registry
+/// (see [`reload_ai_client`] and `sbproxy_ai::reload_provider_registry`).
+/// In-flight requests that already cloned the previous `Arc<AiClient>`
+/// continue against their snapshot until they complete; subsequent
+/// requests pick up the new client transparently.
+static AI_CLIENT: std::sync::LazyLock<arc_swap::ArcSwap<AiClient>> =
+    std::sync::LazyLock::new(|| arc_swap::ArcSwap::from_pointee(AiClient::new()));
 
-/// Process-wide AI budget tracker. Accumulates token and cost usage
-/// across every AI proxy request and is consulted before each
-/// upstream dispatch to enforce the configured budget limits.
+/// Atomically replace the live AI client with a freshly built one.
+///
+/// Called from the reload paths in tandem with
+/// `sbproxy_ai::reload_provider_registry` so a SIGHUP that adds or
+/// edits providers picks up the new catalog without a process
+/// restart. In-flight requests are unaffected; the next request after
+/// the swap sees the new client.
+pub fn reload_ai_client() {
+    AI_CLIENT.store(std::sync::Arc::new(AiClient::new()));
+}
+
+/// Process-wide AI budget tracker.
+///
+/// Accumulates token and cost usage across every AI proxy request
+/// and is consulted before each upstream dispatch to enforce the
+/// configured budget limits. Deliberately a `LazyLock` (and not an
+/// `ArcSwap`) so SIGHUP / file-watcher / admin reload do *not* reset
+/// the tracker: budget windows are wall-clock-relative (e.g. daily,
+/// monthly) and must survive config reloads. A reload that wiped the
+/// tracker would silently roll the counters back to zero and let
+/// already-spent budget through a second time. See WOR-173.
 static BUDGET_TRACKER: std::sync::LazyLock<sbproxy_ai::BudgetTracker> =
     std::sync::LazyLock::new(sbproxy_ai::BudgetTracker::new);
+
+/// Borrow the process-wide AI budget tracker.
+///
+/// Exposed so reload-path integration tests (and any future admin
+/// surface that needs to inspect per-scope accumulators) can read
+/// the live counters without a second source of truth. Hot path
+/// callers inside this crate use the static directly.
+pub fn budget_tracker() -> &'static sbproxy_ai::BudgetTracker {
+    &BUDGET_TRACKER
+}
 
 /// Tracks fire-and-forget webhook callback tasks so graceful shutdown
 /// can drain them. `tokio_util::task::TaskTracker` provides the
@@ -4081,6 +4117,47 @@ fn req_header_value(session: &Session, name: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Build a redacted snapshot of the inbound request headers for the
+/// AI hook surface (`ClassifyRequest::headers`,
+/// `LookupRequest::request_headers`).
+///
+/// Names are lower-cased to match the HTTP/2 and HTTP/3 framing the
+/// rest of the hook surface assumes. Values that are not valid UTF-8
+/// are dropped silently because the hook contract is `String:String`
+/// and lossy decoding would obscure the real wire bytes from any
+/// implementation that wants to reason about them. Headers whose
+/// lower-cased name appears in [`crate::hooks::REDACTED_REQUEST_HEADERS`]
+/// are dropped before the snapshot is returned so credential carriers
+/// (Authorization, Cookie, Proxy-Authorization) never reach the
+/// classifier or semantic cache.
+///
+/// The returned map is fresh per call. Callers that fan a single
+/// request out across multiple hooks should build the snapshot once
+/// and clone it.
+fn snapshot_request_headers(session: &Session) -> std::collections::HashMap<String, String> {
+    snapshot_request_headers_from(session.req_header())
+}
+
+/// Inner form of [`snapshot_request_headers`] that operates on a
+/// `RequestHeader` directly. Split out so unit tests can build a
+/// `RequestHeader` in-process without a live Pingora session.
+fn snapshot_request_headers_from(
+    req: &pingora_http::RequestHeader,
+) -> std::collections::HashMap<String, String> {
+    let raw = &req.headers;
+    let mut out = std::collections::HashMap::with_capacity(raw.len());
+    for (name, value) in raw.iter() {
+        let lname = name.as_str().to_ascii_lowercase();
+        if crate::hooks::REDACTED_REQUEST_HEADERS.contains(&lname.as_str()) {
+            continue;
+        }
+        if let Ok(v) = value.to_str() {
+            out.insert(lname, v.to_string());
+        }
+    }
+    out
+}
+
 /// Handle an AI proxy request by forwarding to the upstream provider via reqwest.
 ///
 /// This function:
@@ -4113,6 +4190,7 @@ async fn handle_ai_proxy(
         let provider = &config.providers[provider_idx];
 
         let resp = AI_CLIENT
+            .load()
             .forward_get_request(provider, &path)
             .await
             .map_err(|e| {
@@ -4246,15 +4324,12 @@ async fn handle_ai_proxy(
                 Some(model.clone())
             };
             // TODO A20: richer prompt extraction strategies (tool use,
-            // multimodal parts, system prompts). TODO: populate `headers`
-            // with a snapshot of the request headers once downstream
-            // consumers need them; empty map for now to avoid per-request
-            // allocations in the common "no consumer" case.
+            // multimodal parts, system prompts).
             let classify_req = crate::hooks::ClassifyRequest {
                 origin: hostname.to_string(),
                 model_id,
                 prompt: extracted_prompt.clone(),
-                headers: std::collections::HashMap::new(),
+                headers: snapshot_request_headers(session),
             };
             if let Some(verdict) = hook.classify_prompt(&classify_req).await {
                 debug!(
@@ -4330,11 +4405,7 @@ async fn handle_ai_proxy(
                 origin: hostname.to_string(),
                 model_id: model_id.clone(),
                 prompt: extracted_prompt.clone(),
-                // TODO: snapshot real request headers when downstream
-                // consumers (key templates with `{header.x}` placeholders)
-                // need them. An empty map is safe for A21's default
-                // key template (`{embedding_model}:{model_id}:{lsh_bucket}`).
-                request_headers: std::collections::HashMap::new(),
+                request_headers: snapshot_request_headers(session),
                 request_body: body_bytes.clone(),
                 method: method.as_str().to_string(),
                 path: path.clone(),
@@ -4501,6 +4572,7 @@ async fn handle_ai_proxy(
         }
 
         match AI_CLIENT
+            .load()
             .forward_request(provider, &path, &attempt_body)
             .await
         {
@@ -11390,6 +11462,31 @@ pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<()> {
     if let Some(al) = compiled.access_log.as_ref() {
         log_capture_header_warnings(al);
     }
+
+    // WOR-173: refresh the AI provider catalog and rebuild the AI
+    // client alongside the pipeline. Both globals live behind an
+    // `ArcSwap`, so this is a lock-free atomic swap from the reload
+    // thread's perspective. Failures fall back to the embedded
+    // catalog with a warn-level log inside `reload_provider_registry`,
+    // matching the startup behaviour. Note: `BUDGET_TRACKER` is
+    // deliberately *not* refreshed - in-memory accumulators must
+    // survive reload, see the doc comment on the static.
+    {
+        let override_path = compiled
+            .server
+            .ai_providers_file
+            .as_deref()
+            .map(std::path::Path::new);
+        if let Err(e) = sbproxy_ai::reload_provider_registry(override_path) {
+            tracing::error!(
+                error = %e,
+                "AI provider registry reload failed; serving with the previous catalog",
+            );
+        } else {
+            reload_ai_client();
+        }
+    }
+
     let mut new_pipeline = CompiledPipeline::from_config(compiled)?;
 
     // Invoke the enterprise reload hook (best-effort): the OSS reload
@@ -11569,9 +11666,10 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
     // Initialise the AI provider catalog from the embedded YAML, with
     // an optional override path from `proxy.ai_providers_file`: use
     // the override file when readable, fall back to the embedded
-    // gzipped catalog otherwise. The init is idempotent so a config
-    // hot-reload does not need to revisit it; reloads to swap the
-    // catalog require a process restart.
+    // gzipped catalog otherwise. The registry lives behind an
+    // `ArcSwap` so SIGHUP / file-watcher / admin reload paths can
+    // swap in a fresh catalog via `reload_provider_registry` without
+    // restarting the process (WOR-173).
     {
         let override_path = server_config
             .ai_providers_file
@@ -12205,6 +12303,86 @@ mod tests {
         // Different hostname -> different token (binds to host).
         let t4 = csrf_token("secret", 1_700_000_000_000_000_000u128, "other.com").unwrap();
         assert_ne!(t1, t4);
+    }
+
+    // --- WOR-189: AI hook header snapshot + redaction ---
+    //
+    // The two AI-side hook surfaces (`ClassifyRequest::headers`,
+    // `LookupRequest::request_headers`) used to ship as empty maps with
+    // a TODO. They now carry a snapshot of the inbound request headers
+    // produced by `snapshot_request_headers_from`. This test pins the
+    // contract: representative headers round-trip lower-cased, and the
+    // three credential carriers in `REDACTED_REQUEST_HEADERS`
+    // (Authorization, Cookie, Proxy-Authorization) are dropped before
+    // any classifier or semantic-cache hook sees them.
+    fn test_request_header(headers: &[(&str, &str)]) -> pingora_http::RequestHeader {
+        let mut req = pingora_http::RequestHeader::build("GET", b"/v1/chat/completions", None)
+            .expect("build request header");
+        for (name, value) in headers {
+            req.insert_header(name.to_string(), *value)
+                .expect("insert header");
+        }
+        req
+    }
+
+    #[test]
+    fn snapshot_request_headers_round_trips_non_credential_headers() {
+        let req = test_request_header(&[
+            ("X-Request-Id", "req-123"),
+            ("Content-Type", "application/json"),
+            ("X-Customer-Id", "tenant-7"),
+        ]);
+        let snap = snapshot_request_headers_from(&req);
+        // Names land lower-cased to match HTTP/2 + HTTP/3 framing.
+        assert_eq!(
+            snap.get("x-request-id").map(String::as_str),
+            Some("req-123")
+        );
+        assert_eq!(
+            snap.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            snap.get("x-customer-id").map(String::as_str),
+            Some("tenant-7")
+        );
+    }
+
+    #[test]
+    fn snapshot_request_headers_drops_authorization() {
+        let req = test_request_header(&[
+            ("Authorization", "Bearer sk-secret"),
+            ("X-Request-Id", "req-123"),
+        ]);
+        let snap = snapshot_request_headers_from(&req);
+        assert!(
+            !snap.contains_key("authorization"),
+            "Authorization must be redacted before reaching hook surfaces"
+        );
+        // Mixed-case spellings still get caught: Pingora lower-cases
+        // the header name on insertion, and we additionally lower-case
+        // on the read side.
+        assert!(
+            !snap.contains_key("Authorization"),
+            "no mixed-case Authorization survives either"
+        );
+        assert_eq!(
+            snap.get("x-request-id").map(String::as_str),
+            Some("req-123")
+        );
+    }
+
+    #[test]
+    fn snapshot_request_headers_drops_cookie_and_proxy_authorization() {
+        let req = test_request_header(&[
+            ("Cookie", "session=abc123"),
+            ("Proxy-Authorization", "Basic dXNlcjpwYXNz"),
+            ("X-Trace-Id", "trace-7"),
+        ]);
+        let snap = snapshot_request_headers_from(&req);
+        assert!(!snap.contains_key("cookie"));
+        assert!(!snap.contains_key("proxy-authorization"));
+        assert_eq!(snap.get("x-trace-id").map(String::as_str), Some("trace-7"));
     }
 
     // --- BotAuth target-uri propagation tests ---
