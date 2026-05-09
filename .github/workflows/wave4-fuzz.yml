@@ -1,10 +1,9 @@
 # Wave 4 fuzz harnesses.
 #
 # Runs the standalone `fuzz/` cargo-fuzz crate's targets as short
-# smoke passes on every push and pull request. Each target gets a
-# bounded `-max_total_time` budget so the CI lane stays under a
-# couple of minutes total; nightly / longer fuzz campaigns are
-# tracked separately and not in this workflow.
+# smoke passes on demand: add the `run-fuzz` label to a PR or fire
+# via workflow_dispatch. Each target gets a bounded `-max_total_time`
+# budget so a smoke run stays under a couple of minutes total.
 #
 # The crate is intentionally NOT a workspace member (see
 # `fuzz/Cargo.toml` for the rationale: the libfuzzer-sys cdylib link
@@ -16,10 +15,9 @@
 name: wave4-fuzz
 
 on:
-  push:
-    branches: [main]
   pull_request:
-    branches: [main]
+    types: [labeled, synchronize]
+  workflow_dispatch:
 
 # Cancel superseded runs so a force-push doesn't burn minutes
 # finishing the obsolete commit's fuzz pass.
@@ -34,6 +32,9 @@ env:
 
 jobs:
   fuzz:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'run-fuzz')
     name: fuzz / ${{ matrix.target }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -93,11 +94,11 @@ jobs:
         # libclang-dev is needed for rquickjs-sys's bindgen build script.
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang
 
+      - name: install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
       - name: install cargo-fuzz
-        # No --locked: cargo-fuzz's published Cargo.lock pins rustix 0.36.5,
-        # which uses reserved rustc_attrs that current stable rustc rejects.
-        # Letting cargo resolve fresh picks a patched rustix in the 0.36 line.
-        run: cargo install cargo-fuzz
+        run: cargo binstall -y cargo-fuzz
 
       - name: run ${{ matrix.target }}
         # Smoke pass only: -max_total_time bounds the libfuzzer

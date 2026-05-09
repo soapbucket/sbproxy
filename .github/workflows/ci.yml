@@ -71,6 +71,10 @@ jobs:
               - '!LICENSE'
               - '!NOTICE'
               - '!.gitignore'
+            observability:
+              - 'crates/sbproxy-observe/**'
+              - 'crates/sbproxy-modules/src/policy/**'
+              - '.github/workflows/ci.yml'
 
       # The workspace's full target/ + ~/.cargo/registry/ tops 14 GB on
       # GitHub-hosted runners (tract-onnx, tokenizers, kube, pingora,
@@ -126,6 +130,24 @@ jobs:
       - name: test (excludes e2e)
         if: steps.filter.outputs.code == 'true'
         run: cargo test --workspace --exclude sbproxy-e2e --locked
+
+      # Build the sbproxy binary so the e2e harness tests below can
+      # spawn it. cargo cannot infer the ordering between
+      # `cargo test -p sbproxy-e2e` and the binary crate.
+      - name: build sbproxy binary (for obs-budgets harness)
+        if: steps.filter.outputs.code == 'true' && steps.filter.outputs.observability == 'true'
+        run: cargo build -p sbproxy --locked
+
+      # Cardinality + redaction regressions are easy to break silently
+      # (a new label sneaks in, the limiter overflows into __other__,
+      # a redactor regex misses a new shape). This canary runs only
+      # when observability or policy code changed.
+      - name: observability budgets (cardinality + redaction)
+        if: steps.filter.outputs.code == 'true' && steps.filter.outputs.observability == 'true'
+        run: |
+          cargo test -p sbproxy-e2e --locked \
+            --test cardinality \
+            --test redaction
 
       - name: doc
         if: steps.filter.outputs.code == 'true'
