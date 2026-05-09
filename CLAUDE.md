@@ -59,7 +59,9 @@ sbproxy-rust/
                           wasmtime + WASI preview-1), MCP server,
                           feature flags
     sbproxy-observe/    - metrics (sbproxy_*), events, structured logging
-    sbproxy-security/   - WAF, PII redactor, certpin, hostfilter
+    sbproxy-security/   - crypto (HKDF), hostfilter, IP/CIDR utilities,
+                          PII redactor, SSRF guard; optional headless-detect
+                          (TLS fingerprint) and agent-verify (reverse DNS)
     sbproxy-tls/        - TLS config, mTLS
     sbproxy-transport/  - HTTP/1.1, H2, H3, websockets, gRPC, GraphQL
     sbproxy-vault/      - secret backends + interpolation
