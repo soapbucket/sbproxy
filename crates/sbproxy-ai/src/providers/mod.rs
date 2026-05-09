@@ -267,7 +267,7 @@ mod tests {
         let yaml = decompress_embedded().expect("embedded gzip valid");
         let catalog: YamlCatalog = serde_yaml::from_str(&yaml).expect("yaml parses");
         assert!(
-            catalog.providers.len() >= 38,
+            catalog.providers.len() >= 43,
             "expected the full default catalog to be embedded; got {}",
             catalog.providers.len()
         );
@@ -279,7 +279,7 @@ mod tests {
         assert!(names.contains(&"openai".to_string()));
         assert!(names.contains(&"anthropic".to_string()));
         assert!(names.contains(&"watsonx".to_string()));
-        assert!(names.len() >= 38);
+        assert!(names.len() >= 43);
     }
 
     #[test]
@@ -372,6 +372,6 @@ mod tests {
         // log and use the embedded set.
         let registry = build_registry(Some(Path::new("/dev/null/nope/missing.yml")))
             .expect("falls back when override unreadable");
-        assert!(registry.providers.len() >= 38);
+        assert!(registry.providers.len() >= 43);
     }
 }

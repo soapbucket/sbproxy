@@ -21,8 +21,12 @@ on:
       - 'sbproxy-rust/docs/**'
       - 'sbproxy-enterprise/docs/**'
       - 'scripts/docs-ci.sh'
+      - 'scripts/check-doc-drift.sh'
       - '.lycheeignore'
       - '.github/workflows/docs-ci.yml'
+      - 'docs/**'
+      - 'llms.txt'
+      - 'README.md'
 
 # Cancel superseded runs on the same ref so force-pushes do not
 # double-spend runner minutes.
@@ -85,3 +89,14 @@ jobs:
             exit 1
           fi
           bash scripts/docs-ci.sh
+
+      - name: check doc drift
+        # Fails if stale provider-count / routing-strategy strings
+        # reappear in docs/, llms.txt, or README.md. See
+        # scripts/check-doc-drift.sh for the policed list.
+        run: |
+          set -euo pipefail
+          if [ ! -x scripts/check-doc-drift.sh ]; then
+            chmod +x scripts/check-doc-drift.sh
+          fi
+          bash scripts/check-doc-drift.sh

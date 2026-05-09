@@ -2,7 +2,7 @@
 
 *Last modified: 2026-05-03*
 
-SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 36 OpenAI-compatible providers plus a native Anthropic translator, and the OpenRouter aggregator routes 200+ more.
+SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 43 native providers, including a native Anthropic translator, and the OpenRouter aggregator routes 200+ more.
 
 ## Provider setup
 
@@ -29,7 +29,7 @@ API keys support environment variable interpolation with `${VAR_NAME}` syntax. N
 
 ### Native providers
 
-36 OpenAI-compatible providers ship in-tree alongside a native Anthropic translator and the OpenRouter aggregator (which routes 200+ more models). Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `ollama`, `vllm`, `together`, `fireworks`, `perplexity`, `xai`, `sagemaker`, `databricks`, `oracle`, `watsonx`, and `openrouter`.
+43 native providers ship in-tree alongside a native Anthropic translator and the OpenRouter aggregator (which routes 200+ more models). Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `ollama`, `vllm`, `together`, `fireworks`, `perplexity`, `xai`, `sagemaker`, `databricks`, `oracle`, `watsonx`, and `openrouter`.
 
 For models that are not natively supported, route through `openrouter` (200+ models behind one key) or point a `vllm` or generic OpenAI-compatible provider at a self-hosted endpoint via `base_url`. See `providers.md` for the full per-provider model table.
 

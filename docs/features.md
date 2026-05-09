@@ -106,7 +106,7 @@ The `ai_proxy` action turns SBproxy into an OpenAI-compatible API gateway. It ac
 
 ### Providers
 
-SBproxy ships with 36 OpenAI-compatible providers plus a native Anthropic translator and the OpenRouter aggregator routing 200+ more. Adapters include openai, anthropic, gemini, azure, bedrock, cohere, mistral, groq, deepseek, ollama, vllm, together, fireworks, perplexity, xai, sagemaker, databricks, oracle, watsonx, openrouter, plus three local-runtime adapters (`tgi`, `lmstudio`, `llamacpp`). The `provider_type` field on a provider picks the adapter (when unset, SBproxy infers it from `name`). For models not covered by a native adapter, route through the openrouter provider (200+ models), or use a self-hosted OpenAI-compatible server via the `vllm`/`generic` adapter with a custom `base_url`.
+SBproxy ships with 43 native providers, including a native Anthropic translator and the OpenRouter aggregator routing 200+ more. Adapters include openai, anthropic, gemini, azure, bedrock, cohere, mistral, groq, deepseek, ollama, vllm, together, fireworks, perplexity, xai, sagemaker, databricks, oracle, watsonx, openrouter, plus three local-runtime adapters (`tgi`, `lmstudio`, `llamacpp`). The `provider_type` field on a provider picks the adapter (when unset, SBproxy infers it from `name`). For models not covered by a native adapter, route through the openrouter provider (200+ models), or use a self-hosted OpenAI-compatible server via the `vllm`/`generic` adapter with a custom `base_url`.
 
 ```yaml
 origins:
@@ -161,6 +161,7 @@ The `routing.strategy` field controls how requests are distributed across provid
 | `least_connections` | Route to provider with fewest active requests |
 | `token_rate` | Balance by token consumption rate |
 | `sticky` | Pin requests to a provider using session/key |
+| `race` | Fan out to every healthy provider in parallel; first non-error response wins, the rest are cancelled |
 
 ```yaml
 action:

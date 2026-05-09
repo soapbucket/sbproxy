@@ -2,7 +2,7 @@
 *Last modified: 2026-05-03*
 
 ## Summary
-- Total files: 78
+- Total files: 48
 - Keep: 52
 - Scrub: 20
 - Delete: 6
@@ -135,7 +135,6 @@
 
 Before release, audit these against current Rust code:
 
-- providers.md: Verify "20 native providers" and "200+ models" counts against `crates/sbproxy-ai/src/providers/`
 - configuration.md: Sample config blocks against current schema in `crates/sbproxy-config/`
 - build.md: Verify Cargo commands and feature flags against Cargo.toml
 - examples: Spot-check 3-5 example configs in `examples/` directory match documented YAML syntax

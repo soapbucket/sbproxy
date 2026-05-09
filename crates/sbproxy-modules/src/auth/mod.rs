@@ -73,7 +73,11 @@ pub enum Auth {
     Bearer(BearerAuth),
     /// JWT validation (structure + expiry, signature check deferred).
     Jwt(JwtAuth),
-    /// HTTP Digest Authentication (placeholder).
+    /// HTTP Digest Authentication. Implements the subset of RFC 7616
+    /// the proxy actually exposes (MD5 digest with `qop=auth`) and
+    /// tracks the highest accepted nonce-count per nonce so a captured
+    /// `Authorization` header cannot be replayed. See [`DigestAuth`]
+    /// for the implementation details.
     Digest(DigestAuth),
     /// Forward auth to an external service.
     ForwardAuth(ForwardAuthProvider),

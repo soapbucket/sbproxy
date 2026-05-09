@@ -6,7 +6,7 @@ Most teams run nginx or Traefik for HTTP traffic, then route AI requests through
 
 ## Key facts
 
-- 200+ LLM models reachable. 20 native provider adapters (OpenAI, Anthropic, Google, Mistral, Cohere, Groq, DeepSeek, and more) plus 200+ models through the OpenRouter aggregator.
+- 200+ LLM models reachable. 43 native providers (OpenAI, Anthropic, Google, Mistral, Cohere, Groq, DeepSeek, and more) plus 200+ models through the OpenRouter aggregator.
 - Sub-millisecond p99 proxy overhead at 50k+ rps on commodity hardware
 - Hot reload with zero dropped connections
 - 14-phase compiled pipeline per origin (compiled once, zero per-request allocation)
@@ -82,7 +82,7 @@ origins:
       routing: fallback_chain
 ```
 
-Routing strategies: round_robin, weighted, fallback_chain, random, lowest_latency, least_connections, cost_optimized, token_rate, sticky.
+Routing strategies (10): round_robin, weighted, fallback_chain, random, lowest_latency, least_connections, cost_optimized, token_rate, sticky, race.
 
 Guardrails: pii, injection, jailbreak, toxicity, content_safety, schema, regex.
 
@@ -114,7 +114,7 @@ Origin fields:
 | Type | Description |
 |------|-------------|
 | proxy | Reverse proxy to upstream URL |
-| ai_proxy | AI gateway with 200+ models (20 native adapters + OpenRouter aggregator), 9 routing strategies, guardrails, budgets |
+| ai_proxy | AI gateway with 200+ models (43 native providers + OpenRouter aggregator), 10 routing strategies (round_robin, weighted, fallback_chain, random, lowest_latency, least_connections, cost_optimized, token_rate, sticky, race), guardrails, budgets |
 | static | Static response (JSON or text) |
 | redirect | HTTP redirect (301/302/307/308) |
 | echo | Echo request as JSON (debugging) |

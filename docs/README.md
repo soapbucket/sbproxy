@@ -79,7 +79,7 @@ origins:
 ## What's in the box
 
 - Reverse proxy: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, connection pooling, hot reload.
-- AI gateway: 200+ LLM models, 9 routing strategies, OpenAI-compatible API, guardrails, budgets, virtual keys, MCP server.
+- AI gateway: 200+ LLM models, 10 routing strategies, OpenAI-compatible API, guardrails, budgets, virtual keys, MCP server.
 - Authentication: API key, basic, bearer, JWT, digest, forward auth, noop.
 - Policies: rate limiting, IP filter, CEL expressions, WAF, DDoS, CSRF, security headers.
 - Transforms: 18 request and response transforms (JSON, HTML, Markdown, CSS, Lua, JavaScript, encoding, and more).

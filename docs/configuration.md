@@ -55,20 +55,25 @@ For AI-specific features in depth, see [ai-gateway.md](ai-gateway.md). For CEL, 
 
 SBproxy reads its configuration from a YAML file, typically named `sb.yml`. This file defines how the proxy listens for traffic, which hostnames it handles, and what it does with each request.
 
-Load a config file:
+Load a config file. The path must be supplied explicitly; the binary does not auto-discover `sb.yml` in the current directory.
 
 ```bash
-# Default (looks for sb.yml in current directory)
-sbproxy serve
+# Explicit path
+sbproxy --config /etc/sbproxy/production.yml
 
-# Custom path
+# Same thing via the `serve` subcommand and the short flag
 sbproxy serve -f /etc/sbproxy/production.yml
+
+# Or via env var for containerised deployments
+SB_CONFIG_FILE=/etc/sbproxy/production.yml sbproxy
 ```
 
 Validate without starting:
 
 ```bash
-sbproxy validate -c sb.yml
+sbproxy validate /etc/sbproxy/production.yml
+# or
+sbproxy --config /etc/sbproxy/production.yml --check
 ```
 
 The config has two main sections: `proxy` (server-level settings) and `origins` (per-hostname routing and behavior). Optional shared-state blocks (`l2_cache_settings`, `messenger_settings`) live nested under `proxy`.
@@ -3130,7 +3135,9 @@ origins:
 Check the configuration for errors without starting the proxy:
 
 ```bash
-sbproxy validate -c sb.yml
+sbproxy validate /etc/sbproxy/sb.yml
+# or, equivalently, on a running --config invocation
+sbproxy --config /etc/sbproxy/sb.yml --check
 ```
 
 This catches:

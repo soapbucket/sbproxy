@@ -80,9 +80,13 @@ sbproxy/
                               header modifiers, error pages, forward rules.
     sbproxy-cache/        - Response cache trait, memory backend,
                               pluggable store interface, cache key partitioning.
-    sbproxy-security/     - WAF engine (OWASP CRS), DDoS protection, CSRF,
-                              RFC 9421 message signatures, PII masking,
-                              host filter (bloom + HashMap lookup).
+    sbproxy-security/     - Cross-cutting security primitives: crypto helpers,
+                              host filter (bloom + HashMap lookup), client-IP
+                              extraction with trusted-proxy CIDRs, PII redactor,
+                              SSRF guard, plus optional headless-browser
+                              detection and bot/agent verification helpers.
+                              The WAF, DDoS, CSRF, and security_headers
+                              policies live in sbproxy-modules/src/policy/.
     sbproxy-tls/          - TLS termination via rustls 0.23 with the `ring`
                               crypto provider, ACME auto-cert (Let's Encrypt),
                               HTTP/3 listener wiring, OCSP stapling.
@@ -381,7 +385,7 @@ implements `sbproxy_ai::providers::Provider`. The provider list is also driven b
 `providers.yaml`, which maps provider names to their base URLs and supported models. Rust
 implementations handle request serialization and response normalization.
 
-36 OpenAI-compatible providers ship in-tree alongside a native Anthropic
+43 native providers ship in-tree alongside a native Anthropic
 translator and the OpenRouter aggregator (which routes 200+ more models).
 Direct adapters include OpenAI, Anthropic, Google Gemini, Azure
 OpenAI, AWS Bedrock, Cohere, Mistral, DeepSeek, xAI / Grok, Perplexity,
@@ -402,6 +406,7 @@ adapters (Hugging Face TGI, LM Studio, llama.cpp).
 | `cost_optimized`    | Lowest score of `connections * 1000 + weight`. Utilization dominates; weight breaks ties in favor of cheaper providers. |
 | `token_rate`        | Provider with the most remaining tokens-per-minute headroom. |
 | `sticky`            | Pin a session key to one provider. Falls back to round robin without a session key. |
+| `race`              | Fan out to every healthy provider in parallel; first non-error response wins, the rest are cancelled. |
 
 ### Streaming
 
