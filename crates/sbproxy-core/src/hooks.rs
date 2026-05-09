@@ -20,6 +20,28 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 // ============================================================================
+// Header redaction policy
+// ============================================================================
+
+/// Lower-cased header names the request pipeline drops before populating
+/// header snapshots on hook surfaces (`ClassifyRequest::headers`,
+/// `LookupRequest::request_headers`).
+///
+/// Redaction is enforced at the snapshot site so hook implementations
+/// never observe raw credential material. The set is deliberately
+/// minimal: it covers the three credential carriers that any HTTP
+/// request can plausibly carry. Hook implementations that need finer
+/// redaction (e.g. cookie-name allow-listing, custom bearer headers)
+/// should redact further on their side rather than asking the proxy to
+/// expand this set.
+///
+/// Names are matched case-insensitively against
+/// `pingora_http::HeaderName::as_str()`, which is already lower-cased on
+/// HTTP/2 and HTTP/3 and folded by Pingora on HTTP/1.1.
+pub const REDACTED_REQUEST_HEADERS: &[&str] =
+    &["authorization", "cookie", "proxy-authorization"];
+
+// ============================================================================
 // Startup hook
 // ============================================================================
 
@@ -68,7 +90,21 @@ pub struct ClassifyRequest {
     pub model_id: Option<String>,
     /// Raw prompt text submitted by the client.
     pub prompt: String,
-    /// Request headers passed through for additional classifier signals.
+    /// Snapshot of the inbound request headers, with credential
+    /// carriers stripped.
+    ///
+    /// The proxy populates this from the live Pingora request just
+    /// before invoking the classifier. Header names are lower-cased to
+    /// match HTTP/2 and HTTP/3 framing. Values come straight from the
+    /// wire and may contain operator-controlled secrets in non-redacted
+    /// header names; implementations should not log them verbatim.
+    ///
+    /// Headers listed in [`REDACTED_REQUEST_HEADERS`] are dropped
+    /// before the snapshot is built and never reach the classifier.
+    /// The contract is "what the caller sees minus credentials"; if
+    /// hook implementations need a header that is currently redacted,
+    /// raise the contract change rather than fishing the value out
+    /// elsewhere.
     pub headers: HashMap<String, String>,
 }
 
@@ -252,7 +288,14 @@ pub struct LookupRequest {
     pub model_id: Option<String>,
     /// Raw prompt text used to compute the embedding.
     pub prompt: String,
-    /// Request headers preserved for cache faithfulness checks.
+    /// Snapshot of the inbound request headers, with credential
+    /// carriers stripped.
+    ///
+    /// Populated from the live Pingora request the same way as
+    /// [`ClassifyRequest::headers`]: header names are lower-cased and
+    /// the entries listed in [`REDACTED_REQUEST_HEADERS`] are dropped
+    /// before the snapshot reaches the cache. Cache key templates that
+    /// reference `{header.x}` placeholders read from this map.
     pub request_headers: HashMap<String, String>,
     /// Request body bytes used for keying when prompts are non-trivial.
     pub request_body: Bytes,
