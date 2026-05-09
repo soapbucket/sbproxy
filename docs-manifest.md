@@ -1,9 +1,9 @@
 # OSS Docs Manifest (WOR-49)
-*Last modified: 2026-05-03*
+*Last modified: 2026-05-09*
 
 ## Summary
-- Total files: 48
-- Keep: 52
+- Total files: 49
+- Keep: 53
 - Scrub: 20
 - Delete: 6
 
@@ -65,6 +65,7 @@
 | feature-flags.md | scrub | Feature flag mechanism is OSS; 2 enterprise refs (flag list examples). Strip enterprise flag examples |
 | features.md | scrub | Feature overview is OSS. 1 enterprise ref (guardrail vendors); strip |
 | kubernetes.md | keep | K8s operator and deployment are OSS; no commercial content |
+| listings.md | keep | Repo-native Listing primitive (WOR-136); no commercial content |
 |  | scrub | Manual testing guide is heavy on commercial rails (x402, MPP, Stripe). 5 Wave refs (testing roadmap context). Could be kept as testing guide but OSS testing is minimal. Mark for potential deletion as it's primarily commercial-rail testing |
 | manual.md | keep | Operator manual is OSS; no commercial content |
 | metrics-stability.md | keep | Metric schema stability; no commercial content |

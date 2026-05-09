@@ -1,0 +1,35 @@
+# Repo-native Listing primitive (WOR-136).
+#
+# A Listing is a published, versioned view of an existing Resource (an
+# origin, an MCP server, or a docs surface). Listings live in
+# `listings/*.yaml` alongside the rest of the proxy config so they are
+# version-controlled with the Repo and validated through the same plan
+# pipeline.
+#
+# This example pairs the standard sb.yml with one Listing manifest under
+# `listings/example.yaml`. The Listing pins the underlying origin to a
+# specific commit SHA via `revision.mode: pin`. See `docs/listings.md`
+# for the full reference and the other two pinning modes
+# (`track-branch`, `tag`).
+#
+# Run:
+#   make run CONFIG=examples/101-listing-primitive/sb.yml
+#
+# Test the underlying origin:
+#   curl -H 'Host: api.example.com' http://127.0.0.1:8080/get
+#
+# The Listing itself is not served on the data path in OSS; it is the
+# input the future hosted-Catalog surface (WOR-135) and the
+# Listing-scoped agent-skills extension (WOR-196) build on.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    authentication:
+      type: jwt
+      secret: hardcoded-not-a-ref

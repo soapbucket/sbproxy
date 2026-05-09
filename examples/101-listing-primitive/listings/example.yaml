@@ -1,0 +1,35 @@
+# Example Listing manifest. Documented in `docs/listings.md`.
+#
+# This Listing publishes the `api.example.com` origin as the
+# `example-api` Listing. The pinning mode is `pin`, so the Listing
+# always serves the revision tagged by the short SHA in
+# `revision.value`.
+apiVersion: sbproxy.dev/v1
+kind: Listing
+metadata:
+  name: example-api
+  labels:
+    team: platform
+    tier: free
+spec:
+  type: api
+  status: published
+  resources:
+    - ref: origins/api.example.com
+      revision:
+        mode: pin
+        value: "abc1234"
+  auth:
+    strategies: [jwt]
+  accessPlan:
+    free:
+      rate: "100/min"
+    paid:
+      price_micros: 1000
+      currency: USD
+  publish:
+    visibility: public
+    docsUrl: "/docs/example-api"
+  lifecycle:
+    deprecation: null
+    sunsetDate: null

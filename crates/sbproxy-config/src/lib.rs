@@ -4,12 +4,14 @@
 //! - Parsing YAML config files into typed structs ([`types`])
 //! - Intermediate representation ([`raw`])
 //! - Compiling configs into immutable, performance-optimized snapshots ([`snapshot`], [`compiler`])
+//! - The repo-native [`listing::Listing`] primitive (WOR-136)
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod compiler;
 pub mod duration;
+pub mod listing;
 pub mod plan;
 pub mod raw;
 pub mod snapshot;
@@ -17,6 +19,13 @@ pub mod types;
 pub mod validate;
 
 pub use compiler::*;
+pub use listing::{
+    load_listing_file, load_listings_from_repo, validate_listings, Listing, ListingAccessPlan,
+    ListingAuth, ListingFreeTier, ListingLifecycle, ListingLoadError, ListingMetadata,
+    ListingPaidTier, ListingPublish, ListingRegistry, ListingResource, ListingSpec, LoadedListing,
+    NoopRevisionResolver, Revision, RevisionMode, RevisionResolver, StaticRevisionResolver,
+    LISTINGS_DIRNAME, LISTING_API_VERSION, LISTING_KIND,
+};
 pub use plan::{
     compute_baseline_revision, plan, plan_with_options, render_text, BlastRadius, BlastRadiusRule,
     PlanEntry, PlanFile, PlanKind, PlanReport, PlanSummary, BLAST_RADIUS_MATRIX,
