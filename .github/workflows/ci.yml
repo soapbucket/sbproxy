@@ -31,6 +31,13 @@ on:
   pull_request:
     branches: [main]
 
+# Default to no permissions; jobs that need more set their own.
+# CodeQL (actions/missing-workflow-permissions) wants every workflow
+# to declare its permissions explicitly rather than rely on the
+# repo-level default.
+permissions:
+  contents: read
+
 # Cancel superseded runs on the same ref so force-pushes don't burn
 # minutes finishing the obsolete commit's jobs.
 concurrency:
