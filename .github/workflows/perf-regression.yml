@@ -1,17 +1,16 @@
 # Performance regression CI (WOR-32).
 #
-# Runs the perf bench on PRs that touch the hot-path crates
-# (sbproxy-core, sbproxy-modules, sbproxy-cache, sbproxy-transport)
-# plus this workflow and its driver scripts. Compares the candidate
-# numbers against a freshly-collected main baseline and posts a comment
-# on the PR with the per-metric deltas.
+# Runs the perf bench on demand: add the `run-perf` label to a PR or
+# fire via workflow_dispatch. Compares the candidate numbers against a
+# freshly-collected main baseline and posts a comment on the PR with
+# the per-metric deltas.
 #
 # Gate: the check fails when one of {p99 latency, idle RSS, max RSS}
 # regresses by more than 5% vs the main baseline. Smaller regressions
 # and any improvement still post the comment but pass the check. RPS
 # and p50 / p95 are reported but informational.
 #
-# Override: a PR labelled `perf-regression-ok` skips the gate. The
+# Override: a PR also labelled `perf-regression-ok` skips the gate. The
 # comment still posts so reviewers see the regression in the PR thread.
 #
 # Baseline strategy: option 1 (run baseline inline). The script checks
@@ -26,15 +25,8 @@ name: perf-regression
 
 on:
   pull_request:
-    paths:
-      - 'crates/sbproxy-core/**'
-      - 'crates/sbproxy-modules/**'
-      - 'crates/sbproxy-cache/**'
-      - 'crates/sbproxy-transport/**'
-      - 'bench-synthetic/**'
-      - 'scripts/perf-regression-run.sh'
-      - 'scripts/perf-regression-comment.py'
-      - '.github/workflows/perf-regression.yml'
+    types: [labeled, synchronize]
+  workflow_dispatch:
 
 # Cancel superseded runs on the same ref so a force-push doesn't burn
 # minutes finishing the obsolete commit's bench.
@@ -55,6 +47,9 @@ env:
 
 jobs:
   perf-regression:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'run-perf')
     name: bench delta vs main
     # Pinned to ubuntu-latest to match the rest of the CI lanes; a future
     # tightening (ubuntu-22.04 or self-hosted) can change just this line.
