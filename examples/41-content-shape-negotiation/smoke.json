@@ -1,0 +1,96 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "cases": [
+    {
+      "name": "markdown shape rewrites Content-Type and stamps x-markdown-tokens",
+      "request": {
+        "method": "GET",
+        "path": "/article",
+        "headers": {
+          "Host": "shape.local",
+          "Accept": "text/markdown"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "headers": {
+          "content-type": "^text/markdown",
+          "x-markdown-tokens": "^\\d+$"
+        }
+      }
+    },
+    {
+      "name": "json shape returns the v1 envelope with the documented fields",
+      "request": {
+        "method": "GET",
+        "path": "/article",
+        "headers": {
+          "Host": "shape.local",
+          "Accept": "application/json"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "headers": {
+          "content-type": "^application/json",
+          "x-markdown-tokens": "^\\d+$"
+        },
+        "body": {
+          "type": "jsonShape",
+          "shape": {
+            "schema_version": "1"
+          }
+        }
+      }
+    },
+    {
+      "name": "html accept passes the upstream body through unchanged",
+      "request": {
+        "method": "GET",
+        "path": "/article",
+        "headers": {
+          "Host": "shape.local",
+          "Accept": "text/html"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "headers": {
+          "content-type": "^text/html"
+        }
+      }
+    }
+  ],
+  "audit_check": false,
+  "_notes": [
+    "This example does not ship a docker-compose.yml, so",
+    "examples-smoke.sh skips it silently. The cases[] block documents",
+    "the assertions a hand-driven smoke run must pass: the markdown",
+    "and json shapes both rewrite Content-Type and stamp",
+    "x-markdown-tokens with a non-negative integer; the json shape's",
+    "body parses as JSON and carries schema_version=\"1\" plus the",
+    "title / content_md / token_estimate / license / url / fetched_at",
+    "/ citation_required fields documented in README.md. The html",
+    "case asserts only the Content-Type because the runner does not",
+    "currently support headers_absent assertions; the README's curl",
+    "example shows that x-markdown-tokens is not stamped on the html",
+    "pass-through (no Markdown projection ran).",
+    "",
+    "The body shape uses a single literal field (schema_version) so",
+    "the runner's deep_match exact-matches it without depending on",
+    "non-deterministic upstream values like fetched_at or token_estimate.",
+    "The full envelope contract is pinned in",
+    "e2e/tests/content_negotiation_e2e.rs (8 tests) and",
+    "e2e/tests/x_markdown_tokens_e2e.rs (5 tests), which exercise the",
+    "same negotiation pipeline against a static-action fixture so they",
+    "do not depend on a live upstream.",
+    "",
+    "The upstream is test.sbproxy.dev, the workspace's hostname",
+    "placeholder; rewrite action.url in sb.yml to a real HTML page",
+    "before driving the cases end-to-end.",
+    "",
+    "audit_check stays false until the OSS audit endpoint lands."
+  ]
+}
