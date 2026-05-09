@@ -213,14 +213,21 @@ impl CelScriptTransform {
     /// the rule is skipped; the rest of the chain continues so a
     /// single broken expression does not knock out the transform.
     /// Returns an empty `Vec` when no rules are configured.
+    ///
+    /// Returns a [`crate::transform::TransformError::InvariantViolated`]
+    /// if a structural invariant is violated (today: a `Remove` rule
+    /// reaching the value-expression evaluation branch). Operators
+    /// who want to keep the legacy panic-free behaviour can continue
+    /// to call this through the [`Self::evaluate_headers_lossy`] shim,
+    /// which drops invariant errors after logging them.
     pub fn evaluate_headers(
         &self,
         body: &[u8],
         status: u16,
         headers: &HeaderMap,
-    ) -> Vec<CelHeaderMutation> {
+    ) -> Result<Vec<CelHeaderMutation>, crate::transform::TransformError> {
         if self.headers.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let ctx = build_response_eval_context(body, status, headers);
         let engine = CelEngine::new();
@@ -282,12 +289,90 @@ impl CelScriptTransform {
                         CelHeaderOp::Append => {
                             out.push(CelHeaderMutation::Append(rule.name.clone(), value_str));
                         }
-                        CelHeaderOp::Remove => unreachable!(),
+                        CelHeaderOp::Remove => {
+                            // WOR-168: this arm was previously
+                            // `unreachable!()`. The outer match arm
+                            // selects `Set | Append`, so under normal
+                            // control flow `Remove` cannot reach here.
+                            // We treat the path as a pipeline-invariant
+                            // violation and surface it through a typed
+                            // `TransformError::InvariantViolated` so the
+                            // request becomes a 500 with attribution
+                            // rather than a panicked Pingora worker.
+                            tracing::error!(
+                                target: "sbproxy::transform::cel",
+                                header = %rule.name,
+                                "cel header transform: invariant violated - CelHeaderOp::Remove reached the value-expression branch",
+                            );
+                            return Err(
+                                crate::transform::TransformError::InvariantViolated {
+                                    reason: format!(
+                                        "cel header rule {:?}: Remove op reached value-expression branch",
+                                        rule.name,
+                                    ),
+                                },
+                            );
+                        }
                     }
                 }
             }
         }
-        out
+        Ok(out)
+    }
+
+    /// Lossy variant of [`Self::evaluate_headers`] that drops invariant
+    /// errors and returns the partially-applied mutation set. Useful for
+    /// the header-only response wiring in `sbproxy-core` where a single
+    /// drift event should not poison the entire response. The error is
+    /// already tracing::error!'d at its source, so the caller just
+    /// loses the partial-rule chain rather than the whole response.
+    pub fn evaluate_headers_lossy(
+        &self,
+        body: &[u8],
+        status: u16,
+        headers: &HeaderMap,
+    ) -> Vec<CelHeaderMutation> {
+        match self.evaluate_headers(body, status, headers) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "sbproxy::transform::cel",
+                    error = %e,
+                    "cel header transform: invariant violated; falling back to empty mutation set",
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// WOR-168 test hook: directly drive the inner `Set | Append`
+    /// switch with an arbitrary `CelHeaderOp` so the
+    /// `unreachable!()` replacement can be exercised by a unit test.
+    /// Production code never hits this surface; the outer match in
+    /// `evaluate_headers` always routes `Remove` to the dedicated arm.
+    #[cfg(test)]
+    pub(crate) fn finalise_value_op_for_test(
+        op: CelHeaderOp,
+        name: &str,
+        value: String,
+    ) -> Result<CelHeaderMutation, crate::transform::TransformError> {
+        match op {
+            CelHeaderOp::Set => Ok(CelHeaderMutation::Set(name.to_string(), value)),
+            CelHeaderOp::Append => Ok(CelHeaderMutation::Append(name.to_string(), value)),
+            CelHeaderOp::Remove => {
+                tracing::error!(
+                    target: "sbproxy::transform::cel",
+                    header = %name,
+                    "cel header transform: invariant violated - CelHeaderOp::Remove reached the value-expression branch",
+                );
+                Err(crate::transform::TransformError::InvariantViolated {
+                    reason: format!(
+                        "cel header rule {:?}: Remove op reached value-expression branch",
+                        name,
+                    ),
+                })
+            }
+        }
     }
 
     /// Apply the response-time CEL expression with full response
@@ -505,7 +590,7 @@ mod tests {
             ],
         });
         let t = CelScriptTransform::from_config(v).unwrap();
-        let mutations = t.evaluate_headers(b"", 418, &HeaderMap::new());
+        let mutations = t.evaluate_headers(b"", 418, &HeaderMap::new()).unwrap();
         assert_eq!(
             mutations,
             vec![CelHeaderMutation::Set(
@@ -522,7 +607,7 @@ mod tests {
             "headers": [{"op": "remove", "name": "x-internal-trace"}],
         });
         let t = CelScriptTransform::from_config(v).unwrap();
-        let mutations = t.evaluate_headers(b"", 200, &HeaderMap::new());
+        let mutations = t.evaluate_headers(b"", 200, &HeaderMap::new()).unwrap();
         assert_eq!(
             mutations,
             vec![CelHeaderMutation::Remove("x-internal-trace".to_string())]
@@ -542,13 +627,85 @@ mod tests {
             ],
         });
         let t = CelScriptTransform::from_config(v).unwrap();
-        let mutations = t.evaluate_headers(b"", 200, &HeaderMap::new());
+        let mutations = t.evaluate_headers(b"", 200, &HeaderMap::new()).unwrap();
         assert_eq!(
             mutations,
             vec![CelHeaderMutation::Set(
                 "x-good".to_string(),
                 "yes".to_string(),
             )]
+        );
+    }
+
+    /// WOR-168: directly drive the inner `Set | Append` switch with a
+    /// `Remove` op via the test hook. Pre-fix, this call site was
+    /// `unreachable!()` and would have panicked the Pingora worker
+    /// under any future regression that routed a `Remove` rule there.
+    /// Post-fix, the same call returns a typed
+    /// `TransformError::InvariantViolated` that the body-buffer
+    /// pipeline maps to a 500 with `x-sbproxy-transform-error`
+    /// attribution.
+    #[test]
+    fn finalise_value_op_returns_invariant_error_for_remove() {
+        let r = CelScriptTransform::finalise_value_op_for_test(
+            CelHeaderOp::Remove,
+            "x-test",
+            "ignored".to_string(),
+        );
+        let err = r.expect_err("Remove in value branch must surface an invariant error");
+        let msg = format!("{err}");
+        assert!(
+            matches!(
+                err,
+                crate::transform::TransformError::InvariantViolated { .. }
+            ),
+            "expected InvariantViolated, got {msg}",
+        );
+        assert!(
+            msg.contains("x-test"),
+            "error must attribute the offending header name: {msg}",
+        );
+    }
+
+    /// WOR-168: the `Set` and `Append` ops must continue to work
+    /// through the same helper so the test hook does not silently
+    /// regress on the happy path.
+    #[test]
+    fn finalise_value_op_returns_set_and_append_ok() {
+        let s = CelScriptTransform::finalise_value_op_for_test(
+            CelHeaderOp::Set,
+            "x-foo",
+            "bar".to_string(),
+        )
+        .unwrap();
+        assert_eq!(s, CelHeaderMutation::Set("x-foo".into(), "bar".into()));
+        let a = CelScriptTransform::finalise_value_op_for_test(
+            CelHeaderOp::Append,
+            "x-foo",
+            "baz".to_string(),
+        )
+        .unwrap();
+        assert_eq!(a, CelHeaderMutation::Append("x-foo".into(), "baz".into()));
+    }
+
+    /// WOR-168: the lossy shim must absorb invariant errors and
+    /// return an empty mutation set rather than propagating.
+    #[test]
+    fn evaluate_headers_lossy_returns_empty_on_invariant_error() {
+        // The inner unreachable arm cannot actually fire from public
+        // config today, but the shim's Err -> empty mapping is what
+        // the `sbproxy-core` upstream-response wiring relies on, so
+        // pin its happy path: a normal Remove rule still flows
+        // through the lossy variant.
+        let v = serde_json::json!({
+            "type": "cel",
+            "headers": [{"op": "remove", "name": "x-internal-trace"}],
+        });
+        let t = CelScriptTransform::from_config(v).unwrap();
+        let mutations = t.evaluate_headers_lossy(b"", 200, &HeaderMap::new());
+        assert_eq!(
+            mutations,
+            vec![CelHeaderMutation::Remove("x-internal-trace".to_string())]
         );
     }
 

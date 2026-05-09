@@ -222,6 +222,15 @@ pub struct ProxyMetrics {
     /// from `sbproxy_errors_total` so dashboards can keep synthetic
     /// noise out of real-traffic SLO numerators.
     pub synthetic_probe_failures: IntCounterVec,
+
+    // --- Reliability metrics (WOR-168) ---
+    /// Counter `sbproxy_mirror_state_drift_total` incremented when the
+    /// request pipeline observes a `mirror_pending` slot that was
+    /// expected to be `Some(...)` but turns out to be `None`. The fix
+    /// for WOR-168 changed the unwrap into a graceful no-op; this
+    /// counter surfaces how often the previously-panicking path is
+    /// taken so the drift can be diagnosed in production.
+    pub mirror_state_drift: prometheus::IntCounter,
 }
 
 impl ProxyMetrics {
@@ -401,6 +410,14 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        // --- Reliability counters (WOR-168) ---
+
+        let mirror_state_drift = prometheus::IntCounter::new(
+            "sbproxy_mirror_state_drift_total",
+            "Times the mirror_pending slot was unexpectedly empty when the pipeline tried to fire a shadow request",
+        )
+        .unwrap();
+
         // --- Register all metrics ---
 
         registry.register(Box::new(requests_total.clone())).unwrap();
@@ -448,6 +465,9 @@ impl ProxyMetrics {
         registry
             .register(Box::new(synthetic_probe_failures.clone()))
             .unwrap();
+        registry
+            .register(Box::new(mirror_state_drift.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -470,6 +490,7 @@ impl ProxyMetrics {
             cache_reserve_writes,
             cache_reserve_evictions,
             synthetic_probe_failures,
+            mirror_state_drift,
         }
     }
 
@@ -908,6 +929,16 @@ pub fn dec_active(origin: &str) {
         .dec();
 }
 
+/// Increment `sbproxy_mirror_state_drift_total` (WOR-168).
+///
+/// Called when the request pipeline expects `mirror_pending` to be
+/// `Some(...)` but finds `None`. Before WOR-168 this path was an
+/// `unwrap()` that would have panicked the worker; now it is a
+/// best-effort no-op with a counter so operators can spot drift.
+pub fn record_mirror_state_drift() {
+    metrics().mirror_state_drift.inc();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1047,6 +1078,27 @@ mod tests {
     // --- Per-origin helper function tests ---
     // These tests use the global metrics() instance. We verify the counters/gauges
     // change by checking the global ProxyMetrics directly after calling helpers.
+
+    /// WOR-168 - the new mirror_state_drift counter must be present
+    /// in the rendered Prometheus output and increment when the
+    /// helper is called.
+    #[test]
+    fn test_record_mirror_state_drift_increments_counter() {
+        let m = metrics();
+        let before = m.mirror_state_drift.get();
+        record_mirror_state_drift();
+        record_mirror_state_drift();
+        let after = m.mirror_state_drift.get();
+        assert!(
+            after >= before + 2,
+            "expected mirror_state_drift to gain >=2, before={before} after={after}",
+        );
+        let output = m.render();
+        assert!(
+            output.contains("sbproxy_mirror_state_drift_total"),
+            "rendered output must include the new counter family",
+        );
+    }
 
     #[test]
     fn test_record_request_increments_counters() {

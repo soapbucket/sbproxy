@@ -1,0 +1,1 @@
+{"type":"cel","headers":[{"op":"remove","name":"x-test","value_expr":"string(response.status)"}]}

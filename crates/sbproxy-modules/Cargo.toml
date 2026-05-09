@@ -123,7 +123,10 @@ lru = "0.16"
 
 # Needed for spawn_blocking when calling sync KVStore methods (Redis rate limiting).
 # Also: rt + time for active health-check probe loops on load_balancer targets.
-tokio = { workspace = true, features = ["rt", "time", "macros"] }
+# rt-multi-thread is used by the dedicated plugin-transform runtime
+# (transform/mod.rs) so a panicking or slow plugin future is isolated
+# from the Pingora worker that called the response filter (WOR-168).
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "macros"] }
 
 # Active health-check probes (GETs against target URLs in a background task).
 # Blocking feature also used to load remote bulk-redirect lists at config compile.
