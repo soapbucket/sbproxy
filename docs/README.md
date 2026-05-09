@@ -43,6 +43,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [metrics-stability.md](metrics-stability.md) - Prometheus metric naming and stability.
 - [adr-classifier-supply-chain-oss.md](adr-classifier-supply-chain-oss.md) - operator-trusted model supply-chain decisions for the OSS classifier path.
 - [adr-config-plan-apply.md](adr-config-plan-apply.md) - audit + design for the proposed `sbproxy plan` and `sbproxy apply` subcommands.
+- [adr-config-source-modes.md](adr-config-source-modes.md) - audit + design for the `file`, `git`, `git+overlay`, and `db` config source modes.
 - [adr-fast-track-amendment.md](adr-fast-track-amendment.md) - template for additive closed-enum ADR changes.
 - [comparison.md](comparison.md) - how SBproxy compares to other proxies and AI gateways.
 
