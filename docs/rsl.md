@@ -1,6 +1,6 @@
 # RSL 1.0 licensing cookbook
 
-*Last modified: 2026-05-04*
+*Last modified: 2026-05-08*
 
 This is the cookbook for expressing a specific license stance via SBproxy YAML and seeing the result in the `/licenses.xml` document the proxy serves. The reader is a publisher author or counsel who wants the right RSL terms on the wire without writing XML by hand.
 
@@ -8,7 +8,7 @@ If you have not yet wired `ai_crawl_control` on the origin, read [ai-crawl-contr
 
 ## What RSL 1.0 expresses
 
-The Really Simple Licensing 1.0 specification (RSL Collective, December 2025, https://rsl.ai/spec/1.0) is a machine-readable XML document that asserts the license terms a publisher offers for AI ingestion of their content. It addresses three categories of AI use:
+The Really Simple Licensing 1.0 specification (RSL Collective, https://rslstandard.org/rsl) is a machine-readable XML document that asserts the license terms a publisher offers for AI ingestion of their content. It addresses three categories of AI use:
 
 - **Training (`type="training"`).** Whether the content may be used as training data for a model. Pay-per-crawl pricing typically attaches here.
 - **Inference (`type="inference"`).** Whether the content may be used as model input at inference time, e.g. as RAG context or as a tool-use payload. Pay-per-inference pricing attaches here.
@@ -62,12 +62,14 @@ origins:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
-<rsl xmlns="https://rsl.ai/spec/1.0" version="1.0">
-  <license urn="urn:rsl:1.0:blog.example.com:0xa3f9d2c1">
-    <origin hostname="blog.example.com" />
-    <ai-use type="training" licensed="true" />
-    <content-signal>ai-train</content-signal>
-  </license>
+<rsl xmlns="https://rslstandard.org/rsl" version="1.0">
+  <content url="https://blog.example.com/*">
+    <license urn="urn:rsl:1.0:blog.example.com:0xa3f9d2c1">
+      <origin hostname="blog.example.com" />
+      <ai-use type="training" licensed="true" />
+      <content-signal>ai-train</content-signal>
+    </license>
+  </content>
 </rsl>
 ```
 
@@ -97,12 +99,14 @@ origins:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
-<rsl xmlns="https://rsl.ai/spec/1.0" version="1.0">
-  <license urn="urn:rsl:1.0:docs.example.com:0xb1c2d3e4">
-    <origin hostname="docs.example.com" />
-    <ai-use type="inference" licensed="true" />
-    <content-signal>ai-input</content-signal>
-  </license>
+<rsl xmlns="https://rslstandard.org/rsl" version="1.0">
+  <content url="https://docs.example.com/*">
+    <license urn="urn:rsl:1.0:docs.example.com:0xb1c2d3e4">
+      <origin hostname="docs.example.com" />
+      <ai-use type="inference" licensed="true" />
+      <content-signal>ai-input</content-signal>
+    </license>
+  </content>
 </rsl>
 ```
 
@@ -137,11 +141,13 @@ origins:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
-<rsl xmlns="https://rsl.ai/spec/1.0" version="1.0">
-  <license urn="urn:rsl:1.0:private.example.com:0x7e8f9a0b">
-    <origin hostname="private.example.com" />
-    <ai-use type="training" licensed="false" />
-  </license>
+<rsl xmlns="https://rslstandard.org/rsl" version="1.0">
+  <content url="https://private.example.com/*">
+    <license urn="urn:rsl:1.0:private.example.com:0x7e8f9a0b">
+      <origin hostname="private.example.com" />
+      <ai-use type="training" licensed="false" />
+    </license>
+  </content>
 </rsl>
 ```
 
@@ -172,7 +178,7 @@ origins:
               currency: USD
 ```
 
-The `/licenses.xml` document asserts the origin-level signal (`search`) plus a per-tier override row when `content_signal` is set on a tier. The Wave 4 schema emits one `<license>` element per origin; a future revision may emit a `<route>` child for per-tier overrides. For the current schema, the policy posture per route is most accurately observed via `/.well-known/tdmrep.json`, which does emit per-route entries.
+The `/licenses.xml` document asserts the origin-level signal (`search`). The current schema emits a single `<content url="https://<hostname>/*">` element wrapping one `<license>` body per origin; per-route grouping (one `<content>` element per route) is a future extension. For the current schema, the policy posture per route is most accurately observed via `/.well-known/tdmrep.json`, which does emit per-route entries.
 
 A runtime request to `/premium/foo` produces `Content-Signal: ai-train` on the response. A request to `/api-reference/v1` produces `Content-Signal: search`. The `urn:rsl:1.0:blog.example.com:<hash>` is the same for both routes because the URN is per-origin per config-version, not per-route.
 
@@ -196,22 +202,20 @@ The URN does not need to be publicly resolvable as an HTTP URL. It is a stable i
 
 ## Validation
 
-The RSL 1.0 specification publishes an XML Schema Definition (XSD) for the document shape. Operators can validate the served `/licenses.xml` against the XSD via any XML-aware tool.
+The RSL 1.0 specification at https://rslstandard.org/rsl is prose-only; the RSL Collective does not publish a canonical XSD for the document shape. Operators can still well-formedness-check the served `/licenses.xml` with any XML-aware tool:
 
 ```bash
 # Fetch the document via curl.
 curl -s -H 'Host: blog.example.com' http://localhost:8080/licenses.xml > licenses.xml
 
-# Validate against the RSL 1.0 XSD.
-xmllint --schema rsl-1.0.xsd --noout licenses.xml
-# Expected: licenses.xml validates
+# Well-formedness check.
+xmllint --noout licenses.xml
+# Expected: no output (means it parsed cleanly)
 ```
 
-The vendored XSD will land in `e2e/fixtures/rsl-1.0.xsd` as part of the Wave 5 schema-vendoring lane (the Wave 4 e2e suite pins the validation behind a feature gate). Until then, fetch the XSD directly from the RSL Collective at https://rsl.ai/spec/1.0/rsl.xsd.
+The wire format follows the prose spec at https://rslstandard.org/rsl. The projection-engine snapshot tests in `crates/sbproxy-modules/src/projections/licenses.rs` pin the byte-for-byte output, so any change to the emitter that drifts from the canonical shape (root namespace, the nested `<rsl><content url="..."><license>...</license></content></rsl>` envelope, the `<ai-use>` mapping) fails the CI gate.
 
-A failed validation is an operator-action signal: it means the served document does not conform to the spec the proxy claims to emit. Open an issue against the SBproxy repo with the served body and the XSD validation error attached.
-
-The same validation runs in CI: the projection-engine snapshot tests assert byte-for-byte equality against fixture documents that were validated against the XSD at commit time. Any change to the projection emitter that breaks RSL 1.0 conformance fails the CI gate.
+If the served document does not match what is documented here, open an issue against the SBproxy repo with the served body attached.
 
 ## Companion documents
 
@@ -220,6 +224,5 @@ The same validation runs in CI: the projection-engine snapshot tests assert byte
 
 External references:
 
-- RSL 1.0 specification: https://rsl.ai/spec/1.0
-- RSL 1.0 XSD: https://rsl.ai/spec/1.0/rsl.xsd
-- RSL Collective: https://rsl.ai/
+- RSL 1.0 specification: https://rslstandard.org/rsl
+- RSL Collective: https://rslstandard.org/

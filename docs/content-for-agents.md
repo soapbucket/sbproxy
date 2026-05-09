@@ -1,6 +1,6 @@
 # Content for agents
 
-*Last modified: 2026-05-04*
+*Last modified: 2026-05-08*
 
 This guide is the operator-facing companion to the content-shaping pillar. If you have SBproxy running and you have already read [configuration.md](configuration.md) and [ai-crawl-control.md](ai-crawl-control.md), this is the next document. It covers how the proxy negotiates a content shape with an agent, how the body is transformed into that shape, what license posture the proxy advertises in four well-known documents, and how operators stamp the per-route editorial signal that ties everything together.
 
@@ -207,43 +207,42 @@ license terms at /licenses.xml and the rights reservation at
 
 ### `/licenses.xml`
 
-Served at `/licenses.xml`. RSL 1.0 format. One `<license>` element per origin-level `Content-Signal` value.
+Served at `/licenses.xml`. RSL 1.0 format. The root element is `<rsl xmlns="https://rslstandard.org/rsl">`; one `<content url="...">` element wraps the `<license>` body.
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
-<rsl xmlns="https://rsl.ai/spec/1.0" version="1.0">
-  <license urn="urn:rsl:1.0:blog.example.com:0xa3f9d2c1">
-    <origin hostname="blog.example.com" />
-    <ai-use type="training" licensed="true" />
-    <content-signal>ai-train</content-signal>
-  </license>
+<rsl xmlns="https://rslstandard.org/rsl" version="1.0">
+  <content url="https://blog.example.com/*">
+    <license urn="urn:rsl:1.0:blog.example.com:0xa3f9d2c1">
+      <origin hostname="blog.example.com" />
+      <ai-use type="training" licensed="true" />
+      <content-signal>ai-train</content-signal>
+    </license>
+  </content>
 </rsl>
 ```
 
-The URN format is `urn:rsl:1.0:<origin_hostname>:<config_version_hash>`. The same URN appears in the `license` field of the JSON envelope so an agent that consumes the envelope and the licenses.xml document sees a consistent identifier.
+The `<content url>` value is the canonical "every URL on this origin" glob (`https://<hostname>/*`); the wire format follows the prose spec at https://rslstandard.org/rsl. The URN format is `urn:rsl:1.0:<origin_hostname>:<config_version_hash>`. The same URN appears in the `license` field of the JSON envelope so an agent that consumes the envelope and the licenses.xml document sees a consistent identifier.
 
 The `Content-Signal` to `<ai-use>` mapping is documented in detail in [rsl.md](rsl.md).
 
 ### `/.well-known/tdmrep.json`
 
-Served at `/.well-known/tdmrep.json`. W3C TDMRep JSON format. One entry per priced route.
+Served at `/.well-known/tdmrep.json`. W3C TDMRep CG-FINAL format: a bare JSON array at the document root, no envelope object. One entry per priced route. Each entry is an object with three hyphenated keys: `location` (URL the policy applies to), `tdm-reservation` (`1` reserves rights, `0` waives them), and `tdm-policy` (URL of the policy document the agent can fetch to negotiate access).
 
 ```json
-{
-  "version": "1.0",
-  "generated": "2026-05-01T12:00:00Z",
-  "policies": [
-    {
-      "location": "/articles/*",
-      "mine-type": ["text/html", "text/markdown"],
-      "right": "train",
-      "license": "https://sbproxy.dev/licenses/blog.example.com"
-    }
-  ]
-}
+[
+  {
+    "location": "/articles/*",
+    "tdm-reservation": 1,
+    "tdm-policy": "https://blog.example.com/licenses.xml"
+  }
+]
 ```
 
-The `right` field maps `Content-Signal` values: `ai-train` produces `"right": "train"`, `ai-input` and `search` produce `"right": "research"`, an absent signal produces no entry (no right asserted equals right reserved).
+When the origin asserts a recognised `Content-Signal` (`ai-train`, `ai-input`, or `search`), each priced route in the policy emits an entry with `tdm-reservation: 1` and a `tdm-policy` pointing at the companion `/licenses.xml` document on the same origin. When the signal is absent, the array is empty (the response middleware instead stamps a `TDM-Reservation: 1` header on every response, so the right is reserved at the header layer rather than asserted in the body).
+
+The wire format follows the prose spec at https://www.w3.org/community/reports/tdmrep/CG-FINAL-tdmrep-20240510/. The W3C TDMRep CG-FINAL is prose-only; there is no canonical JSON Schema published upstream.
 
 ### Refresh-on-config-reload semantics
 
@@ -400,16 +399,18 @@ origins:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
-<rsl xmlns="https://rsl.ai/spec/1.0" version="1.0">
-  <license urn="urn:rsl:1.0:blog.example.com:0xa3f9d2c1">
-    <origin hostname="blog.example.com" />
-    <ai-use type="training" licensed="true" />
-    <content-signal>ai-train</content-signal>
-  </license>
+<rsl xmlns="https://rslstandard.org/rsl" version="1.0">
+  <content url="https://blog.example.com/*">
+    <license urn="urn:rsl:1.0:blog.example.com:0xa3f9d2c1">
+      <origin hostname="blog.example.com" />
+      <ai-use type="training" licensed="true" />
+      <content-signal>ai-train</content-signal>
+    </license>
+  </content>
 </rsl>
 ```
 
-`/.well-known/tdmrep.json` carries `"right": "train"`. Markdown responses get a citation block prepended. JSON envelope responses set `citation_required: true`.
+`/.well-known/tdmrep.json` emits one entry per priced route with `tdm-reservation: 1` and `tdm-policy` pointing at `https://blog.example.com/licenses.xml`. Markdown responses get a citation block prepended. JSON envelope responses set `citation_required: true`.
 
 ### Recipe 2: Allow inference, block training
 
@@ -429,7 +430,7 @@ origins:
               currency: USD
 ```
 
-`/licenses.xml` asserts `<ai-use type="inference" licensed="true" />`. `/.well-known/tdmrep.json` carries `"right": "research"` (the W3C TDMRep value that maps to inference / RAG use). Crawlers attempting to use this content for training operate outside the licensed set; the absence of an `ai-train` declaration is the operator's signal that training is not licensed.
+`/licenses.xml` asserts `<ai-use type="inference" licensed="true" />`. `/.well-known/tdmrep.json` emits one entry per priced route with `tdm-reservation: 1` and `tdm-policy` pointing at the companion `/licenses.xml` (the W3C TDMRep wire format does not encode the train-versus-inference distinction; it asserts only that rights are reserved and points the agent at the RSL document for the licensable terms). Crawlers attempting to use this content for training operate outside the licensed set; the absence of an `ai-train` declaration in the RSL document is the operator's signal that training is not licensed.
 
 ### Recipe 3: Block all AI use, default-deny
 
@@ -454,7 +455,7 @@ origins:
               currency: USD
 ```
 
-`/licenses.xml` asserts `<ai-use type="training" licensed="false" />` (the default-deny mapping). `/.well-known/tdmrep.json` emits no `policies[]` entries (the absent `Content-Signal` produces "no right asserted equals right reserved"). The high tier price on `/*` produces a 402 challenge with a price the operator does not actually expect to be paid; the policy is effectively a paywall on every AI-class request.
+`/licenses.xml` asserts `<ai-use type="training" licensed="false" />` (the default-deny mapping). `/.well-known/tdmrep.json` emits an empty array `[]` (the absent `Content-Signal` produces "no right asserted equals right reserved"; the response middleware instead stamps `TDM-Reservation: 1` on every response so the right is reserved at the header layer). The high tier price on `/*` produces a 402 challenge with a price the operator does not actually expect to be paid; the policy is effectively a paywall on every AI-class request.
 
 This is the recommended posture for content the operator does not want any AI use of.
 
@@ -483,7 +484,7 @@ origins:
               currency: USD
 ```
 
-`/premium/*` requests stamp `Content-Signal: ai-train` on the response; `/public/*` requests stamp `Content-Signal: search`. The `/licenses.xml` document carries one `<license>` element per origin-level signal value plus per-tier overrides; the `urn:rsl:1.0:blog.example.com:<hash>` URN is the same for both routes (the URN is per-origin per config-version, not per-route). Operators expressing finer-grained rights should rely on the TDMRep projection's per-route entries rather than splitting the URN.
+`/premium/*` requests stamp `Content-Signal: ai-train` on the response; `/public/*` requests stamp `Content-Signal: search`. The `/licenses.xml` document carries a single `<content url="https://blog.example.com/*">` element wrapping one `<license>` body for the origin-level signal; the `urn:rsl:1.0:blog.example.com:<hash>` URN is the same for both routes (the URN is per-origin per config-version, not per-route). Per-route grouping inside `<rsl>` (one `<content>` per route) is a future extension. Operators expressing finer-grained rights today should rely on the TDMRep projection's per-route entries rather than splitting the URN.
 
 Run `sbproxy projections render --kind licenses --config ./sb.yml` after making any of these changes to confirm the output before pushing to production.
 
@@ -528,8 +529,8 @@ Companion documents:
 External references:
 
 - IETF draft-koster-rep-ai: https://datatracker.ietf.org/doc/draft-koster-rep-ai/
-- RSL 1.0: https://rsl.ai/spec/1.0
-- W3C TDMRep: https://www.w3.org/2022/tdmrep/
+- RSL 1.0: https://rslstandard.org/rsl
+- W3C TDMRep CG-FINAL: https://www.w3.org/community/reports/tdmrep/CG-FINAL-tdmrep-20240510/
 - IETF draft-ietf-aipref-prefs: https://datatracker.ietf.org/doc/draft-ietf-aipref-prefs/
 - RFC 6906 (the `profile` parameter): https://www.rfc-editor.org/rfc/rfc6906
 - RFC 9110 (the `Accept` header and q-values): https://www.rfc-editor.org/rfc/rfc9110
