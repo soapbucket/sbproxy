@@ -247,12 +247,7 @@ fn prime_tools_list(harness: &ProxyHarness) {
         "id": 0,
         "method": "tools/list"
     });
-    let _ = harness.post_json(
-        "/",
-        "mcp.localhost",
-        &body,
-        &[("X-Api-Key", "alice-key")],
-    );
+    let _ = harness.post_json("/", "mcp.localhost", &body, &[("X-Api-Key", "alice-key")]);
 }
 
 /// 1. The caller's RBAC policy allows `search` only. A

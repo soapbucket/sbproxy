@@ -302,9 +302,7 @@ fn dispatch_plugin(
         // turns this worker into a blocking thread for the duration
         // of the call; other workers stay live and keep polling
         // tasks on the same runtime.
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(future)
-        })
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
     } else {
         // Test path: no enclosing runtime, build a one-shot.
         match tokio::runtime::Builder::new_current_thread()
@@ -327,10 +325,7 @@ fn dispatch_plugin(
         // tokio::time::timeout fired before the plugin finished.
         Ok(Err(_elapsed)) => Err(anyhow::Error::new(TransformError::Plugin {
             plugin: plugin_name_static,
-            detail: format!(
-                "timed out after {}ms",
-                PLUGIN_TRANSFORM_TIMEOUT.as_millis()
-            ),
+            detail: format!("timed out after {}ms", PLUGIN_TRANSFORM_TIMEOUT.as_millis()),
         })),
         // The plugin (or the surrounding future) panicked.
         Err(_panic) => Err(anyhow::Error::new(TransformError::Plugin {
