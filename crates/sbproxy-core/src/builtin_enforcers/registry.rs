@@ -30,8 +30,12 @@
 //! without requiring a `dyn-clone`-style trait extension on the
 //! public surface.
 
+use std::sync::Arc;
+
 use sbproxy_modules::policy::Policy;
 use sbproxy_plugin::PolicyEnforcer;
+
+use super::{CsrfEnforcer, ExposedCredsEnforcer, ExpressionEnforcer, IpFilterEnforcer};
 
 /// Error returned by [`compile_builtin_enforcers`] when a
 /// `Policy` variant has not yet been ported to its newtype
@@ -106,19 +110,23 @@ fn compile_one(policy: Policy) -> Result<Box<dyn PolicyEnforcer>, BuiltinEnforce
         // dashboards keyed on that label keep working through
         // the cutover.
         Policy::RateLimit(_) => Err(BuiltinEnforcerError::NotYetPorted("rate_limiting")),
-        Policy::IpFilter(_) => Err(BuiltinEnforcerError::NotYetPorted("ip_filter")),
+        // Ported in WOR-201 PR 1c.1 (auth-adjacent batch).
+        Policy::IpFilter(p) => Ok(Box::new(IpFilterEnforcer(Arc::new(p)))),
         Policy::SecHeaders(_) => Err(BuiltinEnforcerError::NotYetPorted("security_headers")),
         Policy::RequestLimit(_) => Err(BuiltinEnforcerError::NotYetPorted("request_limit")),
-        Policy::Csrf(_) => Err(BuiltinEnforcerError::NotYetPorted("csrf")),
+        // Ported in WOR-201 PR 1c.1 (auth-adjacent batch).
+        Policy::Csrf(p) => Ok(Box::new(CsrfEnforcer(Arc::new(p)))),
         Policy::Ddos(_) => Err(BuiltinEnforcerError::NotYetPorted("ddos")),
         Policy::Sri(_) => Err(BuiltinEnforcerError::NotYetPorted("sri")),
-        Policy::Expression(_) => Err(BuiltinEnforcerError::NotYetPorted("expression")),
+        // Ported in WOR-201 PR 1c.1 (auth-adjacent batch).
+        Policy::Expression(p) => Ok(Box::new(ExpressionEnforcer(Arc::new(p)))),
         Policy::Assertion(_) => Err(BuiltinEnforcerError::NotYetPorted("assertion")),
         Policy::Waf(_) => Err(BuiltinEnforcerError::NotYetPorted("waf")),
         Policy::RequestValidator(_) => Err(BuiltinEnforcerError::NotYetPorted("request_validator")),
         Policy::ConcurrentLimit(_) => Err(BuiltinEnforcerError::NotYetPorted("concurrent_limit")),
         Policy::AiCrawl(_) => Err(BuiltinEnforcerError::NotYetPorted("ai_crawl_control")),
-        Policy::ExposedCreds(_) => Err(BuiltinEnforcerError::NotYetPorted("exposed_credentials")),
+        // Ported in WOR-201 PR 1c.1 (auth-adjacent batch).
+        Policy::ExposedCreds(p) => Ok(Box::new(ExposedCredsEnforcer(Arc::new(p)))),
         Policy::PageShield(_) => Err(BuiltinEnforcerError::NotYetPorted("page_shield")),
         Policy::Dlp(_) => Err(BuiltinEnforcerError::NotYetPorted("dlp")),
         Policy::OpenApiValidation(_) => {
@@ -207,12 +215,11 @@ mod tests {
                 ),
                 "rate_limiting",
             ),
-            (
-                Policy::IpFilter(
-                    IpFilterPolicy::from_config(serde_json::json!({})).expect("ip_filter default"),
-                ),
-                "ip_filter",
-            ),
+            // IpFilter, Csrf, Expression, ExposedCreds were ported
+            // in WOR-201 PR 1c.1 (auth-adjacent batch). They now
+            // return Ok from `compile_one`; the per-variant Ok
+            // assertions live in `auth_adjacent_variants_compile_to_ok`
+            // below.
             (
                 Policy::SecHeaders(
                     SecHeadersPolicy::from_config(serde_json::json!({}))
@@ -228,13 +235,6 @@ mod tests {
                 "request_limit",
             ),
             (
-                Policy::Csrf(
-                    CsrfPolicy::from_config(serde_json::json!({"secret_key": "s"}))
-                        .expect("csrf default"),
-                ),
-                "csrf",
-            ),
-            (
                 Policy::Ddos(
                     DdosPolicy::from_config(serde_json::json!({})).expect("ddos default"),
                 ),
@@ -245,13 +245,6 @@ mod tests {
                     SriPolicy::from_config(serde_json::json!({})).expect("sri default"),
                 ),
                 "sri",
-            ),
-            (
-                Policy::Expression(
-                    ExpressionPolicy::from_config(serde_json::json!({"expression": "true"}))
-                        .expect("expression default"),
-                ),
-                "expression",
             ),
             (
                 Policy::Assertion(
@@ -291,15 +284,6 @@ mod tests {
                     .expect("ai_crawl default"),
                 ),
                 "ai_crawl_control",
-            ),
-            (
-                Policy::ExposedCreds(
-                    sbproxy_modules::policy::ExposedCredsPolicy::from_config(
-                        serde_json::json!({"passwords": ["hunter2"]}),
-                    )
-                    .expect("exposed_creds default"),
-                ),
-                "exposed_credentials",
             ),
             (
                 Policy::PageShield(
@@ -403,14 +387,62 @@ mod tests {
         assert_eq!(enforcer.policy_type(), "fake_plugin");
     }
 
+    /// WOR-201 PR 1c.1: the four auth-adjacent variants now
+    /// compile to `Ok(...)` instead of `NotYetPorted`. The
+    /// `policy_type()` label on each wrapper matches the stable
+    /// label the response handler / audit pipeline keys on.
+    #[test]
+    fn auth_adjacent_variants_compile_to_ok() {
+        let cases: Vec<(Policy, &'static str)> = vec![
+            (
+                Policy::IpFilter(
+                    IpFilterPolicy::from_config(serde_json::json!({})).expect("ip_filter default"),
+                ),
+                "ip_filter",
+            ),
+            (
+                Policy::Csrf(
+                    CsrfPolicy::from_config(serde_json::json!({"secret_key": "s"}))
+                        .expect("csrf default"),
+                ),
+                "csrf",
+            ),
+            (
+                Policy::Expression(
+                    ExpressionPolicy::from_config(serde_json::json!({"expression": "true"}))
+                        .expect("expression default"),
+                ),
+                "expression",
+            ),
+            (
+                Policy::ExposedCreds(
+                    sbproxy_modules::policy::ExposedCredsPolicy::from_config(
+                        serde_json::json!({"passwords": ["hunter2"]}),
+                    )
+                    .expect("exposed_creds default"),
+                ),
+                "exposed_credentials",
+            ),
+        ];
+        for (policy, expected_label) in cases {
+            let enforcer =
+                compile_one(policy).expect("auth-adjacent ported variant compiles to Ok");
+            assert_eq!(enforcer.policy_type(), expected_label);
+        }
+    }
+
     /// `compile_builtin_enforcers` itself just maps over the
     /// vec; the unit smoke test confirms order is preserved
-    /// and the err / ok mix surfaces correctly.
+    /// and the err / ok mix surfaces correctly. Mixes a still
+    /// not-yet-ported variant (waf), a plugin, and one of the
+    /// PR-1c.1 ported variants (csrf) so the assertion covers
+    /// all three outcome shapes.
     #[test]
     fn compile_builtin_enforcers_preserves_order_and_outcomes() {
         let inputs: Vec<Policy> = vec![
-            Policy::IpFilter(
-                IpFilterPolicy::from_config(serde_json::json!({})).expect("ip_filter default"),
+            Policy::Waf(
+                sbproxy_modules::policy::WafPolicy::from_config(serde_json::json!({}))
+                    .expect("waf default"),
             ),
             Policy::Plugin(Box::new(FakePlugin)),
             Policy::Csrf(
@@ -422,13 +454,13 @@ mod tests {
         assert_eq!(outcomes.len(), 3);
         assert!(matches!(
             outcomes[0],
-            Err(BuiltinEnforcerError::NotYetPorted("ip_filter"))
+            Err(BuiltinEnforcerError::NotYetPorted("waf"))
         ));
         let ok = outcomes[1].as_ref().expect("plugin compiles to Ok");
         assert_eq!(ok.policy_type(), "fake_plugin");
-        assert!(matches!(
-            outcomes[2],
-            Err(BuiltinEnforcerError::NotYetPorted("csrf"))
-        ));
+        let csrf = outcomes[2]
+            .as_ref()
+            .expect("ported csrf variant compiles to Ok");
+        assert_eq!(csrf.policy_type(), "csrf");
     }
 }

@@ -30,6 +30,14 @@
 //! today; that path was already trait-dispatched in PR 1b and is
 //! re-exposed here to keep the eventual cutover mechanical.
 
+pub mod csrf;
+pub mod exposed_creds;
+pub mod expression;
+pub mod ip_filter;
 mod registry;
 
+pub use csrf::CsrfEnforcer;
+pub use exposed_creds::ExposedCredsEnforcer;
+pub use expression::ExpressionEnforcer;
+pub use ip_filter::IpFilterEnforcer;
 pub use registry::{compile_builtin_enforcers, BuiltinEnforcerError};

@@ -13,7 +13,7 @@ use std::net::IpAddr;
 /// If `whitelist` is non-empty, the client IP must match at least one
 /// entry. If `blacklist` is non-empty, the client IP must NOT match
 /// any entry. Both lists can be used together (whitelist is checked first).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct IpFilterPolicy {
     /// CIDR ranges that are explicitly permitted. Empty allows everything.
     #[serde(default)]

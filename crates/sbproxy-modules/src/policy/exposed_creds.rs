@@ -51,7 +51,7 @@ pub enum ExposedCredsAction {
 /// Credentials are extracted from `Authorization: Basic <b64>`. The
 /// HIBP k-anonymity provider lives behind a separate enterprise
 /// adapter (TBD) so the OSS data plane has no outbound dependency.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ExposedCredsPolicy {
     /// Source of the exposure list. Today only `static` is recognised
     /// in OSS; enterprise extends this with `hibp`.
