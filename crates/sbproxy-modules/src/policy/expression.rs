@@ -13,7 +13,7 @@ use crate::policy::aipref::AiprefSignal;
 /// Evaluates a CEL expression against the HTTP request context. If the
 /// expression evaluates to `false`, the request is denied with the
 /// configured status code and message.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExpressionPolicy {
     /// CEL expression evaluated against the request context.
     pub expression: String,

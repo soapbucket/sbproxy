@@ -23,7 +23,7 @@ fn default_safe_methods() -> Vec<String> {
 /// Compares the token in the request header against the token in the
 /// cookie. Protected methods (POST, PUT, DELETE by default) require a
 /// valid CSRF token. All other methods are considered safe.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CsrfPolicy {
     /// HMAC key used to sign CSRF tokens. Go configs use `secret` instead of `secret_key`.
     #[serde(alias = "secret")]
