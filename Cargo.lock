@@ -5646,8 +5646,10 @@ dependencies = [
  "sha2 0.11.0",
  "smallvec",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
  "yaml_serde",
 ]
 

@@ -32,6 +32,8 @@ prometheus.workspace = true
 rand.workspace = true
 futures.workspace = true
 base64.workspace = true
+thiserror.workspace = true
+url.workspace = true
 
 # Embedded provider catalog: gzipped YAML at build time, decompressed
 # on first lookup. flate2 is the standard Rust gzip implementation;
