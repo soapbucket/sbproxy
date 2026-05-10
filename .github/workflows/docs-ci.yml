@@ -24,6 +24,13 @@ on:
       - '.lycheeignore'
       - '.github/workflows/docs-ci.yml'
 
+# Default to read-only contents access for every job in this workflow.
+# CodeQL (actions/missing-workflow-permissions) wants every workflow
+# to declare its permissions explicitly rather than inherit a broader
+# default from the repo settings.
+permissions:
+  contents: read
+
 # Cancel superseded runs on the same ref so force-pushes do not
 # double-spend runner minutes.
 concurrency:
