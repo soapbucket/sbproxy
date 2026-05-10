@@ -577,6 +577,29 @@ pub struct RequestContext {
     /// outgoing response after every other header source so the
     /// plugin policy contract reads "stamp these on the way out."
     pub policy_response_headers: Vec<(String, String)>,
+
+    // --- WOR-201 PR 1c.0: response-handler keying for ported policies ---
+    /// Per-request label that the response handler keys on to choose the
+    /// 429 / 403 / 451 / 502 response shape. Set by the policy that
+    /// returns Deny; carries the same string the existing `audit_deny!`
+    /// macro receives in its `policy_type` argument. Examples:
+    /// `"rate_limit"`, `"ai_crawl_payment"`, `"a2a_chain_depth_exceeded"`.
+    /// Required to preserve byte-identical Deny responses across the
+    /// `PolicyResult` -> `PolicyDecision` migration (WOR-201 PR 1c).
+    /// `None` until the dispatcher in `check_policies` (or a ported
+    /// enforcer wrapper) sets it; the response handler then prefers
+    /// this slot over the macro fallback.
+    pub deny_policy_type: Option<&'static str>,
+
+    /// True when the inbound request was terminated over TLS at the
+    /// edge. The CSRF policy needs this to enforce HTTPS-only cookies;
+    /// it is precomputed here because [`sbproxy_plugin::PolicyEnforcer::enforce`]
+    /// takes the request snapshot and cannot reach back to the live
+    /// Pingora session. The signal mirrors the existing CSRF
+    /// `is_secure` derivation in `server.rs`: either a Pingora
+    /// `ssl_digest` is present (the listener itself was TLS) or the
+    /// trusted-proxy chain stamped `X-Forwarded-Proto: https`.
+    pub tls_terminated: bool,
 }
 
 /// Verdict produced by the headless-browser detector
@@ -706,6 +729,8 @@ impl RequestContext {
             a2a_denial_body: None,
             flags: crate::sb_flags::RequestFlags::default(),
             policy_response_headers: Vec::new(),
+            deny_policy_type: None,
+            tls_terminated: false,
         }
     }
 
