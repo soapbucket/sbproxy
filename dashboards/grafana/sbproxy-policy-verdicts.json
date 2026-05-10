@@ -353,6 +353,60 @@
         }
       ],
       "description": "Top 10 (policy, verdict) tuples by 5-minute rate. Use this to spot a single policy dominating the deny path or a plugin returning Confirm on every request when it should not."
+    },
+    {
+      "id": 6,
+      "title": "semantic_constraint Verdicts",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (verdict) (rate(sbproxy_policy_audit_events_total{policy_type=\"semantic_constraint\"}[5m]))",
+          "legendFormat": "{{verdict}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "WOR-203 PR 3b panel. Per-second verdict rate for the `semantic_constraint` policy. Pair with the SBProxy Judge Backend dashboard for the underlying judge call latency, cache hit rate, and budget telemetry. A non-zero deny rate here typically corresponds to deny verdicts in the judge dashboard's verdict panel."
     }
   ],
   "templating": {

@@ -162,6 +162,9 @@ pub const KNOWN_POLICY_TYPES: &[&str] = &[
     "http_framing",
     "agent_class",
     "a2a",
+    // WOR-203 PR 3b: NL-as-a-policy via the LLM-as-judge backend.
+    // See `crates/sbproxy-modules/src/policy/semantic_constraint.rs`.
+    "semantic_constraint",
 ];
 
 /// Built-in OSS transform `type:` names. Mirrors `sbproxy_modules::compile_transform`.

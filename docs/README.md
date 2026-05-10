@@ -30,6 +30,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [threat-model.md](threat-model.md) - OSS trust boundaries and per-wave review checklist.
 - [events.md](events.md) - the event bus, callback hooks, and emitted event types.
 - [openapi-emission.md](openapi-emission.md) - publishing an OpenAPI 3.0 document from the live config.
+- [policy.md](policy.md) - the policy engine: `semantic_constraint`, the NL linter L001-L009, and the OSS / enterprise capability boundary.
 - [performance.md](performance.md) - tuning guide, benchmark methodology, profiling.
 - [degradation.md](degradation.md) - failure modes and graceful degradation behavior.
 - [upgrade.md](upgrade.md) - migration notes between releases.

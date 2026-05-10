@@ -3018,6 +3018,39 @@ async fn check_policies(
             // enforces chain-depth, cycle, callee-allowlist and
             // caller-denylist checks. Allow paths still emit the
             // per-hop metric so dashboards see depth distribution.
+            // WOR-203 PR 3b: NL-as-a-policy. Render the configured
+            // prompt template against the request envelope and route
+            // through the LLM-as-judge backend. Verdict mapping
+            // matches the table in
+            // `policy/semantic_constraint.rs`. Confirm verdicts are
+            // bridged through `AllowWithHeaders` per the OSS
+            // `adr-policy-verdict-shape.md` contract; the OSS
+            // dispatcher does not park requests, so we surface the
+            // reason on the response via `X-Policy-Confirm` and
+            // continue. Until PR 1c lands a unified PolicyDecision
+            // dispatcher, this arm only honours the Allow / Deny
+            // shapes; the Confirm bridging note is preserved as
+            // documentation for the integration PR.
+            Policy::SemanticConstraint(p) => {
+                let req = session.req_header();
+                let request_ctx = serde_json::json!({
+                    "request": {
+                        "method": req.method.as_str(),
+                        "path": req.uri.path(),
+                        "host": ctx.hostname.to_string(),
+                        "query": req.uri.query().unwrap_or(""),
+                    }
+                });
+                let decision = p.enforce(request_ctx).await;
+                match decision {
+                    sbproxy_plugin::PolicyDecision::Allow
+                    | sbproxy_plugin::PolicyDecision::AllowWithHeaders { .. }
+                    | sbproxy_plugin::PolicyDecision::Confirm { .. } => {}
+                    sbproxy_plugin::PolicyDecision::Deny { status, message } => {
+                        return PolicyResult::Deny(status, message, None, "semantic_constraint");
+                    }
+                }
+            }
             Policy::A2A(p) => {
                 if let Some(a2a_ctx) = ctx.a2a.clone() {
                     let route = ctx.hostname.to_string();
