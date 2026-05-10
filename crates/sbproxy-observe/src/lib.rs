@@ -62,7 +62,7 @@ pub use clock_skew::{
     sntp_query, ClockSkewConfig, ClockSkewMonitor, ProbeError as ClockSkewProbeError,
     DEFAULT_NTP_SOURCE, DEFAULT_POLL_INTERVAL_SECS, SNTP_TIMEOUT, TOLERANCE_SECS,
 };
-pub use events::{EventBus, EventType, ProxyEvent};
+pub use events::{EventBus, EventType, PolicySurface, PolicyVerdictEvent, ProxyEvent, VerdictTag};
 pub use export::{WebhookConfig, WebhookExporter};
 pub use health::{
     default_registry, default_registry_optional, handle_health, handle_healthz, handle_livez,

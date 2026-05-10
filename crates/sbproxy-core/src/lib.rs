@@ -22,6 +22,21 @@ pub mod hook_registry;
 pub mod hooks;
 pub mod identity;
 pub mod pipeline;
+/// WOR-201 PR 1b: policy verdict audit event bus.
+///
+/// Bounded mpsc channel + drain stub for the OSS scope; enterprise
+/// extends the consumer with a NATS-backed audit-chain subscriber
+/// that hash-chains and KMS-signs Merkle roots downstream. See
+/// `docs/adr-policy-audit-binding.md`.
+pub mod policy_bus;
+/// WOR-201 PR 1b: chain reducer + Plugin verdict translation.
+///
+/// Multi-policy resolution rules from
+/// `docs/adr-policy-verdict-shape.md` (Deny wins, first Confirm
+/// wins via the OSS bridge, AllowWithHeaders accumulate). Lives
+/// in its own module so the helpers can be exercised by
+/// integration tests in `crates/sbproxy-core/tests/`.
+pub mod policy_dispatch;
 pub mod reload;
 pub mod router;
 /// WOR-114 Phase 1: per-request feature-flag parsing.

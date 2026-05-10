@@ -159,6 +159,31 @@ pub enum PolicyDecision {
     },
 }
 
+impl PolicyDecision {
+    /// Construct a [`PolicyDecision::Confirm`] from the three OSS
+    /// fields.
+    ///
+    /// `#[non_exhaustive]` blocks struct-literal construction of
+    /// `Confirm` from outside the defining crate. This constructor
+    /// is the supported entry point so plugin authors and the
+    /// dispatcher in `sbproxy-core` can build a Confirm verdict
+    /// without depending on the variant's internal field set.
+    /// Future fields (priority, queue hint, audit binding) land
+    /// here with sensible defaults so existing call sites stay
+    /// green.
+    pub fn confirm(
+        reason: impl Into<String>,
+        webhook_url: Option<url::Url>,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        Self::Confirm {
+            reason: reason.into(),
+            webhook_url,
+            expires_at,
+        }
+    }
+}
+
 /// Third-party action handler (dynamic dispatch).
 ///
 /// Implementations handle incoming requests and decide whether to proxy

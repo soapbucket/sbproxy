@@ -2,6 +2,160 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Policy decision audit event emitted on every policy evaluation.
+///
+/// Bound to the audit event bus (see
+/// `crates/sbproxy-core/src/policy_bus.rs`) and consumed asynchronously
+/// per `docs/adr-policy-audit-binding.md`. The OSS substrate ships an
+/// in-memory drain stub; the enterprise consumer adds tamper-evident
+/// chaining and KMS-signed Merkle root commits downstream of the bus.
+///
+/// The OSS payload is intentionally a subset of the full ADR shape:
+/// it carries the fields a regulator-defensible audit trail can be
+/// reconstructed from in the OSS context (request correlation, the
+/// stable verdict tag, and a coarse decision latency). Enterprise
+/// extends the payload with the rendered rationale, the Cedar policy
+/// content hash, judge call summaries, redacted input contexts, and
+/// W3C trace correlation; those fields are out of scope for OSS so
+/// they are not declared here. The struct is `#[non_exhaustive]` so
+/// adding them later does not break consumers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PolicyVerdictEvent {
+    /// Idempotency key for the consumer; one UUID v4 per policy
+    /// decision.
+    pub event_id: uuid::Uuid,
+    /// Correlates to the access log entry and any traces.
+    pub request_id: String,
+    /// Tenant identifier the request belongs to. Empty string in the
+    /// single-tenant OSS default.
+    pub tenant_id: String,
+    /// Workspace identifier the request belongs to. Empty string in
+    /// the single-tenant OSS default.
+    pub workspace_id: String,
+    /// Wall-clock instant the verdict was rendered.
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    /// Stable identifier for the policy that fired.
+    ///
+    /// In OSS scope this is the policy_type string from the policy
+    /// (`rate_limit`, `waf`, `ip_filter`, ...); the full Cedar policy
+    /// UUID is enterprise scope and lands on the same field once the
+    /// enterprise policy registry is wired.
+    pub policy_id: String,
+    /// Built-in dispatch path versus dynamic-dispatch plugin path.
+    pub surface: PolicySurface,
+    /// Coarse verdict tag suitable for metrics labels.
+    ///
+    /// The full [`sbproxy_plugin::PolicyDecision`] payload (status
+    /// code, message, header list, confirm reason, webhook URL,
+    /// expiry) belongs to the enterprise audit envelope and is
+    /// captured there. The OSS event keeps only the tag so dashboards
+    /// and SIEM rules can break down by verdict shape without
+    /// inheriting the cardinality of the full payload.
+    pub verdict: VerdictTag,
+    /// Wall-clock duration from entering the dispatcher to the
+    /// verdict being produced, in milliseconds. Coarse on purpose;
+    /// the enterprise event carries a microsecond-resolution
+    /// duration and a histogram-friendly seconds-as-f64 sibling.
+    pub decision_latency_ms: u32,
+}
+
+impl PolicyVerdictEvent {
+    /// Construct a [`PolicyVerdictEvent`] with the supplied fields.
+    ///
+    /// `#[non_exhaustive]` blocks out-of-crate struct-literal
+    /// construction so the dispatcher in `sbproxy-core` cannot
+    /// build one with `Self { ... }`. This constructor is the
+    /// supported entry point; future fields land here with
+    /// sensible defaults so existing call sites stay green.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        event_id: uuid::Uuid,
+        request_id: String,
+        tenant_id: String,
+        workspace_id: String,
+        occurred_at: chrono::DateTime<chrono::Utc>,
+        policy_id: String,
+        surface: PolicySurface,
+        verdict: VerdictTag,
+        decision_latency_ms: u32,
+    ) -> Self {
+        Self {
+            event_id,
+            request_id,
+            tenant_id,
+            workspace_id,
+            occurred_at,
+            policy_id,
+            surface,
+            verdict,
+            decision_latency_ms,
+        }
+    }
+}
+
+/// Surface a policy decision was rendered on.
+///
+/// `BuiltIn` covers the 21 built-in OSS policy variants that dispatch
+/// through the enum-arm path in `check_policies`. `Plugin` covers
+/// dynamic-dispatch plugins registered via the
+/// [`sbproxy_plugin::PolicyEnforcer`] trait.
+///
+/// Marked `#[non_exhaustive]` so future surfaces (Cedar, CEL, Lua,
+/// JS, WASM, webhook) the enterprise audit binding distinguishes can
+/// extend this enum without breaking external consumers.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum PolicySurface {
+    /// One of the 21 OSS built-in policy enum arms.
+    BuiltIn,
+    /// A dynamic-dispatch [`sbproxy_plugin::PolicyEnforcer`] impl.
+    Plugin,
+}
+
+impl PolicySurface {
+    /// Stable label suitable for use as a Prometheus metric label.
+    pub fn as_label(&self) -> &'static str {
+        match self {
+            Self::BuiltIn => "built_in",
+            Self::Plugin => "plugin",
+        }
+    }
+}
+
+/// Coarse verdict tag carried on a [`PolicyVerdictEvent`].
+///
+/// Mirrors [`sbproxy_plugin::PolicyDecision`] one-to-one for the OSS
+/// scope: the full payload is captured by the enterprise audit
+/// envelope, the tag here is the dashboard-friendly label.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum VerdictTag {
+    /// Allow with no header decoration.
+    Allow,
+    /// Deny with an HTTP status and message.
+    Deny,
+    /// Hold pending human approval. Routes through `AllowWithHeaders`
+    /// in OSS with `X-Policy-Confirm` stamped on the response.
+    Confirm,
+    /// Allow with response-header decoration.
+    AllowWithHeaders,
+}
+
+impl VerdictTag {
+    /// Stable label suitable for use as a Prometheus metric label.
+    pub fn as_label(&self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Confirm => "confirm",
+            Self::AllowWithHeaders => "allow_with_headers",
+        }
+    }
+}
+
 /// A typed proxy event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyEvent {

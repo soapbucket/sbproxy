@@ -566,6 +566,17 @@ pub struct RequestContext {
     /// `--disable-sb-flags` / `SB_DISABLE_SB_FLAGS=1` causes parsing
     /// to short-circuit so this is always the empty default.
     pub flags: crate::sb_flags::RequestFlags,
+
+    // --- WOR-201 PR 1b: plugin-policy response header injection ---
+    /// Response headers contributed by `Policy::Plugin` enforcers
+    /// returning [`sbproxy_plugin::PolicyDecision::AllowWithHeaders`]
+    /// (or the OSS Confirm bridge that translates `Confirm` into
+    /// `AllowWithHeaders` with `X-Policy-Confirm` stamped per
+    /// `docs/adr-policy-verdict-shape.md`). Drained in
+    /// `response_filter`. Empty by default; appended onto the
+    /// outgoing response after every other header source so the
+    /// plugin policy contract reads "stamp these on the way out."
+    pub policy_response_headers: Vec<(String, String)>,
 }
 
 /// Verdict produced by the headless-browser detector
@@ -694,6 +705,7 @@ impl RequestContext {
             a2a: None,
             a2a_denial_body: None,
             flags: crate::sb_flags::RequestFlags::default(),
+            policy_response_headers: Vec::new(),
         }
     }
 

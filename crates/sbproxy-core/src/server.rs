@@ -1919,6 +1919,83 @@ enum PolicyResult {
     Deny(u16, String, Option<RateLimitInfo>, &'static str),
 }
 
+/// Audit-bus correlation context for one policy decision.
+///
+/// Filled at the dispatcher entry and reused for every policy in the
+/// chain so [`emit_policy_verdict`] does not re-derive identifiers
+/// per arm.
+#[derive(Clone)]
+struct PolicyVerdictCtx {
+    request_id: String,
+    tenant_id: String,
+    workspace_id: String,
+}
+
+/// Try to publish a [`sbproxy_observe::events::PolicyVerdictEvent`]
+/// for one policy decision.
+///
+/// Drop-on-overflow per the audit-binding ADR: a full bus increments
+/// `sbproxy_policy_audit_events_dropped_total{tenant}` and returns
+/// silently. The hot path never blocks on the bus.
+fn emit_policy_verdict(
+    ctx: &PolicyVerdictCtx,
+    policy_id: &str,
+    surface: sbproxy_observe::events::PolicySurface,
+    verdict: sbproxy_observe::events::VerdictTag,
+    decision_started: std::time::Instant,
+) {
+    let elapsed = decision_started.elapsed();
+    let elapsed_ms = elapsed.as_millis().min(u32::MAX as u128) as u32;
+    sbproxy_observe::metrics::record_policy_decision_latency(
+        surface.as_label(),
+        elapsed.as_secs_f64(),
+    );
+    sbproxy_observe::metrics::record_policy_audit_emitted(
+        verdict.as_label(),
+        surface.as_label(),
+        policy_id,
+    );
+    let event = sbproxy_observe::events::PolicyVerdictEvent::new(
+        uuid::Uuid::new_v4(),
+        ctx.request_id.clone(),
+        ctx.tenant_id.clone(),
+        ctx.workspace_id.clone(),
+        chrono::Utc::now(),
+        policy_id.to_string(),
+        surface,
+        verdict,
+        elapsed_ms,
+    );
+    if let Err(_dropped) = crate::policy_bus::try_publish(event) {
+        // Bus full or not yet installed; the dropped-events metric
+        // is the paging signal per
+        // `docs/adr-policy-audit-binding.md`. Tenant label uses the
+        // workspace id as the OSS-scope tenant proxy.
+        sbproxy_observe::metrics::record_policy_audit_event_dropped(&ctx.workspace_id);
+    }
+}
+
+/// Build a frozen `http::Request<bytes::Bytes>` snapshot of the
+/// inbound request for a `PolicyEnforcer` call.
+///
+/// `PolicyEnforcer::enforce` takes an immutable request reference;
+/// this helper materialises one from the Pingora session so the
+/// existing built-in arms can keep their `Session` view while
+/// plugin enforcers see the standard `http` types.
+fn build_plugin_request_snapshot(session: &Session) -> Option<http::Request<bytes::Bytes>> {
+    let req = session.req_header();
+    let method = req.method.as_str();
+    let path_and_query = req
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let builder = http::Request::builder().method(method).uri(path_and_query);
+    let mut built = builder.body(bytes::Bytes::new()).ok()?;
+    *built.headers_mut() = req.headers.clone();
+    Some(built)
+}
+
 /// Evaluate a rate-limit `key:` CEL expression against the current
 /// request. Returns the result coerced to a string when evaluation
 /// succeeds and produces a non-empty value, otherwise `None` so the
@@ -2187,12 +2264,21 @@ fn resolve_addr_override(over: &str, default_port: u16) -> String {
 /// issue the blocking Redis INCR. Local-only token-bucket rate limiters
 /// short-circuit synchronously inside `allow_with_info_async` without hitting
 /// the runtime.
+///
+/// `verdict_ctx` carries the request / tenant / workspace identifiers
+/// reused for every [`sbproxy_observe::events::PolicyVerdictEvent`]
+/// emitted from the chain. Threading it as an argument keeps the
+/// dispatcher pure: the audit-bus correlation is fixed at the
+/// dispatcher entry and never re-derived inside the loop.
 async fn check_policies(
     policies: &[Policy],
     session: &Session,
     ctx: &mut RequestContext,
+    verdict_ctx: &PolicyVerdictCtx,
 ) -> PolicyResult {
+    use sbproxy_observe::events::{PolicySurface, VerdictTag};
     let mut rate_limit_info: Option<RateLimitInfo> = None;
+    let mut confirm_state = crate::policy_dispatch::ConfirmReducerState::default();
 
     // Derive a stable per-request client identifier used as the Redis
     // counter suffix. Falls back to the hostname when the client IP is
@@ -2203,6 +2289,37 @@ async fn check_policies(
         .unwrap_or_else(|| ctx.hostname.to_string());
 
     for policy in policies {
+        // Stable label for this policy used as the audit
+        // `policy_id`. For built-ins this is the
+        // [`Policy::policy_type`] string (`rate_limit`, `waf`, ...).
+        // For [`Policy::Plugin`] variants it is the trait's
+        // `policy_type()` return value supplied by the plugin
+        // author.
+        let policy_label = policy.policy_type().to_string();
+        let policy_started = std::time::Instant::now();
+        let surface = match policy {
+            Policy::Plugin(_) => PolicySurface::Plugin,
+            _ => PolicySurface::BuiltIn,
+        };
+        // Helper macro defined per-iteration so the body can refer
+        // to the in-scope `verdict_ctx`, `policy_label`,
+        // `policy_started`, and `surface`. `macro_rules!` resolves
+        // free identifiers at the definition site, so a macro
+        // defined here (rather than at the function top) sees the
+        // per-iteration bindings. Use as
+        // `return audit_deny!(status, msg, rl_info, policy_type)`.
+        macro_rules! audit_deny {
+            ($status:expr, $msg:expr, $rl:expr, $policy_type:expr) => {{
+                emit_policy_verdict(
+                    verdict_ctx,
+                    &policy_label,
+                    surface,
+                    VerdictTag::Deny,
+                    policy_started,
+                );
+                PolicyResult::Deny($status, $msg, $rl, $policy_type)
+            }};
+        }
         match policy {
             Policy::RateLimit(p) => {
                 let client_id = match p.key.as_deref() {
@@ -2212,19 +2329,14 @@ async fn check_policies(
                 };
                 let info = p.allow_with_info_async(&client_id).await;
                 if !info.allowed {
-                    return PolicyResult::Deny(
-                        429,
-                        "rate limited".to_string(),
-                        Some(info),
-                        "rate_limit",
-                    );
+                    return audit_deny!(429, "rate limited".to_string(), Some(info), "rate_limit");
                 }
                 rate_limit_info = Some(info);
             }
             Policy::IpFilter(p) => {
                 if let Some(ip) = ctx.client_ip {
                     if !p.check_ip(&ip) {
-                        return PolicyResult::Deny(403, "forbidden".to_string(), None, "ip_filter");
+                        return audit_deny!(403, "forbidden".to_string(), None, "ip_filter");
                     }
                 }
             }
@@ -2264,11 +2376,11 @@ async fn check_policies(
                     query_len,
                 ) {
                     debug!(detail = %msg, "request limit exceeded");
-                    return PolicyResult::Deny(
+                    return audit_deny!(
                         413,
                         "request entity too large".to_string(),
                         None,
-                        "request_limit",
+                        "request_limit"
                     );
                 }
                 // Forward the body-size cap to the streaming filter so
@@ -2286,27 +2398,112 @@ async fn check_policies(
                 match w.check_request(&uri, headers, None) {
                     WafResult::Clean => {}
                     WafResult::Blocked(msg) => {
-                        return PolicyResult::Deny(403, msg, None, "waf");
+                        return audit_deny!(403, msg, None, "waf");
                     }
                     WafResult::Error(err) => {
                         if w.fail_open {
                             warn!(error = %err, "WAF engine error, fail_open=true, allowing request");
                         } else {
                             warn!(error = %err, "WAF engine error, fail_open=false, blocking request");
-                            return PolicyResult::Deny(
-                                403,
-                                "WAF engine error".to_string(),
-                                None,
-                                "waf",
-                            );
+                            return audit_deny!(403, "WAF engine error".to_string(), None, "waf");
                         }
                     }
                 }
             }
             // SecHeaders / PageShield run in the response phase. Sri runs
-            // alongside response transforms. Plugin policies run via the
-            // plugin dispatch.
-            Policy::SecHeaders(_) | Policy::PageShield(_) | Policy::Sri(_) | Policy::Plugin(_) => {}
+            // alongside response transforms.
+            Policy::SecHeaders(_) | Policy::PageShield(_) | Policy::Sri(_) => {}
+            // --- WOR-201 PR 1b: Plugin dispatch + chain reducer ---
+            //
+            // Materialise an `http::Request` snapshot from the
+            // session, call the trait's `enforce()`, fold the
+            // returned [`PolicyDecision`] into the existing chain
+            // reducer:
+            //
+            // - `Allow` falls through with no header decoration.
+            // - `AllowWithHeaders` accumulates headers onto
+            //   [`RequestContext::policy_response_headers`]; the
+            //   response_filter drains them on the way out.
+            // - `Deny` short-circuits with the supplied status /
+            //   message (rule 1: any Deny wins).
+            // - `Confirm` is the OSS bridge per
+            //   `docs/adr-policy-verdict-shape.md`: stamp
+            //   `X-Policy-Confirm: <reason>` via the
+            //   AllowWithHeaders mechanism. First Confirm in chain
+            //   order wins (rule 2); later Confirm verdicts are
+            //   recorded in audit but do not re-stamp.
+            //
+            // Trait `enforce()` returning `Err(_)` is treated as
+            // Deny (fail-closed), mirroring the existing built-in
+            // arms' WAF-engine-error behaviour.
+            Policy::Plugin(enforcer) => {
+                let plugin_id = enforcer.policy_type().to_string();
+                let req_snapshot = match build_plugin_request_snapshot(session) {
+                    Some(r) => r,
+                    None => {
+                        // Could not build the snapshot; treat as
+                        // fail-closed deny so the plugin contract
+                        // never sees a malformed request.
+                        emit_policy_verdict(
+                            verdict_ctx,
+                            &plugin_id,
+                            PolicySurface::Plugin,
+                            VerdictTag::Deny,
+                            policy_started,
+                        );
+                        return PolicyResult::Deny(
+                            500,
+                            "policy plugin: bad request".to_string(),
+                            None,
+                            "plugin",
+                        );
+                    }
+                };
+                // The trait expects `&mut dyn Any`; the existing
+                // built-in arms get `&mut RequestContext`. Pass the
+                // typed context through `Any` so plugin authors who
+                // need it can downcast.
+                let ctx_any: &mut dyn std::any::Any = ctx;
+                let decision = match enforcer.enforce(&req_snapshot, ctx_any).await {
+                    Ok(d) => d,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "sbproxy::policy",
+                            error = %err,
+                            plugin = %plugin_id,
+                            "policy plugin enforce() returned error; treating as deny"
+                        );
+                        emit_policy_verdict(
+                            verdict_ctx,
+                            &plugin_id,
+                            PolicySurface::Plugin,
+                            VerdictTag::Deny,
+                            policy_started,
+                        );
+                        return PolicyResult::Deny(
+                            500,
+                            "policy plugin error".to_string(),
+                            None,
+                            "plugin",
+                        );
+                    }
+                };
+                let translated = crate::policy_dispatch::translate_plugin_decision(
+                    decision,
+                    &mut ctx.policy_response_headers,
+                    &mut confirm_state,
+                );
+                emit_policy_verdict(
+                    verdict_ctx,
+                    &plugin_id,
+                    PolicySurface::Plugin,
+                    translated.verdict,
+                    policy_started,
+                );
+                if let Some((status, msg, policy_type)) = translated.deny {
+                    return PolicyResult::Deny(status, msg, None, policy_type);
+                }
+            }
             Policy::HttpFraming(p) => {
                 // Defense against the request-smuggling / desync class
                 // documented at portswigger.net/research/http-desync-attacks-request-smuggling-reborn.
@@ -2339,12 +2536,7 @@ async fn check_policies(
                         Some(session.req_header().method.as_str().to_string()),
                     )
                     .emit();
-                    return PolicyResult::Deny(
-                        400,
-                        violation.message().to_string(),
-                        None,
-                        "http_framing",
-                    );
+                    return audit_deny!(400, violation.message().to_string(), None, "http_framing");
                 }
             }
             Policy::Ddos(p) => {
@@ -2361,11 +2553,11 @@ async fn check_policies(
                             headers_enabled: true,
                             include_retry_after: true,
                         };
-                        return PolicyResult::Deny(
+                        return audit_deny!(
                             429,
                             "ddos protection: too many requests".to_string(),
                             Some(info),
-                            "ddos",
+                            "ddos"
                         );
                     }
                 }
@@ -2375,11 +2567,11 @@ async fn check_policies(
                 if let ExposedCredsResult::Hit { reason } = p.check(&session.req_header().headers) {
                     match p.action() {
                         ExposedCredsAction::Block => {
-                            return PolicyResult::Deny(
+                            return audit_deny!(
                                 403,
                                 "credential flagged as exposed".to_string(),
                                 None,
-                                "exposed_credentials",
+                                "exposed_credentials"
                             );
                         }
                         ExposedCredsAction::Tag => {
@@ -2439,11 +2631,11 @@ async fn check_policies(
                                 reason = ?result.reason,
                                 "blocked: detector matched"
                             );
-                            return PolicyResult::Deny(
+                            return audit_deny!(
                                 403,
                                 p.block_body().to_string(),
                                 None,
-                                "prompt_injection",
+                                "prompt_injection"
                             );
                         }
                         PromptInjectionAction::Tag => {
@@ -2519,11 +2711,11 @@ async fn check_policies(
                     AiCrawlDecision::Allow => {}
                     AiCrawlDecision::Charge { body, challenge } => {
                         ctx.crawl_challenge = Some((p.header_name().to_string(), challenge, body));
-                        return PolicyResult::Deny(
+                        return audit_deny!(
                             402,
                             "payment required".to_string(),
                             None,
-                            "ai_crawl_payment",
+                            "ai_crawl_payment"
                         );
                     }
                     AiCrawlDecision::MultiRail { body, content_type } => {
@@ -2537,11 +2729,11 @@ async fn check_policies(
                         // Crawler-Payment header.
                         ctx.crawl_challenge =
                             Some(("Content-Type".to_string(), content_type.to_string(), body));
-                        return PolicyResult::Deny(
+                        return audit_deny!(
                             402,
                             "payment required".to_string(),
                             None,
-                            "ai_crawl_multi_rail",
+                            "ai_crawl_multi_rail"
                         );
                     }
                     AiCrawlDecision::NoAcceptableRail { body } => {
@@ -2554,11 +2746,11 @@ async fn check_policies(
                             "application/json".to_string(),
                             body,
                         ));
-                        return PolicyResult::Deny(
+                        return audit_deny!(
                             406,
                             "no acceptable rail".to_string(),
                             None,
-                            "ai_crawl_no_acceptable_rail",
+                            "ai_crawl_no_acceptable_rail"
                         );
                     }
                     AiCrawlDecision::LedgerUnavailable {
@@ -2585,11 +2777,11 @@ async fn check_policies(
                             headers_enabled: false,
                             include_retry_after: true,
                         };
-                        return PolicyResult::Deny(
+                        return audit_deny!(
                             503,
                             "ledger unavailable".to_string(),
                             Some(info),
-                            "ai_crawl_ledger_unavailable",
+                            "ai_crawl_ledger_unavailable"
                         );
                     }
                 }
@@ -2602,11 +2794,11 @@ async fn check_policies(
                     let detector_csv = detectors.join(",");
                     match p.action() {
                         DlpAction::Block => {
-                            return PolicyResult::Deny(
+                            return audit_deny!(
                                 403,
                                 format!("dlp: detector {detector_csv} matched"),
                                 None,
-                                "dlp",
+                                "dlp"
                             );
                         }
                         DlpAction::Tag => {
@@ -2631,11 +2823,11 @@ async fn check_policies(
                     Some(guard) => ctx.concurrent_limit_guards.push(guard),
                     None => {
                         debug!(key = %key, max = %p.max, "concurrent limit exceeded");
-                        return PolicyResult::Deny(
+                        return audit_deny!(
                             p.status,
                             "too many concurrent requests".to_string(),
                             None,
-                            "concurrent_limit",
+                            "concurrent_limit"
                         );
                     }
                 }
@@ -2664,11 +2856,11 @@ async fn check_policies(
                             Ok(t) => t,
                             Err(e) => {
                                 warn!(error = %e, "csrf: token generation failed");
-                                return PolicyResult::Deny(
+                                return audit_deny!(
                                     500,
                                     "CSRF token generation failed".to_string(),
                                     None,
-                                    "csrf",
+                                    "csrf"
                                 );
                             }
                         };
@@ -2722,11 +2914,11 @@ async fn check_policies(
                             || cookie_token.is_empty()
                             || header_token != cookie_token
                         {
-                            return PolicyResult::Deny(
+                            return audit_deny!(
                                 403,
                                 "CSRF token missing or invalid".to_string(),
                                 None,
-                                "csrf",
+                                "csrf"
                             );
                         }
                     }
@@ -2792,12 +2984,7 @@ async fn check_policies(
                     &ctx.hostname,
                     views,
                 ) {
-                    return PolicyResult::Deny(
-                        p.deny_status,
-                        p.deny_message.clone(),
-                        None,
-                        "expression",
-                    );
+                    return audit_deny!(p.deny_status, p.deny_message.clone(), None, "expression");
                 }
             }
             Policy::Assertion(_) => {} // Assertions are response-phase (informational)
@@ -2846,10 +3033,25 @@ async fn check_policies(
                             "caller_denied" => "a2a_caller_denied",
                             _ => "a2a",
                         };
-                        return PolicyResult::Deny(status, body, None, policy_type);
+                        return audit_deny!(status, body, None, policy_type);
                     }
                 }
             }
+        }
+
+        // Per-policy Allow audit emission for built-in arms that
+        // fell through the match without an early return. The
+        // Plugin arm emits its own verdict event before falling
+        // through via `translate_plugin_decision`; skip the
+        // catch-all here so we do not double-count.
+        if !matches!(policy, Policy::Plugin(_)) {
+            emit_policy_verdict(
+                verdict_ctx,
+                &policy_label,
+                surface,
+                VerdictTag::Allow,
+                policy_started,
+            );
         }
     }
     PolicyResult::Allow(rate_limit_info)
@@ -7695,7 +7897,18 @@ impl ProxyHttp for SbProxy {
 
         // --- Policy enforcement ---
         let policy_origin = ctx.hostname.to_string();
-        match check_policies(&pipeline.policies[origin_idx], session, ctx).await {
+        // Build the verdict-bus correlation context once per
+        // request. WOR-201 PR 1b. The OSS scope passes
+        // `tenant_id` and `workspace_id` as the same string; the
+        // enterprise audit binding distinguishes them via the
+        // workspace -> tenant lookup the OSS proxy does not own.
+        let policy_workspace_id = pipeline.config.origins[origin_idx].workspace_id.to_string();
+        let verdict_ctx = PolicyVerdictCtx {
+            request_id: ctx.request_id.to_string(),
+            tenant_id: policy_workspace_id.clone(),
+            workspace_id: policy_workspace_id,
+        };
+        match check_policies(&pipeline.policies[origin_idx], session, ctx, &verdict_ctx).await {
             PolicyResult::Allow(rl_info) => {
                 sbproxy_observe::metrics::record_policy(&policy_origin, "all", "allow");
                 ctx.rate_limit_info = rl_info;
@@ -9502,6 +9715,20 @@ impl ProxyHttp for SbProxy {
             for (key, value) in &ctx.properties {
                 to_set.push((format!("X-Sb-Property-{key}"), value.clone()));
             }
+        }
+
+        // WOR-201 PR 1b: drain plugin-policy response headers.
+        //
+        // Every `Policy::Plugin` enforcer that returned
+        // `PolicyDecision::AllowWithHeaders` (or whose `Confirm`
+        // verdict the OSS bridge translated to AllowWithHeaders
+        // with `X-Policy-Confirm` stamped) pushed onto
+        // `ctx.policy_response_headers`. Drain the slot here so
+        // the headers land on the outgoing response in chain
+        // order. Append rather than set so multi-value contracts
+        // (e.g. WWW-Authenticate chains) survive.
+        for entry in std::mem::take(&mut ctx.policy_response_headers) {
+            to_append.push(entry);
         }
 
         // Wave 5 day-6 Item 1: drain CEL header transform mutations.
@@ -11910,6 +12137,44 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
                 );
             }
         }
+    }
+
+    // --- WOR-201 PR 1b: install policy verdict audit bus ---
+    //
+    // Construct a bounded mpsc channel and install the sender as the
+    // process-wide audit bus before the pipeline is loaded. The
+    // dispatcher emits a `PolicyVerdictEvent` for every policy
+    // decision; the OSS drain stub on the receiver prints each event
+    // to stderr as a JSON line. Enterprise replaces the consumer
+    // with a NATS-backed audit-chain subscriber per
+    // `docs/adr-policy-audit-binding.md`.
+    //
+    // Spawn the drain on a dedicated single-threaded runtime in a
+    // background std thread so it lives independently of Pingora's
+    // worker runtimes. This mirrors the SIGHUP handler pattern below
+    // and keeps the audit consumer alive for the full process
+    // lifetime.
+    {
+        let (tx, rx) = crate::policy_bus::channel(crate::policy_bus::DEFAULT_BUS_CAPACITY);
+        let _ = crate::policy_bus::init_global_bus(tx);
+        std::thread::Builder::new()
+            .name("sbproxy-policy-bus-drain".to_string())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to build policy-bus drain runtime");
+                        return;
+                    }
+                };
+                rt.block_on(async move {
+                    crate::policy_bus::drain_to_stderr(rx).await;
+                });
+            })
+            .ok();
     }
 
     // Compile config into a pipeline with action/auth/policy module instances.

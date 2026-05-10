@@ -13,7 +13,9 @@ prometheus.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
-uuid.workspace = true
+# `serde` is on so PolicyVerdictEvent and other typed events can
+# (de)serialise the UUID without an intermediate string conversion.
+uuid = { workspace = true, features = ["v4", "serde"] }
 ulid.workspace = true
 regex.workspace = true
 http.workspace = true
@@ -21,7 +23,9 @@ once_cell = "1"
 rand.workspace = true
 reqwest = { workspace = true }
 tokio.workspace = true
-chrono.workspace = true
+# `serde` is on so PolicyVerdictEvent.occurred_at can (de)serialise
+# the timestamp directly without a custom adapter.
+chrono = { workspace = true, features = ["serde"] }
 hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
