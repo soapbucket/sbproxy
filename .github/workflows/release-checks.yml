@@ -19,6 +19,13 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# Default to read-only contents access for every job in this workflow.
+# CodeQL (actions/missing-workflow-permissions) wants every workflow
+# to declare its permissions explicitly rather than inherit a broader
+# default from the repo settings.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
