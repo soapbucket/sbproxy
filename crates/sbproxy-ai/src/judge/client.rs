@@ -38,7 +38,7 @@ use super::budget::BudgetTracker;
 use super::cache::{cache_key, JudgeCache};
 use super::telemetry::{
     record_budget_exhausted, record_judge_call, VERDICT_ALLOW, VERDICT_ALLOW_WITH_HEADERS,
-    VERDICT_DENY, VERDICT_ERROR,
+    VERDICT_CONFIRM, VERDICT_DENY, VERDICT_ERROR,
 };
 use super::{JudgeConfig, JudgeError};
 
@@ -299,6 +299,7 @@ fn verdict_label(decision: &PolicyDecision) -> &'static str {
         PolicyDecision::Allow => VERDICT_ALLOW,
         PolicyDecision::Deny { .. } => VERDICT_DENY,
         PolicyDecision::AllowWithHeaders { .. } => VERDICT_ALLOW_WITH_HEADERS,
+        PolicyDecision::Confirm { .. } => VERDICT_CONFIRM,
     }
 }
 

@@ -13,6 +13,35 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **Policy verdict audit bus + Plugin dispatch (WOR-201 PR 1b).**
+  Wires the previously-dead `Policy::Plugin` arm in `server.rs` to
+  call the trait's `enforce()`, folds the returned `PolicyDecision`
+  into the existing chain reducer, and emits a
+  `PolicyVerdictEvent` for every decision on a bounded
+  `tokio::sync::mpsc` audit bus per
+  `docs/adr-policy-audit-binding.md`. The OSS substrate ships an
+  in-memory drain stub; enterprise replaces the consumer with a
+  NATS-backed audit-chain subscriber. Multi-policy resolution
+  rules from `docs/adr-policy-verdict-shape.md` are implemented at
+  the chain level: any Deny wins, the first Confirm wins over
+  AllowWithHeaders, AllowWithHeaders accumulate, otherwise Allow.
+  `Confirm` in OSS routes through the existing AllowWithHeaders
+  mechanism with `X-Policy-Confirm: <reason>` stamped on the
+  response; an `expires_at` already in the past synthesises a 410
+  and an SSRF-blocked `webhook_url` synthesises a 502 at decision
+  time. New metrics:
+  `sbproxy_policy_audit_events_total{verdict, surface, policy_id}`,
+  `sbproxy_policy_audit_events_dropped_total{tenant}`,
+  `sbproxy_policy_decision_duration_seconds{surface}`. New Grafana
+  dashboard `sbproxy-policy-verdicts` covers the surface.
+  ([crates/sbproxy-observe/src/events.rs],
+  [crates/sbproxy-observe/src/metrics.rs],
+  [crates/sbproxy-core/src/policy_bus.rs],
+  [crates/sbproxy-core/src/policy_dispatch.rs],
+  [crates/sbproxy-core/src/server.rs],
+  [crates/sbproxy-plugin/src/traits.rs],
+  [dashboards/grafana/sbproxy-policy-verdicts.json])
+
 - **Synthetic-transaction `/readyz` probe (WOR-27).** Optional
   background driver that fires an in-process request through the
   compiled handler chain on a fixed cadence and reports the verdict as

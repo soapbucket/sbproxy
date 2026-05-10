@@ -963,6 +963,87 @@ pub fn record_mirror_state_drift() {
     metrics().mirror_state_drift.inc();
 }
 
+/// Increment `sbproxy_policy_audit_events_total{verdict, surface, policy_id}`.
+///
+/// Called once for every policy decision the dispatcher renders.
+/// Mirrors the [`PolicyVerdictEvent`](crate::events::PolicyVerdictEvent)
+/// payload that lands on the audit bus, but stays local to the
+/// metric registry so dashboards see decisions even when the bus
+/// consumer is offline.
+///
+/// The `policy_id` label is sanitised through the cardinality
+/// limiter so a misbehaving plugin cannot blow up label space by
+/// reporting a fresh policy_type per call.
+pub fn record_policy_audit_emitted(verdict: &str, surface: &str, policy_id: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_policy_audit_events_total",
+            "Policy decisions emitted on the audit event bus, labelled by verdict, surface, and policy_id",
+            &["verdict", "surface", "policy_id"],
+        )
+        .expect("policy audit emitted counter registers")
+    });
+    let policy_id =
+        sanitize_label_budget("sbproxy_policy_audit_events_total", "policy_id", policy_id);
+    counter
+        .with_label_values(&[verdict, surface, policy_id.as_str()])
+        .inc();
+}
+
+/// Increment `sbproxy_policy_audit_events_dropped_total{tenant}`.
+///
+/// Called when the bounded mpsc audit bus is full and the
+/// dispatcher must drop a [`PolicyVerdictEvent`](crate::events::PolicyVerdictEvent)
+/// to avoid blocking the hot path. Per
+/// `docs/adr-policy-audit-binding.md`, this is a paging signal:
+/// operators should alert on a non-zero rate so they get warning
+/// before audit coverage degrades.
+pub fn record_policy_audit_event_dropped(tenant: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_policy_audit_events_dropped_total",
+            "Policy verdict audit events dropped because the bus queue was full",
+            &["tenant"],
+        )
+        .expect("policy audit dropped counter registers")
+    });
+    let tenant = sanitize_label_budget(
+        "sbproxy_policy_audit_events_dropped_total",
+        "tenant",
+        tenant,
+    );
+    counter.with_label_values(&[tenant.as_str()]).inc();
+}
+
+/// Observe the wall-clock latency of a policy decision in seconds.
+///
+/// Records the time from entering the dispatcher to the verdict
+/// being produced, labelled by `surface` (`built_in` / `plugin`).
+/// Bucket boundaries are tuned for the OSS in-process path: most
+/// decisions land under 1 ms, plugin decisions can spread to tens
+/// of milliseconds when an enforcer makes a network call.
+pub fn record_policy_decision_latency(surface: &str, duration_secs: f64) {
+    use prometheus::{register_histogram_vec, HistogramVec};
+    use std::sync::OnceLock;
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    let hist = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_policy_decision_duration_seconds",
+            "Wall-clock latency of policy decisions",
+            &["surface"],
+            vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
+        )
+        .expect("policy decision latency histogram registers")
+    });
+    hist.with_label_values(&[surface]).observe(duration_secs);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

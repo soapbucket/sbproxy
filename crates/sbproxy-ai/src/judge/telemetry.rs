@@ -92,6 +92,11 @@ pub const VERDICT_ALLOW: &str = "allow";
 pub const VERDICT_DENY: &str = "deny";
 /// Verdict bucket label for `PolicyDecision::AllowWithHeaders`.
 pub const VERDICT_ALLOW_WITH_HEADERS: &str = "allow_with_headers";
+/// Verdict bucket label for `PolicyDecision::Confirm` (WOR-201
+/// PR 1a). The judge surface itself rarely emits Confirm today; the
+/// label exists so a future judge prompt that asks "approve?" can
+/// use the same bucket as the dispatcher reducer.
+pub const VERDICT_CONFIRM: &str = "confirm";
 /// Verdict bucket label for non-success outcomes (timeout,
 /// provider error, malformed response, budget exhausted).
 pub const VERDICT_ERROR: &str = "error";
