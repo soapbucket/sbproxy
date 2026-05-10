@@ -131,6 +131,12 @@ fn compile_one(policy: Policy) -> Result<Box<dyn PolicyEnforcer>, BuiltinEnforce
         #[cfg(feature = "agent-class")]
         Policy::AgentClass(_) => Err(BuiltinEnforcerError::NotYetPorted("agent_class")),
         Policy::A2A(_) => Err(BuiltinEnforcerError::NotYetPorted("a2a")),
+        // semantic_constraint shipped in WOR-203 PR-3b after the
+        // initial 1c.0 registry. Same pattern as the other built-ins:
+        // returns NotYetPorted until a per-domain port replaces it.
+        Policy::SemanticConstraint(_) => {
+            Err(BuiltinEnforcerError::NotYetPorted("semantic_constraint"))
+        }
 
         // --- Plugin variant: already trait-dispatched ---
         //
