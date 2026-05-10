@@ -96,7 +96,7 @@ cargo bench -- --baseline before
 
 ```bash
 make build-release
-./target/release/sbproxy --config examples/00-basic-proxy/sb.yml &
+./target/release/sbproxy --config examples/basic-proxy/sb.yml &
 
 # In another terminal, drive load against the local proxy.
 # oha is a simple choice; wrk and hey work too.

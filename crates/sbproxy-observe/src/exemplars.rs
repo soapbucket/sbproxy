@@ -15,7 +15,7 @@
 //!
 //! Operators MUST run Prometheus with `--enable-feature=exemplar-storage`
 //! and scrape with `application/openmetrics-text` content negotiation.
-//! The `examples/00-observability-stack/` Compose recipe wires both.
+//! The `examples/observability-stack/` Compose recipe wires both.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

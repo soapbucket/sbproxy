@@ -36,7 +36,7 @@ operator is running an enterprise build that can settle them.
 
 The split between what OSS does and what the enterprise build does is
 deliberate, and matches the framing the rail-Lightning example PR
-uses (see `examples/32-rail-lightning/README.md`).
+uses (see `examples/rail-lightning/README.md`).
 
 What the OSS proxy does today:
 
@@ -142,7 +142,7 @@ Notes:
 - `rails[].quote_token` is a JWS. One nonce per rail per response, so
   the agent cannot replay a quote across rails. JWKS publication and
   token replay are covered by the
-  `examples/33-quote-token-replay-jwks/` example.
+  `examples/quote-token-replay-jwks/` example.
 - `rails[]` order is the operator's declared preference. Agents break
   ties on this order after q-value sorting their own preference set.
 - Lightning entries appear in the body only when an enterprise
@@ -211,13 +211,13 @@ enterprise.
   agent classes, ledger, tiered pricing.
 - [`enterprise.md`](enterprise.md) - the OSS / enterprise split,
   including the rail settlement features.
-- `examples/30-rail-x402-base-sepolia/` - x402 rail with a hermetic
+- `examples/rail-x402-base-sepolia/` - x402 rail with a hermetic
   mock facilitator.
-- `examples/31-rail-mpp-stripe-test/` - MPP rail with Stripe test
+- `examples/rail-mpp-stripe-test/` - MPP rail with Stripe test
   mode and a wiremock fallback.
-- `examples/32-multi-rail-accept-payment/` - x402 + MPP wired
+- `examples/multi-rail-accept-payment/` - x402 + MPP wired
   together with q-value negotiation.
-- `examples/32-rail-lightning/` - Lightning rail negotiation contract
+- `examples/rail-lightning/` - Lightning rail negotiation contract
   (settlement is enterprise-only).
-- `examples/33-quote-token-replay-jwks/` - JWKS endpoint and
+- `examples/quote-token-replay-jwks/` - JWKS endpoint and
   single-use quote-token enforcement.

@@ -1,6 +1,6 @@
 //! End-to-end coverage for custom `error_pages`.
 //!
-//! `examples/64-error-pages/sb.yml` documents the contract: an
+//! `examples/error-pages/sb.yml` documents the contract: an
 //! `error_pages` list of `{ status, content_type, template, body }`
 //! entries replaces the default plain-text error body when the
 //! proxy itself generates the error response. Status entries may be

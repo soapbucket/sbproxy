@@ -62,19 +62,19 @@ jobs:
           workspaces: bench-synthetic
 
       # Boot the reference observability stack from
-      # examples/00-observability-stack and the bundled crawl-tiered
+      # examples/observability-stack and the bundled crawl-tiered
       # example so the probe has a proxy to talk to with a real
       # ai_crawl_control policy in front of a mock ledger.
       - name: bring up observability stack
         run: |
           set -euo pipefail
-          ( cd examples/00-observability-stack && docker compose up -d --wait )
+          ( cd examples/observability-stack && docker compose up -d --wait )
 
       - name: bring up tiered crawl example
         id: stack
         run: |
           set -euo pipefail
-          ( cd examples/24-ai-crawl-tiered && docker compose up -d --wait )
+          ( cd examples/ai-crawl-tiered && docker compose up -d --wait )
           # The example publishes the proxy on host port 8080 by
           # default. Expose it as a step output so the probe step
           # below can interpolate it.
@@ -120,8 +120,8 @@ jobs:
         if: always()
         run: |
           set -eu
-          ( cd examples/24-ai-crawl-tiered && docker compose down -v --remove-orphans ) || true
-          ( cd examples/00-observability-stack && docker compose down -v --remove-orphans ) || true
+          ( cd examples/ai-crawl-tiered && docker compose down -v --remove-orphans ) || true
+          ( cd examples/observability-stack && docker compose down -v --remove-orphans ) || true
 
       # Failure notification. Opens a GitHub issue with the probe
       # output. Operator routing of that issue (Slack page, PagerDuty

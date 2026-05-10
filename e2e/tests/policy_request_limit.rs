@@ -1,7 +1,7 @@
 //! End-to-end coverage for the `request_limit` policy.
 //!
 //! Exercises the documented behaviour from
-//! `examples/34-request-limit/sb.yml`: requests that exceed any of
+//! `examples/request-limit/sb.yml`: requests that exceed any of
 //! `max_body_size`, `max_url_length`, `max_header_count`, or
 //! `max_query_string_length` are rejected with 413 (request entity
 //! too large) before any upstream is contacted. See

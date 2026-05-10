@@ -5,7 +5,7 @@
 //! `users` list. The realm is surfaced to the client only as part of the
 //! 401 challenge; here we focus on the accept / reject decision and
 //! confirm the upstream is bypassed for unauthenticated traffic. Mirrors
-//! the contract from `examples/22-auth-basic/sb.yml`.
+//! the contract from `examples/auth-basic/sb.yml`.
 
 use base64::Engine;
 use sbproxy_e2e::{MockUpstream, ProxyHarness};

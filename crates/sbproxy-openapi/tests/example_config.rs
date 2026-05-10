@@ -13,7 +13,7 @@ fn load_example() -> sbproxy_config::CompiledConfig {
     // crate's manifest so the test works regardless of cargo's working
     // directory.
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let example = manifest.join("../../examples/96-openapi-emission/sb.yml");
+    let example = manifest.join("../../examples/openapi-emission/sb.yml");
     if !example.exists() {
         // The example is part of the OSS tree; if it is missing in a
         // partial checkout we skip rather than fail.

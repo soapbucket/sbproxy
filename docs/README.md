@@ -65,7 +65,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 make build-release
 
 # Run with a config
-make run CONFIG=examples/00-basic-proxy/sb.yml
+make run CONFIG=examples/basic-proxy/sb.yml
 ```
 
 Minimal `sb.yml`:

@@ -130,4 +130,4 @@ action:
 
 A request for `adapter=alice-tone` lands on whichever of upstream-0 / upstream-2 has fewer in-flight requests. A request for `adapter=eve-poetry` (not loaded anywhere) falls through to `least_connections`, which picks whichever upstream is currently quietest, paying the cold-load penalty there. A request with no `adapter` at all also falls through, since the strategy has no signal.
 
-A working example lives at `examples/99-lora-aware-routing/sb.yml`.
+A working example lives at `examples/lora-aware-routing/sb.yml`.

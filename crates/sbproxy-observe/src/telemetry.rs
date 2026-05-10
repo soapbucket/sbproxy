@@ -57,7 +57,7 @@ pub struct TelemetryConfig {
     /// OTLP collector endpoint. The default depends on the chosen
     /// `transport`: `http://localhost:4318/v1/traces` for HTTP,
     /// `http://localhost:4327` for gRPC (matching the Day-1 reference
-    /// Compose stack in `examples/00-observability-stack/`).
+    /// Compose stack in `examples/observability-stack/`).
     pub endpoint: Option<String>,
     /// OTLP transport selector.
     #[serde(default = "default_transport")]
@@ -98,7 +98,7 @@ fn default_always_sample_errors() -> bool {
 }
 
 /// Default OTLP/gRPC endpoint for the Day-1 reference observability
-/// stack (`examples/00-observability-stack/`). The collector listens
+/// stack (`examples/observability-stack/`). The collector listens
 /// on 4327 instead of 4317 so it doesn't collide with a host-side
 /// collector that operators may also be running.
 pub const DEFAULT_OTLP_ENDPOINT: &str = "http://localhost:4327";
@@ -140,7 +140,7 @@ pub fn init_otlp_pipeline(config: &TelemetryConfig) -> Result<()> {
         return Ok(());
     }
     // Default endpoint matches the Day-1 reference Compose stack
-    // (`examples/00-observability-stack/`). Operators that point at a
+    // (`examples/observability-stack/`). Operators that point at a
     // remote collector override this.
     let endpoint_owned = config
         .endpoint

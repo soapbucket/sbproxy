@@ -1,6 +1,6 @@
 //! Pattern-aware PII redaction at the AI request boundary.
 //!
-//! Mirrors `examples/97-pii-redaction/sb.yml`: with `pii.enabled:
+//! Mirrors `examples/pii-redaction/sb.yml`: with `pii.enabled:
 //! true` on an `ai_proxy` origin, well-known PII shapes (email,
 //! credit card, SSN, OpenAI/Anthropic key prefixes) are stripped
 //! from the JSON request body before the proxy forwards it to the

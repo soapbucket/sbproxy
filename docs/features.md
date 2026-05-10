@@ -1834,7 +1834,7 @@ origins:
           allow: [gh.search_repos, db.query]
 ```
 
-The action speaks JSON-RPC 2.0: `initialize` returns the configured `server_info`, `tools/list` aggregates the federated catalogue, `tools/call` enforces the allowlist guardrail and routes to the upstream that owns the prefix. Tool aggregation, name-collision handling, and the upstream transports (`streamable_http`, `sse`) live in the federation library at `crates/sbproxy-extension/src/mcp/`. See [examples/97-mcp-federation/](../examples/97-mcp-federation/) for a runnable config.
+The action speaks JSON-RPC 2.0: `initialize` returns the configured `server_info`, `tools/list` aggregates the federated catalogue, `tools/call` enforces the allowlist guardrail and routes to the upstream that owns the prefix. Tool aggregation, name-collision handling, and the upstream transports (`streamable_http`, `sse`) live in the federation library at `crates/sbproxy-extension/src/mcp/`. See [examples/mcp-federation/](../examples/mcp-federation/) for a runnable config.
 
 ### Listings
 
@@ -1861,7 +1861,7 @@ spec:
     docsUrl: "/docs/example-api"
 ```
 
-See [listings.md](listings.md) for the full schema reference, the loader behaviour, the plan-validation rules, and a runnable example at [examples/101-listing-primitive/](../examples/101-listing-primitive/).
+See [listings.md](listings.md) for the full schema reference, the loader behaviour, the plan-validation rules, and a runnable example at [examples/listing-primitive/](../examples/listing-primitive/).
 
 ---
 

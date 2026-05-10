@@ -1,6 +1,6 @@
 //! End-to-end coverage for path-, header-, and query-based `forward_rules`.
 //!
-//! `examples/62-forward-rules/sb.yml` documents the contract: a
+//! `examples/forward-rules/sb.yml` documents the contract: a
 //! parent origin defines an ordered list of `forward_rules`, each
 //! with one or more matcher entries (path / header / query) and an
 //! inline child `origin` that takes over when an entry hits. Anything
@@ -78,7 +78,7 @@ origins:
 #[test]
 fn forward_rule_inline_static_origin_serves_without_upstream() {
     // Inline child origin uses a static action; no upstream needed.
-    // Mirrors the /admin/* branch in examples/62-forward-rules.
+    // Mirrors the /admin/* branch in examples/forward-rules.
     let yaml = r#"
 proxy:
   http_bind_port: 0

@@ -246,7 +246,7 @@ state across requests; the WASI sandbox is per-invocation by design.
   (CEL, Lua, JavaScript, WASM).
 - [configuration.md](configuration.md) - the full transform field
   reference, including `fail_on_error` semantics.
-- `examples/38-wasm-transform/sb.yml` - the runnable end-to-end
+- `examples/wasm-transform/sb.yml` - the runnable end-to-end
   example used in this guide.
 - `examples/wasm/echo-rust/` - the Rust hello-world module with a
   Docker-based build script.

@@ -127,7 +127,7 @@ routing:
   strategy: race
 ```
 
-See [examples/89-ai-race](../examples/89-ai-race/sb.yml).
+See [examples/ai-race](../examples/ai-race/sb.yml).
 
 ## Resilience
 
@@ -152,7 +152,7 @@ resilience:
     healthy_threshold: 2
 ```
 
-See [examples/87-ai-resilience](../examples/87-ai-resilience/sb.yml). Field reference in [configuration.md#resilience-resilience](configuration.md#resilience-resilience).
+See [examples/ai-resilience](../examples/ai-resilience/sb.yml). Field reference in [configuration.md#resilience-resilience](configuration.md#resilience-resilience).
 
 ## Shadow eval
 
@@ -165,7 +165,7 @@ shadow:
   timeout_ms: 30000
 ```
 
-See [examples/88-ai-shadow](../examples/88-ai-shadow/sb.yml).
+See [examples/ai-shadow](../examples/ai-shadow/sb.yml).
 
 ## Proxy-native AI patterns
 
@@ -173,10 +173,10 @@ SBproxy is a proxy first, so AI traffic composes with everything else the proxy 
 
 | Pattern | Mechanism | Example |
 |---------|-----------|---------|
-| Tenant access control before any AI call | `policies` (CEL expression) | [93-ai-cel-tenant-gate](../examples/93-ai-cel-tenant-gate/sb.yml) |
-| Mixed AI + non-AI on one hostname (health probes, docs, model catalog) | `forward_rules` with inline child origins | [94-ai-mixed-traffic](../examples/94-ai-mixed-traffic/sb.yml) |
-| Custom DLP beyond built-in PII (codenames, ticket IDs, internal hostnames) | `guardrails.input` with `regex` patterns | [95-ai-regex-dlp](../examples/95-ai-regex-dlp/sb.yml) |
-| Topic enforcement (allow-list of approved keywords) | `regex` guardrail with `action: allow` | [95-ai-regex-dlp](../examples/95-ai-regex-dlp/sb.yml) |
+| Tenant access control before any AI call | `policies` (CEL expression) | [93-ai-cel-tenant-gate](../examples/ai-cel-tenant-gate/sb.yml) |
+| Mixed AI + non-AI on one hostname (health probes, docs, model catalog) | `forward_rules` with inline child origins | [94-ai-mixed-traffic](../examples/ai-mixed-traffic/sb.yml) |
+| Custom DLP beyond built-in PII (codenames, ticket IDs, internal hostnames) | `guardrails.input` with `regex` patterns | [95-ai-regex-dlp](../examples/ai-regex-dlp/sb.yml) |
+| Topic enforcement (allow-list of approved keywords) | `regex` guardrail with `action: allow` | [95-ai-regex-dlp](../examples/ai-regex-dlp/sb.yml) |
 
 CEL policies and request modifiers run before the AI handler dispatches, so a rejection costs no provider tokens. Forward rules dispatch by path, which means health checks and probe traffic can stay on the same hostname without billing a model. Regex guardrails inspect the parsed prompt body and slot in next to PII, injection, jailbreak, and schema guardrails.
 
@@ -194,7 +194,7 @@ Clients always speak the OpenAI chat completions shape; sbproxy rewrites the bod
 
 For Anthropic, the request hoists `system` role messages to the top-level `system` field, defaults `max_tokens` when missing, strips OpenAI-only knobs (`logit_bias`, `n`, `presence_penalty`, `frequency_penalty`, `response_format`, `seed`, `user`), and rewrites the path from `/v1/chat/completions` to `/v1/messages`. The response converts text and tool_use blocks back into the OpenAI `choices[].message.content` and `tool_calls` shape, maps `stop_reason` to `finish_reason`, and renames `usage.input_tokens` / `output_tokens` to `prompt_tokens` / `completion_tokens`.
 
-See [examples/11-ai-claude](../examples/11-ai-claude/sb.yml) and [providers.md](providers.md).
+See [examples/ai-claude](../examples/ai-claude/sb.yml) and [providers.md](providers.md).
 
 ## Rate limits
 

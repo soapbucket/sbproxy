@@ -2,7 +2,7 @@
 //!
 //! Builds a temporary directory of static assets, points the
 //! `local` storage backend at it, and walks the documented curl
-//! invocations from `examples/98-storage-action/sb.yml`.
+//! invocations from `examples/storage-action/sb.yml`.
 
 use std::io::Write;
 

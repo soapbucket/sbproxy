@@ -2,7 +2,7 @@
 //!
 //! Exercises the `api_key` auth provider in both header and
 //! query-parameter modes. Mirrors the contract documented in
-//! `examples/06-auth-api-key/sb.yml`: a missing or wrong key gets a
+//! `examples/auth-api-key/sb.yml`: a missing or wrong key gets a
 //! 401 before the upstream is contacted; a valid key in the configured
 //! header (or the configured query parameter) is forwarded as a 200.
 

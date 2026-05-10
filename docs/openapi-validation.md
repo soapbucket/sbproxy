@@ -70,7 +70,7 @@ origins:
 
 A clean `POST /users/42` with `{"name":"alice","age":30}` is forwarded; `{"age":30}` is rejected with `422` and a JSON body naming `/name`.
 
-A working example config lives at `examples/97-openapi-validation/sb.yml`.
+A working example config lives at `examples/openapi-validation/sb.yml`.
 
 ## Limitations
 

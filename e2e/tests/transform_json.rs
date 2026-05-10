@@ -18,7 +18,7 @@ use sbproxy_e2e::{MockUpstream, ProxyHarness};
 
 #[test]
 fn json_transform_renames_removes_and_sets_fields() {
-    // Mirrors examples/40-transform-json/sb.yml.
+    // Mirrors examples/transform-json/sb.yml.
     let yaml = r#"
 proxy:
   http_bind_port: 0
@@ -65,7 +65,7 @@ origins:
 
 #[test]
 fn json_projection_include_keeps_only_listed_fields() {
-    // Mirrors examples/41-transform-json-projection/sb.yml.
+    // Mirrors examples/transform-json-projection/sb.yml.
     let yaml = r#"
 proxy:
   http_bind_port: 0

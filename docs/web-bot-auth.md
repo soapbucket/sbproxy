@@ -100,4 +100,4 @@ A signed crawler still pays per request unless its `Crawler-Payment` token redee
 - [configuration.md](configuration.md#authentication) - schema reference (`bot_auth` provider).
 - [RFC 9421](https://www.rfc-editor.org/rfc/rfc9421.html) - the underlying signature standard.
 - `crates/sbproxy-modules/src/auth/bot_auth.rs` - source.
-- `examples/91-web-bot-auth/sb.yml` - runnable example.
+- `examples/web-bot-auth/sb.yml` - runnable example.

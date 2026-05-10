@@ -1,6 +1,6 @@
 //! End-to-end coverage for response compression.
 //!
-//! `examples/67-compression/sb.yml` documents the contract: a
+//! `examples/compression/sb.yml` documents the contract: a
 //! `compression:` block with `algorithms: [br, gzip, zstd]` and a
 //! `min_size` floor selects the best algorithm advertised in the
 //! client's `Accept-Encoding` header. Algorithm negotiation is

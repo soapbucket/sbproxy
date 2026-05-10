@@ -2,8 +2,8 @@
 //!
 //! Spawns multiple [`MockUpstream`] instances and points the proxy
 //! at them with different algorithms documented in
-//! `examples/04-load-balancer/sb.yml` and
-//! `examples/71-load-balancer-deployment/sb.yml`. The mock upstreams
+//! `examples/load-balancer/sb.yml` and
+//! `examples/load-balancer-deployment/sb.yml`. The mock upstreams
 //! capture every accepted request so the test can count the
 //! distribution after the run.
 

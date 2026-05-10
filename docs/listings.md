@@ -197,7 +197,7 @@ finding the next time `sbproxy plan` runs against the Repo.
 
 ## Example
 
-The runnable example in `examples/101-listing-primitive/` ships:
+The runnable example in `examples/listing-primitive/` ships:
 
 - `sb.yml` with one origin (`api.example.com`).
 - `listings/example.yaml` that publishes the origin as `example-api`,
@@ -207,7 +207,7 @@ The runnable example in `examples/101-listing-primitive/` ships:
 Run it like any other example:
 
 ```bash
-make run CONFIG=examples/101-listing-primitive/sb.yml
+make run CONFIG=examples/listing-primitive/sb.yml
 ```
 
 The Listing is not on the data path in OSS today: it is the input the

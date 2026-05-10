@@ -34,7 +34,7 @@ transforms:
     timeout_ms: 500
 ```
 
-`examples/38-wasm-transform/sb.yml` is a complete config that loads the echo module and pipes a static HTML response through it.
+`examples/wasm-transform/sb.yml` is a complete config that loads the echo module and pipes a static HTML response through it.
 
 ## See also
 

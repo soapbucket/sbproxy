@@ -1,6 +1,6 @@
 //! End-to-end coverage for the `csrf` policy.
 //!
-//! Exercises the documented behaviour from `examples/32-csrf/sb.yml`:
+//! Exercises the documented behaviour from `examples/csrf/sb.yml`:
 //!
 //! 1. A safe-method request (GET) issues a `csrf_token` cookie via
 //!    `Set-Cookie`.

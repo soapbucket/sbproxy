@@ -163,7 +163,7 @@ You ship the gateway and you ship the spec, in one motion.
 
 ## Example
 
-A runnable example is at [`examples/96-openapi-emission/`](../examples/96-openapi-emission/sb.yml).
+A runnable example is at [`examples/openapi-emission/`](../examples/openapi-emission/sb.yml).
 
 ## See also
 

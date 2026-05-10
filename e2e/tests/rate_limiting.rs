@@ -1,7 +1,7 @@
 //! End-to-end coverage for the rate_limiting policy.
 //!
 //! Exercises the documented behaviour from
-//! `examples/02-rate-limiting/sb.yml`: a token bucket on the
+//! `examples/rate-limiting/sb.yml`: a token bucket on the
 //! request path returns 429 with a `Retry-After` header once the
 //! burst is exhausted.
 

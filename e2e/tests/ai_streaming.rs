@@ -1,6 +1,6 @@
 //! End-to-end coverage for AI gateway SSE streaming.
 //!
-//! `examples/16-ai-streaming/sb.yml` documents the contract: a
+//! `examples/ai-streaming/sb.yml` documents the contract: a
 //! `stream: true` request to `/v1/chat/completions` yields
 //! `text/event-stream` chunks forwarded from the upstream provider
 //! verbatim. The OSS [`MockUpstream`] in `sbproxy-e2e/src/lib.rs`
