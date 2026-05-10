@@ -161,7 +161,7 @@ curl -s -H 'Host: api.example.com' -H 'Authorization: Bearer demo' \
   http://127.0.0.1:8080/.well-known/agent-skills/index.json | jq
 ```
 
-The example bundle at `examples/99-agent-skills/` is runnable with
+The example bundle at `examples/agent-skills/` is runnable with
 `sbproxy serve -f sb.yml` and demonstrates the manifest, the
 visibility filter, and the digest contract end-to-end.
 

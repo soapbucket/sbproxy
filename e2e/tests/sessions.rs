@@ -1,6 +1,6 @@
 //! End-to-end coverage for session cookies.
 //!
-//! `examples/65-sessions/sb.yml` documents the contract: when an
+//! `examples/sessions/sb.yml` documents the contract: when an
 //! origin has a `session:` block, the proxy emits a `Set-Cookie`
 //! header on every response that doesn't already carry the session
 //! cookie. Cookie attributes (`HttpOnly`, `Secure`, `SameSite`,

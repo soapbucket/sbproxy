@@ -1,7 +1,7 @@
 //! End-to-end coverage for `on_request` / `on_response` webhook
 //! callbacks.
 //!
-//! `examples/79-webhook-signing/sb.yml` documents the contract:
+//! `examples/webhook-signing/sb.yml` documents the contract:
 //! configured `on_request` and `on_response` URLs receive a signed
 //! POST with the request envelope. Callbacks default to audit-only
 //! (fire-and-forget) so the request path is not gated on the

@@ -1,6 +1,6 @@
 //! CORS preflight + actual-request behaviour.
 //!
-//! `examples/05-headers-and-cors/sb.yml` documents the shape of
+//! `examples/headers-and-cors/sb.yml` documents the shape of
 //! the `cors:` block. Here we build a small static-action origin
 //! with the same shape so we don't need an external upstream and
 //! exercise the documented preflight contract:

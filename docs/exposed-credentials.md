@@ -78,4 +78,4 @@ Switch `action: block` once those response loops are wired up and the false-posi
 ## See also
 
 - [configuration.md](configuration.md#exposed_credentials) - schema reference.
-- `examples/77-exposed-credentials/` - runnable example.
+- `examples/exposed-credentials/` - runnable example.

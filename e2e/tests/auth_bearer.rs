@@ -1,7 +1,7 @@
 //! Bearer token authentication.
 //!
 //! Validates an opaque bearer token against an allowlist of configured
-//! tokens. Matches the contract from `examples/21-auth-bearer/sb.yml`:
+//! tokens. Matches the contract from `examples/auth-bearer/sb.yml`:
 //! the token is read from `Authorization: Bearer <token>`; absent or
 //! unknown tokens yield a 401 before the upstream is contacted.
 

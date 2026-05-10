@@ -16,7 +16,7 @@ The multi-rail body is the wire-format contract. The OSS build can negotiate it,
 
 What the OSS build cannot do is settle a payment on x402, MPP, Stripe, or Lightning. Settlement code lives in the enterprise build behind the `stripe`, `x402`, `mpp`, `lightning-cln`, `lightning-lnd`, and `lightning-phoenixd` cargo features. With an OSS-only build, the rails advertised in the multi-rail body are honoured by the in-memory or HTTP ledger; the enterprise BillingRail registrations are what actually authorise a real-money settlement.
 
-This is the same framing the rail-Lightning example uses: see `examples/32-rail-lightning/README.md`. For the wire-shape contract on its own, see [`402-challenge.md`](402-challenge.md).
+This is the same framing the rail-Lightning example uses: see `examples/rail-lightning/README.md`. For the wire-shape contract on its own, see [`402-challenge.md`](402-challenge.md).
 
 ## Request flow
 
@@ -313,4 +313,4 @@ Exemplars on `sbproxy_ledger_redeem_duration_seconds_bucket` let Grafana jump fr
 - [configuration.md](configuration.md#ai_crawl_control) - schema reference.
 - [ai-gateway.md](ai-gateway.md) - how this policy interacts with `ai_proxy` upstreams.
 - [observability.md](observability.md) - metrics, logs, traces, dashboards.
-- `examples/95-ai-crawl-control/` - runnable example.
+- `examples/ai-crawl-control/` - runnable example.

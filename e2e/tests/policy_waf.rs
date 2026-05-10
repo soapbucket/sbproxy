@@ -1,6 +1,6 @@
 //! End-to-end coverage for the `waf` policy.
 //!
-//! Exercises the documented behaviour from `examples/31-waf/sb.yml`:
+//! Exercises the documented behaviour from `examples/waf/sb.yml`:
 //! the OWASP-lite ruleset blocks SQLi, XSS, and path-traversal
 //! patterns in the request URI when `owasp_crs.enabled: true`.
 //!

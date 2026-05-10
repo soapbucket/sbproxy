@@ -1,6 +1,6 @@
 //! End-to-end coverage for the response cache.
 //!
-//! `examples/03-response-caching/sb.yml` documents the basic TTL
+//! `examples/response-caching/sb.yml` documents the basic TTL
 //! cache. This file walks the documented behaviour and pins the
 //! `x-sbproxy-cache: HIT` header that the OSS pipeline emits when
 //! it replays a cached response.

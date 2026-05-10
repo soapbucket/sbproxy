@@ -288,10 +288,10 @@ curl http://localhost:9091/readyz
 
 ## Reference Compose stack
 
-`examples/00-observability-stack/` boots Prometheus, Grafana, Tempo, Loki, and an OTel Collector with one command:
+`examples/observability-stack/` boots Prometheus, Grafana, Tempo, Loki, and an OTel Collector with one command:
 
 ```bash
-cd examples/00-observability-stack
+cd examples/observability-stack
 docker compose up -d
 ```
 
@@ -319,4 +319,4 @@ The OTLP endpoint targets the OTel Collector (host port 4327, mapped to the cont
 - [ai-crawl-control.md](ai-crawl-control.md) - per-agent observability for the Pay Per Crawl policy.
 - `deploy/dashboards/` - Grafana JSON for the Wave 1 panels.
 - `deploy/alerts/` - PromQL recording and alerting rules.
-- `examples/00-observability-stack/` - the reference Compose stack.
+- `examples/observability-stack/` - the reference Compose stack.

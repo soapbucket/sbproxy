@@ -1,6 +1,6 @@
 //! End-to-end coverage for the `expression` policy (CEL-based gating).
 //!
-//! Exercises the documented behaviour from `examples/35-cel-policy/sb.yml`:
+//! Exercises the documented behaviour from `examples/cel-policy/sb.yml`:
 //! the request is allowed only when the configured CEL expression
 //! evaluates to `true`. CEL header keys are normalized to lowercase,
 //! so `request.headers["x-role"]` reads the value of any incoming

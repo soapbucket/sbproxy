@@ -20,7 +20,7 @@
 #
 # Usage:
 #   scripts/examples-smoke.sh
-#   scripts/examples-smoke.sh examples/00-basic-proxy
+#   scripts/examples-smoke.sh examples/basic-proxy
 #   scripts/examples-smoke.sh --filter '01-*'
 #
 # Env knobs:

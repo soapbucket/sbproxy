@@ -2,7 +2,7 @@
 //!
 //! Confirms that the per-host `/.well-known/openapi.json` and
 //! `/.well-known/openapi.yaml` endpoints described in
-//! `examples/96-openapi-emission/sb.yml` actually emit a valid
+//! `examples/openapi-emission/sb.yml` actually emit a valid
 //! OpenAPI 3.0 document at runtime.
 
 use sbproxy_e2e::ProxyHarness;

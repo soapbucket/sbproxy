@@ -1,6 +1,6 @@
 //! End-to-end coverage for AI gateway budget enforcement.
 //!
-//! `examples/13-ai-budget/sb.yml` documents the contract: a budget
+//! `examples/ai-budget/sb.yml` documents the contract: a budget
 //! limit fires `block`, `log`, or `downgrade` actions when a scope
 //! key exceeds its `max_cost_usd` or `max_tokens` cap. Budget
 //! tracking lives in `sbproxy-ai/src/budget.rs`; the request path in

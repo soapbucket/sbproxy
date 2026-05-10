@@ -22,11 +22,11 @@ is checked in at `echo.wasm` for convenience; rebuild after editing
 
 ## Run via sbproxy
 
-See `examples/38-wasm-transform/sb.yml` for a complete config that
+See `examples/wasm-transform/sb.yml` for a complete config that
 loads this module and pipes a static HTML response through it.
 
 ```bash
-sbproxy serve -f examples/38-wasm-transform/sb.yml
+sbproxy serve -f examples/wasm-transform/sb.yml
 curl http://127.0.0.1:8080/
 # echoes whatever the upstream sends, transformed by the WASM module
 ```

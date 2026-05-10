@@ -68,7 +68,7 @@ action:
         healthy_threshold: 2
 ```
 
-See [`examples/90-resilience-stack/sb.yml`](../examples/90-resilience-stack/sb.yml).
+See [`examples/resilience-stack/sb.yml`](../examples/resilience-stack/sb.yml).
 
 ---
 
@@ -153,7 +153,7 @@ action:
     ipv6: true
 ```
 
-See [`examples/83-service-discovery/sb.yml`](../examples/83-service-discovery/sb.yml).
+See [`examples/service-discovery/sb.yml`](../examples/service-discovery/sb.yml).
 
 ---
 

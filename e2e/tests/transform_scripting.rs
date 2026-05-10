@@ -16,7 +16,7 @@ use sbproxy_e2e::{MockUpstream, ProxyHarness};
 
 #[test]
 fn lua_json_transform_modifies_json_via_modify_json_function() {
-    // Mirrors examples/49-transform-lua/sb.yml.
+    // Mirrors examples/transform-lua/sb.yml.
     let yaml = r#"
 proxy:
   http_bind_port: 0
@@ -112,7 +112,7 @@ origins:
 
 #[test]
 fn javascript_transform_runs_default_transform_function() {
-    // Mirrors examples/50-transform-javascript/sb.yml.
+    // Mirrors examples/transform-javascript/sb.yml.
     let yaml = r#"
 proxy:
   http_bind_port: 0

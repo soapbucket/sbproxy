@@ -1,6 +1,6 @@
 //! End-to-end coverage for the `ip_filter` policy.
 //!
-//! Exercises the documented behaviour from `examples/30-ip-filter/sb.yml`.
+//! Exercises the documented behaviour from `examples/ip-filter/sb.yml`.
 //! Tests run from 127.0.0.1, so we use `proxy.trusted_proxies: [127.0.0.1/32]`
 //! plus an `X-Forwarded-For` header to simulate a real client IP. The
 //! proxy treats 127.0.0.1 as a trusted hop and uses the leftmost

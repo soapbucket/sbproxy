@@ -1300,7 +1300,7 @@ policies:
 
 The proxy buffers the request body locally until validation completes, then either releases it as one chunk to the upstream or aborts with the configured rejection. Remote `$ref` resolution in schemas is disabled at the workspace level so a malicious schema cannot become an SSRF primitive. The rejection body never echoes the offending payload back to the caller, only the JSON path where validation failed.
 
-See [example 81](../examples/81-request-validator/sb.yml).
+See [example 81](../examples/request-validator/sb.yml).
 
 ### openapi_validation
 
@@ -1341,7 +1341,7 @@ policies:
 
 OpenAPI path templates compile to anchored regexes at startup; per-operation schemas compile once. The rejection body lists only the offending JSON pointer, not the value itself, to keep the surface area an attacker can probe small.
 
-See [example 97](../examples/97-openapi-validation/sb.yml).
+See [example 97](../examples/openapi-validation/sb.yml).
 
 ### concurrent_limit
 
@@ -1365,7 +1365,7 @@ policies:
 
 Each accepted request takes a permit; the permit is released when the request finishes (success, error, or client disconnect). Counters use a sharded `DashMap` so contention across keys is bounded.
 
-See [example 82](../examples/82-concurrent-limit/sb.yml).
+See [example 82](../examples/concurrent-limit/sb.yml).
 
 ### ai_crawl_control
 
@@ -2634,7 +2634,7 @@ The proxy then sets the standard forwarding headers on every upstream request:
 | `Forwarded` (RFC 7239) | `for=<client>; proto=<scheme>; host=<orig>; by=<proxy>` (IPv6 bracketed per RFC) | `disable_forwarded_header` |
 | `Via` | appended `1.1 sbproxy` | `disable_via_header` |
 
-All flags live on the action (or per-target on a load balancer). Default is enabled (no flag set). See [example 73](../examples/73-trusted-proxies/sb.yml) and [example 74](../examples/74-forwarding-headers/sb.yml).
+All flags live on the action (or per-target on a load balancer). Default is enabled (no flag set). See [example 73](../examples/trusted-proxies/sb.yml) and [example 74](../examples/forwarding-headers/sb.yml).
 
 ---
 
@@ -2664,7 +2664,7 @@ origins:
 
 Mirror requests carry `X-Sbproxy-Mirror: 1` and the original `X-Sbproxy-Request-Id` so the shadow upstream can distinguish them from real traffic. Method, path/query, and headers are mirrored; body teeing is not yet supported (sufficient for read endpoints; POST bodies are not replayed in this cut). Hop-by-hop headers and `Host` are not forwarded, `reqwest` rebuilds `Host` from the mirror URL.
 
-See [example 75](../examples/75-request-mirror/sb.yml).
+See [example 75](../examples/request-mirror/sb.yml).
 
 ---
 
@@ -2694,7 +2694,7 @@ origins:
 
 `retry` is accepted on both `proxy` and `load_balancer` actions. For `load_balancer`, a failed target is reported to the outlier detector and circuit breaker so the next retry attempt selects a different healthy peer rather than retrying the same dead target.
 
-See [example 76](../examples/76-upstream-retries/sb.yml).
+See [example 76](../examples/upstream-retries/sb.yml).
 
 ---
 
@@ -2726,7 +2726,7 @@ action:
 | `unhealthy_threshold` | int | `3` | Consecutive failures required to mark unhealthy. |
 | `healthy_threshold` | int | `2` | Consecutive successes required to recover. |
 
-IPv6 targets are supported: the URL builder preserves bracketing. See [example 77](../examples/77-active-health-checks/sb.yml).
+IPv6 targets are supported: the URL builder preserves bracketing. See [example 77](../examples/active-health-checks/sb.yml).
 
 ---
 
@@ -2761,7 +2761,7 @@ The breaker is **complementary to** [outlier detection](#outlier-detection):
 
 Either signal independently ejects a target from `select_target`. Configure both for robust resilience: outlier detection catches "this target is bad in aggregate," the breaker catches "this target is hard down right now." When every target is tripped, the LB falls back to the unfiltered list rather than 502'ing the client.
 
-See [example 84](../examples/84-circuit-breaker/sb.yml).
+See [example 84](../examples/circuit-breaker/sb.yml).
 
 ---
 
@@ -2789,7 +2789,7 @@ action:
 | `min_requests` | int | `5` | Minimum requests in the window before ejection is considered. |
 | `ejection_duration_secs` | int | `30` | How long to keep an ejected target out of rotation. |
 
-When all active targets are ejected, the proxy falls back to the unfiltered list rather than 502'ing the client (better to send to a flaky peer than to fail closed). See [example 78](../examples/78-outlier-detection/sb.yml).
+When all active targets are ejected, the proxy falls back to the unfiltered list rather than 502'ing the client (better to send to a flaky peer than to fail closed). See [example 78](../examples/outlier-detection/sb.yml).
 
 ---
 
@@ -2821,7 +2821,7 @@ The hostname stays as the SNI / `Host` header so TLS verification continues to m
 
 When DNS resolution fails (network glitch, hostname temporarily NXDOMAIN), the proxy falls back to letting Pingora's connect-time resolver handle the lookup.
 
-See [example 83](../examples/83-service-discovery/sb.yml).
+See [example 83](../examples/service-discovery/sb.yml).
 
 ---
 
@@ -2852,7 +2852,7 @@ The same value is exposed as `ctx.request_id` to every other component: webhook 
 
 Inbound values longer than 256 characters are ignored (the proxy generates a fresh ID). Empty / whitespace-only inbound values are ignored.
 
-See [example 80](../examples/80-correlation-id/sb.yml).
+See [example 80](../examples/correlation-id/sb.yml).
 
 ---
 
@@ -2889,7 +2889,7 @@ After a successful handshake, the proxy strips any inbound `X-Client-Cert-*` hea
 
 CN and SAN are extracted by a wrapping `ClientCertVerifier` that captures them at handshake time and indexes by SHA-256 of the cert DER (which matches Pingora's internal `cert_digest`). Chain validation is unchanged. The cache is bounded so a churning client population does not grow it without bound.
 
-See [example 85](../examples/85-mtls-client-auth/sb.yml).
+See [example 85](../examples/mtls-client-auth/sb.yml).
 
 ---
 
@@ -2952,7 +2952,7 @@ The signed material is `"<timestamp>.<body>"`. Receivers should:
 2. Compute `HMAC-SHA256(secret, timestamp + "." + raw_body)`.
 3. Compare to `X-Sbproxy-Signature` (`v1=<hex>`) using a constant-time comparison.
 
-The same `secret` field is accepted on alert webhook channels (`proxy.alerting.channels[]`). See [example 79](../examples/79-webhook-signing/sb.yml).
+The same `secret` field is accepted on alert webhook channels (`proxy.alerting.channels[]`). See [example 79](../examples/webhook-signing/sb.yml).
 
 ---
 

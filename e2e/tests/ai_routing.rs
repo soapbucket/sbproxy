@@ -1,7 +1,7 @@
 //! End-to-end coverage for AI gateway routing strategies.
 //!
-//! `examples/17-ai-routing-fallback/sb.yml` documents
-//! `fallback_chain`, `examples/18-ai-cost-optimized/sb.yml`
+//! `examples/ai-routing-fallback/sb.yml` documents
+//! `fallback_chain`, `examples/ai-cost-optimized/sb.yml`
 //! documents `cost_optimized`, and the `weighted` strategy is tested
 //! at the unit level in `crates/sbproxy-ai/src/routing.rs`. Pinning
 //! these end-to-end requires:

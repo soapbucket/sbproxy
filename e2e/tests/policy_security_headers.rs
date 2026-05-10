@@ -1,7 +1,7 @@
 //! End-to-end coverage for the `security_headers` policy.
 //!
 //! Exercises the documented behaviour from
-//! `examples/33-security-headers/sb.yml`:
+//! `examples/security-headers/sb.yml`:
 //!
 //! - Configured headers (HSTS, X-Frame-Options, ...) appear on every
 //!   response.
