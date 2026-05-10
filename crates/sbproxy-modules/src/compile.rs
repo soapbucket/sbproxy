@@ -18,7 +18,8 @@ use crate::auth::{
 };
 use crate::policy::{
     AssertionPolicy, CsrfPolicy, DdosPolicy, ExpressionPolicy, IpFilterPolicy, Policy,
-    RateLimitPolicy, RequestLimitPolicy, SecHeadersPolicy, SriPolicy, WafPolicy,
+    RateLimitPolicy, RequestLimitPolicy, SecHeadersPolicy, SemanticConstraintPolicy, SriPolicy,
+    WafPolicy,
 };
 use crate::transform::{
     BoilerplateTransform, CelScriptTransform, CitationBlockTransform, CssTransform,
@@ -172,6 +173,14 @@ pub fn compile_policy(config: &serde_json::Value) -> Result<Policy> {
         "a2a" => Ok(Policy::A2A(crate::policy::a2a::A2APolicy::from_config(
             config.clone(),
         )?)),
+        // WOR-203 PR 3b: NL-as-a-policy. The policy module wraps a
+        // configured `JudgeClient` and routes each request through
+        // the configured prompt template. See
+        // `policy/semantic_constraint.rs` and
+        // `docs/adr-policy-compilation.md`.
+        "semantic_constraint" => Ok(Policy::SemanticConstraint(
+            SemanticConstraintPolicy::from_config(config.clone())?,
+        )),
         _ => anyhow::bail!("unknown policy type: {}", type_name),
     }
 }

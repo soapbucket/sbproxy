@@ -1,0 +1,39 @@
+# semantic_constraint policy (WOR-203 PR 3b).
+#
+# Routes every request through the configured LLM-as-judge backend
+# and maps the verdict to allow / deny. The prompt template is
+# rendered against the request envelope (`request.method`,
+# `request.path`, `request.host`, `request.query`) before the call.
+# See docs/policy.md for the full config surface and the OSS vs
+# enterprise capability boundary.
+#
+# This example uses a local placeholder endpoint; in production the
+# endpoint points at the operator's chosen frontier or in-VPC judge
+# provider. The bearer token is read from the environment variable
+# named in `api_key_env` (BYOK).
+#
+# Run:
+#   make run CONFIG=examples/semantic-constraint/sb.yml
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "test.sbproxy.dev":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    policies:
+      - type: semantic_constraint
+        prompt_template: |
+          Return verdict=allow when the request looks like routine
+          API traffic; return verdict=deny when the request path
+          indicates a sensitive admin route. Request: {{ request.method }} {{ request.path }}
+        violations_block: true
+        judge:
+          endpoint: http://127.0.0.1:9999/judge
+          api_key_env: SBPROXY_JUDGE_API_KEY
+          timeout_ms: 2000
+          cache_capacity: 1000
+          budget_tokens: 100000

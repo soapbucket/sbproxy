@@ -27,6 +27,9 @@ pub mod exposed_creds;
 pub mod expression;
 pub mod http_framing;
 pub mod ip_filter;
+/// Natural-language to Cedar policy compiler (WOR-203 PR 3b;
+/// see `adr-policy-compilation.md` NLC pillar B).
+pub mod nl_compiler;
 /// Natural-language policy constraint linter (WOR-203 PR 3a;
 /// see `adr-policy-compilation.md` NLC pillar A).
 pub mod nl_linter;
@@ -38,6 +41,9 @@ pub mod rate_limit;
 pub mod request_limit;
 pub mod request_validator;
 pub mod sec_headers;
+/// `semantic_constraint` policy module (WOR-203 PR 3b; see
+/// `adr-policy-compilation.md` and `adr-judge-trait.md`).
+pub mod semantic_constraint;
 pub mod sharded_limiter;
 pub mod sri;
 pub mod threat_protection;
@@ -72,6 +78,7 @@ pub use exposed_creds::{ExposedCredsAction, ExposedCredsPolicy, ExposedCredsResu
 pub use expression::{ExpressionPolicy, ExpressionViews};
 pub use http_framing::{FramingViolation, HttpFramingPolicy};
 pub use ip_filter::IpFilterPolicy;
+pub use nl_compiler::{NlCompileError, NlCompiler};
 pub use nl_linter::{CharRange, LintViolation, NlLinter, WorkspaceSchema};
 pub use openapi_validation::{
     OpenApiValidationMode, OpenApiValidationPolicy, ValidationResult as OpenApiValidationResult,
@@ -94,6 +101,7 @@ pub use sec_headers::{
     generate_csp_nonce, ContentSecurityPolicy, ContentSecurityPolicySpec, SecHeadersPolicy,
     SecurityHeader,
 };
+pub use semantic_constraint::{JudgeWiring, SemanticConstraintConfig, SemanticConstraintPolicy};
 pub use sri::{SriCheckResult, SriPolicy, SriViolation, SriViolationReason};
 pub use threat_protection::{JsonThreatConfig, ThreatProtection};
 pub use waf::{
@@ -180,6 +188,12 @@ pub enum Policy {
     /// denylist. Evaluation reads `RequestContext.a2a` populated by
     /// the request filter.
     A2A(a2a::A2APolicy),
+    /// `semantic_constraint` policy (WOR-203 PR 3b): runs the
+    /// configured prompt template against the
+    /// [`JudgeClient`](sbproxy_ai::judge::JudgeClient) on every
+    /// request and maps the verdict to a
+    /// [`PolicyDecision`](sbproxy_plugin::PolicyDecision).
+    SemanticConstraint(SemanticConstraintPolicy),
     /// Third-party plugin (only case using dynamic dispatch).
     Plugin(Box<dyn PolicyEnforcer>),
 }
@@ -210,6 +224,7 @@ impl Policy {
             #[cfg(feature = "agent-class")]
             Self::AgentClass(_) => "agent_class",
             Self::A2A(_) => "a2a",
+            Self::SemanticConstraint(_) => "semantic_constraint",
             Self::Plugin(p) => p.policy_type(),
         }
     }
@@ -240,6 +255,7 @@ impl std::fmt::Debug for Policy {
             #[cfg(feature = "agent-class")]
             Self::AgentClass(r) => f.debug_tuple("AgentClass").field(r).finish(),
             Self::A2A(r) => f.debug_tuple("A2A").field(r).finish(),
+            Self::SemanticConstraint(r) => f.debug_tuple("SemanticConstraint").field(r).finish(),
             Self::Plugin(_) => write!(f, "Plugin(...)"),
         }
     }
