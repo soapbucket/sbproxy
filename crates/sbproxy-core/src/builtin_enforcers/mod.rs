@@ -30,14 +30,26 @@
 //! today; that path was already trait-dispatched in PR 1b and is
 //! re-exposed here to keep the eventual cutover mechanical.
 
+pub mod a2a;
+#[cfg(feature = "agent-class")]
+pub mod agent_class;
+pub mod ai_crawl;
 pub mod csrf;
+pub mod dlp;
 pub mod exposed_creds;
 pub mod expression;
 pub mod ip_filter;
+pub mod prompt_injection_v2;
 mod registry;
 
+pub use a2a::A2AEnforcer;
+#[cfg(feature = "agent-class")]
+pub use agent_class::AgentClassEnforcer;
+pub use ai_crawl::AiCrawlEnforcer;
 pub use csrf::CsrfEnforcer;
+pub use dlp::DlpEnforcer;
 pub use exposed_creds::ExposedCredsEnforcer;
 pub use expression::ExpressionEnforcer;
 pub use ip_filter::IpFilterEnforcer;
+pub use prompt_injection_v2::PromptInjectionV2Enforcer;
 pub use registry::{compile_builtin_enforcers, BuiltinEnforcerError};

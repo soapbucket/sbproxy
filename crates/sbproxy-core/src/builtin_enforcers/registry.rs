@@ -35,7 +35,12 @@ use std::sync::Arc;
 use sbproxy_modules::policy::Policy;
 use sbproxy_plugin::PolicyEnforcer;
 
-use super::{CsrfEnforcer, ExposedCredsEnforcer, ExpressionEnforcer, IpFilterEnforcer};
+#[cfg(feature = "agent-class")]
+use super::AgentClassEnforcer;
+use super::{
+    A2AEnforcer, AiCrawlEnforcer, CsrfEnforcer, DlpEnforcer, ExposedCredsEnforcer,
+    ExpressionEnforcer, IpFilterEnforcer, PromptInjectionV2Enforcer,
+};
 
 /// Error returned by [`compile_builtin_enforcers`] when a
 /// `Policy` variant has not yet been ported to its newtype
@@ -124,21 +129,24 @@ fn compile_one(policy: Policy) -> Result<Box<dyn PolicyEnforcer>, BuiltinEnforce
         Policy::Waf(_) => Err(BuiltinEnforcerError::NotYetPorted("waf")),
         Policy::RequestValidator(_) => Err(BuiltinEnforcerError::NotYetPorted("request_validator")),
         Policy::ConcurrentLimit(_) => Err(BuiltinEnforcerError::NotYetPorted("concurrent_limit")),
-        Policy::AiCrawl(_) => Err(BuiltinEnforcerError::NotYetPorted("ai_crawl_control")),
+        // Ported in WOR-201 PR 1c.2 (AI/agent batch).
+        Policy::AiCrawl(p) => Ok(Box::new(AiCrawlEnforcer(Arc::new(p)))),
         // Ported in WOR-201 PR 1c.1 (auth-adjacent batch).
         Policy::ExposedCreds(p) => Ok(Box::new(ExposedCredsEnforcer(Arc::new(p)))),
         Policy::PageShield(_) => Err(BuiltinEnforcerError::NotYetPorted("page_shield")),
-        Policy::Dlp(_) => Err(BuiltinEnforcerError::NotYetPorted("dlp")),
+        // Ported in WOR-201 PR 1c.2 (AI/agent batch).
+        Policy::Dlp(p) => Ok(Box::new(DlpEnforcer(Arc::new(p)))),
         Policy::OpenApiValidation(_) => {
             Err(BuiltinEnforcerError::NotYetPorted("openapi_validation"))
         }
-        Policy::PromptInjectionV2(_) => {
-            Err(BuiltinEnforcerError::NotYetPorted("prompt_injection_v2"))
-        }
+        // Ported in WOR-201 PR 1c.2 (AI/agent batch).
+        Policy::PromptInjectionV2(p) => Ok(Box::new(PromptInjectionV2Enforcer(Arc::new(p)))),
         Policy::HttpFraming(_) => Err(BuiltinEnforcerError::NotYetPorted("http_framing")),
+        // Ported in WOR-201 PR 1c.2 (AI/agent batch).
         #[cfg(feature = "agent-class")]
-        Policy::AgentClass(_) => Err(BuiltinEnforcerError::NotYetPorted("agent_class")),
-        Policy::A2A(_) => Err(BuiltinEnforcerError::NotYetPorted("a2a")),
+        Policy::AgentClass(p) => Ok(Box::new(AgentClassEnforcer(Arc::new(p)))),
+        // Ported in WOR-201 PR 1c.2 (AI/agent batch).
+        Policy::A2A(p) => Ok(Box::new(A2AEnforcer(Arc::new(p)))),
         // semantic_constraint shipped in WOR-203 PR-3b after the
         // initial 1c.0 registry. Same pattern as the other built-ins:
         // returns NotYetPorted until a per-domain port replaces it.
@@ -276,15 +284,7 @@ mod tests {
                 ),
                 "concurrent_limit",
             ),
-            (
-                Policy::AiCrawl(
-                    sbproxy_modules::policy::AiCrawlControlPolicy::from_config(
-                        serde_json::json!({}),
-                    )
-                    .expect("ai_crawl default"),
-                ),
-                "ai_crawl_control",
-            ),
+            // AiCrawl, Dlp, PromptInjectionV2 ported in WOR-201 PR 1c.2.
             (
                 Policy::PageShield(
                     PageShieldPolicy::from_config(
@@ -293,13 +293,6 @@ mod tests {
                     .expect("page_shield default"),
                 ),
                 "page_shield",
-            ),
-            (
-                Policy::Dlp(
-                    sbproxy_modules::policy::DlpPolicy::from_config(serde_json::json!({}))
-                        .expect("dlp default"),
-                ),
-                "dlp",
             ),
             (
                 Policy::OpenApiValidation(
@@ -311,42 +304,14 @@ mod tests {
                 "openapi_validation",
             ),
             (
-                Policy::PromptInjectionV2(
-                    sbproxy_modules::policy::PromptInjectionV2Policy::from_config(
-                        serde_json::json!({}),
-                    )
-                    .expect("prompt_injection_v2 default"),
-                ),
-                "prompt_injection_v2",
-            ),
-            (
                 Policy::HttpFraming(
                     sbproxy_modules::policy::HttpFramingPolicy::from_config(serde_json::json!({}))
                         .expect("http_framing default"),
                 ),
                 "http_framing",
             ),
-            (
-                Policy::A2A(
-                    sbproxy_modules::policy::A2APolicy::from_config(serde_json::json!({}))
-                        .expect("a2a default"),
-                ),
-                "a2a",
-            ),
+            // A2A and AgentClass ported in WOR-201 PR 1c.2.
         ];
-
-        #[cfg(feature = "agent-class")]
-        {
-            v.push((
-                Policy::AgentClass(
-                    sbproxy_modules::policy::agent_class::AgentClassPolicy::from_config(
-                        serde_json::json!({}),
-                    )
-                    .expect("agent_class default"),
-                ),
-                "agent_class",
-            ));
-        }
 
         v
     }
@@ -429,6 +394,65 @@ mod tests {
                 compile_one(policy).expect("auth-adjacent ported variant compiles to Ok");
             assert_eq!(enforcer.policy_type(), expected_label);
         }
+    }
+
+    /// WOR-201 PR 1c.2: the AI/agent variants now compile to
+    /// `Ok(...)` instead of `NotYetPorted`. Mirrors the
+    /// auth-adjacent test above. AgentClass is cfg-gated on the
+    /// `agent-class` feature; covered separately below.
+    #[test]
+    fn ai_agent_variants_compile_to_ok() {
+        let cases: Vec<(Policy, &'static str)> = vec![
+            (
+                Policy::AiCrawl(
+                    sbproxy_modules::policy::AiCrawlControlPolicy::from_config(serde_json::json!(
+                        {}
+                    ))
+                    .expect("ai_crawl default"),
+                ),
+                "ai_crawl_control",
+            ),
+            (
+                Policy::PromptInjectionV2(
+                    sbproxy_modules::policy::PromptInjectionV2Policy::from_config(
+                        serde_json::json!({}),
+                    )
+                    .expect("prompt_injection_v2 default"),
+                ),
+                "prompt_injection_v2",
+            ),
+            (
+                Policy::Dlp(
+                    sbproxy_modules::policy::DlpPolicy::from_config(serde_json::json!({}))
+                        .expect("dlp default"),
+                ),
+                "dlp",
+            ),
+            (
+                Policy::A2A(
+                    sbproxy_modules::policy::A2APolicy::from_config(serde_json::json!({}))
+                        .expect("a2a default"),
+                ),
+                "a2a",
+            ),
+        ];
+        for (policy, expected_label) in cases {
+            let enforcer = compile_one(policy).expect("AI/agent ported variant compiles to Ok");
+            assert_eq!(enforcer.policy_type(), expected_label);
+        }
+    }
+
+    #[cfg(feature = "agent-class")]
+    #[test]
+    fn agent_class_variant_compiles_to_ok() {
+        let policy = Policy::AgentClass(
+            sbproxy_modules::policy::agent_class::AgentClassPolicy::from_config(serde_json::json!(
+                {}
+            ))
+            .expect("agent_class default"),
+        );
+        let enforcer = compile_one(policy).expect("agent_class compiles to Ok");
+        assert_eq!(enforcer.policy_type(), "agent_class");
     }
 
     /// `compile_builtin_enforcers` itself just maps over the
