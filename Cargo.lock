@@ -6044,11 +6044,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "chrono",
  "compact_str",
  "http",
  "inventory",
  "serde_json",
  "tokio",
+ "url",
 ]
 
 [[package]]

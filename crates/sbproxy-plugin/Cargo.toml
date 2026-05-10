@@ -12,6 +12,13 @@ anyhow = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
 compact_str = { workspace = true }
+# `url` is the type behind `PolicyDecision::Confirm::webhook_url`
+# (added per docs/adr-policy-verdict-shape.md, WOR-147 / WOR-201
+# Phase 0). `chrono` is the type behind `expires_at`; the `serde`
+# feature is on so the audit-event work in WOR-201 PR 1c can
+# (de)serialise the timestamp without a second feature bump.
+url = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
