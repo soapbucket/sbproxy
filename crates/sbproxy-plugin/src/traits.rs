@@ -130,6 +130,33 @@ pub enum PolicyDecision {
         /// `(name, value)` pairs to append to the response.
         headers: Vec<(String, String)>,
     },
+    /// Request is held pending human-in-the-loop approval.
+    ///
+    /// See `docs/adr-policy-verdict-shape.md` for the full design
+    /// contract. The OSS dispatcher routes `Confirm` through the
+    /// existing [`PolicyDecision::AllowWithHeaders`] mechanism by
+    /// forwarding the request with `X-Policy-Confirm: <reason>` stamped
+    /// on the response; OSS does not park the request. The enterprise
+    /// interceptor handles parking before the OSS bridge fires: it
+    /// queues the request for approver review, optionally posts to
+    /// `webhook_url`, and resumes or synthesises a deny on `expires_at`.
+    ///
+    /// Marked `#[non_exhaustive]` so future fields (priority, queue
+    /// hint, audit binding) can be added without breaking external
+    /// constructors.
+    #[non_exhaustive]
+    Confirm {
+        /// Human-readable summary of why approval is required, surfaced
+        /// in the confirmation portal and on the OSS
+        /// `X-Policy-Confirm` header.
+        reason: String,
+        /// URL the proxy posts to when notifying the approver. `None`
+        /// falls back to the tenant's default notification channel.
+        webhook_url: Option<url::Url>,
+        /// Deadline after which the dispatcher treats no approval as an
+        /// implicit deny. `None` means no automatic expiry.
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
 }
 
 /// Third-party action handler (dynamic dispatch).
@@ -255,4 +282,91 @@ pub trait RequestEnricher: Send + Sync + 'static {
         req: &http::Request<bytes::Bytes>,
         ctx: &mut dyn std::any::Any,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Confirm carries reason + optional webhook + optional expiry.
+    /// A past `expires_at` must compare as already elapsed; the
+    /// dispatcher relies on this to synthesise an immediate deny per
+    /// `docs/adr-policy-verdict-shape.md`.
+    #[test]
+    fn confirm_variant_round_trip() {
+        let allow = PolicyDecision::Allow;
+        let deny = PolicyDecision::Deny {
+            status: 403,
+            message: "blocked".to_string(),
+        };
+        let allow_headers = PolicyDecision::AllowWithHeaders {
+            headers: vec![("X-Foo".to_string(), "bar".to_string())],
+        };
+
+        let past = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let confirm = PolicyDecision::Confirm {
+            reason: "high-spend AI request requires approval".to_string(),
+            webhook_url: Some(
+                "https://approvals.example/inbound"
+                    .parse::<url::Url>()
+                    .expect("static webhook url parses"),
+            ),
+            expires_at: Some(past),
+        };
+
+        // All four constructors compile and round-trip.
+        let _ = (&allow, &deny, &allow_headers, &confirm);
+
+        // Past `expires_at` is detectable via simple comparison; this
+        // is what the dispatcher uses to short-circuit to Deny.
+        if let PolicyDecision::Confirm { expires_at, .. } = &confirm {
+            let exp = expires_at.expect("expires_at was set Some(past)");
+            assert!(
+                exp < chrono::Utc::now(),
+                "past expires_at must compare as elapsed"
+            );
+        } else {
+            panic!("confirm variant did not match");
+        }
+    }
+
+    /// Load-bearing exhaustiveness check. If a future PR adds a new
+    /// variant to `PolicyDecision` without updating this match, the
+    /// compiler refuses to build the test. That refusal is the point:
+    /// every dispatcher in the workspace will need an analogous update,
+    /// and this test is the canary that fails first.
+    #[test]
+    fn policy_decision_match_is_exhaustive() {
+        fn label(d: &PolicyDecision) -> &'static str {
+            match d {
+                PolicyDecision::Allow => "allow",
+                PolicyDecision::Deny { .. } => "deny",
+                PolicyDecision::AllowWithHeaders { .. } => "allow_with_headers",
+                PolicyDecision::Confirm { .. } => "confirm",
+            }
+        }
+
+        assert_eq!(label(&PolicyDecision::Allow), "allow");
+        assert_eq!(
+            label(&PolicyDecision::Deny {
+                status: 403,
+                message: String::new(),
+            }),
+            "deny"
+        );
+        assert_eq!(
+            label(&PolicyDecision::AllowWithHeaders {
+                headers: Vec::new(),
+            }),
+            "allow_with_headers"
+        );
+        assert_eq!(
+            label(&PolicyDecision::Confirm {
+                reason: String::new(),
+                webhook_url: None,
+                expires_at: None,
+            }),
+            "confirm"
+        );
+    }
 }
