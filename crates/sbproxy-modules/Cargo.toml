@@ -108,6 +108,9 @@ hmac.workspace = true
 ed25519-dalek = "2"
 # ULID for ledger Idempotency-Key + envelope request_id (G1.3).
 ulid.workspace = true
+# UUID for the CompiledPolicy identifiers in the NL policy compiler
+# pipeline (WOR-203 PR 3a).
+uuid = { workspace = true }
 # Strongly typed LedgerError variants (G1.3).
 thiserror.workspace = true
 parking_lot.workspace = true

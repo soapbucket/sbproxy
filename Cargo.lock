@@ -5962,6 +5962,7 @@ dependencies = [
  "tracing",
  "ulid",
  "url",
+ "uuid",
  "yaml_serde",
  "zip",
 ]

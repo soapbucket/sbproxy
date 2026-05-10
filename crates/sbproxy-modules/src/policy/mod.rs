@@ -16,6 +16,9 @@ pub mod ai_crawl;
 pub mod aipref;
 pub mod assertion;
 pub mod bot_detection;
+/// In-memory store of pinned NL-to-Cedar compiled policies
+/// (WOR-203 PR 3a; see `adr-policy-compilation.md` NLC pillar C).
+pub mod compiled_policy_store;
 pub mod concurrent_limit;
 pub mod csrf;
 pub mod ddos;
@@ -24,6 +27,9 @@ pub mod exposed_creds;
 pub mod expression;
 pub mod http_framing;
 pub mod ip_filter;
+/// Natural-language policy constraint linter (WOR-203 PR 3a;
+/// see `adr-policy-compilation.md` NLC pillar A).
+pub mod nl_linter;
 pub mod openapi_validation;
 pub mod page_shield;
 pub mod prompt_injection_v2;
@@ -57,6 +63,7 @@ pub use ai_crawl::{HttpLedger, HttpLedgerConfig};
 pub use aipref::{parse_aipref, AiprefParseError, AiprefSignal};
 pub use assertion::AssertionPolicy;
 pub use bot_detection::BotDetection;
+pub use compiled_policy_store::{CompiledPolicy, CompiledPolicyStore};
 pub use concurrent_limit::{ConcurrentLimitGuard, ConcurrentLimitPolicy};
 pub use csrf::CsrfPolicy;
 pub use ddos::{DdosCheckResult, DdosPolicy};
@@ -65,6 +72,7 @@ pub use exposed_creds::{ExposedCredsAction, ExposedCredsPolicy, ExposedCredsResu
 pub use expression::{ExpressionPolicy, ExpressionViews};
 pub use http_framing::{FramingViolation, HttpFramingPolicy};
 pub use ip_filter::IpFilterPolicy;
+pub use nl_linter::{CharRange, LintViolation, NlLinter, WorkspaceSchema};
 pub use openapi_validation::{
     OpenApiValidationMode, OpenApiValidationPolicy, ValidationResult as OpenApiValidationResult,
 };
