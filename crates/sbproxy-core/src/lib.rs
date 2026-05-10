@@ -16,6 +16,15 @@ pub mod admin;
 /// and the per-request context. Feature-gated by `agent-class` (G1.4).
 #[cfg(feature = "agent-class")]
 pub mod agent_class;
+/// WOR-201 PR 1c.0: empty-shell registry for built-in policy
+/// enforcer wrappers.
+///
+/// Holds the eventual single dispatch point that the per-policy
+/// ports (1c.1 / 1c.2 / 1c.3) will populate. Today every
+/// built-in arm returns `BuiltinEnforcerError::NotYetPorted`; the
+/// `check_policies` enum-arm dispatch in `server.rs` is unchanged.
+/// See `docs/adr-policy-engine-unification.md`.
+pub mod builtin_enforcers;
 pub mod context;
 pub mod dispatch;
 pub mod hook_registry;

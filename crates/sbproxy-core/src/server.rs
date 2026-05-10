@@ -2257,6 +2257,22 @@ fn resolve_addr_override(over: &str, default_port: u16) -> String {
     format!("{}:{}", trimmed, default_port)
 }
 
+/// WOR-201 PR 1c.0: read the effective policy-type label that
+/// the response handler should use to choose its response shape.
+///
+/// Prefers [`RequestContext::deny_policy_type`] when the
+/// dispatcher (or a ported enforcer wrapper) set it; falls back
+/// to the macro-supplied `fallback` label otherwise. The
+/// fallback preserves byte-identical behaviour today because the
+/// PR-1c.0 dispatcher does not yet populate `deny_policy_type`
+/// for built-in policies. Once all 21 built-ins are ported in
+/// 1c.1 / 1c.2 / 1c.3 the macro arg goes away and this helper
+/// reads only from the context slot.
+#[inline]
+fn effective_policy_type(ctx: &RequestContext, fallback: &'static str) -> &'static str {
+    ctx.deny_policy_type.unwrap_or(fallback)
+}
+
 /// Run all policies for an origin. Returns Allow or Deny with status/message.
 ///
 /// Async because rate-limit policies with an attached L2 (Redis) store must
@@ -6504,6 +6520,35 @@ impl ProxyHttp for SbProxy {
             }
         }
 
+        // --- WOR-201 PR 1c.0: precompute tls_terminated on the request context ---
+        //
+        // The CSRF policy already derives this signal locally in
+        // `check_policies` to decide whether to stamp `; Secure` on
+        // its cookie. The per-policy ports (1c.1 / 1c.2 / 1c.3)
+        // build wrapper enforcers that go through the
+        // [`sbproxy_plugin::PolicyEnforcer::enforce`] trait and
+        // receive only a request snapshot, so they cannot reach
+        // back to the live Pingora session for `ssl_digest`.
+        // Precompute the signal here so a wrapper can read it off
+        // `RequestContext::tls_terminated` without further work.
+        // Mirrors the existing CSRF derivation: either Pingora
+        // exposed an `ssl_digest` (the listener itself was TLS) or
+        // the trusted-proxy chain stamped `X-Forwarded-Proto:
+        // https`. The trust-boundary block above strips
+        // `x-forwarded-proto` from untrusted peers so this read is
+        // safe to perform unconditionally here.
+        ctx.tls_terminated = session
+            .digest()
+            .and_then(|d| d.ssl_digest.as_ref())
+            .is_some()
+            || session
+                .req_header()
+                .headers
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.eq_ignore_ascii_case("https"))
+                .unwrap_or(false);
+
         // Increment active connections gauge.
         metrics().active_connections.inc();
 
@@ -7914,6 +7959,13 @@ impl ProxyHttp for SbProxy {
                 ctx.rate_limit_info = rl_info;
             }
             PolicyResult::Deny(status, msg, rl_info, policy_type) => {
+                // WOR-201 PR 1c.0: prefer the per-request slot
+                // when the dispatcher (or a ported enforcer
+                // wrapper) populated it; fall back to the
+                // macro-supplied label so today's behaviour is
+                // unchanged. Once all 21 built-ins port to the
+                // wrapper path the macro arg drops out.
+                let policy_type = effective_policy_type(ctx, policy_type);
                 // The enforcing policy stamps its own stable label
                 // (`waf`, `ip_filter`, `prompt_injection`, ...) so
                 // dashboards and SIEM rules can break down by module
