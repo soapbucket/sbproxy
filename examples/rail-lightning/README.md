@@ -1,4 +1,4 @@
-# 32 - rail-lightning
+# Lightning Network billing rail (BOLT-12)
 *Last modified: 2026-05-07*
 
 Lightning rail in the `Accept-Payment` negotiation contract alongside

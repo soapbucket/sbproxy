@@ -1,4 +1,4 @@
-# 101 - Listing primitive
+# Listing primitive
 
 A minimal example of the repo-native `Listing` primitive (WOR-136).
 

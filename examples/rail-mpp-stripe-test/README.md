@@ -1,4 +1,4 @@
-# 31 - rail-mpp-stripe-test
+# Stripe MPP billing rail (test mode)
 *Last modified: 2026-05-02*
 
 Stripe MPP (Merchant Payment Protocol) paywall in front of a markdown

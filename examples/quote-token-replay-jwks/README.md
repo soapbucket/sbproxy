@@ -1,4 +1,4 @@
-# 33 - quote-token-replay-jwks
+# Quote token JWKS verification with replay protection
 *Last modified: 2026-05-02*
 
 Demonstrates the quote-token JWKS endpoint, end-to-end JWS

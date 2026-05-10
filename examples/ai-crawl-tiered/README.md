@@ -1,4 +1,4 @@
-# 24 - AI Crawl Control with tiered pricing
+# AI Crawl Control with tiered pricing
 *Last modified: 2026-04-30*
 
 Demonstrates a three-tier paywall in front of an article-publishing

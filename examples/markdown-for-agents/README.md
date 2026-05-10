@@ -1,4 +1,4 @@
-# 17 - Markdown for agents
+# Markdown for agents
 *Last modified: 2026-05-02*
 
 Demonstrates the Wave 4 content negotiation surface end-to-end. A

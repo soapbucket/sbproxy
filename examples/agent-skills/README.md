@@ -1,4 +1,4 @@
-# 99 - Agent Skills v0.2.0
+# Agent Skills v0.2.0
 *Last modified: 2026-05-09*
 
 Demonstrates the Agent Skills v0.2.0 well-known projection. SBproxy

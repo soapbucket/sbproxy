@@ -1,4 +1,4 @@
-# 32 - multi-rail-accept-payment
+# Multi-rail 402 with Accept-Payment negotiation
 *Last modified: 2026-05-02*
 
 Both rails (x402 + MPP) configured at once. The example demonstrates

@@ -1,4 +1,4 @@
-# 30 - rail-x402-base-sepolia
+# x402 billing rail on Base Sepolia (USDC)
 *Last modified: 2026-05-02*
 
 x402 v2 paywall in front of an article origin, wired against a local

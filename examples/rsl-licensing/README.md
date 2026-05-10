@@ -1,4 +1,4 @@
-# 18 - RSL licensing
+# RSL licensing
 *Last modified: 2026-05-08*
 
 Demonstrates the Wave 4 policy-graph projections. A single

@@ -1,4 +1,4 @@
-# 19 - robots.txt + llms.txt projections
+# robots.txt + llms.txt projections
 *Last modified: 2026-05-02*
 
 Demonstrates the Wave 4 text-format policy-graph projections.
