@@ -24,6 +24,7 @@ pub mod hierarchical_budget;
 pub mod idempotency;
 pub mod identity;
 pub mod image;
+pub mod judge;
 pub mod key_scoping;
 pub mod model_alias;
 pub mod multimodal;
