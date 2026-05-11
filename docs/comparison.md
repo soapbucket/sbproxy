@@ -56,7 +56,7 @@ SBproxy reaches 200+ models: 43 native providers, including a native Anthropic t
 | Authentication | 7+ types (JWT, forward auth, digest, ...) | API key |
 | Scripting | CEL + Lua + WASM + JS | No |
 | Rate limiting | Built-in, distributed | Built-in |
-| Response caching | Built-in (memory, file, sled, redis) | 7 backends |
+| Response caching | Built-in (memory, file, memcached, redis) | 7 backends |
 | Guardrails | 7 built-in types (PII, injection, ...) | External integrations |
 | P99 proxy overhead | < 1 ms | 240-1200 ms |
 

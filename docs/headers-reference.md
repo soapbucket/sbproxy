@@ -69,16 +69,54 @@ for inter-stage signalling.
 | `x-sbproxy-auth-type` | Inserted by the auth phase for downstream policies; stripped before egress. |
 | `x-sbproxy-prefix-match` / `x-sbproxy-regex-path` / `x-sbproxy-shadow` / `x-sbproxy-tag` | Internal routing breadcrumbs; stripped before egress. |
 
+## Middleware helpers (RFC-shaped responses)
+
+Two helpers in `crates/sbproxy-middleware` produce response shapes that
+follow published RFCs. The helpers are library-level today: they are
+shipped in the binary and unit-tested, but the OSS request pipeline
+does not call them on its own. Plugin authors and out-of-tree
+middleware can invoke them directly. The audit calls out wiring them
+into the default error path as a follow-up.
+
+### `Proxy-Status` (RFC 9209)
+
+Source: `crates/sbproxy-middleware/src/proxy_status.rs`. The
+`build_proxy_status(status, error)` helper emits a structured
+`Proxy-Status` header value identifying the proxy (`sbproxy`), the
+received upstream status, and an optional short error token.
+
+```text
+Proxy-Status: sbproxy; received-status=502; error="connection_refused"
+```
+
+### `application/problem+json` (RFC 9457)
+
+Source: `crates/sbproxy-middleware/src/problem_details.rs`. The
+`problem_details_json(status, title, detail, instance)` helper emits
+a JSON body shaped to the RFC 9457 problem details format. Callers
+that adopt it should set `Content-Type: application/problem+json`
+on the response.
+
+```json
+{
+  "type": "about:blank",
+  "title": "Not Found",
+  "status": 404,
+  "detail": "Origin not configured",
+  "instance": "/api/data"
+}
+```
+
 ## What you will NOT see
 
 The following names sometimes appear in older docs or marketing
 copy. They are not implemented and not on the v1.0 surface:
 
-- `x-sb-flags` — per-request feature-flag system documented in
+- `x-sb-flags`: per-request feature-flag system documented in
   `docs/manual.md` §10. Tracked in [WOR-114](https://linear.app/12345r/issue/WOR-114).
-- `x-sbproxy-debug` — there is no debug header. Set `RUST_LOG=debug`
+- `x-sbproxy-debug`: there is no debug header. Set `RUST_LOG=debug`
   on the proxy process for verbose logs.
-- Any header beginning with `x-sb-debug-*` — same.
+- Any header beginning with `x-sb-debug-*`: same.
 
 ## Verifying live
 

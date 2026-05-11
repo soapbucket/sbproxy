@@ -599,6 +599,79 @@ action:
 
 When `retry_on_failure` is true, a failed validation triggers a retry with the schema injected into the system prompt via `build_schema_instruction`. `extract_json` strips ` ```json ` and ` ``` ` fences before parsing, so models that wrap output in markdown still validate. Validation is structural: required-field presence and per-property type checks (`string`, `number`, `integer`, `boolean`, `array`, `object`, `null`). Full JSON Schema features such as `$ref` and `oneOf` are not implemented.
 
+The validator and the schema-instruction builder are live functions; the wiring that calls them on every chat response is a runtime construct rather than a top-level YAML field. The YAML block above is the shape that ships when a runtime caller threads `StructuredOutputConfig` into the chat handler. Source: `crates/sbproxy-ai/src/structured_output.rs`.
+
+## OpenAI surface-area modules
+
+The `sbproxy-ai` crate ships shape definitions and lightweight handlers for the OpenAI surface beyond chat completions: assistants, threads, batch jobs, image generation, audio, fine-tuning, realtime sessions, and structured output. The shapes are stable and round-trip through `serde_json`; the chat-path router (`crates/sbproxy-ai/src/handler.rs:parse_ai_path` and `crates/sbproxy-ai/src/api_routes.rs:parse_endpoint`) recognises a subset (chat, embeddings, models, rerank, moderations, image generation, audio transcription, audio speech) and falls back to `Unknown` for the rest. The remaining shapes are present so plugin authors can build on top of them and so the action config surface is forward-compatible.
+
+The subsections below describe what each module contributes today.
+
+### `assistants`
+
+Shape definitions for the OpenAI Assistants API. `AssistantHandler::route_request(path, method)` classifies a request into one of: `CreateAssistant`, `ListAssistants`, `GetAssistant(id)`, `CreateThread`, `CreateMessage(thread_id)`, `CreateRun(thread_id)`, `GetRun(thread_id, run_id)`, or `Unknown`. The optional `/v1` prefix is stripped before matching. `AssistantConfig { enabled: bool }` is the on/off shape.
+
+```yaml
+action:
+  type: ai_proxy
+  providers: [...]
+  # Forward-compatible flag, recognised by the parser but not yet enforced.
+  assistants:
+    enabled: true
+```
+
+The router classifier is implemented; routing into the chat dispatcher is not yet wired in the OSS build. Use chat completions for assistant-style flows until the dispatcher lands. Source: `crates/sbproxy-ai/src/assistants.rs:AssistantHandler`.
+
+### `threads`
+
+In-memory `ThreadStore` for OpenAI-style threads and their messages. Stores `Thread { id, created_at, metadata }` and ordered `ThreadMessage { id, thread_id, role, content, created_at }`. The store is thread-safe (mutex-backed) and used by the assistants handler for local session continuity. There is no YAML field that selects a backing store today; the in-memory store is the only implementation. Source: `crates/sbproxy-ai/src/threads.rs:ThreadStore`.
+
+### `batch`
+
+`BatchJob` shape (id, status, created_at, completed_at, total_requests, completed_requests, failed_requests, metadata) plus a `BatchStore` trait with one implementation, `MemoryBatchStore`. Status lifecycle: `pending`, `in_progress`, `completed`, `failed`, `cancelled`. The store is wired by the runtime when a batch dispatcher is constructed; there is no top-level `batch:` YAML block. Source: `crates/sbproxy-ai/src/batch.rs`.
+
+### `image`
+
+Request and response shapes for image generation, edit, and variation. `ImageGenerationRequest { prompt, model, size, n }` and `ImageGenerationResponse { images: Vec<ImageData> }`, where each `ImageData` carries either a `url` or a base-64 `b64_json` payload depending on the provider's `response_format`. `/v1/images/generations` is routed by `api_routes.rs`; the per-call dispatch is built by the runtime. No dedicated YAML knobs. Source: `crates/sbproxy-ai/src/image.rs`.
+
+### `audio`
+
+Request and response shapes for audio transcription and speech synthesis. `TranscriptionRequest { file_url, model, language }`, `TranscriptionResponse { text, duration }`, and `SpeechRequest { input, model, voice }`. `/v1/audio/transcriptions` and `/v1/audio/speech` are recognised by `api_routes.rs`. No dedicated YAML knobs; the audio dispatcher reuses the top-level provider list and routing strategy. Source: `crates/sbproxy-ai/src/audio.rs`.
+
+### `finetune`
+
+Fine-tuning API classifier. `FinetuneHandler::route_request(path, method)` classifies into `CreateJob`, `ListJobs`, `GetJob(id)`, `CancelJob(id)`, `ListEvents(id)`, or `Unknown`, with the optional `/v1` prefix stripped. `FinetuneConfig { enabled: bool }` is the on/off shape.
+
+```yaml
+action:
+  type: ai_proxy
+  providers: [...]
+  # Forward-compatible flag, recognised by the parser but not yet enforced.
+  finetune:
+    enabled: true
+```
+
+Like `assistants`, the classifier is implemented; routing into the chat dispatcher is not yet wired in the OSS build. Source: `crates/sbproxy-ai/src/finetune.rs:FinetuneHandler`.
+
+### `realtime`
+
+Shape definitions and config for OpenAI's Realtime websocket API. `RealtimeConfig { enabled, model }` defaults to `enabled: false` and `model: "gpt-4o-realtime-preview"`. `RealtimeSession { session_id, model, created_at, status }` and `RealtimeEvent { event_type, data }` round-trip through serde. The `/v1/realtime` websocket path is recognised by the proxy but session bridging requires a runtime-level dispatcher; the config shape above is the YAML form that the dispatcher reads.
+
+```yaml
+action:
+  type: ai_proxy
+  providers: [...]
+  realtime:
+    enabled: true
+    model: gpt-4o-realtime-preview
+```
+
+Source: `crates/sbproxy-ai/src/realtime.rs`.
+
+### `structured_output`
+
+Already covered above under [Structured output](#structured-output). Shape and validator are live (`extract_json`, `validate_response`, `build_schema_instruction`); the wiring that runs the validator on every chat response is a runtime construct rather than a top-level YAML field. Source: `crates/sbproxy-ai/src/structured_output.rs`.
+
 ## Per-request attribution
 
 The gateway records provider, model, token counts, and estimated cost for every AI request and exposes them through Prometheus metrics (see below). Direct response headers for these fields are not emitted today.
