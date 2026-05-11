@@ -214,6 +214,44 @@ All metrics below are currently `stable`.
 
 ---
 
+#### `sbproxy_ai_surface_requests_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **stable** |
+| Description | Total AI gateway requests, partitioned by classified surface (chat completions, assistants, image generation, etc.). Additive sibling of `sbproxy_ai_requests_total`. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `surface` | Classified AI surface from `AiSurface::label()` | `chat_completions`, `assistants`, `threads`, `batches`, `fine_tuning`, `files`, `realtime`, `image_generation`, `image_edits`, `image_variations`, `audio_transcription`, `audio_speech`, `moderations`, `reranking`, `embeddings`, `models`, `unknown` |
+| `method` | Inbound HTTP method | `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD` |
+
+A `status` partition is reserved for a future phase that emits surface-aware billing events with the final response status.
+
+---
+
+#### `sbproxy_ai_surface_request_duration_seconds`
+
+| Property | Value |
+|---|---|
+| Type | Histogram |
+| Stability | **stable** |
+| Description | Per-surface request latency in seconds. Recorded via a Drop guard on every exit path of `handle_ai_proxy`, including early-return validation failures. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `surface` | Classified AI surface | (same value set as `sbproxy_ai_surface_requests_total`) |
+| `method` | Inbound HTTP method | `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD` |
+
+Buckets: `0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0`. Matches the bucket schedule of the per-provider `sbproxy_ai_request_duration_seconds` for cross-cut dashboards.
+
+---
+
 #### `sbproxy_ai_tokens_total`
 
 | Property | Value |

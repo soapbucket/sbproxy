@@ -20,6 +20,45 @@ static AI_REQUESTS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Per-surface request counter, partitioned by AI surface (chat
+/// completions, assistants, embeddings, image generation, etc.) and
+/// HTTP method.
+///
+/// Additive with `sbproxy_ai_requests_total`; dashboards that
+/// aggregate by provider/model continue to use the original counter,
+/// while surface-aware views use this one. Cardinality is bounded by
+/// the closed `AiSurface::label()` set times the standard HTTP method
+/// set (~17 surfaces times ~7 methods). A `status` partition will be
+/// added in a later phase when per-surface billing events carry the
+/// final response status.
+static AI_SURFACE_REQUESTS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_surface_requests_total",
+            "AI gateway requests partitioned by classified surface"
+        ),
+        &["surface", "method"]
+    )
+    .unwrap()
+});
+
+/// Per-surface request latency in seconds.
+///
+/// Sibling of `AI_LATENCY` (which is per-provider). The two histograms
+/// share their bucket schedule so cross-cut dashboards can plot
+/// "surface vs provider" side by side without quantile mismatch.
+static AI_SURFACE_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        HistogramOpts::new(
+            "sbproxy_ai_surface_request_duration_seconds",
+            "AI request latency partitioned by classified surface"
+        )
+        .buckets(vec![0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
+        &["surface", "method"]
+    )
+    .unwrap()
+});
+
 static AI_TOKENS: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new("sbproxy_ai_tokens_total", "Tokens consumed"),
@@ -240,6 +279,58 @@ pub fn record_ai_request(
     }
 }
 
+/// Record a request against the per-surface counter.
+///
+/// Called once per AI request from `handle_ai_proxy` (in `sbproxy-core`)
+/// with the surface label from `classify_surface`. Separate from
+/// `record_ai_request` so adding the surface partition does not change
+/// the cardinality of the original counter that existing dashboards
+/// and alerts depend on.
+pub fn record_surface_request(surface: &str, method: &str) {
+    AI_SURFACE_REQUESTS
+        .with_label_values(&[surface, method])
+        .inc();
+}
+
+/// Record per-surface request latency in seconds.
+pub fn record_surface_latency(surface: &str, method: &str, duration_secs: f64) {
+    AI_SURFACE_LATENCY
+        .with_label_values(&[surface, method])
+        .observe(duration_secs);
+}
+
+/// RAII guard that records per-surface latency when it is dropped.
+///
+/// Created at the start of `handle_ai_proxy` (in `sbproxy-core`); its
+/// `Drop` impl observes the elapsed wall-clock time against
+/// `sbproxy_ai_surface_request_duration_seconds`. This guarantees a
+/// latency observation on every exit path, including early returns
+/// for validation failures and panic unwinding.
+pub struct AiSurfaceLatencyGuard {
+    surface: &'static str,
+    method: String,
+    started: std::time::Instant,
+}
+
+impl AiSurfaceLatencyGuard {
+    /// Open a latency guard. `surface` is the static label returned by
+    /// `AiSurface::label()`. `method` is the inbound HTTP method.
+    pub fn new(surface: &'static str, method: String) -> Self {
+        Self {
+            surface,
+            method,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for AiSurfaceLatencyGuard {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed().as_secs_f64();
+        record_surface_latency(self.surface, &self.method, elapsed);
+    }
+}
+
 /// Record a failover event.
 pub fn record_failover(from: &str, to: &str, reason: &str) {
     AI_FAILOVERS.with_label_values(&[from, to, reason]).inc();
@@ -322,6 +413,92 @@ mod tests {
             .iter()
             .find(|f| f.name() == "sbproxy_ai_requests_total");
         assert!(ai_req.is_some());
+    }
+
+    #[test]
+    fn test_record_surface_request() {
+        record_surface_request("assistants", "DELETE");
+        record_surface_request("image_generation", "POST");
+        record_surface_request("chat_completions", "POST");
+
+        let families = prometheus::gather();
+        let surface_req = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_surface_requests_total")
+            .expect("sbproxy_ai_surface_requests_total should be registered");
+
+        // Confirm the new label set is present.
+        let metrics = surface_req.get_metric();
+        let labels: Vec<&str> = metrics
+            .iter()
+            .flat_map(|m| m.get_label().iter().map(|l| l.name()))
+            .collect();
+        for required in &["surface", "method"] {
+            assert!(
+                labels.contains(required),
+                "expected label '{required}' on sbproxy_ai_surface_requests_total"
+            );
+        }
+    }
+
+    #[test]
+    fn test_record_surface_latency() {
+        record_surface_latency("chat_completions", "POST", 1.25);
+        record_surface_latency("realtime", "GET", 0.42);
+
+        let families = prometheus::gather();
+        let surface_lat = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_surface_request_duration_seconds")
+            .expect("sbproxy_ai_surface_request_duration_seconds should be registered");
+
+        // Sanity: at least one observation registered with non-zero count.
+        let total_count: u64 = surface_lat
+            .get_metric()
+            .iter()
+            .map(|m| m.get_histogram().get_sample_count())
+            .sum();
+        assert!(total_count >= 2, "expected at least 2 observations");
+    }
+
+    #[test]
+    fn ai_surface_latency_guard_records_on_drop() {
+        let before = surface_latency_sample_count("audio_speech", "POST");
+        {
+            let _guard = AiSurfaceLatencyGuard::new("audio_speech", "POST".to_string());
+            // Sleep briefly so the elapsed observation is non-zero.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let after = surface_latency_sample_count("audio_speech", "POST");
+        assert_eq!(
+            after,
+            before + 1,
+            "dropping the guard should observe exactly one latency sample"
+        );
+    }
+
+    fn surface_latency_sample_count(surface: &str, method: &str) -> u64 {
+        let families = prometheus::gather();
+        let fam = match families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_surface_request_duration_seconds")
+        {
+            Some(f) => f,
+            None => return 0,
+        };
+        fam.get_metric()
+            .iter()
+            .find(|m| {
+                let labels = m.get_label();
+                labels
+                    .iter()
+                    .any(|l| l.name() == "surface" && l.value() == surface)
+                    && labels
+                        .iter()
+                        .any(|l| l.name() == "method" && l.value() == method)
+            })
+            .map(|m| m.get_histogram().get_sample_count())
+            .unwrap_or(0)
     }
 
     #[test]

@@ -4434,12 +4434,29 @@ async fn handle_ai_proxy(
     // request with a surface label; per-surface dispatch handlers land
     // in later phases. See docs/ai-deep-integration-blueprint.md.
     let surface = sbproxy_ai::handler::classify_surface(&method_str, &path);
+    let surface_label = surface.label();
     debug!(
-        ai.surface = surface.label(),
+        ai.surface = surface_label,
         method = %method_str,
         path = %path,
         "AI proxy: classified surface"
     );
+
+    // Create the top-level request span. The span is registered with
+    // the subscriber (so OTel-style exporters see it as part of the
+    // trace tree) but we do not `.enter()` it because the resulting
+    // guard is `!Send` and `request_filter` is an async function that
+    // must be `Send`. The surface field is carried by the explicit
+    // `debug!` above and by the per-surface metrics below.
+    let _ai_span = sbproxy_ai::tracing_spans::ai_request_span(surface_label, &method_str);
+
+    // Increment the per-surface request counter and start the latency
+    // clock. The latency guard records elapsed time at function exit
+    // regardless of which dispatch path the request takes (success,
+    // upstream error, early-return on validation failure).
+    sbproxy_ai::ai_metrics::record_surface_request(surface_label, &method_str);
+    let _ai_latency_guard =
+        sbproxy_ai::ai_metrics::AiSurfaceLatencyGuard::new(surface_label, method_str.clone());
 
     // Build a router for provider selection.
     let router = AiRouter::new(config.routing.clone(), config.providers.len());
