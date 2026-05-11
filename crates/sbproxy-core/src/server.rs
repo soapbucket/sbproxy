@@ -62,6 +62,15 @@ pub fn reload_ai_client() {
 static BUDGET_TRACKER: std::sync::LazyLock<sbproxy_ai::BudgetTracker> =
     std::sync::LazyLock::new(sbproxy_ai::BudgetTracker::new);
 
+/// Process-wide per-surface rate limiter shared across all AI origins.
+///
+/// State is keyed by `AiSurface::label()` so that per-surface caps
+/// are enforced globally, not per-origin. Operators configure caps
+/// via `ai_handler_config.per_surface_rate_limits`; surfaces without
+/// an entry are uncapped.
+static AI_SURFACE_RATE_LIMITER: std::sync::LazyLock<sbproxy_ai::ratelimit::SurfaceRateLimiter> =
+    std::sync::LazyLock::new(sbproxy_ai::ratelimit::SurfaceRateLimiter::new);
+
 /// Borrow the process-wide AI budget tracker.
 ///
 /// Exposed so reload-path integration tests (and any future admin
@@ -4457,6 +4466,23 @@ async fn handle_ai_proxy(
     sbproxy_ai::ai_metrics::record_surface_request(surface_label, &method_str);
     let _ai_latency_guard =
         sbproxy_ai::ai_metrics::AiSurfaceLatencyGuard::new(surface_label, method_str.clone());
+
+    // Phase 8: per-surface rate limit. Operators configure these via
+    // `ai_handler_config.per_surface_rate_limits` keyed by the
+    // surface label. Surfaces without a config entry are uncapped.
+    // Returns 429 before any upstream call when the per-minute cap
+    // has been reached.
+    if let Some(surface_cfg) = config.per_surface_rate_limits.get(surface_label) {
+        if !AI_SURFACE_RATE_LIMITER.check_rate(surface_label, surface_cfg) {
+            warn!(
+                ai.surface = surface_label,
+                method = %method_str,
+                "AI proxy: per-surface rate limit hit; returning 429"
+            );
+            send_error(session, 429, "per-surface rate limit exceeded").await?;
+            return Ok(());
+        }
+    }
 
     // Gate non-universal surfaces on provider capability. Surfaces
     // that aren't implemented by every provider (assistants, threads,

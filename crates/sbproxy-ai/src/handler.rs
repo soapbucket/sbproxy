@@ -8,7 +8,7 @@ use crate::budget::BudgetConfig;
 use crate::guardrails::GuardrailsConfig;
 use crate::identity::VirtualKeyConfig;
 use crate::provider::ProviderConfig;
-use crate::ratelimit::ModelRateConfig;
+use crate::ratelimit::{ModelRateConfig, SurfaceRateConfig};
 use crate::routing::RoutingStrategy;
 
 /// AI gateway handler configuration.
@@ -40,6 +40,13 @@ pub struct AiHandlerConfig {
     /// Per-model rate limit overrides keyed by model name.
     #[serde(default)]
     pub model_rate_limits: HashMap<String, ModelRateConfig>,
+    /// Per-surface rate-limit overrides keyed by surface label
+    /// (`chat_completions`, `assistants`, `image_generation`, etc.;
+    /// see [`crate::handler::AiSurface::label`]). Operators may cap
+    /// expensive surfaces (image generation, realtime) independently
+    /// of chat. Surfaces without an entry are not capped.
+    #[serde(default)]
+    pub per_surface_rate_limits: HashMap<String, SurfaceRateConfig>,
     /// Maximum concurrent in-flight requests per provider.
     #[serde(default)]
     pub max_concurrent: Option<HashMap<String, u32>>,
@@ -592,6 +599,7 @@ mod tests {
             budget: None,
             virtual_keys: vec![],
             model_rate_limits: HashMap::new(),
+            per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
             resilience: None,
             shadow: None,
@@ -616,6 +624,7 @@ mod tests {
             budget: None,
             virtual_keys: vec![],
             model_rate_limits: HashMap::new(),
+            per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
             resilience: None,
             shadow: None,
@@ -640,6 +649,7 @@ mod tests {
             budget: None,
             virtual_keys: vec![],
             model_rate_limits: HashMap::new(),
+            per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
             resilience: None,
             shadow: None,
@@ -665,6 +675,7 @@ mod tests {
             budget: None,
             virtual_keys: vec![],
             model_rate_limits: HashMap::new(),
+            per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
             resilience: None,
             shadow: None,
