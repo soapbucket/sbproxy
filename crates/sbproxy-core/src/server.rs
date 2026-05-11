@@ -4458,14 +4458,19 @@ async fn handle_ai_proxy(
     let _ai_latency_guard =
         sbproxy_ai::ai_metrics::AiSurfaceLatencyGuard::new(surface_label, method_str.clone());
 
-    // Phase 3: gate stateful surfaces on provider capability. Surfaces
-    // that ship with a per-provider matrix entry (Assistants, Threads
-    // today; more added in later phases) are rejected with 501 when no
-    // configured provider supports them. Chat completions, models,
-    // and embeddings remain universal so they bypass this gate.
-    if matches!(
+    // Gate non-universal surfaces on provider capability. Surfaces
+    // that aren't implemented by every provider (assistants, threads,
+    // batches, fine-tuning, files, realtime, image, audio,
+    // moderations, reranking, embeddings) are rejected with 501 when
+    // no configured provider supports them. Chat completions, models,
+    // and unrecognized paths bypass this gate; the former are
+    // universal, the latter falls through to the existing dispatch
+    // which 404s at the upstream.
+    if !matches!(
         surface,
-        sbproxy_ai::handler::AiSurface::Assistants | sbproxy_ai::handler::AiSurface::Threads
+        sbproxy_ai::handler::AiSurface::ChatCompletions
+            | sbproxy_ai::handler::AiSurface::Models
+            | sbproxy_ai::handler::AiSurface::Unknown
     ) {
         let any_supports = config
             .providers
