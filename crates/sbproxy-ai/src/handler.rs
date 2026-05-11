@@ -490,6 +490,32 @@ impl AiSurface {
     }
 }
 
+/// Extract the surface-specific input-text field from a parsed JSON
+/// body, suitable for running through input guardrails or PII
+/// redactors.
+///
+/// Different surfaces carry user input in different body fields:
+/// image generation/edits/variations uses `body["prompt"]`, audio
+/// speech synthesis uses `body["input"]`, and reranking uses
+/// `body["query"]`. Chat-shape surfaces (ChatCompletions, Assistants,
+/// Threads) carry input in `body["messages"]` and should be guarded
+/// via [`crate::guardrails::GuardrailPipeline::check_input`] instead.
+///
+/// Returns `None` for surfaces whose input is not a single text field
+/// (chat-shape surfaces, binary/multipart surfaces, GET-only surfaces).
+pub fn extract_input_text(surface: &AiSurface, body: &serde_json::Value) -> Option<String> {
+    let field = match surface {
+        AiSurface::ImageGeneration | AiSurface::ImageEdits | AiSurface::ImageVariations => "prompt",
+        AiSurface::AudioSpeech => "input",
+        AiSurface::Reranking => "query",
+        AiSurface::Moderations => "input",
+        _ => return None,
+    };
+    body.get(field)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 /// Classify an inbound request path (and method, where it disambiguates)
 /// into an [`AiSurface`].
 ///
@@ -1048,6 +1074,70 @@ mod tests {
             classify_surface("GET", "/v1/assistants/"),
             AiSurface::Assistants
         );
+    }
+
+    #[test]
+    fn extract_input_text_for_image_uses_prompt() {
+        let body = serde_json::json!({"prompt": "a painting of a cat", "model": "dall-e-3"});
+        assert_eq!(
+            extract_input_text(&AiSurface::ImageGeneration, &body),
+            Some("a painting of a cat".to_string())
+        );
+        assert_eq!(
+            extract_input_text(&AiSurface::ImageEdits, &body),
+            Some("a painting of a cat".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_input_text_for_speech_uses_input() {
+        let body = serde_json::json!({"model": "tts-1", "input": "hello world", "voice": "alloy"});
+        assert_eq!(
+            extract_input_text(&AiSurface::AudioSpeech, &body),
+            Some("hello world".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_input_text_for_reranking_uses_query() {
+        let body = serde_json::json!({"query": "find documents about cats", "documents": []});
+        assert_eq!(
+            extract_input_text(&AiSurface::Reranking, &body),
+            Some("find documents about cats".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_input_text_for_moderations_uses_input() {
+        let body = serde_json::json!({"input": "is this content safe?", "model": "omni"});
+        assert_eq!(
+            extract_input_text(&AiSurface::Moderations, &body),
+            Some("is this content safe?".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_input_text_returns_none_for_chat_shape_surfaces() {
+        // Chat-shape surfaces carry input in `messages`; the existing
+        // GuardrailPipeline::check_input handles them.
+        let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert!(extract_input_text(&AiSurface::ChatCompletions, &body).is_none());
+        assert!(extract_input_text(&AiSurface::Assistants, &body).is_none());
+        assert!(extract_input_text(&AiSurface::Threads, &body).is_none());
+        // Surfaces without a single text input field also return None.
+        assert!(extract_input_text(&AiSurface::Batches, &body).is_none());
+        assert!(extract_input_text(&AiSurface::FineTuning, &body).is_none());
+        assert!(extract_input_text(&AiSurface::Files, &body).is_none());
+    }
+
+    #[test]
+    fn extract_input_text_returns_none_when_field_missing_or_not_string() {
+        let no_prompt = serde_json::json!({"model": "dall-e-3"});
+        assert!(extract_input_text(&AiSurface::ImageGeneration, &no_prompt).is_none());
+
+        // Field present but not a string.
+        let array_prompt = serde_json::json!({"prompt": ["array", "elements"]});
+        assert!(extract_input_text(&AiSurface::ImageGeneration, &array_prompt).is_none());
     }
 
     #[test]

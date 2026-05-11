@@ -4944,6 +4944,33 @@ async fn handle_ai_proxy(
                     send_response(session, 400, "application/json", &body_bytes).await?;
                     return Ok(());
                 }
+
+                // Per-surface input guardrails: image generation,
+                // audio speech, reranking, and moderations carry user
+                // input in a non-messages field (`prompt`, `input`,
+                // `query`). The same guardrail pipeline applies to
+                // that text via check_input_text. Chat-shape surfaces
+                // are already covered by the messages check above.
+                if let Some(text) = sbproxy_ai::handler::extract_input_text(&surface, &body) {
+                    if let Some(block) = pipeline.check_input_text(&text) {
+                        warn!(
+                            ai.surface = surface_label,
+                            guardrail = %block.name,
+                            reason = %block.reason,
+                            "AI proxy: per-surface input guardrail blocked request"
+                        );
+                        let error_body = serde_json::json!({
+                            "error": {
+                                "message": block.reason,
+                                "type": "guardrail_violation",
+                                "code": block.name,
+                            }
+                        });
+                        let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+                        send_response(session, 400, "application/json", &body_bytes).await?;
+                        return Ok(());
+                    }
+                }
             }
         }
     }
