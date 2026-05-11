@@ -1,26 +1,18 @@
-//! WOR-201 PR 1c.3: newtype wrapper enforcer for the
-//! `Policy::RateLimit` variant.
+//! Newtype wrapper enforcer for the `Policy::RateLimit` variant.
 //!
-//! Lifts the body of the `Policy::RateLimit(p)` arm from
-//! `crate::server::check_policies` into a
-//! [`sbproxy_plugin::PolicyEnforcer`] impl. Calls
-//! [`sbproxy_modules::policy::RateLimitPolicy::allow_with_info_async`]
-//! and stashes the resulting `RateLimitInfo` on the request
-//! context so the dispatcher's 429 response handler can emit the
+//! Calls
+//! [`sbproxy_modules::policy::RateLimitPolicy::allow_with_info_for`]
+//! and stashes the resulting `RateLimitInfo` on the request context
+//! so the dispatcher's 429 response handler can emit the
 //! `X-RateLimit-*` headers.
 //!
-//! ## CEL key resolution
-//!
-//! The original arm resolved the rate-limit key via a CEL
-//! expression when `p.key` was set. The CEL helper needs the full
-//! session + ctx slot; from inside the trait we only have the
-//! `RequestContext` (via the `Any` downcast) and the
-//! `http::Request<Bytes>`. The wrapper resolves the key off
-//! `ctx.client_ip` for now and treats `p.key` as an opt-in tag
-//! that future PRs will plumb through; the legacy server.rs arm
-//! falls back to `default_client_id` when CEL resolution returns
-//! `None`, so the behaviour is equivalent for the common case of
-//! IP-keyed rate limits.
+//! When `policy.key` is a non-empty CEL expression the wrapper
+//! evaluates it against the per-request CEL context (method, path,
+//! headers, query, client_ip, hostname, envelope namespace, feature
+//! flags) and uses the result as the rate-limit bucket key. Empty
+//! evaluation or evaluation failure falls back to the client IP so
+//! the policy still rate-limits something rather than degenerating
+//! to a single global bucket.
 //!
 //! Per-deny-reason label: `"rate_limit"`. Single denial shape
 //! (`429 Too Many Requests`) plus a populated
@@ -48,7 +40,7 @@ impl PolicyEnforcer for RateLimitEnforcer {
 
     fn enforce(
         &self,
-        _req: &http::Request<Bytes>,
+        req: &http::Request<Bytes>,
         ctx: &mut dyn std::any::Any,
     ) -> Pin<Box<dyn Future<Output = Result<PolicyDecision>> + Send + '_>> {
         let policy = Arc::clone(&self.0);
@@ -63,10 +55,16 @@ impl PolicyEnforcer for RateLimitEnforcer {
                 });
             }
         };
-        let client_id = ctx
+        let default_client_id = ctx
             .client_ip
             .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "__unknown__".to_string());
+            .unwrap_or_else(|| ctx.hostname.to_string());
+        let client_id = match policy.key.as_deref() {
+            Some(expr) if !expr.is_empty() => {
+                rate_limit_key_from_cel(req, ctx, expr).unwrap_or_else(|| default_client_id.clone())
+            }
+            _ => default_client_id,
+        };
         // Synchronous variant of the rate-limit check. The async
         // path the original server.rs arm called only differs in
         // that it yields between buckets; the per-decision
@@ -87,6 +85,82 @@ impl PolicyEnforcer for RateLimitEnforcer {
             ctx.rate_limit_info = Some(info);
             Box::pin(async move { Ok(PolicyDecision::Allow) })
         }
+    }
+}
+
+/// Evaluate a rate-limit `key:` CEL expression against the current
+/// request. Returns the string-coerced result when evaluation
+/// succeeds and produces a non-empty value, otherwise `None` so the
+/// caller can fall back to the default IP-based key.
+fn rate_limit_key_from_cel(
+    req: &http::Request<Bytes>,
+    ctx: &RequestContext,
+    expr: &str,
+) -> Option<String> {
+    use sbproxy_extension::cel::context::{
+        build_request_context, populate_envelope_namespace, populate_features_namespace,
+        EnvelopeView, FeatureFlagsView,
+    };
+    use sbproxy_extension::cel::{CelEngine, CelValue};
+
+    let method = req.method().as_str();
+    let path = req.uri().path();
+    let query = req.uri().query();
+    let client_ip = ctx.client_ip.map(|ip| ip.to_string());
+
+    let mut cel_ctx = build_request_context(
+        method,
+        path,
+        req.headers(),
+        query,
+        client_ip.as_deref(),
+        ctx.hostname.as_str(),
+    );
+    let session_str = ctx.session_id.map(|s| s.to_string());
+    let parent_str = ctx.parent_session_id.map(|s| s.to_string());
+    let envelope = EnvelopeView {
+        user_id: ctx.user_id.as_deref(),
+        user_id_source: ctx.user_id_source.map(|s| s.as_str()),
+        session_id: session_str.as_deref(),
+        parent_session_id: parent_str.as_deref(),
+        workspace_id: None,
+        properties: Some(&ctx.properties),
+    };
+    populate_envelope_namespace(&mut cel_ctx, &envelope);
+    let features = FeatureFlagsView {
+        debug: ctx.flags.debug,
+        trace: ctx.flags.trace,
+        no_cache: ctx.flags.no_cache,
+        extra: &ctx.flags.extra,
+    };
+    populate_features_namespace(&mut cel_ctx, &features);
+
+    let engine = CelEngine::new();
+    let value = match engine.eval_source(expr, &cel_ctx) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(error = %err, expression = expr, "rate-limit key CEL evaluation failed; falling back to default key");
+            return None;
+        }
+    };
+    let s = match value {
+        CelValue::String(s) => s,
+        CelValue::Int(i) => i.to_string(),
+        CelValue::Float(f) => f.to_string(),
+        CelValue::Bool(b) => b.to_string(),
+        CelValue::Null => return None,
+        CelValue::Map(_) | CelValue::List(_) => {
+            tracing::warn!(
+                expression = expr,
+                "rate-limit key CEL expression produced a map/list; falling back to default key"
+            );
+            return None;
+        }
+    };
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
     }
 }
 

@@ -20,6 +20,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::builtin_enforcers::{compile_builtin_enforcers, CompiledEnforcer};
+use crate::router::HostRouter;
 use sbproxy_cache::{
     CacheReserveBackend, CacheStore, FsReserve, MemoryCacheStore, MemoryReserve, RedisCacheStore,
     RedisReserve,
@@ -28,8 +30,6 @@ use sbproxy_config::{CompiledConfig, Parameter, RequestModifierConfig};
 use sbproxy_modules::compile::{compile_action, compile_auth, compile_policy, compile_transform};
 use sbproxy_modules::transform::{CompiledTransform, TransformConfig};
 use sbproxy_modules::{Action, Auth, BotDetection, Policy, ThreatProtection};
-
-use crate::router::HostRouter;
 
 // --- Forward Rule types ---
 
@@ -703,7 +703,21 @@ pub struct CompiledPipeline {
     /// Compiled auth for each origin (None if no auth configured).
     pub auths: Vec<Option<Auth>>,
     /// Compiled policies for each origin (may be empty).
+    ///
+    /// Response-phase code (`SecHeaders`, `PageShield`, `Sri`) walks
+    /// this vector at response time. Request-phase enforcement uses
+    /// the parallel [`Self::enforcers`] vector below, which carries
+    /// the same chain dispatched through the
+    /// [`sbproxy_plugin::PolicyEnforcer`] trait.
     pub policies: Vec<Vec<Policy>>,
+    /// Compiled built-in + plugin enforcers for each origin (parallel
+    /// to [`Self::policies`]).
+    ///
+    /// Request-phase entry point: `server::check_policies` iterates
+    /// this list and routes each entry through the
+    /// [`sbproxy_plugin::PolicyEnforcer`] trait. Built one-time at
+    /// config compile by [`compile_builtin_enforcers`].
+    pub enforcers: Vec<Vec<CompiledEnforcer>>,
     /// Compiled transforms for each origin (may be empty).
     pub transforms: Vec<Vec<CompiledTransform>>,
     /// Compiled forward rules for each origin (may be empty).
@@ -796,6 +810,7 @@ impl Default for CompiledPipeline {
             actions: Vec::new(),
             auths: Vec::new(),
             policies: Vec::new(),
+            enforcers: Vec::new(),
             transforms: Vec::new(),
             forward_rules: Vec::new(),
             fallbacks: Vec::new(),
@@ -825,6 +840,7 @@ impl CompiledPipeline {
         let mut actions = Vec::with_capacity(config.origins.len());
         let mut auths = Vec::with_capacity(config.origins.len());
         let mut policies = Vec::with_capacity(config.origins.len());
+        let mut enforcers: Vec<Vec<CompiledEnforcer>> = Vec::with_capacity(config.origins.len());
         let mut transforms = Vec::with_capacity(config.origins.len());
         let mut forward_rules = Vec::with_capacity(config.origins.len());
         let mut fallbacks = Vec::with_capacity(config.origins.len());
@@ -843,30 +859,24 @@ impl CompiledPipeline {
             };
             auths.push(auth);
 
-            // Compile policies (zero or more per origin).
-            // After compilation, attach the cluster-shared L2 store (if any) to
-            // each RateLimit policy so it can use Redis-backed counters.
-            let mut origin_policies: Vec<Policy> = origin
-                .policy_configs
-                .iter()
-                .map(compile_policy)
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            if config.l2_store.is_some() {
-                let store = config.l2_store.clone();
-                let origin_id = origin.origin_id.as_str();
-                for p in origin_policies.iter_mut() {
-                    if let Policy::RateLimit(rl) = p {
-                        // take+replace: with_store consumes self and returns Self.
-                        let taken = std::mem::replace(
-                            rl,
-                            sbproxy_modules::RateLimitPolicy::from_config(serde_json::json!({
-                                "requests_per_second": 10.0
-                            }))?,
-                        );
-                        *rl = taken.with_store(store.clone(), origin_id);
-                    }
-                }
-            }
+            // Compile policies (zero or more per origin) twice: once for the
+            // response-phase `Vec<Policy>` that SecHeaders/PageShield/Sri
+            // walk at response time, and once for the request-phase
+            // `Vec<Box<dyn PolicyEnforcer>>` the dispatcher iterates. The
+            // built-in `compile_policy` is a pure parse over `serde_json::Value`,
+            // so the double pass is one-time at config load and has no
+            // request-path cost.
+            let origin_policies = compile_origin_policy_chain(
+                &origin.policy_configs,
+                config.l2_store.clone(),
+                origin.origin_id.as_str(),
+            )?;
+            let policies_for_enforcers = compile_origin_policy_chain(
+                &origin.policy_configs,
+                config.l2_store.clone(),
+                origin.origin_id.as_str(),
+            )?;
+            enforcers.push(compile_builtin_enforcers(policies_for_enforcers));
             policies.push(origin_policies);
 
             // Compile transforms (zero or more per origin).
@@ -1048,6 +1058,7 @@ impl CompiledPipeline {
             actions,
             auths,
             policies,
+            enforcers,
             transforms,
             forward_rules,
             fallbacks,
@@ -1112,6 +1123,41 @@ impl CompiledPipeline {
 // --- Forward rule / fallback compilation helpers ---
 
 /// Compile a list of forward rule JSON values into typed forward rules.
+/// Compile one origin's policy chain from its raw JSON configs and
+/// attach the cluster-shared L2 store to each RateLimit policy.
+///
+/// Called twice per origin during `CompiledPipeline::from_config`:
+/// once for the response-phase `Vec<Policy>` stored on
+/// `pipeline.policies` and once for the request-phase
+/// `Vec<Box<dyn PolicyEnforcer>>` stored on `pipeline.enforcers`.
+/// Both call sites pass the same inputs so the two chains stay in
+/// lockstep.
+fn compile_origin_policy_chain(
+    policy_configs: &[serde_json::Value],
+    l2_store: Option<Arc<dyn sbproxy_platform::storage::KVStore>>,
+    origin_id: &str,
+) -> anyhow::Result<Vec<Policy>> {
+    let mut chain: Vec<Policy> = policy_configs
+        .iter()
+        .map(compile_policy)
+        .collect::<anyhow::Result<_>>()?;
+    if l2_store.is_some() {
+        for p in chain.iter_mut() {
+            if let Policy::RateLimit(rl) = p {
+                // take+replace: with_store consumes self and returns Self.
+                let taken = std::mem::replace(
+                    rl,
+                    sbproxy_modules::RateLimitPolicy::from_config(serde_json::json!({
+                        "requests_per_second": 10.0
+                    }))?,
+                );
+                *rl = taken.with_store(l2_store.clone(), origin_id);
+            }
+        }
+    }
+    Ok(chain)
+}
+
 fn compile_forward_rules(
     raw_rules: &[serde_json::Value],
 ) -> anyhow::Result<Vec<CompiledForwardRule>> {
