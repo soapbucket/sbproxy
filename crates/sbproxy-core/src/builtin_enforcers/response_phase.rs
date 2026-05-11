@@ -27,11 +27,11 @@ use sbproxy_plugin::{PolicyDecision, PolicyEnforcer};
 macro_rules! response_phase_enforcer {
     ($name:ident, $policy:ty, $label:literal) => {
         #[doc = concat!(
-                    "Newtype wrapper that adapts [`",
-                    stringify!($policy),
-                    "`] to the [`PolicyEnforcer`] trait surface. ",
-                    "Response-phase only; request-phase `enforce` returns `Allow`."
-                )]
+                            "Newtype wrapper that adapts [`",
+                            stringify!($policy),
+                            "`] to the [`PolicyEnforcer`] trait surface. ",
+                            "Response-phase only; request-phase `enforce` returns `Allow`."
+                        )]
         pub struct $name(pub Arc<$policy>);
 
         impl PolicyEnforcer for $name {
