@@ -219,9 +219,46 @@ origins:
 
 Clients exceeding the limit receive a `429 Too Many Requests` response with a `Retry-After` header.
 
+### Per-surface rate limits
+
+Per-model and per-tenant rate limits cap each user, key, or model independently. The AI gateway also supports per-surface caps that apply to a classified API surface (chat completions, assistants, image generation, audio speech, ...) so expensive paths can be throttled without affecting cheap ones.
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+      per_surface_rate_limits:
+        image_generation:
+          requests_per_minute: 30
+        audio_speech:
+          requests_per_minute: 60
+        chat_completions:
+          requests_per_minute: 600
+```
+
+Keys are the `AiSurface` labels emitted on metrics (`chat_completions`, `models`, `embeddings`, `assistants`, `threads`, `batches`, `fine_tuning`, `files`, `realtime`, `image_generation`, `image_edits`, `image_variations`, `audio_transcription`, `audio_speech`, `moderations`, `reranking`). Surfaces without an entry are uncapped. When the cap fires, the proxy returns 429 before any upstream call.
+
+The sliding window is one minute, shared across all configured origins (state is process-global). Audio-seconds-per-hour caps for realtime sessions are reserved for the realtime dispatch phase.
+
 ## Guardrails
 
 The proxy supports seven guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, and `regex`. Guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. See the CEL guardrails section below for inline CEL conditions, and `features.md` for the higher-level configuration of each guardrail type.
+
+Input guardrails apply to whichever body field the surface carries user text in:
+
+| Surface | Field guarded |
+|---|---|
+| `chat_completions`, `assistants`, `threads` | `body["messages"][].content` |
+| `image_generation`, `image_edits`, `image_variations` | `body["prompt"]` |
+| `audio_speech` | `body["input"]` |
+| `reranking` | `body["query"]` |
+| `moderations` | `body["input"]` |
+
+A single guardrail block on the AI handler config covers every supported surface; the proxy picks the right field automatically based on the classified surface. Multipart-bodied surfaces (image edits, image variations, audio transcription) bypass the input-guardrail check today because their bodies are forwarded byte-transparently; output-side scanning for those surfaces is reserved for a follow-up.
 
 ## Lua hooks
 
@@ -500,44 +537,44 @@ The alias registry is wired by the runtime rather than read off the `action` blo
 
 ## Supported endpoints
 
-Path detection happens in `crates/sbproxy-ai/src/api_routes.rs::parse_endpoint` for the chat-style surface and in per-feature handler modules for the rest. All endpoint paths are OpenAI-compatible. Provider selection at every path uses the same provider list, routing strategy, virtual keys, budgets, and rate limits as the chat path. Modality-aware filtering (see `multimodal.rs`) removes providers that do not support the request type before routing runs.
+Every inbound request to an `action: ai_proxy` origin is classified into an `AiSurface` by `classify_surface(method, path)` in `crates/sbproxy-ai/src/handler.rs`. The classifier accepts canonical OpenAI paths with optional `/v1` or `/api/v1` prefix and any trailing slash. The surface label appears on the per-surface metrics, on the request tracing span, and on every per-surface decision (rate limit, guardrail extractor, 501 gate).
 
-| Path | Method | Handler module | Notes |
-|------|--------|----------------|-------|
-| `/v1/chat/completions` | POST | `handler.rs`, `api_routes.rs` | Text and multimodal chat. Multimodal is detected when `messages[].content` includes `image_url` or `image` parts. |
-| `/v1/completions` | POST | `handler.rs` | Legacy text completion. |
-| `/v1/embeddings` | POST | `api_routes.rs` | Embedding generation. Routed only to providers that report embedding support (OpenAI, Gemini, Cohere, Mistral). |
-| `/v1/rerank`, `/v1/reranking` | POST | `api_routes.rs` | Document reranking. OpenAI, Anthropic, Gemini, Cohere. |
-| `/v1/moderations` | POST | `api_routes.rs` | Content moderation. OpenAI, Anthropic, Gemini. |
-| `/v1/models` | GET | `api_routes.rs` | List models. All providers respond. |
-| `/v1/images/generations` | POST | `image.rs`, `api_routes.rs` | Image generation. Routed only to providers that report image support (OpenAI, Gemini). |
-| `/v1/images/edits` | POST | `image.rs` | Image edit. |
-| `/v1/images/variations` | POST | `image.rs` | Image variation. |
-| `/v1/audio/transcriptions` | POST | `audio.rs`, `api_routes.rs` | Speech to text. Routed only to providers that report audio support (OpenAI, Gemini, Groq). |
-| `/v1/audio/translations` | POST | `audio.rs` | Translate audio to English text. |
-| `/v1/audio/speech` | POST | `audio.rs`, `api_routes.rs` | Text to speech. |
-| `/v1/realtime` | WebSocket | `realtime.rs` | OpenAI realtime audio session. Disabled by default; enable with `realtime.enabled: true` and pick `realtime.model` (default `gpt-4o-realtime-preview`). |
-| `/v1/assistants` | POST, GET | `assistants.rs` | Create or list assistants. |
-| `/v1/assistants/{id}` | GET | `assistants.rs` | Fetch a single assistant by ID. |
-| `/v1/threads` | POST | `assistants.rs`, `threads.rs` | Create a thread. The proxy keeps a local `ThreadStore` for session continuity. |
-| `/v1/threads/{thread_id}/messages` | POST | `assistants.rs`, `threads.rs` | Append a message to a thread. |
-| `/v1/threads/{thread_id}/runs` | POST | `assistants.rs` | Start a run on a thread. |
-| `/v1/threads/{thread_id}/runs/{run_id}` | GET | `assistants.rs` | Fetch run status. |
-| `/v1/batches` | POST, GET | `batch.rs` | Create or list batch jobs. The proxy keeps a `BatchStore` (in-memory by default) tracking job lifecycle (`pending`, `in_progress`, `completed`, `failed`, `cancelled`). |
-| `/v1/fine_tuning/jobs` | POST, GET | `finetune.rs` | Create or list fine-tuning jobs. |
-| `/v1/fine_tuning/jobs/{id}` | GET | `finetune.rs` | Fetch a single job. |
-| `/v1/fine_tuning/jobs/{id}/cancel` | POST | `finetune.rs` | Cancel a job. |
-| `/v1/fine_tuning/jobs/{id}/events` | GET | `finetune.rs` | List job events. |
+Provider capability is the source of truth for which surfaces a configured provider can serve. The matrix lives in `crates/sbproxy-ai/src/api_routes.rs::provider_supports_surface`. When no configured provider supports the requested surface, the proxy returns **501 Not Implemented** before any upstream call. Universal surfaces (chat completions and models) bypass the gate. Unknown surfaces fall through to the existing dispatch and 404 at the upstream.
 
-### Per-endpoint config
+| Surface label | Method(s) | Path(s) | Providers (today) |
+|---|---|---|---|
+| `chat_completions` | POST | `/v1/chat/completions` | All |
+| `models` | GET | `/v1/models`, `/v1/models/{id}` | All |
+| `embeddings` | POST | `/v1/embeddings` | OpenAI, Gemini, Cohere |
+| `assistants` | POST, GET, DELETE | `/v1/assistants[/{id}[/files[/{file_id}]]]` | OpenAI |
+| `threads` | POST, GET, DELETE | `/v1/threads[/{id}[/messages[/{id}] \| /runs[/{id}[/cancel]]]]`, `/v1/threads/runs` | OpenAI |
+| `batches` | POST, GET | `/v1/batches[/{id}[/cancel]]` | OpenAI |
+| `fine_tuning` | POST, GET | `/v1/fine_tuning/jobs[/{id}[/cancel \| /events]]` | OpenAI |
+| `files` | POST, GET, DELETE | `/v1/files[/{id}[/content]]` | OpenAI |
+| `realtime` | GET (WebSocket upgrade) | `/v1/realtime` | OpenAI |
+| `image_generation` | POST | `/v1/images/generations` | OpenAI, Gemini |
+| `image_edits` | POST (multipart) | `/v1/images/edits` | OpenAI, Gemini |
+| `image_variations` | POST (multipart) | `/v1/images/variations` | OpenAI, Gemini |
+| `audio_transcription` | POST (multipart) | `/v1/audio/transcriptions`, `/v1/audio/translations` | OpenAI, Gemini |
+| `audio_speech` | POST | `/v1/audio/speech` | OpenAI, Gemini |
+| `moderations` | POST | `/v1/moderations` | OpenAI |
+| `reranking` | POST | `/v1/rerank`, `/v1/reranking` | Cohere |
 
-Most non-chat endpoints have no dedicated YAML block; they reuse the top-level `providers`, `routing`, `virtual_keys`, `budget`, `model_rate_limits`, and `max_concurrent` fields. The exceptions:
+### Method coverage
 
-- `realtime`: `RealtimeConfig { enabled: bool, model: String }`. Without `enabled: true` the websocket path is rejected.
-- `assistants`: `AssistantConfig { enabled: bool }`. Pure passthrough flag.
-- `finetune`: `FinetuneConfig { enabled: bool }`. Pure passthrough flag.
+The gateway accepts any standard HTTP method for any supported surface. GET, POST, PUT, DELETE, PATCH, HEAD, and OPTIONS all dispatch through the same provider-selection and observability surface. Methods other than GET/POST forward via `AiClient::forward_with_method` and do not engage the chat-completions body-parse pipeline (no JSON parsing, no budget enforcement, no input guardrails). Method-aware dispatch is what makes `DELETE /v1/assistants/{id}`, `POST /v1/threads/{id}/runs/{id}/cancel`, and the other non-POST verbs work end-to-end.
 
-Audio (`audio.rs`), image (`image.rs`), and batch (`batch.rs`) define request/response shapes and stores but expose no YAML config of their own. Multimodal detection (`multimodal.rs`) is runtime-only: it inspects the path and request body to set a modality, then filters the provider list. There is no `multimodal:` block.
+### Multipart bodies
+
+Image edits, image variations, audio transcription, and audio translation send multipart request bodies. The proxy detects multipart by inspecting the inbound `Content-Type` header; when it starts with `multipart/`, the body is forwarded byte-for-byte via `AiClient::forward_bytes` with the original Content-Type preserved. Provider format translation (Anthropic, etc.) does not run for multipart, since these surfaces are OpenAI-only.
+
+### Per-surface configuration
+
+Per-surface knobs live under `per_surface_rate_limits` (see [Per-surface rate limits](#per-surface-rate-limits)) and apply automatically based on the classified surface. Surfaces have no dedicated YAML config block beyond that; they share the top-level `providers`, `routing`, `virtual_keys`, `budget`, `model_rate_limits`, `max_concurrent`, and `guardrails` settings.
+
+### Surfaces marked enterprise-only
+
+`reranking` is gated to ship dispatch in the enterprise build. In the OSS build the surface is classified (so observability still tags requests with `surface = "reranking"`) and the 501 gate fires unless an enterprise license check passes. The same surface label and matrix entry exist in both builds.
 
 ## Context handling
 
@@ -610,6 +647,8 @@ The proxy exposes aggregate AI usage as Prometheus metrics. When `telemetry.bind
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `sbproxy_ai_requests_total` | Counter | `provider`, `model`, `status` | Total AI requests |
+| `sbproxy_ai_surface_requests_total` | Counter | `surface`, `method` | Total AI requests partitioned by classified surface (chat completions, assistants, image generation, ...) and HTTP method |
+| `sbproxy_ai_surface_request_duration_seconds` | Histogram | `surface`, `method` | Per-surface request latency. Buckets match `sbproxy_ai_request_duration_seconds` for side-by-side dashboards |
 | `sbproxy_ai_tokens_total` | Counter | `provider`, `model`, `direction` | Tokens consumed (`direction` is `input` or `output`) |
 | `sbproxy_ai_cost_dollars_total` | Counter | `provider`, `model` | Estimated cost in USD |
 | `sbproxy_ai_request_duration_seconds` | Histogram | `provider`, `model` | End-to-end AI request latency |
