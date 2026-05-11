@@ -4458,6 +4458,35 @@ async fn handle_ai_proxy(
     let _ai_latency_guard =
         sbproxy_ai::ai_metrics::AiSurfaceLatencyGuard::new(surface_label, method_str.clone());
 
+    // Phase 3: gate stateful surfaces on provider capability. Surfaces
+    // that ship with a per-provider matrix entry (Assistants, Threads
+    // today; more added in later phases) are rejected with 501 when no
+    // configured provider supports them. Chat completions, models,
+    // and embeddings remain universal so they bypass this gate.
+    if matches!(
+        surface,
+        sbproxy_ai::handler::AiSurface::Assistants | sbproxy_ai::handler::AiSurface::Threads
+    ) {
+        let any_supports = config
+            .providers
+            .iter()
+            .any(|p| sbproxy_ai::api_routes::provider_supports_surface(&p.name, &surface));
+        if !any_supports {
+            warn!(
+                ai.surface = surface_label,
+                method = %method_str,
+                "AI proxy: no configured provider supports this surface; returning 501"
+            );
+            send_error(
+                session,
+                501,
+                "no configured AI provider supports this surface",
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
     // Build a router for provider selection.
     let router = AiRouter::new(config.routing.clone(), config.providers.len());
 
