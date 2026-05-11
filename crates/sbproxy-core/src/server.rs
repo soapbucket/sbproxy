@@ -4427,7 +4427,19 @@ async fn handle_ai_proxy(
     origin_idx: Option<usize>,
 ) -> Result<()> {
     let method = session.req_header().method.clone();
+    let method_str = method.as_str().to_string();
     let path = session.req_header().uri.path().to_string();
+
+    // Classify the AI surface for observability. Phase 1 tags every
+    // request with a surface label; per-surface dispatch handlers land
+    // in later phases. See docs/ai-deep-integration-blueprint.md.
+    let surface = sbproxy_ai::handler::classify_surface(&method_str, &path);
+    debug!(
+        ai.surface = surface.label(),
+        method = %method_str,
+        path = %path,
+        "AI proxy: classified surface"
+    );
 
     // Build a router for provider selection.
     let router = AiRouter::new(config.routing.clone(), config.providers.len());
@@ -4452,6 +4464,67 @@ async fn handle_ai_proxy(
         // GET endpoints (e.g. /v1/models) aren't translated yet:
         // Anthropic's models listing has a different shape and most
         // OpenAI clients don't depend on it for routing decisions.
+        let format = sbproxy_ai::client::provider_format(provider);
+        return relay_ai_response(session, resp, format, config.max_body_size).await;
+    }
+
+    // Methods other than GET/POST forward through the method-aware
+    // client without engaging the chat-completions body-parse pipeline
+    // (no body for DELETE/HEAD; body preserved as-is for PUT/PATCH).
+    // Per-surface guardrails, budget enforcement, and PII redaction for
+    // these methods are deferred to later phases; for Phase 1 the goal
+    // is to dispatch without misrouting DELETE as POST.
+    if matches!(
+        method,
+        http::Method::DELETE
+            | http::Method::HEAD
+            | http::Method::PUT
+            | http::Method::PATCH
+            | http::Method::OPTIONS
+    ) {
+        let provider_idx = router.select(&config.providers).ok_or_else(|| {
+            warn!("AI proxy: no enabled providers");
+            Error::new(ErrorType::HTTPStatus(502))
+        })?;
+        let provider = &config.providers[provider_idx];
+
+        // Read the body for methods that typically carry one. DELETE,
+        // HEAD, OPTIONS go through without a body.
+        let body_opt: Option<serde_json::Value> = if matches!(
+            method,
+            http::Method::PUT | http::Method::PATCH
+        ) {
+            let body_bytes = session.read_request_body().await?.unwrap_or_default();
+            if body_bytes.is_empty() {
+                None
+            } else {
+                match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        warn!(error = %e, "AI proxy: invalid JSON body on method-aware request");
+                        send_error(session, 400, "invalid JSON body").await?;
+                        return Ok(());
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
+        let resp = AI_CLIENT
+            .load()
+            .forward_with_method(provider, &method_str, &path, body_opt.as_ref())
+            .await
+            .map_err(|e| {
+                warn!(
+                    error = %e,
+                    method = %method_str,
+                    ai.surface = surface.label(),
+                    "AI proxy: upstream method-aware request failed"
+                );
+                Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
+            })?;
+
         let format = sbproxy_ai::client::provider_format(provider);
         return relay_ai_response(session, resp, format, config.max_body_size).await;
     }

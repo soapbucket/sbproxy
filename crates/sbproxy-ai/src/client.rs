@@ -414,6 +414,90 @@ impl AiClient {
 
         Ok(resp)
     }
+
+    /// Forward a request to a specific provider using the caller's HTTP
+    /// method. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS.
+    ///
+    /// This is the method-aware analogue of [`AiClient::forward_request`]
+    /// (POST only) and [`AiClient::forward_get_request`] (GET only). It
+    /// supports the non-chat OpenAI surfaces (assistants, threads,
+    /// batches, files, fine-tuning) where the API uses DELETE and other
+    /// methods. The body is sent only when present; DELETE typically
+    /// has no body.
+    ///
+    /// Translation through `translators::translate_request` is applied
+    /// when a body is present and the provider speaks a non-OpenAI
+    /// wire format; method-only requests (DELETE without body) are
+    /// not translated.
+    pub async fn forward_with_method(
+        &self,
+        provider: &ProviderConfig,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<reqwest::Response> {
+        let format = provider_format(provider);
+
+        // Translate body and path when the body is present and the
+        // provider format diverges from OpenAI.
+        let (translated_body, translated_path) = match body {
+            Some(b) => {
+                let (tb, tp) = translators::translate_request(format, path, b.clone());
+                (Some(tb), tp)
+            }
+            None => (None, path.to_string()),
+        };
+
+        let base_url_owned = provider.effective_base_url();
+        let base_url = base_url_owned.trim_end_matches('/');
+        let url = build_url(base_url, &translated_path);
+
+        let (auth_header, auth_value) = provider.auth_header();
+
+        debug!(
+            url = %url,
+            method = %method,
+            provider = %provider.name,
+            format = ?format,
+            "forwarding AI request to provider"
+        );
+
+        let reqwest_method = parse_http_method(method)?;
+
+        let mut req = self
+            .http
+            .request(reqwest_method, &url)
+            .header(auth_header, &auth_value);
+
+        if matches!(format, ProviderFormat::Anthropic) {
+            req = req.header("anthropic-version", "2023-06-01");
+        }
+
+        if let Some(tb) = translated_body {
+            req = req.header("content-type", "application/json").json(&tb);
+        }
+
+        let resp = req.send().await?;
+        Ok(resp)
+    }
+}
+
+/// Parse an HTTP method string into a `reqwest::Method`. Accepts the
+/// canonical methods case-insensitively; falls back to
+/// `reqwest::Method::from_bytes` for non-standard verbs.
+fn parse_http_method(method: &str) -> Result<reqwest::Method> {
+    let upper = method.to_ascii_uppercase();
+    match upper.as_str() {
+        "GET" => Ok(reqwest::Method::GET),
+        "POST" => Ok(reqwest::Method::POST),
+        "PUT" => Ok(reqwest::Method::PUT),
+        "DELETE" => Ok(reqwest::Method::DELETE),
+        "PATCH" => Ok(reqwest::Method::PATCH),
+        "HEAD" => Ok(reqwest::Method::HEAD),
+        "OPTIONS" => Ok(reqwest::Method::OPTIONS),
+        other => reqwest::Method::from_bytes(other.as_bytes())
+            .map_err(|e| anyhow::anyhow!("unsupported HTTP method '{other}': {e}")),
+    }
 }
 
 fn provider_retry_attempts(provider: &ProviderConfig) -> usize {
@@ -722,6 +806,35 @@ mod tests {
         // Edge case: no scheme, just concatenate
         let url = build_url("localhost:8080", "/v1/chat/completions");
         assert_eq!(url, "localhost:8080/v1/chat/completions");
+    }
+
+    #[test]
+    fn parse_http_method_accepts_canonical_verbs_case_insensitively() {
+        for (input, expected) in [
+            ("GET", reqwest::Method::GET),
+            ("get", reqwest::Method::GET),
+            ("POST", reqwest::Method::POST),
+            ("put", reqwest::Method::PUT),
+            ("DELETE", reqwest::Method::DELETE),
+            ("PATCH", reqwest::Method::PATCH),
+            ("Head", reqwest::Method::HEAD),
+            ("options", reqwest::Method::OPTIONS),
+        ] {
+            assert_eq!(parse_http_method(input).unwrap(), expected, "input={input}");
+        }
+    }
+
+    #[test]
+    fn parse_http_method_falls_back_for_non_standard_verbs() {
+        // RFC 7231 verbs and non-standard but valid token chars.
+        let m = parse_http_method("CUSTOM").unwrap();
+        assert_eq!(m.as_str(), "CUSTOM");
+    }
+
+    #[test]
+    fn parse_http_method_rejects_invalid_token() {
+        // Space is not a valid HTTP token character.
+        assert!(parse_http_method("BAD METHOD").is_err());
     }
 
     #[test]
