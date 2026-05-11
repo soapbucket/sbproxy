@@ -1,7 +1,10 @@
 //! Budget enforcement for AI gateway usage tracking and limits.
 
 use dashmap::DashMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::handler::AiSurface;
 
 /// Budget enforcement configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -331,6 +334,155 @@ pub fn cheapest_model(candidates: &[String]) -> Option<String> {
     best.map(|(_, name)| name.clone())
 }
 
+// --- Surface-aware billing events (Phase 8) ---
+
+/// Per-surface usage record carried by an [`AiBillingEvent`].
+///
+/// Different surfaces bill in different units: chat completions and
+/// embeddings bill per token; image generation bills per image plus
+/// resolution; transcription and realtime audio bill per second of
+/// input/output audio; text-to-speech bills per character; reranking
+/// bills per document scored. `PerCall` covers fixed-fee endpoints
+/// (moderations) where the cost is independent of payload size.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AiUsage {
+    /// Token-based usage (chat completions, embeddings, assistants,
+    /// fine-tuning training).
+    Tokens {
+        /// Prompt/input tokens consumed.
+        input: u64,
+        /// Completion/output tokens emitted.
+        output: u64,
+    },
+    /// Image generation usage. `count` is the number of images
+    /// returned; `resolution` is the dimension string sent to the
+    /// provider (e.g. `1024x1024`, `1792x1024`).
+    Images {
+        /// Number of images returned in the response.
+        count: u32,
+        /// Resolution string as sent to the provider.
+        resolution: String,
+    },
+    /// Audio usage measured in seconds. Covers realtime audio frames
+    /// and transcription duration.
+    AudioSeconds {
+        /// Audio duration in seconds, fractional.
+        seconds: f64,
+    },
+    /// Character-based usage (text-to-speech synthesis).
+    Characters {
+        /// Number of input characters synthesized.
+        count: u64,
+    },
+    /// Document-count-based usage (reranking).
+    RerankUnits {
+        /// Number of documents scored.
+        documents: u64,
+    },
+    /// Flat per-call usage. Cost does not scale with payload size
+    /// (moderations, list endpoints, single-record GETs).
+    PerCall,
+}
+
+/// Billing event emitted by the AI gateway for a single dispatched
+/// request.
+///
+/// The event is published onto the observability bus and consumed by
+/// any number of sinks: the OSS budget tracker (which enforces token
+/// limits and audio-second caps for the enforceable units), the
+/// enterprise billing pipeline (which records chargeback rows), and
+/// audit log targets.
+///
+/// `occurred_at_unix_secs` is a UTC Unix timestamp so the shape is
+/// JSON-serializable across the observability bus without leaking
+/// `SystemTime`'s opaque representation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AiBillingEvent {
+    /// AI surface classification (chat completions, assistants,
+    /// image generation, ...). Carried as the label string from
+    /// [`AiSurface::label()`] for stable cross-version serialization.
+    pub surface: String,
+    /// Provider that received the dispatched request.
+    pub provider: String,
+    /// Model identifier if the surface carries one. Optional because
+    /// stateful surfaces (file operations, batch status polls) may not
+    /// carry a model.
+    pub model: Option<String>,
+    /// Surface-specific usage record.
+    pub usage: AiUsage,
+    /// Estimated cost in USD. Zero when pricing for the surface is
+    /// not in the catalog (image and audio pricing land alongside
+    /// per-surface enforcement in a follow-up).
+    pub cost_usd: f64,
+    /// UTC Unix timestamp in seconds when the event was created.
+    pub occurred_at_unix_secs: i64,
+    /// Budget scope keys this event should be debited against
+    /// (workspace, hostname, user, api-key, tag, model). Derived from
+    /// the existing [`BudgetTracker::scope_key`] machinery so the
+    /// same key shapes flow through both the event bus and the
+    /// in-process budget tracker.
+    pub scope_keys: Vec<String>,
+}
+
+impl AiBillingEvent {
+    /// Construct a new event with the current wall-clock timestamp.
+    pub fn new(
+        surface: AiSurface,
+        provider: impl Into<String>,
+        model: Option<String>,
+        usage: AiUsage,
+    ) -> Self {
+        Self {
+            surface: surface.label().to_string(),
+            provider: provider.into(),
+            model,
+            usage,
+            cost_usd: 0.0,
+            occurred_at_unix_secs: now_unix_secs(),
+            scope_keys: Vec::new(),
+        }
+    }
+
+    /// Attach an estimated cost in USD. Chainable so call sites can
+    /// build the event in one expression.
+    pub fn with_cost(mut self, cost_usd: f64) -> Self {
+        self.cost_usd = cost_usd;
+        self
+    }
+
+    /// Attach budget scope keys to the event. Chainable.
+    pub fn with_scope_keys(mut self, keys: Vec<String>) -> Self {
+        self.scope_keys = keys;
+        self
+    }
+}
+
+fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Apply an [`AiBillingEvent`] to a [`BudgetTracker`].
+///
+/// Token-based usage (`Tokens`) is debited against every scope key on
+/// the event. Other surface usage types (image, audio, character,
+/// rerank, per-call) are accepted but only contribute to the request
+/// counter today; per-unit budget enforcement for those surfaces
+/// lands when the enforceable-unit budget shapes ship.
+pub fn record_billing_event(tracker: &BudgetTracker, event: &AiBillingEvent) {
+    let token_total: u64 = match &event.usage {
+        AiUsage::Tokens { input, output } => input.saturating_add(*output),
+        _ => 0,
+    };
+    for key in &event.scope_keys {
+        tracker.record_usage(key, token_total, event.cost_usd);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,5 +621,152 @@ mod tests {
         let usage = tracker.get_usage("ws:concurrent");
         assert_eq!(usage.tokens, 16 * 1000);
         assert_eq!(usage.request_count, 16 * 1000);
+    }
+
+    // --- AiBillingEvent and AiUsage (Phase 8 foundations) ---
+
+    #[test]
+    fn billing_event_tokens_serializes_with_kind_tag() {
+        let event = AiBillingEvent::new(
+            AiSurface::ChatCompletions,
+            "openai",
+            Some("gpt-4o".to_string()),
+            AiUsage::Tokens {
+                input: 1000,
+                output: 500,
+            },
+        )
+        .with_cost(0.012)
+        .with_scope_keys(vec!["ws:acme".to_string()]);
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"surface\":\"chat_completions\""));
+        assert!(json.contains("\"kind\":\"tokens\""));
+        assert!(json.contains("\"input\":1000"));
+        assert!(json.contains("\"output\":500"));
+        assert!(json.contains("\"cost_usd\":0.012"));
+        // Round-trips back through Deserialize.
+        let parsed: AiBillingEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn billing_event_image_usage_round_trip() {
+        let event = AiBillingEvent::new(
+            AiSurface::ImageGeneration,
+            "openai",
+            Some("dall-e-3".to_string()),
+            AiUsage::Images {
+                count: 2,
+                resolution: "1024x1024".to_string(),
+            },
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"kind\":\"images\""));
+        assert!(json.contains("\"resolution\":\"1024x1024\""));
+        let parsed: AiBillingEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.surface, "image_generation");
+        match parsed.usage {
+            AiUsage::Images { count, resolution } => {
+                assert_eq!(count, 2);
+                assert_eq!(resolution, "1024x1024");
+            }
+            _ => panic!("expected Images usage"),
+        }
+    }
+
+    #[test]
+    fn billing_event_audio_seconds_and_characters_round_trip() {
+        let audio = AiBillingEvent::new(
+            AiSurface::Realtime,
+            "openai",
+            Some("gpt-4o-realtime".to_string()),
+            AiUsage::AudioSeconds { seconds: 12.5 },
+        );
+        let chars = AiBillingEvent::new(
+            AiSurface::AudioSpeech,
+            "openai",
+            Some("tts-1".to_string()),
+            AiUsage::Characters { count: 240 },
+        );
+        // Round-trips don't lose precision on the non-token shapes.
+        let audio_json = serde_json::to_string(&audio).unwrap();
+        let chars_json = serde_json::to_string(&chars).unwrap();
+        assert!(audio_json.contains("\"seconds\":12.5"));
+        assert!(chars_json.contains("\"count\":240"));
+        let _: AiBillingEvent = serde_json::from_str(&audio_json).unwrap();
+        let _: AiBillingEvent = serde_json::from_str(&chars_json).unwrap();
+    }
+
+    #[test]
+    fn billing_event_rerank_units_and_per_call_round_trip() {
+        let rerank = AiBillingEvent::new(
+            AiSurface::Reranking,
+            "cohere",
+            Some("rerank-english-v3.0".to_string()),
+            AiUsage::RerankUnits { documents: 42 },
+        );
+        let per_call = AiBillingEvent::new(
+            AiSurface::Moderations,
+            "openai",
+            Some("omni-moderation-latest".to_string()),
+            AiUsage::PerCall,
+        );
+        let _: AiBillingEvent =
+            serde_json::from_str(&serde_json::to_string(&rerank).unwrap()).unwrap();
+        let _: AiBillingEvent =
+            serde_json::from_str(&serde_json::to_string(&per_call).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn record_billing_event_debits_tokens_against_each_scope_key() {
+        let tracker = BudgetTracker::new();
+        let event = AiBillingEvent::new(
+            AiSurface::ChatCompletions,
+            "openai",
+            Some("gpt-4o".to_string()),
+            AiUsage::Tokens {
+                input: 800,
+                output: 200,
+            },
+        )
+        .with_cost(0.01)
+        .with_scope_keys(vec!["ws:acme".to_string(), "user:alice".to_string()]);
+
+        record_billing_event(&tracker, &event);
+
+        let ws = tracker.get_usage("ws:acme");
+        let user = tracker.get_usage("user:alice");
+        assert_eq!(ws.tokens, 1000);
+        assert_eq!(user.tokens, 1000);
+        assert!((ws.cost_usd - 0.01).abs() < 1e-9);
+        assert!((user.cost_usd - 0.01).abs() < 1e-9);
+        assert_eq!(ws.request_count, 1);
+        assert_eq!(user.request_count, 1);
+    }
+
+    #[test]
+    fn record_billing_event_non_token_usage_records_zero_tokens() {
+        // Image / audio / character / rerank / per-call events still
+        // tick the request_count and accumulate any per-call cost, but
+        // they contribute zero tokens because the unit doesn't map.
+        let tracker = BudgetTracker::new();
+        let event = AiBillingEvent::new(
+            AiSurface::ImageGeneration,
+            "openai",
+            Some("dall-e-3".to_string()),
+            AiUsage::Images {
+                count: 1,
+                resolution: "1024x1024".to_string(),
+            },
+        )
+        .with_cost(0.04)
+        .with_scope_keys(vec!["ws:acme".to_string()]);
+
+        record_billing_event(&tracker, &event);
+        let usage = tracker.get_usage("ws:acme");
+        assert_eq!(usage.tokens, 0, "image events do not contribute tokens");
+        assert!((usage.cost_usd - 0.04).abs() < 1e-9);
+        assert_eq!(usage.request_count, 1);
     }
 }
