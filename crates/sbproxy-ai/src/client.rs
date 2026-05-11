@@ -482,6 +482,52 @@ impl AiClient {
     }
 }
 
+impl AiClient {
+    /// Forward a raw request body byte-for-byte with the caller's
+    /// `Content-Type` preserved.
+    ///
+    /// Used for surfaces that the proxy must not parse or rewrite:
+    /// `POST /v1/audio/transcriptions`, `POST /v1/images/edits`,
+    /// `POST /v1/images/variations` (multipart bodies), and any
+    /// inbound request with a non-JSON `Content-Type`. The body
+    /// bytes are sent untranslated; provider-format translation
+    /// applies only to JSON bodies routed through
+    /// `forward_with_method` or `forward_request`.
+    pub async fn forward_bytes(
+        &self,
+        provider: &ProviderConfig,
+        method: &str,
+        path: &str,
+        body: bytes::Bytes,
+        content_type: &str,
+    ) -> Result<reqwest::Response> {
+        let base_url_owned = provider.effective_base_url();
+        let base_url = base_url_owned.trim_end_matches('/');
+        let url = build_url(base_url, path);
+        let (auth_header, auth_value) = provider.auth_header();
+        let reqwest_method = parse_http_method(method)?;
+
+        debug!(
+            url = %url,
+            method = %method,
+            provider = %provider.name,
+            content_type = %content_type,
+            body_len = body.len(),
+            "forwarding AI raw-body request to provider"
+        );
+
+        let resp = self
+            .http
+            .request(reqwest_method, &url)
+            .header(auth_header, &auth_value)
+            .header("content-type", content_type)
+            .body(body)
+            .send()
+            .await?;
+        Ok(resp)
+    }
+}
+
 /// Parse an HTTP method string into a `reqwest::Method`. Accepts the
 /// canonical methods case-insensitively; falls back to
 /// `reqwest::Method::from_bytes` for non-standard verbs.

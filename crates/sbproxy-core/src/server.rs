@@ -4583,6 +4583,53 @@ async fn handle_ai_proxy(
     // POST requests: read the body, parse JSON, select provider, forward.
     let body_bytes = session.read_request_body().await?.unwrap_or_default();
 
+    // Multipart short-circuit: surfaces that carry multipart bodies
+    // (audio transcriptions, image edits, image variations, file
+    // uploads) must not be JSON-parsed. We byte-forward the body
+    // verbatim with the inbound Content-Type preserved so the
+    // upstream provider parses it normally.
+    let request_content_type = session
+        .req_header()
+        .headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if request_content_type
+        .to_ascii_lowercase()
+        .starts_with("multipart/")
+    {
+        let provider_idx = router.select(&config.providers).ok_or_else(|| {
+            warn!("AI proxy: no enabled providers");
+            Error::new(ErrorType::HTTPStatus(502))
+        })?;
+        let provider = &config.providers[provider_idx];
+
+        let resp = AI_CLIENT
+            .load()
+            .forward_bytes(
+                provider,
+                &method_str,
+                &path,
+                body_bytes,
+                &request_content_type,
+            )
+            .await
+            .map_err(|e| {
+                warn!(
+                    error = %e,
+                    method = %method_str,
+                    ai.surface = surface_label,
+                    content_type = %request_content_type,
+                    "AI proxy: upstream multipart request failed"
+                );
+                Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
+            })?;
+
+        let format = sbproxy_ai::client::provider_format(provider);
+        return relay_ai_response(session, resp, format, config.max_body_size).await;
+    }
+
     let mut body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
