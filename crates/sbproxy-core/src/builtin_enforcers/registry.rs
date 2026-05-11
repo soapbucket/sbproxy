@@ -38,8 +38,11 @@ use sbproxy_plugin::PolicyEnforcer;
 #[cfg(feature = "agent-class")]
 use super::AgentClassEnforcer;
 use super::{
-    A2AEnforcer, AiCrawlEnforcer, CsrfEnforcer, DlpEnforcer, ExposedCredsEnforcer,
-    ExpressionEnforcer, IpFilterEnforcer, PromptInjectionV2Enforcer,
+    A2AEnforcer, AiCrawlEnforcer, AssertionEnforcer, ConcurrentLimitEnforcer, CsrfEnforcer,
+    DdosEnforcer, DlpEnforcer, ExposedCredsEnforcer, ExpressionEnforcer, HttpFramingEnforcer,
+    IpFilterEnforcer, OpenApiValidationEnforcer, PageShieldEnforcer, PromptInjectionV2Enforcer,
+    RateLimitEnforcer, RequestLimitEnforcer, RequestValidatorEnforcer, SecHeadersEnforcer,
+    SriEnforcer, WafEnforcer,
 };
 
 /// Error returned by [`compile_builtin_enforcers`] when a
@@ -114,34 +117,44 @@ fn compile_one(policy: Policy) -> Result<Box<dyn PolicyEnforcer>, BuiltinEnforce
         // in `NotYetPorted` is the `policy_type()` label so
         // dashboards keyed on that label keep working through
         // the cutover.
-        Policy::RateLimit(_) => Err(BuiltinEnforcerError::NotYetPorted("rate_limiting")),
+        // Ported in WOR-201 PR 1c.3 (HTTP-structural batch).
+        Policy::RateLimit(p) => Ok(Box::new(RateLimitEnforcer(Arc::new(p)))),
         // Ported in WOR-201 PR 1c.1 (auth-adjacent batch).
         Policy::IpFilter(p) => Ok(Box::new(IpFilterEnforcer(Arc::new(p)))),
-        Policy::SecHeaders(_) => Err(BuiltinEnforcerError::NotYetPorted("security_headers")),
-        Policy::RequestLimit(_) => Err(BuiltinEnforcerError::NotYetPorted("request_limit")),
+        // Ported in WOR-201 PR 1c.3 (HTTP-structural batch).
+        Policy::SecHeaders(p) => Ok(Box::new(SecHeadersEnforcer(Arc::new(p)))),
+        // Ported in WOR-201 PR 1c.3 (HTTP-structural batch).
+        Policy::RequestLimit(p) => Ok(Box::new(RequestLimitEnforcer(Arc::new(p)))),
         // Ported in WOR-201 PR 1c.1 (auth-adjacent batch).
         Policy::Csrf(p) => Ok(Box::new(CsrfEnforcer(Arc::new(p)))),
-        Policy::Ddos(_) => Err(BuiltinEnforcerError::NotYetPorted("ddos")),
-        Policy::Sri(_) => Err(BuiltinEnforcerError::NotYetPorted("sri")),
+        // Ported in WOR-201 PR 1c.3 (HTTP-structural batch).
+        Policy::Ddos(p) => Ok(Box::new(DdosEnforcer(Arc::new(p)))),
+        // Ported in WOR-201 PR 1c.3 (HTTP-structural batch).
+        Policy::Sri(p) => Ok(Box::new(SriEnforcer(Arc::new(p)))),
         // Ported in WOR-201 PR 1c.1 (auth-adjacent batch).
         Policy::Expression(p) => Ok(Box::new(ExpressionEnforcer(Arc::new(p)))),
-        Policy::Assertion(_) => Err(BuiltinEnforcerError::NotYetPorted("assertion")),
-        Policy::Waf(_) => Err(BuiltinEnforcerError::NotYetPorted("waf")),
-        Policy::RequestValidator(_) => Err(BuiltinEnforcerError::NotYetPorted("request_validator")),
-        Policy::ConcurrentLimit(_) => Err(BuiltinEnforcerError::NotYetPorted("concurrent_limit")),
+        // Ported in WOR-201 PR 1c.3 (HTTP-structural batch).
+        Policy::Assertion(p) => Ok(Box::new(AssertionEnforcer(Arc::new(p)))),
+        // Ported in WOR-201 PR 1c.3 (HTTP-structural batch).
+        Policy::Waf(p) => Ok(Box::new(WafEnforcer(Arc::new(p)))),
+        // Ported in WOR-201 PR 1c.3 (HTTP-structural batch).
+        Policy::RequestValidator(p) => Ok(Box::new(RequestValidatorEnforcer(Arc::new(p)))),
+        // Ported in WOR-201 PR 1c.3 (HTTP-structural batch).
+        Policy::ConcurrentLimit(p) => Ok(Box::new(ConcurrentLimitEnforcer(Arc::new(p)))),
         // Ported in WOR-201 PR 1c.2 (AI/agent batch).
         Policy::AiCrawl(p) => Ok(Box::new(AiCrawlEnforcer(Arc::new(p)))),
         // Ported in WOR-201 PR 1c.1 (auth-adjacent batch).
         Policy::ExposedCreds(p) => Ok(Box::new(ExposedCredsEnforcer(Arc::new(p)))),
-        Policy::PageShield(_) => Err(BuiltinEnforcerError::NotYetPorted("page_shield")),
+        // Ported in WOR-201 PR 1c.3 (HTTP-structural batch).
+        Policy::PageShield(p) => Ok(Box::new(PageShieldEnforcer(Arc::new(p)))),
         // Ported in WOR-201 PR 1c.2 (AI/agent batch).
         Policy::Dlp(p) => Ok(Box::new(DlpEnforcer(Arc::new(p)))),
-        Policy::OpenApiValidation(_) => {
-            Err(BuiltinEnforcerError::NotYetPorted("openapi_validation"))
-        }
+        // Ported in WOR-201 PR 1c.3 (HTTP-structural batch).
+        Policy::OpenApiValidation(p) => Ok(Box::new(OpenApiValidationEnforcer(Arc::new(p)))),
         // Ported in WOR-201 PR 1c.2 (AI/agent batch).
         Policy::PromptInjectionV2(p) => Ok(Box::new(PromptInjectionV2Enforcer(Arc::new(p)))),
-        Policy::HttpFraming(_) => Err(BuiltinEnforcerError::NotYetPorted("http_framing")),
+        // Ported in WOR-201 PR 1c.3 (HTTP-structural batch).
+        Policy::HttpFraming(p) => Ok(Box::new(HttpFramingEnforcer(Arc::new(p)))),
         // Ported in WOR-201 PR 1c.2 (AI/agent batch).
         #[cfg(feature = "agent-class")]
         Policy::AgentClass(p) => Ok(Box::new(AgentClassEnforcer(Arc::new(p)))),
@@ -208,109 +221,21 @@ mod tests {
     /// are observable from CI without anyone having to wire a
     /// new gate.
     fn every_built_in_variant() -> Vec<(Policy, &'static str)> {
+        // The HTTP-structural batch (WOR-201 PR 1c.3) ported every
+        // remaining variant that previously returned NotYetPorted.
+        // The list is now empty; the regression test below asserts
+        // that nothing in the list returns Ok (vacuously true) and
+        // future variants would re-populate it.
+        //
         // `mut` is conditional on the `agent-class` feature pushing
-        // an extra entry below; allow the unused-mut diagnostic so
-        // the no-feature build stays warning-free without an
-        // unconditional cfg-gate dance.
+        // an extra entry below; the cfg gate keeps the no-feature
+        // build warning-free without an unconditional dance.
         #[allow(unused_mut)]
         let mut v: Vec<(Policy, &'static str)> = vec![
-            (
-                Policy::RateLimit(
-                    sbproxy_modules::policy::RateLimitPolicy::from_config(serde_json::json!({
-                        "requests_per_second": 1
-                    }))
-                    .expect("rate_limit default"),
-                ),
-                "rate_limiting",
-            ),
-            // IpFilter, Csrf, Expression, ExposedCreds were ported
-            // in WOR-201 PR 1c.1 (auth-adjacent batch). They now
-            // return Ok from `compile_one`; the per-variant Ok
-            // assertions live in `auth_adjacent_variants_compile_to_ok`
-            // below.
-            (
-                Policy::SecHeaders(
-                    SecHeadersPolicy::from_config(serde_json::json!({}))
-                        .expect("sec_headers default"),
-                ),
-                "security_headers",
-            ),
-            (
-                Policy::RequestLimit(
-                    RequestLimitPolicy::from_config(serde_json::json!({}))
-                        .expect("request_limit default"),
-                ),
-                "request_limit",
-            ),
-            (
-                Policy::Ddos(
-                    DdosPolicy::from_config(serde_json::json!({})).expect("ddos default"),
-                ),
-                "ddos",
-            ),
-            (
-                Policy::Sri(
-                    SriPolicy::from_config(serde_json::json!({})).expect("sri default"),
-                ),
-                "sri",
-            ),
-            (
-                Policy::Assertion(
-                    AssertionPolicy::from_config(serde_json::json!({"expression": "true"}))
-                        .expect("assertion default"),
-                ),
-                "assertion",
-            ),
-            (
-                Policy::Waf(
-                    sbproxy_modules::policy::WafPolicy::from_config(serde_json::json!({}))
-                        .expect("waf default"),
-                ),
-                "waf",
-            ),
-            (
-                Policy::RequestValidator(
-                    sbproxy_modules::policy::RequestValidatorPolicy::from_config(
-                        serde_json::json!({"schema": {"type": "object"}}),
-                    )
-                    .expect("request_validator default"),
-                ),
-                "request_validator",
-            ),
-            (
-                Policy::ConcurrentLimit(
-                    ConcurrentLimitPolicy::from_config(serde_json::json!({"max": 1}))
-                        .expect("concurrent_limit default"),
-                ),
-                "concurrent_limit",
-            ),
-            // AiCrawl, Dlp, PromptInjectionV2 ported in WOR-201 PR 1c.2.
-            (
-                Policy::PageShield(
-                    PageShieldPolicy::from_config(
-                        serde_json::json!({"directives": ["default-src 'self'"]}),
-                    )
-                    .expect("page_shield default"),
-                ),
-                "page_shield",
-            ),
-            (
-                Policy::OpenApiValidation(
-                    sbproxy_modules::policy::OpenApiValidationPolicy::from_config(
-                        serde_json::json!({"spec": {"openapi": "3.0.0", "info": {"title": "t", "version": "1"}, "paths": {}}}),
-                    )
-                    .expect("openapi default"),
-                ),
-                "openapi_validation",
-            ),
-            (
-                Policy::HttpFraming(
-                    sbproxy_modules::policy::HttpFramingPolicy::from_config(serde_json::json!({}))
-                        .expect("http_framing default"),
-                ),
-                "http_framing",
-            ),
-            // A2A and AgentClass ported in WOR-201 PR 1c.2.
+            // semantic_constraint is the only variant still
+            // `NotYetPorted`; WOR-203 PR 3b ships a Cedar evaluator
+            // bridge that lands separately, after which this entry
+            // moves into the per-variant Ok assertions below.
         ];
 
         v
@@ -456,11 +381,11 @@ mod tests {
     }
 
     /// `compile_builtin_enforcers` itself just maps over the
-    /// vec; the unit smoke test confirms order is preserved
-    /// and the err / ok mix surfaces correctly. Mixes a still
-    /// not-yet-ported variant (waf), a plugin, and one of the
-    /// PR-1c.1 ported variants (csrf) so the assertion covers
-    /// all three outcome shapes.
+    /// vec; the unit smoke test confirms order is preserved and
+    /// the Ok mix surfaces correctly. After WOR-201 PR 1c.3 every
+    /// built-in port returns Ok; the test mixes a plugin and a
+    /// still-`NotYetPorted` variant (`semantic_constraint`) to
+    /// cover both outcome shapes.
     #[test]
     fn compile_builtin_enforcers_preserves_order_and_outcomes() {
         let inputs: Vec<Policy> = vec![
@@ -476,15 +401,121 @@ mod tests {
         ];
         let outcomes = compile_builtin_enforcers(inputs);
         assert_eq!(outcomes.len(), 3);
-        assert!(matches!(
-            outcomes[0],
-            Err(BuiltinEnforcerError::NotYetPorted("waf"))
-        ));
+        let waf = outcomes[0]
+            .as_ref()
+            .expect("ported waf variant compiles to Ok");
+        assert_eq!(waf.policy_type(), "waf");
         let ok = outcomes[1].as_ref().expect("plugin compiles to Ok");
         assert_eq!(ok.policy_type(), "fake_plugin");
         let csrf = outcomes[2]
             .as_ref()
             .expect("ported csrf variant compiles to Ok");
         assert_eq!(csrf.policy_type(), "csrf");
+    }
+
+    /// HTTP-structural batch (WOR-201 PR 1c.3): twelve variants
+    /// flipped from `NotYetPorted` to `Ok(...)`. The matrix below
+    /// confirms each one's wrapper claims the right
+    /// `policy_type()` label.
+    #[test]
+    fn http_structural_variants_compile_to_ok() {
+        let cases: Vec<(Policy, &'static str)> = vec![
+            (
+                Policy::RateLimit(
+                    sbproxy_modules::policy::RateLimitPolicy::from_config(serde_json::json!({
+                        "requests_per_second": 1
+                    }))
+                    .expect("rate_limit default"),
+                ),
+                "rate_limit",
+            ),
+            (
+                Policy::SecHeaders(
+                    SecHeadersPolicy::from_config(serde_json::json!({}))
+                        .expect("sec_headers default"),
+                ),
+                "security_headers",
+            ),
+            (
+                Policy::RequestLimit(
+                    RequestLimitPolicy::from_config(serde_json::json!({}))
+                        .expect("request_limit default"),
+                ),
+                "request_limit",
+            ),
+            (
+                Policy::Ddos(
+                    DdosPolicy::from_config(serde_json::json!({})).expect("ddos default"),
+                ),
+                "ddos",
+            ),
+            (
+                Policy::Sri(
+                    SriPolicy::from_config(serde_json::json!({})).expect("sri default"),
+                ),
+                "sri",
+            ),
+            (
+                Policy::Assertion(
+                    AssertionPolicy::from_config(serde_json::json!({"expression": "true"}))
+                        .expect("assertion default"),
+                ),
+                "assertion",
+            ),
+            (
+                Policy::Waf(
+                    sbproxy_modules::policy::WafPolicy::from_config(serde_json::json!({}))
+                        .expect("waf default"),
+                ),
+                "waf",
+            ),
+            (
+                Policy::RequestValidator(
+                    sbproxy_modules::policy::RequestValidatorPolicy::from_config(
+                        serde_json::json!({"schema": {"type": "object"}}),
+                    )
+                    .expect("request_validator default"),
+                ),
+                "request_validator",
+            ),
+            (
+                Policy::ConcurrentLimit(
+                    ConcurrentLimitPolicy::from_config(serde_json::json!({"max": 1}))
+                        .expect("concurrent_limit default"),
+                ),
+                "concurrent_limit",
+            ),
+            (
+                Policy::PageShield(
+                    PageShieldPolicy::from_config(
+                        serde_json::json!({"directives": ["default-src 'self'"]}),
+                    )
+                    .expect("page_shield default"),
+                ),
+                "page_shield",
+            ),
+            (
+                Policy::OpenApiValidation(
+                    sbproxy_modules::policy::OpenApiValidationPolicy::from_config(
+                        serde_json::json!({"spec": {"openapi": "3.0.0", "info": {"title": "t", "version": "1"}, "paths": {}}}),
+                    )
+                    .expect("openapi default"),
+                ),
+                "openapi_validation",
+            ),
+            (
+                Policy::HttpFraming(
+                    sbproxy_modules::policy::HttpFramingPolicy::from_config(serde_json::json!({}))
+                        .expect("http_framing default"),
+                ),
+                "http_framing",
+            ),
+        ];
+        for (policy, expected_label) in cases {
+            let label = expected_label;
+            let enforcer = compile_one(policy)
+                .unwrap_or_else(|_| panic!("variant labelled {label} compiles to Ok"));
+            assert_eq!(enforcer.policy_type(), expected_label);
+        }
     }
 }
