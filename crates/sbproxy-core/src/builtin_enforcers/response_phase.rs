@@ -24,14 +24,18 @@ use bytes::Bytes;
 use sbproxy_modules::policy::{AssertionPolicy, PageShieldPolicy, SecHeadersPolicy, SriPolicy};
 use sbproxy_plugin::{PolicyDecision, PolicyEnforcer};
 
+/// Static doc string applied to every response-phase wrapper. A
+/// per-policy version would be cleaner, but the cross-version
+/// rustfmt instability around `concat!()` inside `#[doc = ...]`
+/// macro arms isn't worth the maintenance cost; the per-struct
+/// docs at the policy-level cover the specifics.
 macro_rules! response_phase_enforcer {
     ($name:ident, $policy:ty, $label:literal) => {
-        #[doc = concat!(
-                            "Newtype wrapper that adapts [`",
-                            stringify!($policy),
-                            "`] to the [`PolicyEnforcer`] trait surface. ",
-                            "Response-phase only; request-phase `enforce` returns `Allow`."
-                        )]
+        /// Newtype wrapper that adapts a response-phase
+        /// `sbproxy-modules` policy to the `PolicyEnforcer` trait
+        /// surface. `enforce` always returns `Allow` at the
+        /// request phase; the policy's real work happens during
+        /// the response filters.
         pub struct $name(pub Arc<$policy>);
 
         impl PolicyEnforcer for $name {
