@@ -2516,6 +2516,33 @@ The origin-level `rate_limit_headers` block is accepted for forward compatibilit
 
 ---
 
+## Idempotency-Key middleware
+
+`crates/sbproxy-middleware/src/idempotency.rs` ships an
+`Idempotency-Key` middleware that implements the cached-retry vs
+conflict semantics from Wave 3 / R3.2:
+
+1. Request carries `Idempotency-Key`, cache miss: process the
+   request, capture the response, persist
+   `(workspace_id, key, body_hash, response, expires_at)` after the
+   response is final. Default TTL 24 h.
+2. Cache hit, body hash matches: return the cached response. The
+   rate-limit middleware does not consume a slot.
+3. Cache hit, body hash differs: return 409
+   `ledger.idempotency_conflict`. The rate-limit middleware does
+   consume a slot per the A3.4 DoS rule.
+4. No `Idempotency-Key` header: pass through.
+
+The middleware is library-level today and is consumed by the AI
+gateway path through `sbproxy-ai::idempotency`. There is no
+top-level `idempotency:` block on the origin schema yet; the AI
+handler enables the behaviour for AI traffic and the SHA-256
+body-hash + cached-response shape (`CachedResponse`) is reused
+across both surfaces. Cache backends are `InMemoryIdempotencyCache`
+(tests, single instance) and `KvIdempotencyCache` (any
+`sbproxy_platform::storage::KVStore` implementation, including the
+Redis backend).
+
 ## Message signatures
 
 The `message_signatures` block declares the schema for RFC 9421 HTTP Message Signatures. The configuration type is defined in `sbproxy-middleware`, but the signing and verification path is not wired into the OSS request pipeline yet. The block parses cleanly so configs that target a future release validate today.

@@ -306,13 +306,24 @@ The Lua and JavaScript transform variants are defined directly in `mod.rs` rathe
 - `mod.rs` - `JsEngine`, a sandboxed JavaScript execution environment using QuickJS via `rquickjs`. Default 16 MB memory limit and 1 MB stack. `eval` is removed; `json_encode` / `json_decode` are registered as helpers. Used by JavaScript and JsJson transforms.
 
 **WASM** (`src/wasm/`):
-- `mod.rs` - `WasmRuntime`, a sandboxed WebAssembly execution environment. Currently a passthrough stub; full wasmtime integration is planned behind a feature flag. Config supports module paths, allowed hosts, memory limits, and execution timeouts.
+- `mod.rs` - `WasmRuntime`, a sandboxed WebAssembly engine backed by `wasmtime` 44 with the WASI preview-1 surface. Modules read input on stdin and write output to stdout; no preopens, no network, no extra host imports. `WasmConfig` accepts `module_path` or `module_bytes`, an optional `max_memory_pages` (default 256, each page 64 KiB), an optional `timeout_ms` (default 1000), and a reserved `allowed_hosts` list. CPU time is enforced via wasmtime epoch interruption (a background ticker bumps the epoch once per millisecond); memory is capped through `StoreLimits`. Module stderr is captured into `tracing::debug!` with a 1 MiB per-call cap so a runaway module cannot flood the host log pipeline.
 
 **MCP** (`src/mcp/`):
-- `mod.rs` - `McpHandler` implements JSON-RPC 2.0 based Model Context Protocol for exposing tools and resources to LLMs.
-- `registry.rs` - `ToolRegistry` for registering and discovering MCP tools.
-- `handler.rs` - Request handling for MCP protocol messages.
-- `types.rs` - MCP protocol types (tool definitions, resource descriptors).
+- `mod.rs` - Module index. Re-exports the public surface.
+- `handler.rs` - `McpHandler` plus `InitializeContext`. JSON-RPC 2.0 dispatcher for an embedded MCP server.
+- `registry.rs` - `ToolRegistry` and `ToolHandlerType` for registering and discovering tools.
+- `types.rs` - Shared JSON-RPC 2.0 and MCP protocol types.
+- `streamable.rs` - Streamable HTTP transport for calling upstream MCP servers.
+- `sse_client.rs` - Legacy SSE transport for calling upstream MCP servers.
+- `federation.rs` - `McpFederation` and `McpServerConfig`. Aggregates tools across multiple upstream servers behind one MCP endpoint.
+- `access_control.rs` - `ToolAccessPolicy`. Per-tool allow / deny lists keyed by caller identity.
+- `audit.rs` - `McpAuditBuilder` and `McpAuditEntry`. Structured audit record for every tool invocation.
+- `guardrails.rs` - `McpGuardrailConfig` and `check_tool_invocation`. Safety checks (input size, schema, content filters) applied before a tool runs.
+- `code_mode.rs` - `compress_tool_schema` and `estimate_token_reduction`. Shrinks tool schemas before they hit the LLM context window.
+- `context_opt.rs` - `ToolUsageTracker`. Prioritises frequently-used tools when the context budget is tight.
+- `openapi_convert.rs` - `openapi_to_mcp_tools`. Converts an OpenAPI 3.x spec into MCP tool definitions.
+- `rest_to_mcp.rs` - `RestToMcpConfig`, `create_mcp_handler`, `execute_tool_as_rest`. Exposes existing REST APIs as MCP servers without rewriting them.
+- `spans.rs` - Tracing-span helpers shared by the MCP request path.
 
 **How it fits in:** Used by `sbproxy-modules` for expression policies, Lua transforms, and Lua-based matching logic. The MCP handler is used by the AI gateway for tool-use scenarios.
 
@@ -347,6 +358,7 @@ The Lua and JavaScript transform variants are defined directly in `mod.rs` rathe
 - `src/store/memory.rs` - In-memory LRU cache with TTL-based expiry.
 - `src/store/file.rs` - File-based cache store (persists across restarts).
 - `src/store/memcached.rs` - Memcached-backed cache store for distributed caching.
+- `src/store/redis.rs` - Redis-backed cache store. Lets multiple proxy replicas share a single cache pool when running behind a load balancer.
 
 **How it fits in:** Used by `sbproxy-core` in the request/response pipeline. If a cached response exists and is fresh, the upstream request is skipped entirely.
 
@@ -559,7 +571,7 @@ The AI gateway. Easily the largest crate by file count: provider routing across 
 
 ### sbproxy-extension
 
-Scripting and expression runtimes that user-defined logic plugs into: CEL (compiled `CelExpression` evaluated against a request-derived context), Luau-based Lua with a removed-globals sandbox, QuickJS-based JavaScript with a 16 MB memory cap, a WASM scaffold that today is a passthrough stub with config plumbing for a future wasmtime integration, the `McpHandler` JSON-RPC 2.0 Model Context Protocol server with its tool registry, and a feature-flag module. These are the four extension surfaces the public docs steer users toward. **Key types:** `CelExpression`, `LuaEngine`, `JsEngine`, `WasmRuntime`, `McpHandler`. **Start reading here:** `crates/sbproxy-extension/src/lib.rs`.
+Scripting and expression runtimes that user-defined logic plugs into: CEL (compiled `CelExpression` evaluated against a request-derived context), Luau-based Lua with a removed-globals sandbox, QuickJS-based JavaScript with a 16 MB memory cap, a wasmtime 44 + WASI preview-1 WASM engine with epoch-based timeouts and `StoreLimits`-enforced memory caps, the `McpHandler` JSON-RPC 2.0 Model Context Protocol server with its tool registry plus federation, REST-to-MCP conversion, code-mode schema compression, guardrails, and access control, and a feature-flag module. These are the four extension surfaces the public docs steer users toward. **Key types:** `CelExpression`, `LuaEngine`, `JsEngine`, `WasmRuntime`, `McpHandler`. **Start reading here:** `crates/sbproxy-extension/src/lib.rs`.
 
 ### sbproxy-observe
 

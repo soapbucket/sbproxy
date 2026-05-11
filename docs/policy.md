@@ -90,6 +90,99 @@ OSS does not ship:
 
 The enterprise tier reads the same `CompiledPolicy` struct shape produced by the OSS compiler, so policies authored under OSS upgrade cleanly when the enterprise evaluator is wired in.
 
+## request_validator
+
+Validates request bodies against a JSON Schema at the edge. The schema is compiled at config-load time, so each request is a cheap dispatch. Source: `crates/sbproxy-modules/src/policy/request_validator.rs`. Only requests whose `Content-Type` matches one of `content_types` (default `application/json`) are validated; other media types pass through. Remote `$ref` resolution is disabled at the workspace level so a malicious schema cannot become an SSRF primitive. Rejection responses report the failure location (JSON path) without echoing the attacker-controlled payload.
+
+```yaml
+policies:
+  - type: request_validator
+    content_types:
+      - application/json
+    status: 400
+    error_content_type: application/json
+    schema:
+      type: object
+      required: [name, age]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 100}
+        age:  {type: integer, minimum: 0, maximum: 150}
+      additionalProperties: false
+```
+
+Runnable example: `examples/81-request-validator/sb.yml`.
+
+## concurrent_limit
+
+Caps in-flight requests per key. Distinct from `rate_limiting`, which throttles requests per second. Concurrent limits protect backends with low concurrency budgets: legacy SOAP services, DB-bound endpoints, GPU inference workers. Source: `crates/sbproxy-modules/src/policy/concurrent_limit.rs`. Each accepted request takes a permit; the permit releases when the request finishes. When `max` permits are already issued for a key, new requests are rejected immediately with `status` (default 503).
+
+Key strategies:
+
+- `origin` (default): one global counter for the route.
+- `ip`: one counter per client IP.
+- `api_key`: one counter per `X-Api-Key` header (or `Authorization: Bearer` when no api-key auth is configured).
+
+```yaml
+policies:
+  - type: concurrent_limit
+    max: 3
+    key: ip
+    status: 503
+    error_body: '{"error":"too many concurrent requests, retry shortly"}'
+```
+
+Runnable example: `examples/82-concurrent-limit/sb.yml`.
+
+## http_framing
+
+Detects HTTP request-smuggling and desync primitives before they reach the upstream. Source: `crates/sbproxy-modules/src/policy/http_framing.rs`. Pingora's parser catches the wire-level malformed input; this policy adds the semantic-ambiguity layer. Every violation returns 400 and increments `sbproxy_http_framing_blocks_total{reason}` so operators can track attack rates independently of `policy_denied`.
+
+Violations rejected:
+
+| Reason | What it catches |
+|---|---|
+| `dual_cl_te` | Both `Content-Length` and `Transfer-Encoding` headers present (RFC 9112 §6.1). |
+| `duplicate_cl` | Multiple `Content-Length` headers, even when values match. |
+| `malformed_te` | `Transfer-Encoding` value that is not exactly `chunked` after trim and lowercase. Catches `xchunked`, leading whitespace, `gzip, chunked` chains. |
+| `duplicate_te` | Multiple `Transfer-Encoding` headers (TE.TE primitive). |
+| `control_chars` | CR, LF, or NUL in header values that survived parsing. |
+
+```yaml
+policies:
+  - type: http_framing
+```
+
+The policy has no tunable knobs today; the defense set is hard-coded because each violation maps to a known smuggling primitive.
+
+## a2a
+
+Per-route enforcement for agent-to-agent calls. Source: `crates/sbproxy-modules/src/policy/a2a.rs`. The policy fires after authentication and after the resolver chain has populated `caller_agent_id`. Detection runs automatically on two header signals (`Content-Type: application/a2a+json` and `MCP-Method: agents.invoke`); `route_glob` is the operator escape hatch.
+
+Knobs:
+
+- `max_chain_depth`: hard ceiling on hops. Capped at 32 regardless of the configured value. Exceeding it returns 429.
+- `cycle_detection`: `strict` (exact `agent_id` + `request_id` pair must not repeat), `by_agent_id` (default; callee `agent_id` must not appear earlier in the chain), or `by_callable_endpoint` (`agent_id` + endpoint must not repeat). Cycles return 409.
+- `allow_cycles`: when true, the cycle check is skipped.
+- `callee_allowlist`: when non-empty, only listed callees pass. Off-list callees return 403.
+- `caller_denylist`: agents on this list never get past the policy. Returns 403.
+- `bill_caller_only`: true (default) bills the caller's wallet. Setting false flips to callee-billed semantics; the audit log stamps `pricing_anomaly: callee_billed` on each such transaction.
+- `route_glob`: any request whose path matches is treated as A2A traffic even when the protocol-detection headers are absent.
+
+```yaml
+policies:
+  - type: a2a
+    max_chain_depth: 5
+    cycle_detection: by_agent_id
+    callee_allowlist:
+      - "agent:openai:gpt-5"
+      - "agent:anthropic:claude-4"
+    caller_denylist:
+      - "agent:bad:actor"
+    route_glob: "/agents/**"
+```
+
+Runnable example: `examples/40-a2a-protocol/sb.yml`.
+
 ## See also
 
 - `docs/adr-policy-compilation.md`: design rationale for the linter, the compiler, and the pinning contract.

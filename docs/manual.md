@@ -100,9 +100,12 @@ config (log filter, shutdown timing, validation-only mode).
 
 ```
 sbproxy --config <path>
-sbproxy serve -f <path> [--log-level <level>] [--request-log-level <level>] [--grace-time <secs>]
+sbproxy serve -f <path> [--log-level <level>] [--request-log-level <level>] [--grace-time <secs>] [--disable-sb-flags]
 sbproxy validate <path>
 sbproxy --config <path> --check
+sbproxy plan -f <yaml> [--against <yaml>] [--format json|text] [--out <plan-file>]
+sbproxy apply -f <yaml>
+sbproxy apply -p <plan-file>
 sbproxy projections render --kind <kind> --config <path> [--hostname <h>]
 sbproxy --version
 sbproxy --help
@@ -133,6 +136,76 @@ rolling deployment.
 sbproxy validate /etc/sbproxy/sb.yml
 sbproxy --config /etc/sbproxy/sb.yml --check
 ```
+
+### `plan` - diff a proposed config against a baseline
+
+Compiles the proposed YAML, parses both baseline and proposed into
+`ConfigFile`, runs plan-time semantic validation (orphan refs, missing
+secrets, unknown module types), and emits a structured diff. Output is
+a terraform-style text diff by default; `--format json` emits the
+stable plan envelope for tooling. `--out <file>` writes the JSON
+plan-file envelope (which records the baseline revision) so a later
+`sbproxy apply -p <file>` can replay against the same baseline and
+refuse on drift. See [adr-config-plan-apply.md](adr-config-plan-apply.md)
+for the envelope schema.
+
+```bash
+sbproxy plan -f proposed.yml
+sbproxy plan -f proposed.yml --against live.yml --format json
+sbproxy plan -f proposed.yml --out /tmp/sb.plan
+```
+
+Exit codes:
+
+| Code | Meaning |
+|------|---------|
+| 0 | No changes between baseline and proposed. |
+| 1 | CLI / IO error. |
+| 2 | Changes present (informational, not an error). |
+| 3 | Semantic-validation errors. The findings section spells out which rules fired. |
+
+When `--against` is omitted, the baseline is empty, so every origin in
+the proposed config surfaces as `added`. The `--running` baseline
+(pulled from a live admin socket) is deferred.
+
+### `apply` - validate and reload in place
+
+Two flows:
+
+```bash
+sbproxy apply -f proposed.yml          # validate + reload from YAML
+sbproxy apply -p /tmp/sb.plan          # replay a plan file
+```
+
+`apply -f` validates the proposed YAML, runs plan-time semantic
+checks, and calls the same hot-reload primitive the SIGHUP handler
+and file watcher use. `apply -p` reads a plan file from a prior
+`plan --out`, recomputes the plan against the current baseline, and
+refuses (exit 5) if the recorded `baseline_revision` no longer
+matches the live one. Both flows take an exclusive `flock(2)` on
+`<yaml_path>.applylock` so two operators cannot race the same
+reload.
+
+The `-p` form is intentionally env-var driven for the YAML path and
+baseline: the plan file does not embed an on-disk path, so the
+operator points apply at the YAML through `SB_APPLY_CONFIG` and
+optionally overrides the baseline with `SB_APPLY_BASELINE`. See
+[adr-config-plan-apply.md](adr-config-plan-apply.md) for the
+rationale.
+
+```bash
+SB_APPLY_CONFIG=/etc/sbproxy/sb.yml sbproxy apply -p /tmp/sb.plan
+```
+
+Exit codes:
+
+| Code | Meaning |
+|------|---------|
+| 0 | Reload applied cleanly. |
+| 1 | CLI / IO / reload error. |
+| 3 | Semantic-validation errors. Apply refused. |
+| 5 | Plan file is stale. Rerun `plan` and re-apply. |
+| 6 | Another `apply` already holds the applylock. |
 
 ### Flags
 
@@ -201,6 +274,28 @@ sbproxy --config sb.yml --grace-time 30
 SB_GRACE_TIME=60 sbproxy --config sb.yml
 ```
 
+#### `--disable-sb-flags` (bare flag)
+
+Lock off the per-request feature-flag surface (`x-sb-flags` header and
+`?_sb.<k>` query params). When set, every built-in flag reads `false`
+and the `extra` map is empty; CEL expressions that branch on
+`features.*` see the same shape as a request with no flags. Use this
+to harden production deployments that do not expect clients to drive
+proxy behaviour.
+
+- **Default:** off; the flag surface is active.
+- **Environment:** `SB_DISABLE_SB_FLAGS` (accepts `1`, `true`, `yes`,
+  `on`, case-insensitive).
+- **Priority:** CLI flag wins over the env var.
+
+```bash
+sbproxy --config sb.yml --disable-sb-flags
+SB_DISABLE_SB_FLAGS=1 sbproxy --config sb.yml
+```
+
+See [§10. Feature flags](#10-feature-flags) for the surface the kill
+switch disables.
+
 #### `--check`
 
 Validates the config and exits without starting the listener. Equivalent
@@ -213,13 +308,9 @@ sbproxy --config sb.yml --check
 
 ### Planned, not yet wired
 
-The following flags appear in older release notes and will return in a
-later wave but are not honoured by the v1.0 binary:
+The following flag appears in older release notes but is not honoured
+by the v1.0 binary:
 
-- `--disable-sb-flags` / `SB_DISABLE_SB_FLAGS`. Tracked in
-  [WOR-114](https://linear.app/12345r/issue/WOR-114). The header and
-  query-param surface itself is not yet implemented; see
-  [§10. Feature flags](#10-feature-flags) for the planned shape.
 - `--config-dir` / `SB_CONFIG_DIR`. Pass an absolute or relative path
   to `--config`; the loader does not search a directory for known
   filenames.
@@ -1319,6 +1410,8 @@ Variables are applied at process start; changes require a restart.
 | `SB_GRACE_TIME` | `--grace-time` | `0` | Pingora grace period and shutdown timeout in seconds. |
 | `SB_WORKER_THREADS` | (none) | (auto) | Override the auto-detected Pingora worker thread count. Positive integers only. |
 | `SB_DISABLE_SB_FLAGS` | `--disable-sb-flags` | `false` | Lock off the per-request `x-sb-flags` surface. Accepts `1`, `true`, `yes`, `on`. |
+| `SB_APPLY_CONFIG` | (none) | (unset) | Path to the proposed YAML used by `sbproxy apply -p <plan-file>`. Required for the `-p` flow because the plan file does not embed the YAML path. |
+| `SB_APPLY_BASELINE` | (none) | (unset) | Optional baseline override for `sbproxy apply -p`. When set, apply compares the plan's recorded baseline revision against this YAML's revision; otherwise the empty config is the baseline. |
 
 In addition, the standard `RUST_LOG` env var is honoured when neither
 `--log-level` nor `SB_LOG_LEVEL` is set.
