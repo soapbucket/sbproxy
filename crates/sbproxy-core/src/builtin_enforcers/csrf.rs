@@ -181,12 +181,9 @@ impl PolicyEnforcer for CsrfEnforcer {
 }
 
 /// Compute the HMAC-SHA256 CSRF token for the configured secret /
-/// timestamp / hostname triple.
-///
-/// Mirrors the helper that lives in `crate::server::csrf_token`.
-/// Duplicated here (rather than re-exported) so the wrapper's
-/// `enforce()` body has no dependency on `server.rs` internals,
-/// which keeps the eventual `check_policies` slim-down mechanical.
+/// timestamp / hostname triple. Hex-encoded so the value drops
+/// directly into a Set-Cookie body. Forging a token requires
+/// knowledge of `secret`, which never leaves the process.
 fn csrf_token(secret: &str, timestamp: u128, hostname: &str) -> Result<String> {
     use hmac::{KeyInit, Mac, SimpleHmac};
     use sha2::Sha256;
@@ -197,4 +194,24 @@ fn csrf_token(secret: &str, timestamp: u128, hostname: &str) -> Result<String> {
     mac.update(hostname.as_bytes());
     let bytes = mac.finalize().into_bytes();
     Ok(hex::encode(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csrf_token_is_stable_for_same_inputs() {
+        let t1 = csrf_token("secret", 1_700_000_000_000_000_000u128, "example.com").unwrap();
+        let t2 = csrf_token("secret", 1_700_000_000_000_000_000u128, "example.com").unwrap();
+        assert_eq!(t1, t2);
+        // SHA-256 hex output is 64 chars.
+        assert_eq!(t1.len(), 64);
+        // Different secret -> different token.
+        let t3 = csrf_token("other", 1_700_000_000_000_000_000u128, "example.com").unwrap();
+        assert_ne!(t1, t3);
+        // Different hostname -> different token (binds to host).
+        let t4 = csrf_token("secret", 1_700_000_000_000_000_000u128, "other.com").unwrap();
+        assert_ne!(t1, t4);
+    }
 }

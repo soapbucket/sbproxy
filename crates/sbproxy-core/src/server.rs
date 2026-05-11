@@ -24,7 +24,7 @@ use crate::pipeline::CompiledPipeline;
 use crate::reload;
 use sbproxy_ai::{AiClient, AiHandlerConfig, Router as AiRouter};
 use sbproxy_modules::action::ForwardingHeaderControls;
-use sbproxy_modules::{Action, Auth, Policy, RateLimitInfo, WafResult};
+use sbproxy_modules::{Action, Auth, Policy};
 use sbproxy_observe::metrics;
 
 /// Lazily-initialized, hot-reloadable AI client.
@@ -1905,20 +1905,6 @@ fn forward_auth_user_from_trust_headers(headers: &[(String, String)]) -> Option<
 
 // --- Policy checking ---
 
-/// Result of running policy checks on a request.
-enum PolicyResult {
-    /// All policies passed, with optional rate limit info for response headers.
-    Allow(Option<RateLimitInfo>),
-    /// A policy rejected the request with this status, message, optional
-    /// rate-limit metadata, and the stable label of the enforcing
-    /// policy (`rate_limit`, `waf`, `ip_filter`, ...). The label
-    /// flows through to the `sbproxy_policy_triggers_total` metric
-    /// and the security-audit channel so dashboards and SIEM rules
-    /// can break down by enforcing module instead of guessing from
-    /// the response status.
-    Deny(u16, String, Option<RateLimitInfo>, &'static str),
-}
-
 /// Audit-bus correlation context for one policy decision.
 ///
 /// Filled at the dispatcher entry and reused for every policy in the
@@ -1994,85 +1980,6 @@ fn build_plugin_request_snapshot(session: &Session) -> Option<http::Request<byte
     let mut built = builder.body(bytes::Bytes::new()).ok()?;
     *built.headers_mut() = req.headers.clone();
     Some(built)
-}
-
-/// Evaluate a rate-limit `key:` CEL expression against the current
-/// request. Returns the result coerced to a string when evaluation
-/// succeeds and produces a non-empty value, otherwise `None` so the
-/// caller can fall back to the default IP-based key.
-fn rate_limit_key_from_cel(session: &Session, ctx: &RequestContext, expr: &str) -> Option<String> {
-    use sbproxy_extension::cel::context::{
-        build_request_context, populate_envelope_namespace, populate_features_namespace,
-        EnvelopeView, FeatureFlagsView,
-    };
-    use sbproxy_extension::cel::{CelEngine, CelValue};
-
-    let req = session.req_header();
-    let method = req.method.as_str();
-    let path = req.uri.path();
-    let query = req.uri.query();
-    let client_ip = ctx.client_ip.map(|ip| ip.to_string());
-
-    let mut cel_ctx = build_request_context(
-        method,
-        path,
-        &req.headers,
-        query,
-        client_ip.as_deref(),
-        ctx.hostname.as_str(),
-    );
-    // T2.3 / T3.3: expose the Wave 8 envelope so rate-limit keys can
-    // bucket per session_id / user_id without inventing new CEL
-    // syntax. Default empty strings keep `expr` evaluable even when
-    // the corresponding dimension never resolved.
-    let session_str = ctx.session_id.map(|s| s.to_string());
-    let parent_str = ctx.parent_session_id.map(|s| s.to_string());
-    let envelope = EnvelopeView {
-        user_id: ctx.user_id.as_deref(),
-        user_id_source: ctx.user_id_source.map(|s| s.as_str()),
-        session_id: session_str.as_deref(),
-        parent_session_id: parent_str.as_deref(),
-        workspace_id: None,
-        properties: Some(&ctx.properties),
-    };
-    populate_envelope_namespace(&mut cel_ctx, &envelope);
-    // WOR-114 Phase 2: expose `x-sb-flags` parsed flags so CEL
-    // rate-limit keys can branch on `features.debug` etc.
-    let features = FeatureFlagsView {
-        debug: ctx.flags.debug,
-        trace: ctx.flags.trace,
-        no_cache: ctx.flags.no_cache,
-        extra: &ctx.flags.extra,
-    };
-    populate_features_namespace(&mut cel_ctx, &features);
-
-    let engine = CelEngine::new();
-    let value = match engine.eval_source(expr, &cel_ctx) {
-        Ok(v) => v,
-        Err(err) => {
-            warn!(error = %err, expression = expr, "rate-limit key CEL evaluation failed; falling back to default key");
-            return None;
-        }
-    };
-    let s = match value {
-        CelValue::String(s) => s,
-        CelValue::Int(i) => i.to_string(),
-        CelValue::Float(f) => f.to_string(),
-        CelValue::Bool(b) => b.to_string(),
-        CelValue::Null => return None,
-        CelValue::Map(_) | CelValue::List(_) => {
-            warn!(
-                expression = expr,
-                "rate-limit key CEL expression produced a map/list; falling back to default key"
-            );
-            return None;
-        }
-    };
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
 }
 
 /// Decide whether the inbound request is on HTTPS.
@@ -2257,853 +2164,107 @@ fn resolve_addr_override(over: &str, default_port: u16) -> String {
     format!("{}:{}", trimmed, default_port)
 }
 
-/// WOR-201 PR 1c.0: read the effective policy-type label that
-/// the response handler should use to choose its response shape.
+/// Read the effective policy-type label that the response handler
+/// should use to choose its response shape.
 ///
-/// Prefers [`RequestContext::deny_policy_type`] when the
-/// dispatcher (or a ported enforcer wrapper) set it; falls back
-/// to the macro-supplied `fallback` label otherwise. The
-/// fallback preserves byte-identical behaviour today because the
-/// PR-1c.0 dispatcher does not yet populate `deny_policy_type`
-/// for built-in policies. Once all 21 built-ins are ported in
-/// 1c.1 / 1c.2 / 1c.3 the macro arg goes away and this helper
-/// reads only from the context slot.
+/// Prefers [`RequestContext::deny_policy_type`], which the built-in
+/// enforcer wrappers stamp with their stable policy_type label
+/// (`rate_limit`, `waf`, `ip_filter`, ...) before short-circuiting.
+/// Falls back to the dispatcher-supplied `"plugin"`-family label for
+/// the Plugin and dispatcher-synthesised paths that never set the
+/// slot.
 #[inline]
 fn effective_policy_type(ctx: &RequestContext, fallback: &'static str) -> &'static str {
     ctx.deny_policy_type.unwrap_or(fallback)
 }
 
-/// Run all policies for an origin. Returns Allow or Deny with status/message.
+/// Run every enforcer for an origin in chain order. Returns `None`
+/// when every enforcer allowed the request, or `Some((status,
+/// message, fallback_policy_type))` for the first deny.
 ///
-/// Async because rate-limit policies with an attached L2 (Redis) store must
-/// call `allow_with_info_async`, which internally uses `spawn_blocking` to
-/// issue the blocking Redis INCR. Local-only token-bucket rate limiters
-/// short-circuit synchronously inside `allow_with_info_async` without hitting
-/// the runtime.
+/// The fallback label is the `"plugin"`-family string produced by
+/// [`crate::policy_dispatch::translate_plugin_decision`]. Caller
+/// code threads it through [`effective_policy_type`], which prefers
+/// the per-request slot [`RequestContext::deny_policy_type`] set by
+/// the built-in enforcer wrappers (`rate_limit`, `waf`, `ip_filter`,
+/// ...). The slot wins because the wrappers stamp their stable
+/// policy_type label there before short-circuiting; the plugin
+/// fallback only surfaces when no slot was set, which is the case
+/// for `Policy::Plugin` enforcers and dispatcher-synthesised denies.
 ///
-/// `verdict_ctx` carries the request / tenant / workspace identifiers
-/// reused for every [`sbproxy_observe::events::PolicyVerdictEvent`]
-/// emitted from the chain. Threading it as an argument keeps the
-/// dispatcher pure: the audit-bus correlation is fixed at the
-/// dispatcher entry and never re-derived inside the loop.
+/// Async because rate-limit enforcers attached to an L2 (Redis)
+/// store call `allow_with_info_async`, which `spawn_blocking`s the
+/// Redis INCR. Local-only token-bucket rate limiters short-circuit
+/// synchronously without hitting the runtime.
+///
+/// `verdict_ctx` carries the request / tenant / workspace
+/// identifiers reused for every
+/// [`sbproxy_observe::events::PolicyVerdictEvent`] emitted from the
+/// chain. Threading it as an argument keeps the dispatcher pure:
+/// the audit-bus correlation is fixed at the dispatcher entry and
+/// never re-derived inside the loop.
 async fn check_policies(
-    policies: &[Policy],
+    enforcers: &[crate::builtin_enforcers::CompiledEnforcer],
     session: &Session,
     ctx: &mut RequestContext,
     verdict_ctx: &PolicyVerdictCtx,
-) -> PolicyResult {
-    use sbproxy_observe::events::{PolicySurface, VerdictTag};
-    let mut rate_limit_info: Option<RateLimitInfo> = None;
+) -> Option<(u16, String, &'static str)> {
+    use sbproxy_observe::events::VerdictTag;
+
+    // Materialise the request snapshot once. Built-in wrappers and
+    // plugin enforcers share this view; the session-specific data
+    // they need (client_ip, hostname, rate_limit_info) lives on
+    // `RequestContext` and is threaded through the `&mut Any`
+    // downcast inside each `enforce()` body.
+    let req_snapshot = match build_plugin_request_snapshot(session) {
+        Some(r) => r,
+        None => {
+            // Fail-closed: a request that cannot be materialised
+            // into the trait's snapshot is denied with the same
+            // generic plugin-style label the WOR-201 PR 1b
+            // dispatcher used for malformed requests.
+            return Some((500, "policy: bad request".to_string(), "plugin"));
+        }
+    };
+
     let mut confirm_state = crate::policy_dispatch::ConfirmReducerState::default();
 
-    // Derive a stable per-request client identifier used as the Redis
-    // counter suffix. Falls back to the hostname when the client IP is
-    // unavailable (e.g. internal traffic).
-    let default_client_id = ctx
-        .client_ip
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| ctx.hostname.to_string());
-
-    for policy in policies {
-        // Stable label for this policy used as the audit
-        // `policy_id`. For built-ins this is the
-        // [`Policy::policy_type`] string (`rate_limit`, `waf`, ...).
-        // For [`Policy::Plugin`] variants it is the trait's
-        // `policy_type()` return value supplied by the plugin
-        // author.
-        let policy_label = policy.policy_type().to_string();
-        let policy_started = std::time::Instant::now();
-        let surface = match policy {
-            Policy::Plugin(_) => PolicySurface::Plugin,
-            _ => PolicySurface::BuiltIn,
+    for compiled in enforcers {
+        let policy_id = compiled.enforcer.policy_type().to_string();
+        let started = std::time::Instant::now();
+        let surface = compiled.surface;
+        let ctx_any: &mut dyn std::any::Any = ctx;
+        let decision = match compiled.enforcer.enforce(&req_snapshot, ctx_any).await {
+            Ok(d) => d,
+            Err(err) => {
+                tracing::warn!(
+                    target: "sbproxy::policy",
+                    error = %err,
+                    policy = %policy_id,
+                    "policy enforce() returned error; treating as deny"
+                );
+                emit_policy_verdict(verdict_ctx, &policy_id, surface, VerdictTag::Deny, started);
+                return Some((500, "policy error".to_string(), "plugin"));
+            }
         };
-        // Helper macro defined per-iteration so the body can refer
-        // to the in-scope `verdict_ctx`, `policy_label`,
-        // `policy_started`, and `surface`. `macro_rules!` resolves
-        // free identifiers at the definition site, so a macro
-        // defined here (rather than at the function top) sees the
-        // per-iteration bindings. Use as
-        // `return audit_deny!(status, msg, rl_info, policy_type)`.
-        macro_rules! audit_deny {
-            ($status:expr, $msg:expr, $rl:expr, $policy_type:expr) => {{
-                emit_policy_verdict(
-                    verdict_ctx,
-                    &policy_label,
-                    surface,
-                    VerdictTag::Deny,
-                    policy_started,
-                );
-                PolicyResult::Deny($status, $msg, $rl, $policy_type)
-            }};
-        }
-        match policy {
-            Policy::RateLimit(p) => {
-                let client_id = match p.key.as_deref() {
-                    None => default_client_id.clone(),
-                    Some(expr) => rate_limit_key_from_cel(session, ctx, expr)
-                        .unwrap_or_else(|| default_client_id.clone()),
-                };
-                let info = p.allow_with_info_async(&client_id).await;
-                if !info.allowed {
-                    return audit_deny!(429, "rate limited".to_string(), Some(info), "rate_limit");
-                }
-                rate_limit_info = Some(info);
-            }
-            Policy::IpFilter(p) => {
-                if let Some(ip) = ctx.client_ip {
-                    if !p.check_ip(&ip) {
-                        return audit_deny!(403, "forbidden".to_string(), None, "ip_filter");
-                    }
-                }
-            }
-            Policy::RequestLimit(p) => {
-                let header_count = session.req_header().headers.len();
-                let url_len = session.req_header().uri.to_string().len();
-                let query_len = session
-                    .req_header()
-                    .uri
-                    .query()
-                    .map(|q| q.len())
-                    .unwrap_or(0);
-                // Find the largest header value size.
-                let max_header_size = session
-                    .req_header()
-                    .headers
-                    .values()
-                    .map(|v| v.len())
-                    .max()
-                    .unwrap_or(0);
-                // Pull declared body size from `Content-Length` so honest
-                // clients are rejected up-front before any body bytes
-                // arrive. Chunked / unknown-length uploads still hit the
-                // streaming check below.
-                let declared_body_size = session
-                    .req_header()
-                    .headers
-                    .get(http::header::CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                if let Err(msg) = p.check_request(
-                    declared_body_size,
-                    header_count,
-                    max_header_size,
-                    url_len,
-                    query_len,
-                ) {
-                    debug!(detail = %msg, "request limit exceeded");
-                    return audit_deny!(
-                        413,
-                        "request entity too large".to_string(),
-                        None,
-                        "request_limit"
-                    );
-                }
-                // Forward the body-size cap to the streaming filter so
-                // chunked / unknown-length uploads are also enforced
-                // once the bytes are seen. This also catches clients
-                // that lie about Content-Length.
-                if let Some(max) = p.max_body_size {
-                    let cap = ctx.body_size_limit.map(|c| c.min(max)).unwrap_or(max);
-                    ctx.body_size_limit = Some(cap);
-                }
-            }
-            Policy::Waf(w) => {
-                let uri = session.req_header().uri.to_string();
-                let headers = &session.req_header().headers;
-                match w.check_request(&uri, headers, None) {
-                    WafResult::Clean => {}
-                    WafResult::Blocked(msg) => {
-                        return audit_deny!(403, msg, None, "waf");
-                    }
-                    WafResult::Error(err) => {
-                        if w.fail_open {
-                            warn!(error = %err, "WAF engine error, fail_open=true, allowing request");
-                        } else {
-                            warn!(error = %err, "WAF engine error, fail_open=false, blocking request");
-                            return audit_deny!(403, "WAF engine error".to_string(), None, "waf");
-                        }
-                    }
-                }
-            }
-            // SecHeaders / PageShield run in the response phase. Sri runs
-            // alongside response transforms.
-            Policy::SecHeaders(_) | Policy::PageShield(_) | Policy::Sri(_) => {}
-            // --- WOR-201 PR 1b: Plugin dispatch + chain reducer ---
-            //
-            // Materialise an `http::Request` snapshot from the
-            // session, call the trait's `enforce()`, fold the
-            // returned [`PolicyDecision`] into the existing chain
-            // reducer:
-            //
-            // - `Allow` falls through with no header decoration.
-            // - `AllowWithHeaders` accumulates headers onto
-            //   [`RequestContext::policy_response_headers`]; the
-            //   response_filter drains them on the way out.
-            // - `Deny` short-circuits with the supplied status /
-            //   message (rule 1: any Deny wins).
-            // - `Confirm` is the OSS bridge per
-            //   `docs/adr-policy-verdict-shape.md`: stamp
-            //   `X-Policy-Confirm: <reason>` via the
-            //   AllowWithHeaders mechanism. First Confirm in chain
-            //   order wins (rule 2); later Confirm verdicts are
-            //   recorded in audit but do not re-stamp.
-            //
-            // Trait `enforce()` returning `Err(_)` is treated as
-            // Deny (fail-closed), mirroring the existing built-in
-            // arms' WAF-engine-error behaviour.
-            Policy::Plugin(enforcer) => {
-                let plugin_id = enforcer.policy_type().to_string();
-                let req_snapshot = match build_plugin_request_snapshot(session) {
-                    Some(r) => r,
-                    None => {
-                        // Could not build the snapshot; treat as
-                        // fail-closed deny so the plugin contract
-                        // never sees a malformed request.
-                        emit_policy_verdict(
-                            verdict_ctx,
-                            &plugin_id,
-                            PolicySurface::Plugin,
-                            VerdictTag::Deny,
-                            policy_started,
-                        );
-                        return PolicyResult::Deny(
-                            500,
-                            "policy plugin: bad request".to_string(),
-                            None,
-                            "plugin",
-                        );
-                    }
-                };
-                // The trait expects `&mut dyn Any`; the existing
-                // built-in arms get `&mut RequestContext`. Pass the
-                // typed context through `Any` so plugin authors who
-                // need it can downcast.
-                let ctx_any: &mut dyn std::any::Any = ctx;
-                let decision = match enforcer.enforce(&req_snapshot, ctx_any).await {
-                    Ok(d) => d,
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "sbproxy::policy",
-                            error = %err,
-                            plugin = %plugin_id,
-                            "policy plugin enforce() returned error; treating as deny"
-                        );
-                        emit_policy_verdict(
-                            verdict_ctx,
-                            &plugin_id,
-                            PolicySurface::Plugin,
-                            VerdictTag::Deny,
-                            policy_started,
-                        );
-                        return PolicyResult::Deny(
-                            500,
-                            "policy plugin error".to_string(),
-                            None,
-                            "plugin",
-                        );
-                    }
-                };
-                let translated = crate::policy_dispatch::translate_plugin_decision(
-                    decision,
-                    &mut ctx.policy_response_headers,
-                    &mut confirm_state,
-                );
-                emit_policy_verdict(
-                    verdict_ctx,
-                    &plugin_id,
-                    PolicySurface::Plugin,
-                    translated.verdict,
-                    policy_started,
-                );
-                if let Some((status, msg, policy_type)) = translated.deny {
-                    return PolicyResult::Deny(status, msg, None, policy_type);
-                }
-            }
-            Policy::HttpFraming(p) => {
-                // Defense against the request-smuggling / desync class
-                // documented at portswigger.net/research/http-desync-attacks-request-smuggling-reborn.
-                // Pingora's parser strictness handles the wire-level
-                // malformed input; this policy adds the
-                // semantic-ambiguity layer (CL+TE, duplicate CL,
-                // malformed TE, duplicate TE, control chars).
-                //
-                // Three observable signals on every block:
-                //   1. sbproxy_http_framing_blocks_total{reason}
-                //      (Prometheus, low-cardinality)
-                //   2. tracing::warn target=sbproxy::http_framing
-                //      (operational log alongside other policy events)
-                //   3. SecurityAuditEntry on target=security_audit
-                //      (dedicated security log for SIEM forwarding)
-                if let Err(violation) = p.check_request(&session.req_header().headers) {
-                    let reason = violation.metric_reason();
-                    sbproxy_observe::metrics::record_http_framing_block(reason);
-                    tracing::warn!(
-                        target: "sbproxy::http_framing",
-                        reason = %reason,
-                        hostname = %ctx.hostname,
-                        "blocked: HTTP framing violation"
-                    );
-                    sbproxy_observe::SecurityAuditEntry::framing_violation(
-                        reason,
-                        Some(ctx.hostname.to_string()),
-                        ctx.client_ip,
-                        Some(ctx.request_id.to_string()),
-                        Some(session.req_header().method.as_str().to_string()),
-                    )
-                    .emit();
-                    return audit_deny!(400, violation.message().to_string(), None, "http_framing");
-                }
-            }
-            Policy::Ddos(p) => {
-                use sbproxy_modules::DdosCheckResult;
-                if let Some(ip) = ctx.client_ip {
-                    if let DdosCheckResult::Block { retry_after_secs } = p.check(ip) {
-                        // Synthesize a RateLimitInfo so the existing
-                        // 429 response path emits a Retry-After header.
-                        let info = RateLimitInfo {
-                            allowed: false,
-                            limit: p.requests_per_second as u64,
-                            remaining: 0,
-                            reset_secs: retry_after_secs,
-                            headers_enabled: true,
-                            include_retry_after: true,
-                        };
-                        return audit_deny!(
-                            429,
-                            "ddos protection: too many requests".to_string(),
-                            Some(info),
-                            "ddos"
-                        );
-                    }
-                }
-            }
-            Policy::ExposedCreds(p) => {
-                use sbproxy_modules::{ExposedCredsAction, ExposedCredsResult};
-                if let ExposedCredsResult::Hit { reason } = p.check(&session.req_header().headers) {
-                    match p.action() {
-                        ExposedCredsAction::Block => {
-                            return audit_deny!(
-                                403,
-                                "credential flagged as exposed".to_string(),
-                                None,
-                                "exposed_credentials"
-                            );
-                        }
-                        ExposedCredsAction::Tag => {
-                            let entry = (p.header_name().to_string(), reason.to_string());
-                            match ctx.trust_headers.as_mut() {
-                                Some(v) => v.push(entry),
-                                None => ctx.trust_headers = Some(vec![entry]),
-                            }
-                        }
-                    }
-                }
-            }
-            // RequestValidator is body-required and runs in
-            // request_body_filter once the body is fully buffered.
-            // Mark the context so the body filter knows to accumulate.
-            Policy::RequestValidator(_) | Policy::OpenApiValidation(_) => {
-                ctx.validate_request_body = true;
-            }
-            Policy::PromptInjectionV2(p) => {
-                use sbproxy_modules::{PromptInjectionAction, PromptInjectionV2Outcome};
-                // Run detection at request_filter time on the
-                // request-line text + headers so the tag-action path
-                // can stamp trust headers before
-                // `upstream_request_filter` builds the upstream
-                // request. Body-aware detection (the prompt usually
-                // lives in the JSON body) lands with the ONNX
-                // classifier follow-up; for the OSS scaffold the
-                // heuristic detector still fires on injection
-                // vocabulary present in the URL or in custom headers
-                // (a real-world pattern: chat consoles that send the
-                // prompt as a `q=` query parameter), and operators
-                // who want body-aware detection today should pair the
-                // policy with `request_validator` or use the v1
-                // `prompt_injection` guardrail inside `ai_proxy`.
-                let req = session.req_header();
-                let mut prompt = req.uri.to_string();
-                for (name, value) in req.headers.iter() {
-                    let n = name.as_str();
-                    // Skip auth-class headers so tokens carried by
-                    // design don't self-flag, mirroring DLP.
-                    if n == "authorization" || n == "cookie" || n == "set-cookie" {
-                        continue;
-                    }
-                    if let Ok(v) = value.to_str() {
-                        prompt.push('\n');
-                        prompt.push_str(v);
-                    }
-                }
-                if let PromptInjectionV2Outcome::Hit { result } = p.evaluate(&prompt) {
-                    match p.action() {
-                        PromptInjectionAction::Block => {
-                            tracing::warn!(
-                                target: "sbproxy::prompt_injection_v2",
-                                detector = %p.detector_name(),
-                                score = %result.score,
-                                label = %result.label,
-                                reason = ?result.reason,
-                                "blocked: detector matched"
-                            );
-                            return audit_deny!(
-                                403,
-                                p.block_body().to_string(),
-                                None,
-                                "prompt_injection"
-                            );
-                        }
-                        PromptInjectionAction::Tag => {
-                            let score_entry =
-                                (p.score_header().to_string(), format!("{:.3}", result.score));
-                            let label_entry = (
-                                p.label_header().to_string(),
-                                result.label.as_str().to_string(),
-                            );
-                            match ctx.trust_headers.as_mut() {
-                                Some(v) => {
-                                    v.push(score_entry);
-                                    v.push(label_entry);
-                                }
-                                None => {
-                                    ctx.trust_headers = Some(vec![score_entry, label_entry]);
-                                }
-                            }
-                        }
-                        PromptInjectionAction::Log => {
-                            tracing::warn!(
-                                target: "sbproxy::prompt_injection_v2",
-                                detector = %p.detector_name(),
-                                score = %result.score,
-                                label = %result.label,
-                                reason = ?result.reason,
-                                "prompt injection detected (log mode)"
-                            );
-                        }
-                    }
-                }
-            }
-            Policy::AiCrawl(p) => {
-                use sbproxy_modules::AiCrawlDecision;
-                let req = session.req_header();
-                let method = req.method.as_str();
-                let path = req.uri.path();
-                // G1.4 -> G3.6 thread: pass the resolved agent identifier
-                // through to the quote-token signer so the JWS `sub` claim
-                // is the resolved id, not the Wave 1 `"unknown"` placeholder.
-                // Feature-gated because `agent_id` only exists on the
-                // context when the `agent-class` feature is enabled.
-                #[cfg(feature = "agent-class")]
-                let agent_id_str: Option<String> =
-                    ctx.agent_id.as_ref().map(|aid| aid.as_str().to_string());
-                #[cfg(feature = "agent-class")]
-                let agent_id_param: Option<&str> = agent_id_str.as_deref();
-                #[cfg(not(feature = "agent-class"))]
-                let agent_id_param: Option<&str> = None;
-                #[cfg(feature = "agent-class")]
-                let agent_id_for_tier = agent_id_param.unwrap_or("");
-                #[cfg(not(feature = "agent-class"))]
-                let agent_id_for_tier = "";
-                // --- G4.4 + G4.10 closeout: resolve the matched tier's
-                // `citation_required` flag and stamp it into the
-                // request context so downstream transforms read a
-                // single source of truth. The lookup mirrors the one
-                // in `AiCrawlControlPolicy::check`; a separate call is
-                // unfortunate but unavoidable without widening the
-                // policy's return type. The cost is one tier-list scan
-                // per request that already runs the full AiCrawl path.
-                {
-                    let accept = req
-                        .headers
-                        .get(http::header::ACCEPT)
-                        .and_then(|v| v.to_str().ok());
-                    if let Some(tier) = p.matched_tier_for_request(path, agent_id_for_tier, accept)
-                    {
-                        ctx.citation_required = Some(tier.citation_required);
-                    }
-                }
-                match p.check(method, &ctx.hostname, path, &req.headers, agent_id_param) {
-                    AiCrawlDecision::Allow => {}
-                    AiCrawlDecision::Charge { body, challenge } => {
-                        ctx.crawl_challenge = Some((p.header_name().to_string(), challenge, body));
-                        return audit_deny!(
-                            402,
-                            "payment required".to_string(),
-                            None,
-                            "ai_crawl_payment"
-                        );
-                    }
-                    AiCrawlDecision::MultiRail { body, content_type } => {
-                        // G3.4 multi-rail body. We piggyback on the
-                        // existing crawl_challenge slot: the second tuple
-                        // element carries the Content-Type for the
-                        // response writer; the third carries the JSON
-                        // body. The header name is replaced by a sentinel
-                        // (`Content-Type`) so the response writer knows
-                        // to stamp Content-Type instead of the Wave 1
-                        // Crawler-Payment header.
-                        ctx.crawl_challenge =
-                            Some(("Content-Type".to_string(), content_type.to_string(), body));
-                        return audit_deny!(
-                            402,
-                            "payment required".to_string(),
-                            None,
-                            "ai_crawl_multi_rail"
-                        );
-                    }
-                    AiCrawlDecision::NoAcceptableRail { body } => {
-                        // 406 Not Acceptable: agent's Accept-Payment list
-                        // has no overlap with the configured rails. The
-                        // body lists the supported rails so the agent can
-                        // recover; we surface it through the same slot.
-                        ctx.crawl_challenge = Some((
-                            "Content-Type".to_string(),
-                            "application/json".to_string(),
-                            body,
-                        ));
-                        return audit_deny!(
-                            406,
-                            "no acceptable rail".to_string(),
-                            None,
-                            "ai_crawl_no_acceptable_rail"
-                        );
-                    }
-                    AiCrawlDecision::LedgerUnavailable {
-                        body,
-                        retry_after_seconds,
-                    } => {
-                        // Reuse the 402 challenge response slot to carry
-                        // the 503 body; the response writer reads from
-                        // ctx.crawl_challenge whenever the deny status
-                        // is 402, so for 503 we pass the body through
-                        // RateLimitInfo + the deny message.
-                        //
-                        // NB: a future refactor may give 503-from-policy
-                        // its own response slot; for Wave 1 we synthesize
-                        // a RateLimitInfo so the existing Retry-After
-                        // emission path covers us.
-                        ctx.crawl_challenge =
-                            Some((p.header_name().to_string(), String::new(), body));
-                        let info = RateLimitInfo {
-                            allowed: false,
-                            limit: 0,
-                            remaining: 0,
-                            reset_secs: retry_after_seconds as u64,
-                            headers_enabled: false,
-                            include_retry_after: true,
-                        };
-                        return audit_deny!(
-                            503,
-                            "ledger unavailable".to_string(),
-                            Some(info),
-                            "ai_crawl_ledger_unavailable"
-                        );
-                    }
-                }
-            }
-            Policy::Dlp(p) => {
-                use sbproxy_modules::{DlpAction, DlpScanResult};
-                let req = session.req_header();
-                let path_and_query = req.uri.to_string();
-                if let DlpScanResult::Hit { detectors } = p.scan(&path_and_query, &req.headers) {
-                    let detector_csv = detectors.join(",");
-                    match p.action() {
-                        DlpAction::Block => {
-                            return audit_deny!(
-                                403,
-                                format!("dlp: detector {detector_csv} matched"),
-                                None,
-                                "dlp"
-                            );
-                        }
-                        DlpAction::Tag => {
-                            let entry = (p.header_name().to_string(), detector_csv);
-                            match ctx.trust_headers.as_mut() {
-                                Some(v) => v.push(entry),
-                                None => ctx.trust_headers = Some(vec![entry]),
-                            }
-                        }
-                    }
-                }
-            }
-            Policy::ConcurrentLimit(p) => {
-                let origin_id = ctx.origin_idx.map(|i| i.to_string()).unwrap_or_default();
-                let client_ip_str = ctx.client_ip.map(|ip| ip.to_string());
-                let key = p.resolve_key(
-                    &origin_id,
-                    client_ip_str.as_deref(),
-                    &session.req_header().headers,
-                );
-                match p.try_acquire(&key) {
-                    Some(guard) => ctx.concurrent_limit_guards.push(guard),
-                    None => {
-                        debug!(key = %key, max = %p.max, "concurrent limit exceeded");
-                        return audit_deny!(
-                            p.status,
-                            "too many concurrent requests".to_string(),
-                            None,
-                            "concurrent_limit"
-                        );
-                    }
-                }
-            }
-            Policy::Csrf(csrf) => {
-                let method = session.req_header().method.as_str();
-                let path = session.req_header().uri.path();
-
-                // Check if path is exempt.
-                let exempt = csrf
-                    .exempt_paths
-                    .iter()
-                    .any(|p| path.starts_with(p.as_str()));
-                if !exempt {
-                    let is_protected = csrf.is_protected_method(method);
-                    if !is_protected {
-                        let timestamp = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_nanos();
-                        let token = match csrf_token(
-                            csrf.secret_key.as_str(),
-                            timestamp,
-                            ctx.hostname.as_str(),
-                        ) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                warn!(error = %e, "csrf: token generation failed");
-                                return audit_deny!(
-                                    500,
-                                    "CSRF token generation failed".to_string(),
-                                    None,
-                                    "csrf"
-                                );
-                            }
-                        };
-                        let cookie_path = csrf.cookie_path.as_deref().unwrap_or("/");
-                        let same_site = csrf.cookie_same_site.as_deref().unwrap_or("Lax");
-                        let is_secure = session
-                            .digest()
-                            .and_then(|d| d.ssl_digest.as_ref())
-                            .is_some()
-                            || session
-                                .req_header()
-                                .headers
-                                .get("x-forwarded-proto")
-                                .and_then(|v| v.to_str().ok())
-                                .map(|s| s.eq_ignore_ascii_case("https"))
-                                .unwrap_or(false);
-                        let mut cookie = format!(
-                            "{}={}; Path={}; SameSite={}",
-                            csrf.cookie_name, token, cookie_path, same_site,
-                        );
-                        if is_secure {
-                            cookie.push_str("; Secure");
-                        }
-                        ctx.csrf_cookie = Some(cookie);
-                    } else {
-                        // Unsafe method: validate token from header matches cookie.
-                        let header_token = session
-                            .req_header()
-                            .headers
-                            .get(csrf.header_name.as_str())
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("");
-                        let cookie_token = session
-                            .req_header()
-                            .headers
-                            .get("cookie")
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|cookies| {
-                                cookies.split(';').find_map(|c| {
-                                    let c = c.trim();
-                                    let (name, value) = c.split_once('=')?;
-                                    if name.trim() == csrf.cookie_name {
-                                        Some(value.trim().to_string())
-                                    } else {
-                                        None
-                                    }
-                                })
-                            })
-                            .unwrap_or_default();
-                        if header_token.is_empty()
-                            || cookie_token.is_empty()
-                            || header_token != cookie_token
-                        {
-                            return audit_deny!(
-                                403,
-                                "CSRF token missing or invalid".to_string(),
-                                None,
-                                "csrf"
-                            );
-                        }
-                    }
-                }
-            }
-            Policy::Expression(p) => {
-                let method = session.req_header().method.as_str();
-                let path = session.req_header().uri.path();
-                let headers = &session.req_header().headers;
-                let query = session.req_header().uri.query();
-                let client_ip_str = ctx.client_ip.map(|ip| ip.to_string());
-                // Wave 4 / G4.9 + Wave 5 / G5.1, A5.2: thread the
-                // parsed aipref signal, the KYA verdict, and the ML
-                // classifier verdict so CEL expressions can branch on
-                // `request.aipref.*`, `request.kya.*`, and
-                // `request.ml_classification.*` without owning the
-                // verifier / classifier themselves.
-                #[cfg(feature = "agent-class")]
-                let kya_view = Some(sbproxy_extension::cel::context::KyaVerdictView {
-                    verdict: ctx.kya_verdict,
-                    agent_id: ctx.agent_id.as_ref().map(|id| id.as_str()),
-                    vendor: ctx.kya_vendor.as_deref(),
-                    kya_version: ctx.kya_version.as_deref(),
-                    kyab_balance: ctx.kya_kyab_balance,
-                });
-                #[cfg(not(feature = "agent-class"))]
-                let kya_view: Option<
-                    sbproxy_extension::cel::context::KyaVerdictView<'_>,
-                > = None;
-
-                #[cfg(feature = "agent-classifier")]
-                let ml_view = ctx.ml_classification.as_ref().map(|m| {
-                    sbproxy_extension::cel::context::MlClassificationView {
-                        class: Some(m.class.as_str()),
-                        confidence: Some(m.confidence),
-                        model_version: Some(m.model_version),
-                        feature_schema_version: Some(m.feature_schema_version),
-                    }
-                });
-                #[cfg(not(feature = "agent-classifier"))]
-                let ml_view: Option<
-                    sbproxy_extension::cel::context::MlClassificationView<'_>,
-                > = None;
-
-                let features_view = sbproxy_extension::cel::context::FeatureFlagsView {
-                    debug: ctx.flags.debug,
-                    trace: ctx.flags.trace,
-                    no_cache: ctx.flags.no_cache,
-                    extra: &ctx.flags.extra,
-                };
-                let views = sbproxy_modules::ExpressionViews {
-                    aipref: ctx.aipref.as_ref(),
-                    kya: kya_view,
-                    ml: ml_view,
-                    features: Some(features_view),
-                };
-                if !p.evaluate_with_views(
-                    method,
-                    path,
-                    headers,
-                    query,
-                    client_ip_str.as_deref(),
-                    &ctx.hostname,
-                    views,
-                ) {
-                    return audit_deny!(p.deny_status, p.deny_message.clone(), None, "expression");
-                }
-            }
-            Policy::Assertion(_) => {} // Assertions are response-phase (informational)
-            // G1.4 wire: the agent_class policy is a marker. The
-            // resolver runs in `request_filter` via
-            // `core::agent_class::stamp_request_context`, so this arm
-            // has nothing to enforce at policy-evaluation time. A
-            // future wave will read the per-policy header_name knobs
-            // here when the upstream-header stamping moves out of the
-            // request_filter and into the policy phase.
-            #[cfg(feature = "agent-class")]
-            Policy::AgentClass(_) => {}
-            // Wave 7 / A7.2 A2A protocol policy. Reads the typed
-            // envelope populated earlier in `request_filter` and
-            // enforces chain-depth, cycle, callee-allowlist and
-            // caller-denylist checks. Allow paths still emit the
-            // per-hop metric so dashboards see depth distribution.
-            // WOR-203 PR 3b: NL-as-a-policy. Render the configured
-            // prompt template against the request envelope and route
-            // through the LLM-as-judge backend. Verdict mapping
-            // matches the table in
-            // `policy/semantic_constraint.rs`. Confirm verdicts are
-            // bridged through `AllowWithHeaders` per the OSS
-            // `adr-policy-verdict-shape.md` contract; the OSS
-            // dispatcher does not park requests, so we surface the
-            // reason on the response via `X-Policy-Confirm` and
-            // continue. Until PR 1c lands a unified PolicyDecision
-            // dispatcher, this arm only honours the Allow / Deny
-            // shapes; the Confirm bridging note is preserved as
-            // documentation for the integration PR.
-            Policy::SemanticConstraint(p) => {
-                let req = session.req_header();
-                let request_ctx = serde_json::json!({
-                    "request": {
-                        "method": req.method.as_str(),
-                        "path": req.uri.path(),
-                        "host": ctx.hostname.to_string(),
-                        "query": req.uri.query().unwrap_or(""),
-                    }
-                });
-                let decision = p.enforce(request_ctx).await;
-                match decision {
-                    sbproxy_plugin::PolicyDecision::Allow
-                    | sbproxy_plugin::PolicyDecision::AllowWithHeaders { .. }
-                    | sbproxy_plugin::PolicyDecision::Confirm { .. } => {}
-                    sbproxy_plugin::PolicyDecision::Deny { status, message } => {
-                        return PolicyResult::Deny(status, message, None, "semantic_constraint");
-                    }
-                }
-            }
-            Policy::A2A(p) => {
-                if let Some(a2a_ctx) = ctx.a2a.clone() {
-                    let route = ctx.hostname.to_string();
-                    let spec_label = a2a_ctx.spec.as_label();
-                    let callable_endpoint = session.req_header().uri.path().to_string();
-                    let decision = p.evaluate(&a2a_ctx, &callable_endpoint);
-                    sbproxy_observe::metrics::record_a2a_chain_depth(
-                        &route,
-                        spec_label,
-                        a2a_ctx.chain_depth,
-                    );
-                    if decision.is_allow() {
-                        sbproxy_observe::metrics::record_a2a_hop(&route, spec_label, "allow");
-                    } else {
-                        let reason = decision.reason_label();
-                        sbproxy_observe::metrics::record_a2a_hop(
-                            &route,
-                            spec_label,
-                            &format!("deny:{reason}"),
-                        );
-                        sbproxy_observe::metrics::record_a2a_denied(&route, reason);
-                        let body = decision.json_body();
-                        let status = decision.http_status();
-                        ctx.a2a_denial_body = Some(body.clone());
-                        let policy_type: &'static str = match reason {
-                            "depth" => "a2a_chain_depth_exceeded",
-                            "cycle" => "a2a_cycle_detected",
-                            "callee_not_allowed" => "a2a_callee_not_allowed",
-                            "caller_denied" => "a2a_caller_denied",
-                            _ => "a2a",
-                        };
-                        return audit_deny!(status, body, None, policy_type);
-                    }
-                }
-            }
-        }
-
-        // Per-policy Allow audit emission for built-in arms that
-        // fell through the match without an early return. The
-        // Plugin arm emits its own verdict event before falling
-        // through via `translate_plugin_decision`; skip the
-        // catch-all here so we do not double-count.
-        if !matches!(policy, Policy::Plugin(_)) {
-            emit_policy_verdict(
-                verdict_ctx,
-                &policy_label,
-                surface,
-                VerdictTag::Allow,
-                policy_started,
-            );
+        let translated = crate::policy_dispatch::translate_plugin_decision(
+            decision,
+            &mut ctx.policy_response_headers,
+            &mut confirm_state,
+        );
+        emit_policy_verdict(
+            verdict_ctx,
+            &policy_id,
+            surface,
+            translated.verdict,
+            started,
+        );
+        if let Some(deny) = translated.deny {
+            return Some(deny);
         }
     }
-    PolicyResult::Allow(rate_limit_info)
+
+    None
 }
 
 // --- Lua modifier helpers ---
@@ -3470,22 +2631,6 @@ fn sign_webhook(secret: &str, body: &[u8], timestamp: i64) -> anyhow::Result<Str
     mac.update(body);
     let bytes = mac.finalize().into_bytes();
     Ok(format!("v1={}", hex::encode(bytes)))
-}
-
-/// HMAC-SHA256-derived CSRF token bound to a per-config secret, the
-/// request hostname, and a timestamp. Hex-encoded so it drops directly
-/// into a Set-Cookie value. Forging a token requires knowledge of
-/// `secret`, which never leaves the process.
-fn csrf_token(secret: &str, timestamp: u128, hostname: &str) -> anyhow::Result<String> {
-    use hmac::{KeyInit, Mac, SimpleHmac};
-    use sha2::Sha256;
-    let mut mac = SimpleHmac::<Sha256>::new_from_slice(secret.as_bytes())
-        .map_err(|e| anyhow::anyhow!("csrf hmac init failed: {e}"))?;
-    mac.update(timestamp.to_string().as_bytes());
-    mac.update(b".");
-    mac.update(hostname.as_bytes());
-    let bytes = mac.finalize().into_bytes();
-    Ok(hex::encode(bytes))
 }
 
 /// Build the standard webhook envelope shared by `on_request` and
@@ -7986,18 +7131,24 @@ impl ProxyHttp for SbProxy {
             tenant_id: policy_workspace_id.clone(),
             workspace_id: policy_workspace_id,
         };
-        match check_policies(&pipeline.policies[origin_idx], session, ctx, &verdict_ctx).await {
-            PolicyResult::Allow(rl_info) => {
+        match check_policies(&pipeline.enforcers[origin_idx], session, ctx, &verdict_ctx).await {
+            None => {
                 sbproxy_observe::metrics::record_policy(&policy_origin, "all", "allow");
-                ctx.rate_limit_info = rl_info;
+                // `ctx.rate_limit_info` was populated in-place by the
+                // RateLimitEnforcer wrapper, so the response_filter has
+                // the data it needs for X-RateLimit-* headers.
             }
-            PolicyResult::Deny(status, msg, rl_info, policy_type) => {
-                // WOR-201 PR 1c.0: prefer the per-request slot
-                // when the dispatcher (or a ported enforcer
-                // wrapper) populated it; fall back to the
-                // macro-supplied label so today's behaviour is
-                // unchanged. Once all 21 built-ins port to the
-                // wrapper path the macro arg drops out.
+            Some((status, msg, policy_type)) => {
+                // The wrappers stamp `ctx.rate_limit_info` (and
+                // `ctx.a2a_denial_body`, `ctx.crawl_challenge`, ...)
+                // before the short-circuit; snapshot the rate-limit
+                // slot here so the downstream 429 branches can read
+                // it without re-borrowing `ctx` past the mutating
+                // arms below.
+                let rl_info = ctx.rate_limit_info.clone();
+                // Prefer the per-request slot the wrapper populated;
+                // fall back to the dispatcher-supplied "plugin"-family
+                // label otherwise.
                 let policy_type = effective_policy_type(ctx, policy_type);
                 // The enforcing policy stamps its own stable label
                 // (`waf`, `ip_filter`, `prompt_injection`, ...) so
@@ -12814,21 +11965,6 @@ mod tests {
         // Different timestamp -> different signature (replay protection).
         let s3 = sign_webhook("secret", b"hello", 1700000001).unwrap();
         assert_ne!(s1, s3);
-    }
-
-    #[test]
-    fn csrf_token_is_stable_for_same_inputs() {
-        let t1 = csrf_token("secret", 1_700_000_000_000_000_000u128, "example.com").unwrap();
-        let t2 = csrf_token("secret", 1_700_000_000_000_000_000u128, "example.com").unwrap();
-        assert_eq!(t1, t2);
-        // SHA-256 hex output is 64 chars.
-        assert_eq!(t1.len(), 64);
-        // Different secret -> different token.
-        let t3 = csrf_token("other", 1_700_000_000_000_000_000u128, "example.com").unwrap();
-        assert_ne!(t1, t3);
-        // Different hostname -> different token (binds to host).
-        let t4 = csrf_token("secret", 1_700_000_000_000_000_000u128, "other.com").unwrap();
-        assert_ne!(t1, t4);
     }
 
     // --- WOR-189: AI hook header snapshot + redaction ---
