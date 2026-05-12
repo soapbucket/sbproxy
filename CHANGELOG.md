@@ -13,6 +13,30 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **RFC 9457 problem-details default renderer (`problem_details:`).**
+  New per-origin block that opts in to `application/problem+json` for
+  proxy-generated errors (authentication denials, policy denials,
+  default 404) that are not matched by an authored `error_pages`
+  entry. The two blocks compose: per-status custom pages still win
+  when authored; `problem_details` catches everything else with a
+  structured `type` / `title` / `status` / `detail` / `instance`
+  body. `type_base_uri` produces stable per-status `type` URIs;
+  `include_detail: false` suppresses the internal error string.
+  Documented in `docs/configuration.md` and demonstrated by
+  `examples/problem-details/`.
+
+- **Typed `error_pages` config.** The opaque
+  `error_pages: Option<serde_json::Value>` field is now typed as
+  `Option<Vec<ErrorPageEntry>>`. Public types `ErrorPageEntry`,
+  `StatusSpec`, and `ProblemDetailsConfig` live in `sbproxy-config`.
+  The authored YAML shape is unchanged: every existing
+  `error_pages:` list keeps parsing, including the `status:` single-
+  int / `[status]` list shorthand and `template: true` substitution.
+  The OpenAPI emitter now walks typed entries to populate
+  per-status `responses` keys (the previous code inspected the
+  field as an object and silently produced no entries; this is a
+  bug fix on top of the migration).
+
 - **AI gateway Realtime WebSocket dispatch (Phase 7, Option C).**
   `GET /v1/realtime` requests with `Upgrade: websocket` against an
   `ai_proxy` origin are now dispatched through the AI gateway

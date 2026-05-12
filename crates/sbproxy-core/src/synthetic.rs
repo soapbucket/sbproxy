@@ -209,6 +209,7 @@ mod tests {
             forward_rules: Vec::new(),
             fallback_origin: None,
             error_pages: None,
+            problem_details: None,
             proxy_status: None,
             message_signatures: None,
             bot_detection: None,

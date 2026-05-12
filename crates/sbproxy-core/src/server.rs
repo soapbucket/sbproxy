@@ -1251,78 +1251,104 @@ async fn send_error_with_extra_headers(
     Ok(())
 }
 
-/// Send an error response, checking for custom error_pages config first.
+/// Send an error response, choosing the body in this order:
+/// 1. Operator-authored [`sbproxy_config::ErrorPageEntry`] matching
+///    the status code, content-negotiated against the request's
+///    `Accept` header.
+/// 2. RFC 9457 `application/problem+json` when
+///    [`sbproxy_config::ProblemDetailsConfig`] is enabled on the
+///    origin.
+/// 3. Plain-text default (`send_error`).
 ///
-/// If the origin has error_pages configured and one or more entries match the
-/// status code, the best representation for the request's `Accept` header is
-/// selected via content negotiation. If multiple entries match and the client
-/// expresses no preference (or no `Accept` header is present), JSON is
-/// preferred, then HTML, then the first match. Falls back to the default
-/// plain-text error if no entry matches.
+/// When multiple custom pages match a status and the client expresses
+/// no concrete preference, JSON is preferred, then HTML, then the
+/// first authored entry.
 async fn send_error_with_pages(
     session: &mut Session,
     status: u16,
     message: &str,
-    error_pages: &Option<serde_json::Value>,
+    error_pages: Option<&[sbproxy_config::ErrorPageEntry]>,
+    problem_details: Option<&sbproxy_config::ProblemDetailsConfig>,
     request_path: &str,
 ) -> Result<()> {
     if let Some(pages) = error_pages {
-        if let Some(pages_arr) = pages.as_array() {
-            // Collect every entry that matches this status.
-            let candidates: Vec<&serde_json::Value> = pages_arr
-                .iter()
-                .filter(|page| page_matches_status(page, status))
-                .collect();
+        let candidates: Vec<&sbproxy_config::ErrorPageEntry> =
+            pages.iter().filter(|p| p.status.matches(status)).collect();
 
-            if !candidates.is_empty() {
-                let accept = session
-                    .req_header()
-                    .headers
-                    .get("accept")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
-                let chosen = select_error_page(&candidates, accept);
+        if !candidates.is_empty() {
+            let accept = session
+                .req_header()
+                .headers
+                .get("accept")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let chosen = select_error_page(&candidates, accept);
 
-                let ct = chosen
-                    .get("content_type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("application/json");
-                let body_template = chosen.get("body").and_then(|v| v.as_str()).unwrap_or("");
-                let is_template = chosen
-                    .get("template")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+            let body = if chosen.template {
+                chosen
+                    .body
+                    .replace("{{ status_code }}", &status.to_string())
+                    .replace("{{status_code}}", &status.to_string())
+                    .replace("{{ request.path }}", request_path)
+                    .replace("{{request.path}}", request_path)
+            } else {
+                chosen.body.clone()
+            };
 
-                let body = if is_template {
-                    body_template
-                        .replace("{{ status_code }}", &status.to_string())
-                        .replace("{{status_code}}", &status.to_string())
-                        .replace("{{ request.path }}", request_path)
-                        .replace("{{request.path}}", request_path)
-                } else {
-                    body_template.to_string()
-                };
-
-                return send_response(session, status, ct, body.as_bytes()).await;
-            }
+            return send_response(session, status, &chosen.content_type, body.as_bytes()).await;
         }
     }
 
-    // No matching error page, use default.
+    // No custom page matched. Fall through to problem-details when enabled.
+    if let Some(pd) = problem_details {
+        if pd.enabled {
+            let body = render_problem_details(status, message, pd, request_path);
+            return send_response(session, status, "application/problem+json", body.as_bytes())
+                .await;
+        }
+    }
+
+    // No matching error page, no problem-details: plain-text default.
     send_error(session, status, message).await
 }
 
-/// Returns true if the page config's `status` field includes the given status.
-/// `status` may be a single integer or an array of integers.
-fn page_matches_status(page: &serde_json::Value, status: u16) -> bool {
-    let Some(status_val) = page.get("status") else {
-        return false;
+/// Render an RFC 9457 `application/problem+json` body. The `type` field
+/// is derived from `pd.type_base_uri`; when unset the renderer emits
+/// the RFC default `about:blank`. The `detail` field is suppressed
+/// when `pd.include_detail` is false.
+fn render_problem_details(
+    status: u16,
+    message: &str,
+    pd: &sbproxy_config::ProblemDetailsConfig,
+    request_path: &str,
+) -> String {
+    let type_uri = match &pd.type_base_uri {
+        Some(base) => {
+            let trimmed = base.trim_end_matches('/');
+            format!("{}/{}", trimmed, status)
+        }
+        None => "about:blank".to_string(),
     };
-    if let Some(arr) = status_val.as_array() {
-        arr.iter().any(|v| v.as_u64() == Some(status as u64))
-    } else {
-        status_val.as_u64() == Some(status as u64)
+    let title = http::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|s| s.canonical_reason())
+        .unwrap_or("Error")
+        .to_string();
+    let mut body = serde_json::Map::new();
+    body.insert("type".into(), serde_json::Value::String(type_uri));
+    body.insert("title".into(), serde_json::Value::String(title));
+    body.insert("status".into(), serde_json::Value::from(status));
+    if pd.include_detail {
+        body.insert(
+            "detail".into(),
+            serde_json::Value::String(message.to_string()),
+        );
     }
+    body.insert(
+        "instance".into(),
+        serde_json::Value::String(request_path.to_string()),
+    );
+    serde_json::Value::Object(body).to_string()
 }
 
 /// Select the best error page entry for the client's `Accept` header.
@@ -1334,9 +1360,9 @@ fn page_matches_status(page: &serde_json::Value, status: u16) -> bool {
 ///   2. text/html entry
 ///   3. first candidate
 fn select_error_page<'a>(
-    candidates: &[&'a serde_json::Value],
+    candidates: &[&'a sbproxy_config::ErrorPageEntry],
     accept_header: &str,
-) -> &'a serde_json::Value {
+) -> &'a sbproxy_config::ErrorPageEntry {
     let ranges = parse_accept_ranges(accept_header);
 
     // If the client expresses a concrete preference (anything other than
@@ -1347,11 +1373,7 @@ fn select_error_page<'a>(
         let mut best_idx: usize = 0;
         let mut best_q: f32 = 0.0;
         for (i, cand) in candidates.iter().enumerate() {
-            let ct = cand
-                .get("content_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("application/octet-stream");
-            let q = match_accept_q(&ranges, ct);
+            let q = match_accept_q(&ranges, &cand.content_type);
             if q > best_q {
                 best_q = q;
                 best_idx = i;
@@ -1365,12 +1387,7 @@ fn select_error_page<'a>(
     // No concrete preference (missing Accept, empty, or `*/*` only), or
     // concrete prefs matched nothing: apply a sensible default.
     for pref in ["application/json", "text/html"] {
-        if let Some(c) = candidates.iter().find(|c| {
-            c.get("content_type")
-                .and_then(|v| v.as_str())
-                .map(|s| s.starts_with(pref))
-                .unwrap_or(false)
-        }) {
+        if let Some(c) = candidates.iter().find(|c| c.content_type.starts_with(pref)) {
             return c;
         }
     }
@@ -7737,8 +7754,15 @@ impl ProxyHttp for SbProxy {
                             session,
                         );
                         let path = session.req_header().uri.path().to_string();
-                        send_error_with_pages(session, status, &msg, &origin.error_pages, &path)
-                            .await?;
+                        send_error_with_pages(
+                            session,
+                            status,
+                            &msg,
+                            origin.error_pages.as_deref(),
+                            origin.problem_details.as_ref(),
+                            &path,
+                        )
+                        .await?;
                         return Ok(true);
                     }
                 }
@@ -7763,8 +7787,15 @@ impl ProxyHttp for SbProxy {
                             session,
                         );
                         let path = session.req_header().uri.path().to_string();
-                        send_error_with_pages(session, status, msg, &origin.error_pages, &path)
-                            .await?;
+                        send_error_with_pages(
+                            session,
+                            status,
+                            msg,
+                            origin.error_pages.as_deref(),
+                            origin.problem_details.as_ref(),
+                            &path,
+                        )
+                        .await?;
                         return Ok(true);
                     }
                     AuthResult::DenyWithHeaders(status, ref msg, ref extra_headers) => {
@@ -13444,8 +13475,13 @@ mod tests {
 
     // --- Error page content negotiation tests ---
 
-    fn page(status: u16, ct: &str, body: &str) -> serde_json::Value {
-        serde_json::json!({ "status": [status], "content_type": ct, "body": body })
+    fn page(status: u16, ct: &str, body: &str) -> sbproxy_config::ErrorPageEntry {
+        sbproxy_config::ErrorPageEntry {
+            status: sbproxy_config::StatusSpec::Multi(vec![status]),
+            content_type: ct.to_string(),
+            body: body.to_string(),
+            template: false,
+        }
     }
 
     #[test]
@@ -13492,11 +13528,11 @@ mod tests {
             &candidates,
             "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
         );
-        assert_eq!(chosen.get("content_type").unwrap(), "text/html");
+        assert_eq!(chosen.content_type, "text/html");
 
         // API-style Accept: JSON wins.
         let chosen = select_error_page(&candidates, "application/json");
-        assert_eq!(chosen.get("content_type").unwrap(), "application/json");
+        assert_eq!(chosen.content_type, "application/json");
     }
 
     #[test]
@@ -13507,10 +13543,10 @@ mod tests {
         let candidates = vec![&html, &json];
 
         let chosen = select_error_page(&candidates, "*/*");
-        assert_eq!(chosen.get("content_type").unwrap(), "application/json");
+        assert_eq!(chosen.content_type, "application/json");
 
         let chosen = select_error_page(&candidates, "");
-        assert_eq!(chosen.get("content_type").unwrap(), "application/json");
+        assert_eq!(chosen.content_type, "application/json");
     }
 
     #[test]
@@ -13521,17 +13557,20 @@ mod tests {
         let candidates = vec![&plain, &html];
 
         let chosen = select_error_page(&candidates, "image/png");
-        assert_eq!(chosen.get("content_type").unwrap(), "text/html");
+        assert_eq!(chosen.content_type, "text/html");
     }
 
     #[test]
     fn page_matches_status_both_shapes() {
-        let single = serde_json::json!({"status": 404});
-        let list = serde_json::json!({"status": [401, 403, 404]});
-        let none = serde_json::json!({"status": [500]});
-        assert!(page_matches_status(&single, 404));
-        assert!(page_matches_status(&list, 403));
-        assert!(!page_matches_status(&none, 404));
+        // StatusSpec covers the same two authored shapes the JSON form
+        // used to support: a single int (`status: 404`) and a list
+        // (`status: [401, 403, 404]`).
+        let single = sbproxy_config::StatusSpec::Single(404);
+        let list = sbproxy_config::StatusSpec::Multi(vec![401, 403, 404]);
+        let none = sbproxy_config::StatusSpec::Multi(vec![500]);
+        assert!(single.matches(404));
+        assert!(list.matches(403));
+        assert!(!none.matches(404));
     }
 
     // --- Session cookie format tests ---
@@ -15168,5 +15207,65 @@ origins:
         assert!(is_request_https(false, true, Some("HTTPS")));
         assert!(!is_request_https(false, true, Some("http")));
         assert!(!is_request_https(false, true, None));
+    }
+
+    #[test]
+    fn problem_details_defaults_to_about_blank_type() {
+        let pd = sbproxy_config::ProblemDetailsConfig {
+            enabled: true,
+            type_base_uri: None,
+            include_detail: true,
+        };
+        let body = super::render_problem_details(503, "upstream timeout", &pd, "/v1/orders");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["type"], "about:blank");
+        assert_eq!(v["title"], "Service Unavailable");
+        assert_eq!(v["status"], 503);
+        assert_eq!(v["detail"], "upstream timeout");
+        assert_eq!(v["instance"], "/v1/orders");
+    }
+
+    #[test]
+    fn problem_details_uses_type_base_uri_and_strips_trailing_slash() {
+        let pd = sbproxy_config::ProblemDetailsConfig {
+            enabled: true,
+            type_base_uri: Some("https://api.example.com/errors/".to_string()),
+            include_detail: true,
+        };
+        let body = super::render_problem_details(404, "not found", &pd, "/missing");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["type"], "https://api.example.com/errors/404");
+    }
+
+    #[test]
+    fn problem_details_suppresses_detail_when_disabled() {
+        let pd = sbproxy_config::ProblemDetailsConfig {
+            enabled: true,
+            type_base_uri: None,
+            include_detail: false,
+        };
+        let body =
+            super::render_problem_details(500, "internal: db driver panicked", &pd, "/health");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v.get("detail").is_none(), "detail must be suppressed");
+        assert_eq!(v["status"], 500);
+        assert_eq!(v["instance"], "/health");
+    }
+
+    #[test]
+    fn problem_details_unknown_status_falls_back_to_generic_title() {
+        // A non-standard status code with no canonical reason should
+        // still produce valid JSON with a default title.
+        let pd = sbproxy_config::ProblemDetailsConfig {
+            enabled: true,
+            type_base_uri: None,
+            include_detail: true,
+        };
+        let body = super::render_problem_details(599, "weird", &pd, "/x");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // 599 is not a registered IANA status: hyper's `http` crate
+        // resolves no canonical reason, so we fall back to "Error".
+        assert_eq!(v["title"], "Error");
+        assert_eq!(v["status"], 599);
     }
 }
