@@ -3754,6 +3754,353 @@ fn snapshot_request_headers_from(
     out
 }
 
+/// Outcome of the AI gateway idempotency middleware engagement, run
+/// in `handle_ai_proxy` after the request body has been buffered but
+/// before the upstream call. Mirrors the four-branch flow used on the
+/// general HTTP path (see `request_body_filter` for the analogue):
+/// short-circuit replay on hit, 409 on conflict, capture-on-miss for
+/// the response side, or skip with a stamped marker. The
+/// `permit` field is `Some` only on the `Miss` arm: it keeps the
+/// per-origin pool semaphore slot held until the response side
+/// records (or abandons) the captured body.
+enum AiIdempotencyEngagement {
+    /// Middleware did not engage (no `idempotency:` block on the
+    /// origin, method not in the configured set, header absent, or
+    /// origin index missing). The caller proceeds with the upstream
+    /// call unchanged.
+    NotApplicable,
+    /// Cache hit on a matching body hash. The cached response has
+    /// already been written to the session; the caller short-circuits
+    /// the AI gateway path without contacting the provider.
+    Replayed,
+    /// Cache hit with a different body hash. The 409 conflict body
+    /// has already been written to the session. Caller short-circuits.
+    Conflict,
+    /// Cache miss. The caller proceeds with the upstream call, then
+    /// invokes `record_ai_idempotency` with the captured response so
+    /// the next retry hits the cache.
+    Miss {
+        idem: std::sync::Arc<crate::pipeline::CompiledIdempotency>,
+        workspace_id: String,
+        key: String,
+        body_hash: [u8; 32],
+        /// Permit on the per-origin pool semaphore. Held until the
+        /// response side records (or abandons) the capture; dropped
+        /// then so a new buffered request can take the slot.
+        permit: tokio::sync::OwnedSemaphorePermit,
+    },
+    /// Middleware engagement was skipped (oversize body, pool full,
+    /// multipart body). The caller proceeds with the upstream call;
+    /// the AI relay path stamps the marker on the outgoing response
+    /// so operators can see the skip in dashboards.
+    Skipped { reason: &'static str },
+}
+
+/// Run the AI gateway idempotency cache check after the request body
+/// has been buffered. Returns one of four outcomes per
+/// [`AiIdempotencyEngagement`].
+///
+/// The caller must already have read the request body via
+/// `session.read_request_body().await?`; for multipart bodies the
+/// engagement is skipped with `SKIPPED-MULTIPART` since the v1 cache
+/// shape stores raw bytes (multipart streams may not round-trip
+/// safely through the cache without media-type-aware framing). Other
+/// skip paths (oversize request, pool exhausted) match the general
+/// HTTP path's behaviour byte-for-byte.
+async fn engage_ai_idempotency(
+    session: &mut Session,
+    pipeline: &CompiledPipeline,
+    origin_idx: Option<usize>,
+    body_bytes: &[u8],
+    is_multipart: bool,
+) -> Result<AiIdempotencyEngagement> {
+    // Resolve the per-origin idempotency binding; bail out early if
+    // none is configured on this origin.
+    let origin_idx = match origin_idx {
+        Some(i) => i,
+        None => return Ok(AiIdempotencyEngagement::NotApplicable),
+    };
+    let idem = match pipeline
+        .idempotencies
+        .get(origin_idx)
+        .and_then(|o| o.as_ref())
+    {
+        Some(i) => i.clone(),
+        None => return Ok(AiIdempotencyEngagement::NotApplicable),
+    };
+
+    // Gate 1: method must be one of the configured set
+    // (default POST / PUT / PATCH).
+    let method = session.req_header().method.clone();
+    if !idem.methods.contains(&method) {
+        return Ok(AiIdempotencyEngagement::NotApplicable);
+    }
+
+    // Gate 2: the configured header must be present and non-empty.
+    let header_present = session
+        .req_header()
+        .headers
+        .get(idem.header_name.as_str())
+        .and_then(|v| v.to_str().ok())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if !header_present {
+        return Ok(AiIdempotencyEngagement::NotApplicable);
+    }
+
+    // Gate 3: multipart bodies are not cached in v1. The cache
+    // primitive stores raw bytes; multipart streams carry MIME
+    // boundaries that the upstream client may regenerate on retry
+    // even when the user-visible payload is identical. Stamp the
+    // skip marker so operators can spot the case.
+    if is_multipart {
+        return Ok(AiIdempotencyEngagement::Skipped {
+            reason: "SKIPPED-MULTIPART",
+        });
+    }
+
+    // Gate 4: request body cap. Bodies above the cap skip caching
+    // rather than buffering unbounded bytes into the cache primitive.
+    if body_bytes.len() > idem.max_request_body_bytes {
+        return Ok(AiIdempotencyEngagement::Skipped {
+            reason: "SKIPPED-OVERSIZE-REQUEST",
+        });
+    }
+
+    // Gate 5: per-origin pool semaphore. Try-acquire a permit; on
+    // failure (pool full) skip caching so the request still flows.
+    let permit = match idem.permits.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return Ok(AiIdempotencyEngagement::Skipped {
+                reason: "SKIPPED-POOL-FULL",
+            });
+        }
+    };
+
+    let workspace_id = pipeline.config.origins[origin_idx].workspace_id.to_string();
+    let outcome = sbproxy_middleware::idempotency::check_request(
+        idem.cache.as_ref(),
+        &workspace_id,
+        &session.req_header().headers,
+        body_bytes,
+    );
+
+    match outcome {
+        sbproxy_middleware::idempotency::IdempotencyOutcome::NotApplicable => {
+            // Header evaporated between gate 2 and the check (would
+            // only happen on a header that became empty after trim
+            // inside the middleware). Treat as a passthrough.
+            Ok(AiIdempotencyEngagement::NotApplicable)
+        }
+        sbproxy_middleware::idempotency::IdempotencyOutcome::CacheHit(resp) => {
+            // Replay the cached `(status, headers, body)` triple
+            // verbatim. Strip framing headers Pingora will re-derive
+            // for the new client connection so a stale
+            // `transfer-encoding: chunked` does not race the replay.
+            write_ai_cached_response(session, resp.status, &resp.headers, &resp.body).await?;
+            Ok(AiIdempotencyEngagement::Replayed)
+        }
+        sbproxy_middleware::idempotency::IdempotencyOutcome::Conflict => {
+            let (status, content_type, body) = sbproxy_middleware::idempotency::conflict_response();
+            send_response(session, status.as_u16(), content_type, &body).await?;
+            Ok(AiIdempotencyEngagement::Conflict)
+        }
+        sbproxy_middleware::idempotency::IdempotencyOutcome::Miss { key, body_hash } => {
+            Ok(AiIdempotencyEngagement::Miss {
+                idem,
+                workspace_id,
+                key,
+                body_hash,
+                permit,
+            })
+        }
+    }
+}
+
+/// Write a cached AI gateway response directly to the Pingora session.
+/// Stamps `x-sbproxy-idempotency: HIT` so operators can distinguish a
+/// replayed hit from an upstream response. Strips hop-by-hop framing
+/// headers Pingora will re-derive on the outbound connection.
+async fn write_ai_cached_response(
+    session: &mut Session,
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<()> {
+    let mut header =
+        pingora_http::ResponseHeader::build(status, Some(headers.len() + 2)).map_err(|e| {
+            Error::because(
+                ErrorType::InternalError,
+                "idempotency: failed to build replay response header",
+                e,
+            )
+        })?;
+    for (name, value) in headers {
+        let lname = name.to_ascii_lowercase();
+        if lname == "content-length"
+            || lname == "transfer-encoding"
+            || lname == "connection"
+            || lname == "keep-alive"
+            || lname == "x-sbproxy-idempotency"
+        {
+            continue;
+        }
+        let _ = header.insert_header(name.clone(), value.clone());
+    }
+    let _ = header.insert_header("content-length", body.len().to_string());
+    let _ = header.insert_header("x-sbproxy-idempotency", "HIT");
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(bytes::Bytes::copy_from_slice(body)), true)
+        .await?;
+    Ok(())
+}
+
+/// Captured state from an [`AiIdempotencyEngagement::Miss`] needed to
+/// record the upstream response back into the cache once the relay
+/// finishes. Threaded through the relay helpers so callers don't have
+/// to keep five locals alive across the upstream call.
+struct AiIdempotencyCapture {
+    idem: std::sync::Arc<crate::pipeline::CompiledIdempotency>,
+    workspace_id: String,
+    key: String,
+    body_hash: [u8; 32],
+    /// Per-origin pool permit held for the lifetime of the capture.
+    /// Dropped here (on success or abandonment) so a new buffered
+    /// request can take the slot.
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl AiIdempotencyCapture {
+    /// Persist the recorded response under `(workspace_id, key)`.
+    /// `body` is the **post-translation** OpenAI-shape bytes the
+    /// client saw, so retries replay byte-identical to the original
+    /// served response.
+    fn record(self, status: u16, headers: Vec<(String, String)>, body: Vec<u8>) {
+        sbproxy_middleware::idempotency::record_response(
+            self.idem.cache.as_ref(),
+            &self.workspace_id,
+            &self.key,
+            sbproxy_middleware::idempotency::RecordedResponse {
+                status,
+                headers,
+                body,
+                body_hash: self.body_hash,
+                ttl_secs: self.idem.ttl_secs,
+            },
+        );
+    }
+}
+
+/// Send a non-streaming AI gateway response, optionally stamping the
+/// `x-sbproxy-idempotency` skip marker when the middleware
+/// disengaged. Returns the response bytes so the caller can record
+/// them into the idempotency cache on `Miss`.
+///
+/// `cap_response_bytes` caps the captured-for-cache body length;
+/// responses above the cap skip the record with `SKIPPED-OVERSIZE-RESPONSE`
+/// returned via the marker out-parameter so the response_filter still
+/// stamps it (best-effort visible via logs since headers have already
+/// flushed).
+async fn relay_ai_response_with_idempotency(
+    session: &mut Session,
+    resp: reqwest::Response,
+    format: sbproxy_ai::providers::ProviderFormat,
+    max_body_size: Option<usize>,
+    idem_skip_reason: Option<&'static str>,
+    capture: Option<AiIdempotencyCapture>,
+) -> Result<()> {
+    let status = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let resp_body = read_capped_response_body(resp, max_body_size).await?;
+    let translated = sbproxy_ai::translators::translate_response_bytes(format, &resp_body);
+
+    // Record into the idempotency cache before serving the response
+    // so the cache entry is durable even if the client disconnects
+    // mid-body. Honour the response body cap: bodies above the cap
+    // skip the record and the SKIPPED-OVERSIZE-RESPONSE marker is
+    // stamped instead.
+    let (final_skip_reason, capture_for_record) = match capture {
+        Some(cap) => {
+            if translated.len() > cap.idem.max_response_body_bytes {
+                debug!(
+                    body_len = translated.len(),
+                    cap = cap.idem.max_response_body_bytes,
+                    "AI proxy: idempotency response body exceeds cap; abandoning cache record"
+                );
+                (Some("SKIPPED-OVERSIZE-RESPONSE"), None)
+            } else {
+                (idem_skip_reason, Some(cap))
+            }
+        }
+        None => (idem_skip_reason, None),
+    };
+
+    // Build the outgoing response. We do not relay every upstream
+    // header (matches the existing `send_response` contract); we do
+    // stamp the skip marker so dashboards see the disengagement.
+    let extra: Option<(&'static str, &'static str)> =
+        final_skip_reason.map(|r| ("x-sbproxy-idempotency", r));
+    send_response_with_extra(session, status, &content_type, &translated, extra).await?;
+
+    if let Some(cap) = capture_for_record {
+        // Capture the bytes the client actually saw (post-translation).
+        // Headers in the cached entry mirror what we send back: at
+        // minimum the content-type so a replay surfaces the same
+        // shape. Skip framing headers Pingora will recompute.
+        let headers: Vec<(String, String)> =
+            vec![("content-type".to_string(), content_type.clone())];
+        cap.record(status, headers, translated);
+    }
+
+    Ok(())
+}
+
+/// Variant of [`send_response`] that accepts a single optional extra
+/// header (name, value). Used by the AI gateway path to stamp
+/// `x-sbproxy-idempotency: <reason>` on the outgoing response when
+/// the middleware disengaged.
+async fn send_response_with_extra(
+    session: &mut Session,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    extra: Option<(&str, &str)>,
+) -> Result<()> {
+    let cap = if extra.is_some() { 3 } else { 2 };
+    let mut header = pingora_http::ResponseHeader::build(status, Some(cap)).map_err(|e| {
+        Error::because(
+            ErrorType::InternalError,
+            "failed to build response header",
+            e,
+        )
+    })?;
+    header
+        .insert_header("content-type", content_type)
+        .map_err(|e| Error::because(ErrorType::InternalError, "failed to set content-type", e))?;
+    header
+        .insert_header("content-length", body.len().to_string())
+        .map_err(|e| Error::because(ErrorType::InternalError, "failed to set content-length", e))?;
+    if let Some((name, value)) = extra {
+        let _ = header.insert_header(name.to_string(), value.to_string());
+    }
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(bytes::Bytes::copy_from_slice(body)), true)
+        .await?;
+    Ok(())
+}
+
 /// Handle an AI proxy request by forwarding to the upstream provider via reqwest.
 ///
 /// This function:
@@ -3914,17 +4261,19 @@ async fn handle_ai_proxy(
         let provider = &config.providers[provider_idx];
 
         // Read the body for methods that typically carry one. DELETE,
-        // HEAD, OPTIONS go through without a body.
-        let body_opt: Option<serde_json::Value> = if matches!(
+        // HEAD, OPTIONS go through without a body. For PUT / PATCH we
+        // keep the raw bytes alongside the parsed JSON so the
+        // idempotency middleware can hash the verbatim payload.
+        let (body_opt, body_raw): (Option<serde_json::Value>, Vec<u8>) = if matches!(
             method,
             http::Method::PUT | http::Method::PATCH
         ) {
             let body_bytes = session.read_request_body().await?.unwrap_or_default();
             if body_bytes.is_empty() {
-                None
+                (None, Vec::new())
             } else {
                 match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                    Ok(v) => Some(v),
+                    Ok(v) => (Some(v), body_bytes.to_vec()),
                     Err(e) => {
                         warn!(error = %e, "AI proxy: invalid JSON body on method-aware request");
                         send_error(session, 400, "invalid JSON body").await?;
@@ -3933,8 +4282,42 @@ async fn handle_ai_proxy(
                 }
             }
         } else {
-            None
+            (None, Vec::new())
         };
+
+        // --- Idempotency middleware engagement (PUT / PATCH) ---
+        //
+        // Same four-branch flow as the POST path: replay cache hits
+        // verbatim, return 409 on body conflict, capture-on-miss for
+        // the response side, and stamp a SKIPPED marker when a cap
+        // disengaged. The middleware only inspects the request body
+        // on methods configured in `idempotency.methods` (PUT and
+        // PATCH are in the default set), so DELETE / HEAD / OPTIONS
+        // fall through unchanged.
+        let (idem_skip_reason, idem_capture) =
+            match engage_ai_idempotency(session, pipeline, origin_idx, &body_raw, false).await? {
+                AiIdempotencyEngagement::Replayed | AiIdempotencyEngagement::Conflict => {
+                    return Ok(());
+                }
+                AiIdempotencyEngagement::NotApplicable => (None, None),
+                AiIdempotencyEngagement::Skipped { reason } => (Some(reason), None),
+                AiIdempotencyEngagement::Miss {
+                    idem,
+                    workspace_id,
+                    key,
+                    body_hash,
+                    permit,
+                } => (
+                    None,
+                    Some(AiIdempotencyCapture {
+                        idem,
+                        workspace_id,
+                        key,
+                        body_hash,
+                        _permit: permit,
+                    }),
+                ),
+            };
 
         let resp = AI_CLIENT
             .load()
@@ -3959,7 +4342,15 @@ async fn handle_ai_proxy(
             0.0,
             Vec::new(),
         );
-        return relay_ai_response(session, resp, format, config.max_body_size).await;
+        return relay_ai_response_with_idempotency(
+            session,
+            resp,
+            format,
+            config.max_body_size,
+            idem_skip_reason,
+            idem_capture,
+        )
+        .await;
     }
 
     // POST requests: read the body, parse JSON, select provider, forward.
@@ -3977,10 +4368,51 @@ async fn handle_ai_proxy(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    if request_content_type
+    let is_multipart_request = request_content_type
         .to_ascii_lowercase()
-        .starts_with("multipart/")
+        .starts_with("multipart/");
+
+    // --- Idempotency middleware engagement (POST) ---
+    //
+    // Engage before the upstream call (and before the multipart and
+    // semantic-cache hooks) so a cache hit can serve byte-identical
+    // to the original response without invoking any downstream
+    // logic. Multipart bodies are explicitly skipped for v1
+    // (see `engage_ai_idempotency`); the marker stamps the response
+    // so operators can spot the case in dashboards.
+    let (idem_skip_reason, mut idem_capture) = match engage_ai_idempotency(
+        session,
+        pipeline,
+        origin_idx,
+        body_bytes.as_ref(),
+        is_multipart_request,
+    )
+    .await?
     {
+        AiIdempotencyEngagement::Replayed | AiIdempotencyEngagement::Conflict => {
+            return Ok(());
+        }
+        AiIdempotencyEngagement::NotApplicable => (None, None),
+        AiIdempotencyEngagement::Skipped { reason } => (Some(reason), None),
+        AiIdempotencyEngagement::Miss {
+            idem,
+            workspace_id,
+            key,
+            body_hash,
+            permit,
+        } => (
+            None,
+            Some(AiIdempotencyCapture {
+                idem,
+                workspace_id,
+                key,
+                body_hash,
+                _permit: permit,
+            }),
+        ),
+    };
+
+    if is_multipart_request {
         let provider_idx = router.select(&config.providers).ok_or_else(|| {
             warn!("AI proxy: no enabled providers");
             Error::new(ErrorType::HTTPStatus(502))
@@ -4047,7 +4479,9 @@ async fn handle_ai_proxy(
                 cost,
                 Vec::new(),
             );
-            return send_response(session, status, &resp_ct, &resp_bytes).await;
+            let extra: Option<(&str, &str)> =
+                idem_skip_reason.map(|r| ("x-sbproxy-idempotency", r));
+            return send_response_with_extra(session, status, &resp_ct, &resp_bytes, extra).await;
         }
 
         emit_ai_billing_event(
@@ -4058,7 +4492,18 @@ async fn handle_ai_proxy(
             0.0,
             Vec::new(),
         );
-        return relay_ai_response(session, resp, format, config.max_body_size).await;
+        // Multipart never captures for idempotency (engagement
+        // skipped with SKIPPED-MULTIPART). Pass the skip reason
+        // through so the marker still lands on the response.
+        return relay_ai_response_with_idempotency(
+            session,
+            resp,
+            format,
+            config.max_body_size,
+            idem_skip_reason,
+            None,
+        )
+        .await;
     }
 
     let mut body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
@@ -4542,6 +4987,22 @@ async fn handle_ai_proxy(
 
     if let Some(resp) = last_resp {
         if is_stream {
+            // SSE streaming with idempotency engaged: drop the capture
+            // (releases the per-origin pool permit) and abandon
+            // caching for this request. v1 does not buffer SSE
+            // chunks into the idempotency cache because framing-aware
+            // capture is out of scope here; the response headers
+            // have already been written when the relay realizes
+            // we'd exceed the cap on a chunked body, so the
+            // skip marker is not visible to the client. The
+            // operator-visible signal is the absence of a cache hit
+            // on retry, plus the debug log line below.
+            if idem_capture.take().is_some() {
+                debug!(
+                    "AI proxy: idempotency miss on streaming request; abandoning cache record (SSE framing-aware capture is out of scope for v1)"
+                );
+            }
+            let _ = idem_skip_reason;
             let model_id = if model.is_empty() {
                 None
             } else {
@@ -4663,6 +5124,8 @@ async fn handle_ai_proxy(
                 config.max_body_size,
                 recorder,
                 Some(ctx),
+                idem_skip_reason,
+                idem_capture,
             )
             .await
         }
@@ -4782,6 +5245,8 @@ async fn relay_ai_response_with_cache(
     max_body_size: Option<usize>,
     budget_recorder: Option<BudgetRecorderArgs<'_>>,
     ctx: Option<&mut RequestContext>,
+    idem_skip_reason: Option<&'static str>,
+    idem_capture: Option<AiIdempotencyCapture>,
 ) -> Result<()> {
     let status = resp.status().as_u16();
 
@@ -4973,7 +5438,34 @@ async fn relay_ai_response_with_cache(
         }
     }
 
-    send_response(session, status, &content_type, &resp_body).await
+    // --- Idempotency record on miss ---
+    //
+    // Honour the per-origin response body cap; bodies above the cap
+    // skip the record with `SKIPPED-OVERSIZE-RESPONSE` stamped on the
+    // outgoing response (best-effort visible via logs since headers
+    // for a non-streaming response have not yet flushed at this
+    // point).
+    let final_skip_reason = match idem_capture {
+        Some(cap) => {
+            if resp_body.len() > cap.idem.max_response_body_bytes {
+                debug!(
+                    body_len = resp_body.len(),
+                    max_bytes = cap.idem.max_response_body_bytes,
+                    "AI proxy: idempotency response body exceeds cap; abandoning cache record"
+                );
+                Some("SKIPPED-OVERSIZE-RESPONSE")
+            } else {
+                let recorded_headers: Vec<(String, String)> =
+                    vec![("content-type".to_string(), content_type.clone())];
+                cap.record(status, recorded_headers, resp_body.to_vec());
+                idem_skip_reason
+            }
+        }
+        None => idem_skip_reason,
+    };
+
+    let extra: Option<(&str, &str)> = final_skip_reason.map(|r| ("x-sbproxy-idempotency", r));
+    send_response_with_extra(session, status, &content_type, &resp_body, extra).await
 }
 
 /// Bundled inputs for post-dispatch budget recording on a relayed AI
