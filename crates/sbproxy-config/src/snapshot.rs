@@ -14,8 +14,9 @@ use smallvec::SmallVec;
 
 use crate::types::{
     AccessLogConfig, AgentClassesConfig, AgentSkillEntry, CompressionConfig, CorsConfig,
-    HstsConfig, MirrorConfig, OriginRateLimitsConfig, ProxyServerConfig, MessageSignaturesConfig, ProxyStatusConfig,
-    RequestModifierConfig, ResponseCacheConfig, ResponseModifierConfig, SessionConfig,
+    HstsConfig, MessageSignaturesConfig, MirrorConfig, OriginRateLimitsConfig, ProxyServerConfig,
+    ProxyStatusConfig, RequestModifierConfig, ResponseCacheConfig, ResponseModifierConfig,
+    SessionConfig,
 };
 
 /// Fully compiled, immutable origin ready for request processing.

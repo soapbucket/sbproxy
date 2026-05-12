@@ -433,7 +433,7 @@ mod tests {
                 fallback_origin: None,
                 error_pages: None,
                 proxy_status: None,
-            message_signatures: None,
+                message_signatures: None,
                 bot_detection: None,
                 threat_protection: None,
                 on_request: Vec::new(),
