@@ -193,6 +193,15 @@ pub struct RequestContext {
     /// per-origin idempotency buffer pool. Dropped at end of the
     /// request (or earlier on skip / replay) to release the slot.
     pub idempotency_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// Request body buffered in `request_filter` for cache lookup,
+    /// held here for re-injection in `request_body_filter` once the
+    /// body channel is drained. Set on a cache miss so the upstream
+    /// receives the original payload as a single chunk; cleared
+    /// after the body filter consumes it. Same buffer is also used
+    /// for the buffered-but-skipped path (oversize body) so the
+    /// chunks the proxy already pulled off the wire still reach
+    /// the upstream.
+    pub idempotency_reinject: Option<BytesMut>,
     /// Reason the middleware *skipped* engagement for this request,
     /// stamped as `x-sbproxy-idempotency: <reason>` on the response
     /// so operators can spot pool pressure or oversize bodies. None
@@ -753,6 +762,7 @@ impl RequestContext {
             idempotency_conflict: false,
             idempotency_permit: None,
             idempotency_skip_reason: None,
+            idempotency_reinject: None,
             body_size_limit: None,
             body_bytes_seen: 0,
             request_body_bytes: 0,

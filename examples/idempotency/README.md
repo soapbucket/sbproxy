@@ -53,17 +53,6 @@ curl -s -H 'Host: api.local' -H 'Idempotency-Key: order-42' \
   `ledger.idempotency_conflict` body
 - Workspace isolation: two workspaces using the same key never collide
 
-## Known limitation: upstream contact on cache hit
-
-The middleware engages in `request_body_filter`, which fires after
-Pingora has already opened the upstream TCP connection and sent the
-request headers. The proxy aborts before forwarding the request body
-on a cache hit, so the upstream sees one full request (the first
-call) and one aborted partial handshake (the replay). A well-behaved
-upstream tolerates the abort; a poorly-behaved one may log it. The
-client always receives the cached response. Future work moves the
-cache check earlier so the upstream never observes the replay.
-
 ## Backend selection
 
 ```yaml
