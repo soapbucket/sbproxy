@@ -7,6 +7,7 @@
 //! - [`context`] - Plugin context passed during provisioning.
 //! - [`registry`] - Inventory-based plugin discovery at link time.
 //! - [`identity`] - Identity, classification, and anomaly hook surface.
+//! - [`mcp`] - MCP pre-tool-call policy hook trait surface (WOR-152).
 //! - [`audit`] - Admin-action audit emitter trait surface.
 //! - [`verdict_combine`] - Combine multiple `PolicyDecision` votes
 //!   into a single terminal verdict per the WOR-152 matrix.
@@ -18,6 +19,7 @@ pub mod audit;
 pub mod context;
 pub mod identity;
 pub mod lifecycle;
+pub mod mcp;
 pub mod registry;
 pub mod traits;
 pub mod verdict_combine;
@@ -34,6 +36,10 @@ pub use identity::{
     MlClassificationResult, MlClassifierHook, RequestContextView, RequestSnapshotView,
 };
 pub use lifecycle::*;
+pub use mcp::{
+    default_no_op_hook, mcp_policy_hooks, register_mcp_policy_hook, McpPolicyHook,
+    McpPolicyHookEntry, McpToolCallCtx, NoOpMcpPolicyHook,
+};
 pub use registry::*;
 pub use traits::*;
 pub use verdict_combine::{combine_verdicts, CombinedVerdict};

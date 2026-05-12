@@ -5831,6 +5831,7 @@ dependencies = [
  "reqwest",
  "rquickjs",
  "sbproxy-config",
+ "sbproxy-observe",
  "sbproxy-plugin",
  "serde",
  "serde_json",
