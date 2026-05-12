@@ -17,7 +17,7 @@ use pingora_core::upstreams::peer::{HttpPeer, ALPN};
 use pingora_error::{Error, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::context::RequestContext;
 use crate::pipeline::CompiledPipeline;
@@ -5198,6 +5198,115 @@ async fn handle_action(
                 .and_then(|idx| pipeline.config.origins.get(idx))
                 .map(|o| o.hostname.to_string())
                 .unwrap_or_default();
+
+            // Phase 7: realtime WebSocket dispatch. When the request
+            // is a GET upgrade for `/v1/realtime`, run the standard
+            // AI gateway gating (surface classify, 501 capability
+            // check, per-surface rate limit, metrics) and stash the
+            // selected provider's connection target on the request
+            // context so `upstream_peer` can build the dynamic peer.
+            // Returns `Ok(false)` so Pingora proceeds to its normal
+            // transparent forwarding flow.
+            let method = session.req_header().method.clone();
+            let path = session.req_header().uri.path().to_string();
+            let is_websocket_upgrade = session
+                .req_header()
+                .headers
+                .get("upgrade")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_ascii_lowercase().contains("websocket"))
+                .unwrap_or(false);
+            let surface_for_check = sbproxy_ai::handler::classify_surface(method.as_str(), &path);
+            if method == http::Method::GET
+                && is_websocket_upgrade
+                && matches!(surface_for_check, sbproxy_ai::handler::AiSurface::Realtime)
+            {
+                let surface_label = surface_for_check.label();
+                ctx.ai_surface = Some(surface_label.to_string());
+                sbproxy_ai::ai_metrics::record_surface_request(surface_label, method.as_str());
+
+                // Per-surface rate limit gate.
+                if let Some(rate_cfg) = ai.config.per_surface_rate_limits.get(surface_label) {
+                    if !AI_SURFACE_RATE_LIMITER.check_rate(surface_label, rate_cfg) {
+                        warn!(
+                            ai.surface = surface_label,
+                            "AI realtime: per-surface rate limit hit; returning 429"
+                        );
+                        send_error(session, 429, "per-surface rate limit exceeded").await?;
+                        return Ok(true);
+                    }
+                }
+
+                // 501 gate: pick the first provider that supports realtime.
+                let provider = ai
+                    .config
+                    .providers
+                    .iter()
+                    .find(|p| sbproxy_ai::api_routes::provider_supports_realtime(&p.name));
+                let provider = match provider {
+                    Some(p) => p,
+                    None => {
+                        warn!(
+                            ai.surface = surface_label,
+                            "AI realtime: no configured provider supports realtime; returning 501"
+                        );
+                        send_error(session, 501, "no configured AI provider supports realtime")
+                            .await?;
+                        return Ok(true);
+                    }
+                };
+
+                // Parse the provider's base URL into (host, port, tls).
+                // Realtime uses wss:// to api.openai.com; provider base_url
+                // is typically https://api.openai.com/v1, which gives us
+                // the same host/port pair (TLS on 443).
+                let base_url_owned = provider.effective_base_url();
+                let parsed_url = match url::Url::parse(&base_url_owned) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        warn!(error = %e, "AI realtime: invalid provider base_url");
+                        send_error(session, 502, "invalid provider base_url").await?;
+                        return Ok(true);
+                    }
+                };
+                let host = match parsed_url.host_str() {
+                    Some(h) => h.to_string(),
+                    None => {
+                        warn!("AI realtime: provider base_url has no host");
+                        send_error(session, 502, "provider base_url missing host").await?;
+                        return Ok(true);
+                    }
+                };
+                let tls = matches!(parsed_url.scheme(), "https" | "wss");
+                let port = parsed_url
+                    .port_or_known_default()
+                    .unwrap_or(if tls { 443 } else { 80 });
+
+                ctx.ai_realtime_dispatch = Some(crate::context::RealtimeDispatchCtx {
+                    provider_name: provider.name.clone(),
+                    upstream_host: host.clone(),
+                    upstream_port: port,
+                    upstream_tls: tls,
+                    started_at: std::time::Instant::now(),
+                    surface_label: "realtime",
+                });
+                ctx.ai_provider = Some(provider.name.clone());
+                sbproxy_ai::ai_metrics::inc_realtime_sessions_active();
+                info!(
+                    ai.surface = surface_label,
+                    provider = %provider.name,
+                    upstream_host = %host,
+                    upstream_port = port,
+                    upstream_tls = tls,
+                    "AI realtime: session opening, handing off to Pingora for transparent forwarding"
+                );
+
+                // Let Pingora's normal flow continue: `upstream_peer`
+                // will read `ctx.ai_realtime_dispatch` and build the
+                // peer; Pingora forwards bytes after the upgrade.
+                return Ok(false);
+            }
+
             handle_ai_proxy(session, &ai.config, pipeline, &hostname, ctx, origin_idx).await?;
             Ok(true)
         }
@@ -8557,6 +8666,38 @@ impl ProxyHttp for SbProxy {
                 let peer = tune_peer(HttpPeer::new(&*addr, tls, host));
                 Ok(Box::new(peer))
             }
+            Action::AiProxy(_) => {
+                // Phase 7: realtime WebSocket dispatch. `handle_action`
+                // populated `ctx.ai_realtime_dispatch` for this path
+                // after running the AI gateway gating; build the peer
+                // from there and let Pingora forward bytes transparently
+                // through the upgraded connection.
+                let rd = ctx.ai_realtime_dispatch.as_ref().ok_or_else(|| {
+                    warn!("AI proxy reached upstream_peer without a realtime dispatch context");
+                    Error::new(ErrorType::InternalError)
+                })?;
+                guard_upstream(
+                    &rd.upstream_host,
+                    rd.upstream_port,
+                    rd.upstream_tls,
+                    allow_private,
+                )?;
+                debug!(
+                    hostname = %ctx.hostname,
+                    upstream_host = %rd.upstream_host,
+                    upstream_port = %rd.upstream_port,
+                    tls = %rd.upstream_tls,
+                    provider = %rd.provider_name,
+                    "routing AI realtime WebSocket upgrade to provider"
+                );
+                let addr = format!("{}:{}", rd.upstream_host, rd.upstream_port);
+                let peer = tune_peer(HttpPeer::new(
+                    &*addr,
+                    rd.upstream_tls,
+                    rd.upstream_host.clone(),
+                ));
+                Ok(Box::new(peer))
+            }
             Action::Grpc(grpc) => {
                 let (host, port, tls) = grpc.parse_upstream().map_err(|e| {
                     warn!(error = %e, "failed to parse gRPC upstream URL");
@@ -10694,12 +10835,57 @@ impl ProxyHttp for SbProxy {
     ///
     /// Called when the response is fully sent or on fatal error. Records
     /// request metrics, emits events, and decrements load balancer counters.
-    async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut Self::CTX)
+    async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX)
     where
         Self::CTX: Send + Sync,
     {
         // Decrement active connections gauge (global + per-origin).
         metrics().active_connections.dec();
+
+        // Phase 7: AI realtime WebSocket session-close hook. When the
+        // request opened a realtime session, observe duration, tick
+        // the active-sessions gauge down, and emit a session-end
+        // AiBillingEvent with the wall-clock duration as an
+        // approximation of the audio time forwarded. Frame-exact
+        // audio metering would require terminating the WebSocket
+        // (not transparent forwarding); the duration approximation
+        // is the right OSS-v1 substitute since the session
+        // lifetime IS the audio call.
+        if let Some(rd) = ctx.ai_realtime_dispatch.take() {
+            let duration_secs = rd.started_at.elapsed().as_secs_f64();
+            let close_reason = if e.is_some() {
+                "error"
+            } else {
+                "client_closed"
+            };
+            sbproxy_ai::ai_metrics::record_realtime_session_duration(
+                &rd.provider_name,
+                close_reason,
+                duration_secs,
+            );
+            sbproxy_ai::ai_metrics::dec_realtime_sessions_active();
+            let usage = sbproxy_ai::budget::AiUsage::AudioSeconds {
+                seconds: duration_secs,
+            };
+            // Realtime audio pricing isn't in the catalog yet; cost
+            // is reported as 0.0 so operators see the duration on the
+            // event without a fabricated dollar figure.
+            emit_ai_billing_event(
+                rd.surface_label,
+                &rd.provider_name,
+                Some("gpt-4o-realtime-preview".to_string()),
+                usage,
+                0.0,
+                Vec::new(),
+            );
+            info!(
+                ai.surface = rd.surface_label,
+                provider = %rd.provider_name,
+                duration_secs = duration_secs,
+                close_reason = close_reason,
+                "AI realtime: session closed"
+            );
+        }
 
         // Record request metrics.
         let method = session.req_header().method.as_str().to_string();
@@ -10755,7 +10941,7 @@ impl ProxyHttp for SbProxy {
         }
 
         // Record errors.
-        if _e.is_some() {
+        if e.is_some() {
             metrics()
                 .errors_total
                 .with_label_values(&[hostname.as_str(), "proxy_error"])
@@ -10796,7 +10982,7 @@ impl ProxyHttp for SbProxy {
             // days; log emission must not panic.
             u32::try_from(ms).unwrap_or(u32::MAX)
         });
-        let error_class = if _e.is_some() {
+        let error_class = if e.is_some() {
             Some("proxy_error")
         } else {
             None
