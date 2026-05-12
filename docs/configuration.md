@@ -2627,15 +2627,6 @@ See [`examples/idempotency/`](https://github.com/soapbucket/sbproxy/tree/main/ex
 
 Spec: <https://www.rfc-editor.org/rfc/rfc8594.html>.
 
-> **Upstream contact on cache hit.** The middleware runs in the body
-> filter, which fires after Pingora has already opened the upstream
-> TCP connection and sent the request headers. On a cache hit the
-> proxy aborts before forwarding the request body, so the upstream
-> sees one full request (the first call) and one aborted partial
-> handshake (the replay). A well-behaved upstream tolerates the
-> abort; a poorly-behaved one may log it. Future work moves the
-> cache check earlier so the upstream never sees the replay.
-
 > **AI gateway note.** The AI proxy path (`action: ai_proxy`) does not
 > currently engage this middleware. The AI gateway has its own
 > request-flow model and response capture is more involved for

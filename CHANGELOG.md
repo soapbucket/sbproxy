@@ -34,6 +34,22 @@ of the new YAML fields below until the version that ships them.
   RFC 9209 error token in the `detail` field so both signals share
   the same vocabulary.
 
+- **Idempotency cache check moved to `request_filter`.** Before this
+  change, the cache lookup ran in `request_body_filter`, after
+  Pingora had already opened the upstream TCP connection. On a cache
+  hit the upstream observed one aborted partial request before the
+  proxy served the cached response to the client. The check now runs
+  before Pingora's upstream-peer phase: cache hits and body
+  conflicts write the response from inside `request_filter` and
+  return `Ok(true)`, so the upstream is never contacted at all. On
+  cache miss the proxy buffers the body (bounded by
+  `max_request_body_bytes` from PR #139), then re-injects it via
+  `request_body_filter` at end-of-stream so Pingora's normal upstream
+  forwarding picks it up. Existing e2e tests now assert the
+  upstream-not-contacted invariant; the previous "may observe one
+  aborted partial request" caveat has been removed from
+  `docs/configuration.md` and the example README.
+
 - **Idempotency middleware: per-request and pool caps.** Three new
   fields on the `idempotency:` block bound memory usage and let the
   middleware gracefully degrade under pressure rather than buffering

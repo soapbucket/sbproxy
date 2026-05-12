@@ -7,15 +7,11 @@
 //! `x-sbproxy-idempotency: HIT`; body hash conflicts return 409 with
 //! the `ledger.idempotency_conflict` body per RFC 8594.
 //!
-//! These tests verify the **client-visible** semantics. The middleware
-//! engages in `request_body_filter` (after Pingora has already opened
-//! the upstream connection), which means the upstream may observe one
-//! aborted partial request per cache hit. Production deployments
-//! should either route through sticky upstream connections (so the
-//! upstream sees one full request and one aborted handshake), or
-//! place the idempotency-enabled origin in front of an upstream that
-//! tolerates aborted requests. Future work covers `request_filter`
-//! body buffering to eliminate the upstream contact entirely.
+//! These tests verify both the **client-visible** semantics (HIT
+//! marker, conflict body, status) and the **upstream-not-contacted**
+//! invariant. The cache check runs in `request_filter` (not
+//! `request_body_filter`), so on a cache hit Pingora never opens the
+//! upstream connection at all.
 
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use serde_json::json;
@@ -87,6 +83,16 @@ fn second_call_with_same_key_and_body_returns_hit_marker() {
         body["id"], "first",
         "replay must serve the cached body verbatim, not a fresh upstream call"
     );
+    // PR B invariant: cache hit MUST NOT contact the upstream.
+    // The `request_filter` cache check now runs before Pingora's
+    // upstream-peer phase, so a cache hit replays without any
+    // upstream connection. Previous limitation (one aborted partial
+    // request per cache hit) is gone.
+    assert_eq!(
+        upstream.captured().len(),
+        1,
+        "cache hit must NOT contact the upstream a second time"
+    );
 }
 
 #[test]
@@ -118,6 +124,14 @@ fn different_body_with_same_key_returns_409_conflict() {
     assert_eq!(conflict.status, 409);
     let body = conflict.json().expect("decode JSON");
     assert_eq!(body["error"], "ledger.idempotency_conflict");
+    // PR B invariant: the conflicting request MUST NOT contact the
+    // upstream either; the 409 is generated entirely inside
+    // `request_filter`.
+    assert_eq!(
+        upstream.captured().len(),
+        1,
+        "conflict path must NOT double-forward the differing body"
+    );
 }
 
 #[test]
