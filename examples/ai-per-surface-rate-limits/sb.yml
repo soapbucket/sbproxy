@@ -1,0 +1,72 @@
+# AI gateway: per-surface rate limits.
+#
+# Different OpenAI surfaces have different cost and capacity profiles.
+# Chat completions are cheap and high-volume; image generation is
+# slow and expensive; audio speech bills per character; reranking
+# bills per document. Putting one global cap on the origin doesn't
+# capture this. Per-surface rate limits cap each classified surface
+# independently so an image-generation burst doesn't starve chat
+# throughput and vice versa.
+#
+# Surface labels come from `AiSurface::label()`:
+#   chat_completions, models, embeddings, assistants, threads,
+#   batches, fine_tuning, files, realtime, image_generation,
+#   image_edits, image_variations, audio_transcription,
+#   audio_speech, moderations, reranking.
+#
+# Caps are sliding one-minute windows; the proxy returns 429 before
+# any upstream call when the cap fires.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#
+# Run:
+#   make run CONFIG=examples/ai-per-surface-rate-limits/sb.yml
+#
+# Test (within chat cap):
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "gpt-4o-mini",
+#       "messages": [{"role": "user", "content": "Quick check."}]
+#     }'
+#
+# Test (burst past the image cap):
+#   for i in $(seq 1 35); do
+#     curl -s -o /dev/null -w '%{http_code}\n' \
+#       http://127.0.0.1:8080/v1/images/generations \
+#       -H 'Host: ai.local' \
+#       -H 'Content-Type: application/json' \
+#       -d '{
+#         "model": "dall-e-3",
+#         "prompt": "a small cat",
+#         "size": "1024x1024",
+#         "n": 1
+#       }'
+#   done
+#   # The first 30 requests in each minute return 200, the rest 429.
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+            - dall-e-3
+            - tts-1
+            - whisper-1
+
+      per_surface_rate_limits:
+        chat_completions:
+          requests_per_minute: 600
+        image_generation:
+          requests_per_minute: 30
+        audio_speech:
+          requests_per_minute: 60
+        audio_transcription:
+          requests_per_minute: 120
