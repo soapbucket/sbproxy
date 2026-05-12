@@ -5069,6 +5069,19 @@ async fn handle_ai_proxy(
             None
         };
 
+    // For reranking, capture the document count from the request
+    // body. The provider bills per document scored; counting at the
+    // request boundary is exact (reranking responses always return
+    // exactly as many results as documents in the request).
+    let rerank_documents_for_billing: Option<u64> =
+        if matches!(surface, sbproxy_ai::handler::AiSurface::Reranking) {
+            body.get("documents")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len() as u64)
+        } else {
+            None
+        };
+
     // Parse retry config from the action config's routing.retry section.
     // This is done by inspecting the raw handler config.
     let max_attempts = if is_failover {
@@ -5240,6 +5253,7 @@ async fn handle_ai_proxy(
                 provider_name: last_provider_name.as_str(),
                 image_resolution: image_resolution_for_billing.clone(),
                 audio_speech_characters: audio_speech_characters_for_billing,
+                rerank_documents: rerank_documents_for_billing,
             });
             // Capture parser hints from the upstream response before it
             // gets moved into relay_ai_stream. The streaming relay
@@ -5291,6 +5305,7 @@ async fn handle_ai_proxy(
                 provider_name: last_provider_name.as_str(),
                 image_resolution: image_resolution_for_billing.clone(),
                 audio_speech_characters: audio_speech_characters_for_billing,
+                rerank_documents: rerank_documents_for_billing,
             });
             relay_ai_response_with_cache(
                 session,
@@ -5581,6 +5596,10 @@ async fn relay_ai_response_with_cache(
                 sbproxy_ai::budget::AiUsage::Characters {
                     count: args.audio_speech_characters.unwrap_or(0),
                 }
+            } else if args.surface_label == "reranking" {
+                sbproxy_ai::budget::AiUsage::RerankUnits {
+                    documents: args.rerank_documents.unwrap_or(0),
+                }
             } else {
                 sbproxy_ai::budget::AiUsage::PerCall
             };
@@ -5643,6 +5662,11 @@ struct BudgetRecorderArgs<'a> {
     /// relay function can emit a `Characters { count }` billing
     /// event scaled to the TTS provider's per-character rate.
     audio_speech_characters: Option<u64>,
+    /// For reranking requests, the number of documents to score
+    /// (length of `body["documents"]`). Captured at dispatch time
+    /// so the relay function can emit a `RerankUnits { documents }`
+    /// billing event scaled to the provider's per-document rate.
+    rerank_documents: Option<u64>,
 }
 
 /// Inputs to the streaming-cache recorder hook, bundled to keep
