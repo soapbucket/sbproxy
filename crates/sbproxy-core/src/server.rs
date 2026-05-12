@@ -11325,28 +11325,6 @@ impl ProxyHttp for SbProxy {
             return Ok(());
         }
 
-        // --- Idempotency middleware body check ---
-        //
-        // `request_filter` set `ctx.idempotency_buffering = true` when
-        // the resolved origin has `idempotency:` configured, the method
-        // matched the configured set, and the `Idempotency-Key` header
-        // was present. We accumulate the body locally (hold it back
-        // from the upstream), then on `end_of_stream` look the key up
-        // against the cache:
-        //
-        // * Cache hit, matching body hash -> stash the cached response
-        //   in `ctx.idempotency_replay` and abort the upstream by
-        //   returning Err(HTTPStatus). `fail_to_proxy` writes the
-        //   cached body verbatim.
-        // * Cache hit, differing body hash -> flag the conflict in
-        //   `ctx.idempotency_conflict`; `fail_to_proxy` writes the
-        //   RFC 8594 conflict body with status 409.
-        // * Cache miss -> stash `(key, body_hash)` in
-        //   `ctx.idempotency_miss`, release the buffered body to the
-        //   upstream as a single chunk. `response_filter` /
-        //   `response_body_filter` then capture the upstream response
-        //   and call `record_response` so the next retry hits the
-        //   cache.
         // --- Idempotency cache-miss body capture ---
         //
         // `request_filter` set `ctx.idempotency_buffering = true`
