@@ -1453,6 +1453,14 @@ pub struct RawOriginConfig {
     /// Custom error pages keyed by status code or status class.
     #[serde(default)]
     pub error_pages: Option<serde_json::Value>,
+    /// RFC 9209 `Proxy-Status` response header configuration. When
+    /// enabled, the proxy stamps a structured `Proxy-Status` header
+    /// on every non-2xx response so downstream clients can diagnose
+    /// forwarding errors without scraping the body. The identity
+    /// token defaults to `sbproxy` and can be overridden for fleet-
+    /// wide branding (e.g. `acme-edge`).
+    #[serde(default)]
+    pub proxy_status: Option<ProxyStatusConfig>,
     /// Traffic capture / mirroring configuration.
     #[serde(default)]
     pub traffic_capture: Option<serde_json::Value>,
@@ -2152,6 +2160,30 @@ fn default_grace() -> u64 {
 
 fn default_re_resolve() -> u64 {
     60
+}
+
+/// RFC 9209 `Proxy-Status` response header configuration.
+///
+/// When `enabled`, the proxy stamps a structured `Proxy-Status`
+/// header on every non-2xx response. The header carries the proxy
+/// identity, the upstream status, and an optional `error` parameter
+/// derived from the upstream failure mode. Operators consuming the
+/// header can diagnose forwarding errors without scraping the body.
+///
+/// Spec: <https://www.rfc-editor.org/rfc/rfc9209.html>.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ProxyStatusConfig {
+    /// Whether to stamp the `Proxy-Status` header on non-2xx responses.
+    /// Defaults to `false`; opt in per origin so existing operator
+    /// dashboards that match on bare status codes are not surprised.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Proxy identity token used as the first parameter of the header
+    /// (per RFC 9209's grammar). Defaults to `sbproxy`. Operators
+    /// running a fleet can override this for branding
+    /// (e.g. `acme-edge`, `sbproxy-eu-west-1`).
+    #[serde(default)]
+    pub identity: Option<String>,
 }
 
 #[cfg(test)]

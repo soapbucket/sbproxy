@@ -3501,6 +3501,19 @@ impl SseUsageScanner {
 /// pricing tables ship. Chat completions continue to bill through
 /// `record_budget_usage` until the chat usage-extraction is reworked
 /// to emit the new event shape.
+/// Map an HTTP status code to a stable RFC 9209 `Proxy-Status`
+/// `error` token. Returns `None` for status codes that don't have
+/// a canonical proxy-error mapping (the header is still emitted
+/// without the `error` parameter, which is valid per RFC 9209).
+fn proxy_status_error_token(status: u16) -> Option<&'static str> {
+    match status {
+        502 => Some("http_request_error"),
+        503 => Some("connection_terminated"),
+        504 => Some("connection_timeout"),
+        _ => None,
+    }
+}
+
 fn emit_ai_billing_event(
     surface_label: &str,
     provider_name: &str,
@@ -9213,6 +9226,39 @@ impl ProxyHttp for SbProxy {
                 "x-sbproxy-debug-config-rev",
                 pipeline.config_revision.as_str(),
             );
+        }
+
+        // --- RFC 9209 Proxy-Status header (per-origin opt-in) ---
+        //
+        // When the resolved origin has `proxy_status.enabled: true`,
+        // stamp a structured Proxy-Status header on every non-2xx
+        // response. The header carries the configured proxy identity
+        // (`sbproxy` by default), the received upstream status, and
+        // an `error` parameter when the status maps to a known
+        // failure mode. Downstream clients can diagnose forwarding
+        // errors without scraping the body.
+        {
+            let status_code = upstream_response.status.as_u16();
+            if !(200..300).contains(&status_code) {
+                let pipeline = reload::current_pipeline();
+                if let Some(idx) = ctx.origin_idx {
+                    if let Some(origin) = pipeline.config.origins.get(idx) {
+                        if let Some(cfg) = origin.proxy_status.as_ref() {
+                            if cfg.enabled {
+                                let identity = cfg.identity.as_deref().unwrap_or("sbproxy");
+                                let error_token = proxy_status_error_token(status_code);
+                                let value =
+                                    sbproxy_middleware::proxy_status::build_proxy_status_with_identity(
+                                        identity,
+                                        status_code,
+                                        error_token,
+                                    );
+                                let _ = upstream_response.insert_header("proxy-status", value);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // --- Wave 5 / G5.6 wire: AnomalyDetectorHook dispatch ---

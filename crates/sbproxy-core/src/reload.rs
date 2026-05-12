@@ -432,6 +432,7 @@ mod tests {
                 forward_rules: Vec::new(),
                 fallback_origin: None,
                 error_pages: None,
+                proxy_status: None,
                 bot_detection: None,
                 threat_protection: None,
                 on_request: Vec::new(),
