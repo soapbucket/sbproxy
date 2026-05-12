@@ -574,6 +574,15 @@ otel:
   otlp_insecure: false
 ```
 
+### Admin API
+
+The embedded admin server (separate from `/metrics` above; lives on
+its own port) exposes operator routes for request log, per-target
+health, hot reload, drift detection, and the emitted OpenAPI
+document. See [admin-api-reference.md](admin-api-reference.md) for
+the full per-route schema and [section 9](#9-hot-reload) for the
+hot-reload workflow.
+
 ---
 
 ## 6. Health checks
@@ -993,6 +1002,8 @@ Status codes:
 | 503 | Admin server is running without a configured `config_path` (typical for embedded test fixtures). |
 
 The reload endpoint uses the same auth, IP filter, and rate limiter as the read-only admin routes. The single-flight guard means a manual reload during a file-watcher reload does not race; one wins, the other returns `409`. This is the integration point the OSS Kubernetes operator uses to drive hot-reload on `kubectl apply` instead of triggering a rolling restart - see [kubernetes.md](kubernetes.md).
+
+For the complete per-route schema of every admin endpoint (`/api/requests`, `/api/health`, `/api/health/targets`, `/api/stats`, `/api/openapi.{json,yaml}`, `/admin/reload`, `/admin/drift`, plus the unauthenticated probe routes), see [admin-api-reference.md](admin-api-reference.md).
 
 ### What reloads
 

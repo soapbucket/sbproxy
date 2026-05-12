@@ -39,6 +39,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 
 ### Reference
 - [402-challenge.md](402-challenge.md) - wire-format contract for the `402 Payment Required` body, including the OSS-advertises / enterprise-settles split.
+- [admin-api-reference.md](admin-api-reference.md) - per-route schema for the embedded admin server (`/api/*`, `/admin/*`, and the unauthenticated probe routes).
 - [config-stability.md](config-stability.md) - field stability guarantees and versioning.
 - [listings.md](listings.md) - the repo-native `Listing` primitive: schema, loader, three pinning modes, plan-validation rules.
 - [enterprise.md](enterprise.md) - what the enterprise tier adds on top of the OSS data plane and how to request access.
