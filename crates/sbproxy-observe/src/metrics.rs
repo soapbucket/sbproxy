@@ -878,6 +878,35 @@ pub fn record_a2a_denied(route: &str, reason: &str) {
     counter.with_label_values(&[route.as_str(), reason]).inc();
 }
 
+/// Record one MCP pre-tool-call policy hook invocation (WOR-152 PR β).
+///
+/// `verdict` is one of the closed labels `allow`, `deny`, or `confirm`
+/// (the OSS bridge treats `confirm` as a deny until the
+/// `PendingConfirmStore` lands in PR ζ; the verdict label still reads
+/// `confirm` so dashboards can distinguish the two). `mcp_server` is
+/// the logical upstream MCP server name; `tool_name` is the tool the
+/// caller requested. Both label values are sanitised through the
+/// cardinality limiter so a hostile caller cannot blow up label space
+/// by spraying tool names.
+pub fn record_mcp_policy_hook_invocation(verdict: &str, mcp_server: &str, tool_name: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_policy_hook_invocations_total",
+            "MCP pre-tool-call policy hook invocations by verdict, upstream MCP server, and tool",
+            &["verdict", "mcp_server", "tool_name"],
+        )
+        .expect("mcp policy hook invocation counter registers")
+    });
+    let mcp_server = sanitize_label("mcp_server", mcp_server);
+    let tool_name = sanitize_label("tool_name", tool_name);
+    counter
+        .with_label_values(&[verdict, mcp_server.as_str(), tool_name.as_str()])
+        .inc();
+}
+
 /// Record a request blocked by the `http_framing` policy. The
 /// `reason` label is one of the stable strings from
 /// `FramingViolation::metric_reason` (`dual_cl_te`, `duplicate_cl`,

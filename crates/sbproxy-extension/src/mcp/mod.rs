@@ -37,7 +37,7 @@ pub use access_control::ToolAccessPolicy;
 pub use audit::{McpAuditBuilder, McpAuditEntry};
 pub use code_mode::{compress_tool_schema, estimate_token_reduction};
 pub use context_opt::ToolUsageTracker;
-pub use federation::{FederatedTool, McpFederation, McpServerConfig};
+pub use federation::{FederatedTool, McpCallOutcome, McpFederation, McpServerConfig};
 pub use guardrails::{check_tool_invocation, McpGuardrailConfig};
 pub use handler::{InitializeContext, McpHandler};
 pub use openapi_convert::openapi_to_mcp_tools;
