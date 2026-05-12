@@ -19,11 +19,6 @@ use ulid::Ulid;
 
 use crate::hooks::{ClassifyVerdict, IntentCategory};
 
-/// Cached `(status, headers, body)` triple staged for replay by the
-/// idempotency middleware. Pulled out of `RequestContext` as a named
-/// alias so the type signature stays readable.
-pub type IdempotencyReplay = (u16, Vec<(String, String)>, Vec<u8>);
-
 /// Realtime WebSocket dispatch state carried on the request context.
 ///
 /// Populated by `handle_action` when an `Action::AiProxy` request is
@@ -181,27 +176,10 @@ pub struct RequestContext {
     /// with [`Self::idempotency_response_status`] and written when the
     /// body filter sees `end_of_stream`.
     pub idempotency_response_headers: Option<Vec<(String, String)>>,
-    /// Cached response to replay verbatim from `fail_to_proxy` when
-    /// the request body filter found a cache hit. The triple is
-    /// `(status, headers, body)`.
-    pub idempotency_replay: Option<IdempotencyReplay>,
-    /// Flag set by the request body filter when a cached entry exists
-    /// for the same `(workspace, key)` but the body hash differs.
-    /// `fail_to_proxy` reads this and writes the 409 conflict body.
-    pub idempotency_conflict: bool,
     /// Permit held while the request is participating in the
     /// per-origin idempotency buffer pool. Dropped at end of the
-    /// request (or earlier on skip / replay) to release the slot.
+    /// request to release the slot.
     pub idempotency_permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    /// Request body buffered in `request_filter` for cache lookup,
-    /// held here for re-injection in `request_body_filter` once the
-    /// body channel is drained. Set on a cache miss so the upstream
-    /// receives the original payload as a single chunk; cleared
-    /// after the body filter consumes it. Same buffer is also used
-    /// for the buffered-but-skipped path (oversize body) so the
-    /// chunks the proxy already pulled off the wire still reach
-    /// the upstream.
-    pub idempotency_reinject: Option<BytesMut>,
     /// Reason the middleware *skipped* engagement for this request,
     /// stamped as `x-sbproxy-idempotency: <reason>` on the response
     /// so operators can spot pool pressure or oversize bodies. None
@@ -758,11 +736,8 @@ impl RequestContext {
             idempotency_response_body_buf: None,
             idempotency_response_status: None,
             idempotency_response_headers: None,
-            idempotency_replay: None,
-            idempotency_conflict: false,
             idempotency_permit: None,
             idempotency_skip_reason: None,
-            idempotency_reinject: None,
             body_size_limit: None,
             body_bytes_seen: 0,
             request_body_bytes: 0,
