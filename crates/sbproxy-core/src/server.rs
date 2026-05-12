@@ -4484,6 +4484,10 @@ async fn handle_ai_proxy(
         path = %path,
         "AI proxy: classified surface"
     );
+    // Stamp the surface label onto the request context so the access
+    // log line carries it alongside the existing `ai_provider`,
+    // `ai_model`, and token-count fields.
+    ctx.ai_surface = Some(surface_label.to_string());
 
     // Create the top-level request span. The span is registered with
     // the subscriber (so OTel-style exporters see it as part of the
@@ -12083,6 +12087,7 @@ fn emit_access_log(
         model: ctx.ai_model.clone(),
         tokens_in: ctx.ai_tokens_in,
         tokens_out: ctx.ai_tokens_out,
+        ai_surface: ctx.ai_surface.clone(),
         cache_result,
         // Wave 6 / G6.2 access-log v1 fields. Most surface stamping
         // lands as the request flows through the pipeline (e.g.
@@ -12154,6 +12159,10 @@ struct AccessLogContext {
     tokens_in: Option<u64>,
     /// Completion / output tokens generated.
     tokens_out: Option<u64>,
+    /// Classified AI surface label (`chat_completions`, `assistants`,
+    /// `image_generation`, ...). Stamped by `handle_ai_proxy` so the
+    /// access log carries it alongside provider/model/token counts.
+    ai_surface: Option<String>,
     /// Cache result label (`hit`, `miss`, `stale`, `bypass`) when
     /// the response cache ran.
     cache_result: Option<String>,
@@ -12215,6 +12224,7 @@ impl AccessLogContext {
             model: None,
             tokens_in: None,
             tokens_out: None,
+            ai_surface: None,
             cache_result: None,
             tier: None,
             shape: None,
@@ -12305,6 +12315,7 @@ fn emit_access_log_entry(
         model: context.model,
         tokens_in: context.tokens_in,
         tokens_out: context.tokens_out,
+        ai_surface: context.ai_surface,
         trace_id,
         cache_result: context.cache_result,
         envelope_request_id: context.envelope_request_id,
