@@ -13,6 +13,27 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **`proxy_status` and `problem_details` now cover upstream
+  failures.** Before this change, `proxy_status.enabled: true`
+  stamped the `Proxy-Status` header on proxy-generated errors
+  (auth deny, policy deny, default 404) but **not** on upstream
+  failures routed through Pingora's `fail_to_proxy` path (connect
+  refused, connect timeout, TLS handshake error, mid-stream
+  connection loss). The fix wires both blocks into the
+  upstream-failure path so dashboards consuming `Proxy-Status` see
+  consistent coverage across error sources. The status code +
+  RFC 9209 `error` token derive from the Pingora `ErrorType` via
+  a new `map_upstream_failure` translator: 504 +
+  `connection_timeout` for `ConnectTimedout` /
+  `ReadTimedout`; 502 + `connection_refused` for `ConnectRefused`;
+  502 + `tls_protocol_error` for TLS errors; 502 +
+  `connection_terminated` for mid-stream loss; 502 +
+  `http_request_error` as the catch-all. When
+  `problem_details.enabled: true` the body is now rendered as
+  `application/problem+json` for upstream failures too, with the
+  RFC 9209 error token in the `detail` field so both signals share
+  the same vocabulary.
+
 - **RFC 8594 idempotency middleware (`idempotency:`).** Per-origin
   block that engages on POST / PUT / PATCH (configurable via
   `methods:`) when an `Idempotency-Key` header is present. The

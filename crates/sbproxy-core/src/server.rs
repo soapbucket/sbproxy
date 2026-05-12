@@ -3531,6 +3531,49 @@ fn proxy_status_error_token(status: u16) -> Option<&'static str> {
     }
 }
 
+/// Translate a Pingora upstream-failure error into the
+/// `(http_status, rfc_9209_error_token)` tuple `fail_to_proxy`
+/// stamps on the synthesised response. The mapping mirrors RFC 9209
+/// section 2.3.4 ("Proxy Errors") so dashboards consuming the
+/// `Proxy-Status` header can break down upstream failures by
+/// failure mode without scraping the response body.
+fn map_upstream_failure(e: &Error) -> (u16, Option<&'static str>) {
+    use pingora_error::ErrorType as Et;
+    match &e.etype {
+        // Connect-phase timeouts surface as 504 with the canonical
+        // `connection_timeout` token.
+        Et::ConnectTimedout | Et::TLSHandshakeTimedout | Et::ReadTimedout | Et::WriteTimedout => {
+            (504, Some("connection_timeout"))
+        }
+        // Connect refused / no route: 502 with `connection_refused`.
+        Et::ConnectRefused | Et::ConnectNoRoute => (502, Some("connection_refused")),
+        // TLS protocol failures (handshake error, invalid cert): 502
+        // with `tls_protocol_error`.
+        Et::TLSHandshakeFailure | Et::InvalidCert | Et::HandshakeError | Et::TLSWantX509Lookup => {
+            (502, Some("tls_protocol_error"))
+        }
+        // Mid-stream connection failures: 502 with
+        // `connection_terminated`.
+        Et::ReadError
+        | Et::WriteError
+        | Et::ConnectionClosed
+        | Et::H1Error
+        | Et::H2Error
+        | Et::InvalidH2
+        | Et::H2Downgrade => (502, Some("connection_terminated")),
+        // Generic connect / proxy-chain errors fall back to 502 with
+        // the catch-all `http_request_error`.
+        Et::ConnectError | Et::ConnectProxyFailure | Et::BindError | Et::SocketError => {
+            (502, Some("http_request_error"))
+        }
+        // Application-level HTTPStatus: honour the carried status code.
+        Et::HTTPStatus(code) => (*code, proxy_status_error_token(*code)),
+        // Everything else (InvalidHTTPHeader, FileOpenError, custom,
+        // unknown): 502 with the catch-all token.
+        _ => (502, Some("http_request_error")),
+    }
+}
+
 /// Build the `http::Request<bytes::Bytes>` view of the inbound
 /// Pingora session that the RFC 9421 verifier expects.
 ///
@@ -11342,12 +11385,81 @@ impl ProxyHttp for SbProxy {
             }
         }
 
-        // Default error handling (no fallback configured or fallback failed).
-        let code = 502u16;
-        let _ = send_error(session, code, "bad gateway").await;
-        ctx.response_status = Some(code);
+        // --- Default upstream-error handling ---
+        //
+        // The fallback path didn't catch this; render a synthesised
+        // error response. The status code and `Proxy-Status` `error`
+        // token derive from the actual failure mode via
+        // `map_upstream_failure` so dashboards consuming RFC 9209 can
+        // break down by failure mode (connection_timeout vs
+        // tls_protocol_error vs ...) without scraping the body.
+        //
+        // When the resolved origin has `proxy_status.enabled: true`,
+        // stamp the structured `Proxy-Status` header. When it also
+        // has `problem_details.enabled: true`, render the body as
+        // `application/problem+json` per RFC 9457. Both blocks are
+        // opt-in and compose with the existing proxy-generated error
+        // path (auth deny, policy deny, default 404).
+        let (status_code, error_token) = map_upstream_failure(e);
+
+        // Resolve per-origin config (when an origin is set; some
+        // failure modes hit before request_filter completes the
+        // origin lookup).
+        let request_path = session.req_header().uri.path().to_string();
+        let pipeline = reload::current_pipeline();
+        let origin_cfg = ctx
+            .origin_idx
+            .and_then(|idx| pipeline.config.origins.get(idx));
+        let proxy_status_cfg = origin_cfg.and_then(|o| o.proxy_status.as_ref());
+        let problem_details_cfg = origin_cfg.and_then(|o| o.problem_details.as_ref());
+
+        // Build the response body. Problem-details wins when enabled;
+        // otherwise fall back to the existing plain-text "bad
+        // gateway" payload.
+        let (body_bytes, content_type) = match problem_details_cfg {
+            Some(pd) if pd.enabled => {
+                let detail = error_token.unwrap_or("upstream request failed");
+                let body = render_problem_details(status_code, detail, pd, &request_path);
+                (body.into_bytes(), "application/problem+json")
+            }
+            _ => (b"bad gateway".to_vec(), "text/plain; charset=utf-8"),
+        };
+
+        // Build the response header. Allocate room for content-type
+        // + content-length + optional proxy-status; insert_header is
+        // cheap if the slot is unused.
+        let header_cap = 2 + usize::from(proxy_status_cfg.is_some_and(|c| c.enabled));
+        let mut header = match pingora_http::ResponseHeader::build(status_code, Some(header_cap)) {
+            Ok(h) => h,
+            Err(_) => {
+                let _ = send_error(session, status_code, "bad gateway").await;
+                ctx.response_status = Some(status_code);
+                return FailToProxy {
+                    error_code: status_code,
+                    can_reuse_downstream: false,
+                };
+            }
+        };
+        let _ = header.insert_header("content-type", content_type);
+        let _ = header.insert_header("content-length", body_bytes.len().to_string());
+        if let Some(ps) = proxy_status_cfg {
+            if ps.enabled {
+                let identity = ps.identity.as_deref().unwrap_or("sbproxy");
+                let value = sbproxy_middleware::proxy_status::build_proxy_status_with_identity(
+                    identity,
+                    status_code,
+                    error_token,
+                );
+                let _ = header.insert_header("proxy-status", value);
+            }
+        }
+        let _ = session.write_response_header(Box::new(header), false).await;
+        let _ = session
+            .write_response_body(Some(bytes::Bytes::from(body_bytes)), true)
+            .await;
+        ctx.response_status = Some(status_code);
         FailToProxy {
-            error_code: code,
+            error_code: status_code,
             can_reuse_downstream: false,
         }
     }
@@ -15556,5 +15668,67 @@ origins:
         // resolves no canonical reason, so we fall back to "Error".
         assert_eq!(v["title"], "Error");
         assert_eq!(v["status"], 599);
+    }
+
+    #[test]
+    fn map_upstream_failure_translates_pingora_etype_to_status_and_token() {
+        use pingora_error::{Error, ErrorType};
+        // Connect-phase timeouts surface as 504 / connection_timeout.
+        let e = Error::new(ErrorType::ConnectTimedout);
+        assert_eq!(
+            super::map_upstream_failure(&e),
+            (504, Some("connection_timeout"))
+        );
+        let e = Error::new(ErrorType::ReadTimedout);
+        assert_eq!(
+            super::map_upstream_failure(&e),
+            (504, Some("connection_timeout"))
+        );
+        // Refused / no route -> 502 / connection_refused.
+        let e = Error::new(ErrorType::ConnectRefused);
+        assert_eq!(
+            super::map_upstream_failure(&e),
+            (502, Some("connection_refused"))
+        );
+        // TLS errors -> 502 / tls_protocol_error.
+        let e = Error::new(ErrorType::TLSHandshakeFailure);
+        assert_eq!(
+            super::map_upstream_failure(&e),
+            (502, Some("tls_protocol_error"))
+        );
+        let e = Error::new(ErrorType::InvalidCert);
+        assert_eq!(
+            super::map_upstream_failure(&e),
+            (502, Some("tls_protocol_error"))
+        );
+        // Mid-stream loss -> 502 / connection_terminated.
+        let e = Error::new(ErrorType::ConnectionClosed);
+        assert_eq!(
+            super::map_upstream_failure(&e),
+            (502, Some("connection_terminated"))
+        );
+        let e = Error::new(ErrorType::ReadError);
+        assert_eq!(
+            super::map_upstream_failure(&e),
+            (502, Some("connection_terminated"))
+        );
+        // Generic ConnectError -> 502 / http_request_error catch-all.
+        let e = Error::new(ErrorType::ConnectError);
+        assert_eq!(
+            super::map_upstream_failure(&e),
+            (502, Some("http_request_error"))
+        );
+        // HTTPStatus(N) -> (N, mapping). 504 maps back via proxy_status_error_token.
+        let e = Error::new(ErrorType::HTTPStatus(504));
+        assert_eq!(
+            super::map_upstream_failure(&e),
+            (504, Some("connection_timeout"))
+        );
+        // Unknown / catch-all -> 502 / http_request_error.
+        let e = Error::new(ErrorType::UnknownError);
+        assert_eq!(
+            super::map_upstream_failure(&e),
+            (502, Some("http_request_error"))
+        );
     }
 }

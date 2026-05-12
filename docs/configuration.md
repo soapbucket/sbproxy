@@ -2562,6 +2562,19 @@ See [`examples/problem-details/`](https://github.com/soapbucket/sbproxy/tree/mai
 
 Spec: <https://www.rfc-editor.org/rfc/rfc9457.html>.
 
+The renderer covers both error sources:
+
+- **Proxy-generated errors** (authentication denials, policy denials,
+  the default 404 for unknown origins) when no matching `error_pages`
+  entry exists.
+- **Upstream failures** (connect refused, connect timeout, TLS
+  handshake errors, mid-stream connection loss) routed through
+  Pingora's `fail_to_proxy` path. The `detail` field carries the
+  RFC 9209 error token (`connection_refused`,
+  `connection_timeout`, `tls_protocol_error`, `connection_terminated`,
+  `http_request_error`) so downstream tooling can break down by
+  failure mode without scraping the body.
+
 ---
 
 ## Idempotency
