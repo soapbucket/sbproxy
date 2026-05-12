@@ -545,8 +545,16 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
     if let Some(ref mut fallback) = config.fallback_origin {
         interpolate_config_vars(fallback, &config.variables);
     }
-    if let Some(ref mut error_pages) = config.error_pages {
-        interpolate_config_vars(error_pages, &config.variables);
+    if let Some(ref mut pages) = config.error_pages {
+        for entry in pages.iter_mut() {
+            if entry.body.contains("{{") {
+                entry.body = resolve_template_string(&entry.body, &config.variables);
+            }
+            if entry.content_type.contains("{{") {
+                entry.content_type =
+                    resolve_template_string(&entry.content_type, &config.variables);
+            }
+        }
     }
     // Interpolate request/response modifier header values.
     for modifier in &mut config.request_modifiers {
@@ -771,6 +779,7 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
             .collect(),
         fallback_origin: config.fallback_origin,
         error_pages: config.error_pages,
+        problem_details: config.problem_details,
         proxy_status: config.proxy_status,
         message_signatures: config.message_signatures,
         bot_detection: config.bot_detection,

@@ -1450,9 +1450,20 @@ pub struct RawOriginConfig {
     /// Configuration for rate-limit response headers (`X-RateLimit-*`, `Retry-After`).
     #[serde(default)]
     pub rate_limit_headers: Option<serde_json::Value>,
-    /// Custom error pages keyed by status code or status class.
+    /// Per-status custom error response bodies. Each entry covers one
+    /// or more HTTP status codes and contributes a content-typed body
+    /// the proxy substitutes when it generates the matching status.
+    /// Multiple entries for the same status are content-negotiated
+    /// against the inbound request's `Accept` header.
     #[serde(default)]
-    pub error_pages: Option<serde_json::Value>,
+    pub error_pages: Option<Vec<ErrorPageEntry>>,
+    /// RFC 9457 `application/problem+json` default-renderer
+    /// configuration. When enabled, proxy-generated errors that are
+    /// not matched by an [`ErrorPageEntry`] render as a structured
+    /// problem-details body. Composes with `error_pages`: custom
+    /// pages still win when authored. See [`ProblemDetailsConfig`].
+    #[serde(default)]
+    pub problem_details: Option<ProblemDetailsConfig>,
     /// RFC 9209 `Proxy-Status` response header configuration. When
     /// enabled, the proxy stamps a structured `Proxy-Status` header
     /// on every non-2xx response so downstream clients can diagnose
@@ -2184,6 +2195,88 @@ pub struct ProxyStatusConfig {
     /// (e.g. `acme-edge`, `sbproxy-eu-west-1`).
     #[serde(default)]
     pub identity: Option<String>,
+}
+
+/// Status code spec for an [`ErrorPageEntry`]. Either a single integer
+/// (`status: 401`) or a list (`status: [401, 403]`). The list form is
+/// the historical authored shape; the single-int form is a sugar.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum StatusSpec {
+    /// Single status code.
+    Single(u16),
+    /// Multiple status codes; any match counts.
+    Multi(Vec<u16>),
+}
+
+impl StatusSpec {
+    /// Returns true when `status` is covered by this spec.
+    pub fn matches(&self, status: u16) -> bool {
+        match self {
+            Self::Single(s) => *s == status,
+            Self::Multi(arr) => arr.contains(&status),
+        }
+    }
+
+    /// Yield every status code this spec covers, in authored order.
+    pub fn iter(&self) -> Box<dyn Iterator<Item = u16> + '_> {
+        match self {
+            Self::Single(s) => Box::new(std::iter::once(*s)),
+            Self::Multi(arr) => Box::new(arr.iter().copied()),
+        }
+    }
+}
+
+/// One per-status custom error page entry. Multiple entries for the
+/// same status code are content-negotiated against the inbound request's
+/// `Accept` header.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ErrorPageEntry {
+    /// Which HTTP status code(s) this entry covers.
+    pub status: StatusSpec,
+    /// `Content-Type` to advertise on the response.
+    pub content_type: String,
+    /// Response body. When `template = true`, the proxy substitutes
+    /// `{{ status_code }}` and `{{ request.path }}` (with or without
+    /// surrounding whitespace) at request time.
+    pub body: String,
+    /// When true, treat `body` as a template and run substitution.
+    #[serde(default)]
+    pub template: bool,
+}
+
+/// RFC 9457 Problem Details default-renderer configuration.
+///
+/// When enabled, any proxy-generated error response that is *not*
+/// already matched by a custom [`ErrorPageEntry`] is rendered as
+/// `application/problem+json` per RFC 9457. The two configs compose:
+/// operators can author per-status custom pages and still opt in to
+/// problem-details as a structured fallback for everything else.
+///
+/// Spec: <https://www.rfc-editor.org/rfc/rfc9457.html>.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ProblemDetailsConfig {
+    /// Whether to render unmatched proxy-generated errors as
+    /// `application/problem+json`. Defaults to `false`; existing
+    /// operators see no behavior change unless they opt in.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URI for the `type` field. When set to e.g.
+    /// `https://api.example.com/errors`, status 503 renders as
+    /// `type: https://api.example.com/errors/503`. When unset, the
+    /// renderer emits the RFC 9457 default `about:blank`.
+    #[serde(default)]
+    pub type_base_uri: Option<String>,
+    /// When true (the default), the renderer copies the proxy's
+    /// internal error message into the `detail` field. Operators who
+    /// route problem responses to external clients can set this to
+    /// false to avoid leaking upstream error text.
+    #[serde(default = "default_include_detail")]
+    pub include_detail: bool,
+}
+
+fn default_include_detail() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -3078,6 +3171,103 @@ origins: {}
             CompiledHeaderAllowlist::compile(&["".to_string(), "   ".to_string()]);
         assert!(compiled.is_empty());
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn status_spec_single_matches_only_that_code() {
+        let s = StatusSpec::Single(401);
+        assert!(s.matches(401));
+        assert!(!s.matches(403));
+        assert_eq!(s.iter().collect::<Vec<_>>(), vec![401]);
+    }
+
+    #[test]
+    fn status_spec_multi_matches_any_listed() {
+        let s = StatusSpec::Multi(vec![401, 403, 429]);
+        assert!(s.matches(401));
+        assert!(s.matches(429));
+        assert!(!s.matches(500));
+        assert_eq!(s.iter().collect::<Vec<_>>(), vec![401, 403, 429]);
+    }
+
+    #[test]
+    fn error_page_entry_parses_single_status_yaml() {
+        let yaml = r#"
+status: 401
+content_type: application/json
+template: true
+body: '{"error":"unauthorized","code":{{ status_code }}}'
+"#;
+        let entry: ErrorPageEntry = serde_yaml::from_str(yaml).unwrap();
+        assert!(entry.template);
+        assert!(matches!(entry.status, StatusSpec::Single(401)));
+        assert_eq!(entry.content_type, "application/json");
+    }
+
+    #[test]
+    fn error_page_entry_parses_multi_status_yaml() {
+        let yaml = r#"
+status: [401, 403]
+content_type: text/html
+body: "<h1>Denied</h1>"
+"#;
+        let entry: ErrorPageEntry = serde_yaml::from_str(yaml).unwrap();
+        assert!(!entry.template);
+        match entry.status {
+            StatusSpec::Multi(arr) => assert_eq!(arr, vec![401, 403]),
+            _ => panic!("expected Multi variant"),
+        }
+    }
+
+    #[test]
+    fn problem_details_defaults_to_include_detail_true() {
+        let yaml = r#"
+enabled: true
+"#;
+        let pd: ProblemDetailsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(pd.enabled);
+        assert!(pd.include_detail);
+        assert!(pd.type_base_uri.is_none());
+    }
+
+    #[test]
+    fn problem_details_parses_type_base_uri_and_suppresses_detail() {
+        let yaml = r#"
+enabled: true
+type_base_uri: "https://api.example.com/errors"
+include_detail: false
+"#;
+        let pd: ProblemDetailsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(pd.enabled);
+        assert!(!pd.include_detail);
+        assert_eq!(
+            pd.type_base_uri.as_deref(),
+            Some("https://api.example.com/errors")
+        );
+    }
+
+    #[test]
+    fn error_pages_array_shape_parses_at_origin_level() {
+        // Matches the historical authored shape used by examples/error-pages
+        // and the conformance suite: error_pages is a top-level YAML array.
+        let yaml = r#"
+action:
+  type: proxy
+  url: http://upstream
+error_pages:
+  - status: 401
+    content_type: application/json
+    body: '{"error":"unauthorized"}'
+  - status: [403, 404]
+    content_type: text/plain
+    body: "denied"
+"#;
+        let origin: RawOriginConfig = serde_yaml::from_str(yaml).unwrap();
+        let pages = origin.error_pages.expect("error_pages parses");
+        assert_eq!(pages.len(), 2);
+        assert!(pages[0].status.matches(401));
+        assert!(pages[1].status.matches(403));
+        assert!(pages[1].status.matches(404));
     }
 }
 

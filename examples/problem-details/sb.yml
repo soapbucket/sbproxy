@@ -1,0 +1,54 @@
+# RFC 9457 problem-details default renderer.
+#
+# Authoring `problem_details:` on an origin tells the proxy to render any
+# proxy-generated error response that is not matched by a custom
+# `error_pages` entry as `application/problem+json` per RFC 9457. The two
+# blocks compose: per-status custom pages still win when authored.
+#
+# This example has a single origin protected by API key authentication.
+# Requests without the `X-Api-Key` header get a 401 from the proxy. The
+# `error_pages` block matches 401 explicitly with a hand-authored JSON
+# body. Any *other* proxy-generated error on this origin (e.g. a 403 from
+# a future policy deny) falls through to the problem-details renderer.
+#
+# Run:
+#   sbproxy serve -f sb.yml
+#
+# Try:
+#   # 401 hits the custom error_pages entry (authored body wins).
+#   curl -sv -H 'Host: api.local' http://127.0.0.1:8080/get 2>&1 | grep -E '^< HTTP|^\{'
+#
+#   # If we forced a different code (e.g. by adding a policy that denies
+#   # with 403), problem-details kicks in and renders the response as
+#   # application/problem+json with type, title, status, detail, instance.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    authentication:
+      type: api_key
+      header_name: X-Api-Key
+      api_keys:
+        - secret-key
+
+    # Per-status custom page for 401. Wins over the problem-details
+    # fallback when the proxy generates a 401.
+    error_pages:
+      - status: 401
+        content_type: application/json
+        body: '{"error":"unauthorized","hint":"set X-Api-Key"}'
+
+    # Default RFC 9457 renderer for every other proxy-generated error.
+    # `type_base_uri` yields stable `type` URIs of the form
+    # `https://api.example.com/errors/<status>`. `include_detail: false`
+    # would suppress the internal error string from the `detail` field.
+    problem_details:
+      enabled: true
+      type_base_uri: "https://api.example.com/errors"
+      include_detail: true

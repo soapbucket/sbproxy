@@ -14,9 +14,9 @@ use smallvec::SmallVec;
 
 use crate::types::{
     AccessLogConfig, AgentClassesConfig, AgentSkillEntry, CompressionConfig, CorsConfig,
-    HstsConfig, MessageSignaturesConfig, MirrorConfig, OriginRateLimitsConfig, ProxyServerConfig,
-    ProxyStatusConfig, RequestModifierConfig, ResponseCacheConfig, ResponseModifierConfig,
-    SessionConfig,
+    ErrorPageEntry, HstsConfig, MessageSignaturesConfig, MirrorConfig, OriginRateLimitsConfig,
+    ProblemDetailsConfig, ProxyServerConfig, ProxyStatusConfig, RequestModifierConfig,
+    ResponseCacheConfig, ResponseModifierConfig, SessionConfig,
 };
 
 /// Fully compiled, immutable origin ready for request processing.
@@ -74,8 +74,16 @@ pub struct CompiledOrigin {
     pub forward_rules: Vec<serde_json::Value>,
     /// Fallback origin: serves when the primary upstream fails (kept as JSON for deferred compilation).
     pub fallback_origin: Option<serde_json::Value>,
-    /// Custom error pages configuration (kept as JSON for deferred evaluation).
-    pub error_pages: Option<serde_json::Value>,
+    /// Per-status custom error response bodies. Each entry covers one
+    /// or more HTTP status codes; multiple entries for the same code
+    /// are content-negotiated against the inbound request's `Accept`
+    /// header. See [`ErrorPageEntry`].
+    pub error_pages: Option<Vec<ErrorPageEntry>>,
+    /// RFC 9457 problem-details default renderer. When `Some` with
+    /// `enabled = true`, proxy-generated errors that are *not* matched
+    /// by an [`ErrorPageEntry`] render as `application/problem+json`.
+    /// See [`ProblemDetailsConfig`].
+    pub problem_details: Option<ProblemDetailsConfig>,
     /// RFC 9209 `Proxy-Status` response header configuration. When
     /// `Some` with `enabled = true`, the response filter stamps a
     /// structured `Proxy-Status` header on every non-2xx response.

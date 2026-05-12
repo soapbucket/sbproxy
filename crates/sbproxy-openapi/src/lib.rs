@@ -302,10 +302,10 @@ fn build_responses(origin: &sbproxy_config::CompiledOrigin) -> Value {
     }
 
     if let Some(pages) = &origin.error_pages {
-        if let Some(obj) = pages.as_object() {
-            for code in obj.keys() {
+        for entry in pages {
+            for code in entry.status.iter() {
                 responses
-                    .entry(code.clone())
+                    .entry(code.to_string())
                     .or_insert_with(|| json!({ "description": format!("HTTP {}", code) }));
             }
         }
@@ -482,6 +482,7 @@ mod tests {
             forward_rules: Vec::new(),
             fallback_origin: None,
             error_pages: None,
+            problem_details: None,
             proxy_status: None,
             message_signatures: None,
             bot_detection: None,

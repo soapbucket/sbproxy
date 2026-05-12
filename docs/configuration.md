@@ -434,6 +434,7 @@ origins:
 | `threat_protection` | object | | IP reputation / blocklist config. |
 | `rate_limit_headers` | object | | `X-RateLimit-*` and `Retry-After` header configuration. |
 | `error_pages` | list | | Custom error pages keyed by status code or class. |
+| `problem_details` | object | | RFC 9457 `application/problem+json` default renderer. Composes with `error_pages`. |
 | `traffic_capture` | object | | Traffic capture / mirroring. |
 | `message_signatures` | object | | RFC 9421 HTTP message signatures. |
 | `connection_pool` | object | | Per-origin connection pool tuning. |
@@ -2508,6 +2509,57 @@ origins:
 | `content_type` | string | `application/json` | `Content-Type` header sent with the response. |
 | `body` | string | `""` | Response body. May contain template placeholders when `template` is true. |
 | `template` | bool | false | When true, substitute `{{ status_code }}` and `{{ request.path }}` in the body. Both spaced and unspaced forms are accepted. |
+
+---
+
+## Problem details (RFC 9457)
+
+The `problem_details` block opts the origin into RFC 9457
+`application/problem+json` responses for proxy-generated errors that
+are not matched by an `error_pages` entry. The two blocks compose:
+per-status custom pages still win when authored; `problem_details`
+catches everything else with a structured body.
+
+```yaml
+origins:
+  "api.example.com":
+    error_pages:
+      - status: 401
+        content_type: application/json
+        body: '{"error":"unauthorized","hint":"set X-Api-Key"}'
+
+    problem_details:
+      enabled: true
+      type_base_uri: "https://api.example.com/errors"
+      include_detail: true
+```
+
+A proxy-generated 403 on this origin (no `error_pages` entry) renders as:
+
+```json
+{
+  "type": "https://api.example.com/errors/403",
+  "title": "Forbidden",
+  "status": 403,
+  "detail": "policy denied",
+  "instance": "/restricted"
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | false | When true, render unmatched proxy-generated errors as `application/problem+json`. |
+| `type_base_uri` | string | | Base URI for the `type` field; the status code is appended (e.g. `https://api.example.com/errors/503`). When unset the renderer emits the RFC 9457 default `about:blank`. |
+| `include_detail` | bool | true | When false, the `detail` field is suppressed (operators can avoid leaking internal error text). |
+
+The renderer fires from the same proxy-generated error path that
+`error_pages` participates in (authentication denials, policy denials,
+default 404). Upstream-returned status codes are not rewritten; the
+renderer only handles errors the proxy itself generates.
+
+See [`examples/problem-details/`](https://github.com/soapbucket/sbproxy/tree/main/examples/problem-details).
+
+Spec: <https://www.rfc-editor.org/rfc/rfc9457.html>.
 
 ---
 
