@@ -7896,6 +7896,37 @@ impl ProxyHttp for SbProxy {
             );
         }
 
+        // --- Idempotency middleware pre-check ---
+        //
+        // When the resolved origin has `idempotency:` configured and
+        // the request method is one of the configured set, set
+        // `ctx.idempotency_buffering = true` so `request_body_filter`
+        // accumulates the body, computes its hash, and short-circuits
+        // cache hits / conflicts before the action runs. The middleware
+        // sits ahead of policies so a successful replay does not
+        // consume rate-limit tokens. Requests without the
+        // `Idempotency-Key` header skip buffering and fall through to
+        // the normal flow.
+        if let Some(idem) = pipeline
+            .idempotencies
+            .get(origin_idx)
+            .and_then(|o| o.as_ref())
+        {
+            let method_matches = idem.methods.contains(&session.req_header().method);
+            let header_present = session
+                .req_header()
+                .headers
+                .get(idem.header_name.as_str())
+                .and_then(|v| v.to_str().ok())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if method_matches && header_present {
+                ctx.idempotency_buffering = true;
+                ctx.idempotency_workspace =
+                    Some(pipeline.config.origins[origin_idx].workspace_id.to_string());
+            }
+        }
+
         // --- Policy enforcement ---
         let policy_origin = ctx.hostname.to_string();
         // Build the verdict-bus correlation context once per
@@ -9447,6 +9478,28 @@ impl ProxyHttp for SbProxy {
             }
         }
 
+        // --- Idempotency cache-miss response capture ---
+        //
+        // When `request_body_filter` recorded a cache miss on this
+        // request, `ctx.idempotency_miss` carries the key + body hash.
+        // Snapshot the upstream status and headers here so
+        // `response_body_filter` can pair them with the accumulated
+        // body and call `record_response` once the stream ends.
+        if ctx.idempotency_miss.is_some() {
+            ctx.idempotency_response_status = Some(upstream_response.status.as_u16());
+            let headers: Vec<(String, String)> = upstream_response
+                .headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|v| (name.as_str().to_string(), v.to_string()))
+                })
+                .collect();
+            ctx.idempotency_response_headers = Some(headers);
+        }
+
         // --- Wave 5 / G5.6 wire: AnomalyDetectorHook dispatch ---
         //
         // Run every registered anomaly detector hook against the
@@ -10536,6 +10589,112 @@ impl ProxyHttp for SbProxy {
             return Ok(());
         }
 
+        // --- Idempotency middleware body check ---
+        //
+        // `request_filter` set `ctx.idempotency_buffering = true` when
+        // the resolved origin has `idempotency:` configured, the method
+        // matched the configured set, and the `Idempotency-Key` header
+        // was present. We accumulate the body locally (hold it back
+        // from the upstream), then on `end_of_stream` look the key up
+        // against the cache:
+        //
+        // * Cache hit, matching body hash -> stash the cached response
+        //   in `ctx.idempotency_replay` and abort the upstream by
+        //   returning Err(HTTPStatus). `fail_to_proxy` writes the
+        //   cached body verbatim.
+        // * Cache hit, differing body hash -> flag the conflict in
+        //   `ctx.idempotency_conflict`; `fail_to_proxy` writes the
+        //   RFC 8594 conflict body with status 409.
+        // * Cache miss -> stash `(key, body_hash)` in
+        //   `ctx.idempotency_miss`, release the buffered body to the
+        //   upstream as a single chunk. `response_filter` /
+        //   `response_body_filter` then capture the upstream response
+        //   and call `record_response` so the next retry hits the
+        //   cache.
+        if ctx.idempotency_buffering {
+            let buf = ctx
+                .request_body_buf
+                .get_or_insert_with(bytes::BytesMut::new);
+            if let Some(chunk) = body.take() {
+                buf.extend_from_slice(&chunk);
+            }
+            if end_of_stream {
+                let collected = ctx.request_body_buf.take().unwrap_or_default();
+                let pipeline = reload::current_pipeline();
+                let idem = ctx
+                    .origin_idx
+                    .and_then(|i| pipeline.idempotencies.get(i))
+                    .and_then(|opt| opt.as_ref());
+                let workspace = ctx.idempotency_workspace.clone().unwrap_or_default();
+                if let Some(idem) = idem {
+                    let outcome = sbproxy_middleware::idempotency::check_request(
+                        idem.cache.as_ref(),
+                        &workspace,
+                        &session.req_header().headers,
+                        &collected,
+                    );
+                    match outcome {
+                        sbproxy_middleware::idempotency::IdempotencyOutcome::NotApplicable => {
+                            // Header must have evaporated between
+                            // `request_filter` and here; fall through
+                            // to a normal forward of the buffered body.
+                            let frozen = collected.freeze();
+                            *body = Some(frozen);
+                            ctx.idempotency_buffering = false;
+                            return Ok(());
+                        }
+                        sbproxy_middleware::idempotency::IdempotencyOutcome::CacheHit(resp) => {
+                            ctx.idempotency_replay = Some((resp.status, resp.headers, resp.body));
+                            ctx.idempotency_buffering = false;
+                            // Pingora routes `request_body_filter` errors
+                            // to `fail_to_proxy` only when the error
+                            // signals an actual failure; a success-class
+                            // status (e.g. the cached 200) is ignored.
+                            // We always raise InternalError here and let
+                            // `fail_to_proxy` see the replay struct
+                            // first and override the status with the
+                            // cached one. The Err is a control signal,
+                            // not a real error.
+                            return Err(pingora_error::Error::explain(
+                                pingora_error::ErrorType::InternalError,
+                                "idempotency cache hit",
+                            ));
+                        }
+                        sbproxy_middleware::idempotency::IdempotencyOutcome::Conflict => {
+                            ctx.idempotency_conflict = true;
+                            ctx.idempotency_buffering = false;
+                            return Err(pingora_error::Error::explain(
+                                pingora_error::ErrorType::InternalError,
+                                "idempotency body conflict",
+                            ));
+                        }
+                        sbproxy_middleware::idempotency::IdempotencyOutcome::Miss {
+                            key,
+                            body_hash,
+                        } => {
+                            ctx.idempotency_miss = Some((key, body_hash));
+                            ctx.idempotency_response_body_buf =
+                                Some(bytes::BytesMut::with_capacity(8192));
+                            // Release the buffered body to the upstream
+                            // as a single chunk.
+                            let frozen = collected.freeze();
+                            *body = Some(frozen);
+                            ctx.idempotency_buffering = false;
+                            return Ok(());
+                        }
+                    }
+                }
+                // Idempotency compiled binding evaporated mid-flight
+                // (config reload between request_filter and here).
+                // Fall through to a normal body forward.
+                let frozen = collected.freeze();
+                *body = Some(frozen);
+                ctx.idempotency_buffering = false;
+            }
+            // Mid-stream chunks: hold off forwarding until end_of_stream.
+            return Ok(());
+        }
+
         // Mirror that doesn't need the body (mirror_body: false) -
         // fire on first body filter call so the shadow request is
         // not delayed by an upload it doesn't care about.
@@ -10676,6 +10835,52 @@ impl ProxyHttp for SbProxy {
                                 tracing::warn!(error = %e, "cache write failed");
                             }
                         });
+                    }
+                }
+            }
+        }
+
+        // --- Idempotency cache-miss body capture ---
+        //
+        // When `request_body_filter` set `ctx.idempotency_miss`, the
+        // upstream response is destined for the cache. Accumulate
+        // every chunk passing through here; at `end_of_stream` pair
+        // the body with the status / headers snapshotted by
+        // `response_filter` and call `record_response`. The capture
+        // is best-effort: a missing piece (status, headers, or buffer)
+        // simply skips the write rather than holding up the response.
+        if ctx.idempotency_response_body_buf.is_some() {
+            if let Some(chunk) = body.as_ref() {
+                if let Some(buf) = ctx.idempotency_response_body_buf.as_mut() {
+                    buf.extend_from_slice(chunk);
+                }
+            }
+            if end_of_stream {
+                if let Some((key, body_hash)) = ctx.idempotency_miss.take() {
+                    let buf = ctx.idempotency_response_body_buf.take();
+                    let status = ctx.idempotency_response_status.take();
+                    let headers = ctx.idempotency_response_headers.take();
+                    let workspace = ctx.idempotency_workspace.clone().unwrap_or_default();
+                    if let (Some(buf), Some(status), Some(headers)) = (buf, status, headers) {
+                        let pipeline = reload::current_pipeline();
+                        if let Some(idem) = ctx
+                            .origin_idx
+                            .and_then(|i| pipeline.idempotencies.get(i))
+                            .and_then(|opt| opt.as_ref())
+                        {
+                            sbproxy_middleware::idempotency::record_response(
+                                idem.cache.as_ref(),
+                                &workspace,
+                                &key,
+                                sbproxy_middleware::idempotency::RecordedResponse {
+                                    status,
+                                    headers,
+                                    body: buf.to_vec(),
+                                    body_hash,
+                                    ttl_secs: idem.ttl_secs,
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -10992,6 +11197,90 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // --- Idempotency cache hit (replay cached response) ---
+        // `request_body_filter` matched the cache and aborted the
+        // upstream so we could replay the cached `(status, headers,
+        // body)` triple verbatim. Replay before falling through to
+        // the validator / fallback / generic 502 branches because
+        // the cache hit is a normal serve, not an error.
+        if let Some((status, headers, body)) = ctx.idempotency_replay.take() {
+            // Strip any framing headers from the cached entry; Pingora
+            // owns transfer-encoding / content-length / connection on
+            // the new client connection and will rederive them. Leaving
+            // an upstream's `connection: close` on the replay can race
+            // the response delivery on the client socket.
+            let headers: Vec<(String, String)> = headers
+                .into_iter()
+                .filter(|(n, _)| {
+                    let lower = n.to_ascii_lowercase();
+                    lower != "content-length"
+                        && lower != "transfer-encoding"
+                        && lower != "connection"
+                })
+                .collect();
+            let mut header =
+                match pingora_http::ResponseHeader::build(status, Some(headers.len() + 1)) {
+                    Ok(h) => h,
+                    Err(_) => {
+                        let _ = send_error(session, status, "idempotency replay failed").await;
+                        ctx.response_status = Some(status);
+                        return FailToProxy {
+                            error_code: status,
+                            can_reuse_downstream: true,
+                        };
+                    }
+                };
+            for (name, value) in headers {
+                let _ = header.insert_header(name, value);
+            }
+            // Mark the response as a replay so operators can tell it
+            // apart in logs. The header is intentionally short.
+            let _ = header.insert_header("x-sbproxy-idempotency", "HIT");
+            let _ = session.write_response_header(Box::new(header), false).await;
+            let _ = session
+                .write_response_body(Some(bytes::Bytes::from(body)), true)
+                .await;
+            ctx.response_status = Some(status);
+            return FailToProxy {
+                error_code: status,
+                can_reuse_downstream: true,
+            };
+        }
+
+        // --- Idempotency body conflict (409) ---
+        // The cache held a response for this key but the request body
+        // hashed to a different value, so per RFC 8594 we return 409
+        // `ledger.idempotency_conflict` and let the client retry with
+        // a fresh key. The body shape is pinned by
+        // `sbproxy_middleware::idempotency::conflict_response`.
+        if ctx.idempotency_conflict {
+            ctx.idempotency_conflict = false;
+            let (status, content_type, body) = sbproxy_middleware::idempotency::conflict_response();
+            let status_u16 = status.as_u16();
+            let mut header = match pingora_http::ResponseHeader::build(status_u16, Some(2)) {
+                Ok(h) => h,
+                Err(_) => {
+                    let _ = send_error(session, status_u16, "idempotency conflict").await;
+                    ctx.response_status = Some(status_u16);
+                    return FailToProxy {
+                        error_code: status_u16,
+                        can_reuse_downstream: true,
+                    };
+                }
+            };
+            let _ = header.insert_header("content-type", content_type);
+            let _ = header.insert_header("content-length", body.len().to_string());
+            let _ = session.write_response_header(Box::new(header), false).await;
+            let _ = session
+                .write_response_body(Some(bytes::Bytes::from(body)), true)
+                .await;
+            ctx.response_status = Some(status_u16);
+            return FailToProxy {
+                error_code: status_u16,
+                can_reuse_downstream: true,
+            };
+        }
+
         // --- Request body validator rejection ---
         // The body filter intentionally aborted the upstream after a
         // validation failure. Surface the configured status / body

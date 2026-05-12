@@ -1482,6 +1482,12 @@ pub struct RawOriginConfig {
     /// HTTP message signatures configuration (RFC 9421).
     #[serde(default)]
     pub message_signatures: Option<MessageSignaturesConfig>,
+    /// RFC 8594-style idempotency-key middleware. Opt in per origin to
+    /// have the proxy short-circuit retries of POST/PUT/PATCH (or any
+    /// configured method) carrying a repeated `Idempotency-Key`
+    /// header. See [`IdempotencyConfig`].
+    #[serde(default)]
+    pub idempotency: Option<IdempotencyConfig>,
     /// Per-origin connection pool tuning.  Falls back to proxy-wide defaults
     /// when not specified.
     #[serde(default)]
@@ -2277,6 +2283,62 @@ pub struct ProblemDetailsConfig {
 
 fn default_include_detail() -> bool {
     true
+}
+
+/// RFC 8594-style idempotency middleware configuration.
+///
+/// When `enabled`, the proxy reads an idempotency key from the
+/// configured request header (default: `Idempotency-Key`), hashes the
+/// request body for conflict detection, and serves cached responses on
+/// retries. Workspace-isolated keys mean two workspaces using the same
+/// key never collide. The middleware engages only on the listed HTTP
+/// methods; defaults to POST, PUT, and PATCH.
+///
+/// Backed by `sbproxy_middleware::idempotency` (the cache backend
+/// trait + memory / Redis impls). For Redis-backed clusters set
+/// `backend: redis`; the cache binds to the cluster L2 store at
+/// compile time. Single-instance deployments leave `backend: memory`
+/// (the default).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct IdempotencyConfig {
+    /// Whether to engage the idempotency middleware on this origin.
+    /// Defaults to false; opt in per origin.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Request header name carrying the idempotency key. Defaults to
+    /// `Idempotency-Key`.
+    #[serde(default)]
+    pub header_name: Option<String>,
+    /// Time-to-live for cached entries, in seconds. Defaults to 86400
+    /// (24 hours).
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+    /// HTTP methods the middleware engages on. Defaults to
+    /// `[POST, PUT, PATCH]`. Other methods (idempotent by HTTP spec)
+    /// pass through unaffected.
+    #[serde(default)]
+    pub methods: Option<Vec<String>>,
+    /// Cache backend selector. `memory` (the default) uses an
+    /// in-process LRU; `redis` binds to the cluster L2 store at
+    /// compile time. Operators who set `redis` without configuring
+    /// `proxy.l2_store` get an error at config-validate time.
+    #[serde(default)]
+    pub backend: IdempotencyBackend,
+}
+
+/// Cache backend for [`IdempotencyConfig`].
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IdempotencyBackend {
+    /// In-process cache. Default. Suitable for single-instance
+    /// deployments and per-replica idempotency in clusters where
+    /// retries land on the same replica.
+    #[default]
+    Memory,
+    /// Cluster-wide cache backed by the shared L2 store
+    /// (`proxy.l2_store`). Required for clusters where retries may
+    /// land on different replicas.
+    Redis,
 }
 
 #[cfg(test)]

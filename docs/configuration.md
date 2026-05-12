@@ -437,6 +437,7 @@ origins:
 | `problem_details` | object | | RFC 9457 `application/problem+json` default renderer. Composes with `error_pages`. |
 | `traffic_capture` | object | | Traffic capture / mirroring. |
 | `message_signatures` | object | | RFC 9421 HTTP message signatures. |
+| `idempotency` | object | | RFC 8594 idempotency middleware. See [Idempotency](#idempotency). |
 | `connection_pool` | object | | Per-origin connection pool tuning. |
 | `extensions` | object | | Opaque map for enterprise / third-party origin-level blocks. |
 
@@ -2560,6 +2561,70 @@ renderer only handles errors the proxy itself generates.
 See [`examples/problem-details/`](https://github.com/soapbucket/sbproxy/tree/main/examples/problem-details).
 
 Spec: <https://www.rfc-editor.org/rfc/rfc9457.html>.
+
+---
+
+## Idempotency
+
+The `idempotency:` block opts the origin into RFC 8594-style cached
+retries. The middleware reads the `Idempotency-Key` request header,
+hashes the request body, and:
+
+- **First call** under a given key: forwards the request upstream and
+  caches the response under `(workspace, key)` keyed by the body hash.
+- **Replay** with the same key + same body: returns the cached
+  response with `x-sbproxy-idempotency: HIT`. The upstream is not
+  contacted.
+- **Conflict** (same key, different body): returns 409 with the
+  `ledger.idempotency_conflict` JSON body per the RFC.
+
+The middleware runs ahead of policy enforcement so a cached replay
+does not consume a rate-limit slot.
+
+```yaml
+origins:
+  "api.example.com":
+    idempotency:
+      enabled: true
+      header_name: Idempotency-Key  # default
+      ttl_secs: 86400               # default (24 h)
+      methods: [POST, PUT, PATCH]   # default
+      backend: memory               # or `redis`
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | false | When true, the middleware engages on this origin. |
+| `header_name` | string | `Idempotency-Key` | Request header carrying the key. |
+| `ttl_secs` | int | 86400 | Cache entry TTL in seconds. |
+| `methods` | list | `[POST, PUT, PATCH]` | HTTP methods that engage the middleware. Other methods pass through. |
+| `backend` | enum | `memory` | `memory` (per-origin, per-replica) or `redis` (binds to `proxy.l2_store` for cluster-wide replay). |
+
+The `memory` backend is per-origin and per-replica: suitable for
+single-instance deployments and clusters with sticky routing. The
+`redis` backend binds at config-compile time to the cluster L2 store
+configured under `proxy.l2_store`; an origin asking for `redis`
+without that block surfaces a clear config-load error rather than
+silently downgrading.
+
+See [`examples/idempotency/`](https://github.com/soapbucket/sbproxy/tree/main/examples/idempotency).
+
+Spec: <https://www.rfc-editor.org/rfc/rfc8594.html>.
+
+> **Upstream contact on cache hit.** The middleware runs in the body
+> filter, which fires after Pingora has already opened the upstream
+> TCP connection and sent the request headers. On a cache hit the
+> proxy aborts before forwarding the request body, so the upstream
+> sees one full request (the first call) and one aborted partial
+> handshake (the replay). A well-behaved upstream tolerates the
+> abort; a poorly-behaved one may log it. Future work moves the
+> cache check earlier so the upstream never sees the replay.
+
+> **AI gateway note.** The AI proxy path (`action: ai_proxy`) does not
+> currently engage this middleware. The AI gateway has its own
+> request-flow model and response capture is more involved for
+> streaming completions. Track the follow-up in
+> `docs/missing.md`.
 
 ---
 

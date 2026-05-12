@@ -14,9 +14,9 @@ use smallvec::SmallVec;
 
 use crate::types::{
     AccessLogConfig, AgentClassesConfig, AgentSkillEntry, CompressionConfig, CorsConfig,
-    ErrorPageEntry, HstsConfig, MessageSignaturesConfig, MirrorConfig, OriginRateLimitsConfig,
-    ProblemDetailsConfig, ProxyServerConfig, ProxyStatusConfig, RequestModifierConfig,
-    ResponseCacheConfig, ResponseModifierConfig, SessionConfig,
+    ErrorPageEntry, HstsConfig, IdempotencyConfig, MessageSignaturesConfig, MirrorConfig,
+    OriginRateLimitsConfig, ProblemDetailsConfig, ProxyServerConfig, ProxyStatusConfig,
+    RequestModifierConfig, ResponseCacheConfig, ResponseModifierConfig, SessionConfig,
 };
 
 /// Fully compiled, immutable origin ready for request processing.
@@ -94,6 +94,13 @@ pub struct CompiledOrigin {
     /// on every inbound request to this origin ahead of any downstream auth
     /// provider. See [`MessageSignaturesConfig`].
     pub message_signatures: Option<MessageSignaturesConfig>,
+    /// RFC 8594-style idempotency middleware configuration. When
+    /// `Some` with `enabled = true`, the request body filter buffers
+    /// the request body for the configured methods, hashes it, and
+    /// short-circuits cache hits / conflicts before the action runs.
+    /// See [`IdempotencyConfig`]. The actual cache backend is
+    /// instantiated at pipeline-compile time in `sbproxy-core`.
+    pub idempotency: Option<IdempotencyConfig>,
     /// Bot detection configuration (kept as JSON for deferred compilation).
     pub bot_detection: Option<serde_json::Value>,
     /// Threat protection configuration (kept as JSON for deferred compilation).

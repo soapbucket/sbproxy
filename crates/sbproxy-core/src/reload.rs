@@ -435,6 +435,7 @@ mod tests {
                 problem_details: None,
                 proxy_status: None,
                 message_signatures: None,
+                idempotency: None,
                 bot_detection: None,
                 threat_protection: None,
                 on_request: Vec::new(),
