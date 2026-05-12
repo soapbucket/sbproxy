@@ -4344,6 +4344,44 @@ impl SseUsageScanner {
 /// cost is estimated against the model the request actually
 /// executed against using the embedded price catalog in
 /// `sbproxy-ai/src/budget.rs`.
+/// Build and publish a per-surface `AiBillingEvent` for a request
+/// that has just returned a response from the upstream.
+///
+/// Phase 8 of the AI deep-integration plan: every dispatched AI
+/// request emits a billing event onto the observability bus and into
+/// the in-process `BudgetTracker`. Non-chat surfaces (image, audio,
+/// moderations, reranking, files, batches, fine-tuning) ship today
+/// as `PerCall` events with `cost_usd = 0.0`; per-unit pricing for
+/// images, audio seconds, and rerank documents lands when the
+/// pricing tables ship. Chat completions continue to bill through
+/// `record_budget_usage` until the chat usage-extraction is reworked
+/// to emit the new event shape.
+fn emit_ai_billing_event(
+    surface: &sbproxy_ai::handler::AiSurface,
+    provider_name: &str,
+    model: Option<String>,
+    usage: sbproxy_ai::budget::AiUsage,
+    cost_usd: f64,
+    scope_keys: Vec<String>,
+) {
+    let event = sbproxy_ai::budget::AiBillingEvent::new(
+        surface.clone(),
+        provider_name.to_string(),
+        model,
+        usage,
+    )
+    .with_cost(cost_usd)
+    .with_scope_keys(scope_keys);
+    sbproxy_ai::budget::record_billing_event(&BUDGET_TRACKER, &event);
+    tracing::info!(
+        ai.surface = event.surface.as_str(),
+        ai.provider = event.provider.as_str(),
+        ai.cost_usd = event.cost_usd,
+        ai.occurred_at_unix_secs = event.occurred_at_unix_secs,
+        "AI billing event"
+    );
+}
+
 fn record_budget_usage(
     cfg: &sbproxy_ai::BudgetConfig,
     keys: &[(usize, String)],
@@ -4542,6 +4580,14 @@ async fn handle_ai_proxy(
         // Anthropic's models listing has a different shape and most
         // OpenAI clients don't depend on it for routing decisions.
         let format = sbproxy_ai::client::provider_format(provider);
+        emit_ai_billing_event(
+            &surface,
+            &provider.name,
+            None,
+            sbproxy_ai::budget::AiUsage::PerCall,
+            0.0,
+            Vec::new(),
+        );
         return relay_ai_response(session, resp, format, config.max_body_size).await;
     }
 
@@ -4603,6 +4649,14 @@ async fn handle_ai_proxy(
             })?;
 
         let format = sbproxy_ai::client::provider_format(provider);
+        emit_ai_billing_event(
+            &surface,
+            &provider.name,
+            None,
+            sbproxy_ai::budget::AiUsage::PerCall,
+            0.0,
+            Vec::new(),
+        );
         return relay_ai_response(session, resp, format, config.max_body_size).await;
     }
 
@@ -4653,6 +4707,14 @@ async fn handle_ai_proxy(
             })?;
 
         let format = sbproxy_ai::client::provider_format(provider);
+        emit_ai_billing_event(
+            &surface,
+            &provider.name,
+            None,
+            sbproxy_ai::budget::AiUsage::PerCall,
+            0.0,
+            Vec::new(),
+        );
         return relay_ai_response(session, resp, format, config.max_body_size).await;
     }
 
