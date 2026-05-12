@@ -246,7 +246,7 @@ The sliding window is one minute, shared across all configured origins (state is
 
 ## Guardrails
 
-The proxy supports seven guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, and `regex`. Guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. See the CEL guardrails section below for inline CEL conditions, and `features.md` for the higher-level configuration of each guardrail type.
+The proxy supports eight guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, `regex`, and `context_poisoning`. Guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. See the CEL guardrails section below for inline CEL conditions, and `features.md` for the higher-level configuration of each guardrail type.
 
 Input guardrails apply to whichever body field the surface carries user text in:
 
@@ -259,6 +259,39 @@ Input guardrails apply to whichever body field the surface carries user text in:
 | `moderations` | `body["input"]` |
 
 A single guardrail block on the AI handler config covers every supported surface; the proxy picks the right field automatically based on the classified surface. Multipart-bodied surfaces (image edits, image variations, audio transcription) bypass the input-guardrail check today because their bodies are forwarded byte-transparently; output-side scanning for those surfaces is reserved for a follow-up.
+
+### Context-poisoning guardrail
+
+The `context_poisoning` input guardrail flags untrusted retrieval content that tries to manipulate the model before a downstream tool call. This is the indirect prompt injection vector from Greshake et al. (2023): a RAG pipeline pulls a poisoned page into the model's context, and the model then issues a tool call influenced by that content.
+
+The check runs on the full input, including any `role: tool` or `role: function` messages that the AI gateway treats as retrieval content. Findings carry a stable `rule_id` and a confidence weight; the `min_confidence` setting filters out low-weight rules.
+
+```yaml
+guardrails:
+  input:
+    - type: context_poisoning
+      enabled: true
+      action: deny           # log | score | deny (default deny)
+      min_confidence: 0.5
+      rules:                 # optional allowlist; omit for all rules
+        - cp_instruction_ignore_previous
+        - cp_tool_call_scaffold
+        - cp_encoded_instruction
+        - cp_conflicting_directive
+```
+
+The rule catalogue covers four families:
+
+| Family | Sample rule IDs | Detects |
+|---|---|---|
+| Instruction-like patterns | `cp_instruction_ignore_previous`, `cp_instruction_you_are_now`, `cp_instruction_system_prompt_leak`, `cp_suspicious_url` | "ignore previous instructions" style payloads, role-swap framings, exfiltration URL shapes |
+| Tool-call hints | `cp_tool_call_scaffold`, `cp_tool_call_json_shape` | Literal `<tool_use>`, `function_call:`, or JSON tool invocations inside passive content |
+| Encoded instructions | `cp_encoded_instruction` | Base64 and hex blobs that decode to instruction-like text |
+| Conflicting directives | `cp_conflicting_directive`, `cp_instruction_imperative_regex` | Imperative second-person language in `role: tool` or `role: function` content |
+
+Every hit emits `sbproxy_ai_context_poisoning_findings_total{rule_id, action}`. When `action: deny`, the request is also counted in `sbproxy_ai_context_poisoning_blocked_total` and the proxy returns a 4xx before any upstream call. `action: log` and `action: score` keep the request flowing; they differ only in the metric label so dashboards can separate observability volume from scoring volume.
+
+See `examples/ai-context-poisoning/` for a complete sample configuration and curl commands.
 
 ## Lua hooks
 
