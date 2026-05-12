@@ -5044,6 +5044,18 @@ async fn handle_ai_proxy(
     // Default retry-on-status codes for failover.
     let retry_statuses: Vec<u16> = vec![500, 502, 503];
 
+    // Surface-specific request-body inspection captured once before
+    // the failover loop so each attempt's BudgetRecorderArgs carries
+    // the same record. For image_generation, we capture the `size`
+    // field so the response-side billing event can emit an
+    // `Images { count, resolution }` variant with a real resolution.
+    let image_resolution_for_billing: Option<String> =
+        if matches!(surface, sbproxy_ai::handler::AiSurface::ImageGeneration) {
+            body.get("size").and_then(|v| v.as_str()).map(String::from)
+        } else {
+            None
+        };
+
     // Parse retry config from the action config's routing.retry section.
     // This is done by inspecting the raw handler config.
     let max_attempts = if is_failover {
@@ -5213,6 +5225,7 @@ async fn handle_ai_proxy(
                 model: model.as_str(),
                 surface_label,
                 provider_name: last_provider_name.as_str(),
+                image_resolution: image_resolution_for_billing.clone(),
             });
             // Capture parser hints from the upstream response before it
             // gets moved into relay_ai_stream. The streaming relay
@@ -5262,6 +5275,7 @@ async fn handle_ai_proxy(
                 model: model.as_str(),
                 surface_label,
                 provider_name: last_provider_name.as_str(),
+                image_resolution: image_resolution_for_billing.clone(),
             });
             relay_ai_response_with_cache(
                 session,
@@ -5526,13 +5540,27 @@ async fn relay_ai_response_with_cache(
             );
             // Emit a surface-tagged AiBillingEvent alongside the
             // existing budget recording. Token-bearing responses
-            // emit a Tokens variant; responses without a usage block
-            // (image generation, audio speech, moderations through
-            // the POST path) emit PerCall.
+            // emit a Tokens variant. Image generation responses use
+            // the captured request resolution plus a count parsed
+            // from the response's `data` array. Other non-token
+            // surfaces (audio speech, moderations through the POST
+            // path) fall back to PerCall.
             let usage = if prompt_tokens != 0 || completion_tokens != 0 {
                 sbproxy_ai::budget::AiUsage::Tokens {
                     input: prompt_tokens,
                     output: completion_tokens,
+                }
+            } else if args.surface_label == "image_generation" {
+                let count = serde_json::from_slice::<serde_json::Value>(&resp_body)
+                    .ok()
+                    .and_then(|v| v.get("data").and_then(|d| d.as_array()).map(|a| a.len()))
+                    .unwrap_or(0) as u32;
+                sbproxy_ai::budget::AiUsage::Images {
+                    count,
+                    resolution: args
+                        .image_resolution
+                        .clone()
+                        .unwrap_or_else(|| "1024x1024".to_string()),
                 }
             } else {
                 sbproxy_ai::budget::AiUsage::PerCall
@@ -5585,6 +5613,12 @@ struct BudgetRecorderArgs<'a> {
     /// Provider that received the dispatched request. Same source
     /// of truth as the `provider` field in the access log.
     provider_name: &'a str,
+    /// For image generation requests, the resolution requested
+    /// (e.g. `1024x1024`, `1024x1792`). Captured from the inbound
+    /// request body at dispatch time and threaded here so the
+    /// relay function can emit an `Images { count, resolution }`
+    /// billing event with the resolution from the request.
+    image_resolution: Option<String>,
 }
 
 /// Inputs to the streaming-cache recorder hook, bundled to keep
