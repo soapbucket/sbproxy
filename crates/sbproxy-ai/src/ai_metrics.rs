@@ -157,6 +157,95 @@ static AI_BUDGET_UTILIZATION: LazyLock<GaugeVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+// --- Realtime session metrics (Phase 7) ---
+
+static AI_REALTIME_SESSIONS_ACTIVE: LazyLock<Gauge> = LazyLock::new(|| {
+    register_gauge!(
+        "sbproxy_ai_realtime_sessions_active",
+        "Currently open OpenAI Realtime API WebSocket sessions"
+    )
+    .unwrap()
+});
+
+static AI_REALTIME_SESSION_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        HistogramOpts::new(
+            "sbproxy_ai_realtime_session_duration_seconds",
+            "Wall-clock duration of a Realtime WebSocket session, recorded on close"
+        )
+        .buckets(vec![
+            1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0
+        ]),
+        &["provider", "close_reason"]
+    )
+    .unwrap()
+});
+
+static AI_REALTIME_AUDIO_SECONDS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_realtime_audio_seconds_total",
+            "Cumulative audio seconds forwarded over Realtime sessions"
+        ),
+        &["provider", "direction"]
+    )
+    .unwrap()
+});
+
+static AI_REALTIME_FRAMES_FORWARDED: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_realtime_frames_forwarded_total",
+            "Cumulative frames forwarded over Realtime sessions"
+        ),
+        &["provider", "direction", "kind"]
+    )
+    .unwrap()
+});
+
+/// Bump the active-sessions gauge on Realtime session open.
+pub fn inc_realtime_sessions_active() {
+    AI_REALTIME_SESSIONS_ACTIVE.inc();
+}
+
+/// Bump the active-sessions gauge on Realtime session close.
+pub fn dec_realtime_sessions_active() {
+    AI_REALTIME_SESSIONS_ACTIVE.dec();
+}
+
+/// Read the current active-sessions gauge value.
+pub fn realtime_sessions_active_value() -> f64 {
+    AI_REALTIME_SESSIONS_ACTIVE.get()
+}
+
+/// Record a Realtime session duration in seconds. `close_reason` is
+/// a low-cardinality label (`client_closed`, `upstream_closed`,
+/// `policy_violation`, `error`).
+pub fn record_realtime_session_duration(provider: &str, close_reason: &str, duration_secs: f64) {
+    AI_REALTIME_SESSION_DURATION
+        .with_label_values(&[provider, close_reason])
+        .observe(duration_secs);
+}
+
+/// Record audio seconds forwarded over a Realtime session.
+/// `direction` is `inbound` (client to provider) or `outbound`
+/// (provider to client).
+pub fn record_realtime_audio_seconds(provider: &str, direction: &str, seconds: f64) {
+    if seconds <= 0.0 {
+        return;
+    }
+    AI_REALTIME_AUDIO_SECONDS
+        .with_label_values(&[provider, direction])
+        .inc_by(seconds);
+}
+
+/// Record one frame forwarded. `kind` is `text` or `audio`.
+pub fn record_realtime_frame(provider: &str, direction: &str, kind: &str) {
+    AI_REALTIME_FRAMES_FORWARDED
+        .with_label_values(&[provider, direction, kind])
+        .inc();
+}
+
 // --- Shadow supervisor metrics ---
 
 static AI_SHADOW_INFLIGHT: LazyLock<Gauge> = LazyLock::new(|| {
@@ -459,6 +548,81 @@ mod tests {
             .map(|m| m.get_histogram().get_sample_count())
             .sum();
         assert!(total_count >= 2, "expected at least 2 observations");
+    }
+
+    #[test]
+    fn realtime_metrics_increment_and_decrement() {
+        let before = realtime_sessions_active_value();
+        inc_realtime_sessions_active();
+        inc_realtime_sessions_active();
+        assert!((realtime_sessions_active_value() - before - 2.0).abs() < 1e-9);
+        dec_realtime_sessions_active();
+        dec_realtime_sessions_active();
+        assert!((realtime_sessions_active_value() - before).abs() < 1e-9);
+    }
+
+    #[test]
+    fn realtime_session_duration_records_observation() {
+        record_realtime_session_duration("openai", "client_closed", 42.5);
+        let families = prometheus::gather();
+        let fam = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_realtime_session_duration_seconds")
+            .expect("metric should be registered");
+        let total: u64 = fam
+            .get_metric()
+            .iter()
+            .map(|m| m.get_histogram().get_sample_count())
+            .sum();
+        assert!(total >= 1, "expected at least one observation");
+    }
+
+    #[test]
+    fn realtime_audio_seconds_registers_metric_family() {
+        // Negative or zero seconds should not record (a frame with
+        // zero bytes or a misconfigured sample rate should not
+        // contribute). Positive values should land in the family.
+        record_realtime_audio_seconds("openai", "inbound", 0.0);
+        record_realtime_audio_seconds("openai", "inbound", -1.5);
+        record_realtime_audio_seconds("openai", "inbound", 0.1);
+        let families = prometheus::gather();
+        let fam = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_realtime_audio_seconds_total")
+            .expect("metric should be registered");
+        let labels: Vec<&str> = fam
+            .get_metric()
+            .iter()
+            .flat_map(|m| m.get_label().iter().map(|l| l.name()))
+            .collect();
+        for required in &["provider", "direction"] {
+            assert!(
+                labels.contains(required),
+                "expected label '{required}' on sbproxy_ai_realtime_audio_seconds_total"
+            );
+        }
+    }
+
+    #[test]
+    fn realtime_frames_forwarded_counter_increments_per_kind() {
+        record_realtime_frame("openai", "inbound", "audio");
+        record_realtime_frame("openai", "outbound", "text");
+        let families = prometheus::gather();
+        let fam = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_realtime_frames_forwarded_total")
+            .expect("metric should be registered");
+        let labels: Vec<&str> = fam
+            .get_metric()
+            .iter()
+            .flat_map(|m| m.get_label().iter().map(|l| l.name()))
+            .collect();
+        for required in &["provider", "direction", "kind"] {
+            assert!(
+                labels.contains(required),
+                "expected label '{required}' on sbproxy_ai_realtime_frames_forwarded_total"
+            );
+        }
     }
 
     #[test]

@@ -95,6 +95,16 @@ pub fn provider_supports_endpoint(provider: &str, endpoint: &AiEndpoint) -> bool
     }
 }
 
+/// Check whether a provider supports the OpenAI Realtime API.
+///
+/// Convenience wrapper for the [`provider_supports_surface`] lookup
+/// for the Realtime surface specifically; the dispatch path uses
+/// this to decide whether to attempt a WebSocket upgrade or return
+/// 501 immediately. Today the matrix returns true only for `openai`.
+pub fn provider_supports_realtime(provider: &str) -> bool {
+    provider_supports_surface(provider, &crate::handler::AiSurface::Realtime)
+}
+
 /// Check whether a provider supports a given AI surface.
 ///
 /// Surface-level analogue of [`provider_supports_endpoint`]. Covers the

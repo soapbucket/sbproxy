@@ -475,6 +475,13 @@ pub struct RequestContext {
     /// AI request carries the surface (chat_completions, assistants,
     /// image_generation, etc.) without re-parsing the path.
     pub ai_surface: Option<String>,
+    /// OpenAI Realtime API session identifier for sessions dispatched
+    /// through the realtime WebSocket path. `None` for non-realtime
+    /// AI requests. Set by the realtime dispatcher when the upstream
+    /// session is established; carried through the request context so
+    /// the access log line emitted on session close carries the
+    /// session id.
+    pub ai_realtime_session: Option<String>,
 
     // --- Wave 4 content negotiation (G4.2 / G4.3 / G4.4) ---
     //
@@ -723,6 +730,7 @@ impl RequestContext {
             ai_tokens_in: None,
             ai_tokens_out: None,
             ai_surface: None,
+            ai_realtime_session: None,
             content_shape_pricing: None,
             content_shape_transform: None,
             markdown_token_estimate: None,
