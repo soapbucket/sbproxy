@@ -112,6 +112,21 @@ impl GuardrailPipeline {
         None
     }
 
+    /// Check raw input text. Used for surfaces that don't carry a
+    /// chat-style `messages` array: image prompts (`body["prompt"]`),
+    /// audio speech input (`body["input"]`), and reranking queries
+    /// (`body["query"]`). The body-field-to-text extraction is
+    /// surface-specific and lives in
+    /// [`crate::handler::extract_input_text`].
+    pub fn check_input_text(&self, content: &str) -> Option<GuardrailBlock> {
+        for guard in &self.input {
+            if let Some(block) = guard.check(content) {
+                return Some(block);
+            }
+        }
+        None
+    }
+
     /// Check output content. Returns first block encountered.
     pub fn check_output(&self, content: &str) -> Option<GuardrailBlock> {
         for guard in &self.output {

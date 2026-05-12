@@ -51,13 +51,19 @@ pub fn parse_endpoint(path: &str) -> AiEndpoint {
 
 /// Check whether a provider supports a given AI endpoint.
 ///
-/// Provider capability matrix:
+/// Provider capability matrix, grounded in the actual provider APIs as of
+/// 2026-05:
 /// - All providers support `ChatCompletions` and `Models`.
 /// - OpenAI supports all endpoints.
-/// - Anthropic does not support embeddings or image generation.
-/// - Gemini supports all endpoints.
-/// - Cohere supports embeddings and reranking only (no chat/image/audio).
-/// - All other providers: only chat completions and models.
+/// - Anthropic supports only chat completions and models. The older
+///   variant of this matrix claimed Anthropic supported audio,
+///   reranking, and moderations; the production Anthropic API has none
+///   of those.
+/// - Gemini supports embeddings, image generation, audio (transcription
+///   and speech via the Gemini API), and reranking. Gemini does not
+///   support OpenAI's moderation endpoint shape.
+/// - Cohere supports embeddings and reranking (plus chat/models).
+/// - Unknown providers: only chat completions and models.
 pub fn provider_supports_endpoint(provider: &str, endpoint: &AiEndpoint) -> bool {
     match (provider, endpoint) {
         // Universal: all providers support chat and models.
@@ -67,14 +73,17 @@ pub fn provider_supports_endpoint(provider: &str, endpoint: &AiEndpoint) -> bool
         // OpenAI: supports everything.
         ("openai", _) => true,
 
-        // Anthropic: no embeddings, no image generation.
-        ("anthropic", AiEndpoint::Embeddings) => false,
-        ("anthropic", AiEndpoint::ImageGeneration) => false,
-        // Anthropic supports audio, reranking, moderations.
-        ("anthropic", _) => true,
+        // Anthropic: only chat + models. Everything else is unsupported.
+        ("anthropic", _) => false,
 
-        // Gemini: supports all endpoints.
-        ("gemini", _) => true,
+        // Gemini: embeddings, image, audio, reranking. No moderations
+        // (OpenAI shape); use Gemini's separate safety API instead.
+        ("gemini", AiEndpoint::Embeddings) => true,
+        ("gemini", AiEndpoint::ImageGeneration) => true,
+        ("gemini", AiEndpoint::AudioTranscription) => true,
+        ("gemini", AiEndpoint::AudioSpeech) => true,
+        ("gemini", AiEndpoint::Reranking) => true,
+        ("gemini", _) => false,
 
         // Cohere: only embeddings and reranking (plus chat/models covered above).
         ("cohere", AiEndpoint::Embeddings) => true,
@@ -82,6 +91,50 @@ pub fn provider_supports_endpoint(provider: &str, endpoint: &AiEndpoint) -> bool
         ("cohere", _) => false,
 
         // Unknown providers: only chat completions and models (covered above).
+        _ => false,
+    }
+}
+
+/// Check whether a provider supports a given AI surface.
+///
+/// Surface-level analogue of [`provider_supports_endpoint`]. Covers the
+/// stateful and WebSocket surfaces (assistants, threads, batches,
+/// fine-tuning, files, realtime) that the older [`AiEndpoint`] enum
+/// did not model.
+///
+/// The dispatch path uses this matrix to decide whether to return 501
+/// Not Implemented before any upstream call is made.
+pub fn provider_supports_surface(provider: &str, surface: &crate::handler::AiSurface) -> bool {
+    use crate::handler::AiSurface;
+    match (provider, surface) {
+        // Universal: chat + models.
+        (_, AiSurface::ChatCompletions) => true,
+        (_, AiSurface::Models) => true,
+
+        // OpenAI supports every shipped surface in this enum.
+        ("openai", _) => true,
+
+        // Anthropic: only chat + models (above). Everything else is false.
+        ("anthropic", _) => false,
+
+        // Gemini: embeddings, image generation, audio, reranking. No
+        // assistants, threads, batches, fine_tuning (Gemini has fine-
+        // tuning but at a different path; not the OpenAI shape), files
+        // in the OpenAI sense, realtime, image edits/variations,
+        // moderations.
+        ("gemini", AiSurface::Embeddings) => true,
+        ("gemini", AiSurface::ImageGeneration) => true,
+        ("gemini", AiSurface::AudioTranscription) => true,
+        ("gemini", AiSurface::AudioSpeech) => true,
+        ("gemini", AiSurface::Reranking) => true,
+        ("gemini", _) => false,
+
+        // Cohere: embeddings and reranking (plus chat/models above).
+        ("cohere", AiSurface::Embeddings) => true,
+        ("cohere", AiSurface::Reranking) => true,
+        ("cohere", _) => false,
+
+        // Unknown providers: chat + models only.
         _ => false,
     }
 }
@@ -229,43 +282,56 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_supports_audio_and_moderations() {
+    fn anthropic_supports_only_chat_and_models() {
+        // The Anthropic API does not expose OpenAI-shape audio,
+        // reranking, or moderations endpoints. Earlier versions of this
+        // matrix claimed it did; the matrix has been corrected to
+        // match the actual provider surface.
         assert!(provider_supports_endpoint(
             "anthropic",
-            &AiEndpoint::AudioTranscription
+            &AiEndpoint::ChatCompletions
         ));
-        assert!(provider_supports_endpoint(
-            "anthropic",
-            &AiEndpoint::AudioSpeech
-        ));
-        assert!(provider_supports_endpoint(
-            "anthropic",
-            &AiEndpoint::Moderations
-        ));
-        assert!(provider_supports_endpoint(
-            "anthropic",
-            &AiEndpoint::Reranking
-        ));
-    }
-
-    #[test]
-    fn gemini_supports_all_endpoints() {
-        let endpoints = [
-            AiEndpoint::ChatCompletions,
+        assert!(provider_supports_endpoint("anthropic", &AiEndpoint::Models));
+        for endpoint in &[
             AiEndpoint::Embeddings,
             AiEndpoint::Reranking,
             AiEndpoint::ImageGeneration,
             AiEndpoint::AudioTranscription,
             AiEndpoint::AudioSpeech,
             AiEndpoint::Moderations,
+        ] {
+            assert!(
+                !provider_supports_endpoint("anthropic", endpoint),
+                "anthropic should not advertise support for {endpoint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_supports_correct_endpoints() {
+        // Gemini supports embeddings, image generation, audio
+        // transcription, audio speech, and reranking on top of the
+        // universal chat/models. It does not support OpenAI's
+        // moderation endpoint shape; the operator should use Gemini's
+        // separate safety API instead.
+        for endpoint in &[
+            AiEndpoint::ChatCompletions,
             AiEndpoint::Models,
-        ];
-        for endpoint in &endpoints {
+            AiEndpoint::Embeddings,
+            AiEndpoint::ImageGeneration,
+            AiEndpoint::AudioTranscription,
+            AiEndpoint::AudioSpeech,
+            AiEndpoint::Reranking,
+        ] {
             assert!(
                 provider_supports_endpoint("gemini", endpoint),
                 "gemini should support {endpoint:?}"
             );
         }
+        assert!(!provider_supports_endpoint(
+            "gemini",
+            &AiEndpoint::Moderations
+        ));
     }
 
     #[test]
@@ -315,5 +381,130 @@ mod tests {
             "mystery-ai",
             &AiEndpoint::ImageGeneration
         ));
+    }
+
+    // --- provider_supports_surface coverage ---
+
+    #[test]
+    fn surface_matrix_universal_chat_and_models() {
+        use crate::handler::AiSurface;
+        for provider in &[
+            "openai",
+            "anthropic",
+            "gemini",
+            "cohere",
+            "unknown-provider",
+        ] {
+            assert!(
+                provider_supports_surface(provider, &AiSurface::ChatCompletions),
+                "{provider} should support chat completions"
+            );
+            assert!(
+                provider_supports_surface(provider, &AiSurface::Models),
+                "{provider} should support models"
+            );
+        }
+    }
+
+    #[test]
+    fn surface_matrix_openai_supports_all_shipped_surfaces() {
+        use crate::handler::AiSurface;
+        for surface in &[
+            AiSurface::ChatCompletions,
+            AiSurface::Models,
+            AiSurface::Embeddings,
+            AiSurface::Assistants,
+            AiSurface::Threads,
+            AiSurface::Batches,
+            AiSurface::FineTuning,
+            AiSurface::Files,
+            AiSurface::Realtime,
+            AiSurface::ImageGeneration,
+            AiSurface::ImageEdits,
+            AiSurface::ImageVariations,
+            AiSurface::AudioTranscription,
+            AiSurface::AudioSpeech,
+            AiSurface::Moderations,
+            AiSurface::Reranking,
+        ] {
+            assert!(
+                provider_supports_surface("openai", surface),
+                "openai should support {surface:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn surface_matrix_anthropic_only_chat_models() {
+        use crate::handler::AiSurface;
+        for surface in &[
+            AiSurface::Embeddings,
+            AiSurface::Assistants,
+            AiSurface::Threads,
+            AiSurface::Batches,
+            AiSurface::FineTuning,
+            AiSurface::Realtime,
+            AiSurface::ImageGeneration,
+            AiSurface::AudioTranscription,
+            AiSurface::Moderations,
+            AiSurface::Reranking,
+        ] {
+            assert!(
+                !provider_supports_surface("anthropic", surface),
+                "anthropic should not advertise support for {surface:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn surface_matrix_gemini_supports_correct_subset() {
+        use crate::handler::AiSurface;
+        // True for these:
+        for surface in &[
+            AiSurface::Embeddings,
+            AiSurface::ImageGeneration,
+            AiSurface::AudioTranscription,
+            AiSurface::AudioSpeech,
+            AiSurface::Reranking,
+        ] {
+            assert!(
+                provider_supports_surface("gemini", surface),
+                "gemini should support {surface:?}"
+            );
+        }
+        // False for these:
+        for surface in &[
+            AiSurface::Assistants,
+            AiSurface::Threads,
+            AiSurface::Batches,
+            AiSurface::FineTuning,
+            AiSurface::Realtime,
+            AiSurface::Moderations,
+        ] {
+            assert!(
+                !provider_supports_surface("gemini", surface),
+                "gemini should not advertise support for {surface:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn surface_matrix_cohere_only_embeddings_reranking() {
+        use crate::handler::AiSurface;
+        assert!(provider_supports_surface("cohere", &AiSurface::Embeddings));
+        assert!(provider_supports_surface("cohere", &AiSurface::Reranking));
+        for surface in &[
+            AiSurface::Assistants,
+            AiSurface::Threads,
+            AiSurface::Batches,
+            AiSurface::ImageGeneration,
+            AiSurface::AudioSpeech,
+            AiSurface::Moderations,
+        ] {
+            assert!(
+                !provider_supports_surface("cohere", surface),
+                "cohere should not advertise support for {surface:?}"
+            );
+        }
     }
 }

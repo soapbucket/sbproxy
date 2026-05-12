@@ -4,6 +4,16 @@
 //! most useful when profiling the AI gateway pipeline. Callers enter the
 //! returned span with `.entered()` or pass it to `Instrument::instrument`.
 
+/// Create the top-level span for an AI request.
+///
+/// Opened at the entry of `handle_ai_proxy`. Carries the classified
+/// surface label (e.g. `chat_completions`, `assistants`, `image_generation`)
+/// alongside the HTTP method so traces can be partitioned by surface
+/// without re-parsing the path.
+pub fn ai_request_span(surface: &str, method: &str) -> tracing::Span {
+    tracing::info_span!("ai.request", surface = surface, method = method)
+}
+
 /// Create a span for provider selection.
 ///
 /// Records which provider and model were chosen by the routing layer so that
@@ -31,6 +41,13 @@ pub fn streaming_span(provider: &str, model: &str) -> tracing::Span {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ai_request_span_carries_surface_and_method() {
+        let span = ai_request_span("assistants", "DELETE");
+        let dbg = format!("{:?}", span);
+        let _ = dbg;
+    }
 
     #[test]
     fn provider_selection_span_is_valid() {

@@ -62,6 +62,15 @@ pub fn reload_ai_client() {
 static BUDGET_TRACKER: std::sync::LazyLock<sbproxy_ai::BudgetTracker> =
     std::sync::LazyLock::new(sbproxy_ai::BudgetTracker::new);
 
+/// Process-wide per-surface rate limiter shared across all AI origins.
+///
+/// State is keyed by `AiSurface::label()` so that per-surface caps
+/// are enforced globally, not per-origin. Operators configure caps
+/// via `ai_handler_config.per_surface_rate_limits`; surfaces without
+/// an entry are uncapped.
+static AI_SURFACE_RATE_LIMITER: std::sync::LazyLock<sbproxy_ai::ratelimit::SurfaceRateLimiter> =
+    std::sync::LazyLock::new(sbproxy_ai::ratelimit::SurfaceRateLimiter::new);
+
 /// Borrow the process-wide AI budget tracker.
 ///
 /// Exposed so reload-path integration tests (and any future admin
@@ -3480,6 +3489,40 @@ impl SseUsageScanner {
 /// cost is estimated against the model the request actually
 /// executed against using the embedded price catalog in
 /// `sbproxy-ai/src/budget.rs`.
+/// Build and publish a per-surface `AiBillingEvent` for a request
+/// that has just returned a response from the upstream.
+///
+/// Phase 8 of the AI deep-integration plan: every dispatched AI
+/// request emits a billing event onto the observability bus and into
+/// the in-process `BudgetTracker`. Non-chat surfaces (image, audio,
+/// moderations, reranking, files, batches, fine-tuning) ship today
+/// as `PerCall` events with `cost_usd = 0.0`; per-unit pricing for
+/// images, audio seconds, and rerank documents lands when the
+/// pricing tables ship. Chat completions continue to bill through
+/// `record_budget_usage` until the chat usage-extraction is reworked
+/// to emit the new event shape.
+fn emit_ai_billing_event(
+    surface_label: &str,
+    provider_name: &str,
+    model: Option<String>,
+    usage: sbproxy_ai::budget::AiUsage,
+    cost_usd: f64,
+    scope_keys: Vec<String>,
+) {
+    let event =
+        sbproxy_ai::budget::AiBillingEvent::from_label(surface_label, provider_name, model, usage)
+            .with_cost(cost_usd)
+            .with_scope_keys(scope_keys);
+    sbproxy_ai::budget::record_billing_event(&BUDGET_TRACKER, &event);
+    tracing::info!(
+        ai.surface = event.surface.as_str(),
+        ai.provider = event.provider.as_str(),
+        ai.cost_usd = event.cost_usd,
+        ai.occurred_at_unix_secs = event.occurred_at_unix_secs,
+        "AI billing event"
+    );
+}
+
 fn record_budget_usage(
     cfg: &sbproxy_ai::BudgetConfig,
     keys: &[(usize, String)],
@@ -3572,7 +3615,91 @@ async fn handle_ai_proxy(
     origin_idx: Option<usize>,
 ) -> Result<()> {
     let method = session.req_header().method.clone();
+    let method_str = method.as_str().to_string();
     let path = session.req_header().uri.path().to_string();
+
+    // Classify the AI surface for observability. Phase 1 tags every
+    // request with a surface label; per-surface dispatch handlers land
+    // in later phases. See docs/ai-deep-integration-blueprint.md.
+    let surface = sbproxy_ai::handler::classify_surface(&method_str, &path);
+    let surface_label = surface.label();
+    debug!(
+        ai.surface = surface_label,
+        method = %method_str,
+        path = %path,
+        "AI proxy: classified surface"
+    );
+    // Stamp the surface label onto the request context so the access
+    // log line carries it alongside the existing `ai_provider`,
+    // `ai_model`, and token-count fields.
+    ctx.ai_surface = Some(surface_label.to_string());
+
+    // Create the top-level request span. The span is registered with
+    // the subscriber (so OTel-style exporters see it as part of the
+    // trace tree) but we do not `.enter()` it because the resulting
+    // guard is `!Send` and `request_filter` is an async function that
+    // must be `Send`. The surface field is carried by the explicit
+    // `debug!` above and by the per-surface metrics below.
+    let _ai_span = sbproxy_ai::tracing_spans::ai_request_span(surface_label, &method_str);
+
+    // Increment the per-surface request counter and start the latency
+    // clock. The latency guard records elapsed time at function exit
+    // regardless of which dispatch path the request takes (success,
+    // upstream error, early-return on validation failure).
+    sbproxy_ai::ai_metrics::record_surface_request(surface_label, &method_str);
+    let _ai_latency_guard =
+        sbproxy_ai::ai_metrics::AiSurfaceLatencyGuard::new(surface_label, method_str.clone());
+
+    // Phase 8: per-surface rate limit. Operators configure these via
+    // `ai_handler_config.per_surface_rate_limits` keyed by the
+    // surface label. Surfaces without a config entry are uncapped.
+    // Returns 429 before any upstream call when the per-minute cap
+    // has been reached.
+    if let Some(surface_cfg) = config.per_surface_rate_limits.get(surface_label) {
+        if !AI_SURFACE_RATE_LIMITER.check_rate(surface_label, surface_cfg) {
+            warn!(
+                ai.surface = surface_label,
+                method = %method_str,
+                "AI proxy: per-surface rate limit hit; returning 429"
+            );
+            send_error(session, 429, "per-surface rate limit exceeded").await?;
+            return Ok(());
+        }
+    }
+
+    // Gate non-universal surfaces on provider capability. Surfaces
+    // that aren't implemented by every provider (assistants, threads,
+    // batches, fine-tuning, files, realtime, image, audio,
+    // moderations, reranking, embeddings) are rejected with 501 when
+    // no configured provider supports them. Chat completions, models,
+    // and unrecognized paths bypass this gate; the former are
+    // universal, the latter falls through to the existing dispatch
+    // which 404s at the upstream.
+    if !matches!(
+        surface,
+        sbproxy_ai::handler::AiSurface::ChatCompletions
+            | sbproxy_ai::handler::AiSurface::Models
+            | sbproxy_ai::handler::AiSurface::Unknown
+    ) {
+        let any_supports = config
+            .providers
+            .iter()
+            .any(|p| sbproxy_ai::api_routes::provider_supports_surface(&p.name, &surface));
+        if !any_supports {
+            warn!(
+                ai.surface = surface_label,
+                method = %method_str,
+                "AI proxy: no configured provider supports this surface; returning 501"
+            );
+            send_error(
+                session,
+                501,
+                "no configured AI provider supports this surface",
+            )
+            .await?;
+            return Ok(());
+        }
+    }
 
     // Build a router for provider selection.
     let router = AiRouter::new(config.routing.clone(), config.providers.len());
@@ -3598,11 +3725,184 @@ async fn handle_ai_proxy(
         // Anthropic's models listing has a different shape and most
         // OpenAI clients don't depend on it for routing decisions.
         let format = sbproxy_ai::client::provider_format(provider);
+        emit_ai_billing_event(
+            surface_label,
+            &provider.name,
+            None,
+            sbproxy_ai::budget::AiUsage::PerCall,
+            0.0,
+            Vec::new(),
+        );
+        return relay_ai_response(session, resp, format, config.max_body_size).await;
+    }
+
+    // Methods other than GET/POST forward through the method-aware
+    // client without engaging the chat-completions body-parse pipeline
+    // (no body for DELETE/HEAD; body preserved as-is for PUT/PATCH).
+    // Per-surface guardrails, budget enforcement, and PII redaction for
+    // these methods are deferred to later phases; for Phase 1 the goal
+    // is to dispatch without misrouting DELETE as POST.
+    if matches!(
+        method,
+        http::Method::DELETE
+            | http::Method::HEAD
+            | http::Method::PUT
+            | http::Method::PATCH
+            | http::Method::OPTIONS
+    ) {
+        let provider_idx = router.select(&config.providers).ok_or_else(|| {
+            warn!("AI proxy: no enabled providers");
+            Error::new(ErrorType::HTTPStatus(502))
+        })?;
+        let provider = &config.providers[provider_idx];
+
+        // Read the body for methods that typically carry one. DELETE,
+        // HEAD, OPTIONS go through without a body.
+        let body_opt: Option<serde_json::Value> = if matches!(
+            method,
+            http::Method::PUT | http::Method::PATCH
+        ) {
+            let body_bytes = session.read_request_body().await?.unwrap_or_default();
+            if body_bytes.is_empty() {
+                None
+            } else {
+                match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        warn!(error = %e, "AI proxy: invalid JSON body on method-aware request");
+                        send_error(session, 400, "invalid JSON body").await?;
+                        return Ok(());
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
+        let resp = AI_CLIENT
+            .load()
+            .forward_with_method(provider, &method_str, &path, body_opt.as_ref())
+            .await
+            .map_err(|e| {
+                warn!(
+                    error = %e,
+                    method = %method_str,
+                    ai.surface = surface.label(),
+                    "AI proxy: upstream method-aware request failed"
+                );
+                Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
+            })?;
+
+        let format = sbproxy_ai::client::provider_format(provider);
+        emit_ai_billing_event(
+            surface_label,
+            &provider.name,
+            None,
+            sbproxy_ai::budget::AiUsage::PerCall,
+            0.0,
+            Vec::new(),
+        );
         return relay_ai_response(session, resp, format, config.max_body_size).await;
     }
 
     // POST requests: read the body, parse JSON, select provider, forward.
     let body_bytes = session.read_request_body().await?.unwrap_or_default();
+
+    // Multipart short-circuit: surfaces that carry multipart bodies
+    // (audio transcriptions, image edits, image variations, file
+    // uploads) must not be JSON-parsed. We byte-forward the body
+    // verbatim with the inbound Content-Type preserved so the
+    // upstream provider parses it normally.
+    let request_content_type = session
+        .req_header()
+        .headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if request_content_type
+        .to_ascii_lowercase()
+        .starts_with("multipart/")
+    {
+        let provider_idx = router.select(&config.providers).ok_or_else(|| {
+            warn!("AI proxy: no enabled providers");
+            Error::new(ErrorType::HTTPStatus(502))
+        })?;
+        let provider = &config.providers[provider_idx];
+
+        let resp = AI_CLIENT
+            .load()
+            .forward_bytes(
+                provider,
+                &method_str,
+                &path,
+                body_bytes,
+                &request_content_type,
+            )
+            .await
+            .map_err(|e| {
+                warn!(
+                    error = %e,
+                    method = %method_str,
+                    ai.surface = surface_label,
+                    content_type = %request_content_type,
+                    "AI proxy: upstream multipart request failed"
+                );
+                Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
+            })?;
+
+        let format = sbproxy_ai::client::provider_format(provider);
+
+        // For audio_transcription requests, peek at the response body
+        // to extract `duration` (present when the operator requests
+        // verbose_json output) so the billing event reflects the real
+        // audio length instead of falling back to PerCall. Other
+        // multipart surfaces (image edits/variations, file upload)
+        // continue to emit PerCall here; their per-unit usage is
+        // captured on the request side and emitted in the chat path.
+        if surface_label == "audio_transcription" {
+            let status = resp.status().as_u16();
+            let resp_ct = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/json")
+                .to_string();
+            let resp_bytes = read_capped_response_body(resp, config.max_body_size).await?;
+            // Whisper is the only OpenAI transcription model today;
+            // the inbound body is multipart so the model is not in a
+            // JSON field. Default to `whisper-1` for cost lookup; a
+            // future commit that parses multipart fields can refine.
+            let model = Some("whisper-1".to_string());
+            let duration = serde_json::from_slice::<serde_json::Value>(&resp_bytes)
+                .ok()
+                .and_then(|v| v.get("duration").and_then(|d| d.as_f64()));
+            let usage = match duration {
+                Some(secs) => sbproxy_ai::budget::AiUsage::AudioSeconds { seconds: secs },
+                None => sbproxy_ai::budget::AiUsage::PerCall,
+            };
+            let cost = sbproxy_ai::budget::estimate_cost_for_usage("whisper-1", &usage);
+            emit_ai_billing_event(
+                surface_label,
+                &provider.name,
+                model,
+                usage,
+                cost,
+                Vec::new(),
+            );
+            return send_response(session, status, &resp_ct, &resp_bytes).await;
+        }
+
+        emit_ai_billing_event(
+            surface_label,
+            &provider.name,
+            None,
+            sbproxy_ai::budget::AiUsage::PerCall,
+            0.0,
+            Vec::new(),
+        );
+        return relay_ai_response(session, resp, format, config.max_body_size).await;
+    }
 
     let mut body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
@@ -3892,6 +4192,33 @@ async fn handle_ai_proxy(
                     send_response(session, 400, "application/json", &body_bytes).await?;
                     return Ok(());
                 }
+
+                // Per-surface input guardrails: image generation,
+                // audio speech, reranking, and moderations carry user
+                // input in a non-messages field (`prompt`, `input`,
+                // `query`). The same guardrail pipeline applies to
+                // that text via check_input_text. Chat-shape surfaces
+                // are already covered by the messages check above.
+                if let Some(text) = sbproxy_ai::handler::extract_input_text(&surface, &body) {
+                    if let Some(block) = pipeline.check_input_text(&text) {
+                        warn!(
+                            ai.surface = surface_label,
+                            guardrail = %block.name,
+                            reason = %block.reason,
+                            "AI proxy: per-surface input guardrail blocked request"
+                        );
+                        let error_body = serde_json::json!({
+                            "error": {
+                                "message": block.reason,
+                                "type": "guardrail_violation",
+                                "code": block.name,
+                            }
+                        });
+                        let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+                        send_response(session, 400, "application/json", &body_bytes).await?;
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -3906,6 +4233,44 @@ async fn handle_ai_proxy(
     let is_failover = matches!(config.routing, sbproxy_ai::RoutingStrategy::FallbackChain);
     // Default retry-on-status codes for failover.
     let retry_statuses: Vec<u16> = vec![500, 502, 503];
+
+    // Surface-specific request-body inspection captured once before
+    // the failover loop so each attempt's BudgetRecorderArgs carries
+    // the same record. For image_generation, we capture the `size`
+    // field so the response-side billing event can emit an
+    // `Images { count, resolution }` variant with a real resolution.
+    let image_resolution_for_billing: Option<String> =
+        if matches!(surface, sbproxy_ai::handler::AiSurface::ImageGeneration) {
+            body.get("size").and_then(|v| v.as_str()).map(String::from)
+        } else {
+            None
+        };
+
+    // For audio speech, capture the input character count once
+    // before the failover loop. The TTS provider bills per character
+    // of `input` text; counting at the request boundary is exact and
+    // doesn't require parsing the binary audio response body.
+    let audio_speech_characters_for_billing: Option<u64> =
+        if matches!(surface, sbproxy_ai::handler::AiSurface::AudioSpeech) {
+            body.get("input")
+                .and_then(|v| v.as_str())
+                .map(|s| s.chars().count() as u64)
+        } else {
+            None
+        };
+
+    // For reranking, capture the document count from the request
+    // body. The provider bills per document scored; counting at the
+    // request boundary is exact (reranking responses always return
+    // exactly as many results as documents in the request).
+    let rerank_documents_for_billing: Option<u64> =
+        if matches!(surface, sbproxy_ai::handler::AiSurface::Reranking) {
+            body.get("documents")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len() as u64)
+        } else {
+            None
+        };
 
     // Parse retry config from the action config's routing.retry section.
     // This is done by inspecting the raw handler config.
@@ -3938,6 +4303,11 @@ async fn handle_ai_proxy(
     // resolver so a Vertex / Bedrock / Cohere host picks the right
     // parser without operators having to override `usage_parser`.
     let mut last_upstream_host: Option<String> = None;
+    // Track the provider name that produced `last_resp` so the
+    // billing event emission outside the for loop can attribute the
+    // request to the right provider without re-deriving from
+    // `provider_idx`.
+    let mut last_provider_name: String = String::new();
 
     for (attempt, &provider_idx) in provider_order.iter().enumerate() {
         if attempt >= max_attempts {
@@ -3993,6 +4363,7 @@ async fn handle_ai_proxy(
                 last_upstream_host = url::Url::parse(&provider.effective_base_url())
                     .ok()
                     .and_then(|u| u.host_str().map(|h| h.to_string()));
+                last_provider_name = provider.name.clone();
                 last_resp = Some(resp);
                 break;
             }
@@ -4068,6 +4439,11 @@ async fn handle_ai_proxy(
                 config: b,
                 keys: &budget_keys,
                 model: model.as_str(),
+                surface_label,
+                provider_name: last_provider_name.as_str(),
+                image_resolution: image_resolution_for_billing.clone(),
+                audio_speech_characters: audio_speech_characters_for_billing,
+                rerank_documents: rerank_documents_for_billing,
             });
             // Capture parser hints from the upstream response before it
             // gets moved into relay_ai_stream. The streaming relay
@@ -4115,6 +4491,11 @@ async fn handle_ai_proxy(
                 config: b,
                 keys: &budget_keys,
                 model: model.as_str(),
+                surface_label,
+                provider_name: last_provider_name.as_str(),
+                image_resolution: image_resolution_for_billing.clone(),
+                audio_speech_characters: audio_speech_characters_for_billing,
+                rerank_documents: rerank_documents_for_billing,
             });
             relay_ai_response_with_cache(
                 session,
@@ -4377,6 +4758,51 @@ async fn relay_ai_response_with_cache(
                 prompt_tokens,
                 completion_tokens,
             );
+            // Emit a surface-tagged AiBillingEvent alongside the
+            // existing budget recording. Token-bearing responses
+            // emit a Tokens variant. Image generation responses use
+            // the captured request resolution plus a count parsed
+            // from the response's `data` array. Other non-token
+            // surfaces (audio speech, moderations through the POST
+            // path) fall back to PerCall.
+            let usage = if prompt_tokens != 0 || completion_tokens != 0 {
+                sbproxy_ai::budget::AiUsage::Tokens {
+                    input: prompt_tokens,
+                    output: completion_tokens,
+                }
+            } else if args.surface_label == "image_generation" {
+                let count = serde_json::from_slice::<serde_json::Value>(&resp_body)
+                    .ok()
+                    .and_then(|v| v.get("data").and_then(|d| d.as_array()).map(|a| a.len()))
+                    .unwrap_or(0) as u32;
+                sbproxy_ai::budget::AiUsage::Images {
+                    count,
+                    resolution: args
+                        .image_resolution
+                        .clone()
+                        .unwrap_or_else(|| "1024x1024".to_string()),
+                }
+            } else if args.surface_label == "audio_speech" {
+                sbproxy_ai::budget::AiUsage::Characters {
+                    count: args.audio_speech_characters.unwrap_or(0),
+                }
+            } else if args.surface_label == "reranking" {
+                sbproxy_ai::budget::AiUsage::RerankUnits {
+                    documents: args.rerank_documents.unwrap_or(0),
+                }
+            } else {
+                sbproxy_ai::budget::AiUsage::PerCall
+            };
+            let cost = sbproxy_ai::budget::estimate_cost_for_usage(args.model, &usage);
+            let scope_keys = args.keys.iter().map(|(_, k)| k.clone()).collect::<Vec<_>>();
+            emit_ai_billing_event(
+                args.surface_label,
+                args.provider_name,
+                Some(args.model.to_string()),
+                usage,
+                cost,
+                scope_keys,
+            );
         }
     } else if let Some(ctx) = ctx {
         // Even without a budget recorder we still want the access log
@@ -4407,6 +4833,30 @@ struct BudgetRecorderArgs<'a> {
     /// Model the request actually ran against (after any downgrade).
     /// Drives cost estimation via the embedded price catalog.
     model: &'a str,
+    /// Classified AI surface (`chat_completions`, `embeddings`,
+    /// `assistants`, `image_generation`, ...). Carried through so
+    /// the relay function can emit a surface-tagged
+    /// `AiBillingEvent` alongside the budget recording.
+    surface_label: &'a str,
+    /// Provider that received the dispatched request. Same source
+    /// of truth as the `provider` field in the access log.
+    provider_name: &'a str,
+    /// For image generation requests, the resolution requested
+    /// (e.g. `1024x1024`, `1024x1792`). Captured from the inbound
+    /// request body at dispatch time and threaded here so the
+    /// relay function can emit an `Images { count, resolution }`
+    /// billing event with the resolution from the request.
+    image_resolution: Option<String>,
+    /// For audio speech requests, the character count of the input
+    /// text (`body["input"]`). Captured at dispatch time so the
+    /// relay function can emit a `Characters { count }` billing
+    /// event scaled to the TTS provider's per-character rate.
+    audio_speech_characters: Option<u64>,
+    /// For reranking requests, the number of documents to score
+    /// (length of `body["documents"]`). Captured at dispatch time
+    /// so the relay function can emit a `RerankUnits { documents }`
+    /// billing event scaled to the provider's per-document rate.
+    rerank_documents: Option<u64>,
 }
 
 /// Inputs to the streaming-cache recorder hook, bundled to keep
@@ -4684,6 +5134,26 @@ async fn relay_ai_stream(
                     args.model,
                     tokens.prompt_tokens as u64,
                     tokens.completion_tokens as u64,
+                );
+                let prompt = tokens.prompt_tokens as u64;
+                let completion = tokens.completion_tokens as u64;
+                let usage = if prompt != 0 || completion != 0 {
+                    sbproxy_ai::budget::AiUsage::Tokens {
+                        input: prompt,
+                        output: completion,
+                    }
+                } else {
+                    sbproxy_ai::budget::AiUsage::PerCall
+                };
+                let cost = sbproxy_ai::budget::estimate_cost_for_usage(args.model, &usage);
+                let scope_keys = args.keys.iter().map(|(_, k)| k.clone()).collect::<Vec<_>>();
+                emit_ai_billing_event(
+                    args.surface_label,
+                    args.provider_name,
+                    Some(args.model.to_string()),
+                    usage,
+                    cost,
+                    scope_keys,
                 );
             }
         }
@@ -10768,6 +11238,7 @@ fn emit_access_log(
         model: ctx.ai_model.clone(),
         tokens_in: ctx.ai_tokens_in,
         tokens_out: ctx.ai_tokens_out,
+        ai_surface: ctx.ai_surface.clone(),
         cache_result,
         // Wave 6 / G6.2 access-log v1 fields. Most surface stamping
         // lands as the request flows through the pipeline (e.g.
@@ -10839,6 +11310,10 @@ struct AccessLogContext {
     tokens_in: Option<u64>,
     /// Completion / output tokens generated.
     tokens_out: Option<u64>,
+    /// Classified AI surface label (`chat_completions`, `assistants`,
+    /// `image_generation`, ...). Stamped by `handle_ai_proxy` so the
+    /// access log carries it alongside provider/model/token counts.
+    ai_surface: Option<String>,
     /// Cache result label (`hit`, `miss`, `stale`, `bypass`) when
     /// the response cache ran.
     cache_result: Option<String>,
@@ -10900,6 +11375,7 @@ impl AccessLogContext {
             model: None,
             tokens_in: None,
             tokens_out: None,
+            ai_surface: None,
             cache_result: None,
             tier: None,
             shape: None,
@@ -10990,6 +11466,7 @@ fn emit_access_log_entry(
         model: context.model,
         tokens_in: context.tokens_in,
         tokens_out: context.tokens_out,
+        ai_surface: context.ai_surface,
         trace_id,
         cache_result: context.cache_result,
         envelope_request_id: context.envelope_request_id,

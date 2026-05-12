@@ -7,6 +7,16 @@
 //! `data:` line and records the largest `(prompt, completion)` pair
 //! it sees.
 //!
+//! The parser also handles **OpenAI Assistants v2 run streams**.
+//! Run streams use typed events like
+//! `event: thread.run.completed\ndata: {...}\n\n`. The parser
+//! ignores every `event:` line (lines that don't start with `data:`
+//! return early) and finds `usage` inside any `data:` payload it
+//! sees, so the terminal `thread.run.completed` event with its
+//! `usage` block is recorded the same way as the chat-completions
+//! terminal frame. No surface-aware code is required to extract
+//! token usage from a run stream.
+//!
 //! Real-world streams may interleave keep-alive comments (`: ping`)
 //! and frames without `usage`; both are silently ignored. JSON parse
 //! failures are also ignored: a malformed upstream chunk must never
@@ -197,5 +207,66 @@ mod tests {
     fn snapshot_none_on_empty_stream() {
         let p = OpenAiUsageParser::new();
         assert!(p.snapshot().is_none());
+    }
+
+    // --- Assistants v2 run stream compatibility (Phase 3c) ---
+
+    #[test]
+    fn captures_usage_from_run_completed_event() {
+        // OpenAI Assistants v2 run streams use typed events. The
+        // parser must skip the `event:` lines and read `usage`
+        // from the `data:` payload of the terminal
+        // `thread.run.completed` event.
+        let mut p = OpenAiUsageParser::new();
+        let body = b"event: thread.run.created\n\
+                     data: {\"id\":\"run_abc\",\"object\":\"thread.run\",\"status\":\"queued\"}\n\n\
+                     event: thread.message.delta\n\
+                     data: {\"id\":\"msg_xyz\",\"delta\":{\"content\":[{\"type\":\"text\",\"text\":{\"value\":\"hello\"}}]}}\n\n\
+                     event: thread.run.completed\n\
+                     data: {\"id\":\"run_abc\",\"status\":\"completed\",\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":34,\"total_tokens\":154}}\n\n\
+                     event: done\n\
+                     data: [DONE]\n\n";
+        p.feed(body);
+        assert_eq!(
+            p.snapshot(),
+            Some(UsageTokens {
+                prompt_tokens: 120,
+                completion_tokens: 34,
+            }),
+            "the terminal thread.run.completed usage block should be captured"
+        );
+    }
+
+    #[test]
+    fn ignores_event_lines_without_data_payload() {
+        // A stream of typed events without a usage block should not
+        // produce a snapshot. The parser must not invent counts.
+        let mut p = OpenAiUsageParser::new();
+        let body = b"event: thread.run.created\n\
+                     data: {\"id\":\"run_abc\",\"status\":\"queued\"}\n\n\
+                     event: thread.message.delta\n\
+                     data: {\"id\":\"msg_xyz\",\"delta\":{}}\n\n\
+                     event: thread.run.failed\n\
+                     data: {\"id\":\"run_abc\",\"status\":\"failed\"}\n\n";
+        p.feed(body);
+        assert!(p.snapshot().is_none(), "no usage block, no snapshot");
+    }
+
+    #[test]
+    fn run_stream_chunks_split_across_event_and_data_lines() {
+        // Verify the line-buffer carries partial event-prefix lines
+        // across chunk boundaries the same way it handles partial
+        // data: lines.
+        let mut p = OpenAiUsageParser::new();
+        p.feed(b"event: thread.run.completed\ndata: {\"usa");
+        assert!(p.snapshot().is_none(), "incomplete data line so far");
+        p.feed(b"ge\":{\"prompt_tokens\":7,\"completion_tokens\":11}}\n\n");
+        assert_eq!(
+            p.snapshot(),
+            Some(UsageTokens {
+                prompt_tokens: 7,
+                completion_tokens: 11,
+            })
+        );
     }
 }

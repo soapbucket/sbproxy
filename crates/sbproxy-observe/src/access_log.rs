@@ -57,6 +57,11 @@ pub struct AccessLogEntry {
     /// Completion / output tokens generated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_out: Option<u64>,
+    /// Classified AI surface label (`chat_completions`, `assistants`,
+    /// `image_generation`, ...) for AI gateway requests. None for
+    /// non-AI origins or when the surface could not be classified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_surface: Option<String>,
     /// W3C trace-id for distributed tracing correlation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
@@ -384,6 +389,7 @@ impl Default for AccessLogEntry {
             model: None,
             tokens_in: None,
             tokens_out: None,
+            ai_surface: None,
             trace_id: None,
             cache_result: None,
             envelope_request_id: None,
@@ -599,6 +605,7 @@ mod tests {
             model: None,
             tokens_in: None,
             tokens_out: None,
+            ai_surface: None,
             trace_id: None,
             cache_result: None,
             envelope_request_id: None,

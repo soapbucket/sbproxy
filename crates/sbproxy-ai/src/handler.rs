@@ -8,7 +8,7 @@ use crate::budget::BudgetConfig;
 use crate::guardrails::GuardrailsConfig;
 use crate::identity::VirtualKeyConfig;
 use crate::provider::ProviderConfig;
-use crate::ratelimit::ModelRateConfig;
+use crate::ratelimit::{ModelRateConfig, SurfaceRateConfig};
 use crate::routing::RoutingStrategy;
 
 /// AI gateway handler configuration.
@@ -40,6 +40,13 @@ pub struct AiHandlerConfig {
     /// Per-model rate limit overrides keyed by model name.
     #[serde(default)]
     pub model_rate_limits: HashMap<String, ModelRateConfig>,
+    /// Per-surface rate-limit overrides keyed by surface label
+    /// (`chat_completions`, `assistants`, `image_generation`, etc.;
+    /// see [`crate::handler::AiSurface::label`]). Operators may cap
+    /// expensive surfaces (image generation, realtime) independently
+    /// of chat. Surfaces without an entry are not capped.
+    #[serde(default)]
+    pub per_surface_rate_limits: HashMap<String, SurfaceRateConfig>,
     /// Maximum concurrent in-flight requests per provider.
     #[serde(default)]
     pub max_concurrent: Option<HashMap<String, u32>>,
@@ -378,6 +385,12 @@ impl AiHandlerConfig {
 }
 
 /// Detected AI API path type.
+///
+/// Superseded by [`AiSurface`], which covers the full OpenAI-compatible
+/// surface area (assistants, threads, batches, fine-tuning, files,
+/// realtime, image, audio, moderations, reranking) in addition to the
+/// three originally recognised endpoints. Kept for source compatibility
+/// with downstream callers; new code should use `AiSurface`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AiApiPath {
     /// OpenAI-compatible chat completions endpoint.
@@ -391,6 +404,9 @@ pub enum AiApiPath {
 }
 
 /// Parse a request path to determine the AI API endpoint type.
+///
+/// Superseded by [`classify_surface`]. Retained for source-compatible
+/// callers; the dispatch path now uses `classify_surface`.
 pub fn parse_ai_path(path: &str) -> AiApiPath {
     if path.ends_with("/chat/completions") {
         AiApiPath::ChatCompletions
@@ -400,6 +416,168 @@ pub fn parse_ai_path(path: &str) -> AiApiPath {
         AiApiPath::Embeddings
     } else {
         AiApiPath::Unknown
+    }
+}
+
+/// Classified AI API surface for a given request.
+///
+/// Unifies the older `AiApiPath` and `AiEndpoint` enums. Every variant
+/// corresponds to a distinct dispatch path inside `handle_ai_proxy`.
+/// New variants may be added in minor releases; pattern matches must
+/// include a wildcard arm.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AiSurface {
+    /// `POST /v1/chat/completions`.
+    ChatCompletions,
+    /// `GET /v1/models` or `GET /v1/models/{id}`.
+    Models,
+    /// `POST /v1/embeddings`.
+    Embeddings,
+    /// `/v1/assistants` and `/v1/assistants/{id}` (all methods).
+    Assistants,
+    /// `/v1/threads` and any sub-path (`messages`, `runs`, `cancel`, ...).
+    Threads,
+    /// `/v1/batches` and `/v1/batches/{id}` (and `/cancel`).
+    Batches,
+    /// `/v1/fine_tuning/jobs` and sub-paths (`events`, `cancel`).
+    FineTuning,
+    /// `/v1/files`, `/v1/files/{id}`, `/v1/files/{id}/content`.
+    Files,
+    /// `GET /v1/realtime` (WebSocket upgrade).
+    Realtime,
+    /// `POST /v1/images/generations`.
+    ImageGeneration,
+    /// `POST /v1/images/edits` (multipart body).
+    ImageEdits,
+    /// `POST /v1/images/variations` (multipart body).
+    ImageVariations,
+    /// `POST /v1/audio/transcriptions` (multipart body).
+    AudioTranscription,
+    /// `POST /v1/audio/speech` (binary response body).
+    AudioSpeech,
+    /// `POST /v1/moderations`.
+    Moderations,
+    /// `POST /v1/rerank` or `POST /v1/reranking`.
+    Reranking,
+    /// Path did not match any known AI surface.
+    Unknown,
+}
+
+impl AiSurface {
+    /// Short identifier suitable for metric labels and tracing
+    /// attributes. Stable across versions.
+    pub fn label(&self) -> &'static str {
+        match self {
+            AiSurface::ChatCompletions => "chat_completions",
+            AiSurface::Models => "models",
+            AiSurface::Embeddings => "embeddings",
+            AiSurface::Assistants => "assistants",
+            AiSurface::Threads => "threads",
+            AiSurface::Batches => "batches",
+            AiSurface::FineTuning => "fine_tuning",
+            AiSurface::Files => "files",
+            AiSurface::Realtime => "realtime",
+            AiSurface::ImageGeneration => "image_generation",
+            AiSurface::ImageEdits => "image_edits",
+            AiSurface::ImageVariations => "image_variations",
+            AiSurface::AudioTranscription => "audio_transcription",
+            AiSurface::AudioSpeech => "audio_speech",
+            AiSurface::Moderations => "moderations",
+            AiSurface::Reranking => "reranking",
+            AiSurface::Unknown => "unknown",
+        }
+    }
+}
+
+/// Extract the surface-specific input-text field from a parsed JSON
+/// body, suitable for running through input guardrails or PII
+/// redactors.
+///
+/// Different surfaces carry user input in different body fields:
+/// image generation/edits/variations uses `body["prompt"]`, audio
+/// speech synthesis uses `body["input"]`, and reranking uses
+/// `body["query"]`. Chat-shape surfaces (ChatCompletions, Assistants,
+/// Threads) carry input in `body["messages"]` and should be guarded
+/// via [`crate::guardrails::GuardrailPipeline::check_input`] instead.
+///
+/// Returns `None` for surfaces whose input is not a single text field
+/// (chat-shape surfaces, binary/multipart surfaces, GET-only surfaces).
+pub fn extract_input_text(surface: &AiSurface, body: &serde_json::Value) -> Option<String> {
+    let field = match surface {
+        AiSurface::ImageGeneration | AiSurface::ImageEdits | AiSurface::ImageVariations => "prompt",
+        AiSurface::AudioSpeech => "input",
+        AiSurface::Reranking => "query",
+        AiSurface::Moderations => "input",
+        _ => return None,
+    };
+    body.get(field)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Classify an inbound request path (and method, where it disambiguates)
+/// into an [`AiSurface`].
+///
+/// The classifier is method-aware where the OpenAI API uses the same path
+/// for different surfaces (none today, but the signature reserves the
+/// option). Paths are matched after stripping any `/v1` or `/api/v1`
+/// prefix and any trailing slash, so the proxy works regardless of
+/// whether the operator's clients send canonical or prefixed paths.
+pub fn classify_surface(_method: &str, path: &str) -> AiSurface {
+    // Strip query string and trailing slash, then strip any /v1 or
+    // /api/v1 prefix.
+    let path = path.split('?').next().unwrap_or(path);
+    let path = path.trim_end_matches('/');
+    let path = path
+        .strip_prefix("/api/v1")
+        .or_else(|| path.strip_prefix("/v1"))
+        .unwrap_or(path);
+    let path = if path.is_empty() { "/" } else { path };
+
+    // Split into segments for prefix-aware matching.
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    match segments.as_slice() {
+        ["chat", "completions"] => AiSurface::ChatCompletions,
+        ["models"] | ["models", _] => AiSurface::Models,
+        ["embeddings"] => AiSurface::Embeddings,
+
+        // Assistants and any sub-path.
+        ["assistants", ..] => AiSurface::Assistants,
+
+        // Threads and any sub-path (messages, runs, cancel).
+        ["threads", ..] => AiSurface::Threads,
+
+        // Batches and any sub-path.
+        ["batches", ..] => AiSurface::Batches,
+
+        // Fine-tuning: OpenAI uses `/v1/fine_tuning/jobs[/...]`.
+        ["fine_tuning", ..] => AiSurface::FineTuning,
+
+        // Files and content sub-path.
+        ["files"] | ["files", _] | ["files", _, "content"] => AiSurface::Files,
+
+        // Realtime WebSocket.
+        ["realtime", ..] => AiSurface::Realtime,
+
+        // Image surfaces. `generations` does not take a multipart body;
+        // `edits` and `variations` do.
+        ["images", "generations"] => AiSurface::ImageGeneration,
+        ["images", "edits"] => AiSurface::ImageEdits,
+        ["images", "variations"] => AiSurface::ImageVariations,
+
+        // Audio.
+        ["audio", "transcriptions"] => AiSurface::AudioTranscription,
+        ["audio", "translations"] => AiSurface::AudioTranscription, // same dispatch
+        ["audio", "speech"] => AiSurface::AudioSpeech,
+
+        ["moderations"] => AiSurface::Moderations,
+
+        // Reranking has two canonical names.
+        ["rerank"] | ["reranking"] => AiSurface::Reranking,
+
+        _ => AiSurface::Unknown,
     }
 }
 
@@ -447,6 +625,7 @@ mod tests {
             budget: None,
             virtual_keys: vec![],
             model_rate_limits: HashMap::new(),
+            per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
             resilience: None,
             shadow: None,
@@ -471,6 +650,7 @@ mod tests {
             budget: None,
             virtual_keys: vec![],
             model_rate_limits: HashMap::new(),
+            per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
             resilience: None,
             shadow: None,
@@ -495,6 +675,7 @@ mod tests {
             budget: None,
             virtual_keys: vec![],
             model_rate_limits: HashMap::new(),
+            per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
             resilience: None,
             shadow: None,
@@ -520,6 +701,7 @@ mod tests {
             budget: None,
             virtual_keys: vec![],
             model_rate_limits: HashMap::new(),
+            per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
             resilience: None,
             shadow: None,
@@ -689,5 +871,282 @@ mod tests {
         assert!(prompt.contains("[REDACTED:INTERNAL]"), "{prompt}");
         // Defaults still active alongside the custom rule.
         assert!(prompt.contains("[REDACTED:EMAIL]"), "{prompt}");
+    }
+
+    // --- classify_surface coverage ---
+
+    #[test]
+    fn classify_chat_completions_canonical_and_prefixed() {
+        assert_eq!(
+            classify_surface("POST", "/v1/chat/completions"),
+            AiSurface::ChatCompletions
+        );
+        assert_eq!(
+            classify_surface("POST", "/api/v1/chat/completions"),
+            AiSurface::ChatCompletions
+        );
+        assert_eq!(
+            classify_surface("POST", "/v1/chat/completions?stream=true"),
+            AiSurface::ChatCompletions
+        );
+    }
+
+    #[test]
+    fn classify_models_list_and_get_by_id() {
+        assert_eq!(classify_surface("GET", "/v1/models"), AiSurface::Models);
+        assert_eq!(
+            classify_surface("GET", "/v1/models/gpt-4o-mini"),
+            AiSurface::Models
+        );
+    }
+
+    #[test]
+    fn classify_embeddings() {
+        assert_eq!(
+            classify_surface("POST", "/v1/embeddings"),
+            AiSurface::Embeddings
+        );
+    }
+
+    #[test]
+    fn classify_assistants_surface() {
+        for path in [
+            "/v1/assistants",
+            "/v1/assistants/asst_abc",
+            "/v1/assistants/asst_abc/files",
+            "/v1/assistants/asst_abc/files/file_xyz",
+        ] {
+            assert_eq!(
+                classify_surface("GET", path),
+                AiSurface::Assistants,
+                "{path} should classify as Assistants"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_threads_surface() {
+        for path in [
+            "/v1/threads",
+            "/v1/threads/thread_abc",
+            "/v1/threads/thread_abc/messages",
+            "/v1/threads/thread_abc/messages/msg_xyz",
+            "/v1/threads/thread_abc/runs",
+            "/v1/threads/thread_abc/runs/run_xyz",
+            "/v1/threads/thread_abc/runs/run_xyz/cancel",
+            "/v1/threads/runs",
+        ] {
+            assert_eq!(
+                classify_surface("POST", path),
+                AiSurface::Threads,
+                "{path} should classify as Threads"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_batches_surface() {
+        for path in [
+            "/v1/batches",
+            "/v1/batches/batch_abc",
+            "/v1/batches/batch_abc/cancel",
+        ] {
+            assert_eq!(
+                classify_surface("POST", path),
+                AiSurface::Batches,
+                "{path} should classify as Batches"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_fine_tuning_surface_uses_underscore_path() {
+        // OpenAI uses /v1/fine_tuning (underscore), not /v1/fine-tuning.
+        // The pre-existing parse_endpoint test treated /v1/fine-tuning/jobs
+        // as Unknown; classify_surface accepts the canonical underscore form.
+        for path in [
+            "/v1/fine_tuning/jobs",
+            "/v1/fine_tuning/jobs/ftjob_abc",
+            "/v1/fine_tuning/jobs/ftjob_abc/cancel",
+            "/v1/fine_tuning/jobs/ftjob_abc/events",
+        ] {
+            assert_eq!(
+                classify_surface("POST", path),
+                AiSurface::FineTuning,
+                "{path} should classify as FineTuning"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_files_surface() {
+        for path in [
+            "/v1/files",
+            "/v1/files/file_abc",
+            "/v1/files/file_abc/content",
+        ] {
+            assert_eq!(
+                classify_surface("GET", path),
+                AiSurface::Files,
+                "{path} should classify as Files"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_realtime_surface() {
+        assert_eq!(classify_surface("GET", "/v1/realtime"), AiSurface::Realtime);
+        // Realtime sometimes carries a model query param.
+        assert_eq!(
+            classify_surface("GET", "/v1/realtime?model=gpt-4o-realtime-preview"),
+            AiSurface::Realtime
+        );
+    }
+
+    #[test]
+    fn classify_image_surfaces() {
+        assert_eq!(
+            classify_surface("POST", "/v1/images/generations"),
+            AiSurface::ImageGeneration
+        );
+        assert_eq!(
+            classify_surface("POST", "/v1/images/edits"),
+            AiSurface::ImageEdits
+        );
+        assert_eq!(
+            classify_surface("POST", "/v1/images/variations"),
+            AiSurface::ImageVariations
+        );
+    }
+
+    #[test]
+    fn classify_audio_surfaces() {
+        assert_eq!(
+            classify_surface("POST", "/v1/audio/transcriptions"),
+            AiSurface::AudioTranscription
+        );
+        // Translations dispatches as transcription (same handler, different
+        // language semantics at the provider).
+        assert_eq!(
+            classify_surface("POST", "/v1/audio/translations"),
+            AiSurface::AudioTranscription
+        );
+        assert_eq!(
+            classify_surface("POST", "/v1/audio/speech"),
+            AiSurface::AudioSpeech
+        );
+    }
+
+    #[test]
+    fn classify_moderations() {
+        assert_eq!(
+            classify_surface("POST", "/v1/moderations"),
+            AiSurface::Moderations
+        );
+    }
+
+    #[test]
+    fn classify_reranking_both_paths() {
+        assert_eq!(classify_surface("POST", "/v1/rerank"), AiSurface::Reranking);
+        assert_eq!(
+            classify_surface("POST", "/v1/reranking"),
+            AiSurface::Reranking
+        );
+    }
+
+    #[test]
+    fn classify_unknown_path_returns_unknown() {
+        assert_eq!(classify_surface("GET", "/health"), AiSurface::Unknown);
+        assert_eq!(
+            classify_surface("POST", "/v1/something/unmapped"),
+            AiSurface::Unknown
+        );
+        assert_eq!(classify_surface("GET", "/"), AiSurface::Unknown);
+    }
+
+    #[test]
+    fn classify_strips_trailing_slash() {
+        assert_eq!(
+            classify_surface("POST", "/v1/chat/completions/"),
+            AiSurface::ChatCompletions
+        );
+        assert_eq!(
+            classify_surface("GET", "/v1/assistants/"),
+            AiSurface::Assistants
+        );
+    }
+
+    #[test]
+    fn extract_input_text_for_image_uses_prompt() {
+        let body = serde_json::json!({"prompt": "a painting of a cat", "model": "dall-e-3"});
+        assert_eq!(
+            extract_input_text(&AiSurface::ImageGeneration, &body),
+            Some("a painting of a cat".to_string())
+        );
+        assert_eq!(
+            extract_input_text(&AiSurface::ImageEdits, &body),
+            Some("a painting of a cat".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_input_text_for_speech_uses_input() {
+        let body = serde_json::json!({"model": "tts-1", "input": "hello world", "voice": "alloy"});
+        assert_eq!(
+            extract_input_text(&AiSurface::AudioSpeech, &body),
+            Some("hello world".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_input_text_for_reranking_uses_query() {
+        let body = serde_json::json!({"query": "find documents about cats", "documents": []});
+        assert_eq!(
+            extract_input_text(&AiSurface::Reranking, &body),
+            Some("find documents about cats".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_input_text_for_moderations_uses_input() {
+        let body = serde_json::json!({"input": "is this content safe?", "model": "omni"});
+        assert_eq!(
+            extract_input_text(&AiSurface::Moderations, &body),
+            Some("is this content safe?".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_input_text_returns_none_for_chat_shape_surfaces() {
+        // Chat-shape surfaces carry input in `messages`; the existing
+        // GuardrailPipeline::check_input handles them.
+        let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert!(extract_input_text(&AiSurface::ChatCompletions, &body).is_none());
+        assert!(extract_input_text(&AiSurface::Assistants, &body).is_none());
+        assert!(extract_input_text(&AiSurface::Threads, &body).is_none());
+        // Surfaces without a single text input field also return None.
+        assert!(extract_input_text(&AiSurface::Batches, &body).is_none());
+        assert!(extract_input_text(&AiSurface::FineTuning, &body).is_none());
+        assert!(extract_input_text(&AiSurface::Files, &body).is_none());
+    }
+
+    #[test]
+    fn extract_input_text_returns_none_when_field_missing_or_not_string() {
+        let no_prompt = serde_json::json!({"model": "dall-e-3"});
+        assert!(extract_input_text(&AiSurface::ImageGeneration, &no_prompt).is_none());
+
+        // Field present but not a string.
+        let array_prompt = serde_json::json!({"prompt": ["array", "elements"]});
+        assert!(extract_input_text(&AiSurface::ImageGeneration, &array_prompt).is_none());
+    }
+
+    #[test]
+    fn ai_surface_label_is_stable() {
+        // Spot-check the label contract that metric collectors depend on.
+        assert_eq!(AiSurface::ChatCompletions.label(), "chat_completions");
+        assert_eq!(AiSurface::Assistants.label(), "assistants");
+        assert_eq!(AiSurface::FineTuning.label(), "fine_tuning");
+        assert_eq!(AiSurface::AudioTranscription.label(), "audio_transcription");
+        assert_eq!(AiSurface::Unknown.label(), "unknown");
     }
 }

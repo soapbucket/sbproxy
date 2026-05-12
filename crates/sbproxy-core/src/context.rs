@@ -470,6 +470,11 @@ pub struct RequestContext {
     pub ai_tokens_in: Option<u64>,
     /// Completion / output tokens reported by the provider response.
     pub ai_tokens_out: Option<u64>,
+    /// Classified AI surface label from `classify_surface`. Stamped at
+    /// the entry of `handle_ai_proxy` so every access log line for an
+    /// AI request carries the surface (chat_completions, assistants,
+    /// image_generation, etc.) without re-parsing the path.
+    pub ai_surface: Option<String>,
 
     // --- Wave 4 content negotiation (G4.2 / G4.3 / G4.4) ---
     //
@@ -717,6 +722,7 @@ impl RequestContext {
             ai_model: None,
             ai_tokens_in: None,
             ai_tokens_out: None,
+            ai_surface: None,
             content_shape_pricing: None,
             content_shape_transform: None,
             markdown_token_estimate: None,
