@@ -774,6 +774,7 @@ origins:
 | `budget` | object | | Budget enforcement configuration. |
 | `virtual_keys` | list | | Virtual API keys mapped to provider keys and scopes. |
 | `model_rate_limits` | map | | Per-model rate limit overrides keyed by model name. |
+| `per_surface_rate_limits` | map | | Per-surface rate limit overrides keyed by AI surface label (`chat_completions`, `assistants`, `image_generation`, ...). |
 | `max_concurrent` | map | | Maximum concurrent in-flight requests per provider. |
 | `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. |
 | `shadow` | object | | Side-by-side eval: mirror each request to a second provider and log metrics. |
@@ -866,6 +867,24 @@ model_rate_limits:
 |-------|------|---------|-------------|
 | `requests_per_minute` | int | unset | Requests-per-minute cap for this model. |
 | `tokens_per_minute` | int | unset | Tokens-per-minute cap for this model. |
+
+#### Per-surface rate limits (`per_surface_rate_limits`)
+
+Keyed by AI surface label. The labels are the same stable strings emitted on the `sbproxy_ai_surface_requests_total` metric: `chat_completions`, `models`, `embeddings`, `assistants`, `threads`, `batches`, `fine_tuning`, `files`, `realtime`, `image_generation`, `image_edits`, `image_variations`, `audio_transcription`, `audio_speech`, `moderations`, `reranking`. Surfaces without an entry are uncapped. When the cap is hit, the proxy returns 429 before any upstream call.
+
+```yaml
+per_surface_rate_limits:
+  image_generation:
+    requests_per_minute: 30
+  audio_speech:
+    requests_per_minute: 60
+  chat_completions:
+    requests_per_minute: 600
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `requests_per_minute` | int | unset | Requests-per-minute cap for this surface. Sliding one-minute window, shared globally across the process. |
 
 #### Guardrails (`guardrails`)
 
