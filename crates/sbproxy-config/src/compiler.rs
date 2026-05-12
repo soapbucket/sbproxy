@@ -782,6 +782,7 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         problem_details: config.problem_details,
         proxy_status: config.proxy_status,
         message_signatures: config.message_signatures,
+        idempotency: config.idempotency,
         bot_detection: config.bot_detection,
         threat_protection: config.threat_protection,
         on_request: config.on_request,

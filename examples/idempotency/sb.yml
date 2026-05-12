@@ -1,0 +1,66 @@
+# RFC 8594 idempotency middleware.
+#
+# Authoring `idempotency:` on an origin tells the proxy to short-circuit
+# retries that carry the same `Idempotency-Key` header and the same
+# request body. The cache lookup runs ahead of policy enforcement so a
+# cached replay never consumes a rate-limit slot.
+#
+# Flow:
+#
+#   * First call with key X: forwarded to upstream. The upstream response
+#     (status + headers + body) is cached under (workspace, X) keyed by
+#     the SHA-256 hash of the request body. TTL defaults to 24 h.
+#
+#   * Retry with key X and the same body: the proxy replays the cached
+#     response. The replay carries `x-sbproxy-idempotency: HIT` so
+#     operators can tell it apart in logs.
+#
+#   * Retry with key X but a different body: the proxy returns 409 with
+#     the `ledger.idempotency_conflict` body per the RFC.
+#
+# Only POST, PUT, and PATCH engage by default; other methods (which the
+# HTTP spec defines as idempotent) pass through unaffected.
+#
+# Run:
+#   sbproxy serve -f sb.yml
+#
+# Try:
+#   # First call: forwarded; upstream sees one request.
+#   curl -s -H 'Host: api.local' -H 'Idempotency-Key: order-42' \
+#        -H 'Content-Type: application/json' \
+#        -d '{"sku":"abc","qty":1}' \
+#        http://127.0.0.1:8080/orders
+#
+#   # Retry with same key + body: replayed from cache (no upstream call).
+#   # Response carries `x-sbproxy-idempotency: HIT`.
+#   curl -sv -H 'Host: api.local' -H 'Idempotency-Key: order-42' \
+#        -H 'Content-Type: application/json' \
+#        -d '{"sku":"abc","qty":1}' \
+#        http://127.0.0.1:8080/orders 2>&1 | grep -i sbproxy
+#
+#   # Same key, different body: 409 conflict.
+#   curl -s -H 'Host: api.local' -H 'Idempotency-Key: order-42' \
+#        -H 'Content-Type: application/json' \
+#        -d '{"sku":"xyz","qty":99}' \
+#        http://127.0.0.1:8080/orders
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://httpbin.org
+
+    # `enabled: true` is the only required field. Everything else is
+    # tuning. The default header name is `Idempotency-Key`, the default
+    # methods are `[POST, PUT, PATCH]`, and the default TTL is 86400 s
+    # (24 h). Memory backend is per-origin; for cluster deployments set
+    # `backend: redis` and configure `proxy.l2_store`.
+    idempotency:
+      enabled: true
+      header_name: Idempotency-Key
+      ttl_secs: 86400
+      methods: [POST, PUT, PATCH]
+      backend: memory

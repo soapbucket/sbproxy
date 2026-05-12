@@ -13,6 +13,42 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **RFC 8594 idempotency middleware (`idempotency:`).** Per-origin
+  block that engages on POST / PUT / PATCH (configurable via
+  `methods:`) when an `Idempotency-Key` header is present. The
+  middleware sits ahead of policies in the handler chain, hashes the
+  request body, and short-circuits the three branches per the RFC:
+  cache hits replay the cached `(status, headers, body)` verbatim
+  with `x-sbproxy-idempotency: HIT`; conflicts (same key, different
+  body) return 409 with the `ledger.idempotency_conflict` JSON body;
+  misses forward to the upstream and capture the response for the
+  next retry. Workspace-isolated keys prevent cross-tenant
+  collisions. Memory backend (default) is per-origin and per-replica;
+  `backend: redis` binds to `proxy.l2_store` at config-compile time
+  for cluster-wide replay. Cached replays do not consume rate-limit
+  slots. Documented in `docs/configuration.md` and demonstrated by
+  `examples/idempotency/`. Known v1 limitation: the cache check
+  fires in `request_body_filter`, after Pingora has already opened
+  the upstream connection. On a cache hit the upstream observes one
+  aborted partial handshake before the proxy serves the cached
+  response to the client; future work moves the check earlier so the
+  upstream never sees the replay.
+
+### Removed
+
+- **`sbproxy_ai::IdempotencyCache`.** The OSS AI gateway never wired
+  this cache; it was publicly re-exported but had zero callers in the
+  workspace. The new `idempotency:` block on general HTTP origins
+  (above) supersedes it. AI gateway integration is a follow-up tracked
+  in `docs/missing.md`. Plugin authors that imported the removed
+  type can switch to
+  `sbproxy_middleware::idempotency::{IdempotencyCache,
+  InMemoryIdempotencyCache, KvIdempotencyCache}` which carries the
+  richer surface (workspace isolation, body-hash conflict detection,
+  conflict body builder).
+
+### Added
+
 - **RFC 9457 problem-details default renderer (`problem_details:`).**
   New per-origin block that opts in to `application/problem+json` for
   proxy-generated errors (authentication denials, policy denials,

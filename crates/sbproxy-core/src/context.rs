@@ -19,6 +19,11 @@ use ulid::Ulid;
 
 use crate::hooks::{ClassifyVerdict, IntentCategory};
 
+/// Cached `(status, headers, body)` triple staged for replay by the
+/// idempotency middleware. Pulled out of `RequestContext` as a named
+/// alias so the type signature stays readable.
+pub type IdempotencyReplay = (u16, Vec<(String, String)>, Vec<u8>);
+
 /// Realtime WebSocket dispatch state carried on the request context.
 ///
 /// Populated by `handle_action` when an `Action::AiProxy` request is
@@ -148,6 +153,42 @@ pub struct RequestContext {
     /// upstream by returning Ok with no body, then we synthesise the
     /// rejection in `fail_to_proxy`).
     pub validator_failed: Option<(u16, String, String)>,
+
+    // --- Idempotency middleware state ---
+    /// Set in `request_filter` when the origin has `idempotency:`
+    /// configured and the request method matches the configured set.
+    /// `request_body_filter` reads this flag and buffers the request
+    /// body into [`Self::request_body_buf`] so the body hash can be
+    /// computed against the cache.
+    pub idempotency_buffering: bool,
+    /// Workspace identifier (resolved by auth or defaulted to the
+    /// origin's workspace id) used as the cache key prefix to prevent
+    /// cross-tenant collisions on the same `Idempotency-Key`.
+    pub idempotency_workspace: Option<String>,
+    /// Idempotency key + body hash captured on a cache miss. Carried
+    /// into `response_body_filter` so the captured upstream response
+    /// can be stored under the same `(workspace, key)` pair.
+    pub idempotency_miss: Option<(String, [u8; 32])>,
+    /// Buffer the upstream response body accumulates into while the
+    /// proxy captures a cache-miss response for later replay.
+    pub idempotency_response_body_buf: Option<BytesMut>,
+    /// Upstream response status captured at `response_filter` time so
+    /// the cache entry written at end-of-body carries the correct
+    /// status. Parallel to [`Self::cache_status`] but kept separate
+    /// because the response cache and idempotency cache can both run.
+    pub idempotency_response_status: Option<u16>,
+    /// Response headers captured at `response_filter` time, paired
+    /// with [`Self::idempotency_response_status`] and written when the
+    /// body filter sees `end_of_stream`.
+    pub idempotency_response_headers: Option<Vec<(String, String)>>,
+    /// Cached response to replay verbatim from `fail_to_proxy` when
+    /// the request body filter found a cache hit. The triple is
+    /// `(status, headers, body)`.
+    pub idempotency_replay: Option<IdempotencyReplay>,
+    /// Flag set by the request body filter when a cached entry exists
+    /// for the same `(workspace, key)` but the body hash differs.
+    /// `fail_to_proxy` reads this and writes the 409 conflict body.
+    pub idempotency_conflict: bool,
 
     // --- Request body size limit (streaming) ---
     /// Streaming-time max body size cap from `RequestLimitPolicy`.
@@ -693,6 +734,14 @@ impl RequestContext {
             validate_request_body: false,
             request_body_buf: None,
             validator_failed: None,
+            idempotency_buffering: false,
+            idempotency_workspace: None,
+            idempotency_miss: None,
+            idempotency_response_body_buf: None,
+            idempotency_response_status: None,
+            idempotency_response_headers: None,
+            idempotency_replay: None,
+            idempotency_conflict: false,
             body_size_limit: None,
             body_bytes_seen: 0,
             request_body_bytes: 0,

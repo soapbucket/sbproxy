@@ -689,6 +689,30 @@ impl TlsFingerprintConfig {
     }
 }
 
+/// Compiled idempotency middleware bound to a single origin.
+///
+/// Built once at config-compile time and held by [`CompiledPipeline`]
+/// keyed by origin index. The cache implementation is selected from
+/// the [`sbproxy_config::IdempotencyBackend`] discriminator: `Memory`
+/// gets an [`sbproxy_middleware::idempotency::InMemoryIdempotencyCache`]
+/// and `Redis` gets a
+/// [`sbproxy_middleware::idempotency::KvIdempotencyCache`] wrapping
+/// the cluster L2 store.
+pub struct CompiledIdempotency {
+    /// Cache backend trait object. Workspace-scoped per call.
+    pub cache: Arc<dyn sbproxy_middleware::idempotency::IdempotencyCache>,
+    /// Request header carrying the idempotency key. Defaults to
+    /// `Idempotency-Key` but the operator can override per origin.
+    pub header_name: String,
+    /// Time-to-live for cached entries, in seconds. Pre-applied
+    /// default (24 h) so the request path doesn't re-check.
+    pub ttl_secs: u64,
+    /// HTTP methods this middleware engages on. Pre-parsed from the
+    /// authored YAML so the request path does a `.contains` against
+    /// a small vec rather than reparsing on every request.
+    pub methods: smallvec::SmallVec<[http::Method; 4]>,
+}
+
 /// A compiled config with its module instances ready for request processing.
 ///
 /// Each vec is parallel to `config.origins` - index N in `actions` corresponds
@@ -728,6 +752,10 @@ pub struct CompiledPipeline {
     pub bot_detections: Vec<Option<BotDetection>>,
     /// Compiled threat protection for each origin (None if not configured).
     pub threat_protections: Vec<Option<ThreatProtection>>,
+    /// Compiled idempotency middleware for each origin (None when the
+    /// origin has no `idempotency:` block or `enabled = false`).
+    /// Parallel to [`Self::config`].`origins`.
+    pub idempotencies: Vec<Option<Arc<CompiledIdempotency>>>,
     /// Shared response cache backend.
     ///
     /// Points at a Redis-backed store when `CompiledConfig.l2_store` is set,
@@ -816,6 +844,7 @@ impl Default for CompiledPipeline {
             fallbacks: Vec::new(),
             bot_detections: Vec::new(),
             threat_protections: Vec::new(),
+            idempotencies: Vec::new(),
             cache_store: None,
             cache_reserve: None,
             cache_reserve_admission: None,
@@ -929,6 +958,28 @@ impl CompiledPipeline {
                 None => None,
             };
             threat_protections.push(threat);
+        }
+
+        // --- Compile per-origin idempotency middleware ---
+        //
+        // Built after the main per-origin loop because the Redis backend
+        // binds to the cluster L2 store on `CompiledConfig`. Memory
+        // backends are origin-local. An origin asking for `backend:
+        // redis` without `proxy.l2_store` configured surfaces a clear
+        // compile-time error rather than silently downgrading.
+        let mut idempotencies: Vec<Option<Arc<CompiledIdempotency>>> =
+            Vec::with_capacity(config.origins.len());
+        for origin in &config.origins {
+            let cfg = match origin.idempotency.as_ref() {
+                Some(c) if c.enabled => c,
+                _ => {
+                    idempotencies.push(None);
+                    continue;
+                }
+            };
+            let compiled = compile_origin_idempotency(cfg, &config)
+                .map_err(|e| anyhow::anyhow!("origin {}: {}", origin.origin_id, e))?;
+            idempotencies.push(Some(Arc::new(compiled)));
         }
 
         let router = HostRouter::new(&config);
@@ -1064,6 +1115,7 @@ impl CompiledPipeline {
             fallbacks,
             bot_detections,
             threat_protections,
+            idempotencies,
             cache_store,
             cache_reserve,
             cache_reserve_admission,
@@ -1132,6 +1184,63 @@ impl CompiledPipeline {
 /// `Vec<Box<dyn PolicyEnforcer>>` stored on `pipeline.enforcers`.
 /// Both call sites pass the same inputs so the two chains stay in
 /// lockstep.
+/// Build a [`CompiledIdempotency`] from the authored YAML block.
+///
+/// `Memory` backend allocates a fresh in-process cache per origin so
+/// each origin has its own keyspace and a config reload does not leak
+/// state across configs. `Redis` backend wraps the cluster L2 store
+/// declared at `proxy.l2_store`; if that is absent the function
+/// returns an error rather than silently downgrading.
+fn compile_origin_idempotency(
+    cfg: &sbproxy_config::IdempotencyConfig,
+    config: &CompiledConfig,
+) -> anyhow::Result<CompiledIdempotency> {
+    let ttl_secs = cfg
+        .ttl_secs
+        .unwrap_or(sbproxy_middleware::idempotency::DEFAULT_TTL_SECS);
+    let header_name = cfg
+        .header_name
+        .as_deref()
+        .unwrap_or(sbproxy_middleware::idempotency::IDEMPOTENCY_KEY_HEADER)
+        .to_string();
+    let methods = match cfg.methods.as_ref() {
+        Some(list) => list
+            .iter()
+            .map(|m| {
+                http::Method::from_bytes(m.to_ascii_uppercase().as_bytes()).map_err(|e| {
+                    anyhow::anyhow!("invalid HTTP method `{}` in idempotency.methods: {}", m, e)
+                })
+            })
+            .collect::<anyhow::Result<smallvec::SmallVec<[http::Method; 4]>>>()?,
+        None => {
+            // Default: the three methods that conventionally carry an
+            // Idempotency-Key per RFC 8594 §2.
+            smallvec::smallvec![http::Method::POST, http::Method::PUT, http::Method::PATCH,]
+        }
+    };
+    let cache: Arc<dyn sbproxy_middleware::idempotency::IdempotencyCache> = match cfg.backend {
+        sbproxy_config::IdempotencyBackend::Memory => {
+            Arc::new(sbproxy_middleware::idempotency::InMemoryIdempotencyCache::new())
+        }
+        sbproxy_config::IdempotencyBackend::Redis => {
+            let kv = config.l2_store.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "idempotency.backend = redis requires proxy.l2_store to be configured"
+                )
+            })?;
+            Arc::new(sbproxy_middleware::idempotency::KvIdempotencyCache::new(
+                kv, ttl_secs,
+            ))
+        }
+    };
+    Ok(CompiledIdempotency {
+        cache,
+        header_name,
+        ttl_secs,
+        methods,
+    })
+}
+
 fn compile_origin_policy_chain(
     policy_configs: &[serde_json::Value],
     l2_store: Option<Arc<dyn sbproxy_platform::storage::KVStore>>,
@@ -1494,6 +1603,7 @@ mod tests {
                 problem_details: None,
                 proxy_status: None,
                 message_signatures: None,
+                idempotency: None,
                 bot_detection: None,
                 threat_protection: None,
                 on_request: Vec::new(),
@@ -1634,6 +1744,7 @@ mod tests {
                 problem_details: None,
                 proxy_status: None,
                 message_signatures: None,
+                idempotency: None,
                 bot_detection: None,
                 threat_protection: None,
                 on_request: Vec::new(),
