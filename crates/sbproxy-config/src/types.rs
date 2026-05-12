@@ -1470,7 +1470,7 @@ pub struct RawOriginConfig {
     pub mirror: Option<MirrorConfig>,
     /// HTTP message signatures configuration (RFC 9421).
     #[serde(default)]
-    pub message_signatures: Option<serde_json::Value>,
+    pub message_signatures: Option<MessageSignaturesConfig>,
     /// Per-origin connection pool tuning.  Falls back to proxy-wide defaults
     /// when not specified.
     #[serde(default)]
@@ -3079,4 +3079,43 @@ origins: {}
         assert!(compiled.is_empty());
         assert!(warnings.is_empty());
     }
+}
+
+/// RFC 9421 HTTP Message Signatures verification configuration.
+///
+/// When `verify: true`, the proxy enforces RFC 9421 signature
+/// verification on every inbound request to this origin. Requests
+/// without a valid `Signature-Input` + `Signature` header pair
+/// matching the configured `key_id` are rejected with `401
+/// Unauthorized` and `WWW-Authenticate: Signature` before any
+/// downstream auth provider runs.
+///
+/// `algorithm` is `hmac_sha256` or `ed25519`. `key` carries the
+/// shared secret (HMAC) or the base64/hex-encoded raw 32-byte
+/// public key (Ed25519). `required_components` is the optional set
+/// of canonical components every accepted signature must cover.
+/// `clock_skew_seconds` defaults to 30s.
+///
+/// Spec: <https://www.rfc-editor.org/rfc/rfc9421.html>.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MessageSignaturesConfig {
+    /// Whether to enforce signature verification on inbound requests.
+    #[serde(default)]
+    pub verify: bool,
+    /// Required signature algorithm (`hmac_sha256` or `ed25519`).
+    pub algorithm: String,
+    /// The `keyid` value the signer is expected to advertise.
+    pub key_id: String,
+    /// Verification key material.
+    pub key: String,
+    /// Optional canonical components every accepted signature must cover.
+    #[serde(default)]
+    pub required_components: Vec<String>,
+    /// Optional clock skew tolerance in seconds. Defaults to 30s.
+    #[serde(default = "default_signature_clock_skew_seconds")]
+    pub clock_skew_seconds: u64,
+}
+
+fn default_signature_clock_skew_seconds() -> u64 {
+    30
 }

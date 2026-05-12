@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 
 use crate::types::{
     AccessLogConfig, AgentClassesConfig, AgentSkillEntry, CompressionConfig, CorsConfig,
-    HstsConfig, MirrorConfig, OriginRateLimitsConfig, ProxyServerConfig, ProxyStatusConfig,
+    HstsConfig, MirrorConfig, OriginRateLimitsConfig, ProxyServerConfig, MessageSignaturesConfig, ProxyStatusConfig,
     RequestModifierConfig, ResponseCacheConfig, ResponseModifierConfig, SessionConfig,
 };
 
@@ -80,6 +80,11 @@ pub struct CompiledOrigin {
     /// structured `Proxy-Status` header on every non-2xx response.
     /// See [`ProxyStatusConfig`].
     pub proxy_status: Option<ProxyStatusConfig>,
+    /// RFC 9421 HTTP Message Signatures verification. When `Some` with
+    /// `verify = true`, the request filter enforces signature verification
+    /// on every inbound request to this origin ahead of any downstream auth
+    /// provider. See [`MessageSignaturesConfig`].
+    pub message_signatures: Option<MessageSignaturesConfig>,
     /// Bot detection configuration (kept as JSON for deferred compilation).
     pub bot_detection: Option<serde_json::Value>,
     /// Threat protection configuration (kept as JSON for deferred compilation).
