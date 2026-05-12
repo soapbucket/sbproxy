@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-05-09*
+*Last modified: 2026-05-12*
 
 SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 43 native providers, including a native Anthropic translator, and the OpenRouter aggregator routes 200+ more.
 
@@ -453,15 +453,32 @@ origins:
 
 The `extensions` map is opaque to the OSS config parser; runtime components that recognise the key apply it.
 
-### Idempotency cache
+### Idempotency middleware (RFC 8594)
 
-Returns the same response for retries carrying a matching `Idempotency-Key` header. Implemented in `idempotency.rs` as `IdempotencyCache`. The constructor takes a single argument: `ttl_secs: u64`. Entries are removed lazily on the next lookup after they expire.
+Engages on `action: ai_proxy` origins when an `Idempotency-Key`
+header is present on a POST / PUT / PATCH request. The middleware
+sits ahead of the upstream provider call: on a cache hit the
+gateway replays the cached `(status, headers, body)` triple
+directly to the client with `x-sbproxy-idempotency: HIT` and
+never contacts the provider, so Stripe-style retries do not
+double-bill the upstream. On a body conflict the gateway returns
+409 `ledger.idempotency_conflict`. On a miss the gateway forwards
+and records the post-translation OpenAI-shape bytes the client
+saw so retries replay byte-identical.
 
-| Field | Type | Default | Notes |
-|-------|------|---------|-------|
-| `ttl_secs` | u64 | constructor arg | Window during which a duplicate `Idempotency-Key` returns the cached response. |
+Per-origin caps (`max_request_body_bytes`,
+`max_response_body_bytes`, `max_concurrent_buffers`) bound memory
+and skip caching gracefully when a request exceeds them. Skip
+reasons stamp on the outgoing response as
+`x-sbproxy-idempotency: SKIPPED-...` so operators can spot
+graceful degradation in dashboards.
 
-Like the exact prompt cache, the idempotency cache is built by the runtime rather than configured under `action`.
+Configuration is identical to general HTTP origins: see the
+`idempotency:` block reference under
+[`configuration.md`](configuration.md). v1 limitations: multipart
+request bodies (audio transcription, image edit / variation, file
+upload) are not cached, and SSE streaming responses abandon the
+cache record above the response cap.
 
 ## Per-provider limits
 
