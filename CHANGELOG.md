@@ -13,6 +13,53 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **AI gateway OpenAI surface dispatch (Option A).** The `ai_proxy`
+  action now routes every OpenAI-compatible surface through a
+  single classifier with per-surface observability and gating:
+
+  - New `AiSurface` enum + `classify_surface(method, path)` cover
+    chat completions, models, embeddings, assistants and threads
+    (full v2 surface), batches, fine-tuning, files, realtime,
+    image generation/edits/variations, audio transcription/speech,
+    moderations, and reranking. Marked `#[non_exhaustive]` so
+    future variants don't break downstream pattern matches.
+  - Method coverage extended past GET/POST: DELETE, PUT, PATCH,
+    HEAD, and OPTIONS dispatch through `AiClient::forward_with_method`
+    without engaging the JSON body-parse pipeline.
+  - Multipart bodies (image edits/variations, audio transcription,
+    file uploads) byte-forward via `AiClient::forward_bytes` with
+    the inbound `Content-Type` preserved. Previously these surfaces
+    returned a 400 "invalid JSON body" from the chat-path body parse.
+  - Provider capability matrix in `api_routes.rs` corrected:
+    Anthropic no longer claims audio/reranking/moderations support,
+    Gemini no longer claims moderations. A new
+    `provider_supports_surface` matrix gates non-universal surfaces
+    with **501 Not Implemented** when no configured provider
+    supports the surface.
+  - Per-surface observability: new
+    `sbproxy_ai_surface_requests_total{surface, method}` counter and
+    `sbproxy_ai_surface_request_duration_seconds{surface, method}`
+    histogram. Sibling of the existing per-provider metrics so
+    dashboards can pivot between surface and provider views.
+    Documented in `docs/metrics-stability.md`.
+  - Per-surface input guardrails: image generation, audio speech,
+    reranking, and moderations bodies now have their input field
+    (`prompt`, `input`, `query`, `input`) extracted and run through
+    the same guardrail pipeline as chat-style `messages`.
+  - Per-surface rate limits: new `per_surface_rate_limits` field
+    on the AI handler config, keyed by surface label. 429 fires
+    before any upstream call when the cap is hit.
+  - Surface-aware billing event: new `AiBillingEvent` carrying
+    `AiUsage` with `Tokens`, `Images { count, resolution }`,
+    `AudioSeconds`, `Characters`, `RerankUnits`, and `PerCall`
+    variants. Every dispatched request emits exactly one event.
+    Image generation, audio speech, and reranking emit real cost
+    via per-surface pricing tables (`lookup_image_price`,
+    `lookup_audio_speech_price`, `lookup_rerank_price`,
+    `lookup_audio_transcription_price`). `docs/ai-gateway.md`
+    documents the new surface, methods, guardrails, and rate-limit
+    knobs.
+
 - **Policy verdict audit bus + Plugin dispatch (WOR-201 PR 1b).**
   Wires the previously-dead `Policy::Plugin` arm in `server.rs` to
   call the trait's `enforce()`, folds the returned `PolicyDecision`
