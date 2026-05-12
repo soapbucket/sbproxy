@@ -3,12 +3,22 @@
 //! Produces structured `Proxy-Status` header values that downstream clients and
 //! intermediaries can use to diagnose forwarding errors.
 
-/// Build an RFC 9209 `Proxy-Status` header value.
-///
-/// The proxy token is always `sbproxy`. When an error description is provided it
-/// is appended as an `error` parameter.
+/// Build an RFC 9209 `Proxy-Status` header value with the default
+/// `sbproxy` identity. When an error description is provided it is
+/// appended as an `error` parameter.
 pub fn build_proxy_status(status: u16, error: Option<&str>) -> String {
-    let mut value = format!("sbproxy; received-status={}", status);
+    build_proxy_status_with_identity("sbproxy", status, error)
+}
+
+/// Build an RFC 9209 `Proxy-Status` header value with an
+/// operator-configured proxy identity (e.g. `acme-edge`,
+/// `sbproxy-eu-west-1`).
+pub fn build_proxy_status_with_identity(
+    identity: &str,
+    status: u16,
+    error: Option<&str>,
+) -> String {
+    let mut value = format!("{}; received-status={}", identity, status);
     if let Some(err) = error {
         value.push_str(&format!("; error=\"{}\"", err));
     }
@@ -32,5 +42,20 @@ mod tests {
             header,
             "sbproxy; received-status=502; error=\"connection_refused\""
         );
+    }
+
+    #[test]
+    fn test_custom_identity() {
+        let header = build_proxy_status_with_identity("acme-edge", 504, Some("upstream_timeout"));
+        assert_eq!(
+            header,
+            "acme-edge; received-status=504; error=\"upstream_timeout\""
+        );
+    }
+
+    #[test]
+    fn test_custom_identity_no_error() {
+        let header = build_proxy_status_with_identity("sbproxy-eu-1", 200, None);
+        assert_eq!(header, "sbproxy-eu-1; received-status=200");
     }
 }

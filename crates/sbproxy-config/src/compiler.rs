@@ -771,6 +771,8 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
             .collect(),
         fallback_origin: config.fallback_origin,
         error_pages: config.error_pages,
+        proxy_status: config.proxy_status,
+        message_signatures: config.message_signatures,
         bot_detection: config.bot_detection,
         threat_protection: config.threat_protection,
         on_request: config.on_request,

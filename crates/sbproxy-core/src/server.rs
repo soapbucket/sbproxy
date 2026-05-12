@@ -3501,6 +3501,103 @@ impl SseUsageScanner {
 /// pricing tables ship. Chat completions continue to bill through
 /// `record_budget_usage` until the chat usage-extraction is reworked
 /// to emit the new event shape.
+/// Map an HTTP status code to a stable RFC 9209 `Proxy-Status`
+/// `error` token. Returns `None` for status codes that don't have
+/// a canonical proxy-error mapping (the header is still emitted
+/// without the `error` parameter, which is valid per RFC 9209).
+fn proxy_status_error_token(status: u16) -> Option<&'static str> {
+    match status {
+        502 => Some("http_request_error"),
+        503 => Some("connection_terminated"),
+        504 => Some("connection_timeout"),
+        _ => None,
+    }
+}
+
+/// Build the `http::Request<bytes::Bytes>` view of the inbound
+/// Pingora session that the RFC 9421 verifier expects.
+///
+/// Body is empty: the OSS v1 message-signatures gate verifies
+/// signatures over no-body components (`@method`, `@target-uri`,
+/// `@authority`, `@scheme`, `@path`, `@query`, plus arbitrary
+/// header references). Body coverage (`content-digest`) requires
+/// buffering the body ahead of the auth phase and lands as a
+/// follow-up.
+fn build_signature_verification_request(session: &Session) -> http::Request<bytes::Bytes> {
+    let req_header = session.req_header();
+    let method = req_header.method.clone();
+    let uri = req_header.uri.clone();
+    let mut builder = http::Request::builder().method(method).uri(uri);
+    if let Some(hmap) = builder.headers_mut() {
+        for (name, value) in &req_header.headers {
+            hmap.insert(name.clone(), value.clone());
+        }
+    }
+    builder
+        .body(bytes::Bytes::new())
+        .expect("inbound headers always build a valid http::Request")
+}
+
+/// Cache of compiled `MessageSignatureVerifier` instances keyed by
+/// the configuration's memory address. Same pattern as
+/// `cached_guardrails_pipeline`: hot reload swaps in a new config
+/// address, so stale entries fall out of use.
+static MESSAGE_SIGNATURE_VERIFIER_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            usize,
+            std::sync::Arc<sbproxy_middleware::signatures::MessageSignatureVerifier>,
+        >,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Look up (or compile-and-cache) the message-signature verifier for
+/// the given configuration. Returns `None` when the config is
+/// invalid (key fails to decode, unknown algorithm); the auth phase
+/// rejects the request with 401 in that case rather than silently
+/// bypassing the gate.
+fn cached_message_signature_verifier(
+    cfg: &sbproxy_config::MessageSignaturesConfig,
+) -> Option<std::sync::Arc<sbproxy_middleware::signatures::MessageSignatureVerifier>> {
+    let key = cfg as *const _ as usize;
+    if let Ok(map) = MESSAGE_SIGNATURE_VERIFIER_CACHE.lock() {
+        if let Some(v) = map.get(&key) {
+            return Some(v.clone());
+        }
+    }
+    let algorithm = match cfg.algorithm.as_str() {
+        "hmac_sha256" => sbproxy_middleware::signatures::SignatureAlgorithm::HmacSha256,
+        "ed25519" => sbproxy_middleware::signatures::SignatureAlgorithm::Ed25519,
+        other => {
+            warn!(
+                algorithm = %other,
+                "message_signatures: unknown algorithm; rejecting all requests for this origin"
+            );
+            return None;
+        }
+    };
+    let mw_config = sbproxy_middleware::signatures::MessageSignatureConfig {
+        algorithm,
+        key_id: cfg.key_id.clone(),
+        key: cfg.key.clone(),
+        required_components: cfg.required_components.clone(),
+        clock_skew_seconds: cfg.clock_skew_seconds,
+    };
+    match sbproxy_middleware::signatures::MessageSignatureVerifier::new(mw_config) {
+        Ok(v) => {
+            let arc = std::sync::Arc::new(v);
+            if let Ok(mut map) = MESSAGE_SIGNATURE_VERIFIER_CACHE.lock() {
+                map.insert(key, arc.clone());
+            }
+            Some(arc)
+        }
+        Err(e) => {
+            warn!(error = %e, "message_signatures: failed to compile verifier; rejecting all requests for this origin");
+            None
+        }
+    }
+}
+
 fn emit_ai_billing_event(
     surface_label: &str,
     provider_name: &str,
@@ -7100,6 +7197,77 @@ impl ProxyHttp for SbProxy {
         };
         ctx.origin_idx = Some(origin_idx);
 
+        // --- RFC 9421 HTTP Message Signatures verification ---
+        //
+        // When the origin has `message_signatures.verify: true`,
+        // enforce signature verification on every inbound request
+        // before any downstream auth provider runs. Failures
+        // produce a 401 with `WWW-Authenticate: Signature`.
+        // Body coverage (`content-digest`) is reserved for a
+        // follow-up; the http::Request we hand the verifier carries
+        // an empty body, so signatures over body components fail
+        // with a missing-component reason from the verifier.
+        {
+            let pipeline_guard = reload::current_pipeline();
+            let origin_for_sig = &pipeline_guard.config.origins[origin_idx];
+            if let Some(ms_cfg) = origin_for_sig.message_signatures.as_ref() {
+                if ms_cfg.verify {
+                    if let Some(verifier) = cached_message_signature_verifier(ms_cfg) {
+                        let req = build_signature_verification_request(session);
+                        match verifier.verify_request(&req) {
+                            sbproxy_middleware::signatures::VerifyVerdict::Ok {
+                                signature_label,
+                            } => {
+                                debug!(
+                                    signature_label = %signature_label,
+                                    "message_signatures: request verified"
+                                );
+                            }
+                            sbproxy_middleware::signatures::VerifyVerdict::Failed { reason } => {
+                                warn!(
+                                    hostname = %ctx.hostname,
+                                    reason = %reason,
+                                    "message_signatures: verification failed; returning 401"
+                                );
+                                drop(pipeline_guard);
+                                let body = b"{\"error\":\"signature verification failed\"}";
+                                let mut header = pingora_http::ResponseHeader::build(401, Some(2))
+                                    .map_err(|e| {
+                                        Error::because(
+                                            ErrorType::InternalError,
+                                            "build 401 header",
+                                            e,
+                                        )
+                                    })?;
+                                let _ = header.insert_header("content-type", "application/json");
+                                let _ = header.insert_header("www-authenticate", "Signature");
+                                session
+                                    .write_response_header(Box::new(header), false)
+                                    .await?;
+                                session
+                                    .write_response_body(
+                                        Some(bytes::Bytes::from_static(body)),
+                                        true,
+                                    )
+                                    .await?;
+                                ctx.response_status = Some(401);
+                                return Ok(true);
+                            }
+                        }
+                    } else {
+                        warn!(
+                            hostname = %ctx.hostname,
+                            "message_signatures: verifier unavailable; returning 401"
+                        );
+                        drop(pipeline_guard);
+                        send_error(session, 401, "signature verification unavailable").await?;
+                        ctx.response_status = Some(401);
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
         // Increment per-origin active connections after successful resolution.
         sbproxy_observe::metrics::inc_active(ctx.hostname.as_str());
 
@@ -9213,6 +9381,39 @@ impl ProxyHttp for SbProxy {
                 "x-sbproxy-debug-config-rev",
                 pipeline.config_revision.as_str(),
             );
+        }
+
+        // --- RFC 9209 Proxy-Status header (per-origin opt-in) ---
+        //
+        // When the resolved origin has `proxy_status.enabled: true`,
+        // stamp a structured Proxy-Status header on every non-2xx
+        // response. The header carries the configured proxy identity
+        // (`sbproxy` by default), the received upstream status, and
+        // an `error` parameter when the status maps to a known
+        // failure mode. Downstream clients can diagnose forwarding
+        // errors without scraping the body.
+        {
+            let status_code = upstream_response.status.as_u16();
+            if !(200..300).contains(&status_code) {
+                let pipeline = reload::current_pipeline();
+                if let Some(idx) = ctx.origin_idx {
+                    if let Some(origin) = pipeline.config.origins.get(idx) {
+                        if let Some(cfg) = origin.proxy_status.as_ref() {
+                            if cfg.enabled {
+                                let identity = cfg.identity.as_deref().unwrap_or("sbproxy");
+                                let error_token = proxy_status_error_token(status_code);
+                                let value =
+                                    sbproxy_middleware::proxy_status::build_proxy_status_with_identity(
+                                        identity,
+                                        status_code,
+                                        error_token,
+                                    );
+                                let _ = upstream_response.insert_header("proxy-status", value);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // --- Wave 5 / G5.6 wire: AnomalyDetectorHook dispatch ---

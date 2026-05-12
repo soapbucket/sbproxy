@@ -1453,6 +1453,14 @@ pub struct RawOriginConfig {
     /// Custom error pages keyed by status code or status class.
     #[serde(default)]
     pub error_pages: Option<serde_json::Value>,
+    /// RFC 9209 `Proxy-Status` response header configuration. When
+    /// enabled, the proxy stamps a structured `Proxy-Status` header
+    /// on every non-2xx response so downstream clients can diagnose
+    /// forwarding errors without scraping the body. The identity
+    /// token defaults to `sbproxy` and can be overridden for fleet-
+    /// wide branding (e.g. `acme-edge`).
+    #[serde(default)]
+    pub proxy_status: Option<ProxyStatusConfig>,
     /// Traffic capture / mirroring configuration.
     #[serde(default)]
     pub traffic_capture: Option<serde_json::Value>,
@@ -1462,7 +1470,7 @@ pub struct RawOriginConfig {
     pub mirror: Option<MirrorConfig>,
     /// HTTP message signatures configuration (RFC 9421).
     #[serde(default)]
-    pub message_signatures: Option<serde_json::Value>,
+    pub message_signatures: Option<MessageSignaturesConfig>,
     /// Per-origin connection pool tuning.  Falls back to proxy-wide defaults
     /// when not specified.
     #[serde(default)]
@@ -2152,6 +2160,30 @@ fn default_grace() -> u64 {
 
 fn default_re_resolve() -> u64 {
     60
+}
+
+/// RFC 9209 `Proxy-Status` response header configuration.
+///
+/// When `enabled`, the proxy stamps a structured `Proxy-Status`
+/// header on every non-2xx response. The header carries the proxy
+/// identity, the upstream status, and an optional `error` parameter
+/// derived from the upstream failure mode. Operators consuming the
+/// header can diagnose forwarding errors without scraping the body.
+///
+/// Spec: <https://www.rfc-editor.org/rfc/rfc9209.html>.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ProxyStatusConfig {
+    /// Whether to stamp the `Proxy-Status` header on non-2xx responses.
+    /// Defaults to `false`; opt in per origin so existing operator
+    /// dashboards that match on bare status codes are not surprised.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Proxy identity token used as the first parameter of the header
+    /// (per RFC 9209's grammar). Defaults to `sbproxy`. Operators
+    /// running a fleet can override this for branding
+    /// (e.g. `acme-edge`, `sbproxy-eu-west-1`).
+    #[serde(default)]
+    pub identity: Option<String>,
 }
 
 #[cfg(test)]
@@ -3047,4 +3079,43 @@ origins: {}
         assert!(compiled.is_empty());
         assert!(warnings.is_empty());
     }
+}
+
+/// RFC 9421 HTTP Message Signatures verification configuration.
+///
+/// When `verify: true`, the proxy enforces RFC 9421 signature
+/// verification on every inbound request to this origin. Requests
+/// without a valid `Signature-Input` + `Signature` header pair
+/// matching the configured `key_id` are rejected with `401
+/// Unauthorized` and `WWW-Authenticate: Signature` before any
+/// downstream auth provider runs.
+///
+/// `algorithm` is `hmac_sha256` or `ed25519`. `key` carries the
+/// shared secret (HMAC) or the base64/hex-encoded raw 32-byte
+/// public key (Ed25519). `required_components` is the optional set
+/// of canonical components every accepted signature must cover.
+/// `clock_skew_seconds` defaults to 30s.
+///
+/// Spec: <https://www.rfc-editor.org/rfc/rfc9421.html>.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MessageSignaturesConfig {
+    /// Whether to enforce signature verification on inbound requests.
+    #[serde(default)]
+    pub verify: bool,
+    /// Required signature algorithm (`hmac_sha256` or `ed25519`).
+    pub algorithm: String,
+    /// The `keyid` value the signer is expected to advertise.
+    pub key_id: String,
+    /// Verification key material.
+    pub key: String,
+    /// Optional canonical components every accepted signature must cover.
+    #[serde(default)]
+    pub required_components: Vec<String>,
+    /// Optional clock skew tolerance in seconds. Defaults to 30s.
+    #[serde(default = "default_signature_clock_skew_seconds")]
+    pub clock_skew_seconds: u64,
+}
+
+fn default_signature_clock_skew_seconds() -> u64 {
+    30
 }
