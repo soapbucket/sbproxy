@@ -8,6 +8,8 @@
 //! - [`registry`] - Inventory-based plugin discovery at link time.
 //! - [`identity`] - Identity, classification, and anomaly hook surface.
 //! - [`audit`] - Admin-action audit emitter trait surface.
+//! - [`verdict_combine`] - Combine multiple `PolicyDecision` votes
+//!   into a single terminal verdict per the WOR-152 matrix.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -18,6 +20,7 @@ pub mod identity;
 pub mod lifecycle;
 pub mod registry;
 pub mod traits;
+pub mod verdict_combine;
 
 pub use audit::{
     current_admin_audit_emitter, install_admin_audit_emitter, AdminAuditEmitter,
@@ -33,3 +36,4 @@ pub use identity::{
 pub use lifecycle::*;
 pub use registry::*;
 pub use traits::*;
+pub use verdict_combine::{combine_verdicts, CombinedVerdict};
