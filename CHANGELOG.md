@@ -34,6 +34,20 @@ of the new YAML fields below until the version that ships them.
   RFC 9209 error token in the `detail` field so both signals share
   the same vocabulary.
 
+- **Idempotency middleware: per-request and pool caps.** Three new
+  fields on the `idempotency:` block bound memory usage and let the
+  middleware gracefully degrade under pressure rather than buffering
+  unbounded bodies. `max_request_body_bytes` (default 1 MiB) caps
+  the per-request buffer; bodies above the cap skip caching with
+  `x-sbproxy-idempotency: SKIPPED-OVERSIZE-REQUEST` stamped on the
+  response. `max_response_body_bytes` (default 1 MiB) caps the
+  per-response cache buffer; responses above the cap stream through
+  uncached. `max_concurrent_buffers` (default 256) is a per-origin
+  pool over concurrent buffered requests; pool exhaustion skips the
+  cache with `x-sbproxy-idempotency: SKIPPED-POOL-FULL`. Worst-case
+  memory is bounded at `max_concurrent_buffers * max_request_body_bytes`
+  per origin.
+
 - **RFC 8594 idempotency middleware (`idempotency:`).** Per-origin
   block that engages on POST / PUT / PATCH (configurable via
   `methods:`) when an `Idempotency-Key` header is present. The

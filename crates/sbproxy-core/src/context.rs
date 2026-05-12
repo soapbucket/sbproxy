@@ -189,6 +189,15 @@ pub struct RequestContext {
     /// for the same `(workspace, key)` but the body hash differs.
     /// `fail_to_proxy` reads this and writes the 409 conflict body.
     pub idempotency_conflict: bool,
+    /// Permit held while the request is participating in the
+    /// per-origin idempotency buffer pool. Dropped at end of the
+    /// request (or earlier on skip / replay) to release the slot.
+    pub idempotency_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// Reason the middleware *skipped* engagement for this request,
+    /// stamped as `x-sbproxy-idempotency: <reason>` on the response
+    /// so operators can spot pool pressure or oversize bodies. None
+    /// when the middleware engaged normally (hit / miss / conflict).
+    pub idempotency_skip_reason: Option<&'static str>,
 
     // --- Request body size limit (streaming) ---
     /// Streaming-time max body size cap from `RequestLimitPolicy`.
@@ -742,6 +751,8 @@ impl RequestContext {
             idempotency_response_headers: None,
             idempotency_replay: None,
             idempotency_conflict: false,
+            idempotency_permit: None,
+            idempotency_skip_reason: None,
             body_size_limit: None,
             body_bytes_seen: 0,
             request_body_bytes: 0,

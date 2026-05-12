@@ -711,6 +711,18 @@ pub struct CompiledIdempotency {
     /// authored YAML so the request path does a `.contains` against
     /// a small vec rather than reparsing on every request.
     pub methods: smallvec::SmallVec<[http::Method; 4]>,
+    /// Maximum request body bytes the middleware will buffer for
+    /// the cache check. Requests larger than this cap gracefully
+    /// degrade: skip caching and stamp the SKIPPED-OVERSIZE-REQUEST
+    /// marker.
+    pub max_request_body_bytes: usize,
+    /// Maximum response body bytes the middleware will buffer for
+    /// caching. Responses larger than this cap stream uncached.
+    pub max_response_body_bytes: usize,
+    /// Per-origin semaphore capping concurrent buffered requests.
+    /// Acquire a permit on engagement; pool exhaustion forces the
+    /// request through the no-cache path.
+    pub permits: Arc<tokio::sync::Semaphore>,
 }
 
 /// A compiled config with its module instances ready for request processing.
@@ -1233,11 +1245,24 @@ fn compile_origin_idempotency(
             ))
         }
     };
+    let max_request_body_bytes = cfg
+        .max_request_body_bytes
+        .unwrap_or(sbproxy_config::DEFAULT_IDEMPOTENCY_MAX_REQUEST_BYTES);
+    let max_response_body_bytes = cfg
+        .max_response_body_bytes
+        .unwrap_or(sbproxy_config::DEFAULT_IDEMPOTENCY_MAX_RESPONSE_BYTES);
+    let max_concurrent_buffers = cfg
+        .max_concurrent_buffers
+        .unwrap_or(sbproxy_config::DEFAULT_IDEMPOTENCY_MAX_CONCURRENT_BUFFERS);
+    let permits = Arc::new(tokio::sync::Semaphore::new(max_concurrent_buffers));
     Ok(CompiledIdempotency {
         cache,
         header_name,
         ttl_secs,
         methods,
+        max_request_body_bytes,
+        max_response_body_bytes,
+        permits,
     })
 }
 

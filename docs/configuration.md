@@ -2612,6 +2612,9 @@ origins:
 | `ttl_secs` | int | 86400 | Cache entry TTL in seconds. |
 | `methods` | list | `[POST, PUT, PATCH]` | HTTP methods that engage the middleware. Other methods pass through. |
 | `backend` | enum | `memory` | `memory` (per-origin, per-replica) or `redis` (binds to `proxy.l2_store` for cluster-wide replay). |
+| `max_request_body_bytes` | int | 1048576 (1 MiB) | Per-request cap on buffered body bytes. Bodies larger than this skip the cache; response carries `x-sbproxy-idempotency: SKIPPED-OVERSIZE-REQUEST`. |
+| `max_response_body_bytes` | int | 1048576 (1 MiB) | Per-response cap on cached body bytes. Responses larger than this stream through uncached. |
+| `max_concurrent_buffers` | int | 256 | Per-origin cap on concurrent buffered requests. When the pool is exhausted, new requests skip the cache; response carries `x-sbproxy-idempotency: SKIPPED-POOL-FULL`. Worst-case memory per origin is roughly `max_concurrent_buffers * max_request_body_bytes`. |
 
 The `memory` backend is per-origin and per-replica: suitable for
 single-instance deployments and clusters with sticky routing. The
