@@ -71,41 +71,55 @@ for inter-stage signalling.
 
 ## Middleware helpers (RFC-shaped responses)
 
-Two helpers in `crates/sbproxy-middleware` produce response shapes that
-follow published RFCs. The helpers are library-level today: they are
-shipped in the binary and unit-tested, but the OSS request pipeline
-does not call them on its own. Plugin authors and out-of-tree
-middleware can invoke them directly. The audit calls out wiring them
-into the default error path as a follow-up.
+Two helpers in `crates/sbproxy-middleware` produce response shapes
+that follow published RFCs. Both are opt-in per origin and fire on
+two error paths: proxy-generated errors (auth deny, policy deny,
+default 404) and upstream failures routed through Pingora's
+`fail_to_proxy` path (connect refused, connect timeout, TLS
+handshake error, mid-stream connection loss). See
+[configuration.md](configuration.md) for the per-origin config block.
 
 ### `Proxy-Status` (RFC 9209)
 
-Source: `crates/sbproxy-middleware/src/proxy_status.rs`. The
-`build_proxy_status(status, error)` helper emits a structured
-`Proxy-Status` header value identifying the proxy (`sbproxy`), the
-received upstream status, and an optional short error token.
+Source: `crates/sbproxy-middleware/src/proxy_status.rs`. Stamped on
+non-2xx responses when the origin has
+`proxy_status.enabled: true`. The header carries the proxy
+identity (`sbproxy` by default; configurable per origin), the
+received upstream status, and a short error token sourced from the
+failure mode.
 
 ```text
 Proxy-Status: sbproxy; received-status=502; error="connection_refused"
+Proxy-Status: sbproxy; received-status=504; error="connection_timeout"
+Proxy-Status: sbproxy; received-status=502; error="tls_protocol_error"
+Proxy-Status: sbproxy; received-status=502; error="connection_terminated"
 ```
+
+The error token catalogue mirrors RFC 9209 section 2.3.4
+(`connection_refused`, `connection_timeout`, `tls_protocol_error`,
+`connection_terminated`, `http_request_error`).
 
 ### `application/problem+json` (RFC 9457)
 
-Source: `crates/sbproxy-middleware/src/problem_details.rs`. The
-`problem_details_json(status, title, detail, instance)` helper emits
-a JSON body shaped to the RFC 9457 problem details format. Callers
-that adopt it should set `Content-Type: application/problem+json`
-on the response.
+Source: `crates/sbproxy-middleware/src/problem_details.rs`. Renders
+the response body as `application/problem+json` when the origin has
+`problem_details.enabled: true` and no custom `error_pages` entry
+matches the status. The body shape is the RFC 9457 problem details
+format with `type`, `title`, `status`, `detail`, `instance` fields.
 
 ```json
 {
-  "type": "about:blank",
-  "title": "Not Found",
-  "status": 404,
-  "detail": "Origin not configured",
-  "instance": "/api/data"
+  "type": "https://api.example.com/errors/502",
+  "title": "Bad Gateway",
+  "status": 502,
+  "detail": "connection_refused",
+  "instance": "/v1/orders"
 }
 ```
+
+On upstream failures the `detail` field carries the same RFC 9209
+error token that lands in the `Proxy-Status` header so downstream
+tooling reading either signal sees the same vocabulary.
 
 ## What you will NOT see
 
