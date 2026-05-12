@@ -19,6 +19,38 @@ use ulid::Ulid;
 
 use crate::hooks::{ClassifyVerdict, IntentCategory};
 
+/// Realtime WebSocket dispatch state carried on the request context.
+///
+/// Populated by `handle_action` when an `Action::AiProxy` request is
+/// classified as the Realtime surface and arrives with an
+/// `Upgrade: websocket` header. The AI gateway runs its gating logic
+/// (`provider_supports_realtime`, per-surface rate limit, surface
+/// metrics) before the dispatcher selects a provider and stashes the
+/// connection target here. The `upstream_peer` callback reads this
+/// to build the dynamic `HttpPeer`; Pingora then forwards bytes
+/// transparently between client and provider after the
+/// `101 Switching Protocols` handshake. The `logging` callback reads
+/// it again at session close to observe duration, decrement the
+/// active-sessions gauge, and emit a session-end `AiBillingEvent`.
+#[derive(Debug, Clone)]
+pub struct RealtimeDispatchCtx {
+    /// Provider that received this realtime session (e.g. `openai`).
+    pub provider_name: String,
+    /// Upstream host the WebSocket connects to.
+    pub upstream_host: String,
+    /// Upstream port (443 for wss, 80 for ws by default).
+    pub upstream_port: u16,
+    /// Whether the upstream uses TLS.
+    pub upstream_tls: bool,
+    /// Wall-clock instant when the session started. Diffed against
+    /// the `logging` callback time to produce the session-duration
+    /// histogram observation and the AudioSeconds billing approximation.
+    pub started_at: Instant,
+    /// Stable surface label (`"realtime"`) for downstream metric and
+    /// log attribution.
+    pub surface_label: &'static str,
+}
+
 /// Parameters captured at `request_filter` time and consumed by
 /// `request_body_filter` to fire a request mirror with the optional
 /// teed body.
@@ -475,6 +507,21 @@ pub struct RequestContext {
     /// AI request carries the surface (chat_completions, assistants,
     /// image_generation, etc.) without re-parsing the path.
     pub ai_surface: Option<String>,
+    /// OpenAI Realtime API session identifier for sessions dispatched
+    /// through the realtime WebSocket path. `None` for non-realtime
+    /// AI requests. Set by the realtime dispatcher when the upstream
+    /// session is established; carried through the request context so
+    /// the access log line emitted on session close carries the
+    /// session id.
+    pub ai_realtime_session: Option<String>,
+    /// Realtime WebSocket dispatch state. Populated in `handle_action`
+    /// when the AI gateway recognizes a `GET /v1/realtime` WebSocket
+    /// upgrade for an `Action::AiProxy` origin. Carries the selected
+    /// provider's connection target so `upstream_peer` can build the
+    /// peer without re-running the AI gateway's gating logic, and the
+    /// `logging` hook can observe session duration + emit the
+    /// session-end `AiBillingEvent`.
+    pub ai_realtime_dispatch: Option<RealtimeDispatchCtx>,
 
     // --- Wave 4 content negotiation (G4.2 / G4.3 / G4.4) ---
     //
@@ -723,6 +770,8 @@ impl RequestContext {
             ai_tokens_in: None,
             ai_tokens_out: None,
             ai_surface: None,
+            ai_realtime_session: None,
+            ai_realtime_dispatch: None,
             content_shape_pricing: None,
             content_shape_transform: None,
             markdown_token_estimate: None,
