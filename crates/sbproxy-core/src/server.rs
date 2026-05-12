@@ -5056,6 +5056,19 @@ async fn handle_ai_proxy(
             None
         };
 
+    // For audio speech, capture the input character count once
+    // before the failover loop. The TTS provider bills per character
+    // of `input` text; counting at the request boundary is exact and
+    // doesn't require parsing the binary audio response body.
+    let audio_speech_characters_for_billing: Option<u64> =
+        if matches!(surface, sbproxy_ai::handler::AiSurface::AudioSpeech) {
+            body.get("input")
+                .and_then(|v| v.as_str())
+                .map(|s| s.chars().count() as u64)
+        } else {
+            None
+        };
+
     // Parse retry config from the action config's routing.retry section.
     // This is done by inspecting the raw handler config.
     let max_attempts = if is_failover {
@@ -5226,6 +5239,7 @@ async fn handle_ai_proxy(
                 surface_label,
                 provider_name: last_provider_name.as_str(),
                 image_resolution: image_resolution_for_billing.clone(),
+                audio_speech_characters: audio_speech_characters_for_billing,
             });
             // Capture parser hints from the upstream response before it
             // gets moved into relay_ai_stream. The streaming relay
@@ -5276,6 +5290,7 @@ async fn handle_ai_proxy(
                 surface_label,
                 provider_name: last_provider_name.as_str(),
                 image_resolution: image_resolution_for_billing.clone(),
+                audio_speech_characters: audio_speech_characters_for_billing,
             });
             relay_ai_response_with_cache(
                 session,
@@ -5562,6 +5577,10 @@ async fn relay_ai_response_with_cache(
                         .clone()
                         .unwrap_or_else(|| "1024x1024".to_string()),
                 }
+            } else if args.surface_label == "audio_speech" {
+                sbproxy_ai::budget::AiUsage::Characters {
+                    count: args.audio_speech_characters.unwrap_or(0),
+                }
             } else {
                 sbproxy_ai::budget::AiUsage::PerCall
             };
@@ -5619,6 +5638,11 @@ struct BudgetRecorderArgs<'a> {
     /// relay function can emit an `Images { count, resolution }`
     /// billing event with the resolution from the request.
     image_resolution: Option<String>,
+    /// For audio speech requests, the character count of the input
+    /// text (`body["input"]`). Captured at dispatch time so the
+    /// relay function can emit a `Characters { count }` billing
+    /// event scaled to the TTS provider's per-character rate.
+    audio_speech_characters: Option<u64>,
 }
 
 /// Inputs to the streaming-cache recorder hook, bundled to keep
