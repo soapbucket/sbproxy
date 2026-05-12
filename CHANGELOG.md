@@ -13,6 +13,41 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **AI gateway Realtime WebSocket dispatch (Phase 7, Option C).**
+  `GET /v1/realtime` requests with `Upgrade: websocket` against an
+  `ai_proxy` origin are now dispatched through the AI gateway
+  pipeline:
+
+  - Pre-upgrade gating runs the same surface classification, 501
+    capability check (only providers in
+    `provider_supports_realtime` are eligible; today: OpenAI),
+    per-surface rate limit, and provider selection as the rest of
+    the AI surface set.
+  - After the gating passes, Pingora forwards bytes between
+    client and provider transparently through the upgraded
+    connection. The dispatcher does not terminate the WebSocket;
+    per-frame guardrails and frame-exact audio metering are
+    reserved for a future enterprise terminate-and-relay path so
+    every AI gateway feature added to `handle_action` continues
+    to apply to realtime through one shared code path.
+  - `sbproxy_ai_realtime_sessions_active` (gauge),
+    `sbproxy_ai_realtime_session_duration_seconds` (histogram),
+    `sbproxy_ai_realtime_audio_seconds_total` (counter), and
+    `sbproxy_ai_realtime_frames_forwarded_total` (counter) are
+    registered. The OSS dispatch ticks the gauge on session open
+    and observes the duration histogram on close. Documented in
+    `docs/metrics-stability.md`.
+  - At session close, `logging` emits a session-end
+    `AiBillingEvent` with `AudioSeconds { seconds }` valued at
+    the wall-clock session duration so realtime usage appears on
+    the standard billing-event bus alongside chat/image/audio.
+  - `RealtimeSessionTracker` (lock-free atomic counters) and
+    `audio_seconds_from_frame(bytes, sample_rate, channels)` ship
+    in `sbproxy-ai::realtime` for the eventual terminate-and-relay
+    path to consume.
+  - `docs/ai-gateway.md` documents the new dispatch path with a
+    YAML example and the per-surface rate-limit knob.
+
 - **AI gateway OpenAI surface dispatch (Option A).** The `ai_proxy`
   action now routes every OpenAI-compatible surface through a
   single classifier with per-surface observability and gating:

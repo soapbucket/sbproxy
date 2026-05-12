@@ -389,6 +389,70 @@ Buckets: `0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0`. Matches the bucket s
 
 ---
 
+#### `sbproxy_ai_realtime_sessions_active`
+
+| Property | Value |
+|---|---|
+| Type | Gauge |
+| Stability | **stable** |
+| Description | Currently open OpenAI Realtime API WebSocket sessions. Ticks up at upgrade time and down at session close (whether the client or upstream initiated the close). |
+
+No labels.
+
+---
+
+#### `sbproxy_ai_realtime_session_duration_seconds`
+
+| Property | Value |
+|---|---|
+| Type | Histogram |
+| Stability | **stable** |
+| Description | Wall-clock duration of a Realtime WebSocket session, observed once at session close. Buckets span 1 s to 30 min for typical Realtime call durations. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `provider` | AI provider that handled the session | `openai` |
+| `close_reason` | Why the session ended | `client_closed`, `upstream_closed`, `policy_violation`, `error` |
+
+---
+
+#### `sbproxy_ai_realtime_audio_seconds_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **stable** |
+| Description | Cumulative audio seconds forwarded over Realtime sessions. Frame-exact accounting requires terminate-and-relay (not on the OSS dispatch path); the OSS dispatcher uses session wall-clock duration as a duration proxy on close, partitioned per direction so dashboards see "inbound" (client to provider) and "outbound" (provider to client) separately. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `provider` | AI provider | `openai` |
+| `direction` | Audio direction | `inbound`, `outbound` |
+
+---
+
+#### `sbproxy_ai_realtime_frames_forwarded_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **stable** |
+| Description | Cumulative frames forwarded over Realtime sessions. Today this counter is only incremented when an enterprise terminate-and-relay path is in use; the OSS transparent forwarding path doesn't see individual frames. Reserved label set is stable so dashboards built against the metric continue to work when the enterprise dispatch lands. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `provider` | AI provider | `openai` |
+| `direction` | Frame direction | `inbound`, `outbound` |
+| `kind` | Frame payload kind | `text`, `audio` |
+
+---
+
 ## Deprecation process
 
 When a stable metric must change:

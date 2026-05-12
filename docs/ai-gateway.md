@@ -732,6 +732,10 @@ The proxy exposes aggregate AI usage as Prometheus metrics. When `telemetry.bind
 | `sbproxy_ai_key_requests_total` | Counter | `virtual_key`, `provider`, `model` | Requests per virtual key |
 | `sbproxy_ai_key_tokens_total` | Counter | `virtual_key`, `direction` | Tokens per virtual key |
 | `sbproxy_ai_key_cost_dollars_total` | Counter | `virtual_key` | Cost in USD per virtual key |
+| `sbproxy_ai_realtime_sessions_active` | Gauge | | Currently open OpenAI Realtime API WebSocket sessions |
+| `sbproxy_ai_realtime_session_duration_seconds` | Histogram | `provider`, `close_reason` | Wall-clock duration of a Realtime WebSocket session, observed at close. `close_reason` is `client_closed` or `error` |
+| `sbproxy_ai_realtime_audio_seconds_total` | Counter | `provider`, `direction` | Cumulative audio seconds forwarded over Realtime sessions. Frame-exact accounting requires terminate-and-relay (not on the OSS path); the OSS dispatcher uses session wall-clock as a duration proxy on close |
+| `sbproxy_ai_realtime_frames_forwarded_total` | Counter | `provider`, `direction`, `kind` | Cumulative frames forwarded over Realtime sessions (`kind` is `text` or `audio`). Reserved for a future enterprise terminate-and-relay path |
 
 Use these to build spending dashboards, set budget alerts, and track provider reliability without any application-level instrumentation.
 
@@ -806,6 +810,55 @@ for chunk in stream:
     if chunk.choices[0].delta.content:
         print(chunk.choices[0].delta.content, end="")
 ```
+
+## Realtime
+
+The AI gateway routes OpenAI Realtime API WebSocket sessions through the same dispatch path as the rest of the surface set. A client opens `GET /v1/realtime` with `Upgrade: websocket` against the proxy, the gateway runs its standard pre-upgrade gating, picks an enabled provider that supports Realtime (today: OpenAI), and lets Pingora forward bytes between the client and the provider after the `101 Switching Protocols` handshake.
+
+What runs before the upgrade:
+- Surface classification stamps `ai.surface = "realtime"` on the request span and the access log.
+- The 501 capability gate fires if no configured provider supports Realtime.
+- The per-surface rate limit (`per_surface_rate_limits.realtime`) fires before the upgrade is attempted, returning 429 when the cap is hit.
+- The active-sessions gauge `sbproxy_ai_realtime_sessions_active` ticks up.
+
+What runs during the session:
+- Pingora forwards WebSocket frames byte-transparently. The proxy does not inspect individual frames (per-frame guardrails are not on the OSS path; they would require terminate-and-relay, which is reserved for an enterprise build).
+
+What runs at session close (the `logging` hook):
+- The active-sessions gauge ticks down.
+- `sbproxy_ai_realtime_session_duration_seconds` records the wall-clock session lifetime.
+- An `AiBillingEvent` fires with `usage = AudioSeconds { seconds = wall_clock }` so operators see realtime usage on the standard billing event bus. Cost is reported as 0.0 in OSS until the realtime rate card lands in the pricing helper; downstream consumers can compute cost from the duration.
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          base_url: https://api.openai.com/v1
+          models: [gpt-4o-realtime-preview]
+      per_surface_rate_limits:
+        realtime:
+          requests_per_minute: 30
+```
+
+A client connects with the standard OpenAI Realtime URL, replacing the OpenAI host with the proxy host:
+
+```python
+import websocket  # websocket-client
+
+ws = websocket.create_connection(
+    "wss://ai.example.com/v1/realtime?model=gpt-4o-realtime-preview",
+    header=[
+        "Authorization: Bearer <virtual-key>",
+        "OpenAI-Beta: realtime=v1",
+    ],
+)
+```
+
+The proxy enforces gating before the upgrade and emits a session-end billing event after close; per-frame inspection is reserved for an enterprise terminate-and-relay path that would land alongside a dedicated Pingora `Service` impl.
 
 ## Full example
 
