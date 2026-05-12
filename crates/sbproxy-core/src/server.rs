@@ -7964,9 +7964,41 @@ impl ProxyHttp for SbProxy {
                 .map(|s| !s.trim().is_empty())
                 .unwrap_or(false);
             if method_matches && header_present {
-                ctx.idempotency_buffering = true;
-                ctx.idempotency_workspace =
-                    Some(pipeline.config.origins[origin_idx].workspace_id.to_string());
+                // Backpressure gate 1: oversize body. When the
+                // client sent a content-length header that already
+                // exceeds the cap, we know the buffer won't fit. Skip
+                // engagement up front so the request streams without
+                // the body filter holding chunks back. The streaming
+                // check in `request_body_filter` covers the
+                // chunked / no-content-length case.
+                let cl_oversize = session
+                    .req_header()
+                    .headers
+                    .get(http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .map(|cl| cl > idem.max_request_body_bytes)
+                    .unwrap_or(false);
+                if cl_oversize {
+                    ctx.idempotency_skip_reason = Some("SKIPPED-OVERSIZE-REQUEST");
+                } else {
+                    // Backpressure gate 2: pool exhaustion. Try-acquire
+                    // a permit; on failure the request flows through
+                    // the no-cache path. We hold the permit on ctx
+                    // until end-of-request so concurrent buffered
+                    // requests stay bounded by `max_concurrent_buffers`.
+                    match idem.permits.clone().try_acquire_owned() {
+                        Ok(permit) => {
+                            ctx.idempotency_permit = Some(permit);
+                            ctx.idempotency_buffering = true;
+                            ctx.idempotency_workspace =
+                                Some(pipeline.config.origins[origin_idx].workspace_id.to_string());
+                        }
+                        Err(_) => {
+                            ctx.idempotency_skip_reason = Some("SKIPPED-POOL-FULL");
+                        }
+                    }
+                }
             }
         }
 
@@ -9543,6 +9575,17 @@ impl ProxyHttp for SbProxy {
             ctx.idempotency_response_headers = Some(headers);
         }
 
+        // --- Idempotency skip-reason marker ---
+        //
+        // When `request_filter` or `request_body_filter` disengaged
+        // the middleware (oversize body, pool exhausted), stamp the
+        // reason on the response so operators can see the skip in
+        // dashboards. The header is informational; the response
+        // body and status come from the upstream untouched.
+        if let Some(reason) = ctx.idempotency_skip_reason {
+            let _ = upstream_response.insert_header("x-sbproxy-idempotency", reason);
+        }
+
         // --- Wave 5 / G5.6 wire: AnomalyDetectorHook dispatch ---
         //
         // Run every registered anomaly detector hook against the
@@ -10655,9 +10698,39 @@ impl ProxyHttp for SbProxy {
         //   and call `record_response` so the next retry hits the
         //   cache.
         if ctx.idempotency_buffering {
+            // Streaming oversize guard: when content-length was
+            // absent or lied, the buffer can still grow past the
+            // configured per-request cap mid-stream. Abandon
+            // caching in that case, release the buffered bytes to
+            // the upstream as a normal chunk, and stamp the
+            // SKIPPED-OVERSIZE-REQUEST marker on the response.
+            let max_req_bytes = {
+                let pipeline = reload::current_pipeline();
+                ctx.origin_idx
+                    .and_then(|i| pipeline.idempotencies.get(i))
+                    .and_then(|opt| opt.as_ref())
+                    .map(|i| i.max_request_body_bytes)
+                    .unwrap_or(usize::MAX)
+            };
             let buf = ctx
                 .request_body_buf
                 .get_or_insert_with(bytes::BytesMut::new);
+            let incoming = body.as_ref().map(|c| c.len()).unwrap_or(0);
+            if buf.len().saturating_add(incoming) > max_req_bytes {
+                // Release whatever we have (existing buffer + this
+                // chunk) so the upstream sees the full payload, then
+                // disengage and record the skip reason for the
+                // response_filter marker.
+                let mut out = ctx.request_body_buf.take().unwrap_or_default();
+                if let Some(chunk) = body.take() {
+                    out.extend_from_slice(&chunk);
+                }
+                *body = Some(out.freeze());
+                ctx.idempotency_buffering = false;
+                ctx.idempotency_permit = None;
+                ctx.idempotency_skip_reason = Some("SKIPPED-OVERSIZE-REQUEST");
+                return Ok(());
+            }
             if let Some(chunk) = body.take() {
                 buf.extend_from_slice(&chunk);
             }
@@ -10893,9 +10966,39 @@ impl ProxyHttp for SbProxy {
         // is best-effort: a missing piece (status, headers, or buffer)
         // simply skips the write rather than holding up the response.
         if ctx.idempotency_response_body_buf.is_some() {
+            // Response-size cap: when the upstream response grows
+            // past `max_response_body_bytes` we abandon caching for
+            // this request rather than buffering unbounded memory.
+            // The chunk flows through to the client untouched; the
+            // marker on the response tells operators we couldn't
+            // cache it.
+            let max_resp_bytes = {
+                let pipeline = reload::current_pipeline();
+                ctx.origin_idx
+                    .and_then(|i| pipeline.idempotencies.get(i))
+                    .and_then(|opt| opt.as_ref())
+                    .map(|i| i.max_response_body_bytes)
+                    .unwrap_or(usize::MAX)
+            };
             if let Some(chunk) = body.as_ref() {
                 if let Some(buf) = ctx.idempotency_response_body_buf.as_mut() {
-                    buf.extend_from_slice(chunk);
+                    if buf.len().saturating_add(chunk.len()) > max_resp_bytes {
+                        // Drop the capture buffer; future chunks
+                        // stream through unbuffered.
+                        ctx.idempotency_response_body_buf = None;
+                        ctx.idempotency_miss = None;
+                        ctx.idempotency_response_status = None;
+                        ctx.idempotency_response_headers = None;
+                        ctx.idempotency_skip_reason = Some("SKIPPED-OVERSIZE-RESPONSE");
+                        // Note: the header was already flushed to the
+                        // client at this point so the skip marker is
+                        // best-effort visible only via logs / events.
+                        // Tracked as an enhancement; for now we still
+                        // mark ctx so the request log captures the
+                        // reason.
+                    } else {
+                        buf.extend_from_slice(chunk);
+                    }
                 }
             }
             if end_of_stream {

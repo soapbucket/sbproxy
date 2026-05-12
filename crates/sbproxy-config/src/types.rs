@@ -2324,7 +2324,42 @@ pub struct IdempotencyConfig {
     /// `proxy.l2_store` get an error at config-validate time.
     #[serde(default)]
     pub backend: IdempotencyBackend,
+    /// Maximum request body size in bytes that the middleware will
+    /// buffer for the cache check. Requests larger than this cap
+    /// gracefully degrade: the middleware skips caching for that
+    /// request and stamps `x-sbproxy-idempotency:
+    /// SKIPPED-OVERSIZE-REQUEST` on the response so operators can
+    /// see the skip. Defaults to 1 MiB.
+    #[serde(default)]
+    pub max_request_body_bytes: Option<usize>,
+    /// Maximum response body size in bytes that will be buffered for
+    /// caching. Responses larger than this cap stream to the client
+    /// uncached; the next retry with the same key falls through to
+    /// the upstream. Defaults to 1 MiB.
+    #[serde(default)]
+    pub max_response_body_bytes: Option<usize>,
+    /// Process-wide cap on the number of concurrent buffered
+    /// idempotency requests *for this origin*. When the pool is
+    /// exhausted, new requests skip caching and stream normally;
+    /// `x-sbproxy-idempotency: SKIPPED-POOL-FULL` is stamped so
+    /// operators can spot pool pressure. Defaults to 256, which at
+    /// the default per-request cap gives a 256 MiB worst-case
+    /// memory budget per origin.
+    #[serde(default)]
+    pub max_concurrent_buffers: Option<usize>,
 }
+
+/// Default cap on request body bytes the middleware will buffer
+/// for the cache check (1 MiB). Above this, the middleware skips
+/// caching.
+pub const DEFAULT_IDEMPOTENCY_MAX_REQUEST_BYTES: usize = 1024 * 1024;
+/// Default cap on response body bytes the middleware will buffer
+/// for caching (1 MiB). Above this, the response streams through
+/// uncached.
+pub const DEFAULT_IDEMPOTENCY_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Default pool cap: how many concurrent buffered idempotency
+/// requests per origin (256).
+pub const DEFAULT_IDEMPOTENCY_MAX_CONCURRENT_BUFFERS: usize = 256;
 
 /// Cache backend for [`IdempotencyConfig`].
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
