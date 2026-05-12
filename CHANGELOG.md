@@ -114,21 +114,6 @@ of the new YAML fields below until the version that ships them.
   response to the client; future work moves the check earlier so the
   upstream never sees the replay.
 
-### Removed
-
-- **`sbproxy_ai::IdempotencyCache`.** The OSS AI gateway never wired
-  this cache; it was publicly re-exported but had zero callers in the
-  workspace. The new `idempotency:` block on general HTTP origins
-  (above) supersedes it. AI gateway integration is a follow-up tracked
-  in `docs/missing.md`. Plugin authors that imported the removed
-  type can switch to
-  `sbproxy_middleware::idempotency::{IdempotencyCache,
-  InMemoryIdempotencyCache, KvIdempotencyCache}` which carries the
-  richer surface (workspace isolation, body-hash conflict detection,
-  conflict body builder).
-
-### Added
-
 - **RFC 9457 problem-details default renderer (`problem_details:`).**
   New per-origin block that opts in to `application/problem+json` for
   proxy-generated errors (authentication denials, policy denials,
@@ -405,6 +390,19 @@ of the new YAML fields below until the version that ships them.
   in-process readiness probe that exercises a caller-provided path and
   reports through the same `/readyz` component model as built-in probes.
   ([crates/sbproxy-observe/src/health.rs])
+
+### Removed
+
+- **`sbproxy_ai::IdempotencyCache`.** The OSS AI gateway never wired
+  this cache; it was publicly re-exported but had zero callers in the
+  workspace. The new `idempotency:` block on general HTTP origins
+  (above) supersedes it. AI gateway integration is a follow-up tracked
+  in `docs/missing.md`. Plugin authors that imported the removed
+  type can switch to
+  `sbproxy_middleware::idempotency::{IdempotencyCache,
+  InMemoryIdempotencyCache, KvIdempotencyCache}` which carries the
+  richer surface (workspace isolation, body-hash conflict detection,
+  conflict body builder).
 
 ### Changed
 
