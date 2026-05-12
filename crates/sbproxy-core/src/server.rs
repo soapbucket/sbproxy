@@ -4703,6 +4703,47 @@ async fn handle_ai_proxy(
             })?;
 
         let format = sbproxy_ai::client::provider_format(provider);
+
+        // For audio_transcription requests, peek at the response body
+        // to extract `duration` (present when the operator requests
+        // verbose_json output) so the billing event reflects the real
+        // audio length instead of falling back to PerCall. Other
+        // multipart surfaces (image edits/variations, file upload)
+        // continue to emit PerCall here; their per-unit usage is
+        // captured on the request side and emitted in the chat path.
+        if surface_label == "audio_transcription" {
+            let status = resp.status().as_u16();
+            let resp_ct = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/json")
+                .to_string();
+            let resp_bytes = read_capped_response_body(resp, config.max_body_size).await?;
+            // Whisper is the only OpenAI transcription model today;
+            // the inbound body is multipart so the model is not in a
+            // JSON field. Default to `whisper-1` for cost lookup; a
+            // future commit that parses multipart fields can refine.
+            let model = Some("whisper-1".to_string());
+            let duration = serde_json::from_slice::<serde_json::Value>(&resp_bytes)
+                .ok()
+                .and_then(|v| v.get("duration").and_then(|d| d.as_f64()));
+            let usage = match duration {
+                Some(secs) => sbproxy_ai::budget::AiUsage::AudioSeconds { seconds: secs },
+                None => sbproxy_ai::budget::AiUsage::PerCall,
+            };
+            let cost = sbproxy_ai::budget::estimate_cost_for_usage("whisper-1", &usage);
+            emit_ai_billing_event(
+                surface_label,
+                &provider.name,
+                model,
+                usage,
+                cost,
+                Vec::new(),
+            );
+            return send_response(session, status, &resp_ct, &resp_bytes).await;
+        }
+
         emit_ai_billing_event(
             surface_label,
             &provider.name,
