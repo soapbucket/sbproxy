@@ -296,6 +296,100 @@ fn lookup_price(model: &str) -> Option<ModelPrice> {
     None
 }
 
+/// Look up a per-image USD price for `model` at the given resolution.
+///
+/// Resolutions are matched case-insensitively against the model's
+/// published rate card. Returns `None` for unknown model+resolution
+/// combinations; the caller falls back to zero so unknown surfaces
+/// don't silently inflate cost.
+fn lookup_image_price(model: &str, resolution: &str) -> Option<f64> {
+    let m = model.to_ascii_lowercase();
+    let r = resolution.to_ascii_lowercase();
+    // OpenAI DALL-E 3 (list prices as of 2026)
+    if m.contains("dall-e-3") {
+        return match r.as_str() {
+            "1024x1024" => Some(0.040),
+            "1024x1792" | "1792x1024" => Some(0.080),
+            // HD variants typically appear as a separate model in
+            // the request body; if the operator encodes it in the
+            // resolution string we recognize the canonical HD shapes.
+            "hd-1024x1024" => Some(0.080),
+            "hd-1024x1792" | "hd-1792x1024" => Some(0.120),
+            _ => None,
+        };
+    }
+    // OpenAI DALL-E 2
+    if m.contains("dall-e-2") {
+        return match r.as_str() {
+            "256x256" => Some(0.016),
+            "512x512" => Some(0.018),
+            "1024x1024" => Some(0.020),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Look up a per-second USD price for audio transcription / translation.
+/// Whisper bills $0.006 per minute = $0.0001 per second.
+fn lookup_audio_transcription_price(model: &str) -> Option<f64> {
+    let m = model.to_ascii_lowercase();
+    if m.contains("whisper") {
+        return Some(0.000_1);
+    }
+    None
+}
+
+/// Look up a per-character USD price for text-to-speech.
+/// OpenAI tts-1: $15 / 1M chars; tts-1-hd: $30 / 1M chars.
+fn lookup_audio_speech_price(model: &str) -> Option<f64> {
+    let m = model.to_ascii_lowercase();
+    if m.contains("tts-1-hd") {
+        return Some(0.000_030);
+    }
+    if m.contains("tts-1") {
+        return Some(0.000_015);
+    }
+    None
+}
+
+/// Look up a per-document USD price for reranking. Cohere bills
+/// $2 / 1000 documents = $0.002 per document.
+fn lookup_rerank_price(model: &str) -> Option<f64> {
+    let m = model.to_ascii_lowercase();
+    if m.starts_with("rerank-") {
+        return Some(0.002);
+    }
+    None
+}
+
+/// Estimate the USD cost of a billing event given the model name and
+/// the surface-specific usage record.
+///
+/// Token-bearing usage delegates to [`estimate_cost`]. Image, audio,
+/// character, and rerank usage consults its own pricing helper.
+/// `PerCall` always returns 0.0 (flat-fee endpoints like moderations
+/// don't scale with payload size; the operator can pair this with
+/// their own ledger if they need per-call accounting).
+pub fn estimate_cost_for_usage(model: &str, usage: &AiUsage) -> f64 {
+    match usage {
+        AiUsage::Tokens { input, output } => estimate_cost(model, *input, *output),
+        AiUsage::Images { count, resolution } => lookup_image_price(model, resolution)
+            .map(|p| p * (*count as f64))
+            .unwrap_or(0.0),
+        AiUsage::AudioSeconds { seconds } => lookup_audio_transcription_price(model)
+            .map(|p| p * seconds)
+            .unwrap_or(0.0),
+        AiUsage::Characters { count } => lookup_audio_speech_price(model)
+            .map(|p| p * (*count as f64))
+            .unwrap_or(0.0),
+        AiUsage::RerankUnits { documents } => lookup_rerank_price(model)
+            .map(|p| p * (*documents as f64))
+            .unwrap_or(0.0),
+        AiUsage::PerCall => 0.0,
+    }
+}
+
 /// Estimate the USD cost of a request given the model name and token
 /// counts. Unknown models fall back to a flat $5 per million blended
 /// rate so a missing entry never silently zero-rates a request.
@@ -766,6 +860,109 @@ mod tests {
         assert!((user.cost_usd - 0.01).abs() < 1e-9);
         assert_eq!(ws.request_count, 1);
         assert_eq!(user.request_count, 1);
+    }
+
+    // --- estimate_cost_for_usage and per-surface pricing helpers ---
+
+    #[test]
+    fn estimate_cost_for_usage_tokens_matches_estimate_cost() {
+        let usage = AiUsage::Tokens {
+            input: 1000,
+            output: 500,
+        };
+        let via_usage = estimate_cost_for_usage("gpt-4o", &usage);
+        let via_legacy = estimate_cost("gpt-4o", 1000, 500);
+        assert!((via_usage - via_legacy).abs() < 1e-9);
+        assert!(via_usage > 0.0);
+    }
+
+    #[test]
+    fn estimate_cost_for_usage_image_dalle_3() {
+        let usage_std = AiUsage::Images {
+            count: 1,
+            resolution: "1024x1024".to_string(),
+        };
+        let usage_wide = AiUsage::Images {
+            count: 1,
+            resolution: "1024x1792".to_string(),
+        };
+        let usage_pair = AiUsage::Images {
+            count: 2,
+            resolution: "1024x1024".to_string(),
+        };
+        assert!((estimate_cost_for_usage("dall-e-3", &usage_std) - 0.040).abs() < 1e-9);
+        assert!((estimate_cost_for_usage("dall-e-3", &usage_wide) - 0.080).abs() < 1e-9);
+        assert!((estimate_cost_for_usage("dall-e-3", &usage_pair) - 0.080).abs() < 1e-9);
+    }
+
+    #[test]
+    fn estimate_cost_for_usage_image_dalle_2_resolutions() {
+        for (res, expected) in [("256x256", 0.016), ("512x512", 0.018), ("1024x1024", 0.020)] {
+            let usage = AiUsage::Images {
+                count: 1,
+                resolution: res.to_string(),
+            };
+            let got = estimate_cost_for_usage("dall-e-2", &usage);
+            assert!(
+                (got - expected).abs() < 1e-9,
+                "expected ${expected} at {res}, got ${got}"
+            );
+        }
+    }
+
+    #[test]
+    fn estimate_cost_for_usage_audio_transcription_per_second() {
+        let usage = AiUsage::AudioSeconds { seconds: 60.0 };
+        // Whisper: $0.006 per minute = $0.36 per hour, $0.0001 per second.
+        let got = estimate_cost_for_usage("whisper-1", &usage);
+        assert!((got - 0.006).abs() < 1e-9, "got ${got}");
+    }
+
+    #[test]
+    fn estimate_cost_for_usage_audio_speech_per_character() {
+        let usage = AiUsage::Characters { count: 1_000_000 };
+        // tts-1: $15 per 1M chars.
+        let standard = estimate_cost_for_usage("tts-1", &usage);
+        assert!((standard - 15.0).abs() < 1e-6, "got ${standard}");
+        // tts-1-hd: $30 per 1M chars.
+        let hd = estimate_cost_for_usage("tts-1-hd", &usage);
+        assert!((hd - 30.0).abs() < 1e-6, "got ${hd}");
+    }
+
+    #[test]
+    fn estimate_cost_for_usage_rerank_per_document() {
+        let usage = AiUsage::RerankUnits { documents: 1000 };
+        // Cohere rerank: $2 per 1000 docs.
+        let got = estimate_cost_for_usage("rerank-english-v3.0", &usage);
+        assert!((got - 2.0).abs() < 1e-9, "got ${got}");
+    }
+
+    #[test]
+    fn estimate_cost_for_usage_per_call_is_zero() {
+        assert_eq!(estimate_cost_for_usage("any-model", &AiUsage::PerCall), 0.0);
+    }
+
+    #[test]
+    fn estimate_cost_for_usage_unknown_model_returns_zero_for_per_unit_surfaces() {
+        // Image / audio / character / rerank with an unknown model
+        // surfaces 0.0 (so operators don't see fabricated cost). This
+        // is the opposite default from token-based pricing, which
+        // falls back to a pessimistic blended rate so a budget cap
+        // still fires.
+        let img = AiUsage::Images {
+            count: 1,
+            resolution: "1024x1024".to_string(),
+        };
+        assert_eq!(estimate_cost_for_usage("unknown-image-model", &img), 0.0);
+        let audio = AiUsage::AudioSeconds { seconds: 30.0 };
+        assert_eq!(estimate_cost_for_usage("unknown-audio-model", &audio), 0.0);
+        let chars = AiUsage::Characters { count: 1000 };
+        assert_eq!(estimate_cost_for_usage("unknown-tts-model", &chars), 0.0);
+        let rerank = AiUsage::RerankUnits { documents: 10 };
+        assert_eq!(
+            estimate_cost_for_usage("unknown-rerank-model", &rerank),
+            0.0
+        );
     }
 
     #[test]

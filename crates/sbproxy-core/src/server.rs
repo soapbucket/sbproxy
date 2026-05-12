@@ -5537,7 +5537,7 @@ async fn relay_ai_response_with_cache(
             } else {
                 sbproxy_ai::budget::AiUsage::PerCall
             };
-            let cost = sbproxy_ai::estimate_cost(args.model, prompt_tokens, completion_tokens);
+            let cost = sbproxy_ai::budget::estimate_cost_for_usage(args.model, &usage);
             let scope_keys = args.keys.iter().map(|(_, k)| k.clone()).collect::<Vec<_>>();
             emit_ai_billing_event(
                 args.surface_label,
@@ -5873,7 +5873,7 @@ async fn relay_ai_stream(
                 } else {
                     sbproxy_ai::budget::AiUsage::PerCall
                 };
-                let cost = sbproxy_ai::estimate_cost(args.model, prompt, completion);
+                let cost = sbproxy_ai::budget::estimate_cost_for_usage(args.model, &usage);
                 let scope_keys = args.keys.iter().map(|(_, k)| k.clone()).collect::<Vec<_>>();
                 emit_ai_billing_event(
                     args.surface_label,
