@@ -1,6 +1,8 @@
 //! AI guardrails pipeline - input/output content safety checks.
 
 mod content_safety;
+mod context_poisoning;
+mod context_poisoning_rules;
 // WOR-191: `injection` is `pub` so the v2 detector in
 // `sbproxy-modules::policy::prompt_injection_v2` can re-use the
 // canonical `COMMON_INJECTION_PATTERNS` and `SUSPICIOUS_PATTERNS`
@@ -13,6 +15,11 @@ mod schema;
 mod toxicity;
 
 pub use content_safety::ContentSafetyGuardrail;
+pub use context_poisoning::{
+    ContextPoisoningConfig, ContextPoisoningGuardrail, Finding as ContextPoisoningFinding,
+    GuardrailAction,
+};
+pub use context_poisoning_rules::{ContextPoisoningRule, CONTEXT_POISONING_RULES};
 pub use injection::InjectionGuardrail;
 pub use jailbreak::JailbreakGuardrail;
 pub use pii::{PiiAction, PiiGuardrail};
@@ -51,6 +58,10 @@ pub enum Guardrail {
     Schema(SchemaGuardrail),
     /// Regular expression based deny-list guardrail.
     Regex(RegexGuardrail),
+    /// Context-poisoning detection guardrail. Flags untrusted
+    /// retrieval content that tries to influence a subsequent tool
+    /// call (WOR-159).
+    ContextPoisoning(ContextPoisoningGuardrail),
 }
 
 impl Guardrail {
@@ -64,6 +75,7 @@ impl Guardrail {
             Self::ContentSafety(_) => "content_safety",
             Self::Schema(_) => "schema",
             Self::Regex(_) => "regex",
+            Self::ContextPoisoning(_) => "context_poisoning",
         }
     }
 
@@ -77,6 +89,16 @@ impl Guardrail {
             Self::ContentSafety(g) => g.check(content),
             Self::Schema(g) => g.check(content),
             Self::Regex(g) => g.check(content),
+            Self::ContextPoisoning(g) => g.check(content),
+        }
+    }
+
+    /// Role-aware check for the context-poisoning guardrail. Other
+    /// guardrails fall back to text-only [`Guardrail::check`].
+    pub fn check_messages(&self, messages: &[Message]) -> Option<GuardrailBlock> {
+        match self {
+            Self::ContextPoisoning(g) => g.check_messages(messages),
+            _ => self.check(&extract_text_from_messages(messages)),
         }
     }
 }
@@ -102,10 +124,16 @@ impl GuardrailPipeline {
     }
 
     /// Check input messages. Returns first block encountered.
+    ///
+    /// Each guardrail decides whether it consumes the concatenated
+    /// text view or the role-aware messages view via
+    /// [`Guardrail::check_messages`]. The context-poisoning guardrail
+    /// (WOR-159) reads message roles to gate its
+    /// `cp_conflicting_directive` rule; every other guardrail uses
+    /// the flat text view of the concatenated message bodies.
     pub fn check_input(&self, messages: &[Message]) -> Option<GuardrailBlock> {
-        let content = extract_text_from_messages(messages);
         for guard in &self.input {
-            if let Some(block) = guard.check(&content) {
+            if let Some(block) = guard.check_messages(messages) {
                 return Some(block);
             }
         }
@@ -193,6 +221,12 @@ pub fn compile_guardrail(config: &serde_json::Value) -> Result<Guardrail> {
         "content_safety" => Ok(Guardrail::ContentSafety(serde_json::from_value(
             config.clone(),
         )?)),
+        "context_poisoning" => {
+            let cfg: ContextPoisoningConfig = serde_json::from_value(config.clone())?;
+            Ok(Guardrail::ContextPoisoning(ContextPoisoningGuardrail::new(
+                cfg,
+            )))
+        }
         "schema" => Ok(Guardrail::Schema(schema::SchemaGuardrail::from_config(
             config,
         )?)),

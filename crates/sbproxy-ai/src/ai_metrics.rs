@@ -453,6 +453,53 @@ pub fn record_guardrail_block(category: &str) {
     AI_GUARDRAIL_BLOCKS.with_label_values(&[category]).inc();
 }
 
+// --- Context-poisoning guardrail metrics (WOR-159) ---
+
+/// Per-rule, per-action counter of context-poisoning findings. Fires
+/// once for every rule hit regardless of whether the configured
+/// `action` blocks the request, so dashboards can compare log/score
+/// volume against deny volume.
+static AI_CONTEXT_POISONING_FINDINGS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_context_poisoning_findings_total",
+            "Context-poisoning guardrail findings",
+        ),
+        &["rule_id", "action"]
+    )
+    .unwrap()
+});
+
+/// Counter of context-poisoning hits that resulted in a blocked
+/// request (configured action `deny`).
+static AI_CONTEXT_POISONING_BLOCKED: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "sbproxy_ai_context_poisoning_blocked_total",
+        "Context-poisoning guardrail blocked-request count",
+    )
+    .unwrap()
+});
+
+/// Record a single context-poisoning finding. `rule_id` is the stable
+/// ID from the rule catalogue; `action` is one of `log`, `score`,
+/// `deny`.
+pub fn record_context_poisoning_finding(rule_id: &str, action: &str) {
+    AI_CONTEXT_POISONING_FINDINGS
+        .with_label_values(&[rule_id, action])
+        .inc();
+}
+
+/// Record one context-poisoning hit that resulted in a blocked
+/// request. Called only when `action` is `deny`.
+pub fn record_context_poisoning_blocked() {
+    AI_CONTEXT_POISONING_BLOCKED.inc();
+}
+
+/// Read the cumulative blocked-request counter. Used in tests.
+pub fn context_poisoning_blocked_value() -> f64 {
+    AI_CONTEXT_POISONING_BLOCKED.get()
+}
+
 /// Record a cache result.
 pub fn record_cache_result(provider: &str, cache_type: &str, hit: bool) {
     let result = if hit { "hit" } else { "miss" };
