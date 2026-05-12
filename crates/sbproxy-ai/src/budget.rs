@@ -445,6 +445,29 @@ impl AiBillingEvent {
         }
     }
 
+    /// Construct a new event from a pre-computed surface label string.
+    ///
+    /// Use this when the dispatch path already carries the surface
+    /// label (the stable string from [`AiSurface::label`]) and we
+    /// don't want to round-trip through the `AiSurface` enum to set
+    /// it. Functionally equivalent to [`AiBillingEvent::new`].
+    pub fn from_label(
+        surface_label: impl Into<String>,
+        provider: impl Into<String>,
+        model: Option<String>,
+        usage: AiUsage,
+    ) -> Self {
+        Self {
+            surface: surface_label.into(),
+            provider: provider.into(),
+            model,
+            usage,
+            cost_usd: 0.0,
+            occurred_at_unix_secs: now_unix_secs(),
+            scope_keys: Vec::new(),
+        }
+    }
+
     /// Attach an estimated cost in USD. Chainable so call sites can
     /// build the event in one expression.
     pub fn with_cost(mut self, cost_usd: f64) -> Self {

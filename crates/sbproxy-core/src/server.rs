@@ -4357,21 +4357,17 @@ impl SseUsageScanner {
 /// `record_budget_usage` until the chat usage-extraction is reworked
 /// to emit the new event shape.
 fn emit_ai_billing_event(
-    surface: &sbproxy_ai::handler::AiSurface,
+    surface_label: &str,
     provider_name: &str,
     model: Option<String>,
     usage: sbproxy_ai::budget::AiUsage,
     cost_usd: f64,
     scope_keys: Vec<String>,
 ) {
-    let event = sbproxy_ai::budget::AiBillingEvent::new(
-        surface.clone(),
-        provider_name.to_string(),
-        model,
-        usage,
-    )
-    .with_cost(cost_usd)
-    .with_scope_keys(scope_keys);
+    let event =
+        sbproxy_ai::budget::AiBillingEvent::from_label(surface_label, provider_name, model, usage)
+            .with_cost(cost_usd)
+            .with_scope_keys(scope_keys);
     sbproxy_ai::budget::record_billing_event(&BUDGET_TRACKER, &event);
     tracing::info!(
         ai.surface = event.surface.as_str(),
@@ -4581,7 +4577,7 @@ async fn handle_ai_proxy(
         // OpenAI clients don't depend on it for routing decisions.
         let format = sbproxy_ai::client::provider_format(provider);
         emit_ai_billing_event(
-            &surface,
+            surface_label,
             &provider.name,
             None,
             sbproxy_ai::budget::AiUsage::PerCall,
@@ -4650,7 +4646,7 @@ async fn handle_ai_proxy(
 
         let format = sbproxy_ai::client::provider_format(provider);
         emit_ai_billing_event(
-            &surface,
+            surface_label,
             &provider.name,
             None,
             sbproxy_ai::budget::AiUsage::PerCall,
@@ -4708,7 +4704,7 @@ async fn handle_ai_proxy(
 
         let format = sbproxy_ai::client::provider_format(provider);
         emit_ai_billing_event(
-            &surface,
+            surface_label,
             &provider.name,
             None,
             sbproxy_ai::budget::AiUsage::PerCall,
@@ -5079,6 +5075,11 @@ async fn handle_ai_proxy(
     // resolver so a Vertex / Bedrock / Cohere host picks the right
     // parser without operators having to override `usage_parser`.
     let mut last_upstream_host: Option<String> = None;
+    // Track the provider name that produced `last_resp` so the
+    // billing event emission outside the for loop can attribute the
+    // request to the right provider without re-deriving from
+    // `provider_idx`.
+    let mut last_provider_name: String = String::new();
 
     for (attempt, &provider_idx) in provider_order.iter().enumerate() {
         if attempt >= max_attempts {
@@ -5134,6 +5135,7 @@ async fn handle_ai_proxy(
                 last_upstream_host = url::Url::parse(&provider.effective_base_url())
                     .ok()
                     .and_then(|u| u.host_str().map(|h| h.to_string()));
+                last_provider_name = provider.name.clone();
                 last_resp = Some(resp);
                 break;
             }
@@ -5209,6 +5211,8 @@ async fn handle_ai_proxy(
                 config: b,
                 keys: &budget_keys,
                 model: model.as_str(),
+                surface_label,
+                provider_name: last_provider_name.as_str(),
             });
             // Capture parser hints from the upstream response before it
             // gets moved into relay_ai_stream. The streaming relay
@@ -5256,6 +5260,8 @@ async fn handle_ai_proxy(
                 config: b,
                 keys: &budget_keys,
                 model: model.as_str(),
+                surface_label,
+                provider_name: last_provider_name.as_str(),
             });
             relay_ai_response_with_cache(
                 session,
@@ -5518,6 +5524,29 @@ async fn relay_ai_response_with_cache(
                 prompt_tokens,
                 completion_tokens,
             );
+            // Emit a surface-tagged AiBillingEvent alongside the
+            // existing budget recording. Token-bearing responses
+            // emit a Tokens variant; responses without a usage block
+            // (image generation, audio speech, moderations through
+            // the POST path) emit PerCall.
+            let usage = if prompt_tokens != 0 || completion_tokens != 0 {
+                sbproxy_ai::budget::AiUsage::Tokens {
+                    input: prompt_tokens,
+                    output: completion_tokens,
+                }
+            } else {
+                sbproxy_ai::budget::AiUsage::PerCall
+            };
+            let cost = sbproxy_ai::estimate_cost(args.model, prompt_tokens, completion_tokens);
+            let scope_keys = args.keys.iter().map(|(_, k)| k.clone()).collect::<Vec<_>>();
+            emit_ai_billing_event(
+                args.surface_label,
+                args.provider_name,
+                Some(args.model.to_string()),
+                usage,
+                cost,
+                scope_keys,
+            );
         }
     } else if let Some(ctx) = ctx {
         // Even without a budget recorder we still want the access log
@@ -5548,6 +5577,14 @@ struct BudgetRecorderArgs<'a> {
     /// Model the request actually ran against (after any downgrade).
     /// Drives cost estimation via the embedded price catalog.
     model: &'a str,
+    /// Classified AI surface (`chat_completions`, `embeddings`,
+    /// `assistants`, `image_generation`, ...). Carried through so
+    /// the relay function can emit a surface-tagged
+    /// `AiBillingEvent` alongside the budget recording.
+    surface_label: &'a str,
+    /// Provider that received the dispatched request. Same source
+    /// of truth as the `provider` field in the access log.
+    provider_name: &'a str,
 }
 
 /// Inputs to the streaming-cache recorder hook, bundled to keep
@@ -5825,6 +5862,26 @@ async fn relay_ai_stream(
                     args.model,
                     tokens.prompt_tokens as u64,
                     tokens.completion_tokens as u64,
+                );
+                let prompt = tokens.prompt_tokens as u64;
+                let completion = tokens.completion_tokens as u64;
+                let usage = if prompt != 0 || completion != 0 {
+                    sbproxy_ai::budget::AiUsage::Tokens {
+                        input: prompt,
+                        output: completion,
+                    }
+                } else {
+                    sbproxy_ai::budget::AiUsage::PerCall
+                };
+                let cost = sbproxy_ai::estimate_cost(args.model, prompt, completion);
+                let scope_keys = args.keys.iter().map(|(_, k)| k.clone()).collect::<Vec<_>>();
+                emit_ai_billing_event(
+                    args.surface_label,
+                    args.provider_name,
+                    Some(args.model.to_string()),
+                    usage,
+                    cost,
+                    scope_keys,
                 );
             }
         }
