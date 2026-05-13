@@ -1073,6 +1073,196 @@ pub fn record_policy_decision_latency(surface: &str, duration_secs: f64) {
     hist.with_label_values(&[surface]).observe(duration_secs);
 }
 
+// --- WOR-75: four exemplar-emitting histograms ---
+//
+// Each helper below registers its own `HistogramVec` lazily, calls
+// `.observe(duration_secs)`, and stamps the active trace + span IDs
+// onto the matching bucket via `exemplars::record(...)`. The metric
+// names line up with the WOR-75 allow-list in
+// [`crate::exemplars::is_exemplar_metric`].
+//
+// All four share [`exemplars::STANDARD_LATENCY_BUCKETS`] so dashboards
+// can use one bucket template across the request, ledger, policy,
+// outbound, and audit pipelines. Bucket boundaries match
+// `request_duration` (12 buckets from 1ms to 10s) so an outlier in
+// the gateway always lands in the same `le=...` slot as the outlier
+// in the corresponding downstream call.
+
+/// Observe the wall-clock latency of one payment-token redemption in
+/// seconds (WOR-75 / `sbproxy_ledger_redeem_duration_seconds`).
+///
+/// Called by the `ai_crawl` policy after every
+/// [`crate::events::PolicyVerdictEvent`]-eligible ledger call. The
+/// `outcome` label is one of `success`, `hard_failure`, or
+/// `transient_failure` so the dashboard can distinguish "ledger is
+/// up but the token is bad" from "ledger is unreachable" without
+/// blowing up cardinality. `host` carries the request hostname so
+/// per-origin dashboards can split slow ledgers from fast ones.
+///
+/// An exemplar with the active OpenTelemetry trace + span IDs is
+/// stamped onto the matching bucket; scrapers negotiating
+/// `application/openmetrics-text` will see the `# {trace_id="..."}`
+/// suffix.
+pub fn record_ledger_redeem_duration(host: &str, outcome: &str, duration_secs: f64) {
+    use prometheus::{register_histogram_vec, HistogramVec};
+    use std::sync::OnceLock;
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    let hist = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_ledger_redeem_duration_seconds",
+            "Wall-clock latency of a single ledger token redemption",
+            &["host", "outcome"],
+            crate::exemplars::STANDARD_LATENCY_BUCKETS.to_vec(),
+        )
+        .expect("ledger redeem histogram registers")
+    });
+    let host_san = sanitize_label("host", host);
+    hist.with_label_values(&[host_san.as_str(), outcome])
+        .observe(duration_secs);
+    let (trace_id, span_id) = current_trace_ids();
+    crate::exemplars::record(
+        "sbproxy_ledger_redeem_duration_seconds",
+        &[("host", host_san.as_str()), ("outcome", outcome)],
+        duration_secs,
+        crate::exemplars::STANDARD_LATENCY_BUCKETS,
+        &trace_id,
+        &span_id,
+    );
+}
+
+/// Observe the wall-clock latency of one policy-chain evaluation in
+/// seconds (WOR-75 / `sbproxy_policy_evaluation_duration_seconds`).
+///
+/// This is the cousin of [`record_policy_decision_latency`]: that one
+/// is the per-policy decision timer, while this one covers the full
+/// chain evaluation (every policy in the chain for one request) so
+/// dashboards can see end-to-end policy overhead per origin without
+/// stitching per-policy buckets together. `origin` is the request
+/// hostname; `verdict` is one of `allow`, `deny`, `confirm` to match
+/// the verdict bus vocabulary.
+///
+/// An exemplar with the active trace + span IDs lands on the matching
+/// bucket so a Grafana "click an outlier" path reaches the right
+/// span.
+pub fn record_policy_evaluation_duration(origin: &str, verdict: &str, duration_secs: f64) {
+    use prometheus::{register_histogram_vec, HistogramVec};
+    use std::sync::OnceLock;
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    let hist = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_policy_evaluation_duration_seconds",
+            "Wall-clock latency of one full policy-chain evaluation",
+            &["origin", "verdict"],
+            crate::exemplars::STANDARD_LATENCY_BUCKETS.to_vec(),
+        )
+        .expect("policy evaluation histogram registers")
+    });
+    let origin_san = sanitize_label("origin", origin);
+    hist.with_label_values(&[origin_san.as_str(), verdict])
+        .observe(duration_secs);
+    let (trace_id, span_id) = current_trace_ids();
+    crate::exemplars::record(
+        "sbproxy_policy_evaluation_duration_seconds",
+        &[("origin", origin_san.as_str()), ("verdict", verdict)],
+        duration_secs,
+        crate::exemplars::STANDARD_LATENCY_BUCKETS,
+        &trace_id,
+        &span_id,
+    );
+}
+
+/// Observe the wall-clock latency of one outbound upstream request in
+/// seconds (WOR-75 / `sbproxy_outbound_request_duration_seconds`).
+///
+/// Called from the proxy dispatch path after the upstream response
+/// has been read (or the call has failed). `host` is the upstream
+/// hostname (sanitised through the cardinality limiter); `method` is
+/// the request method; `status` is the upstream response status or
+/// `"error"` when the upstream call failed before a status was seen.
+///
+/// An exemplar with the active trace + span IDs is stamped onto the
+/// matching bucket. The metric is a peer to
+/// `sbproxy_origin_request_duration_seconds`: that one is the
+/// inbound view (proxy boundary), this one is the outbound view
+/// (upstream boundary). Both share the standard 12-bucket layout so
+/// dashboards can subtract one from the other to surface
+/// proxy-internal overhead.
+pub fn record_outbound_request_duration(
+    host: &str,
+    method: &str,
+    status: &str,
+    duration_secs: f64,
+) {
+    use prometheus::{register_histogram_vec, HistogramVec};
+    use std::sync::OnceLock;
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    let hist = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_outbound_request_duration_seconds",
+            "Wall-clock latency of one outbound upstream request",
+            &["host", "method", "status"],
+            crate::exemplars::STANDARD_LATENCY_BUCKETS.to_vec(),
+        )
+        .expect("outbound request histogram registers")
+    });
+    let host_san = sanitize_label("host", host);
+    hist.with_label_values(&[host_san.as_str(), method, status])
+        .observe(duration_secs);
+    let (trace_id, span_id) = current_trace_ids();
+    crate::exemplars::record(
+        "sbproxy_outbound_request_duration_seconds",
+        &[
+            ("host", host_san.as_str()),
+            ("method", method),
+            ("status", status),
+        ],
+        duration_secs,
+        crate::exemplars::STANDARD_LATENCY_BUCKETS,
+        &trace_id,
+        &span_id,
+    );
+}
+
+/// Observe the wall-clock latency of one audit-channel emission in
+/// seconds (WOR-75 / `sbproxy_audit_emit_duration_seconds`).
+///
+/// Called by [`crate::audit::ConfigAuditEntry::emit`] and
+/// [`crate::audit::SecurityAuditEntry::emit`] after the JSON has been
+/// pushed to the `config_audit` / `security_audit` tracing target.
+/// `channel` is one of `config`, `security`; `outcome` is `ok` when
+/// serialization succeeded and `serialize_error` when the JSON encode
+/// returned an error (in which case the audit was dropped, which is
+/// itself worth alerting on).
+///
+/// An exemplar with the active trace + span IDs lands on the matching
+/// bucket; this is the primary way operators correlate a slow audit
+/// emit with the request that triggered it.
+pub fn record_audit_emit_duration(channel: &str, outcome: &str, duration_secs: f64) {
+    use prometheus::{register_histogram_vec, HistogramVec};
+    use std::sync::OnceLock;
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    let hist = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_audit_emit_duration_seconds",
+            "Wall-clock latency of one audit-channel emission",
+            &["channel", "outcome"],
+            crate::exemplars::STANDARD_LATENCY_BUCKETS.to_vec(),
+        )
+        .expect("audit emit histogram registers")
+    });
+    hist.with_label_values(&[channel, outcome])
+        .observe(duration_secs);
+    let (trace_id, span_id) = current_trace_ids();
+    crate::exemplars::record(
+        "sbproxy_audit_emit_duration_seconds",
+        &[("channel", channel), ("outcome", outcome)],
+        duration_secs,
+        crate::exemplars::STANDARD_LATENCY_BUCKETS,
+        &trace_id,
+        &span_id,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1601,5 +1791,100 @@ mod tests {
             - 2_000; // 2 seconds in the past
         LAST_SCRAPE.store(past, Ordering::Relaxed);
         assert!(allow_scrape(), "scrape after interval must be allowed");
+    }
+
+    // --- WOR-75: exemplar wiring on the four new histograms ---
+    //
+    // Each test exercises the helper end-to-end (histogram observe +
+    // exemplar record). The render fragment proves the bucket
+    // landed; the `last_recorded_for_test` probe proves the exemplar
+    // landed. Labels include a per-test unique value so parallel
+    // runners do not stomp the global exemplar store.
+
+    #[test]
+    fn record_ledger_redeem_duration_emits_bucket_and_exemplar() {
+        let host = "ledger-host-uniq.example.com";
+        record_ledger_redeem_duration(host, "success", 0.004);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_ledger_redeem_duration_seconds"),
+            "histogram family missing from render:\n{out}"
+        );
+        // Hostname is sanitised through the cardinality limiter so we
+        // look up the exemplar by the sanitised form to match what
+        // the helper recorded.
+        let host_san = sanitize_label("host", host);
+        let ex = crate::exemplars::last_recorded_for_test(
+            "sbproxy_ledger_redeem_duration_seconds",
+            &[("host", host_san.as_str()), ("outcome", "success")],
+        );
+        assert!(
+            ex.is_some(),
+            "expected an exemplar for ledger_redeem; store entry missing"
+        );
+        let ex = ex.expect("exemplar present");
+        assert!((ex.value - 0.004).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn record_policy_evaluation_duration_emits_bucket_and_exemplar() {
+        let origin = "policy-origin-uniq.example.com";
+        record_policy_evaluation_duration(origin, "allow", 0.012);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_policy_evaluation_duration_seconds"),
+            "histogram family missing from render:\n{out}"
+        );
+        let origin_san = sanitize_label("origin", origin);
+        let ex = crate::exemplars::last_recorded_for_test(
+            "sbproxy_policy_evaluation_duration_seconds",
+            &[("origin", origin_san.as_str()), ("verdict", "allow")],
+        );
+        assert!(
+            ex.is_some(),
+            "expected an exemplar for policy_evaluation; store entry missing"
+        );
+    }
+
+    #[test]
+    fn record_outbound_request_duration_emits_bucket_and_exemplar() {
+        let host = "outbound-host-uniq.example.com";
+        record_outbound_request_duration(host, "GET", "200", 0.030);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_outbound_request_duration_seconds"),
+            "histogram family missing from render:\n{out}"
+        );
+        let host_san = sanitize_label("host", host);
+        let ex = crate::exemplars::last_recorded_for_test(
+            "sbproxy_outbound_request_duration_seconds",
+            &[
+                ("host", host_san.as_str()),
+                ("method", "GET"),
+                ("status", "200"),
+            ],
+        );
+        assert!(
+            ex.is_some(),
+            "expected an exemplar for outbound_request; store entry missing"
+        );
+    }
+
+    #[test]
+    fn record_audit_emit_duration_emits_bucket_and_exemplar() {
+        record_audit_emit_duration("config", "ok", 0.0015);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_audit_emit_duration_seconds"),
+            "histogram family missing from render:\n{out}"
+        );
+        let ex = crate::exemplars::last_recorded_for_test(
+            "sbproxy_audit_emit_duration_seconds",
+            &[("channel", "config"), ("outcome", "ok")],
+        );
+        assert!(
+            ex.is_some(),
+            "expected an exemplar for audit_emit; store entry missing"
+        );
     }
 }

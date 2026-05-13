@@ -36,10 +36,28 @@ impl ConfigAuditEntry {
     ///
     /// The record is written to the `config_audit` target so operators can
     /// route it to a dedicated sink independently of the main application log.
+    ///
+    /// WOR-75: the wall-clock time of one emission lands on the
+    /// `sbproxy_audit_emit_duration_seconds{channel="config"}`
+    /// histogram with the active trace as exemplar so dashboards can
+    /// flag a slow audit sink and hop straight to the originating span.
+    /// The `outcome` label is `ok` when JSON serialization succeeds and
+    /// `serialize_error` when it does not (in which case the audit was
+    /// dropped, which is itself worth alerting on).
     pub fn emit(&self) {
-        if let Ok(json) = serde_json::to_string(self) {
-            tracing::info!(target: "config_audit", "{}", json);
-        }
+        let started = std::time::Instant::now();
+        let outcome = match serde_json::to_string(self) {
+            Ok(json) => {
+                tracing::info!(target: "config_audit", "{}", json);
+                "ok"
+            }
+            Err(_) => "serialize_error",
+        };
+        crate::metrics::record_audit_emit_duration(
+            "config",
+            outcome,
+            started.elapsed().as_secs_f64(),
+        );
     }
 }
 
@@ -173,10 +191,26 @@ impl SecurityAuditEntry {
     /// level. WARN (not INFO) so default subscribers surface
     /// security events in operational dashboards while still
     /// letting downstream SIEM filter by target.
+    ///
+    /// WOR-75: the wall-clock time of one emission lands on the
+    /// `sbproxy_audit_emit_duration_seconds{channel="security"}`
+    /// histogram with the active trace as exemplar. The `outcome`
+    /// label is `ok` on success and `serialize_error` if the JSON
+    /// encode fails (the audit is dropped in that case).
     pub fn emit(&self) {
-        if let Ok(json) = serde_json::to_string(self) {
-            tracing::warn!(target: "security_audit", "{}", json);
-        }
+        let started = std::time::Instant::now();
+        let outcome = match serde_json::to_string(self) {
+            Ok(json) => {
+                tracing::warn!(target: "security_audit", "{}", json);
+                "ok"
+            }
+            Err(_) => "serialize_error",
+        };
+        crate::metrics::record_audit_emit_duration(
+            "security",
+            outcome,
+            started.elapsed().as_secs_f64(),
+        );
     }
 }
 

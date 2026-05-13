@@ -1967,6 +1967,16 @@ fn emit_policy_verdict(
         surface.as_label(),
         policy_id,
     );
+    // WOR-75: stamp an exemplar on the policy-evaluation histogram so
+    // dashboards can hop from a slow-policy bucket to the originating
+    // trace. The hostname dimension is the request's tenant
+    // workspace_id (the OSS tenant proxy); verdict is the closed
+    // allow/deny/confirm label already on the audit bus.
+    sbproxy_observe::metrics::record_policy_evaluation_duration(
+        &ctx.workspace_id,
+        verdict.as_label(),
+        elapsed.as_secs_f64(),
+    );
     let event = sbproxy_observe::events::PolicyVerdictEvent::new(
         uuid::Uuid::new_v4(),
         ctx.request_id.clone(),

@@ -1505,10 +1505,28 @@ impl AiCrawlControlPolicy {
         {
             let token = token.trim();
             if !token.is_empty() {
-                match self
-                    .ledger
-                    .redeem(token, host, path, price.amount_micros, &price.currency)
-                {
+                // WOR-75: time the redeem call so the
+                // `sbproxy_ledger_redeem_duration_seconds` histogram
+                // and its exemplar can land on every code path
+                // (success, hard failure, transient failure). The
+                // `outcome` label mirrors the three branches below so
+                // dashboards can distinguish "slow ledger" from "slow
+                // signature check".
+                let redeem_started = std::time::Instant::now();
+                let result =
+                    self.ledger
+                        .redeem(token, host, path, price.amount_micros, &price.currency);
+                let outcome = match &result {
+                    Ok(_) => "success",
+                    Err(e) if e.retryable => "transient_failure",
+                    Err(_) => "hard_failure",
+                };
+                sbproxy_observe::metrics::record_ledger_redeem_duration(
+                    host,
+                    outcome,
+                    redeem_started.elapsed().as_secs_f64(),
+                );
+                match result {
                     Ok(_) => return AiCrawlDecision::Allow,
                     Err(err) if err.retryable => {
                         let body = self.unavailable_body(host, path, &err);

@@ -314,6 +314,45 @@ fn render_exemplar(ex: &Exemplar) -> String {
     format!("# {{{}}} {} {}", label_str, ex.value, ex.timestamp_secs)
 }
 
+// --- Test helpers ---
+
+/// Look up the most recently recorded exemplar for a `(metric, labels)`
+/// pair across every bucket. Returns the highest-value exemplar that
+/// matches (i.e. the one stamped onto the `+Inf` bucket plus every
+/// smaller bucket the value falls into).
+///
+/// `labels` must be supplied in the same order as the original
+/// [`record`] call so the canonical label-string lookup matches.
+/// Returns `None` when no exemplar has been recorded for the
+/// `(metric, labels)` pair.
+///
+/// Exposed so unit tests in other crates can assert "the helper
+/// stamped an exemplar onto this metric" without reaching into the
+/// private store.
+pub fn last_recorded_for_test(metric: &'static str, labels: &[(&str, &str)]) -> Option<Exemplar> {
+    let label_str = render_labels(labels);
+    let g = store().lock().expect("exemplar store mutex poisoned");
+    // Probe every standard bucket plus +Inf and return the first hit;
+    // because `record` writes the same payload into every matching
+    // bucket, any non-None result is the right one.
+    for b in STANDARD_LATENCY_BUCKETS {
+        let key = Key {
+            metric,
+            labels: label_str.clone(),
+            le: format_bucket(*b),
+        };
+        if let Some(ex) = g.get(&key) {
+            return Some(ex.clone());
+        }
+    }
+    let key = Key {
+        metric,
+        labels: label_str,
+        le: "+Inf".to_string(),
+    };
+    g.get(&key).cloned()
+}
+
 // --- Tests ---
 
 #[cfg(test)]
