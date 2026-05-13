@@ -47,6 +47,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [headers-reference.md](headers-reference.md) - every response header the proxy can emit, with the config that triggers it.
 - [metrics-stability.md](metrics-stability.md) - Prometheus metric naming and stability.
 - [model-pinning.md](model-pinning.md) - how SHA-256 hashes get computed and pinned for the classifier known-model registry.
+- [adr-ai-hub-format.md](adr-ai-hub-format.md) - hub `ChatFormat` trait and the canonical `ChatRequest` / `ChatResponse` shape that backs `/v1/chat/completions`, `/v1/messages`, and `/v1/responses`.
 - [adr-classifier-supply-chain-oss.md](adr-classifier-supply-chain-oss.md) - operator-trusted model supply-chain decisions for the OSS classifier path.
 - [adr-config-plan-apply.md](adr-config-plan-apply.md) - audit + design for the proposed `sbproxy plan` and `sbproxy apply` subcommands.
 - [adr-config-source-modes.md](adr-config-source-modes.md) - audit + design for the `file`, `git`, `git+overlay`, and `db` config source modes.
