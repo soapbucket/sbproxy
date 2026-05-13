@@ -30,7 +30,7 @@ This Code of Conduct applies within all project spaces, and it also applies when
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the project maintainers at conduct@soapbucket.dev. All complaints will be reviewed and investigated promptly and fairly.
+Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the project maintainers at conduct@soapbucket.com. All complaints will be reviewed and investigated promptly and fairly.
 
 ## Attribution
 
