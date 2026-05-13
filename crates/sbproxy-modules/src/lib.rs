@@ -44,12 +44,12 @@ pub use projections::{
     current_projections, install_projections, render_projections, ProjectionDocs,
 };
 pub use transform::{
-    BoilerplateConfig, BoilerplateTransform, CelScriptTransform, CitationBlockConfig,
-    CitationBlockTransform, CompiledTransform, DiscardTransform, EncodingTransform,
-    FormatConvertTransform, JavaScriptTransform, JsonEnvelope, JsonEnvelopeTransform,
-    JsonProjectionTransform, JsonSchemaTransform, JsonTransform, LuaJsonTransform,
-    MarkdownProjection, NormalizeTransform, PayloadLimitTransform, ReplaceStringsTransform,
-    SseChunkingTransform, TemplateTransform, Transform, TransformConfig, WasmTransform,
-    DEFAULT_TOKEN_BYTES_RATIO, JSON_ENVELOPE_CONTENT_TYPE, JSON_ENVELOPE_PROFILE,
-    JSON_ENVELOPE_SCHEMA_VERSION,
+    A2aAgentCardRewriteConfig, A2aAgentCardRewriter, BoilerplateConfig, BoilerplateTransform,
+    CelScriptTransform, CitationBlockConfig, CitationBlockTransform, CompiledTransform,
+    DiscardTransform, EncodingTransform, FormatConvertTransform, JavaScriptTransform, JsonEnvelope,
+    JsonEnvelopeTransform, JsonProjectionTransform, JsonSchemaTransform, JsonTransform,
+    LuaJsonTransform, MarkdownProjection, NormalizeTransform, PayloadLimitTransform,
+    ReplaceStringsTransform, SseChunkingTransform, TemplateTransform, Transform, TransformConfig,
+    WasmTransform, DEFAULT_AGENT_CARD_PATHS, DEFAULT_TOKEN_BYTES_RATIO, JSON_ENVELOPE_CONTENT_TYPE,
+    JSON_ENVELOPE_PROFILE, JSON_ENVELOPE_SCHEMA_VERSION,
 };

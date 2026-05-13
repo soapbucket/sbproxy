@@ -7,6 +7,7 @@
 //! chunking), and a pipeline wrapper that controls content-type
 //! matching and error behavior.
 
+mod a2a_agent_card_rewrite;
 mod boilerplate;
 mod cel_script;
 mod citation_block;
@@ -16,6 +17,9 @@ mod json_envelope;
 mod markup;
 mod text;
 
+pub use a2a_agent_card_rewrite::{
+    A2aAgentCardRewriteConfig, A2aAgentCardRewriter, DEFAULT_AGENT_CARD_PATHS,
+};
 pub use boilerplate::{BoilerplateConfig, BoilerplateTransform};
 pub use cel_script::{
     CelHeaderMutation, CelHeaderOp, CelHeaderRule, CelScriptTransform, HEADER_DENY_LIST,
@@ -157,6 +161,13 @@ pub enum Transform {
     /// `request.kya.verdict` back into the response body for
     /// assertions.
     CelScript(CelScriptTransform),
+    /// WOR-234: rewrites the `url` / `endpoint` / `agent.url` fields
+    /// on A2A agent-card responses so MCP and A2A clients route
+    /// follow-up calls through the proxy instead of jumping straight
+    /// at the upstream. The standard `apply` here is a no-op; the
+    /// path-aware rewrite is invoked from a typed dispatch arm that
+    /// threads in the request path.
+    A2aAgentCardRewrite(A2aAgentCardRewriter),
     /// No transformation applied.
     Noop,
     /// Third-party plugin (only case using dynamic dispatch).
@@ -191,6 +202,7 @@ impl Transform {
             Self::CitationBlock(_) => "citation_block",
             Self::JsonEnvelope(_) => "json_envelope",
             Self::CelScript(_) => "cel",
+            Self::A2aAgentCardRewrite(_) => "a2a_agent_card_rewrite",
             Self::Noop => "noop",
             Self::Plugin(p) => p.transform_type(),
         }
@@ -234,6 +246,11 @@ impl Transform {
             // and the chain compiles end-to-end.
             Self::CitationBlock(_) | Self::JsonEnvelope(_) => Ok(()),
             Self::CelScript(t) => t.apply(body),
+            // WOR-234: the standard `apply` cannot see the request
+            // path. Leave the body alone here; the path-aware
+            // rewrite runs from a typed dispatch arm in the
+            // response-filter wiring.
+            Self::A2aAgentCardRewrite(t) => t.apply(body),
             Self::Noop => Ok(()),
             Self::Plugin(handler) => dispatch_plugin(handler.as_ref(), body, content_type),
         }
@@ -362,6 +379,7 @@ impl std::fmt::Debug for Transform {
             Self::CitationBlock(t) => f.debug_tuple("CitationBlock").field(t).finish(),
             Self::JsonEnvelope(t) => f.debug_tuple("JsonEnvelope").field(t).finish(),
             Self::CelScript(t) => f.debug_tuple("CelScript").field(t).finish(),
+            Self::A2aAgentCardRewrite(t) => f.debug_tuple("A2aAgentCardRewrite").field(t).finish(),
             Self::Noop => write!(f, "Noop"),
             Self::Plugin(_) => write!(f, "Plugin(...)"),
         }
