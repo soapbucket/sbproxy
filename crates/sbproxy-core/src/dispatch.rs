@@ -383,10 +383,32 @@ async fn proxy_upstream(
         req_builder = req_builder.body(b);
     }
 
-    let upstream_resp = req_builder
+    // WOR-75: time the outbound call (regardless of success) and
+    // stamp the result onto `sbproxy_outbound_request_duration_seconds`
+    // along with the active trace exemplar. The host label is the
+    // upstream URL's host so dashboards can split slow upstreams
+    // from fast ones; `status` is the upstream status code or the
+    // sentinel `"error"` when the call failed before a status was
+    // available.
+    let outbound_started = std::time::Instant::now();
+    let outbound_host = uri.host().unwrap_or("").to_string();
+    let outbound_method = method.as_str().to_string();
+    let send_result = req_builder
         .send()
         .await
-        .with_context(|| format!("upstream request to {}", upstream_url))?;
+        .with_context(|| format!("upstream request to {}", upstream_url));
+    let upstream_resp = match send_result {
+        Ok(r) => r,
+        Err(e) => {
+            sbproxy_observe::metrics::record_outbound_request_duration(
+                &outbound_host,
+                &outbound_method,
+                "error",
+                outbound_started.elapsed().as_secs_f64(),
+            );
+            return Err(e);
+        }
+    };
 
     // Convert response.
     let resp_status = upstream_resp.status().as_u16();
@@ -401,6 +423,12 @@ async fn proxy_upstream(
         .bytes()
         .await
         .context("reading upstream body")?;
+    sbproxy_observe::metrics::record_outbound_request_duration(
+        &outbound_host,
+        &outbound_method,
+        resp_status.to_string().as_str(),
+        outbound_started.elapsed().as_secs_f64(),
+    );
     let body_opt = if resp_body.is_empty() {
         None
     } else {
