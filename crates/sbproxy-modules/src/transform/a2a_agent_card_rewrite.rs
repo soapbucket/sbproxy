@@ -213,7 +213,7 @@ fn rewrite_string_field(
     if rewritten == value {
         return false;
     }
-    obj.insert(field, serde_json::Value::String(rewritten));
+    obj.insert(field.to_string(), serde_json::Value::String(rewritten));
     true
 }
 
