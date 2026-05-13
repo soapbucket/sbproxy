@@ -22,12 +22,13 @@ use crate::policy::{
     WafPolicy,
 };
 use crate::transform::{
-    BoilerplateTransform, CelScriptTransform, CitationBlockTransform, CssTransform,
-    DiscardTransform, EncodingTransform, FormatConvertTransform, HtmlToMarkdownTransform,
-    HtmlTransform, JavaScriptTransform, JsJsonTransform, JsonEnvelopeTransform,
-    JsonProjectionTransform, JsonSchemaTransform, JsonTransform, LuaJsonTransform,
-    MarkdownTransform, NormalizeTransform, OptimizeHtmlTransform, PayloadLimitTransform,
-    ReplaceStringsTransform, SseChunkingTransform, TemplateTransform, Transform, WasmTransform,
+    A2aAgentCardRewriter, BoilerplateTransform, CelScriptTransform, CitationBlockTransform,
+    CssTransform, DiscardTransform, EncodingTransform, FormatConvertTransform,
+    HtmlToMarkdownTransform, HtmlTransform, JavaScriptTransform, JsJsonTransform,
+    JsonEnvelopeTransform, JsonProjectionTransform, JsonSchemaTransform, JsonTransform,
+    LuaJsonTransform, MarkdownTransform, NormalizeTransform, OptimizeHtmlTransform,
+    PayloadLimitTransform, ReplaceStringsTransform, SseChunkingTransform, TemplateTransform,
+    Transform, WasmTransform,
 };
 
 /// Compile a JSON action config into an Action enum variant.
@@ -262,6 +263,12 @@ pub fn compile_transform(config: &serde_json::Value) -> Result<Transform> {
         "cel" => Ok(Transform::CelScript(CelScriptTransform::from_config(
             config.clone(),
         )?)),
+        // WOR-234: A2A agent-card URL rewriter. The path-aware
+        // dispatch wiring lives in `sbproxy-core::server`; this
+        // arm only constructs the rewriter from operator config.
+        "a2a_agent_card_rewrite" => Ok(Transform::A2aAgentCardRewrite(
+            A2aAgentCardRewriter::from_config(config.clone())?,
+        )),
         "noop" => Ok(Transform::Noop),
         _ => anyhow::bail!("unknown transform type: {}", type_name),
     }
