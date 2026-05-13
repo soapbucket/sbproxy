@@ -24,8 +24,9 @@ pub use mcp::{
     McpServerPrefix,
 };
 pub use routing::{
-    build_routing_strategy, list_routing_strategies, AlwaysFirstHealthyStrategy, LoraAwareStrategy,
-    RoutingRequest, RoutingStrategy, RoutingStrategyRegistration, TargetState,
+    build_routing_strategy, list_routing_strategies, AlwaysFirstHealthyStrategy, BanditStrategy,
+    GpuAwareStrategy, LoraAwareStrategy, LoraStrategy, RoutingRequest, RoutingStrategy,
+    RoutingStrategyRegistration, TargetState,
 };
 pub use storage::*;
 pub use versioning::*;

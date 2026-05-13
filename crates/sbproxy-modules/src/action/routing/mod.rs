@@ -60,8 +60,14 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use http::HeaderMap;
 
+pub mod bandit;
+pub mod gpu_aware;
+pub mod lora;
 pub mod lora_aware;
 
+pub use bandit::BanditStrategy;
+pub use gpu_aware::GpuAwareStrategy;
+pub use lora::LoraStrategy;
 pub use lora_aware::LoraAwareStrategy;
 
 // --- RoutingRequest ---
@@ -243,10 +249,13 @@ pub fn list_routing_strategies() -> Vec<&'static str> {
 /// Reference [`RoutingStrategy`] implementation that picks the
 /// lowest-index healthy target.
 ///
-/// This is **for documentation and tests only**. Production
-/// strategies (LoRA-aware, GPU-aware, contextual bandit) live in
-/// downstream crates. Use the existing `lb_method: round_robin` or
-/// `least_connections` for production deployments.
+/// This is **for documentation and tests only**. Production-grade
+/// adapters ship in this same module: [`BanditStrategy`] for
+/// epsilon-greedy multi-armed bandit routing, [`GpuAwareStrategy`]
+/// for telemetry-driven GPU-utilisation routing, and [`LoraStrategy`]
+/// plus [`LoraAwareStrategy`] for LoRA-adapter affinity. The existing
+/// `lb_method: round_robin` and `least_connections` algorithms remain
+/// the right defaults when no specialised signal is available.
 pub struct AlwaysFirstHealthyStrategy;
 
 impl RoutingStrategy for AlwaysFirstHealthyStrategy {
