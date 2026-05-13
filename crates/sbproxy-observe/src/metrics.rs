@@ -878,6 +878,60 @@ pub fn record_a2a_denied(route: &str, reason: &str) {
     counter.with_label_values(&[route.as_str(), reason]).inc();
 }
 
+/// Record a bounded channel drop on a hot-path lane (WOR-169).
+///
+/// `lane` is a fixed identifier for the channel's purpose
+/// (`"hooks"`, `"streaming"`, `"mirror"`, ...). `reason` is one of the
+/// closed strings `"channel_full"` (the receiver was alive but the
+/// buffer was at capacity) or `"receiver_closed"` (the consumer hung
+/// up). Both label values are compile-time constants so this counter
+/// has zero label cardinality risk.
+///
+/// Emitted as `sbproxy_<lane>_channel_dropped_total{reason}`; the
+/// counter is created lazily on the first drop so the metric only
+/// appears in the scrape output when there is something to report.
+/// Subsequent drops on the same `lane` reuse the cached counter, so
+/// the increment path is one `HashMap::get` and one atomic add.
+///
+/// The counter is registered on both `metrics().registry` (the
+/// canonical `sbproxy_*` registry that the scrape endpoint serves)
+/// and `prometheus::default_registry()` (where ad-hoc tests and
+/// `prometheus::gather()` look). Either side may have already
+/// registered an identical counter (e.g. test re-runs); the
+/// `AlreadyReg` error is non-fatal, the metric still increments.
+pub fn record_channel_drop(lane: &'static str, reason: &'static str) {
+    use prometheus::IntCounterVec;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    // One counter per `lane`. The lane is part of the metric name so
+    // we cannot share a single CounterVec across lanes; instead we
+    // memoise a per-lane CounterVec keyed by the lane string.
+    static REGISTRY: OnceLock<Mutex<HashMap<&'static str, IntCounterVec>>> = OnceLock::new();
+    let map = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().expect("channel-drop registry mutex poisoned");
+    let counter = guard.entry(lane).or_insert_with(|| {
+        let name = format!("sbproxy_{lane}_channel_dropped_total");
+        let cv = IntCounterVec::new(
+            Opts::new(
+                name,
+                "Bounded channel sends dropped on the hot path, labelled by drop reason",
+            ),
+            &["reason"],
+        )
+        .expect("channel drop counter constructs");
+        // Register on the canonical scrape registry so the metric
+        // reaches a `/metrics` endpoint.
+        let _ = metrics().registry.register(Box::new(cv.clone()));
+        // Register on the process-global default registry so ad-hoc
+        // `prometheus::gather()` calls (e.g. unit tests, scrapers
+        // that read the default registry directly) also see the
+        // counter.
+        let _ = prometheus::default_registry().register(Box::new(cv.clone()));
+        cv
+    });
+    counter.with_label_values(&[reason]).inc();
+}
+
 /// Record one MCP pre-tool-call policy hook invocation (WOR-152 PR β).
 ///
 /// `verdict` is one of the closed labels `allow`, `deny`, or `confirm`
