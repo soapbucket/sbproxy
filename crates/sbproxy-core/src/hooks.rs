@@ -541,6 +541,19 @@ pub enum StreamCacheEvent {
     },
 }
 
+/// Default capacity for the bounded recorder channel (WOR-169).
+///
+/// Sized for ~1 second of headroom at 1k events/sec on a typical SSE
+/// stream. The receiver lives inside the enterprise recorder and is
+/// expected to drain at least as fast as the upstream produces chunks;
+/// when it temporarily falls behind, the proxy drops the chunk and
+/// increments `sbproxy_hooks_channel_dropped_total{reason="channel_full"}`
+/// rather than buffering without bound and risking OOM under load.
+/// Enterprise call sites that want a different bound can construct
+/// their own [`tokio::sync::mpsc::channel`] of any size and assign the
+/// sender to [`StreamCacheChannel::tx`] directly.
+pub const STREAM_CACHE_CHANNEL_CAPACITY: usize = 1024;
+
 /// Channel handed to the proxy when a recorder session starts.
 ///
 /// The proxy owns `tx` and sends one [`StreamCacheEvent::Chunk`] per
@@ -548,12 +561,21 @@ pub enum StreamCacheEvent {
 /// [`StreamCacheEvent::End`]. The receiver lives inside the enterprise
 /// implementation; OSS code never reads from it.
 ///
-/// Sends are non-blocking. A closed channel (the enterprise side dropped
-/// the receiver early) is not an error: the proxy logs at debug and
-/// stops sending.
+/// Sends are non-blocking and use [`tokio::sync::mpsc::Sender::try_send`]
+/// so a slow or unreachable receiver never stalls the hot path. A
+/// closed channel (the enterprise side dropped the receiver early)
+/// is not an error: the proxy increments
+/// `sbproxy_hooks_channel_dropped_total{reason="receiver_closed"}` and
+/// stops sending. A full channel surfaces as
+/// `sbproxy_hooks_channel_dropped_total{reason="channel_full"}`.
 pub struct StreamCacheChannel {
     /// Sender used by the proxy to push events into the recorder session.
-    pub tx: tokio::sync::mpsc::UnboundedSender<StreamCacheEvent>,
+    ///
+    /// Bounded at [`STREAM_CACHE_CHANNEL_CAPACITY`] by default;
+    /// enterprise implementations that want a different bound can
+    /// build a [`tokio::sync::mpsc::channel`] of any size and assign
+    /// the sender here.
+    pub tx: tokio::sync::mpsc::Sender<StreamCacheEvent>,
 }
 
 /// RAII guard that fans SSE stream events into a [`StreamCacheChannel`]
@@ -585,23 +607,36 @@ impl StreamCacheGuard {
         }
     }
 
-    /// Forward a single chunk. Best-effort: any send failure
-    /// (channel closed) is silently dropped.
+    /// Forward a single chunk. Best-effort and non-blocking: the
+    /// underlying channel is bounded at [`STREAM_CACHE_CHANNEL_CAPACITY`]
+    /// and a full buffer or closed receiver causes the chunk to be
+    /// dropped with a `sbproxy_hooks_channel_dropped_total{reason}`
+    /// increment. The recorder is enterprise-only and explicitly
+    /// fail-open: dropping chunks is preferable to stalling the
+    /// proxy hot path.
     pub fn chunk(&self, bytes: Bytes) {
-        let _ = self.channel.tx.send(StreamCacheEvent::Chunk(bytes));
+        if let Err(err) = self.channel.tx.try_send(StreamCacheEvent::Chunk(bytes)) {
+            record_stream_cache_drop(&err);
+        }
     }
 
     /// Send the terminal `End { complete: true }` event. After this call
     /// the guard no longer emits a terminal event on drop.
     ///
-    /// Calling `finish` more than once is a no-op.
+    /// Calling `finish` more than once is a no-op. The terminal event
+    /// is best-effort: if the receiver has hung up or the channel is
+    /// at capacity, the drop is counted against
+    /// `sbproxy_hooks_channel_dropped_total` and the guard moves on.
     pub fn finish(mut self) {
         if !self.finished {
             self.finished = true;
-            let _ = self
+            if let Err(err) = self
                 .channel
                 .tx
-                .send(StreamCacheEvent::End { complete: true });
+                .try_send(StreamCacheEvent::End { complete: true })
+            {
+                record_stream_cache_drop(&err);
+            }
         }
     }
 }
@@ -610,12 +645,27 @@ impl Drop for StreamCacheGuard {
     fn drop(&mut self) {
         if !self.finished {
             self.finished = true;
-            let _ = self
+            if let Err(err) = self
                 .channel
                 .tx
-                .send(StreamCacheEvent::End { complete: false });
+                .try_send(StreamCacheEvent::End { complete: false })
+            {
+                record_stream_cache_drop(&err);
+            }
         }
     }
+}
+
+/// Map a `TrySendError` from the recorder channel into a
+/// `sbproxy_hooks_channel_dropped_total` increment. Lives outside the
+/// guard impl so both the chunk path and the terminal-event paths
+/// can share the classification.
+fn record_stream_cache_drop(err: &tokio::sync::mpsc::error::TrySendError<StreamCacheEvent>) {
+    let reason = match err {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => "channel_full",
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => "receiver_closed",
+    };
+    sbproxy_observe::metrics::record_channel_drop("hooks", reason);
 }
 
 /// Records a streaming AI response into a downstream cache for later
@@ -750,7 +800,7 @@ mod tests {
         seen_ctx: Mutex<Option<StreamCacheCtx>>,
         // Holds the receiver half so we can drain it after the guard
         // is dropped without racing the test thread.
-        rx: Mutex<Option<mpsc::UnboundedReceiver<StreamCacheEvent>>>,
+        rx: Mutex<Option<mpsc::Receiver<StreamCacheEvent>>>,
     }
 
     impl MockRecorder {
@@ -784,7 +834,7 @@ mod tests {
             if !self.accept {
                 return None;
             }
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = mpsc::channel(STREAM_CACHE_CHANNEL_CAPACITY);
             *self.rx.lock().unwrap() = Some(rx);
             Some(StreamCacheChannel { tx })
         }
@@ -908,10 +958,95 @@ mod tests {
         // If the enterprise side drops its receiver early (an explicit
         // "stop recording" signal), `chunk` and `finish` must not
         // panic; they swallow SendError silently.
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(STREAM_CACHE_CHANNEL_CAPACITY);
         drop(rx);
         let guard = StreamCacheGuard::new(StreamCacheChannel { tx });
         guard.chunk(Bytes::from_static(b"x"));
         guard.finish(); // no panic, no error
+    }
+
+    /// Scrape the `sbproxy_hooks_channel_dropped_total{reason}` value
+    /// from the global Prometheus registry, returning 0 when no
+    /// counter exists yet. The lazy-init in `record_channel_drop`
+    /// means the metric is absent until the first drop fires.
+    ///
+    /// The `get_*` accessors are deprecated in prometheus 0.14 in
+    /// favour of `name()` / `value()` / `metric()`, but the new
+    /// `Counter::value()` accessor on the inner `MessageField<Counter>`
+    /// is the only way to extract the f64 sample. We keep the
+    /// deprecated `MetricFamily::get_*` calls for label inspection
+    /// and silence the warning locally; the bridge is well-defined
+    /// and stable across the 0.14 line.
+    #[allow(deprecated)]
+    fn hooks_drop_total(reason: &str) -> u64 {
+        for mf in prometheus::gather() {
+            if mf.get_name() != "sbproxy_hooks_channel_dropped_total" {
+                continue;
+            }
+            for m in mf.get_metric() {
+                let matches = m
+                    .get_label()
+                    .iter()
+                    .any(|lp| lp.get_name() == "reason" && lp.get_value() == reason);
+                if matches {
+                    // `m.get_counter()` returns `&MessageField<Counter>`
+                    // which derefs to `&Counter`; `Counter::value()`
+                    // yields the f64 sample value.
+                    return m.get_counter().value() as u64;
+                }
+            }
+        }
+        0
+    }
+
+    /// WOR-169: a bounded recorder channel that fills past its
+    /// capacity must drop the overflowing send AND increment
+    /// `sbproxy_hooks_channel_dropped_total{reason="channel_full"}`.
+    /// Verifies the documented backpressure policy directly.
+    #[tokio::test]
+    async fn channel_full_drops_chunk_and_increments_counter() {
+        // Capacity 2 keeps the test fast while still exercising the
+        // "full" branch of `TrySendError`. We deliberately do NOT
+        // drain the receiver so the channel saturates.
+        let (tx, _rx) = mpsc::channel(2);
+        let guard = StreamCacheGuard::new(StreamCacheChannel { tx });
+
+        let before = hooks_drop_total("channel_full");
+        // Fill the channel to capacity (slots 1 and 2).
+        guard.chunk(Bytes::from_static(b"a"));
+        guard.chunk(Bytes::from_static(b"b"));
+        // Third chunk has nowhere to land: channel is full, receiver
+        // is still alive. The send must be dropped silently and the
+        // "channel_full" counter must tick.
+        guard.chunk(Bytes::from_static(b"c"));
+        let after = hooks_drop_total("channel_full");
+
+        assert!(
+            after > before,
+            "channel_full counter must increment by at least 1 (before={before}, after={after})"
+        );
+        // The guard's drop attempt for the terminal End will also
+        // see the full channel and tick the same counter, which is
+        // fine; we only care that the chunk drop was counted.
+    }
+
+    /// WOR-169: when the receiver hangs up, the next send must be
+    /// dropped AND counted under the `receiver_closed` label rather
+    /// than `channel_full`. Keeps the two failure modes
+    /// distinguishable on the dashboard.
+    #[tokio::test]
+    async fn receiver_closed_drops_send_and_increments_counter() {
+        let (tx, rx) = mpsc::channel(STREAM_CACHE_CHANNEL_CAPACITY);
+        drop(rx); // explicit "stop recording" signal from the enterprise side
+        let guard = StreamCacheGuard::new(StreamCacheChannel { tx });
+
+        let before = hooks_drop_total("receiver_closed");
+        guard.chunk(Bytes::from_static(b"x"));
+        let after = hooks_drop_total("receiver_closed");
+
+        assert!(
+            after > before,
+            "receiver_closed counter must increment by at least 1 (before={before}, after={after})"
+        );
     }
 }
