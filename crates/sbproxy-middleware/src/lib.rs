@@ -14,4 +14,8 @@ pub mod idempotency;
 pub mod modifiers;
 pub mod problem_details;
 pub mod proxy_status;
+/// Per-origin rate-limit middleware (WOR-66). Consumes the
+/// `rate_limits:` block on `CompiledOrigin` and gates traffic ahead of
+/// the per-origin policy chain.
+pub mod rate_limit;
 pub mod signatures;

@@ -5886,6 +5886,8 @@ dependencies = [
  "hex",
  "hmac",
  "http",
+ "lru",
+ "parking_lot",
  "rand 0.8.6",
  "sbproxy-cache",
  "sbproxy-config",
