@@ -36,6 +36,12 @@ flate2 = "1"
 brotli = "3"
 zstd = "0.13"
 
+# Rate-limit middleware (WOR-66): parking_lot for the bucket mutex (we
+# avoid std::sync::Mutex's poisoning semantics on the request-hot path),
+# lru for the bounded per-key bucket cache.
+parking_lot = { workspace = true }
+lru = "0.16"
+
 [dev-dependencies]
 tempfile = "3"
 serde_yaml = { workspace = true }
