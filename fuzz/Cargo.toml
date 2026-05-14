@@ -15,12 +15,12 @@
 # this change. CI runs longer; see `.github/workflows/wave4-fuzz.yml`
 # (B4.5 / B4.6 fan-out).
 #
-# Once G4.5 (robots.txt parser), G4.6 (llms.txt projection), and G4.7
-# (RSL XML emitter / parser counterpart) merge, repoint each
-# fuzz_target to the public parser entry-point in the relevant Wave 4
-# crate. The current implementations call into in-file stubs that
-# exercise the harness machinery and document the contract; replace
-# the stubs once the production parsers are in tree.
+# G4.6 (llms.txt projection, WOR-130) and WOR-188 (llms_pricing)
+# have landed; the `llms_txt_parser` target drives the public
+# `sbproxy_modules::transform::{llms_txt, llms_pricing}::parse`
+# entry-points directly. G4.5 (robots.txt) and G4.7 (RSL XML
+# emitter / parser counterpart) still call in-file stubs; replace
+# those once the production parsers are in tree.
 
 # Empty `[workspace]` block: tells cargo this manifest is a standalone
 # workspace root. Without it cargo would climb up to the proxy
