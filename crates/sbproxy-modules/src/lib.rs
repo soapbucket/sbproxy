@@ -43,6 +43,10 @@ pub use policy::{HttpLedger, HttpLedgerConfig};
 pub use projections::{
     current_projections, install_projections, render_projections, ProjectionDocs,
 };
+pub use transform::llms_txt::{
+    parse as parse_llms_txt, Link as LlmsTxtLink, LlmsTxt, LlmsTxtGenerator,
+    ParseError as LlmsTxtParseError, Section as LlmsTxtSection,
+};
 pub use transform::{
     A2aAgentCardRewriteConfig, A2aAgentCardRewriter, BoilerplateConfig, BoilerplateTransform,
     CelScriptTransform, CitationBlockConfig, CitationBlockTransform, CompiledTransform,
