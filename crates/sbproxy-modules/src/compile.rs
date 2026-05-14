@@ -182,6 +182,13 @@ pub fn compile_policy(config: &serde_json::Value) -> Result<Policy> {
         "semantic_constraint" => Ok(Policy::SemanticConstraint(
             SemanticConstraintPolicy::from_config(config.clone())?,
         )),
+        // WOR-188: outbound peer-pricing pre-flight. Stored as an
+        // `Arc<PeerPricingPreflightPolicy>` so the outbound
+        // dispatcher (a later wiring PR) can clone a cheap handle
+        // out of the compiled chain.
+        "peer_pricing_preflight" => Ok(Policy::PeerPricingPreflight(std::sync::Arc::new(
+            crate::policy::PeerPricingPreflightPolicy::from_config(config.clone())?,
+        ))),
         _ => anyhow::bail!("unknown policy type: {}", type_name),
     }
 }

@@ -1,0 +1,46 @@
+# Outbound peer-pricing pre-flight (WOR-188).
+#
+# When an internal agent calls a cooperating peer through this
+# origin, the `peer_pricing_preflight` policy:
+#
+# 1. Side-fetches the peer's `llms.txt` on the first outbound call
+#    and caches the parsed manifest for `cache_ttl` (default 1h).
+# 2. Matches the outbound request path against the manifest's
+#    priced routes.
+# 3. Applies the configured per-request and rolling 24-hour budgets.
+# 4. Returns `402 Payment Required` to the agent with a structured
+#    body when the matched price overruns the budget.
+#
+# See docs/outbound-peer-pricing.md for the full contract and the
+# 402 body schema.
+#
+# Run:
+#   make run CONFIG=examples/outbound-peer-pricing/sb.yml
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "test.sbproxy.dev":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    policies:
+      - type: peer_pricing_preflight
+        # Hard cap on a single outbound call, in major units of the
+        # currency the peer advertises (here, one USD cent).
+        max_price_per_request: 0.01
+
+        # Rolling 24-hour budget in micros (1e-6 of the currency).
+        # 10_000_000 micros = 10 USD per day.
+        daily_budget_micros: 10000000
+
+        # Cache TTL for the parsed peer manifest. Accepts duration
+        # strings (`30m`, `1h`, `5s`, ...).
+        cache_ttl: 1h
+
+        # How to behave when a peer either returns a non-200 or
+        # publishes an unparseable manifest. `allow` lets the call
+        # through; `block` returns a 402 with `reason: no_manifest`.
+        on_no_manifest: allow

@@ -39,6 +39,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 
 ### Reference
 - [402-challenge.md](402-challenge.md) - wire-format contract for the `402 Payment Required` body, including the OSS-advertises / enterprise-settles split.
+- [outbound-peer-pricing.md](outbound-peer-pricing.md) - the `peer_pricing_preflight` policy: parse a peer's `llms.txt`, gate egress on budget, return a structured 402 to the agent on overflow.
 - [admin-api-reference.md](admin-api-reference.md) - per-route schema for the embedded admin server (`/api/*`, `/admin/*`, and the unauthenticated probe routes).
 - [config-stability.md](config-stability.md) - field stability guarantees and versioning.
 - [listings.md](listings.md) - the repo-native `Listing` primitive: schema, loader, three pinning modes, plan-validation rules.

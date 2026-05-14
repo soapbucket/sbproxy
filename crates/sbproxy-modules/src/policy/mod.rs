@@ -35,6 +35,8 @@ pub mod nl_compiler;
 pub mod nl_linter;
 pub mod openapi_validation;
 pub mod page_shield;
+/// WOR-188: outbound peer-pricing pre-flight policy.
+pub mod peer_pricing_preflight;
 pub mod prompt_injection_v2;
 pub mod quote_token;
 pub mod rate_limit;
@@ -84,6 +86,13 @@ pub use openapi_validation::{
     OpenApiValidationMode, OpenApiValidationPolicy, ValidationResult as OpenApiValidationResult,
 };
 pub use page_shield::{PageShieldMode, PageShieldPolicy, DEFAULT_REPORT_PATH};
+pub use peer_pricing_preflight::{
+    BlockReason as PeerPricingBlockReason, FetchResult as PeerPricingFetchResult, ManifestFetcher,
+    OnNoManifest, PeerPricingPreflightConfig, PeerPricingPreflightPolicy,
+    PreflightDecision as PeerPricingPreflightDecision,
+    DEFAULT_CACHE_TTL as PEER_PRICING_DEFAULT_CACHE_TTL,
+    NO_MANIFEST_TTL as PEER_PRICING_NO_MANIFEST_TTL,
+};
 pub use prompt_injection_v2::{
     classification_cache_stats, evaluate_body, reset_classification_cache, BodyAwareConfig,
     BodyAwareOutcome, ClassificationCacheStats, DetectionLabel, DetectionResult, Detector,
@@ -194,6 +203,12 @@ pub enum Policy {
     /// request and maps the verdict to a
     /// [`PolicyDecision`](sbproxy_plugin::PolicyDecision).
     SemanticConstraint(SemanticConstraintPolicy),
+    /// WOR-188 outbound peer-pricing pre-flight. The variant carries
+    /// the configured policy so the config compiler can accept the
+    /// `peer_pricing_preflight` type at YAML load time; per-request
+    /// enforcement is invoked from the outbound dispatcher (a
+    /// separate code path from the inbound `PolicyEnforcer` trait).
+    PeerPricingPreflight(std::sync::Arc<PeerPricingPreflightPolicy>),
     /// Third-party plugin (only case using dynamic dispatch).
     Plugin(Box<dyn PolicyEnforcer>),
 }
@@ -225,6 +240,7 @@ impl Policy {
             Self::AgentClass(_) => "agent_class",
             Self::A2A(_) => "a2a",
             Self::SemanticConstraint(_) => "semantic_constraint",
+            Self::PeerPricingPreflight(_) => "peer_pricing_preflight",
             Self::Plugin(p) => p.policy_type(),
         }
     }
@@ -256,6 +272,9 @@ impl std::fmt::Debug for Policy {
             Self::AgentClass(r) => f.debug_tuple("AgentClass").field(r).finish(),
             Self::A2A(r) => f.debug_tuple("A2A").field(r).finish(),
             Self::SemanticConstraint(r) => f.debug_tuple("SemanticConstraint").field(r).finish(),
+            Self::PeerPricingPreflight(r) => {
+                f.debug_tuple("PeerPricingPreflight").field(r).finish()
+            }
             Self::Plugin(_) => write!(f, "Plugin(...)"),
         }
     }
