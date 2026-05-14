@@ -71,7 +71,10 @@ pub use providers::{
     get_provider_info, init_provider_registry, list_providers, reload_provider_registry,
     ProviderFormat, ProviderInfo,
 };
-pub use ratelimit::{ModelRateConfig, ModelRateLimiter};
+pub use ratelimit::{
+    Admission, ModelRateConfig, ModelRateLimiter, RejectReason, Rejection, SurfaceRateConfig,
+    SurfaceRateLimiter, DEFAULT_ESTIMATED_TOKENS, DEFAULT_MAX_KEYS,
+};
 pub use response_dedup::ResponseDedup;
 pub use routing::{Router, RoutingStrategy};
 pub use semantic_cache::{CachedAiResponse, SemanticCache};
