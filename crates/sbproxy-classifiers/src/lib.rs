@@ -63,12 +63,17 @@
 
 pub mod agent_class;
 pub mod agent_classifier_types;
+pub mod judge_rpc;
 pub mod known_models;
 
 pub use agent_class::{
     AgentClass, AgentClassCatalog, AgentId, AgentIdSource, AgentPurpose, DEFAULT_CATALOG_YAML,
 };
 pub use agent_classifier_types::{MlClass, MlClassification};
+pub use judge_rpc::{
+    build_judge_client, JudgeClientLike, JudgeRpcConfig, JudgeRpcConfigError, JudgeRpcService,
+    DEFAULT_BUDGET_TOKENS,
+};
 pub use known_models::{lookup as lookup_known_model, KnownModel, KNOWN_MODELS};
 
 use std::fs;

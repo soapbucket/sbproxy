@@ -40,5 +40,28 @@ regex = { workspace = true }
 serde_yaml = { workspace = true }
 serde_json = { workspace = true }
 
+# Classifier Judge gRPC service. The OSS handler delegates to
+# `sbproxy_ai::judge::JudgeClient` for the actual upstream call,
+# caching, and budget enforcement; we only own the wire layer.
+# Pinned to the same major as e2e/Cargo.toml so a single tonic /
+# prost compile is shared by the workspace.
+tonic = "0.12"
+prost = "0.13"
+sbproxy-ai.workspace = true
+sbproxy-plugin.workspace = true
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+
 [dev-dependencies]
 tempfile = "3"
+# In-process tonic server tests for the Judge RPC handler.
+tokio = { workspace = true, features = ["full", "macros"] }
+chrono = { workspace = true }
+
+[build-dependencies]
+# Compiles `proto/judge.proto` for the Classifier Judge RPC. Kept
+# pinned to the same major as `tonic` above so the workspace builds
+# a single tonic/prost.
+tonic-build = "0.12"

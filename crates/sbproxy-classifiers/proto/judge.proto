@@ -1,0 +1,120 @@
+// SPDX-License-Identifier: BUSL-1.1
+//
+// Classifier Judge gRPC service.
+//
+// The Judge RPC is the gRPC version of
+// `sbproxy_ai::judge::JudgeClient::semantic(prompt, payload)`. The
+// server delegates each call into a process-wide JudgeClient that
+// owns the upstream LLM HTTP connection, the LRU cache, and the
+// budget tracker. The wire surface mirrors the
+// `sbproxy_plugin::PolicyDecision` enum so clients see the same four
+// verdicts (allow, deny, allow-with-headers, confirm) the in-process
+// authoring surfaces see.
+
+syntax = "proto3";
+
+package sbproxy.classifier.judge.v1;
+
+// Classifier Judge service. A thin gRPC fronting for the OSS
+// `JudgeClient`. Authentication, tenancy, and transport security are
+// expected to terminate before this service.
+service Judge {
+  // Evaluate a prompt over a JSON payload and return a PolicyDecision.
+  // The server caches verdicts by (prompt_hash, payload_hash) inside
+  // the underlying JudgeClient; a cache hit skips the upstream call
+  // entirely and does not charge the budget.
+  rpc Semantic(JudgeRequest) returns (JudgeResponse);
+}
+
+// Request shape for `Judge.Semantic`.
+//
+// The payload travels as a JSON-encoded string so the proto stays
+// stable as the upstream contract evolves. Callers SHOULD send the
+// payload as a UTF-8 JSON object body; arrays and primitives are
+// accepted.
+message JudgeRequest {
+  // System prompt that drives the judge. Wired into the upstream
+  // chat-completions call as `{"role": "system", "content": prompt}`.
+  string prompt = 1;
+  // JSON-encoded payload string. Forwarded verbatim as the user-role
+  // body. Empty string is equivalent to `null`.
+  string payload_json = 2;
+}
+
+// Response shape for `Judge.Semantic`.
+//
+// Mirrors `sbproxy_plugin::PolicyDecision`: one of `allow`, `deny`,
+// `allow_with_headers`, or `confirm`. The reason field is the human
+// readable summary surfaced for telemetry; specific fields per
+// verdict travel in the `verdict` oneof. Cache hits set
+// `cached = true` and `cost_usd = 0`.
+message JudgeResponse {
+  // Top-level verdict tag. Matches the variant of `verdict`.
+  Verdict verdict_kind = 1;
+
+  // Specific verdict payload. Empty for `VERDICT_ALLOW`.
+  oneof verdict {
+    DenyVerdict deny = 2;
+    AllowWithHeadersVerdict allow_with_headers = 3;
+    ConfirmVerdict confirm = 4;
+  }
+
+  // Human readable reason. Same string used in telemetry and in the
+  // OSS `X-Policy-Confirm` header for confirm verdicts.
+  string reason = 5;
+  // True when the verdict came from the in-process LRU cache. The
+  // server's budget tracker is NOT charged on a cache hit.
+  bool cached = 6;
+  // Cost in US dollars reported by the upstream provider, when
+  // available. Zero for cache hits or for providers that do not
+  // report cost.
+  double cost_usd = 7;
+}
+
+// Top-level verdict tag.
+enum Verdict {
+  VERDICT_UNSPECIFIED = 0;
+  VERDICT_ALLOW = 1;
+  VERDICT_DENY = 2;
+  VERDICT_ALLOW_WITH_HEADERS = 3;
+  VERDICT_CONFIRM = 4;
+}
+
+// Payload for `VERDICT_DENY`. The HTTP status and message map
+// directly to `PolicyDecision::Deny { status, message }`.
+message DenyVerdict {
+  // HTTP status code to return to the upstream caller.
+  uint32 status = 1;
+  // Human readable denial reason.
+  string message = 2;
+}
+
+// Payload for `VERDICT_ALLOW_WITH_HEADERS`. Each header is appended
+// to the outbound response by the caller.
+message AllowWithHeadersVerdict {
+  // Ordered list of `(name, value)` pairs to append.
+  repeated Header headers = 1;
+}
+
+// One response header to append for `VERDICT_ALLOW_WITH_HEADERS`.
+message Header {
+  // Header name (RFC 7230 token chars only).
+  string name = 1;
+  // Header value (visible US-ASCII, no CR/LF).
+  string value = 2;
+}
+
+// Payload for `VERDICT_CONFIRM`. The OSS dispatcher routes confirm
+// verdicts through the `AllowWithHeaders` mechanism; the enterprise
+// interceptor parks the request and uses these fields to drive the
+// approval portal.
+message ConfirmVerdict {
+  // Summary of why approval is required.
+  string reason = 1;
+  // Optional webhook URL the proxy posts to when notifying the
+  // approver. Empty when the tenant default channel is used.
+  string webhook_url = 2;
+  // Optional deadline (RFC 3339) after which no-approval is an
+  // implicit deny. Empty means no automatic expiry.
+  string expires_at = 3;
+}
