@@ -12,6 +12,15 @@ use std::collections::HashMap;
 /// Top-level config file structure (sb.yml).
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ConfigFile {
+    /// Optional source descriptor (WOR-185).
+    ///
+    /// When set, the config compiler resolves the listed source(s)
+    /// before parsing the rest of the file. The remaining fields on
+    /// `ConfigFile` are still honored: the file the source resolves
+    /// to is itself a `ConfigFile`. When unset (the historical
+    /// default), the file is treated as inline config.
+    #[serde(default)]
+    pub source: Option<ConfigSource>,
     /// Server-wide settings parsed from the top-level `proxy:` block.
     #[serde(default)]
     pub proxy: ProxyServerConfig,
@@ -32,6 +41,58 @@ pub struct ConfigFile {
     /// bot-auth / cache settings.
     #[serde(default)]
     pub agent_classes: Option<AgentClassesConfig>,
+}
+
+/// Where to load a `sb.yml` config text from (WOR-185).
+///
+/// The default (no `source:` field at all) means the file is the
+/// config: the surrounding `ConfigFile` is treated as inline content
+/// and consumed directly. When `source:` is present, the compiler
+/// resolves it to a config text string before parsing.
+///
+/// Three kinds are recognised today:
+///
+/// * `local` keeps the historical behaviour - the inline file is the
+///   config. This is the form that round-trips when an operator writes
+///   `source: { kind: local }` explicitly.
+/// * `git` points at a remote git repository, an optional revision
+///   (branch, tag, or commit), and a path within the repository to
+///   the actual config file.
+/// * `git_overlay` composes one base source with one or more overlay
+///   sources, merging each in order. A `db` form is reserved for a
+///   later iteration but is intentionally not part of this primitive
+///   yet.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConfigSource {
+    /// The inline file is the config; nothing is fetched. This is the
+    /// historical behaviour and the implied default when `source:`
+    /// is omitted.
+    Local,
+    /// Clone a git repository and read a single file inside it as the
+    /// config text.
+    Git {
+        /// Repository URL (https, ssh, or any URL `git clone` accepts).
+        repo: String,
+        /// Optional branch, tag, or commit sha. When `None`, the
+        /// default branch is used.
+        #[serde(default)]
+        revision: Option<String>,
+        /// Path inside the repository to the config file, relative
+        /// to the repository root.
+        path: String,
+    },
+    /// Compose a base source with one or more overlays. Each overlay
+    /// is merged onto the accumulated result in the order it appears
+    /// in the list.
+    GitOverlay {
+        /// The base source the overlays are layered on top of.
+        base: Box<ConfigSource>,
+        /// Overlays applied in order; each is itself a `ConfigSource`
+        /// so overlays can chain arbitrarily deep (subject to the
+        /// recursion cap enforced by the loader).
+        overlays: Vec<ConfigSource>,
+    },
 }
 
 // --- Agent-class top-level config ---

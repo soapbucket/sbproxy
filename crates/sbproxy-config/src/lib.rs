@@ -15,6 +15,7 @@ pub mod listing;
 pub mod plan;
 pub mod raw;
 pub mod snapshot;
+pub mod source;
 pub mod types;
 pub mod validate;
 
@@ -32,6 +33,9 @@ pub use plan::{
 };
 pub use raw::*;
 pub use snapshot::*;
+pub use source::{
+    load_from_source, ConfigSourceError, FetchContext, GitBinaryCloner, MAX_RECURSION_DEPTH,
+};
 pub use types::*;
 pub use validate::{
     validate, PlanFinding, Severity, ValidationOptions, KNOWN_ACTION_TYPES, KNOWN_AUTH_TYPES,
