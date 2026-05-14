@@ -509,6 +509,40 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     })
 }
 
+/// Async wrapper that honours a [`crate::ConfigSource`] before compiling.
+///
+/// `inline_text` is the YAML the operator handed the binary. The
+/// function parses the file far enough to see whether a `source:`
+/// discriminator is set, then resolves it via
+/// [`crate::source::load_from_source`] and feeds the resolved text
+/// back through [`compile_config`].
+///
+/// `ConfigSource::Local` (or no `source:` field at all) preserves
+/// the historical behaviour: `inline_text` is the config.
+pub async fn compile_config_from_source(
+    inline_text: &str,
+    fetch_ctx: &crate::source::FetchContext,
+) -> Result<CompiledConfig> {
+    // Pre-parse just the `source:` discriminator. We do this with a
+    // permissive lightweight type so a YAML that is mostly garbage
+    // still surfaces its source error here, rather than masking it
+    // behind a downstream schema error.
+    #[derive(serde::Deserialize)]
+    struct SourceHead {
+        #[serde(default)]
+        source: Option<crate::types::ConfigSource>,
+    }
+    let head: SourceHead =
+        serde_yaml::from_str(inline_text).context("failed to parse top-level source: block")?;
+    let resolved = match head.source {
+        None | Some(crate::types::ConfigSource::Local) => inline_text.to_string(),
+        Some(src) => crate::source::load_from_source(&src, inline_text, fetch_ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!("config source: {e}"))?,
+    };
+    compile_config(&resolved)
+}
+
 /// Compile a single origin from its raw config.
 pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<CompiledOrigin> {
     let allowed_methods: SmallVec<[http::Method; 4]> = config
@@ -2520,5 +2554,48 @@ origins: {}
             block.get("tenant_id").and_then(|v| v.as_str()),
             Some("tenant-legacy")
         );
+    }
+
+    // --- compile_config_from_source: inline (no source) path ----------
+
+    #[tokio::test]
+    async fn compile_config_from_source_without_source_field_keeps_inline_behaviour() {
+        // When `source:` is omitted, `compile_config_from_source` must
+        // behave identically to `compile_config(inline)`.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  app.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+"#;
+        let ctx = crate::source::FetchContext::with_git_binary();
+        let cfg = compile_config_from_source(yaml, &ctx)
+            .await
+            .expect("compile from inline");
+        assert!(cfg.host_map.contains_key("app.example.com"));
+    }
+
+    #[tokio::test]
+    async fn compile_config_from_source_local_kind_keeps_inline_behaviour() {
+        // Explicit `source: { kind: local }` is the same as no source.
+        let yaml = r#"
+source:
+  kind: local
+proxy:
+  http_bind_port: 8080
+origins:
+  app.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+"#;
+        let ctx = crate::source::FetchContext::with_git_binary();
+        let cfg = compile_config_from_source(yaml, &ctx)
+            .await
+            .expect("compile from local kind");
+        assert!(cfg.host_map.contains_key("app.example.com"));
     }
 }

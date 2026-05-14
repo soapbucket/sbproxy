@@ -20,7 +20,9 @@ compact_str = { workspace = true }
 smallvec = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
 serde_json = { workspace = true }
 tempfile = "3"
+tokio = { workspace = true }
