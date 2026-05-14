@@ -3,16 +3,16 @@
 //!
 //! The compiler historically accepted a single string of YAML and went
 //! straight to parsing. WOR-185 adds an optional `source:` discriminator
-//! on [`ConfigFile`] that lets operators load the underlying text from
-//! places other than the inline file:
+//! on [`crate::ConfigFile`] that lets operators load the underlying
+//! text from places other than the inline file:
 //!
-//! * [`ConfigSource::Local`] - keep the historical behaviour; the file
-//!   the operator hands the binary is the config.
-//! * [`ConfigSource::Git`] - clone a remote repository at an optional
-//!   revision and read one file inside it as the config text.
-//! * [`ConfigSource::GitOverlay`] - resolve a base source first, then
-//!   layer one or more overlay sources on top, merging the YAML at
-//!   each step.
+//! * [`crate::ConfigSource::Local`] - keep the historical behaviour;
+//!   the file the operator hands the binary is the config.
+//! * [`crate::ConfigSource::Git`] - clone a remote repository at an
+//!   optional revision and read one file inside it as the config text.
+//! * [`crate::ConfigSource::GitOverlay`] - resolve a base source first,
+//!   then layer one or more overlay sources on top, merging the YAML
+//!   at each step.
 //!
 //! Everything in this module operates on `String` payloads. The result
 //! flows straight back into [`crate::compile_config`], which keeps the

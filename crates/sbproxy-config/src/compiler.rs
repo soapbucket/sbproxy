@@ -509,7 +509,7 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     })
 }
 
-/// Async wrapper that honours a [`ConfigSource`] before compiling.
+/// Async wrapper that honours a [`crate::ConfigSource`] before compiling.
 ///
 /// `inline_text` is the YAML the operator handed the binary. The
 /// function parses the file far enough to see whether a `source:`
