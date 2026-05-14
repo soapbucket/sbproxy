@@ -173,6 +173,14 @@ jobs:
         with:
           shared-key: release
 
+      # `sbproxy-classifiers` has a `build.rs` that runs `tonic-build`,
+      # which needs `protoc` on PATH (added by PR #156, Classifier Judge
+      # RPC). The main `build / test` job already installs it; the
+      # release-build job is a separate runner so it needs the same
+      # install.
+      - name: install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: build release binary
         run: cargo build --release -p sbproxy --locked
 
