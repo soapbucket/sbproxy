@@ -19,9 +19,9 @@ use super::AgentClassEnforcer;
 use super::{
     A2AEnforcer, AiCrawlEnforcer, AssertionEnforcer, ConcurrentLimitEnforcer, CsrfEnforcer,
     DdosEnforcer, DlpEnforcer, ExposedCredsEnforcer, ExpressionEnforcer, HttpFramingEnforcer,
-    IpFilterEnforcer, OpenApiValidationEnforcer, PageShieldEnforcer, PromptInjectionV2Enforcer,
-    RateLimitEnforcer, RequestLimitEnforcer, RequestValidatorEnforcer, SecHeadersEnforcer,
-    SemanticConstraintEnforcer, SriEnforcer, WafEnforcer,
+    IpFilterEnforcer, OpenApiValidationEnforcer, PageShieldEnforcer, PeerPricingPreflightEnforcer,
+    PromptInjectionV2Enforcer, RateLimitEnforcer, RequestLimitEnforcer, RequestValidatorEnforcer,
+    SecHeadersEnforcer, SemanticConstraintEnforcer, SriEnforcer, WafEnforcer,
 };
 
 /// One compiled policy ready for request-phase dispatch.
@@ -80,6 +80,7 @@ fn compile_one(policy: Policy) -> CompiledEnforcer {
         Policy::AgentClass(p) => builtin(AgentClassEnforcer(Arc::new(p))),
         Policy::A2A(p) => builtin(A2AEnforcer(Arc::new(p))),
         Policy::SemanticConstraint(p) => builtin(SemanticConstraintEnforcer(Arc::new(p))),
+        Policy::PeerPricingPreflight(p) => builtin(PeerPricingPreflightEnforcer(p)),
         Policy::Plugin(enforcer) => CompiledEnforcer {
             surface: PolicySurface::Plugin,
             enforcer,

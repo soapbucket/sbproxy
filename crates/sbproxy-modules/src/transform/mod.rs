@@ -14,6 +14,7 @@ mod citation_block;
 mod control;
 mod json;
 mod json_envelope;
+pub mod llms_pricing;
 pub mod llms_txt;
 mod markup;
 mod text;
