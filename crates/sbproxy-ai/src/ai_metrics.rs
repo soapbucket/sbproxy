@@ -340,6 +340,24 @@ static AI_KEY_COST: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+// --- AI gateway rate-limit rejection counter (WOR-223) ---
+//
+// Operators alert on any non-zero rate of this counter to detect a
+// rejected client. `axis` is the bucket that tripped (`rpm`, `tpm`,
+// `rpd`, `tpd`, `concurrent`). `key_hash` is the hashed virtual key
+// the rejection was charged to; the limiter never receives the raw
+// key. `model` is the upstream model name.
+static AI_RATELIMIT_REJECTED: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_ratelimit_rejected_total",
+            "AI gateway rate-limit rejections, partitioned by axis",
+        ),
+        &["axis", "key_hash", "model"]
+    )
+    .unwrap()
+});
+
 /// Record a completed AI request.
 pub fn record_ai_request(
     provider: &str,
@@ -511,6 +529,28 @@ pub fn record_cache_result(provider: &str, cache_type: &str, hit: bool) {
 /// Update budget utilization gauge.
 pub fn set_budget_utilization(scope: &str, ratio: f64) {
     AI_BUDGET_UTILIZATION.with_label_values(&[scope]).set(ratio);
+}
+
+/// Record an AI gateway rate-limit rejection.
+///
+/// `axis` is the stable label returned by
+/// [`crate::ratelimit::RejectReason::axis_label`]; `key_hash` is the
+/// hashed virtual-key identifier (never the raw key); `model` is the
+/// upstream model name. Surface this via the
+/// `sbproxy_ai_ratelimit_rejected_total` counter; operators alert when
+/// any axis fires.
+pub fn record_ratelimit_rejected(axis: &str, key_hash: &str, model: &str) {
+    AI_RATELIMIT_REJECTED
+        .with_label_values(&[axis, key_hash, model])
+        .inc();
+}
+
+/// Read the cumulative value of the rate-limit rejection counter for
+/// one `(axis, key_hash, model)` triple. Used by tests.
+pub fn ratelimit_rejected_value(axis: &str, key_hash: &str, model: &str) -> f64 {
+    AI_RATELIMIT_REJECTED
+        .with_label_values(&[axis, key_hash, model])
+        .get()
 }
 
 /// Record per-key usage.
