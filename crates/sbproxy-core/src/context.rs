@@ -544,6 +544,13 @@ pub struct RequestContext {
     /// AI request carries the surface (chat_completions, assistants,
     /// image_generation, etc.) without re-parsing the path.
     pub ai_surface: Option<String>,
+    /// Inbound `ChatFormat` id when the request entered on a native
+    /// shim path (`anthropic` for `/v1/messages`, `responses` for
+    /// `/v1/responses`). `None` (or `"openai"`) for the canonical
+    /// `/v1/chat/completions` path. Set by `handle_ai_proxy` after the
+    /// inbound parse and read by the relay path so the response body
+    /// is rewrapped into the format the client expects.
+    pub ai_inbound_format: Option<String>,
     /// WOR-232 pre-flight rate-limit reservation. Stamped by
     /// `handle_ai_proxy` after the prompt has been parsed and the
     /// tiktoken estimator has run; reconciled on the response side
@@ -823,6 +830,7 @@ impl RequestContext {
             ai_tokens_in: None,
             ai_tokens_out: None,
             ai_surface: None,
+            ai_inbound_format: None,
             ai_admission: None,
             ai_realtime_session: None,
             ai_realtime_dispatch: None,

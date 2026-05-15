@@ -18,6 +18,7 @@ pub mod context_relay;
 pub mod degradation;
 pub mod fill_first;
 pub mod finetune;
+pub mod format;
 pub mod guardrails;
 pub mod handler;
 pub mod hierarchical_budget;
