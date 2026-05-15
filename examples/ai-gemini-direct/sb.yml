@@ -1,0 +1,59 @@
+# AI gateway: Google Gemini direct.
+#
+# Routes calls to generativelanguage.googleapis.com. Clients send
+# OpenAI-shaped chat completion requests; sbproxy translates them to
+# Gemini's `:generateContent` shape on the upstream side and
+# translates the response back to OpenAI shape so OpenAI SDK clients
+# work without changes.
+#
+# What's translated:
+#   * Request: `system` role hoisted to `systemInstruction`, sampling
+#     knobs moved under `generationConfig` (with camelCase keys),
+#     `tools` rewritten to `functionDeclarations`, OpenAI-only fields
+#     stripped (logit_bias, n, presence_penalty, frequency_penalty,
+#     response_format, seed, user), path rewritten from
+#     /v1/chat/completions to /v1beta/models/{model}:generateContent.
+#   * Response: text parts concatenated into
+#     `choices[].message.content`, `functionCall` parts converted to
+#     `tool_calls`, `finishReason` mapped to `finish_reason`, usage
+#     tokens renamed.
+#
+# Known limitation: streaming responses (`stream: true`) pass through
+# in Gemini's native SSE shape today. Use the non-streaming form
+# below to exercise the translator end to end.
+#
+# Setup:
+#   export GEMINI_API_KEY=...
+#   make run CONFIG=examples/ai-gemini-direct/sb.yml
+#
+# Test (OpenAI-style request, Gemini on the upstream):
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "gemini-1.5-pro",
+#       "messages": [
+#         {"role": "system", "content": "You write terse haiku."},
+#         {"role": "user", "content": "Write a haiku about caching."}
+#       ]
+#     }'
+#
+# The response comes back in OpenAI shape (`choices[0].message.content`,
+# `usage.prompt_tokens`, etc.) even though Gemini served it.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: gemini
+          api_key: ${GEMINI_API_KEY}
+          default_model: gemini-1.5-pro
+          models:
+            - gemini-1.5-pro
+            - gemini-1.5-flash
+            - gemini-2.0-flash
+      routing: round_robin
