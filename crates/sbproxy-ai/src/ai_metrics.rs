@@ -429,6 +429,33 @@ pub fn record_surface_latency(surface: &str, method: &str, duration_secs: f64) {
         .observe(duration_secs);
 }
 
+/// Counter for requests that bypassed the hub round-trip because the
+/// client and upstream provider speak the same wire format. The
+/// `inbound_format` label matches the values stamped on
+/// `ctx.ai_inbound_format` (`anthropic`, `openai`, `responses`); the
+/// `provider_format` label matches `ProviderFormat` snake-case names.
+/// Cardinality is bounded by the small closed sets on both sides.
+static AI_NATIVE_BYPASS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_native_bypass_total",
+            "AI requests that bypassed the hub format round-trip when client format matched provider format"
+        ),
+        &["inbound_format", "provider_format"]
+    )
+    .unwrap()
+});
+
+/// Record one native-format-bypass event. Called from the AI dispatch
+/// path in `sbproxy-core` once an inbound request has been matched to
+/// an upstream provider whose wire format already equals the inbound
+/// format, so no hub round-trip is needed.
+pub fn record_native_bypass(inbound_format: &str, provider_format: &str) {
+    AI_NATIVE_BYPASS
+        .with_label_values(&[inbound_format, provider_format])
+        .inc();
+}
+
 /// RAII guard that records per-surface latency when it is dropped.
 ///
 /// Created at the start of `handle_ai_proxy` (in `sbproxy-core`); its

@@ -113,6 +113,94 @@ pub fn rewrap_response_for_inbound(inbound_format: Option<&str>, body: &[u8]) ->
     }
 }
 
+/// WOR-229: Native-format bypass classification.
+///
+/// Returned by [`native_bypass_for`] when an inbound format and an
+/// upstream provider's wire format are the same, so the gateway can
+/// forward the client bytes verbatim and skip both legs of the hub
+/// translation. Variants carry the native upstream path the gateway
+/// should target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeBypass {
+    /// OpenAI Chat Completions client hitting any OpenAI-compatible
+    /// upstream. The current pipeline already byte-forwards this case
+    /// because no inbound translation runs, but the classification is
+    /// recorded for metrics so operators can see the share of native
+    /// traffic on the canonical path.
+    OpenAiChat,
+    /// Anthropic Messages client hitting an Anthropic upstream. The
+    /// hub round-trip is genuinely skipped: the native body bytes go
+    /// to `/v1/messages` on the upstream and the response bytes come
+    /// back unmodified.
+    AnthropicMessages,
+}
+
+impl NativeBypass {
+    /// Inbound HTTP path the bypass dispatches to on the upstream.
+    pub fn native_path(self) -> &'static str {
+        match self {
+            NativeBypass::OpenAiChat => "/v1/chat/completions",
+            NativeBypass::AnthropicMessages => "/v1/messages",
+        }
+    }
+
+    /// Stable label used for the `inbound_format` metric dimension.
+    pub fn inbound_label(self) -> &'static str {
+        match self {
+            NativeBypass::OpenAiChat => "openai",
+            NativeBypass::AnthropicMessages => "anthropic",
+        }
+    }
+
+    /// Stable label used for the `provider_format` metric dimension.
+    pub fn provider_label(self) -> &'static str {
+        match self {
+            NativeBypass::OpenAiChat => "openai",
+            NativeBypass::AnthropicMessages => "anthropic",
+        }
+    }
+}
+
+/// Classify whether the inbound format and the upstream provider's
+/// wire format are equal enough for a native bypass.
+///
+/// `inbound_format` is the value stamped on `ctx.ai_inbound_format`
+/// after the inbound parse (`None` and `Some("openai")` both mean the
+/// canonical OpenAI Chat path; `Some("anthropic")` is `/v1/messages`;
+/// `Some("responses")` is `/v1/responses`).
+///
+/// `provider_format` is the upstream provider's catalog format from
+/// `data/ai_providers.yml`.
+///
+/// `provider_name` is the canonical provider name. Some bypass cases
+/// require a specific upstream (e.g. OpenAI Responses currently only
+/// exists on `api.openai.com`, not on the broader OpenAI-compatible
+/// fleet), so the classifier consults the name to avoid sending a
+/// `/v1/responses` payload to a Groq or Together upstream that will
+/// 404 it.
+///
+/// Returns `Some(NativeBypass)` when the gateway should byte-forward
+/// the inbound body to the upstream's native path, or `None` when the
+/// request must go through the hub round-trip.
+pub fn native_bypass_for(
+    inbound_format: Option<&str>,
+    provider_format: crate::providers::ProviderFormat,
+    _provider_name: &str,
+) -> Option<NativeBypass> {
+    use crate::providers::ProviderFormat;
+    match (inbound_format, provider_format) {
+        (None | Some("openai"), ProviderFormat::OpenAi) => Some(NativeBypass::OpenAiChat),
+        (Some("anthropic"), ProviderFormat::Anthropic) => Some(NativeBypass::AnthropicMessages),
+        // OpenAI Responses bypass is intentionally out of scope here.
+        // Most OpenAI-compatible upstreams do not yet expose
+        // `/v1/responses`, and the hub-mediated path already produces
+        // the right wire shape for the client. A future ticket can
+        // add an opt-in `provider.supports_responses` flag and flip
+        // bypass on when set.
+        _ => None,
+    }
+}
+
 /// A bidirectional translator between a wire format and the hub.
 ///
 /// The trait is method-style and uses the names called out in the
@@ -158,4 +246,76 @@ pub trait ChatFormat: Send + Sync + 'static {
         chunk: &HubChunk,
         ctx: &BridgeContext,
     ) -> Result<Vec<String>, ChatError>;
+}
+
+#[cfg(test)]
+mod native_bypass_tests {
+    use super::{native_bypass_for, NativeBypass};
+    use crate::providers::ProviderFormat;
+
+    #[test]
+    fn openai_chat_inbound_matches_openai_upstream() {
+        assert_eq!(
+            native_bypass_for(None, ProviderFormat::OpenAi, "openai"),
+            Some(NativeBypass::OpenAiChat),
+        );
+        assert_eq!(
+            native_bypass_for(Some("openai"), ProviderFormat::OpenAi, "groq"),
+            Some(NativeBypass::OpenAiChat),
+        );
+    }
+
+    #[test]
+    fn anthropic_inbound_matches_anthropic_upstream() {
+        assert_eq!(
+            native_bypass_for(Some("anthropic"), ProviderFormat::Anthropic, "anthropic"),
+            Some(NativeBypass::AnthropicMessages),
+        );
+    }
+
+    #[test]
+    fn responses_inbound_is_out_of_scope_for_v1() {
+        // Most OpenAI-compatible upstreams do not expose
+        // `/v1/responses`; bypass is intentionally restricted until
+        // a per-provider opt-in lands.
+        assert_eq!(
+            native_bypass_for(Some("responses"), ProviderFormat::OpenAi, "openai"),
+            None,
+        );
+    }
+
+    #[test]
+    fn mismatched_pairs_fall_back_to_hub() {
+        assert_eq!(
+            native_bypass_for(Some("anthropic"), ProviderFormat::OpenAi, "openai"),
+            None,
+        );
+        assert_eq!(
+            native_bypass_for(None, ProviderFormat::Anthropic, "anthropic"),
+            None,
+        );
+        assert_eq!(
+            native_bypass_for(Some("anthropic"), ProviderFormat::Google, "gemini"),
+            None,
+        );
+    }
+
+    #[test]
+    fn enum_labels_are_stable() {
+        assert_eq!(NativeBypass::OpenAiChat.inbound_label(), "openai");
+        assert_eq!(NativeBypass::OpenAiChat.provider_label(), "openai");
+        assert_eq!(
+            NativeBypass::OpenAiChat.native_path(),
+            "/v1/chat/completions"
+        );
+        assert_eq!(NativeBypass::AnthropicMessages.inbound_label(), "anthropic");
+        assert_eq!(
+            NativeBypass::AnthropicMessages.provider_label(),
+            "anthropic"
+        );
+        assert_eq!(
+            NativeBypass::AnthropicMessages.native_path(),
+            "/v1/messages"
+        );
+    }
 }

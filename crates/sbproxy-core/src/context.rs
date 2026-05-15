@@ -551,6 +551,13 @@ pub struct RequestContext {
     /// inbound parse and read by the relay path so the response body
     /// is rewrapped into the format the client expects.
     pub ai_inbound_format: Option<String>,
+    /// WOR-229: True when the inbound client format matched the
+    /// upstream provider's native format, so the request bypassed the
+    /// hub round-trip and the response body is already in the inbound
+    /// shape. Read by the response handler to skip the rewrap step
+    /// that would otherwise convert an OpenAI Chat body into the
+    /// inbound wire shape.
+    pub ai_native_bypass: bool,
     /// WOR-232 pre-flight rate-limit reservation. Stamped by
     /// `handle_ai_proxy` after the prompt has been parsed and the
     /// tiktoken estimator has run; reconciled on the response side
@@ -831,6 +838,7 @@ impl RequestContext {
             ai_tokens_out: None,
             ai_surface: None,
             ai_inbound_format: None,
+            ai_native_bypass: false,
             ai_admission: None,
             ai_realtime_session: None,
             ai_realtime_dispatch: None,

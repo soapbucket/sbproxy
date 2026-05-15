@@ -483,6 +483,52 @@ impl AiClient {
 }
 
 impl AiClient {
+    /// WOR-229: Forward a JSON request body byte-for-byte to a native
+    /// upstream path, skipping the OpenAI Chat hub translation.
+    ///
+    /// Used by the native-format bypass: when the inbound client
+    /// format equals the upstream provider's wire format, the gateway
+    /// sends the inbound body directly to the upstream's native path
+    /// rather than translating it through the hub and back. Adds the
+    /// per-format request headers `forward_request` would normally
+    /// add (today: `anthropic-version` for Anthropic upstreams).
+    pub async fn forward_native_bypass(
+        &self,
+        provider: &ProviderConfig,
+        method: &str,
+        native_path: &str,
+        body: bytes::Bytes,
+    ) -> Result<reqwest::Response> {
+        let format = provider_format(provider);
+
+        let base_url_owned = provider.effective_base_url();
+        let base_url = base_url_owned.trim_end_matches('/');
+        let url = build_url(base_url, native_path);
+        let (auth_header, auth_value) = provider.auth_header();
+        let reqwest_method = parse_http_method(method)?;
+
+        debug!(
+            url = %url,
+            method = %method,
+            provider = %provider.name,
+            format = ?format,
+            body_len = body.len(),
+            "WOR-229 native bypass: forwarding inbound body to upstream native path"
+        );
+
+        let mut req = self
+            .http
+            .request(reqwest_method, &url)
+            .header(auth_header, &auth_value)
+            .header("content-type", "application/json");
+        if matches!(format, ProviderFormat::Anthropic) {
+            req = req.header("anthropic-version", "2023-06-01");
+        }
+
+        let resp = req.body(body).send().await?;
+        Ok(resp)
+    }
+
     /// Forward a raw request body byte-for-byte with the caller's
     /// `Content-Type` preserved.
     ///
