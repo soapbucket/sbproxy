@@ -1,6 +1,6 @@
 # Listings
 
-*Last modified: 2026-05-09*
+*Last modified: 2026-05-15*
 
 A `Listing` is a published, versioned view of an existing Resource (an
 origin, an MCP server, or a docs surface). Listings live in the same

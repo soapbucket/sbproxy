@@ -76,7 +76,7 @@ use std::path::Path;
 
 use bytes::Bytes;
 use compact_str::CompactString;
-use sbproxy_config::{AgentSkillEntry, CompiledConfig};
+use sbproxy_config::{AgentSkillEntry, CompiledConfig, ListingRegistry, LoadedListing};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -462,6 +462,168 @@ pub fn render_indices(
         out.insert(origin.hostname.clone(), idx);
     }
     out
+}
+
+// --- Listing-scoped indices (WOR-196) ---
+
+/// One Listing's resolved Agent Skills index, keyed for serving at
+/// `/.well-known/agent-skills/<listing-name>/index.json`.
+///
+/// The struct carries:
+///
+/// - The Listing name (matches the URL path segment after
+///   `/.well-known/agent-skills/`).
+/// - The set of origin hostnames the Listing publishes; the data-plane
+///   handler matches the request `Host` against this set so a Listing
+///   only serves on hostnames it explicitly opts into.
+/// - The fully-resolved [`AgentSkillsIndex`] (per-entry manifest rows,
+///   hash-pinned artifact bytes, digest map).
+#[derive(Debug, Clone)]
+pub struct ListingScopedIndex {
+    /// Listing name (matches `Listing.metadata.name`).
+    pub listing_name: String,
+    /// Hostnames the Listing publishes. Sourced from the Listing's
+    /// `spec.resources[].ref` entries of kind `origins/<hostname>`.
+    pub hostnames: Vec<CompactString>,
+    /// The resolved index, hashed at config-load time. Re-used at
+    /// serve time exactly like the per-origin index from
+    /// [`render_indices`].
+    pub index: AgentSkillsIndex,
+}
+
+/// Build a per-Listing Agent Skills index from a registry.
+///
+/// Walks every Listing whose `spec.skills[]` is non-empty, resolves
+/// each entry's artifact body against the workspace root (the same
+/// CWD resolution the per-origin path uses), and returns the index
+/// keyed by Listing name. Listings whose entries all fail to load are
+/// skipped so the well-known URL 404s instead of serving an empty
+/// manifest.
+///
+/// Per WOR-196 the resolved hostnames come from the Listing's
+/// `spec.resources[].ref` entries (kinds `origins/<hostname>`); other
+/// resource kinds are recorded but do not contribute hostnames for
+/// the OSS surface today.
+pub fn render_listing_indices(
+    registry: &ListingRegistry,
+    workspace_root: &Path,
+) -> HashMap<String, ListingScopedIndex> {
+    let mut out = HashMap::new();
+    for loaded in registry.iter() {
+        if loaded.listing.spec.skills.is_empty() {
+            continue;
+        }
+        let idx = build_index(&loaded.listing.spec.skills, workspace_root);
+        if idx.entries.is_empty() && idx.artifacts.is_empty() {
+            continue;
+        }
+        let hostnames = listing_origin_hostnames(loaded);
+        out.insert(
+            loaded.listing.metadata.name.clone(),
+            ListingScopedIndex {
+                listing_name: loaded.listing.metadata.name.clone(),
+                hostnames,
+                index: idx,
+            },
+        );
+    }
+    out
+}
+
+/// Extract the origin hostnames a Listing publishes from its
+/// `spec.resources[].ref` entries. Returns the set of hostnames for
+/// every `origins/<hostname>` reference. Other kinds (`mcp/`,
+/// `docs/`) are skipped: the OSS data plane only serves Agent Skills
+/// on origin hostnames today.
+fn listing_origin_hostnames(loaded: &LoadedListing) -> Vec<CompactString> {
+    let mut out: Vec<CompactString> = Vec::new();
+    for res in &loaded.listing.spec.resources {
+        let Some((kind, target)) = split_ref(&res.reference) else {
+            continue;
+        };
+        if kind == "origins" && !out.iter().any(|h| h.as_str() == target) {
+            out.push(CompactString::new(target));
+        }
+    }
+    out
+}
+
+fn split_ref(reference: &str) -> Option<(&str, &str)> {
+    let (kind, name) = reference.split_once('/')?;
+    if kind.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some((kind, name))
+}
+
+/// Merge a per-origin [`AgentSkillsIndex`] with every visible
+/// per-Listing index whose `hostnames` include the request hostname.
+///
+/// Used by the data plane to serve the aggregated
+/// `/.well-known/agent-skills/index.json` endpoint on a Catalog
+/// domain. The merge is name-deduplicated: when two indices contribute
+/// an entry with the same `name`, the first occurrence wins (the
+/// per-origin entries are walked first, then Listings in stable
+/// lexicographic order).
+///
+/// Visibility is preserved on every merged entry; the higher-level
+/// [`render_manifest`] still filters anonymous callers down to
+/// `Public` entries.
+pub fn aggregate_for_hostname(
+    per_origin: Option<&AgentSkillsIndex>,
+    listings: &HashMap<String, ListingScopedIndex>,
+    hostname: &str,
+) -> AgentSkillsIndex {
+    let mut merged = AgentSkillsIndex::default();
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // First pass: per-origin entries (the WOR-193 surface).
+    if let Some(idx) = per_origin {
+        for e in &idx.entries {
+            if seen_names.insert(e.name.clone()) {
+                merged.entries.push(e.clone());
+            }
+        }
+        for (k, v) in &idx.artifacts {
+            merged
+                .artifacts
+                .entry(k.clone())
+                .or_insert_with(|| v.clone());
+        }
+        for (k, v) in &idx.digests {
+            merged.digests.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+
+    // Second pass: per-Listing entries whose hostnames include the
+    // request hostname. Listings are walked in stable lexicographic
+    // order so the union is deterministic across reloads.
+    let mut listing_names: Vec<&String> = listings.keys().collect();
+    listing_names.sort();
+    for name in listing_names {
+        let Some(scoped) = listings.get(name) else {
+            continue;
+        };
+        if !scoped.hostnames.iter().any(|h| h.as_str() == hostname) {
+            continue;
+        }
+        for e in &scoped.index.entries {
+            if seen_names.insert(e.name.clone()) {
+                merged.entries.push(e.clone());
+            }
+        }
+        for (k, v) in &scoped.index.artifacts {
+            merged
+                .artifacts
+                .entry(k.clone())
+                .or_insert_with(|| v.clone());
+        }
+        for (k, v) in &scoped.index.digests {
+            merged.digests.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+
+    merged
 }
 
 // --- Archive validation (WOR-194) ---
@@ -978,6 +1140,179 @@ mod tests {
         let tampered = b"# Hello attacker\n";
         let observed = sha256_hex(tampered);
         assert_ne!(recorded, observed, "tamper must produce a different digest");
+    }
+
+    // --- WOR-196 listing-scoped tests --------------------------------
+
+    fn listing_yaml(name: &str, hostname: &str, skill_url: &str, visibility: &str) -> String {
+        format!(
+            r#"
+apiVersion: sbproxy.dev/v1
+kind: Listing
+metadata:
+  name: {name}
+spec:
+  type: api
+  status: published
+  resources:
+    - ref: origins/{hostname}
+      revision:
+        mode: pin
+        value: abc1234
+  skills:
+    - name: {name}-skill
+      type: skill-md
+      description: "Test skill"
+      url: {skill_url}
+      visibility: {visibility}
+      body: |
+        # {name}
+"#
+        )
+    }
+
+    fn registry_from_yaml(yamls: &[String]) -> ListingRegistry {
+        let mut loaded = Vec::new();
+        for (i, body) in yamls.iter().enumerate() {
+            let listing: sbproxy_config::Listing =
+                serde_yaml::from_str(body).expect("Listing parse");
+            loaded.push(sbproxy_config::LoadedListing {
+                source_path: std::path::PathBuf::from(format!("listings/{i}.yaml")),
+                listing,
+            });
+        }
+        let mut findings = Vec::new();
+        ListingRegistry::from_loaded(loaded, &mut findings)
+    }
+
+    #[test]
+    fn render_listing_indices_builds_per_listing_view() {
+        let y1 = listing_yaml("first", "api.example.com", "/skills/first.md", "public");
+        let y2 = listing_yaml(
+            "second",
+            "api.example.com",
+            "/skills/second.md",
+            "authenticated",
+        );
+        let registry = registry_from_yaml(&[y1, y2]);
+        let map = render_listing_indices(&registry, Path::new("."));
+        assert_eq!(map.len(), 2);
+        let first = map.get("first").expect("first listing");
+        assert_eq!(first.listing_name, "first");
+        assert_eq!(first.hostnames.len(), 1);
+        assert_eq!(first.hostnames[0].as_str(), "api.example.com");
+        assert_eq!(first.index.entries.len(), 1);
+        assert_eq!(first.index.entries[0].name, "first-skill");
+    }
+
+    #[test]
+    fn render_listing_indices_skips_listings_without_skills() {
+        let yaml = r#"
+apiVersion: sbproxy.dev/v1
+kind: Listing
+metadata:
+  name: no-skills
+spec:
+  type: api
+  status: draft
+  resources:
+    - ref: origins/api.example.com
+      revision:
+        mode: pin
+        value: abc1234
+"#;
+        let registry = registry_from_yaml(&[yaml.to_string()]);
+        let map = render_listing_indices(&registry, Path::new("."));
+        assert!(map.is_empty(), "listing without skills must not project");
+    }
+
+    #[test]
+    fn aggregated_index_unions_origin_and_listings_for_hostname() {
+        // Per-origin entry under one hostname.
+        let origin_entry = make_entry(
+            "origin-skill",
+            "skill-md",
+            "/skills/origin.md",
+            "origin body",
+        );
+        let origin_idx = build_index(std::slice::from_ref(&origin_entry), Path::new("."));
+
+        // Two listings: one publishes the same hostname, one publishes
+        // a different hostname. Only the same-hostname listing should
+        // contribute to the merged manifest.
+        let y_same = listing_yaml("same", "api.example.com", "/skills/same.md", "public");
+        let y_other = listing_yaml("other", "other.example.com", "/skills/other.md", "public");
+        let registry = registry_from_yaml(&[y_same, y_other]);
+        let listings = render_listing_indices(&registry, Path::new("."));
+
+        let merged = aggregate_for_hostname(Some(&origin_idx), &listings, "api.example.com");
+        let names: Vec<&str> = merged.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"origin-skill"));
+        assert!(names.contains(&"same-skill"));
+        assert!(!names.contains(&"other-skill"));
+    }
+
+    #[test]
+    fn aggregated_index_dedupes_by_name() {
+        // Per-origin entry plus a Listing entry that re-declares the
+        // same `name`. The merged view keeps the per-origin entry and
+        // skips the duplicate from the Listing.
+        let origin_entry = make_entry(
+            "deploy-via-pr",
+            "skill-md",
+            "/skills/origin.md",
+            "origin body",
+        );
+        let origin_idx = build_index(std::slice::from_ref(&origin_entry), Path::new("."));
+
+        let yaml = r#"
+apiVersion: sbproxy.dev/v1
+kind: Listing
+metadata:
+  name: dup-listing
+spec:
+  type: api
+  status: published
+  resources:
+    - ref: origins/api.example.com
+      revision:
+        mode: pin
+        value: abc1234
+  skills:
+    - name: deploy-via-pr
+      type: skill-md
+      description: "Duplicate name from a Listing"
+      url: /skills/listing.md
+      visibility: public
+      body: |
+        # listing body
+"#
+        .to_string();
+        let registry = registry_from_yaml(&[yaml]);
+        let listings = render_listing_indices(&registry, Path::new("."));
+        let merged = aggregate_for_hostname(Some(&origin_idx), &listings, "api.example.com");
+        let dup_count = merged
+            .entries
+            .iter()
+            .filter(|e| e.name == "deploy-via-pr")
+            .count();
+        assert_eq!(dup_count, 1, "merged manifest must dedupe by name");
+        // The per-origin entry's URL wins (it is walked first).
+        let entry = merged
+            .entries
+            .iter()
+            .find(|e| e.name == "deploy-via-pr")
+            .unwrap();
+        assert_eq!(entry.url, "/skills/origin.md");
+    }
+
+    #[test]
+    fn aggregated_index_empty_when_no_listings_match_hostname() {
+        let y = listing_yaml("nope", "other.example.com", "/skills/x.md", "public");
+        let registry = registry_from_yaml(&[y]);
+        let listings = render_listing_indices(&registry, Path::new("."));
+        let merged = aggregate_for_hostname(None, &listings, "api.example.com");
+        assert!(merged.entries.is_empty());
     }
 
     #[test]

@@ -21,11 +21,11 @@ pub mod validate;
 
 pub use compiler::*;
 pub use listing::{
-    load_listing_file, load_listings_from_repo, validate_listings, Listing, ListingAccessPlan,
-    ListingAuth, ListingFreeTier, ListingLifecycle, ListingLoadError, ListingMetadata,
-    ListingPaidTier, ListingPublish, ListingRegistry, ListingResource, ListingSpec, LoadedListing,
-    NoopRevisionResolver, Revision, RevisionMode, RevisionResolver, StaticRevisionResolver,
-    LISTINGS_DIRNAME, LISTING_API_VERSION, LISTING_KIND,
+    is_well_placed_skill_url, load_listing_file, load_listings_from_repo, validate_listings,
+    Listing, ListingAccessPlan, ListingAuth, ListingFreeTier, ListingLifecycle, ListingLoadError,
+    ListingMetadata, ListingPaidTier, ListingPublish, ListingRegistry, ListingResource,
+    ListingSpec, LoadedListing, NoopRevisionResolver, Revision, RevisionMode, RevisionResolver,
+    StaticRevisionResolver, LISTINGS_DIRNAME, LISTING_API_VERSION, LISTING_KIND,
 };
 pub use plan::{
     compute_baseline_revision, plan, plan_with_options, render_text, BlastRadius, BlastRadiusRule,

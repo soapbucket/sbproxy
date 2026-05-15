@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{ConfigFile, RawOriginConfig};
+use crate::types::{AgentSkillEntry, ConfigFile, RawOriginConfig};
 use crate::validate::{PlanFinding, Severity};
 
 // --- Schema -------------------------------------------------------------
@@ -125,8 +125,29 @@ pub struct ListingSpec {
     /// Lifecycle metadata: deprecation note + sunset date.
     #[serde(default)]
     pub lifecycle: ListingLifecycle,
-    // TODO(WOR-196): per-Listing agent-skills extension lands here as
-    // `skills: Vec<ListingSkill>`.
+    /// Per-Listing Agent Skills v0.2.0 advertisement (WOR-196).
+    ///
+    /// Each entry mirrors the top-level `agent_skills:` block from
+    /// `WOR-193`: `name`, `type`, `description`, `url`, optional
+    /// `visibility`, plus the `path` / `body` / archive-safety knobs.
+    /// At config-load time the projection layer resolves the artifact
+    /// bytes, hashes them, and exposes the resulting index at two
+    /// well-known paths:
+    ///
+    /// - `GET /.well-known/agent-skills/<listing-name>/index.json`
+    ///   serves the per-Listing manifest.
+    /// - `GET /.well-known/agent-skills/index.json` on a Catalog
+    ///   domain serves the union of every visible Listing's
+    ///   `spec.skills[]` plus any top-level `agent_skills` configured
+    ///   directly on the origin.
+    ///
+    /// Plan-time validation (see [`validate_listings`]) checks that
+    /// every `url` resolves to a file under `skills/` in the same
+    /// Repo or is a fully-qualified URL; pinned digests on the
+    /// underlying entry are recomputed at config-load time and
+    /// rejected when they diverge from the artifact bytes.
+    #[serde(default)]
+    pub skills: Vec<AgentSkillEntry>,
 }
 
 /// One Resource the Listing exposes.
@@ -734,6 +755,21 @@ fn validate_one<R: RevisionResolver>(
         }
     }
 
+    // --- spec.skills (WOR-196) ---------------------------------------
+    //
+    // Each Listing carries an optional `spec.skills[]` block matching
+    // the shape of the top-level `agent_skills:` config block from
+    // WOR-193. The validator enforces three rules:
+    //
+    // 1. The `type` discriminator must be `skill-md` or `archive`.
+    // 2. The `url` must be either fully-qualified (`https://...` or
+    //    `http://...`) or path-relative to a file under `skills/` in
+    //    the Repo (path-absolute `/skills/...` or relative
+    //    `skills/...`). Other paths produce a
+    //    `listing-skill-url-out-of-tree` error.
+    // 3. Names must be unique within one Listing's `spec.skills[]`.
+    validate_listing_skills(loaded, findings);
+
     // --- auth.strategies vs underlying Resource ----------------------
     if !listing.spec.auth.strategies.is_empty() {
         if let Some(resource_auth) = &first_origin_auth_type {
@@ -761,6 +797,112 @@ fn validate_one<R: RevisionResolver>(
             }
         }
     }
+}
+
+/// Plan-time validation for `Listing.spec.skills[]` (WOR-196).
+///
+/// Walks every entry and emits findings against the existing plan
+/// stream. The rules mirror the AC on WOR-196:
+///
+/// - `type` must be `skill-md` or `archive`; other values produce a
+///   `listing-skill-bad-type` error.
+/// - `url` must be either fully-qualified (`https://...`,
+///   `http://...`) or resolve to a file under `skills/` in the Repo
+///   (path-absolute `/skills/...` or relative `skills/...`). Other
+///   shapes produce a `listing-skill-url-out-of-tree` error.
+/// - `name` must be unique within one Listing's `spec.skills[]`.
+///   Duplicates produce a `duplicate-listing-skill-name` error.
+/// - `visibility` must be `public` or `authenticated`; anything else
+///   produces an `unknown-listing-skill-visibility` warning so a
+///   forward-compatible value passes parsing without breaking the
+///   plan.
+fn validate_listing_skills(loaded: &LoadedListing, findings: &mut Vec<PlanFinding>) {
+    let listing = &loaded.listing;
+    let name = &listing.metadata.name;
+    let mut seen_names: BTreeSet<&str> = BTreeSet::new();
+
+    for (idx, skill) in listing.spec.skills.iter().enumerate() {
+        let entry_path = format!("listings.{name}.spec.skills[{idx}]");
+
+        // -- type discriminator --
+        if !matches!(skill.kind.as_str(), "skill-md" | "archive") {
+            findings.push(PlanFinding {
+                severity: Severity::Error,
+                rule_id: "listing-skill-bad-type".to_string(),
+                path: format!("{entry_path}.type"),
+                message: format!(
+                    "listing '{name}' skill[{idx}] has unsupported type '{}' (expected 'skill-md' or 'archive')",
+                    skill.kind
+                ),
+            });
+        }
+
+        // -- url placement --
+        if !is_well_placed_skill_url(&skill.url) {
+            findings.push(PlanFinding {
+                severity: Severity::Error,
+                rule_id: "listing-skill-url-out-of-tree".to_string(),
+                path: format!("{entry_path}.url"),
+                message: format!(
+                    "listing '{name}' skill[{idx}] url '{}' must be fully-qualified or resolve to a file under skills/ in the Repo",
+                    skill.url
+                ),
+            });
+        }
+
+        // -- name uniqueness --
+        if !seen_names.insert(skill.name.as_str()) {
+            findings.push(PlanFinding {
+                severity: Severity::Error,
+                rule_id: "duplicate-listing-skill-name".to_string(),
+                path: format!("{entry_path}.name"),
+                message: format!(
+                    "listing '{name}' skill[{idx}] duplicates name '{}' already declared in the same Listing",
+                    skill.name
+                ),
+            });
+        }
+
+        // -- visibility (warn) --
+        if !matches!(skill.visibility.as_str(), "public" | "authenticated") {
+            findings.push(PlanFinding {
+                severity: Severity::Warn,
+                rule_id: "unknown-listing-skill-visibility".to_string(),
+                path: format!("{entry_path}.visibility"),
+                message: format!(
+                    "listing '{name}' skill[{idx}] has unknown visibility '{}' (known: public, authenticated)",
+                    skill.visibility
+                ),
+            });
+        }
+    }
+}
+
+/// True when a skill `url` is acceptable for plan-time validation.
+///
+/// Accepts:
+///
+/// - Fully-qualified URLs (`http://...` or `https://...`).
+/// - Path-absolute URLs that point inside `/skills/` (e.g.
+///   `/skills/deploy.md`).
+/// - Path-relative URLs under `skills/` (e.g.
+///   `skills/deploy.md`).
+///
+/// Anything else (a bare filename, `/etc/passwd`, `../escape`) fails
+/// the check so an operator authoring a Listing cannot accidentally
+/// publish a skill URL that resolves outside the Repo's `skills/`
+/// directory.
+pub fn is_well_placed_skill_url(url: &str) -> bool {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return true;
+    }
+    if url.contains("..") {
+        return false;
+    }
+    if let Some(rest) = url.strip_prefix('/') {
+        return rest.starts_with("skills/");
+    }
+    url.starts_with("skills/")
 }
 
 /// Pull the type of the underlying Resource's auth block. Mirrors the
@@ -1294,6 +1436,318 @@ origins:
             .collect();
         assert_eq!(unknown.len(), 1);
         assert_eq!(unknown[0].severity, Severity::Warn);
+    }
+
+    // --- WOR-196 spec.skills tests -----------------------------------
+
+    const LISTING_WITH_SKILLS: &str = r#"
+apiVersion: sbproxy.dev/v1
+kind: Listing
+metadata:
+  name: listing-with-skills
+spec:
+  type: api
+  status: published
+  resources:
+    - ref: origins/api.example.com
+      revision:
+        mode: pin
+        value: abc1234
+  skills:
+    - name: deploy-via-pr
+      type: skill-md
+      description: "Open a PR to deploy"
+      url: /skills/deploy.md
+      visibility: public
+    - name: internal-rotate-secret
+      type: skill-md
+      description: "Rotate a credential"
+      url: skills/rotate.md
+      visibility: authenticated
+"#;
+
+    fn cfg_with_origin() -> ConfigFile {
+        parse_config(
+            r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://upstream.example.com
+"#,
+        )
+    }
+
+    #[test]
+    fn spec_skills_round_trips_through_yaml() {
+        let listing = parse(LISTING_WITH_SKILLS);
+        assert_eq!(listing.spec.skills.len(), 2);
+        assert_eq!(listing.spec.skills[0].name, "deploy-via-pr");
+        assert_eq!(listing.spec.skills[0].kind, "skill-md");
+        assert_eq!(listing.spec.skills[0].url, "/skills/deploy.md");
+        assert_eq!(listing.spec.skills[0].visibility, "public");
+        assert_eq!(listing.spec.skills[1].name, "internal-rotate-secret");
+        assert_eq!(listing.spec.skills[1].visibility, "authenticated");
+    }
+
+    #[test]
+    fn spec_skills_default_is_empty() {
+        let listing = parse(SAMPLE_LISTING);
+        assert!(
+            listing.spec.skills.is_empty(),
+            "listing without skills: must round-trip as empty"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_well_placed_urls() {
+        let listing = parse(LISTING_WITH_SKILLS);
+        let loaded = LoadedListing {
+            source_path: PathBuf::from("listings/with-skills.yaml"),
+            listing,
+        };
+        let mut findings = Vec::new();
+        let registry = ListingRegistry::from_loaded(vec![loaded], &mut findings);
+        let cfg = cfg_with_origin();
+        let mut findings = Vec::new();
+        validate_listings(&registry, &cfg, &NoopRevisionResolver, &mut findings);
+        assert!(
+            findings
+                .iter()
+                .all(|f| !f.rule_id.starts_with("listing-skill-")
+                    && f.rule_id != "duplicate-listing-skill-name"
+                    && f.rule_id != "unknown-listing-skill-visibility"),
+            "got findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_out_of_tree_url() {
+        let yaml = r#"
+apiVersion: sbproxy.dev/v1
+kind: Listing
+metadata:
+  name: bad-skill
+spec:
+  type: api
+  status: draft
+  resources:
+    - ref: origins/api.example.com
+      revision:
+        mode: pin
+        value: abc1234
+  skills:
+    - name: bad
+      type: skill-md
+      description: "Out of tree"
+      url: /etc/passwd
+"#;
+        let listing = parse(yaml);
+        let loaded = LoadedListing {
+            source_path: PathBuf::from("listings/bad.yaml"),
+            listing,
+        };
+        let mut findings = Vec::new();
+        let registry = ListingRegistry::from_loaded(vec![loaded], &mut findings);
+        let cfg = cfg_with_origin();
+        let mut findings = Vec::new();
+        validate_listings(&registry, &cfg, &NoopRevisionResolver, &mut findings);
+        let bad: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "listing-skill-url-out-of-tree")
+            .collect();
+        assert_eq!(bad.len(), 1, "got findings: {findings:?}");
+        assert_eq!(bad[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn validate_rejects_parent_traversal_in_url() {
+        let yaml = r#"
+apiVersion: sbproxy.dev/v1
+kind: Listing
+metadata:
+  name: traversal
+spec:
+  type: api
+  status: draft
+  resources:
+    - ref: origins/api.example.com
+      revision:
+        mode: pin
+        value: abc1234
+  skills:
+    - name: bad
+      type: skill-md
+      description: "Traversal attempt"
+      url: skills/../../../../etc/passwd
+"#;
+        let listing = parse(yaml);
+        let loaded = LoadedListing {
+            source_path: PathBuf::from("listings/traversal.yaml"),
+            listing,
+        };
+        let mut findings = Vec::new();
+        let registry = ListingRegistry::from_loaded(vec![loaded], &mut findings);
+        let cfg = cfg_with_origin();
+        let mut findings = Vec::new();
+        validate_listings(&registry, &cfg, &NoopRevisionResolver, &mut findings);
+        assert!(findings
+            .iter()
+            .any(|f| f.rule_id == "listing-skill-url-out-of-tree"));
+    }
+
+    #[test]
+    fn validate_accepts_fully_qualified_url() {
+        let yaml = r#"
+apiVersion: sbproxy.dev/v1
+kind: Listing
+metadata:
+  name: remote-skill
+spec:
+  type: api
+  status: published
+  resources:
+    - ref: origins/api.example.com
+      revision:
+        mode: pin
+        value: abc1234
+  skills:
+    - name: remote
+      type: skill-md
+      description: "Fully-qualified url"
+      url: https://cdn.example.com/skills/remote.md
+"#;
+        let listing = parse(yaml);
+        let loaded = LoadedListing {
+            source_path: PathBuf::from("listings/remote.yaml"),
+            listing,
+        };
+        let mut findings = Vec::new();
+        let registry = ListingRegistry::from_loaded(vec![loaded], &mut findings);
+        let cfg = cfg_with_origin();
+        let mut findings = Vec::new();
+        validate_listings(&registry, &cfg, &NoopRevisionResolver, &mut findings);
+        assert!(findings
+            .iter()
+            .all(|f| f.rule_id != "listing-skill-url-out-of-tree"));
+    }
+
+    #[test]
+    fn validate_flags_duplicate_skill_names() {
+        let yaml = r#"
+apiVersion: sbproxy.dev/v1
+kind: Listing
+metadata:
+  name: dup-skill
+spec:
+  type: api
+  status: draft
+  resources:
+    - ref: origins/api.example.com
+      revision:
+        mode: pin
+        value: abc1234
+  skills:
+    - name: same
+      type: skill-md
+      description: "First"
+      url: /skills/a.md
+    - name: same
+      type: skill-md
+      description: "Second"
+      url: /skills/b.md
+"#;
+        let listing = parse(yaml);
+        let loaded = LoadedListing {
+            source_path: PathBuf::from("listings/dup.yaml"),
+            listing,
+        };
+        let mut findings = Vec::new();
+        let registry = ListingRegistry::from_loaded(vec![loaded], &mut findings);
+        let cfg = cfg_with_origin();
+        let mut findings = Vec::new();
+        validate_listings(&registry, &cfg, &NoopRevisionResolver, &mut findings);
+        let dup: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "duplicate-listing-skill-name")
+            .collect();
+        assert_eq!(dup.len(), 1, "got findings: {findings:?}");
+    }
+
+    #[test]
+    fn validate_flags_bad_skill_type() {
+        let yaml = r#"
+apiVersion: sbproxy.dev/v1
+kind: Listing
+metadata:
+  name: bad-type
+spec:
+  type: api
+  status: draft
+  resources:
+    - ref: origins/api.example.com
+      revision:
+        mode: pin
+        value: abc1234
+  skills:
+    - name: weird
+      type: executable
+      description: "Not a v0.2.0 type"
+      url: /skills/weird.exe
+"#;
+        let listing = parse(yaml);
+        let loaded = LoadedListing {
+            source_path: PathBuf::from("listings/badtype.yaml"),
+            listing,
+        };
+        let mut findings = Vec::new();
+        let registry = ListingRegistry::from_loaded(vec![loaded], &mut findings);
+        let cfg = cfg_with_origin();
+        let mut findings = Vec::new();
+        validate_listings(&registry, &cfg, &NoopRevisionResolver, &mut findings);
+        assert!(findings
+            .iter()
+            .any(|f| f.rule_id == "listing-skill-bad-type"));
+    }
+
+    #[test]
+    fn unknown_visibility_is_warning() {
+        let yaml = r#"
+apiVersion: sbproxy.dev/v1
+kind: Listing
+metadata:
+  name: weird-vis
+spec:
+  type: api
+  status: draft
+  resources:
+    - ref: origins/api.example.com
+      revision:
+        mode: pin
+        value: abc1234
+  skills:
+    - name: hidden
+      type: skill-md
+      description: "Unknown visibility"
+      url: /skills/hidden.md
+      visibility: members-only
+"#;
+        let listing = parse(yaml);
+        let loaded = LoadedListing {
+            source_path: PathBuf::from("listings/weird.yaml"),
+            listing,
+        };
+        let mut findings = Vec::new();
+        let registry = ListingRegistry::from_loaded(vec![loaded], &mut findings);
+        let cfg = cfg_with_origin();
+        let mut findings = Vec::new();
+        validate_listings(&registry, &cfg, &NoopRevisionResolver, &mut findings);
+        let warn: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "unknown-listing-skill-visibility")
+            .collect();
+        assert_eq!(warn.len(), 1, "got findings: {findings:?}");
+        assert_eq!(warn[0].severity, Severity::Warn);
     }
 
     #[test]
