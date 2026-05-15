@@ -333,6 +333,13 @@ pub struct ProxyServerConfig {
     /// their own keys.
     #[serde(default)]
     pub extensions: HashMap<String, serde_yaml::Value>,
+    /// Tunable client-side timeouts for the proxy's outbound HTTP
+    /// helpers (forward-auth, callbacks, mirrors, SWR refreshes, bot-
+    /// auth directory). Defaults match the prior hardcoded literals
+    /// so existing configs see no behaviour change. See
+    /// [`HttpClientTimeoutsConfig`] for the field list.
+    #[serde(default)]
+    pub http_client_timeouts: HttpClientTimeoutsConfig,
 }
 
 impl Default for ProxyServerConfig {
@@ -359,6 +366,7 @@ impl Default for ProxyServerConfig {
             mtls: None,
             synthetic_probe: None,
             extensions: HashMap::new(),
+            http_client_timeouts: HttpClientTimeoutsConfig::default(),
         }
     }
 }
@@ -948,6 +956,94 @@ fn default_max_log() -> usize {
 
 fn default_http_port() -> u16 {
     8080
+}
+
+// --- HTTP Client Timeouts (WOR-175) ---
+
+/// Tunable client-side timeouts for the proxy's outbound HTTP helpers.
+///
+/// Several internal code paths build pooled `reqwest::Client` instances
+/// to call out to operator-controlled services: forward-auth services,
+/// callback / webhook receivers, mirror destinations, stale-while-
+/// revalidate refreshes against origin upstreams, and Web Bot Auth
+/// directory lookups. Each helper used to bake a `Duration::from_secs`
+/// literal into a `LazyLock`-built client, which meant operators had
+/// to fork the binary to extend a timeout for a slow auth service or
+/// shorten one for an aggressive deadline budget.
+///
+/// All fields default to the prior hardcoded values so existing
+/// configs see no behaviour change. Operators only set a field here
+/// to nudge a specific timeout.
+///
+/// Example:
+///
+/// ```yaml
+/// proxy:
+///   http_client_timeouts:
+///     forward_auth_client_secs: 60
+///     callback_client_secs: 15
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HttpClientTimeoutsConfig {
+    /// Outer client-level timeout for the shared forward-auth
+    /// `reqwest::Client`. The per-request timeout from each
+    /// `forward_auth.timeout` field still applies on top. Defaults
+    /// to 30s.
+    #[serde(default = "default_forward_auth_client_secs")]
+    pub forward_auth_client_secs: u64,
+    /// Per-request fallback timeout for a forward-auth subrequest
+    /// when the auth provider's own `timeout` field is unset.
+    /// Defaults to 5s.
+    #[serde(default = "default_forward_auth_request_secs")]
+    pub forward_auth_request_secs: u64,
+    /// Client-level timeout for the Web Bot Auth directory client
+    /// that fetches signed directories from agent operators.
+    /// Defaults to 5s.
+    #[serde(default = "default_bot_auth_directory_client_secs")]
+    pub bot_auth_directory_client_secs: u64,
+    /// Client-level timeout for the stale-while-revalidate refresh
+    /// client that re-fetches expired cache entries in the
+    /// background. Defaults to 30s to match the conservative outer
+    /// ceiling the rest of the proxy uses for outbound HTTP.
+    #[serde(default = "default_swr_client_secs")]
+    pub swr_client_secs: u64,
+    /// Client-level timeout for the callback / webhook client that
+    /// fires audit-mode webhooks and other fire-and-forget POSTs.
+    /// Defaults to 10s.
+    #[serde(default = "default_callback_client_secs")]
+    pub callback_client_secs: u64,
+}
+
+impl Default for HttpClientTimeoutsConfig {
+    fn default() -> Self {
+        Self {
+            forward_auth_client_secs: default_forward_auth_client_secs(),
+            forward_auth_request_secs: default_forward_auth_request_secs(),
+            bot_auth_directory_client_secs: default_bot_auth_directory_client_secs(),
+            swr_client_secs: default_swr_client_secs(),
+            callback_client_secs: default_callback_client_secs(),
+        }
+    }
+}
+
+fn default_forward_auth_client_secs() -> u64 {
+    30
+}
+
+fn default_forward_auth_request_secs() -> u64 {
+    5
+}
+
+fn default_bot_auth_directory_client_secs() -> u64 {
+    5
+}
+
+fn default_swr_client_secs() -> u64 {
+    30
+}
+
+fn default_callback_client_secs() -> u64 {
+    10
 }
 
 // --- ACME Config ---
