@@ -7,6 +7,14 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+// WOR-227 scaffold. Binary-side anchor for the admin UI + chat
+// playground stub. The actual route handlers live in
+// `sbproxy_core::admin_ui` and `sbproxy_core::admin_playground`;
+// the modules here re-export so the file paths called out in the
+// WOR-227 plan resolve and so future binary-only wiring has a
+// home.
+mod admin;
+
 use std::env;
 
 // mimalloc is Microsoft's high-performance allocator. Typically 5-10% faster

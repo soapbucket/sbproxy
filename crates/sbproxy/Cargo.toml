@@ -50,6 +50,12 @@ llms-txt = ["sbproxy-modules/llms-txt"]
 # `features.tlsFingerprint = false` when running on a tightly-budgeted
 # free tier; on by default for the publishable matrix builds.
 tls-fingerprint = ["sbproxy-core/tls-fingerprint"]
+# WOR-227 (scaffold). Forwards through to `sbproxy-core/embed-admin-ui`.
+# When on, the admin server embeds `ui/dist/` via `include_dir!` and
+# serves the dashboard at `/admin/ui/*`. Off by default so the standard
+# build does not require a prior `pnpm build` of the React scaffold.
+# See `ui/README.md` for the build flow.
+embed-admin-ui = ["sbproxy-core/embed-admin-ui"]
 
 [dependencies]
 sbproxy-core.workspace = true

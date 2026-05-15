@@ -42,6 +42,13 @@ tls-fingerprint = [
     "sbproxy-security/tls-fingerprint",
     "dep:sbproxy-classifiers",
 ]
+# WOR-227 (scaffold). When on, the admin server compiles in
+# `include_dir!("../../ui/dist")` and serves the embedded asset
+# tree at `/admin/ui/*`. Off by default so the standard build does
+# not depend on a prior `pnpm build` and binary size stays slim.
+# Real views land in follow-up tickets; this feature only wires
+# the scaffold mount.
+embed-admin-ui = ["dep:include_dir"]
 
 [dependencies]
 sbproxy-plugin.workspace = true
@@ -128,6 +135,12 @@ sha2.workspace = true
 hmac.workspace = true
 hex.workspace = true
 chrono.workspace = true
+
+# WOR-227 scaffold. Optional; only pulled in by the `embed-admin-ui`
+# feature. The macro embeds `ui/dist/` at compile time so the
+# binary serves the admin SPA without a separate static-asset
+# deployment.
+include_dir = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

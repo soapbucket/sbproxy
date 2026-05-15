@@ -12,6 +12,15 @@
 #![warn(missing_docs)]
 
 pub mod admin;
+/// WOR-227 scaffold. Stub chat-playground handler mounted on the
+/// admin server. Returns 501 today; the follow-up ticket wires it
+/// through `proxy_router.oneshot`.
+pub mod admin_playground;
+/// WOR-227 scaffold. Static-asset surface for the built-in admin
+/// dashboard at `/admin/ui/*`. Embedded via `include_dir!` when the
+/// `embed-admin-ui` feature is on; serves a one-line operator hint
+/// otherwise.
+pub mod admin_ui;
 /// Agent-class capture seam between the resolver in `sbproxy-modules`
 /// and the per-request context. Feature-gated by `agent-class` (G1.4).
 #[cfg(feature = "agent-class")]

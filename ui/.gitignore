@@ -1,0 +1,6 @@
+node_modules/
+dist/
+!dist/.gitkeep
+*.log
+.DS_Store
+.vite/

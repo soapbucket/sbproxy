@@ -923,6 +923,21 @@ pub fn handle_admin_request(
         );
     }
 
+    // --- WOR-227 scaffold: built-in admin UI + playground stub. ---
+    //
+    // Both modules return `Some(...)` for paths they own and `None`
+    // otherwise, so we delegate first and only fall through to the
+    // existing dispatcher when neither matches. The UI mount sits
+    // behind the `embed-admin-ui` cargo feature; without the
+    // feature, requests under `/admin/ui` return a one-line 404
+    // explaining how to enable the embedded build.
+    if let Some(response) = crate::admin_ui::dispatch(method, path) {
+        return response;
+    }
+    if let Some(response) = crate::admin_playground::dispatch(method, path) {
+        return response;
+    }
+
     // --- Method-aware routes first ---
     if path == "/admin/reload" {
         if method.eq_ignore_ascii_case("POST") {
