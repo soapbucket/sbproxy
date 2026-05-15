@@ -41,6 +41,12 @@ url.workspace = true
 flate2 = "1"
 serde_yaml.workspace = true
 
+# Pre-request token estimation for fail-fast TPM enforcement (WOR-232).
+# Ships the cl100k_base and o200k_base BPEs used by GPT-4, GPT-4o, and
+# the o-series. The crate caches its `CoreBPE` singletons internally
+# so each tokenizer pays its initialization cost once per process.
+tiktoken-rs = "0.11"
+
 [dev-dependencies]
 tempfile = "3"
 tracing-subscriber.workspace = true

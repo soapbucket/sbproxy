@@ -71,6 +71,15 @@ static BUDGET_TRACKER: std::sync::LazyLock<sbproxy_ai::BudgetTracker> =
 static AI_SURFACE_RATE_LIMITER: std::sync::LazyLock<sbproxy_ai::ratelimit::SurfaceRateLimiter> =
     std::sync::LazyLock::new(sbproxy_ai::ratelimit::SurfaceRateLimiter::new);
 
+/// Process-wide per-model rate limiter for the AI gateway (WOR-223,
+/// WOR-232). One bucket per `(apikey, model)` pair, sized to the
+/// `model_rate_limits` entry on the matching `AiHandlerConfig`. The
+/// limiter is consulted at the entry of `handle_ai_proxy` with a
+/// real tiktoken-derived prompt-token estimate so TPM rejections
+/// happen before any byte goes upstream.
+static AI_MODEL_RATE_LIMITER: std::sync::LazyLock<sbproxy_ai::ratelimit::ModelRateLimiter> =
+    std::sync::LazyLock::new(sbproxy_ai::ratelimit::ModelRateLimiter::new);
+
 /// Borrow the process-wide AI budget tracker.
 ///
 /// Exposed so reload-path integration tests (and any future admin
@@ -4611,6 +4620,61 @@ async fn handle_ai_proxy(
         Vec::new()
     };
 
+    // --- Pre-request token estimate + TPM reservation (WOR-232) ---
+    //
+    // For chat completions only: we have the parsed `messages` array,
+    // so we can pass it through the tiktoken-rs estimator. Other
+    // surfaces (embeddings, images, audio, ...) book a token-free
+    // reservation that exercises only the RPM / RPD / concurrent axes;
+    // their byte-size budgets land at reconcile time the same way the
+    // WOR-223 default path handles them.
+    //
+    // The reservation is keyed on the hashed authorization value the
+    // budget block already extracted shape-for-shape (or an empty
+    // string when no header was sent). When `model_rate_limits` does
+    // not list the resolved model, the limiter still books a per-key
+    // reservation against a zero-cap bucket and admits the request
+    // without gating, so the cost of a miss is one HashMap lookup.
+    if let Some(rate_cfg) = config.model_rate_limits.get(&model) {
+        let apikey = req_header_value(session, "authorization").unwrap_or_default();
+        let parsed_messages = body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| serde_json::from_value::<sbproxy_ai::Message>(m.clone()).ok())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let estimated = sbproxy_ai::estimate_tokens(&model, &parsed_messages);
+        match AI_MODEL_RATE_LIMITER.admit(&apikey, &model, rate_cfg, Some(estimated)) {
+            Ok(admission) => {
+                ctx.ai_admission = Some(admission);
+            }
+            Err(rej) => {
+                warn!(
+                    ai.surface = surface_label,
+                    model = %model,
+                    axis = rej.reason.axis_label(),
+                    retry_after = rej.retry_after_secs,
+                    estimated_tokens = estimated,
+                    "AI proxy: model rate limit hit pre-flight; returning 429"
+                );
+                let retry = rej.retry_after_secs.to_string();
+                let extra: Option<(&str, &str)> = Some(("retry-after", &retry));
+                send_response_with_extra(
+                    session,
+                    429,
+                    "application/json",
+                    br#"{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}"#,
+                    extra,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
+
     // --- Prompt classifier hook (fail-open) ---
     //
     // If the enterprise prompt classifier is wired into the pipeline, call
@@ -5254,7 +5318,7 @@ async fn relay_ai_response_with_cache(
     miss_info: Option<PendingSemcacheMiss>,
     max_body_size: Option<usize>,
     budget_recorder: Option<BudgetRecorderArgs<'_>>,
-    ctx: Option<&mut RequestContext>,
+    mut ctx: Option<&mut RequestContext>,
     idem_skip_reason: Option<&'static str>,
     idem_capture: Option<AiIdempotencyCapture>,
 ) -> Result<()> {
@@ -5376,10 +5440,20 @@ async fn relay_ai_response_with_cache(
     if let Some(args) = budget_recorder.as_ref() {
         if (200..300).contains(&status) {
             let (prompt_tokens, completion_tokens) = extract_usage(&resp_body);
+            // WOR-232 reconcile: hand the real `usage.prompt_tokens`
+            // back to the rate-limit reservation so TPM math settles
+            // against the truth. Reservations that never see a usage
+            // block fall through to the `Drop` path which refunds the
+            // full reservation.
+            if let Some(ctx_ref) = ctx.as_mut() {
+                if let Some(adm) = ctx_ref.ai_admission.take() {
+                    adm.reconcile(prompt_tokens);
+                }
+            }
             // Stamp the token counts onto the request context so the
             // access log records them alongside the rest of the AI
             // gateway envelope.
-            if let Some(ctx) = ctx {
+            if let Some(ctx) = ctx.as_mut() {
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);
             }
@@ -5441,6 +5515,12 @@ async fn relay_ai_response_with_cache(
         // to capture token usage when the upstream returned a body.
         if (200..300).contains(&status) {
             let (prompt_tokens, completion_tokens) = extract_usage(&resp_body);
+            // WOR-232 reconcile: mirror the budget-recorder branch so
+            // origins without a configured budget still settle their
+            // TPM reservation against the upstream's reported usage.
+            if let Some(adm) = ctx.ai_admission.take() {
+                adm.reconcile(prompt_tokens);
+            }
             if prompt_tokens != 0 || completion_tokens != 0 {
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);

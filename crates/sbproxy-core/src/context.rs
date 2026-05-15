@@ -544,6 +544,14 @@ pub struct RequestContext {
     /// AI request carries the surface (chat_completions, assistants,
     /// image_generation, etc.) without re-parsing the path.
     pub ai_surface: Option<String>,
+    /// WOR-232 pre-flight rate-limit reservation. Stamped by
+    /// `handle_ai_proxy` after the prompt has been parsed and the
+    /// tiktoken estimator has run; reconciled on the response side
+    /// with the upstream's `usage.prompt_tokens` so TPM / TPD math
+    /// settles against the real token count. Dropping the field
+    /// without calling `reconcile` refunds the full reservation,
+    /// which is the right behaviour on upstream-error paths.
+    pub ai_admission: Option<sbproxy_ai::Admission>,
     /// OpenAI Realtime API session identifier for sessions dispatched
     /// through the realtime WebSocket path. `None` for non-realtime
     /// AI requests. Set by the realtime dispatcher when the upstream
@@ -815,6 +823,7 @@ impl RequestContext {
             ai_tokens_in: None,
             ai_tokens_out: None,
             ai_surface: None,
+            ai_admission: None,
             ai_realtime_session: None,
             ai_realtime_dispatch: None,
             content_shape_pricing: None,
