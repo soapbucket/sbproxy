@@ -4180,6 +4180,33 @@ async fn send_response_with_extra(
 /// 4. Maps the model name if a model_map is configured
 /// 5. Forwards the request to the provider's API
 /// 6. Relays the response back to the client (streaming or non-streaming)
+///
+/// WOR-229: Build the bypass body for a native-format upstream call.
+///
+/// `original` is the inbound native bytes (Anthropic Messages JSON
+/// today). `resolved_model` is the post-`map_model` model name the
+/// router chose. The helper rewrites `body["model"]` in the native
+/// JSON when it differs from the original, then reserialises. When no
+/// remap is needed (the common case for native-native traffic where
+/// operators do not configure a model_map), the original bytes are
+/// returned as-is so the request truly is a byte forward.
+fn make_native_bypass_body(
+    original: &bytes::Bytes,
+    resolved_model: &str,
+) -> Result<bytes::Bytes, serde_json::Error> {
+    if resolved_model.is_empty() {
+        return Ok(original.clone());
+    }
+    let mut parsed: serde_json::Value = serde_json::from_slice(original)?;
+    let existing = parsed.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    if existing == resolved_model {
+        return Ok(original.clone());
+    }
+    parsed["model"] = serde_json::Value::String(resolved_model.to_string());
+    let remapped = serde_json::to_vec(&parsed)?;
+    Ok(bytes::Bytes::from(remapped))
+}
+
 async fn handle_ai_proxy(
     session: &mut Session,
     config: &AiHandlerConfig,
@@ -4433,6 +4460,17 @@ async fn handle_ai_proxy(
 
     // POST requests: read the body, parse JSON, select provider, forward.
     let body_bytes = session.read_request_body().await?.unwrap_or_default();
+
+    // WOR-229: stash the native body so the dispatcher can
+    // byte-forward the inbound bytes to the upstream when the
+    // upstream's wire format equals the inbound format. The
+    // hub-mediated translation block immediately below rewrites
+    // `body_bytes` to OpenAI Chat JSON; capturing here preserves the
+    // original shape for the bypass branch in the dispatch for-loop.
+    // The native target path is supplied by the `NativeBypass` enum
+    // rather than the inbound path so the bypass works even when the
+    // proxy is fronting an idiosyncratic inbound URL.
+    let native_request_bytes_for_bypass: bytes::Bytes = body_bytes.clone();
 
     // --- Native-format inbound shim (WOR-224) ---
     //
@@ -5124,14 +5162,92 @@ async fn handle_ai_proxy(
         // the response-handling path (see `extract_usage`).
         ctx.ai_provider = Some(provider.name.clone());
         if !resolved_model.is_empty() {
-            ctx.ai_model = Some(resolved_model);
+            ctx.ai_model = Some(resolved_model.clone());
         }
 
-        match AI_CLIENT
-            .load()
-            .forward_request(provider, &path, &attempt_body)
-            .await
-        {
+        // WOR-229: native-format bypass. When the inbound client
+        // format equals the upstream provider's wire format, send
+        // the inbound body verbatim to the upstream's native path
+        // and skip the hub round-trip. `native_bypass_for` returns
+        // `None` for any mismatched pair, in which case the existing
+        // hub-mediated `forward_request` call below runs. Streaming
+        // bypass is out of scope for this iteration; the upstream
+        // returns native SSE that the streaming relay would need to
+        // emit as-is, which is a separate code path. Track this as a
+        // follow-up.
+        let provider_format = sbproxy_ai::client::provider_format(provider);
+        let bypass = if is_stream {
+            None
+        } else {
+            sbproxy_ai::format::native_bypass_for(
+                ctx.ai_inbound_format.as_deref(),
+                provider_format,
+                &provider.name,
+            )
+        };
+        let upstream_call: Option<(bytes::Bytes, &'static str)> = match bypass {
+            Some(sbproxy_ai::format::NativeBypass::AnthropicMessages) => {
+                // Anthropic Messages -> Anthropic upstream: re-emit
+                // the native body bytes (with the resolved model
+                // substituted in) to the upstream's `/v1/messages`
+                // path. The OpenAI Chat hub body that lives in
+                // `attempt_body` is discarded for this iteration.
+                match make_native_bypass_body(&native_request_bytes_for_bypass, &resolved_model) {
+                    Ok(body) => {
+                        sbproxy_ai::ai_metrics::record_native_bypass(
+                            sbproxy_ai::format::NativeBypass::AnthropicMessages.inbound_label(),
+                            sbproxy_ai::format::NativeBypass::AnthropicMessages.provider_label(),
+                        );
+                        ctx.ai_native_bypass = true;
+                        Some((
+                            body,
+                            sbproxy_ai::format::NativeBypass::AnthropicMessages.native_path(),
+                        ))
+                    }
+                    Err(e) => {
+                        // If the native body fails to parse here
+                        // something is very wrong; fall back to the
+                        // hub path so the request still has a chance
+                        // of succeeding.
+                        warn!(
+                            error = %e,
+                            provider = %provider.name,
+                            "WOR-229: native bypass body remap failed; falling back to hub path"
+                        );
+                        ctx.ai_native_bypass = false;
+                        None
+                    }
+                }
+            }
+            Some(sbproxy_ai::format::NativeBypass::OpenAiChat) => {
+                // OpenAI Chat -> OpenAI-compatible upstream: the
+                // current hub path is already a byte forward for
+                // this pair, so the bypass is just a metric tag.
+                // `attempt_body` already carries the model remap; we
+                // leave the hub call below to run unchanged.
+                sbproxy_ai::ai_metrics::record_native_bypass(
+                    sbproxy_ai::format::NativeBypass::OpenAiChat.inbound_label(),
+                    sbproxy_ai::format::NativeBypass::OpenAiChat.provider_label(),
+                );
+                ctx.ai_native_bypass = true;
+                None
+            }
+            None => None,
+        };
+
+        let result = if let Some((bypass_body, native_path)) = upstream_call {
+            AI_CLIENT
+                .load()
+                .forward_native_bypass(provider, &method_str, native_path, bypass_body)
+                .await
+        } else {
+            AI_CLIENT
+                .load()
+                .forward_request(provider, &path, &attempt_body)
+                .await
+        };
+
+        match result {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 if is_failover
@@ -5505,12 +5621,25 @@ async fn relay_ai_response_with_cache(
     // in OpenAI Chat shape (so cross-format cache hits remain cheap)
     // and only the bytes leaving the gateway are re-emitted in the
     // client-expected wire shape.
+    //
+    // WOR-229 native bypass: when the inbound format matched the
+    // upstream provider's wire format, the response is already in the
+    // client's expected shape (it came directly from the native
+    // upstream path), so the rewrap step is skipped.
     let inbound_format: Option<String> = ctx.as_ref().and_then(|c| c.ai_inbound_format.clone());
-    let resp_body: bytes::Bytes = match inbound_format.as_deref() {
-        Some("anthropic") | Some("responses") => bytes::Bytes::from(
-            sbproxy_ai::format::rewrap_response_for_inbound(inbound_format.as_deref(), &resp_body),
-        ),
-        _ => resp_body,
+    let native_bypass = ctx.as_ref().map(|c| c.ai_native_bypass).unwrap_or(false);
+    let resp_body: bytes::Bytes = if native_bypass {
+        resp_body
+    } else {
+        match inbound_format.as_deref() {
+            Some("anthropic") | Some("responses") => {
+                bytes::Bytes::from(sbproxy_ai::format::rewrap_response_for_inbound(
+                    inbound_format.as_deref(),
+                    &resp_body,
+                ))
+            }
+            _ => resp_body,
+        }
     };
 
     // --- Semantic cache write on miss ---
@@ -16885,5 +17014,51 @@ origins:
             super::map_upstream_failure(&e),
             (502, Some("http_request_error"))
         );
+    }
+
+    // --- WOR-229: native bypass body helper ---
+
+    #[test]
+    fn wor_229_bypass_body_empty_model_returns_original_bytes() {
+        let original = bytes::Bytes::from_static(
+            br#"{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let out = super::make_native_bypass_body(&original, "").unwrap();
+        // Empty resolved_model means the router did not map; passing
+        // the original bytes through verbatim preserves the byte
+        // forward guarantee of the bypass.
+        assert_eq!(out.as_ref(), original.as_ref());
+    }
+
+    #[test]
+    fn wor_229_bypass_body_same_model_returns_original_bytes() {
+        let original = bytes::Bytes::from_static(
+            br#"{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let out = super::make_native_bypass_body(&original, "claude-3-5-sonnet").unwrap();
+        // No mutation needed when the resolved model already matches
+        // the body's model. The original bytes flow through.
+        assert_eq!(out.as_ref(), original.as_ref());
+    }
+
+    #[test]
+    fn wor_229_bypass_body_remaps_model_when_router_chose_different() {
+        let original = bytes::Bytes::from_static(
+            br#"{"model":"sonnet-alias","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let out = super::make_native_bypass_body(&original, "claude-3-5-sonnet-20241022").unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed["model"].as_str().unwrap(),
+            "claude-3-5-sonnet-20241022"
+        );
+        assert_eq!(parsed["messages"][0]["role"].as_str().unwrap(), "user");
+    }
+
+    #[test]
+    fn wor_229_bypass_body_propagates_parse_errors() {
+        let invalid = bytes::Bytes::from_static(b"{not valid json");
+        let err = super::make_native_bypass_body(&invalid, "claude-3-5-sonnet").unwrap_err();
+        assert!(err.is_syntax() || err.is_data());
     }
 }
