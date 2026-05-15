@@ -8056,51 +8056,212 @@ impl ProxyHttp for SbProxy {
             let req_path = session.req_header().uri.path().to_string();
             let docs = sbproxy_modules::projections::current_projections();
             let host_key = pipeline.config.origins[origin_idx].hostname.as_str();
-            if let Some(idx) = docs.agent_skills.get(host_key) {
-                if req_path == "/.well-known/agent-skills/index.json" {
-                    // Resolve the request scheme so relative URLs in
-                    // the manifest emit the right `https://` vs
-                    // `http://` prefix. Listener TLS is the
-                    // authoritative signal; spoofable proxy headers
-                    // are honoured only when the immediate peer is in
-                    // `proxy.trusted_proxies`.
-                    let listener_is_tls = session
-                        .digest()
-                        .and_then(|d| d.ssl_digest.as_ref())
-                        .is_some();
-                    let scheme = if listener_is_tls { "https" } else { "http" };
-                    // Visibility: anonymous callers see the public-only
-                    // manifest. Authenticated callers see the full
-                    // manifest. The proxy's auth pipeline runs after
-                    // this handler, so we infer "authenticated" from
-                    // the presence of an Authorization header. This
-                    // is a conservative heuristic; the manifest still
-                    // ships SHA-256 digests so a downstream agent
-                    // verifies integrity even without the gate.
-                    let authenticated = session.req_header().headers.get("authorization").is_some();
-                    let host_authority = session
-                        .req_header()
-                        .headers
-                        .get("host")
-                        .and_then(|v| v.to_str().ok());
-                    let body = sbproxy_modules::projections::agent_skills::render_manifest(
-                        idx,
-                        authenticated,
-                        host_authority,
-                        scheme,
-                    );
-                    send_response(session, 200, "application/json", body.as_bytes()).await?;
+            let per_origin_idx = docs.agent_skills.get(host_key);
+
+            // Resolve the request scheme so relative URLs in the
+            // manifest emit the right `https://` vs `http://` prefix.
+            // Listener TLS is the authoritative signal; spoofable proxy
+            // headers are honoured only when the immediate peer is in
+            // `proxy.trusted_proxies`.
+            let listener_is_tls = session
+                .digest()
+                .and_then(|d| d.ssl_digest.as_ref())
+                .is_some();
+            let scheme = if listener_is_tls { "https" } else { "http" };
+            let authenticated = session.req_header().headers.get("authorization").is_some();
+            let host_authority = session
+                .req_header()
+                .headers
+                .get("host")
+                .and_then(|v| v.to_str().ok());
+            let caller = if authenticated {
+                "authenticated"
+            } else {
+                "anonymous"
+            };
+
+            // --- WOR-196 per-Listing manifest --------------------------------
+            //
+            // Path:
+            //   /.well-known/agent-skills/<listing-name>/index.json
+            //
+            // The handler looks the listing up by name in the
+            // projection cache and rejects (404) when the listing
+            // either does not exist or does not publish this origin
+            // hostname. The per-Listing manifest is the same JSON
+            // envelope the per-origin path serves, computed off the
+            // Listing's `spec.skills[]` block.
+            if let Some(rest) = req_path.strip_prefix("/.well-known/agent-skills/") {
+                if let Some((listing_name, sub)) = rest.split_once('/') {
+                    if !listing_name.is_empty() {
+                        let scoped = docs.agent_skills_listings.get(listing_name);
+                        let publishes_host = scoped
+                            .map(|s| s.hostnames.iter().any(|h| h.as_str() == host_key))
+                            .unwrap_or(false);
+                        if let (Some(scoped), true) = (scoped, publishes_host) {
+                            if sub == "index.json" {
+                                let body =
+                                    sbproxy_modules::projections::agent_skills::render_manifest(
+                                        &scoped.index,
+                                        authenticated,
+                                        host_authority,
+                                        scheme,
+                                    );
+                                // Audit fan-out (WOR-196 AC): every
+                                // index request logs caller, listing
+                                // id, and the host key the manifest
+                                // was served against.
+                                tracing::info!(
+                                    target: "sbproxy::audit",
+                                    event = "agent_skill.listing_index",
+                                    listing_id = %listing_name,
+                                    hostname = %host_key,
+                                    caller = %caller,
+                                    request_id = %ctx.request_id,
+                                    "agent skills listing index served"
+                                );
+                                send_response(session, 200, "application/json", body.as_bytes())
+                                    .await?;
+                                return Ok(true);
+                            }
+                            // Per-Listing artifact body. The artifact
+                            // cache keys on the manifest URL (path-
+                            // absolute), so we look up the served
+                            // path with a leading slash. `sub` here is
+                            // the rest of the URL after the listing
+                            // segment, normalised back to the path
+                            // shape the manifest publishes.
+                            let cache_key = format!("/{sub}");
+                            if let Some(body) = scoped.index.artifacts.get(cache_key.as_str()) {
+                                if let Some(expected_hex) =
+                                    scoped.index.digests.get(cache_key.as_str())
+                                {
+                                    let observed_hex =
+                                        sbproxy_modules::projections::agent_skills::sha256_hex(
+                                            body,
+                                        );
+                                    if &observed_hex != expected_hex {
+                                        let skill_name = scoped
+                                            .index
+                                            .entries
+                                            .iter()
+                                            .find(|e| {
+                                                let cmp = if e.url.starts_with('/') {
+                                                    e.url.clone()
+                                                } else if !e.url.starts_with("http") {
+                                                    format!("/{}", e.url)
+                                                } else {
+                                                    String::new()
+                                                };
+                                                cmp == cache_key
+                                            })
+                                            .map(|e| e.name.clone())
+                                            .unwrap_or_else(|| cache_key.clone());
+                                        sbproxy_observe::metrics::metrics()
+                                            .agent_skill_digest_mismatch
+                                            .with_label_values(&[skill_name.as_str()])
+                                            .inc();
+                                        tracing::error!(
+                                            target: "sbproxy::audit",
+                                            event = "agent_skill.digest_mismatch",
+                                            skill_name = %skill_name,
+                                            listing_id = %listing_name,
+                                            hostname = %host_key,
+                                            expected_digest = %expected_hex,
+                                            observed_digest = %observed_hex,
+                                            caller = %caller,
+                                            request_id = %ctx.request_id,
+                                            "agent skill artifact body diverged from manifest digest"
+                                        );
+                                        send_error(session, 503, "service unavailable").await?;
+                                        return Ok(true);
+                                    }
+                                }
+                                let ct = scoped
+                                    .index
+                                    .entries
+                                    .iter()
+                                    .find(|e| {
+                                        let cmp = if e.url.starts_with('/') {
+                                            e.url.clone()
+                                        } else if !e.url.starts_with("http") {
+                                            format!("/{}", e.url)
+                                        } else {
+                                            String::new()
+                                        };
+                                        cmp == cache_key
+                                    })
+                                    .map(|e| match e.kind.as_str() {
+                                        "skill-md" => "text/markdown; charset=utf-8",
+                                        "archive" => "application/octet-stream",
+                                        _ => "application/octet-stream",
+                                    })
+                                    .unwrap_or("application/octet-stream");
+                                tracing::info!(
+                                    target: "sbproxy::audit",
+                                    event = "agent_skill.listing_artifact",
+                                    listing_id = %listing_name,
+                                    hostname = %host_key,
+                                    artifact_path = %cache_key,
+                                    caller = %caller,
+                                    request_id = %ctx.request_id,
+                                    "agent skills listing artifact served"
+                                );
+                                send_response(session, 200, ct, body.as_ref()).await?;
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- Aggregated manifest at the unprefixed well-known URL --------
+            //
+            // `/.well-known/agent-skills/index.json` returns the union
+            // of the per-origin entries (the WOR-193 surface) and every
+            // Listing whose `spec.resources[].ref` lists this hostname
+            // as an origin. The merge dedupes by `name` (first
+            // occurrence wins) so a Listing that re-declares a
+            // per-origin entry name does not double-count.
+            if req_path == "/.well-known/agent-skills/index.json" {
+                let merged = sbproxy_modules::projections::agent_skills::aggregate_for_hostname(
+                    per_origin_idx,
+                    &docs.agent_skills_listings,
+                    host_key,
+                );
+                if merged.entries.is_empty() && per_origin_idx.is_none() {
+                    // No top-level `agent_skills:` and no matching
+                    // Listing skills: 404 so cooperative agents get a
+                    // clean signal that no manifest is advertised on
+                    // this hostname.
+                    send_error(session, 404, "agent-skills not configured").await?;
                     return Ok(true);
                 }
-                // Path-absolute artifact body. Re-hash on every serve
-                // (WOR-194); on mismatch return 503 + audit + counter.
+                let body = sbproxy_modules::projections::agent_skills::render_manifest(
+                    &merged,
+                    authenticated,
+                    host_authority,
+                    scheme,
+                );
+                tracing::info!(
+                    target: "sbproxy::audit",
+                    event = "agent_skill.aggregated_index",
+                    hostname = %host_key,
+                    caller = %caller,
+                    request_id = %ctx.request_id,
+                    "agent skills aggregated index served"
+                );
+                send_response(session, 200, "application/json", body.as_bytes()).await?;
+                return Ok(true);
+            }
+
+            // --- Per-origin artifact fan-out (WOR-193 / WOR-194) ------------
+            if let Some(idx) = per_origin_idx {
                 if let Some(body) = idx.artifacts.get(req_path.as_str()) {
                     if let Some(expected_hex) = idx.digests.get(req_path.as_str()) {
                         let observed_hex =
                             sbproxy_modules::projections::agent_skills::sha256_hex(body);
                         if &observed_hex != expected_hex {
-                            // Pinpoint the entry so the audit row and
-                            // metric label carry the same skill name.
                             let skill_name = idx
                                 .entries
                                 .iter()
@@ -8120,18 +8281,6 @@ impl ProxyHttp for SbProxy {
                                 .agent_skill_digest_mismatch
                                 .with_label_values(&[skill_name.as_str()])
                                 .inc();
-                            // Caller identity surface: presence of an
-                            // Authorization header. The audit row keeps
-                            // the actual credential out of the log; the
-                            // operator's audit pipeline correlates with
-                            // request id and access-log to recover the
-                            // full identity if needed.
-                            let caller =
-                                if session.req_header().headers.get("authorization").is_some() {
-                                    "authenticated"
-                                } else {
-                                    "anonymous"
-                                };
                             tracing::error!(
                                 target: "sbproxy::audit",
                                 event = "agent_skill.digest_mismatch",
@@ -8147,10 +8296,6 @@ impl ProxyHttp for SbProxy {
                             return Ok(true);
                         }
                     }
-                    // Pick a sensible content type per artifact kind.
-                    // `skill-md` is `text/markdown`; `archive` defaults
-                    // to `application/octet-stream` because callers
-                    // sniff the magic bytes themselves.
                     let ct = if let Some(entry) = idx.entries.iter().find(|e| {
                         let cmp = if e.url.starts_with('/') {
                             e.url.clone()
@@ -8172,13 +8317,6 @@ impl ProxyHttp for SbProxy {
                     send_response(session, 200, ct, body.as_ref()).await?;
                     return Ok(true);
                 }
-            } else if req_path == "/.well-known/agent-skills/index.json" {
-                // Origin without `agent_skills:` 404s the well-known
-                // URL rather than falling through to the upstream so
-                // the agent gets a clean signal that no manifest is
-                // advertised on this hostname.
-                send_error(session, 404, "agent-skills not configured").await?;
-                return Ok(true);
             }
         }
 
@@ -13243,6 +13381,38 @@ pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<()> {
 
     let mut new_pipeline = CompiledPipeline::from_config(compiled)?;
 
+    // WOR-196: pick up `listings/*.yaml` from the same Repo (the
+    // directory the served `sb.yml` lives in) and stash the loaded
+    // registry on the pipeline. The projection layer reads
+    // `pipeline.listings` and renders the per-Listing Agent Skills
+    // surface for the well-known endpoints. Load errors are logged
+    // at warn level and the registry stays empty; the OSS surface
+    // continues to serve the top-level `agent_skills:` block.
+    {
+        let repo_root = std::path::Path::new(config_path)
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let mut load_errors: Vec<sbproxy_config::ListingLoadError> = Vec::new();
+        let loaded = sbproxy_config::load_listings_from_repo(&repo_root, &mut load_errors);
+        for err in &load_errors {
+            tracing::warn!(error = %err, "listings load error; skipping entry");
+        }
+        if !loaded.is_empty() {
+            let mut findings: Vec<sbproxy_config::PlanFinding> = Vec::new();
+            new_pipeline.listings =
+                sbproxy_config::ListingRegistry::from_loaded(loaded, &mut findings);
+            for finding in &findings {
+                tracing::warn!(
+                    rule_id = %finding.rule_id,
+                    path = %finding.path,
+                    message = %finding.message,
+                    "listing registry finding"
+                );
+            }
+        }
+    }
+
     // Invoke the enterprise reload hook (best-effort): the OSS reload
     // path must continue to swap the pipeline even if a downstream
     // hook errors, otherwise a failing enterprise extension would
@@ -13530,6 +13700,36 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
 
     // Compile config into a pipeline with action/auth/policy module instances.
     let mut pipeline = CompiledPipeline::from_config(compiled)?;
+
+    // WOR-196: pick up `listings/*.yaml` from the same Repo (the
+    // directory the served `sb.yml` lives in) and stash the loaded
+    // registry on the pipeline so the projection layer can serve the
+    // per-Listing and aggregated agent-skills endpoints. Mirrors the
+    // same wiring in `reload_from_config_path` so SIGHUP and file-
+    // watcher reloads pick up listing edits too.
+    {
+        let repo_root = std::path::Path::new(config_path)
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let mut load_errors: Vec<sbproxy_config::ListingLoadError> = Vec::new();
+        let loaded = sbproxy_config::load_listings_from_repo(&repo_root, &mut load_errors);
+        for err in &load_errors {
+            tracing::warn!(error = %err, "listings load error; skipping entry");
+        }
+        if !loaded.is_empty() {
+            let mut findings: Vec<sbproxy_config::PlanFinding> = Vec::new();
+            pipeline.listings = sbproxy_config::ListingRegistry::from_loaded(loaded, &mut findings);
+            for finding in &findings {
+                tracing::warn!(
+                    rule_id = %finding.rule_id,
+                    path = %finding.path,
+                    message = %finding.message,
+                    "listing registry finding"
+                );
+            }
+        }
+    }
 
     // Give enterprise code a chance to wire its hooks, construct clients,
     // and register origins. Failures here do NOT block serving: they log

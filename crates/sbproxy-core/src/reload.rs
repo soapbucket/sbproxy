@@ -135,8 +135,11 @@ pub fn load_pipeline(new_pipeline: CompiledPipeline) {
     // hot-path freshness check. Cross-process verification (Wave 6
     // signed batch) re-derives the version from the config bytes.
     let config_version = next_config_version();
-    let docs =
-        sbproxy_modules::projections::render_projections(&new_pipeline.config, config_version);
+    let docs = sbproxy_modules::projections::render_projections_with_listings(
+        &new_pipeline.config,
+        &new_pipeline.listings,
+        config_version,
+    );
     sbproxy_modules::projections::install_projections(docs);
     pipeline_store().store(Arc::new(new_pipeline));
 }

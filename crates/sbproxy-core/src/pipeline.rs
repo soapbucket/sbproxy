@@ -838,6 +838,17 @@ pub struct CompiledPipeline {
     /// are not duplicated when several origins point at the same
     /// hostname.
     pub dns_resolver: Arc<sbproxy_platform::RefreshingResolver>,
+    /// Repo-native Listing registry (WOR-136) populated at config
+    /// load.
+    ///
+    /// Each Listing's `spec.skills[]` block (WOR-196) feeds the
+    /// per-Listing Agent Skills projection at
+    /// `/.well-known/agent-skills/<listing-name>/index.json` plus the
+    /// aggregated `/.well-known/agent-skills/index.json` surface on a
+    /// Catalog domain. The registry is empty when the Repo has no
+    /// `listings/` directory; in that case the top-level
+    /// `agent_skills:` block keeps the WOR-193 surface intact.
+    pub listings: sbproxy_config::ListingRegistry,
 }
 
 impl Default for CompiledPipeline {
@@ -867,6 +878,7 @@ impl Default for CompiledPipeline {
             upstream_allow_private_cidrs: Vec::new(),
             config_revision: String::new(),
             dns_resolver: Arc::new(sbproxy_platform::RefreshingResolver::new()),
+            listings: sbproxy_config::ListingRegistry::default(),
         }
     }
 }
@@ -1138,6 +1150,7 @@ impl CompiledPipeline {
             upstream_allow_private_cidrs,
             config_revision,
             dns_resolver: Arc::new(sbproxy_platform::RefreshingResolver::new()),
+            listings: sbproxy_config::ListingRegistry::default(),
         };
         // Spawn active health-check probes for any load_balancer
         // target that has `health_check:` configured. Best-effort: if

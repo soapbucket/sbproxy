@@ -39,7 +39,7 @@ use std::sync::{Arc, OnceLock};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use compact_str::CompactString;
-use sbproxy_config::CompiledConfig;
+use sbproxy_config::{CompiledConfig, ListingRegistry};
 use sbproxy_plugin::{current_admin_audit_emitter, ProjectionRefreshEvent};
 use sha2::{Digest, Sha256};
 
@@ -93,9 +93,38 @@ pub struct ProjectionDocs {
     /// without `agent_skills:` produce no entries; the data-plane
     /// handler 404s the well-known URL for those hostnames.
     pub agent_skills: HashMap<CompactString, agent_skills::AgentSkillsIndex>,
+    /// Per-Listing Agent Skills indices (WOR-196).
+    ///
+    /// Keyed by `Listing.metadata.name`. Each entry carries the set
+    /// of origin hostnames the Listing publishes plus the resolved
+    /// [`agent_skills::AgentSkillsIndex`] for that Listing's
+    /// `spec.skills[]` block. The data-plane handler serves three
+    /// surfaces from this map:
+    ///
+    /// - `GET /.well-known/agent-skills/<listing-name>/index.json`
+    ///   serves one Listing's manifest (`ListingScopedIndex.index`).
+    /// - `GET /.well-known/agent-skills/<listing-name>/<artifact>`
+    ///   serves an individual skill body re-hosted by the proxy.
+    /// - `GET /.well-known/agent-skills/index.json` returns the
+    ///   merged manifest combining the per-origin entries (when
+    ///   present) with every Listing whose `hostnames` include the
+    ///   request hostname.
+    pub agent_skills_listings: HashMap<String, agent_skills::ListingScopedIndex>,
 }
 
-/// Compute all four projection bodies for every origin in `config`.
+/// Compute every projection body for every origin in `config`, with
+/// no Listing-scoped overlay.
+///
+/// Equivalent to calling [`render_projections_with_listings`] with an
+/// empty registry; existing callers that have not been threaded with
+/// a `ListingRegistry` yet keep working unchanged.
+pub fn render_projections(config: &CompiledConfig, config_version: u64) -> ProjectionDocs {
+    render_projections_with_listings(config, &ListingRegistry::default(), config_version)
+}
+
+/// Compute every projection body for every origin in `config`,
+/// folding the Listing-scoped agent-skills overlay (WOR-196) into the
+/// result.
 ///
 /// Walks `config.origins`, filters for origins with an
 /// `ai_crawl_control` policy entry in `policy_configs`, extracts the
@@ -105,7 +134,21 @@ pub struct ProjectionDocs {
 ///
 /// Origins without `ai_crawl_control` produce no entries; readers
 /// treat the absence as a 404.
-pub fn render_projections(config: &CompiledConfig, config_version: u64) -> ProjectionDocs {
+///
+/// The Listing-scoped overlay populates
+/// [`ProjectionDocs::agent_skills_listings`]; each Listing's
+/// `spec.skills[]` block resolves the same way the top-level
+/// `agent_skills:` block does (`build_index` walks the entries,
+/// hashes artifact bodies against the workspace root, and caches the
+/// result). The aggregated `/.well-known/agent-skills/index.json` on
+/// a request hostname is computed at serve time by walking the
+/// per-origin entry (if any) and merging in every Listing whose
+/// `hostnames` include the request authority.
+pub fn render_projections_with_listings(
+    config: &CompiledConfig,
+    listings: &ListingRegistry,
+    config_version: u64,
+) -> ProjectionDocs {
     let mut docs = ProjectionDocs {
         config_version,
         ..ProjectionDocs::default()
@@ -118,10 +161,18 @@ pub fn render_projections(config: &CompiledConfig, config_version: u64) -> Proje
     // in their YAML get filesystem reads relative to where the proxy
     // was started, matching the convention the other projection
     // modules use for any local-file resolution.
-    docs.agent_skills = agent_skills::render_indices(
-        config,
-        &std::env::current_dir().unwrap_or_else(|_| ".".into()),
-    );
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    docs.agent_skills = agent_skills::render_indices(config, &workspace_root);
+
+    // WOR-196: per-Listing agent-skills overlay. Each Listing in the
+    // registry contributes a `ListingScopedIndex` keyed by its
+    // `metadata.name`; the data-plane handler serves it at
+    // `/.well-known/agent-skills/<listing-name>/index.json` plus the
+    // re-hosted artifact bodies, and the aggregated
+    // `/.well-known/agent-skills/index.json` on a Catalog domain
+    // unions every Listing's entries with the per-origin entries
+    // computed above.
+    docs.agent_skills_listings = agent_skills::render_listing_indices(listings, &workspace_root);
 
     for origin in &config.origins {
         // --- Discover the ai_crawl_control entry, if any ---
@@ -257,6 +308,37 @@ pub fn install_projections(docs: ProjectionDocs) {
                     .map(|b| b.len())
                     .unwrap_or(0),
             });
+        }
+    }
+
+    // WOR-196: emit one ProjectionRefreshEvent per (listing, skill)
+    // pair so audit sinks record the manifest digests for the
+    // Listing-scoped surface too. The `projection_kind` is namespaced
+    // as `listing-agent-skill:<listing>:<skill>` so an operator can
+    // distinguish the two surfaces in the audit log.
+    for (listing_name, scoped) in &emit_snapshot.agent_skills_listings {
+        for entry in &scoped.index.entries {
+            let hex_only = entry
+                .digest
+                .strip_prefix("sha256:")
+                .unwrap_or(&entry.digest);
+            // Emit one row per hostname the Listing publishes so the
+            // audit log shows which origin a verifier can hit to
+            // re-fetch the artifact.
+            for hostname in &scoped.hostnames {
+                emitter.record_projection_refresh(ProjectionRefreshEvent {
+                    hostname: hostname.to_string(),
+                    projection_kind: format!("listing-agent-skill:{listing_name}:{}", entry.name),
+                    config_version: cv,
+                    doc_hash: hex_only.to_string(),
+                    byte_len: scoped
+                        .index
+                        .artifacts
+                        .get(&CompactString::new(canonical_path_from_url(&entry.url)))
+                        .map(|b| b.len())
+                        .unwrap_or(0),
+                });
+            }
         }
     }
 }
@@ -420,6 +502,63 @@ mod tests {
         let live = current_projections();
         assert_eq!(live.config_version, 99);
         assert!(live.robots_txt.contains_key("a.example.com"));
+    }
+
+    #[test]
+    fn render_projections_with_listings_populates_listing_map() {
+        // Compile a minimal config with no agent_skills at the
+        // top-level, then add a Listing that carries `spec.skills[]`.
+        // The Listing's index should land in
+        // `docs.agent_skills_listings` keyed by `metadata.name`.
+        let cfg = config_with_origin("api.example.com", serde_json::json!({"type": "rate_limit"}));
+        let yaml = r#"
+apiVersion: sbproxy.dev/v1
+kind: Listing
+metadata:
+  name: scoped-listing
+spec:
+  type: api
+  status: published
+  resources:
+    - ref: origins/api.example.com
+      revision:
+        mode: pin
+        value: abc1234
+  skills:
+    - name: hello
+      type: skill-md
+      description: "Hello skill"
+      url: /skills/hello.md
+      visibility: public
+      body: |
+        # Hello
+"#;
+        let listing: sbproxy_config::Listing = serde_yaml::from_str(yaml).unwrap();
+        let mut findings = Vec::new();
+        let registry = ListingRegistry::from_loaded(
+            vec![sbproxy_config::LoadedListing {
+                source_path: std::path::PathBuf::from("listings/scoped.yaml"),
+                listing,
+            }],
+            &mut findings,
+        );
+        let docs = render_projections_with_listings(&cfg, &registry, 42);
+        let scoped = docs
+            .agent_skills_listings
+            .get("scoped-listing")
+            .expect("listing-scoped index missing");
+        assert_eq!(scoped.listing_name, "scoped-listing");
+        assert_eq!(scoped.hostnames.len(), 1);
+        assert_eq!(scoped.hostnames[0].as_str(), "api.example.com");
+        assert_eq!(scoped.index.entries.len(), 1);
+        assert_eq!(scoped.index.entries[0].name, "hello");
+    }
+
+    #[test]
+    fn render_projections_empty_registry_keeps_listing_map_empty() {
+        let cfg = config_with_origin("api.example.com", serde_json::json!({"type": "rate_limit"}));
+        let docs = render_projections(&cfg, 1);
+        assert!(docs.agent_skills_listings.is_empty());
     }
 
     #[test]

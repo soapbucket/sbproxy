@@ -79,7 +79,17 @@ pub struct ProxyHarness {
     child: Child,
     port: u16,
     /// Hold the temp file alive so the proxy can keep reading it.
-    _config: NamedTempFile,
+    ///
+    /// One of `_config` (the YAML temp file) or `_workspace` (the
+    /// workspace tempdir) carries the proxy's config payload; the
+    /// other slot is empty. Both are owned by the harness so the
+    /// proxy child keeps reading from a stable path.
+    _config: Option<NamedTempFile>,
+    /// Hold the workspace tempdir alive when the harness was built
+    /// with [`Self::start_with_workspace`]. Drop happens after the
+    /// proxy child is reaped, so listings and other workspace files
+    /// stay readable for the full life of the proxy.
+    _workspace: Option<tempfile::TempDir>,
     /// Lazy-initialised so harness construction does not invoke
     /// `reqwest::blocking::Client::builder().build()` at the call site.
     /// Building the blocking client spins up an internal tokio
@@ -138,7 +148,58 @@ impl ProxyHarness {
         let harness = Self {
             child,
             port,
-            _config: file,
+            _config: Some(file),
+            _workspace: None,
+            client: std::sync::OnceLock::new(),
+        };
+        harness.wait_for_ready(DEFAULT_STARTUP_TIMEOUT)?;
+        Ok(harness)
+    }
+
+    /// Start the proxy against a temp workspace populated with
+    /// `(relative_path, content)` files plus an `sb.yml` written from
+    /// `yaml`.
+    ///
+    /// Used by tests that need the proxy to discover sibling files
+    /// (e.g. `listings/*.yaml` for WOR-196) relative to the config
+    /// path. The harness places the rewritten YAML at
+    /// `<workspace>/sb.yml` and points `--config` at that file so the
+    /// listing loader's "config-file parent is the Repo root"
+    /// contract holds.
+    pub fn start_with_workspace(yaml: &str, files: &[(&str, &str)]) -> anyhow::Result<Self> {
+        let port = pick_free_port()?;
+        let final_yaml = inject_port(yaml, port)?;
+        let bin = proxy_binary_path();
+        if !bin.is_file() {
+            anyhow::bail!(
+                "release binary missing at {}; run `cargo build --release -p sbproxy` first",
+                bin.display()
+            );
+        }
+        let tmp = tempfile::tempdir()?;
+        for (rel, body) in files {
+            let path = tmp.path().join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, body)?;
+        }
+        let cfg_path = tmp.path().join("sb.yml");
+        std::fs::write(&cfg_path, final_yaml.as_bytes())?;
+
+        let child = Command::new(&bin)
+            .arg("--config")
+            .arg(&cfg_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("spawn {}: {}", bin.display(), e))?;
+
+        let harness = Self {
+            child,
+            port,
+            _config: None,
+            _workspace: Some(tmp),
             client: std::sync::OnceLock::new(),
         };
         harness.wait_for_ready(DEFAULT_STARTUP_TIMEOUT)?;
@@ -250,9 +311,17 @@ impl ProxyHarness {
     /// Tests that exercise hot-reload mutate this file and then poke
     /// the proxy (file watcher event or `POST /admin/reload`) to
     /// pick up the change. The path is stable for the lifetime of
-    /// the harness.
-    pub fn config_path(&self) -> &Path {
-        self._config.path()
+    /// the harness; for harnesses built via
+    /// [`Self::start_with_workspace`] the path is the `sb.yml` inside
+    /// the workspace tempdir.
+    pub fn config_path(&self) -> PathBuf {
+        if let Some(file) = &self._config {
+            return file.path().to_path_buf();
+        }
+        if let Some(ws) = &self._workspace {
+            return ws.path().join("sb.yml");
+        }
+        unreachable!("harness must own either a config tempfile or a workspace tempdir")
     }
 
     /// Overwrite the proxy's on-disk config with new YAML and
@@ -264,7 +333,7 @@ impl ProxyHarness {
     /// file on disk.
     pub fn rewrite_config(&self, yaml: &str) -> anyhow::Result<()> {
         let final_yaml = inject_port(yaml, self.port)?;
-        std::fs::write(self._config.path(), final_yaml)?;
+        std::fs::write(self.config_path(), final_yaml)?;
         Ok(())
     }
 
