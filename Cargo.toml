@@ -201,6 +201,14 @@ jsonschema = { version = "0.17", default-features = false }
 # applylock companion so two operators do not race the same reload.
 fs2 = "0.4"
 
+# Compile-time directory embedding. WOR-227 (scaffold) gates this
+# behind the `embed-admin-ui` feature so the default build does not
+# touch `ui/dist/` and the binary stays slim. The macro form is
+# `include_dir!("path")`; the served subtree is the contents of
+# `ui/dist/` after `pnpm build`. An empty `dist/.gitkeep` keeps the
+# macro resolvable in checkouts that have not run a UI build yet.
+include_dir = "0.7"
+
 # UUID
 uuid = { version = "1", features = ["v4"] }
 
