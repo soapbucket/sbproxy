@@ -669,14 +669,26 @@ fn build_response_cache_key(
 
 /// HTTP client used by the stale-while-revalidate path. Reused across
 /// every SWR refresh so connection pooling and keep-alive amortize
-/// across origins. The 30s timeout matches the conservative ceiling
-/// the rest of the proxy uses for outbound HTTP.
-static SWR_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("swr reqwest::Client build must succeed")
-});
+/// across origins. The client is built lazily on first use from the
+/// `proxy.http_client_timeouts.swr_client_secs` config key (default
+/// 30s, matching the conservative ceiling the rest of the proxy uses
+/// for outbound HTTP). Hot-reloading the timeout requires a process
+/// restart; pooled connections are kept across reloads.
+static SWR_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+fn swr_client() -> &'static reqwest::Client {
+    SWR_CLIENT.get_or_init(|| {
+        let secs = reload::current_pipeline()
+            .config
+            .server
+            .http_client_timeouts
+            .swr_client_secs;
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(secs))
+            .build()
+            .expect("swr reqwest::Client build must succeed")
+    })
+}
 
 /// Spawn an async refresh of `cache_key` against the origin's upstream.
 ///
@@ -725,7 +737,7 @@ fn spawn_swr_revalidation(
         // modifiers / forward rules etc. are skipped because they
         // already ran on the synchronous request that triggered this
         // refresh.
-        let resp = match SWR_CLIENT
+        let resp = match swr_client()
             .get(&full_url)
             .header("host", &hostname)
             .send()
@@ -1673,7 +1685,7 @@ async fn check_auth(
                     .map(|v| !v.trim().is_empty())
                     .unwrap_or(false)
             {
-                b.verify_async(&req, &BOT_AUTH_DIRECTORY_CLIENT).await
+                b.verify_async(&req, bot_auth_directory_client()).await
             } else {
                 b.verify(&req)
             };
@@ -1814,33 +1826,59 @@ async fn check_auth(
 /// single pooled client across all requests avoids the per-request
 /// socket and TLS-handshake cost of constructing a fresh
 /// `reqwest::Client`. The per-call `fwd.timeout` is applied as a
-/// request-scoped deadline below.
-static FORWARD_AUTH_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("forward-auth reqwest::Client build must succeed")
-});
+/// request-scoped deadline below. The outer client-level timeout
+/// (default 30s) reads from
+/// `proxy.http_client_timeouts.forward_auth_client_secs` on first use.
+static FORWARD_AUTH_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+fn forward_auth_client() -> &'static reqwest::Client {
+    FORWARD_AUTH_CLIENT.get_or_init(|| {
+        let secs = reload::current_pipeline()
+            .config
+            .server
+            .http_client_timeouts
+            .forward_auth_client_secs;
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(secs))
+            .build()
+            .expect("forward-auth reqwest::Client build must succeed")
+    })
+}
 
 /// Lazily-initialized HTTP client for dynamic Web Bot Auth directory
 /// lookups. Directory fetches have their own 2s deadline inside
 /// `sbproxy-modules`; this client-level timeout is a conservative
-/// outer guard and shares connections across requests.
-static BOT_AUTH_DIRECTORY_CLIENT: std::sync::LazyLock<reqwest::Client> =
-    std::sync::LazyLock::new(|| {
+/// outer guard and shares connections across requests. Reads from
+/// `proxy.http_client_timeouts.bot_auth_directory_client_secs`
+/// (default 5s) on first use.
+static BOT_AUTH_DIRECTORY_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+fn bot_auth_directory_client() -> &'static reqwest::Client {
+    BOT_AUTH_DIRECTORY_CLIENT.get_or_init(|| {
+        let secs = reload::current_pipeline()
+            .config
+            .server
+            .http_client_timeouts
+            .bot_auth_directory_client_secs;
         reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(secs))
             .build()
             .expect("bot-auth directory reqwest::Client build must succeed")
-    });
+    })
+}
 
 /// Run forward auth by making an HTTP subrequest to the auth service.
 async fn check_forward_auth(
     fwd: &sbproxy_modules::auth::ForwardAuthProvider,
     request_headers: &http::HeaderMap,
 ) -> std::result::Result<Vec<(String, String)>, (u16, String)> {
-    let client = &*FORWARD_AUTH_CLIENT;
-    let timeout = std::time::Duration::from_secs(fwd.timeout.unwrap_or(5));
+    let client = forward_auth_client();
+    let default_request_secs = reload::current_pipeline()
+        .config
+        .server
+        .http_client_timeouts
+        .forward_auth_request_secs;
+    let timeout = std::time::Duration::from_secs(fwd.timeout.unwrap_or(default_request_secs));
 
     let method_str = fwd.method.as_deref().unwrap_or("GET");
     let req_method = method_str
@@ -2523,12 +2561,23 @@ fn build_session_cookie(config: &sbproxy_config::SessionConfig, session_id: &str
 /// system-level resource starvation; both are unrecoverable for the
 /// callback path, so we surface the failure via panic rather than
 /// silently dropping to a `Client::default()` (which has no timeout).
-static CALLBACK_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .expect("callback reqwest::Client build must succeed")
-});
+/// Reads from `proxy.http_client_timeouts.callback_client_secs`
+/// (default 10s) on first use.
+static CALLBACK_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+fn callback_client() -> &'static reqwest::Client {
+    CALLBACK_CLIENT.get_or_init(|| {
+        let secs = reload::current_pipeline()
+            .config
+            .server
+            .http_client_timeouts
+            .callback_client_secs;
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(secs))
+            .build()
+            .expect("callback reqwest::Client build must succeed")
+    })
+}
 
 /// Fire a fire-and-forget shadow copy of an inbound request at a
 /// mirror URL. The response is read and discarded; errors are logged
@@ -2591,7 +2640,7 @@ async fn fire_request_mirror(
         }
     };
 
-    let client = &*CALLBACK_CLIENT;
+    let client = callback_client();
     let method = match method.as_str() {
         "GET" => reqwest::Method::GET,
         "POST" => reqwest::Method::POST,
@@ -2925,7 +2974,7 @@ fn build_webhook_request(
     config_revision: &str,
     timeout_secs: u64,
 ) -> Option<reqwest::RequestBuilder> {
-    let client = &*CALLBACK_CLIENT;
+    let client = callback_client();
     let body = match serde_json::to_vec(payload) {
         Ok(b) => b,
         Err(e) => {

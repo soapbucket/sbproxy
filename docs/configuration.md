@@ -185,7 +185,33 @@ proxy:
 | `trusted_proxies` | array of CIDR strings | `[]` | Source ranges whose inbound `X-Forwarded-For` / `X-Real-IP` / `Forwarded` headers are honoured. Connections from outside the list have those headers stripped on ingress so they cannot spoof identity. IPv6 CIDRs work. See [Trusted proxies and forwarding headers](#trusted-proxies-and-forwarding-headers). |
 | `correlation_id` | object | enabled, `X-Request-Id`, echo on | Correlation-ID propagation policy. See [Correlation ID](#correlation-id). |
 | `mtls` | object | unset | mTLS client-certificate verification on the HTTPS listener. See [mTLS client authentication](#mtls-client-authentication). |
+| `http_client_timeouts` | object | (see below) | Tunable timeouts for the proxy's outbound HTTP helpers (forward-auth, callbacks, mirrors, SWR refreshes, bot-auth directory). See [HTTP client timeouts](#http-client-timeouts). |
 | `extensions` | object | | Opaque map for enterprise / third-party top-level config blocks. OSS never parses these. |
+
+### HTTP client timeouts
+
+The proxy keeps a small set of pooled `reqwest::Client` instances for its outbound helper requests. Each one used to bake a hardcoded timeout into the binary; operators who wanted a slower forward-auth deadline or a shorter callback budget had to fork the binary. The `http_client_timeouts` block exposes those numbers as config keys.
+
+All fields default to the values the binary used before this block existed, so omitting it leaves behaviour unchanged.
+
+```yaml
+proxy:
+  http_client_timeouts:
+    forward_auth_client_secs: 30
+    forward_auth_request_secs: 5
+    bot_auth_directory_client_secs: 5
+    swr_client_secs: 30
+    callback_client_secs: 10
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `forward_auth_client_secs` | int | 30 | Outer client-level timeout for the shared forward-auth client. The per-provider `forward_auth.timeout` field still applies on top. |
+| `forward_auth_request_secs` | int | 5 | Per-request fallback timeout for a forward-auth subrequest when the provider's own `timeout` field is unset. |
+| `bot_auth_directory_client_secs` | int | 5 | Client-level timeout for the Web Bot Auth directory lookup client. |
+| `swr_client_secs` | int | 30 | Client-level timeout for the stale-while-revalidate background refresh client. |
+| `callback_client_secs` | int | 10 | Client-level timeout for the callback / webhook client used by fire-and-forget POSTs. |
+
 
 ### HTTP/3 fields
 
