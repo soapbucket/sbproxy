@@ -12,16 +12,16 @@
 //!   * `stop_reason` strings (`end_turn`, `max_tokens`, `tool_use`,
 //!     `stop_sequence`) normalised to the hub `FinishReason`.
 //!
-//! Streaming for the Anthropic shape is deferred to WOR-226; the
-//! `from_hub_stream` arm returns `ChatError::not_implemented` so a
-//! caller wiring a stream against an Anthropic inbound sees a clear
-//! pointer rather than a silent misroute.
+//! Streaming for the Anthropic outbound emitter is implemented under
+//! WOR-226: `from_hub_stream` turns each hub chunk into the matching
+//! Anthropic Messages SSE frames (`event: message_start`,
+//! `content_block_*`, `message_delta`, `message_stop`).
 
 use serde_json::{json, Map, Value};
 
 use super::{
-    BridgeContext, ChatError, ChatFormat, ContentPart, FinishReason, HubChunk, HubMessage,
-    HubRequest, HubResponse, HubToolDefinition, HubUsage, Role,
+    BridgeContext, ChatError, ChatFormat, ContentPart, ContentPartDelta, FinishReason, HubChunk,
+    HubMessage, HubRequest, HubResponse, HubToolDefinition, HubUsage, Role,
 };
 
 const INBOUND_PATHS: &[&str] = &["/v1/messages"];
@@ -141,15 +141,127 @@ impl ChatFormat for AnthropicMessagesFormat {
 
     fn from_hub_stream(
         &self,
-        _chunk: &HubChunk,
+        chunk: &HubChunk,
         _ctx: &BridgeContext,
     ) -> Result<Vec<String>, ChatError> {
-        // Streaming for Anthropic inbound is wired under WOR-226. Until
-        // then the chat-completions inbound path is the only one with an
-        // end-to-end streaming bridge.
-        Err(ChatError::not_implemented(
-            "anthropic SSE emission not yet wired; see WOR-226",
-        ))
+        Ok(hub_chunk_to_anthropic_sse(chunk))
+    }
+}
+
+/// Translate one hub chunk into a vector of Anthropic Messages SSE
+/// frames. Each entry is a complete `event: ...\ndata: ...\n\n`
+/// payload ready for the wire.
+///
+/// The Anthropic shape is more frame-heavy than the hub vocabulary:
+/// `MessageStart` expands to `event: message_start` *and* an opening
+/// `event: content_block_start` so a first `text_delta` always lands
+/// at a known content block. `MessageStop` emits both a
+/// `event: message_delta` carrying `stop_reason` and the terminal
+/// `event: message_stop` frame.
+pub(crate) fn hub_chunk_to_anthropic_sse(chunk: &HubChunk) -> Vec<String> {
+    match chunk {
+        HubChunk::MessageStart { id, model } => {
+            let start = json!({
+                "type": "message_start",
+                "message": {
+                    "id": id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                }
+            });
+            let block_open = json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            });
+            vec![
+                format!("event: message_start\ndata: {start}\n\n"),
+                format!("event: content_block_start\ndata: {block_open}\n\n"),
+            ]
+        }
+        HubChunk::ContentDelta { index, delta } => match delta {
+            ContentPartDelta::Text(t) => {
+                let body = json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "text_delta", "text": t}
+                });
+                vec![format!("event: content_block_delta\ndata: {body}\n\n")]
+            }
+        },
+        HubChunk::ToolCallDelta { index, delta } => {
+            let mut frames = Vec::new();
+            // The first delta carrying id+name opens a tool-use
+            // content block. Subsequent argument-chunk deltas emit
+            // `input_json_delta` events.
+            if delta.id.is_some() || delta.name.is_some() {
+                let mut block = Map::new();
+                block.insert("type".into(), Value::String("tool_use".into()));
+                if let Some(id) = &delta.id {
+                    block.insert("id".into(), Value::String(id.clone()));
+                }
+                if let Some(name) = &delta.name {
+                    block.insert("name".into(), Value::String(name.clone()));
+                }
+                block.insert("input".into(), Value::Object(Map::new()));
+                let body = json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": Value::Object(block),
+                });
+                frames.push(format!("event: content_block_start\ndata: {body}\n\n"));
+            }
+            if let Some(arg) = &delta.arguments_chunk {
+                let body = json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "input_json_delta", "partial_json": arg}
+                });
+                frames.push(format!("event: content_block_delta\ndata: {body}\n\n"));
+            }
+            frames
+        }
+        HubChunk::Usage(u) => {
+            // Anthropic carries usage on `message_delta` rather than
+            // as a standalone event; we emit a partial `message_delta`
+            // here so clients that read usage incrementally see the
+            // running totals.
+            let body = json!({
+                "type": "message_delta",
+                "delta": {},
+                "usage": {
+                    "input_tokens": u.prompt_tokens,
+                    "output_tokens": u.completion_tokens,
+                }
+            });
+            vec![format!("event: message_delta\ndata: {body}\n\n")]
+        }
+        HubChunk::MessageStop { finish_reason } => {
+            let stop_reason = match finish_reason {
+                FinishReason::Stop => "end_turn",
+                FinishReason::Length => "max_tokens",
+                FinishReason::ToolCalls => "tool_use",
+                FinishReason::ContentFilter => "stop_sequence",
+                FinishReason::Other(s) => s.as_str(),
+            };
+            let block_close = json!({"type": "content_block_stop", "index": 0});
+            let mdelta = json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
+                "usage": {"output_tokens": 0}
+            });
+            let mstop = json!({"type": "message_stop"});
+            vec![
+                format!("event: content_block_stop\ndata: {block_close}\n\n"),
+                format!("event: message_delta\ndata: {mdelta}\n\n"),
+                format!("event: message_stop\ndata: {mstop}\n\n"),
+            ]
+        }
     }
 }
 
@@ -559,15 +671,88 @@ mod tests {
     }
 
     #[test]
-    fn streaming_emit_is_not_implemented_yet() {
-        let err = fmt()
+    fn streaming_message_start_emits_two_frames() {
+        let frames = fmt()
             .from_hub_stream(
-                &HubChunk::MessageStop {
-                    finish_reason: FinishReason::Stop,
+                &HubChunk::MessageStart {
+                    id: "msg_1".into(),
+                    model: "claude-3-5-sonnet".into(),
                 },
                 &BridgeContext::default(),
             )
-            .unwrap_err();
-        assert_eq!(err.status(), 501);
+            .unwrap();
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].starts_with("event: message_start\n"));
+        assert!(frames[1].starts_with("event: content_block_start\n"));
+    }
+
+    #[test]
+    fn streaming_text_delta_emits_content_block_delta() {
+        let frames = fmt()
+            .from_hub_stream(
+                &HubChunk::ContentDelta {
+                    index: 0,
+                    delta: super::super::ContentPartDelta::Text("hi".into()),
+                },
+                &BridgeContext::default(),
+            )
+            .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].contains("text_delta"));
+        assert!(frames[0].contains("\"text\":\"hi\""));
+    }
+
+    #[test]
+    fn streaming_stop_emits_three_terminator_frames() {
+        let frames = fmt()
+            .from_hub_stream(
+                &HubChunk::MessageStop {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+                &BridgeContext::default(),
+            )
+            .unwrap();
+        assert_eq!(frames.len(), 3);
+        assert!(frames[0].contains("content_block_stop"));
+        assert!(frames[1].contains("\"stop_reason\":\"tool_use\""));
+        assert!(frames[2].contains("message_stop"));
+    }
+
+    #[test]
+    fn streaming_tool_call_emits_block_start_then_input_delta() {
+        // First delta carrying id+name opens the block.
+        let f1 = fmt()
+            .from_hub_stream(
+                &HubChunk::ToolCallDelta {
+                    index: 1,
+                    delta: super::super::HubToolCallDelta {
+                        id: Some("toolu_1".into()),
+                        name: Some("get_weather".into()),
+                        arguments_chunk: None,
+                    },
+                },
+                &BridgeContext::default(),
+            )
+            .unwrap();
+        assert_eq!(f1.len(), 1);
+        assert!(f1[0].contains("content_block_start"));
+        assert!(f1[0].contains("\"tool_use\""));
+        // Subsequent delta with arguments emits input_json_delta only.
+        let f2 = fmt()
+            .from_hub_stream(
+                &HubChunk::ToolCallDelta {
+                    index: 1,
+                    delta: super::super::HubToolCallDelta {
+                        id: None,
+                        name: None,
+                        arguments_chunk: Some("{\"ci".into()),
+                    },
+                },
+                &BridgeContext::default(),
+            )
+            .unwrap();
+        assert_eq!(f2.len(), 1);
+        assert!(f2[0].contains("input_json_delta"));
+        assert!(f2[0].contains("partial_json"));
     }
 }
