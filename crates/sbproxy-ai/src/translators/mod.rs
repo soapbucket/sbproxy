@@ -14,6 +14,8 @@
 //! follow as separate translators registered the same way.
 
 pub mod anthropic;
+pub mod bedrock;
+pub mod gemini;
 
 use crate::providers::ProviderFormat;
 
@@ -22,9 +24,10 @@ use crate::providers::ProviderFormat;
 /// providers; calls the matching translator for native providers.
 ///
 /// `path` is the inbound path (e.g. `/v1/chat/completions`) and may
-/// be rewritten by the translator (Anthropic uses `/v1/messages`).
-/// The returned `(body, path)` pair is what the AI client should
-/// send upstream.
+/// be rewritten by the translator (Anthropic uses `/v1/messages`,
+/// Gemini uses `/v1beta/models/{model}:generateContent`, Bedrock
+/// Converse uses `/model/{modelId}/converse`). The returned
+/// `(body, path)` pair is what the AI client should send upstream.
 pub fn translate_request(
     format: ProviderFormat,
     path: &str,
@@ -33,10 +36,11 @@ pub fn translate_request(
     match format {
         ProviderFormat::OpenAi => (body, path.to_string()),
         ProviderFormat::Anthropic => anthropic::request_to_native(body, path),
-        // Gemini, Bedrock, Custom: not implemented yet. Pass through
-        // and let the caller fail loudly. Documented as a known
-        // limitation; covered by OpenRouter routing in the meantime.
-        _ => (body, path.to_string()),
+        ProviderFormat::Google => gemini::request_to_native(body, path),
+        ProviderFormat::Bedrock => bedrock::request_to_native(body, path),
+        // Custom: pass through. Custom-format operators bring their
+        // own translator via a plugin; the relay path stays lossless.
+        ProviderFormat::Custom => (body, path.to_string()),
     }
 }
 
@@ -46,7 +50,9 @@ pub fn translate_response(format: ProviderFormat, body: serde_json::Value) -> se
     match format {
         ProviderFormat::OpenAi => body,
         ProviderFormat::Anthropic => anthropic::response_to_openai(body),
-        _ => body,
+        ProviderFormat::Google => gemini::response_to_openai(body),
+        ProviderFormat::Bedrock => bedrock::response_to_openai(body),
+        ProviderFormat::Custom => body,
     }
 }
 

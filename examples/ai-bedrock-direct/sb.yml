@@ -1,0 +1,66 @@
+# AI gateway: AWS Bedrock direct (Converse API).
+#
+# Routes calls to bedrock-runtime.{region}.amazonaws.com. Clients send
+# OpenAI-shaped chat completion requests; sbproxy translates them to
+# Bedrock's model-agnostic Converse API on the upstream side and
+# translates the response back to OpenAI shape so OpenAI SDK clients
+# work without changes.
+#
+# What's translated:
+#   * Request: `system` role hoisted to top-level `system: [{text}]`,
+#     sampling knobs moved under `inferenceConfig` (camelCase keys),
+#     `tools` rewritten to `toolConfig.tools[].toolSpec`, OpenAI-only
+#     fields stripped (logit_bias, n, presence_penalty,
+#     frequency_penalty, response_format, seed, user, top_k), path
+#     rewritten from /v1/chat/completions to /model/{modelId}/converse.
+#   * Response: text content blocks concatenated into
+#     `choices[].message.content`, `toolUse` blocks converted to
+#     `tool_calls`, `stopReason` mapped to `finish_reason`, usage
+#     tokens renamed from inputTokens/outputTokens.
+#
+# Auth: Bedrock requires SigV4 request signing. The example below
+# uses a static `Authorization` header (typically a short-lived
+# session token from `aws sts get-session-token` or `aws-vault exec`);
+# wiring full SigV4 signing into the request path is tracked
+# separately. Operators with a sidecar that handles SigV4 can point
+# `default_base_url` at it instead.
+#
+# Known limitation: streaming responses (`stream: true`) pass through
+# in Bedrock's native EventStream shape today. Use the non-streaming
+# form below to exercise the translator end to end.
+#
+# Setup:
+#   export BEDROCK_AUTH="Bearer ${AWS_SESSION_TOKEN}"
+#   make run CONFIG=examples/ai-bedrock-direct/sb.yml
+#
+# Test (OpenAI-style request, Bedrock on the upstream):
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+#       "messages": [
+#         {"role": "system", "content": "You write terse haiku."},
+#         {"role": "user", "content": "Write a haiku about caching."}
+#       ]
+#     }'
+#
+# The response comes back in OpenAI shape (`choices[0].message.content`,
+# `usage.prompt_tokens`, etc.) even though Bedrock served it.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: bedrock
+          api_key: ${BEDROCK_AUTH}
+          default_model: anthropic.claude-3-5-sonnet-20240620-v1:0
+          models:
+            - anthropic.claude-3-5-sonnet-20240620-v1:0
+            - anthropic.claude-3-haiku-20240307-v1:0
+            - meta.llama3-70b-instruct-v1:0
+      routing: round_robin

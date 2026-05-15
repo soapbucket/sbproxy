@@ -62,6 +62,11 @@ pub fn parse_endpoint(path: &str) -> AiEndpoint {
 /// - Gemini supports embeddings, image generation, audio (transcription
 ///   and speech via the Gemini API), and reranking. Gemini does not
 ///   support OpenAI's moderation endpoint shape.
+/// - Vertex matches Gemini support (same underlying Google API family).
+/// - Bedrock supports only chat completions and models. Bedrock has
+///   embeddings via Titan but they require the legacy `InvokeModel`
+///   shape, not the OpenAI `/v1/embeddings` shape, so they're not
+///   listed here.
 /// - Cohere supports embeddings and reranking (plus chat/models).
 /// - Unknown providers: only chat completions and models.
 pub fn provider_supports_endpoint(provider: &str, endpoint: &AiEndpoint) -> bool {
@@ -76,14 +81,20 @@ pub fn provider_supports_endpoint(provider: &str, endpoint: &AiEndpoint) -> bool
         // Anthropic: only chat + models. Everything else is unsupported.
         ("anthropic", _) => false,
 
-        // Gemini: embeddings, image, audio, reranking. No moderations
-        // (OpenAI shape); use Gemini's separate safety API instead.
-        ("gemini", AiEndpoint::Embeddings) => true,
-        ("gemini", AiEndpoint::ImageGeneration) => true,
-        ("gemini", AiEndpoint::AudioTranscription) => true,
-        ("gemini", AiEndpoint::AudioSpeech) => true,
-        ("gemini", AiEndpoint::Reranking) => true,
-        ("gemini", _) => false,
+        // Gemini and Vertex: embeddings, image, audio, reranking. No
+        // moderations (OpenAI shape); use Gemini's separate safety API
+        // instead. Vertex AI exposes the same Generative Language
+        // surface so its capability matrix mirrors Gemini's.
+        ("gemini" | "vertex", AiEndpoint::Embeddings) => true,
+        ("gemini" | "vertex", AiEndpoint::ImageGeneration) => true,
+        ("gemini" | "vertex", AiEndpoint::AudioTranscription) => true,
+        ("gemini" | "vertex", AiEndpoint::AudioSpeech) => true,
+        ("gemini" | "vertex", AiEndpoint::Reranking) => true,
+        ("gemini" | "vertex", _) => false,
+
+        // Bedrock: chat + models (above). No OpenAI-shape embeddings,
+        // image generation, audio, reranking, or moderations.
+        ("bedrock", _) => false,
 
         // Cohere: only embeddings and reranking (plus chat/models covered above).
         ("cohere", AiEndpoint::Embeddings) => true,
@@ -127,17 +138,22 @@ pub fn provider_supports_surface(provider: &str, surface: &crate::handler::AiSur
         // Anthropic: only chat + models (above). Everything else is false.
         ("anthropic", _) => false,
 
-        // Gemini: embeddings, image generation, audio, reranking. No
-        // assistants, threads, batches, fine_tuning (Gemini has fine-
-        // tuning but at a different path; not the OpenAI shape), files
-        // in the OpenAI sense, realtime, image edits/variations,
-        // moderations.
-        ("gemini", AiSurface::Embeddings) => true,
-        ("gemini", AiSurface::ImageGeneration) => true,
-        ("gemini", AiSurface::AudioTranscription) => true,
-        ("gemini", AiSurface::AudioSpeech) => true,
-        ("gemini", AiSurface::Reranking) => true,
-        ("gemini", _) => false,
+        // Gemini and Vertex: embeddings, image generation, audio,
+        // reranking. No assistants, threads, batches, fine_tuning
+        // (Gemini has fine-tuning but at a different path; not the
+        // OpenAI shape), files in the OpenAI sense, realtime, image
+        // edits/variations, moderations. Vertex AI sits on the same
+        // Google API family so its surface matrix mirrors Gemini.
+        ("gemini" | "vertex", AiSurface::Embeddings) => true,
+        ("gemini" | "vertex", AiSurface::ImageGeneration) => true,
+        ("gemini" | "vertex", AiSurface::AudioTranscription) => true,
+        ("gemini" | "vertex", AiSurface::AudioSpeech) => true,
+        ("gemini" | "vertex", AiSurface::Reranking) => true,
+        ("gemini" | "vertex", _) => false,
+
+        // Bedrock: chat + models only (above). The other OpenAI
+        // surfaces don't map onto Bedrock's API family.
+        ("bedrock", _) => false,
 
         // Cohere: embeddings and reranking (plus chat/models above).
         ("cohere", AiSurface::Embeddings) => true,
@@ -345,6 +361,55 @@ mod tests {
     }
 
     #[test]
+    fn vertex_matches_gemini_support() {
+        // Vertex AI rides on the same Google generative API family, so
+        // its support matrix must match Gemini's.
+        for endpoint in &[
+            AiEndpoint::ChatCompletions,
+            AiEndpoint::Models,
+            AiEndpoint::Embeddings,
+            AiEndpoint::ImageGeneration,
+            AiEndpoint::AudioTranscription,
+            AiEndpoint::AudioSpeech,
+            AiEndpoint::Reranking,
+        ] {
+            assert!(
+                provider_supports_endpoint("vertex", endpoint),
+                "vertex should support {endpoint:?}"
+            );
+        }
+        assert!(!provider_supports_endpoint(
+            "vertex",
+            &AiEndpoint::Moderations
+        ));
+    }
+
+    #[test]
+    fn bedrock_only_supports_chat_and_models() {
+        // Bedrock has embeddings via Titan but they're served behind
+        // the legacy InvokeModel shape, not OpenAI's /v1/embeddings,
+        // so the OpenAI surface matrix lists only chat + models.
+        assert!(provider_supports_endpoint(
+            "bedrock",
+            &AiEndpoint::ChatCompletions
+        ));
+        assert!(provider_supports_endpoint("bedrock", &AiEndpoint::Models));
+        for endpoint in &[
+            AiEndpoint::Embeddings,
+            AiEndpoint::Reranking,
+            AiEndpoint::ImageGeneration,
+            AiEndpoint::AudioTranscription,
+            AiEndpoint::AudioSpeech,
+            AiEndpoint::Moderations,
+        ] {
+            assert!(
+                !provider_supports_endpoint("bedrock", endpoint),
+                "bedrock should not advertise support for {endpoint:?}"
+            );
+        }
+    }
+
+    #[test]
     fn cohere_supports_embeddings_and_reranking() {
         assert!(provider_supports_endpoint(
             "cohere",
@@ -494,6 +559,66 @@ mod tests {
             assert!(
                 !provider_supports_surface("gemini", surface),
                 "gemini should not advertise support for {surface:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn surface_matrix_vertex_matches_gemini() {
+        use crate::handler::AiSurface;
+        for surface in &[
+            AiSurface::ChatCompletions,
+            AiSurface::Models,
+            AiSurface::Embeddings,
+            AiSurface::ImageGeneration,
+            AiSurface::AudioTranscription,
+            AiSurface::AudioSpeech,
+            AiSurface::Reranking,
+        ] {
+            assert!(
+                provider_supports_surface("vertex", surface),
+                "vertex should support {surface:?}"
+            );
+        }
+        for surface in &[
+            AiSurface::Assistants,
+            AiSurface::Threads,
+            AiSurface::Batches,
+            AiSurface::FineTuning,
+            AiSurface::Realtime,
+            AiSurface::Moderations,
+        ] {
+            assert!(
+                !provider_supports_surface("vertex", surface),
+                "vertex should not advertise support for {surface:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn surface_matrix_bedrock_only_chat_models() {
+        use crate::handler::AiSurface;
+        assert!(provider_supports_surface(
+            "bedrock",
+            &AiSurface::ChatCompletions
+        ));
+        assert!(provider_supports_surface("bedrock", &AiSurface::Models));
+        for surface in &[
+            AiSurface::Assistants,
+            AiSurface::Threads,
+            AiSurface::Batches,
+            AiSurface::FineTuning,
+            AiSurface::Embeddings,
+            AiSurface::ImageGeneration,
+            AiSurface::AudioTranscription,
+            AiSurface::AudioSpeech,
+            AiSurface::Reranking,
+            AiSurface::Realtime,
+            AiSurface::Moderations,
+        ] {
+            assert!(
+                !provider_supports_surface("bedrock", surface),
+                "bedrock should not advertise support for {surface:?}"
             );
         }
     }
