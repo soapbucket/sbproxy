@@ -27,12 +27,17 @@
 //! gets a clear pointer rather than silent misbehaviour.
 
 pub mod anthropic_messages;
+pub mod native_streams;
 pub mod openai_chat;
 pub mod openai_responses;
 mod registry;
 mod types;
 
 pub use anthropic_messages::AnthropicMessagesFormat;
+pub use native_streams::{
+    split_sse_frame, AnthropicStreamState, BedrockStreamState, GeminiStreamState,
+    NativeStreamFormat, NativeStreamTranslator, SseFramer,
+};
 pub use openai_chat::OpenAiChatFormat;
 pub use openai_responses::OpenAiResponsesFormat;
 pub use registry::FormatRegistry;

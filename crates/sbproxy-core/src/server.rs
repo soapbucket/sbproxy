@@ -5219,12 +5219,15 @@ async fn handle_ai_proxy(
             let semcache_key: Option<String> =
                 semcache_miss.as_ref().map(|(_, key, _, _, _)| key.clone());
             let _ = semcache_miss;
-            if sbproxy_ai::translators::requires_translation(last_format) {
-                warn!(
-                    format = ?last_format,
-                    "AI proxy: streaming SSE relay does not yet translate non-OpenAI event shapes"
-                );
-            }
+            // SSE event-shape translation for non-OpenAI providers
+            // (WOR-226). When the upstream emits Anthropic
+            // `event: content_block_delta`, Gemini
+            // `streamGenerateContent`, or Bedrock Converse-stream
+            // payloads, the relay reframes them into the hub
+            // vocabulary and re-emits in the inbound format's wire
+            // shape so clients see a uniform stream. The
+            // OpenAI-in-OpenAI-out branch stays a pure byte forward.
+            let stream_inbound_format: Option<String> = ctx.ai_inbound_format.clone();
             // Opaque pass-through of the AI handler's
             // `semantic_cache.streaming` block. The OSS proxy never
             // validates this; the enterprise recorder reads whatever
@@ -5285,6 +5288,10 @@ async fn handle_ai_proxy(
                     upstream_host,
                     content_type: resp_content_type,
                     x_provider: resp_x_provider,
+                },
+                StreamFormatArgs {
+                    upstream_format: last_format,
+                    inbound_format: stream_inbound_format,
                 },
             )
             .await
@@ -5756,6 +5763,28 @@ struct StreamUsageParserArgs {
     x_provider: Option<String>,
 }
 
+/// Wire-format args the streaming relay consults to decide whether
+/// the upstream SSE bytes need translation into the hub vocabulary
+/// before being re-emitted in the inbound format's shape.
+///
+/// `upstream_format` is the provider's native wire format (`OpenAi`,
+/// `Anthropic`, `Google`, `Bedrock`, `Custom`). `inbound_format` is
+/// the wire shape the client expects on the response (`None` /
+/// `Some("openai")` for OpenAI Chat Completions; `Some("anthropic")`
+/// for `/v1/messages`; `Some("responses")` for `/v1/responses`).
+///
+/// The relay translates whenever `upstream_format` is non-OpenAI
+/// (the upstream emits a native shape we must parse) regardless of
+/// the inbound format. Pure pass-through (OpenAI in / OpenAI out)
+/// continues to byte-forward without buffering or parsing.
+#[derive(Debug, Clone)]
+struct StreamFormatArgs {
+    /// Upstream provider wire format.
+    upstream_format: sbproxy_ai::providers::ProviderFormat,
+    /// Inbound format id the client expects on the response wire.
+    inbound_format: Option<String>,
+}
+
 /// Relay a streaming (SSE) AI response back to the client.
 ///
 /// # Stream safety integration
@@ -5788,6 +5817,47 @@ struct StreamUsageParserArgs {
 // real work: enterprise hooks (safety + cache recorder), OSS budget
 // recorder, and the per-request identifiers the recorder session
 // needs. Splitting them into a struct would just move the noise.
+/// Build the native-stream translator + inbound emitter pair for a
+/// given `(upstream, inbound)` format combination.
+///
+/// Returns `(None, None)` for the no-translation pass-through path
+/// (upstream is OpenAI-compatible). Returns `(Some(translator),
+/// Some(emitter))` when the upstream emits a non-OpenAI native shape
+/// and the bytes need reframing. The OpenAI Chat emitter is the
+/// default inbound shape because every existing client speaks OpenAI
+/// Chat Completions; `/v1/messages` and `/v1/responses` inbound
+/// surfaces override.
+fn build_stream_translator(
+    args: &StreamFormatArgs,
+) -> (
+    Option<sbproxy_ai::format::NativeStreamTranslator>,
+    Option<Box<dyn sbproxy_ai::format::ChatFormat>>,
+) {
+    use sbproxy_ai::format::{
+        AnthropicMessagesFormat, ChatFormat, NativeStreamFormat, NativeStreamTranslator,
+        OpenAiChatFormat, OpenAiResponsesFormat,
+    };
+    use sbproxy_ai::providers::ProviderFormat;
+    let native = match args.upstream_format {
+        ProviderFormat::Anthropic => Some(NativeStreamFormat::Anthropic),
+        ProviderFormat::Google => Some(NativeStreamFormat::Gemini),
+        ProviderFormat::Bedrock => Some(NativeStreamFormat::Bedrock),
+        // OpenAI / Custom: zero-cost pass-through.
+        ProviderFormat::OpenAi | ProviderFormat::Custom => None,
+    };
+    let translator = native.map(NativeStreamTranslator::new);
+    let emitter: Option<Box<dyn ChatFormat>> = if translator.is_some() {
+        Some(match args.inbound_format.as_deref() {
+            Some("anthropic") => Box::new(AnthropicMessagesFormat) as Box<dyn ChatFormat>,
+            Some("responses") => Box::new(OpenAiResponsesFormat) as Box<dyn ChatFormat>,
+            _ => Box::new(OpenAiChatFormat) as Box<dyn ChatFormat>,
+        })
+    } else {
+        None
+    };
+    (translator, emitter)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn relay_ai_stream(
     session: &mut Session,
@@ -5799,6 +5869,7 @@ async fn relay_ai_stream(
     recorder_args: StreamCacheRecorderArgs,
     budget_recorder: Option<BudgetRecorderArgs<'_>>,
     parser_args: StreamUsageParserArgs,
+    format_args: StreamFormatArgs,
 ) -> Result<()> {
     let status = resp.status().as_u16();
 
@@ -5912,6 +5983,22 @@ async fn relay_ai_stream(
     } else {
         None
     };
+
+    // --- Native-format streaming translator (WOR-226) ---
+    //
+    // When the upstream emits a non-OpenAI native SSE shape we walk
+    // every byte through a hub-format translator: native bytes ->
+    // `HubChunk`s -> client's inbound wire shape. OpenAI in /
+    // OpenAI out stays a zero-cost pass-through.
+    let (mut native_translator, inbound_emitter) = build_stream_translator(&format_args);
+    let bridge_ctx = sbproxy_ai::format::BridgeContext {
+        inbound_format: format_args
+            .inbound_format
+            .clone()
+            .unwrap_or_else(|| "openai".into()),
+        stream: true,
+        ..Default::default()
+    };
     loop {
         match stream.next().await {
             Some(Ok(chunk)) => {
@@ -5964,8 +6051,35 @@ async fn relay_ai_stream(
                 // error. The recorder guard's `Drop` impl will then
                 // emit a terminal `End { complete: false }` on the way
                 // out of this function.
+                let outbound_bytes = if let (Some(t), Some(emitter)) =
+                    (native_translator.as_mut(), inbound_emitter.as_ref())
+                {
+                    let hub_chunks = t.feed(&chunk_bytes);
+                    if hub_chunks.is_empty() {
+                        continue;
+                    }
+                    let mut translated = String::new();
+                    for hub in &hub_chunks {
+                        match emitter.from_hub_stream(hub, &bridge_ctx) {
+                            Ok(frames) => {
+                                for f in frames {
+                                    translated.push_str(&f);
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    "AI proxy: inbound format SSE emitter failed; skipping chunk"
+                                );
+                            }
+                        }
+                    }
+                    Bytes::from(translated)
+                } else {
+                    chunk_bytes
+                };
                 session
-                    .write_response_body(Some(chunk_bytes), false)
+                    .write_response_body(Some(outbound_bytes), false)
                     .await?;
             }
             Some(Err(e)) => {
@@ -5974,6 +6088,28 @@ async fn relay_ai_stream(
             }
             None => {
                 upstream_complete = true;
+                // Flush any tail bytes from the translator so a frame
+                // straddling the last network read still surfaces.
+                if let (Some(t), Some(emitter)) =
+                    (native_translator.as_mut(), inbound_emitter.as_ref())
+                {
+                    let tail = t.flush();
+                    if !tail.is_empty() {
+                        let mut translated = String::new();
+                        for hub in &tail {
+                            if let Ok(frames) = emitter.from_hub_stream(hub, &bridge_ctx) {
+                                for f in frames {
+                                    translated.push_str(&f);
+                                }
+                            }
+                        }
+                        if !translated.is_empty() {
+                            let _ = session
+                                .write_response_body(Some(Bytes::from(translated)), false)
+                                .await;
+                        }
+                    }
+                }
                 break;
             }
         }

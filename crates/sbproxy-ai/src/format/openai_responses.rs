@@ -22,8 +22,8 @@
 use serde_json::{json, Map, Value};
 
 use super::{
-    BridgeContext, ChatError, ChatFormat, ContentPart, FinishReason, HubChunk, HubMessage,
-    HubRequest, HubResponse, HubToolDefinition, Role,
+    BridgeContext, ChatError, ChatFormat, ContentPart, ContentPartDelta, FinishReason, HubChunk,
+    HubMessage, HubRequest, HubResponse, HubToolDefinition, Role,
 };
 
 const INBOUND_PATHS: &[&str] = &["/v1/responses"];
@@ -168,15 +168,96 @@ impl ChatFormat for OpenAiResponsesFormat {
 
     fn from_hub_stream(
         &self,
-        _chunk: &HubChunk,
+        chunk: &HubChunk,
         _ctx: &BridgeContext,
     ) -> Result<Vec<String>, ChatError> {
-        // Streaming for the Responses inbound branch lands with
-        // WOR-226. Chat Completions is the only inbound branch with an
-        // end-to-end streaming bridge today.
-        Err(ChatError::not_implemented(
-            "responses SSE emission not yet wired; see WOR-226",
-        ))
+        Ok(hub_chunk_to_responses_sse(chunk))
+    }
+}
+
+/// Translate one hub chunk into a vector of OpenAI Responses SSE
+/// frames. The Responses streaming wire format uses typed
+/// `event: response.*` markers (`response.created`,
+/// `response.output_text.delta`, `response.function_call_arguments.delta`,
+/// `response.completed`). Each entry returned is a complete
+/// `event: ...\ndata: ...\n\n` payload.
+pub(crate) fn hub_chunk_to_responses_sse(chunk: &HubChunk) -> Vec<String> {
+    match chunk {
+        HubChunk::MessageStart { id, model } => {
+            let body = json!({
+                "type": "response.created",
+                "response": {
+                    "id": id,
+                    "object": "response",
+                    "model": model,
+                    "status": "in_progress",
+                    "output": []
+                }
+            });
+            vec![format!("event: response.created\ndata: {body}\n\n")]
+        }
+        HubChunk::ContentDelta { index, delta } => match delta {
+            ContentPartDelta::Text(t) => {
+                let body = json!({
+                    "type": "response.output_text.delta",
+                    "output_index": index,
+                    "content_index": 0,
+                    "delta": t,
+                });
+                vec![format!(
+                    "event: response.output_text.delta\ndata: {body}\n\n"
+                )]
+            }
+        },
+        HubChunk::ToolCallDelta { index, delta } => {
+            let mut frames = Vec::new();
+            // First delta carrying id+name announces the function
+            // call output item; subsequent argument-chunk deltas use
+            // `response.function_call_arguments.delta`.
+            if delta.id.is_some() || delta.name.is_some() {
+                let mut item = Map::new();
+                item.insert("type".into(), Value::String("function_call".into()));
+                if let Some(id) = &delta.id {
+                    item.insert("id".into(), Value::String(id.clone()));
+                }
+                if let Some(name) = &delta.name {
+                    item.insert("name".into(), Value::String(name.clone()));
+                }
+                item.insert("arguments".into(), Value::String(String::new()));
+                let body = json!({
+                    "type": "response.output_item.added",
+                    "output_index": index,
+                    "item": Value::Object(item),
+                });
+                frames.push(format!(
+                    "event: response.output_item.added\ndata: {body}\n\n"
+                ));
+            }
+            if let Some(arg) = &delta.arguments_chunk {
+                let body = json!({
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": index,
+                    "delta": arg,
+                });
+                frames.push(format!(
+                    "event: response.function_call_arguments.delta\ndata: {body}\n\n"
+                ));
+            }
+            frames
+        }
+        HubChunk::Usage(_) => Vec::new(),
+        HubChunk::MessageStop { finish_reason } => {
+            let status = match finish_reason {
+                FinishReason::Stop | FinishReason::ToolCalls => "completed",
+                FinishReason::Length | FinishReason::ContentFilter => "incomplete",
+                FinishReason::Other(_) => "completed",
+            };
+            let body = json!({
+                "type": "response.completed",
+                "response": {"status": status}
+            });
+            vec![format!("event: response.completed\ndata: {body}\n\n")]
+        }
     }
 }
 
@@ -566,15 +647,84 @@ mod tests {
     }
 
     #[test]
-    fn streaming_emit_is_not_implemented_yet() {
-        let err = fmt()
+    fn streaming_message_start_emits_response_created() {
+        let frames = fmt()
+            .from_hub_stream(
+                &HubChunk::MessageStart {
+                    id: "resp_1".into(),
+                    model: "gpt-4o".into(),
+                },
+                &BridgeContext::default(),
+            )
+            .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].starts_with("event: response.created\n"));
+        assert!(frames[0].contains("\"resp_1\""));
+    }
+
+    #[test]
+    fn streaming_text_delta_emits_output_text_delta() {
+        let frames = fmt()
+            .from_hub_stream(
+                &HubChunk::ContentDelta {
+                    index: 0,
+                    delta: super::super::ContentPartDelta::Text("hello".into()),
+                },
+                &BridgeContext::default(),
+            )
+            .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].contains("response.output_text.delta"));
+        assert!(frames[0].contains("\"delta\":\"hello\""));
+    }
+
+    #[test]
+    fn streaming_stop_emits_response_completed() {
+        let frames = fmt()
             .from_hub_stream(
                 &HubChunk::MessageStop {
                     finish_reason: FinishReason::Stop,
                 },
                 &BridgeContext::default(),
             )
-            .unwrap_err();
-        assert_eq!(err.status(), 501);
+            .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].contains("response.completed"));
+        assert!(frames[0].contains("completed"));
+    }
+
+    #[test]
+    fn streaming_tool_call_emits_output_item_then_arguments_delta() {
+        let f1 = fmt()
+            .from_hub_stream(
+                &HubChunk::ToolCallDelta {
+                    index: 0,
+                    delta: super::super::HubToolCallDelta {
+                        id: Some("call_1".into()),
+                        name: Some("get_weather".into()),
+                        arguments_chunk: None,
+                    },
+                },
+                &BridgeContext::default(),
+            )
+            .unwrap();
+        assert_eq!(f1.len(), 1);
+        assert!(f1[0].contains("response.output_item.added"));
+        assert!(f1[0].contains("function_call"));
+        let f2 = fmt()
+            .from_hub_stream(
+                &HubChunk::ToolCallDelta {
+                    index: 0,
+                    delta: super::super::HubToolCallDelta {
+                        id: None,
+                        name: None,
+                        arguments_chunk: Some("{\"city".into()),
+                    },
+                },
+                &BridgeContext::default(),
+            )
+            .unwrap();
+        assert_eq!(f2.len(), 1);
+        assert!(f2[0].contains("response.function_call_arguments.delta"));
     }
 }
