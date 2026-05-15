@@ -128,9 +128,14 @@ pub fn provider_supports_realtime(provider: &str) -> bool {
 pub fn provider_supports_surface(provider: &str, surface: &crate::handler::AiSurface) -> bool {
     use crate::handler::AiSurface;
     match (provider, surface) {
-        // Universal: chat + models.
+        // Universal: chat + models. Messages and Responses are
+        // native-format inbound shims (WOR-224) that translate down to
+        // the same hub shape as chat completions, so every
+        // chat-capable provider supports them.
         (_, AiSurface::ChatCompletions) => true,
         (_, AiSurface::Models) => true,
+        (_, AiSurface::Messages) => true,
+        (_, AiSurface::Responses) => true,
 
         // OpenAI supports every shipped surface in this enum.
         ("openai", _) => true,

@@ -4080,6 +4080,7 @@ async fn relay_ai_response_with_idempotency(
     max_body_size: Option<usize>,
     idem_skip_reason: Option<&'static str>,
     capture: Option<AiIdempotencyCapture>,
+    inbound_format: Option<&str>,
 ) -> Result<()> {
     let status = resp.status().as_u16();
     let content_type = resp
@@ -4090,6 +4091,7 @@ async fn relay_ai_response_with_idempotency(
         .to_string();
     let resp_body = read_capped_response_body(resp, max_body_size).await?;
     let translated = sbproxy_ai::translators::translate_response_bytes(format, &resp_body);
+    let translated = sbproxy_ai::format::rewrap_response_for_inbound(inbound_format, &translated);
 
     // Record into the idempotency cache before serving the response
     // so the cache entry is durable even if the client disconnects
@@ -4188,7 +4190,7 @@ async fn handle_ai_proxy(
 ) -> Result<()> {
     let method = session.req_header().method.clone();
     let method_str = method.as_str().to_string();
-    let path = session.req_header().uri.path().to_string();
+    let mut path = session.req_header().uri.path().to_string();
 
     // Classify the AI surface for observability. Phase 1 tags every
     // request with a surface label; per-surface dispatch handlers land
@@ -4305,7 +4307,14 @@ async fn handle_ai_proxy(
             0.0,
             Vec::new(),
         );
-        return relay_ai_response(session, resp, format, config.max_body_size).await;
+        return relay_ai_response(
+            session,
+            resp,
+            format,
+            config.max_body_size,
+            ctx.ai_inbound_format.as_deref(),
+        )
+        .await;
     }
 
     // Methods other than GET/POST forward through the method-aware
@@ -4417,12 +4426,67 @@ async fn handle_ai_proxy(
             config.max_body_size,
             idem_skip_reason,
             idem_capture,
+            ctx.ai_inbound_format.as_deref(),
         )
         .await;
     }
 
     // POST requests: read the body, parse JSON, select provider, forward.
     let body_bytes = session.read_request_body().await?.unwrap_or_default();
+
+    // --- Native-format inbound shim (WOR-224) ---
+    //
+    // Anthropic Messages and OpenAI Responses arrive on their own
+    // paths but the rest of the AI pipeline (router, guardrails,
+    // budget, translator, semantic cache, idempotency) speaks the
+    // canonical OpenAI Chat Completions shape. The shim parses the
+    // inbound body through the matching `ChatFormat`, re-emits it as
+    // OpenAI Chat Completions JSON, and rewrites the path so the
+    // upstream selection and translator pipeline run unchanged. The
+    // inbound format id is stamped on the request context so the
+    // relay path can wrap the response body back into the format the
+    // client expects.
+    let body_bytes = match surface {
+        sbproxy_ai::handler::AiSurface::Messages => {
+            match sbproxy_ai::format::anthropic_messages::translate_anthropic_request_to_openai(
+                body_bytes.as_ref(),
+            ) {
+                Ok(translated) => {
+                    ctx.ai_inbound_format = Some("anthropic".into());
+                    path = "/v1/chat/completions".into();
+                    bytes::Bytes::from(translated)
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "AI proxy: failed to parse Anthropic Messages inbound body"
+                    );
+                    send_error(session, e.status(), e.message()).await?;
+                    return Ok(());
+                }
+            }
+        }
+        sbproxy_ai::handler::AiSurface::Responses => {
+            match sbproxy_ai::format::openai_responses::translate_responses_request_to_openai(
+                body_bytes.as_ref(),
+            ) {
+                Ok(translated) => {
+                    ctx.ai_inbound_format = Some("responses".into());
+                    path = "/v1/chat/completions".into();
+                    bytes::Bytes::from(translated)
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "AI proxy: failed to parse OpenAI Responses inbound body"
+                    );
+                    send_error(session, e.status(), e.message()).await?;
+                    return Ok(());
+                }
+            }
+        }
+        _ => body_bytes,
+    };
 
     // Multipart short-circuit: surfaces that carry multipart bodies
     // (audio transcriptions, image edits, image variations, file
@@ -4570,6 +4634,7 @@ async fn handle_ai_proxy(
             config.max_body_size,
             idem_skip_reason,
             None,
+            ctx.ai_inbound_format.as_deref(),
         )
         .await;
     }
@@ -5275,6 +5340,7 @@ async fn relay_ai_response(
     resp: reqwest::Response,
     format: sbproxy_ai::providers::ProviderFormat,
     max_body_size: Option<usize>,
+    inbound_format: Option<&str>,
 ) -> Result<()> {
     let status = resp.status().as_u16();
 
@@ -5289,6 +5355,7 @@ async fn relay_ai_response(
     let resp_body = read_capped_response_body(resp, max_body_size).await?;
 
     let translated = sbproxy_ai::translators::translate_response_bytes(format, &resp_body);
+    let translated = sbproxy_ai::format::rewrap_response_for_inbound(inbound_format, &translated);
     send_response(session, status, &content_type, &translated).await
 }
 
@@ -5424,6 +5491,19 @@ async fn relay_ai_response_with_cache(
         ))
     } else {
         raw_body
+    };
+
+    // Native-format inbound rewrap (WOR-224). When the client entered
+    // on a `/v1/messages` or `/v1/responses` path the cached body stays
+    // in OpenAI Chat shape (so cross-format cache hits remain cheap)
+    // and only the bytes leaving the gateway are re-emitted in the
+    // client-expected wire shape.
+    let inbound_format: Option<String> = ctx.as_ref().and_then(|c| c.ai_inbound_format.clone());
+    let resp_body: bytes::Bytes = match inbound_format.as_deref() {
+        Some("anthropic") | Some("responses") => bytes::Bytes::from(
+            sbproxy_ai::format::rewrap_response_for_inbound(inbound_format.as_deref(), &resp_body),
+        ),
+        _ => resp_body,
     };
 
     // --- Semantic cache write on miss ---

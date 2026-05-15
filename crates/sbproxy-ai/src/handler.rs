@@ -460,6 +460,12 @@ pub enum AiSurface {
     Moderations,
     /// `POST /v1/rerank` or `POST /v1/reranking`.
     Reranking,
+    /// `POST /v1/messages` (Anthropic Messages native inbound). Bridged
+    /// to the hub by `format::AnthropicMessagesFormat`.
+    Messages,
+    /// `POST /v1/responses` (OpenAI Responses native inbound). Bridged
+    /// to the hub by `format::OpenAiResponsesFormat`.
+    Responses,
     /// Path did not match any known AI surface.
     Unknown,
 }
@@ -485,6 +491,8 @@ impl AiSurface {
             AiSurface::AudioSpeech => "audio_speech",
             AiSurface::Moderations => "moderations",
             AiSurface::Reranking => "reranking",
+            AiSurface::Messages => "messages",
+            AiSurface::Responses => "responses",
             AiSurface::Unknown => "unknown",
         }
     }
@@ -576,6 +584,12 @@ pub fn classify_surface(_method: &str, path: &str) -> AiSurface {
 
         // Reranking has two canonical names.
         ["rerank"] | ["reranking"] => AiSurface::Reranking,
+
+        // Native-format inbound paths (WOR-224). These bridge to the
+        // hub format and then dispatch through the same upstream
+        // pipeline as chat completions.
+        ["messages"] => AiSurface::Messages,
+        ["responses"] => AiSurface::Responses,
 
         _ => AiSurface::Unknown,
     }
