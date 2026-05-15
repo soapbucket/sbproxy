@@ -358,6 +358,29 @@ static AI_RATELIMIT_REJECTED: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+// --- Pre-request token estimate error ratio (WOR-232) ---
+//
+// Sampled at reconcile time as `(actual - estimated) / actual` so the
+// histogram captures both over-estimation (negative values) and
+// under-estimation (positive values). The buckets straddle zero so a
+// well-tuned estimator concentrates around 0 and operators alert when
+// the p95 drifts outside +/- 0.10. The `model` label keeps drift
+// observable per model so an upstream tokenizer change shows up as a
+// step function on one series rather than blurring into the aggregate.
+static AI_TOKEN_ESTIMATE_ERROR_RATIO: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        HistogramOpts::new(
+            "sbproxy_ai_token_estimate_error_ratio",
+            "Relative error of pre-request token estimate vs upstream usage.prompt_tokens",
+        )
+        .buckets(vec![
+            -1.0, -0.5, -0.25, -0.10, -0.05, 0.0, 0.05, 0.10, 0.25, 0.5, 1.0
+        ]),
+        &["model"]
+    )
+    .unwrap()
+});
+
 /// Record a completed AI request.
 pub fn record_ai_request(
     provider: &str,
@@ -551,6 +574,21 @@ pub fn ratelimit_rejected_value(axis: &str, key_hash: &str, model: &str) -> f64 
     AI_RATELIMIT_REJECTED
         .with_label_values(&[axis, key_hash, model])
         .get()
+}
+
+/// Record one observation against the pre-request token-estimate error
+/// histogram (WOR-232). `estimated` is the pre-flight reservation;
+/// `actual` is the reconciled `usage.prompt_tokens` from the upstream
+/// response. A zero-token actual is dropped to keep the ratio
+/// well-defined.
+pub fn record_token_estimate_error(model: &str, estimated: u64, actual: u64) {
+    if actual == 0 {
+        return;
+    }
+    let ratio = (actual as f64 - estimated as f64) / actual as f64;
+    AI_TOKEN_ESTIMATE_ERROR_RATIO
+        .with_label_values(&[model])
+        .observe(ratio);
 }
 
 /// Record per-key usage.

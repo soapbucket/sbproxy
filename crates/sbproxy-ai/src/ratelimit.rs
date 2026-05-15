@@ -139,6 +139,11 @@ pub struct Admission {
     bucket: Arc<EntityBuckets>,
     permit: Option<OwnedSemaphorePermit>,
     reserved_tokens: u64,
+    /// Model the reservation was charged to. Stamped here so the
+    /// post-flight estimate-error histogram (WOR-232) can label its
+    /// observation without the caller having to thread the model
+    /// string back through to `reconcile`.
+    model: String,
     reconciled: bool,
 }
 
@@ -146,6 +151,7 @@ impl std::fmt::Debug for Admission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Admission")
             .field("reserved_tokens", &self.reserved_tokens)
+            .field("model", &self.model)
             .field("reconciled", &self.reconciled)
             .field("permit_held", &self.permit.is_some())
             .finish()
@@ -156,12 +162,27 @@ impl Admission {
     /// Replace the pre-flight reservation with the actual token
     /// usage reported by the upstream provider. The bucket refunds
     /// over-reservation; under-reservation is charged as an
-    /// additional debit.
+    /// additional debit. The relative estimate error is sampled into
+    /// `sbproxy_ai_token_estimate_error_ratio` so operators can spot
+    /// drift between the pre-flight estimator and the upstream's own
+    /// token count.
     pub fn reconcile(mut self, actual_tokens: u64) {
         self.bucket
             .reconcile_tokens(self.reserved_tokens, actual_tokens);
+        crate::ai_metrics::record_token_estimate_error(
+            &self.model,
+            self.reserved_tokens,
+            actual_tokens,
+        );
         self.reconciled = true;
         // Dropping releases the permit.
+    }
+
+    /// Token count this admission reserved at request entry. Exposed so
+    /// the request filter can compute its own estimate-vs-actual delta
+    /// for logs and audit events without having to re-parse the prompt.
+    pub fn reserved_tokens(&self) -> u64 {
+        self.reserved_tokens
     }
 
     /// Manually release the concurrency permit and refund the full
@@ -455,6 +476,7 @@ impl ModelRateLimiter {
             bucket,
             permit,
             reserved_tokens: est,
+            model: model.to_string(),
             reconciled: false,
         })
     }
