@@ -57,6 +57,12 @@ jobs:
     name: build / test
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Per-job permissions in addition to the workflow root block,
+    # so the auth contract stays explicit if the root default ever
+    # widens. CodeQL (actions/missing-workflow-permissions) prefers
+    # this defense-in-depth shape.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -164,6 +170,8 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -198,6 +206,8 @@ jobs:
     name: supply chain (cargo-deny)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -220,6 +230,8 @@ jobs:
     name: crate graph (hot/async layering)
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
