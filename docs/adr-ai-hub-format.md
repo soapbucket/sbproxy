@@ -40,7 +40,7 @@ We will introduce a `ChatFormat` trait under `crates/sbproxy-ai/src/format/` tha
 
 The pseudo-Rust surface is short on purpose. The trait is the contract the whole pipeline depends on, so the smaller it is the fewer places have to change when we add a sixth provider.
 
-```rust
+```rust,ignore
 // crates/sbproxy-ai/src/format/mod.rs
 
 /// A bidirectional translator between a wire format and the hub.
@@ -117,7 +117,7 @@ Fourth, `ChatError` is the formats' error type, with HTTP status carried inline.
 
 The hub `ChatRequest` and `ChatResponse` shape are deliberately close to the OpenAI chat-completions JSON shape. OpenAI's chat-completions is the closest existing shape to a lowest common denominator: it has roles, message-level content arrays, tool calls, tool results, finish reasons, usage tokens, and streaming deltas, and every other provider's shape can be projected into it without losing the load-bearing fields.
 
-```rust
+```rust,ignore
 // crates/sbproxy-ai/src/format/types.rs
 
 pub struct ChatRequest {
@@ -218,7 +218,7 @@ Opt-in inbound formats is the conservative default. If we turn on `/v1/messages`
 
 Streaming is the highest-leverage and the highest-risk part of this design, so the hub event vocabulary is deliberately tiny.
 
-```rust
+```rust,ignore
 pub enum ChatEvent {
     MessageStart { id: String, model: String },
     ContentDelta { index: usize, part: ContentPartDelta },

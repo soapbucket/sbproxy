@@ -47,8 +47,8 @@ install their own fetch via `setCodemodeFetch(...)`.
 
 The federation registry exposes a single method:
 
-```rust
-let federation: McpFederation = // ... built at startup
+```rust,ignore
+let federation: McpFederation = /* built at startup */;
 let module_text: String = federation.codemode_ts("https://gw.example/.well-known/mcp");
 ```
 

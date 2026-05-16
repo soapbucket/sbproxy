@@ -137,7 +137,7 @@ The policy reads peer manifests with
 `sbproxy_modules::transform::llms_txt::parse`, which is the input
 dual of `sbproxy_modules::projections::llms::render`:
 
-```rust
+```rust,ignore
 let parsed = parse(bytes)?;
 println!("sitename = {:?}", parsed.sitename);
 for route in parsed.routes {
