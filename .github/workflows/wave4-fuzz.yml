@@ -69,7 +69,7 @@ jobs:
           - target: stateful_proxy
             time: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Reclaim disk: the fuzz crate pulls the full proxy graph
       # (pingora, tract-onnx, tokenizers) so target/ tops several

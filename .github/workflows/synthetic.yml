@@ -38,8 +38,6 @@ env:
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
 
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
   synthetic-probe:
     if: |
@@ -49,7 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4.1.7
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -109,7 +107,7 @@ jobs:
 
       - name: upload probe output
         if: always()
-        uses: actions/upload-artifact@v4.4.0
+        uses: actions/upload-artifact@v5
         with:
           name: synthetic-probe-output
           path: target/synthetic-logs/
@@ -129,7 +127,7 @@ jobs:
       # first-line signal.
       - name: failure-notification
         if: failure()
-        uses: actions/github-script@v7.0.1
+        uses: actions/github-script@v8
         env:
           PROBE_OUTPUT_FILE: target/synthetic-logs/probe.jsonl
         with:
@@ -187,7 +185,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4.1.7
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -222,7 +220,7 @@ jobs:
 
       - name: upload failure artifacts
         if: failure()
-        uses: actions/upload-artifact@v4.4.0
+        uses: actions/upload-artifact@v5
         with:
           name: chaos-hot-reload-logs
           path: target/chaos-logs/

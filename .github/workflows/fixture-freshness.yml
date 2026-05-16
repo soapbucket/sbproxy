@@ -42,15 +42,13 @@ env:
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
 
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
   fixture-freshness:
     name: regen + diff
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4.1.7
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
