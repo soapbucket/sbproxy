@@ -23,15 +23,13 @@ env:
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
 
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
   e2e:
     name: e2e (workspace)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: ./.github/actions/rust-setup
         with:

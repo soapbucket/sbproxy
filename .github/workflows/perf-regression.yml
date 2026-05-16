@@ -43,7 +43,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   perf-regression:
@@ -63,14 +62,14 @@ jobs:
       # one for the PR head (candidate) at ./candidate-src. The script
       # is the same for both, only the working directory differs.
       - name: checkout candidate (PR head)
-        uses: actions/checkout@v4.1.7
+        uses: actions/checkout@v5
         with:
           path: candidate-src
           # The default fetch-depth of 1 is fine; this lane does not
           # need history beyond the PR head.
 
       - name: checkout baseline (main)
-        uses: actions/checkout@v4.1.7
+        uses: actions/checkout@v5
         with:
           repository: ${{ github.event.pull_request.base.repo.full_name }}
           ref: ${{ github.event.pull_request.base.ref }}
@@ -179,7 +178,7 @@ jobs:
 
       - name: upload bench artifacts
         if: always()
-        uses: actions/upload-artifact@v4.4.0
+        uses: actions/upload-artifact@v5
         with:
           name: perf-regression-bench
           path: perf-out/
@@ -193,7 +192,7 @@ jobs:
       # comment instead of stacking new ones.
       - name: post PR comment
         if: always() && github.event.pull_request != null
-        uses: actions/github-script@v7.0.1
+        uses: actions/github-script@v8
         env:
           COMMENT_FILE: perf-out/comment.md
         with:

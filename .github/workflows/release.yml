@@ -34,8 +34,6 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
   build:
     name: build / ${{ matrix.target }}
@@ -62,7 +60,7 @@ jobs:
           # `scripts/install.sh` for the same fallback message.
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -92,7 +90,7 @@ jobs:
           (cd dist && shasum -a 256 "sbproxy_${{ matrix.platform }}.tar.gz" > "sbproxy_${{ matrix.platform }}.tar.gz.sha256")
 
       - name: upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: bin-${{ matrix.platform }}
           path: dist/
@@ -103,7 +101,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: generate cyclonedx sbom
         uses: anchore/sbom-action@v0
@@ -114,7 +112,7 @@ jobs:
           output-file: sbom.cyclonedx.json
 
       - name: upload sbom
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: sbom
           path: sbom.cyclonedx.json
@@ -131,10 +129,10 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
 
@@ -191,16 +189,16 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: download binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
           pattern: bin-*
 
       - name: download sbom
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: sbom
           path: artifacts/sbom

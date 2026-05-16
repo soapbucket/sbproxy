@@ -37,16 +37,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
   docs-ci:
     name: docs / lint + exec
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # --- Cache lychee link-check results ---
       #
@@ -55,7 +52,7 @@ jobs:
       # entries from masking newly-broken links indefinitely while still
       # avoiding per-PR upstream traffic.
       - name: cache lychee
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .lycheecache
           key: lychee-${{ hashFiles('.lycheeignore') }}-${{ github.run_id }}

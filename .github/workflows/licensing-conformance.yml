@@ -52,8 +52,6 @@ env:
   RSL_XSD_URL: 'https://rsl.ai/spec/1.0/rsl.xsd'
   TDMREP_SCHEMA_URL: 'https://www.w3.org/community/reports/tdmrep/CG-FINAL-tdmrep-20240202/schema/tdmrep.json'
 
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
 
   # --- Upstream schema sync (tag push + dispatch) ---
@@ -67,7 +65,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4.1.7
+      - uses: actions/checkout@v5
 
       - name: install curl + diff
         run: |
@@ -90,7 +88,7 @@ jobs:
             echo "key=licensing-schemas-${week}" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         id: schema_cache
         with:
           path: |
