@@ -21,6 +21,7 @@
 pub mod access_control;
 pub mod audit;
 pub mod code_mode;
+pub mod codemode_ts;
 pub mod context_opt;
 pub mod federation;
 pub mod guardrails;
