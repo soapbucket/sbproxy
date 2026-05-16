@@ -201,6 +201,26 @@ impl McpFederation {
         self.tools.load().values().cloned().collect()
     }
 
+    /// WOR-410: Emit a Cloudflare-Code-Mode-compatible TypeScript
+    /// module covering every federated tool currently in the
+    /// registry.
+    ///
+    /// `callback_base_url` is the URL the emitted module uses to
+    /// reach the gateway for each tool call (the runtime stub posts
+    /// to `{callback_base_url}/call/{tool}`). Pass the gateway's
+    /// `/.well-known/mcp` base if you serve this module at the
+    /// gateway itself.
+    ///
+    /// The tools are returned in lexicographic order so the
+    /// emitted module is reproducible across calls. Operators that
+    /// depend on byte-stability for Etag computation can hash the
+    /// returned string.
+    pub fn codemode_ts(&self, callback_base_url: &str) -> String {
+        let mut tools: Vec<FederatedTool> = self.tools.load().values().cloned().collect();
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        super::codemode_ts::emit_codemode_ts(&tools, callback_base_url)
+    }
+
     /// Call a tool, routing to the correct upstream server.
     ///
     /// Backward-compatible wrapper around
@@ -501,6 +521,71 @@ mod tests {
     fn test_resolve_unknown_tool_returns_none() {
         let fed = McpFederation::new(vec![mock_server("s", "http://s.test")]);
         assert!(fed.resolve_tool("nonexistent_tool").is_none());
+    }
+
+    // --- WOR-410: codemode.ts emission against the federation ---
+
+    #[test]
+    fn wor_410_codemode_ts_includes_every_federated_tool() {
+        let fed = McpFederation::new(vec![]);
+        let mut map = HashMap::new();
+        map.insert(
+            "search_docs".to_string(),
+            FederatedTool {
+                name: "search_docs".to_string(),
+                description: "Search documentation".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }),
+                server_name: "docs".to_string(),
+            },
+        );
+        map.insert(
+            "open_pr".to_string(),
+            FederatedTool {
+                name: "open_pr".to_string(),
+                description: "Open a pull request".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "draft": {"type": "boolean"}
+                    },
+                    "required": ["title"]
+                }),
+                server_name: "gh".to_string(),
+            },
+        );
+        fed.tools.store(Arc::new(map));
+
+        let out = fed.codemode_ts("https://gw.example/.well-known/mcp");
+        assert!(out.contains("export interface SearchDocsInput"));
+        assert!(out.contains("export interface OpenPrInput"));
+        assert!(out.contains("search_docs:"));
+        assert!(out.contains("open_pr:"));
+        assert!(out.contains("https://gw.example/.well-known/mcp/call/"));
+    }
+
+    #[test]
+    fn wor_410_codemode_ts_is_reproducible_across_calls() {
+        // Tools sort lexicographically before emission so a hash of
+        // the output stays stable as long as the registry does.
+        let fed = McpFederation::new(vec![]);
+        let mut map = HashMap::new();
+        map.insert("z_tool".to_string(), make_tool("z_tool", "s"));
+        map.insert("a_tool".to_string(), make_tool("a_tool", "s"));
+        fed.tools.store(Arc::new(map));
+
+        let a = fed.codemode_ts("http://x");
+        let b = fed.codemode_ts("http://x");
+        assert_eq!(a, b);
+
+        // a_tool must appear before z_tool in the namespace block.
+        let idx_a = a.find("a_tool:").expect("a_tool present");
+        let idx_z = a.find("z_tool:").expect("z_tool present");
+        assert!(idx_a < idx_z);
     }
 
     #[test]
