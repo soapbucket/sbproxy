@@ -4,7 +4,7 @@
 #
 # Options:
 #   SBPROXY_VERSION   - version to install (default: latest)
-#   SBPROXY_INSTALL   - install directory (default: /usr/local/bin)
+#   SBPROXY_INSTALL   - install directory (default: $HOME/.local/bin)
 
 set -e
 

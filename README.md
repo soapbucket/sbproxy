@@ -4,7 +4,7 @@
 
 <h1 align="center">SBproxy</h1>
 
-*Last modified: 2026-04-28*
+*Last modified: 2026-05-16*
 
 <h3 align="center">The AI gateway built like a real proxy.</h3>
 
@@ -38,6 +38,14 @@ Most teams run one tool for HTTP traffic and another for LLM traffic. That's two
 ---
 
 ## Install
+
+curl (macOS / Linux):
+
+```bash
+curl -fsSL https://download.sbproxy.dev | sh
+```
+
+The script detects your OS and architecture, fetches the matching release binary from GitHub, and drops it in `~/.local/bin`. Override with `SBPROXY_INSTALL=<dir>` for a custom location or `SBPROXY_VERSION=<tag>` to pin a release.
 
 Homebrew (macOS / Linux):
 
@@ -119,4 +127,4 @@ SBproxy v1.0 is a Rust rewrite. The Go implementation that previously occupied t
 
 Licensed under [BSL 1.1](LICENSE). Source available on GitHub. Production use is permitted for everything except offering SBproxy as a competing hosted or managed service.
 
-For commercial licensing inquiries, contact `legal@soapbucket.com`. See also [NOTICE](NOTICE) and [TRADEMARKS](TRADEMARKS.md). A [Soap Bucket LLC](https://www.soapbucket.org) project.
+For commercial licensing inquiries, contact `legal@soapbucket.com`. See also [NOTICE](NOTICE) and [TRADEMARKS](TRADEMARKS.md). A [Soap Bucket LLC](https://www.soapbucket.com) project.
