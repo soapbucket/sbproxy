@@ -5121,6 +5121,29 @@ async fn handle_ai_proxy(
     if is_failover {
         provider_order.sort_by_key(|&i| config.providers[i].priority.unwrap_or(u32::MAX));
     }
+    // Cascade + streaming: cascade does not retry mid-stream, so
+    // we dispatch to tier 1 only and let the streaming relay
+    // handle the response unchanged. The model substitution is
+    // applied to the request body below in the per-provider loop.
+    if let Some(cascade_cfg) = router.cascade_config() {
+        if is_stream {
+            if let Some(first_tier) = cascade_cfg.tiers.first() {
+                if let Some(idx) = config
+                    .providers
+                    .iter()
+                    .position(|p| p.enabled && p.name == first_tier.provider_id)
+                {
+                    provider_order = vec![idx];
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.insert(
+                            "model".to_string(),
+                            serde_json::Value::String(first_tier.model.clone()),
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     let mut last_resp: Option<reqwest::Response> = None;
     let mut last_format: sbproxy_ai::providers::ProviderFormat =
@@ -5136,6 +5159,72 @@ async fn handle_ai_proxy(
     // request to the right provider without re-deriving from
     // `provider_idx`.
     let mut last_provider_name: String = String::new();
+
+    // --- Cascade routing (WOR-489) ---
+    //
+    // When the configured strategy is `Cascade`, dispatch through
+    // the dedicated tier-by-tier path which reads each response
+    // body, checks `confidence_score` against the tier's threshold,
+    // and retries on the next tier when the score is sub-threshold,
+    // empty, or refused. Streaming requests fall through to the
+    // standard dispatch loop below; mid-stream retry is out of
+    // scope for v1. The cascade path writes the response back to
+    // the client directly because it already has the body bytes;
+    // skipping `relay_ai_response_with_cache` also means cascade
+    // does not engage the semantic cache write or idempotency
+    // capture in v1, which is documented in the example README.
+    if let Some(cascade_cfg) = router.cascade_config() {
+        if !is_stream {
+            let outcome = AI_CLIENT
+                .load()
+                .forward_cascade(config, cascade_cfg, &path, &body)
+                .await;
+            match outcome {
+                Ok(o) => {
+                    ctx.ai_provider = Some(o.provider_name.clone());
+                    if !o.model.is_empty() {
+                        ctx.ai_model = Some(o.model.clone());
+                    }
+                    let content_type = o
+                        .headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_else(|| "application/json".to_string());
+                    let translated = sbproxy_ai::format::rewrap_response_for_inbound(
+                        ctx.ai_inbound_format.as_deref(),
+                        &o.body,
+                    );
+                    emit_ai_billing_event(
+                        surface_label,
+                        &o.provider_name,
+                        Some(o.model.clone()),
+                        sbproxy_ai::budget::AiUsage::PerCall,
+                        0.0,
+                        Vec::new(),
+                    );
+                    // Drop any idempotency capture: cascade does not
+                    // engage the idempotency cache write in v1
+                    // because the response body is already
+                    // materialized outside the relay path.
+                    let _ = idem_capture.take();
+                    let _ = idem_skip_reason;
+                    return send_response(session, o.status, &content_type, &translated).await;
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "AI proxy: cascade dispatch failed; returning 502"
+                    );
+                    return Err(Error::because(
+                        ErrorType::ConnectError,
+                        "AI cascade failed",
+                        e,
+                    ));
+                }
+            }
+        }
+    }
 
     for (attempt, &provider_idx) in provider_order.iter().enumerate() {
         if attempt >= max_attempts {

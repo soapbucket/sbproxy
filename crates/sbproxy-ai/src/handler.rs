@@ -318,26 +318,65 @@ fn default_strategy() -> RoutingStrategy {
 /// Deserialize routing from either:
 /// - A flat string: `"round_robin"` (Rust format)
 /// - A nested object: `{strategy: "round_robin", ...}` (Go format)
+/// - A cascade object: `{strategy: "cascade", tiers: [...], max_total_cost: ...}`
 fn deserialize_routing<'de, D>(deserializer: D) -> Result<RoutingStrategy, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    struct RoutingObject {
-        strategy: RoutingStrategy,
+    use crate::routing::{CascadeConfig, CascadeTier};
+    use serde::de::Error;
+
+    // Step 1: capture the raw input. Cascade carries a struct
+    // payload alongside the `strategy` discriminator, so we cannot
+    // round-trip through a unit-only enum like `RoutingStrategy`
+    // before reading the cascade-specific fields.
+    let value = serde_json::Value::deserialize(deserializer)?;
+
+    // Flat string form: `"round_robin"` etc. Cascade has no flat
+    // form because it carries required fields.
+    if value.is_string() {
+        return serde_json::from_value::<RoutingStrategy>(value).map_err(Error::custom);
     }
 
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum RoutingFormat {
-        Flat(RoutingStrategy),
-        Nested(RoutingObject),
+    // Nested object form: must have a `strategy` field. When the
+    // strategy is `cascade`, the same object also carries `tiers`
+    // and optional `max_total_cost`. Every other strategy is a
+    // unit variant and ignores the extra keys.
+    let obj = value.as_object().ok_or_else(|| {
+        Error::custom("routing must be either a strategy name string or an object")
+    })?;
+    let strategy_raw = obj
+        .get("strategy")
+        .ok_or_else(|| Error::custom("routing object is missing the required `strategy` field"))?;
+    let strategy_name = strategy_raw
+        .as_str()
+        .ok_or_else(|| Error::custom("routing.strategy must be a string"))?;
+
+    if strategy_name == "cascade" {
+        #[derive(Deserialize)]
+        struct CascadePayload {
+            #[serde(default)]
+            tiers: Vec<CascadeTier>,
+            #[serde(default)]
+            max_total_cost: Option<u64>,
+        }
+        let payload: CascadePayload =
+            serde_json::from_value(serde_json::Value::Object(obj.clone()))
+                .map_err(Error::custom)?;
+        if payload.tiers.is_empty() {
+            return Err(Error::custom("cascade routing requires at least one tier"));
+        }
+        return Ok(RoutingStrategy::Cascade(CascadeConfig {
+            tiers: payload.tiers,
+            max_total_cost: payload.max_total_cost,
+        }));
     }
 
-    match RoutingFormat::deserialize(deserializer)? {
-        RoutingFormat::Flat(s) => Ok(s),
-        RoutingFormat::Nested(obj) => Ok(obj.strategy),
-    }
+    // Re-route every other strategy through the existing
+    // unit-enum deserializer so the `snake_case` rename stays in
+    // one place.
+    let strategy_value = serde_json::Value::String(strategy_name.to_string());
+    serde_json::from_value::<RoutingStrategy>(strategy_value).map_err(Error::custom)
 }
 
 impl AiResilienceConfig {
@@ -762,6 +801,65 @@ mod tests {
     fn ai_handler_config_missing_providers() {
         let json = serde_json::json!({});
         assert!(AiHandlerConfig::from_config(json).is_err());
+    }
+
+    // --- Cascade routing deserialization ---
+
+    #[test]
+    fn cascade_routing_parses_from_nested_object() {
+        // The cascade form carries a non-trivial payload alongside
+        // the `strategy` discriminator. The custom deserializer in
+        // this module is responsible for stitching the two together
+        // into `RoutingStrategy::Cascade(CascadeConfig { ... })`.
+        let cfg_json = serde_json::json!({
+            "providers": [
+                {"name": "cheap", "api_key": "x"},
+                {"name": "smart", "api_key": "y"}
+            ],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [
+                    {
+                        "provider_id": "cheap",
+                        "model": "gpt-4o-mini",
+                        "quality_threshold": 0.75
+                    },
+                    {
+                        "provider_id": "smart",
+                        "model": "gpt-4o",
+                        "quality_threshold": 0.9,
+                        "cost_cap": 50000
+                    }
+                ],
+                "max_total_cost": 100000
+            }
+        });
+        let config = AiHandlerConfig::from_config(cfg_json).expect("parse");
+        let cascade = match &config.routing {
+            RoutingStrategy::Cascade(c) => c,
+            other => panic!("expected Cascade, got {other:?}"),
+        };
+        assert_eq!(cascade.tiers.len(), 2);
+        assert_eq!(cascade.tiers[0].provider_id, "cheap");
+        assert_eq!(cascade.tiers[0].model, "gpt-4o-mini");
+        assert!((cascade.tiers[0].quality_threshold - 0.75).abs() < 1e-6);
+        assert_eq!(cascade.tiers[1].cost_cap, Some(50000));
+        assert_eq!(cascade.max_total_cost, Some(100000));
+    }
+
+    #[test]
+    fn cascade_routing_rejects_empty_tiers() {
+        // Cascade without any tiers is a configuration error: the
+        // dispatch loop would have nothing to walk. The deserializer
+        // surfaces the error at config-load time.
+        let cfg_json = serde_json::json!({
+            "providers": [{"name": "openai"}],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": []
+            }
+        });
+        assert!(AiHandlerConfig::from_config(cfg_json).is_err());
     }
 
     // --- PII redaction end-to-end wiring ---

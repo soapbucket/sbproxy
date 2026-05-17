@@ -37,6 +37,60 @@ pub enum RoutingStrategy {
     /// Trades doubled spend for halved latency on the chat-first-token
     /// path; useful when every millisecond of TTFT matters.
     Race,
+    /// Try a sequence of (provider, model) tiers from cheapest to
+    /// most expensive. Each tier's response is graded against a
+    /// quality threshold; if the response falls below threshold,
+    /// is empty, or is refused, the request retries on the next
+    /// tier. Theoretically Pareto-optimal under standard assumptions
+    /// (see arxiv 2410.10347, "A Unified Approach to Routing and
+    /// Cascading for LLMs"). Streaming requests dispatch only to
+    /// the first tier; mid-stream retry is out of scope for v1.
+    Cascade(CascadeConfig),
+}
+
+/// Configuration for the [`RoutingStrategy::Cascade`] variant.
+///
+/// `tiers` is ordered: the first entry is tried first, the last
+/// entry is the final fallback. `max_total_cost`, when set, is a
+/// best-effort budget cap (in micro-USD) that aborts the cascade
+/// once the cumulative estimated cost of attempted tiers would
+/// exceed it. The cap is checked before dispatching each tier so
+/// a single in-flight tier can still finish.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct CascadeConfig {
+    /// Ordered list of tiers to try. Must contain at least one
+    /// entry; the config compiler rejects empty lists.
+    pub tiers: Vec<CascadeTier>,
+    /// Optional cumulative cost cap across the cascade. The unit
+    /// is the same micro-USD scale used by the cost catalog
+    /// (`crate::budget::estimate_cost`). `None` disables the cap.
+    #[serde(default)]
+    pub max_total_cost: Option<u64>,
+}
+
+/// One step of a [`CascadeConfig`].
+///
+/// `quality_threshold` is interpreted against the response's
+/// `confidence_score` field (a JSON number in `[0.0, 1.0]`). When
+/// the field is absent the response is treated as quality `1.0`
+/// and accepted; cascade therefore does not retry providers that
+/// do not emit a score. Richer scoring (classifier-driven, CEL
+/// expressions) is a follow-up.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct CascadeTier {
+    /// Name of the provider in [`crate::handler::AiHandlerConfig::providers`].
+    pub provider_id: String,
+    /// Model id to send to that provider for this tier.
+    pub model: String,
+    /// Minimum acceptable `confidence_score` for this tier's
+    /// response. Responses scoring below this value trigger a
+    /// retry on the next tier.
+    pub quality_threshold: f32,
+    /// Optional per-tier cost cap in micro-USD. When set, the
+    /// cascade will not dispatch this tier if doing so would push
+    /// the cumulative cost above the cap.
+    #[serde(default)]
+    pub cost_cap: Option<u64>,
 }
 
 /// Router that selects a provider for each request.
@@ -431,6 +485,24 @@ impl Router {
                 // eligible.
                 Some(enabled[0].0)
             }
+            RoutingStrategy::Cascade(ref cfg) => {
+                // The cascade dispatcher walks `cfg.tiers` itself
+                // (via `cascade_config()`); the basic `select` API
+                // just hands back the first tier's provider so
+                // callers that do not engage the cascade path still
+                // get a deterministic provider. If the first tier's
+                // provider name doesn't match any configured
+                // provider, fall through to the first enabled one
+                // so we never return None for misconfigured cascades.
+                if let Some(first) = cfg.tiers.first() {
+                    for &(idx, p) in &enabled {
+                        if p.name == first.provider_id {
+                            return Some(idx);
+                        }
+                    }
+                }
+                Some(enabled[0].0)
+            }
         }
     }
 
@@ -438,6 +510,22 @@ impl Router {
     /// client uses this to decide whether to fan out the request.
     pub fn is_race(&self) -> bool {
         matches!(self.strategy, RoutingStrategy::Race)
+    }
+
+    /// Returns true when the configured strategy is `Cascade`. The
+    /// AI client uses this to decide whether to engage the
+    /// tier-by-tier cascade dispatch path.
+    pub fn is_cascade(&self) -> bool {
+        matches!(self.strategy, RoutingStrategy::Cascade(_))
+    }
+
+    /// Borrow the cascade config when the configured strategy is
+    /// [`RoutingStrategy::Cascade`].
+    pub fn cascade_config(&self) -> Option<&CascadeConfig> {
+        match &self.strategy {
+            RoutingStrategy::Cascade(cfg) => Some(cfg),
+            _ => None,
+        }
     }
 
     /// Return every eligible provider index. Used by the race
@@ -631,6 +719,51 @@ mod tests {
         let json = serde_json::json!("sticky");
         let strategy: RoutingStrategy = serde_json::from_value(json).unwrap();
         assert!(matches!(strategy, RoutingStrategy::Sticky));
+    }
+
+    // --- Cascade Tests ---
+
+    fn cascade_strategy() -> RoutingStrategy {
+        RoutingStrategy::Cascade(CascadeConfig {
+            tiers: vec![
+                CascadeTier {
+                    provider_id: "smart".to_string(),
+                    model: "gpt-4o".to_string(),
+                    quality_threshold: 0.9,
+                    cost_cap: None,
+                },
+                CascadeTier {
+                    provider_id: "cheap".to_string(),
+                    model: "gpt-4o-mini".to_string(),
+                    quality_threshold: 0.7,
+                    cost_cap: None,
+                },
+            ],
+            max_total_cost: Some(10_000),
+        })
+    }
+
+    #[test]
+    fn router_is_cascade_reports_strategy() {
+        let router = Router::new(cascade_strategy(), 2);
+        assert!(router.is_cascade());
+        assert!(!router.is_race());
+        assert!(router.cascade_config().is_some());
+    }
+
+    #[test]
+    fn router_select_picks_first_tier_provider() {
+        // The basic `select` API hands back the provider whose
+        // name matches the cascade's first tier so callers that
+        // do not engage the cascade-aware dispatcher still get a
+        // deterministic provider.
+        let providers = vec![
+            make_provider("cheap", 1, None, true),
+            make_provider("smart", 1, None, true),
+        ];
+        let router = Router::new(cascade_strategy(), providers.len());
+        let idx = router.select(&providers).expect("select");
+        assert_eq!(idx, 1, "first tier targets `smart`, which is index 1");
     }
 
     // --- LowestLatency Tests ---
