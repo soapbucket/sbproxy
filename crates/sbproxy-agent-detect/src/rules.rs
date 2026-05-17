@@ -388,6 +388,7 @@ mod tests {
             }),
             tls: ja4.map(|j| TlsSignals {
                 ja4: Some(j.to_string()),
+                ..TlsSignals::default()
             }),
             payload: None,
         }

@@ -71,6 +71,18 @@ pub struct TlsFingerprint {
     /// session. Populated by the upstream connector. `None` for
     /// inbound-only captures.
     pub ja4s: Option<String>,
+    /// SNI server-name hostname the client requested in the
+    /// ClientHello's `server_name` extension (WOR-586). `None` when
+    /// the extension was absent or the host_name entry could not be
+    /// parsed. Lowercased per IDN normalisation expectations; IDN
+    /// punycode is left as-is (clients send the A-label on the wire).
+    pub sni: Option<String>,
+    /// Full ALPN protocol-id list the client advertised in the
+    /// `application_layer_protocol_negotiation` extension, in the
+    /// order they appeared on the wire and with GREASE entries
+    /// filtered. Example: `["h2", "http/1.1"]`. Empty when the
+    /// extension was absent (WOR-586).
+    pub alpn: Vec<String>,
     /// Whether the fingerprint reflects the actual client rather
     /// than an intermediate proxy / CDN. Computed from per-origin
     /// CIDR rules; defaults to `false` when no rule matches
@@ -135,6 +147,8 @@ pub fn parse_client_hello(bytes: &[u8]) -> TlsFingerprint {
         ja4: Some(ja4),
         ja4h: None,
         ja4s: None,
+        sni: parsed.sni.clone(),
+        alpn: parsed.alpn.clone(),
         trustworthy: false,
     }
 }
@@ -187,12 +201,25 @@ struct ParsedClientHello {
     /// Negotiated TLS version from `supported_versions` (extension
     /// 0x002b). Highest non-GREASE version wins.
     supported_version: Option<u16>,
-    /// SNI present? (extension 0x0000).
+    /// SNI present? (extension 0x0000). Slice 3 of WOR-499
+    /// additionally extracts the hostname into [`Self::sni`]; the
+    /// boolean is retained for the JA4 prefix bit, which is
+    /// indifferent to the actual host.
     has_sni: bool,
+    /// SNI hostname when the `server_name` extension contained a
+    /// `host_name` entry (type 0). Empty when the extension was
+    /// absent or carried only non-host_name entries.
+    sni: Option<String>,
     /// First and last ALPN values (extension 0x0010), GREASE
-    /// filtered. Each entry is the ALPN protocol ID string.
+    /// filtered. Each entry is the ALPN protocol ID string. JA4
+    /// only consumes first / last; the full list lives on
+    /// [`Self::alpn`].
     alpn_first: Option<String>,
     alpn_last: Option<String>,
+    /// Full ALPN protocol-id list in wire order, GREASE filtered.
+    /// Populated alongside `alpn_first` / `alpn_last`; consumed by
+    /// the agent-detect signal layer (WOR-586).
+    alpn: Vec<String>,
     /// Signature algorithms (extension 0x000d), GREASE filtered.
     /// Not currently consumed by JA3 / JA4 emission, but parsed
     /// here so the JA4-extended (`ja4_r`) variant can be added in a
@@ -236,8 +263,10 @@ fn parse_client_hello_body(body: &[u8]) -> Option<ParsedClientHello> {
     let mut ec_point_formats = Vec::new();
     let mut supported_version: Option<u16> = None;
     let mut has_sni = false;
+    let mut sni: Option<String> = None;
     let mut alpn_first: Option<String> = None;
     let mut alpn_last: Option<String> = None;
+    let mut alpn: Vec<String> = Vec::new();
     let mut sig_algs = Vec::new();
 
     while ext_reader.remaining() >= 4 {
@@ -251,9 +280,34 @@ fn parse_client_hello_body(body: &[u8]) -> Option<ParsedClientHello> {
         extensions.push(ext_type);
 
         match ext_type {
-            // server_name
+            // server_name (RFC 6066 §3): u16 list_len, then a list
+            // of `(u8 name_type, u16 host_name_len, bytes)`. We
+            // accept the first `name_type == 0 (host_name)` entry
+            // we see and lowercase the IDN A-label per RFC 5890
+            // expectations.
             0x0000 => {
                 has_sni = true;
+                let mut r = ByteReader::new(ext_data);
+                if let Some(list_len) = r.read_u16() {
+                    let list_len = list_len as usize;
+                    let mut inner = ByteReader::new(r.take(list_len)?);
+                    while inner.remaining() >= 3 {
+                        let name_type = inner.read_u8()?;
+                        let host_name_len = inner.read_u16()? as usize;
+                        let host_bytes = inner.take(host_name_len)?;
+                        if name_type == 0 && !host_bytes.is_empty() {
+                            // ASCII-only hostnames (or IDN A-labels)
+                            // are the spec; reject non-UTF8 quietly
+                            // so a malformed SNI does not panic.
+                            if let Ok(s) = std::str::from_utf8(host_bytes) {
+                                let lowered = s.to_ascii_lowercase();
+                                if sni.is_none() {
+                                    sni = Some(lowered);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             // supported_groups (named curves)
             0x000a => {
@@ -305,6 +359,7 @@ fn parse_client_hello_body(body: &[u8]) -> Option<ParsedClientHello> {
                 }
                 alpn_first = all_alpns.first().cloned();
                 alpn_last = all_alpns.last().cloned();
+                alpn = all_alpns;
             }
             // supported_versions
             0x002b => {
@@ -337,8 +392,10 @@ fn parse_client_hello_body(body: &[u8]) -> Option<ParsedClientHello> {
         ec_point_formats,
         supported_version,
         has_sni,
+        sni,
         alpn_first,
         alpn_last,
+        alpn,
         sig_algs,
     })
 }
@@ -928,5 +985,98 @@ mod tests {
         let fp = parse_client_hello(&b);
         let ja4 = fp.ja4.expect("ja4 populated");
         assert!(ja4.starts_with("t12"), "expected TLS 1.2 prefix in {ja4}");
+    }
+
+    /// WOR-586: a ClientHello with a populated SNI host_name + ALPN
+    /// list must surface the hostname and the full list (not just
+    /// first/last) on `TlsFingerprint`.
+    fn synthetic_client_hello_with_sni(host: &str) -> Vec<u8> {
+        let mut b = Vec::new();
+        // legacy_version, random, session_id
+        b.extend_from_slice(&[0x03, 0x03]);
+        b.extend_from_slice(&[0u8; 32]);
+        b.push(0);
+        // cipher_suites: [0x1301]
+        b.extend_from_slice(&[0x00, 0x02]);
+        b.extend_from_slice(&[0x13, 0x01]);
+        // compression_methods
+        b.extend_from_slice(&[0x01, 0x00]);
+
+        // --- Extensions: server_name with host_name + ALPN ["h3","h2","http/1.1"] ---
+        let mut ext: Vec<u8> = Vec::new();
+
+        // server_name extension (type 0x0000):
+        //   list_len (u16) + name_type (u8 = 0) + host_name_len (u16) + bytes
+        let host_bytes = host.as_bytes();
+        let inner_len = 1 + 2 + host_bytes.len();
+        let sni_ext_len = 2 + inner_len; // outer carries the list_len
+        ext.extend_from_slice(&[0x00, 0x00]);
+        ext.extend_from_slice(&(sni_ext_len as u16).to_be_bytes());
+        ext.extend_from_slice(&(inner_len as u16).to_be_bytes());
+        ext.push(0); // host_name type
+        ext.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
+        ext.extend_from_slice(host_bytes);
+
+        // ALPN extension (0x0010): h3, h2, http/1.1
+        let mut alpn = Vec::new();
+        alpn.push(2);
+        alpn.extend_from_slice(b"h3");
+        alpn.push(2);
+        alpn.extend_from_slice(b"h2");
+        alpn.push(8);
+        alpn.extend_from_slice(b"http/1.1");
+        let alpn_list_len = alpn.len() as u16;
+        let alpn_ext_len = alpn_list_len + 2;
+        ext.extend_from_slice(&[0x00, 0x10]);
+        ext.extend_from_slice(&alpn_ext_len.to_be_bytes());
+        ext.extend_from_slice(&alpn_list_len.to_be_bytes());
+        ext.extend_from_slice(&alpn);
+
+        let ext_len = ext.len() as u16;
+        b.extend_from_slice(&ext_len.to_be_bytes());
+        b.extend_from_slice(&ext);
+        b
+    }
+
+    #[test]
+    fn sni_hostname_is_extracted_and_lowercased() {
+        let body = synthetic_client_hello_with_sni("Example.Test.SBProxy.dev");
+        let fp = parse_client_hello(&body);
+        assert_eq!(fp.sni.as_deref(), Some("example.test.sbproxy.dev"));
+    }
+
+    #[test]
+    fn alpn_full_list_is_extracted_in_wire_order() {
+        let body = synthetic_client_hello_with_sni("example.test");
+        let fp = parse_client_hello(&body);
+        assert_eq!(
+            fp.alpn,
+            vec!["h3".to_string(), "h2".to_string(), "http/1.1".to_string()],
+        );
+    }
+
+    #[test]
+    fn missing_sni_extension_yields_none() {
+        // synthetic_client_hello() builds a hello with an empty
+        // SNI extension (length 0) so the host_name list is empty;
+        // the parser should leave `sni` as None.
+        let body = synthetic_client_hello();
+        let fp = parse_client_hello(&body);
+        assert!(fp.sni.is_none());
+    }
+
+    #[test]
+    fn no_alpn_extension_yields_empty_vec() {
+        // ja4_falls_back rebuild path: a hello without an ALPN ext.
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0x03, 0x03]);
+        b.extend_from_slice(&[0u8; 32]);
+        b.push(0);
+        b.extend_from_slice(&[0x00, 0x02]);
+        b.extend_from_slice(&[0x13, 0x01]);
+        b.extend_from_slice(&[0x01, 0x00]);
+        b.extend_from_slice(&[0x00, 0x00]); // ext total = 0
+        let fp = parse_client_hello(&b);
+        assert!(fp.alpn.is_empty());
     }
 }

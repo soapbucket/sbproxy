@@ -134,15 +134,45 @@ pub struct Signals {
     pub payload: Option<PayloadSignals>,
 }
 
-/// TLS-layer signals. Slice 2 (WOR-585) introduces the minimal field
-/// set the rule-pack matcher reads against: the JA4 fingerprint string.
-/// Slice 3 (WOR-586) populates this from `sbproxy-tls`; slices 7
-/// (WOR-590) add JA4T + JA4X. Until then the field is `None` and the
-/// matcher's `ja4_prefix` predicate falls through.
+/// TLS-layer signals. Slice 2 (WOR-585) seeded the minimal field set;
+/// slice 3 (WOR-586) mirrors the full `sbproxy_tls::fingerprint::TlsFingerprint`
+/// shape: JA4 (ClientHello), JA4H (request), JA4S (ServerHello)
+/// fingerprints plus ALPN list and SNI hostname. Slice 7 (WOR-590)
+/// will add JA4T + JA4X.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TlsSignals {
     /// JA4 ClientHello fingerprint string (FoxIO format).
     pub ja4: Option<String>,
+    /// JA4H HTTP request fingerprint. Populated mid-pipeline once the
+    /// request headers are visible.
+    pub ja4h: Option<String>,
+    /// JA4S TLS ServerHello fingerprint from the proxy's outbound
+    /// session. `None` for inbound-only captures.
+    pub ja4s: Option<String>,
+    /// SNI host_name the client requested, lowercased. `None` when
+    /// the extension was absent.
+    pub sni: Option<String>,
+    /// Full ALPN protocol-id list in wire order, GREASE filtered.
+    /// Empty when the extension was absent.
+    pub alpn: Vec<String>,
+}
+
+impl From<&sbproxy_tls::fingerprint::TlsFingerprint> for TlsSignals {
+    /// Lossless projection of the TLS-layer fingerprint onto the
+    /// agent-detect signal type. Callers attach a `TlsFingerprint` at
+    /// handshake time per the existing layering; downstream agent-
+    /// detect scoring reads only this projection so it does not need
+    /// to know about the `trustworthy` CIDR classification or the
+    /// JA3 hash (neither of which the rule-pack matcher consults).
+    fn from(fp: &sbproxy_tls::fingerprint::TlsFingerprint) -> Self {
+        Self {
+            ja4: fp.ja4.clone(),
+            ja4h: fp.ja4h.clone(),
+            ja4s: fp.ja4s.clone(),
+            sni: fp.sni.clone(),
+            alpn: fp.alpn.clone(),
+        }
+    }
 }
 
 /// HTTP-layer signals. Slice 2 (WOR-585) introduces the minimal field
@@ -278,5 +308,37 @@ mod tests {
         // request context.
         fn _accept(_: &dyn AgentScorer) {}
         _accept(&DefaultScorer);
+    }
+
+    // --- WOR-586: From<&TlsFingerprint> for TlsSignals ---
+
+    #[test]
+    fn from_empty_tls_fingerprint_yields_default_signals() {
+        let fp = sbproxy_tls::fingerprint::TlsFingerprint::empty();
+        let signals: TlsSignals = (&fp).into();
+        assert!(signals.ja4.is_none());
+        assert!(signals.ja4h.is_none());
+        assert!(signals.ja4s.is_none());
+        assert!(signals.sni.is_none());
+        assert!(signals.alpn.is_empty());
+    }
+
+    #[test]
+    fn from_populated_tls_fingerprint_mirrors_every_field() {
+        let fp = sbproxy_tls::fingerprint::TlsFingerprint {
+            ja3: Some("ignored".into()),
+            ja4: Some("t13d1516h2_8daaf6152771".into()),
+            ja4h: Some("ge11nn030000_d4ce69e9c2f0".into()),
+            ja4s: Some("t1302h2_2e6abc78c2d7".into()),
+            sni: Some("api.example.test".into()),
+            alpn: vec!["h2".into(), "http/1.1".into()],
+            trustworthy: true,
+        };
+        let signals: TlsSignals = (&fp).into();
+        assert_eq!(signals.ja4.as_deref(), Some("t13d1516h2_8daaf6152771"));
+        assert_eq!(signals.ja4h.as_deref(), Some("ge11nn030000_d4ce69e9c2f0"));
+        assert_eq!(signals.ja4s.as_deref(), Some("t1302h2_2e6abc78c2d7"));
+        assert_eq!(signals.sni.as_deref(), Some("api.example.test"));
+        assert_eq!(signals.alpn, vec!["h2".to_string(), "http/1.1".to_string()]);
     }
 }
