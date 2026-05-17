@@ -5905,6 +5905,7 @@ dependencies = [
  "uuid",
  "wasi-common",
  "wasmtime",
+ "yaml_serde",
 ]
 
 [[package]]
