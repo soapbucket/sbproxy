@@ -81,6 +81,7 @@ sbproxy-ai = { path = "crates/sbproxy-ai" }
 sbproxy-tls = { path = "crates/sbproxy-tls" }
 sbproxy-openapi = { path = "crates/sbproxy-openapi" }
 sbproxy-classifiers = { path = "crates/sbproxy-classifiers" }
+sbproxy-agent-detect = { path = "crates/sbproxy-agent-detect" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
