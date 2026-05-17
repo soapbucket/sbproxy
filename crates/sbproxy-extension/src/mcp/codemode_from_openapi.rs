@@ -32,9 +32,16 @@
 //! follow-up tickets. This module exposes only the library function so
 //! callers can hand the emitted string back over their own surface.
 
+use std::collections::HashSet;
+
 use super::codemode_ts::emit_codemode_ts;
 use super::federation::FederatedTool;
 use super::openapi_convert::openapi_to_mcp_tools;
+
+/// Response media types that signal a streaming response. An operation
+/// is treated as streaming for codemode emission iff at least one of
+/// its `2xx` responses declares one of these content types.
+const STREAMING_MEDIA_TYPES: &[&str] = &["text/event-stream", "application/x-ndjson"];
 
 /// Default `server_name` stamped onto every [`FederatedTool`] the
 /// converter manufactures. Surfaces in the JSDoc preamble of each
@@ -61,6 +68,7 @@ pub fn emit_codemode_from_openapi(spec: &serde_json::Value, callback_base_url: &
 /// that want to combine OpenAPI-derived tools with tools from a live
 /// MCP federation before emitting the module.
 pub fn openapi_to_federated_tools(spec: &serde_json::Value) -> Vec<FederatedTool> {
+    let streaming_ops = streaming_operation_names(spec);
     let raw = openapi_to_mcp_tools(spec);
     let mut tools = Vec::with_capacity(raw.len());
     for v in raw {
@@ -76,24 +84,100 @@ pub fn openapi_to_federated_tools(spec: &serde_json::Value) -> Vec<FederatedTool
             .get("inputSchema")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
-        // OpenAPI operations are single-shot today; if the spec
-        // declares a streaming response (text/event-stream or
-        // application/x-ndjson) we could promote `streaming` to true
-        // when WOR-501 follow-up lands the OpenAPI response-media-type
-        // walker. Default to false for now so the emitted module shape
-        // matches the existing OpenAPI->REST callback convention.
+        // An operation is streaming iff at least one of its 2xx
+        // responses declares `text/event-stream` or
+        // `application/x-ndjson`. The codemode emitter then renders
+        // the call as `AsyncIterable<Output>` (WOR-487 follow-up).
+        let streaming = streaming_ops.contains(&name);
         tools.push(FederatedTool {
             name,
             description,
             input_schema,
             server_name: OPENAPI_SOURCE_NAME.to_string(),
-            streaming: false,
+            streaming,
         });
     }
     // Sort lexicographically for reproducible output, mirroring the
     // MCP-federation path's `codemode_ts()`.
     tools.sort_by(|a, b| a.name.cmp(&b.name));
     tools
+}
+
+/// Walk the OpenAPI spec and return the set of operation tool names
+/// whose responses declare a streaming media type.
+///
+/// The match key is the same one [`openapi_to_mcp_tools`] uses: the
+/// operation's `x-mcp.name` override when present, then `operationId`,
+/// then the synthesised `method_path` fallback. Matching the converter
+/// here keeps the streaming flag consistent with the emitted tool
+/// name, including under WOR-485 overrides.
+fn streaming_operation_names(spec: &serde_json::Value) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Some(paths) = spec.get("paths").and_then(|p| p.as_object()) else {
+        return out;
+    };
+    for (path, methods) in paths {
+        let Some(methods_obj) = methods.as_object() else {
+            continue;
+        };
+        for (method, operation) in methods_obj {
+            let Some(op) = operation.as_object() else {
+                continue;
+            };
+            if !operation_is_streaming(op) {
+                continue;
+            }
+            let derived;
+            let name: &str = if let Some(override_name) = mcp_override_name(op) {
+                override_name
+            } else if let Some(id) = op.get("operationId").and_then(|v| v.as_str()) {
+                id
+            } else {
+                derived = format!("{}_{}", method, path.replace('/', "_"));
+                &derived
+            };
+            out.insert(name.to_string());
+        }
+    }
+    out
+}
+
+/// True when at least one of the operation's `2xx` responses declares
+/// a streaming media type.
+fn operation_is_streaming(op: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let Some(responses) = op.get("responses").and_then(|r| r.as_object()) else {
+        return false;
+    };
+    for (status, response) in responses {
+        if !status.starts_with('2') {
+            continue;
+        }
+        let Some(content) = response.get("content").and_then(|c| c.as_object()) else {
+            continue;
+        };
+        if content
+            .keys()
+            .any(|k| STREAMING_MEDIA_TYPES.contains(&k.as_str()))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extract an `x-mcp.name` or `x-sbproxy-mcp.name` override. Mirrors
+/// the precedence used by [`openapi_to_mcp_tools`]: the latter wins
+/// when both are present.
+fn mcp_override_name(op: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    for key in ["x-mcp", "x-sbproxy-mcp"] {
+        if let Some(obj) = op.get(key).and_then(|v| v.as_object()) {
+            if let Some(name) = obj.get("name").and_then(|n| n.as_str()) {
+                // The `x-sbproxy-mcp` pass overrides the `x-mcp` one.
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -266,5 +350,138 @@ mod tests {
         let out = emit_codemode_from_openapi(&s, "x");
         assert!(out.contains("listUsers:"));
         assert!(!out.contains("createUser:"));
+    }
+
+    // --- Streaming detection ---
+
+    fn streaming_spec() -> serde_json::Value {
+        json!({
+            "openapi": "3.0.0",
+            "paths": {
+                "/feed": {
+                    "get": {
+                        "operationId": "streamFeed",
+                        "responses": {
+                            "200": {
+                                "content": {
+                                    "text/event-stream": {"schema": {"type": "string"}}
+                                }
+                            }
+                        }
+                    }
+                },
+                "/logs": {
+                    "get": {
+                        "operationId": "tailLogs",
+                        "responses": {
+                            "200": {
+                                "content": {
+                                    "application/x-ndjson": {"schema": {"type": "object"}}
+                                }
+                            }
+                        }
+                    }
+                },
+                "/users": {
+                    "get": {
+                        "operationId": "listUsers",
+                        "responses": {
+                            "200": {
+                                "content": {
+                                    "application/json": {"schema": {"type": "object"}}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn sse_response_marks_operation_streaming() {
+        let tools = openapi_to_federated_tools(&streaming_spec());
+        let by_name: std::collections::HashMap<_, _> =
+            tools.iter().map(|t| (t.name.as_str(), t)).collect();
+        assert!(by_name["streamFeed"].streaming, "SSE op should stream");
+        assert!(by_name["tailLogs"].streaming, "NDJSON op should stream");
+        assert!(
+            !by_name["listUsers"].streaming,
+            "JSON response should not stream"
+        );
+    }
+
+    #[test]
+    fn streaming_op_emits_async_iterable_signature() {
+        let out = emit_codemode_from_openapi(&streaming_spec(), "https://gw.example");
+        assert!(
+            out.contains("streamFeed: (input: StreamFeedInput): AsyncIterable<StreamFeedOutput>"),
+            "streaming op should be AsyncIterable, got:\n{}",
+            out
+        );
+        assert!(
+            out.contains("tailLogs: (input: TailLogsInput): AsyncIterable<TailLogsOutput>"),
+            "ndjson op should be AsyncIterable"
+        );
+        assert!(
+            out.contains("listUsers: (input: ListUsersInput): Promise<ListUsersOutput>"),
+            "non-streaming op should keep Promise<>"
+        );
+        assert!(
+            out.contains("async function* __codemode_call_stream"),
+            "streaming runtime helper should be emitted"
+        );
+    }
+
+    #[test]
+    fn x_mcp_name_override_carries_through_streaming_detection() {
+        // The streaming flag should follow the x-mcp.name override so
+        // the emitted module has a consistent name + signature.
+        let s = json!({
+            "paths": {
+                "/feed": {
+                    "get": {
+                        "operationId": "streamFeed",
+                        "x-mcp": {"name": "subscribe_feed"},
+                        "responses": {
+                            "200": {
+                                "content": {
+                                    "text/event-stream": {"schema": {"type": "string"}}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let tools = openapi_to_federated_tools(&s);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "subscribe_feed");
+        assert!(tools[0].streaming);
+    }
+
+    #[test]
+    fn non_2xx_streaming_response_does_not_promote_streaming() {
+        // A 4xx error response with text/event-stream is not a
+        // streaming success path; ignore it.
+        let s = json!({
+            "paths": {
+                "/users": {
+                    "get": {
+                        "operationId": "listUsers",
+                        "responses": {
+                            "200": {
+                                "content": {"application/json": {"schema": {"type": "object"}}}
+                            },
+                            "429": {
+                                "content": {"text/event-stream": {"schema": {"type": "string"}}}
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let tools = openapi_to_federated_tools(&s);
+        assert!(!tools[0].streaming);
     }
 }
