@@ -21,6 +21,7 @@ on:
       - 'sbproxy-rust/docs/**'
       - 'sbproxy-enterprise/docs/**'
       - 'scripts/docs-ci.sh'
+      - 'scripts/check-spec-citations.sh'
       - '.lycheeignore'
       - '.github/workflows/docs-ci.yml'
 
@@ -89,3 +90,8 @@ jobs:
             exit 1
           fi
           bash scripts/docs-ci.sh
+
+      # WOR-528: catch the four spec-citation regressions called out in
+      # the 2026-05-15 Public RFCs audit before they ship.
+      - name: spec citation hygiene
+        run: bash scripts/check-spec-citations.sh
