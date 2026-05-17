@@ -22,9 +22,10 @@
 //!   shape. Slice 7 (WOR-590) lands the field on the struct but
 //!   leaves the value as `None` on the inbound path: Pingora 0.8's
 //!   `Session` abstraction does not surface the raw TCP socket
-//!   options block, so the value cannot be computed today.
-//!   See [`compute_ja4t`] for the pure helper and the field
-//!   rustdoc for the layering note.
+//!   options block, so the value cannot be computed today. See
+//!   the field rustdoc on `TlsFingerprint::ja4t` for the layering
+//!   note; a future `compute_ja4t` helper will ship once a
+//!   listener-level capture lands.
 //! - **JA4X** (X.509 cert-chain fingerprint): truncated SHA-256 of
 //!   each cert's issuer DN, signature algorithm OID, and extension
 //!   OID list, joined per FoxIO spec. Populated by the mTLS verify
@@ -113,10 +114,10 @@ pub struct TlsFingerprint {
     /// JA4T spec. Slice 7 / WOR-590 lands the field on the struct
     /// but currently leaves the inbound path's value as `None`:
     /// the raw TCP options block is not surfaced by Pingora 0.8's
-    /// `Session` abstraction. The pure helper [`compute_ja4t`]
-    /// exists so a future listener-level capture (or an enterprise
-    /// sidecar that observes the SYN) can populate the field
-    /// without re-walking the FoxIO format.
+    /// `Session` abstraction. A future `compute_ja4t` helper will
+    /// ship alongside the listener-level capture (or an enterprise
+    /// sidecar that observes the SYN) so callers can populate the
+    /// field without re-walking the FoxIO format.
     // TODO(WOR-590): wire JA4T capture once Pingora exposes the
     // raw TCP socket options, or thread it through a SYN-observing
     // sidecar header on the trusted-proxy path.
