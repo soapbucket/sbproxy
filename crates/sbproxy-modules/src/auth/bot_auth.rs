@@ -12,6 +12,8 @@
 //! in YAML. Periodic refresh of a hosted directory (JWKS-shaped) is
 //! tracked as a follow-up that wires onto the same `Directory` trait.
 
+use std::sync::Arc;
+
 use sbproxy_middleware::signatures::{
     parse_signature_input, MessageSignatureConfig, MessageSignatureVerifier, SignatureAlgorithm,
     VerifyVerdict,
@@ -19,6 +21,7 @@ use sbproxy_middleware::signatures::{
 use serde::Deserialize;
 
 use crate::auth::bot_auth_directory::{self, DirectoryConfig};
+use crate::policy::quote_token::{NonceCheck, NonceStore};
 
 /// One agent in the directory.
 #[derive(Debug, Clone, Deserialize)]
@@ -47,6 +50,39 @@ fn default_required_components() -> Vec<String> {
     vec!["@method".to_string(), "@target-uri".to_string()]
 }
 
+/// Operator knob (WOR-502) controlling how the verifier reacts when a
+/// signature's `nonce` parameter has already been observed.
+///
+/// The Web Bot Auth deep-dive flagged that Cloudflare's reference
+/// verifier ignores `nonce` and relies entirely on the 60-second
+/// `created` expiry, which leaves a generous replay window. SBproxy's
+/// verifier checks each `nonce` against a [`NonceStore`] when one is
+/// wired in; this enum selects whether a hit is fatal or merely
+/// surfaced through metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoncePolicy {
+    /// Default. A replayed nonce produces a `Failed { reason:
+    /// "nonce_replay" }` verdict.
+    #[default]
+    Strict,
+    /// Replay is logged through the metric counter only; the verifier
+    /// still returns `Verified`. Intended for shadow rollouts where
+    /// operators want visibility before flipping to strict.
+    Permissive,
+}
+
+impl NoncePolicy {
+    /// Label string emitted on the metric counter. Stays in lockstep
+    /// with the `serde(rename_all)` so log and metric names match.
+    fn metric_label(self) -> &'static str {
+        match self {
+            NoncePolicy::Strict => "strict",
+            NoncePolicy::Permissive => "permissive",
+        }
+    }
+}
+
 /// Configuration for the Web Bot Auth provider.
 #[derive(Debug, Deserialize)]
 pub struct BotAuthConfig {
@@ -64,6 +100,14 @@ pub struct BotAuthConfig {
     /// by fetching the JWKS-shaped hosted directory.
     #[serde(default)]
     pub directory: Option<DirectoryConfig>,
+    /// Replay policy applied when the verifier observes a `nonce`
+    /// parameter (WOR-502). Defaults to [`NoncePolicy::Strict`] so
+    /// operators get fail-closed behaviour out of the box; flip to
+    /// [`NoncePolicy::Permissive`] for shadow rollouts. Inert when no
+    /// [`NonceStore`] is injected via
+    /// [`BotAuthProvider::with_nonce_store`].
+    #[serde(default)]
+    pub nonce_policy: NoncePolicy,
 }
 
 fn default_skew_seconds() -> u64 {
@@ -133,6 +177,18 @@ pub struct BotAuthProvider {
     /// config compile time so directory fetches reuse a pooled
     /// connection across requests.
     directory_client: Option<reqwest::Client>,
+    /// Optional single-use [`NonceStore`] (WOR-502). When set, every
+    /// `Signature-Input` carrying a `nonce` parameter is run through
+    /// [`NonceStore::check_and_consume`]; a hit means the nonce has
+    /// been seen before and the verifier reacts per
+    /// [`Self::nonce_policy`]. When `None`, nonce checking is a
+    /// no-op, which is the default for callers that have not been
+    /// wired in yet (preserves backward compatibility for
+    /// `BotAuthProvider::from_config` callers and existing tests).
+    nonce_store: Option<Arc<dyn NonceStore>>,
+    /// Replay policy applied when [`Self::nonce_store`] is set and
+    /// returns `AlreadyConsumed` for the request's nonce.
+    nonce_policy: NoncePolicy,
 }
 
 impl std::fmt::Debug for BotAuthProvider {
@@ -195,7 +251,31 @@ impl BotAuthProvider {
             clock_skew_seconds: cfg.clock_skew_seconds,
             directory: cfg.directory,
             directory_client,
+            nonce_store: None,
+            nonce_policy: cfg.nonce_policy,
         })
+    }
+
+    /// Inject a [`NonceStore`] for replay-protection (WOR-502).
+    ///
+    /// When set, every verified request's `nonce` parameter is
+    /// consumed through [`NonceStore::check_and_consume`]. A hit
+    /// triggers a `Failed { reason: "nonce_replay" }` verdict under
+    /// [`NoncePolicy::Strict`], or a metric-only log under
+    /// [`NoncePolicy::Permissive`].
+    ///
+    /// Returns the provider for chaining at construction sites.
+    /// Callers that never inject a store keep today's behaviour:
+    /// nonce checking is a no-op and the verifier degrades to
+    /// timestamp-only replay protection.
+    ///
+    /// Workspace-scoped nonce ledgers are a follow-up; the current
+    /// implementation looks the nonce up under a single global key
+    /// space. Operators running multi-tenant deployments should file
+    /// against the WOR-502 follow-up before flipping to strict.
+    pub fn with_nonce_store(mut self, store: Arc<dyn NonceStore>) -> Self {
+        self.nonce_store = Some(store);
+        self
     }
 
     /// True when this provider is configured with a dynamic
@@ -203,6 +283,48 @@ impl BotAuthProvider {
     /// invoke the async resolution path.
     pub fn has_directory(&self) -> bool {
         self.directory.is_some()
+    }
+
+    /// Run the optional nonce-store check for a parsed
+    /// `Signature-Input` nonce. Returns:
+    ///
+    /// - `Ok(())` when nonce checking is disabled (no store wired,
+    ///   or the request advertised no `nonce` parameter), the nonce
+    ///   is fresh, or the policy is permissive (the metric is
+    ///   incremented but the caller still proceeds).
+    /// - `Err(replay_reason)` when the policy is strict and the
+    ///   nonce was already consumed; the caller maps this into the
+    ///   appropriate `BotAuthVerdict::Failed`.
+    ///
+    /// Errors from the underlying store (a Postgres backend timing
+    /// out, for example) are treated as fail-open so a transient
+    /// storage incident does not turn into a 401 storm. The store's
+    /// own metrics surface the underlying failure.
+    fn check_nonce(&self, nonce: Option<&str>) -> Result<(), &'static str> {
+        let Some(store) = self.nonce_store.as_ref() else {
+            return Ok(());
+        };
+        let Some(nonce) = nonce else {
+            return Ok(());
+        };
+        match store.check_and_consume(nonce) {
+            Ok(NonceCheck::Fresh) | Ok(NonceCheck::Unknown) => Ok(()),
+            Ok(NonceCheck::AlreadyConsumed) => {
+                sbproxy_observe::metrics::record_bot_auth_nonce_replay(
+                    self.nonce_policy.metric_label(),
+                );
+                match self.nonce_policy {
+                    NoncePolicy::Strict => Err("nonce_replay"),
+                    NoncePolicy::Permissive => Ok(()),
+                }
+            }
+            Err(_) => {
+                // Store-side failure (timeout, IO, ...). Fail-open: the
+                // store's own metrics surface the underlying incident
+                // and the timestamp-window check still bounds replay.
+                Ok(())
+            }
+        }
     }
 
     /// Verify a request, consulting the dynamic directory when the
@@ -274,9 +396,17 @@ impl BotAuthProvider {
                 };
             }
         };
-        let advertised_kid = entries
+        // Track both the advertised kid and its sibling `nonce` so
+        // the WOR-502 replay check can run after the cryptographic
+        // verify finishes.
+        let (advertised_kid, advertised_nonce) = entries
             .iter()
-            .find_map(|(_, e)| e.params.keyid.clone())
+            .find_map(|(_, e)| {
+                e.params
+                    .keyid
+                    .clone()
+                    .map(|kid| (kid, e.params.nonce.clone()))
+            })
             .unwrap_or_default();
         let Some(matched) = keys.iter().find(|k| k.kid == advertised_kid) else {
             return BotAuthVerdict::UnknownAgent {
@@ -311,9 +441,17 @@ impl BotAuthProvider {
         };
 
         match verifier.verify_request(req) {
-            VerifyVerdict::Ok { .. } => BotAuthVerdict::Verified {
-                agent_name: matched.agent.clone().unwrap_or_else(|| matched.kid.clone()),
-            },
+            VerifyVerdict::Ok { .. } => {
+                if let Err(reason) = self.check_nonce(advertised_nonce.as_deref()) {
+                    return BotAuthVerdict::Failed {
+                        agent_name: matched.agent.clone(),
+                        reason: reason.to_string(),
+                    };
+                }
+                BotAuthVerdict::Verified {
+                    agent_name: matched.agent.clone().unwrap_or_else(|| matched.kid.clone()),
+                }
+            }
             VerifyVerdict::Failed { reason } => BotAuthVerdict::Failed {
                 agent_name: matched.agent.clone(),
                 reason,
@@ -344,17 +482,19 @@ impl BotAuthProvider {
             }
         };
         // Pick the first signature with a recognised keyid; an inbound
-        // crawler typically advertises one.
-        let mut matched_key_id: Option<String> = None;
+        // crawler typically advertises one. Track the matched entry's
+        // nonce alongside the keyid so the WOR-502 replay check sees
+        // the same signature we are about to verify cryptographically.
+        let mut matched: Option<(String, Option<String>)> = None;
         for (_label, entry) in &entries {
             if let Some(kid) = entry.params.keyid.as_deref() {
                 if self.by_key_id.contains_key(kid) {
-                    matched_key_id = Some(kid.to_string());
+                    matched = Some((kid.to_string(), entry.params.nonce.clone()));
                     break;
                 }
             }
         }
-        let Some(kid) = matched_key_id else {
+        let Some((kid, nonce)) = matched else {
             // Surface the first claimed keyid so logs name what the
             // crawler advertised.
             let claimed = entries
@@ -368,9 +508,21 @@ impl BotAuthProvider {
             .get(&kid)
             .expect("checked contains_key above");
         match verifier.verify_request(req) {
-            VerifyVerdict::Ok { .. } => BotAuthVerdict::Verified {
-                agent_name: agent_name.clone(),
-            },
+            VerifyVerdict::Ok { .. } => {
+                // WOR-502: only burn the nonce once we know the
+                // request was genuinely signed by the claimed agent,
+                // otherwise an attacker could exhaust a legitimate
+                // nonce by replaying an unsigned spoof.
+                if let Err(reason) = self.check_nonce(nonce.as_deref()) {
+                    return BotAuthVerdict::Failed {
+                        agent_name: Some(agent_name.clone()),
+                        reason: reason.to_string(),
+                    };
+                }
+                BotAuthVerdict::Verified {
+                    agent_name: agent_name.clone(),
+                }
+            }
             VerifyVerdict::Failed { reason } => BotAuthVerdict::Failed {
                 agent_name: Some(agent_name.clone()),
                 reason,
@@ -382,6 +534,7 @@ impl BotAuthProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::quote_token::InMemoryNonceStore;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
     fn ed25519_keypair() -> (Vec<u8>, Vec<u8>) {
@@ -390,6 +543,62 @@ mod tests {
         let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
         let public = kp.public_key().as_ref().to_vec();
         (pkcs8.as_ref().to_vec(), public)
+    }
+
+    /// Build a real Ed25519-signed request whose Signature-Input
+    /// carries a `nonce` parameter. The signature base is computed
+    /// against the public helper so the verifier accepts it; tests
+    /// then replay or vary the request to exercise the WOR-502
+    /// branches.
+    fn signed_request_with_nonce(
+        pkcs8: &[u8],
+        key_id: &str,
+        nonce: &str,
+    ) -> http::Request<bytes::Bytes> {
+        let kp = Ed25519KeyPair::from_pkcs8(pkcs8).unwrap();
+        let label = "sig1";
+        let sig_input_value = format!(
+            "{label}=(\"@method\" \"@target-uri\");created=1700000000;keyid=\"{key_id}\";alg=\"ed25519\";nonce=\"{nonce}\""
+        );
+        let req_base = http::Request::builder()
+            .method("GET")
+            .uri("https://example.com/article")
+            .header("signature-input", &sig_input_value)
+            .body(bytes::Bytes::new())
+            .unwrap();
+        let entries = parse_signature_input(&sig_input_value).unwrap();
+        let (_, entry) = &entries[0];
+        let base = sbproxy_middleware::signatures::build_signature_base(&req_base, entry).unwrap();
+        let sig = kp.sign(base.as_bytes());
+        let sig_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, sig.as_ref());
+        let sig_value = format!("{label}=:{sig_b64}:");
+        http::Request::builder()
+            .method("GET")
+            .uri("https://example.com/article")
+            .header("signature-input", sig_input_value)
+            .header("signature", sig_value)
+            .body(bytes::Bytes::new())
+            .unwrap()
+    }
+
+    /// Build a provider seeded with a single ed25519 agent whose
+    /// public key is `public`. Callers chain `with_nonce_store`
+    /// when they want WOR-502 enforcement.
+    fn provider_with_agent(key_id: &str, public: &[u8]) -> BotAuthProvider {
+        let public_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, public);
+        BotAuthProvider::from_config(serde_json::json!({
+            "agents": [
+                {
+                    "name": "openai-gptbot",
+                    "key_id": key_id,
+                    "algorithm": "ed25519",
+                    "public_key": public_b64,
+                    "required_components": ["@method", "@target-uri"],
+                }
+            ]
+        }))
+        .expect("provider builds")
     }
 
     #[test]
@@ -529,5 +738,212 @@ mod tests {
             }
             other => panic!("expected Verified, got {:?}", other),
         }
+    }
+
+    // --- WOR-502: nonce enforcement on the verifier ---
+
+    #[test]
+    fn nonce_policy_defaults_to_strict() {
+        // When the operator omits `nonce_policy`, the provider must
+        // fail closed. Anything else is a regression.
+        let policy: NoncePolicy =
+            serde_json::from_value(serde_json::json!(null)).unwrap_or_default();
+        assert_eq!(policy, NoncePolicy::Strict);
+    }
+
+    #[test]
+    fn strict_first_time_nonce_verifies() {
+        let (pkcs8, public) = ed25519_keypair();
+        let key_id = "wor-502-strict-fresh";
+        let provider = provider_with_agent(key_id, &public)
+            .with_nonce_store(Arc::new(InMemoryNonceStore::new()) as Arc<dyn NonceStore>);
+        let req = signed_request_with_nonce(&pkcs8, key_id, "nonce-001");
+        match provider.verify(&req) {
+            BotAuthVerdict::Verified { agent_name } => {
+                assert_eq!(agent_name, "openai-gptbot");
+            }
+            other => panic!("expected Verified on first use, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn strict_replayed_nonce_returns_failed_nonce_replay() {
+        let (pkcs8, public) = ed25519_keypair();
+        let key_id = "wor-502-strict-replay";
+        let store = Arc::new(InMemoryNonceStore::new()) as Arc<dyn NonceStore>;
+        let provider = provider_with_agent(key_id, &public).with_nonce_store(store);
+        let req = signed_request_with_nonce(&pkcs8, key_id, "nonce-replay");
+        // First call consumes the nonce.
+        assert!(matches!(
+            provider.verify(&req),
+            BotAuthVerdict::Verified { .. }
+        ));
+        // Second call must be rejected with reason="nonce_replay".
+        match provider.verify(&req) {
+            BotAuthVerdict::Failed { reason, agent_name } => {
+                assert_eq!(reason, "nonce_replay");
+                assert_eq!(agent_name.as_deref(), Some("openai-gptbot"));
+            }
+            other => panic!("expected Failed nonce_replay, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn permissive_replayed_nonce_verifies_and_increments_metric() {
+        let (pkcs8, public) = ed25519_keypair();
+        let key_id = "wor-502-permissive-replay";
+        let public_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &public);
+        let provider = BotAuthProvider::from_config(serde_json::json!({
+            "nonce_policy": "permissive",
+            "agents": [
+                {
+                    "name": "openai-gptbot",
+                    "key_id": key_id,
+                    "algorithm": "ed25519",
+                    "public_key": public_b64,
+                    "required_components": ["@method", "@target-uri"],
+                }
+            ]
+        }))
+        .expect("provider builds")
+        .with_nonce_store(Arc::new(InMemoryNonceStore::new()) as Arc<dyn NonceStore>);
+
+        let req = signed_request_with_nonce(&pkcs8, key_id, "nonce-permissive");
+
+        // Snapshot the counter before the replay; the metric is
+        // registered lazily on the first record call.
+        let before = permissive_replay_metric();
+        assert!(matches!(
+            provider.verify(&req),
+            BotAuthVerdict::Verified { .. }
+        ));
+        // Permissive: second call still verifies but the metric must
+        // bump by exactly one.
+        match provider.verify(&req) {
+            BotAuthVerdict::Verified { agent_name } => {
+                assert_eq!(agent_name, "openai-gptbot");
+            }
+            other => panic!("expected Verified under permissive replay, got {:?}", other),
+        }
+        let after = permissive_replay_metric();
+        assert_eq!(
+            after,
+            before + 1,
+            "permissive replay must increment the metric exactly once"
+        );
+    }
+
+    #[test]
+    fn no_nonce_store_replay_does_not_trip() {
+        // Backward compatibility: providers built without a nonce
+        // store must keep their pre-WOR-502 behaviour even when the
+        // same nonce is presented twice.
+        let (pkcs8, public) = ed25519_keypair();
+        let key_id = "wor-502-no-store";
+        let provider = provider_with_agent(key_id, &public);
+        let req = signed_request_with_nonce(&pkcs8, key_id, "nonce-no-store");
+        assert!(matches!(
+            provider.verify(&req),
+            BotAuthVerdict::Verified { .. }
+        ));
+        assert!(matches!(
+            provider.verify(&req),
+            BotAuthVerdict::Verified { .. }
+        ));
+    }
+
+    #[test]
+    fn request_without_nonce_parameter_is_unchanged() {
+        // A signature with no `nonce` parameter must verify exactly
+        // like it did before WOR-502. The check is skipped because
+        // `entry.params.nonce` is None; the store is never touched.
+        let (pkcs8, public) = ed25519_keypair();
+        let key_id = "wor-502-no-nonce-param";
+        let public_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &public);
+
+        let kp = Ed25519KeyPair::from_pkcs8(&pkcs8).unwrap();
+        let label = "sig1";
+        let sig_input_value = format!(
+            "{label}=(\"@method\" \"@target-uri\");created=1700000000;keyid=\"{key_id}\";alg=\"ed25519\""
+        );
+        let req_base = http::Request::builder()
+            .method("GET")
+            .uri("https://example.com/article")
+            .header("signature-input", &sig_input_value)
+            .body(bytes::Bytes::new())
+            .unwrap();
+        let entries = parse_signature_input(&sig_input_value).unwrap();
+        let (_, entry) = &entries[0];
+        let base = sbproxy_middleware::signatures::build_signature_base(&req_base, entry).unwrap();
+        let sig = kp.sign(base.as_bytes());
+        let sig_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, sig.as_ref());
+        let sig_value = format!("{label}=:{sig_b64}:");
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("https://example.com/article")
+            .header("signature-input", sig_input_value)
+            .header("signature", sig_value)
+            .body(bytes::Bytes::new())
+            .unwrap();
+
+        let provider = BotAuthProvider::from_config(serde_json::json!({
+            "agents": [
+                {
+                    "name": "openai-gptbot",
+                    "key_id": key_id,
+                    "algorithm": "ed25519",
+                    "public_key": public_b64,
+                    "required_components": ["@method", "@target-uri"],
+                }
+            ]
+        }))
+        .expect("provider builds")
+        .with_nonce_store(Arc::new(InMemoryNonceStore::new()) as Arc<dyn NonceStore>);
+
+        // Even with a store wired in and strict policy, no `nonce`
+        // parameter means no check. Calling verify twice still
+        // succeeds because the store is never consulted.
+        assert!(matches!(
+            provider.verify(&req),
+            BotAuthVerdict::Verified { .. }
+        ));
+        assert!(matches!(
+            provider.verify(&req),
+            BotAuthVerdict::Verified { .. }
+        ));
+    }
+
+    /// Read the current value of the `permissive` label on the
+    /// WOR-502 replay counter, so tests can assert the delta after a
+    /// recorded event. Returns zero before any record call has
+    /// landed (the counter is registered lazily inside
+    /// `record_bot_auth_nonce_replay`).
+    ///
+    /// prometheus 0.14 wraps the counter in `protobuf::MessageField`
+    /// rather than returning it by value, so we follow the same
+    /// `.as_ref().unwrap().value.unwrap()` ladder the clock-skew
+    /// tests use.
+    fn permissive_replay_metric() -> u64 {
+        let families = prometheus::gather();
+        for family in families {
+            if family.name() != "sbproxy_bot_auth_nonce_replay_total" {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let matches_permissive = metric
+                    .get_label()
+                    .iter()
+                    .any(|l| l.name() == "policy" && l.value() == "permissive");
+                if !matches_permissive {
+                    continue;
+                }
+                let v = metric.counter.as_ref().and_then(|c| c.value).unwrap_or(0.0);
+                return v as u64;
+            }
+        }
+        0
     }
 }

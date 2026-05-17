@@ -981,6 +981,29 @@ pub fn record_http_framing_block(reason: &str) {
     counter.with_label_values(&[reason]).inc();
 }
 
+/// Record a replayed nonce observed by the Web Bot Auth verifier
+/// (WOR-502). `policy` is one of the closed labels `strict` (the
+/// verifier rejected the request) or `permissive` (the verifier
+/// logged the replay and still returned Verified, the operator
+/// opted in to monitoring without blocking).
+///
+/// Cardinality is bounded at two label values; both are compile-time
+/// constants on the call path so there is no cardinality risk.
+pub fn record_bot_auth_nonce_replay(policy: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_bot_auth_nonce_replay_total",
+            "Web Bot Auth signatures rejected (or logged) because the nonce was already observed",
+            &["policy"],
+        )
+        .expect("bot auth nonce replay counter registers")
+    });
+    counter.with_label_values(&[policy]).inc();
+}
+
 /// Count JWKS refreshes triggered synchronously by an unknown JWT `kid`.
 ///
 /// `result` is intentionally closed by convention: `success`, `failure`,
