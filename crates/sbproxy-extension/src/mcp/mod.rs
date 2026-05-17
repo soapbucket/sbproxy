@@ -17,6 +17,7 @@
 //! - [`guardrails`] - Safety controls for MCP tool invocations.
 //! - [`context_opt`] - Optimize context window usage by prioritising frequently-used tools.
 //! - [`rest_to_mcp`] - Expose REST APIs as MCP servers.
+//! - [`verify_before_commit`] - VIGIL-pattern verify-before-commit checks for tool calls.
 
 pub mod access_control;
 pub mod audit;
@@ -34,6 +35,7 @@ pub mod spans;
 pub mod sse_client;
 pub mod streamable;
 pub mod types;
+pub mod verify_before_commit;
 
 pub use access_control::ToolAccessPolicy;
 pub use audit::{McpAuditBuilder, McpAuditEntry};
@@ -47,3 +49,7 @@ pub use openapi_convert::openapi_to_mcp_tools;
 pub use registry::{ToolHandlerType, ToolRegistry};
 pub use rest_to_mcp::{create_mcp_handler, execute_tool_as_rest, RestToMcpConfig};
 pub use types::*;
+pub use verify_before_commit::{
+    CompositeVerifier, DescriptorFile, StaticDescriptorVerifier, ToolDescriptor,
+    VerifyBeforeCommit, VerifyContext, VerifyVerdict,
+};
