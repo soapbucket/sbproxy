@@ -1,5 +1,5 @@
 # sbproxy (Rust workspace)
-*Last modified: 2026-05-03*
+*Last modified: 2026-05-17*
 
 The active implementation of sbproxy. Cargo workspace with ~20
 crates under `crates/`, an e2e suite under `e2e/`, examples under
@@ -113,12 +113,29 @@ chain-construction path.
 
 ## Conventions
 
-- The public API surface lives in `sbproxy-plugin`, `sbproxy-config`,
-  and `sbproxy-httpkit`. Internal crates must not be imported from
-  these. Two further public crates (`sbproxy-events` and
-  `sbproxy-proxy`) are planned but not yet implemented; until they
-  ship, the closest analogs are `sbproxy-observe` (events / metrics)
-  and `sbproxy-core` (request pipeline) plus the `sbproxy` binary.
+- The public API surface is the following three crates, and only
+  these three. Internal crates must not be imported from them, and
+  no other crate in this workspace is part of the public surface
+  today.
+  - `sbproxy-plugin` - public plugin trait surface (`PolicyEnforcer`,
+    `ActionHandler`, `AuthProvider`, `TransformHandler`,
+    `RequestEnricher`, registry).
+  - `sbproxy-config` - config schema and `compile_config()` entry
+    point.
+  - `sbproxy-httpkit` - HTTP request/response helpers shared by
+    plugin authors.
+
+  Two further public crates are planned but not yet shipped:
+  - `sbproxy-events` (planned) - until it lands, events and metrics
+    are reached through `sbproxy-observe`, which is treated as
+    internal.
+  - `sbproxy-proxy` (planned) - until it lands, the request
+    pipeline lives in `sbproxy-core` plus the `sbproxy` binary,
+    both also treated as internal.
+
+  Do not advertise the two planned crates as available; reach for
+  the `sbproxy-observe` / `sbproxy-core` analogs in the interim and
+  expect the seam to move when the planned crates ship.
 - Storage stack: `redb` for embedded KV, SQLite for relational, and
   `memory / file / memcached / redis` for the response cache. Pebble
   is Go-only and is not used in this workspace.
