@@ -21,6 +21,7 @@
 pub mod access_control;
 pub mod audit;
 pub mod code_mode;
+pub mod codemode_from_openapi;
 pub mod codemode_ts;
 pub mod context_opt;
 pub mod federation;
@@ -37,6 +38,7 @@ pub mod types;
 pub use access_control::ToolAccessPolicy;
 pub use audit::{McpAuditBuilder, McpAuditEntry};
 pub use code_mode::{compress_tool_schema, estimate_token_reduction};
+pub use codemode_from_openapi::{emit_codemode_from_openapi, openapi_to_federated_tools};
 pub use context_opt::ToolUsageTracker;
 pub use federation::{FederatedTool, McpCallOutcome, McpFederation, McpServerConfig};
 pub use guardrails::{check_tool_invocation, McpGuardrailConfig};
