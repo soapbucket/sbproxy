@@ -7903,6 +7903,13 @@ impl ProxyHttp for SbProxy {
                         ja4,
                         ja4h: ja4h_supplied,
                         ja4s: ja4s_supplied,
+                        // WOR-586 added `sni` + `alpn`; this synthetic
+                        // construction path lacks the raw ClientHello
+                        // bytes, so leave both at their defaults. The
+                        // real ClientHello-parsing path populates them
+                        // via `parse_client_hello`.
+                        sni: None,
+                        alpn: Vec::new(),
                         trustworthy,
                     });
                 }
