@@ -184,13 +184,28 @@ fn write_codemode_namespace(out: &mut String, tools: &[FederatedTool]) {
         let pascal = to_pascal_case(&tool.name);
         let one_line_desc = tool.description.lines().next().unwrap_or("").trim();
         let _ = writeln!(out, "  /** {} */", one_line_desc.replace("*/", "* /"));
-        let _ = writeln!(
-            out,
-            "  {ident}: (input: {pascal}Input): Promise<{pascal}Output> => __codemode_call('{tool}', input as unknown),",
-            ident = to_safe_ident(&tool.name),
-            tool = tool.name,
-            pascal = pascal,
-        );
+        if tool.streaming {
+            // Streaming tools yield chunks rather than resolve once.
+            // Emit `AsyncIterable<Output>` so the agent can
+            // `for await (const chunk of codemode.tool(...))`. The
+            // matching runtime helper consumes the upstream as
+            // server-sent events or NDJSON.
+            let _ = writeln!(
+                out,
+                "  {ident}: (input: {pascal}Input): AsyncIterable<{pascal}Output> => __codemode_call_stream('{tool}', input as unknown),",
+                ident = to_safe_ident(&tool.name),
+                tool = tool.name,
+                pascal = pascal,
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  {ident}: (input: {pascal}Input): Promise<{pascal}Output> => __codemode_call('{tool}', input as unknown),",
+                ident = to_safe_ident(&tool.name),
+                tool = tool.name,
+                pascal = pascal,
+            );
+        }
     }
     let _ = writeln!(out, "}} as const;");
     let _ = writeln!(out);
@@ -198,7 +213,8 @@ fn write_codemode_namespace(out: &mut String, tools: &[FederatedTool]) {
     let _ = writeln!(out);
 }
 
-fn write_runtime_stub(out: &mut String, base_url: &str, _tools: &[FederatedTool]) {
+fn write_runtime_stub(out: &mut String, base_url: &str, tools: &[FederatedTool]) {
+    let any_streaming = tools.iter().any(|t| t.streaming);
     let _ = writeln!(out, "// --- Runtime stub ---");
     let _ = writeln!(out, "//");
     let _ = writeln!(
@@ -265,6 +281,117 @@ fn write_runtime_stub(out: &mut String, base_url: &str, _tools: &[FederatedTool]
     );
     let _ = writeln!(out, "  }}");
     let _ = writeln!(out, "  return (await response.json()) as any;");
+    let _ = writeln!(out, "}}");
+
+    if any_streaming {
+        write_streaming_runtime_stub(out, base_url);
+    }
+}
+
+fn write_streaming_runtime_stub(out: &mut String, base_url: &str) {
+    let _ = writeln!(out);
+    let _ = writeln!(out, "// Streaming variant. Consumes the upstream as");
+    let _ = writeln!(out, "// `text/event-stream` (one JSON object per `data:`");
+    let _ = writeln!(out, "// line) or `application/x-ndjson` (one JSON object");
+    let _ = writeln!(out, "// per newline-delimited line). Yields each parsed");
+    let _ = writeln!(out, "// chunk; rejects on transport error.");
+    let _ = writeln!(
+        out,
+        "async function* __codemode_call_stream(tool: string, input: unknown): AsyncIterable<any> {{"
+    );
+    let _ = writeln!(out, "  const headers: Record<string, string> = {{");
+    let _ = writeln!(out, "    'content-type': 'application/json',");
+    let _ = writeln!(
+        out,
+        "    'accept': 'text/event-stream, application/x-ndjson',"
+    );
+    let _ = writeln!(out, "  }};");
+    let _ = writeln!(out, "  const env = (globalThis as any).process?.env;");
+    let _ = writeln!(out, "  const token = env?.AGENT_GATEWAY_TOKEN;");
+    let _ = writeln!(
+        out,
+        "  if (typeof token === 'string' && token.length > 0) {{"
+    );
+    let _ = writeln!(out, "    headers['authorization'] = `Bearer ${{token}}`;");
+    let _ = writeln!(out, "  }}");
+    let _ = writeln!(
+        out,
+        "  const url = `{base_url}/call/${{encodeURIComponent(tool)}}`;"
+    );
+    let _ = writeln!(out, "  const response = await __codemode_fetch(url, {{");
+    let _ = writeln!(out, "    method: 'POST',");
+    let _ = writeln!(out, "    headers,");
+    let _ = writeln!(out, "    body: JSON.stringify(input ?? {{}}),");
+    let _ = writeln!(out, "  }});");
+    let _ = writeln!(out, "  if (!response.ok || !response.body) {{");
+    let _ = writeln!(
+        out,
+        "    const text = await response.text().catch(() => '');"
+    );
+    let _ = writeln!(
+        out,
+        "    throw new Error(`codemode ${{tool}} stream failed ${{response.status}}: ${{text}}`);"
+    );
+    let _ = writeln!(out, "  }}");
+    let _ = writeln!(
+        out,
+        "  const ct = (response.headers.get('content-type') ?? '').toLowerCase();"
+    );
+    let _ = writeln!(out, "  const isSse = ct.includes('text/event-stream');");
+    let _ = writeln!(out, "  const reader = response.body.getReader();");
+    let _ = writeln!(out, "  const decoder = new TextDecoder('utf-8');");
+    let _ = writeln!(out, "  let buf = '';");
+    let _ = writeln!(out, "  try {{");
+    let _ = writeln!(out, "    while (true) {{");
+    let _ = writeln!(out, "      const {{ value, done }} = await reader.read();");
+    let _ = writeln!(out, "      if (done) break;");
+    let _ = writeln!(
+        out,
+        "      buf += decoder.decode(value, {{ stream: true }});"
+    );
+    let _ = writeln!(out, "      let idx;");
+    let _ = writeln!(out, "      const delim = isSse ? '\\n\\n' : '\\n';");
+    let _ = writeln!(out, "      while ((idx = buf.indexOf(delim)) !== -1) {{");
+    let _ = writeln!(out, "        const frame = buf.slice(0, idx);");
+    let _ = writeln!(out, "        buf = buf.slice(idx + delim.length);");
+    let _ = writeln!(
+        out,
+        "        const payload = isSse ? extractSseData(frame) : frame.trim();"
+    );
+    let _ = writeln!(out, "        if (!payload) continue;");
+    let _ = writeln!(out, "        if (payload === '[DONE]') return;");
+    let _ = writeln!(out, "        try {{");
+    let _ = writeln!(out, "          yield JSON.parse(payload) as any;");
+    let _ = writeln!(out, "        }} catch {{");
+    let _ = writeln!(out, "          // Skip unparseable frames; the agent");
+    let _ = writeln!(out, "          // sees the surrounding stream intact.");
+    let _ = writeln!(out, "        }}");
+    let _ = writeln!(out, "      }}");
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "    const tail = buf.trim();");
+    let _ = writeln!(out, "    if (tail && tail !== '[DONE]') {{");
+    let _ = writeln!(
+        out,
+        "      try {{ yield JSON.parse(tail) as any; }} catch {{}}"
+    );
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "  }} finally {{");
+    let _ = writeln!(out, "    reader.releaseLock();");
+    let _ = writeln!(out, "  }}");
+    let _ = writeln!(out, "}}");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "function extractSseData(frame: string): string {{");
+    let _ = writeln!(out, "  const lines = frame.split('\\n');");
+    let _ = writeln!(out, "  const data: string[] = [];");
+    let _ = writeln!(out, "  for (const line of lines) {{");
+    let _ = writeln!(out, "    if (line.startsWith('data:')) {{");
+    let _ = writeln!(
+        out,
+        "      data.push(line.slice('data:'.length).replace(/^ /, ''));"
+    );
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "  }}");
+    let _ = writeln!(out, "  return data.join('\\n');");
     let _ = writeln!(out, "}}");
 }
 
@@ -557,6 +684,21 @@ mod tests {
             description: description.to_string(),
             input_schema,
             server_name: "test-server".to_string(),
+            streaming: false,
+        }
+    }
+
+    fn streaming_tool(
+        name: &str,
+        description: &str,
+        input_schema: serde_json::Value,
+    ) -> FederatedTool {
+        FederatedTool {
+            name: name.to_string(),
+            description: description.to_string(),
+            input_schema,
+            server_name: "test-server".to_string(),
+            streaming: true,
         }
     }
 
@@ -740,5 +882,62 @@ mod tests {
         assert!(out.contains("export interface HelloOutput {"));
         assert!(out.contains("content?: Array<{"));
         assert!(out.contains("isError?: boolean;"));
+    }
+
+    #[test]
+    fn streaming_tool_emits_async_iterable_signature() {
+        let schema = json!({"type": "object", "properties": {}});
+        let out = emit_codemode_ts(
+            &[streaming_tool(
+                "stream_search",
+                "Stream search results",
+                schema,
+            )],
+            "https://gw.example",
+        );
+        assert!(
+            out.contains("AsyncIterable<StreamSearchOutput>"),
+            "streaming tool should declare AsyncIterable<Output>, got:\n{}",
+            out
+        );
+        assert!(
+            !out.contains("stream_search') => __codemode_call("),
+            "streaming tool should not use the single-response helper"
+        );
+        assert!(
+            out.contains("__codemode_call_stream('stream_search'"),
+            "streaming tool should call the streaming helper"
+        );
+    }
+
+    #[test]
+    fn streaming_runtime_stub_is_emitted_only_when_needed() {
+        let schema = json!({"type": "object", "properties": {}});
+        let non_streaming = emit_codemode_ts(&[tool("plain", "Plain", schema.clone())], "x");
+        assert!(
+            !non_streaming.contains("async function* __codemode_call_stream"),
+            "non-streaming modules should not carry the streaming helper"
+        );
+
+        let streaming = emit_codemode_ts(
+            &[streaming_tool("flow", "Streaming flow", schema)],
+            "https://gw.example",
+        );
+        assert!(streaming.contains("async function* __codemode_call_stream"));
+        assert!(streaming.contains("text/event-stream"));
+        assert!(streaming.contains("application/x-ndjson"));
+        assert!(streaming.contains("function extractSseData"));
+    }
+
+    #[test]
+    fn mixed_tools_emit_correct_signatures_per_tool() {
+        let schema = json!({"type": "object", "properties": {}});
+        let tools = vec![
+            tool("once", "single-shot", schema.clone()),
+            streaming_tool("forever", "infinite", schema),
+        ];
+        let out = emit_codemode_ts(&tools, "https://gw.example");
+        assert!(out.contains("once: (input: OnceInput): Promise<OnceOutput>"));
+        assert!(out.contains("forever: (input: ForeverInput): AsyncIterable<ForeverOutput>"));
     }
 }

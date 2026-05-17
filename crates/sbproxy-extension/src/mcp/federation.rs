@@ -67,6 +67,15 @@ pub struct FederatedTool {
     pub input_schema: serde_json::Value,
     /// Name of the upstream server that owns this tool.
     pub server_name: String,
+    /// True when the upstream signalled that this tool returns a stream
+    /// of chunks rather than a single response value. The codemode TS
+    /// emitter renders streaming tools with an `AsyncIterable<Output>`
+    /// signature so agents can `for await` over the response. Recognised
+    /// signals (any one is enough): a top-level `streaming: true` boolean
+    /// on the tool definition, the Speakeasy-style `x-streaming: true`
+    /// extension, or an `outputContentType` of `text/event-stream` or
+    /// `application/x-ndjson`.
+    pub streaming: bool,
 }
 
 // --- McpFederation ---
@@ -179,11 +188,13 @@ impl McpFederation {
                     .get("inputSchema")
                     .cloned()
                     .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+                let streaming = tool_advertises_streaming(&t);
                 Some(FederatedTool {
                     name,
                     description,
                     input_schema,
                     server_name: server.name.clone(),
+                    streaming,
                 })
             })
             .collect();
@@ -449,6 +460,35 @@ impl McpFederation {
     }
 }
 
+/// Detect whether an upstream MCP `tools/list` entry advertises a
+/// streaming response. The MCP spec does not pin the streaming
+/// signal yet, so the federation recognises three conventions any
+/// one of which is enough:
+///
+/// 1. A top-level `streaming: true` boolean on the tool definition,
+///    matching the shape `@cloudflare/codemode` v0.2.1 emits.
+/// 2. An `x-streaming: true` extension, matching the Speakeasy
+///    annotation style.
+/// 3. An `outputContentType` (or `output_content_type` snake-case
+///    alias) of `text/event-stream` or `application/x-ndjson`,
+///    derived from the upstream's declared response media type.
+fn tool_advertises_streaming(tool: &serde_json::Value) -> bool {
+    if tool.get("streaming").and_then(|v| v.as_bool()) == Some(true) {
+        return true;
+    }
+    if tool.get("x-streaming").and_then(|v| v.as_bool()) == Some(true) {
+        return true;
+    }
+    let content_type = tool
+        .get("outputContentType")
+        .or_else(|| tool.get("output_content_type"))
+        .and_then(|v| v.as_str());
+    matches!(
+        content_type,
+        Some("text/event-stream") | Some("application/x-ndjson")
+    )
+}
+
 /// Return the registered policy hooks, or a single-element list with
 /// the default no-op hook when nothing is registered.
 ///
@@ -486,6 +526,7 @@ mod tests {
             description: format!("Tool {}", name),
             input_schema: json!({"type": "object", "properties": {}}),
             server_name: server.to_string(),
+            streaming: false,
         }
     }
 
@@ -540,6 +581,7 @@ mod tests {
                     "required": ["query"]
                 }),
                 server_name: "docs".to_string(),
+                streaming: false,
             },
         );
         map.insert(
@@ -556,6 +598,7 @@ mod tests {
                     "required": ["title"]
                 }),
                 server_name: "gh".to_string(),
+                streaming: false,
             },
         );
         fed.tools.store(Arc::new(map));
@@ -609,6 +652,7 @@ mod tests {
             description: "Search the web".to_string(),
             input_schema: json!({"type": "object", "properties": {"query": {"type": "string"}}}),
             server_name: "web_server".to_string(),
+            streaming: false,
         };
         assert_eq!(tool.name, "search");
         assert_eq!(tool.server_name, "web_server");
@@ -631,6 +675,50 @@ mod tests {
             transport: "sse".to_string(),
         };
         assert_eq!(config.transport, "sse");
+    }
+
+    // --- WOR-487: streaming detection ---
+
+    #[test]
+    fn tool_advertises_streaming_via_top_level_flag() {
+        let t = json!({"name": "stream", "streaming": true});
+        assert!(tool_advertises_streaming(&t));
+    }
+
+    #[test]
+    fn tool_advertises_streaming_via_x_streaming_extension() {
+        let t = json!({"name": "stream", "x-streaming": true});
+        assert!(tool_advertises_streaming(&t));
+    }
+
+    #[test]
+    fn tool_advertises_streaming_via_event_stream_content_type() {
+        let t = json!({"name": "stream", "outputContentType": "text/event-stream"});
+        assert!(tool_advertises_streaming(&t));
+    }
+
+    #[test]
+    fn tool_advertises_streaming_via_ndjson_content_type() {
+        let t = json!({"name": "stream", "output_content_type": "application/x-ndjson"});
+        assert!(tool_advertises_streaming(&t));
+    }
+
+    #[test]
+    fn tool_not_streaming_by_default() {
+        let t = json!({"name": "plain"});
+        assert!(!tool_advertises_streaming(&t));
+    }
+
+    #[test]
+    fn tool_streaming_false_is_not_streaming() {
+        let t = json!({"name": "plain", "streaming": false});
+        assert!(!tool_advertises_streaming(&t));
+    }
+
+    #[test]
+    fn tool_unrelated_content_type_is_not_streaming() {
+        let t = json!({"name": "plain", "outputContentType": "application/json"});
+        assert!(!tool_advertises_streaming(&t));
     }
 
     // --- Collision handling (simulated) ---
