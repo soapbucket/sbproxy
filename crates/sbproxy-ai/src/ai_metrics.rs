@@ -296,6 +296,44 @@ pub fn record_shadow_timeout() {
     AI_SHADOW_TIMEOUT.inc();
 }
 
+// --- Cascade routing metrics ---
+
+/// Per-tier outcome counter for the [`RoutingStrategy::Cascade`]
+/// dispatch path. `tier` is the 0-based tier index as a decimal
+/// string; `outcome` is one of `accepted`, `retry`, or `cost_cap`.
+/// Cardinality is bounded by the number of configured tiers (in
+/// practice 2 to 5) times the three outcome labels.
+///
+/// [`RoutingStrategy::Cascade`]: crate::routing::RoutingStrategy::Cascade
+static AI_CASCADE_TIER_OUTCOMES: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_cascade_tier_outcomes_total",
+            "Cascade routing tier outcomes (accepted | retry | cost_cap)"
+        ),
+        &["tier", "outcome"]
+    )
+    .unwrap()
+});
+
+/// Record one cascade tier outcome. `tier_index` is converted to a
+/// decimal label; `outcome` should be a low-cardinality stable
+/// string from the closed set `{accepted, retry, cost_cap}`.
+pub fn record_cascade_tier_outcome(tier_index: usize, outcome: &str) {
+    AI_CASCADE_TIER_OUTCOMES
+        .with_label_values(&[tier_index.to_string().as_str(), outcome])
+        .inc();
+}
+
+/// Read the cumulative cascade tier outcome counter value. Tests
+/// use this to assert that the expected tiers ticked. Returns 0
+/// when no observations have landed yet.
+pub fn cascade_tier_outcome_value(tier_index: usize, outcome: &str) -> f64 {
+    AI_CASCADE_TIER_OUTCOMES
+        .with_label_values(&[tier_index.to_string().as_str(), outcome])
+        .get()
+}
+
 /// Read the current value of the in-flight shadow gauge. Used in
 /// tests and admin diagnostics to assert supervisor depth.
 pub fn shadow_inflight_value() -> f64 {

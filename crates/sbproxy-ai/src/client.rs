@@ -715,6 +715,345 @@ impl AiClient {
     }
 }
 
+/// Result of one cascade dispatch.
+///
+/// Carries the response that was either accepted by a tier or
+/// returned as the cascade's last attempt when the cost cap fired
+/// before any tier accepted. Tests and the server-side relay
+/// inspect [`Self::tier_index`] to learn which tier won.
+#[derive(Debug)]
+pub struct CascadeOutcome {
+    /// Final HTTP status from the accepted tier.
+    pub status: u16,
+    /// Response headers from the accepted tier.
+    pub headers: Vec<(String, String)>,
+    /// Response body bytes (already translated to OpenAI shape when
+    /// the upstream speaks a non-OpenAI wire format).
+    pub body: bytes::Bytes,
+    /// Name of the provider whose response is being returned.
+    pub provider_name: String,
+    /// Model id used for the chosen tier.
+    pub model: String,
+    /// Upstream wire format of the chosen tier.
+    pub format: ProviderFormat,
+    /// 0-based index of the tier whose response is being returned.
+    pub tier_index: usize,
+    /// `true` when the cascade exited because a tier's response
+    /// scored at or above its `quality_threshold`; `false` when the
+    /// cascade returned the last tier's response after exhausting
+    /// tiers without acceptance (cost cap, or no tier met the bar).
+    pub accepted: bool,
+}
+
+impl AiClient {
+    /// Dispatch a request using the cascade routing strategy. Walks
+    /// `cascade.tiers` in order; for each tier:
+    ///
+    /// 1. Skip the tier when dispatching it would push the
+    ///    cumulative estimated cost above `max_total_cost` (or
+    ///    above the tier's `cost_cap`). Record an outcome of
+    ///    `cost_cap`.
+    /// 2. Send the request with the tier's `model` substituted
+    ///    into the body's `model` field.
+    /// 3. Read the response body bytes (consuming the response),
+    ///    translate non-OpenAI shapes back to OpenAI Chat, and
+    ///    look for a top-level `confidence_score` JSON number.
+    /// 4. When the score is `>=` `quality_threshold` (or the field
+    ///    is absent, which is treated as `1.0`), accept and
+    ///    return the response. Record an outcome of `accepted`.
+    /// 5. When the response is empty, returned a refusal, or
+    ///    scored below the threshold, advance to the next tier.
+    ///    Record an outcome of `retry` and remember the body so
+    ///    the caller still has something to return when every
+    ///    tier scores low.
+    ///
+    /// On a transport error or 5xx response, the dispatcher logs
+    /// and advances to the next tier (the failure is also recorded
+    /// against the resilience layer when the provider exists in
+    /// the configured list). The cascade never short-circuits the
+    /// request entirely; the caller always gets the most recent
+    /// upstream response back, even when every tier disappointed.
+    ///
+    /// Streaming requests are out of scope: callers should detect
+    /// `body.stream == true` and skip this method.
+    pub async fn forward_cascade(
+        &self,
+        config: &AiHandlerConfig,
+        cascade: &crate::routing::CascadeConfig,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<CascadeOutcome> {
+        if cascade.tiers.is_empty() {
+            return Err(anyhow::anyhow!("cascade has no tiers"));
+        }
+
+        let mut last_outcome: Option<CascadeOutcome> = None;
+        let mut total_cost_micros: u64 = 0;
+
+        for (tier_idx, tier) in cascade.tiers.iter().enumerate() {
+            // Cost cap gate. Both the cascade-level and per-tier
+            // caps are evaluated against `estimate_cost_micros`
+            // for the tier's model. The cap fires before dispatch
+            // so a still-in-flight tier can finish even when its
+            // completion would push us over the budget.
+            let projected = total_cost_micros.saturating_add(estimate_cost_micros(&tier.model));
+            let over_global = cascade.max_total_cost.is_some_and(|cap| projected > cap);
+            let over_tier = tier.cost_cap.is_some_and(|cap| projected > cap);
+            if over_global || over_tier {
+                debug!(
+                    tier = tier_idx,
+                    provider = %tier.provider_id,
+                    model = %tier.model,
+                    projected_micros = projected,
+                    global_cap = ?cascade.max_total_cost,
+                    tier_cap = ?tier.cost_cap,
+                    "cascade: skipping tier; would exceed cost cap"
+                );
+                ai_metrics::record_cascade_tier_outcome(tier_idx, "cost_cap");
+                continue;
+            }
+
+            // Find the provider config for this tier.
+            let provider = match config
+                .providers
+                .iter()
+                .find(|p| p.name == tier.provider_id && p.enabled)
+            {
+                Some(p) => p,
+                None => {
+                    warn!(
+                        tier = tier_idx,
+                        provider_id = %tier.provider_id,
+                        "cascade: tier provider not found or disabled; skipping"
+                    );
+                    ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
+                    continue;
+                }
+            };
+
+            // Build the per-tier body with the tier's model
+            // substituted in. We do this before any model_map
+            // remap because the tier-specified model is the
+            // authoritative choice.
+            let mut tier_body = body.clone();
+            if let Some(obj) = tier_body.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(tier.model.clone()),
+                );
+            }
+
+            debug!(
+                tier = tier_idx,
+                provider = %provider.name,
+                model = %tier.model,
+                threshold = tier.quality_threshold,
+                "cascade: dispatching tier"
+            );
+
+            let resp = match self.forward_request(provider, path, &tier_body).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        tier = tier_idx,
+                        provider = %provider.name,
+                        error = %e,
+                        "cascade: transport error; trying next tier"
+                    );
+                    ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+            let format = provider_format(provider);
+
+            // Snapshot headers before consuming the body. We carry
+            // a small whitelist back through `CascadeOutcome`; the
+            // server-side relay re-applies them when writing the
+            // response back to the client.
+            let header_pairs: Vec<(String, String)> = resp
+                .headers()
+                .iter()
+                .filter_map(|(k, v)| {
+                    v.to_str()
+                        .ok()
+                        .map(|s| (k.as_str().to_string(), s.to_string()))
+                })
+                .collect();
+
+            // Bound the read at 8 MiB so a misbehaving provider
+            // cannot OOM the gateway. This is the same magnitude
+            // used by `read_capped_response_body` in the server
+            // when no explicit cap is configured.
+            let raw_bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(
+                        tier = tier_idx,
+                        provider = %provider.name,
+                        error = %e,
+                        "cascade: body read failed; trying next tier"
+                    );
+                    ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
+                    continue;
+                }
+            };
+
+            total_cost_micros = projected;
+
+            // Translate non-OpenAI shapes back to OpenAI Chat so the
+            // confidence_score lookup runs uniformly. The translated
+            // bytes are also what we hand back to the caller; the
+            // gateway speaks OpenAI Chat to clients by default.
+            let translated_vec = translators::translate_response_bytes(format, &raw_bytes);
+            let translated = bytes::Bytes::from(translated_vec);
+
+            // 5xx responses are treated as failure regardless of
+            // body shape. The cascade falls through to the next
+            // tier with the rationale that an upstream error is
+            // not a quality verdict.
+            if status.is_server_error() {
+                warn!(
+                    tier = tier_idx,
+                    provider = %provider.name,
+                    status = %status,
+                    "cascade: tier returned 5xx; trying next"
+                );
+                ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
+                last_outcome = Some(CascadeOutcome {
+                    status: status.as_u16(),
+                    headers: header_pairs,
+                    body: translated,
+                    provider_name: provider.name.clone(),
+                    model: tier.model.clone(),
+                    format,
+                    tier_index: tier_idx,
+                    accepted: false,
+                });
+                continue;
+            }
+
+            // Extract the quality signal. When `confidence_score`
+            // is absent we treat the response as quality 1.0 and
+            // accept. Empty or refusal-style responses force a
+            // retry even when no score is present.
+            let quality = extract_confidence_score(&translated);
+            let is_refusal = response_is_empty_or_refused(&translated);
+
+            if is_refusal {
+                debug!(
+                    tier = tier_idx,
+                    provider = %provider.name,
+                    "cascade: tier returned empty or refused response; trying next"
+                );
+                ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
+                last_outcome = Some(CascadeOutcome {
+                    status: status.as_u16(),
+                    headers: header_pairs,
+                    body: translated,
+                    provider_name: provider.name.clone(),
+                    model: tier.model.clone(),
+                    format,
+                    tier_index: tier_idx,
+                    accepted: false,
+                });
+                continue;
+            }
+
+            if quality < tier.quality_threshold {
+                debug!(
+                    tier = tier_idx,
+                    provider = %provider.name,
+                    quality,
+                    threshold = tier.quality_threshold,
+                    "cascade: tier scored below threshold; trying next"
+                );
+                ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
+                last_outcome = Some(CascadeOutcome {
+                    status: status.as_u16(),
+                    headers: header_pairs,
+                    body: translated,
+                    provider_name: provider.name.clone(),
+                    model: tier.model.clone(),
+                    format,
+                    tier_index: tier_idx,
+                    accepted: false,
+                });
+                continue;
+            }
+
+            // Accepted.
+            ai_metrics::record_cascade_tier_outcome(tier_idx, "accepted");
+            return Ok(CascadeOutcome {
+                status: status.as_u16(),
+                headers: header_pairs,
+                body: translated,
+                provider_name: provider.name.clone(),
+                model: tier.model.clone(),
+                format,
+                tier_index: tier_idx,
+                accepted: true,
+            });
+        }
+
+        last_outcome
+            .ok_or_else(|| anyhow::anyhow!("cascade exhausted without dispatching any tier"))
+    }
+}
+
+/// Estimate the cost of one request to `model` in micro-USD. Wraps
+/// [`crate::budget::estimate_cost`] with sensible default token
+/// counts (`prompt_tokens=512`, `completion_tokens=512`) so the
+/// cascade can compare projected spend across tiers before sending
+/// the request. The exact token shape of an in-flight request is
+/// not known until the response arrives; this estimate is a
+/// reasonable mid-conversation default.
+fn estimate_cost_micros(model: &str) -> u64 {
+    let cost_dollars = crate::budget::estimate_cost(model, 512, 512);
+    (cost_dollars * 1_000_000.0).round() as u64
+}
+
+/// Look for a top-level `confidence_score` JSON number in the
+/// response body. Returns `1.0` when the field is absent or the
+/// body is not JSON; returns `0.0` when the field is malformed.
+fn extract_confidence_score(body: &[u8]) -> f32 {
+    let v: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return 1.0,
+    };
+    match v.get("confidence_score") {
+        Some(score) => score.as_f64().map(|f| f as f32).unwrap_or(0.0),
+        None => 1.0,
+    }
+}
+
+/// Detect empty or explicit-refusal responses. Returns `true` when
+/// the body is empty, when no `choices[0].message.content` is
+/// present, or when the content is whitespace only. Refusal
+/// detection is intentionally conservative: only obvious empty
+/// shapes count; classifier-based refusal detection is a follow-up.
+fn response_is_empty_or_refused(body: &[u8]) -> bool {
+    if body.is_empty() {
+        return true;
+    }
+    let v: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let content = v
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"));
+    match content {
+        Some(serde_json::Value::String(s)) => s.trim().is_empty(),
+        Some(serde_json::Value::Null) | None => true,
+        _ => false,
+    }
+}
+
 /// Fire a single shadow request at `provider`, log the metadata, and
 /// drain the body so connections return to the pool.
 async fn run_shadow_request(

@@ -1,0 +1,77 @@
+# AI gateway: cascade routing across two tiers.
+#
+# The `cascade` strategy walks an ordered list of (provider, model)
+# tiers from cheapest to most expensive. Each tier's response is
+# graded against `quality_threshold` (compared to the response body's
+# top-level `confidence_score` field). When the score falls below the
+# threshold, the response is empty, or the response is refused, the
+# cascade retries on the next tier. The dispatcher stops as soon as
+# a tier's response meets the threshold or `max_total_cost` is hit.
+#
+# This implements the routing pattern proven Pareto-optimal in
+# "A Unified Approach to Routing and Cascading for LLMs"
+# (arxiv 2410.10347): try the cheap model first, fall back to the
+# expensive one only when the cheap answer is sub-threshold.
+#
+# Limitations in this version:
+#   - Streaming requests dispatch to tier 1 only. Mid-stream retry
+#     is out of scope for v1.
+#   - Quality scoring relies on the upstream emitting an explicit
+#     `confidence_score: f32` JSON field. Providers that do not
+#     emit one are treated as quality 1.0 (always accepted).
+#   - The semantic response cache is not engaged on the cascade
+#     path. The non-cascade strategies still cache normally.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#
+# Run:
+#   make run CONFIG=examples/ai-cascade-routing/sb.yml
+#
+# Test:
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "messages": [{"role": "user",
+#         "content": "Summarise the cascade routing pattern in one sentence."}]
+#     }'
+#
+# Each tier outcome ticks the
+# `sbproxy_ai_cascade_tier_outcomes_total{tier, outcome}` counter so
+# operators can plot how often the cheap tier is enough versus how
+# often the request escalates to the expensive tier.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing:
+        strategy: cascade
+        # Cap the cumulative micro-USD spend per request. Set high
+        # enough that both tiers can run when needed; tune downward
+        # to bias towards the cheap tier under cost pressure.
+        max_total_cost: 100000
+        tiers:
+          # Tier 1: cheapest path. Most short factual queries score
+          # above 0.7 here and never hit tier 2.
+          - provider_id: openai
+            model: gpt-4o-mini
+            quality_threshold: 0.7
+
+          # Tier 2: fallback. Only consulted when tier 1 returned
+          # an empty / refused / low-confidence answer.
+          - provider_id: openai
+            model: gpt-4o
+            quality_threshold: 0.85
+
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+            - gpt-4o
