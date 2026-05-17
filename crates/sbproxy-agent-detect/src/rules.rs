@@ -385,6 +385,7 @@ mod tests {
             http: Some(HttpSignals {
                 user_agent: ua.map(String::from),
                 headers_present: headers.iter().map(|h| h.to_ascii_lowercase()).collect(),
+                ..HttpSignals::default()
             }),
             tls: ja4.map(|j| TlsSignals {
                 ja4: Some(j.to_string()),
