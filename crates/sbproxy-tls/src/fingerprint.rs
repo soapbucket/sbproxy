@@ -83,11 +83,35 @@ pub struct TlsFingerprint {
     /// filtered. Example: `["h2", "http/1.1"]`. Empty when the
     /// extension was absent (WOR-586).
     pub alpn: Vec<String>,
+    /// Whether the ClientHello advertised a post-quantum hybrid
+    /// key share (WOR-501). Akamai enabled PQ-TLS by default on
+    /// 2026-01-31; by early 2026 about 57% of browser-initiated
+    /// connections include the `X25519MLKEM768` key share. Stock
+    /// Python `requests`, Node `node-fetch`, Go `net/http`, and the
+    /// vendor SDKs do not negotiate MLKEM. Absence on a connection
+    /// that otherwise claims to be a real browser is a strong
+    /// non-browser signal observable from the ClientHello.
+    pub pq_tls_present: bool,
     /// Whether the fingerprint reflects the actual client rather
     /// than an intermediate proxy / CDN. Computed from per-origin
     /// CIDR rules; defaults to `false` when no rule matches
     /// (conservative, per A5.1).
     pub trustworthy: bool,
+}
+
+/// IANA-assigned codepoints for post-quantum hybrid key-exchange
+/// groups (WOR-501). The X25519MLKEM768 hybrid is the one major
+/// browsers default to as of early 2026; the SecP256r1MLKEM768
+/// codepoint is recognised for completeness because Cloudflare,
+/// Google, and others have shipped it in interop builds.
+const PQ_KEY_SHARE_GROUPS: &[u16] = &[
+    // X25519MLKEM768 (Chrome / Edge / Akamai default in 2026).
+    0x11ec, // SecP256r1MLKEM768 (interop builds; see IANA TLS registry).
+    0x11eb,
+];
+
+fn key_shares_contain_pq(groups: &[u16]) -> bool {
+    groups.iter().any(|g| PQ_KEY_SHARE_GROUPS.contains(g))
 }
 
 impl TlsFingerprint {
@@ -142,6 +166,8 @@ pub fn parse_client_hello(bytes: &[u8]) -> TlsFingerprint {
     let ja3 = compute_ja3(&parsed);
     let ja4 = compute_ja4(&parsed);
 
+    let pq_tls_present = key_shares_contain_pq(&parsed.key_share_groups);
+
     TlsFingerprint {
         ja3: Some(ja3),
         ja4: Some(ja4),
@@ -149,6 +175,7 @@ pub fn parse_client_hello(bytes: &[u8]) -> TlsFingerprint {
         ja4s: None,
         sni: parsed.sni.clone(),
         alpn: parsed.alpn.clone(),
+        pq_tls_present,
         trustworthy: false,
     }
 }
@@ -220,6 +247,12 @@ struct ParsedClientHello {
     /// Populated alongside `alpn_first` / `alpn_last`; consumed by
     /// the agent-detect signal layer (WOR-586).
     alpn: Vec<String>,
+    /// Named groups the client offered in the `key_share` extension
+    /// (0x0033), GREASE filtered. Distinct from `curves`
+    /// (`supported_groups`, 0x000a): an entry in `key_share` is one
+    /// the client actually generated a public key for. Consumed by
+    /// the PQ-TLS detection signal (WOR-501).
+    key_share_groups: Vec<u16>,
     /// Signature algorithms (extension 0x000d), GREASE filtered.
     /// Not currently consumed by JA3 / JA4 emission, but parsed
     /// here so the JA4-extended (`ja4_r`) variant can be added in a
@@ -267,6 +300,7 @@ fn parse_client_hello_body(body: &[u8]) -> Option<ParsedClientHello> {
     let mut alpn_first: Option<String> = None;
     let mut alpn_last: Option<String> = None;
     let mut alpn: Vec<String> = Vec::new();
+    let mut key_share_groups: Vec<u16> = Vec::new();
     let mut sig_algs = Vec::new();
 
     while ext_reader.remaining() >= 4 {
@@ -361,6 +395,27 @@ fn parse_client_hello_body(body: &[u8]) -> Option<ParsedClientHello> {
                 alpn_last = all_alpns.last().cloned();
                 alpn = all_alpns;
             }
+            // key_share (RFC 8446 §4.2.8): u16 client_shares_len, then
+            // a list of `(u16 group, u16 key_exchange_len, bytes)`.
+            // We capture the group codepoints; the key bytes are not
+            // material to fingerprinting and can be sensitive, so we
+            // skip them. WOR-501 reads this list to detect the
+            // X25519MLKEM768 hybrid key share.
+            0x0033 => {
+                let mut r = ByteReader::new(ext_data);
+                if let Some(client_shares_len) = r.read_u16() {
+                    let client_shares_len = client_shares_len as usize;
+                    let mut inner = ByteReader::new(r.take(client_shares_len)?);
+                    while inner.remaining() >= 4 {
+                        let group = inner.read_u16()?;
+                        let key_exchange_len = inner.read_u16()? as usize;
+                        inner.skip(key_exchange_len)?;
+                        if !is_grease(group) {
+                            key_share_groups.push(group);
+                        }
+                    }
+                }
+            }
             // supported_versions
             0x002b => {
                 let mut r = ByteReader::new(ext_data);
@@ -396,6 +451,7 @@ fn parse_client_hello_body(body: &[u8]) -> Option<ParsedClientHello> {
         alpn_first,
         alpn_last,
         alpn,
+        key_share_groups,
         sig_algs,
     })
 }
@@ -1063,6 +1119,72 @@ mod tests {
         let body = synthetic_client_hello();
         let fp = parse_client_hello(&body);
         assert!(fp.sni.is_none());
+    }
+
+    /// WOR-501: PQ-TLS detection signal.
+    /// Build a ClientHello with a `key_share` extension carrying the
+    /// X25519MLKEM768 group code so the parser flips `pq_tls_present`
+    /// to true.
+    fn synthetic_client_hello_with_key_share(group: u16, key_len: usize) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0x03, 0x03]);
+        b.extend_from_slice(&[0u8; 32]);
+        b.push(0);
+        b.extend_from_slice(&[0x00, 0x02]);
+        b.extend_from_slice(&[0x13, 0x01]);
+        b.extend_from_slice(&[0x01, 0x00]);
+
+        // key_share extension (0x0033):
+        //   u16 client_shares_len, then list of:
+        //     u16 group, u16 key_exchange_len, bytes
+        let mut shares = Vec::new();
+        shares.extend_from_slice(&group.to_be_bytes());
+        shares.extend_from_slice(&(key_len as u16).to_be_bytes());
+        shares.extend(std::iter::repeat_n(0u8, key_len));
+        let client_shares_len = shares.len() as u16;
+        let ext_len = client_shares_len + 2;
+
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&[0x00, 0x33]);
+        ext.extend_from_slice(&ext_len.to_be_bytes());
+        ext.extend_from_slice(&client_shares_len.to_be_bytes());
+        ext.extend_from_slice(&shares);
+
+        let ext_total = ext.len() as u16;
+        b.extend_from_slice(&ext_total.to_be_bytes());
+        b.extend_from_slice(&ext);
+        b
+    }
+
+    #[test]
+    fn pq_tls_present_for_x25519mlkem768_key_share() {
+        // X25519MLKEM768 codepoint per IANA TLS supported groups.
+        let body = synthetic_client_hello_with_key_share(0x11ec, 32);
+        let fp = parse_client_hello(&body);
+        assert!(
+            fp.pq_tls_present,
+            "X25519MLKEM768 key share should set pq_tls_present=true",
+        );
+    }
+
+    #[test]
+    fn pq_tls_absent_for_x25519_only_key_share() {
+        // Classic X25519 (0x001d) only: no PQ hybrid offered.
+        let body = synthetic_client_hello_with_key_share(0x001d, 32);
+        let fp = parse_client_hello(&body);
+        assert!(
+            !fp.pq_tls_present,
+            "X25519-only key share should leave pq_tls_present=false",
+        );
+    }
+
+    #[test]
+    fn pq_tls_absent_when_no_key_share_extension() {
+        // synthetic_client_hello() builds a hello with no key_share
+        // extension; the parser leaves the field at its default.
+        let body = synthetic_client_hello();
+        let fp = parse_client_hello(&body);
+        assert!(!fp.pq_tls_present);
     }
 
     #[test]

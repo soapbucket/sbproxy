@@ -155,6 +155,14 @@ pub struct TlsSignals {
     /// Full ALPN protocol-id list in wire order, GREASE filtered.
     /// Empty when the extension was absent.
     pub alpn: Vec<String>,
+    /// Whether the ClientHello advertised a post-quantum hybrid key
+    /// share (WOR-501). True for browsers that have rolled out
+    /// X25519MLKEM768 (Chrome / Edge default in 2026); false for
+    /// stock SDK HTTP stacks, which do not negotiate MLKEM. The
+    /// scorer uses the *absence* of this signal on a request whose
+    /// User-Agent claims a real browser as a high-confidence
+    /// non-browser tell.
+    pub pq_tls_present: bool,
 }
 
 impl From<&sbproxy_tls::fingerprint::TlsFingerprint> for TlsSignals {
@@ -171,6 +179,7 @@ impl From<&sbproxy_tls::fingerprint::TlsFingerprint> for TlsSignals {
             ja4s: fp.ja4s.clone(),
             sni: fp.sni.clone(),
             alpn: fp.alpn.clone(),
+            pq_tls_present: fp.pq_tls_present,
         }
     }
 }
@@ -332,6 +341,7 @@ mod tests {
             ja4s: Some("t1302h2_2e6abc78c2d7".into()),
             sni: Some("api.example.test".into()),
             alpn: vec!["h2".into(), "http/1.1".into()],
+            pq_tls_present: true,
             trustworthy: true,
         };
         let signals: TlsSignals = (&fp).into();
@@ -340,5 +350,6 @@ mod tests {
         assert_eq!(signals.ja4s.as_deref(), Some("t1302h2_2e6abc78c2d7"));
         assert_eq!(signals.sni.as_deref(), Some("api.example.test"));
         assert_eq!(signals.alpn, vec!["h2".to_string(), "http/1.1".to_string()]);
+        assert!(signals.pq_tls_present);
     }
 }
