@@ -7993,14 +7993,17 @@ impl ProxyHttp for SbProxy {
                         ja4h: ja4h_supplied,
                         ja4s: ja4s_supplied,
                         // WOR-586 added `sni` + `alpn`; WOR-501 added
-                        // `pq_tls_present`. This synthetic construction
-                        // path lacks the raw ClientHello bytes, so
-                        // default all three. The real
-                        // ClientHello-parsing path populates them via
-                        // `parse_client_hello`.
+                        // `pq_tls_present`; WOR-590 added `ja4t` +
+                        // `ja4x`. This synthetic construction path
+                        // lacks the raw ClientHello bytes / TCP option
+                        // block / mTLS cert chain, so default them
+                        // all. The real ClientHello-parsing path and
+                        // the mTLS verify path populate them.
                         sni: None,
                         alpn: Vec::new(),
                         pq_tls_present: false,
+                        ja4t: None,
+                        ja4x: None,
                         trustworthy,
                     });
                 }

@@ -175,6 +175,17 @@ pub struct TlsSignals {
     /// User-Agent claims a real browser as a high-confidence
     /// non-browser tell.
     pub pq_tls_present: bool,
+    /// JA4T TCP fingerprint (WOR-590 slice 7). Currently always
+    /// `None` because Pingora 0.8 does not surface the SYN-packet
+    /// TCP options block; the field is reserved on the signal
+    /// shape so downstream consumers can take the dependency now
+    /// without breaking later when a listener-level capture lands.
+    pub ja4t: Option<String>,
+    /// JA4X X.509 cert-chain fingerprint (WOR-590 slice 7).
+    /// Populated by the mTLS verify path when the client presents
+    /// a cert chain; `None` for anonymous TLS or when chain
+    /// parsing failed.
+    pub ja4x: Option<String>,
 }
 
 impl From<&sbproxy_tls::fingerprint::TlsFingerprint> for TlsSignals {
@@ -192,6 +203,8 @@ impl From<&sbproxy_tls::fingerprint::TlsFingerprint> for TlsSignals {
             sni: fp.sni.clone(),
             alpn: fp.alpn.clone(),
             pq_tls_present: fp.pq_tls_present,
+            ja4t: fp.ja4t.clone(),
+            ja4x: fp.ja4x.clone(),
         }
     }
 }
@@ -401,6 +414,8 @@ mod tests {
             sni: Some("api.example.test".into()),
             alpn: vec!["h2".into(), "http/1.1".into()],
             pq_tls_present: true,
+            ja4t: Some("65535_2_1460_64".into()),
+            ja4x: Some("1_aaaaaaaaaaaa_bbbbbbbbbbbb_cccccccccccc".into()),
             trustworthy: true,
         };
         let signals: TlsSignals = (&fp).into();
@@ -410,5 +425,10 @@ mod tests {
         assert_eq!(signals.sni.as_deref(), Some("api.example.test"));
         assert_eq!(signals.alpn, vec!["h2".to_string(), "http/1.1".to_string()]);
         assert!(signals.pq_tls_present);
+        assert_eq!(signals.ja4t.as_deref(), Some("65535_2_1460_64"));
+        assert_eq!(
+            signals.ja4x.as_deref(),
+            Some("1_aaaaaaaaaaaa_bbbbbbbbbbbb_cccccccccccc"),
+        );
     }
 }
