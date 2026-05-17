@@ -340,6 +340,13 @@ pub struct ProxyServerConfig {
     /// [`HttpClientTimeoutsConfig`] for the field list.
     #[serde(default)]
     pub http_client_timeouts: HttpClientTimeoutsConfig,
+    /// Sandbox limits for the embedded scripting engines (JavaScript,
+    /// Lua, ...). Per-engine sub-blocks live under
+    /// [`ScriptingConfig`]; unset blocks fall back to safe defaults.
+    /// This is the operator knob for the CPU time budget that backs
+    /// the JS interrupt handler installed in WOR-595.
+    #[serde(default)]
+    pub scripting: ScriptingConfig,
 }
 
 impl Default for ProxyServerConfig {
@@ -367,7 +374,184 @@ impl Default for ProxyServerConfig {
             synthetic_probe: None,
             extensions: HashMap::new(),
             http_client_timeouts: HttpClientTimeoutsConfig::default(),
+            scripting: ScriptingConfig::default(),
         }
+    }
+}
+
+// --- Scripting engine sandbox config (WOR-595) ---
+
+/// Per-engine scripting sandbox limits, exposed under the
+/// `proxy.scripting:` block of sb.yml.
+///
+/// Currently exposes a `javascript:` sub-block; future tickets will
+/// add equivalents for the other embedded engines. Operators who do
+/// not set this block get the documented defaults (see the per-engine
+/// types for their values).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ScriptingConfig {
+    /// JavaScript engine sandbox knobs. Covers the QuickJS-backed
+    /// `JsEngine` used by transforms, request matchers, and WAF
+    /// custom rules.
+    #[serde(default)]
+    pub javascript: JsScriptingConfig,
+}
+
+/// JavaScript engine config block (`proxy.scripting.javascript:`).
+///
+/// Wraps the sandbox limits the engine enforces every time it runs a
+/// script. Adding fresh knobs here (module loader settings, host
+/// bindings, ...) should keep `sandbox:` as its own sub-block so
+/// existing configs keep parsing.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct JsScriptingConfig {
+    /// Sandbox limits: CPU time budget, heap memory cap, and native
+    /// stack cap. See [`JsSandboxConfig`].
+    #[serde(default)]
+    pub sandbox: JsSandboxConfig,
+}
+
+/// JavaScript sandbox limits enforced on every script execution
+/// (WOR-595).
+///
+/// The `budget_ms` field is the CPU time budget for a single
+/// `execute` / `call_function` / `match_request` / `waf_match` call.
+/// QuickJS calls the engine's interrupt handler periodically during
+/// evaluation; when the elapsed wall-clock time exceeds `budget_ms`
+/// the interrupt handler returns `true`, which aborts the script with
+/// an uncatchable exception that surfaces in Rust as a structured
+/// timeout error.
+///
+/// The `memory_mb` and `stack_kb` fields are passed through to
+/// `Runtime::set_memory_limit` and `Runtime::set_max_stack_size`
+/// respectively. They guard against runaway allocations and deeply
+/// recursive scripts in the same way the CPU budget guards against
+/// `while (true) {}`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JsSandboxConfig {
+    /// Wall-clock CPU budget per script execution. Defaults to 100
+    /// ms, which is comfortably above any reasonable transform /
+    /// matcher script but well under the per-request timeout budget
+    /// of a typical request.
+    #[serde(default = "default_js_budget_ms")]
+    pub budget_ms: u64,
+    /// Maximum heap memory the QuickJS runtime is allowed to allocate
+    /// for the lifetime of this engine instance. Defaults to 16 MB.
+    #[serde(default = "default_js_memory_mb")]
+    pub memory_mb: usize,
+    /// Maximum native stack size for the QuickJS runtime, in
+    /// kilobytes. Defaults to 1024 KB (1 MB).
+    #[serde(default = "default_js_stack_kb")]
+    pub stack_kb: usize,
+}
+
+impl Default for JsSandboxConfig {
+    fn default() -> Self {
+        Self {
+            budget_ms: default_js_budget_ms(),
+            memory_mb: default_js_memory_mb(),
+            stack_kb: default_js_stack_kb(),
+        }
+    }
+}
+
+fn default_js_budget_ms() -> u64 {
+    100
+}
+
+fn default_js_memory_mb() -> usize {
+    16
+}
+
+fn default_js_stack_kb() -> usize {
+    1024
+}
+
+#[cfg(test)]
+mod scripting_config_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_documentation() {
+        let cfg = JsSandboxConfig::default();
+        assert_eq!(cfg.budget_ms, 100);
+        assert_eq!(cfg.memory_mb, 16);
+        assert_eq!(cfg.stack_kb, 1024);
+    }
+
+    #[test]
+    fn empty_scripting_block_uses_defaults() {
+        let cfg: ScriptingConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(cfg.javascript.sandbox.budget_ms, 100);
+        assert_eq!(cfg.javascript.sandbox.memory_mb, 16);
+        assert_eq!(cfg.javascript.sandbox.stack_kb, 1024);
+    }
+
+    #[test]
+    fn empty_javascript_block_uses_defaults() {
+        let yaml = "javascript: {}\n";
+        let cfg: ScriptingConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.javascript.sandbox.budget_ms, 100);
+    }
+
+    #[test]
+    fn operator_can_override_budget_ms() {
+        let yaml = r#"
+javascript:
+  sandbox:
+    budget_ms: 250
+"#;
+        let cfg: ScriptingConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.javascript.sandbox.budget_ms, 250);
+        // Other fields still default.
+        assert_eq!(cfg.javascript.sandbox.memory_mb, 16);
+        assert_eq!(cfg.javascript.sandbox.stack_kb, 1024);
+    }
+
+    #[test]
+    fn operator_can_override_all_sandbox_fields() {
+        let yaml = r#"
+javascript:
+  sandbox:
+    budget_ms: 50
+    memory_mb: 32
+    stack_kb: 2048
+"#;
+        let cfg: ScriptingConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.javascript.sandbox.budget_ms, 50);
+        assert_eq!(cfg.javascript.sandbox.memory_mb, 32);
+        assert_eq!(cfg.javascript.sandbox.stack_kb, 2048);
+    }
+
+    #[test]
+    fn scripting_block_round_trips_through_yaml() {
+        let original = ScriptingConfig {
+            javascript: JsScriptingConfig {
+                sandbox: JsSandboxConfig {
+                    budget_ms: 75,
+                    memory_mb: 8,
+                    stack_kb: 512,
+                },
+            },
+        };
+        let yaml = serde_yaml::to_string(&original).unwrap();
+        let decoded: ScriptingConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(decoded.javascript.sandbox.budget_ms, 75);
+        assert_eq!(decoded.javascript.sandbox.memory_mb, 8);
+        assert_eq!(decoded.javascript.sandbox.stack_kb, 512);
+    }
+
+    #[test]
+    fn proxy_block_accepts_scripting_subblock() {
+        let yaml = r#"
+http_bind_port: 8080
+scripting:
+  javascript:
+    sandbox:
+      budget_ms: 200
+"#;
+        let cfg: ProxyServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.scripting.javascript.sandbox.budget_ms, 200);
     }
 }
 
