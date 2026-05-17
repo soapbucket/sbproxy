@@ -17,11 +17,12 @@ use sbproxy_plugin::PolicyEnforcer;
 #[cfg(feature = "agent-class")]
 use super::AgentClassEnforcer;
 use super::{
-    A2AEnforcer, AiCrawlEnforcer, AssertionEnforcer, ConcurrentLimitEnforcer, CsrfEnforcer,
-    DdosEnforcer, DlpEnforcer, ExposedCredsEnforcer, ExpressionEnforcer, HttpFramingEnforcer,
-    IpFilterEnforcer, OpenApiValidationEnforcer, PageShieldEnforcer, PeerPricingPreflightEnforcer,
-    PromptInjectionV2Enforcer, RateLimitEnforcer, RequestLimitEnforcer, RequestValidatorEnforcer,
-    SecHeadersEnforcer, SemanticConstraintEnforcer, SriEnforcer, WafEnforcer,
+    A2AEnforcer, AgentBudgetEnforcer, AiCrawlEnforcer, AssertionEnforcer, ConcurrentLimitEnforcer,
+    CsrfEnforcer, DdosEnforcer, DlpEnforcer, ExposedCredsEnforcer, ExpressionEnforcer,
+    HttpFramingEnforcer, IpFilterEnforcer, OpenApiValidationEnforcer, PageShieldEnforcer,
+    PeerPricingPreflightEnforcer, PromptInjectionV2Enforcer, RateLimitEnforcer,
+    RequestLimitEnforcer, RequestValidatorEnforcer, SecHeadersEnforcer, SemanticConstraintEnforcer,
+    SriEnforcer, WafEnforcer,
 };
 
 /// One compiled policy ready for request-phase dispatch.
@@ -81,6 +82,7 @@ fn compile_one(policy: Policy) -> CompiledEnforcer {
         Policy::A2A(p) => builtin(A2AEnforcer(Arc::new(p))),
         Policy::SemanticConstraint(p) => builtin(SemanticConstraintEnforcer(Arc::new(p))),
         Policy::PeerPricingPreflight(p) => builtin(PeerPricingPreflightEnforcer(p)),
+        Policy::AgentBudget(p) => builtin(AgentBudgetEnforcer(p)),
         Policy::Plugin(enforcer) => CompiledEnforcer {
             surface: PolicySurface::Plugin,
             enforcer,

@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use bytes::BytesMut;
 use compact_str::CompactString;
-use sbproxy_modules::policy::ConcurrentLimitGuard;
+use sbproxy_modules::policy::{AgentBudgetGuard, ConcurrentLimitGuard};
 use sbproxy_modules::transform::{CelHeaderMutation, MarkdownProjection};
 use sbproxy_modules::{ContentShape, RateLimitInfo};
 use sbproxy_observe::UserIdSource;
@@ -132,6 +132,10 @@ pub struct RequestContext {
     /// guards release their slots when dropped, which happens when the
     /// context is dropped at the end of the request lifecycle.
     pub concurrent_limit_guards: Vec<ConcurrentLimitGuard>,
+    /// Permits issued by `AgentBudgetPolicy` (WOR-506). Same lifecycle
+    /// as `concurrent_limit_guards`: each guard tracks an in-flight
+    /// agent-keyed slot and releases it when the request finishes.
+    pub agent_budget_guards: Vec<AgentBudgetGuard>,
 
     // --- Request validator state ---
     /// Set by `check_policies` when a `RequestValidator` policy is
@@ -749,6 +753,7 @@ impl RequestContext {
             lb_target_idx: None,
             retry_count: 0,
             concurrent_limit_guards: Vec::new(),
+            agent_budget_guards: Vec::new(),
             validate_request_body: false,
             request_body_buf: None,
             validator_failed: None,
