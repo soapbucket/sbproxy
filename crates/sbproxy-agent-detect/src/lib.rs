@@ -35,6 +35,10 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod rules;
+
+pub use rules::{AgentRule, MatchSpec, RulePack, RulePackError};
+
 // --- Public detection shape -------------------------------------------------
 
 /// Outcome the scorer produces for a single request.
@@ -130,24 +134,29 @@ pub struct Signals {
     pub payload: Option<PayloadSignals>,
 }
 
-/// Placeholder TLS signal shell. The fields land in WOR-586 + WOR-590;
-/// the unit struct keeps the type name reachable from the rest of the
-/// proxy now so later slices can fill it in without churning callers.
+/// TLS-layer signals. Slice 2 (WOR-585) introduces the minimal field
+/// set the rule-pack matcher reads against: the JA4 fingerprint string.
+/// Slice 3 (WOR-586) populates this from `sbproxy-tls`; slices 7
+/// (WOR-590) add JA4T + JA4X. Until then the field is `None` and the
+/// matcher's `ja4_prefix` predicate falls through.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TlsSignals {
-    // Reserved for WOR-586 / WOR-590. Fields intentionally omitted in
-    // the slice-1 skeleton; adding them later is backward-compatible
-    // because the struct is `Default` and not constructed by name in
-    // tests today.
-    #[doc(hidden)]
-    pub _reserved: (),
+    /// JA4 ClientHello fingerprint string (FoxIO format).
+    pub ja4: Option<String>,
 }
 
-/// Placeholder HTTP signal shell. Fields land in WOR-587.
+/// HTTP-layer signals. Slice 2 (WOR-585) introduces the minimal field
+/// set the rule-pack matcher reads against: the `User-Agent` header
+/// value plus the list of header names the request carried. Slice 4
+/// (WOR-587) extends this with the header order hash, UA bucket, and
+/// cookie persistence signal.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HttpSignals {
-    #[doc(hidden)]
-    pub _reserved: (),
+    /// Raw `User-Agent` header value, when present.
+    pub user_agent: Option<String>,
+    /// Lowercased header names the request carried. Used by the
+    /// rule-pack matcher's `header_present` predicate.
+    pub headers_present: Vec<String>,
 }
 
 /// Placeholder payload signal shell. Fields land in WOR-591.

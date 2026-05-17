@@ -5654,6 +5654,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbproxy-agent-detect"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "regex",
+ "serde",
+ "serde_json",
+ "yaml_serde",
+]
+
+[[package]]
 name = "sbproxy-ai"
 version = "0.1.0"
 dependencies = [

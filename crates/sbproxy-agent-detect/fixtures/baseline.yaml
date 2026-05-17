@@ -1,0 +1,68 @@
+# ADRF v0 baseline rule pack (WOR-585).
+#
+# Identifications for the five named agents from the WOR-500 ticket.
+# Each entry documents the signal tells the rule keys off so an
+# operator reviewing the pack can audit the rationale without
+# leaving the file. Sources are public surfaces (vendor docs and
+# their published SDKs); refresh periodically as the agents rev.
+#
+# Per-rule ordering: more specific rules come first. The Cursor and
+# Copilot rules sit ahead of the OpenAI SDK rules because both ship
+# their own User-Agent prefix; if we did not order them this way,
+# both would otherwise match the generic OpenAI-Beta header tell.
+
+version: 0
+agents:
+  # Anthropic's Claude Code CLI ships User-Agent `claude-cli/X.Y.Z
+  # (external, cli)` plus the OpenAI-style `x-stainless-*` header
+  # set because the SDK reuses Stainless tooling for outbound calls.
+  - id: claude-code-cli
+    match:
+      user_agent_pattern: '^claude-cli/'
+      header_present:
+        - x-stainless-arch
+    provenance: unsigned-named
+    score: 95
+    confidence: 0.95
+
+  # Cursor's agent reaches upstream tooling through its own UA. The
+  # cursor-agent build also adds an `x-cursor-*` header on requests
+  # the agent routes through the IDE backplane.
+  - id: cursor
+    match:
+      user_agent_pattern: '(?i)cursor[-/]'
+    provenance: unsigned-named
+    score: 90
+    confidence: 0.85
+
+  # OpenAI's Codex CLI: User-Agent prefix is `codex-cli/`, and the
+  # SDK adds the standard `openai-beta` header on every Responses
+  # API call.
+  - id: codex-cli
+    match:
+      user_agent_pattern: '^codex-cli/'
+    provenance: unsigned-named
+    score: 90
+    confidence: 0.9
+
+  # GitHub Copilot's CLI + chat surfaces share the
+  # `github-copilot-cli/` UA prefix. The IDE-embedded variants also
+  # carry an `Editor-Version` header that pin the IDE the request
+  # originated from; we leave that as an enrichment for a later
+  # slice's rule pack rather than gating the basic id on it.
+  - id: copilot
+    match:
+      user_agent_pattern: '(?i)github-copilot'
+    provenance: unsigned-named
+    score: 90
+    confidence: 0.85
+
+  # JetBrains Junie ships `Junie/X.Y` as its UA prefix. The agent
+  # also opens a long-lived SSE channel which we will signal-bucket
+  # in a later slice; for the baseline pack the UA alone is enough.
+  - id: junie
+    match:
+      user_agent_pattern: '^Junie/'
+    provenance: unsigned-named
+    score: 90
+    confidence: 0.85
