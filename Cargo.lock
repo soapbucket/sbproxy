@@ -5658,11 +5658,13 @@ name = "sbproxy-agent-detect"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "regex",
  "sbproxy-tls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "yaml_serde",
 ]
 
