@@ -19,9 +19,15 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [ai-gateway.md](ai-gateway.md) - providers, routing strategies, guardrails, budgets, streaming.
 - [providers.md](providers.md) - the catalog of supported LLM providers.
 - [scripting.md](scripting.md) - CEL, Lua, JavaScript, and WASM scripting reference.
+- [wasm-development.md](wasm-development.md) - writing WebAssembly modules for the `wasm` transform against the WASI preview-1 contract.
 - [mcp.md](mcp.md) - the MCP gateway: wire shape, capabilities, and `experimental.agentSkillsUrl` advertising.
 - [agent-skills.md](agent-skills.md) - Agent Skills v0.2.0 well-known projection: schema, integrity, archive safety, no-script-execution contract.
 - [cloudflare-code-mode.md](cloudflare-code-mode.md) - typed TypeScript module emission for Cloudflare Code Mode agents over the MCP federation registry.
+- [ai-crawl-control.md](ai-crawl-control.md) - the `ai_crawl_control` policy: Pay Per Crawl token challenge, ledger trait, OSS-advertises / enterprise-settles split.
+- [content-for-agents.md](content-for-agents.md) - operator guide to agent-aware content delivery: shape negotiation, body transforms, well-known license posture.
+- [rsl.md](rsl.md) - RSL 1.0 licensing cookbook: expressing license stance via YAML and the resulting `/licenses.xml` projection.
+- [web-bot-auth.md](web-bot-auth.md) - the `bot_auth` provider: verifying RFC 9421-signed AI crawlers against a published key directory.
+- [prompt-injection-v2.md](prompt-injection-v2.md) - the v2 guardrail: swappable detector returning score + label, with score-to-action mapping.
 
 ### Operations
 - [access-log.md](access-log.md) - structured JSON access log: filters, sampling, header capture, redaction.
@@ -44,16 +50,19 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [admin-api-reference.md](admin-api-reference.md) - per-route schema for the embedded admin server (`/api/*`, `/admin/*`, and the unauthenticated probe routes).
 - [config-stability.md](config-stability.md) - field stability guarantees and versioning.
 - [listings.md](listings.md) - the repo-native `Listing` primitive: schema, loader, three pinning modes, plan-validation rules.
+- [bulk-redirects.md](bulk-redirects.md) - the `redirect` action's source-to-destination row list, compiled at load time into an O(1) path lookup.
+- [cache-reserve.md](cache-reserve.md) - long-tail cold tier under the response cache: backends (memory, filesystem, Redis) and admission sampling.
+- [exposed-credentials.md](exposed-credentials.md) - the `exposed_credentials` policy: detect known-leaked basic-auth passwords and tag or block.
+- [feature-flags.md](feature-flags.md) - the sticky-bucketing flag store plus the `flag_enabled(name, key)` CEL helper.
+- [routing-strategies.md](routing-strategies.md) - the `RoutingStrategy` trait: opt-in extension point for custom upstream selection inside `load_balancer`.
+- [openapi-validation.md](openapi-validation.md) - the `openapi_validation` policy: validating request bodies against an OpenAPI 3.0 document at startup.
+- [onnx-classifier.md](onnx-classifier.md) - the `sbproxy-classifiers` ONNX inference path and Hugging Face tokenizer wrapper used by learned detectors.
 - [enterprise.md](enterprise.md) - what the enterprise tier adds on top of the OSS data plane and how to request access.
 - [glossary.md](glossary.md) - vocabulary used in this documentation set.
 - [headers-reference.md](headers-reference.md) - every response header the proxy can emit, with the config that triggers it.
 - [metrics-stability.md](metrics-stability.md) - Prometheus metric naming and stability.
 - [model-pinning.md](model-pinning.md) - how SHA-256 hashes get computed and pinned for the classifier known-model registry.
 - [adr-ai-hub-format.md](adr-ai-hub-format.md) - hub `ChatFormat` trait and the canonical `ChatRequest` / `ChatResponse` shape that backs `/v1/chat/completions`, `/v1/messages`, and `/v1/responses`.
-- [adr-classifier-supply-chain-oss.md](adr-classifier-supply-chain-oss.md) - operator-trusted model supply-chain decisions for the OSS classifier path.
-- [adr-config-plan-apply.md](adr-config-plan-apply.md) - audit + design for the proposed `sbproxy plan` and `sbproxy apply` subcommands.
-- [adr-config-source-modes.md](adr-config-source-modes.md) - audit + design for the `file`, `git`, `git+overlay`, and `db` config source modes.
-- [adr-fast-track-amendment.md](adr-fast-track-amendment.md) - template for additive closed-enum ADR changes.
 - [comparison.md](comparison.md) - how SBproxy compares to other proxies and AI gateways.
 
 ### Contributing
