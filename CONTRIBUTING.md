@@ -1,9 +1,9 @@
 # Contributing to sbproxy
-*Last modified: 2026-04-27*
+*Last modified: 2026-05-17*
 
 ## Prerequisites
 
-- Rust 1.75+ (for RPITIT support)
+- Rust 1.82+ (workspace MSRV, pinned in `Cargo.toml`)
 - Cargo (comes with Rust)
 - Node.js 18+ (for e2e test backends)
 - cmake (for Pingora's BoringSSL dependency)
@@ -56,7 +56,7 @@ cargo test -p sbproxy-modules json_transform_set_fields
 
 See [docs/architecture.md](docs/architecture.md) for the full architecture guide.
 
-The project is a Cargo workspace with 19 crates under `crates/`. Each crate has a single responsibility.
+The project is a Cargo workspace with 20 crates under `crates/`. Each crate has a single responsibility.
 
 ## Adding a new module
 
@@ -128,23 +128,41 @@ inventory::submit! {
 ## Code style
 
 - Follow `rustfmt` defaults
-- Use `cargo clippy -- -D warnings` before committing
 - Prefer `anyhow::Result` for fallible functions
 - Use `CompactString` for short strings (hostnames, IDs)
 - Use `SmallVec` for small collections (policies, transforms)
 - Write doc comments on all public types and functions
 
+## Pre-commit gates
+
+Run all five before pushing. Each one mirrors a required CI gate; if any fails locally, CI will fail too.
+
+| Check | Command |
+|---|---|
+| Format | `cargo fmt --all -- --check` |
+| Build | `cargo build --workspace` |
+| Test | `cargo test --workspace --release --tests` |
+| Clippy | `cargo clippy --workspace --all-targets -- -D warnings` |
+| Docs | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items` |
+
+Fix the issue before pushing. Do not paper over with `#[allow(...)]` unless you also write a one-line comment explaining the deliberate exception.
+
 ## E2E tests
 
+Two suites ship in-tree. Both run against the release binary:
+
+- `e2e/tests/*.rs` is the Rust-native suite, driven by `cargo test -p sbproxy-e2e --release`. One file per feature, typed harness.
+- `e2e/conformance/` is the vendored curl + bash conformance suite (93 cases). It is the strictest HTTP wire-protocol harness we ship.
+
 ```bash
-# Run smoke tests
+# Run the curl conformance suite (all cases)
 ./scripts/run-e2e.sh
 
 # Run specific cases
 ./scripts/run-e2e.sh 01 14 11
 ```
 
-E2E tests reuse the Go test suite configs with a compatibility layer for field name differences.
+See `e2e/conformance/HOW-TO-RUN.md` for the side-by-side comparison of the two suites.
 
 ## Benchmarks
 
