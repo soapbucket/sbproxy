@@ -9,6 +9,8 @@
 pub mod a2a;
 /// `Accept-Payment` header parser (Wave 3 / R3.1, A3.1).
 pub mod accept_payment;
+/// WOR-506 `agent_budget` semantic rate-limit primitive.
+pub mod agent_budget;
 #[cfg(feature = "agent-class")]
 pub mod agent_class;
 pub mod ai_crawl;
@@ -58,6 +60,10 @@ pub use a2a::{
 pub use accept_payment::{
     rail_tokens as accept_payment_rail_tokens, AcceptPayment,
     ParseError as AcceptPaymentParseError, RailKind, RailPreference,
+};
+pub use agent_budget::{
+    AgentBudgetDecision, AgentBudgetExceedReason, AgentBudgetGuard, AgentBudgetOnAnonymous,
+    AgentBudgetOnExceed, AgentBudgetPolicy,
 };
 pub use ai_crawl::{
     accept_implies_multi_rail, parse_accept_payment, resolve_agent_preferences,
@@ -209,6 +215,11 @@ pub enum Policy {
     /// enforcement is invoked from the outbound dispatcher (a
     /// separate code path from the inbound `PolicyEnforcer` trait).
     PeerPricingPreflight(std::sync::Arc<PeerPricingPreflightPolicy>),
+    /// WOR-506 `agent_budget`: per-`agent_id` semantic rate limit.
+    /// Keyed on the resolver-produced agent identity, not the client
+    /// IP, so a tight LLM-driven loop hits a single bucket regardless
+    /// of how many TCP connections it opens.
+    AgentBudget(std::sync::Arc<AgentBudgetPolicy>),
     /// Third-party plugin (only case using dynamic dispatch).
     Plugin(Box<dyn PolicyEnforcer>),
 }
@@ -241,6 +252,7 @@ impl Policy {
             Self::A2A(_) => "a2a",
             Self::SemanticConstraint(_) => "semantic_constraint",
             Self::PeerPricingPreflight(_) => "peer_pricing_preflight",
+            Self::AgentBudget(_) => "agent_budget",
             Self::Plugin(p) => p.policy_type(),
         }
     }
@@ -275,6 +287,7 @@ impl std::fmt::Debug for Policy {
             Self::PeerPricingPreflight(r) => {
                 f.debug_tuple("PeerPricingPreflight").field(r).finish()
             }
+            Self::AgentBudget(r) => f.debug_tuple("AgentBudget").field(r).finish(),
             Self::Plugin(_) => write!(f, "Plugin(...)"),
         }
     }

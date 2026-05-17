@@ -189,6 +189,13 @@ pub fn compile_policy(config: &serde_json::Value) -> Result<Policy> {
         "peer_pricing_preflight" => Ok(Policy::PeerPricingPreflight(std::sync::Arc::new(
             crate::policy::PeerPricingPreflightPolicy::from_config(config.clone())?,
         ))),
+        // WOR-506: per-`agent_id` semantic rate limit. The policy is
+        // wrapped in `Arc` so the enforcer wrapper in `sbproxy-core`
+        // can share the bucket state across the compiled chain
+        // without cloning the LRU caches.
+        "agent_budget" => Ok(Policy::AgentBudget(std::sync::Arc::new(
+            crate::policy::AgentBudgetPolicy::from_config(config.clone())?,
+        ))),
         _ => anyhow::bail!("unknown policy type: {}", type_name),
     }
 }
@@ -651,6 +658,19 @@ mod tests {
         });
         let policy = compile_policy(&json).unwrap();
         assert_eq!(policy.policy_type(), "sri");
+    }
+
+    #[test]
+    fn compile_policy_agent_budget() {
+        let json = serde_json::json!({
+            "type": "agent_budget",
+            "requests_per_minute": 60,
+            "tokens_per_hour": 100000,
+            "burst": 10,
+            "on_exceed": "deny"
+        });
+        let policy = compile_policy(&json).unwrap();
+        assert_eq!(policy.policy_type(), "agent_budget");
     }
 
     // --- compile_transform tests ---

@@ -20,6 +20,7 @@
 //! plan.
 
 pub mod a2a;
+pub mod agent_budget;
 #[cfg(feature = "agent-class")]
 pub mod agent_class;
 pub mod ai_crawl;
@@ -43,6 +44,7 @@ pub mod semantic_constraint;
 pub mod waf;
 
 pub use a2a::A2AEnforcer;
+pub use agent_budget::AgentBudgetEnforcer;
 #[cfg(feature = "agent-class")]
 pub use agent_class::AgentClassEnforcer;
 pub use ai_crawl::AiCrawlEnforcer;
