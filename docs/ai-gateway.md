@@ -260,6 +260,25 @@ Input guardrails apply to whichever body field the surface carries user text in:
 
 A single guardrail block on the AI handler config covers every supported surface; the proxy picks the right field automatically based on the classified surface. Multipart-bodied surfaces (image edits, image variations, audio transcription) bypass the input-guardrail check today because their bodies are forwarded byte-transparently; output-side scanning for those surfaces is reserved for a follow-up.
 
+### Streaming policy
+
+A guardrail is *streaming-safe* when its block decision is stable as soon as the chunk it sees is decided. The proxy classifies the built-in guardrails per the WOR-235 hub-format ADR:
+
+| Guardrail | Streaming-safe | Reason |
+|---|---|---|
+| `regex` | yes | per-chunk regex match is stable |
+| `pii` | yes | PII patterns match per-chunk |
+| `schema` | yes | JSON schema validation is decided on the parsed value |
+| `context_poisoning` | yes | rule matches are per-message |
+| `injection` | no | multi-token context windows; partial windows produce false negatives |
+| `toxicity` | no | full-text classifier; partial-window scores are misleading |
+| `jailbreak` | no | multi-pattern + multi-token detector |
+| `content_safety` | no | full-text classifier (self-harm, violence, etc.) |
+
+On the buffered (non-streaming) path the proxy runs every configured output guardrail against the full response. On the streaming output path the proxy runs only the streaming-safe guardrails on each chunk; non-safe guardrails are skipped because evaluating them against a partial window produces both false positives (tripping on benign mid-stream substrings) and false negatives (missing late-stream signal). Input guardrails always run against the full request regardless of `stream`.
+
+Operators that want a non-safe guardrail to apply to streaming responses anyway should accept the partial-window risk explicitly and run a second buffered pass once the stream closes; the per-entry `streaming_safe` override surface for that case rides a follow-up.
+
 ### Context-poisoning guardrail
 
 The `context_poisoning` input guardrail flags untrusted retrieval content that tries to manipulate the model before a downstream tool call. This is the indirect prompt injection vector from Greshake et al. (2023): a RAG pipeline pulls a poisoned page into the model's context, and the model then issues a tool call influenced by that content.
