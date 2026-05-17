@@ -19,6 +19,9 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 regex = { workspace = true }
 anyhow = { workspace = true }
+# Slice 5 (WOR-588): lock-free swap of the live rule pack so the hot
+# path reads through a single atomic pointer load.
+arc-swap = { workspace = true }
 # Slice 3 (WOR-586): pull in `sbproxy-tls` so the detection layer can
 # build `TlsSignals` directly from the existing `TlsFingerprint`
 # captured at handshake time. Both crates live in the OSS workspace
@@ -30,3 +33,4 @@ sbproxy-tls = { path = "../sbproxy-tls" }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+tempfile = "3"

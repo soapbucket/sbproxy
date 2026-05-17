@@ -36,11 +36,15 @@
 use serde::{Deserialize, Serialize};
 
 pub mod http_extractors;
+pub mod loader;
 pub mod payload_extractors;
 pub mod rules;
 
 pub use http_extractors::{
     extract_http_signals, header_order_hash, user_agent_bucket, vendor_headers, UserAgentBucket,
+};
+pub use loader::{
+    ReloadMetrics, ReloadOutcome, RulePackLoader, RELOAD_METRIC_NAME, RELOAD_OUTCOME_LABELS,
 };
 pub use payload_extractors::{
     count_unique_filesystem_paths, extract_payload_signals, is_stack_trace_shaped,
