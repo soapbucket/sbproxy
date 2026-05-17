@@ -7,13 +7,17 @@ publish = false
 
 # Agent fingerprint library (WOR-499 Module 1.1). Surfaces an
 # `AgentDetection` value (score / agent_id / provenance / confidence /
-# signals_used) the rest of the proxy can branch on. Slice 1 ships the
-# crate skeleton + types + a default scorer; signal extractors, rule
-# packs, hot reload, scripting bindings, and the CatBoost ONNX scorer
-# ride later slices (WOR-585 through WOR-592).
+# signals_used) the rest of the proxy can branch on. The crate-skeleton
+# slice (WOR-584) shipped the types; slice 2 (WOR-585) ships the
+# ADRF YAML rule-pack format + parser + matcher; the signal extractors,
+# hot reload, scripting bindings, and the CatBoost ONNX scorer ride
+# later slices (WOR-586 through WOR-592).
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+regex = { workspace = true }
+anyhow = { workspace = true }
 
 [dev-dependencies]
