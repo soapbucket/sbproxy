@@ -20,6 +20,7 @@ members = [
     "crates/sbproxy-openapi",
     "crates/sbproxy-k8s-operator",
     "crates/sbproxy-classifiers",
+    "crates/sbproxy-agent-detect",
     "e2e",
 ]
 # The k8s operator pulls kube + k8s-openapi, which adds ~30-60s to a cold
@@ -46,6 +47,7 @@ default-members = [
     "crates/sbproxy-tls",
     "crates/sbproxy-openapi",
     "crates/sbproxy-classifiers",
+    "crates/sbproxy-agent-detect",
     "e2e",
 ]
 

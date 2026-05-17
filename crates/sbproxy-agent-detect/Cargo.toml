@@ -1,0 +1,19 @@
+[package]
+name = "sbproxy-agent-detect"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+# Agent fingerprint library (WOR-499 Module 1.1). Surfaces an
+# `AgentDetection` value (score / agent_id / provenance / confidence /
+# signals_used) the rest of the proxy can branch on. Slice 1 ships the
+# crate skeleton + types + a default scorer; signal extractors, rule
+# packs, hot reload, scripting bindings, and the CatBoost ONNX scorer
+# ride later slices (WOR-585 through WOR-592).
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
