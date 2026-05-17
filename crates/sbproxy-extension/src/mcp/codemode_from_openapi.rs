@@ -76,11 +76,18 @@ pub fn openapi_to_federated_tools(spec: &serde_json::Value) -> Vec<FederatedTool
             .get("inputSchema")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
+        // OpenAPI operations are single-shot today; if the spec
+        // declares a streaming response (text/event-stream or
+        // application/x-ndjson) we could promote `streaming` to true
+        // when WOR-501 follow-up lands the OpenAPI response-media-type
+        // walker. Default to false for now so the emitted module shape
+        // matches the existing OpenAPI->REST callback convention.
         tools.push(FederatedTool {
             name,
             description,
             input_schema,
             server_name: OPENAPI_SOURCE_NAME.to_string(),
+            streaming: false,
         });
     }
     // Sort lexicographically for reproducible output, mirroring the
