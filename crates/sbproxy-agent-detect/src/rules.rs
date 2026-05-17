@@ -657,13 +657,25 @@ agents:
 
     #[test]
     fn baseline_fixture_pack_parses() {
-        // The five baseline agents the WOR-585 ticket calls out;
-        // shipped as a fixture under fixtures/ so the next slice can
-        // load + golden-test the same data.
+        // The five baseline agents from WOR-585 plus the five SDK /
+        // agent shapes added by WOR-500. Shipped as a fixture under
+        // fixtures/ so the next slice can load + golden-test the
+        // same data.
         let yaml = include_str!("../fixtures/baseline.yaml");
         let pack = CompiledRulePack::from_yaml_str(yaml).expect("baseline fixture parses");
         let ids: Vec<&str> = pack.source.agents.iter().map(|a| a.id.as_str()).collect();
-        for expected in ["claude-code-cli", "cursor", "codex-cli", "copilot", "junie"] {
+        for expected in [
+            "claude-code-cli",
+            "cursor",
+            "codex-cli",
+            "copilot",
+            "junie",
+            "gemini-cli",
+            "openai-sdk-python",
+            "anthropic-sdk-python",
+            "langchain",
+            "llamaindex",
+        ] {
             assert!(
                 ids.contains(&expected),
                 "baseline fixture missing {expected}"
@@ -684,5 +696,228 @@ agents:
             .expect("claude-code-cli should match canonical UA");
         assert_eq!(d.agent_id.as_deref(), Some("claude-code-cli"));
         assert_eq!(d.provenance, AgentProvenance::UnsignedNamed);
+    }
+
+    // --- WOR-500: extended named-agent rules ------------------------
+
+    fn baseline_pack() -> CompiledRulePack {
+        let yaml = include_str!("../fixtures/baseline.yaml");
+        CompiledRulePack::from_yaml_str(yaml).expect("baseline fixture parses")
+    }
+
+    #[test]
+    fn baseline_cursor_matches_cursor_agent_ua() {
+        let d = baseline_pack()
+            .evaluate(&signals_with(
+                Some("cursor-agent/0.41.5 (darwin; arm64)"),
+                &[],
+                None,
+            ))
+            .expect("cursor rule should match cursor-agent UA");
+        assert_eq!(d.agent_id.as_deref(), Some("cursor"));
+    }
+
+    #[test]
+    fn baseline_cursor_does_not_match_plain_browser() {
+        assert!(baseline_pack()
+            .evaluate(&signals_with(
+                Some("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"),
+                &[],
+                None,
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn baseline_codex_cli_requires_openai_beta_header() {
+        let pack = baseline_pack();
+        // UA alone is not enough: the rule requires the openai-beta
+        // header tell.
+        assert!(pack
+            .evaluate(&signals_with(Some("codex-cli/0.7.1"), &[], None))
+            .is_none());
+        // UA + openai-beta header: the rule fires.
+        let d = pack
+            .evaluate(&signals_with(
+                Some("codex-cli/0.7.1"),
+                &["openai-beta"],
+                None,
+            ))
+            .expect("codex-cli should match with openai-beta header");
+        assert_eq!(d.agent_id.as_deref(), Some("codex-cli"));
+    }
+
+    #[test]
+    fn baseline_copilot_matches_github_copilot_cli_ua() {
+        let d = baseline_pack()
+            .evaluate(&signals_with(Some("github-copilot-cli/1.2.0"), &[], None))
+            .expect("copilot should match github-copilot-cli UA");
+        assert_eq!(d.agent_id.as_deref(), Some("copilot"));
+    }
+
+    #[test]
+    fn baseline_copilot_does_not_match_random_ua() {
+        assert!(baseline_pack()
+            .evaluate(&signals_with(Some("curl/8.4.0"), &[], None))
+            .is_none());
+    }
+
+    #[test]
+    fn baseline_junie_matches_junie_ua() {
+        let d = baseline_pack()
+            .evaluate(&signals_with(Some("Junie/2.0.1"), &[], None))
+            .expect("junie should match Junie/ UA");
+        assert_eq!(d.agent_id.as_deref(), Some("junie"));
+    }
+
+    #[test]
+    fn baseline_junie_is_case_sensitive() {
+        // Junie/ is anchored and case-sensitive on purpose; the SDK
+        // ships the capitalised prefix and a lowercase form would be
+        // suspicious enough that we'd rather miss than falsely tag.
+        assert!(baseline_pack()
+            .evaluate(&signals_with(Some("junie/2.0.1"), &[], None))
+            .is_none());
+    }
+
+    #[test]
+    fn baseline_gemini_cli_matches_canonical_ua() {
+        let d = baseline_pack()
+            .evaluate(&signals_with(Some("gemini-cli/0.3.0"), &[], None))
+            .expect("gemini-cli should match gemini-cli/ UA");
+        assert_eq!(d.agent_id.as_deref(), Some("gemini-cli"));
+        assert_eq!(d.score, 90);
+    }
+
+    #[test]
+    fn baseline_gemini_cli_does_not_match_codex() {
+        // Codex CLI traffic must not be misattributed to gemini-cli.
+        let detection = baseline_pack().evaluate(&signals_with(Some("codex-cli/0.7.1"), &[], None));
+        assert!(detection
+            .as_ref()
+            .map(|d| d.agent_id.as_deref() != Some("gemini-cli"))
+            .unwrap_or(true));
+    }
+
+    #[test]
+    fn baseline_openai_sdk_python_requires_three_stainless_headers() {
+        let pack = baseline_pack();
+        // UA alone, no headers: rule does not fire.
+        assert!(pack
+            .evaluate(&signals_with(Some("OpenAI/Python 1.30.0"), &[], None))
+            .is_none());
+        // UA + only two of three required headers: rule does not fire.
+        assert!(pack
+            .evaluate(&signals_with(
+                Some("OpenAI/Python 1.30.0"),
+                &["x-stainless-arch", "x-stainless-os"],
+                None,
+            ))
+            .is_none());
+        // UA + all three Stainless headers: rule fires.
+        let d = pack
+            .evaluate(&signals_with(
+                Some("OpenAI/Python 1.30.0"),
+                &["x-stainless-arch", "x-stainless-os", "x-stainless-lang"],
+                None,
+            ))
+            .expect("openai-sdk-python should match with all three Stainless headers");
+        assert_eq!(d.agent_id.as_deref(), Some("openai-sdk-python"));
+        assert_eq!(d.provenance, AgentProvenance::UnsignedNamed);
+    }
+
+    #[test]
+    fn baseline_openai_sdk_python_misses_on_node_ua() {
+        // The Node JS SDK ships under `OpenAI/JS ...`, not
+        // `OpenAI/Python ...`. The Python-rule UA anchor must reject
+        // it even though both SDKs carry the same Stainless header
+        // trio.
+        let detection = baseline_pack().evaluate(&signals_with(
+            Some("OpenAI/JS 4.55.0"),
+            &["x-stainless-arch", "x-stainless-os", "x-stainless-lang"],
+            None,
+        ));
+        assert!(detection
+            .as_ref()
+            .map(|d| d.agent_id.as_deref() != Some("openai-sdk-python"))
+            .unwrap_or(true));
+    }
+
+    #[test]
+    fn baseline_anthropic_sdk_python_requires_anthropic_version_header() {
+        let pack = baseline_pack();
+        // UA + only one of the two required headers: rule does not fire.
+        assert!(pack
+            .evaluate(&signals_with(
+                Some("Anthropic/Python 0.34.0"),
+                &["x-stainless-arch"],
+                None,
+            ))
+            .is_none());
+        // UA + both required headers: rule fires.
+        let d = pack
+            .evaluate(&signals_with(
+                Some("Anthropic/Python 0.34.0"),
+                &["x-stainless-arch", "anthropic-version"],
+                None,
+            ))
+            .expect("anthropic-sdk-python should match with x-stainless-arch + anthropic-version");
+        assert_eq!(d.agent_id.as_deref(), Some("anthropic-sdk-python"));
+    }
+
+    #[test]
+    fn baseline_anthropic_sdk_python_does_not_collide_with_openai_sdk() {
+        // An OpenAI/Python UA carrying the Stainless trio must not
+        // be misattributed to anthropic-sdk-python, even though both
+        // rules require x-stainless-arch. The UA prefix disambiguates.
+        let d = baseline_pack()
+            .evaluate(&signals_with(
+                Some("OpenAI/Python 1.30.0"),
+                &["x-stainless-arch", "x-stainless-os", "x-stainless-lang"],
+                None,
+            ))
+            .expect("openai-sdk-python should fire on this signal set");
+        assert_eq!(d.agent_id.as_deref(), Some("openai-sdk-python"));
+    }
+
+    #[test]
+    fn baseline_langchain_matches_anchored_ua() {
+        let d = baseline_pack()
+            .evaluate(&signals_with(Some("langchain/0.2.5"), &[], None))
+            .expect("langchain should match anchored UA");
+        assert_eq!(d.agent_id.as_deref(), Some("langchain"));
+    }
+
+    #[test]
+    fn baseline_langchain_does_not_match_mid_string_mention() {
+        // Anchored at start-of-string: a UA that merely mentions
+        // LangChain mid-comment should not be tagged.
+        assert!(baseline_pack()
+            .evaluate(&signals_with(
+                Some("Mozilla/5.0 (uses langchain internally)"),
+                &[],
+                None,
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn baseline_llamaindex_matches_both_spellings() {
+        let pack = baseline_pack();
+        let d = pack
+            .evaluate(&signals_with(Some("llama-index/0.10.0"), &[], None))
+            .expect("llamaindex should match hyphenated spelling");
+        assert_eq!(d.agent_id.as_deref(), Some("llamaindex"));
+        let d = pack
+            .evaluate(&signals_with(Some("LlamaIndex/0.10.0"), &[], None))
+            .expect("llamaindex should match camel-case spelling");
+        assert_eq!(d.agent_id.as_deref(), Some("llamaindex"));
+    }
+
+    #[test]
+    fn baseline_llamaindex_does_not_match_unrelated_ua() {
+        assert!(baseline_pack()
+            .evaluate(&signals_with(Some("python-requests/2.31.0"), &[], None))
+            .is_none());
     }
 }

@@ -1,6 +1,10 @@
-# ADRF v0 baseline rule pack (WOR-585).
+# ADRF v0 baseline rule pack (WOR-585 + WOR-500).
 #
-# Identifications for the five named agents from the WOR-500 ticket.
+# Identifications for the five named agents from the WOR-585 baseline
+# (claude-code-cli, cursor, codex-cli, copilot, junie) plus five
+# additional SDK / agent shapes added by WOR-500 (OpenAI Python SDK,
+# Anthropic Python SDK, LangChain, LlamaIndex, Gemini CLI).
+#
 # Each entry documents the signal tells the rule keys off so an
 # operator reviewing the pack can audit the rationale without
 # leaving the file. Sources are public surfaces (vendor docs and
@@ -10,12 +14,24 @@
 # Copilot rules sit ahead of the OpenAI SDK rules because both ship
 # their own User-Agent prefix; if we did not order them this way,
 # both would otherwise match the generic OpenAI-Beta header tell.
+# The Codex CLI rule sits ahead of the bare `OpenAI/Python ` SDK
+# rule for the same reason: Codex CLI rides on top of the OpenAI
+# SDK but identifies itself first via the `codex-cli/` prefix.
+#
+# Source references:
+# - Chaser Systems "What data do coding agents send" (2026-03)
+# - Speedscale "Peeking Under the Hood of Cursor" (2026-02)
+# - xSeek Claude user-agents reference doc
+# - OpenAI Stainless SDK source (openai-python, anthropic-sdk-python)
+# - Sysdig Prempti Falco rules for Claude Code / Codex CLI / Gemini CLI
 
 version: 0
 agents:
   # Anthropic's Claude Code CLI ships User-Agent `claude-cli/X.Y.Z
   # (external, cli)` plus the OpenAI-style `x-stainless-*` header
   # set because the SDK reuses Stainless tooling for outbound calls.
+  # The X.Y.Z version-pin is intentionally NOT in the regex so the
+  # rule survives Claude Code rev bumps without a rule-pack update.
   - id: claude-code-cli
     match:
       user_agent_pattern: '^claude-cli/'
@@ -26,8 +42,11 @@ agents:
     confidence: 0.95
 
   # Cursor's agent reaches upstream tooling through its own UA. The
-  # cursor-agent build also adds an `x-cursor-*` header on requests
-  # the agent routes through the IDE backplane.
+  # cursor-agent build also adds `x-cursor-*` headers (mode, workspace,
+  # checksum, ghost-mode) on requests routed through the IDE backplane.
+  # We do not gate on those headers here because they are not
+  # publicly documented and may change without notice; the UA prefix
+  # alone is high-confidence enough for the named tier.
   - id: cursor
     match:
       user_agent_pattern: '(?i)cursor[-/]'
@@ -37,17 +56,21 @@ agents:
 
   # OpenAI's Codex CLI: User-Agent prefix is `codex-cli/`, and the
   # SDK adds the standard `openai-beta` header on every Responses
-  # API call.
+  # API call. The `openai-beta` header tell is documented in the
+  # OpenAI Stainless SDK and is required for any Responses API
+  # request, so it is a stable enrichment signal.
   - id: codex-cli
     match:
       user_agent_pattern: '^codex-cli/'
+      header_present:
+        - openai-beta
     provenance: unsigned-named
-    score: 90
+    score: 92
     confidence: 0.9
 
   # GitHub Copilot's CLI + chat surfaces share the
   # `github-copilot-cli/` UA prefix. The IDE-embedded variants also
-  # carry an `Editor-Version` header that pin the IDE the request
+  # carry an `Editor-Version` header that pins the IDE the request
   # originated from; we leave that as an enrichment for a later
   # slice's rule pack rather than gating the basic id on it.
   - id: copilot
@@ -65,4 +88,71 @@ agents:
       user_agent_pattern: '^Junie/'
     provenance: unsigned-named
     score: 90
+    confidence: 0.85
+
+  # Google's Gemini CLI: User-Agent prefix is `gemini-cli/X.Y.Z`.
+  # The Sysdig Prempti Falco rule set documents this prefix; the CLI
+  # also exhibits a telemetry escalation pattern if blocked which we
+  # will key off in a follow-up slice with payload signals.
+  - id: gemini-cli
+    match:
+      user_agent_pattern: '^gemini-cli/'
+    provenance: unsigned-named
+    score: 90
+    confidence: 0.9
+
+  # OpenAI's official Python SDK (openai-python) sends User-Agent
+  # `OpenAI/Python X.Y.Z` and emits the Stainless trio of headers
+  # `x-stainless-arch`, `x-stainless-os`, `x-stainless-lang`. The
+  # rule requires all three headers so legitimate library traffic
+  # is distinguished from a hand-rolled requester that happens to
+  # spoof the UA but does not know to add the Stainless preamble.
+  - id: openai-sdk-python
+    match:
+      user_agent_pattern: '^OpenAI/Python '
+      header_present:
+        - x-stainless-arch
+        - x-stainless-os
+        - x-stainless-lang
+    provenance: unsigned-named
+    score: 88
+    confidence: 0.9
+
+  # Anthropic's official Python SDK (anthropic-sdk-python) shares
+  # the Stainless tooling with openai-python and sends User-Agent
+  # `Anthropic/Python X.Y.Z`. The `anthropic-version` header is
+  # required on every Messages API request, so we use it as the
+  # second tell (over `x-stainless-os`) to keep this rule distinct
+  # from openai-sdk-python in audit logs.
+  - id: anthropic-sdk-python
+    match:
+      user_agent_pattern: '^Anthropic/Python '
+      header_present:
+        - x-stainless-arch
+        - anthropic-version
+    provenance: unsigned-named
+    score: 88
+    confidence: 0.9
+
+  # LangChain orchestrator: the framework sets `User-Agent: langchain`
+  # (case-insensitive prefix; some integrations append a slash +
+  # version, others a space + version). Anchoring at start-of-string
+  # avoids matching unrelated UAs that happen to mention LangChain
+  # in a parenthetical comment.
+  - id: langchain
+    match:
+      user_agent_pattern: '(?i)^langchain\b'
+    provenance: unsigned-named
+    score: 85
+    confidence: 0.85
+
+  # LlamaIndex orchestrator: the framework ships under either the
+  # `llama-index` or `llamaindex` package name and surfaces the same
+  # name verbatim in its User-Agent. We accept both spellings to
+  # cover both the PyPI distribution name and the import-time name.
+  - id: llamaindex
+    match:
+      user_agent_pattern: '(?i)^(llama-index|llamaindex)\b'
+    provenance: unsigned-named
+    score: 85
     confidence: 0.85
