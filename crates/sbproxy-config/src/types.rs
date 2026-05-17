@@ -328,6 +328,14 @@ pub struct ProxyServerConfig {
     /// when the proxy is unable to service its own requests.
     #[serde(default)]
     pub synthetic_probe: Option<SyntheticProbeConfig>,
+    /// Scripting runtime limits. Today this block carries the Lua
+    /// sandbox knobs (execution-time budget, memory budget, pattern
+    /// API gating); other languages (CEL, JavaScript, WebAssembly)
+    /// keep their own knobs elsewhere until they have similar enforcement
+    /// surfaces. When omitted, the documented defaults are applied
+    /// (see [`LuaSandboxConfig::default`]).
+    #[serde(default)]
+    pub scripting: ScriptingConfig,
     /// Opaque extensions for out-of-tree top-level config blocks.
     /// The compiler never parses these; extension consumers read
     /// their own keys.
@@ -365,6 +373,7 @@ impl Default for ProxyServerConfig {
             correlation_id: CorrelationIdConfig::default(),
             mtls: None,
             synthetic_probe: None,
+            scripting: ScriptingConfig::default(),
             extensions: HashMap::new(),
             http_client_timeouts: HttpClientTimeoutsConfig::default(),
         }
@@ -458,6 +467,102 @@ fn default_synthetic_interval_secs() -> u64 {
 
 fn default_synthetic_timeout_ms() -> u64 {
     1000
+}
+
+// --- Scripting runtime limits (WOR-594) ---
+
+/// Scripting runtime limits applied to user-supplied scripts.
+///
+/// The runtime knobs live under `proxy.scripting:` so operators can
+/// raise or lower them per deployment without touching the binary. At
+/// present only the Lua engine reads from this block; the CEL, JS, and
+/// WebAssembly engines manage their own budgets separately. When the
+/// block is omitted from `sb.yml`, [`Self::default`] is applied, which
+/// matches the documented defaults of the embedded Lua sandbox.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ScriptingConfig {
+    /// Lua sandbox limits. Always populated, even when the operator
+    /// omitted the block, so callers never have to special-case
+    /// `None`.
+    #[serde(default)]
+    pub lua: LuaScriptingConfig,
+}
+
+/// Lua scripting runtime configuration. Wraps the sandbox limits so
+/// future Lua-specific tunables (preloaded libraries, request-binding
+/// budgets, etc.) have a stable home.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LuaScriptingConfig {
+    /// Per-script execution limits.
+    #[serde(default)]
+    pub sandbox: LuaSandboxConfig,
+}
+
+/// Sandbox configuration applied to every Lua script invocation.
+///
+/// Three knobs:
+///
+/// * `max_execution_ms` is a wall-clock budget enforced through the
+///   Luau interrupt callback. Once exceeded, the script is aborted
+///   with an `Error::external` propagated back to the caller.
+/// * `max_memory_mb` caps the Lua VM's total allocator footprint.
+///   Allocations past the limit fail the script with
+///   `Error::MemoryError`, which is far cheaper than letting a
+///   runaway script OOM the proxy process.
+/// * `allow_patterns` gates the Lua pattern API (`string.find`,
+///   `string.match`, `string.gmatch`). The pattern engine has known
+///   pathological inputs that can lock a worker, so operators who do
+///   not need patterns can drop them entirely.
+///
+/// The on-the-wire field uses `max_memory_mb` (megabytes) because
+/// that is the unit operators reason about; the engine converts to
+/// bytes internally.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LuaSandboxConfig {
+    /// Wall-clock execution budget per Lua invocation, in
+    /// milliseconds. Default: 100 ms.
+    #[serde(default = "default_lua_max_execution_ms")]
+    pub max_execution_ms: u64,
+    /// Hard cap on the Lua VM's allocator footprint, in megabytes.
+    /// Default: 8 MB.
+    #[serde(default = "default_lua_max_memory_mb")]
+    pub max_memory_mb: usize,
+    /// Whether to expose the Lua pattern API (`string.find`,
+    /// `string.match`, `string.gmatch`). Default: `true` for back
+    /// compatibility; flip to `false` to disable pattern matching.
+    #[serde(default = "default_lua_allow_patterns")]
+    pub allow_patterns: bool,
+}
+
+impl Default for LuaSandboxConfig {
+    fn default() -> Self {
+        Self {
+            max_execution_ms: default_lua_max_execution_ms(),
+            max_memory_mb: default_lua_max_memory_mb(),
+            allow_patterns: default_lua_allow_patterns(),
+        }
+    }
+}
+
+impl LuaSandboxConfig {
+    /// Effective memory cap in bytes (`max_memory_mb * 1024 * 1024`),
+    /// saturating on overflow. The engine consumes bytes, so this
+    /// keeps the unit conversion in one place.
+    pub fn max_memory_bytes(&self) -> usize {
+        self.max_memory_mb.saturating_mul(1024 * 1024)
+    }
+}
+
+fn default_lua_max_execution_ms() -> u64 {
+    100
+}
+
+fn default_lua_max_memory_mb() -> usize {
+    8
+}
+
+fn default_lua_allow_patterns() -> bool {
+    true
 }
 
 /// mTLS client certificate verification on the HTTPS listener.
@@ -2861,6 +2966,80 @@ http3:
         assert!(config.acme.is_none());
         assert!(config.http3.is_none());
         assert_eq!(config.http_bind_port, 8080);
+    }
+
+    // --- ScriptingConfig / LuaSandboxConfig tests (WOR-594) ---
+
+    #[test]
+    fn lua_sandbox_config_default_matches_documented_values() {
+        let cfg = LuaSandboxConfig::default();
+        assert_eq!(cfg.max_execution_ms, 100);
+        assert_eq!(cfg.max_memory_mb, 8);
+        assert!(cfg.allow_patterns);
+        assert_eq!(cfg.max_memory_bytes(), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn scripting_config_default_carries_lua_defaults() {
+        let cfg = ScriptingConfig::default();
+        assert_eq!(cfg.lua.sandbox, LuaSandboxConfig::default());
+    }
+
+    #[test]
+    fn proxy_server_config_omitted_scripting_uses_defaults() {
+        let yaml = r#"
+http_bind_port: 8080
+"#;
+        let config: ProxyServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.scripting.lua.sandbox.max_execution_ms, 100);
+        assert_eq!(config.scripting.lua.sandbox.max_memory_mb, 8);
+        assert!(config.scripting.lua.sandbox.allow_patterns);
+    }
+
+    #[test]
+    fn proxy_server_config_lua_sandbox_overridable_from_yaml() {
+        let yaml = r#"
+http_bind_port: 8080
+scripting:
+  lua:
+    sandbox:
+      max_execution_ms: 250
+      max_memory_mb: 64
+      allow_patterns: false
+"#;
+        let config: ProxyServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let sandbox = config.scripting.lua.sandbox;
+        assert_eq!(sandbox.max_execution_ms, 250);
+        assert_eq!(sandbox.max_memory_mb, 64);
+        assert!(!sandbox.allow_patterns);
+        assert_eq!(sandbox.max_memory_bytes(), 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn proxy_server_config_lua_sandbox_partial_override_keeps_defaults() {
+        let yaml = r#"
+http_bind_port: 8080
+scripting:
+  lua:
+    sandbox:
+      max_execution_ms: 500
+"#;
+        let config: ProxyServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let sandbox = config.scripting.lua.sandbox;
+        assert_eq!(sandbox.max_execution_ms, 500);
+        assert_eq!(sandbox.max_memory_mb, 8);
+        assert!(sandbox.allow_patterns);
+    }
+
+    #[test]
+    fn lua_sandbox_config_max_memory_bytes_saturates_on_overflow() {
+        let cfg = LuaSandboxConfig {
+            max_execution_ms: 100,
+            max_memory_mb: usize::MAX,
+            allow_patterns: true,
+        };
+        // Saturating multiplication clamps at usize::MAX rather than panicking.
+        assert_eq!(cfg.max_memory_bytes(), usize::MAX);
     }
 
     // --- ConnectionPoolConfig tests ---

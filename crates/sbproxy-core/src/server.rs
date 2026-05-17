@@ -13753,6 +13753,13 @@ pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<()> {
         log_capture_header_warnings(al);
     }
 
+    // WOR-594: refresh the operator-configured Lua sandbox limits on
+    // reload so SIGHUP / hot-reload pick up changes to
+    // `proxy.scripting.lua.sandbox:` without restarting the process.
+    sbproxy_extension::lua::install_sandbox_config(sbproxy_extension::lua::SandboxConfig::from(
+        &compiled.server.scripting.lua.sandbox,
+    ));
+
     // WOR-173: refresh the AI provider catalog and rebuild the AI
     // client alongside the pipeline. Both globals live behind an
     // `ArcSwap`, so this is a lock-free atomic swap from the reload
@@ -13984,6 +13991,16 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
             },
         );
     }
+
+    // WOR-594: install the operator-configured Lua sandbox limits
+    // into the extension crate's process-wide handle. Every
+    // `LuaEngine::new()` after this point (request modifiers, response
+    // modifiers, WAF custom rules, JSON transforms) picks up these
+    // values; before this runs, the documented defaults are in
+    // effect.
+    sbproxy_extension::lua::install_sandbox_config(sbproxy_extension::lua::SandboxConfig::from(
+        &server_config.scripting.lua.sandbox,
+    ));
 
     // Initialise the AI provider catalog from the embedded YAML, with
     // an optional override path from `proxy.ai_providers_file`: use

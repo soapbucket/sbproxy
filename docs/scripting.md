@@ -1,6 +1,6 @@
 # SBproxy scripting reference: CEL, Lua, JavaScript, and WASM
 
-*Last modified: 2026-04-24*
+*Last modified: 2026-05-17*
 
 SBproxy includes four scripting engines for custom logic: CEL (Common Expression Language), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
@@ -466,7 +466,7 @@ response_modifiers:
 
 ## 4. Lua scripting
 
-Lua gives you a full scripting language: variables, loops, helper functions, conditionals, and string pattern matching. The proxy uses the Luau runtime via `mlua`. Scripts run in a sandboxed VM with a 100ms timeout and a 1,000,000 instruction limit.
+Lua gives you a full scripting language: variables, loops, helper functions, conditionals, and string pattern matching. The proxy uses the Luau runtime via `mlua`. Scripts run in a sandboxed VM under a configurable wall-clock and memory budget; see [§4.8](#48-sandbox-limits) for the operator knobs.
 
 ### 4.1 Function signature
 
@@ -912,6 +912,28 @@ request_modifiers:
         add_query   = { access_level = access_level }
       }
 ```
+
+### 4.8 Sandbox limits
+
+Every Lua invocation runs under a configurable sandbox. The defaults are tight enough to keep an adversarial script from stalling a worker; raise them if your scripts legitimately need more headroom, or tighten them further on sensitive deployments.
+
+```yaml
+proxy:
+  scripting:
+    lua:
+      sandbox:
+        max_execution_ms: 100   # wall-clock budget per invocation
+        max_memory_mb: 8        # cap on the Lua VM's allocator footprint
+        allow_patterns: true    # expose string.find / string.match / string.gmatch
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `max_execution_ms` | `100` | Wall-clock budget per invocation. Scripts that exceed it abort with a sandbox-timeout error and the request fails closed. Set `0` to disable the timer (not recommended). |
+| `max_memory_mb` | `8` | Hard ceiling on the Lua VM's allocator footprint. Allocations past the cap fail the script rather than letting it grow the proxy's resident set. |
+| `allow_patterns` | `true` | Whether to expose the Lua pattern API (`string.find`, `string.match`, `string.gmatch`). The pattern engine has known pathological inputs; flip to `false` if your scripts do not need pattern matching. The rest of `string.*` keeps working either way. |
+
+Limits apply to every Lua surface uniformly: request modifiers, response modifiers, JSON transforms, forward-rule matchers, and WAF custom rules. Changes take effect on the next config reload (SIGHUP, admin reload, or filesystem watch) without restarting the process.
 
 ---
 

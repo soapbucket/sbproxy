@@ -8,11 +8,40 @@ pub mod bindings;
 pub mod sandbox;
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use mlua::prelude::*;
+use mlua::VmState;
+use parking_lot::RwLock;
 
 pub use sandbox::SandboxConfig;
+
+// --- Process-wide sandbox handle ---
+
+/// Process-wide active Lua sandbox configuration. The proxy boot path
+/// calls [`install_sandbox_config`] once with the values from
+/// `proxy.scripting.lua.sandbox:` in `sb.yml`; thereafter, every
+/// [`LuaEngine::new`] picks up the active limits without each
+/// request-time callsite having to thread the config through. The
+/// initial value matches the documented YAML defaults so the engine
+/// is safe even before the boot path runs.
+static GLOBAL_SANDBOX_CONFIG: once_cell::sync::Lazy<RwLock<Arc<SandboxConfig>>> =
+    once_cell::sync::Lazy::new(|| RwLock::new(Arc::new(SandboxConfig::default())));
+
+/// Replace the process-wide sandbox configuration. Subsequent
+/// `LuaEngine::new()` calls will adopt the new limits. Existing
+/// engines keep the config they were constructed with.
+pub fn install_sandbox_config(config: SandboxConfig) {
+    *GLOBAL_SANDBOX_CONFIG.write() = Arc::new(config);
+}
+
+/// Read the process-wide sandbox configuration. Returns a cloned
+/// [`Arc`] so callers can hold onto it without keeping the lock.
+pub fn active_sandbox_config() -> Arc<SandboxConfig> {
+    GLOBAL_SANDBOX_CONFIG.read().clone()
+}
 
 // --- Lua Engine ---
 
@@ -22,27 +51,98 @@ pub use sandbox::SandboxConfig;
 /// `waf_match`) builds a fresh `mlua::Lua` so globals set by one
 /// invocation cannot leak into the next. This is the H6 isolation
 /// guarantee: there is no shared interpreter state across calls.
+///
+/// The engine carries a [`SandboxConfig`] that pins the wall-clock,
+/// memory, and pattern-API limits applied to every invocation. Use
+/// [`LuaEngine::new`] for the documented defaults or
+/// [`LuaEngine::with_config`] to honor operator overrides from
+/// `proxy.scripting.lua.sandbox` in `sb.yml`.
 pub struct LuaEngine {
-    _private: (),
+    config: SandboxConfig,
 }
 
 impl LuaEngine {
-    /// Create a new sandboxed Lua engine with default configuration.
+    /// Create a new sandboxed Lua engine using the process-wide active
+    /// sandbox configuration ([`active_sandbox_config`]).
+    ///
+    /// The boot path installs operator settings from
+    /// `proxy.scripting.lua.sandbox:` via [`install_sandbox_config`];
+    /// before that runs, the documented defaults
+    /// ([`SandboxConfig::default`]) are in effect. Existing engines
+    /// keep the snapshot they were constructed with.
     ///
     /// Construction is cheap: each `execute` / `call_function` /
     /// `match_request` / `waf_match` call builds its own Lua state
     /// internally, so the engine itself holds no Lua state.
     pub fn new() -> Result<Self> {
-        let _ = Self::fresh_lua()?;
-        Ok(Self { _private: () })
+        let cfg = (*active_sandbox_config()).clone();
+        Self::with_config(cfg)
+    }
+
+    /// Create a new sandboxed Lua engine with an operator-supplied
+    /// sandbox configuration. Used by the runtime to thread the
+    /// values from `proxy.scripting.lua.sandbox:` in `sb.yml` through
+    /// to the engine.
+    pub fn with_config(config: SandboxConfig) -> Result<Self> {
+        // Construct a throwaway Lua state once so allocator / sandbox
+        // setup errors surface at construction time rather than on the
+        // first script call.
+        let _ = Self::build_lua(&config)?;
+        Ok(Self { config })
+    }
+
+    /// Borrow the active sandbox configuration. Useful for assertions
+    /// in tests and for runtime status pages that want to surface the
+    /// effective limits.
+    pub fn config(&self) -> &SandboxConfig {
+        &self.config
     }
 
     /// Build a fresh sandboxed Lua state. Used per-invocation to
     /// guarantee globals from one call do not bleed into the next.
-    fn fresh_lua() -> Result<Lua> {
+    fn fresh_lua(&self) -> Result<Lua> {
+        Self::build_lua(&self.config)
+    }
+
+    /// Build a fresh sandboxed Lua state pre-loaded with the supplied
+    /// limits. Pulled out into an associated function so
+    /// [`LuaEngine::with_config`] can run the same setup once at
+    /// construction time without holding `self`.
+    fn build_lua(config: &SandboxConfig) -> Result<Lua> {
         let lua = Lua::new();
+
+        // Memory cap: must be installed before user code allocates so
+        // an attacker-controlled script cannot win the race between
+        // construction and the cap. A `0` request would be interpreted
+        // by mlua as "no limit", so clamp to at least 1 byte.
+        let mem_limit = config.max_memory.max(1);
+        lua.set_memory_limit(mem_limit)?;
+
         Self::sandbox(&lua)?;
+        Self::install_pattern_gating(&lua, config.allow_patterns)?;
         Self::register_json_helpers(&lua)?;
+
+        // Wall-clock budget: the Luau interrupt callback is invoked
+        // periodically by the VM (every few back-edges/calls). The
+        // first call past `deadline` aborts the script with
+        // `Error::external`, which surfaces back to the host as an
+        // `anyhow` error. `set_hook` is not available with the
+        // `luau` mlua feature, so this is the supported escape.
+        let budget_ms = config.max_execution_ms;
+        if budget_ms > 0 {
+            let start = Instant::now();
+            let deadline_ms = budget_ms;
+            lua.set_interrupt(move |_| {
+                if start.elapsed().as_millis() as u64 >= deadline_ms {
+                    Err(mlua::Error::external(LuaSandboxTimeout {
+                        budget_ms: deadline_ms,
+                    }))
+                } else {
+                    Ok(VmState::Continue)
+                }
+            });
+        }
+
         Ok(lua)
     }
 
@@ -65,6 +165,28 @@ impl LuaEngine {
         globals.set("loadstring", mlua::Value::Nil)?;
         globals.set("debug", mlua::Value::Nil)?;
         globals.set("package", mlua::Value::Nil)?;
+        Ok(())
+    }
+
+    /// Replace `string.find` / `string.match` / `string.gmatch` with
+    /// error-raising stubs when the operator has disabled the Lua
+    /// pattern API. The pattern engine has known pathological inputs
+    /// (catastrophic backtracking on greedy alternation), and
+    /// operators who don't need patterns can disable them entirely
+    /// without losing the rest of the `string` table.
+    fn install_pattern_gating(lua: &Lua, allow_patterns: bool) -> Result<()> {
+        if allow_patterns {
+            return Ok(());
+        }
+        let stub = lua.create_function(|_, _: mlua::MultiValue| -> mlua::Result<mlua::Value> {
+            Err(mlua::Error::external(
+                "Lua pattern API disabled by sandbox (proxy.scripting.lua.sandbox.allow_patterns)",
+            ))
+        })?;
+        let string_tbl: mlua::Table = lua.globals().get("string")?;
+        string_tbl.set("find", stub.clone())?;
+        string_tbl.set("match", stub.clone())?;
+        string_tbl.set("gmatch", stub)?;
         Ok(())
     }
 
@@ -99,7 +221,7 @@ impl LuaEngine {
         script: &str,
         globals: HashMap<String, serde_json::Value>,
     ) -> Result<serde_json::Value> {
-        let lua = Self::fresh_lua()?;
+        let lua = self.fresh_lua()?;
 
         for (key, value) in &globals {
             let lua_val = json_to_lua_value(&lua, value)?;
@@ -124,7 +246,7 @@ impl LuaEngine {
         func_name: &str,
         args: Vec<serde_json::Value>,
     ) -> Result<serde_json::Value> {
-        let lua = Self::fresh_lua()?;
+        let lua = self.fresh_lua()?;
 
         lua.load(script).exec()?;
 
@@ -156,7 +278,7 @@ impl LuaEngine {
         request: &serde_json::Value,
         context: &serde_json::Value,
     ) -> Result<bool> {
-        let lua = Self::fresh_lua()?;
+        let lua = self.fresh_lua()?;
 
         lua.load(script).exec()?;
 
@@ -188,7 +310,7 @@ impl LuaEngine {
         headers: &std::collections::HashMap<String, String>,
         body: Option<&str>,
     ) -> Result<bool> {
-        let lua = Self::fresh_lua()?;
+        let lua = self.fresh_lua()?;
 
         let req_table = lua.create_table()?;
         req_table.set("uri", uri)?;
@@ -217,6 +339,33 @@ impl LuaEngine {
         Ok(result)
     }
 }
+
+// --- Sandbox errors ---
+
+/// Raised by the Luau interrupt callback when a script has exceeded
+/// its configured wall-clock budget. Surfaced to callers wrapped in
+/// `mlua::Error::ExternalError`; the host treats it the same as any
+/// other Lua failure (the request fails, the script's modifications
+/// are discarded). The struct keeps the budget value so logs and
+/// metrics can attribute the timeout back to the configured limit.
+#[derive(Debug, Clone, Copy)]
+pub struct LuaSandboxTimeout {
+    /// The configured wall-clock budget, in milliseconds, that the
+    /// script exceeded.
+    pub budget_ms: u64,
+}
+
+impl std::fmt::Display for LuaSandboxTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Lua sandbox timeout: script exceeded {} ms execution budget",
+            self.budget_ms
+        )
+    }
+}
+
+impl std::error::Error for LuaSandboxTimeout {}
 
 // --- JSON <-> Lua Conversion ---
 
@@ -884,5 +1033,197 @@ mod tests {
                 .unwrap(),
             "true"
         );
+    }
+
+    // --- Sandbox enforcement (WOR-594) ---
+
+    #[test]
+    fn sandbox_timeout_aborts_infinite_loop() {
+        let engine = LuaEngine::with_config(SandboxConfig {
+            max_execution_ms: 50,
+            max_memory: 8 * 1024 * 1024,
+            allow_patterns: true,
+        })
+        .unwrap();
+
+        let start = std::time::Instant::now();
+        let result = engine.execute("while true do end", HashMap::new());
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "infinite loop should be aborted by sandbox, got Ok"
+        );
+        assert!(
+            elapsed.as_millis() < 50 + 1500,
+            "interrupt fired too late: {elapsed:?}"
+        );
+        // The budget itself surfaces in the error chain.
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("sandbox timeout") || msg.contains("execution budget"),
+            "error message did not name the budget: {msg}"
+        );
+    }
+
+    #[test]
+    fn sandbox_memory_limit_blocks_oversized_allocation() {
+        // Cap at 1 MB; the script tries to grow a table well past that.
+        let engine = LuaEngine::with_config(SandboxConfig {
+            max_execution_ms: 1_000,
+            max_memory: 1024 * 1024,
+            allow_patterns: true,
+        })
+        .unwrap();
+
+        // Build a long string by repeated concatenation. Doubling the
+        // size each step blows through 1 MB after about 20 rounds,
+        // long before Lua would have allocated 1 GB.
+        let script = r#"
+            local s = "x"
+            for i = 1, 64 do
+                s = s .. s
+            end
+            return #s
+        "#;
+        let result = engine.execute(script, HashMap::new());
+        assert!(
+            result.is_err(),
+            "allocation past the memory cap should error, got Ok: {:?}",
+            result.ok()
+        );
+    }
+
+    #[test]
+    fn sandbox_allow_patterns_false_disables_string_find() {
+        let engine = LuaEngine::with_config(SandboxConfig {
+            max_execution_ms: 1_000,
+            max_memory: 8 * 1024 * 1024,
+            allow_patterns: false,
+        })
+        .unwrap();
+
+        let result = engine.execute(r#"return string.find("hello", "ell")"#, HashMap::new());
+        assert!(
+            result.is_err(),
+            "string.find should error when allow_patterns=false, got Ok: {:?}",
+            result.ok()
+        );
+    }
+
+    #[test]
+    fn sandbox_allow_patterns_false_disables_string_match() {
+        let engine = LuaEngine::with_config(SandboxConfig {
+            max_execution_ms: 1_000,
+            max_memory: 8 * 1024 * 1024,
+            allow_patterns: false,
+        })
+        .unwrap();
+        let result = engine.execute(r#"return string.match("abc", "a")"#, HashMap::new());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sandbox_allow_patterns_false_disables_string_gmatch() {
+        let engine = LuaEngine::with_config(SandboxConfig {
+            max_execution_ms: 1_000,
+            max_memory: 8 * 1024 * 1024,
+            allow_patterns: false,
+        })
+        .unwrap();
+        let result = engine.execute(
+            r#"for w in string.gmatch("a b c", "%S+") do end return 0"#,
+            HashMap::new(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sandbox_allow_patterns_true_keeps_string_find_working() {
+        let engine = LuaEngine::with_config(SandboxConfig {
+            max_execution_ms: 1_000,
+            max_memory: 8 * 1024 * 1024,
+            allow_patterns: true,
+        })
+        .unwrap();
+
+        let result = engine
+            .execute(
+                r#"local s, _ = string.find("hello", "ell"); return s"#,
+                HashMap::new(),
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(2));
+    }
+
+    #[test]
+    fn sandbox_string_other_helpers_remain_usable() {
+        // Even with patterns gated, `string.upper`, `string.len`, ... must still work.
+        let engine = LuaEngine::with_config(SandboxConfig {
+            max_execution_ms: 1_000,
+            max_memory: 8 * 1024 * 1024,
+            allow_patterns: false,
+        })
+        .unwrap();
+        let result = engine
+            .execute(r#"return string.upper("hi")"#, HashMap::new())
+            .unwrap();
+        assert_eq!(result, serde_json::json!("HI"));
+    }
+
+    #[test]
+    fn lua_engine_default_config_matches_documented_defaults() {
+        // The default engine carries the same limits the YAML defaults
+        // document, so `LuaEngine::new()` is safe out of the box.
+        let engine = LuaEngine::new().unwrap();
+        let cfg = engine.config();
+        assert_eq!(cfg.max_execution_ms, 100);
+        assert_eq!(cfg.max_memory, 8 * 1024 * 1024);
+        assert!(cfg.allow_patterns);
+    }
+
+    #[test]
+    fn lua_engine_default_runs_short_scripts_within_budget() {
+        // A trivial script must comfortably fit in the default 100 ms budget.
+        let engine = LuaEngine::new().unwrap();
+        let result = engine.execute("return 1 + 1", HashMap::new()).unwrap();
+        assert_eq!(result, serde_json::json!(2));
+    }
+
+    #[test]
+    fn sandbox_config_from_lua_sandbox_config_round_trips() {
+        use sbproxy_config::LuaSandboxConfig;
+        let yaml = LuaSandboxConfig {
+            max_execution_ms: 333,
+            max_memory_mb: 4,
+            allow_patterns: false,
+        };
+        let engine = LuaEngine::with_config(SandboxConfig::from(&yaml)).unwrap();
+        let cfg = engine.config();
+        assert_eq!(cfg.max_execution_ms, 333);
+        assert_eq!(cfg.max_memory, 4 * 1024 * 1024);
+        assert!(!cfg.allow_patterns);
+    }
+
+    #[test]
+    fn install_sandbox_config_round_trips_via_global_handle() {
+        // The global handle is process-wide, so we save and restore it
+        // around the assertions to keep this test friendly with
+        // anyone running the suite in parallel.
+        let saved = (*active_sandbox_config()).clone();
+
+        install_sandbox_config(SandboxConfig {
+            max_execution_ms: 777,
+            max_memory: 2 * 1024 * 1024,
+            allow_patterns: false,
+        });
+
+        let observed = (*active_sandbox_config()).clone();
+        assert_eq!(observed.max_execution_ms, 777);
+        assert_eq!(observed.max_memory, 2 * 1024 * 1024);
+        assert!(!observed.allow_patterns);
+
+        // Restore the prior config so other tests are unaffected.
+        install_sandbox_config(saved);
     }
 }
