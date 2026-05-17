@@ -6,10 +6,10 @@
 //! point the gateway at a typed REST API and hand agents a typed
 //! codemode module without standing up an intermediate MCP server.
 //!
-//! The conversion reuses [`openapi_convert::openapi_to_mcp_tools`] to
-//! turn each `paths.<path>.<method>` entry into a tool definition with
-//! a JSON-Schema input, then materialises a [`FederatedTool`] per
-//! operation and runs the existing [`codemode_ts::emit_codemode_ts`]
+//! The conversion reuses [`super::openapi_convert::openapi_to_mcp_tools`]
+//! to turn each `paths.<path>.<method>` entry into a tool definition
+//! with a JSON-Schema input, then materialises a [`FederatedTool`] per
+//! operation and runs the existing [`super::codemode_ts::emit_codemode_ts`]
 //! emitter. The emitted module is byte-for-byte compatible with the
 //! MCP-federation-derived output, so the runtime stub, the typing
 //! conventions, and the tool-call dispatch are all shared.
@@ -20,7 +20,8 @@
 //! prefer the `domain_noun_verb` convention from the [AWS Prescriptive
 //! Guidance for MCP] can attach an `x-mcp.name` (or `x-sbproxy-mcp.name`)
 //! override on the operation. The override is parsed by
-//! [`openapi_to_mcp_tools`] (WOR-485) and surfaces here unchanged.
+//! [`super::openapi_convert::openapi_to_mcp_tools`] (WOR-485) and
+//! surfaces here unchanged.
 //!
 //! [AWS Prescriptive Guidance for MCP]: https://docs.aws.amazon.com/prescriptive-guidance/latest/mcp-strategies/mcp-tool-strategy-organization.html
 //!
@@ -56,9 +57,9 @@ pub fn emit_codemode_from_openapi(spec: &serde_json::Value, callback_base_url: &
 }
 
 /// Convert an OpenAPI spec into the [`FederatedTool`] shape consumed
-/// by [`emit_codemode_ts`]. Exposed for callers that want to combine
-/// OpenAPI-derived tools with tools from a live MCP federation before
-/// emitting the module.
+/// by [`super::codemode_ts::emit_codemode_ts`]. Exposed for callers
+/// that want to combine OpenAPI-derived tools with tools from a live
+/// MCP federation before emitting the module.
 pub fn openapi_to_federated_tools(spec: &serde_json::Value) -> Vec<FederatedTool> {
     let raw = openapi_to_mcp_tools(spec);
     let mut tools = Vec::with_capacity(raw.len());
