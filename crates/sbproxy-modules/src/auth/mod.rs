@@ -8,6 +8,9 @@ pub mod bot_auth_directory;
 /// Wave 6 / R6.1 Crawler Authorization Protocol (CAP) verifier.
 pub mod cap;
 pub mod jwks;
+/// WOR-504 trust-tier combiner: collapses signed / named / scored
+/// signals into a single enum for downstream policy consumption.
+pub mod trust_tier;
 
 pub use bot_auth::{BotAuthAgent, BotAuthConfig, BotAuthProvider, BotAuthVerdict};
 pub use bot_auth_directory::{
@@ -16,6 +19,7 @@ pub use bot_auth_directory::{
     MIN_DIRECTORY_TTL_SECS,
 };
 pub use cap::{CapConfig, CapError, CapTokenView, CapVerdict, CapVerifier};
+pub use trust_tier::{compute_trust_tier, TrustSignals, TrustTier, NAMED_AGENT_SCORE_THRESHOLD};
 
 use base64::Engine;
 use md5::{Digest as Md5Digest, Md5};
