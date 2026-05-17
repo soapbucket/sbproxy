@@ -6977,6 +6977,8 @@ async fn handle_mcp_action(
     // any TypeScript agent or sandbox can `import` the module
     // directly without a separate codegen step.
     if method == http::Method::GET && req_path == "/.well-known/mcp/codemode.ts" {
+        use sha2::{Digest, Sha256};
+
         let listener_is_tls = session
             .digest()
             .and_then(|d| d.ssl_digest.as_ref())
@@ -6999,19 +7001,91 @@ async fn handle_mcp_action(
             None => String::new(),
         };
         let module = mcp.federation.codemode_ts(&callback_base);
-        send_response(
-            session,
-            200,
-            "text/typescript; charset=utf-8",
-            module.as_bytes(),
-        )
-        .await?;
+
+        // Strong ETag is the lowercase hex SHA-256 of the emitted
+        // bytes wrapped in double quotes per RFC 9110 §8.8.3. The
+        // federation sorts tools lexicographically before emission,
+        // so the digest is stable across calls as long as the tool
+        // registry does not change; a CDN or browser can pin against
+        // it with `If-None-Match` and skip the body on the next pull.
+        let digest = Sha256::digest(module.as_bytes());
+        let mut etag_value = String::with_capacity(2 + digest.len() * 2);
+        etag_value.push('"');
+        for byte in digest.iter() {
+            etag_value.push_str(&format!("{:02x}", byte));
+        }
+        etag_value.push('"');
+
+        let if_none_match = session
+            .req_header()
+            .headers
+            .get("if-none-match")
+            .and_then(|v| v.to_str().ok());
+
+        // 60 seconds keeps the catalogue fresh enough that a
+        // federation refresh propagates quickly, while
+        // `must-revalidate` forces shared caches to re-check via
+        // the Etag once the TTL expires.
+        const CACHE_CONTROL: &str = "max-age=60, must-revalidate";
+
+        // RFC 9110 §13.1.2 If-None-Match matching is a list of
+        // entity tags or `*`; accept any whitespace-separated entry
+        // that matches the digest. We avoid weak tags entirely
+        // because the body is byte-stable on every emission.
+        let etag_match = if_none_match
+            .map(|h| {
+                h.split(',')
+                    .any(|tok| tok.trim() == etag_value || tok.trim() == "*")
+            })
+            .unwrap_or(false);
+
+        if etag_match {
+            let mut header = pingora_http::ResponseHeader::build(304, Some(2)).map_err(|e| {
+                Error::because(ErrorType::InternalError, "failed to build 304 header", e)
+            })?;
+            let _ = header.insert_header("etag", &etag_value);
+            let _ = header.insert_header("cache-control", CACHE_CONTROL);
+            session
+                .write_response_header(Box::new(header), true)
+                .await?;
+            tracing::info!(
+                target: "sbproxy::audit",
+                event = "mcp.codemode_ts.not_modified",
+                mcp_server = %mcp.server_name,
+                request_id = %ctx.request_id,
+                "codemode.ts module unchanged; returned 304"
+            );
+            return Ok(());
+        }
+
+        // 200 path: write content-type + content-length + etag +
+        // cache-control inline so we can carry both custom headers.
+        let body = module.into_bytes();
+        let mut header = pingora_http::ResponseHeader::build(200, Some(4)).map_err(|e| {
+            Error::because(
+                ErrorType::InternalError,
+                "failed to build codemode.ts header",
+                e,
+            )
+        })?;
+        let _ = header.insert_header("content-type", "text/typescript; charset=utf-8");
+        let _ = header.insert_header("content-length", body.len().to_string());
+        let _ = header.insert_header("etag", &etag_value);
+        let _ = header.insert_header("cache-control", CACHE_CONTROL);
+        session
+            .write_response_header(Box::new(header), false)
+            .await?;
+        let body_len = body.len();
+        session
+            .write_response_body(Some(bytes::Bytes::from(body)), true)
+            .await?;
         tracing::info!(
             target: "sbproxy::audit",
             event = "mcp.codemode_ts.served",
             mcp_server = %mcp.server_name,
             request_id = %ctx.request_id,
-            byte_count = module.len(),
+            byte_count = body_len,
+            etag = %etag_value,
             "served codemode.ts module"
         );
         return Ok(());
