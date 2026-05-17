@@ -8702,6 +8702,72 @@ impl ProxyHttp for SbProxy {
                 }
             }
 
+            // --- WOR-525: ARDP discovery endpoint -----------------------------
+            //
+            // Path:
+            //   /.well-known/sbproxy-agent
+            //
+            // Returns a small JSON capability advertisement per
+            // draft-pioli-agent-discovery-01 (Agent Registration and
+            // Discovery Protocol) section 4. The shape lists the
+            // tenant id plus the subset of agent-facing endpoints that
+            // are actually configured on this origin: `mcp` when the
+            // origin's action is `Action::Mcp`, `agent_skills` when
+            // the origin has any agent-skills surface (per-origin
+            // entries or a Listing publishing this hostname), and
+            // `openapi` when `expose_openapi: true`. Non-GET requests
+            // return 405. Every served response emits an
+            // `ardp.discovery.served` audit event.
+            if req_path == "/.well-known/sbproxy-agent" {
+                if session.req_header().method != http::Method::GET {
+                    send_error(session, 405, "method not allowed").await?;
+                    return Ok(true);
+                }
+
+                let aggregated_skills =
+                    sbproxy_modules::projections::agent_skills::aggregate_for_hostname(
+                        per_origin_idx,
+                        &docs.agent_skills_listings,
+                        host_key,
+                    );
+                let has_agent_skills =
+                    !aggregated_skills.entries.is_empty() || per_origin_idx.is_some();
+                let has_mcp = matches!(pipeline.actions.get(origin_idx), Some(Action::Mcp(_)));
+                let has_openapi = pipeline.config.origins[origin_idx].expose_openapi;
+
+                let origin = &pipeline.config.origins[origin_idx];
+                let agent_id = if !origin.workspace_id.is_empty() {
+                    origin.workspace_id.as_str()
+                } else if !origin.origin_id.is_empty() {
+                    origin.origin_id.as_str()
+                } else {
+                    host_key
+                };
+
+                let body = render_ardp_discovery(
+                    agent_id,
+                    scheme,
+                    host_authority,
+                    has_mcp,
+                    has_agent_skills,
+                    has_openapi,
+                );
+                tracing::info!(
+                    target: "sbproxy::audit",
+                    event = "ardp.discovery.served",
+                    hostname = %host_key,
+                    agent_id = %agent_id,
+                    caller = %caller,
+                    has_mcp,
+                    has_agent_skills,
+                    has_openapi,
+                    request_id = %ctx.request_id,
+                    "ardp discovery advertisement served"
+                );
+                send_response(session, 200, "application/json", body.as_bytes()).await?;
+                return Ok(true);
+            }
+
             // --- Aggregated manifest at the unprefixed well-known URL --------
             //
             // `/.well-known/agent-skills/index.json` returns the union
@@ -14640,6 +14706,76 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
     server.run_forever();
 }
 
+/// Render the ARDP (`/.well-known/sbproxy-agent`) capability
+/// advertisement as a compact JSON string.
+///
+/// Pure helper so the JSON shape is unit-testable without booting the
+/// Pingora pipeline. The advertised endpoint keys (`mcp`, `agent_skills`,
+/// `openapi`) are emitted only when the corresponding capability is
+/// actually configured on the origin; the `capabilities` array tracks the
+/// same set so registry consumers can branch on a string list without
+/// re-walking the endpoint map. The publisher block is constant and
+/// names the project surface, not the operator.
+///
+/// Per draft-pioli-agent-discovery-01 §4. Wire format is JSON; this
+/// function builds a `serde_json::Value` and renders it with the
+/// canonical compact encoder so the body is stable across releases.
+fn render_ardp_discovery(
+    agent_id: &str,
+    scheme: &str,
+    host_authority: Option<&str>,
+    has_mcp: bool,
+    has_agent_skills: bool,
+    has_openapi: bool,
+) -> String {
+    let base = match host_authority {
+        Some(auth) if !auth.is_empty() => format!("{scheme}://{auth}"),
+        _ => String::new(),
+    };
+
+    let mut endpoints = serde_json::Map::new();
+    let mut capabilities: Vec<&'static str> = Vec::new();
+    if has_mcp {
+        let url = if base.is_empty() {
+            "/mcp".to_string()
+        } else {
+            format!("{base}/mcp")
+        };
+        endpoints.insert("mcp".to_string(), serde_json::Value::String(url));
+        capabilities.push("mcp.tools");
+    }
+    if has_agent_skills {
+        let url = if base.is_empty() {
+            "/.well-known/agent-skills/index.json".to_string()
+        } else {
+            format!("{base}/.well-known/agent-skills/index.json")
+        };
+        endpoints.insert("agent_skills".to_string(), serde_json::Value::String(url));
+        capabilities.push("agent_skills.v0_2");
+    }
+    if has_openapi {
+        let url = if base.is_empty() {
+            "/.well-known/openapi.json".to_string()
+        } else {
+            format!("{base}/.well-known/openapi.json")
+        };
+        endpoints.insert("openapi".to_string(), serde_json::Value::String(url));
+        capabilities.push("openapi");
+    }
+
+    let value = serde_json::json!({
+        "schema_version": "1",
+        "agent_id": agent_id,
+        "endpoints": endpoints,
+        "capabilities": capabilities,
+        "publisher": {
+            "name": "sbproxy",
+            "url": "https://sbproxy.dev"
+        }
+    });
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -17299,5 +17435,126 @@ origins:
         let invalid = bytes::Bytes::from_static(b"{not valid json");
         let err = super::make_native_bypass_body(&invalid, "claude-3-5-sonnet").unwrap_err();
         assert!(err.is_syntax() || err.is_data());
+    }
+
+    // --- WOR-525: ARDP discovery JSON shape ---
+
+    #[test]
+    fn ardp_discovery_emits_required_top_level_keys() {
+        let body = super::render_ardp_discovery(
+            "ws-1",
+            "https",
+            Some("agent.example.com"),
+            true,
+            true,
+            true,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["schema_version"], "1");
+        assert_eq!(v["agent_id"], "ws-1");
+        assert!(v["endpoints"].is_object());
+        assert!(v["capabilities"].is_array());
+        assert_eq!(v["publisher"]["name"], "sbproxy");
+        assert_eq!(v["publisher"]["url"], "https://sbproxy.dev");
+    }
+
+    #[test]
+    fn ardp_discovery_lists_all_endpoints_when_all_enabled() {
+        let body = super::render_ardp_discovery(
+            "ws-1",
+            "https",
+            Some("agent.example.com"),
+            true,
+            true,
+            true,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["endpoints"]["mcp"], "https://agent.example.com/mcp");
+        assert_eq!(
+            v["endpoints"]["agent_skills"],
+            "https://agent.example.com/.well-known/agent-skills/index.json"
+        );
+        assert_eq!(
+            v["endpoints"]["openapi"],
+            "https://agent.example.com/.well-known/openapi.json"
+        );
+        let caps: Vec<String> = v["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect();
+        assert!(caps.contains(&"mcp.tools".to_string()));
+        assert!(caps.contains(&"agent_skills.v0_2".to_string()));
+        assert!(caps.contains(&"openapi".to_string()));
+    }
+
+    #[test]
+    fn ardp_discovery_omits_endpoint_keys_when_capability_off() {
+        // Only MCP is configured; agent_skills and openapi keys must
+        // not appear, and the capabilities array tracks the same set.
+        let body = super::render_ardp_discovery(
+            "ws-1",
+            "https",
+            Some("agent.example.com"),
+            true,
+            false,
+            false,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let endpoints = v["endpoints"].as_object().unwrap();
+        assert!(endpoints.contains_key("mcp"));
+        assert!(!endpoints.contains_key("agent_skills"));
+        assert!(!endpoints.contains_key("openapi"));
+        let caps: Vec<String> = v["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(caps, vec!["mcp.tools".to_string()]);
+    }
+
+    #[test]
+    fn ardp_discovery_emits_empty_endpoints_when_nothing_configured() {
+        let body = super::render_ardp_discovery(
+            "ws-1",
+            "https",
+            Some("agent.example.com"),
+            false,
+            false,
+            false,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["endpoints"].as_object().unwrap().is_empty());
+        assert!(v["capabilities"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ardp_discovery_uses_relative_urls_when_host_authority_missing() {
+        // Spec lets the client fill in the host when the proxy can't
+        // resolve the inbound `Host` header; a path-absolute URL is
+        // the safest fallback.
+        let body = super::render_ardp_discovery("ws-1", "https", None, true, true, false);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["endpoints"]["mcp"], "/mcp");
+        assert_eq!(
+            v["endpoints"]["agent_skills"],
+            "/.well-known/agent-skills/index.json"
+        );
+    }
+
+    #[test]
+    fn ardp_discovery_respects_http_scheme() {
+        let body = super::render_ardp_discovery(
+            "ws-1",
+            "http",
+            Some("agent.example.com"),
+            true,
+            false,
+            false,
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["endpoints"]["mcp"], "http://agent.example.com/mcp");
     }
 }
