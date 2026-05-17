@@ -23,3 +23,7 @@ pub mod proxy_status;
 /// the per-origin policy chain.
 pub mod rate_limit;
 pub mod signatures;
+/// RFC 9421 HTTP Message Signatures: outbound signing path (sign on
+/// egress). Companion to [`signatures`], which implements the inbound
+/// verification half.
+pub mod signatures_egress;
