@@ -1,4 +1,4 @@
-//! TLS ClientHello fingerprinting (JA3 / JA4 / JA4H / JA4S).
+//! TLS ClientHello fingerprinting (JA3 / JA4 / JA4H / JA4S / JA4T / JA4X).
 //!
 //! Wave 5 / G5.3.
 //!
@@ -18,6 +18,17 @@
 //! - **JA4S** (ServerHello): outbound fingerprint of the upstream's
 //!   reply. Stub here. Wave 5 leaves the field as `None`; outbound
 //!   capture lands with the connector hardening in B5.x.
+//! - **JA4T** (TCP fingerprint): SYN-packet TCP options + window
+//!   shape. Slice 7 (WOR-590) lands the field on the struct but
+//!   leaves the value as `None` on the inbound path: Pingora 0.8's
+//!   `Session` abstraction does not surface the raw TCP socket
+//!   options block, so the value cannot be computed today.
+//!   See [`compute_ja4t`] for the pure helper and the field
+//!   rustdoc for the layering note.
+//! - **JA4X** (X.509 cert-chain fingerprint): truncated SHA-256 of
+//!   each cert's issuer DN, signature algorithm OID, and extension
+//!   OID list, joined per FoxIO spec. Populated by the mTLS verify
+//!   path when the client presents a cert chain.
 //!
 //! # Capture point
 //!
@@ -97,6 +108,26 @@ pub struct TlsFingerprint {
     /// CIDR rules; defaults to `false` when no rule matches
     /// (conservative, per A5.1).
     pub trustworthy: bool,
+    /// JA4T TCP fingerprint (SYN packet window size + window
+    /// scaling + TCP options list + MSS + IP TTL) per the FoxIO
+    /// JA4T spec. Slice 7 / WOR-590 lands the field on the struct
+    /// but currently leaves the inbound path's value as `None`:
+    /// the raw TCP options block is not surfaced by Pingora 0.8's
+    /// `Session` abstraction. The pure helper [`compute_ja4t`]
+    /// exists so a future listener-level capture (or an enterprise
+    /// sidecar that observes the SYN) can populate the field
+    /// without re-walking the FoxIO format.
+    // TODO(WOR-590): wire JA4T capture once Pingora exposes the
+    // raw TCP socket options, or thread it through a SYN-observing
+    // sidecar header on the trusted-proxy path.
+    pub ja4t: Option<String>,
+    /// JA4X X.509 cert-chain fingerprint computed from the client
+    /// cert chain presented during mTLS. Format per FoxIO:
+    /// `<num_certs>_<sha256_12(issuer_string)>_<sha256_12(sig_alg_oid)>_<sha256_12(ext_oid_list)>`.
+    /// `None` when the client did not present a cert chain
+    /// (anonymous TLS), when chain parsing failed, or when mTLS is
+    /// not enabled on the listener.
+    pub ja4x: Option<String>,
 }
 
 /// IANA-assigned codepoints for post-quantum hybrid key-exchange
@@ -177,6 +208,12 @@ pub fn parse_client_hello(bytes: &[u8]) -> TlsFingerprint {
         alpn: parsed.alpn.clone(),
         pq_tls_present,
         trustworthy: false,
+        // WOR-590: JA4T comes from the SYN-packet TCP options
+        // block; Pingora does not surface that today. The mTLS
+        // verify hook populates JA4X separately (see
+        // `compute_ja4x`).
+        ja4t: None,
+        ja4x: None,
     }
 }
 
