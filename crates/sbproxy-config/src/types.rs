@@ -348,13 +348,6 @@ pub struct ProxyServerConfig {
     /// [`HttpClientTimeoutsConfig`] for the field list.
     #[serde(default)]
     pub http_client_timeouts: HttpClientTimeoutsConfig,
-    /// Sandbox limits for the embedded scripting engines (JavaScript,
-    /// Lua, ...). Per-engine sub-blocks live under
-    /// [`ScriptingConfig`]; unset blocks fall back to safe defaults.
-    /// This is the operator knob for the CPU time budget that backs
-    /// the JS interrupt handler installed in WOR-595.
-    #[serde(default)]
-    pub scripting: ScriptingConfig,
 }
 
 impl Default for ProxyServerConfig {
@@ -383,22 +376,26 @@ impl Default for ProxyServerConfig {
             scripting: ScriptingConfig::default(),
             extensions: HashMap::new(),
             http_client_timeouts: HttpClientTimeoutsConfig::default(),
-            scripting: ScriptingConfig::default(),
         }
     }
 }
 
-// --- Scripting engine sandbox config (WOR-595) ---
+// --- Scripting engine sandbox config (WOR-594 + WOR-595) ---
 
 /// Per-engine scripting sandbox limits, exposed under the
 /// `proxy.scripting:` block of sb.yml.
 ///
-/// Currently exposes a `javascript:` sub-block; future tickets will
-/// add equivalents for the other embedded engines. Operators who do
-/// not set this block get the documented defaults (see the per-engine
-/// types for their values).
+/// Today this block carries sub-blocks for the Lua engine (WOR-594)
+/// and the JavaScript engine (WOR-595). The CEL and WebAssembly
+/// engines manage their own budgets separately. Operators who omit
+/// the block get the documented defaults from each sub-block.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ScriptingConfig {
+    /// Lua sandbox limits. Always populated, even when the operator
+    /// omitted the block, so callers never have to special-case
+    /// `None`.
+    #[serde(default)]
+    pub lua: LuaScriptingConfig,
     /// JavaScript engine sandbox knobs. Covers the QuickJS-backed
     /// `JsEngine` used by transforms, request matchers, and WAF
     /// custom rules.
@@ -535,6 +532,7 @@ javascript:
     #[test]
     fn scripting_block_round_trips_through_yaml() {
         let original = ScriptingConfig {
+            lua: LuaScriptingConfig::default(),
             javascript: JsScriptingConfig {
                 sandbox: JsSandboxConfig {
                     budget_ms: 75,
@@ -653,24 +651,7 @@ fn default_synthetic_timeout_ms() -> u64 {
     1000
 }
 
-// --- Scripting runtime limits (WOR-594) ---
-
-/// Scripting runtime limits applied to user-supplied scripts.
-///
-/// The runtime knobs live under `proxy.scripting:` so operators can
-/// raise or lower them per deployment without touching the binary. At
-/// present only the Lua engine reads from this block; the CEL, JS, and
-/// WebAssembly engines manage their own budgets separately. When the
-/// block is omitted from `sb.yml`, [`Self::default`] is applied, which
-/// matches the documented defaults of the embedded Lua sandbox.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub struct ScriptingConfig {
-    /// Lua sandbox limits. Always populated, even when the operator
-    /// omitted the block, so callers never have to special-case
-    /// `None`.
-    #[serde(default)]
-    pub lua: LuaScriptingConfig,
-}
+// --- Lua scripting runtime limits (WOR-594) ---
 
 /// Lua scripting runtime configuration. Wraps the sandbox limits so
 /// future Lua-specific tunables (preloaded libraries, request-binding
