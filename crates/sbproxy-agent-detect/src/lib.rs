@@ -35,8 +35,12 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod payload_extractors;
 pub mod rules;
 
+pub use payload_extractors::{
+    count_unique_filesystem_paths, extract_payload_signals, is_stack_trace_shaped,
+};
 pub use rules::{AgentRule, MatchSpec, RulePack, RulePackError};
 
 // --- Public detection shape -------------------------------------------------
@@ -198,11 +202,35 @@ pub struct HttpSignals {
     pub headers_present: Vec<String>,
 }
 
-/// Placeholder payload signal shell. Fields land in WOR-591.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// Payload-shaped signals lifted from the request body. Slice 8
+/// (WOR-591) introduces the three fields the scorer reads against
+/// today. See [`crate::payload_extractors`] for the pure-function
+/// extractors that build this struct from a body slice.
+///
+/// The signal set is intentionally PII-safe: filesystem-path
+/// leakage is reported as a count (never the path text), and the
+/// stack-trace detector returns a boolean. Operators can ship the
+/// full struct to metrics and audit without a redactor in the path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PayloadSignals {
-    #[doc(hidden)]
-    pub _reserved: (),
+    /// Number of unique absolute filesystem paths the body leaks.
+    /// Matches the three OS home-directory shapes (macOS, Linux,
+    /// Windows). Surfaces the count only; the path text is never
+    /// retained on this struct so the signal is safe to log.
+    pub filesystem_paths_leaked: u32,
+    /// True when the body contains a recognised runtime stack
+    /// trace (Python, Node, Go panic, Java). Useful for the agent
+    /// scorer because human-driven traffic almost never POSTs a
+    /// raw traceback to a model endpoint, but agent retry loops
+    /// commonly forward the runtime error verbatim.
+    pub stack_trace_shaped: bool,
+    /// Reserved for the session-window embedding-burst heuristic.
+    /// A per-request body cannot determine session-level rate, so
+    /// this slice hard-wires the value to `false`; a follow-up
+    /// will wire session state (request count + embedding-payload
+    /// ratio over a sliding window) and flip the field on when
+    /// the burst threshold is crossed.
+    pub embedding_burst: bool,
 }
 
 // --- Scorer trait -----------------------------------------------------------
