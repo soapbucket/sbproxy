@@ -35,9 +35,13 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod http_extractors;
 pub mod payload_extractors;
 pub mod rules;
 
+pub use http_extractors::{
+    extract_http_signals, header_order_hash, user_agent_bucket, vendor_headers, UserAgentBucket,
+};
 pub use payload_extractors::{
     count_unique_filesystem_paths, extract_payload_signals, is_stack_trace_shaped,
 };
@@ -188,18 +192,41 @@ impl From<&sbproxy_tls::fingerprint::TlsFingerprint> for TlsSignals {
     }
 }
 
-/// HTTP-layer signals. Slice 2 (WOR-585) introduces the minimal field
-/// set the rule-pack matcher reads against: the `User-Agent` header
-/// value plus the list of header names the request carried. Slice 4
-/// (WOR-587) extends this with the header order hash, UA bucket, and
-/// cookie persistence signal.
+/// HTTP-layer signals consumed by the rule-pack matcher and the
+/// future ML scorer. Slice 2 (WOR-585) seeded the matcher fields
+/// (`user_agent`, `headers_present`); slice 4 (WOR-587) extends the
+/// shape with the order-sensitive + vendor-aware extractors the
+/// scoring layer needs.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HttpSignals {
     /// Raw `User-Agent` header value, when present.
     pub user_agent: Option<String>,
-    /// Lowercased header names the request carried. Used by the
-    /// rule-pack matcher's `header_present` predicate.
+    /// Lowercased header names the request carried, in arrival
+    /// order. Used by the rule-pack matcher's `header_present`
+    /// predicate and by the order-sensitive
+    /// [`header_order_hash`] extractor.
     pub headers_present: Vec<String>,
+    /// SHA-256 hex (lowercase, 64 chars) of the concatenated
+    /// `\n`-delimited lowercased header-name list, computed in
+    /// arrival order. Stable across requests with identical header
+    /// order; differs on any reorder. Empty when no headers were
+    /// captured (so a stream of zero-header requests does not all
+    /// collide on the SHA-256 of the empty string).
+    pub header_order_hash: String,
+    /// Lowercased vendor-aware header names detected on the request.
+    /// Recognised names (slice 4): `x-stainless-*` family (OpenAI
+    /// Stainless SDKs and downstream consumers like Anthropic's
+    /// Claude Code CLI), `anthropic-version`, `openai-beta`.
+    pub vendor_headers: Vec<String>,
+    /// Coarse User-Agent classification computed by
+    /// [`user_agent_bucket`]. `None` when no `User-Agent` header was
+    /// captured.
+    pub user_agent_bucket: Option<UserAgentBucket>,
+    /// Whether the request carried a `Cookie` header. Crude proxy
+    /// for "this client persists state across requests", which is
+    /// rare for stateless agent / SDK traffic and ubiquitous for
+    /// real browsers.
+    pub cookie_persistence: bool,
 }
 
 /// Payload-shaped signals lifted from the request body. Slice 8
