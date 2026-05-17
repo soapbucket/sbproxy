@@ -4,58 +4,183 @@
 //! (via rquickjs) for running user-defined scripts in request/response
 //! processing. Used for custom matching logic, request transformations,
 //! and WAF rules. Parallel alternative to the Lua engine.
+//!
+//! ## Sandbox
+//!
+//! Every script runs under three independently enforced limits, all
+//! configurable from `sb.yml` via `proxy.scripting.javascript.sandbox`:
+//!
+//! * **CPU time budget** (`budget_ms`, default 100 ms): a watchdog
+//!   timer flips an atomic flag after the budget elapses. The
+//!   interrupt handler installed on the QuickJS runtime polls that
+//!   flag and aborts execution with an uncatchable exception, which
+//!   surfaces in Rust as [`JsExecutionError::Interrupt`]. This is the
+//!   guard against scripts like `while (true) {}` (WOR-595).
+//! * **Heap memory cap** (`memory_mb`, default 16 MB): handed to
+//!   QuickJS via `Runtime::set_memory_limit`. Hitting the cap raises
+//!   an allocation error, which surfaces as
+//!   [`JsExecutionError::Other`] with the underlying message.
+//! * **Native stack cap** (`stack_kb`, default 1 MB): handed to
+//!   QuickJS via `Runtime::set_max_stack_size`. Guards against
+//!   deeply recursive scripts.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::Result;
 use rquickjs::function::Rest;
 use rquickjs::{Array, Context, Function, Object, Runtime, String as JsString, Value};
+use thiserror::Error;
+
+pub use sbproxy_config::types::JsSandboxConfig;
+
+// --- Errors ---
+
+/// Structured error returned by every public method on [`JsEngine`].
+///
+/// Distinguishing the interrupt path from a generic script error
+/// matters because callers handle the two differently: a script that
+/// exceeded its CPU budget is a sign of operator misconfiguration or
+/// adversarial input and should be logged at warn level with the
+/// budget value, whereas a script that raised a `TypeError` is a
+/// per-request data bug and is usually logged at debug.
+#[derive(Debug, Error)]
+pub enum JsExecutionError {
+    /// The script exceeded its CPU time budget and the interrupt
+    /// handler aborted it. The attached value is the budget that was
+    /// in effect for the run, in milliseconds.
+    #[error("javascript execution exceeded {budget_ms} ms CPU budget")]
+    Interrupt {
+        /// The CPU budget the engine was configured with, in ms.
+        budget_ms: u64,
+    },
+    /// Any other failure during execution: syntax error, runtime
+    /// exception thrown by the script, out-of-memory from the
+    /// QuickJS allocator, JS-to-JSON conversion failure, etc.
+    #[error("javascript execution failed: {0}")]
+    Other(#[from] anyhow::Error),
+}
+
+impl JsExecutionError {
+    /// Returns `true` if this is an [`Self::Interrupt`] variant.
+    ///
+    /// Convenience for callers that want a single matcher (such as a
+    /// `match` in a hot path) without writing out the full pattern.
+    pub fn is_interrupt(&self) -> bool {
+        matches!(self, Self::Interrupt { .. })
+    }
+}
 
 // --- JS Engine ---
 
 /// A sandboxed JavaScript execution environment.
 ///
 /// Wraps a rquickjs `Context` with dangerous globals removed, JSON helper
-/// functions registered, and memory/stack limits enforced. Each engine
-/// instance maintains its own QuickJS runtime and context.
+/// functions registered, and memory / stack / CPU-budget limits enforced.
+/// Each engine instance maintains its own QuickJS runtime and context.
 pub struct JsEngine {
     // The Runtime must be kept alive for the lifetime of the Context.
-    // It is not accessed after construction but must not be dropped.
+    // It is not accessed after construction (except by the interrupt
+    // handler, which holds an internal reference via the closure
+    // captured in `set_interrupt_handler`) but must not be dropped.
     #[allow(dead_code)]
     runtime: Runtime,
     context: Context,
+    /// Atomic flag the watchdog thread flips when the CPU budget
+    /// expires. The interrupt handler installed on `runtime` reads
+    /// this on every poll and returns `true` to abort eval once set.
+    /// `Arc<...>` so both the closure and the watchdog can hold it.
+    interrupt: Arc<AtomicBool>,
+    /// The sandbox limits this engine was constructed with. Stored so
+    /// `execute` / `call_function` / `match_request` / `waf_match`
+    /// can read `budget_ms` for the watchdog and stamp the same
+    /// value on the structured `Interrupt` error returned to the
+    /// caller.
+    sandbox: JsSandboxConfig,
 }
 
 impl JsEngine {
-    /// Create a new sandboxed JS engine with default configuration.
+    /// Create a new sandboxed JS engine with default sandbox limits.
     ///
-    /// Sets a 16 MB memory limit and a 1 MB stack size limit. Removes `eval`
-    /// to prevent dynamic code injection, and registers `json_encode` /
-    /// `json_decode` as global helpers.
+    /// Equivalent to `JsEngine::with_sandbox(JsSandboxConfig::default())`.
+    /// Sets a 100 ms CPU budget, a 16 MB memory limit, and a 1 MB
+    /// stack size limit. Removes `eval` to prevent dynamic code
+    /// injection, and registers `json_encode` / `json_decode` as
+    /// global helpers.
     pub fn new() -> Result<Self> {
-        Self::with_memory_limit(16 * 1024 * 1024)
+        Self::with_sandbox(JsSandboxConfig::default())
     }
 
     /// Create a new sandboxed JS engine with a custom memory limit.
     ///
-    /// The stack size limit is fixed at 1 MB. The memory limit applies to the
-    /// entire QuickJS runtime heap.
+    /// Convenience wrapper that keeps the CPU budget and stack size
+    /// at their defaults and overrides only the heap memory cap.
+    /// `limit_bytes` is in bytes (it gets translated to MB inside the
+    /// underlying [`JsSandboxConfig`]).
     pub fn with_memory_limit(limit_bytes: usize) -> Result<Self> {
+        // `set_memory_limit` is byte-precise, so for users who pass a
+        // value that is not a clean MB multiple we round up to the
+        // next MB to preserve the historical "at least this much"
+        // behaviour of the old API.
+        let memory_mb = limit_bytes.div_ceil(1024 * 1024).max(1);
+        Self::with_sandbox(JsSandboxConfig {
+            memory_mb,
+            ..JsSandboxConfig::default()
+        })
+    }
+
+    /// Create a new sandboxed JS engine with operator-provided sandbox limits.
+    ///
+    /// This is the path through which `proxy.scripting.javascript.sandbox`
+    /// from sb.yml reaches the engine. The supplied [`JsSandboxConfig`]
+    /// is applied to the QuickJS runtime up front and then retained
+    /// for the lifetime of the engine so the CPU-budget watchdog can
+    /// read it on every script invocation.
+    pub fn with_sandbox(sandbox: JsSandboxConfig) -> Result<Self> {
         let runtime = Runtime::new()?;
-        runtime.set_memory_limit(limit_bytes);
-        runtime.set_max_stack_size(1024 * 1024);
+        runtime.set_memory_limit(sandbox.memory_mb.saturating_mul(1024 * 1024));
+        runtime.set_max_stack_size(sandbox.stack_kb.saturating_mul(1024));
+
+        // Install the interrupt handler once at construction time.
+        // The closure captures a clone of the Arc so the watchdog
+        // thread (which holds the original) and the handler observe
+        // the same flag. Reading is `Relaxed` because we do not need
+        // to order any data behind the flag itself; the only payload
+        // is the boolean.
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let interrupt_for_handler = Arc::clone(&interrupt);
+        runtime.set_interrupt_handler(Some(Box::new(move || {
+            interrupt_for_handler.load(Ordering::Relaxed)
+        })));
 
         let context = Context::full(&runtime)?;
 
         context.with(|ctx| {
             // Sandbox: remove dangerous globals
-            Self::sandbox(&ctx)?;
+            Self::sandbox_ctx(&ctx)?;
             // Register json_encode / json_decode helpers
             Self::register_helpers(&ctx)?;
             Ok::<_, anyhow::Error>(())
         })?;
 
-        Ok(Self { runtime, context })
+        Ok(Self {
+            runtime,
+            context,
+            interrupt,
+            sandbox,
+        })
+    }
+
+    /// Returns the sandbox limits this engine is enforcing.
+    ///
+    /// Exposed for callers (and tests) that want to assert what the
+    /// engine was configured with without round-tripping through the
+    /// original [`JsSandboxConfig`] they constructed it from.
+    pub fn sandbox_config(&self) -> &JsSandboxConfig {
+        &self.sandbox
     }
 
     /// Remove dangerous globals for sandboxing.
@@ -63,7 +188,7 @@ impl JsEngine {
     /// QuickJS does not expose filesystem or network APIs by default, but we
     /// additionally remove `eval` to prevent dynamic code construction and
     /// injection attacks.
-    fn sandbox(ctx: &rquickjs::Ctx) -> Result<()> {
+    fn sandbox_ctx(ctx: &rquickjs::Ctx) -> Result<()> {
         let globals = ctx.globals();
         globals.remove("eval")?;
         Ok(())
@@ -83,29 +208,115 @@ impl JsEngine {
         Ok(())
     }
 
+    /// Run a closure under the CPU-budget watchdog.
+    ///
+    /// All public entry points funnel through this helper so the
+    /// budget enforcement is in exactly one place. The control flow:
+    ///
+    /// 1. Clear the interrupt flag (in case a prior run was
+    ///    interrupted, leaving it set).
+    /// 2. Spawn a detached watchdog thread that sleeps for
+    ///    `budget_ms` and then flips the flag. Its handle is dropped
+    ///    so the thread is not joined; if the closure finishes first
+    ///    the thread wakes, observes the closure-done signal, and
+    ///    exits without touching the flag.
+    /// 3. Run the closure. QuickJS calls the interrupt handler
+    ///    periodically; the handler aborts when the flag is set.
+    /// 4. After the closure returns, clear the flag and signal the
+    ///    watchdog that the run is over.
+    /// 5. If the flag observed `true` at any point, translate the
+    ///    closure's error into [`JsExecutionError::Interrupt`];
+    ///    otherwise wrap it in [`JsExecutionError::Other`].
+    fn with_budget<T>(
+        &self,
+        f: impl FnOnce() -> Result<T>,
+    ) -> std::result::Result<T, JsExecutionError> {
+        // Reset before each run so a previously tripped flag does
+        // not pre-abort the new evaluation.
+        self.interrupt.store(false, Ordering::Relaxed);
+
+        // The watchdog and the runner share a "done" signal: when
+        // the closure completes (success or failure), the runner
+        // sets `done` and the watchdog can wake up and exit without
+        // tripping the interrupt. Without this, every script run
+        // would burn one watchdog thread for the full `budget_ms`
+        // even when the script finished in microseconds.
+        let done = Arc::new(AtomicBool::new(false));
+        let interrupt_for_watchdog = Arc::clone(&self.interrupt);
+        let done_for_watchdog = Arc::clone(&done);
+        let budget_ms = self.sandbox.budget_ms;
+
+        // Detach the watchdog. We never join: if the script finishes
+        // early, the watchdog wakes up promptly, sees `done`, and
+        // exits.
+        let _watchdog = thread::spawn(move || {
+            // Sleep in small slices so a fast script does not have
+            // to wait the full budget for the thread to exit. The
+            // slice value is a balance between responsiveness and
+            // overhead; 5 ms is well under the smallest reasonable
+            // budget and keeps wakeups cheap.
+            let slice = Duration::from_millis(5);
+            let mut remaining = Duration::from_millis(budget_ms);
+            while remaining > Duration::ZERO {
+                if done_for_watchdog.load(Ordering::Relaxed) {
+                    return;
+                }
+                let step = remaining.min(slice);
+                thread::sleep(step);
+                remaining -= step;
+            }
+            if !done_for_watchdog.load(Ordering::Relaxed) {
+                interrupt_for_watchdog.store(true, Ordering::Relaxed);
+            }
+        });
+
+        let result = f();
+
+        // Signal the watchdog whether or not the run succeeded.
+        done.store(true, Ordering::Relaxed);
+
+        // Did the watchdog beat us? The atomic read here gives the
+        // authoritative answer: if the flag is set, the interrupt
+        // handler returned `true` at least once and we should treat
+        // any error as a budget interrupt regardless of the specific
+        // rquickjs error variant.
+        let interrupted = self.interrupt.load(Ordering::Relaxed);
+
+        match result {
+            Ok(v) => Ok(v),
+            Err(_) if interrupted => Err(JsExecutionError::Interrupt { budget_ms }),
+            Err(e) => Err(JsExecutionError::Other(e)),
+        }
+    }
+
     /// Execute a JavaScript script with the given globals set.
     ///
     /// Each key in `globals` is set as a global variable before execution.
     /// The return value of the script expression is converted to JSON.
     /// Scripts that produce `undefined` return `null`.
+    ///
+    /// Returns [`JsExecutionError::Interrupt`] if the script exceeded
+    /// the configured CPU budget.
     pub fn execute(
         &self,
         script: &str,
         globals: HashMap<String, serde_json::Value>,
-    ) -> Result<serde_json::Value> {
-        self.context.with(|ctx| {
-            let global = ctx.globals();
+    ) -> std::result::Result<serde_json::Value, JsExecutionError> {
+        self.with_budget(|| {
+            self.context.with(|ctx| {
+                let global = ctx.globals();
 
-            // Set input globals before running the script
-            for (key, value) in &globals {
-                let js_val = json_to_js(&ctx, value)?;
-                global.set(key.as_str(), js_val)?;
-            }
+                // Set input globals before running the script
+                for (key, value) in &globals {
+                    let js_val = json_to_js(&ctx, value)?;
+                    global.set(key.as_str(), js_val)?;
+                }
 
-            // Execute the script and capture the result value
-            let result: Value = ctx.eval(script)?;
+                // Execute the script and capture the result value
+                let result: Value = ctx.eval(script)?;
 
-            js_to_json(&ctx, &result)
+                js_to_json(&ctx, &result)
+            })
         })
     }
 
@@ -123,45 +334,47 @@ impl JsEngine {
         script: &str,
         func_name: &str,
         args: Vec<serde_json::Value>,
-    ) -> Result<serde_json::Value> {
-        self.context.with(|ctx| {
-            // Load the script so the function is defined as a global
-            ctx.eval::<(), _>(script)?;
+    ) -> std::result::Result<serde_json::Value, JsExecutionError> {
+        self.with_budget(|| {
+            self.context.with(|ctx| {
+                // Load the script so the function is defined as a global
+                ctx.eval::<(), _>(script)?;
 
-            let global = ctx.globals();
-            let func: Function = global.get(func_name)?;
+                let global = ctx.globals();
+                let func: Function = global.get(func_name)?;
 
-            // Convert args to JS values
-            let js_args: Vec<Value> = args
-                .iter()
-                .map(|a| json_to_js(&ctx, a))
-                .collect::<anyhow::Result<Vec<_>>>()?;
+                // Convert args to JS values
+                let js_args: Vec<Value> = args
+                    .iter()
+                    .map(|a| json_to_js(&ctx, a))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
 
-            // --- Dispatch by arg count ---
-            // For 0-2 args we construct typed tuples so rquickjs can pass
-            // them directly. For 3+ args we wrap the remaining values in
-            // `Rest<Value>` so they are spread into the call without any
-            // string interpolation. The previous implementation built a
-            // `format!("{}(...__js_args__)", func_name)` and passed it to
-            // `ctx.eval`, which let an attacker-controlled `func_name`
-            // inject arbitrary JavaScript (H7).
-            let result: Value = match js_args.len() {
-                0 => func.call(())?,
-                1 => func.call((js_args.into_iter().next().unwrap(),))?,
-                2 => {
-                    let mut iter = js_args.into_iter();
-                    func.call((iter.next().unwrap(), iter.next().unwrap()))?
-                }
-                _ => {
-                    let mut iter = js_args.into_iter();
-                    let a0 = iter.next().unwrap();
-                    let a1 = iter.next().unwrap();
-                    let rest: Vec<Value> = iter.collect();
-                    func.call((a0, a1, Rest(rest)))?
-                }
-            };
+                // --- Dispatch by arg count ---
+                // For 0-2 args we construct typed tuples so rquickjs can pass
+                // them directly. For 3+ args we wrap the remaining values in
+                // `Rest<Value>` so they are spread into the call without any
+                // string interpolation. The previous implementation built a
+                // `format!("{}(...__js_args__)", func_name)` and passed it to
+                // `ctx.eval`, which let an attacker-controlled `func_name`
+                // inject arbitrary JavaScript (H7).
+                let result: Value = match js_args.len() {
+                    0 => func.call(())?,
+                    1 => func.call((js_args.into_iter().next().unwrap(),))?,
+                    2 => {
+                        let mut iter = js_args.into_iter();
+                        func.call((iter.next().unwrap(), iter.next().unwrap()))?
+                    }
+                    _ => {
+                        let mut iter = js_args.into_iter();
+                        let a0 = iter.next().unwrap();
+                        let a1 = iter.next().unwrap();
+                        let rest: Vec<Value> = iter.collect();
+                        func.call((a0, a1, Rest(rest)))?
+                    }
+                };
 
-            js_to_json(&ctx, &result)
+                js_to_json(&ctx, &result)
+            })
         })
     }
 
@@ -182,18 +395,20 @@ impl JsEngine {
         script: &str,
         request: &serde_json::Value,
         context: &serde_json::Value,
-    ) -> Result<bool> {
-        self.context.with(|ctx| {
-            ctx.eval::<(), _>(script)?;
+    ) -> std::result::Result<bool, JsExecutionError> {
+        self.with_budget(|| {
+            self.context.with(|ctx| {
+                ctx.eval::<(), _>(script)?;
 
-            let global = ctx.globals();
-            let func: Function = global.get("match_request")?;
+                let global = ctx.globals();
+                let func: Function = global.get("match_request")?;
 
-            let req_js = json_to_js(&ctx, request)?;
-            let ctx_js = json_to_js(&ctx, context)?;
+                let req_js = json_to_js(&ctx, request)?;
+                let ctx_js = json_to_js(&ctx, context)?;
 
-            let result: bool = func.call((req_js, ctx_js))?;
-            Ok(result)
+                let result: bool = func.call((req_js, ctx_js))?;
+                Ok(result)
+            })
         })
     }
 
@@ -217,42 +432,44 @@ impl JsEngine {
         uri: &str,
         headers: &HashMap<String, String>,
         body: Option<&str>,
-    ) -> Result<bool> {
-        self.context.with(|ctx| {
-            // --- Build the request object ---
-            let req = Object::new(ctx.clone())?;
-            req.set("uri", uri)?;
+    ) -> std::result::Result<bool, JsExecutionError> {
+        self.with_budget(|| {
+            self.context.with(|ctx| {
+                // --- Build the request object ---
+                let req = Object::new(ctx.clone())?;
+                req.set("uri", uri)?;
 
-            // Normalize header names to lowercase in a JS object
-            let hdrs_obj = Object::new(ctx.clone())?;
-            for (k, v) in headers {
-                hdrs_obj.set(k.to_lowercase().as_str(), v.as_str())?;
-            }
-            req.set("headers", hdrs_obj)?;
+                // Normalize header names to lowercase in a JS object
+                let hdrs_obj = Object::new(ctx.clone())?;
+                for (k, v) in headers {
+                    hdrs_obj.set(k.to_lowercase().as_str(), v.as_str())?;
+                }
+                req.set("headers", hdrs_obj)?;
 
-            if let Some(b) = body {
-                req.set("body", b)?;
-            }
+                if let Some(b) = body {
+                    req.set("body", b)?;
+                }
 
-            // Register a shared header-lookup function and attach it to the
-            // request object. Using a pre-defined JS function lets QuickJS
-            // resolve `this` correctly when called as request.header("...").
-            ctx.eval::<(), _>(
-                r#"
-                globalThis.__waf_header_fn__ = function(name) {
-                    return this.headers[name.toLowerCase()];
-                };
-                "#,
-            )?;
-            let header_fn: Function = ctx.globals().get("__waf_header_fn__")?;
-            req.set("header", header_fn)?;
+                // Register a shared header-lookup function and attach it to the
+                // request object. Using a pre-defined JS function lets QuickJS
+                // resolve `this` correctly when called as request.header("...").
+                ctx.eval::<(), _>(
+                    r#"
+                    globalThis.__waf_header_fn__ = function(name) {
+                        return this.headers[name.toLowerCase()];
+                    };
+                    "#,
+                )?;
+                let header_fn: Function = ctx.globals().get("__waf_header_fn__")?;
+                req.set("header", header_fn)?;
 
-            // --- Load script and call match() ---
-            ctx.eval::<(), _>(script)?;
-            let global = ctx.globals();
-            let func: Function = global.get("match")?;
-            let result: bool = func.call((req,))?;
-            Ok(result)
+                // --- Load script and call match() ---
+                ctx.eval::<(), _>(script)?;
+                let global = ctx.globals();
+                let func: Function = global.get("match")?;
+                let result: bool = func.call((req,))?;
+                Ok(result)
+            })
         })
     }
 }
@@ -349,6 +566,7 @@ fn js_to_json<'js>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     // --- Engine Construction ---
 
@@ -361,6 +579,23 @@ mod tests {
     #[test]
     fn test_with_memory_limit() {
         let _engine = JsEngine::with_memory_limit(32 * 1024 * 1024).unwrap();
+    }
+
+    #[test]
+    fn test_with_sandbox_round_trips_config() {
+        let cfg = JsSandboxConfig {
+            budget_ms: 250,
+            memory_mb: 8,
+            stack_kb: 512,
+        };
+        let engine = JsEngine::with_sandbox(cfg).unwrap();
+        assert_eq!(engine.sandbox_config().budget_ms, 250);
+        assert_eq!(engine.sandbox_config().memory_mb, 8);
+        assert_eq!(engine.sandbox_config().stack_kb, 512);
+        // The engine should still run a trivial script under that
+        // sandbox.
+        let v = engine.execute("1 + 2", HashMap::new()).unwrap();
+        assert_eq!(v, serde_json::json!(3));
     }
 
     // --- Basic Execution ---
@@ -948,6 +1183,195 @@ mod tests {
         let engine = JsEngine::new().unwrap();
         let result = engine.execute("json_decode('{{{invalid')", HashMap::new());
         assert!(result.is_err());
+    }
+
+    // --- CPU Budget (WOR-595) ---
+
+    /// `while (true) {}` must terminate within `budget_ms + slack` and
+    /// surface as a structured `Interrupt` error tagged with the
+    /// configured budget. The slack accounts for the watchdog poll
+    /// interval and QuickJS's interrupt poll cadence.
+    #[test]
+    fn cpu_budget_interrupts_infinite_loop() {
+        let engine = JsEngine::with_sandbox(JsSandboxConfig {
+            budget_ms: 50,
+            ..JsSandboxConfig::default()
+        })
+        .unwrap();
+
+        let start = Instant::now();
+        let result = engine.execute("while (true) {}", HashMap::new());
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("infinite loop must error out");
+        assert!(
+            err.is_interrupt(),
+            "infinite loop should produce Interrupt, got {err:?}"
+        );
+        match err {
+            JsExecutionError::Interrupt { budget_ms } => assert_eq!(budget_ms, 50),
+            other => panic!("expected Interrupt, got {other:?}"),
+        }
+        // budget + generous slack. QuickJS polls every ~256 ops so
+        // there is some over-shoot beyond the watchdog firing, plus
+        // the watchdog itself sleeps in 5 ms slices. Use 500 ms as a
+        // generous upper bound that still catches "ran forever".
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "infinite loop overran budget+slack: {elapsed:?}"
+        );
+    }
+
+    /// A trivial fast script must complete well under the budget,
+    /// proving the watchdog does not impose its own latency floor on
+    /// healthy scripts.
+    #[test]
+    fn cpu_budget_does_not_slow_fast_scripts() {
+        let engine = JsEngine::with_sandbox(JsSandboxConfig {
+            budget_ms: 500,
+            ..JsSandboxConfig::default()
+        })
+        .unwrap();
+
+        let start = Instant::now();
+        let result = engine.execute("1 + 2", HashMap::new()).unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(result, serde_json::json!(3));
+        // Fast scripts should not pay the full budget. 100 ms is
+        // comfortably under the 500 ms budget while leaving room
+        // for CI jitter.
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "fast script should not block on watchdog: {elapsed:?}"
+        );
+    }
+
+    /// Interrupt and memory-limit errors must be distinguishable.
+    /// Memory exhaustion comes back as `Other`, not `Interrupt`, so
+    /// callers can log the two paths separately and operators can
+    /// alert on them independently.
+    #[test]
+    fn memory_limit_error_is_not_interrupt() {
+        // Tiny heap so allocation fails fast; generous CPU budget
+        // so we are sure the failure is OOM rather than timeout.
+        let engine = JsEngine::with_sandbox(JsSandboxConfig {
+            budget_ms: 5_000,
+            memory_mb: 1,
+            stack_kb: 1024,
+        })
+        .unwrap();
+
+        let result = engine.execute(
+            "let arr = []; for(let i = 0; i < 10000000; i++) arr.push('x'.repeat(1000));",
+            HashMap::new(),
+        );
+        let err = result.expect_err("OOM script must error out");
+        assert!(
+            !err.is_interrupt(),
+            "OOM should NOT be Interrupt, got {err:?}"
+        );
+    }
+
+    /// After an interrupt, the engine must remain usable. The
+    /// interrupt flag is reset at the start of every run, so a
+    /// follow-up script with a normal workload still completes.
+    /// This is the regression guard for the watchdog leaving the
+    /// flag in a stuck state.
+    #[test]
+    fn engine_recovers_after_interrupt() {
+        let engine = JsEngine::with_sandbox(JsSandboxConfig {
+            budget_ms: 30,
+            ..JsSandboxConfig::default()
+        })
+        .unwrap();
+
+        let first = engine.execute("while (true) {}", HashMap::new());
+        assert!(first.is_err());
+
+        // Same engine should also recover: a quick script after the
+        // interrupt-tripping run must succeed because `with_budget`
+        // clears the flag on every entry.
+        let second = engine.execute("2 + 2", HashMap::new()).unwrap();
+        assert_eq!(second, serde_json::json!(4));
+    }
+
+    /// `call_function` is funneled through the same budget helper as
+    /// `execute`, so an infinite loop inside the callee must trip
+    /// the watchdog the same way.
+    #[test]
+    fn cpu_budget_applies_to_call_function() {
+        let engine = JsEngine::with_sandbox(JsSandboxConfig {
+            budget_ms: 50,
+            ..JsSandboxConfig::default()
+        })
+        .unwrap();
+
+        let result = engine.call_function("function spin() { while (true) {} }", "spin", vec![]);
+        let err = result.expect_err("spinning call_function must error");
+        assert!(err.is_interrupt(), "got {err:?}");
+    }
+
+    /// And the same for `match_request`.
+    #[test]
+    fn cpu_budget_applies_to_match_request() {
+        let engine = JsEngine::with_sandbox(JsSandboxConfig {
+            budget_ms: 50,
+            ..JsSandboxConfig::default()
+        })
+        .unwrap();
+
+        let result = engine.match_request(
+            "function match_request(req, ctx) { while (true) {} }",
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+        );
+        let err = result.expect_err("spinning match_request must error");
+        assert!(err.is_interrupt(), "got {err:?}");
+    }
+
+    /// And `waf_match`.
+    #[test]
+    fn cpu_budget_applies_to_waf_match() {
+        let engine = JsEngine::with_sandbox(JsSandboxConfig {
+            budget_ms: 50,
+            ..JsSandboxConfig::default()
+        })
+        .unwrap();
+
+        let headers = HashMap::new();
+        let result = engine.waf_match(
+            "function match(request) { while (true) {} }",
+            "/",
+            &headers,
+            None,
+        );
+        let err = result.expect_err("spinning waf_match must error");
+        assert!(err.is_interrupt(), "got {err:?}");
+    }
+
+    /// Operator override: a JsSandboxConfig deserialised from the
+    /// YAML shape used in `proxy.scripting.javascript.sandbox`
+    /// reaches the engine unchanged and is honored at runtime.
+    #[test]
+    fn operator_yaml_override_reaches_engine() {
+        let yaml = r#"
+budget_ms: 60
+memory_mb: 4
+stack_kb: 256
+"#;
+        let cfg: JsSandboxConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.budget_ms, 60);
+        let engine = JsEngine::with_sandbox(cfg).unwrap();
+        assert_eq!(engine.sandbox_config().budget_ms, 60);
+        // And the budget is enforced.
+        let err = engine
+            .execute("while (true) {}", HashMap::new())
+            .expect_err("should interrupt");
+        match err {
+            JsExecutionError::Interrupt { budget_ms } => assert_eq!(budget_ms, 60),
+            other => panic!("expected Interrupt, got {other:?}"),
+        }
     }
 
     // --- Modern JavaScript Features ---
