@@ -6967,6 +6967,56 @@ async fn handle_mcp_action(
     };
 
     let method = session.req_header().method.clone();
+    let req_path = session.req_header().uri.path();
+
+    // WOR-483: serve the federated tool catalogue as a typed
+    // Cloudflare-Code-Mode TypeScript module at
+    // `/.well-known/mcp/codemode.ts`. WOR-410 added the
+    // `McpFederation::codemode_ts(callback_base_url)` library
+    // function; this branch wraps it in a one-URL HTTP surface so
+    // any TypeScript agent or sandbox can `import` the module
+    // directly without a separate codegen step.
+    if method == http::Method::GET && req_path == "/.well-known/mcp/codemode.ts" {
+        let listener_is_tls = session
+            .digest()
+            .and_then(|d| d.ssl_digest.as_ref())
+            .is_some();
+        let scheme = if listener_is_tls { "https" } else { "http" };
+        let callback_base = match session
+            .req_header()
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+        {
+            // The runtime stub posts each tool call to
+            // `{callback}/call/{tool_name}`, so the callback root is
+            // the MCP gateway path itself (the request path stripped
+            // of the well-known suffix). For the typical mount where
+            // the MCP origin owns the whole hostname, the gateway
+            // accepts the JSON-RPC POSTs at `/`; passing the bare
+            // origin URL is the safest default.
+            Some(authority) => format!("{scheme}://{authority}"),
+            None => String::new(),
+        };
+        let module = mcp.federation.codemode_ts(&callback_base);
+        send_response(
+            session,
+            200,
+            "text/typescript; charset=utf-8",
+            module.as_bytes(),
+        )
+        .await?;
+        tracing::info!(
+            target: "sbproxy::audit",
+            event = "mcp.codemode_ts.served",
+            mcp_server = %mcp.server_name,
+            request_id = %ctx.request_id,
+            byte_count = module.len(),
+            "served codemode.ts module"
+        );
+        return Ok(());
+    }
+
     if method != http::Method::POST {
         send_error(session, 405, "MCP gateway accepts POST only").await?;
         return Ok(());
