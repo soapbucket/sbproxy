@@ -177,6 +177,16 @@ impl FetchContext {
 /// [`crate::compile_config`]. `inline_text` is the content of the
 /// file the operator handed the binary; it is used as the `Local`
 /// payload (so the historical "no source field" path still works).
+///
+/// # Blocking I/O
+///
+/// WOR-618: resolving a [`ConfigSource::Git`] source does blocking
+/// filesystem work (tempdir creation, `mkdir`, `read_to_string`) and
+/// shells out to `git` synchronously through [`Cloner::clone_into`].
+/// That work runs inline rather than pulling a tokio runtime dependency
+/// into this (public) crate: it happens at config load and reload, never
+/// on the per-request path. A caller that drives this from a hot
+/// reconcile loop should dispatch it to a blocking thread pool itself.
 pub async fn load_from_source(
     source: &ConfigSource,
     inline_text: &str,

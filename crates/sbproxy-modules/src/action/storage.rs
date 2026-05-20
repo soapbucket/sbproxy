@@ -128,6 +128,11 @@ impl StorageAction {
                 // dirs at construction time. We pre-create the dir so a
                 // fresh deployment with `path: /var/cache/sbproxy` does
                 // not fail to start before any user has uploaded.
+                //
+                // WOR-618: `build` runs at config-compile time (startup
+                // and reload), never on the per-request path, so this
+                // blocking `create_dir_all` does not stall a request
+                // worker. Keep it synchronous.
                 std::fs::create_dir_all(path).map_err(|e| {
                     anyhow::anyhow!("failed to create local storage path '{}': {}", path, e)
                 })?;

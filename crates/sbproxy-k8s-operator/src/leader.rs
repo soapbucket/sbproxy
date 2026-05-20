@@ -117,11 +117,15 @@ pub const SERVICE_ACCOUNT_NS_PATH: &str = "/var/run/secrets/kubernetes.io/servic
 
 /// Convenience wrapper used by `main.rs`: discover the namespace using the
 /// real environment + service-account file.
-pub fn discover_namespace_default() -> String {
-    discover_namespace(
-        |k| std::env::var(k).ok(),
-        || std::fs::read_to_string(SERVICE_ACCOUNT_NS_PATH).ok(),
-    )
+///
+/// WOR-618: the caller (`async fn run` in `main.rs`) is on a tokio runtime,
+/// so the service-account file read goes through `tokio::fs` to avoid
+/// stalling the runtime worker on a slow `read_to_string`.
+pub async fn discover_namespace_default() -> String {
+    let file_value = tokio::fs::read_to_string(SERVICE_ACCOUNT_NS_PATH)
+        .await
+        .ok();
+    discover_namespace(|k| std::env::var(k).ok(), || file_value.clone())
 }
 
 /// Outcome of a single acquire attempt.
