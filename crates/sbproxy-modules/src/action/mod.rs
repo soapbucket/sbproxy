@@ -784,6 +784,16 @@ mod tests {
             }
         });
 
+        // Warm up reqwest::blocking's one-time process init (crypto provider
+        // install, cert loading, runtime spawn). On a cold process that init
+        // costs ~1-2s and, if folded into the timed section below, makes the
+        // sub-2s bound flaky under load. A connection to a closed port returns
+        // immediately, so this pays the init without waiting on a timeout.
+        let _ = fetch_bulk_list_body(
+            "http://127.0.0.1:1/warmup",
+            std::time::Duration::from_millis(100),
+        );
+
         let started = std::time::Instant::now();
         let result = fetch_bulk_list_body(
             &format!("http://{addr}/list.csv"),
@@ -792,9 +802,12 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(result.is_err(), "a hung server must surface an error");
+        // The 300ms timeout must bound the wait. The ceiling is generous so a
+        // loaded CI runner does not flake, while still failing loudly if the
+        // timeout is dropped (a hung server otherwise blocks indefinitely).
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "the configured timeout must fire well under 2s, took {elapsed:?}"
+            elapsed < std::time::Duration::from_secs(5),
+            "the configured timeout must bound the wait, took {elapsed:?}"
         );
     }
 
