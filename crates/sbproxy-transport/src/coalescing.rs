@@ -64,21 +64,31 @@ impl RequestCoalescer {
         &self,
         key: &str,
     ) -> Option<broadcast::Receiver<Arc<CoalescedResponse>>> {
-        let mut in_flight = self.in_flight.lock();
-        if let Some(sender) = in_flight.get(key) {
-            // Request already in flight - subscribe to its result
-            return Some(sender.subscribe());
-        }
-        if in_flight.len() >= self.max_keys {
-            // Capacity reached. Rather than blow memory, disable
-            // coalescing for this request: the caller proceeds as an
-            // uncoalesced leader and we simply don't track it.
-            return None;
-        }
-        // We are the leader - register ourselves
-        let (tx, _) = broadcast::channel(self.max_waiters);
-        in_flight.insert(key.to_string(), tx);
-        None
+        // WOR-623: clone the in-flight sender (if any) under the lock and
+        // release the guard before calling `subscribe()`. subscribe() is
+        // per-waiter work that should not be serialized behind the global
+        // coalescer lock. The leader-registration path does not subscribe,
+        // so it stays under the lock.
+        let existing = {
+            let mut in_flight = self.in_flight.lock();
+            match in_flight.get(key) {
+                Some(sender) => Some(sender.clone()),
+                None => {
+                    if in_flight.len() >= self.max_keys {
+                        // Capacity reached. Rather than blow memory, disable
+                        // coalescing for this request: the caller proceeds as
+                        // an uncoalesced leader and we simply don't track it.
+                        return None;
+                    }
+                    // We are the leader - register ourselves.
+                    let (tx, _) = broadcast::channel(self.max_waiters);
+                    in_flight.insert(key.to_string(), tx);
+                    None
+                }
+            }
+        };
+        // Lock released. Subscribe outside the critical section.
+        existing.map(|sender| sender.subscribe())
     }
 
     /// Complete a coalesced request, notifying all waiters with the response.
