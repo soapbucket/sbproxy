@@ -142,7 +142,7 @@ impl AcmeClient {
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(accept_invalid)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("ACME HTTP client builder failed; cannot honor the configured TLS verification mode");
 
         Self {
             http,

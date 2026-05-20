@@ -87,7 +87,9 @@ impl JudgeClient {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_millis(u64::from(config.timeout_ms)))
             .build()
-            .unwrap_or_default();
+            .expect(
+                "judge HTTP client builder failed; cannot enforce the configured request timeout",
+            );
         let provider_label = config.endpoint.host_str().unwrap_or("unknown").to_string();
         let cache = Arc::new(JudgeCache::new(config.cache_capacity));
         let budget = Arc::new(BudgetTracker::new(config.budget_tokens));
@@ -113,7 +115,9 @@ impl JudgeClient {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_millis(u64::from(config.timeout_ms)))
             .build()
-            .unwrap_or_default();
+            .expect(
+                "judge HTTP client builder failed; cannot enforce the configured request timeout",
+            );
         let provider_label = config.endpoint.host_str().unwrap_or("unknown").to_string();
         Self {
             config: Arc::new(config),
@@ -412,6 +416,48 @@ mod tests {
             budget_tokens: budget,
         };
         JudgeClient::new(cfg)
+    }
+
+    #[tokio::test]
+    async fn configured_timeout_is_enforced() {
+        // WOR-596: a hung upstream judge must surface a timeout error
+        // rather than stall the caller. This exercises the real
+        // constructor path; if the builder ever silently fell back to a
+        // no-timeout client, this call would hang well past 2s.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept connections but never reply, holding the sockets open.
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(s) => held.push(s),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let cfg = JudgeConfig {
+            endpoint: url::Url::parse(&format!("http://{addr}/")).unwrap(),
+            api_key_env: "SBPROXY_JUDGE_TEST_KEY".to_string(),
+            timeout_ms: 300,
+            cache_capacity: 16,
+            budget_tokens: 1_000,
+        };
+        let client = JudgeClient::new(cfg);
+
+        let started = std::time::Instant::now();
+        let result = client.semantic("system prompt", json!({"q": "hi"})).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(JudgeError::Timeout)),
+            "hung upstream must surface a timeout error, got {result:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "configured 300ms timeout must fire well under 2s, took {elapsed:?}"
+        );
     }
 
     #[tokio::test]

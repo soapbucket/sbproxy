@@ -73,7 +73,7 @@ fn spawn_refresh_task(cache: Arc<JwksCache>, url: String, refresh_secs: u64) {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("JWKS refresh client builder failed; cannot enforce the request timeout");
         loop {
             if let Err(e) = cache.refresh_with(&client).await {
                 tracing::warn!(
