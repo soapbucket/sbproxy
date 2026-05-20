@@ -148,7 +148,7 @@ impl AiClient {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
-                .unwrap_or_default(),
+                .expect("AI HTTP client builder failed; cannot enforce the request timeout"),
             shadow_supervisor: Arc::new(ShadowSupervisor::default()),
         }
     }
@@ -161,7 +161,7 @@ impl AiClient {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
-                .unwrap_or_default(),
+                .expect("AI HTTP client builder failed; cannot enforce the request timeout"),
             shadow_supervisor: supervisor,
         }
     }
