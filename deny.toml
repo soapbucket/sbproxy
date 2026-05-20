@@ -44,9 +44,15 @@ ignore = [
   # the crate, the pulling-in dependency, and the fix plan. Remove entries
   # when the upstream releases a patched version and Renovate has updated
   # Cargo.lock; CI will then enforce automatically.
-  # protobuf 2.x: uncontrolled recursion. Locked in via prometheus 0.13 via
-  # pingora 0.8 (the latest published pingora). Resolves when pingora upstream
-  # publishes a release that bumps prometheus to a 3.x-compatible line.
+  # RUSTSEC-2024-0437: protobuf 2.x uncontrolled recursion when DECODING
+  # untrusted protobuf. Reaches the graph only via prometheus 0.13.4 ->
+  # pingora-core 0.8 (the latest published pingora); our direct prometheus
+  # dep is 0.14 (protobuf 3.7.2). Not exploitable here: sbproxy only ENCODES
+  # its own metrics through the prometheus client (the protobuf exposition
+  # format is write-only on the /metrics path) and never decodes
+  # attacker-supplied protobuf. Resolves when pingora upstream bumps
+  # prometheus to a protobuf-3.x line; CI re-gates automatically once
+  # Cargo.lock updates.
   "RUSTSEC-2024-0437",
 ]
 

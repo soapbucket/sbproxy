@@ -1,0 +1,16 @@
+# cargo-audit configuration.
+#
+# The workspace's authoritative advisory gate is cargo-deny (see deny.toml
+# [advisories] and the "supply chain (cargo-deny)" job in
+# .github/workflows/ci.yml), which checks the same RustSec advisory database
+# and fails CI on any un-ignored vulnerability. This file mirrors the single
+# tracked ignore so a developer who runs `cargo audit` directly gets the same
+# clean result rather than a spurious failure.
+[advisories]
+ignore = [
+    # RUSTSEC-2024-0437: protobuf 2.x decode-recursion. Reaches the graph only
+    # via pingora 0.8's prometheus 0.13.4; sbproxy encodes its own metrics and
+    # never decodes untrusted protobuf, so it is not exploitable here. Full
+    # rationale lives in deny.toml. Resolves when pingora bumps prometheus.
+    "RUSTSEC-2024-0437",
+]
