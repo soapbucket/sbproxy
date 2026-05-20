@@ -5,10 +5,14 @@
 //! returned buffers are simply dropped.
 
 use bytes::BytesMut;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 /// Thread-safe pool of reusable BytesMut buffers.
 /// Avoids repeated heap allocation for response body buffering.
+///
+/// Uses `parking_lot::Mutex` so a panic by a buffer producer or consumer
+/// cannot poison the pool and cascade into every subsequent
+/// `get`/`put` call.
 pub struct BufferPool {
     pool: Mutex<Vec<BytesMut>>,
     default_capacity: usize,
@@ -35,7 +39,6 @@ impl BufferPool {
     pub fn get(&self) -> BytesMut {
         self.pool
             .lock()
-            .unwrap()
             .pop()
             .map(|mut buf| {
                 buf.clear();
@@ -48,7 +51,7 @@ impl BufferPool {
     ///
     /// If the pool is already at capacity the buffer is silently dropped.
     pub fn put(&self, buf: BytesMut) {
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock();
         if pool.len() < self.max_pool_size {
             pool.push(buf);
         }
@@ -57,7 +60,7 @@ impl BufferPool {
 
     /// Number of buffers currently available in the pool.
     pub fn available(&self) -> usize {
-        self.pool.lock().unwrap().len()
+        self.pool.lock().len()
     }
 }
 

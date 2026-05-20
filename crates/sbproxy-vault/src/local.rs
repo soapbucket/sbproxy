@@ -4,8 +4,8 @@
 //! on drop and accidental `Display`/`Debug` formatting renders `[REDACTED]`
 //! instead of the plaintext.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use anyhow::Result;
 
@@ -35,7 +35,7 @@ impl LocalVault {
     /// Returns `None` if the key is absent. The returned `SecretString`
     /// zeroizes its backing memory when dropped.
     pub fn get_secret(&self, key: &str) -> Result<Option<SecretString>> {
-        Ok(self.secrets.lock().unwrap().get(key).cloned())
+        Ok(self.secrets.lock().get(key).cloned())
     }
 
     /// Retrieve a secret by key and expose its plaintext as a `String`.
@@ -43,32 +43,26 @@ impl LocalVault {
     /// Provided for callers that interact with APIs requiring a `String`.
     /// Use sparingly and never log the returned value.
     pub fn get_secret_exposed(&self, key: &str) -> Result<Option<String>> {
-        Ok(self
-            .secrets
-            .lock()
-            .unwrap()
-            .get(key)
-            .map(|s| s.expose().to_string()))
+        Ok(self.secrets.lock().get(key).map(|s| s.expose().to_string()))
     }
 
     /// Store a secret under the given key, overwriting any previous value.
     pub fn set_secret(&self, key: &str, value: &str) -> Result<()> {
         self.secrets
             .lock()
-            .unwrap()
             .insert(key.to_string(), SecretString::new(value));
         Ok(())
     }
 
     /// Delete a secret by key. No-op if the key does not exist.
     pub fn delete_secret(&self, key: &str) -> Result<()> {
-        self.secrets.lock().unwrap().remove(key);
+        self.secrets.lock().remove(key);
         Ok(())
     }
 
     /// List all secret keys currently stored.
     pub fn list_keys(&self) -> Result<Vec<String>> {
-        Ok(self.secrets.lock().unwrap().keys().cloned().collect())
+        Ok(self.secrets.lock().keys().cloned().collect())
     }
 }
 

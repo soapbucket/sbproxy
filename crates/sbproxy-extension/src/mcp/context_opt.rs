@@ -1,8 +1,8 @@
 //! Optimize context window usage for MCP tool schemas.
 //! Prioritize frequently-used tools, drop rarely-used ones.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 /// Tracks how often each MCP tool is invoked so the proxy can
 /// prioritise the most-used tools when the context window is limited.
@@ -20,19 +20,19 @@ impl ToolUsageTracker {
 
     /// Record one invocation of `tool_name`.
     pub fn record_use(&self, tool_name: &str) {
-        let mut counts = self.counts.lock().unwrap();
+        let mut counts = self.counts.lock();
         *counts.entry(tool_name.to_string()).or_insert(0) += 1;
     }
 
     /// Return the number of times `tool_name` has been invoked.
     pub fn get_count(&self, tool_name: &str) -> u64 {
-        let counts = self.counts.lock().unwrap();
+        let counts = self.counts.lock();
         counts.get(tool_name).copied().unwrap_or(0)
     }
 
     /// Return all tools sorted by descending usage count (most used first).
     pub fn ranked_tools(&self) -> Vec<(String, u64)> {
-        let counts = self.counts.lock().unwrap();
+        let counts = self.counts.lock();
         let mut ranked: Vec<(String, u64)> = counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         ranked

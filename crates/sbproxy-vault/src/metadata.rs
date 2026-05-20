@@ -3,8 +3,8 @@
 //! Metadata is useful for auditing (first/last resolved timestamps, resolution
 //! counts) and for surfacing secret usage in the admin API.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Metadata associated with a single resolved secret.
@@ -42,7 +42,7 @@ impl SecretMetadataTracker {
     /// - On subsequent calls: updates `last_resolved` and increments `resolve_count`.
     pub fn record_resolve(&self, name: &str, source: &str) {
         let now = iso8601_now();
-        let mut map = self.entries.lock().unwrap();
+        let mut map = self.entries.lock();
         if let Some(entry) = map.get_mut(name) {
             entry.last_resolved = now;
             entry.resolve_count += 1;
@@ -63,12 +63,12 @@ impl SecretMetadataTracker {
 
     /// Return the metadata for `name`, or `None` if it has never been resolved.
     pub fn get(&self, name: &str) -> Option<SecretMeta> {
-        self.entries.lock().unwrap().get(name).cloned()
+        self.entries.lock().get(name).cloned()
     }
 
     /// Return all tracked secrets as a list.
     pub fn list(&self) -> Vec<SecretMeta> {
-        self.entries.lock().unwrap().values().cloned().collect()
+        self.entries.lock().values().cloned().collect()
     }
 }
 

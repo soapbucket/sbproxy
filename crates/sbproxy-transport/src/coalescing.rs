@@ -4,8 +4,9 @@
 //! upstream request is made and the response is shared with all waiters.
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// Hard cap on distinct in-flight keys. The coalescer's map is keyed by
@@ -63,7 +64,7 @@ impl RequestCoalescer {
         &self,
         key: &str,
     ) -> Option<broadcast::Receiver<Arc<CoalescedResponse>>> {
-        let mut in_flight = self.in_flight.lock().unwrap();
+        let mut in_flight = self.in_flight.lock();
         if let Some(sender) = in_flight.get(key) {
             // Request already in flight - subscribe to its result
             return Some(sender.subscribe());
@@ -82,7 +83,7 @@ impl RequestCoalescer {
 
     /// Complete a coalesced request, notifying all waiters with the response.
     pub fn complete(&self, key: &str, response: CoalescedResponse) {
-        let mut in_flight = self.in_flight.lock().unwrap();
+        let mut in_flight = self.in_flight.lock();
         if let Some(sender) = in_flight.remove(key) {
             // Ignore send errors (no receivers is fine)
             let _ = sender.send(Arc::new(response));
@@ -94,12 +95,12 @@ impl RequestCoalescer {
     /// Removes the key from the in-flight map. Any waiters that subscribed
     /// will receive a `RecvError` when the sender is dropped.
     pub fn cancel(&self, key: &str) {
-        self.in_flight.lock().unwrap().remove(key);
+        self.in_flight.lock().remove(key);
     }
 
     /// Return the number of currently in-flight coalesced keys.
     pub fn in_flight_count(&self) -> usize {
-        self.in_flight.lock().unwrap().len()
+        self.in_flight.lock().len()
     }
 }
 

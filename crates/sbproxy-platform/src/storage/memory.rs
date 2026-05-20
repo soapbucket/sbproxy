@@ -1,7 +1,7 @@
 //! In-memory KVStore backed by a HashMap with a max-entries cap.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -13,6 +13,10 @@ use super::KVStore;
 /// When the number of entries reaches `max_entries`, the oldest entry
 /// (by insertion order approximation) is evicted on the next `put`.
 /// A `max_entries` of 0 means unlimited.
+///
+/// Uses `parking_lot::Mutex`, which is unpoisoned by design, so a panic
+/// while a producer holds the lock cannot cascade into every subsequent
+/// `get`/`put`/`delete` and turn one panic into a store-wide outage.
 pub struct MemoryKVStore {
     data: Mutex<HashMap<Vec<u8>, Bytes>>,
     max_entries: usize,
@@ -30,12 +34,12 @@ impl MemoryKVStore {
 
 impl KVStore for MemoryKVStore {
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let data = self.data.lock().expect("lock poisoned");
+        let data = self.data.lock();
         Ok(data.get(key).cloned())
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let mut data = self.data.lock().expect("lock poisoned");
+        let mut data = self.data.lock();
 
         // Evict an arbitrary entry if at capacity and inserting a new key.
         if self.max_entries > 0 && data.len() >= self.max_entries && !data.contains_key(key) {
@@ -50,13 +54,13 @@ impl KVStore for MemoryKVStore {
     }
 
     fn delete(&self, key: &[u8]) -> Result<()> {
-        let mut data = self.data.lock().expect("lock poisoned");
+        let mut data = self.data.lock();
         data.remove(key);
         Ok(())
     }
 
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
-        let data = self.data.lock().expect("lock poisoned");
+        let data = self.data.lock();
         let results = data
             .iter()
             .filter(|(k, _)| k.starts_with(prefix))
@@ -120,7 +124,7 @@ mod tests {
         // At capacity. Inserting a new key should evict one entry.
         store.put(b"k3", b"v3").unwrap();
 
-        let data = store.data.lock().unwrap();
+        let data = store.data.lock();
         assert_eq!(data.len(), 2);
         // k3 must be present (just inserted).
         assert!(data.contains_key(&b"k3"[..]));
@@ -135,7 +139,7 @@ mod tests {
         // Overwriting an existing key should NOT evict.
         store.put(b"k1", b"updated").unwrap();
 
-        let data = store.data.lock().unwrap();
+        let data = store.data.lock();
         assert_eq!(data.len(), 2);
         assert_eq!(data.get(&b"k1"[..]).unwrap(), &b"updated"[..]);
         assert_eq!(data.get(&b"k2"[..]).unwrap(), &b"v2"[..]);
@@ -147,7 +151,7 @@ mod tests {
         for i in 0..1000u32 {
             store.put(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
         }
-        let data = store.data.lock().unwrap();
+        let data = store.data.lock();
         assert_eq!(data.len(), 1000);
     }
 }

@@ -20,6 +20,7 @@ serde_json.workspace = true
 hex.workspace = true
 base64.workspace = true
 dashmap.workspace = true
+parking_lot.workspace = true
 
 # Blocking HTTP client for SQS and GCP Pub/Sub backends
 ureq = { version = "2", features = ["json"] }

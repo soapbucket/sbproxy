@@ -2,8 +2,8 @@
 //!
 //! Maintains a thread-safe map of target identifiers to their current health state.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 /// Health state of an upstream target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,25 +32,25 @@ impl HealthTracker {
     /// Get the health state of a target. Returns `Unknown` if the target has not
     /// been registered.
     pub fn get_state(&self, target: &str) -> HealthState {
-        let states = self.states.lock().unwrap();
+        let states = self.states.lock();
         states.get(target).copied().unwrap_or(HealthState::Unknown)
     }
 
     /// Set the health state of a target.
     pub fn set_state(&self, target: &str, state: HealthState) {
-        let mut states = self.states.lock().unwrap();
+        let mut states = self.states.lock();
         states.insert(target.to_string(), state);
     }
 
     /// Remove a target from the tracker.
     pub fn remove(&self, target: &str) {
-        let mut states = self.states.lock().unwrap();
+        let mut states = self.states.lock();
         states.remove(target);
     }
 
     /// List all tracked targets and their states.
     pub fn all_states(&self) -> Vec<(String, HealthState)> {
-        let states = self.states.lock().unwrap();
+        let states = self.states.lock();
         states.iter().map(|(k, v)| (k.clone(), *v)).collect()
     }
 }

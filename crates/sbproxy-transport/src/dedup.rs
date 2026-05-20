@@ -5,8 +5,8 @@
 //! deduplication window return the cached status code immediately without
 //! forwarding to the upstream.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -39,7 +39,7 @@ impl DedupCache {
     /// deduplication window; `None` otherwise. Expired entries are evicted
     /// lazily on each check.
     pub fn check(&self, hash: &str) -> Option<u16> {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock();
         let now = Instant::now();
 
         // Lazy eviction: remove expired entries on each access.
@@ -52,7 +52,7 @@ impl DedupCache {
     ///
     /// The entry expires after the configured window duration.
     pub fn store(&self, hash: &str, status: u16) {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock();
         let expiry = Instant::now() + self.window;
         cache.insert(hash.to_string(), (expiry, status));
     }

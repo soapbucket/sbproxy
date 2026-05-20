@@ -1,10 +1,10 @@
 //! ACME challenge handlers: HTTP-01 and TLS-ALPN-01.
 
 use anyhow::{Context, Result};
+use parking_lot::Mutex;
 use rcgen::{CertificateParams, CustomExtension, DistinguishedName, KeyPair};
 use ring::digest::{digest, SHA256};
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 // --- Constants ---
 
@@ -14,6 +14,10 @@ pub const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 // --- Http01ChallengeStore ---
 
 /// Thread-safe store of pending HTTP-01 challenge tokens.
+///
+/// Uses `parking_lot::Mutex`, which is unpoisoned by design, so a panic
+/// while a challenge insert/lookup is in flight cannot cascade to subsequent
+/// ACME validations.
 pub struct Http01ChallengeStore {
     pending: Mutex<HashMap<String, String>>,
 }
@@ -30,18 +34,17 @@ impl Http01ChallengeStore {
     pub fn set(&self, token: &str, key_authorization: &str) {
         self.pending
             .lock()
-            .unwrap()
             .insert(token.to_owned(), key_authorization.to_owned());
     }
 
     /// Look up the key authorization for a token.
     pub fn get(&self, token: &str) -> Option<String> {
-        self.pending.lock().unwrap().get(token).cloned()
+        self.pending.lock().get(token).cloned()
     }
 
     /// Remove a token once the challenge is complete.
     pub fn remove(&self, token: &str) {
-        self.pending.lock().unwrap().remove(token);
+        self.pending.lock().remove(token);
     }
 }
 

@@ -1,7 +1,7 @@
 //! Streaming performance analytics: Time to First Token and Tokens Per Second.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::ai_metrics;
@@ -123,10 +123,7 @@ impl StreamRegistry {
     /// Register a new stream and start tracking it.
     pub fn start_stream(&self, request_id: &str, provider: &str, model: &str) {
         let tracker = StreamTracker::new(request_id, provider, model);
-        self.active
-            .lock()
-            .unwrap()
-            .insert(request_id.to_string(), tracker);
+        self.active.lock().insert(request_id.to_string(), tracker);
     }
 
     /// Record a token arrival for the given stream.
@@ -134,7 +131,7 @@ impl StreamRegistry {
     /// If this is the first token, `record_first_token` is called on the
     /// tracker; otherwise `record_token` is called.
     pub fn record_token(&self, request_id: &str) {
-        if let Some(tracker) = self.active.lock().unwrap().get_mut(request_id) {
+        if let Some(tracker) = self.active.lock().get_mut(request_id) {
             if tracker.first_token.is_none() {
                 tracker.record_first_token();
             } else {
@@ -147,12 +144,12 @@ impl StreamRegistry {
     ///
     /// Returns `None` if no active stream with that ID exists.
     pub fn end_stream(&self, request_id: &str) -> Option<StreamTracker> {
-        self.active.lock().unwrap().remove(request_id)
+        self.active.lock().remove(request_id)
     }
 
     /// Current number of active (in-flight) streams.
     pub fn active_count(&self) -> usize {
-        self.active.lock().unwrap().len()
+        self.active.lock().len()
     }
 }
 

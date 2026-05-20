@@ -1,6 +1,7 @@
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Policy decision audit event emitted on every policy evaluation.
 ///
@@ -215,7 +216,7 @@ impl EventBus {
 
     /// Subscribe to events of a specific type.
     pub fn subscribe(&self, event_type: EventType, handler: EventHandler) {
-        let mut handlers = self.handlers.lock().unwrap();
+        let mut handlers = self.handlers.lock();
         handlers
             .entry(event_type)
             .or_default()
@@ -224,7 +225,7 @@ impl EventBus {
 
     /// Publish an event to all subscribers.
     pub fn publish(&self, event: &ProxyEvent) {
-        let handlers = self.handlers.lock().unwrap();
+        let handlers = self.handlers.lock();
         if let Some(subscribers) = handlers.get(&event.event_type) {
             for handler in subscribers {
                 handler(event);
@@ -234,7 +235,7 @@ impl EventBus {
 
     /// Number of subscribers for an event type.
     pub fn subscriber_count(&self, event_type: &EventType) -> usize {
-        let handlers = self.handlers.lock().unwrap();
+        let handlers = self.handlers.lock();
         handlers.get(event_type).map(|v| v.len()).unwrap_or(0)
     }
 }

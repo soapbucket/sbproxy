@@ -4,8 +4,8 @@
 //! between API keys, the conversation history must be carried along.
 //! `ContextRelay` is a lightweight thread-safe store for that history.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 /// Thread-safe store that maps session IDs to their conversation messages.
 ///
@@ -26,7 +26,7 @@ impl ContextRelay {
 
     /// Persist messages for `session_id`, replacing any prior history.
     pub fn store_messages(&self, session_id: &str, messages: Vec<serde_json::Value>) {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock();
         sessions.insert(session_id.to_string(), messages);
     }
 
@@ -34,19 +34,19 @@ impl ContextRelay {
     ///
     /// Returns `None` when no history has been stored for that ID.
     pub fn get_messages(&self, session_id: &str) -> Option<Vec<serde_json::Value>> {
-        let sessions = self.sessions.lock().unwrap();
+        let sessions = self.sessions.lock();
         sessions.get(session_id).cloned()
     }
 
     /// Delete the stored history for `session_id`.
     pub fn clear_session(&self, session_id: &str) {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock();
         sessions.remove(session_id);
     }
 
     /// Return the number of sessions currently stored.
     pub fn session_count(&self) -> usize {
-        let sessions = self.sessions.lock().unwrap();
+        let sessions = self.sessions.lock();
         sessions.len()
     }
 }
