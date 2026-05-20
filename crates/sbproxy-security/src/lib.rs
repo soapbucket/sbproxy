@@ -17,7 +17,9 @@ pub mod ssrf;
 pub use agent_verify::{
     verify_reverse_dns, Resolver, ReverseDnsCache, ReverseDnsVerdict, StubResolver, SystemResolver,
 };
+#[allow(deprecated)]
 pub use crypto::hkdf_derive;
+pub use crypto::{hkdf_derive_purpose, HkdfPurpose};
 #[cfg(feature = "tls-fingerprint")]
 pub use headless_detect::{
     detect as detect_headless, HeadlessSignal as HeadlessDetectSignal, TlsFingerprintCatalog,
