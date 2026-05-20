@@ -5,13 +5,84 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Derive a key using HKDF-SHA256 (RFC 5869).
+/// HKDF key-derivation purpose.
 ///
-/// - `ikm`: Input keying material.
-/// - `salt`: Optional salt value (can be empty).
-/// - `info`: Context and application-specific info string.
-/// - `output_len`: Desired output length in bytes (max 255 * 32).
+/// Each variant maps to a canonical, versioned `info` string so two call
+/// sites cannot accidentally derive the same key for different uses. RFC
+/// 5869 requires the `info` input to be distinct per intended use
+/// (encryption vs signing vs MAC); routing typed callers through this enum
+/// makes that separation impossible to get wrong by hand. WOR-647.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HkdfPurpose {
+    /// Key used for symmetric encryption.
+    Encryption,
+    /// Key used for signing.
+    Signing,
+    /// Key used for message authentication (HMAC).
+    Mac,
+}
+
+impl HkdfPurpose {
+    /// The canonical, versioned HKDF `info` string for this purpose.
+    ///
+    /// The `.vN` suffix lets the derivation scheme be rotated in future
+    /// without colliding with keys derived under an earlier scheme.
+    fn info(self) -> &'static [u8] {
+        match self {
+            HkdfPurpose::Encryption => b"sbproxy.hkdf.encryption.v1",
+            HkdfPurpose::Signing => b"sbproxy.hkdf.signing.v1",
+            HkdfPurpose::Mac => b"sbproxy.hkdf.mac.v1",
+        }
+    }
+}
+
+/// Derive a key for a specific [`HkdfPurpose`] using HKDF-SHA256 (RFC 5869).
+///
+/// This is the preferred entry point: the purpose enum guarantees a
+/// distinct, versioned `info` string per key use, so two distinct purposes
+/// can never derive the same key from the same `(ikm, salt)`.
+///
+/// - `ikm`: input keying material.
+/// - `salt`: optional salt value (may be empty).
+/// - `purpose`: the key's intended use; selects the `info` string.
+/// - `output_len`: desired output length in bytes (max 255 * 32).
+pub fn hkdf_derive_purpose(
+    ikm: &[u8],
+    salt: &[u8],
+    purpose: HkdfPurpose,
+    output_len: usize,
+) -> Vec<u8> {
+    hkdf_derive_raw(ikm, salt, purpose.info(), output_len)
+}
+
+/// Derive a key using HKDF-SHA256 (RFC 5869) with a caller-supplied `info`.
+///
+/// # Key separation
+///
+/// Per RFC 5869, `info` MUST be unique per intended key use (for example
+/// `b"...encryption.v1"` vs `b"...signing.v1"`). Two call sites that pass
+/// the same `info` derive the same key; if one then uses it for encryption
+/// and the other for signing, both are weakened. Prefer
+/// [`hkdf_derive_purpose`], which makes that separation type-safe; reach for
+/// this raw form only for RFC conformance or interop with an externally
+/// specified `info`.
+///
+/// - `ikm`: input keying material.
+/// - `salt`: optional salt value (may be empty).
+/// - `info`: context string; MUST be distinct per key purpose.
+/// - `output_len`: desired output length in bytes (max 255 * 32).
+#[deprecated(
+    note = "use hkdf_derive_purpose for type-safe key separation; the raw-info form is for RFC conformance / external interop only"
+)]
 pub fn hkdf_derive(ikm: &[u8], salt: &[u8], info: &[u8], output_len: usize) -> Vec<u8> {
+    hkdf_derive_raw(ikm, salt, info, output_len)
+}
+
+/// Internal HKDF-SHA256 derivation shared by [`hkdf_derive`] and
+/// [`hkdf_derive_purpose`]. Private so every caller picks one of the two
+/// public entry points and the deprecation on the raw-info form is honoured.
+fn hkdf_derive_raw(ikm: &[u8], salt: &[u8], info: &[u8], output_len: usize) -> Vec<u8> {
     // Extract: PRK = HMAC-SHA256(salt, IKM)
     let prk = hmac_sha256(salt, ikm);
     // Expand
@@ -53,7 +124,24 @@ fn hkdf_expand(prk: &[u8], info: &[u8], output_len: usize) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    // Several known-answer / RFC-5869 vector tests exercise the deprecated
+    // raw `hkdf_derive` (info-bytes) form directly, which is intentional:
+    // RFC vectors are specified in terms of explicit `info` bytes.
+    #![allow(deprecated)]
     use super::*;
+
+    #[test]
+    fn hkdf_derive_purpose_distinct_purposes_differ() {
+        // WOR-647: distinct purposes must never derive the same key from the
+        // same (ikm, salt).
+        let enc = hkdf_derive_purpose(b"secret", b"salt", HkdfPurpose::Encryption, 32);
+        let sig = hkdf_derive_purpose(b"secret", b"salt", HkdfPurpose::Signing, 32);
+        let mac = hkdf_derive_purpose(b"secret", b"salt", HkdfPurpose::Mac, 32);
+        assert_ne!(enc, sig);
+        assert_ne!(enc, mac);
+        assert_ne!(sig, mac);
+        assert_eq!(enc.len(), 32);
+    }
 
     #[test]
     fn test_hkdf_derive_produces_correct_length() {
