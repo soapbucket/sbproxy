@@ -400,8 +400,12 @@ impl KVStore for RedisKVStore {
                 ])?;
                 match resp {
                     RespValue::Array(mut elems) if elems.len() == 2 => {
-                        let keys_resp = elems.pop().unwrap();
-                        let cursor_resp = elems.pop().unwrap();
+                        let keys_resp = elems.pop().ok_or_else(|| {
+                            anyhow::anyhow!("redis SCAN returned malformed response")
+                        })?;
+                        let cursor_resp = elems.pop().ok_or_else(|| {
+                            anyhow::anyhow!("redis SCAN returned malformed response")
+                        })?;
 
                         let next_cursor = match cursor_resp {
                             RespValue::Bytes(b) => b,

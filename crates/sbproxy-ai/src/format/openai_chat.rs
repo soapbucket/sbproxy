@@ -245,7 +245,14 @@ pub(crate) fn parse_openai_message(obj: &Map<String, Value>) -> Result<HubMessag
                 .cloned()
                 .unwrap_or(Value::Null);
             let input = match &raw_args {
-                Value::String(s) => serde_json::from_str(s).unwrap_or(Value::String(s.clone())),
+                // OpenAI encodes tool-call arguments as a JSON string. An empty
+                // string means "no arguments". Anything non-empty must be valid
+                // JSON: surfacing it as a raw string would hand the hub a
+                // string-shaped value where structured arguments are expected.
+                Value::String(s) if s.trim().is_empty() => Value::Object(Map::new()),
+                Value::String(s) => serde_json::from_str(s).map_err(|_| {
+                    ChatError::bad_request("tool call arguments are not valid JSON")
+                })?,
                 other => other.clone(),
             };
             content.push(ContentPart::ToolUse {

@@ -93,7 +93,12 @@ impl FileCacheStore {
         }
 
         // --- Read expiry timestamp ---
-        let expiry = u64::from_be_bytes(data[..8].try_into().unwrap());
+        // `data.len() >= 8` is guaranteed by the corrupt-file check above, so
+        // copy the header bytes into a fixed array rather than unwrapping a
+        // fallible try_into on disk-controlled input.
+        let mut header = [0u8; 8];
+        header.copy_from_slice(&data[..8]);
+        let expiry = u64::from_be_bytes(header);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -243,6 +248,21 @@ mod tests {
         };
         store.put("exp", &expired).unwrap();
         assert!(store.get("exp").unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupt_short_file_is_evicted() {
+        let dir = TempDir::new().unwrap();
+        let store = make_store(&dir);
+
+        // A file shorter than the 8-byte expiry header is corrupt. Reading it
+        // must not panic on the header parse; it returns None and evicts.
+        let path = store.path_for("corrupt");
+        std::fs::write(&path, b"abc").unwrap();
+        assert!(path.exists());
+
+        assert!(store.get("corrupt").unwrap().is_none());
+        assert!(!path.exists(), "corrupt file should be evicted");
     }
 
     #[test]
