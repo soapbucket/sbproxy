@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-05-03*
+*Last modified: 2026-05-20*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -67,7 +67,7 @@ sbproxy/
                                           encoding, format_convert, normalize,
                                           payload_limit, replace_strings,
                                           html_to_markdown, sse_chunking, noop
-    sbproxy-ai/           - AI gateway: 20+ native providers, routing,
+    sbproxy-ai/           - AI gateway: 43 native providers, routing,
                               guardrails, budget enforcement, key vault,
                               memory store, MCP federation.
     sbproxy-extension/    - Scripting and extension runtimes:
