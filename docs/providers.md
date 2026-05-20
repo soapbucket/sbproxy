@@ -1,5 +1,5 @@
 # Supported providers
-*Last modified: 2026-04-25*
+*Last modified: 2026-05-20*
 
 SBproxy ships native adapters for 43 LLM providers, reaching 200+ models behind one OpenAI-compatible API. Most adapters speak the OpenAI wire format and pass through unchanged; a few (Anthropic, Bedrock, Gemini, SageMaker, Oracle, Watsonx) translate to the provider's native shape.
 
@@ -38,6 +38,18 @@ Each provider has a default base URL and auth format. Override `base_url` if you
 | `crusoe` | Crusoe Cloud Inference | OpenAI | `Authorization: Bearer` | `https://managed-inference-api-proxy.crusoecloud.com/v1` |
 | `featherless` | Featherless AI | OpenAI | `Authorization: Bearer` | `https://api.featherless.ai/v1` |
 | `reka` | Reka AI | OpenAI | `Authorization: Bearer` | `https://api.reka.ai/v1` |
+| `anyscale` | Anyscale Endpoints | OpenAI | `Authorization: Bearer` | `https://api.endpoints.anyscale.com/v1` |
+| `cerebras` | Cerebras Inference | OpenAI | `Authorization: Bearer` | `https://api.cerebras.ai/v1` |
+| `nvidia` | NVIDIA NIM | OpenAI | `Authorization: Bearer` | `https://integrate.api.nvidia.com/v1` |
+| `hyperbolic` | Hyperbolic | OpenAI | `Authorization: Bearer` | `https://api.hyperbolic.xyz/v1` |
+| `lepton` | Lepton AI | OpenAI | `Authorization: Bearer` | `https://api.lepton.run/v1` |
+| `deepinfra` | DeepInfra | OpenAI | `Authorization: Bearer` | `https://api.deepinfra.com/v1/openai` |
+| `novita` | Novita AI | OpenAI | `Authorization: Bearer` | `https://api.novita.ai/v3/openai` |
+| `sambanova` | SambaNova Cloud | OpenAI | `Authorization: Bearer` | `https://api.sambanova.ai/v1` |
+| `siliconflow` | SiliconFlow | OpenAI | `Authorization: Bearer` | `https://api.siliconflow.cn/v1` |
+| `moonshot` | Moonshot AI (Kimi) | OpenAI | `Authorization: Bearer` | `https://api.moonshot.cn/v1` |
+| `dashscope` | Alibaba DashScope (Qwen) | OpenAI | `Authorization: Bearer` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| `zhipu` | Zhipu AI (GLM) | OpenAI | `Authorization: Bearer` | `https://open.bigmodel.cn/api/paas/v4` |
 | `voyage` | Voyage AI (embeddings only)[^embed-only] | OpenAI | `Authorization: Bearer` | `https://api.voyageai.com/v1` |
 | `jina` | Jina AI (embeddings only)[^embed-only] | OpenAI | `Authorization: Bearer` | `https://api.jina.ai/v1` |
 

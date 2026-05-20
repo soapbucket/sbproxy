@@ -1,6 +1,6 @@
 # SBproxy features manual
 
-*Last modified: 2026-05-04*
+*Last modified: 2026-05-20*
 
 Reference for SBproxy features. Each section covers what a feature does, how to configure it, and a working example against `test.sbproxy.dev`.
 
@@ -1967,7 +1967,7 @@ The proxy is split into focused crates:
 - `sbproxy-config`: YAML parsing, type definitions
 - `sbproxy-core`: CompiledOrigin, phase dispatch, plugin registry, hot reload
 - `sbproxy-modules`: actions, auth, policies, transforms
-- `sbproxy-ai`: AI gateway (20+ providers, routing, guardrails, budgets, MCP)
+- `sbproxy-ai`: AI gateway (43 providers, routing, guardrails, budgets, MCP)
 - `sbproxy-middleware`: CORS, HSTS, compression, header modifiers
 - `sbproxy-extension`: WASM (wasmtime), Lua (mlua/Luau), CEL (cel-rust), JavaScript (QuickJS)
 - `sbproxy-cache`: response cache, pluggable backends
