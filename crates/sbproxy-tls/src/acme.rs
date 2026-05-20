@@ -24,6 +24,35 @@ pub const LETS_ENCRYPT_PRODUCTION: &str = "https://acme-v02.api.letsencrypt.org/
 /// Let's Encrypt staging ACME directory (for testing without rate limits).
 pub const LETS_ENCRYPT_STAGING: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";
 
+/// Return `true` only when `directory_url`'s parsed host is `localhost` or a
+/// loopback IP address.
+///
+/// WOR-597: the previous check was `directory_url.contains("localhost") ||
+/// directory_url.contains("127.0.0.1")`, which matched the text anywhere in
+/// the URL (query string, subdomain, userinfo). An attacker could craft a
+/// non-loopback URL containing that text and turn off TLS verification for
+/// the ACME directory fetch, enabling an on-path MITM of the certificate
+/// issuance. Parsing the authority and inspecting only the host closes that.
+/// Any parse failure fails closed (verification stays on).
+fn is_loopback_directory(directory_url: &str) -> bool {
+    let Ok(uri) = directory_url.parse::<http::Uri>() else {
+        return false;
+    };
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    // Strip IPv6 literal brackets so `[::1]` parses as an `IpAddr`.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
 // --- ACME JSON types ---
 
 /// ACME directory object returned by the directory URL.
@@ -134,11 +163,14 @@ impl AcmeClient {
     /// `challenge_types` lists preferred challenge types in priority order
     /// (e.g., `["http-01", "tls-alpn-01"]`).
     ///
-    /// When the directory URL contains "localhost", the HTTP client will
-    /// automatically accept invalid TLS certificates (for Pebble testing).
+    /// When the directory URL's host is `localhost` or a loopback IP, the
+    /// HTTP client accepts invalid TLS certificates (for Pebble testing).
+    /// The host is parsed rather than substring-matched, so a non-loopback
+    /// URL that merely contains the text "localhost" or "127.0.0.1" (in a
+    /// query string, subdomain, or userinfo) does not disable certificate
+    /// verification (WOR-597).
     pub fn new(directory_url: &str, email: &str, challenge_types: Vec<String>) -> Self {
-        let accept_invalid =
-            directory_url.contains("localhost") || directory_url.contains("127.0.0.1");
+        let accept_invalid = is_loopback_directory(directory_url);
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(accept_invalid)
             .build()
@@ -1038,6 +1070,33 @@ mod tests {
 
     fn make_store() -> CertStore<MemoryKVStore> {
         CertStore::new(MemoryKVStore::new(0))
+    }
+
+    // --- WOR-597: directory-URL loopback detection ---
+
+    #[test]
+    fn loopback_directory_accepts_real_localhost_and_loopback_ips() {
+        assert!(is_loopback_directory("https://localhost:14000/dir"));
+        assert!(is_loopback_directory("http://127.0.0.1:14000/dir"));
+        assert!(is_loopback_directory("https://[::1]:14000/dir"));
+    }
+
+    #[test]
+    fn loopback_directory_rejects_production_and_substring_bypasses() {
+        // A real CA must keep certificate verification on.
+        assert!(!is_loopback_directory(LETS_ENCRYPT_PRODUCTION));
+        // Query-string injection: the host is attacker.example, not localhost.
+        assert!(!is_loopback_directory(
+            "https://attacker.example/?localhost=1"
+        ));
+        // Subdomain: the host is localhost.attacker.example, not localhost.
+        assert!(!is_loopback_directory(
+            "https://localhost.attacker.example/dir"
+        ));
+        // A bare 127.0.0.1 in the path does not make the host loopback.
+        assert!(!is_loopback_directory("https://attacker.example/127.0.0.1"));
+        // Unparseable input fails closed.
+        assert!(!is_loopback_directory("not a url"));
     }
 
     fn synthetic_challenge(kind: &str) -> Challenge {
