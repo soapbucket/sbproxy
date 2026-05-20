@@ -282,7 +282,19 @@ impl CompiledStorage {
                         Some(v) => v,
                         None => return error_response(416, "range not satisfiable"),
                     };
-                    let r = (start as usize)..(end as usize + 1);
+                    // resolve() guarantees start <= end < total, so this
+                    // inclusive-to-exclusive conversion cannot overflow today.
+                    // Compute it with checked_add + try_from anyway so a future
+                    // change to resolve() (or a 32-bit target) cannot silently
+                    // overflow or truncate an attacker-influenced range
+                    // (WOR-600).
+                    let r = match (
+                        usize::try_from(start),
+                        end.checked_add(1).and_then(|e| usize::try_from(e).ok()),
+                    ) {
+                        (Ok(s), Some(e)) => s..e,
+                        _ => return error_response(416, "range not satisfiable"),
+                    };
                     match self.store.get_range(&key, r.clone()).await {
                         Ok(bytes) => {
                             let mut headers = build_headers(&meta, &key, Some(bytes.len() as u64));
@@ -554,6 +566,40 @@ fn reject_traversal(field: &str, value: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use object_store::PutPayload;
+
+    // --- WOR-600: Range header resolution ---
+
+    #[test]
+    fn range_resolve_clamps_huge_end_to_object_size() {
+        // bytes=0-18446744073709551615 (u64::MAX) must clamp to the last byte
+        // of the object rather than overflow the inclusive->exclusive cast.
+        let spec = parse_range("bytes=0-18446744073709551615").expect("parses");
+        assert_eq!(spec.resolve(1000), Some((0, 999)));
+    }
+
+    #[test]
+    fn range_resolve_rejects_inverted_and_out_of_bounds() {
+        // Start beyond the object size is unsatisfiable.
+        assert_eq!(parse_range("bytes=2000-3000").unwrap().resolve(1000), None);
+        // Start past the (clamped) end is unsatisfiable.
+        assert_eq!(parse_range("bytes=900-100").unwrap().resolve(1000), None);
+        // A zero-length object is never satisfiable.
+        assert_eq!(parse_range("bytes=0-10").unwrap().resolve(0), None);
+    }
+
+    #[test]
+    fn range_resolve_suffix_and_open_ended() {
+        // bytes=-500 -> last 500 bytes.
+        assert_eq!(
+            parse_range("bytes=-500").unwrap().resolve(1000),
+            Some((500, 999))
+        );
+        // bytes=500- -> from byte 500 to the end.
+        assert_eq!(
+            parse_range("bytes=500-").unwrap().resolve(1000),
+            Some((500, 999))
+        );
+    }
 
     // --- WOR-601: local-root canonicalization ---
 
