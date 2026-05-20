@@ -455,6 +455,13 @@ fn lua_value_to_json(lua: &Lua, value: &mlua::Value) -> mlua::Result<serde_json:
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate or assert the process-global sandbox
+    /// config (`install_sandbox_config` / `active_sandbox_config`, read by
+    /// `LuaEngine::new()`). Without it, the round-trip test's temporary
+    /// `install_sandbox_config(777)` races the default-config assertion in
+    /// parallel runs and the default test flakes (observed 777 != 100).
+    static SANDBOX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // --- Basic Execution ---
 
     #[test]
@@ -1173,6 +1180,9 @@ mod tests {
 
     #[test]
     fn lua_engine_default_config_matches_documented_defaults() {
+        // Hold the lock so a parallel round-trip test cannot have the
+        // global config temporarily installed to non-default values.
+        let _g = SANDBOX_LOCK.lock().unwrap();
         // The default engine carries the same limits the YAML defaults
         // document, so `LuaEngine::new()` is safe out of the box.
         let engine = LuaEngine::new().unwrap();
@@ -1207,9 +1217,10 @@ mod tests {
 
     #[test]
     fn install_sandbox_config_round_trips_via_global_handle() {
-        // The global handle is process-wide, so we save and restore it
-        // around the assertions to keep this test friendly with
-        // anyone running the suite in parallel.
+        // The global handle is process-wide. Hold the shared lock (so the
+        // default-config assertion never observes our temporary value) and
+        // save/restore around the assertions.
+        let _g = SANDBOX_LOCK.lock().unwrap();
         let saved = (*active_sandbox_config()).clone();
 
         install_sandbox_config(SandboxConfig {
