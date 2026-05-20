@@ -57,16 +57,31 @@ impl AsyncRedisKVStore {
     }
 
     async fn conn(&self) -> Result<MultiplexedConnection> {
-        let mut guard = self.conn.lock().await;
-        if let Some(c) = guard.as_ref() {
-            return Ok(c.clone());
+        // Fast path: return the cached multiplexed connection. The guard is
+        // released at the end of this block so it is never held across the
+        // connection-setup await below (WOR-621). Holding it there would
+        // serialize every concurrent caller behind whichever one is
+        // currently establishing the connection.
+        {
+            let guard = self.conn.lock().await;
+            if let Some(c) = guard.as_ref() {
+                return Ok(c.clone());
+            }
         }
+        // Slow path: establish the connection without holding the lock.
         let client = Client::open(self.config.url.as_str())
             .with_context(|| format!("invalid redis url '{}'", self.config.url))?;
         let c = client
             .get_multiplexed_async_connection()
             .await
             .with_context(|| format!("connecting to redis at '{}'", self.config.url))?;
+        // Cache it under a brief lock. If another caller raced us and already
+        // stored a connection, keep theirs (multiplexed handles are
+        // equivalent) and drop ours.
+        let mut guard = self.conn.lock().await;
+        if let Some(existing) = guard.as_ref() {
+            return Ok(existing.clone());
+        }
         *guard = Some(c.clone());
         Ok(c)
     }
