@@ -13863,13 +13863,36 @@ fn emit_access_log_entry(
                     .max(1)
                     .saturating_mul(1024)
                     .saturating_mul(1024);
-                if let Err(e) = entry.emit_to_file(
-                    path,
-                    max_size_bytes,
-                    cfg.output.max_backups,
-                    cfg.output.compress,
-                ) {
-                    tracing::warn!(error = %e, path = %path, "access log file write failed");
+                let max_backups = cfg.output.max_backups;
+                let compress = cfg.output.compress;
+                let path_buf = std::path::PathBuf::from(path);
+                // WOR-618: per-request file writes (open, append, rotation,
+                // gzip on rollover) issue blocking I/O. Dispatch to the
+                // tokio blocking pool when a runtime is in scope so the
+                // reactor thread keeps serving other requests; fall back
+                // to inline execution from unit tests that drive this code
+                // path without a runtime.
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    let path_for_log = path_buf.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) =
+                            entry.emit_to_file(&path_buf, max_size_bytes, max_backups, compress)
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                path = %path_for_log.display(),
+                                "access log file write failed",
+                            );
+                        }
+                    });
+                } else if let Err(e) =
+                    entry.emit_to_file(&path_buf, max_size_bytes, max_backups, compress)
+                {
+                    tracing::warn!(
+                        error = %e,
+                        path = %path_buf.display(),
+                        "access log file write failed",
+                    );
                 }
             } else {
                 tracing::warn!("access_log.output.type=file configured without output.path");
@@ -14095,8 +14118,23 @@ pub fn install_sighup_handler(config_path: String) {
         tracing::info!("SIGHUP handler installed; send `kill -HUP <pid>` to reload");
         while sig.recv().await.is_some() {
             tracing::info!("SIGHUP received; reloading config...");
-            if let Err(e) = reload_from_config_path(&config_path) {
-                tracing::error!(error = %e, "SIGHUP reload failed; serving prior pipeline");
+            // WOR-618: `reload_from_config_path` does blocking config-file
+            // reads, YAML parsing, pipeline rebuild, and projection refresh.
+            // Run it on the blocking pool so the tokio worker that owns
+            // the SIGHUP listener stays responsive to other signals.
+            let path = config_path.clone();
+            let result = tokio::task::spawn_blocking(move || reload_from_config_path(&path)).await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "SIGHUP reload failed; serving prior pipeline");
+                }
+                Err(join_err) => {
+                    tracing::error!(
+                        error = %join_err,
+                        "SIGHUP reload task panicked; serving prior pipeline",
+                    );
+                }
             }
         }
     });

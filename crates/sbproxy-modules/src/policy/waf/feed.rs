@@ -550,7 +550,28 @@ impl WafFeedSubscriber {
 
         // Persist last-good. Failure here is logged but not fatal: an
         // unwriteable cache directory must not stall a healthy feed.
-        if let Err(e) = self.write_cache(raw) {
+        //
+        // WOR-618: `apply_bundle` is reached from the async HTTP poll
+        // loop and the async Redis subscriber loop; running the
+        // blocking filesystem writes inline would stall the tokio
+        // worker. Dispatch to the blocking pool when a runtime is in
+        // scope so the subscriber loop keeps polling. Fall back to
+        // inline execution for tests and any future sync caller.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let raw_owned = raw.to_vec();
+            let path = self.config.cache_path();
+            let signature_key_env = self.config.signature_key_env.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) =
+                    write_cache_blocking(&path, &raw_owned, signature_key_env.as_deref())
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "WAF feed: failed to persist last-good cache",
+                    );
+                }
+            });
+        } else if let Err(e) = self.write_cache(raw) {
             tracing::warn!(error = %e, "WAF feed: failed to persist last-good cache");
         }
         tracing::info!(
@@ -792,33 +813,43 @@ impl WafFeedSubscriber {
     /// configured cache directory. Atomic-ish: writes to a `.tmp`
     /// sibling and renames into place.
     fn write_cache(&self, raw: &[u8]) -> Result<()> {
-        let path = self.config.cache_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create cache dir {}", parent.display()))?;
-        }
-        // Recompute the signature so the on-disk artifact is
-        // self-contained. Using the same signing key the publisher uses
-        // means the next process restart can hot-load it through the
-        // standard verify path.
-        let key_env = self
-            .config
-            .signature_key_env
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("signature_key_env not configured"))?;
-        let key = std::env::var(key_env)
-            .with_context(|| format!("WAF feed: signature key env var '{}' not set", key_env))?;
-        let signature = compute_signature(raw, key.as_bytes());
-
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, raw).with_context(|| format!("write cache {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path)
-            .with_context(|| format!("rename cache to {}", path.display()))?;
-        let sig_path = path.with_extension("sig");
-        std::fs::write(&sig_path, signature)
-            .with_context(|| format!("write cache sig {}", sig_path.display()))?;
-        Ok(())
+        write_cache_blocking(
+            &self.config.cache_path(),
+            raw,
+            self.config.signature_key_env.as_deref(),
+        )
     }
+}
+
+/// Free-function form of `WafFeedSubscriber::write_cache` so the async
+/// hot-reload paths can dispatch it to the tokio blocking pool with
+/// owned data, without holding a reference to `self`.
+fn write_cache_blocking(
+    path: &std::path::Path,
+    raw: &[u8],
+    signature_key_env: Option<&str>,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create cache dir {}", parent.display()))?;
+    }
+    // Recompute the signature so the on-disk artifact is
+    // self-contained. Using the same signing key the publisher uses
+    // means the next process restart can hot-load it through the
+    // standard verify path.
+    let key_env =
+        signature_key_env.ok_or_else(|| anyhow::anyhow!("signature_key_env not configured"))?;
+    let key = std::env::var(key_env)
+        .with_context(|| format!("WAF feed: signature key env var '{}' not set", key_env))?;
+    let signature = compute_signature(raw, key.as_bytes());
+
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, raw).with_context(|| format!("write cache {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename cache to {}", path.display()))?;
+    let sig_path = path.with_extension("sig");
+    std::fs::write(&sig_path, signature)
+        .with_context(|| format!("write cache sig {}", sig_path.display()))?;
+    Ok(())
 }
 
 /// Internal HTTP fetch outcome.

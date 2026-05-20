@@ -1130,13 +1130,16 @@ pub fn spawn_admin_server(
                     .await;
                     return;
                 }
-                handle_admin_connection(sock, &state).await;
+                handle_admin_connection(sock, state).await;
             });
         }
     }))
 }
 
-async fn handle_admin_connection(mut sock: tokio::net::TcpStream, state: &AdminState) {
+async fn handle_admin_connection(
+    mut sock: tokio::net::TcpStream,
+    state: std::sync::Arc<AdminState>,
+) {
     use tokio::io::AsyncReadExt;
     let mut buf = [0u8; 8192];
     let n = match sock.read(&mut buf).await {
@@ -1161,8 +1164,36 @@ async fn handle_admin_connection(mut sock: tokio::net::TcpStream, state: &AdminS
             auth_header = Some(rest.trim().to_string());
         }
     }
-    let (status, content_type, body) =
-        handle_admin_request(method, path, state, auth_header.as_deref());
+    // WOR-618: `handle_admin_request` does blocking std::fs reads for
+    // `POST /admin/reload` (re-read the config file) and
+    // `GET /admin/drift` (re-hash the on-disk config). Both routes can
+    // block on slow disks or large config files; run the dispatcher on
+    // the blocking pool so the admin listener task keeps accepting new
+    // connections.
+    let method_owned = method.to_string();
+    let path_owned = path.to_string();
+    let auth_owned = auth_header.clone();
+    let state_for_task = state.clone();
+    let (status, content_type, body) = match tokio::task::spawn_blocking(move || {
+        handle_admin_request(
+            &method_owned,
+            &path_owned,
+            &state_for_task,
+            auth_owned.as_deref(),
+        )
+    })
+    .await
+    {
+        Ok(triple) => triple,
+        Err(e) => {
+            tracing::warn!(error = %e, "admin: dispatcher task panicked");
+            (
+                500,
+                "application/json",
+                r#"{"error":"internal server error"}"#.to_string(),
+            )
+        }
+    };
     let _ = write_admin_response(sock, status, content_type, &body).await;
 }
 

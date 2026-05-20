@@ -124,7 +124,7 @@ async fn run(cli: Cli) -> Result<()> {
         return run_controller(client, &cli).await;
     }
 
-    let lease_namespace = discover_namespace_default();
+    let lease_namespace = discover_namespace_default().await;
     let hostname = std::env::var("K8S_POD_NAME")
         .ok()
         .or_else(|| std::env::var("HOSTNAME").ok())
