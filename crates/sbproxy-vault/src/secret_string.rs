@@ -69,14 +69,42 @@ impl Clone for SecretString {
 impl PartialEq for SecretString {
     fn eq(&self, other: &Self) -> bool {
         // Constant-time comparison to prevent timing side-channels.
-        if self.inner.len() != other.inner.len() {
-            return false;
+        //
+        // WOR-593: do NOT early-return on a length mismatch. An
+        // `if self.len() != other.len() { return false }` exits before
+        // the comparison loop and leaks the secret's length through
+        // timing, which an attacker can probe byte-by-byte. We do not
+        // use `subtle::ConstantTimeEq` for slices either: its slice impl
+        // short-circuits on length the same way.
+        //
+        // Instead, fold the length difference into the accumulator and
+        // walk every position up to the longer slice, padding the
+        // shorter side with a constant byte so the loop body does the
+        // same work for either ordering.
+        let a = &self.inner;
+        let b = &other.inner;
+
+        // Widen to u64 (exact on 32- and 64-bit usize) and fold all
+        // bytes of the length XOR into one byte with a fixed sequence of
+        // shifts: the accumulator is non-zero iff the lengths differ,
+        // computed without a data-dependent branch or loop.
+        let len_xor = (a.len() as u64) ^ (b.len() as u64);
+        let mut acc: u8 = (len_xor
+            | (len_xor >> 8)
+            | (len_xor >> 16)
+            | (len_xor >> 24)
+            | (len_xor >> 32)
+            | (len_xor >> 40)
+            | (len_xor >> 48)
+            | (len_xor >> 56)) as u8;
+
+        let max = a.len().max(b.len());
+        for i in 0..max {
+            let ai = a.get(i).copied().unwrap_or(0);
+            let bi = b.get(i).copied().unwrap_or(0);
+            acc |= ai ^ bi;
         }
-        let mut result = 0u8;
-        for (a, b) in self.inner.iter().zip(other.inner.iter()) {
-            result |= a ^ b;
-        }
-        result == 0
+        acc == 0
     }
 }
 
@@ -139,6 +167,21 @@ mod tests {
         let a = SecretString::new("short");
         let b = SecretString::new("much_longer_value");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn constant_time_equality_prefix_is_not_equal() {
+        // WOR-593: a value that is a strict prefix of another (the
+        // bytes match up to the shorter length, only the length
+        // differs) must not compare equal. This guards the
+        // length-difference fold against being masked by the
+        // byte loop.
+        assert_ne!(SecretString::new("abc"), SecretString::new("abcd"));
+        assert_ne!(SecretString::new("abcd"), SecretString::new("abc"));
+        // Empty versus non-empty differs by length alone.
+        assert_ne!(SecretString::new(""), SecretString::new("\0"));
+        // Empty versus empty is equal.
+        assert_eq!(SecretString::new(""), SecretString::new(""));
     }
 
     #[test]
