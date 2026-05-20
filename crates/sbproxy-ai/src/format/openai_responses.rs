@@ -262,18 +262,9 @@ pub(crate) fn hub_chunk_to_responses_sse(chunk: &HubChunk) -> Vec<String> {
 }
 
 fn parse_responses_message(obj: &Map<String, Value>) -> Result<HubMessage, ChatError> {
-    let role_s = obj.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-    let role = match role_s {
-        "user" => Role::User,
-        "assistant" => Role::Assistant,
-        "system" => Role::System,
-        "tool" => Role::Tool,
-        other => {
-            return Err(ChatError::bad_request(format!(
-                "unsupported message role: {other}"
-            )));
-        }
-    };
+    // WOR-599: missing or unknown role is an error, not a silent default to
+    // user. Shared helper lives in the format module.
+    let role = super::parse_role(obj)?;
     let mut content = Vec::new();
     if let Some(c) = obj.get("content") {
         match c {
