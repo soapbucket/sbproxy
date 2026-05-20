@@ -563,7 +563,7 @@ impl RedirectAction {
                         url
                     );
                 }
-                let body = reqwest::blocking::get(url)?.error_for_status()?.text()?;
+                let body = fetch_bulk_list_body(url, std::time::Duration::from_secs(10))?;
                 let kind = format
                     .as_deref()
                     .or_else(|| {
@@ -739,9 +739,64 @@ impl std::fmt::Debug for Action {
     }
 }
 
+/// Fetch a bulk-redirect list body over HTTP with a finite request timeout.
+///
+/// WOR-602: this runs at config-compile time. `reqwest::blocking::get` has no
+/// timeout, so a slow or unresponsive remote hangs proxy startup with no
+/// error, and a fleet-wide rolling deploy can stall every replica on the same
+/// host. A bounded client turns that into a clear, time-boxed failure.
+fn fetch_bulk_list_body(url: &str, timeout: std::time::Duration) -> anyhow::Result<String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| anyhow::anyhow!("bulk redirect list: failed to build HTTP client: {e}"))?;
+    let body = client
+        .get(url)
+        .send()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "config compile: bulk redirect list '{url}' fetch failed (timeout {timeout:?}): {e}"
+            )
+        })?
+        .error_for_status()?
+        .text()?;
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_list_fetch_times_out_on_a_hung_server() {
+        // WOR-602: a server that accepts the connection but never replies must
+        // produce a bounded error rather than hang config compile. A short
+        // timeout keeps the test fast.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(s) => held.push(s),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let result = fetch_bulk_list_body(
+            &format!("http://{addr}/list.csv"),
+            std::time::Duration::from_millis(300),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "a hung server must surface an error");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the configured timeout must fire well under 2s, took {elapsed:?}"
+        );
+    }
 
     #[test]
     fn proxy_action_type() {

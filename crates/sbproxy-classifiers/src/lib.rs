@@ -627,7 +627,10 @@ fn ensure_cached_file(
     }
 
     tracing::info!(url = url, path = %path.display(), "downloading model file");
-    let mut resp = reqwest::blocking::get(url)
+    let mut resp = download_client()
+        .with_context(|| format!("building HTTP client to download {url}"))?
+        .get(url)
+        .send()
         .with_context(|| format!("downloading {url}"))?
         .error_for_status()
         .with_context(|| format!("downloading {url}"))?;
@@ -752,7 +755,10 @@ fn fetch_signature_bytes(url: &str, cache_dir: &Path, kind: &str) -> Result<Vec<
         fs::read(&path).with_context(|| format!("reading cached {kind} signature {path:?}"))?
     } else {
         tracing::info!(url = url, "downloading detached signature");
-        let mut resp = reqwest::blocking::get(url)
+        let mut resp = download_client()
+            .with_context(|| format!("building HTTP client to download signature {url}"))?
+            .get(url)
+            .send()
             .with_context(|| format!("downloading signature {url}"))?
             .error_for_status()
             .with_context(|| format!("downloading signature {url}"))?;
@@ -824,6 +830,18 @@ pub fn default_model_cache_dir() -> PathBuf {
     } else {
         PathBuf::from(".sbproxy-cache").join("models")
     }
+}
+
+/// Build a blocking HTTP client for model / signature downloads with finite
+/// timeouts, so a hung origin cannot stall startup indefinitely (WOR-602).
+///
+/// A connect timeout bounds a no-response-on-connect hang; a generous total
+/// timeout bounds a stalled mid-download while still allowing large models.
+fn download_client() -> reqwest::Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
 }
 
 #[cfg(test)]
