@@ -683,20 +683,37 @@ fn build_response_cache_key(
 /// 30s, matching the conservative ceiling the rest of the proxy uses
 /// for outbound HTTP). Hot-reloading the timeout requires a process
 /// restart; pooled connections are kept across reloads.
-static SWR_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+static SWR_CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
 
-fn swr_client() -> &'static reqwest::Client {
-    SWR_CLIENT.get_or_init(|| {
-        let secs = reload::current_pipeline()
-            .config
-            .server
-            .http_client_timeouts
-            .swr_client_secs;
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(secs))
-            .build()
-            .expect("swr reqwest::Client build must succeed")
-    })
+/// Lazily-built shared client for stale-while-revalidate background
+/// refreshes. WOR-619: a `reqwest::Client::builder().build()` failure (a
+/// systemic TLS-init problem) must not panic the first request that needs
+/// SWR. The client is built once; on failure the error is logged and SWR is
+/// disabled (callers skip revalidation and keep serving cached entries)
+/// instead of `.expect()`-ing per use.
+fn swr_client() -> Option<&'static reqwest::Client> {
+    SWR_CLIENT
+        .get_or_init(|| {
+            let secs = reload::current_pipeline()
+                .config
+                .server
+                .http_client_timeouts
+                .swr_client_secs;
+            match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(secs))
+                .build()
+            {
+                Ok(client) => Some(client),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "swr: failed to build revalidation HTTP client; stale-while-revalidate disabled"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
 }
 
 /// Spawn an async refresh of `cache_key` against the origin's upstream.
@@ -746,12 +763,13 @@ fn spawn_swr_revalidation(
         // modifiers / forward rules etc. are skipped because they
         // already ran on the synchronous request that triggered this
         // refresh.
-        let resp = match swr_client()
-            .get(&full_url)
-            .header("host", &hostname)
-            .send()
-            .await
-        {
+        let Some(client) = swr_client() else {
+            // The revalidation client could not be built (logged once at
+            // init). SWR is best-effort, so skip the refresh and keep
+            // serving the cached entry.
+            return;
+        };
+        let resp = match client.get(&full_url).header("host", &hostname).send().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
@@ -3651,7 +3669,7 @@ fn map_upstream_failure(e: &Error) -> (u16, Option<&'static str>) {
 /// header references). Body coverage (`content-digest`) requires
 /// buffering the body ahead of the auth phase and lands as a
 /// follow-up.
-fn build_signature_verification_request(session: &Session) -> http::Request<bytes::Bytes> {
+fn build_signature_verification_request(session: &Session) -> Option<http::Request<bytes::Bytes>> {
     let req_header = session.req_header();
     let method = req_header.method.clone();
     let uri = req_header.uri.clone();
@@ -3661,9 +3679,20 @@ fn build_signature_verification_request(session: &Session) -> http::Request<byte
             hmap.insert(name.clone(), value.clone());
         }
     }
-    builder
-        .body(bytes::Bytes::new())
-        .expect("inbound headers always build a valid http::Request")
+    // WOR-619: method/uri/headers are already-parsed `http` types, so this
+    // build is effectively infallible today, but the inputs are
+    // attacker-influenced. Surface a build failure as `None` (the caller
+    // fails closed with a 401) rather than panicking the request.
+    match builder.body(bytes::Bytes::new()) {
+        Ok(req) => Some(req),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "message_signatures: failed to rebuild inbound request for verification"
+            );
+            None
+        }
+    }
 }
 
 /// Cache of compiled `MessageSignatureVerifier` instances keyed by
@@ -8474,7 +8503,16 @@ impl ProxyHttp for SbProxy {
             if let Some(ms_cfg) = origin_for_sig.message_signatures.as_ref() {
                 if ms_cfg.verify {
                     if let Some(verifier) = cached_message_signature_verifier(ms_cfg) {
-                        let req = build_signature_verification_request(session);
+                        let Some(req) = build_signature_verification_request(session) else {
+                            warn!(
+                                hostname = %ctx.hostname,
+                                "message_signatures: could not rebuild request for verification; returning 401"
+                            );
+                            drop(pipeline_guard);
+                            send_error(session, 401, "signature verification unavailable").await?;
+                            ctx.response_status = Some(401);
+                            return Ok(true);
+                        };
                         match verifier.verify_request(&req) {
                             sbproxy_middleware::signatures::VerifyVerdict::Ok {
                                 signature_label,
