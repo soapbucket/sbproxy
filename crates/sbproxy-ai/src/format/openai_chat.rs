@@ -176,18 +176,9 @@ impl ChatFormat for OpenAiChatFormat {
 /// Parse one OpenAI message object into a `HubMessage`. Pulled out so
 /// both the live request path and the test fixtures can call it.
 pub(crate) fn parse_openai_message(obj: &Map<String, Value>) -> Result<HubMessage, ChatError> {
-    let role_s = obj.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-    let role = match role_s {
-        "user" => Role::User,
-        "assistant" => Role::Assistant,
-        "tool" => Role::Tool,
-        "system" => Role::System,
-        other => {
-            return Err(ChatError::bad_request(format!(
-                "unsupported message role: {other}"
-            )));
-        }
-    };
+    // WOR-599: missing or unknown role is an error, not a silent default to
+    // user. Shared helper lives in the format module.
+    let role = super::parse_role(obj)?;
 
     let mut content: Vec<ContentPart> = Vec::new();
 

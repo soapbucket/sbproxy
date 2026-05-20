@@ -248,6 +248,77 @@ pub trait ChatFormat: Send + Sync + 'static {
     ) -> Result<Vec<String>, ChatError>;
 }
 
+/// Parse the `role` field of a chat message into a [`Role`].
+///
+/// WOR-599: a missing or unrecognized role is an error, never a silent
+/// default to [`Role::User`]. The role is a security-relevant routing
+/// decision (a user turn must not be able to masquerade as a system turn),
+/// so the inbound parsers all funnel through this one helper rather than
+/// each doing `unwrap_or("user")`.
+pub(crate) fn parse_role(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Role, ChatError> {
+    let role_s = obj
+        .get("role")
+        .and_then(|r| r.as_str())
+        .ok_or_else(|| ChatError::bad_request("chat message is missing a 'role' field"))?;
+    match role_s {
+        "user" => Ok(Role::User),
+        "assistant" => Ok(Role::Assistant),
+        "system" => Ok(Role::System),
+        "tool" => Ok(Role::Tool),
+        other => Err(ChatError::bad_request(format!(
+            "unsupported message role: {other}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod role_parse_tests {
+    use super::{parse_role, Role};
+    use serde_json::json;
+
+    fn obj(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn missing_role_is_an_error_not_user() {
+        assert!(
+            parse_role(&obj(json!({"content": "x"}))).is_err(),
+            "a missing role must error, not default to user"
+        );
+    }
+
+    #[test]
+    fn unknown_role_is_an_error_not_user() {
+        assert!(
+            parse_role(&obj(json!({"role": "developer", "content": "x"}))).is_err(),
+            "an unknown role must error, not default to user"
+        );
+    }
+
+    #[test]
+    fn known_roles_parse_to_their_variant() {
+        assert_eq!(
+            parse_role(&obj(json!({"role": "user"}))).unwrap(),
+            Role::User
+        );
+        assert_eq!(
+            parse_role(&obj(json!({"role": "assistant"}))).unwrap(),
+            Role::Assistant
+        );
+        assert_eq!(
+            parse_role(&obj(json!({"role": "system"}))).unwrap(),
+            Role::System
+        );
+        assert_eq!(
+            parse_role(&obj(json!({"role": "tool"}))).unwrap(),
+            Role::Tool
+        );
+    }
+}
+
 #[cfg(test)]
 mod native_bypass_tests {
     use super::{native_bypass_for, NativeBypass};

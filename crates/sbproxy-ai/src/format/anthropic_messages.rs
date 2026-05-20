@@ -266,16 +266,16 @@ pub(crate) fn hub_chunk_to_anthropic_sse(chunk: &HubChunk) -> Vec<String> {
 }
 
 fn parse_anthropic_message(obj: &Map<String, Value>) -> Result<HubMessage, ChatError> {
-    let role_s = obj.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-    let role = match role_s {
-        "user" => Role::User,
-        "assistant" => Role::Assistant,
-        other => {
-            return Err(ChatError::bad_request(format!(
-                "unsupported message role: {other}"
-            )));
-        }
-    };
+    // WOR-599: parse via the shared helper (missing or unknown role -> error,
+    // never a silent default to user), then enforce that Anthropic message
+    // turns carry only user or assistant roles (system is a top-level field,
+    // tool results are content blocks).
+    let role = super::parse_role(obj)?;
+    if !matches!(role, Role::User | Role::Assistant) {
+        return Err(ChatError::bad_request(format!(
+            "anthropic messages support only 'user' and 'assistant' roles, got {role:?}"
+        )));
+    }
 
     let mut content: Vec<ContentPart> = Vec::new();
     match obj.get("content") {
