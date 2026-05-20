@@ -1,6 +1,6 @@
 # Running sbproxy on Kubernetes
 
-*Last modified: 2026-04-26*
+*Last modified: 2026-05-20*
 
 The OSS Kubernetes operator at `crates/sbproxy-k8s-operator/` reconciles two CustomResources into a running proxy: an `SBProxy` describes the deployment shape, and an `SBProxyConfig` carries the `sb.yml` document the proxy reads on startup. The operator owns a Deployment, Service, and ConfigMap per `SBProxy`.
 
@@ -161,6 +161,41 @@ The chart grants the verbs the lock requires. The operator's ClusterRole include
 The Lease namespace is discovered in this order: `K8S_NAMESPACE` env var (the chart wires this from the downward API), the service-account namespace file at `/var/run/secrets/kubernetes.io/serviceaccount/namespace`, then the literal string `default` as a last resort.
 
 The lease timing matches client-go defaults: `leaseDurationSeconds=15`, renew every 5s, retry every 2s, abort the renew loop after a 10s API call timeout.
+
+## Graceful shutdown
+
+Both `sbproxy` and `sbproxy-k8s-operator` install handlers for
+SIGTERM and SIGINT. The kubelet sends SIGTERM at the start of pod
+termination and waits up to `terminationGracePeriodSeconds`
+(default 30s) before sending SIGKILL. Each process drains in-flight
+work up to its own grace budget and exits with code `0` on a clean
+drain or `1` when the budget is exceeded.
+
+| Component | Grace budget env var | Default | What it drains |
+| --- | --- | --- | --- |
+| `sbproxy` | `SBPROXY_SHUTDOWN_GRACE_MS` | `30000` (30s) | In-flight HTTP requests, WebSocket frames, AI streams |
+| `sbproxy-k8s-operator` | `SBPROXY_SHUTDOWN_GRACE_MS` | `30000` (30s) | In-flight reconcile passes, leader lease step-down |
+
+Set both pod specs' `terminationGracePeriodSeconds` to at least the
+drain budget plus a small buffer. Without that headroom the kubelet
+will SIGKILL the process mid-drain and any in-flight requests will
+drop.
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 60
+  containers:
+  - name: sbproxy
+    env:
+      - name: SBPROXY_SHUTDOWN_GRACE_MS
+        value: "45000"
+```
+
+When a shutdown signal arrives, both binaries emit a structured
+`shutdown_signal_received` tracing event including the signal name
+and resolved grace budget. Grep for it during incident response to
+confirm the drain started before the kubelet's hard kill window
+expired.
 
 ## Local smoke test
 

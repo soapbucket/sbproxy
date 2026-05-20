@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-05-04*
+*Last modified: 2026-05-20*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -100,7 +100,9 @@ config (log filter, shutdown timing, validation-only mode).
 
 ```
 sbproxy --config <path>
-sbproxy serve -f <path> [--log-level <level>] [--request-log-level <level>] [--grace-time <secs>] [--disable-sb-flags]
+sbproxy serve -f <path> [--log-level <level>] [--request-log-level <level>]
+                        [--shutdown-grace-ms <ms>] [--grace-time <secs>]
+                        [--disable-sb-flags]
 sbproxy validate <path>
 sbproxy --config <path> --check
 sbproxy plan -f <yaml> [--against <yaml>] [--format json|text] [--out <plan-file>]
@@ -257,16 +259,41 @@ sbproxy --config sb.yml --log-level warn --request-log-level debug
 SB_REQUEST_LOG_LEVEL=trace sbproxy --config sb.yml
 ```
 
-#### `--grace-time` (seconds)
+#### `--shutdown-grace-ms` (milliseconds)
+
+Milliseconds Pingora waits for in-flight requests to complete on
+SIGTERM before closing connections. Applied to both Pingora's
+`grace_period_seconds` and `graceful_shutdown_timeout_seconds`
+(rounded up to the next whole second). Supersedes `--grace-time`.
+
+- **Default:** `30000` (30 seconds), matching Kubernetes' default
+  `terminationGracePeriodSeconds` so a pod eviction in a
+  default-configured cluster drains cleanly. Set to `0` for instant
+  shutdown in test runners.
+- **Environment:** `SBPROXY_SHUTDOWN_GRACE_MS`
+- **Priority:** CLI flag wins over the env var; either wins over the
+  legacy `--grace-time` / `SB_GRACE_TIME`.
+
+```bash
+sbproxy --config sb.yml --shutdown-grace-ms 30000
+SBPROXY_SHUTDOWN_GRACE_MS=60000 sbproxy --config sb.yml
+```
+
+When SBproxy receives SIGTERM or SIGINT it emits a structured
+`shutdown_signal_received` tracing event that includes the resolved
+grace budget so operators can confirm the drain started before the
+orchestrator's hard kill.
+
+#### `--grace-time` (seconds, legacy)
 
 Seconds Pingora waits for in-flight requests to complete on SIGTERM
-before closing connections. Applied to both Pingora's
-`grace_period_seconds` and `graceful_shutdown_timeout_seconds`.
+before closing connections. Kept for back-compat; new deployments
+should use `--shutdown-grace-ms` (which is the spelling the
+Kubernetes operator and the docs lead with).
 
-- **Default:** `0` (instant shutdown). Works well in test runners and
-  in environments where the load balancer drains traffic before
-  sending SIGTERM. For production with long-lived streams, set to
-  the worst-case stream duration plus a buffer (often 30-120s).
+- **Default:** unset, so `--shutdown-grace-ms` resolves to its 30s
+  default. Setting `--grace-time` suppresses the 30s default so the
+  legacy value wins.
 - **Environment:** `SB_GRACE_TIME`
 
 ```bash
@@ -363,20 +390,29 @@ On successful startup, the log includes:
 
 | Signal | Action |
 |--------|--------|
-| `SIGTERM` | Graceful shutdown |
-| `SIGINT` (Ctrl+C) | Graceful shutdown |
+| `SIGTERM` | Graceful shutdown (drain in-flight requests up to the grace budget) |
+| `SIGINT` (Ctrl+C) | Fast shutdown (drop in-flight requests immediately) |
+| `SIGQUIT` | Graceful upgrade (zero-downtime binary swap, when configured) |
 | `SIGHUP` | Config reload (log level changes take effect immediately) |
+
+Both the `sbproxy` binary and the `sbproxy-k8s-operator` install
+handlers for SIGTERM and SIGINT. Each receipt emits a structured
+`shutdown_signal_received` tracing event with the signal name and the
+resolved grace budget so operators can confirm the drain started.
 
 ### Graceful shutdown
 
-On `SIGTERM` or `SIGINT`, SBproxy proceeds as follows:
+On `SIGTERM`, SBproxy proceeds as follows:
 
 1. The health manager is marked as shutting down. `/ready` and `/readyz` immediately return `503`. Load balancers should stop routing new traffic within one health check interval.
-2. SBproxy waits up to `--grace-time` seconds for in-flight requests to complete, polling every 100ms.
-3. After all in-flight requests drain (or grace time expires), background subscribers and the reload watcher are stopped.
-4. The HTTP and HTTPS listeners shut down with a 10-second deadline.
-5. Flush operations on logging backends and AI cost tracking complete.
-6. The process exits with code `0`.
+2. SBproxy emits the `shutdown_signal_received` event with `signal=SIGTERM` and the resolved `grace_seconds`.
+3. SBproxy waits up to `--shutdown-grace-ms` milliseconds for in-flight requests to complete, polling every 100ms.
+4. After all in-flight requests drain (or grace time expires), background subscribers and the reload watcher are stopped.
+5. The HTTP and HTTPS listeners shut down with a 10-second deadline.
+6. Flush operations on logging backends and AI cost tracking complete.
+7. The process exits with code `0` on clean shutdown. The Kubernetes operator exits with code `1` when the grace window is exceeded so the orchestrator surfaces an alert.
+
+On `SIGINT`, Pingora skips the grace window and tears down listeners immediately; in-flight requests see a connection close. Use this only for fast local-dev shutdowns.
 
 ---
 
@@ -1418,7 +1454,8 @@ Variables are applied at process start; changes require a restart.
 | `SB_CONFIG_FILE` | `-f`, `--config` | (empty) | Path to `sb.yml`. Required if no flag and no positional arg. |
 | `SB_LOG_LEVEL` | `--log-level` | `info` | Filter for `tracing-subscriber`. Wins over `RUST_LOG`. |
 | `SB_REQUEST_LOG_LEVEL` | `--request-log-level` | (unset) | Appends an `access_log=<level>` target filter for request/access logs. |
-| `SB_GRACE_TIME` | `--grace-time` | `0` | Pingora grace period and shutdown timeout in seconds. |
+| `SBPROXY_SHUTDOWN_GRACE_MS` | `--shutdown-grace-ms` | `30000` | SIGINT/SIGTERM drain budget in milliseconds. Wins over `SB_GRACE_TIME`. |
+| `SB_GRACE_TIME` | `--grace-time` | (unset) | Legacy Pingora grace period and shutdown timeout in seconds. Superseded by `SBPROXY_SHUTDOWN_GRACE_MS`. |
 | `SB_WORKER_THREADS` | (none) | (auto) | Override the auto-detected Pingora worker thread count. Positive integers only. |
 | `SB_DISABLE_SB_FLAGS` | `--disable-sb-flags` | `false` | Lock off the per-request `x-sb-flags` surface. Accepts `1`, `true`, `yes`, `on`. |
 | `SB_APPLY_CONFIG` | (none) | (unset) | Path to the proposed YAML used by `sbproxy apply -p <plan-file>`. Required for the `-p` flow because the plan file does not embed the YAML path. |

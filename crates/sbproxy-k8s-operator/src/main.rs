@@ -39,6 +39,12 @@ const LEADER_LEASE_NAME: &str = "sbproxy-operator-leader";
 /// human edits.
 const FIELD_MANAGER: &str = "sbproxy-k8s-operator";
 
+/// Default graceful-shutdown drain budget when no env var is set.
+/// WOR-636. Matches the binary's default and Kubernetes' default
+/// `terminationGracePeriodSeconds` so the kubelet's pod-termination
+/// grace window aligns with our drain budget.
+const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 30_000;
+
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "sbproxy-k8s-operator",
@@ -78,7 +84,7 @@ struct Ctx {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Cli::parse();
 
     // Init tracing once, regardless of subcommand.
@@ -87,10 +93,153 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     if let Some(Command::PrintCrds) = cli.command {
-        return print_crds();
+        match print_crds() {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to print CRDs");
+                std::process::exit(1);
+            }
+        }
     }
 
-    run(cli).await
+    // WOR-636: race the reconcile loop against SIGINT/SIGTERM so a
+    // kubelet pod-eviction or `docker stop` produces a clean exit
+    // with a structured shutdown log instead of an OS kill at
+    // `terminationGracePeriodSeconds`.
+    let grace = resolve_shutdown_grace_ms();
+    let mut run_handle = tokio::spawn(run(cli));
+    let shutdown = wait_for_shutdown_signal();
+    tokio::pin!(shutdown);
+
+    let exit_code = tokio::select! {
+        biased;
+        // The signal arm runs first under `biased`; if a signal
+        // arrives concurrently with the controller exiting, we
+        // prefer the signal path so the operator log makes the
+        // shutdown cause unambiguous.
+        signal_name = &mut shutdown => {
+            tracing::info!(
+                event = "shutdown_signal_received",
+                signal = %signal_name,
+                grace_ms = grace,
+                "shutdown signal received; stopping reconcile loop"
+            );
+            // Race the controller's clean-exit path against the
+            // grace budget. We do not abort the task on entry: the
+            // controller's own cancellation path (loss of leader
+            // lease, watcher stream drop) is the canonical
+            // shutdown trigger, so we give it the grace window to
+            // finish in flight. After the budget expires we abort
+            // and exit 1 so the orchestrator sees an unclean
+            // shutdown and can surface an alert.
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(grace),
+                &mut run_handle,
+            )
+            .await
+            {
+                Ok(Ok(Ok(()))) => {
+                    tracing::info!(
+                        event = "shutdown_complete",
+                        signal = %signal_name,
+                        "operator stopped cleanly"
+                    );
+                    0
+                }
+                Ok(Ok(Err(e))) => {
+                    tracing::error!(
+                        error = %e,
+                        event = "shutdown_complete_with_error",
+                        signal = %signal_name,
+                        "operator stopped with error"
+                    );
+                    1
+                }
+                Ok(Err(join_err)) => {
+                    tracing::error!(
+                        error = %join_err,
+                        event = "shutdown_complete_with_error",
+                        signal = %signal_name,
+                        "operator task join error"
+                    );
+                    1
+                }
+                Err(_) => {
+                    run_handle.abort();
+                    tracing::warn!(
+                        event = "shutdown_grace_exceeded",
+                        signal = %signal_name,
+                        grace_ms = grace,
+                        "grace period exceeded; forcing exit"
+                    );
+                    1
+                }
+            }
+        }
+        res = &mut run_handle => {
+            match res {
+                Ok(Ok(())) => 0,
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "operator exited with error");
+                    1
+                }
+                Err(join_err) => {
+                    tracing::error!(error = %join_err, "operator task join error");
+                    1
+                }
+            }
+        }
+    };
+
+    std::process::exit(exit_code);
+}
+
+/// Resolve `SBPROXY_SHUTDOWN_GRACE_MS`, falling back to
+/// [`DEFAULT_SHUTDOWN_GRACE_MS`] when the env var is unset or
+/// malformed. WOR-636.
+fn resolve_shutdown_grace_ms() -> u64 {
+    match std::env::var("SBPROXY_SHUTDOWN_GRACE_MS") {
+        Ok(v) => match v.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(
+                    value = %v,
+                    "SBPROXY_SHUTDOWN_GRACE_MS is not a non-negative integer; using default"
+                );
+                DEFAULT_SHUTDOWN_GRACE_MS
+            }
+        },
+        Err(_) => DEFAULT_SHUTDOWN_GRACE_MS,
+    }
+}
+
+/// Block until SIGINT or SIGTERM arrives, returning a static label
+/// the caller can include in structured logs. WOR-636.
+///
+/// On non-Unix targets we fall back to `ctrl_c` only because
+/// `SignalKind::terminate()` is Unix-only; Windows operators get
+/// SIGINT-equivalent behaviour through Ctrl+C and the orchestrator
+/// (Service Manager, container runtime) handles the analogue of
+/// SIGTERM.
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+    // Failing to install either handler is fatal in the same way
+    // Pingora treats it: we cannot guarantee a clean shutdown
+    // without the signal path, so propagate the panic upward and
+    // let the orchestrator restart the pod.
+    let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    tokio::select! {
+        _ = sigint.recv() => "SIGINT",
+        _ = sigterm.recv() => "SIGTERM",
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> &'static str {
+    let _ = tokio::signal::ctrl_c().await;
+    "ctrl_c"
 }
 
 /// Emit both CRDs as a single multi-document YAML stream.
@@ -611,5 +760,44 @@ mod tests {
     #[test]
     fn leader_lease_name_is_pinned() {
         assert_eq!(LEADER_LEASE_NAME, "sbproxy-operator-leader");
+    }
+
+    // --- WOR-636: SIGINT/SIGTERM grace-period parser ---
+
+    /// The 30s default tracks Kubernetes' default
+    /// `terminationGracePeriodSeconds`; a change here is a behaviour
+    /// change for the kubelet drain window.
+    #[test]
+    fn shutdown_grace_default_is_30_seconds() {
+        assert_eq!(DEFAULT_SHUTDOWN_GRACE_MS, 30_000);
+    }
+
+    /// `SBPROXY_SHUTDOWN_GRACE_MS` overrides the default when set to
+    /// a non-negative integer.
+    #[test]
+    fn shutdown_grace_env_overrides_default() {
+        std::env::set_var("SBPROXY_SHUTDOWN_GRACE_MS", "12345");
+        let got = resolve_shutdown_grace_ms();
+        std::env::remove_var("SBPROXY_SHUTDOWN_GRACE_MS");
+        assert_eq!(got, 12_345);
+    }
+
+    /// A malformed `SBPROXY_SHUTDOWN_GRACE_MS` falls back to the
+    /// default rather than panicking; a misconfigured pod still
+    /// drains in the documented 30s window.
+    #[test]
+    fn shutdown_grace_malformed_env_falls_back_to_default() {
+        std::env::set_var("SBPROXY_SHUTDOWN_GRACE_MS", "thirty-seconds");
+        let got = resolve_shutdown_grace_ms();
+        std::env::remove_var("SBPROXY_SHUTDOWN_GRACE_MS");
+        assert_eq!(got, DEFAULT_SHUTDOWN_GRACE_MS);
+    }
+
+    /// An unset `SBPROXY_SHUTDOWN_GRACE_MS` resolves to the
+    /// documented default.
+    #[test]
+    fn shutdown_grace_unset_env_returns_default() {
+        std::env::remove_var("SBPROXY_SHUTDOWN_GRACE_MS");
+        assert_eq!(resolve_shutdown_grace_ms(), DEFAULT_SHUTDOWN_GRACE_MS);
     }
 }

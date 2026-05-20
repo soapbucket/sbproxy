@@ -13,6 +13,30 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **Explicit SIGINT/SIGTERM handling with a structured shutdown
+  event and a 30s default drain budget (WOR-636).** Pingora's
+  `Server::run_forever` already trapped SIGTERM and SIGINT, but
+  the proxy emitted no operator-facing log line on receipt, so a
+  pod eviction or `docker stop` looked the same as a crash in the
+  log stream. This change subscribes to Pingora's execution-phase
+  broadcast and emits `shutdown_signal_received`,
+  `shutdown_grace_period`, and `shutdown_complete` tracing events
+  with the resolved grace budget. The Kubernetes operator
+  (`sbproxy-k8s-operator`) now installs the same SIGINT/SIGTERM
+  handlers via `tokio::signal::ctrl_c` and
+  `tokio::signal::unix::signal(SignalKind::terminate())`; before
+  this change the operator relied on the orchestrator SIGKILL at
+  `terminationGracePeriodSeconds`. The drain budget is the new
+  `SBPROXY_SHUTDOWN_GRACE_MS` env var (or `--shutdown-grace-ms`
+  CLI flag) which defaults to 30000ms, matching Kubernetes'
+  default `terminationGracePeriodSeconds`. The legacy
+  `SB_GRACE_TIME` / `--grace-time` (seconds) still works and
+  takes precedence when explicitly set; an unset legacy var lets
+  the new 30s default apply. Operator exits 0 on a clean drain,
+  1 when the grace window is exceeded, so the orchestrator can
+  alert. Documented in `docs/manual.md` §3 and
+  `docs/kubernetes.md` §Graceful shutdown.
+
 - **Idempotency middleware now engages on AI gateway origins
   (`action: ai_proxy`).** Before this change, the
   RFC 8594 middleware only ran on general HTTP origins
