@@ -14146,6 +14146,147 @@ pub fn install_sighup_handler(_config_path: String) {
     tracing::debug!("SIGHUP handler is unix-only; skipping on this target");
 }
 
+/// Resolve the graceful-shutdown grace period (in whole seconds) from
+/// the two supported env vars. WOR-636.
+///
+/// Precedence (highest wins):
+/// 1. `SBPROXY_SHUTDOWN_GRACE_MS` (milliseconds, current canonical
+///    spelling)
+/// 2. `SB_GRACE_TIME` (seconds, legacy)
+/// 3. `0` (Pingora's instant-shutdown default; the binary wrapper
+///    overlays a 30s default before this is called)
+///
+/// Pingora's `grace_period_seconds` is a whole-second field, so the
+/// millisecond value rounds up to the next whole second when it does
+/// not divide evenly. A value of `0` is preserved as `0`. A value
+/// that fails to parse logs a warning and falls through to the next
+/// source.
+pub(crate) fn resolve_shutdown_grace_seconds(ms_var: Option<&str>, sec_var: Option<&str>) -> u64 {
+    if let Some(v) = ms_var {
+        match v.parse::<u64>() {
+            Ok(ms) => {
+                // Round milliseconds up to the next whole second so a
+                // 500ms grace still gives an in-flight request a full
+                // second to drain. Saturates at u64::MAX / 1000.
+                let secs = ms.saturating_add(999) / 1000;
+                return secs;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    value = %v,
+                    "SBPROXY_SHUTDOWN_GRACE_MS is not a non-negative integer; ignoring"
+                );
+            }
+        }
+    }
+    if let Some(v) = sec_var {
+        match v.parse::<u64>() {
+            Ok(s) => return s,
+            Err(_) => {
+                tracing::warn!(
+                    value = %v,
+                    "SB_GRACE_TIME is not a non-negative integer; ignoring"
+                );
+            }
+        }
+    }
+    0
+}
+
+/// Spawn a background thread that subscribes to the Pingora server's
+/// `execution_phase_watch` broadcast and emits structured tracing
+/// events at each transition. WOR-636.
+///
+/// Pingora handles SIGINT (fast shutdown) and SIGTERM (graceful
+/// shutdown) inside [`pingora_core::server::Server::run_forever`].
+/// The phase broadcast is the documented surface for observing those
+/// transitions from outside the Pingora runtime; emitting our own
+/// `tracing` events here means operators see a clear "shutdown
+/// signal received" log line in the same stream as the request logs,
+/// and the `shutdown.kind` / `shutdown.grace_seconds` fields make the
+/// event filterable by structured-log consumers.
+///
+/// The subscriber must be acquired **before** `Server::run_forever`
+/// consumes the `Server` value; this function is a no-op when called
+/// after that point because the broadcast sender is dropped.
+fn spawn_shutdown_phase_logger(
+    mut rx: tokio::sync::broadcast::Receiver<pingora_core::server::ExecutionPhase>,
+    grace_seconds: u64,
+) {
+    std::thread::Builder::new()
+        .name("sbproxy-shutdown-log".to_string())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "failed to build shutdown-phase logger runtime; structured shutdown logs disabled"
+                    );
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(pingora_core::server::ExecutionPhase::GracefulTerminate) => {
+                            tracing::info!(
+                                event = "shutdown_signal_received",
+                                signal = "SIGTERM",
+                                kind = "graceful",
+                                grace_seconds = grace_seconds,
+                                "SIGTERM received; draining in-flight requests"
+                            );
+                        }
+                        Ok(pingora_core::server::ExecutionPhase::ShutdownStarted) => {
+                            tracing::info!(
+                                event = "shutdown_started",
+                                grace_seconds = grace_seconds,
+                                "shutdown started"
+                            );
+                        }
+                        Ok(pingora_core::server::ExecutionPhase::ShutdownGracePeriod) => {
+                            tracing::info!(
+                                event = "shutdown_grace_period",
+                                grace_seconds = grace_seconds,
+                                "graceful shutdown grace period started"
+                            );
+                        }
+                        Ok(pingora_core::server::ExecutionPhase::ShutdownRuntimes) => {
+                            tracing::info!(
+                                event = "shutdown_runtimes",
+                                "waiting for service runtimes to exit"
+                            );
+                        }
+                        Ok(pingora_core::server::ExecutionPhase::Terminated) => {
+                            tracing::info!(event = "shutdown_complete", "sbproxy has stopped");
+                            break;
+                        }
+                        Ok(_) => {
+                            // Earlier phases (Running, etc.) are not
+                            // shutdown-related; skip them.
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(
+                                skipped = skipped,
+                                "shutdown-phase logger lagged behind Pingora's phase broadcast"
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            // Sender dropped: the server is fully
+                            // torn down. Nothing more to log.
+                            break;
+                        }
+                    }
+                }
+            });
+        })
+        .ok();
+}
+
 /// Create and start a Pingora server with the given config file path.
 ///
 /// This function:
@@ -14156,9 +14297,17 @@ pub fn install_sighup_handler(_config_path: String) {
 /// 5. Creates a Pingora server with an HTTP proxy service
 /// 6. Starts the server (blocks forever)
 ///
-/// Pingora handles SIGTERM/SIGINT for graceful shutdown internally.
-/// The file watcher handles config reload on file change, which is
-/// equivalent to SIGHUP-based reload in traditional servers.
+/// Pingora handles SIGTERM (graceful shutdown) and SIGINT (fast
+/// shutdown) internally inside `Server::run_forever`. We subscribe
+/// to Pingora's execution-phase broadcast (see
+/// `spawn_shutdown_phase_logger`) so a structured tracing event is
+/// emitted when a shutdown signal arrives; operators can grep for
+/// `shutdown_signal_received` in the logs to see the drain start.
+/// The grace period is resolved by `resolve_shutdown_grace_seconds`
+/// from `SBPROXY_SHUTDOWN_GRACE_MS` (preferred) or `SB_GRACE_TIME`
+/// (legacy). The file watcher handles config reload on file change,
+/// which is equivalent to SIGHUP-based reload in traditional
+/// servers.
 pub fn run(config_path: &str) -> anyhow::Result<()> {
     use pingora_core::apps::HttpServerOptions;
     use pingora_core::server::configuration::ServerConf as PingoraServerConf;
@@ -14424,12 +14573,25 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
         None
     };
 
-    // Create Pingora server. By default we use a zero grace period for
-    // instant shutdown: the Go e2e runner sends SIGTERM between test cases
-    // and immediately tries to bind the same port for the next case, so
-    // any grace period causes the port to stay busy and the next case
-    // fails to start. Production deployments override via `--grace-time`
-    // or `SB_GRACE_TIME` (see docs/manual.md §1).
+    // Create Pingora server. The graceful-shutdown grace period is
+    // resolved from three sources (preferred first):
+    //
+    //   1. `SBPROXY_SHUTDOWN_GRACE_MS` (milliseconds, WOR-636)
+    //   2. `SB_GRACE_TIME` (seconds, legacy, kept for back-compat)
+    //   3. zero (instant) for the Go e2e runner and dev loops
+    //
+    // The binary wrapper (`crates/sbproxy/src/main.rs`) overlays a 30s
+    // default before calling in here so end users get a sane grace
+    // period without setting any env var; the in-process default
+    // stays zero so the Go e2e runner (which sends SIGTERM between
+    // test cases and immediately tries to bind the same port for the
+    // next case) does not pay a 30s port-busy penalty.
+    //
+    // Pingora handles SIGINT (fast shutdown) and SIGTERM (graceful
+    // shutdown) inside `Server::run_forever`. We subscribe to the
+    // execution-phase broadcast below so the structured shutdown log
+    // line lands in operator-facing tracing output. See
+    // `docs/manual.md` for the signal contract.
     //
     // Performance tuning (see sbproxy-bench/docs/TUNING.md):
     //   * threads: Pingora's default is 1 (single-threaded). Match Go's
@@ -14440,10 +14602,10 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
     // threads don't block on syscalls. Tier-2 tuning from
     // sbproxy-bench/docs/TUNING.md. Two pools is the Pingora-recommended
     // starting point for 8+ core machines.
-    let grace_seconds = std::env::var("SB_GRACE_TIME")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
+    let grace_seconds = resolve_shutdown_grace_seconds(
+        std::env::var("SBPROXY_SHUTDOWN_GRACE_MS").ok().as_deref(),
+        std::env::var("SB_GRACE_TIME").ok().as_deref(),
+    );
     // Worker thread count. `SB_WORKER_THREADS` (when a positive
     // integer) overrides the auto-detected value; otherwise we use
     // `std::thread::available_parallelism()`, which honours cgroup
@@ -14744,6 +14906,14 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
     }
 
     server.bootstrap();
+
+    // WOR-636: subscribe to Pingora's execution-phase broadcast
+    // before `run_forever` consumes the server so an explicit
+    // structured tracing event lands when SIGINT or SIGTERM is
+    // received. Pingora handles the signal itself; this just makes
+    // the shutdown visible to operator-facing logs.
+    spawn_shutdown_phase_logger(server.watch_execution_phase(), grace_seconds);
+
     server.run_forever();
 }
 
@@ -17597,5 +17767,62 @@ origins:
         );
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["endpoints"]["mcp"], "http://agent.example.com/mcp");
+    }
+
+    // --- WOR-636 graceful-shutdown grace period parser ---
+
+    #[test]
+    fn resolve_shutdown_grace_ms_preferred_over_seconds() {
+        // The canonical spelling (`SBPROXY_SHUTDOWN_GRACE_MS`) wins
+        // when both are set so the new env var fully supersedes the
+        // legacy `SB_GRACE_TIME`.
+        assert_eq!(
+            super::resolve_shutdown_grace_seconds(Some("30000"), Some("5")),
+            30
+        );
+    }
+
+    #[test]
+    fn resolve_shutdown_grace_ms_rounds_up_to_seconds() {
+        // 500ms must produce 1 second so partial seconds still give
+        // in-flight requests at least one full second to drain.
+        assert_eq!(super::resolve_shutdown_grace_seconds(Some("500"), None), 1);
+        assert_eq!(super::resolve_shutdown_grace_seconds(Some("1001"), None), 2);
+        // Zero stays zero (instant shutdown).
+        assert_eq!(super::resolve_shutdown_grace_seconds(Some("0"), None), 0);
+    }
+
+    #[test]
+    fn resolve_shutdown_grace_falls_back_to_legacy_seconds() {
+        // No SBPROXY_SHUTDOWN_GRACE_MS: read SB_GRACE_TIME.
+        assert_eq!(super::resolve_shutdown_grace_seconds(None, Some("12")), 12);
+    }
+
+    #[test]
+    fn resolve_shutdown_grace_default_zero_when_both_unset() {
+        // Both env vars unset: the in-process default is zero so the
+        // Go e2e runner can rebind the listener between cases. The
+        // binary wrapper overlays a 30s default before calling here.
+        assert_eq!(super::resolve_shutdown_grace_seconds(None, None), 0);
+    }
+
+    #[test]
+    fn resolve_shutdown_grace_malformed_ms_falls_through() {
+        // A non-numeric `SBPROXY_SHUTDOWN_GRACE_MS` is ignored (with
+        // a warning the test cannot easily capture); the legacy
+        // seconds value still wins.
+        assert_eq!(
+            super::resolve_shutdown_grace_seconds(Some("not-a-number"), Some("7")),
+            7
+        );
+    }
+
+    #[test]
+    fn resolve_shutdown_grace_malformed_seconds_falls_through_to_default() {
+        // Both malformed: default to zero.
+        assert_eq!(
+            super::resolve_shutdown_grace_seconds(Some("nope"), Some("also-nope")),
+            0
+        );
     }
 }

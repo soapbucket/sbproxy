@@ -57,6 +57,27 @@ fn main() {
         env::set_var("SB_GRACE_TIME", grace.to_string());
     }
 
+    // WOR-636: resolve `--shutdown-grace-ms` /
+    // `SBPROXY_SHUTDOWN_GRACE_MS` and stash it in the environment so
+    // `sbproxy_core::run` can pick it up. The binary overlays a 30s
+    // default so orchestrators (kubelet, systemd, docker) get a sane
+    // drain window without setting any env var; the in-process
+    // default inside `sbproxy_core` stays at zero so the Go e2e
+    // runner can rebind the listener between test cases.
+    let resolved_ms = resolve_shutdown_grace_ms(&args).or_else(|| {
+        // If the legacy `--grace-time` / `SB_GRACE_TIME` is set,
+        // do not overlay the 30s default: respect what the
+        // operator asked for.
+        if resolve_grace_time(&args).is_some() {
+            None
+        } else {
+            Some(DEFAULT_SHUTDOWN_GRACE_MS)
+        }
+    });
+    if let Some(ms) = resolved_ms {
+        env::set_var("SBPROXY_SHUTDOWN_GRACE_MS", ms.to_string());
+    }
+
     // WOR-114: lock off the per-request feature-flag surface for
     // production hardening. CLI flag wins; otherwise honour
     // `SB_DISABLE_SB_FLAGS=1`.
@@ -254,6 +275,32 @@ fn resolve_request_log_level(args: &[String]) -> Option<String> {
     }
 }
 
+/// Default graceful-shutdown drain budget when no env var or CLI
+/// flag is set. WOR-636. Matches the upstream client-go controller
+/// default and the Kubernetes default `terminationGracePeriodSeconds`
+/// so a pod eviction in a default-configured cluster drains cleanly.
+const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 30_000;
+
+/// Resolve `--shutdown-grace-ms <ms>` / `SBPROXY_SHUTDOWN_GRACE_MS`.
+/// Returns `None` when neither is set; the caller decides whether to
+/// overlay the 30s default. The CLI value wins over the env value
+/// when both are supplied.
+fn resolve_shutdown_grace_ms(args: &[String]) -> Option<u64> {
+    if let Some(v) = take_flag_value(args, "--shutdown-grace-ms") {
+        if let Ok(n) = v.parse::<u64>() {
+            return Some(n);
+        }
+        eprintln!("warning: --shutdown-grace-ms '{v}' is not a number; ignoring");
+    }
+    if let Ok(v) = env::var("SBPROXY_SHUTDOWN_GRACE_MS") {
+        if let Ok(n) = v.parse::<u64>() {
+            return Some(n);
+        }
+        eprintln!("warning: SBPROXY_SHUTDOWN_GRACE_MS '{v}' is not a number; ignoring");
+    }
+    None
+}
+
 /// Resolve `--grace-time <secs>` / `SB_GRACE_TIME`. Returns `None` when
 /// neither is set, in which case the core uses its built-in default.
 fn resolve_grace_time(args: &[String]) -> Option<u64> {
@@ -322,7 +369,11 @@ fn parse_config_path(args: &[String]) -> Option<&str> {
                 i += 1;
                 continue;
             }
-            "--log-level" | "--request-log-level" | "--log-format" | "--grace-time" => {
+            "--log-level"
+            | "--request-log-level"
+            | "--log-format"
+            | "--grace-time"
+            | "--shutdown-grace-ms" => {
                 i += 2; // skip flag + value
                 continue;
             }
@@ -378,7 +429,8 @@ fn general_usage_str() -> &'static str {
 
 USAGE:
     sbproxy --config <path>
-    sbproxy serve -f <path> [--log-level <level>] [--request-log-level <level>] [--grace-time <secs>]
+    sbproxy serve -f <path> [--log-level <level>] [--request-log-level <level>]
+                            [--grace-time <secs>] [--shutdown-grace-ms <ms>]
     sbproxy validate <path>
     sbproxy --config <path> --check
     sbproxy plan -f <yaml> [--against <yaml>] [--format json|text] [--out <plan-file>]
@@ -395,8 +447,13 @@ FLAGS:
                                  SB_LOG_LEVEL and RUST_LOG. Default: info.
     --request-log-level <level>  access_log target filter. Wins over
                                  SB_REQUEST_LOG_LEVEL. Default: unset.
-    --grace-time <secs>          Graceful-shutdown timeout. Wins over
-                                 SB_GRACE_TIME. Default: 0 (instant).
+    --grace-time <secs>          Graceful-shutdown timeout (seconds,
+                                 legacy). Wins over SB_GRACE_TIME.
+                                 Superseded by --shutdown-grace-ms.
+    --shutdown-grace-ms <ms>     SIGINT/SIGTERM drain budget in
+                                 milliseconds. Wins over
+                                 SBPROXY_SHUTDOWN_GRACE_MS and over
+                                 --grace-time. Default: 30000 (30s).
     --disable-sb-flags           Lock off the per-request feature-flag
                                  surface (`x-sb-flags` header and
                                  `?_sb.<k>` query params). Default: off.
@@ -406,7 +463,9 @@ ENV:
     SB_CONFIG_FILE               --config fallback.
     SB_LOG_LEVEL                 --log-level fallback.
     SB_REQUEST_LOG_LEVEL         --request-log-level fallback.
-    SB_GRACE_TIME                --grace-time fallback.
+    SB_GRACE_TIME                --grace-time fallback (seconds).
+    SBPROXY_SHUTDOWN_GRACE_MS    --shutdown-grace-ms fallback
+                                 (milliseconds). Default: 30000.
     SB_DISABLE_SB_FLAGS          --disable-sb-flags fallback (1/true/yes/on).
     RUST_LOG                     tracing filter when --log-level and
                                  SB_LOG_LEVEL are unset.
@@ -1133,5 +1192,68 @@ mod tests {
             "/etc/sbproxy/sb.yml",
         ]);
         assert_eq!(parse_config_path(&argv), Some("/etc/sbproxy/sb.yml"));
+    }
+
+    // --- WOR-636: SIGINT/SIGTERM grace-period parser ---
+
+    #[test]
+    fn shutdown_grace_ms_cli_overrides_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        env::set_var("SBPROXY_SHUTDOWN_GRACE_MS", "5000");
+        let got = resolve_shutdown_grace_ms(&args(&["sbproxy", "--shutdown-grace-ms", "12000"]));
+        env::remove_var("SBPROXY_SHUTDOWN_GRACE_MS");
+        assert_eq!(got, Some(12_000));
+    }
+
+    #[test]
+    fn shutdown_grace_ms_env_only() {
+        let _g = ENV_LOCK.lock().unwrap();
+        env::set_var("SBPROXY_SHUTDOWN_GRACE_MS", "45000");
+        let got = resolve_shutdown_grace_ms(&args(&["sbproxy"]));
+        env::remove_var("SBPROXY_SHUTDOWN_GRACE_MS");
+        assert_eq!(got, Some(45_000));
+    }
+
+    #[test]
+    fn shutdown_grace_ms_unset_returns_none() {
+        let _g = ENV_LOCK.lock().unwrap();
+        env::remove_var("SBPROXY_SHUTDOWN_GRACE_MS");
+        assert_eq!(resolve_shutdown_grace_ms(&args(&["sbproxy"])), None);
+    }
+
+    #[test]
+    fn shutdown_grace_ms_malformed_cli_is_ignored() {
+        let _g = ENV_LOCK.lock().unwrap();
+        env::remove_var("SBPROXY_SHUTDOWN_GRACE_MS");
+        // CLI value cannot be parsed: function falls through to the
+        // env (also unset), returning None. The warning lands on
+        // stderr; the unit test does not capture stderr but the
+        // contract is that an unparseable value is non-fatal.
+        let got = resolve_shutdown_grace_ms(&args(&[
+            "sbproxy",
+            "--shutdown-grace-ms",
+            "thirty seconds please",
+        ]));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn parse_config_skips_shutdown_grace_ms_value() {
+        let argv = args(&[
+            "sbproxy",
+            "--shutdown-grace-ms",
+            "30000",
+            "--config",
+            "/etc/sbproxy/sb.yml",
+        ]);
+        assert_eq!(parse_config_path(&argv), Some("/etc/sbproxy/sb.yml"));
+    }
+
+    /// The 30s default tracks Kubernetes' default
+    /// `terminationGracePeriodSeconds`. Any change here is a
+    /// behaviour change for orchestrators that rely on the default.
+    #[test]
+    fn shutdown_grace_default_is_30_seconds() {
+        assert_eq!(DEFAULT_SHUTDOWN_GRACE_MS, 30_000);
     }
 }
