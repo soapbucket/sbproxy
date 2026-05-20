@@ -196,16 +196,23 @@ mod tests {
         let len = buf.len();
 
         // Confirm the bytes are non-zero before zeroization.
+        // SAFETY: `ptr` comes from `buf.as_mut_ptr()` and `buf` is alive for
+        // the whole test; `i < len` keeps `ptr.add(i)` in bounds, and `u8`
+        // has no alignment requirement, so each volatile read is valid.
         for i in 0..len {
             assert_ne!(unsafe { std::ptr::read_volatile(ptr.add(i)) }, 0);
         }
 
         // Simulate the zeroization that Drop performs.
+        // SAFETY: same invariants as above; `buf` is uniquely owned in this
+        // test, so the writes through `ptr` do not alias any other reference.
         for i in 0..len {
             unsafe { std::ptr::write_volatile(ptr.add(i), 0) };
         }
 
         // Verify all bytes are zero while the Vec is still alive (so memory is valid).
+        // SAFETY: `buf` is still alive, `ptr` addresses its allocation, and
+        // `i < len` bounds every read.
         for i in 0..len {
             assert_eq!(
                 unsafe { std::ptr::read_volatile(ptr.add(i)) },
