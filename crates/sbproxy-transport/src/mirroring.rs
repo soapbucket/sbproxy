@@ -31,6 +31,24 @@ fn default_sample_rate() -> f64 {
     1.0
 }
 
+/// Shared HTTP client for fire-and-forget mirror requests.
+///
+/// WOR-598: built once with finite request and connect timeouts so a slow or
+/// dead shadow upstream cannot accumulate hung background tasks (which would
+/// leak memory and block graceful shutdown). Mirroring is observability-only,
+/// so the timeouts are deliberately tight: a degraded shadow must never affect
+/// the primary path.
+fn mirror_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("mirror HTTP client builder failed; cannot enforce shadow-request timeouts")
+    })
+}
+
 // --- mirror_request ---
 
 /// Mirror a request to the shadow upstream.  Fire-and-forget.
@@ -76,7 +94,7 @@ pub fn mirror_request(
     tokio::spawn(async move {
         debug!(url = %target_url, "mirroring request to shadow upstream");
 
-        let client = reqwest::Client::new();
+        let client = mirror_client();
 
         let req_method = match reqwest::Method::from_bytes(method.as_bytes()) {
             Ok(m) => m,
@@ -198,6 +216,43 @@ mod tests {
             sample_rate: 1.0,
         };
         mirror_request(&cfg, "GET", "/ping", &[], None);
+    }
+
+    #[test]
+    fn mirror_to_dead_shadow_returns_immediately() {
+        // A listener that accepts but never replies models a hung shadow.
+        // mirror_request must spawn the work and return at once so a dead
+        // shadow can never delay the primary path (WOR-598); the bounded
+        // client keeps the detached task from living forever.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(s) => held.push(s),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let cfg = MirrorConfig {
+            shadow_url: format!("http://{addr}"),
+            sample_rate: 1.0,
+        };
+        let started = std::time::Instant::now();
+        mirror_request(&cfg, "GET", "/x", &[], None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "mirror_request must not block the caller on a hung shadow, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
