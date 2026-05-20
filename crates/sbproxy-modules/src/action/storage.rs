@@ -14,6 +14,7 @@
 //! Missing objects are surfaced as `404`; transient backend errors
 //! become `502`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -36,7 +37,9 @@ pub struct StorageAction {
     /// Key prefix prepended to every request path.
     #[serde(default)]
     pub prefix: Option<String>,
-    /// Local filesystem root path (for the `local` backend).
+    /// Local filesystem root path (for the `local` backend). Canonicalized
+    /// at build time, so any symlinks in the path are resolved to their real
+    /// target before the object store is rooted there (WOR-601).
     #[serde(default)]
     pub path: Option<String>,
     /// Default index file served for directory requests (e.g. `index.html`).
@@ -124,19 +127,10 @@ impl StorageAction {
                     .path
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("local backend requires 'path'"))?;
-                // LocalFileSystem rejects relative paths and missing
-                // dirs at construction time. We pre-create the dir so a
-                // fresh deployment with `path: /var/cache/sbproxy` does
-                // not fail to start before any user has uploaded.
-                //
-                // WOR-618: `build` runs at config-compile time (startup
-                // and reload), never on the per-request path, so this
-                // blocking `create_dir_all` does not stall a request
-                // worker. Keep it synchronous.
-                std::fs::create_dir_all(path).map_err(|e| {
-                    anyhow::anyhow!("failed to create local storage path '{}': {}", path, e)
-                })?;
-                let local = object_store::local::LocalFileSystem::new_with_prefix(path)?;
+                // Pre-create and canonicalize the configured root before
+                // handing it to the object store; see `resolve_local_root`.
+                let root = resolve_local_root(path)?;
+                let local = object_store::local::LocalFileSystem::new_with_prefix(&root)?;
                 Arc::new(local)
             }
             "s3" => {
@@ -180,6 +174,31 @@ impl StorageAction {
             store,
         })
     }
+}
+
+/// Pre-create and canonicalize a local-storage root before it is handed
+/// to `LocalFileSystem`.
+///
+/// WOR-618: `build` runs at config-compile time (startup and reload),
+/// never on the per-request path, so the blocking `create_dir_all` and
+/// `canonicalize` here do not stall a request worker.
+///
+/// WOR-601: the parse-time `reject_traversal` check is a string scan for
+/// `..` and does not resolve symlinks, so an operator could point `path`
+/// at a symlink whose target (or whose ancestor's target) escapes the
+/// intended root. Canonicalizing after creating the directory resolves
+/// every symlink in the path, pinning the object store's authority to the
+/// real directory rather than wherever a symlink happens to point.
+fn resolve_local_root(path: &str) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(path)
+        .map_err(|e| anyhow::anyhow!("failed to create local storage path '{}': {}", path, e))?;
+    std::fs::canonicalize(path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to canonicalize local storage path '{}': {}",
+            path,
+            e
+        )
+    })
 }
 
 /// Outcome of [`CompiledStorage::serve`].
@@ -535,6 +554,33 @@ fn reject_traversal(field: &str, value: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use object_store::PutPayload;
+
+    // --- WOR-601: local-root canonicalization ---
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_local_root_canonicalizes_through_symlink() {
+        // A path that traverses a symlinked ancestor must resolve to the
+        // real directory so the object store's authority cannot be widened
+        // by a symlink the operator did not intend.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Configure the storage path through the symlink.
+        let configured = link.join("sub");
+        let resolved = resolve_local_root(configured.to_str().unwrap()).unwrap();
+
+        // The resolved root is the real directory, with no symlink left in it.
+        let expected = std::fs::canonicalize(&real).unwrap().join("sub");
+        assert_eq!(resolved, expected);
+        assert!(
+            !resolved.starts_with(&link),
+            "symlink component must be resolved away, got {resolved:?}"
+        );
+    }
 
     // --- config validation tests ---
 
