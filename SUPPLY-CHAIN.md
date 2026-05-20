@@ -259,7 +259,7 @@ We make a graded set of claims here. We are honest about which are stronger.
 
 ### 6.1 What we guarantee today
 
-- **Pinned Rust toolchain** via `rust-toolchain.toml`. Two builders running with the same toolchain version produce builds against the same compiler.
+- **Fixed toolchain channel** via `dtolnay/rust-toolchain` (`stable`) in CI, with the minimum supported version declared in `Cargo.toml` (`rust-version`). Two builders on the same channel build against the same compiler release. An exact, workspace-wide version pin is not committed today; see 6.2.
 - **Pinned dependency graph** via committed `Cargo.lock` and the `--locked` flag. Two builders see the same crate versions and the same transitive resolution.
 - **Pinned action versions** via SHA. Two builders see the same workflow logic.
 - **`-Cstrip=symbols`** to remove debug symbols and reduce sources of nondeterminism in the binary.
@@ -269,6 +269,7 @@ This means: if you build from the same source, with the same toolchain, on a sim
 ### 6.2 What we do not yet guarantee
 
 - **Bit-for-bit identical binaries** across builders. Achieving this requires removing every source of nondeterminism (timestamp embeds, file ordering, codegen unit nondeterminism). It is a multi-week project. We have not done it yet. The `reproducible build probe` workflow now builds the release binary twice on independent GitHub-hosted runners and uploads the SHA-256 comparison report as an artifact, but the probe is informational until the diff reaches zero.
+- **An exact pinned toolchain version** across every lane. We build on a fixed `stable` channel and declare an MSRV, but do not commit a `rust-toolchain.toml` pinning one version, because the fuzzing lane runs on nightly. Converging every lane onto a single pinned toolchain is part of the bit-for-bit work above.
 
 If your security policy requires bit-for-bit reproducibility today, talk to us. We will work with you on a bridge: independent rebuild from a tagged source, SBOM and dependency-graph comparison, and a written attestation that the dependency surface matches.
 

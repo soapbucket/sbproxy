@@ -162,7 +162,7 @@ We track open hardening items publicly. As of the latest release:
 
 - **Streaming SSE response capture in the semantic cache** is intentionally bypassed. See `SUPPLY-CHAIN.md` for the rationale and the framing-aware capture roadmap (Q3 2026).
 - **First-party prompt-injection detection** is heuristic. For strict use cases, integrate one of the supported guardrail vendors (Aporia, Lakera, Model Armor, Patronus, Pangea, CrowdStrike) via the enterprise tier.
-- **Reproducible builds** are deterministic at the dependency-graph level (pinned `Cargo.lock`, pinned `rust-toolchain.toml`, `--locked` flag). Bit-for-bit reproducibility across builders is on the roadmap; we publish CI verification status as it lands.
+- **Reproducible builds** are deterministic at the dependency-graph level: the committed `Cargo.lock` pins every dependency version and CI builds with `--locked`. The toolchain is a fixed Rust release channel installed in CI, and the workspace minimum is declared in `Cargo.toml` (`rust-version`). Bit-for-bit reproducibility across builders, including an exact pinned toolchain version, is on the roadmap; we publish CI verification status as it lands.
 
 ---
 
