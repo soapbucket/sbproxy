@@ -157,6 +157,11 @@ mod tests {
     use super::*;
     use crate::local::LocalVault;
 
+    /// Serializes the tests that mutate the process-global environment so
+    /// `std::env::set_var`/`remove_var` never race a concurrent reader in
+    /// this test binary (WOR-648).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn backend_with(key: &str, value: &str) -> Arc<dyn VaultBackend> {
         let vault = LocalVault::new();
         vault.set_secret(key, value).unwrap();
@@ -192,6 +197,13 @@ mod tests {
 
     #[test]
     fn resolve_secret_no_backend_env_fallback() {
+        // Hold the lock for the whole body so no other env-mutating test runs
+        // concurrently. SAFETY (for both unsafe blocks below): `set_var` /
+        // `remove_var` mutate process-global state; ENV_LOCK excludes the
+        // other env tests in this binary, and no vault code reads the
+        // environment except through these locked tests, so there is no
+        // concurrent environment access.
+        let _env = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("TEST_SECRET_ENV_FALLBACK", "from_env") };
         let resolver = resolver_no_backend().with_fallback(ResolveFallback::Env);
         let result = resolver.resolve("secret:TEST_SECRET_ENV_FALLBACK").unwrap();
@@ -215,6 +227,10 @@ mod tests {
 
     #[test]
     fn resolve_env_var_pattern() {
+        // SAFETY (for both unsafe blocks below): ENV_LOCK serializes the
+        // env-mutating tests in this binary, so `set_var`/`remove_var` never
+        // race a concurrent environment access.
+        let _env = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("TEST_RESOLVER_ENV", "from_environment") };
         let resolver = resolver_no_backend();
         assert_eq!(
