@@ -4,8 +4,8 @@
 //! providers may return identical responses.  This module tracks content
 //! hashes so duplicate responses can be detected and suppressed.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
 
@@ -29,7 +29,7 @@ impl ResponseDedup {
     /// or `None` if the response is novel.
     pub fn check(&self, response: &str) -> Option<String> {
         let h = Self::hash(response);
-        let hashes = self.hashes.lock().unwrap();
+        let hashes = self.hashes.lock();
         hashes.get(&h).cloned()
     }
 
@@ -39,7 +39,7 @@ impl ResponseDedup {
     /// the original attribution is preserved (first-writer-wins).
     pub fn record(&self, response: &str, provider: &str) {
         let h = Self::hash(response);
-        let mut hashes = self.hashes.lock().unwrap();
+        let mut hashes = self.hashes.lock();
         hashes.entry(h).or_insert_with(|| provider.to_string());
     }
 

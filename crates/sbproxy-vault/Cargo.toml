@@ -11,6 +11,7 @@ serde_json.workspace = true
 base64.workspace = true
 ring.workspace = true
 hex.workspace = true
+parking_lot.workspace = true
 # `spawn_blocking` for the async file-resolver wrapper.
 tokio = { workspace = true, features = ["rt"] }
 

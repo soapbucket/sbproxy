@@ -3,8 +3,8 @@
 //! Parses rate limit headers from provider responses and tracks
 //! remaining capacity. Pre-emptively throttles when close to limits.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Current rate limit state observed from a provider's response headers.
@@ -91,7 +91,7 @@ impl ProviderRateLimitTracker {
 
         let reset_at = reset_secs.map(|s| Instant::now() + Duration::from_secs_f64(s));
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let entry = state
             .entry(provider.to_string())
             .or_insert_with(|| ProviderRateState {
@@ -123,7 +123,7 @@ impl ProviderRateLimitTracker {
     /// Does NOT throttle if no state is recorded for the provider (unknown -> allow).
     /// Clears stale throttle state after the reset window has passed.
     pub fn should_throttle(&self, provider: &str) -> bool {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let Some(entry) = state.get_mut(provider) else {
             return false;
         };
@@ -163,7 +163,7 @@ impl ProviderRateLimitTracker {
 
     /// Get the current rate state for a provider, if any has been recorded.
     pub fn get_state(&self, provider: &str) -> Option<ProviderRateState> {
-        self.state.lock().unwrap().get(provider).cloned()
+        self.state.lock().get(provider).cloned()
     }
 }
 
@@ -318,7 +318,7 @@ mod tests {
 
         // Set remaining=0 with an already-expired reset (0 seconds in the future)
         {
-            let mut state = tracker.state.lock().unwrap();
+            let mut state = tracker.state.lock();
             state.insert(
                 "openai".to_string(),
                 ProviderRateState {

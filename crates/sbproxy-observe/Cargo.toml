@@ -20,6 +20,7 @@ ulid.workspace = true
 regex.workspace = true
 http.workspace = true
 once_cell = "1"
+parking_lot.workspace = true
 rand.workspace = true
 reqwest = { workspace = true }
 tokio.workspace = true

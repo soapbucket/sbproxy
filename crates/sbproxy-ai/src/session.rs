@@ -7,10 +7,10 @@
 //! the dispatch path can observe stateful upstream entities without
 //! introducing a second storage primitive.
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
 use crate::types::Message;
 
@@ -68,7 +68,7 @@ impl SessionStore {
     /// Refreshes `last_active` on every call so that frequently-accessed
     /// sessions remain in the store under capacity-based eviction.
     pub fn get_or_create(&self, session_id: &str) -> ConversationSession {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock();
         if let Some(session) = sessions.get_mut(session_id) {
             session.last_active = self.tick();
             return session.clone();
@@ -101,7 +101,7 @@ impl SessionStore {
     /// Append messages to an existing session. Creates the session if missing.
     pub fn append_messages(&self, session_id: &str, messages: &[Message]) {
         let now = self.tick();
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock();
 
         let session =
             sessions
@@ -123,7 +123,7 @@ impl SessionStore {
     /// Refreshes `last_active` on every call.
     pub fn get_history(&self, session_id: &str) -> Option<Vec<Message>> {
         let now = self.tick();
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock();
         sessions.get_mut(session_id).map(|s| {
             s.last_active = now;
             s.messages.clone()
@@ -132,7 +132,7 @@ impl SessionStore {
 
     /// Remove a session entirely.
     pub fn clear(&self, session_id: &str) {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock();
         sessions.remove(session_id);
     }
 
@@ -142,26 +142,26 @@ impl SessionStore {
     /// is the caller's responsibility (see the typed helpers below
     /// for the standard namespacing).
     pub fn put_artifact(&self, key: &str, value: serde_json::Value) {
-        let mut artifacts = self.artifacts.lock().unwrap();
+        let mut artifacts = self.artifacts.lock();
         artifacts.insert(key.to_string(), value);
     }
 
     /// Fetch an artifact by namespaced key. Returns `None` when the
     /// key is absent.
     pub fn get_artifact(&self, key: &str) -> Option<serde_json::Value> {
-        let artifacts = self.artifacts.lock().unwrap();
+        let artifacts = self.artifacts.lock();
         artifacts.get(key).cloned()
     }
 
     /// Remove an artifact by namespaced key.
     pub fn delete_artifact(&self, key: &str) {
-        let mut artifacts = self.artifacts.lock().unwrap();
+        let mut artifacts = self.artifacts.lock();
         artifacts.remove(key);
     }
 
     /// Drop every artifact. Conversation sessions are unaffected.
     pub fn clear_artifacts(&self) {
-        let mut artifacts = self.artifacts.lock().unwrap();
+        let mut artifacts = self.artifacts.lock();
         artifacts.clear();
     }
 
@@ -209,7 +209,7 @@ impl SessionStore {
     /// array.
     pub fn append_thread_message(&self, thread_id: &str, message: serde_json::Value) {
         let key = format!("thread:{}/messages", thread_id);
-        let mut artifacts = self.artifacts.lock().unwrap();
+        let mut artifacts = self.artifacts.lock();
         let entry = artifacts
             .entry(key)
             .or_insert_with(|| serde_json::Value::Array(Vec::new()));
@@ -220,7 +220,7 @@ impl SessionStore {
 
     /// Read the mirrored message list for a thread.
     pub fn get_thread_messages(&self, thread_id: &str) -> Option<Vec<serde_json::Value>> {
-        let artifacts = self.artifacts.lock().unwrap();
+        let artifacts = self.artifacts.lock();
         artifacts
             .get(&format!("thread:{}/messages", thread_id))
             .and_then(|v| v.as_array().cloned())

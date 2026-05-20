@@ -1,8 +1,8 @@
 //! Bounded in-memory messenger using std::sync::mpsc channels.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::Mutex;
 
 use anyhow::Result;
 
@@ -32,7 +32,7 @@ impl MemoryMessenger {
 
 impl Messenger for MemoryMessenger {
     fn publish(&self, msg: &Message) -> Result<()> {
-        let mut channels = self.channels.lock().unwrap();
+        let mut channels = self.channels.lock();
         if let Some(senders) = channels.get_mut(&msg.topic) {
             // Remove disconnected senders and send to the rest.
             senders.retain(|sender| {
@@ -45,7 +45,7 @@ impl Messenger for MemoryMessenger {
 
     fn subscribe(&self, topic: &str) -> Result<Box<dyn Iterator<Item = Message> + Send>> {
         let (tx, rx) = mpsc::sync_channel::<Message>(self.max_pending);
-        let mut channels = self.channels.lock().unwrap();
+        let mut channels = self.channels.lock();
         channels.entry(topic.to_string()).or_default().push(tx);
         Ok(Box::new(ChannelIterator { rx }))
     }

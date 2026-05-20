@@ -3,7 +3,7 @@
 //! Prevents overwhelming upstream services by limiting the rate of outgoing
 //! requests using a token bucket algorithm with configurable burst capacity.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::Instant;
 
 /// Token bucket rate limiter for upstream requests.
@@ -36,7 +36,7 @@ impl UpstreamRateLimiter {
 
     /// Try to acquire a token. Returns `true` if the request is allowed.
     pub fn try_acquire(&self) -> bool {
-        let mut bucket = self.bucket.lock().unwrap();
+        let mut bucket = self.bucket.lock();
         let now = Instant::now();
         let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * bucket.refill_rate).min(bucket.max_tokens);

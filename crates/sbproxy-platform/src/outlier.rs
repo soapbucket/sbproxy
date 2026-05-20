@@ -21,8 +21,8 @@
 //! detector.record_failure("host-b:8080");
 //! ```
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 // --- OutlierDetectorConfig ---
@@ -135,7 +135,7 @@ impl OutlierDetector {
     ///
     /// Expired ejections are removed lazily on this call.
     pub fn is_ejected(&self, endpoint: &str) -> bool {
-        let mut ejected = self.ejected.lock().unwrap();
+        let mut ejected = self.ejected.lock();
         match ejected.get(endpoint) {
             None => false,
             Some(&re_admit_at) => {
@@ -158,8 +158,8 @@ impl OutlierDetector {
         let now = Instant::now();
         let mut newly_ejected = Vec::new();
 
-        let mut stats_map = self.stats.lock().unwrap();
-        let mut ejected_map = self.ejected.lock().unwrap();
+        let mut stats_map = self.stats.lock();
+        let mut ejected_map = self.ejected.lock();
 
         for (endpoint, stats) in stats_map.iter_mut() {
             // --- Reset window if expired ---
@@ -193,7 +193,7 @@ impl OutlierDetector {
     /// Returns the IDs of endpoints that were re-admitted.
     pub fn check_readmissions(&self) -> Vec<String> {
         let now = Instant::now();
-        let mut ejected_map = self.ejected.lock().unwrap();
+        let mut ejected_map = self.ejected.lock();
 
         let readmitted: Vec<String> = ejected_map
             .iter()
@@ -219,7 +219,7 @@ impl OutlierDetector {
     /// if it has expired.
     fn with_stats_mut(&self, endpoint: &str, f: impl FnOnce(&mut EndpointStats)) {
         let window = Duration::from_secs(self.config.window_secs);
-        let mut stats_map = self.stats.lock().unwrap();
+        let mut stats_map = self.stats.lock();
         let stats = stats_map
             .entry(endpoint.to_string())
             .or_insert_with(EndpointStats::new);
@@ -346,7 +346,7 @@ mod tests {
         // Manually insert an expired ejection and verify is_ejected re-admits.
         let detector = OutlierDetector::new(default_config());
         {
-            let mut ejected_map = detector.ejected.lock().unwrap();
+            let mut ejected_map = detector.ejected.lock();
             // Set re-admit time 1 second in the past.
             ejected_map.insert(
                 "expired-host".to_string(),
@@ -379,7 +379,7 @@ mod tests {
         // Ensure saturating arithmetic prevents u32 overflow.
         let detector = OutlierDetector::new(default_config());
         {
-            let mut stats_map = detector.stats.lock().unwrap();
+            let mut stats_map = detector.stats.lock();
             let stats = stats_map
                 .entry("overflow-test".to_string())
                 .or_insert_with(EndpointStats::new);

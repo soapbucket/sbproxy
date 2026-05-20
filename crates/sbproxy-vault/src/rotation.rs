@@ -4,8 +4,8 @@
 //! grace period so that in-flight requests using the old credential are not
 //! immediately rejected.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::secret_string::SecretString;
@@ -53,7 +53,7 @@ impl RotationManager {
     ///
     /// The previous current value, if any, enters the grace period.
     pub fn update(&self, name: &str, new_value: SecretString) {
-        let mut map = self.secrets.lock().unwrap();
+        let mut map = self.secrets.lock();
         let previous = map.remove(name).map(|old| (old.current, Instant::now()));
         map.insert(
             name.to_string(),
@@ -67,7 +67,7 @@ impl RotationManager {
     /// Return `true` if `candidate` matches the **current** value or the
     /// **previous** value still within its grace period.
     pub fn validate(&self, name: &str, candidate: &str) -> bool {
-        let map = self.secrets.lock().unwrap();
+        let map = self.secrets.lock();
         let Some(entry) = map.get(name) else {
             return false;
         };
@@ -86,28 +86,24 @@ impl RotationManager {
 
     /// Return the current value of `name`, or `None` if unknown.
     pub fn get_current(&self, name: &str) -> Option<SecretString> {
-        self.secrets
-            .lock()
-            .unwrap()
-            .get(name)
-            .map(|e| e.current.clone())
+        self.secrets.lock().get(name).map(|e| e.current.clone())
     }
 
     /// Return `true` when the re-resolve interval has elapsed since the last
     /// call to [`mark_resolved`](RotationManager::mark_resolved).
     pub fn needs_re_resolve(&self) -> bool {
-        self.last_resolve.lock().unwrap().elapsed() >= self.re_resolve_interval
+        self.last_resolve.lock().elapsed() >= self.re_resolve_interval
     }
 
     /// Record that secrets have just been re-resolved from the vault, resetting
     /// the re-resolve interval timer.
     pub fn mark_resolved(&self) {
-        *self.last_resolve.lock().unwrap() = Instant::now();
+        *self.last_resolve.lock() = Instant::now();
     }
 
     /// Remove grace-period entries that have expired.
     pub fn cleanup_expired(&self) {
-        let mut map = self.secrets.lock().unwrap();
+        let mut map = self.secrets.lock();
         for entry in map.values_mut() {
             if let Some((_, replaced_at)) = &entry.previous {
                 if replaced_at.elapsed() >= self.grace_period {

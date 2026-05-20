@@ -5,8 +5,8 @@
 //! `HierarchicalBudget` instance can enforce budgets at every level of the
 //! organizational hierarchy simultaneously.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 /// Identifies a single scope in the budget hierarchy.
 ///
@@ -60,7 +60,7 @@ impl HierarchicalBudget {
     /// Set the spending limit for the given scope.
     pub fn set_limit(&self, scope: &BudgetScope, limit: f64) {
         let key = Self::scope_key(scope);
-        let mut budgets = self.budgets.lock().unwrap();
+        let mut budgets = self.budgets.lock();
         let entry = budgets.entry(key).or_insert((0.0, 0.0));
         entry.0 = limit;
     }
@@ -71,7 +71,7 @@ impl HierarchicalBudget {
     /// limit of 0.0 so that the spend is tracked even before a limit is set.
     pub fn record_spend(&self, scope: &BudgetScope, amount: f64) {
         let key = Self::scope_key(scope);
-        let mut budgets = self.budgets.lock().unwrap();
+        let mut budgets = self.budgets.lock();
         let entry = budgets.entry(key).or_insert((0.0, 0.0));
         entry.1 += amount;
     }
@@ -82,7 +82,7 @@ impl HierarchicalBudget {
     /// below 80%, in the warning band (80–99.9%), or fully exceeded (>= 100%).
     pub fn check_budget(&self, scope: &BudgetScope) -> BudgetCheckResult {
         let key = Self::scope_key(scope);
-        let budgets = self.budgets.lock().unwrap();
+        let budgets = self.budgets.lock();
 
         let (limit, spent) = match budgets.get(&key) {
             Some(entry) => *entry,
@@ -110,7 +110,7 @@ impl HierarchicalBudget {
     /// Returns 0.0 when no limit is set or the limit is zero.
     pub fn get_utilization(&self, scope: &BudgetScope) -> f64 {
         let key = Self::scope_key(scope);
-        let budgets = self.budgets.lock().unwrap();
+        let budgets = self.budgets.lock();
         match budgets.get(&key) {
             Some((limit, spent)) if *limit > 0.0 => spent / limit,
             _ => 0.0,

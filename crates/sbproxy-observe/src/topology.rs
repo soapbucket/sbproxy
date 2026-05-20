@@ -2,8 +2,8 @@
 //!
 //! Tracks source -> destination -> protocol edges for mesh visualization.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 // --- Edge ---
 
@@ -64,7 +64,7 @@ impl TopologyTracker {
             protocol: protocol.to_string(),
         };
 
-        let mut edges = self.edges.lock().unwrap();
+        let mut edges = self.edges.lock();
         let stats = edges.entry(edge).or_insert(EdgeStats {
             request_count: 0,
             error_count: 0,
@@ -84,7 +84,6 @@ impl TopologyTracker {
     pub fn get_topology(&self) -> Vec<(Edge, EdgeStats)> {
         self.edges
             .lock()
-            .unwrap()
             .iter()
             .map(|(e, s)| (e.clone(), s.clone()))
             .collect()
@@ -92,7 +91,7 @@ impl TopologyTracker {
 
     /// Clear all tracked edges and statistics.
     pub fn reset(&self) {
-        self.edges.lock().unwrap().clear();
+        self.edges.lock().clear();
     }
 }
 

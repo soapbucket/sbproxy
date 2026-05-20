@@ -1,8 +1,8 @@
 //! Virtual API key management and per-key rate limiting.
 
+use parking_lot::Mutex;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 /// Virtual API key configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -130,7 +130,7 @@ impl KeyRateLimiter {
 
     /// Check if a request is within rate limits for a key. Returns true if allowed.
     pub fn check_rate(&self, key: &str, config: &VirtualKeyConfig) -> bool {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let entry = state.entry(key.to_string()).or_default();
 
         let now = std::time::Instant::now();
@@ -158,7 +158,7 @@ impl KeyRateLimiter {
 
     /// Record token usage for rate tracking.
     pub fn record_tokens(&self, key: &str, tokens: u64) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if let Some(entry) = state.get_mut(key) {
             entry.tokens_this_minute += tokens;
         }

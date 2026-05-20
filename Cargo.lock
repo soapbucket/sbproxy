@@ -5916,6 +5916,7 @@ name = "sbproxy-httpkit"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "parking_lot",
 ]
 
 [[package]]
@@ -6054,6 +6055,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
+ "parking_lot",
  "prometheus 0.14.0",
  "rand 0.8.6",
  "regex",
@@ -6098,6 +6100,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "hex",
+ "parking_lot",
  "postgres",
  "redb",
  "redis",
@@ -6190,6 +6193,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "parking_lot",
  "reqwest",
  "sbproxy-plugin",
  "serde",
@@ -6206,6 +6210,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "hex",
+ "parking_lot",
  "ring",
  "serde_json",
  "tempfile",
