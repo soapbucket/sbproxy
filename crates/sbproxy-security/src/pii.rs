@@ -483,8 +483,13 @@ pub fn default_rules() -> Vec<PiiRule> {
             // RFC 5322 simplified: local@domain with a TLD of 2+
             // alphabetic characters. We do not try to match every
             // valid email; we match every shape an operator would
-            // call PII.
-            pattern: r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b".to_string(),
+            // call PII. The quantifiers are upper-bounded to RFC 5321
+            // limits (local part 64, domain 255, TLD 63) so a long
+            // non-matching run cannot drive an unbounded scan window
+            // (WOR-606). The regex crate is RE2-style so there is no
+            // catastrophic backtracking; these bounds are belt-and-
+            // suspenders and keep the compiled program small.
+            pattern: r"(?i)\b[a-z0-9._%+\-]{1,64}@[a-z0-9.\-]{1,255}\.[a-z]{2,63}\b".to_string(),
             replacement: Some("[REDACTED:EMAIL]".to_string()),
             validator: None,
             anchor: Some("@".to_string()),
@@ -505,10 +510,14 @@ pub fn default_rules() -> Vec<PiiRule> {
         },
         PiiRule {
             name: "credit_card".to_string(),
-            // 13-19 digits with optional separators, validated via
-            // Luhn so we do not redact arbitrary ID numbers that
-            // happen to look like card shapes.
-            pattern: r"\b(?:\d[ -]?){12,18}\d\b".to_string(),
+            // 13-19 digits with optional single separators between
+            // digits, validated via Luhn so we do not redact arbitrary
+            // ID numbers that happen to look like card shapes. Written
+            // as "digit then (sep? digit) x12-18" so the separator sits
+            // between digits rather than after every digit; equivalent
+            // to the prior form but with the quantifier bounded on the
+            // grouped element (WOR-606).
+            pattern: r"\b\d(?:[ -]?\d){12,18}\b".to_string(),
             replacement: Some("[REDACTED:CARD]".to_string()),
             validator: Some("luhn".to_string()),
             anchor: None,
@@ -649,6 +658,29 @@ mod tests {
         // Stripe test card 4242-4242-4242-4242 passes Luhn.
         let out = r.redact("Card 4242-4242-4242-4242 stored.");
         assert_eq!(out, "Card [REDACTED:CARD] stored.");
+    }
+
+    #[test]
+    fn redact_is_linear_on_long_non_matching_input() {
+        // WOR-606: the regex crate is RE2-style (no catastrophic backtracking),
+        // and the bounded-quantifier patterns keep it that way. Assert a
+        // generous wall-clock budget on the pathological inputs from the ticket
+        // so any regression toward super-linear behaviour is caught.
+        let r = defaults();
+        let inputs = [
+            format!("{}!", "a".repeat(4096)), // long run, no '@', no digits
+            "1234567890".repeat(64),          // 640 contiguous digits, no card boundary
+        ];
+        for input in &inputs {
+            let started = std::time::Instant::now();
+            let _ = r.redact(input);
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_millis(100),
+                "redact should stay linear; took {elapsed:?} on a {}-byte input",
+                input.len()
+            );
+        }
     }
 
     #[test]
