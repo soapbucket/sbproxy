@@ -1440,12 +1440,20 @@ struct AcceptRange {
     q: f32,
 }
 
+/// Upper bound on the number of `Accept` header entries parsed per request.
+/// Content negotiation only ever needs a handful of media types; capping the
+/// parse stops an attacker from forcing a large per-request allocation (and the
+/// CPU to build it) by sending tens of thousands of comma-separated entries
+/// (WOR-608).
+const MAX_ACCEPT_RANGES: usize = 32;
+
 fn parse_accept_ranges(header: &str) -> Vec<AcceptRange> {
     if header.is_empty() {
         return Vec::new();
     }
     header
         .split(',')
+        .take(MAX_ACCEPT_RANGES)
         .filter_map(|part| {
             let part = part.trim();
             if part.is_empty() {
@@ -15810,6 +15818,25 @@ mod tests {
         assert!((ranges[1].q - 1.0).abs() < f32::EPSILON);
         assert_eq!(ranges[2].typ, "*");
         assert_eq!(ranges[2].subtype, "*");
+    }
+
+    #[test]
+    fn accept_parse_is_capped_against_flood() {
+        // WOR-608: a header with tens of thousands of entries must not produce
+        // an unbounded Vec. The parse is capped at MAX_ACCEPT_RANGES.
+        let flood = vec!["application/json"; 10_000].join(", ");
+        let started = std::time::Instant::now();
+        let ranges = parse_accept_ranges(&flood);
+        let elapsed = started.elapsed();
+        assert!(
+            ranges.len() <= MAX_ACCEPT_RANGES,
+            "parsed {} entries, expected <= {MAX_ACCEPT_RANGES}",
+            ranges.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "capped parse should be fast, took {elapsed:?}"
+        );
     }
 
     #[test]
