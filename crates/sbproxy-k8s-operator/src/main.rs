@@ -431,6 +431,37 @@ async fn reconcile_one(sbproxy: Arc<SBProxy>, ctx: Arc<Ctx>) -> Result<Action, R
 
     let hash = reconcile::config_hash(&cfg.spec.config);
 
+    // --- Preview-validate the referenced config (WOR-611) ---
+    // A malformed config must not roll out to every replica. Validate it here;
+    // on failure record the error in status and requeue without touching the
+    // Deployment, so operators see the problem on the CRD instead of a
+    // crash-looping fleet.
+    if let Err(msg) = reconcile::validate_config_yaml(&cfg.spec.config) {
+        tracing::warn!(
+            name = %name,
+            namespace = %ns,
+            error = %msg,
+            "referenced SBProxyConfig failed validation; not rolling out"
+        );
+        patch_status(
+            &ctx.client,
+            &ns,
+            &name,
+            serde_json::json!({ "status": { "lastError": msg } }),
+        )
+        .await;
+        return Ok(Action::requeue(Duration::from_secs(60)));
+    }
+    // Config is valid: record the hash being rolled out and clear any prior
+    // error so a fixed config no longer shows the stale failure.
+    patch_status(
+        &ctx.client,
+        &ns,
+        &name,
+        serde_json::json!({ "status": { "configHash": hash, "lastError": "" } }),
+    )
+    .await;
+
     // --- Render desired state ---
     let desired_cm = reconcile::desired_configmap(&sbproxy, &cfg);
     let desired_svc = reconcile::desired_service(&sbproxy);
@@ -526,6 +557,27 @@ async fn reconcile_one(sbproxy: Arc<SBProxy>, ctx: Arc<Ctx>) -> Result<Action, R
 
     // Requeue periodically as a belt-and-braces against missed watch events.
     Ok(Action::requeue(Duration::from_secs(300)))
+}
+
+/// Patch the `SBProxy` `status` subresource with a JSON merge patch.
+///
+/// Best-effort: a status write failure is logged and swallowed so it never
+/// fails the reconcile (status is observability, not correctness). Used by
+/// the config preview-validation path (WOR-611) to surface a bad config on
+/// the CRD and to clear the error once the config validates again.
+async fn patch_status(client: &Client, ns: &str, name: &str, body: serde_json::Value) {
+    let api: Api<SBProxy> = Api::namespaced(client.clone(), ns);
+    if let Err(e) = api
+        .patch_status(name, &PatchParams::default(), &Patch::Merge(&body))
+        .await
+    {
+        tracing::warn!(
+            name = %name,
+            namespace = %ns,
+            error = %e,
+            "failed to patch SBProxy status"
+        );
+    }
 }
 
 /// Best-effort `POST /admin/reload` against every running proxy
