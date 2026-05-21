@@ -375,6 +375,31 @@ fn owner_reference(sbproxy: &SBProxy) -> OwnerReference {
     }
 }
 
+/// Preview-validate an `SBProxyConfig.spec.config` document (WOR-611).
+///
+/// Parses the YAML into the config schema and runs the static validator
+/// (`sbproxy_config::validate`, which checks against the `KNOWN_*_TYPES`
+/// tables and needs no runtime module registry). Returns `Ok(())` when the
+/// document parses and has no error-severity findings, or a human-readable
+/// error string otherwise. The reconciler records this in `status.lastError`
+/// and skips the rollout, so a malformed config is caught here instead of
+/// crash-looping every replica.
+pub fn validate_config_yaml(yaml: &str) -> Result<(), String> {
+    let config: sbproxy_config::ConfigFile =
+        serde_yaml::from_str(yaml).map_err(|e| format!("config parse error: {e}"))?;
+    let findings = sbproxy_config::validate(&config, &sbproxy_config::ValidationOptions::default());
+    let errors: Vec<String> = findings
+        .iter()
+        .filter(|f| f.severity == sbproxy_config::Severity::Error)
+        .map(|f| format!("{} ({})", f.message, f.path))
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +439,21 @@ mod tests {
                     .to_string(),
             },
         }
+    }
+
+    #[test]
+    fn validate_config_yaml_accepts_minimal_config() {
+        // An empty origins map is a well-formed config with no findings.
+        assert!(validate_config_yaml("origins: {}\n").is_ok());
+    }
+
+    #[test]
+    fn validate_config_yaml_rejects_malformed_yaml() {
+        // WOR-611: a parse failure is reported (and the reconciler records it
+        // in status) instead of crash-looping every pod.
+        let err = validate_config_yaml("origins:\n  example.com: [unterminated")
+            .expect_err("malformed YAML must be rejected");
+        assert!(err.contains("parse error"), "unexpected error: {err}");
     }
 
     #[test]

@@ -24,6 +24,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 
+# Config validation. Public sbproxy crate; used to preview-parse and
+# lint a referenced SBProxyConfig at reconcile time (WOR-611) so a
+# malformed config is rejected before it rolls out to every pod. The
+# validator checks against static KNOWN_*_TYPES tables, so this does
+# not pull in the runtime module registry.
+sbproxy-config = { workspace = true }
+
 # Kubernetes client + controller-runtime + CRD derive.
 # `runtime` enables kube-runtime (Controller, watcher, finalizers).
 # `derive` enables the CustomResource macro from kube-derive.
