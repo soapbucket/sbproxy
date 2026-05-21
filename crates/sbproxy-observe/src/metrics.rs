@@ -240,6 +240,11 @@ pub struct ProxyMetrics {
     /// HTTP 503 to the client and emits a structured audit event on
     /// every increment.
     pub agent_skill_digest_mismatch: IntCounterVec,
+    /// Gauge `sbproxy_dedup_cache_size` of entries currently held in the
+    /// request-deduplication cache. Published by the owner of the
+    /// `DedupCache` (see `sbproxy-transport`); lets operators spot a cache
+    /// that is growing unexpectedly under a stream of unique request hashes.
+    pub dedup_cache_size: IntGauge,
 }
 
 impl ProxyMetrics {
@@ -438,6 +443,12 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        let dedup_cache_size = IntGauge::new(
+            "sbproxy_dedup_cache_size",
+            "Entries currently held in the request-deduplication cache",
+        )
+        .unwrap();
+
         // --- Register all metrics ---
 
         registry.register(Box::new(requests_total.clone())).unwrap();
@@ -491,6 +502,9 @@ impl ProxyMetrics {
         registry
             .register(Box::new(agent_skill_digest_mismatch.clone()))
             .unwrap();
+        registry
+            .register(Box::new(dedup_cache_size.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -515,6 +529,7 @@ impl ProxyMetrics {
             synthetic_probe_failures,
             mirror_state_drift,
             agent_skill_digest_mismatch,
+            dedup_cache_size,
         }
     }
 
@@ -1372,6 +1387,14 @@ mod tests {
         m.active_connections.set(42);
         let output = m.render();
         assert!(output.contains("sbproxy_active_connections 42"));
+    }
+
+    #[test]
+    fn test_dedup_cache_size_gauge() {
+        let m = ProxyMetrics::new();
+        m.dedup_cache_size.set(7);
+        let output = m.render();
+        assert!(output.contains("sbproxy_dedup_cache_size 7"));
     }
 
     #[test]

@@ -7,6 +7,7 @@
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -14,14 +15,29 @@ use sha2::{Digest, Sha256};
 /// Cache entry: (expiry instant, cached HTTP status code).
 type CacheEntry = (Instant, u16);
 
+/// How often (in `store` calls) the full expired-entry scan runs. A lookup
+/// must stay O(1) even under a flood of unique hashes, so the O(n) purge is
+/// amortized: it runs once per `PURGE_INTERVAL` inserts rather than on every
+/// access.
+const PURGE_INTERVAL: usize = 256;
+
 /// Request deduplication cache.
 ///
 /// Stores a sliding-window map of request content hashes to their last-seen
 /// HTTP status code. Duplicate requests (same method + path + body) within
 /// the configured window return the cached status without hitting the upstream.
+///
+/// Eviction is amortized: [`check`](Self::check) is O(1) and only ever drops
+/// the single entry it looked at if that entry is expired, while the periodic
+/// full scan runs from [`store`](Self::store) once per `PURGE_INTERVAL`
+/// inserts. The owner can publish [`len`](Self::len) to the
+/// `sbproxy_dedup_cache_size` gauge (defined in `sbproxy-observe`) the same
+/// way the connection count drives `sbproxy_active_connections`.
 pub struct DedupCache {
     cache: Mutex<HashMap<String, CacheEntry>>,
     window: Duration,
+    /// Inserts since the last full purge; gates the amortized O(n) scan.
+    stores_since_purge: AtomicUsize,
 }
 
 impl DedupCache {
@@ -30,31 +46,58 @@ impl DedupCache {
         Self {
             cache: Mutex::new(HashMap::new()),
             window: Duration::from_secs(window_secs),
+            stores_since_purge: AtomicUsize::new(0),
         }
     }
 
     /// Check if a request hash is a duplicate.
     ///
     /// Returns the cached HTTP status code if the hash was seen within the
-    /// deduplication window; `None` otherwise. Expired entries are evicted
-    /// lazily on each check.
+    /// deduplication window; `None` otherwise. This is O(1): it inspects only
+    /// the requested key and drops it if it has expired, leaving the bulk
+    /// eviction to the amortized purge in [`store`](Self::store).
     pub fn check(&self, hash: &str) -> Option<u16> {
-        let mut cache = self.cache.lock();
         let now = Instant::now();
-
-        // Lazy eviction: remove expired entries on each access.
-        cache.retain(|_, (expiry, _)| *expiry > now);
-
-        cache.get(hash).map(|&(_, status)| status)
+        let mut cache = self.cache.lock();
+        match cache.get(hash) {
+            Some(&(expiry, status)) if expiry > now => Some(status),
+            Some(_) => {
+                // Expired: drop just this key (O(1)); no full-cache scan.
+                cache.remove(hash);
+                None
+            }
+            None => None,
+        }
     }
 
     /// Store a completed request's hash and HTTP status code.
     ///
-    /// The entry expires after the configured window duration.
+    /// The entry expires after the configured window duration. Every
+    /// `PURGE_INTERVAL` stores this also runs a full sweep to drop expired
+    /// entries, so a stream of unique hashes cannot grow the map without bound.
     pub fn store(&self, hash: &str, status: u16) {
-        let mut cache = self.cache.lock();
         let expiry = Instant::now() + self.window;
+        let mut cache = self.cache.lock();
         cache.insert(hash.to_string(), (expiry, status));
+
+        // Amortized eviction: pay the O(n) scan only once per PURGE_INTERVAL
+        // inserts so the common path stays O(1).
+        if self.stores_since_purge.fetch_add(1, Ordering::Relaxed) + 1 >= PURGE_INTERVAL {
+            self.stores_since_purge.store(0, Ordering::Relaxed);
+            let now = Instant::now();
+            cache.retain(|_, (expiry, _)| *expiry > now);
+        }
+    }
+
+    /// Number of entries currently held (including any not-yet-purged expired
+    /// entries). Intended for publishing the `sbproxy_dedup_cache_size` gauge.
+    pub fn len(&self) -> usize {
+        self.cache.lock().len()
+    }
+
+    /// Whether the cache currently holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.cache.lock().is_empty()
     }
 
     /// Generate a content hash from method, path, and optional body bytes.
@@ -117,6 +160,28 @@ mod tests {
         assert!(
             cache.check(&hash).is_none(),
             "expired entry should not be returned"
+        );
+    }
+
+    #[test]
+    fn store_runs_amortized_purge_to_bound_the_cache() {
+        // window 0 => every entry is expired the instant after it is stored.
+        let cache = DedupCache::new(0);
+
+        // Stream more unique hashes than PURGE_INTERVAL so the periodic sweep
+        // fires at least once; without it the map would grow to 300 entries.
+        for i in 0..300u32 {
+            let h = DedupCache::request_hash("POST", "/uniq", Some(&i.to_be_bytes()));
+            cache.store(&h, 200);
+        }
+
+        // The sweep at the 256th insert drops every entry stored so far, so
+        // only the post-sweep inserts can remain. The map is bounded well
+        // below the number of unique hashes we streamed.
+        assert!(
+            cache.len() < 256,
+            "amortized purge should bound the cache, got {}",
+            cache.len()
         );
     }
 
