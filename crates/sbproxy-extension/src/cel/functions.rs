@@ -199,12 +199,43 @@ fn cel_regex_match(input: Arc<String>, pattern: Arc<String>) -> bool {
     regex_match(&input, &pattern)
 }
 
-/// Test whether `input` matches the given regex `pattern`. Returns false if the
-/// pattern fails to compile.
+/// Maximum length of a user-supplied regex pattern. Patterns longer than this
+/// are rejected without compiling (WOR-607). The `regex` crate is RE2-style so
+/// there is no catastrophic backtracking, but a multi-KB pattern compiled per
+/// call is still its own DoS on a hot path.
+const MAX_REGEX_PATTERN_LEN: usize = 1024;
+
+/// Ceiling on the compiled program and lazy-DFA size for user-supplied
+/// patterns. Bounds the per-call memory a pathological (but short) pattern such
+/// as `a{1000}{1000}` can demand.
+const REGEX_SIZE_LIMIT: usize = 1 << 20;
+
+/// Test whether `input` matches the given regex `pattern`.
+///
+/// Returns `false` if the pattern is rejected (over `MAX_REGEX_PATTERN_LEN`)
+/// or fails to compile within `REGEX_SIZE_LIMIT`. Rejections and compile
+/// failures are logged at `warn` so they are observable rather than silently
+/// swallowed.
 pub fn regex_match(input: &str, pattern: &str) -> bool {
-    regex::Regex::new(pattern)
-        .map(|re| re.is_match(input))
-        .unwrap_or(false)
+    if pattern.len() > MAX_REGEX_PATTERN_LEN {
+        tracing::warn!(
+            pattern_len = pattern.len(),
+            max = MAX_REGEX_PATTERN_LEN,
+            "regex_match: pattern exceeds size limit; rejecting"
+        );
+        return false;
+    }
+    match regex::RegexBuilder::new(pattern)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_SIZE_LIMIT)
+        .build()
+    {
+        Ok(re) => re.is_match(input),
+        Err(e) => {
+            tracing::warn!(error = %e, "regex_match: pattern failed to compile");
+            false
+        }
+    }
 }
 
 // --- String Functions ---
@@ -328,6 +359,23 @@ mod tests {
     #[test]
     fn test_regex_match_invalid_pattern() {
         assert!(!regex_match("anything", "[invalid"));
+    }
+
+    #[test]
+    fn test_regex_match_rejects_oversized_pattern() {
+        // WOR-607: a pattern over the length cap is rejected, not compiled.
+        let huge = "a".repeat(MAX_REGEX_PATTERN_LEN + 1);
+        assert!(!regex_match("aaaa", &huge));
+        // A pattern at the cap still works.
+        let ok = "a".repeat(MAX_REGEX_PATTERN_LEN);
+        assert!(regex_match(&"a".repeat(MAX_REGEX_PATTERN_LEN), &ok));
+    }
+
+    #[test]
+    fn test_regex_match_rejects_size_limit_blowup() {
+        // WOR-607: a short pattern whose compiled program exceeds the size
+        // limit must be rejected (returns false) rather than allocating freely.
+        assert!(!regex_match("aaaa", r"a{1000}{1000}{1000}"));
     }
 
     // --- CEL integration tests for custom functions ---
