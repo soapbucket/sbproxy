@@ -92,7 +92,40 @@ impl AlertDispatcher {
                         let alert = alert.clone();
 
                         tokio::spawn(async move {
-                            deliver_alert(client, url, headers, secret, alert).await;
+                            // WOR-604: SSRF guard before egress. Alert payloads
+                            // carry operational context, so never POST them to
+                            // a loopback / link-local / private target or a
+                            // non-http(s) scheme. `validate_url` may resolve
+                            // DNS, so run it on the blocking pool rather than
+                            // stalling an async worker. Re-validating per
+                            // dispatch (rather than once at construction) also
+                            // means a transient DNS failure never permanently
+                            // disables a legitimate webhook.
+                            let to_check = url.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                webhook_url_allowed(&to_check)
+                            })
+                            .await
+                            {
+                                Ok(Ok(())) => {
+                                    deliver_alert(client, url, headers, secret, alert).await;
+                                }
+                                Ok(Err(reason)) => {
+                                    tracing::error!(
+                                        target: "alerting",
+                                        url = %url,
+                                        reason = %reason,
+                                        "webhook url failed SSRF validation - skipping delivery"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        target: "alerting",
+                                        error = %e,
+                                        "SSRF validation task failed - skipping delivery"
+                                    );
+                                }
+                            }
                         });
                     } else {
                         tracing::error!(
@@ -127,6 +160,16 @@ fn sign_alert(secret: &str, body: &[u8], timestamp: i64) -> String {
     mac.update(body);
     let bytes = mac.finalize().into_bytes();
     format!("v1={}", hex::encode(bytes))
+}
+
+/// SSRF guard for an alert webhook URL (WOR-604).
+///
+/// Wraps [`sbproxy_security::ssrf::validate_url`]: rejects non-`http(s)`
+/// schemes and URLs whose host is (or resolves to) a loopback, link-local,
+/// or otherwise private address. Returns `Err(reason)` when the URL must not
+/// be used as an alert sink.
+fn webhook_url_allowed(url: &str) -> Result<(), String> {
+    sbproxy_security::ssrf::validate_url(url)
 }
 
 /// POST a single alert to a webhook URL. Best-effort, one attempt.
@@ -299,6 +342,25 @@ mod tests {
         assert_eq!(config.channel_type, "log");
         assert!(config.url.is_none());
         assert!(config.headers.is_empty());
+    }
+
+    #[test]
+    fn webhook_url_allowed_rejects_ssrf_targets() {
+        // WOR-604: these are all IP-literal / non-http(s) targets, so the
+        // check is deterministic (no DNS) and must reject every one.
+        for bad in [
+            "http://127.0.0.1/alert",
+            "http://169.254.169.254/latest/meta-data",
+            "file:///etc/passwd",
+            "http://[::1]:6379/",
+        ] {
+            assert!(
+                webhook_url_allowed(bad).is_err(),
+                "expected {bad} to be rejected as an SSRF target"
+            );
+        }
+        // A public IP-literal https URL passes (no DNS for a literal).
+        assert!(webhook_url_allowed("https://8.8.8.8/alert").is_ok());
     }
 
     #[test]
