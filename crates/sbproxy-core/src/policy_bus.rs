@@ -80,6 +80,17 @@ pub fn global_bus() -> Option<PolicyBus> {
     GLOBAL_BUS.get().cloned()
 }
 
+/// Upper bound on a single serialized audit line (WOR-609).
+///
+/// The OSS [`PolicyVerdictEvent`] is already bounded by construction (the
+/// inbound request id is capped upstream at 256 bytes and the OSS payload
+/// carries no request-header or response-body context, which are
+/// enterprise-only fields), so an oversized line is not reachable today. This
+/// cap is defense-in-depth for the `#[non_exhaustive]` struct as the enterprise
+/// audit envelope grows it, and it keeps a single event from flooding the audit
+/// sink and the disk behind it.
+const MAX_AUDIT_LINE_BYTES: usize = 64 * 1024;
+
 /// Spawn the OSS drain stub that prints every event to stderr as
 /// a JSON line.
 ///
@@ -100,13 +111,51 @@ pub async fn drain_to_stderr(mut rx: PolicyVerdictReceiver) {
                 // `eprintln!` rather than the tracing subscriber
                 // so the audit emission survives even when log
                 // sampling is on for the broader proxy.
-                eprintln!("policy_verdict_event: {line}");
+                eprintln!("policy_verdict_event: {}", bound_audit_line(&event, line));
             }
             Err(err) => {
                 tracing::warn!(error = %err, "policy_verdict_event: serialise failed");
             }
         }
     }
+}
+
+/// Bound a serialized audit line to [`MAX_AUDIT_LINE_BYTES`].
+///
+/// An oversized line collapses to a valid-JSON marker that preserves the
+/// correlation keys, stamps `truncated: true`, and records the original size,
+/// so downstream `jq`/log-shipper consumers stay parseable and the truncation
+/// is observable.
+fn bound_audit_line(event: &PolicyVerdictEvent, line: String) -> String {
+    if line.len() <= MAX_AUDIT_LINE_BYTES {
+        return line;
+    }
+    tracing::warn!(
+        original_bytes = line.len(),
+        request_id = %event.request_id,
+        "policy_verdict_event: truncated oversized audit line"
+    );
+    serde_json::json!({
+        "event_id": event.event_id,
+        "request_id": truncate_on_char_boundary(&event.request_id, 256),
+        "policy_id": truncate_on_char_boundary(&event.policy_id, 256),
+        "verdict": &event.verdict,
+        "truncated": true,
+        "original_bytes": line.len(),
+    })
+    .to_string()
+}
+
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 character.
+fn truncate_on_char_boundary(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 /// Try to publish an audit event without blocking.
@@ -157,6 +206,47 @@ mod tests {
             VerdictTag::Allow,
             1,
         )
+    }
+
+    #[test]
+    fn audit_line_passes_through_when_small() {
+        let event = sample_event();
+        let line = serde_json::to_string(&event).unwrap();
+        // A normal event is well under the cap and is emitted verbatim.
+        assert!(line.len() <= MAX_AUDIT_LINE_BYTES);
+        assert_eq!(bound_audit_line(&event, line.clone()), line);
+    }
+
+    #[test]
+    fn audit_line_is_bounded_and_marked_when_oversized() {
+        // WOR-609: an event whose serialization exceeds the cap collapses to a
+        // bounded, still-valid-JSON marker stamped truncated:true. (The OSS
+        // event is bounded in practice; we force the condition with a
+        // pathological request id to exercise the guard.)
+        let event = PolicyVerdictEvent::new(
+            uuid::Uuid::new_v4(),
+            "x".repeat(200_000),
+            String::new(),
+            String::new(),
+            Utc::now(),
+            "rate_limit".to_string(),
+            PolicySurface::BuiltIn,
+            VerdictTag::Allow,
+            1,
+        );
+        let line = serde_json::to_string(&event).unwrap();
+        assert!(line.len() > MAX_AUDIT_LINE_BYTES);
+
+        let bounded = bound_audit_line(&event, line);
+        assert!(
+            bounded.len() <= MAX_AUDIT_LINE_BYTES,
+            "bounded line is {} bytes",
+            bounded.len()
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&bounded).expect("marker is valid JSON");
+        assert_eq!(parsed["truncated"], serde_json::json!(true));
+        assert_eq!(parsed["policy_id"], serde_json::json!("rate_limit"));
     }
 
     #[tokio::test]
