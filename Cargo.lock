@@ -6062,6 +6062,7 @@ dependencies = [
  "regex",
  "reqwest",
  "sbproxy-plugin",
+ "sbproxy-security",
  "serde",
  "serde_json",
  "sha2 0.11.0",
