@@ -89,7 +89,6 @@ futures = "0.3"
 
 # Bytes and buffers
 bytes = "1"
-bumpalo = { version = "3", features = ["collections"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
