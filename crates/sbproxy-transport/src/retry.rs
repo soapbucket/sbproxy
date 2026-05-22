@@ -97,13 +97,28 @@ impl RetryConfig {
 pub struct RetryBudget {
     /// Max ratio of retries to total requests (0.0 – 1.0).
     max_ratio: f64,
-    /// Rolling count of all requests (retries + originals).
-    total_requests: AtomicU64,
-    /// Rolling count of retries only.
-    total_retries: AtomicU64,
+    /// Packed rolling counters: the low 32 bits are total requests (retries +
+    /// originals), the high 32 bits are retries only. Both live in one atomic
+    /// so every read observes a consistent `(retries, total)` pair and the
+    /// computed ratio is one that actually held at some instant. Two separate
+    /// `Relaxed` atomics could be read at different points in time on a weakly
+    /// ordered CPU, yielding a ratio that was never true (WOR-622). A single
+    /// `fetch_add` also keeps the two fields in lockstep for concurrent
+    /// writers. The 32-bit fields are ample for a window that is reset
+    /// periodically via [`RetryBudget::reset`].
+    counters: AtomicU64,
     /// Window length in seconds (not currently enforced at the atomic level;
     /// callers should call [`RetryBudget::reset`] for explicit resets).
     pub window_secs: u64,
+}
+
+/// Low 32 bits of the packed counter hold the total request count.
+const RETRY_BUDGET_TOTAL_MASK: u64 = 0xFFFF_FFFF;
+
+/// Unpack the counter word into `(total, retries)`.
+#[inline]
+fn unpack_retry_counters(packed: u64) -> (u64, u64) {
+    (packed & RETRY_BUDGET_TOTAL_MASK, packed >> 32)
 }
 
 impl RetryBudget {
@@ -115,8 +130,7 @@ impl RetryBudget {
     pub fn new(max_ratio: f64, window_secs: u64) -> Self {
         Self {
             max_ratio: max_ratio.clamp(0.0, 1.0),
-            total_requests: AtomicU64::new(0),
-            total_retries: AtomicU64::new(0),
+            counters: AtomicU64::new(0),
             window_secs,
         }
     }
@@ -127,11 +141,10 @@ impl RetryBudget {
     /// `max_ratio`, or when fewer than 1 request has been recorded (to avoid
     /// division by zero at startup).
     pub fn allow_retry(&self) -> bool {
-        let total = self.total_requests.load(Ordering::Relaxed);
+        let (total, retries) = unpack_retry_counters(self.counters.load(Ordering::Relaxed));
         if total == 0 {
             return true;
         }
-        let retries = self.total_retries.load(Ordering::Relaxed);
         let ratio = retries as f64 / total as f64;
         ratio < self.max_ratio
     }
@@ -142,26 +155,25 @@ impl RetryBudget {
     ///   counter.
     /// * `is_retry = false` increments only the total counter.
     pub fn record_request(&self, is_retry: bool) {
-        self.total_requests.fetch_add(1, Ordering::Relaxed);
-        if is_retry {
-            self.total_retries.fetch_add(1, Ordering::Relaxed);
-        }
+        // Bump total (low word) and, for a retry, retries (high word) in a
+        // single atomic add so a concurrent reader never sees a torn pair and
+        // retries can never momentarily exceed total.
+        let delta = if is_retry { (1_u64 << 32) | 1 } else { 1 };
+        self.counters.fetch_add(delta, Ordering::Relaxed);
     }
 
     /// Reset all counters (call this at the start of each window).
     pub fn reset(&self) {
-        self.total_requests.store(0, Ordering::Relaxed);
-        self.total_retries.store(0, Ordering::Relaxed);
+        self.counters.store(0, Ordering::Relaxed);
     }
 
     /// Current retry ratio (retries / total).  Returns `0.0` when no requests
     /// have been recorded yet.
     pub fn current_ratio(&self) -> f64 {
-        let total = self.total_requests.load(Ordering::Relaxed);
+        let (total, retries) = unpack_retry_counters(self.counters.load(Ordering::Relaxed));
         if total == 0 {
             return 0.0;
         }
-        let retries = self.total_retries.load(Ordering::Relaxed);
         retries as f64 / total as f64
     }
 }
@@ -342,5 +354,44 @@ mod tests {
         // 1 retry / 3 total = 0.333...
         let ratio = budget.current_ratio();
         assert!((ratio - 1.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn budget_concurrent_reads_never_observe_impossible_ratio() {
+        // WOR-622: with the counters packed into a single atomic, every read
+        // sees a consistent (retries, total) pair, so the observed ratio can
+        // never exceed 1.0 even while many threads record concurrently. Two
+        // separate Relaxed atomics could read retries from a later instant
+        // than total and produce a ratio > 1.0.
+        use std::sync::Arc;
+        use std::thread;
+
+        let budget = Arc::new(RetryBudget::new(0.5, 60));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let b = Arc::clone(&budget);
+            handles.push(thread::spawn(move || {
+                for i in 0..50_000u64 {
+                    b.record_request(i % 3 == 0);
+                    // A reader must never see retries > total.
+                    assert!(
+                        b.current_ratio() <= 1.0,
+                        "observed an impossible retry ratio > 1.0"
+                    );
+                    let _ = b.allow_retry();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Exactly ceil(50000/3) of every 50000 records were retries, across
+        // all 8 threads, so the final ratio settles near 1/3.
+        let ratio = budget.current_ratio();
+        assert!(
+            (0.30..0.36).contains(&ratio),
+            "final ratio {ratio} outside expected band"
+        );
     }
 }
