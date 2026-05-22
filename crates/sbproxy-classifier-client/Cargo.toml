@@ -1,0 +1,18 @@
+[package]
+name = "sbproxy-classifier-client"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "Resilient gRPC client for the classifier sidecar InferenceService (WOR-704)."
+
+[dependencies]
+sbproxy-classifier-proto = { path = "../sbproxy-classifier-proto" }
+tonic = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "macros"] }
+tokio-stream = { version = "0.1", features = ["net"] }
