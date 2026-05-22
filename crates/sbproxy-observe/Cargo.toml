@@ -27,6 +27,8 @@ parking_lot.workspace = true
 rand.workspace = true
 reqwest = { workspace = true }
 tokio.workspace = true
+# TaskTracker drains in-flight alert webhook deliveries on shutdown (WOR-652).
+tokio-util.workspace = true
 # `serde` is on so PolicyVerdictEvent.occurred_at can (de)serialise
 # the timestamp directly without a custom adapter.
 chrono = { workspace = true, features = ["serde"] }

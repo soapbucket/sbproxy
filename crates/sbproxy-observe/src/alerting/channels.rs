@@ -47,11 +47,16 @@ pub struct Alert {
 
 /// Fans out alert payloads to all configured notification channels.
 ///
-/// Webhook delivery is fire-and-forget (Tokio task per channel). Log
+/// Webhook delivery runs on a Tokio task per channel. Each task is
+/// registered with a `TaskTracker` so [`drain`](Self::drain) can wait
+/// for in-flight deliveries during graceful shutdown instead of the
+/// runtime aborting them and silently dropping alerts (an alert is most
+/// likely to fire during the incident that triggers the shutdown). Log
 /// delivery writes directly via `tracing`.
 pub struct AlertDispatcher {
     channels: Vec<AlertChannelConfig>,
     client: reqwest::Client,
+    tasks: tokio_util::task::TaskTracker,
 }
 
 impl AlertDispatcher {
@@ -62,7 +67,20 @@ impl AlertDispatcher {
             .build()
             .expect("failed to build reqwest client for alert dispatcher");
 
-        Self { channels, client }
+        Self {
+            channels,
+            client,
+            tasks: tokio_util::task::TaskTracker::new(),
+        }
+    }
+
+    /// Wait for every in-flight webhook delivery to finish, then close the
+    /// tracker. Call this from the graceful-shutdown driver before tearing
+    /// down the runtime so alerts that fired late are not lost. After this
+    /// returns, `fire` should not be called again.
+    pub async fn drain(&self) {
+        self.tasks.close();
+        self.tasks.wait().await;
     }
 
     /// Fire an alert to all configured channels.
@@ -91,7 +109,7 @@ impl AlertDispatcher {
                         let secret = channel.secret.clone();
                         let alert = alert.clone();
 
-                        tokio::spawn(async move {
+                        self.tasks.spawn(async move {
                             // WOR-604: SSRF guard before egress. Alert payloads
                             // carry operational context, so never POST them to
                             // a loopback / link-local / private target or a
@@ -396,6 +414,26 @@ mod tests {
         let dispatcher = AlertDispatcher::new(channels);
         // Should log an error but not panic.
         dispatcher.fire(make_alert("warning"));
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_in_flight_webhook_task() {
+        // A webhook to a loopback target: the SSRF guard rejects it, so the
+        // spawned delivery task runs and completes quickly without making a
+        // real request. The point is that `drain` registers and waits for
+        // that task rather than the runtime aborting it on shutdown.
+        let channels = vec![AlertChannelConfig {
+            channel_type: "webhook".to_string(),
+            url: Some("http://127.0.0.1/alert".to_string()),
+            headers: vec![],
+            secret: None,
+        }];
+        let dispatcher = AlertDispatcher::new(channels);
+        dispatcher.fire(make_alert("critical"));
+        // Returns once the tracked delivery task finishes.
+        dispatcher.drain().await;
+        assert!(dispatcher.tasks.is_closed());
+        assert!(dispatcher.tasks.is_empty());
     }
 
     #[test]
