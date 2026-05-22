@@ -11,6 +11,7 @@ pub mod health;
 pub mod messenger;
 pub mod outlier;
 pub mod proxy_protocol;
+mod resp;
 pub mod storage;
 
 pub use adaptive_breaker::AdaptiveBreaker;
