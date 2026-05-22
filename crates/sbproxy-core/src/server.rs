@@ -15455,7 +15455,8 @@ mod tests {
             &self,
             _req: &http::Request<bytes::Bytes>,
             _ctx: &mut dyn std::any::Any,
-        ) -> Pin<Box<dyn Future<Output = anyhow::Result<AuthDecision>> + Send + '_>> {
+        ) -> Pin<Box<dyn Future<Output = sbproxy_plugin::PluginResult<AuthDecision>> + Send + '_>>
+        {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let d = self.decision.clone();
             Box::pin(async move { Ok(d) })
@@ -15476,8 +15477,9 @@ mod tests {
             &self,
             _req: &http::Request<bytes::Bytes>,
             _ctx: &mut dyn std::any::Any,
-        ) -> Pin<Box<dyn Future<Output = anyhow::Result<AuthDecision>> + Send + '_>> {
-            Box::pin(async move { Err(anyhow::anyhow!("upstream auth server unreachable")) })
+        ) -> Pin<Box<dyn Future<Output = sbproxy_plugin::PluginResult<AuthDecision>> + Send + '_>>
+        {
+            Box::pin(async move { Err(anyhow::anyhow!("upstream auth server unreachable").into()) })
         }
     }
 
@@ -15615,7 +15617,7 @@ mod tests {
                 &self,
                 req: &http::Request<bytes::Bytes>,
                 _ctx: &mut dyn std::any::Any,
-            ) -> Pin<Box<dyn Future<Output = anyhow::Result<AuthDecision>> + Send + '_>>
+            ) -> Pin<Box<dyn Future<Output = sbproxy_plugin::PluginResult<AuthDecision>> + Send + '_>>
             {
                 let method = req.method().as_str().to_string();
                 let uri = req.uri().to_string();
@@ -15641,7 +15643,7 @@ mod tests {
                 &self,
                 req: &http::Request<bytes::Bytes>,
                 ctx: &mut dyn std::any::Any,
-            ) -> Pin<Box<dyn Future<Output = anyhow::Result<AuthDecision>> + Send + '_>>
+            ) -> Pin<Box<dyn Future<Output = sbproxy_plugin::PluginResult<AuthDecision>> + Send + '_>>
             {
                 self.inner.authenticate(req, ctx)
             }

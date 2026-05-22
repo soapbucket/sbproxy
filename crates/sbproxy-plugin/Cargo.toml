@@ -1,6 +1,9 @@
 [package]
 name = "sbproxy-plugin"
-version = "0.1.0"
+# 0.1 -> 0.2: breaking change to the plugin trait API (WOR-620) -- trait
+# methods now return PluginError instead of anyhow::Error. 0.x breaking
+# changes bump the minor per semver.
+version = "0.2.0"
 edition = "2021"
 license.workspace = true
 publish = false
@@ -9,6 +12,7 @@ publish = false
 inventory = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
 compact_str = { workspace = true }

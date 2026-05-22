@@ -121,8 +121,9 @@ mod tests {
             _ctx: &mut dyn std::any::Any,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = anyhow::Result<sbproxy_plugin::PolicyDecision>>
-                    + Send
+                dyn std::future::Future<
+                        Output = sbproxy_plugin::PluginResult<sbproxy_plugin::PolicyDecision>,
+                    > + Send
                     + '_,
             >,
         > {

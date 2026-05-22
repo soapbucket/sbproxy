@@ -23,7 +23,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::Result;
 use bytes::Bytes;
 use sbproxy_modules::policy::AiCrawlControlPolicy;
 use sbproxy_modules::AiCrawlDecision;
@@ -45,7 +44,8 @@ impl PolicyEnforcer for AiCrawlEnforcer {
         &self,
         req: &http::Request<Bytes>,
         ctx: &mut dyn std::any::Any,
-    ) -> Pin<Box<dyn Future<Output = Result<PolicyDecision>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = sbproxy_plugin::PluginResult<PolicyDecision>> + Send + '_>>
+    {
         let policy = Arc::clone(&self.0);
         let ctx = match ctx.downcast_mut::<RequestContext>() {
             Some(c) => c,

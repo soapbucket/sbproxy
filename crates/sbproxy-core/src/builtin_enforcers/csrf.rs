@@ -57,7 +57,8 @@ impl PolicyEnforcer for CsrfEnforcer {
         &self,
         req: &http::Request<Bytes>,
         ctx: &mut dyn std::any::Any,
-    ) -> Pin<Box<dyn Future<Output = Result<PolicyDecision>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = sbproxy_plugin::PluginResult<PolicyDecision>> + Send + '_>>
+    {
         let csrf = Arc::clone(&self.0);
         let method = req.method().as_str().to_string();
         let path = req

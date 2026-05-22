@@ -339,8 +339,10 @@ fn dispatch_plugin(
     };
 
     match outcome {
-        // Plugin returned a normal result.
-        Ok(Ok(apply_result)) => apply_result,
+        // Plugin returned a normal result. Map the typed PluginError back into
+        // anyhow for this dispatcher's return type (WOR-620); the error chain
+        // is preserved.
+        Ok(Ok(apply_result)) => apply_result.map_err(anyhow::Error::from),
         // tokio::time::timeout fired before the plugin finished.
         Ok(Err(_elapsed)) => Err(anyhow::Error::new(TransformError::Plugin {
             plugin: plugin_name_static,
@@ -1122,7 +1124,8 @@ mod tests {
             body: &'a mut bytes::BytesMut,
             _content_type: Option<&'a str>,
             _ctx: &'a TransformContext<'a>,
-        ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        ) -> Pin<Box<dyn std::future::Future<Output = sbproxy_plugin::PluginResult<()>> + Send + 'a>>
+        {
             let calls = self.calls.clone();
             Box::pin(async move {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -1166,8 +1169,9 @@ mod tests {
                 _body: &'a mut bytes::BytesMut,
                 _content_type: Option<&'a str>,
                 _ctx: &'a TransformContext<'a>,
-            ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>
-            {
+            ) -> Pin<
+                Box<dyn std::future::Future<Output = sbproxy_plugin::PluginResult<()>> + Send + 'a>,
+            > {
                 Box::pin(async { Ok(()) })
             }
         }
@@ -1204,8 +1208,9 @@ mod tests {
                 _body: &'a mut bytes::BytesMut,
                 _content_type: Option<&'a str>,
                 _ctx: &'a TransformContext<'a>,
-            ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>
-            {
+            ) -> Pin<
+                Box<dyn std::future::Future<Output = sbproxy_plugin::PluginResult<()>> + Send + 'a>,
+            > {
                 Box::pin(async {
                     panic!("plugin oops");
                 })
@@ -1255,8 +1260,9 @@ mod tests {
                 _body: &'a mut bytes::BytesMut,
                 _content_type: Option<&'a str>,
                 _ctx: &'a TransformContext<'a>,
-            ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>
-            {
+            ) -> Pin<
+                Box<dyn std::future::Future<Output = sbproxy_plugin::PluginResult<()>> + Send + 'a>,
+            > {
                 Box::pin(async {
                     // Sleep well beyond the dispatcher's wall-clock
                     // cap so the timeout branch is exercised.
