@@ -1,3 +1,38 @@
+{{/*
+Operator RBAC rules. Shared verbatim between the namespaced Role and the
+cluster-wide ClusterRole so the two paths can never drift (WOR-610).
+*/}}
+{{- define "sbproxy.operatorRbacRules" -}}
+# Watch + manage our own CRDs.
+- apiGroups: ["sbproxy.dev"]
+  resources: ["sbproxies", "sbproxyconfigs"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["sbproxy.dev"]
+  resources: ["sbproxies/status"]
+  verbs: ["get", "update", "patch"]
+# Manage the Deployment / Service / ConfigMap children we own.
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["services", "configmaps"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Emit events so kubectl describe surfaces reconcile diagnostics.
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+# Leader election. The operator races for a coordination.k8s.io/v1 Lease
+# named `sbproxy-operator-leader` in its own namespace. Only the lock holder
+# reconciles; standbys wait. See docs/kubernetes.md "Leader election".
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+{{- end -}}
+{{- if eq .Values.rbac.scope "cluster" }}
+# Cluster scope: the operator watches all namespaces, so it needs a
+# ClusterRole. A compromised operator pod can reach SBProxy configs in any
+# namespace; prefer `rbac.scope: namespace` unless you genuinely need a
+# cluster-wide operator.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -7,30 +42,7 @@ metadata:
     app.kubernetes.io/component: operator
     app.kubernetes.io/managed-by: {{ .Release.Service }}
 rules:
-  # Watch + manage our own CRDs.
-  - apiGroups: ["sbproxy.dev"]
-    resources: ["sbproxies", "sbproxyconfigs"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["sbproxy.dev"]
-    resources: ["sbproxies/status"]
-    verbs: ["get", "update", "patch"]
-  # Manage the Deployment / Service / ConfigMap children we own.
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: [""]
-    resources: ["services", "configmaps"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Emit events so kubectl describe surfaces reconcile diagnostics.
-  - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["create", "patch"]
-  # Leader election. The operator races for a coordination.k8s.io/v1 Lease
-  # named `sbproxy-operator-leader` in its own namespace. Only the lock holder
-  # reconciles; standbys wait. See docs/kubernetes.md "Leader election".
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  {{- include "sbproxy.operatorRbacRules" . | nindent 2 }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -48,3 +60,37 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: {{ .Values.serviceAccount.name }}
+{{- else }}
+# Namespace scope (default): the operator manages resources only in its own
+# namespace, so a namespaced Role is sufficient and a supply-chain
+# compromise cannot reach configs in other namespaces.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.serviceAccount.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: sbproxy
+    app.kubernetes.io/component: operator
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+rules:
+  {{- include "sbproxy.operatorRbacRules" . | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.serviceAccount.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: sbproxy
+    app.kubernetes.io/component: operator
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ .Values.namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.serviceAccount.name }}
+{{- end }}
