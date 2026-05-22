@@ -5738,6 +5738,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbproxy-classifier-sidecar"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "sbproxy-classifier-proto",
+ "sbproxy-classifiers",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sbproxy-classifiers"
 version = "0.1.0"
 dependencies = [
