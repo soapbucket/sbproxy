@@ -5729,6 +5729,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbproxy-classifier-proto"
+version = "0.1.0"
+dependencies = [
+ "prost 0.13.5",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
 name = "sbproxy-classifiers"
 version = "0.1.0"
 dependencies = [

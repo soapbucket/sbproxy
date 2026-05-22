@@ -1,0 +1,14 @@
+[package]
+name = "sbproxy-classifier-proto"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "Shared gRPC InferenceService contract for the sbproxy classifier sidecar (WOR-704)."
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
