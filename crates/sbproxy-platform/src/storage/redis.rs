@@ -15,7 +15,7 @@
 //! - Only RESP2 simple strings, bulk strings, integers, and arrays are decoded.
 //! - Pool size is fixed after construction.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::BufReader;
 use std::net::TcpStream;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -24,71 +24,7 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 
 use super::KVStore;
-
-// --- RESP protocol helpers ---
-
-/// Write a RESP bulk-string array (the standard command format) to `w`.
-fn write_command(w: &mut impl Write, args: &[&[u8]]) -> Result<()> {
-    write!(w, "*{}\r\n", args.len())?;
-    for arg in args {
-        write!(w, "${}\r\n", arg.len())?;
-        w.write_all(arg)?;
-        w.write_all(b"\r\n")?;
-    }
-    w.flush()?;
-    Ok(())
-}
-
-/// Read one RESP value from `r` and return it as raw bytes (for bulk strings),
-/// an integer string, or a simple string. Arrays are returned as a flat list
-/// of their element values.
-#[derive(Debug)]
-#[allow(dead_code)] // Integer is part of the RESP spec; kept for completeness.
-enum RespValue {
-    Nil,
-    Bytes(Vec<u8>),
-    Integer(i64),
-    Array(Vec<RespValue>),
-}
-
-fn read_resp(r: &mut BufReader<TcpStream>) -> Result<RespValue> {
-    let mut line = String::new();
-    r.read_line(&mut line)?;
-    let line = line.trim_end_matches("\r\n");
-
-    let (prefix, rest) = line.split_at(1);
-    match prefix {
-        "+" => Ok(RespValue::Bytes(rest.as_bytes().to_vec())),
-        "-" => bail!("Redis error: {}", rest),
-        ":" => {
-            let n: i64 = rest.parse().context("parse integer")?;
-            Ok(RespValue::Integer(n))
-        }
-        "$" => {
-            let len: i64 = rest.parse().context("parse bulk length")?;
-            if len < 0 {
-                return Ok(RespValue::Nil);
-            }
-            let len = len as usize;
-            let mut buf = vec![0u8; len + 2]; // +2 for \r\n
-            r.read_exact(&mut buf)?;
-            buf.truncate(len);
-            Ok(RespValue::Bytes(buf))
-        }
-        "*" => {
-            let count: i64 = rest.parse().context("parse array length")?;
-            if count < 0 {
-                return Ok(RespValue::Nil);
-            }
-            let mut items = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                items.push(read_resp(r)?);
-            }
-            Ok(RespValue::Array(items))
-        }
-        _ => bail!("unexpected RESP prefix {:?}", prefix),
-    }
-}
+use crate::resp::{read_resp, write_command, RespValue};
 
 // --- Connection management ---
 
