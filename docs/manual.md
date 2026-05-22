@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-05-20*
+*Last modified: 2026-05-22*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -137,6 +137,16 @@ rolling deployment.
 ```bash
 sbproxy validate /etc/sbproxy/sb.yml
 sbproxy --config /etc/sbproxy/sb.yml --check
+```
+
+Add `--format json` to emit a single JSON object instead of the human
+line, so CI can parse the result. A valid config prints
+`{"valid":true,"path":"..."}`; an invalid one prints
+`{"valid":false,"path":"...","error":"..."}` and still exits 2. The
+default is `--format text`.
+
+```bash
+sbproxy validate /etc/sbproxy/sb.yml --format json
 ```
 
 ### `plan` - diff a proposed config against a baseline

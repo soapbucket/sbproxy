@@ -132,7 +132,7 @@ fn main() {
             .cloned()
             .collect();
         match handle_validate_subcommand(&filtered) {
-            Ok(()) => return,
+            Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("validate: {e:#}");
                 std::process::exit(2);
@@ -423,7 +423,7 @@ USAGE:
     sbproxy --config <path>
     sbproxy serve -f <path> [--log-level <level>] [--request-log-level <level>]
                             [--grace-time <secs>] [--shutdown-grace-ms <ms>]
-    sbproxy validate <path>
+    sbproxy validate <path> [--format json|text]
     sbproxy --config <path> --check
     sbproxy plan -f <yaml> [--against <yaml>] [--format json|text] [--out <plan-file>]
     sbproxy apply -f <yaml>
@@ -466,21 +466,59 @@ DOCS:
     https://github.com/soapbucket/sbproxy/blob/main/docs/README.md"
 }
 
-/// Validate an `sb.yml` without starting the proxy. Returns Ok on a config
-/// that loads and compiles cleanly; Err with a context-rich message
-/// otherwise. Wired to the `sbproxy validate <path>` subcommand.
-fn handle_validate_subcommand(args: &[String]) -> anyhow::Result<()> {
+/// Validate an `sb.yml` without starting the proxy. Returns the process
+/// exit code: `0` for a config that loads and compiles cleanly, `2` for
+/// one that does not. `Err` is reserved for usage errors (missing path,
+/// bad `--format`), which the caller prints and exits `2`.
+///
+/// With `--format json` the result is emitted as a single JSON object on
+/// stdout so CI can parse it: `{"valid": true, "path": "..."}` or
+/// `{"valid": false, "path": "...", "error": "..."}`. The default
+/// `--format text` keeps the human line on success and a stderr error on
+/// failure. Wired to the `sbproxy validate <path>` subcommand.
+fn handle_validate_subcommand(args: &[String]) -> anyhow::Result<i32> {
+    let json = parse_validate_json(args)?;
     let path = parse_validate_path(args).ok_or_else(|| {
         anyhow::anyhow!(
-            "missing config path\n\nusage: sbproxy validate <path>\n   or: sbproxy validate --config <path>"
+            "missing config path\n\nusage: sbproxy validate <path> [--format json|text]\n   or: sbproxy validate --config <path>"
         )
     })?;
-    let yaml = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("failed to read config '{path}': {e}"))?;
-    sbproxy_config::compile_config(&yaml)
-        .map_err(|e| anyhow::anyhow!("config '{path}' did not compile:\n{e:#}"))?;
-    println!("ok: {path} is a valid sbproxy config");
-    Ok(())
+
+    // Read + compile. The read and compile failures are the two
+    // "invalid config" outcomes; in JSON mode they are reported as
+    // `{"valid": false, ...}` with exit 2 rather than propagated.
+    let outcome = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read config '{path}': {e}"))
+        .and_then(|yaml| {
+            sbproxy_config::compile_config(&yaml)
+                .map(|_| ())
+                .map_err(|e| anyhow::anyhow!("config '{path}' did not compile:\n{e:#}"))
+        });
+
+    match (json, outcome) {
+        (false, Ok(())) => {
+            println!("ok: {path} is a valid sbproxy config");
+            Ok(0)
+        }
+        // Text mode delegates the failure print to the caller, which
+        // prefixes "validate: " and exits 2.
+        (false, Err(e)) => Err(e),
+        (true, Ok(())) => {
+            println!("{}", serde_json::json!({ "valid": true, "path": path }));
+            Ok(0)
+        }
+        (true, Err(e)) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "valid": false,
+                    "path": path,
+                    "error": format!("{e:#}"),
+                })
+            );
+            Ok(2)
+        }
+    }
 }
 
 /// Pluck the config path out of `validate`'s argv. Mirrors `parse_config_path`
@@ -490,11 +528,37 @@ fn parse_validate_path(args: &[String]) -> Option<&str> {
     while i < args.len() {
         match args[i].as_str() {
             "--config" | "-f" => return args.get(i + 1).map(|s| s.as_str()),
+            // Skip the `--format <value>` pair so its value is not
+            // mistaken for the positional config path.
+            "--format" => i += 2,
             arg if !arg.starts_with('-') => return Some(arg),
             _ => i += 1,
         }
     }
     None
+}
+
+/// Parse `--format json|text` for `validate`. Returns `true` for JSON
+/// output, `false` (the default) for text. Errors on a missing or
+/// unrecognised value so a typo surfaces instead of silently defaulting.
+fn parse_validate_json(args: &[String]) -> anyhow::Result<bool> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--format" {
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| anyhow::anyhow!("--format requires a value (json|text)"))?;
+            return match value.as_str() {
+                "json" => Ok(true),
+                "text" => Ok(false),
+                other => Err(anyhow::anyhow!(
+                    "invalid --format '{other}'; expected 'json' or 'text'"
+                )),
+            };
+        }
+        i += 1;
+    }
+    Ok(false)
 }
 
 #[derive(Debug)]
@@ -1247,5 +1311,90 @@ mod tests {
     #[test]
     fn shutdown_grace_default_is_30_seconds() {
         assert_eq!(DEFAULT_SHUTDOWN_GRACE_MS, 30_000);
+    }
+
+    // --- WOR-653: `sbproxy validate --format json|text` ---
+
+    #[test]
+    fn validate_format_defaults_to_text() {
+        assert!(!parse_validate_json(&args(&["cfg.yml"])).unwrap());
+    }
+
+    #[test]
+    fn validate_format_parses_json_and_text() {
+        assert!(parse_validate_json(&args(&["cfg.yml", "--format", "json"])).unwrap());
+        assert!(!parse_validate_json(&args(&["--format", "text", "cfg.yml"])).unwrap());
+    }
+
+    #[test]
+    fn validate_format_rejects_unknown_value() {
+        let err = parse_validate_json(&args(&["--format", "yaml"])).unwrap_err();
+        assert!(err.to_string().contains("invalid --format"));
+    }
+
+    #[test]
+    fn validate_format_requires_a_value() {
+        let err = parse_validate_json(&args(&["--format"])).unwrap_err();
+        assert!(err.to_string().contains("--format requires a value"));
+    }
+
+    #[test]
+    fn validate_path_skips_the_format_pair() {
+        // Regression: --format's value must not be read as the path.
+        assert_eq!(
+            parse_validate_path(&args(&["--format", "json", "cfg.yml"])),
+            Some("cfg.yml")
+        );
+        assert_eq!(
+            parse_validate_path(&args(&["cfg.yml", "--format", "json"])),
+            Some("cfg.yml")
+        );
+    }
+
+    // Write `body` to a unique temp file and return its path.
+    fn temp_config(body: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "sbproxy-validate-test-{}-{n}.yml",
+            std::process::id()
+        ));
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    const MINIMAL_VALID: &str = "proxy:\n  http_bind_port: 8080\norigins:\n  \"x.local\":\n    action:\n      type: proxy\n      url: https://test.sbproxy.dev\n";
+
+    #[test]
+    fn validate_valid_config_exits_zero() {
+        let path = temp_config(MINIMAL_VALID);
+        let p = path.to_str().unwrap();
+        assert_eq!(handle_validate_subcommand(&args(&[p])).unwrap(), 0);
+        assert_eq!(
+            handle_validate_subcommand(&args(&[p, "--format", "json"])).unwrap(),
+            0
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_bad_config_text_errors_json_exits_two() {
+        let path = temp_config("this is not: [valid yaml");
+        let p = path.to_str().unwrap();
+        // Text mode propagates the failure to the caller as an Err.
+        assert!(handle_validate_subcommand(&args(&[p])).is_err());
+        // JSON mode reports it as a structured result with exit code 2.
+        assert_eq!(
+            handle_validate_subcommand(&args(&[p, "--format", "json"])).unwrap(),
+            2
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_missing_path_is_a_usage_error() {
+        // No positional path and no --config: usage error regardless of format.
+        assert!(handle_validate_subcommand(&args(&["--format", "json"])).is_err());
     }
 }
