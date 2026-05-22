@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+// Shared inference contract for the sbproxy classifier sidecar (WOR-704).
+//
+// This proto is the ONLY artifact shared between the OSS minimal sidecar and
+// the enterprise rich sidecar: both implement `InferenceService`, so the
+// proxy speaks to whichever is deployed through one client. It is
+// deliberately self-contained (no imports) and minimal -- the enterprise
+// sidecar adds its own RPCs (Judge, admin, license-leak) as a superset.
+// proto3 keeps field/RPC additions backward compatible.
+package sbproxy.classifier.v1;
+
+// Inference RPCs the proxy calls on the hot path, plus capability probes.
+service InferenceService {
+  // Classify text into scored labels (prompt-injection, agent-class, ...).
+  rpc Classify (ClassifyRequest) returns (ClassifyResponse);
+  // Produce embedding vectors for one or more texts.
+  rpc Embed (EmbedRequest) returns (EmbedResponse);
+  // Describe a loaded model (used for capability negotiation at startup).
+  rpc ModelInfo (ModelInfoRequest) returns (ModelInfoResponse);
+  // Report sidecar version + the set of model ids it can serve.
+  rpc Version (VersionRequest) returns (VersionResponse);
+}
+
+message ClassifyRequest {
+  // Logical model id to route to (e.g. "prompt-injection-v2",
+  // "agent-class"). Empty selects the sidecar's default classifier.
+  string model = 1;
+  // Text to classify.
+  string text = 2;
+  // Return at most this many labels (0 = all).
+  uint32 top_k = 3;
+}
+
+message ClassifyResponse {
+  // Scored labels, highest score first.
+  repeated Label labels = 1;
+  // Inference latency in microseconds, for the proxy's metrics.
+  uint64 latency_us = 2;
+}
+
+message Label {
+  string name = 1;
+  double score = 2;
+}
+
+message EmbedRequest {
+  // Logical embedding-model id. Empty selects the default.
+  string model = 1;
+  // Texts to embed.
+  repeated string texts = 2;
+}
+
+message EmbedResponse {
+  // One embedding per input text, in request order.
+  repeated Embedding embeddings = 1;
+  uint64 latency_us = 2;
+}
+
+message Embedding {
+  repeated float values = 1;
+}
+
+message ModelInfoRequest {
+  // Model id to describe. Empty describes the default classifier.
+  string model = 1;
+}
+
+message ModelInfoResponse {
+  // Resolved model id.
+  string model = 1;
+  // Whether the sidecar has this model loaded and ready to serve.
+  bool loaded = 2;
+  // Output label names, when the model exposes a fixed label set.
+  repeated string labels = 3;
+  // Embedding dimensionality, for embedding models (0 otherwise).
+  uint32 embedding_dim = 4;
+}
+
+message VersionRequest {}
+
+message VersionResponse {
+  // Sidecar build version, e.g. "sbproxy-classifier 0.1.0".
+  string version = 1;
+  // Logical model ids this sidecar can serve.
+  repeated string models = 2;
+}

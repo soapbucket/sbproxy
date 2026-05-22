@@ -20,6 +20,7 @@ members = [
     "crates/sbproxy-openapi",
     "crates/sbproxy-k8s-operator",
     "crates/sbproxy-classifiers",
+    "crates/sbproxy-classifier-proto",
     "crates/sbproxy-agent-detect",
     "e2e",
 ]
@@ -47,6 +48,7 @@ default-members = [
     "crates/sbproxy-tls",
     "crates/sbproxy-openapi",
     "crates/sbproxy-classifiers",
+    "crates/sbproxy-classifier-proto",
     "crates/sbproxy-agent-detect",
     "e2e",
 ]
@@ -170,6 +172,16 @@ wasi-common = "44"
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# gRPC for the classifier sidecar (WOR-704). The proxy speaks one
+# InferenceService contract to either the minimal OSS sidecar or the
+# enterprise rich sidecar. Versions match the enterprise client (tonic 0.12 /
+# prost 0.13); all three are already present transitively in Cargo.lock.
+# Default features only (transport + codegen) -- UDS/localhost needs no TLS;
+# a remote-sidecar TLS feature can be added when that transport lands.
+tonic = "0.12"
+prost = "0.13"
+tonic-build = "0.12"
 
 # Background task tracking (graceful shutdown drains).
 tokio-util = { version = "0.7", features = ["rt"] }
