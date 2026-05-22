@@ -124,6 +124,17 @@ pub struct WasmConfig {
     /// interruption trap when the deadline is hit.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Maximum fuel (roughly, wasm instructions) a single invocation
+    /// may consume. Defaults to 1,000,000,000 when unset; the module
+    /// aborts with an out-of-fuel trap once the budget is exhausted.
+    ///
+    /// Fuel is a deterministic, instruction-granular complement to the
+    /// wall-clock `timeout_ms` epoch deadline (which is only accurate
+    /// to the 1 ms epoch tick). The default is generous enough that a
+    /// well-behaved request-path script never hits it; lower it to put
+    /// a hard ceiling on per-call CPU.
+    #[serde(default)]
+    pub max_fuel: Option<u64>,
 }
 
 impl WasmConfig {
@@ -133,6 +144,11 @@ impl WasmConfig {
 
     fn timeout(&self) -> Duration {
         Duration::from_millis(self.timeout_ms.unwrap_or(1000))
+    }
+
+    /// Per-invocation fuel budget. See [`WasmConfig::max_fuel`].
+    fn fuel(&self) -> u64 {
+        self.max_fuel.unwrap_or(1_000_000_000)
     }
 }
 
@@ -241,6 +257,14 @@ impl WasmRuntime {
 
         let mut store: Store<HostState> = Store::new(&self.engine, HostState { wasi, limits });
         store.limiter(|s| &mut s.limits);
+
+        // Fuel-based budget (WOR-613). The engine has `consume_fuel(true)`, so
+        // the store must be given an explicit budget or the first instruction
+        // traps. This bounds per-call CPU at instruction granularity,
+        // independent of the 1 ms epoch tick.
+        store
+            .set_fuel(self.config.fuel())
+            .map_err(|e| anyhow::anyhow!("setting WASM fuel budget: {e:?}"))?;
 
         // Epoch-based deadline. We bump the global ticker once per
         // millisecond; a module that does not yield within
@@ -374,7 +398,10 @@ fn build_engine() -> Result<Engine> {
     let engine = ENGINE.get_or_init(|| {
         let mut config = Config::new();
         config.epoch_interruption(true);
-        config.consume_fuel(false);
+        // Fuel gives a deterministic, instruction-granular budget that
+        // complements the 1 ms epoch tick (WOR-613). Each `Store` sets its
+        // per-invocation budget via `set_fuel` from `WasmConfig::fuel()`.
+        config.consume_fuel(true);
         let engine = Engine::new(&config).expect("creating wasmtime engine");
         let engine = Arc::new(engine);
 
@@ -415,7 +442,34 @@ mod tests {
             allowed_hosts: vec![],
             max_memory_pages: None,
             timeout_ms: None,
+            max_fuel: None,
         }
+    }
+
+    #[test]
+    fn config_fuel_defaults_and_overrides() {
+        let mut c = config_with(ECHO_WASM);
+        assert_eq!(c.fuel(), 1_000_000_000, "default fuel budget");
+        c.max_fuel = Some(50_000);
+        assert_eq!(c.fuel(), 50_000, "configured fuel budget");
+    }
+
+    #[test]
+    fn exhausting_fuel_traps_execution() {
+        // WOR-613: a tiny fuel budget must abort execution. The echo module
+        // runs fine under the default budget (see echo_module_round_trips),
+        // so a 1-unit budget can only fail by running out of fuel.
+        let mut config = config_with(ECHO_WASM);
+        config.max_fuel = Some(1);
+        let runtime = WasmRuntime::new(config).expect("compile echo module");
+        let err = runtime
+            .execute("transform", b"hello")
+            .expect_err("a 1-unit fuel budget must trap");
+        let msg = format!("{err:?}").to_lowercase();
+        assert!(
+            msg.contains("fuel"),
+            "expected out-of-fuel error, got: {msg}"
+        );
     }
 
     #[test]
@@ -444,6 +498,7 @@ mod tests {
             allowed_hosts: vec![],
             max_memory_pages: None,
             timeout_ms: None,
+            max_fuel: None,
         })
         .unwrap();
         assert!(!runtime.is_available());
