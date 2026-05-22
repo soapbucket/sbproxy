@@ -379,7 +379,9 @@ impl Detector for OnnxDetector {
     }
 }
 
-fn classify_score(score: f64, threshold: f64) -> DetectionLabel {
+/// Map a `[0,1]` injection score onto the v2 label vocabulary. Shared with the
+/// sidecar detector so both report the same `suspicious`/`injection` cutoffs.
+pub(super) fn classify_score(score: f64, threshold: f64) -> DetectionLabel {
     if score >= threshold {
         DetectionLabel::Injection
     } else if score >= 0.3 {
