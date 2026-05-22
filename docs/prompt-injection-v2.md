@@ -1,5 +1,5 @@
 # prompt_injection_v2
-*Last modified: 2026-04-27*
+*Last modified: 2026-05-22*
 
 Successor to the v1 `prompt_injection` heuristic guardrail. The v2
 policy splits *detection* from *enforcement*: a swappable detector
@@ -52,6 +52,7 @@ pre-loads state at startup, not in `detect` itself.
 |------|-------------|
 | `heuristic-v1` | Case-insensitive substring matching against the OWASP-LLM-01 vocabulary plus a small "suspicious" cue list. Default; works out of the box. |
 | `onnx` | Pure-Rust ONNX inference via `tract-onnx`. Loads a Hugging Face style classifier from a configurable URL, validates SHA-256, caches on disk, and falls back to the heuristic on any load failure. See [onnx-classifier.md](onnx-classifier.md). |
+| `sidecar` | Runs inference in a separate process over gRPC instead of in the proxy. The proxy holds one client; the sidecar (minimal OSS or richer enterprise) implements the shared `InferenceService`. Isolates the model runtime so a bad model cannot exhaust the proxy. Fail-open by default. See [Running detection out of process](#running-detection-out-of-process-the-sidecar-detector). |
 
 ## Registering a custom detector
 
@@ -150,6 +151,119 @@ against the bundled golden corpora) runs unconditionally in the
 default OSS test suite via the same test file. That gate is what
 guards against regressions to the OSS-shipped detector; the ONNX gate
 guards the enterprise classifier.
+
+## Running detection out of process: the sidecar detector
+
+`detector: onnx` loads the model inside the proxy. That keeps the
+request path simple, but the proxy then parses and runs a model graph
+on its own heap. A malformed or oversized model can exhaust proxy
+memory, and the model runtime competes with request serving for CPU.
+
+The `sidecar` detector moves inference into a separate process. The
+proxy holds one gRPC client and sends the prompt to a sidecar that
+implements the `InferenceService` contract; the sidecar runs the model
+and returns a label and score. The proxy and the model runtime no
+longer share an address space, so a bad model takes down the sidecar,
+which an orchestrator restarts, rather than the proxy.
+
+Two sidecars implement the same contract:
+
+- The minimal OSS sidecar (`sbproxy-classifier-sidecar`) wraps the same
+  `tract-onnx` engine the in-process `onnx` detector uses.
+- The enterprise sidecar adds batching, GPU execution providers, and a
+  model registry behind the identical proto.
+
+Switching between them is a deployment change, not a config change.
+
+### Config
+
+```yaml
+policies:
+  - type: prompt_injection_v2
+    action: tag
+    detector: sidecar
+    threshold: 0.5
+    detector_config:
+      # gRPC endpoint of the sidecar.
+      endpoint: http://127.0.0.1:9440
+      # Model id to request; empty selects the sidecar's default.
+      model: prompt-injection
+      # Label the model emits for an injection verdict (case-insensitive).
+      injection_label: injection
+      # Per-call timeout in milliseconds (covers the lazy connect).
+      timeout_ms: 250
+      # Fail policy when the sidecar is unreachable or slow.
+      fail_closed: false
+```
+
+The client connects lazily, so the proxy starts even when the sidecar
+is not up yet, and the first request after the sidecar comes online
+succeeds. An invalid `endpoint` is the only error reported at config
+load.
+
+### Fail policy
+
+A sidecar that is down, slower than `timeout_ms`, or returning an error
+is handled by `fail_closed`:
+
+- `fail_closed: false` (default) returns a clean verdict and lets the
+  request through, so an inference outage never blocks traffic. This
+  matches the in-process `onnx` detector, which also degrades to clean
+  on a model error.
+- `fail_closed: true` returns a high-confidence injection. Pair this
+  with `action: block` only when a missing verdict should deny the
+  request, and budget for the sidecar's availability accordingly.
+
+### Running the OSS sidecar
+
+The sidecar is a separate binary built from this workspace. The OSS
+build does not ship model weights; supply your own ONNX file and
+tokenizer (the `protectai/deberta-v3-base-prompt-injection-v2`
+artifacts the `onnx` detector uses work here too):
+
+```bash
+cargo run -p sbproxy-classifier-sidecar -- \
+  --listen 127.0.0.1:9440 \
+  --default-model prompt-injection \
+  --model prompt-injection=/models/model.onnx:/models/tokenizer.json
+```
+
+`--model ID=MODEL:TOKENIZER` registers a model under an id the policy
+references via `detector_config.model`.
+
+### Co-locating in Kubernetes
+
+Run the sidecar as a second container in the proxy pod and point the
+policy at `http://127.0.0.1:9440`. Sharing the pod keeps the call over
+loopback, so the added latency is one local gRPC round trip rather than
+a network hop. Build and publish the images from this workspace; the
+refs below are placeholders.
+
+```yaml
+spec:
+  containers:
+    - name: sbproxy
+      image: REGISTRY/sbproxy:TAG
+      # proxy config selects detector: sidecar, endpoint http://127.0.0.1:9440
+    - name: classifier-sidecar
+      image: REGISTRY/sbproxy-classifier-sidecar:TAG
+      args:
+        - --listen=127.0.0.1:9440
+        - --default-model=prompt-injection
+        - --model=prompt-injection=/models/model.onnx:/models/tokenizer.json
+      volumeMounts:
+        - name: models
+          mountPath: /models
+          readOnly: true
+  volumes:
+    - name: models
+      # Stage model artifacts however you prefer: a baked image layer,
+      # an initContainer download, or a persistent volume.
+      emptyDir: {}
+```
+
+A runnable config is at
+[`examples/prompt-injection-sidecar/`](../examples/prompt-injection-sidecar/).
 
 ## What the OSS scaffold scans
 

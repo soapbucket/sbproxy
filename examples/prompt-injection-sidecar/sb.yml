@@ -1,0 +1,87 @@
+# prompt_injection_v2 with the out-of-process sidecar detector.
+#
+# Instead of loading an ONNX model inside the proxy (`detector: onnx`),
+# this routes detection to a separate process over gRPC. The proxy
+# holds one client and sends the prompt to a sidecar that implements
+# the shared InferenceService contract; the sidecar runs the model and
+# returns a label and score. The model runtime is isolated from request
+# serving, so a malformed or oversized model takes down the sidecar
+# (which an orchestrator restarts), not the proxy.
+#
+# The same config works against the minimal OSS sidecar
+# (`sbproxy-classifier-sidecar`) and the richer enterprise sidecar;
+# switching between them is a deployment change, not a config change.
+#
+# Run the OSS sidecar (supply your own ONNX model + tokenizer; OSS does
+# not ship weights):
+#   cargo run -p sbproxy-classifier-sidecar -- \
+#     --listen 127.0.0.1:9440 \
+#     --default-model prompt-injection \
+#     --model prompt-injection=/models/model.onnx:/models/tokenizer.json
+#
+# Run the proxy:
+#   make run CONFIG=examples/prompt-injection-sidecar/sb.yml
+#
+# See docs/prompt-injection-v2.md for the fail policy and a Kubernetes
+# co-location manifest.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  # tag mode: every request is scored and the upstream sees the verdict
+  # headers, but nothing is rejected.
+  "tag.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    policies:
+      - type: prompt_injection_v2
+        action: tag
+        detector: sidecar
+        threshold: 0.5
+        enable_body_aware: true
+        detector_config:
+          # gRPC endpoint of the sidecar.
+          endpoint: http://127.0.0.1:9440
+          # Model id to request; must match an id the sidecar serves
+          # (its --model / --default-model). Empty selects the
+          # sidecar's default model.
+          model: prompt-injection
+          # Label the model emits for an injection verdict. Compared
+          # case-insensitively, so "injection" matches "INJECTION".
+          injection_label: injection
+          # Per-call timeout in milliseconds. Covers the lazy connect
+          # on the first request after the sidecar comes online.
+          timeout_ms: 250
+          # Fail-open: if the sidecar is down or slow, treat the prompt
+          # as clean and let the request through. This is the default
+          # and matches the in-process onnx detector.
+          fail_closed: false
+
+  # block mode with fail-closed: requests are rejected on an injection
+  # verdict, and a missing verdict (sidecar down) is also a reject.
+  "block.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    policies:
+      - type: prompt_injection_v2
+        action: block
+        detector: sidecar
+        threshold: 0.7
+        enable_body_aware: true
+        block_body: '{"error":"prompt injection detected"}'
+        block_content_type: application/json
+        detector_config:
+          endpoint: http://127.0.0.1:9440
+          model: prompt-injection
+          injection_label: injection
+          timeout_ms: 250
+          # Fail-closed: a missing verdict denies the request. Pair
+          # this with action: block only when you would rather drop
+          # traffic than let it through unscored, and budget for the
+          # sidecar's availability accordingly.
+          fail_closed: true
