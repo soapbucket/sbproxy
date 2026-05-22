@@ -132,18 +132,15 @@ pub fn mirror_request(
 
 // --- Internal helpers ---
 
-/// Return a pseudo-random f64 in [0, 1) using the system time as entropy.
+/// Return a uniformly random f64 in [0, 1) for sampling decisions.
 ///
-/// This is intentionally lightweight; cryptographic quality is not required
-/// for sampling decisions.
+/// Uses the `rand` thread-local RNG (matching the cache and AI samplers).
+/// The previous clock-based version (`subsec_nanos() % 1_000_000`) was biased:
+/// two calls within the same nanosecond returned the same value, and on a
+/// high-RPS proxy the distribution tracked the clock rather than being
+/// uniform (WOR-651). Cryptographic quality is not required here.
 fn random_f64() -> f64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    // Map nanos (0..1_000_000_000) into [0, 1)
-    (nanos % 1_000_000) as f64 / 1_000_000.0
+    rand::random::<f64>()
 }
 
 // --- Tests ---
@@ -165,6 +162,24 @@ mod tests {
         let json = r#"{"shadow_url": "http://shadow.internal", "sample_rate": 0.25}"#;
         let cfg: MirrorConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.sample_rate, 0.25);
+    }
+
+    #[test]
+    fn random_f64_is_in_range_and_varied() {
+        // WOR-651: a real PRNG yields many distinct values in a tight loop.
+        // The previous clock-based sampler repeated heavily within the same
+        // nanosecond window.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let v = random_f64();
+            assert!((0.0..1.0).contains(&v), "sample {v} out of [0,1)");
+            seen.insert(v.to_bits());
+        }
+        assert!(
+            seen.len() > 100,
+            "expected varied samples from a real PRNG, got {}",
+            seen.len()
+        );
     }
 
     #[test]
