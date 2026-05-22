@@ -10,7 +10,7 @@ reference for CRDs, hot reload, leader election, and local smoke testing.
 
 ## Install the chart
 
-The Helm chart lives at `deploy/helm/sbproxy/`. It installs the CRDs, the operator Deployment, the ServiceAccount, and a ClusterRole/Binding granting the verbs the operator needs.
+The Helm chart lives at `deploy/helm/sbproxy/`. It installs the CRDs, the operator Deployment, the ServiceAccount, and the RBAC the operator needs. By default that RBAC is a namespaced Role and RoleBinding, so the operator can only touch its own namespace.
 
 ```bash
 helm install sbproxy ./deploy/helm/sbproxy \
@@ -23,9 +23,16 @@ Key values:
 | Value | Meaning |
 | --- | --- |
 | `image.repository`, `image.tag` | Operator image. Pin a tag when shipping. |
-| `watchNamespace` | If set, the operator watches a single namespace. Empty (default) watches the whole cluster. |
+| `rbac.scope` | `namespace` (default) grants a namespaced Role and watches only the operator's own namespace. `cluster` grants a ClusterRole and watches every namespace. |
+| `watchNamespace` | Cluster scope only: narrow the watch to one namespace while keeping the cluster-wide grant. Ignored under `rbac.scope: namespace`. |
 | `logLevel` | Maps to `--log-level` and `RUST_LOG`. Try `kube=debug,sbproxy_k8s_operator=debug` while validating. |
 | `installCrds` | Set to `false` if CRDs are managed out of band (e.g. argo or flux). |
+
+### RBAC scope
+
+The chart defaults to `rbac.scope: namespace`: a Role and RoleBinding in the operator's namespace, and the operator watches only that namespace. A compromised operator pod cannot read or write SBProxy configs anywhere else, which matters because an `SBProxyConfig` holds the full `sb.yml` and its upstream credentials. To manage several namespaces this way, install one operator per namespace.
+
+Set `rbac.scope: cluster` only when you need a single operator across the whole cluster. That grants a ClusterRole and watches every namespace; set `watchNamespace` alongside it to narrow the watch without narrowing the grant.
 
 ## Define an `SBProxyConfig`
 
@@ -150,13 +157,15 @@ The Lease's holder identity follows the convention `<pod-name>_<8 hex chars>`. I
 kubectl get lease sbproxy-operator-leader -n sbproxy-system -o yaml
 ```
 
-The chart grants the verbs the lock requires. The operator's ClusterRole includes:
+The chart grants the verbs the lock requires. The operator's Role (or ClusterRole under `rbac.scope: cluster`) includes:
 
 ```yaml
 - apiGroups: ["coordination.k8s.io"]
   resources: ["leases"]
   verbs: ["get", "list", "watch", "create", "update", "patch"]
 ```
+
+The Lease lives in the operator's own namespace, so the namespaced Role covers it.
 
 The Lease namespace is discovered in this order: `K8S_NAMESPACE` env var (the chart wires this from the downward API), the service-account namespace file at `/var/run/secrets/kubernetes.io/serviceaccount/namespace`, then the literal string `default` as a last resort.
 

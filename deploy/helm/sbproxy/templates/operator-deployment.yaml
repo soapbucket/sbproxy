@@ -30,9 +30,18 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
-            {{- if .Values.watchNamespace }}
+            {{- if eq .Values.rbac.scope "cluster" }}
+            {{- with .Values.watchNamespace }}
+            # Cluster scope: optionally narrow the watch to one namespace
+            # without giving up the cluster-wide RBAC grant.
             - --namespace
-            - {{ .Values.watchNamespace }}
+            - {{ . }}
+            {{- end }}
+            {{- else }}
+            # Namespace scope (default): the namespaced Role only covers the
+            # operator's own namespace, so the operator must watch exactly it.
+            - --namespace
+            - {{ .Values.namespace }}
             {{- end }}
             - --log-level
             - {{ .Values.logLevel | quote }}

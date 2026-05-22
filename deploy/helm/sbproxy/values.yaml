@@ -28,8 +28,23 @@ leaderElection:
 # (e.g. `kube=debug,sbproxy_k8s_operator=debug`).
 logLevel: info
 
-# If set, the operator only watches this namespace. If empty, it watches all
-# namespaces (cluster scope) and the RBAC granted is a ClusterRole.
+# RBAC scope granted to the operator (WOR-610).
+#
+#   namespace (default): a namespaced Role + RoleBinding in `.namespace`.
+#     The operator watches only its own namespace, so a compromised operator
+#     pod cannot read or write SBProxy configs in other namespaces. This is
+#     the secure default; deploy one operator per namespace you want managed.
+#
+#   cluster: a ClusterRole + ClusterRoleBinding. The operator watches all
+#     namespaces (optionally narrowed by `watchNamespace`). Only choose this
+#     when you genuinely need a single cluster-wide operator; it can reach
+#     every SBProxyConfig (and its upstream credentials) in the cluster.
+rbac:
+  scope: namespace
+
+# Cluster-scope only: narrow an `rbac.scope: cluster` operator to watch a
+# single namespace without giving up the cluster-wide RBAC grant. Ignored in
+# namespace scope (the operator always watches its own `.namespace` there).
 watchNamespace: ""
 
 # Resource requests and limits for the operator pod itself.
