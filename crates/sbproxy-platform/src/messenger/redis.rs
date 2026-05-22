@@ -11,7 +11,8 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -96,12 +97,17 @@ impl Connection {
         Ok(Self { reader, writer })
     }
 
-    /// Connect without a read timeout (for blocking XREAD subscriptions).
+    /// Connect for a blocking XREAD subscription with a bounded read timeout.
+    ///
+    /// The timeout is longer than the XREAD block window, so a normal idle
+    /// period returns a nil reply first; the socket timeout only fires when
+    /// Redis itself stops responding, which keeps the subscriber thread from
+    /// wedging forever in an uninterruptible read (WOR-649).
     fn connect_blocking(addr: &str) -> Result<Self> {
         let stream =
             TcpStream::connect(addr).with_context(|| format!("connect to Redis at {}", addr))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-        // No read timeout: XREAD BLOCK 0 waits indefinitely.
+        stream.set_read_timeout(Some(XREAD_SOCKET_READ_TIMEOUT))?;
         let writer = stream.try_clone()?;
         let reader = BufReader::new(stream);
         Ok(Self { reader, writer })
@@ -135,10 +141,15 @@ impl Default for RedisMessengerConfig {
 ///
 /// `publish` uses `XADD {topic} * payload {json}`.
 /// `subscribe` opens a dedicated blocking connection and issues
-/// `XREAD BLOCK 0 STREAMS {topic} $` to receive new entries.
+/// `XREAD BLOCK {ms} STREAMS {topic} $` on a bounded window so the
+/// subscriber can observe cancellation between reads.
 pub struct RedisMessenger {
     addr: String,
     conn: Mutex<Option<Connection>>,
+    /// Shared cancel flag handed to every subscription iterator. Set on drop
+    /// (or via [`RedisMessenger::stop`]) so an idle subscriber exits within
+    /// one XREAD block window instead of parking forever (WOR-649).
+    stop: Arc<AtomicBool>,
 }
 
 impl RedisMessenger {
@@ -147,7 +158,16 @@ impl RedisMessenger {
         Self {
             addr: config.addr,
             conn: Mutex::new(None),
+            stop: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Signal every live subscription iterator to stop. After this, each
+    /// iterator's `next` returns `None` within one XREAD block window. Called
+    /// automatically on drop; exposed for callers that want to stop
+    /// subscriptions while keeping the messenger alive.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 
     /// Execute a command on the shared (non-blocking) connection, reconnecting
@@ -189,18 +209,42 @@ impl Messenger for RedisMessenger {
 
     /// Subscribe to a topic via a dedicated blocking XREAD connection.
     ///
-    /// The returned iterator blocks until a new entry arrives and terminates
-    /// when the connection is closed or an error occurs.
+    /// The returned iterator blocks (in bounded windows) until a new entry
+    /// arrives and terminates when the messenger is dropped or stopped, the
+    /// connection cannot be re-established, or a malformed reply is seen.
     fn subscribe(&self, topic: &str) -> Result<Box<dyn Iterator<Item = Message> + Send>> {
         let addr = self.addr.clone();
         let topic = topic.to_string();
-        Ok(Box::new(RedisStreamIterator::new(addr, topic)))
+        Ok(Box::new(RedisStreamIterator::new(
+            addr,
+            topic,
+            self.stop.clone(),
+        )))
+    }
+}
+
+impl Drop for RedisMessenger {
+    fn drop(&mut self) {
+        // Stop any iterators that outlive the messenger so they unwind on the
+        // next block-window boundary rather than blocking a thread forever.
+        self.stop();
     }
 }
 
 // --- Iterator ---
 
-/// Blocking iterator that reads from a Redis Stream using `XREAD BLOCK 0`.
+/// Milliseconds XREAD blocks before returning a nil reply when no new entries
+/// arrive. Bounded (not `0`) so the subscriber loop regains control roughly
+/// once per window and can observe shutdown between reads (WOR-649).
+const XREAD_BLOCK_MS: &[u8] = b"1000";
+
+/// Socket read timeout for the blocking subscription. Longer than the XREAD
+/// block window so a normal block expiry returns first; this only fires when
+/// Redis stops responding entirely.
+const XREAD_SOCKET_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Blocking iterator that reads from a Redis Stream using a bounded `XREAD
+/// BLOCK` window.
 struct RedisStreamIterator {
     addr: String,
     topic: String,
@@ -208,15 +252,19 @@ struct RedisStreamIterator {
     conn: Option<Connection>,
     /// The last-seen stream entry ID; starts as `$` (only new entries).
     last_id: String,
+    /// Shared cancel flag. When set, `next` returns `None` (ending iteration)
+    /// at the next block-window boundary (WOR-649).
+    stop: Arc<AtomicBool>,
 }
 
 impl RedisStreamIterator {
-    fn new(addr: String, topic: String) -> Self {
+    fn new(addr: String, topic: String, stop: Arc<AtomicBool>) -> Self {
         Self {
             addr,
             topic,
             conn: None,
             last_id: "$".to_string(),
+            stop,
         }
     }
 
@@ -236,18 +284,29 @@ impl RedisStreamIterator {
         let last_id_bytes = self.last_id.as_bytes().to_vec();
 
         let conn = self.conn.as_mut()?;
-        let resp = conn
-            .call(&[
-                b"XREAD",
-                b"BLOCK",
-                b"0",
-                b"STREAMS",
-                &topic_bytes,
-                &last_id_bytes,
-            ])
-            .ok()?;
-
-        self.parse_xread_response(resp)
+        match conn.call(&[
+            b"XREAD",
+            b"BLOCK",
+            XREAD_BLOCK_MS,
+            b"STREAMS",
+            &topic_bytes,
+            &last_id_bytes,
+        ]) {
+            // Block window expired with no new entries (RESP nil): hand back an
+            // empty batch so `next` loops and re-issues, giving the caller a
+            // chance to observe shutdown between reads instead of parking.
+            Ok(RespValue::Nil) => Some(Vec::new()),
+            Ok(resp) => self.parse_xread_response(resp),
+            // Read timeout or transient I/O error: drop the connection so the
+            // next read reconnects (last_id is preserved on the iterator), and
+            // retry rather than silently ending the subscription. A genuinely
+            // unreachable Redis surfaces when the reconnect in `ensure_connected`
+            // fails, which ends iteration cleanly.
+            Err(_) => {
+                self.conn = None;
+                Some(Vec::new())
+            }
+        }
     }
 
     /// Parse the nested RESP array returned by XREAD.
@@ -327,6 +386,12 @@ impl Iterator for RedisStreamIterator {
 
     fn next(&mut self) -> Option<Message> {
         loop {
+            // Cancellation check (WOR-649). The bounded XREAD block returns at
+            // least once per window, so a stop signalled mid-wait is observed
+            // here within ~one block window and ends iteration cleanly.
+            if self.stop.load(Ordering::Relaxed) {
+                return None;
+            }
             // Read a batch; if the connection died, stop iteration.
             let batch = self.read_next()?;
             if !batch.is_empty() {
@@ -337,7 +402,9 @@ impl Iterator for RedisStreamIterator {
                 // a single-connection implementation.
                 return Some(batch.into_iter().next().unwrap());
             }
-            // Empty batch (shouldn't happen with BLOCK 0) - retry.
+            // Empty batch: the bounded block expired (or a transient error
+            // dropped the connection). Loop and re-issue; this is the point
+            // where a caller driving the iterator can step out on shutdown.
         }
     }
 }
@@ -364,6 +431,23 @@ mod tests {
     }
 
     #[test]
+    fn xread_block_is_bounded_and_under_socket_timeout() {
+        // WOR-649: XREAD must use a bounded, non-zero block so the subscriber
+        // loop regains control periodically, and that window must be shorter
+        // than the socket read timeout so a normal idle period returns a nil
+        // reply (handled as "retry") instead of tripping the timeout.
+        let block_ms: u64 = std::str::from_utf8(XREAD_BLOCK_MS)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(block_ms > 0, "XREAD block must be bounded, not 0");
+        assert!(
+            Duration::from_millis(block_ms) < XREAD_SOCKET_READ_TIMEOUT,
+            "block window must be shorter than the socket read timeout"
+        );
+    }
+
+    #[test]
     fn parse_xread_response_valid() {
         // Build a synthetic XREAD response: one stream, one entry, one payload field.
         let msg = make_msg("events", json!({"action": "created"}));
@@ -379,7 +463,11 @@ mod tests {
         let stream = RespValue::Array(vec![RespValue::Bytes(b"events".to_vec()), entries]);
         let response = RespValue::Array(vec![stream]);
 
-        let mut iter = RedisStreamIterator::new("127.0.0.1:6379".to_string(), "events".to_string());
+        let mut iter = RedisStreamIterator::new(
+            "127.0.0.1:6379".to_string(),
+            "events".to_string(),
+            Arc::new(AtomicBool::new(false)),
+        );
         let messages = iter.parse_xread_response(response).unwrap();
 
         assert_eq!(messages.len(), 1);
@@ -390,8 +478,40 @@ mod tests {
 
     #[test]
     fn parse_xread_response_nil_returns_none() {
-        let mut iter = RedisStreamIterator::new("127.0.0.1:6379".to_string(), "events".to_string());
+        let mut iter = RedisStreamIterator::new(
+            "127.0.0.1:6379".to_string(),
+            "events".to_string(),
+            Arc::new(AtomicBool::new(false)),
+        );
         assert!(iter.parse_xread_response(RespValue::Nil).is_none());
+    }
+
+    #[test]
+    fn subscribe_iterator_stops_when_cancelled() {
+        // WOR-649: a cancelled subscription ends iteration without needing a
+        // live connection. The stop flag is checked before any read, so a
+        // pre-cancelled iterator returns None immediately (no socket attempt).
+        let stop = Arc::new(AtomicBool::new(true));
+        let mut iter = RedisStreamIterator::new(
+            "127.0.0.1:1".to_string(), // unreachable port; must not be dialed
+            "events".to_string(),
+            stop,
+        );
+        assert!(
+            iter.next().is_none(),
+            "a cancelled subscription must end iteration"
+        );
+    }
+
+    #[test]
+    fn dropping_messenger_signals_subscriptions_to_stop() {
+        // The messenger's drop sets the shared stop flag, so an iterator that
+        // outlives it ends iteration rather than blocking a thread forever.
+        let messenger = RedisMessenger::new(RedisMessengerConfig::default());
+        let stop = messenger.stop.clone();
+        assert!(!stop.load(Ordering::Relaxed));
+        drop(messenger);
+        assert!(stop.load(Ordering::Relaxed), "drop must signal stop");
     }
 
     #[test]
