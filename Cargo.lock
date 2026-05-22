@@ -5729,6 +5729,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbproxy-classifier-client"
+version = "0.1.0"
+dependencies = [
+ "sbproxy-classifier-proto",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
 name = "sbproxy-classifier-proto"
 version = "0.1.0"
 dependencies = [
