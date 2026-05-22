@@ -87,6 +87,7 @@ sbproxy-ai = { path = "crates/sbproxy-ai" }
 sbproxy-tls = { path = "crates/sbproxy-tls" }
 sbproxy-openapi = { path = "crates/sbproxy-openapi" }
 sbproxy-classifiers = { path = "crates/sbproxy-classifiers" }
+sbproxy-classifier-client = { path = "crates/sbproxy-classifier-client" }
 sbproxy-agent-detect = { path = "crates/sbproxy-agent-detect" }
 
 # Async runtime

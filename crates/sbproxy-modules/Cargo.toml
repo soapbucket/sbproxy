@@ -76,6 +76,7 @@ sbproxy-security.workspace = true
 sbproxy-cache.workspace = true
 sbproxy-platform.workspace = true
 sbproxy-classifiers.workspace = true
+sbproxy-classifier-client.workspace = true
 sbproxy-observe.workspace = true
 prometheus.workspace = true
 

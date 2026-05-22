@@ -65,6 +65,26 @@ impl ClassifierClient {
         })
     }
 
+    /// Build a client that connects lazily on first use.
+    ///
+    /// Unlike [`connect`](Self::connect) this does not dial immediately, so it
+    /// is safe to call from synchronous config-load code: the connection (and
+    /// any failure) surfaces on the first `classify`/`version` call, bounded by
+    /// `call_timeout`. Only an invalid endpoint URI fails here.
+    pub fn connect_lazy(
+        endpoint: &str,
+        call_timeout: Duration,
+    ) -> Result<Self, ClassifierClientError> {
+        let channel = Endpoint::from_shared(endpoint.to_string())
+            .map_err(|e| ClassifierClientError::Connect(e.to_string()))?
+            .connect_timeout(call_timeout)
+            .connect_lazy();
+        Ok(Self {
+            inner: InferenceServiceClient::new(channel),
+            timeout: call_timeout,
+        })
+    }
+
     /// Classify `text` with the named model (empty = the sidecar's default).
     pub async fn classify(
         &self,

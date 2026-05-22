@@ -17,6 +17,7 @@ mod body_aware;
 mod detector;
 mod heuristic;
 mod onnx;
+mod sidecar;
 
 pub use body_aware::{
     classification_cache_stats, evaluate_body, reset_classification_cache, BodyAwareConfig,
@@ -28,6 +29,7 @@ pub use detector::{
 };
 pub use heuristic::{HeuristicDetector, HEURISTIC_DETECTOR_NAME};
 pub use onnx::{OnnxDetector, ONNX_DETECTOR_NAME};
+pub use sidecar::{SidecarDetector, SIDECAR_DETECTOR_NAME};
 
 use std::sync::Arc;
 
@@ -210,6 +212,8 @@ impl PromptInjectionV2Policy {
         // policy. Everything else uses the zero-arg inventory factory.
         let detector = if raw.detector == onnx::ONNX_DETECTOR_NAME {
             onnx::OnnxDetector::from_config(&raw.detector_config)
+        } else if raw.detector == sidecar::SIDECAR_DETECTOR_NAME {
+            sidecar::SidecarDetector::from_config(&raw.detector_config)?
         } else {
             lookup_detector(&raw.detector).ok_or_else(|| {
                 anyhow!(
