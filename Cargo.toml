@@ -21,6 +21,7 @@ members = [
     "crates/sbproxy-k8s-operator",
     "crates/sbproxy-classifiers",
     "crates/sbproxy-classifier-proto",
+    "crates/sbproxy-classifier-sidecar",
     "crates/sbproxy-agent-detect",
     "e2e",
 ]
@@ -49,6 +50,7 @@ default-members = [
     "crates/sbproxy-openapi",
     "crates/sbproxy-classifiers",
     "crates/sbproxy-classifier-proto",
+    "crates/sbproxy-classifier-sidecar",
     "crates/sbproxy-agent-detect",
     "e2e",
 ]
