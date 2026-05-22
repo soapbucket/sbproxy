@@ -13,7 +13,6 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use anyhow::Result;
 use sbproxy_core::policy_bus::{self, PolicyBus, PolicyVerdictReceiver};
 use sbproxy_core::policy_dispatch::{translate_plugin_decision, ConfirmReducerState};
 use sbproxy_observe::events::{PolicySurface, PolicyVerdictEvent, VerdictTag};
@@ -37,7 +36,8 @@ impl PolicyEnforcer for CountingEnforcer {
         &self,
         _req: &http::Request<bytes::Bytes>,
         _ctx: &mut dyn Any,
-    ) -> Pin<Box<dyn Future<Output = Result<PolicyDecision>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = sbproxy_plugin::PluginResult<PolicyDecision>> + Send + '_>>
+    {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let factory = self.decision_factory;
         Box::pin(async move { Ok(factory()) })

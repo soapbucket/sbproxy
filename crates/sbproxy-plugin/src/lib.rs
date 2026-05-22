@@ -17,6 +17,7 @@
 
 pub mod audit;
 pub mod context;
+pub mod error;
 pub mod identity;
 pub mod lifecycle;
 pub mod mcp;
@@ -29,6 +30,7 @@ pub use audit::{
     NoOpAdminAuditEmitter, ProjectionRefreshEvent,
 };
 pub use context::*;
+pub use error::{PluginError, PluginResult};
 pub use identity::{
     anomaly_hooks, identity_hooks, ml_classifier_hooks, register_anomaly_hook,
     register_identity_hook, register_ml_classifier_hook, AgentIdSourceLabel, AnomalyDetectorHook,

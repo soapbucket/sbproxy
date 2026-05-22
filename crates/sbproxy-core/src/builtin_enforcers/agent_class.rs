@@ -15,7 +15,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::Result;
 use bytes::Bytes;
 use sbproxy_modules::policy::agent_class::AgentClassPolicy;
 use sbproxy_plugin::{PolicyDecision, PolicyEnforcer};
@@ -33,7 +32,8 @@ impl PolicyEnforcer for AgentClassEnforcer {
         &self,
         _req: &http::Request<Bytes>,
         _ctx: &mut dyn std::any::Any,
-    ) -> Pin<Box<dyn Future<Output = Result<PolicyDecision>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = sbproxy_plugin::PluginResult<PolicyDecision>> + Send + '_>>
+    {
         Box::pin(async move { Ok(PolicyDecision::Allow) })
     }
 }

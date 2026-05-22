@@ -7,7 +7,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use anyhow::Result;
+use crate::PluginResult;
 
 /// Outcome of an action handler - either proxied upstream or responded directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,7 +197,7 @@ pub trait ActionHandler: Send + Sync + 'static {
         &self,
         req: &mut http::Request<bytes::Bytes>,
         ctx: &mut dyn std::any::Any,
-    ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = PluginResult<ActionOutcome>> + Send + '_>>;
 }
 
 /// Third-party auth provider (dynamic dispatch).
@@ -213,7 +213,7 @@ pub trait AuthProvider: Send + Sync + 'static {
         &self,
         req: &http::Request<bytes::Bytes>,
         ctx: &mut dyn std::any::Any,
-    ) -> Pin<Box<dyn Future<Output = Result<AuthDecision>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = PluginResult<AuthDecision>> + Send + '_>>;
 }
 
 /// Third-party policy enforcer (dynamic dispatch).
@@ -228,7 +228,7 @@ pub trait PolicyEnforcer: Send + Sync + 'static {
         &self,
         req: &http::Request<bytes::Bytes>,
         ctx: &mut dyn std::any::Any,
-    ) -> Pin<Box<dyn Future<Output = Result<PolicyDecision>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = PluginResult<PolicyDecision>> + Send + '_>>;
 }
 
 /// Per-invocation context threaded into [`TransformHandler::apply`].
@@ -293,7 +293,7 @@ pub trait TransformHandler: Send + Sync + 'static {
         body: &'a mut bytes::BytesMut,
         content_type: Option<&'a str>,
         ctx: &'a TransformContext<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = PluginResult<()>> + Send + 'a>>;
 }
 
 /// Request enricher - adds data to request context (GeoIP, UA parsing, etc.).
@@ -306,7 +306,7 @@ pub trait RequestEnricher: Send + Sync + 'static {
         &self,
         req: &http::Request<bytes::Bytes>,
         ctx: &mut dyn std::any::Any,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = PluginResult<()>> + Send + '_>>;
 }
 
 #[cfg(test)]

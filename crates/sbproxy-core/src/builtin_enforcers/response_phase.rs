@@ -19,7 +19,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::Result;
 use bytes::Bytes;
 use sbproxy_modules::policy::{AssertionPolicy, PageShieldPolicy, SecHeadersPolicy, SriPolicy};
 use sbproxy_plugin::{PolicyDecision, PolicyEnforcer};
@@ -47,7 +46,9 @@ macro_rules! response_phase_enforcer {
                 &self,
                 _req: &http::Request<Bytes>,
                 _ctx: &mut dyn std::any::Any,
-            ) -> Pin<Box<dyn Future<Output = Result<PolicyDecision>> + Send + '_>> {
+            ) -> Pin<
+                Box<dyn Future<Output = sbproxy_plugin::PluginResult<PolicyDecision>> + Send + '_>,
+            > {
                 Box::pin(async move { Ok(PolicyDecision::Allow) })
             }
         }
