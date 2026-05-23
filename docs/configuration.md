@@ -818,7 +818,8 @@ Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowe
 | `name` | string | required | Unique provider name used to reference this entry. |
 | `provider_type` | string | inferred from `name` | Provider type (`openai`, `anthropic`, `google`, etc.). |
 | `api_key` | string | | API key used to authenticate with the upstream. |
-| `base_url` | string | provider default | Override the upstream base URL. |
+| `base_url` | string | provider default | Override the upstream base URL. Validated at config load: non-`http(s)` schemes and private/loopback targets are rejected as SSRF risks unless `allow_private_base_url` is set. |
+| `allow_private_base_url` | bool | `false` | Allow `base_url` to point at a loopback/private address (a local model server). The scheme check still applies. |
 | `models` | list | `[]` | Models served by this provider; empty defers to the provider catalog. |
 | `default_model` | string | | Model used when the request omits an explicit model. |
 | `model_map` | map | `{}` | Logical to upstream model name mapping. |

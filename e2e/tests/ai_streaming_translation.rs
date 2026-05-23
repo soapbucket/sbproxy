@@ -32,6 +32,7 @@ origins:
         - name: anthropic
           api_key: "stub-key"
           base_url: "{upstream_base}"
+          allow_private_base_url: true
           models: [claude-3-5-sonnet]
       routing:
         strategy: round_robin
@@ -53,6 +54,7 @@ origins:
         - name: gemini
           api_key: "stub-key"
           base_url: "{upstream_base}"
+          allow_private_base_url: true
           models: [gemini-1.5-pro]
       routing:
         strategy: round_robin

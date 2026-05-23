@@ -63,6 +63,9 @@ fn handler_config(providers: &[(&str, SocketAddr)]) -> AiHandlerConfig {
                 "provider_type": "openai",
                 "api_key": "test-key",
                 "base_url": format!("http://{addr}"),
+                // The mock listens on a loopback address; opt in so the
+                // WOR-603 base_url SSRF guard does not reject it.
+                "allow_private_base_url": true,
             })
         })
         .collect();

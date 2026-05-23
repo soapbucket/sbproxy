@@ -568,6 +568,7 @@ mod tests {
             api_version: None,
             host_override: None,
             disable_forwarded_host_header: false,
+            allow_private_base_url: false,
         }
     }
 

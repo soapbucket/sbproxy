@@ -14,6 +14,7 @@ origins:
         - name: provider-a
           api_key: test-key-a
           base_url: http://127.0.0.1:18889/v1
+          allow_private_base_url: true
           models:
             - gpt-4o-mini
           headers:
@@ -21,6 +22,7 @@ origins:
         - name: provider-b
           api_key: test-key-b
           base_url: http://127.0.0.1:18890/v1
+          allow_private_base_url: true
           models:
             - gpt-4o-mini
           headers:

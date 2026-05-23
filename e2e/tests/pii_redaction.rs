@@ -26,6 +26,7 @@ origins:
         - name: openai
           api_key: "stub-key"
           base_url: "{upstream_base}"
+          allow_private_base_url: true
       routing:
         strategy: round_robin
       pii:
