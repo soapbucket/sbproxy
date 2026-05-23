@@ -1,0 +1,1120 @@
+//! AI request support helpers: guardrail-pipeline memoization,
+//! budget gating, usage extraction, upstream-error mapping, HTTP
+//! message-signature verification, AI billing, and idempotency.
+//!
+//! Extracted from `server.rs` (WOR-629). Behavior-preserving move:
+//! `use super::*` re-imports the parent module's private items and
+//! `use` aliases, so the moved code needs no rewiring.
+
+use super::*;
+
+/// Process-wide memoization of compiled guardrail pipelines, keyed by
+/// the address of the configured `GuardrailsConfig`. The address is
+/// stable for the lifetime of an `AiHandlerConfig` (held in the
+/// reload-managed `Arc<Pipeline>`), so a hit returns the
+/// already-compiled `GuardrailPipeline` rather than re-running regex
+/// compilation on every request. Hot reload swaps in a new pipeline
+/// (and therefore a new config address), so stale entries fall out of
+/// use; the map is small (one entry per ai handler config) and never
+/// grows hot.
+pub(super) static GUARDRAIL_PIPELINE_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<usize, std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Look up (or compile-and-cache) the guardrail pipeline for the given
+/// configuration. Returns `None` and emits a `tracing::warn!` when
+/// `compile_pipeline` fails so the AI proxy can fall through to its
+/// no-guardrails behaviour (matching the previous best-effort policy).
+pub(super) fn cached_guardrails_pipeline(
+    guardrails_config: &sbproxy_ai::guardrails::GuardrailsConfig,
+) -> Option<std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>> {
+    let key = guardrails_config as *const _ as usize;
+    if let Ok(map) = GUARDRAIL_PIPELINE_CACHE.lock() {
+        if let Some(p) = map.get(&key) {
+            return Some(p.clone());
+        }
+    }
+    match sbproxy_ai::guardrails::compile_pipeline(guardrails_config) {
+        Ok(pipeline) => {
+            let arc = std::sync::Arc::new(pipeline);
+            if let Ok(mut map) = GUARDRAIL_PIPELINE_CACHE.lock() {
+                map.insert(key, arc.clone());
+            }
+            Some(arc)
+        }
+        Err(e) => {
+            warn!(error = %e, "AI proxy: failed to compile guardrails, skipping");
+            None
+        }
+    }
+}
+
+/// Best-effort extraction of a single prompt string from a parsed AI request
+/// body.
+///
+/// Handles the common OpenAI-style `messages: [{role, content}]` shape by
+/// concatenating the content of the trailing user messages. Falls back to a
+/// bare `prompt` string field when present (legacy completions). Returns an
+/// empty string when nothing usable is found; callers should treat an empty
+/// result as "skip classification".
+///
+/// This is intentionally minimal. Task A20 tracks a richer extractor that
+/// understands tool-use parts, multimodal content, and system prompts.
+/// Extract a textual representation of the prompt from an AI request
+/// body. Used by classifier hooks, semantic-cache key derivation, and
+/// PII redaction logging.
+///
+/// Handles the major API surfaces:
+///
+/// - **OpenAI chat completions**: `messages[*].content` as string or
+///   array of `{type, text|image_url|image}` parts.
+/// - **OpenAI Responses API**: top-level `input` as string or array.
+/// - **Anthropic Messages API**: top-level `system` as string or array
+///   of text blocks, plus `messages[*]` with content blocks.
+/// - **Tool use / tool result blocks**: `type: tool_use` (extract the
+///   tool's `input` JSON), `type: tool_result` (extract `content`).
+/// - **Multimodal image parts**: emit a `[image]` placeholder so
+///   classifiers see *something* representing the modality rather
+///   than silently dropping the segment.
+/// - **Legacy completions**: bare `prompt` field as string or array.
+pub(super) fn extract_prompt_text(body: &serde_json::Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    // Anthropic-style top-level system prompt.
+    if let Some(system) = body.get("system") {
+        extract_into(system, &mut parts);
+    }
+
+    // OpenAI chat completions / Anthropic messages: messages[*].content
+    if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
+        for msg in messages {
+            if let Some(content) = msg.get("content") {
+                extract_into(content, &mut parts);
+            }
+            // OpenAI tool calls: messages[*].tool_calls[*].function.arguments
+            if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                for call in tool_calls {
+                    if let Some(args) = call
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(|a| a.as_str())
+                    {
+                        parts.push(args.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // OpenAI Responses API: top-level `input` (string or content array).
+    if parts.is_empty() {
+        if let Some(input) = body.get("input") {
+            extract_into(input, &mut parts);
+        }
+    }
+
+    // Legacy completions: bare `prompt` field.
+    if parts.is_empty() {
+        if let Some(prompt) = body.get("prompt") {
+            extract_into(prompt, &mut parts);
+        }
+    }
+
+    parts.join("\n")
+}
+
+/// Recursively walk a value drawing text out of every shape we know:
+/// raw strings, arrays of content blocks, objects with `text`,
+/// `tool_use` `input` payloads, `tool_result` `content`, and image
+/// placeholders.
+pub(super) fn extract_into(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) if !s.is_empty() => {
+            out.push(s.clone());
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                extract_into(item, out);
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            // Block-typed content (Anthropic + OpenAI multimodal).
+            let block_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match block_type {
+                "text" => {
+                    if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
+                        if !t.is_empty() {
+                            out.push(t.to_string());
+                        }
+                    }
+                }
+                "image" | "image_url" | "input_image" => {
+                    // Surface a marker so classifiers / cache keys
+                    // see a placeholder for the image rather than
+                    // dropping the entire block.
+                    out.push("[image]".to_string());
+                }
+                "tool_use" => {
+                    // Anthropic tool_use: serialise the JSON `input`
+                    // so classifiers see the structured arguments.
+                    if let Some(input) = obj.get("input") {
+                        if let Ok(s) = serde_json::to_string(input) {
+                            out.push(s);
+                        }
+                    }
+                }
+                "tool_result" => {
+                    if let Some(content) = obj.get("content") {
+                        extract_into(content, out);
+                    }
+                }
+                _ => {
+                    // Generic fallback for shapes we have not
+                    // catalogued yet: pull `text` if present, else
+                    // recurse into each value once. This keeps the
+                    // extractor tolerant of new vendor shapes.
+                    if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
+                        if !t.is_empty() {
+                            out.push(t.to_string());
+                        }
+                    } else if let Some(content) = obj.get("content") {
+                        extract_into(content, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// --- AI proxy handler ---
+
+/// Outcome of a pre-dispatch budget check. Tells the caller whether
+/// the request should proceed, fail with a 402, or have its model
+/// rewritten before forwarding upstream.
+pub(super) enum BudgetGate {
+    /// No limit was exceeded. Continue with the original model.
+    Allow,
+    /// At least one limit fired and the configured action is `block`.
+    /// The caller must short-circuit with the supplied status + JSON body.
+    Block { status: u16, body: Vec<u8> },
+    /// At least one limit fired and the configured action is `downgrade`.
+    /// The caller must rewrite the request body's `model` to this name.
+    Downgrade { model: String },
+}
+
+/// Build the list of scope keys to check / record against for a given
+/// AI request. We compute one key per limit so a workspace cap can
+/// coexist with a per-api-key cap on the same origin.
+pub(super) fn budget_scope_keys(
+    cfg: &sbproxy_ai::BudgetConfig,
+    workspace_id: &str,
+    api_key: Option<&str>,
+    user: Option<&str>,
+    model: Option<&str>,
+    origin: Option<&str>,
+    tag: Option<&str>,
+) -> Vec<(usize, String)> {
+    let mut out = Vec::with_capacity(cfg.limits.len());
+    for (idx, limit) in cfg.limits.iter().enumerate() {
+        if let Some(key) = sbproxy_ai::budget::BudgetTracker::scope_key(
+            &limit.scope,
+            workspace_id,
+            api_key,
+            user,
+            model,
+            origin,
+            tag,
+        ) {
+            out.push((idx, key));
+        }
+    }
+    out
+}
+
+/// Compute a single limit's utilization ratio for the
+/// `sbproxy_ai_budget_utilization_ratio` gauge. Returns `None` when
+/// the limit has neither a token nor cost cap configured.
+pub(super) fn limit_utilization(
+    usage_tokens: u64,
+    usage_cost: f64,
+    limit: &sbproxy_ai::budget::BudgetLimit,
+) -> Option<f64> {
+    if let Some(max) = limit.max_tokens {
+        if max > 0 {
+            return Some(usage_tokens as f64 / max as f64);
+        }
+    }
+    if let Some(max) = limit.max_cost_usd {
+        if max > 0.0 {
+            return Some(usage_cost / max);
+        }
+    }
+    None
+}
+
+/// Run the budget pre-flight for a request.
+///
+/// Each configured limit produces a scope key. The first limit that
+/// reports `exceeded == true` decides the action: `Log` falls
+/// through (so a stricter `Block` later in the list still fires),
+/// `Block` short-circuits with 402, and `Downgrade` rewrites the
+/// request's model. When `downgrade_to` is unset, the cheapest model
+/// across the configured providers' `models` lists is selected from
+/// the embedded price catalog; if no candidates are available the
+/// request blocks instead of silently passing through.
+pub(super) fn budget_preflight(
+    cfg: &sbproxy_ai::BudgetConfig,
+    keys: &[(usize, String)],
+    providers: &[sbproxy_ai::ProviderConfig],
+) -> BudgetGate {
+    for (limit_idx, key) in keys {
+        let result = match BUDGET_TRACKER.check_limits(cfg, key) {
+            Some(r) => r,
+            None => continue,
+        };
+        if !result.exceeded {
+            continue;
+        }
+        let limit = &cfg.limits[*limit_idx];
+        if let Some(ratio) =
+            limit_utilization(result.current_tokens, result.current_cost_usd, limit)
+        {
+            sbproxy_ai::ai_metrics::set_budget_utilization(scope_label(&limit.scope), ratio);
+        }
+        match result.action {
+            sbproxy_ai::OnExceedAction::Log => {
+                tracing::warn!(
+                    scope = scope_label(&limit.scope),
+                    reason = %result.reason,
+                    "AI budget: limit exceeded (log; allowing request)"
+                );
+                continue;
+            }
+            sbproxy_ai::OnExceedAction::Block => {
+                tracing::warn!(
+                    scope = scope_label(&limit.scope),
+                    reason = %result.reason,
+                    "AI budget: limit exceeded (block; rejecting request)"
+                );
+                let body = serde_json::json!({
+                    "error": {
+                        "type": "budget_exceeded",
+                        "scope": scope_label(&limit.scope),
+                        "message": result.reason,
+                    }
+                });
+                return BudgetGate::Block {
+                    status: 402,
+                    body: serde_json::to_vec(&body).unwrap_or_default(),
+                };
+            }
+            sbproxy_ai::OnExceedAction::Downgrade => {
+                let target = limit.downgrade_to.clone().or_else(|| {
+                    let mut candidates: Vec<String> = Vec::new();
+                    for p in providers {
+                        for m in &p.models {
+                            candidates.push(m.clone());
+                        }
+                    }
+                    sbproxy_ai::cheapest_model(&candidates)
+                });
+                match target {
+                    Some(model) => {
+                        tracing::warn!(
+                            scope = scope_label(&limit.scope),
+                            new_model = %model,
+                            reason = %result.reason,
+                            "AI budget: limit exceeded (downgrade; rewriting model)"
+                        );
+                        return BudgetGate::Downgrade { model };
+                    }
+                    None => {
+                        tracing::warn!(
+                            scope = scope_label(&limit.scope),
+                            reason = %result.reason,
+                            "AI budget: limit exceeded (downgrade unset and no candidates; blocking)"
+                        );
+                        let body = serde_json::json!({
+                            "error": {
+                                "type": "budget_exceeded",
+                                "scope": scope_label(&limit.scope),
+                                "message": format!(
+                                    "{}; downgrade target unavailable",
+                                    result.reason
+                                ),
+                            }
+                        });
+                        return BudgetGate::Block {
+                            status: 402,
+                            body: serde_json::to_vec(&body).unwrap_or_default(),
+                        };
+                    }
+                }
+            }
+        }
+    }
+    BudgetGate::Allow
+}
+
+/// Stable label for the budget metric `scope` dimension.
+pub(super) fn scope_label(scope: &sbproxy_ai::budget::BudgetScope) -> &'static str {
+    match scope {
+        sbproxy_ai::budget::BudgetScope::Workspace => "workspace",
+        sbproxy_ai::budget::BudgetScope::ApiKey => "api_key",
+        sbproxy_ai::budget::BudgetScope::User => "user",
+        sbproxy_ai::budget::BudgetScope::Model => "model",
+        sbproxy_ai::budget::BudgetScope::Origin => "origin",
+        sbproxy_ai::budget::BudgetScope::Tag => "tag",
+    }
+}
+
+/// Extract `(prompt_tokens, completion_tokens)` from an
+/// OpenAI-shaped chat completion JSON response. Falls back to
+/// Anthropic's `input_tokens` / `output_tokens` so non-translated
+/// upstreams still report usage. Returns `(0, 0)` when no usage
+/// block is present.
+pub(super) fn extract_usage(body: &[u8]) -> (u64, u64) {
+    let parsed: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return (0, 0),
+    };
+    let usage = match parsed.get("usage") {
+        Some(u) => u,
+        None => return (0, 0),
+    };
+    let prompt = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let completion = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    (prompt, completion)
+}
+
+/// Streaming-aware accumulator for SSE `usage` blocks.
+///
+/// AI providers report token usage in the terminal SSE chunk rather
+/// than in a `Content-Length`-framed JSON body. The two shapes we
+/// care about are:
+///
+/// * OpenAI: `data: {"id":"...", "usage":{"prompt_tokens":N,
+///   "completion_tokens":M, ...}, ...}` followed by `data: [DONE]`.
+/// * Anthropic: `event: message_delta\ndata: {"usage":{
+///   "input_tokens":N, "output_tokens":M}, ...}`.
+///
+/// `feed` accepts arbitrary chunk bytes (frames may arrive split or
+/// coalesced), splits them at `\n` boundaries, and parses every
+/// `data: <json>` line that contains a `usage` object. Anthropic's
+/// `message_start` reports a partial usage (input only) and
+/// `message_delta` updates it with output tokens; we keep the
+/// largest values seen so the post-stream record reflects the final
+/// totals from either shape.
+///
+/// The scanner buffers at most a single line of pending bytes so
+/// Deprecated thin shim around the pluggable
+/// [`sbproxy_ai::SseUsageParser`] family. Kept for one release
+/// cycle so external callers that picked up the previous
+/// public-by-accident type do not break; the streaming relay now
+/// constructs parsers directly via
+/// [`sbproxy_ai::select_parser`].
+///
+/// Compiled only under `cfg(test)` because it has no other in-tree
+/// users; pinning the legacy public API surface lives in the
+/// `sbproxy-ai` crate's `usage_parser` module.
+#[cfg(test)]
+#[deprecated(
+    note = "use sbproxy_ai::select_parser with usage_parser: auto; this shim only handles \
+            the OpenAI / Anthropic shapes and will be removed in a future release"
+)]
+pub(super) struct SseUsageScanner {
+    inner: Box<dyn sbproxy_ai::SseUsageParser>,
+}
+
+#[cfg(test)]
+#[allow(deprecated)]
+impl SseUsageScanner {
+    /// Build a scanner backed by the generic parser, which handles
+    /// both OpenAI and Anthropic shapes (and silently passes through
+    /// other shapes too).
+    pub(super) fn new() -> Self {
+        let hints = sbproxy_ai::UsageParserHints::default();
+        // `select_parser("generic", ...)` always returns `Some`.
+        let inner = sbproxy_ai::select_parser("generic", &hints)
+            .expect("generic parser must always be available");
+        Self { inner }
+    }
+
+    /// Feed a chunk of stream bytes.
+    pub(super) fn feed(&mut self, bytes: &[u8]) {
+        self.inner.feed(bytes);
+    }
+
+    /// Tokens captured so far. Returns `(0, 0)` until the first
+    /// `usage` block is parsed (matches the legacy contract).
+    pub(super) fn totals(&self) -> (u64, u64) {
+        match self.inner.snapshot() {
+            Some(t) => (t.prompt_tokens as u64, t.completion_tokens as u64),
+            None => (0, 0),
+        }
+    }
+}
+
+/// Record post-dispatch usage against every configured budget scope
+/// for this request. Tokens come from the upstream `usage` block;
+/// cost is estimated against the model the request actually
+/// executed against using the embedded price catalog in
+/// `sbproxy-ai/src/budget.rs`.
+/// Build and publish a per-surface `AiBillingEvent` for a request
+/// that has just returned a response from the upstream.
+///
+/// Phase 8 of the AI deep-integration plan: every dispatched AI
+/// request emits a billing event onto the observability bus and into
+/// the in-process `BudgetTracker`. Non-chat surfaces (image, audio,
+/// moderations, reranking, files, batches, fine-tuning) ship today
+/// as `PerCall` events with `cost_usd = 0.0`; per-unit pricing for
+/// images, audio seconds, and rerank documents lands when the
+/// pricing tables ship. Chat completions continue to bill through
+/// `record_budget_usage` until the chat usage-extraction is reworked
+/// to emit the new event shape.
+/// Map an HTTP status code to a stable RFC 9209 `Proxy-Status`
+/// `error` token. Returns `None` for status codes that don't have
+/// a canonical proxy-error mapping (the header is still emitted
+/// without the `error` parameter, which is valid per RFC 9209).
+pub(super) fn proxy_status_error_token(status: u16) -> Option<&'static str> {
+    match status {
+        502 => Some("http_request_error"),
+        503 => Some("connection_terminated"),
+        504 => Some("connection_timeout"),
+        _ => None,
+    }
+}
+
+/// Translate a Pingora upstream-failure error into the
+/// `(http_status, rfc_9209_error_token)` tuple `fail_to_proxy`
+/// stamps on the synthesised response. The mapping mirrors RFC 9209
+/// section 2.3.4 ("Proxy Errors") so dashboards consuming the
+/// `Proxy-Status` header can break down upstream failures by
+/// failure mode without scraping the response body.
+pub(super) fn map_upstream_failure(e: &Error) -> (u16, Option<&'static str>) {
+    use pingora_error::ErrorType as Et;
+    match &e.etype {
+        // Connect-phase timeouts surface as 504 with the canonical
+        // `connection_timeout` token.
+        Et::ConnectTimedout | Et::TLSHandshakeTimedout | Et::ReadTimedout | Et::WriteTimedout => {
+            (504, Some("connection_timeout"))
+        }
+        // Connect refused / no route: 502 with `connection_refused`.
+        Et::ConnectRefused | Et::ConnectNoRoute => (502, Some("connection_refused")),
+        // TLS protocol failures (handshake error, invalid cert): 502
+        // with `tls_protocol_error`.
+        Et::TLSHandshakeFailure | Et::InvalidCert | Et::HandshakeError | Et::TLSWantX509Lookup => {
+            (502, Some("tls_protocol_error"))
+        }
+        // Mid-stream connection failures: 502 with
+        // `connection_terminated`.
+        Et::ReadError
+        | Et::WriteError
+        | Et::ConnectionClosed
+        | Et::H1Error
+        | Et::H2Error
+        | Et::InvalidH2
+        | Et::H2Downgrade => (502, Some("connection_terminated")),
+        // Generic connect / proxy-chain errors fall back to 502 with
+        // the catch-all `http_request_error`.
+        Et::ConnectError | Et::ConnectProxyFailure | Et::BindError | Et::SocketError => {
+            (502, Some("http_request_error"))
+        }
+        // Application-level HTTPStatus: honour the carried status code.
+        Et::HTTPStatus(code) => (*code, proxy_status_error_token(*code)),
+        // Everything else (InvalidHTTPHeader, FileOpenError, custom,
+        // unknown): 502 with the catch-all token.
+        _ => (502, Some("http_request_error")),
+    }
+}
+
+/// Build the `http::Request<bytes::Bytes>` view of the inbound
+/// Pingora session that the RFC 9421 verifier expects.
+///
+/// Body is empty: the OSS v1 message-signatures gate verifies
+/// signatures over no-body components (`@method`, `@target-uri`,
+/// `@authority`, `@scheme`, `@path`, `@query`, plus arbitrary
+/// header references). Body coverage (`content-digest`) requires
+/// buffering the body ahead of the auth phase and lands as a
+/// follow-up.
+pub(super) fn build_signature_verification_request(
+    session: &Session,
+) -> Option<http::Request<bytes::Bytes>> {
+    let req_header = session.req_header();
+    let method = req_header.method.clone();
+    let uri = req_header.uri.clone();
+    let mut builder = http::Request::builder().method(method).uri(uri);
+    if let Some(hmap) = builder.headers_mut() {
+        for (name, value) in &req_header.headers {
+            hmap.insert(name.clone(), value.clone());
+        }
+    }
+    // WOR-619: method/uri/headers are already-parsed `http` types, so this
+    // build is effectively infallible today, but the inputs are
+    // attacker-influenced. Surface a build failure as `None` (the caller
+    // fails closed with a 401) rather than panicking the request.
+    match builder.body(bytes::Bytes::new()) {
+        Ok(req) => Some(req),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "message_signatures: failed to rebuild inbound request for verification"
+            );
+            None
+        }
+    }
+}
+
+/// Cache of compiled `MessageSignatureVerifier` instances keyed by
+/// the configuration's memory address. Same pattern as
+/// `cached_guardrails_pipeline`: hot reload swaps in a new config
+/// address, so stale entries fall out of use.
+pub(super) static MESSAGE_SIGNATURE_VERIFIER_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            usize,
+            std::sync::Arc<sbproxy_middleware::signatures::MessageSignatureVerifier>,
+        >,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Look up (or compile-and-cache) the message-signature verifier for
+/// the given configuration. Returns `None` when the config is
+/// invalid (key fails to decode, unknown algorithm); the auth phase
+/// rejects the request with 401 in that case rather than silently
+/// bypassing the gate.
+pub(super) fn cached_message_signature_verifier(
+    cfg: &sbproxy_config::MessageSignaturesConfig,
+) -> Option<std::sync::Arc<sbproxy_middleware::signatures::MessageSignatureVerifier>> {
+    let key = cfg as *const _ as usize;
+    if let Ok(map) = MESSAGE_SIGNATURE_VERIFIER_CACHE.lock() {
+        if let Some(v) = map.get(&key) {
+            return Some(v.clone());
+        }
+    }
+    let algorithm = match cfg.algorithm.as_str() {
+        "hmac_sha256" => sbproxy_middleware::signatures::SignatureAlgorithm::HmacSha256,
+        "ed25519" => sbproxy_middleware::signatures::SignatureAlgorithm::Ed25519,
+        other => {
+            warn!(
+                algorithm = %other,
+                "message_signatures: unknown algorithm; rejecting all requests for this origin"
+            );
+            return None;
+        }
+    };
+    let mw_config = sbproxy_middleware::signatures::MessageSignatureConfig {
+        algorithm,
+        key_id: cfg.key_id.clone(),
+        key: cfg.key.clone(),
+        required_components: cfg.required_components.clone(),
+        clock_skew_seconds: cfg.clock_skew_seconds,
+    };
+    match sbproxy_middleware::signatures::MessageSignatureVerifier::new(mw_config) {
+        Ok(v) => {
+            let arc = std::sync::Arc::new(v);
+            if let Ok(mut map) = MESSAGE_SIGNATURE_VERIFIER_CACHE.lock() {
+                map.insert(key, arc.clone());
+            }
+            Some(arc)
+        }
+        Err(e) => {
+            warn!(error = %e, "message_signatures: failed to compile verifier; rejecting all requests for this origin");
+            None
+        }
+    }
+}
+
+pub(super) fn emit_ai_billing_event(
+    surface_label: &str,
+    provider_name: &str,
+    model: Option<String>,
+    usage: sbproxy_ai::budget::AiUsage,
+    cost_usd: f64,
+    scope_keys: Vec<String>,
+) {
+    let event =
+        sbproxy_ai::budget::AiBillingEvent::from_label(surface_label, provider_name, model, usage)
+            .with_cost(cost_usd)
+            .with_scope_keys(scope_keys);
+    sbproxy_ai::budget::record_billing_event(&BUDGET_TRACKER, &event);
+    tracing::info!(
+        ai.surface = event.surface.as_str(),
+        ai.provider = event.provider.as_str(),
+        ai.cost_usd = event.cost_usd,
+        ai.occurred_at_unix_secs = event.occurred_at_unix_secs,
+        "AI billing event"
+    );
+}
+
+pub(super) fn record_budget_usage(
+    cfg: &sbproxy_ai::BudgetConfig,
+    keys: &[(usize, String)],
+    model: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) {
+    if prompt_tokens == 0 && completion_tokens == 0 {
+        return;
+    }
+    let total_tokens = prompt_tokens + completion_tokens;
+    let cost = sbproxy_ai::estimate_cost(model, prompt_tokens, completion_tokens);
+    for (limit_idx, key) in keys {
+        BUDGET_TRACKER.record_usage(key, total_tokens, cost);
+        let limit = &cfg.limits[*limit_idx];
+        let usage = BUDGET_TRACKER.get_usage(key);
+        if let Some(ratio) = limit_utilization(usage.tokens, usage.cost_usd, limit) {
+            sbproxy_ai::ai_metrics::set_budget_utilization(scope_label(&limit.scope), ratio);
+        }
+    }
+}
+
+/// Read a request header value as an owned `String`. Returns `None`
+/// when the header is missing or the value is not valid UTF-8.
+pub(super) fn req_header_value(session: &Session, name: &str) -> Option<String> {
+    session
+        .req_header()
+        .headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Build a redacted snapshot of the inbound request headers for the
+/// AI hook surface (`ClassifyRequest::headers`,
+/// `LookupRequest::request_headers`).
+///
+/// Names are lower-cased to match the HTTP/2 and HTTP/3 framing the
+/// rest of the hook surface assumes. Values that are not valid UTF-8
+/// are dropped silently because the hook contract is `String:String`
+/// and lossy decoding would obscure the real wire bytes from any
+/// implementation that wants to reason about them. Headers whose
+/// lower-cased name appears in [`crate::hooks::REDACTED_REQUEST_HEADERS`]
+/// are dropped before the snapshot is returned so credential carriers
+/// (Authorization, Cookie, Proxy-Authorization) never reach the
+/// classifier or semantic cache.
+///
+/// The returned map is fresh per call. Callers that fan a single
+/// request out across multiple hooks should build the snapshot once
+/// and clone it.
+pub(super) fn snapshot_request_headers(
+    session: &Session,
+) -> std::collections::HashMap<String, String> {
+    snapshot_request_headers_from(session.req_header())
+}
+
+/// Inner form of [`snapshot_request_headers`] that operates on a
+/// `RequestHeader` directly. Split out so unit tests can build a
+/// `RequestHeader` in-process without a live Pingora session.
+pub(super) fn snapshot_request_headers_from(
+    req: &pingora_http::RequestHeader,
+) -> std::collections::HashMap<String, String> {
+    let raw = &req.headers;
+    let mut out = std::collections::HashMap::with_capacity(raw.len());
+    for (name, value) in raw.iter() {
+        let lname = name.as_str().to_ascii_lowercase();
+        if crate::hooks::REDACTED_REQUEST_HEADERS.contains(&lname.as_str()) {
+            continue;
+        }
+        if let Ok(v) = value.to_str() {
+            out.insert(lname, v.to_string());
+        }
+    }
+    out
+}
+
+/// Outcome of the AI gateway idempotency middleware engagement, run
+/// in `handle_ai_proxy` after the request body has been buffered but
+/// before the upstream call. Mirrors the four-branch flow used on the
+/// general HTTP path (see `request_body_filter` for the analogue):
+/// short-circuit replay on hit, 409 on conflict, capture-on-miss for
+/// the response side, or skip with a stamped marker. The
+/// `permit` field is `Some` only on the `Miss` arm: it keeps the
+/// per-origin pool semaphore slot held until the response side
+/// records (or abandons) the captured body.
+pub(super) enum AiIdempotencyEngagement {
+    /// Middleware did not engage (no `idempotency:` block on the
+    /// origin, method not in the configured set, header absent, or
+    /// origin index missing). The caller proceeds with the upstream
+    /// call unchanged.
+    NotApplicable,
+    /// Cache hit on a matching body hash. The cached response has
+    /// already been written to the session; the caller short-circuits
+    /// the AI gateway path without contacting the provider.
+    Replayed,
+    /// Cache hit with a different body hash. The 409 conflict body
+    /// has already been written to the session. Caller short-circuits.
+    Conflict,
+    /// Cache miss. The caller proceeds with the upstream call, then
+    /// invokes `record_ai_idempotency` with the captured response so
+    /// the next retry hits the cache.
+    Miss {
+        idem: std::sync::Arc<crate::pipeline::CompiledIdempotency>,
+        workspace_id: String,
+        key: String,
+        body_hash: [u8; 32],
+        /// Permit on the per-origin pool semaphore. Held until the
+        /// response side records (or abandons) the capture; dropped
+        /// then so a new buffered request can take the slot.
+        permit: tokio::sync::OwnedSemaphorePermit,
+    },
+    /// Middleware engagement was skipped (oversize body, pool full,
+    /// multipart body). The caller proceeds with the upstream call;
+    /// the AI relay path stamps the marker on the outgoing response
+    /// so operators can see the skip in dashboards.
+    Skipped { reason: &'static str },
+}
+
+/// Run the AI gateway idempotency cache check after the request body
+/// has been buffered. Returns one of four outcomes per
+/// [`AiIdempotencyEngagement`].
+///
+/// The caller must already have read the request body via
+/// `session.read_request_body().await?`; for multipart bodies the
+/// engagement is skipped with `SKIPPED-MULTIPART` since the v1 cache
+/// shape stores raw bytes (multipart streams may not round-trip
+/// safely through the cache without media-type-aware framing). Other
+/// skip paths (oversize request, pool exhausted) match the general
+/// HTTP path's behaviour byte-for-byte.
+pub(super) async fn engage_ai_idempotency(
+    session: &mut Session,
+    pipeline: &CompiledPipeline,
+    origin_idx: Option<usize>,
+    body_bytes: &[u8],
+    is_multipart: bool,
+) -> Result<AiIdempotencyEngagement> {
+    // Resolve the per-origin idempotency binding; bail out early if
+    // none is configured on this origin.
+    let origin_idx = match origin_idx {
+        Some(i) => i,
+        None => return Ok(AiIdempotencyEngagement::NotApplicable),
+    };
+    let idem = match pipeline
+        .idempotencies
+        .get(origin_idx)
+        .and_then(|o| o.as_ref())
+    {
+        Some(i) => i.clone(),
+        None => return Ok(AiIdempotencyEngagement::NotApplicable),
+    };
+
+    // Gate 1: method must be one of the configured set
+    // (default POST / PUT / PATCH).
+    let method = session.req_header().method.clone();
+    if !idem.methods.contains(&method) {
+        return Ok(AiIdempotencyEngagement::NotApplicable);
+    }
+
+    // Gate 2: the configured header must be present and non-empty.
+    let header_present = session
+        .req_header()
+        .headers
+        .get(idem.header_name.as_str())
+        .and_then(|v| v.to_str().ok())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if !header_present {
+        return Ok(AiIdempotencyEngagement::NotApplicable);
+    }
+
+    // Gate 3: multipart bodies are not cached in v1. The cache
+    // primitive stores raw bytes; multipart streams carry MIME
+    // boundaries that the upstream client may regenerate on retry
+    // even when the user-visible payload is identical. Stamp the
+    // skip marker so operators can spot the case.
+    if is_multipart {
+        return Ok(AiIdempotencyEngagement::Skipped {
+            reason: "SKIPPED-MULTIPART",
+        });
+    }
+
+    // Gate 4: request body cap. Bodies above the cap skip caching
+    // rather than buffering unbounded bytes into the cache primitive.
+    if body_bytes.len() > idem.max_request_body_bytes {
+        return Ok(AiIdempotencyEngagement::Skipped {
+            reason: "SKIPPED-OVERSIZE-REQUEST",
+        });
+    }
+
+    // Gate 5: per-origin pool semaphore. Try-acquire a permit; on
+    // failure (pool full) skip caching so the request still flows.
+    let permit = match idem.permits.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return Ok(AiIdempotencyEngagement::Skipped {
+                reason: "SKIPPED-POOL-FULL",
+            });
+        }
+    };
+
+    let workspace_id = pipeline.config.origins[origin_idx].workspace_id.to_string();
+    let outcome = sbproxy_middleware::idempotency::check_request(
+        idem.cache.as_ref(),
+        &workspace_id,
+        &session.req_header().headers,
+        body_bytes,
+    );
+
+    match outcome {
+        sbproxy_middleware::idempotency::IdempotencyOutcome::NotApplicable => {
+            // Header evaporated between gate 2 and the check (would
+            // only happen on a header that became empty after trim
+            // inside the middleware). Treat as a passthrough.
+            Ok(AiIdempotencyEngagement::NotApplicable)
+        }
+        sbproxy_middleware::idempotency::IdempotencyOutcome::CacheHit(resp) => {
+            // Replay the cached `(status, headers, body)` triple
+            // verbatim. Strip framing headers Pingora will re-derive
+            // for the new client connection so a stale
+            // `transfer-encoding: chunked` does not race the replay.
+            write_ai_cached_response(session, resp.status, &resp.headers, &resp.body).await?;
+            Ok(AiIdempotencyEngagement::Replayed)
+        }
+        sbproxy_middleware::idempotency::IdempotencyOutcome::Conflict => {
+            let (status, content_type, body) = sbproxy_middleware::idempotency::conflict_response();
+            send_response(session, status.as_u16(), content_type, &body).await?;
+            Ok(AiIdempotencyEngagement::Conflict)
+        }
+        sbproxy_middleware::idempotency::IdempotencyOutcome::Miss { key, body_hash } => {
+            Ok(AiIdempotencyEngagement::Miss {
+                idem,
+                workspace_id,
+                key,
+                body_hash,
+                permit,
+            })
+        }
+    }
+}
+
+/// Write a cached AI gateway response directly to the Pingora session.
+/// Stamps `x-sbproxy-idempotency: HIT` so operators can distinguish a
+/// replayed hit from an upstream response. Strips hop-by-hop framing
+/// headers Pingora will re-derive on the outbound connection.
+pub(super) async fn write_ai_cached_response(
+    session: &mut Session,
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<()> {
+    let mut header =
+        pingora_http::ResponseHeader::build(status, Some(headers.len() + 2)).map_err(|e| {
+            Error::because(
+                ErrorType::InternalError,
+                "idempotency: failed to build replay response header",
+                e,
+            )
+        })?;
+    for (name, value) in headers {
+        let lname = name.to_ascii_lowercase();
+        if lname == "content-length"
+            || lname == "transfer-encoding"
+            || lname == "connection"
+            || lname == "keep-alive"
+            || lname == "x-sbproxy-idempotency"
+        {
+            continue;
+        }
+        let _ = header.insert_header(name.clone(), value.clone());
+    }
+    let _ = header.insert_header("content-length", body.len().to_string());
+    let _ = header.insert_header("x-sbproxy-idempotency", "HIT");
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(bytes::Bytes::copy_from_slice(body)), true)
+        .await?;
+    Ok(())
+}
+
+/// Captured state from an [`AiIdempotencyEngagement::Miss`] needed to
+/// record the upstream response back into the cache once the relay
+/// finishes. Threaded through the relay helpers so callers don't have
+/// to keep five locals alive across the upstream call.
+pub(super) struct AiIdempotencyCapture {
+    pub(super) idem: std::sync::Arc<crate::pipeline::CompiledIdempotency>,
+    pub(super) workspace_id: String,
+    pub(super) key: String,
+    pub(super) body_hash: [u8; 32],
+    /// Per-origin pool permit held for the lifetime of the capture.
+    /// Dropped here (on success or abandonment) so a new buffered
+    /// request can take the slot.
+    pub(super) _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl AiIdempotencyCapture {
+    /// Persist the recorded response under `(workspace_id, key)`.
+    /// `body` is the **post-translation** OpenAI-shape bytes the
+    /// client saw, so retries replay byte-identical to the original
+    /// served response.
+    pub(super) fn record(self, status: u16, headers: Vec<(String, String)>, body: Vec<u8>) {
+        sbproxy_middleware::idempotency::record_response(
+            self.idem.cache.as_ref(),
+            &self.workspace_id,
+            &self.key,
+            sbproxy_middleware::idempotency::RecordedResponse {
+                status,
+                headers,
+                body,
+                body_hash: self.body_hash,
+                ttl_secs: self.idem.ttl_secs,
+            },
+        );
+    }
+}
+
+/// Send a non-streaming AI gateway response, optionally stamping the
+/// `x-sbproxy-idempotency` skip marker when the middleware
+/// disengaged. Returns the response bytes so the caller can record
+/// them into the idempotency cache on `Miss`.
+///
+/// `cap_response_bytes` caps the captured-for-cache body length;
+/// responses above the cap skip the record with `SKIPPED-OVERSIZE-RESPONSE`
+/// returned via the marker out-parameter so the response_filter still
+/// stamps it (best-effort visible via logs since headers have already
+/// flushed).
+pub(super) async fn relay_ai_response_with_idempotency(
+    session: &mut Session,
+    resp: reqwest::Response,
+    format: sbproxy_ai::providers::ProviderFormat,
+    max_body_size: Option<usize>,
+    idem_skip_reason: Option<&'static str>,
+    capture: Option<AiIdempotencyCapture>,
+    inbound_format: Option<&str>,
+) -> Result<()> {
+    let status = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let resp_body = read_capped_response_body(resp, max_body_size).await?;
+    let translated = sbproxy_ai::translators::translate_response_bytes(format, &resp_body);
+    let translated = sbproxy_ai::format::rewrap_response_for_inbound(inbound_format, &translated);
+
+    // Record into the idempotency cache before serving the response
+    // so the cache entry is durable even if the client disconnects
+    // mid-body. Honour the response body cap: bodies above the cap
+    // skip the record and the SKIPPED-OVERSIZE-RESPONSE marker is
+    // stamped instead.
+    let (final_skip_reason, capture_for_record) = match capture {
+        Some(cap) => {
+            if translated.len() > cap.idem.max_response_body_bytes {
+                debug!(
+                    body_len = translated.len(),
+                    cap = cap.idem.max_response_body_bytes,
+                    "AI proxy: idempotency response body exceeds cap; abandoning cache record"
+                );
+                (Some("SKIPPED-OVERSIZE-RESPONSE"), None)
+            } else {
+                (idem_skip_reason, Some(cap))
+            }
+        }
+        None => (idem_skip_reason, None),
+    };
+
+    // Build the outgoing response. We do not relay every upstream
+    // header (matches the existing `send_response` contract); we do
+    // stamp the skip marker so dashboards see the disengagement.
+    let extra: Option<(&'static str, &'static str)> =
+        final_skip_reason.map(|r| ("x-sbproxy-idempotency", r));
+    send_response_with_extra(session, status, &content_type, &translated, extra).await?;
+
+    if let Some(cap) = capture_for_record {
+        // Capture the bytes the client actually saw (post-translation).
+        // Headers in the cached entry mirror what we send back: at
+        // minimum the content-type so a replay surfaces the same
+        // shape. Skip framing headers Pingora will recompute.
+        let headers: Vec<(String, String)> =
+            vec![("content-type".to_string(), content_type.clone())];
+        cap.record(status, headers, translated);
+    }
+
+    Ok(())
+}
+
+/// Variant of [`send_response`] that accepts a single optional extra
+/// header (name, value). Used by the AI gateway path to stamp
+/// `x-sbproxy-idempotency: <reason>` on the outgoing response when
+/// the middleware disengaged.
+pub(super) async fn send_response_with_extra(
+    session: &mut Session,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    extra: Option<(&str, &str)>,
+) -> Result<()> {
+    let cap = if extra.is_some() { 3 } else { 2 };
+    let mut header = pingora_http::ResponseHeader::build(status, Some(cap)).map_err(|e| {
+        Error::because(
+            ErrorType::InternalError,
+            "failed to build response header",
+            e,
+        )
+    })?;
+    header
+        .insert_header("content-type", content_type)
+        .map_err(|e| Error::because(ErrorType::InternalError, "failed to set content-type", e))?;
+    header
+        .insert_header("content-length", body.len().to_string())
+        .map_err(|e| Error::because(ErrorType::InternalError, "failed to set content-length", e))?;
+    if let Some((name, value)) = extra {
+        let _ = header.insert_header(name.to_string(), value.to_string());
+    }
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(bytes::Bytes::copy_from_slice(body)), true)
+        .await?;
+    Ok(())
+}
+
+/// Handle an AI proxy request by forwarding to the upstream provider via reqwest.
+///
+/// This function:
+/// 1. Reads the request body from the Pingora session
+/// 2. Parses the JSON body to extract model name and stream flag
+/// 3. Selects a provider via the configured routing strategy
+/// 4. Maps the model name if a model_map is configured
+/// 5. Forwards the request to the provider's API
+/// 6. Relays the response back to the client (streaming or non-streaming)
+///
+/// WOR-229: Build the bypass body for a native-format upstream call.
+///
+/// `original` is the inbound native bytes (Anthropic Messages JSON
+/// today). `resolved_model` is the post-`map_model` model name the
+/// router chose. The helper rewrites `body["model"]` in the native
+/// JSON when it differs from the original, then reserialises. When no
+/// remap is needed (the common case for native-native traffic where
+/// operators do not configure a model_map), the original bytes are
+/// returned as-is so the request truly is a byte forward.
+pub(super) fn make_native_bypass_body(
+    original: &bytes::Bytes,
+    resolved_model: &str,
+) -> Result<bytes::Bytes, serde_json::Error> {
+    if resolved_model.is_empty() {
+        return Ok(original.clone());
+    }
+    let mut parsed: serde_json::Value = serde_json::from_slice(original)?;
+    let existing = parsed.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    if existing == resolved_model {
+        return Ok(original.clone());
+    }
+    parsed["model"] = serde_json::Value::String(resolved_model.to_string());
+    let remapped = serde_json::to_vec(&parsed)?;
+    Ok(bytes::Bytes::from(remapped))
+}
