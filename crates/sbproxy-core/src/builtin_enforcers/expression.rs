@@ -108,11 +108,24 @@ impl PolicyEnforcer for ExpressionEnforcer {
             no_cache: ctx.flags.no_cache,
             extra: &ctx.flags.extra,
         };
+        // WOR-589: expose the agent-detection verdict (WOR-706 stamps it
+        // on ctx when proxy.extensions.agent_detect is enabled) so CEL
+        // policies can branch on `request.agent.score` etc.
+        let agent_detect_view = ctx.agent_detection.as_ref().map(|ad| {
+            sbproxy_extension::cel::context::AgentDetectView {
+                score: ad.score,
+                agent_id: ad.agent_id.as_deref(),
+                provenance: ad.provenance.as_str(),
+                confidence: ad.confidence,
+                signals_used: &ad.signals_used,
+            }
+        });
         let views = sbproxy_modules::ExpressionViews {
             aipref: ctx.aipref.as_ref(),
             kya: kya_view,
             ml: ml_view,
             features: Some(features_view),
+            agent_detect: agent_detect_view,
         };
 
         let allowed = policy.evaluate_with_views(
