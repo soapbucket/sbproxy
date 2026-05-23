@@ -72,4 +72,4 @@ pub mod synthetic;
 pub mod wave8;
 
 // Re-export the main entry point for convenience.
-pub use server::run;
+pub use server::{run, GraceConfig};

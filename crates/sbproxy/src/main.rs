@@ -41,34 +41,29 @@ fn main() {
         .compact()
         .init();
 
-    // Resolve --grace-time / SB_GRACE_TIME and stash it as an env var the
-    // core picks up when constructing the Pingora server config. We pass
-    // this through the environment rather than threading a new function
-    // arg so existing callers of `sbproxy_core::run` keep working.
-    if let Some(grace) = resolve_grace_time(&args) {
-        env::set_var("SB_GRACE_TIME", grace.to_string());
-    }
-
-    // WOR-636: resolve `--shutdown-grace-ms` /
-    // `SBPROXY_SHUTDOWN_GRACE_MS` and stash it in the environment so
-    // `sbproxy_core::run` can pick it up. The binary overlays a 30s
-    // default so orchestrators (kubelet, systemd, docker) get a sane
-    // drain window without setting any env var; the in-process
-    // default inside `sbproxy_core` stays at zero so the Go e2e
-    // runner can rebind the listener between test cases.
-    let resolved_ms = resolve_shutdown_grace_ms(&args).or_else(|| {
-        // If the legacy `--grace-time` / `SB_GRACE_TIME` is set,
-        // do not overlay the 30s default: respect what the
-        // operator asked for.
-        if resolve_grace_time(&args).is_some() {
+    // WOR-646: resolve the graceful-shutdown grace period from the CLI
+    // flags / env the operator set (`--grace-time` / `SB_GRACE_TIME`,
+    // and the WOR-636 `--shutdown-grace-ms` / `SBPROXY_SHUTDOWN_GRACE_MS`)
+    // and pass it to `sbproxy_core::run` as a parameter, rather than
+    // re-exporting it as a process env var for the core to read back.
+    // The binary overlays a 30s default for `shutdown_grace_ms` so
+    // orchestrators (kubelet, systemd, docker) get a sane drain window
+    // without setting any env var; the in-process default inside
+    // `sbproxy_core` stays at zero so the Go e2e runner can rebind the
+    // listener between test cases. The legacy `--grace-time` suppresses
+    // that 30s overlay so the operator's explicit value wins.
+    let grace_time_secs = resolve_grace_time(&args);
+    let shutdown_grace_ms = resolve_shutdown_grace_ms(&args).or({
+        if grace_time_secs.is_some() {
             None
         } else {
             Some(DEFAULT_SHUTDOWN_GRACE_MS)
         }
     });
-    if let Some(ms) = resolved_ms {
-        env::set_var("SBPROXY_SHUTDOWN_GRACE_MS", ms.to_string());
-    }
+    let grace = sbproxy_core::GraceConfig {
+        shutdown_grace_ms,
+        grace_time_secs,
+    };
 
     // WOR-114: lock off the per-request feature-flag surface for
     // production hardening. CLI flag wins; otherwise honour
@@ -197,7 +192,7 @@ fn main() {
 
     match config_path {
         Some(path) => {
-            if let Err(e) = sbproxy_core::run(&path) {
+            if let Err(e) = sbproxy_core::run(&path, grace) {
                 eprintln!("Fatal: {e:#}");
                 std::process::exit(1);
             }

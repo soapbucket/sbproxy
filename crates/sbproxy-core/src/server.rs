@@ -14282,6 +14282,22 @@ pub(crate) fn resolve_shutdown_grace_seconds(ms_var: Option<&str>, sec_var: Opti
     0
 }
 
+/// Graceful-shutdown grace-period inputs for [`run`] (WOR-646).
+///
+/// The binary (`crates/sbproxy/src/main.rs`) resolves these from its
+/// CLI flags / env (`--shutdown-grace-ms` / `SBPROXY_SHUTDOWN_GRACE_MS`
+/// and `--grace-time` / `SB_GRACE_TIME`) and passes them in explicitly,
+/// rather than re-exporting them as process env vars for `run` to read
+/// back. Both `None` means the in-process default of zero (instant
+/// shutdown), which the Go e2e runner and dev loops rely on.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct GraceConfig {
+    /// Preferred source: shutdown grace in milliseconds (WOR-636).
+    pub shutdown_grace_ms: Option<u64>,
+    /// Legacy source: grace in whole seconds (`SB_GRACE_TIME`).
+    pub grace_time_secs: Option<u64>,
+}
+
 /// Spawn a background thread that subscribes to the Pingora server's
 /// `execution_phase_watch` broadcast and emits structured tracing
 /// events at each transition. WOR-636.
@@ -14392,12 +14408,13 @@ fn spawn_shutdown_phase_logger(
 /// `spawn_shutdown_phase_logger`) so a structured tracing event is
 /// emitted when a shutdown signal arrives; operators can grep for
 /// `shutdown_signal_received` in the logs to see the drain start.
-/// The grace period is resolved by `resolve_shutdown_grace_seconds`
-/// from `SBPROXY_SHUTDOWN_GRACE_MS` (preferred) or `SB_GRACE_TIME`
-/// (legacy). The file watcher handles config reload on file change,
+/// The grace period comes from the [`GraceConfig`] the binary passes
+/// in (preferring `shutdown_grace_ms` over `grace_time_secs`), resolved
+/// to seconds by `resolve_shutdown_grace_seconds`. The file watcher
+/// handles config reload on file change,
 /// which is equivalent to SIGHUP-based reload in traditional
 /// servers.
-pub fn run(config_path: &str) -> anyhow::Result<()> {
+pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     use pingora_core::apps::HttpServerOptions;
     use pingora_core::server::configuration::ServerConf as PingoraServerConf;
     use pingora_core::server::Server;
@@ -14719,10 +14736,13 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
     // threads don't block on syscalls. Tier-2 tuning from
     // sbproxy-bench/docs/TUNING.md. Two pools is the Pingora-recommended
     // starting point for 8+ core machines.
-    let grace_seconds = resolve_shutdown_grace_seconds(
-        std::env::var("SBPROXY_SHUTDOWN_GRACE_MS").ok().as_deref(),
-        std::env::var("SB_GRACE_TIME").ok().as_deref(),
-    );
+    // WOR-646: grace inputs are passed in explicitly by the binary
+    // rather than read back from process env. The string-taking helper
+    // is reused as-is (it also tolerates malformed input from any other
+    // caller); a resolved u64 always reparses cleanly.
+    let grace_ms = grace.shutdown_grace_ms.map(|m| m.to_string());
+    let grace_secs = grace.grace_time_secs.map(|s| s.to_string());
+    let grace_seconds = resolve_shutdown_grace_seconds(grace_ms.as_deref(), grace_secs.as_deref());
     // Worker thread count. `SB_WORKER_THREADS` (when a positive
     // integer) overrides the auto-detected value; otherwise we use
     // `std::thread::available_parallelism()`, which honours cgroup
