@@ -20,7 +20,19 @@ use sbproxy_classifier_client::{ClassifierClient, ClassifierClientError};
 use serde::Deserialize;
 
 use super::detector::{DetectionLabel, DetectionResult, Detector};
-use super::onnx::classify_score;
+
+/// Map a `[0,1]` injection score onto the v2 label vocabulary. Owned by
+/// the sidecar detector (the in-process ONNX detector that previously
+/// shared it was removed in WOR-612).
+fn classify_score(score: f64, threshold: f64) -> DetectionLabel {
+    if score >= threshold {
+        DetectionLabel::Injection
+    } else if score >= 0.3 {
+        DetectionLabel::Suspicious
+    } else {
+        DetectionLabel::Clean
+    }
+}
 
 /// Config name selecting this detector (`detector: "sidecar"`).
 pub const SIDECAR_DETECTOR_NAME: &str = "sidecar";

@@ -32,13 +32,11 @@
 //! ```
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Instant;
 
 use sbproxy_modules::{
     classification_cache_stats, evaluate_body, reset_classification_cache, BodyAwareConfig,
-    BodyAwareOutcome, DetectionLabel, OnnxDetector, PromptInjectionV2Outcome,
-    PromptInjectionV2Policy,
+    BodyAwareOutcome, DetectionLabel, PromptInjectionV2Outcome, PromptInjectionV2Policy,
 };
 
 /// Locate the workspace `eval/prompt_injection` directory regardless of
@@ -185,94 +183,6 @@ fn heuristic_baseline_meets_precision_and_recall_thresholds() {
         recall,
         merged.tp,
         merged.fn_
-    );
-}
-
-/// ONNX detector eval. Skipped unless `SBPROXY_ONNX_MODEL` and
-/// `SBPROXY_ONNX_TOKENIZER` point at local files.
-///
-/// Gate: precision and recall both >= 0.9 against the OWASP corpus,
-/// false-positive rate < 2% against the clean corpus.
-#[test]
-#[ignore = "requires SBPROXY_ONNX_MODEL + SBPROXY_ONNX_TOKENIZER env vars"]
-fn onnx_detector_meets_target() {
-    let model = match std::env::var("SBPROXY_ONNX_MODEL") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!(
-                "SBPROXY_ONNX_MODEL not set; skipping. Provide model + tokenizer paths to gate."
-            );
-            return;
-        }
-    };
-    let tokenizer = match std::env::var("SBPROXY_ONNX_TOKENIZER") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("SBPROXY_ONNX_TOKENIZER not set; skipping.");
-            return;
-        }
-    };
-    let injection_label =
-        std::env::var("SBPROXY_ONNX_INJECTION_LABEL").unwrap_or_else(|_| "INJECTION".to_string());
-
-    // Load directly from local files so the test does not depend on
-    // network or cache-dir state.
-    let labels = vec!["SAFE".to_string(), injection_label.clone()];
-    let classifier = match sbproxy_classifiers::OnnxClassifier::load_with_labels(
-        std::path::Path::new(&model),
-        std::path::Path::new(&tokenizer),
-        Some(labels),
-    ) {
-        Ok(c) => Arc::new(c),
-        Err(e) => panic!("ONNX classifier load failed: {e}"),
-    };
-    let detector = OnnxDetector::from_classifier(classifier, 0.5, injection_label);
-    let policy = PromptInjectionV2Policy::with_detector(Arc::new(detector)).with_threshold(0.5);
-    let injections = load_all_injections();
-    let cleans = load_all_cleans();
-
-    let pos = evaluate(&policy, &injections, true);
-    let neg = evaluate(&policy, &cleans, false);
-    let merged = Counts {
-        tp: pos.tp,
-        fn_: pos.fn_,
-        fp: neg.fp,
-        tn: neg.tn,
-    };
-
-    let precision = merged.precision();
-    let recall = merged.recall();
-    let fpr = if (merged.fp + merged.tn) == 0 {
-        0.0
-    } else {
-        merged.fp as f64 / (merged.fp + merged.tn) as f64
-    };
-
-    eprintln!(
-        "onnx eval: tp={} fp={} tn={} fn={} precision={:.3} recall={:.3} fpr={:.3}",
-        merged.tp, merged.fp, merged.tn, merged.fn_, precision, recall, fpr
-    );
-
-    assert!(
-        precision >= 0.9,
-        "precision {:.3} below 0.9 (tp={}, fp={})",
-        precision,
-        merged.tp,
-        merged.fp
-    );
-    assert!(
-        recall >= 0.9,
-        "recall {:.3} below 0.9 (tp={}, fn={})",
-        recall,
-        merged.tp,
-        merged.fn_
-    );
-    assert!(
-        fpr < 0.02,
-        "false-positive rate {:.3} above 2% (fp={}, tn={})",
-        fpr,
-        merged.fp,
-        merged.tn
     );
 }
 

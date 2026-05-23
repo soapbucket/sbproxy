@@ -92,7 +92,6 @@ directory (with its `sb.yml` and README). Generated from `examples/` on 2026-05-
 | [outlier-detection](outlier-detection/) | A round-robin load balancer with two targets: `httpbin.org` and `httpbingo.org`. The `outlier_detection` block tracks each target's success/ |
 | [page-shield](page-shield/) | Client-side script monitoring via Content Security Policy report intake. The `page_shield` policy stamps a `Content-Security-Policy-Report-O |
 | [pii-redaction](pii-redaction/) | When `pii.enabled: true` is set on an AI proxy origin, the gateway redacts well-known PII shapes from the parsed JSON request body before fo |
-| [prompt-injection-onnx](prompt-injection-onnx/) | Two origins demonstrating the `prompt_injection_v2` policy with an ONNX-backed neural classifier. The `tag.local` origin runs in `tag` mode  |
 | [prompt-injection-sidecar](prompt-injection-sidecar/) | Two origins demonstrating the `prompt_injection_v2` policy with the out-of-process `sidecar` detector: inference runs in a separate process over gRPC instead of in the proxy, isolating the model runtime. Shows `fail_closed` allow-vs-deny and `tag` vs `block`. |
 | [prompt-injection-v2](prompt-injection-v2/) | The successor to the v1 `prompt_injection` heuristic guardrail. The v2 policy splits detection from enforcement: a swappable detector return |
 | [quote-token-replay-jwks](quote-token-replay-jwks/) | Demonstrates the quote-token JWKS endpoint, end-to-end JWS |

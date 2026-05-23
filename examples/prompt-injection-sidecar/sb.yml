@@ -1,7 +1,7 @@
 # prompt_injection_v2 with the out-of-process sidecar detector.
 #
-# Instead of loading an ONNX model inside the proxy (`detector: onnx`),
-# this routes detection to a separate process over gRPC. The proxy
+# Instead of loading an ONNX model inside the proxy, this routes
+# detection to a separate process over gRPC. The proxy
 # holds one client and sends the prompt to a sidecar that implements
 # the shared InferenceService contract; the sidecar runs the model and
 # returns a label and score. The model runtime is isolated from request
@@ -56,8 +56,7 @@ origins:
           # on the first request after the sidecar comes online.
           timeout_ms: 250
           # Fail-open: if the sidecar is down or slow, treat the prompt
-          # as clean and let the request through. This is the default
-          # and matches the in-process onnx detector.
+          # as clean and let the request through. This is the default.
           fail_closed: false
 
   # block mode with fail-closed: requests are rejected on an injection

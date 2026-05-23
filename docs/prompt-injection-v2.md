@@ -1,5 +1,5 @@
 # prompt_injection_v2
-*Last modified: 2026-05-22*
+*Last modified: 2026-05-23*
 
 Successor to the v1 `prompt_injection` heuristic guardrail. The v2
 policy splits *detection* from *enforcement*: a swappable detector
@@ -51,7 +51,6 @@ pre-loads state at startup, not in `detect` itself.
 | Name | Description |
 |------|-------------|
 | `heuristic-v1` | Case-insensitive substring matching against the OWASP-LLM-01 vocabulary plus a small "suspicious" cue list. Default; works out of the box. |
-| `onnx` | Pure-Rust ONNX inference via `tract-onnx`. Loads a Hugging Face style classifier from a configurable URL, validates SHA-256, caches on disk, and falls back to the heuristic on any load failure. See [onnx-classifier.md](onnx-classifier.md). |
 | `sidecar` | Runs inference in a separate process over gRPC instead of in the proxy. The proxy holds one client; the sidecar (minimal OSS or richer enterprise) implements the shared `InferenceService`. Isolates the model runtime so a bad model cannot exhaust the proxy. Fail-open by default. See [Running detection out of process](#running-detection-out-of-process-the-sidecar-detector). |
 
 ## Registering a custom detector
@@ -122,54 +121,39 @@ thresholds are intentionally lower than the eventual ONNX target
 measure final detector quality. Bump the thresholds when the ONNX
 classifier lands.
 
-## OSS vs enterprise: what ships and what runs in CI
+## In-process vs out-of-process model inference
 
-The ONNX inference code in
-`crates/sbproxy-modules/src/policy/prompt_injection_v2/onnx.rs` ships
-in the OSS build. Operators with their own trained model and tokenizer
-files can wire them up by setting `detector: onnx` plus
-`detector_config.model_url` and `detector_config.tokenizer_url` (with
-optional SHA-256 pinning). The `tract-onnx` runtime is statically
-linked, so no system dependency is required.
+The OSS build ships only the heuristic detector in-process. Model
+inference runs out of process in the classifier sidecar, never inside
+the proxy: parsing and running a model graph on the proxy's own heap
+lets a malformed or oversized model exhaust proxy memory (WOR-612), so
+that path was removed. `detector: sidecar` is the supported way to run a
+learned classifier; `detector: onnx` is no longer accepted and fails at
+config load with a pointer to the sidecar.
 
-The trained model weights themselves do not ship in OSS. There is no
-default model URL baked into the build, and no model artifact is
-included in any release asset.
-
-The ONNX-gated eval test at
-`crates/sbproxy-modules/tests/prompt_injection_eval.rs` is
-`#[ignore]`-gated and additionally guarded by the
-`SBPROXY_ONNX_MODEL` and `SBPROXY_ONNX_TOKENIZER` environment
-variables. When those variables are unset the test exits early with a
-SKIP message, which is the case for every job in the OSS CI
-pipeline. The enterprise CI pipeline has access to the trained model
-and tokenizer and exercises the test on every change to the v2
-detector.
+The trained model weights do not ship in OSS. There is no default model
+baked into the build and no model artifact in any release asset; you
+supply the ONNX file and tokenizer to the sidecar.
 
 The heuristic detector's quality gate (precision and recall >= 0.7
-against the bundled golden corpora) runs unconditionally in the
-default OSS test suite via the same test file. That gate is what
-guards against regressions to the OSS-shipped detector; the ONNX gate
-guards the enterprise classifier.
+against the bundled golden corpora) runs unconditionally in the default
+OSS test suite via
+`crates/sbproxy-modules/tests/prompt_injection_eval.rs`. That gate
+guards the OSS-shipped detector against regressions.
 
 ## Running detection out of process: the sidecar detector
 
-`detector: onnx` loads the model inside the proxy. That keeps the
-request path simple, but the proxy then parses and runs a model graph
-on its own heap. A malformed or oversized model can exhaust proxy
-memory, and the model runtime competes with request serving for CPU.
-
-The `sidecar` detector moves inference into a separate process. The
+A learned classifier runs in a separate process, not in the proxy. The
 proxy holds one gRPC client and sends the prompt to a sidecar that
 implements the `InferenceService` contract; the sidecar runs the model
-and returns a label and score. The proxy and the model runtime no
-longer share an address space, so a bad model takes down the sidecar,
-which an orchestrator restarts, rather than the proxy.
+and returns a label and score. Because the proxy and the model runtime
+do not share an address space, a bad model takes down the sidecar (which
+an orchestrator restarts) rather than the proxy.
 
 Two sidecars implement the same contract:
 
-- The minimal OSS sidecar (`sbproxy-classifier-sidecar`) wraps the same
-  `tract-onnx` engine the in-process `onnx` detector uses.
+- The minimal OSS sidecar (`sbproxy-classifier-sidecar`) wraps the
+  `tract-onnx` engine.
 - The enterprise sidecar adds batching, GPU execution providers, and a
   model registry behind the identical proto.
 
@@ -207,9 +191,7 @@ A sidecar that is down, slower than `timeout_ms`, or returning an error
 is handled by `fail_closed`:
 
 - `fail_closed: false` (default) returns a clean verdict and lets the
-  request through, so an inference outage never blocks traffic. This
-  matches the in-process `onnx` detector, which also degrades to clean
-  on a model error.
+  request through, so an inference outage never blocks traffic.
 - `fail_closed: true` returns a high-confidence injection. Pair this
   with `action: block` only when a missing verdict should deny the
   request, and budget for the sidecar's availability accordingly.
@@ -219,7 +201,7 @@ is handled by `fail_closed`:
 The sidecar is a separate binary built from this workspace. The OSS
 build does not ship model weights; supply your own ONNX file and
 tokenizer (the `protectai/deberta-v3-base-prompt-injection-v2`
-artifacts the `onnx` detector uses work here too):
+artifacts work well):
 
 ```bash
 cargo run -p sbproxy-classifier-sidecar -- \

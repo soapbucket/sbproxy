@@ -4,7 +4,7 @@ Two origins demonstrating the `prompt_injection_v2` policy with the out-of-proce
 
 ## Run
 
-The OSS build does not ship model weights, so supply your own ONNX model and tokenizer. The `protectai/deberta-v3-base-prompt-injection-v2` artifacts used by the `onnx` detector work here too.
+The OSS build does not ship model weights, so supply your own ONNX model and tokenizer. The `protectai/deberta-v3-base-prompt-injection-v2` artifacts work well.
 
 Start the sidecar:
 

@@ -33,12 +33,11 @@ pub use policy::{
     DdosCheckResult, DdosPolicy, DetectionLabel, DetectionResult, Detector, DlpAction,
     DlpDirection, DlpPolicy, DlpScanResult, ExposedCredsAction, ExposedCredsPolicy,
     ExposedCredsResult, ExpressionPolicy, ExpressionViews, InMemoryLedger, LedgerError, Money,
-    OnnxDetector, OpenApiValidationMode, OpenApiValidationPolicy, OpenApiValidationResult,
-    PageShieldMode, PageShieldPolicy, PaywallPosition, Policy, PromptInjectionAction,
-    PromptInjectionV2Outcome, PromptInjectionV2Policy, RateLimitInfo, RateLimitPolicy,
-    RedeemResult, SecHeadersPolicy, SecurityHeader, SriCheckResult, SriPolicy, SriViolation,
-    SriViolationReason, ThreatProtection, Tier, WafResult, HEURISTIC_DETECTOR_NAME,
-    ONNX_DETECTOR_NAME,
+    OpenApiValidationMode, OpenApiValidationPolicy, OpenApiValidationResult, PageShieldMode,
+    PageShieldPolicy, PaywallPosition, Policy, PromptInjectionAction, PromptInjectionV2Outcome,
+    PromptInjectionV2Policy, RateLimitInfo, RateLimitPolicy, RedeemResult, SecHeadersPolicy,
+    SecurityHeader, SriCheckResult, SriPolicy, SriViolation, SriViolationReason, ThreatProtection,
+    Tier, WafResult, HEURISTIC_DETECTOR_NAME,
 };
 #[cfg(feature = "http-ledger")]
 pub use policy::{HttpLedger, HttpLedgerConfig};
