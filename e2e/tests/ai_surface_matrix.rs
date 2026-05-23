@@ -167,3 +167,74 @@ fn openai_embeddings_is_forwarded_to_upstream() {
         "OpenAI-format embeddings pass through unchanged"
     );
 }
+
+// WOR-752 Finding B: an unrecognized path against a translated-format
+// (Anthropic) provider must 501 rather than forward verbatim to an
+// upstream that cannot interpret it.
+#[test]
+fn unknown_path_on_translated_provider_returns_501() {
+    let upstream = MockUpstream::start(json!({"unused": true})).expect("mock");
+    let harness = ProxyHarness::start_with_yaml(&config_for(
+        "anthropic",
+        "claude.localhost",
+        &upstream.base_url(),
+    ))
+    .expect("start proxy");
+
+    let resp = harness
+        .post_json(
+            "/v1/widgets",
+            "claude.localhost",
+            &json!({"anything": true}),
+            &[],
+        )
+        .expect("post");
+
+    assert_eq!(
+        resp.status, 501,
+        "unknown path on an Anthropic-only origin must 501, not verbatim-forward; got {}",
+        resp.status
+    );
+    assert!(
+        upstream.captured().is_empty(),
+        "a 501'd unknown path must not reach the upstream"
+    );
+}
+
+// Forward-compat preserved: an unrecognized path against an OpenAI-format
+// provider still passes through verbatim (a new OpenAI path the catalog
+// has not learned yet keeps working).
+#[test]
+fn unknown_path_on_openai_provider_is_forwarded() {
+    let upstream = MockUpstream::start(json!({"ok": true})).expect("mock");
+    let harness = ProxyHarness::start_with_yaml(&config_for(
+        "openai",
+        "openai.localhost",
+        &upstream.base_url(),
+    ))
+    .expect("start proxy");
+
+    let resp = harness
+        .post_json(
+            "/v1/widgets",
+            "openai.localhost",
+            &json!({"anything": true}),
+            &[],
+        )
+        .expect("post");
+
+    assert_eq!(
+        resp.status, 200,
+        "unknown path on an OpenAI origin should pass through (forward-compat); got {}",
+        resp.status
+    );
+    let captured = upstream.captured();
+    assert!(
+        !captured.is_empty(),
+        "openai unknown path must reach the upstream"
+    );
+    assert_eq!(
+        captured[0].path, "/v1/widgets",
+        "OpenAI-format unknown path passes through unchanged"
+    );
+}

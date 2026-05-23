@@ -4339,6 +4339,35 @@ async fn handle_ai_proxy(
         }
     }
 
+    // WOR-752 Finding B: an unrecognized (`Unknown`) path can only be
+    // forwarded verbatim. That is correct forward-compat for an
+    // OpenAI-format upstream (a new OpenAI path the catalog has not
+    // learned yet still works), but for a translated-format provider
+    // (Anthropic / Google / Bedrock) the upstream expects a different
+    // wire shape and path, so a verbatim forward is guaranteed to fail
+    // with a confusing upstream error (the #240 class). 501 the unknown
+    // path when no configured provider is OpenAI-format, rather than
+    // forwarding a doomed request.
+    if matches!(surface, sbproxy_ai::handler::AiSurface::Unknown) {
+        let has_passthrough = config.providers.iter().any(|p| {
+            sbproxy_ai::client::provider_format(p) == sbproxy_ai::providers::ProviderFormat::OpenAi
+        });
+        if !has_passthrough {
+            warn!(
+                ai.surface = surface_label,
+                method = %method_str,
+                "AI proxy: unrecognized path with no OpenAI-format provider to pass it through; returning 501"
+            );
+            send_error(
+                session,
+                501,
+                "unrecognized AI path: no OpenAI-compatible provider is configured to handle it",
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
     // Build a router for provider selection.
     let router = AiRouter::new(config.routing.clone(), config.providers.len());
 
