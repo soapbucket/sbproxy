@@ -468,6 +468,77 @@ pub fn populate_tls_namespace(ctx: &mut CelContext, view: &TlsFingerprintView<'_
     ctx.set("request", CelValue::Map(request_map));
 }
 
+/// Borrowed view over the agent-detection verdict exposed to CEL under
+/// `request.agent` (WOR-589). The caller (`sbproxy-core`) owns the
+/// strings on `RequestContext.agent_detection`, so this borrows rather
+/// than clones.
+///
+/// Empty / absent fields render as the zero value (`0`, `""`, `[]`) so
+/// expressions can write `request.agent.score >= 80` without first
+/// probing for presence.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentDetectView<'a> {
+    /// Agent-origin probability, 0-100.
+    pub score: u8,
+    /// Named agent id when a rule matched, else `None` (renders `""`).
+    pub agent_id: Option<&'a str>,
+    /// Provenance tier: `signed` / `unsigned-named` / `unsigned-anonymous`.
+    pub provenance: &'a str,
+    /// Scorer confidence, 0.0-1.0.
+    pub confidence: f32,
+    /// Names of the signals the scorer consulted (audit trail).
+    pub signals_used: &'a [String],
+}
+
+/// Stamp the [`AgentDetectView`] under `request.agent.*` (WOR-589).
+///
+/// Exposed bindings:
+///
+/// - `request.agent.score` - int 0-100.
+/// - `request.agent.id` - named agent id string or `""`.
+/// - `request.agent.provenance` - tier string.
+/// - `request.agent.confidence` - float 0.0-1.0.
+/// - `request.agent.signals_used` - list of strings.
+///
+/// Idempotent: re-invoking overwrites the previous values so request-
+/// and response-time CEL evaluations can share one context.
+pub fn populate_agent_detect_namespace(ctx: &mut CelContext, view: &AgentDetectView<'_>) {
+    let mut agent_map = HashMap::with_capacity(5);
+    agent_map.insert("score".to_string(), CelValue::Int(i64::from(view.score)));
+    agent_map.insert(
+        "id".to_string(),
+        CelValue::String(view.agent_id.unwrap_or("").to_string()),
+    );
+    agent_map.insert(
+        "provenance".to_string(),
+        CelValue::String(view.provenance.to_string()),
+    );
+    agent_map.insert(
+        "confidence".to_string(),
+        CelValue::Float(f64::from(view.confidence)),
+    );
+    agent_map.insert(
+        "signals_used".to_string(),
+        CelValue::List(
+            view.signals_used
+                .iter()
+                .map(|s| CelValue::String(s.clone()))
+                .collect(),
+        ),
+    );
+
+    let request_var = ctx
+        .variables
+        .remove("request")
+        .unwrap_or_else(|| CelValue::Map(HashMap::new()));
+    let mut request_map = match request_var {
+        CelValue::Map(m) => m,
+        _ => HashMap::new(),
+    };
+    request_map.insert("agent".to_string(), CelValue::Map(agent_map));
+    ctx.set("request", CelValue::Map(request_map));
+}
+
 /// Wave 8 envelope dimensions exposed to CEL. Borrowed view so the
 /// caller's RequestContext owns the strings and the CEL builder
 /// avoids cloning. Empty / `None` fields render as the zero value
@@ -1263,6 +1334,69 @@ mod tests {
             .unwrap());
         assert!(engine
             .eval_bool_source(r#"request.tls.trustworthy == false"#, &ctx)
+            .unwrap());
+    }
+
+    // --- AgentDetectView (WOR-589) tests ---
+
+    #[test]
+    fn agent_detect_namespace_exposes_score_id_provenance_confidence_signals() {
+        let mut ctx = build_request_context("GET", "/", &HeaderMap::new(), None, None, "h.com");
+        let signals = vec![
+            "http.user_agent".to_string(),
+            "http.header_order".to_string(),
+        ];
+        let view = AgentDetectView {
+            score: 95,
+            agent_id: Some("claude-code-cli"),
+            provenance: "unsigned-named",
+            confidence: 0.9,
+            signals_used: &signals,
+        };
+        populate_agent_detect_namespace(&mut ctx, &view);
+
+        let engine = CelEngine::new();
+        assert!(engine
+            .eval_bool_source("request.agent.score >= 80", &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source(r#"request.agent.id == "claude-code-cli""#, &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source(r#"request.agent.provenance == "unsigned-named""#, &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source("request.agent.confidence > 0.8", &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source("size(request.agent.signals_used) == 2", &ctx)
+            .unwrap());
+    }
+
+    #[test]
+    fn agent_detect_namespace_defaults_render_as_zero_values() {
+        // Unscored verdict: score 0, empty id, empty signals. Expressions
+        // still evaluate without nil errors.
+        let mut ctx = build_request_context("GET", "/", &HeaderMap::new(), None, None, "h.com");
+        let signals: Vec<String> = Vec::new();
+        let view = AgentDetectView {
+            score: 0,
+            agent_id: None,
+            provenance: "unsigned-anonymous",
+            confidence: 0.0,
+            signals_used: &signals,
+        };
+        populate_agent_detect_namespace(&mut ctx, &view);
+
+        let engine = CelEngine::new();
+        assert!(engine
+            .eval_bool_source("request.agent.score == 0", &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source("size(request.agent.id) == 0", &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source("size(request.agent.signals_used) == 0", &ctx)
             .unwrap());
     }
 

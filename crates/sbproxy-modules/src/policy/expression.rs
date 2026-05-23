@@ -165,6 +165,13 @@ impl ExpressionPolicy {
             sbproxy_extension::cel::context::populate_features_namespace(&mut ctx, flags);
         }
 
+        // WOR-589: stamp the agent-detection verdict whenever the scorer
+        // ran (proxy.extensions.agent_detect.enabled). Absent `agent_detect`
+        // leaves `request.agent.*` unset.
+        if let Some(agent) = views.agent_detect.as_ref() {
+            sbproxy_extension::cel::context::populate_agent_detect_namespace(&mut ctx, agent);
+        }
+
         match engine.compile(&self.expression) {
             Ok(expr) => engine.eval_bool(&expr, &ctx).unwrap_or(false),
             Err(_) => true, // Fail open on compile error only
@@ -194,6 +201,12 @@ pub struct ExpressionViews<'a> {
     /// Default `None` keeps existing call sites that have not yet
     /// threaded `RequestContext.flags` through compiling.
     pub features: Option<sbproxy_extension::cel::context::FeatureFlagsView<'a>>,
+    /// WOR-589 agent-detection verdict view. When `Some`,
+    /// `populate_agent_detect_namespace` runs and CEL expressions can
+    /// branch on `request.agent.score`, `request.agent.id`, etc. Default
+    /// `None` leaves the namespace unset (every `request.agent.*` access
+    /// yields the engine's zero value).
+    pub agent_detect: Option<sbproxy_extension::cel::context::AgentDetectView<'a>>,
 }
 
 #[cfg(test)]
