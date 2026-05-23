@@ -643,6 +643,14 @@ pub struct RequestContext {
     /// See [`sbproxy_tls::TlsFingerprint`].
     pub tls_fingerprint: Option<sbproxy_tls::TlsFingerprint>,
 
+    /// Agent-detection verdict for this request (WOR-499). `None` unless
+    /// `proxy.extensions.agent_detect.enabled` is set, in which case the
+    /// pipeline runs the configured scorer in `request_filter` and stores
+    /// the result here for the scripting bridges (`request.agent.*`) and the
+    /// `trust_tier` combiner to read. See
+    /// [`sbproxy_agent_detect::AgentDetection`].
+    pub agent_detection: Option<sbproxy_agent_detect::AgentDetection>,
+
     // --- Wave 5 / G5.4 headless detection ---
     //
     // Populated by `sbproxy_security::headless_detect` after the
@@ -854,6 +862,7 @@ impl RequestContext {
             rsl_urn: None,
             citation_required: None,
             tls_fingerprint: None,
+            agent_detection: None,
             headless_signal: None,
             a2a: None,
             a2a_denial_body: None,

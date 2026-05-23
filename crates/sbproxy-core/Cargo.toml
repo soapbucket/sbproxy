@@ -64,6 +64,12 @@ sbproxy-cache.workspace = true
 sbproxy-platform.workspace = true
 sbproxy-openapi.workspace = true
 sbproxy-security.workspace = true
+# Agent-detect engine (WOR-499). The pipeline runs the scorer per request
+# when enabled and stashes the AgentDetection on the request context for the
+# scripting bridges and the trust_tier combiner. Non-optional: behaviour is
+# gated by a default-off config flag, not a cargo feature, so server.rs stays
+# free of #[cfg] noise on the hot path.
+sbproxy-agent-detect.workspace = true
 # Optional: only pulled in when the `agent-class` feature is on. The
 # request context references `sbproxy_classifiers::AgentId` etc., and
 # the scripting bridges read those types to expose `request.agent_id`.

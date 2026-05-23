@@ -8148,6 +8148,49 @@ impl ProxyHttp for SbProxy {
             }
         }
 
+        // --- WOR-706 wire: agent-detect scorer ---
+        //
+        // When `proxy.extensions.agent_detect.enabled` is set, build the
+        // TLS + HTTP signal bag from the context the pipeline already has
+        // (TLS fingerprint stamped above; headers read here) and run the
+        // rule-pack scorer. The verdict lands on `ctx.agent_detection` for
+        // the scripting bridges (`request.agent.*`, WOR-589) and the
+        // `trust_tier` combiner to read. Payload signals need a buffered
+        // body and are a follow-up; the TLS + HTTP extractors are cheap and
+        // allocation-light. Default off, so deployments that do not enable
+        // agent detection skip this block entirely.
+        {
+            let pipeline = reload::current_pipeline();
+            if pipeline.agent_detect_config.enabled {
+                if let Some(loader) = reload::agent_detect_loader() {
+                    let tls = ctx
+                        .tls_fingerprint
+                        .as_ref()
+                        .map(sbproxy_agent_detect::TlsSignals::from);
+                    let req = session.req_header();
+                    let cookie_persistence = req.headers.contains_key(http::header::COOKIE);
+                    let http = Some(sbproxy_agent_detect::extract_http_signals(
+                        req.headers
+                            .iter()
+                            .map(|(name, value)| (name.as_str(), value.to_str().unwrap_or(""))),
+                        cookie_persistence,
+                    ));
+                    let signals = sbproxy_agent_detect::Signals {
+                        tls,
+                        http,
+                        payload: None,
+                    };
+                    // A rule miss is a clean unsigned-anonymous verdict
+                    // (score 0), not the absence of a result.
+                    let detection = loader
+                        .pack()
+                        .evaluate(&signals)
+                        .unwrap_or_else(sbproxy_agent_detect::AgentDetection::unscored);
+                    ctx.agent_detection = Some(detection);
+                }
+            }
+        }
+
         // --- Wave 5 / A5.2 wire: ML classifier dispatch ---
         //
         // Run the registered ML classifier hooks after the rule-based
@@ -14462,6 +14505,34 @@ pub fn run(config_path: &str) -> anyhow::Result<()> {
                     error = %e,
                     "failed to load embedded TLS fingerprint catalogue; headless detection disabled"
                 );
+            }
+        }
+    }
+
+    // --- WOR-706: install agent-detect rule-pack loader ---
+    //
+    // When `proxy.extensions.agent_detect.enabled` is set with a
+    // `rule_pack_path`, load the ADRF pack once and install the loader so
+    // `request_filter` can run the scorer. A load failure (or a missing
+    // path) degrades to no detection (the request_filter block
+    // short-circuits when no loader is installed) rather than blocking
+    // serving, matching the TLS-catalogue block above.
+    {
+        let agent_detect_cfg =
+            crate::pipeline::AgentDetectConfig::from_extensions(&compiled.server.extensions);
+        if agent_detect_cfg.enabled {
+            match agent_detect_cfg.rule_pack_path.as_deref() {
+                Some(path) => match sbproxy_agent_detect::RulePackLoader::open(path) {
+                    Ok(loader) => reload::set_agent_detect_loader(loader),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        path = %path,
+                        "failed to load agent-detect rule pack; agent detection disabled",
+                    ),
+                },
+                None => tracing::warn!(
+                    "agent_detect.enabled is set but rule_pack_path is unset; agent detection disabled",
+                ),
             }
         }
     }
