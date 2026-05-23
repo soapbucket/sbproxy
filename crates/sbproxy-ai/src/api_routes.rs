@@ -143,18 +143,26 @@ pub fn provider_supports_surface(provider: &str, surface: &crate::handler::AiSur
         // Anthropic: only chat + models (above). Everything else is false.
         ("anthropic", _) => false,
 
-        // Gemini and Vertex: embeddings, image generation, audio,
-        // reranking. No assistants, threads, batches, fine_tuning
-        // (Gemini has fine-tuning but at a different path; not the
-        // OpenAI shape), files in the OpenAI sense, realtime, image
-        // edits/variations, moderations. Vertex AI sits on the same
-        // Google API family so its surface matrix mirrors Gemini.
-        ("gemini" | "vertex", AiSurface::Embeddings) => true,
-        ("gemini" | "vertex", AiSurface::ImageGeneration) => true,
-        ("gemini" | "vertex", AiSurface::AudioTranscription) => true,
-        ("gemini" | "vertex", AiSurface::AudioSpeech) => true,
-        ("gemini" | "vertex", AiSurface::Reranking) => true,
-        ("gemini" | "vertex", _) => false,
+        // Vertex AI exposes an OpenAI-compatible endpoint (catalog
+        // `format: openai`), so these surfaces pass through unchanged
+        // like any OpenAI-compatible provider.
+        ("vertex", AiSurface::Embeddings) => true,
+        ("vertex", AiSurface::ImageGeneration) => true,
+        ("vertex", AiSurface::AudioTranscription) => true,
+        ("vertex", AiSurface::AudioSpeech) => true,
+        ("vertex", AiSurface::Reranking) => true,
+        ("vertex", _) => false,
+
+        // Gemini (Google wire format) is translated, not passed through.
+        // Only chat completions has a Google translator today (the
+        // universal arm above also covers models/messages/responses).
+        // Embeddings, image generation, audio, and reranking have no
+        // Google translator, so claiming support here would forward the
+        // request verbatim to a path Gemini does not expose (WOR-752
+        // Finding A, the same class as #240). Return false so the
+        // gateway 501s instead of forwarding a doomed request; the
+        // non-chat Gemini translators are tracked separately.
+        ("gemini", _) => false,
 
         // Bedrock: chat + models only (above). The other OpenAI
         // surfaces don't map onto Bedrock's API family.
@@ -537,40 +545,47 @@ mod tests {
     }
 
     #[test]
-    fn surface_matrix_gemini_supports_correct_subset() {
+    fn surface_matrix_gemini_supports_only_translated_chat_surfaces() {
         use crate::handler::AiSurface;
-        // True for these:
+        // Gemini is the Google wire format and only has a chat-completions
+        // translator; chat + the inbound shims (Messages/Responses, which
+        // translate down to chat) work, and models is universal.
         for surface in &[
-            AiSurface::Embeddings,
-            AiSurface::ImageGeneration,
-            AiSurface::AudioTranscription,
-            AiSurface::AudioSpeech,
-            AiSurface::Reranking,
+            AiSurface::ChatCompletions,
+            AiSurface::Models,
+            AiSurface::Messages,
+            AiSurface::Responses,
         ] {
             assert!(
                 provider_supports_surface("gemini", surface),
                 "gemini should support {surface:?}"
             );
         }
-        // False for these:
+        // WOR-752 Finding A: these have no Google translator, so the
+        // gateway must 501 rather than forward verbatim to a path Gemini
+        // does not expose.
         for surface in &[
+            AiSurface::Embeddings,
+            AiSurface::ImageGeneration,
+            AiSurface::AudioTranscription,
+            AiSurface::AudioSpeech,
+            AiSurface::Reranking,
             AiSurface::Assistants,
             AiSurface::Threads,
-            AiSurface::Batches,
-            AiSurface::FineTuning,
-            AiSurface::Realtime,
             AiSurface::Moderations,
         ] {
             assert!(
                 !provider_supports_surface("gemini", surface),
-                "gemini should not advertise support for {surface:?}"
+                "gemini must not advertise {surface:?} without a translator (Finding A)"
             );
         }
     }
 
     #[test]
-    fn surface_matrix_vertex_matches_gemini() {
+    fn surface_matrix_vertex_passthrough_diverges_from_gemini() {
         use crate::handler::AiSurface;
+        // Vertex is OpenAI-format passthrough (catalog format: openai), so
+        // it keeps the extra surfaces gemini (translated) cannot serve.
         for surface in &[
             AiSurface::ChatCompletions,
             AiSurface::Models,
@@ -598,6 +613,10 @@ mod tests {
                 "vertex should not advertise support for {surface:?}"
             );
         }
+        // The Finding A divergence: vertex (passthrough) advertises
+        // surfaces that gemini (translated, no translator) must not.
+        assert!(provider_supports_surface("vertex", &AiSurface::Embeddings));
+        assert!(!provider_supports_surface("gemini", &AiSurface::Embeddings));
     }
 
     #[test]
