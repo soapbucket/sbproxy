@@ -232,6 +232,7 @@ There are **no Python or Node runtime dependencies** in the gateway hot path. Th
 
 - We do not vendor dependencies into the repo (no `vendor/` directory) because it obscures provenance. The SBOM and Cargo.lock are the canonical record.
 - We use `cargo-deny` (configured in `deny.toml`) in CI to enforce: license allowlist, advisory-database checks (RustSec), and source allowlist.
+- The advisory gate detects unmaintained crates across the whole graph (`unmaintained = "all"`), including transitive ones. Each unmaintained finding must be triaged in the `deny.toml` `[advisories] ignore` list with a named owner, the transitive path, and a revisit trigger; a new untriaged unmaintained crate fails the gate. The current entries (six transitive `unmaintained` advisories, all carrying upstream dependency owners) are documented inline in `deny.toml`; they are not vulnerabilities and `cargo audit` reports zero vulnerabilities.
 - We do not consume crates from non-`crates.io` sources without explicit reviewer approval.
 
 ---

@@ -34,11 +34,14 @@ feature-depth = 1
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "warn"
-# `unmaintained` is a scope setting in cargo-deny v0.16+. "workspace" reports
-# only when a workspace crate directly depends on an unmaintained crate;
-# transitive unmaintained findings are not gating. Triage them via the
-# warning output in CI rather than blocking unrelated PRs.
-unmaintained = "workspace"
+# `unmaintained` is a scope setting in cargo-deny v0.16+. "all" detects every
+# unmaintained crate in the graph, including transitive ones, and gates on
+# them. We use "all" so each unmaintained finding must be explicitly triaged
+# in the `ignore` list below with a named owner and a revisit trigger, rather
+# than silently warned-and-forgotten. New transitive unmaintained crates that
+# are not yet triaged will fail the gate, which is the intended signal: decide
+# and document before merging (see WOR-616).
+unmaintained = "all"
 ignore = [
   # Tracked transitive findings. Each entry should carry a comment naming
   # the crate, the pulling-in dependency, and the fix plan. Remove entries
@@ -54,6 +57,53 @@ ignore = [
   # prometheus to a protobuf-3.x line; CI re-gates automatically once
   # Cargo.lock updates.
   "RUSTSEC-2024-0437",
+
+  # --- WOR-616: unmaintained transitive crates -----------------------------
+  # The following six advisories are all `unmaintained`-class warnings (not
+  # active vulnerabilities; `cargo audit` reports 0 vulnerabilities). Each
+  # crate enters the graph transitively through a direct dependency we cannot
+  # patch from here, and none has a maintained drop-in replacement reachable
+  # without an upstream bump. We ignore them so the supply-chain gate stays
+  # green while keeping an owner and a revisit trigger per entry. Reassess at
+  # each dependency bump; remove the entry once the named direct dep stops
+  # pulling the crate.
+
+  # RUSTSEC-2025-0012: backoff 0.4.0. Path: backoff -> kube-runtime -> kube
+  # (direct dep) -> sbproxy-k8s-operator. Unmaintained, no maintained
+  # replacement reachable; transitive; revisit when kube updates.
+  "RUSTSEC-2025-0012",
+
+  # RUSTSEC-2025-0069: daemonize 0.5.0. Path: daemonize -> pingora-core
+  # (direct dep, latest published pingora 0.8). Unmaintained, no maintained
+  # replacement reachable; transitive; revisit when pingora updates.
+  "RUSTSEC-2025-0069",
+
+  # RUSTSEC-2024-0388: derivative 2.2.0. Paths: derivative -> pingora-core
+  # (direct dep) and derivative -> kube-runtime -> kube (direct dep).
+  # Unmaintained, no maintained replacement reachable; transitive; revisit
+  # when pingora and kube update.
+  "RUSTSEC-2024-0388",
+
+  # RUSTSEC-2024-0384: instant 0.1.13. Paths: instant -> notify-types ->
+  # notify (direct dep) and instant -> backoff -> kube-runtime -> kube
+  # (direct dep). Unmaintained, no maintained replacement reachable;
+  # transitive; revisit when notify and kube update.
+  "RUSTSEC-2024-0384",
+
+  # RUSTSEC-2024-0436: paste 1.0.15. Paths: paste -> tract-* -> tract-onnx
+  # (direct dep) and paste -> tokenizers (direct dep), both via
+  # sbproxy-classifiers. Unmaintained, no maintained replacement reachable;
+  # transitive; revisit when tract-onnx and tokenizers update.
+  "RUSTSEC-2024-0436",
+
+  # RUSTSEC-2025-0134: rustls-pemfile 2.2.0. Paths: rustls-pemfile ->
+  # pingora-rustls -> pingora-core (direct dep), -> object_store (direct
+  # dep), -> kube-client -> kube (direct dep), and -> axum-server (direct
+  # dep). The workspace's own direct rustls-pemfile use is already retired in
+  # favor of rustls-pki-types; only these transitive copies remain.
+  # Unmaintained, no maintained replacement reachable; transitive; revisit
+  # when pingora, object_store, kube, and axum-server update.
+  "RUSTSEC-2025-0134",
 ]
 
 # --- Licenses -----------------------------------------------------------------
