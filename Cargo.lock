@@ -5844,6 +5844,7 @@ dependencies = [
  "rand 0.8.6",
  "regex",
  "reqwest",
+ "sbproxy-agent-detect",
  "sbproxy-ai",
  "sbproxy-cache",
  "sbproxy-classifiers",

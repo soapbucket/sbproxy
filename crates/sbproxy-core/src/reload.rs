@@ -272,6 +272,35 @@ pub fn tls_fingerprint_catalog(
     TLS_FINGERPRINT_CATALOG.get().map(|swap| swap.load())
 }
 
+// --- Agent-detect rule-pack loader singleton (WOR-706) ---
+//
+// The binary loads the ADRF rule pack once at startup from
+// `proxy.extensions.agent_detect.rule_pack_path` and installs the loader
+// here. `request_filter` reads the compiled pack via the loader when
+// agent detection is enabled. The loader owns its own `ArcSwap`, so a
+// SIGHUP reload swaps the pack contents in place without replacing this
+// slot; that is why the slot is `OnceLock` rather than `RwLock`.
+
+/// Global agent-detect rule-pack loader, populated at startup when
+/// `proxy.extensions.agent_detect.rule_pack_path` is set. `None`
+/// otherwise; `request_filter` short-circuits on `None`.
+static AGENT_DETECT_LOADER: OnceLock<Arc<sbproxy_agent_detect::RulePackLoader>> = OnceLock::new();
+
+/// Install the process-wide agent-detect rule-pack loader. Idempotent: a
+/// later call after the first wins is ignored, so a config hot-reload of
+/// the rule-pack *path* keeps the original loader. The pack *contents*
+/// still hot-reload through the loader's own `ArcSwap` via `reload()`.
+pub fn set_agent_detect_loader(loader: sbproxy_agent_detect::RulePackLoader) {
+    let _ = AGENT_DETECT_LOADER.set(Arc::new(loader));
+}
+
+/// Borrow the global agent-detect rule-pack loader, when one is installed.
+/// Returns `None` before `set_agent_detect_loader` runs (e.g. when the
+/// rule-pack path is unset or in tests that bypass the binary entrypoint).
+pub fn agent_detect_loader() -> Option<&'static Arc<sbproxy_agent_detect::RulePackLoader>> {
+    AGENT_DETECT_LOADER.get()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

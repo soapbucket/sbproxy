@@ -689,6 +689,51 @@ impl TlsFingerprintConfig {
     }
 }
 
+/// Agent-detect engine configuration (WOR-499), read from
+/// `proxy.extensions.agent_detect`.
+///
+/// `enabled: false` (the default) keeps the scorer out of the request
+/// path entirely, so deployments that do not use agent detection pay
+/// nothing. When enabled, `request_filter` builds the TLS + HTTP signal
+/// bag, runs the rule-pack scorer, and stores the verdict on the request
+/// context for the scripting bridges (`request.agent.*`) and the
+/// `trust_tier` combiner.
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+pub struct AgentDetectConfig {
+    /// Master switch. `false` (the default) disables the scorer.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the ADRF YAML rule pack. When unset the scorer runs with
+    /// an empty pack (every request scores as unsigned-anonymous);
+    /// operators normally point this at their pack.
+    #[serde(default)]
+    pub rule_pack_path: Option<String>,
+}
+
+impl AgentDetectConfig {
+    /// Build from the parsed `proxy.extensions.agent_detect` block.
+    /// Returns the disabled default when the block is absent or fails to
+    /// parse; a parse error warns rather than failing the whole compile,
+    /// matching [`TlsFingerprintConfig::from_extensions`].
+    pub fn from_extensions(
+        extensions: &std::collections::HashMap<String, serde_yaml::Value>,
+    ) -> Self {
+        let Some(block) = extensions.get("agent_detect") else {
+            return Self::default();
+        };
+        match serde_yaml::from_value::<AgentDetectConfig>(block.clone()) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "proxy.extensions.agent_detect failed to parse; agent detection disabled",
+                );
+                Self::default()
+            }
+        }
+    }
+}
+
 /// Compiled idempotency middleware bound to a single origin.
 ///
 /// Built once at config-compile time and held by [`CompiledPipeline`]
@@ -810,6 +855,9 @@ pub struct CompiledPipeline {
     /// operator's deployment that lacks a TLS-terminating sidecar does
     /// not pay the parse cost.
     pub tls_fingerprint_config: TlsFingerprintConfig,
+    /// Agent-detect engine config (WOR-499). When `enabled = false`
+    /// (the default) the scorer never runs in `request_filter`.
+    pub agent_detect_config: AgentDetectConfig,
     /// Opt-in switch for raw CSP-report logging.
     ///
     /// CSP reports may carry URLs with embedded credentials, session
@@ -874,6 +922,7 @@ impl Default for CompiledPipeline {
             hooks: crate::hooks::Hooks::default(),
             trusted_proxy_cidrs: Vec::new(),
             tls_fingerprint_config: TlsFingerprintConfig::default(),
+            agent_detect_config: AgentDetectConfig::default(),
             page_shield_raw_report_log: false,
             upstream_allow_private_cidrs: Vec::new(),
             config_revision: String::new(),
@@ -1087,6 +1136,7 @@ impl CompiledPipeline {
         // migration also fills from legacy features.tls_fingerprint).
         let tls_fingerprint_config =
             TlsFingerprintConfig::from_extensions(&config.server.extensions);
+        let agent_detect_config = AgentDetectConfig::from_extensions(&config.server.extensions);
 
         // --- Page Shield raw-report opt-in ---
         // CSP reports default to redacted-only structured logs. The
@@ -1146,6 +1196,7 @@ impl CompiledPipeline {
             hooks: crate::hooks::Hooks::default(),
             trusted_proxy_cidrs,
             tls_fingerprint_config,
+            agent_detect_config,
             page_shield_raw_report_log,
             upstream_allow_private_cidrs,
             config_revision,
@@ -2532,6 +2583,45 @@ origins: {}
         assert_eq!(trustworthy_cidrs.len(), 1);
         let untrusted_cidrs = tls.untrusted_cidrs();
         assert_eq!(untrusted_cidrs.len(), 1);
+    }
+
+    // --- WOR-706: AgentDetectConfig roundtrip tests ---
+
+    #[test]
+    fn agent_detect_config_default_is_disabled() {
+        let cfg = AgentDetectConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.rule_pack_path.is_none());
+    }
+
+    #[test]
+    fn agent_detect_config_absent_block_is_disabled() {
+        // No proxy.extensions.agent_detect at all: disabled default.
+        let yaml = "proxy:\n  http_bind_port: 8080\norigins: {}\n";
+        let cfg = sbproxy_config::compile_config(yaml).expect("compile");
+        let ad = AgentDetectConfig::from_extensions(&cfg.server.extensions);
+        assert!(!ad.enabled);
+        assert!(ad.rule_pack_path.is_none());
+    }
+
+    #[test]
+    fn agent_detect_config_round_trips_from_extensions_block() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  extensions:
+    agent_detect:
+      enabled: true
+      rule_pack_path: /etc/sbproxy/agents.yml
+origins: {}
+"#;
+        let cfg = sbproxy_config::compile_config(yaml).expect("compile");
+        let ad = AgentDetectConfig::from_extensions(&cfg.server.extensions);
+        assert!(ad.enabled);
+        assert_eq!(
+            ad.rule_pack_path.as_deref(),
+            Some("/etc/sbproxy/agents.yml")
+        );
     }
 
     #[test]
