@@ -56,7 +56,6 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [feature-flags.md](feature-flags.md) - the sticky-bucketing flag store plus the `flag_enabled(name, key)` CEL helper.
 - [routing-strategies.md](routing-strategies.md) - the `RoutingStrategy` trait: opt-in extension point for custom upstream selection inside `load_balancer`.
 - [openapi-validation.md](openapi-validation.md) - the `openapi_validation` policy: validating request bodies against an OpenAPI 3.0 document at startup.
-- [onnx-classifier.md](onnx-classifier.md) - the `sbproxy-classifiers` ONNX inference path and Hugging Face tokenizer wrapper used by learned detectors.
 - [enterprise.md](enterprise.md) - what the enterprise tier adds on top of the OSS data plane and how to request access.
 - [glossary.md](glossary.md) - vocabulary used in this documentation set.
 - [headers-reference.md](headers-reference.md) - every response header the proxy can emit, with the config that triggers it.

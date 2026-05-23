@@ -102,8 +102,8 @@ pub use peer_pricing_preflight::{
 pub use prompt_injection_v2::{
     classification_cache_stats, evaluate_body, reset_classification_cache, BodyAwareConfig,
     BodyAwareOutcome, ClassificationCacheStats, DetectionLabel, DetectionResult, Detector,
-    OnnxDetector, PromptInjectionAction, PromptInjectionV2Outcome, PromptInjectionV2Policy,
-    HEURISTIC_DETECTOR_NAME, ONNX_DETECTOR_NAME,
+    PromptInjectionAction, PromptInjectionV2Outcome, PromptInjectionV2Policy,
+    HEURISTIC_DETECTOR_NAME,
 };
 pub use quote_token::{
     InMemoryNonceStore, IssuedQuote, NonceCheck, NonceContext, NonceError, NonceStore, QuoteClaims,

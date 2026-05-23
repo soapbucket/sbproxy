@@ -10,7 +10,7 @@ The successor to the v1 `prompt_injection` heuristic guardrail. The v2 policy sp
 sbproxy serve -f sb.yml
 ```
 
-The example wires three hostnames (`tag.local`, `block.local`, `log.local`) so you can see all three actions side by side. To swap to a probabilistic detector that an enterprise build may register, set `detector: onnx-deberta` and provide the model via `SBPROXY_ONNX_MODEL` (see example 100).
+The example wires three hostnames (`tag.local`, `block.local`, `log.local`) so you can see all three actions side by side. To swap to a probabilistic detector, run the classifier sidecar and set `detector: sidecar` (see the [prompt-injection-sidecar](../prompt-injection-sidecar/) example).
 
 ## Try it
 
@@ -59,6 +59,5 @@ curl -s -H 'Host: log.local' \
 ## See also
 
 - [docs/prompt-injection-v2.md](../../docs/prompt-injection-v2.md)
-- [docs/onnx-classifier.md](../../docs/onnx-classifier.md)
 - [docs/ai-gateway.md](../../docs/ai-gateway.md)
 - [docs/features.md](../../docs/features.md)

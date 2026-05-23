@@ -110,8 +110,8 @@ impl KnownModel {
 /// SHA-256 hashes are deliberately empty in the initial landing of
 /// this registry: the build sandbox where this code is reviewed has
 /// no outbound network access and we will not commit a hash we have
-/// not verified. The downstream detector (`OnnxDetector::from_config`)
-/// treats an unpinned entry as "skip SHA validation"; operators who
+/// not verified. The model loader treats an unpinned entry as "skip
+/// SHA validation"; operators who
 /// run the proxy in production should populate the hashes locally on
 /// first download (the file lands in the on-disk cache and you can
 /// `sha256sum` it) and submit a follow-up PR with the values, or set

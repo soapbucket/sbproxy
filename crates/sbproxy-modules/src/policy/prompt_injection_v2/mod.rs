@@ -16,7 +16,6 @@
 mod body_aware;
 mod detector;
 mod heuristic;
-mod onnx;
 mod sidecar;
 
 pub use body_aware::{
@@ -28,7 +27,6 @@ pub use detector::{
     DetectorFactory,
 };
 pub use heuristic::{HeuristicDetector, HEURISTIC_DETECTOR_NAME};
-pub use onnx::{OnnxDetector, ONNX_DETECTOR_NAME};
 pub use sidecar::{SidecarDetector, SIDECAR_DETECTOR_NAME};
 
 use std::sync::Arc;
@@ -206,12 +204,20 @@ impl PromptInjectionV2Policy {
                 raw.threshold
             ));
         }
-        // Detectors that need configuration (currently only the
-        // ONNX detector) go through their own constructor so we can
-        // forward `detector_config` and apply graceful-degradation
-        // policy. Everything else uses the zero-arg inventory factory.
-        let detector = if raw.detector == onnx::ONNX_DETECTOR_NAME {
-            onnx::OnnxDetector::from_config(&raw.detector_config)
+        // The sidecar detector needs configuration (endpoint, model,
+        // fail policy) so it goes through its own constructor that
+        // forwards `detector_config`. Everything else uses the zero-arg
+        // inventory factory.
+        let detector = if raw.detector == "onnx" {
+            // WOR-612: the in-process ONNX detector was removed so the
+            // proxy never parses a model graph in its own address space
+            // (a malicious/oversized model could OOM it). Run the
+            // classifier sidecar and select `detector: "sidecar"` instead.
+            return Err(anyhow!(
+                "prompt_injection_v2 detector \"onnx\" (in-process ONNX) was removed: \
+                 run the classifier sidecar and use detector: \"sidecar\" instead \
+                 (see docs/prompt-injection-v2.md)"
+            ));
         } else if raw.detector == sidecar::SIDECAR_DETECTOR_NAME {
             sidecar::SidecarDetector::from_config(&raw.detector_config)?
         } else {
