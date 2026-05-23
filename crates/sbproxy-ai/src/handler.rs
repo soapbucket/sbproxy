@@ -394,7 +394,16 @@ impl AiResilienceConfig {
 impl AiHandlerConfig {
     /// Build from a generic JSON value.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
-        Ok(serde_json::from_value(value)?)
+        let config: Self = serde_json::from_value(value)?;
+        // WOR-603: validate each provider's base_url at config load so an
+        // SSRF target (file://, link-local metadata, loopback, ...) fails
+        // fast here rather than being dispatched at request time.
+        for provider in &config.providers {
+            provider
+                .validate_base_url()
+                .map_err(|e| anyhow::anyhow!("ai provider {:?} base_url: {e}", provider.name))?;
+        }
+        Ok(config)
     }
 
     /// Number of provider attempts allowed for one client request.

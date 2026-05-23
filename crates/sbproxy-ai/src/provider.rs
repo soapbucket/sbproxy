@@ -58,6 +58,14 @@ pub struct ProviderConfig {
     /// rewrites the upstream `Host`.
     #[serde(default)]
     pub disable_forwarded_host_header: bool,
+    /// Allow this provider's `base_url` to point at a private/loopback
+    /// address (WOR-603). Defaults to `false`: a `base_url` resolving to
+    /// a loopback, link-local, or RFC1918 target is rejected at config
+    /// load as an SSRF risk. Set `true` for a local model server
+    /// (Ollama, vLLM, LM Studio on `127.0.0.1`/LAN). Non-`http(s)`
+    /// schemes (`file://`, ...) are always rejected regardless.
+    #[serde(default)]
+    pub allow_private_base_url: bool,
 }
 
 fn default_weight() -> u32 {
@@ -80,6 +88,44 @@ impl ProviderConfig {
         get_provider_info(ptype)
             .map(|info| info.default_base_url)
             .unwrap_or_else(|| "http://localhost:8080/v1".to_string())
+    }
+
+    /// Validate an operator-supplied `base_url` for SSRF safety (WOR-603).
+    ///
+    /// When no `base_url` is set the provider uses a registry default
+    /// (a known-good public URL), so there is nothing to check. When one
+    /// is set:
+    ///
+    /// - Non-`http(s)` schemes (`file://`, `gopher://`, ...) are always
+    ///   rejected.
+    /// - By default the URL must not target a private/loopback/link-local
+    ///   address (blocks `http://169.254.169.254/`, `http://127.0.0.1/`,
+    ///   internal hosts), via [`sbproxy_security::ssrf::validate_url`].
+    /// - When `allow_private_base_url` is set, the private-address block is
+    ///   skipped (for a local model server) but the scheme check still
+    ///   applies.
+    ///
+    /// # Errors
+    ///
+    /// Returns the human-readable reason the URL was rejected.
+    pub fn validate_base_url(&self) -> Result<(), String> {
+        let Some(url) = self.base_url.as_deref() else {
+            return Ok(());
+        };
+        if self.allow_private_base_url {
+            // Operator opted into a local/private model server. Still
+            // reject non-http(s) schemes; allow any host/IP otherwise.
+            let parsed =
+                reqwest::Url::parse(url).map_err(|e| format!("invalid base_url {url:?}: {e}"))?;
+            match parsed.scheme() {
+                "http" | "https" => Ok(()),
+                other => Err(format!(
+                    "base_url {url:?}: blocked scheme {other:?}; only http/https are permitted"
+                )),
+            }
+        } else {
+            sbproxy_security::ssrf::validate_url(url)
+        }
     }
 
     /// Get the auth header name and formatted value for this provider.
@@ -134,6 +180,7 @@ mod tests {
             api_version: None,
             host_override: None,
             disable_forwarded_host_header: false,
+            allow_private_base_url: false,
         }
     }
 
@@ -309,5 +356,60 @@ mod tests {
     fn effective_base_url_ollama() {
         let p = make_provider("ollama");
         assert_eq!(p.effective_base_url(), "http://localhost:11434/v1");
+    }
+
+    // --- WOR-603: base_url SSRF validation ---
+
+    fn provider_with_base_url(url: &str, allow_private: bool) -> ProviderConfig {
+        let mut p = make_provider("custom");
+        p.base_url = Some(url.to_string());
+        p.allow_private_base_url = allow_private;
+        p
+    }
+
+    #[test]
+    fn base_url_none_is_ok() {
+        // No override -> registry default -> nothing to validate.
+        assert!(make_provider("openai").validate_base_url().is_ok());
+    }
+
+    #[test]
+    fn base_url_public_https_is_ok() {
+        assert!(provider_with_base_url("https://8.8.8.8/v1", false)
+            .validate_base_url()
+            .is_ok());
+    }
+
+    #[test]
+    fn base_url_file_scheme_rejected_even_when_private_allowed() {
+        // Non-http(s) is always blocked, regardless of allow_private.
+        assert!(provider_with_base_url("file:///etc/passwd", false)
+            .validate_base_url()
+            .is_err());
+        assert!(provider_with_base_url("file:///etc/passwd", true)
+            .validate_base_url()
+            .is_err());
+    }
+
+    #[test]
+    fn base_url_link_local_metadata_rejected_by_default() {
+        // The classic SSRF target: cloud metadata at 169.254.169.254.
+        assert!(
+            provider_with_base_url("http://169.254.169.254/latest/meta-data", false)
+                .validate_base_url()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn base_url_loopback_rejected_by_default_but_allowed_with_opt_in() {
+        // A local model server: blocked by default, allowed when the
+        // operator opts in (e.g. Ollama on 127.0.0.1).
+        assert!(provider_with_base_url("http://127.0.0.1:11434/v1", false)
+            .validate_base_url()
+            .is_err());
+        assert!(provider_with_base_url("http://127.0.0.1:11434/v1", true)
+            .validate_base_url()
+            .is_ok());
     }
 }

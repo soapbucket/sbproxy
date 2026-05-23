@@ -13,6 +13,7 @@ origins:
         - name: mock-openai
           api_key: test-key
           base_url: http://127.0.0.1:18889/v1
+          allow_private_base_url: true
           models:
             - gpt-4o-mini
             - error-model

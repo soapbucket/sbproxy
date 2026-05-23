@@ -119,6 +119,20 @@ providers:
 
 Local and self-hosted OpenAI-compatible runtimes are first-class providers in the registry: `ollama`, `vllm`, `tgi`, `lmstudio`, and `llamacpp`. Each has a sensible default `base_url` matching the runtime's convention. Override `base_url` if you bind elsewhere. See [example 86](../examples/local-models/sb.yml) for a hybrid local-plus-cloud config that falls back from a local Ollama to OpenAI when local is offline.
 
+### base_url validation and local servers
+
+An overridden `base_url` is validated at config load to keep it from becoming an SSRF vector. Non-`http(s)` schemes (`file://`, ...) are always rejected, and by default a URL that targets a loopback, link-local, or private (RFC 1918) address is rejected too, so a stray `http://169.254.169.254/` or `http://127.0.0.1/` fails fast instead of being dispatched at request time.
+
+A local model server is the legitimate exception: it lives on `127.0.0.1` or a LAN address. Set `allow_private_base_url: true` on that provider to permit its private `base_url`. The scheme check still applies. Providers that use a registry default (no `base_url` override) are unaffected.
+
+```yaml
+providers:
+  - name: local-ollama
+    provider_type: ollama
+    base_url: http://127.0.0.1:11434/v1
+    allow_private_base_url: true
+```
+
 ## See also
 
 - [AI gateway](ai-gateway.md) - routing strategies, guardrails, budgets, streaming.
