@@ -33,9 +33,29 @@ use std::time::{Duration, Instant};
 use serde_yaml::Value as Yaml;
 use tempfile::NamedTempFile;
 
-/// Default startup wait window. Release builds usually bind quickly,
-/// but shared CI runners can be CPU-starved by concurrent cargo builds.
-const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default startup wait window. This is a ceiling, not a fixed sleep:
+/// `wait_for_ready` polls the HTTP readiness probe every 50 ms and
+/// returns the instant the proxy answers, so a healthy boot costs well
+/// under a second. The ceiling only matters when the machine is starved,
+/// which is exactly the local-gate case: e2e runs right after the full
+/// workspace build, so the box is hot and the freshly spawned proxy can
+/// take several seconds to bring its accept loop live. 10 s was too tight
+/// there (it flaked two auth_basic tests); 30 s gives headroom without
+/// slowing healthy runs. Override with `SBPROXY_E2E_STARTUP_TIMEOUT_SECS`
+/// on an unusually slow host.
+const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Resolve the startup wait window: `SBPROXY_E2E_STARTUP_TIMEOUT_SECS`
+/// when it is set to a positive integer, otherwise
+/// [`DEFAULT_STARTUP_TIMEOUT`].
+fn startup_timeout() -> Duration {
+    std::env::var("SBPROXY_E2E_STARTUP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_STARTUP_TIMEOUT)
+}
 
 /// Locate the `sbproxy` binary built by the workspace. Prefers the
 /// release build at `target/release/sbproxy`; falls back to
@@ -152,7 +172,7 @@ impl ProxyHarness {
             _workspace: None,
             client: std::sync::OnceLock::new(),
         };
-        harness.wait_for_ready(DEFAULT_STARTUP_TIMEOUT)?;
+        harness.wait_for_ready(startup_timeout())?;
         Ok(harness)
     }
 
@@ -202,7 +222,7 @@ impl ProxyHarness {
             _workspace: Some(tmp),
             client: std::sync::OnceLock::new(),
         };
-        harness.wait_for_ready(DEFAULT_STARTUP_TIMEOUT)?;
+        harness.wait_for_ready(startup_timeout())?;
         Ok(harness)
     }
 
@@ -1036,7 +1056,20 @@ mod tests {
 
     #[test]
     fn default_startup_timeout_tolerates_busy_release_boots() {
-        assert_eq!(DEFAULT_STARTUP_TIMEOUT, Duration::from_secs(10));
+        // Generous ceiling for a proxy spawned on a box hot from the
+        // pre-e2e workspace build; a healthy boot still answers the probe
+        // in well under a second, so this does not slow healthy runs.
+        assert!(DEFAULT_STARTUP_TIMEOUT >= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn startup_timeout_falls_back_to_default_without_env() {
+        // With the override unset, the resolver returns the default. (We
+        // do not mutate the env here: env is process-global and these
+        // tests run in parallel.)
+        if std::env::var("SBPROXY_E2E_STARTUP_TIMEOUT_SECS").is_err() {
+            assert_eq!(startup_timeout(), DEFAULT_STARTUP_TIMEOUT);
+        }
     }
 
     #[test]
