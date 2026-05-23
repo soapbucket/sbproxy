@@ -1,6 +1,6 @@
 # Glossary
 
-*Last modified: 2026-05-04*
+*Last modified: 2026-05-23*
 
 A plain-English mapping of the acronyms and protocol names that appear
 in SBproxy commits, configuration, and documentation. If you have ever
@@ -12,7 +12,7 @@ in the context of this proxy, this is the page.
 | OLP                 | Open Licensing Protocol                              | A four-step flow for publishers to advertise a licence catalogue, agents to discover it, and the gateway to issue licence tokens (`jti` claims) bound to a licence row. The verifier ships in OSS via the AI crawl control policy; the issuer is enterprise-side. |
 | CAP                 | Crawler Authorization Protocol                       | A JWT-based capability-token format that an agent presents in `CAP-Token:` or `Authorization: CAP <jwt>`. The OSS verifier checks signature, claims, audience, glob-allowed paths, and (optionally) per-token rate limits. The issuer ships enterprise-side. |
 | MCP                 | Model Context Protocol                               | The Anthropic-originated tool-and-resource catalogue protocol. SBproxy ships an MCP federation action that aggregates tool catalogues across upstream MCP servers and routes `tools/call` per tool. |
-| x402                | x402 protocol (Coinbase et al.)                      | A stablecoin-on-chain payment rail riding HTTP 402. SBproxy emits x402 challenge entries in multi-rail 402 responses and verifies redemption tokens via the x402 facilitator. v2 is supported; v1 is rejected with a typed error. |
+| x402                | x402 protocol (Linux Foundation x402 Foundation)     | A stablecoin-on-chain payment rail riding HTTP 402. x402 moved to a Linux Foundation project on 2026-04-02. SBproxy emits x402 challenge entries in multi-rail 402 responses and verifies redemption tokens via the x402 facilitator. v2 is supported; v1 is rejected with a typed error. |
 | MPP                 | Merchant Payment Protocol                            | The card-and-stablecoin-on-Stripe payment rail. SBproxy emits MPP challenge entries that carry a Stripe `payment_intent` id; redemption confirms against Stripe. |
 | DPoP                | Demonstration of Proof-of-Possession (RFC 9449)      | A JWS that proves the presenter holds the private key bound to an access token. SBproxy uses DPoP on outbound credential resolution so a stolen access token alone is insufficient to call an upstream. |
 | RFC 8693            | OAuth 2.0 Token Exchange                             | The token-exchange grant that powers SBproxy's outbound credential resolver. SBproxy uses RFC 8693 to swap an inbound identity for an upstream access token under one delegation-aware interface. |
