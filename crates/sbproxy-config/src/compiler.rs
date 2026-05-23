@@ -378,15 +378,18 @@ fn migrate_features_to_extensions(yaml: &str) -> Result<String> {
             .find(|(legacy, _)| *legacy == name)
         {
             Some((legacy, canonical)) => {
-                // Stay dependency-light: write straight to stderr.
-                // Operators relying on structured logs already get
-                // the `proxy.extensions[...]` block on the typed
-                // bootstrap so the only audience for this line is
-                // the engineer running `sbproxy --config foo.yml`.
-                eprintln!(
-                    "warning: deprecated config: features.{} is deprecated; \
+                // Route through tracing so the warning lands in the
+                // same structured-log stream operators already watch
+                // alongside the `proxy.extensions[...]` bootstrap block.
+                // Legacy and canonical names are emitted as fields so
+                // they survive any log formatter.
+                tracing::warn!(
+                    legacy = legacy,
+                    canonical = canonical,
+                    "deprecated config: features.{} is deprecated; \
                      lifting into proxy.extensions.{}",
-                    legacy, canonical,
+                    legacy,
+                    canonical,
                 );
                 migrated.push(((*canonical).to_string(), v));
             }
@@ -639,9 +642,10 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         Some(v) => match serde_json::from_value::<crate::types::ResponseCacheConfig>(v.clone()) {
             Ok(cfg) => Some(cfg),
             Err(e) => {
-                eprintln!(
-                    "[sbproxy-config] ignoring response_cache for {}: {}",
-                    hostname, e
+                tracing::warn!(
+                    hostname = %hostname,
+                    error = %e,
+                    "ignoring response_cache: failed to deserialize config block"
                 );
                 None
             }

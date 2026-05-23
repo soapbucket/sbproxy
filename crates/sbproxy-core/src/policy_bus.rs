@@ -110,7 +110,9 @@ pub async fn drain_to_stderr(mut rx: PolicyVerdictReceiver) {
                 // enterprise extension point. We deliberately use
                 // `eprintln!` rather than the tracing subscriber
                 // so the audit emission survives even when log
-                // sampling is on for the broader proxy.
+                // sampling is on for the broader proxy. This is
+                // intentional; WOR-637 deliberately left this site
+                // unconverted for that audit-durability reason.
                 eprintln!("policy_verdict_event: {}", bound_audit_line(&event, line));
             }
             Err(err) => {

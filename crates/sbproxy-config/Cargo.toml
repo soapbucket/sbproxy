@@ -20,6 +20,7 @@ compact_str = { workspace = true }
 smallvec = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]
