@@ -80,6 +80,14 @@ sbproxy-modules = { path = "../crates/sbproxy-modules" }
 http = "1"
 serde_json = "1"
 
+# WOR-650 script-engine fuzz targets: drive the CEL, Lua, JavaScript,
+# and WASM engines (`cel::CelEngine`, `lua::LuaEngine`, `js::JsEngine`,
+# `wasm::WasmRuntime`) with adversarial input. This crate is the
+# largest attack surface in the proxy; the four targets below feed it
+# malformed scripts and modules so sandbox-escape / denial-of-service
+# panics surface as fuzzer crashes rather than production aborts.
+sbproxy-extension = { path = "../crates/sbproxy-extension" }
+
 [[bin]]
 name = "rsl_xml_parser"
 path = "fuzz_targets/rsl_xml_parser.rs"
@@ -129,5 +137,47 @@ doc = false
 [[bin]]
 name = "cel_script"
 path = "fuzz_targets/cel_script.rs"
+test = false
+doc = false
+
+# WOR-650 CEL expression-engine fuzzer. Drives `CelEngine::compile`
+# and (on the rare input that parses) `eval` / `eval_bool` against a
+# fixed request-shaped context so the parser and evaluator see
+# adversarial input. Source length is capped so the fuzzer cannot
+# wedge on a multi-megabyte expression.
+[[bin]]
+name = "cel_eval"
+path = "fuzz_targets/cel_eval.rs"
+test = false
+doc = false
+
+# WOR-650 Lua scripting-engine fuzzer. Drives `LuaEngine::execute` and
+# `call_function` under a tight sandbox (25 ms wall-clock, 4 MiB heap,
+# pattern API enabled) so a hostile script cannot stall the fuzzer.
+# Script length is capped at 4 KiB.
+[[bin]]
+name = "lua_execute"
+path = "fuzz_targets/lua_execute.rs"
+test = false
+doc = false
+
+# WOR-650 JavaScript scripting-engine fuzzer. Drives
+# `JsEngine::execute` and `call_function` under a tight sandbox (25 ms
+# CPU budget, 4 MiB heap, 256 KiB stack) so `while (true) {}` and deep
+# recursion are bounded. Script length is capped at 4 KiB.
+[[bin]]
+name = "js_execute"
+path = "fuzz_targets/js_execute.rs"
+test = false
+doc = false
+
+# WOR-650 WASM runtime fuzzer. Feeds arbitrary bytes to
+# `WasmRuntime::new` (wasmtime's validating compiler) and, on the rare
+# input that compiles, instantiates and runs the module under a tight
+# sandbox (16 pages, 25 ms epoch, low fuel). Candidate-module length
+# is capped at 256 KiB.
+[[bin]]
+name = "wasm_execute"
+path = "fuzz_targets/wasm_execute.rs"
 test = false
 doc = false

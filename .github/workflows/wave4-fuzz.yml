@@ -68,6 +68,19 @@ jobs:
           # smoke-pass tier as the rest.
           - target: stateful_proxy
             time: 30
+          # WOR-650 script-engine fuzzers. Each drives one of the four
+          # scripting runtimes (CEL, Lua, JavaScript, WASM) with
+          # adversarial input under a tight per-invocation sandbox so
+          # sandbox-escape / denial-of-service panics surface here
+          # rather than in production. 60s per the ticket's CI ask.
+          - target: cel_eval
+            time: 60
+          - target: lua_execute
+            time: 60
+          - target: js_execute
+            time: 60
+          - target: wasm_execute
+            time: 60
     steps:
       - uses: actions/checkout@v5
 
