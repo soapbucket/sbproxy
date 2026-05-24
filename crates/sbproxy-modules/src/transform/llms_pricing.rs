@@ -1,4 +1,4 @@
-//! WOR-188: parser for the priced-route flavour of `llms.txt`.
+//! Parser for the priced-route flavour of `llms.txt`.
 //!
 //! This module is the input dual of
 //! [`crate::projections::llms::render`]: it takes the bytes that

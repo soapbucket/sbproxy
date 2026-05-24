@@ -1,6 +1,6 @@
-//! Wave 4 / G4.5..G4.10 wire: policy-graph projections.
+//! Policy-graph projections.
 //!
-//! A4.1. The four projections are:
+//! The four projections are:
 //!
 //! - `robots.txt` per IETF draft-koster-rep-ai
 //! - `llms.txt` and `llms-full.txt` per the Anthropic / Mistral
@@ -8,7 +8,7 @@
 //! - `/licenses.xml` per RSL 1.0
 //! - `/.well-known/tdmrep.json` per W3C TDMRep
 //!
-//! WOR-193 adds a fifth sibling:
+//! Adds a fifth sibling:
 //!
 //! - `/.well-known/agent-skills/index.json` per the Agent Skills v0.2.0
 //!   discovery RFC (`https://github.com/cloudflare/agent-skills-discovery-rfc`).

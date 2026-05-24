@@ -21,8 +21,8 @@
 //!   header value verbatim (already colon-wrapped per §3).
 //! - A streaming `DigestSink::new(alg)` that accepts body chunks via
 //!   `update(&[u8])` and finalises into the same header value. The
-//!   sink shape is what the Pingora body filter will hook into when
-//!   WOR-519 wires sign-on-egress.
+//!   sink shape is what the Pingora body filter will hook into once
+//!   sign-on-egress is wired.
 //!
 //! # Wire format (RFC 9530 §3)
 //!

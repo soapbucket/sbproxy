@@ -9,7 +9,7 @@
 //!   dependency reports healthy. Kubelet uses this to decide whether
 //!   to route traffic. Failing dependencies are listed in the body.
 //!
-//! Wave 1 ships hooks for the dependencies that exist today and stub
+//! Ships hooks for the dependencies that exist today and stub
 //! variants for the ones landing in later waves (Stripe in Wave 2,
 //! facilitator quorum in Wave 3, agent registry in Wave 2). The stubs
 //! return `Healthy` so they don't break readiness in builds where

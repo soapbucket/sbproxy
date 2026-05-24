@@ -999,7 +999,7 @@ mod tests {
         0
     }
 
-    /// WOR-169: a bounded recorder channel that fills past its
+    /// A bounded recorder channel that fills past its
     /// capacity must drop the overflowing send AND increment
     /// `sbproxy_hooks_channel_dropped_total{reason="channel_full"}`.
     /// Verifies the documented backpressure policy directly.
@@ -1030,7 +1030,7 @@ mod tests {
         // fine; we only care that the chunk drop was counted.
     }
 
-    /// WOR-169: when the receiver hangs up, the next send must be
+    /// When the receiver hangs up, the next send must be
     /// dropped AND counted under the `receiver_closed` label rather
     /// than `channel_full`. Keeps the two failure modes
     /// distinguishable on the dashboard.

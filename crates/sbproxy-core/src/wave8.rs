@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 // Copyright 2026 Soap Bucket LLC
 
-//! Wave 8 P0 edge capture wired into the Pingora request pipeline.
+//! P0 edge capture wired into the Pingora request pipeline.
 //!
 //! `capture_dimensions` reads the four caller-supplied envelope
 //! dimensions (custom properties, session ID, parent session ID, user

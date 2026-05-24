@@ -1,4 +1,4 @@
-//! G4.4 JSON envelope transform: wraps Markdown projection in the v1 schema.
+//! JSON envelope transform: wraps Markdown projection in the v1 schema.
 //!
 //! Implements the JSON envelope schema. The envelope is the output
 //! shape for the `ContentShape::Json` branch of the content-negotiation
@@ -138,7 +138,7 @@ impl JsonEnvelope {
 
 // --- Transform ---
 
-/// G4.4 transform: serialises the in-context [`MarkdownProjection`] as a
+/// Transform: serialises the in-context [`MarkdownProjection`] as a
 /// JSON envelope when the negotiated transformation shape is `Json`.
 ///
 /// The transform is a per-origin singleton; it carries no per-request

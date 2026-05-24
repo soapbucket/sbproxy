@@ -1,4 +1,4 @@
-//! WOR-201 PR 1c.1: newtype wrapper enforcer for the
+//! Newtype wrapper enforcer for the
 //! `Policy::Csrf` variant.
 //!
 //! Lifts the body of the `Policy::Csrf(csrf)` arm that lived in

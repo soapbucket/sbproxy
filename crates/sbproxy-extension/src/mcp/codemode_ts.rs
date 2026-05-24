@@ -1,4 +1,4 @@
-//! WOR-410: Cloudflare Code Mode TypeScript module emission.
+//! Cloudflare Code Mode TypeScript module emission.
 //!
 //! Cloudflare's Code Mode pattern fetches an MCP server's tool list and
 //! converts each tool's JSON Schema into a typed TypeScript function.

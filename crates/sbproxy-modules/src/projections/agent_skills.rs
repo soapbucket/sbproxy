@@ -1,4 +1,4 @@
-//! WOR-193 / WOR-194: Agent Skills v0.2.0 well-known projection.
+//! Agent Skills v0.2.0 well-known projection.
 //!
 //! The Agent Skills v0.2.0 specification describes a well-known
 //! discovery endpoint at `GET /.well-known/agent-skills/index.json`

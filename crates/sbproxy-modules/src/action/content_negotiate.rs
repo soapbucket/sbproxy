@@ -1,4 +1,4 @@
-//! G4.2 content-negotiate action: resolves content shape from `Accept` headers.
+//! Content-negotiate action: resolves content shape from `Accept` headers.
 //!
 //! Implements the two-pass `Accept`-resolution contract.
 //!

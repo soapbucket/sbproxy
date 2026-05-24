@@ -1,4 +1,4 @@
-//! G4.10 boilerplate-stripping transform.
+//! Boilerplate-stripping transform.
 //!
 //! Removes navigation chrome, footers, sidebars, ad blocks, and comment
 //! sections from HTML so the downstream Markdown projection sees

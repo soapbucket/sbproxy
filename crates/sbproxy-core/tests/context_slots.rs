@@ -1,4 +1,4 @@
-//! WOR-201 PR 1c.0: per-request context slots that the
+//! Per-request context slots that the
 //! response handler keys on after the per-policy ports.
 //!
 //! `RequestContext::deny_policy_type` carries the same string

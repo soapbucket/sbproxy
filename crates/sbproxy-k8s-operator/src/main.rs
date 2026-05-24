@@ -40,7 +40,7 @@ const LEADER_LEASE_NAME: &str = "sbproxy-operator-leader";
 const FIELD_MANAGER: &str = "sbproxy-k8s-operator";
 
 /// Default graceful-shutdown drain budget when no env var is set.
-/// WOR-636. Matches the binary's default and Kubernetes' default
+/// Matches the binary's default and Kubernetes' default
 /// `terminationGracePeriodSeconds` so the kubelet's pod-termination
 /// grace window aligns with our drain budget.
 const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 30_000;

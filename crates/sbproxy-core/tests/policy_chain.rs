@@ -1,4 +1,4 @@
-//! WOR-201 PR 1b: multi-policy chain reducer rules.
+//! Multi-policy chain reducer rules.
 //!
 //! Exercises the resolution rules from
 //! `docs/adr-policy-verdict-shape.md` against the public

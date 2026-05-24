@@ -12,7 +12,7 @@
 //!   `Suspicious`, and the matched pattern in `reason`.
 //! - No match yields `score = 0.0`, label `Clean`, no reason.
 //!
-//! WOR-191: pattern lists are imported from
+//! Pattern lists are imported from
 //! [`sbproxy_ai::guardrails::injection`] so v1 (boolean block) and
 //! v2 (scored `Detector`) can never drift. The canonical lists live
 //! in `sbproxy-ai` because the workspace dep graph runs

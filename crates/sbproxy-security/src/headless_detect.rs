@@ -1,7 +1,5 @@
 //! Headless-browser detection via TLS fingerprint matching.
 //!
-//! Wave 5 / G5.4.
-//!
 //! # What this module does
 //!
 //! Reads a request's JA4 fingerprint (captured by

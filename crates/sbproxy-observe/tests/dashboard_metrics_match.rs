@@ -1,4 +1,4 @@
-//! WOR-164 drift guard: every PromQL metric name referenced in
+//! Drift guard: every PromQL metric name referenced in
 //! `dashboards/grafana/*.json` must be declared somewhere under
 //! `crates/`. Spinning up the full binary just to scrape `/metrics`
 //! is overkill for a CI gate, so this test grabs every distinct

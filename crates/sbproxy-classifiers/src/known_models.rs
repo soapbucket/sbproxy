@@ -231,7 +231,7 @@ mod tests {
         assert_eq!(m.pinned_pair(), Some(("aa", "bb")));
     }
 
-    /// WOR-190 supply-chain guard: a `KnownModel` registry entry must
+    /// Supply-chain guard: a `KnownModel` registry entry must
     /// not be merged with an empty or sentinel SHA-256 value. Without
     /// this assertion the detector silently degrades to "unpinned"
     /// posture and a future re-introduction would not trip review.

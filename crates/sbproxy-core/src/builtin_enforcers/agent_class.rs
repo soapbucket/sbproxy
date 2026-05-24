@@ -1,4 +1,4 @@
-//! WOR-201 PR 1c.2: newtype wrapper enforcer for the
+//! Newtype wrapper enforcer for the
 //! `Policy::AgentClass` variant.
 //!
 //! The original `Policy::AgentClass(_)` arm in

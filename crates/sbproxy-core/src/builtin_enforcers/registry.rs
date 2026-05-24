@@ -1,4 +1,4 @@
-//! WOR-201 PR 1c.4: central registry that compiles every
+//! Central registry that compiles every
 //! [`Policy`] variant into a boxed [`PolicyEnforcer`].
 //!
 //! After 1c.4 every variant is wired through its newtype wrapper

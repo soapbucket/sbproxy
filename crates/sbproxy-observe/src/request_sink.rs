@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 // Copyright 2026 Soap Bucket LLC
 
-//! Wave 8 / T4.6 transport adapter: a generic sink for completed
+//! Transport adapter: a generic sink for completed
 //! [`crate::request_event::RequestEvent`] values.
 //!
 //! The OSS build ships a [`NoopSink`] default and a [`LoggingSink`]

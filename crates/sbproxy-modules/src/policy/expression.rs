@@ -189,19 +189,19 @@ impl ExpressionPolicy {
 /// existing call site compiling.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ExpressionViews<'a> {
-    /// Wave 4 / G4.9 aipref preference signal.
+    /// Aipref preference signal.
     pub aipref: Option<&'a AiprefSignal>,
-    /// Wave 5 / G5.1 KYA verifier verdict view.
+    /// KYA verifier verdict view.
     pub kya: Option<sbproxy_extension::cel::context::KyaVerdictView<'a>>,
-    /// Wave 5 / A5.2 ML agent classifier verdict view.
+    /// ML agent classifier verdict view.
     pub ml: Option<sbproxy_extension::cel::context::MlClassificationView<'a>>,
-    /// WOR-114 Phase 2 per-request feature flags view. When `Some`,
+    /// Phase 2 per-request feature flags view. When `Some`,
     /// `populate_features_namespace` runs and CEL expressions can
     /// branch on `features.debug`, `features["no-cache"]`, etc.
     /// Default `None` keeps existing call sites that have not yet
     /// threaded `RequestContext.flags` through compiling.
     pub features: Option<sbproxy_extension::cel::context::FeatureFlagsView<'a>>,
-    /// WOR-589 agent-detection verdict view. When `Some`,
+    /// Agent-detection verdict view. When `Some`,
     /// `populate_agent_detect_namespace` runs and CEL expressions can
     /// branch on `request.agent.score`, `request.agent.id`, etc. Default
     /// `None` leaves the namespace unset (every `request.agent.*` access

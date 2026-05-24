@@ -483,7 +483,7 @@ impl AiClient {
 }
 
 impl AiClient {
-    /// WOR-229: Forward a JSON request body byte-for-byte to a native
+    /// Forward a JSON request body byte-for-byte to a native
     /// upstream path, skipping the OpenAI Chat hub translation.
     ///
     /// Used by the native-format bypass: when the inbound client

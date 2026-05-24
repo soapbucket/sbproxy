@@ -1,4 +1,4 @@
-//! WOR-227 scaffold. Static-asset surface for the built-in admin UI.
+//! Static-asset surface for the built-in admin UI.
 //!
 //! When the `embed-admin-ui` cargo feature is on, the binary embeds
 //! the contents of `ui/dist/` (the React + Vite build output) via

@@ -551,7 +551,7 @@ mod tests {
         assert!(!action.is_tool_allowed("gh.delete_repo"));
     }
 
-    /// WOR-186: per-server `rbac` must reference a declared label.
+    /// Per-server `rbac` must reference a declared label.
     /// A typo in the upstream config silently allowing every tool is
     /// the exact failure mode this guard prevents.
     #[test]
@@ -572,7 +572,7 @@ mod tests {
         );
     }
 
-    /// WOR-186: an action that only sets `rbac` but no `rbac_policies`
+    /// An action that only sets `rbac` but no `rbac_policies`
     /// table at all must not silently fall through.
     #[test]
     fn rejects_rbac_without_policy_table() {
@@ -589,7 +589,7 @@ mod tests {
         );
     }
 
-    /// WOR-186: a valid `timeout:` field is now stored on the action
+    /// A valid `timeout:` field is now stored on the action
     /// (no longer a hard config error).
     #[test]
     fn timeout_field_is_stored_on_action() {

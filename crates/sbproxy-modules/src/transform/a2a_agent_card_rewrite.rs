@@ -1,4 +1,4 @@
-//! WOR-234 A2A agent-card URL rewriter.
+//! A2A agent-card URL rewriter.
 //!
 //! Rewrites the `url`, `endpoint`, and nested `agent.url` fields on
 //! JSON responses served at well-known A2A discovery paths

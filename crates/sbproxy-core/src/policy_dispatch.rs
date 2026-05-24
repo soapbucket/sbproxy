@@ -1,4 +1,4 @@
-//! WOR-201 PR 1b: chain reducer + Plugin verdict translation.
+//! Chain reducer + Plugin verdict translation.
 //!
 //! This module isolates the multi-policy resolution rules from
 //! `docs/adr-policy-verdict-shape.md`:

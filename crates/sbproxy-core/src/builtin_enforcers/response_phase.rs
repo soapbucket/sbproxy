@@ -1,4 +1,4 @@
-//! WOR-201 PR 1c.3: newtype wrapper enforcers for the four
+//! Newtype wrapper enforcers for the four
 //! response-phase policies (`SecHeaders`, `PageShield`, `Sri`,
 //! `Assertion`).
 //!

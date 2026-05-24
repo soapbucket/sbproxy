@@ -1054,7 +1054,7 @@ pub(super) async fn handle_mcp_action(
     write_jsonrpc(session, &response).await
 }
 
-/// WOR-186: resolve the caller's virtual key for MCP RBAC lookups.
+/// Resolve the caller's virtual key for MCP RBAC lookups.
 ///
 /// Pulls the resolved subject from the auth decision when the request
 /// authenticated; returns the empty string for anonymous traffic so a

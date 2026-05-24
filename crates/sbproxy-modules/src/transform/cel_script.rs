@@ -345,7 +345,7 @@ impl CelScriptTransform {
         }
     }
 
-    /// WOR-168 test hook: directly drive the inner `Set | Append`
+    /// Test hook: directly drive the inner `Set | Append`
     /// switch with an arbitrary `CelHeaderOp` so the
     /// `unreachable!()` replacement can be exercised by a unit test.
     /// Production code never hits this surface; the outer match in
@@ -637,7 +637,7 @@ mod tests {
         );
     }
 
-    /// WOR-168: directly drive the inner `Set | Append` switch with a
+    /// Directly drive the inner `Set | Append` switch with a
     /// `Remove` op via the test hook. Pre-fix, this call site was
     /// `unreachable!()` and would have panicked the Pingora worker
     /// under any future regression that routed a `Remove` rule there.
@@ -667,7 +667,7 @@ mod tests {
         );
     }
 
-    /// WOR-168: the `Set` and `Append` ops must continue to work
+    /// The `Set` and `Append` ops must continue to work
     /// through the same helper so the test hook does not silently
     /// regress on the happy path.
     #[test]
@@ -688,7 +688,7 @@ mod tests {
         assert_eq!(a, CelHeaderMutation::Append("x-foo".into(), "baz".into()));
     }
 
-    /// WOR-168: the lossy shim must absorb invariant errors and
+    /// The lossy shim must absorb invariant errors and
     /// return an empty mutation set rather than propagating.
     #[test]
     fn evaluate_headers_lossy_returns_empty_on_invariant_error() {

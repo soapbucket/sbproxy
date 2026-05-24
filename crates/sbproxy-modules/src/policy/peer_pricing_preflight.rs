@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-//! WOR-188: outbound peer-pricing pre-flight policy.
+//! Outbound peer-pricing pre-flight policy.
 //!
 //! When sbproxy issues an outbound request to a cooperating peer the
 //! pre-flight checks the peer's published `llms.txt` for a priced

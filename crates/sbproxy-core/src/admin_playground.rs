@@ -1,4 +1,4 @@
-//! WOR-227 scaffold. Chat playground stub handler.
+//! Chat playground stub handler.
 //!
 //! Real wiring (route the request through `proxy_router.oneshot`
 //! and stream a model's response back to the dashboard) is deferred

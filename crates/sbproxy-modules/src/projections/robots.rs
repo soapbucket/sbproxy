@@ -1,4 +1,4 @@
-//! G4.5: `robots.txt` projection per IETF draft-koster-rep-ai.
+//! `robots.txt` projection per IETF draft-koster-rep-ai.
 //!
 //! Format:
 //!
