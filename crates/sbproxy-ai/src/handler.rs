@@ -97,6 +97,15 @@ pub struct AiHandlerConfig {
     /// the same way (skip redaction).
     #[serde(skip)]
     pub(crate) pii_redactor: OnceLock<Option<sbproxy_security::pii::PiiRedactor>>,
+    /// Lazy-built OSS embedding semantic cache (WOR-796), parsed from
+    /// the `semantic_cache` block on first use. `None` inside the
+    /// OnceLock means the cache is disabled or misconfigured; the
+    /// request path treats both as "no semantic layer". Held in an
+    /// `Arc` so the instance (and its entries) persist across requests
+    /// for the lifetime of this per-origin config.
+    #[serde(skip)]
+    pub(crate) embedding_cache:
+        OnceLock<Option<std::sync::Arc<crate::semantic_cache::EmbeddingCache>>>,
 }
 
 fn default_usage_parser() -> String {
@@ -124,6 +133,35 @@ impl AiHandlerConfig {
                         None
                     }
                 }
+            })
+            .as_ref()
+    }
+
+    /// Return the OSS embedding semantic cache for this handler,
+    /// building it on first call (WOR-796). `None` when the
+    /// `semantic_cache` block is absent, disabled, missing the
+    /// `embedding` provider sub-block, or fails to parse. The cache is
+    /// opt-in, so the common path returns `None` with no cost beyond
+    /// the one-time parse.
+    pub fn embedding_cache(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::semantic_cache::EmbeddingCache>> {
+        self.embedding_cache
+            .get_or_init(|| {
+                let value = self.semantic_cache.as_ref()?;
+                let cfg: crate::semantic_cache::EmbeddingCacheConfig =
+                    match serde_json::from_value(value.clone()) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "AI handler: semantic_cache block did not parse as an embedding \
+                                 cache config; semantic caching disabled"
+                            );
+                            return None;
+                        }
+                    };
+                crate::semantic_cache::EmbeddingCache::from_config(&cfg).map(std::sync::Arc::new)
             })
             .as_ref()
     }
@@ -755,6 +793,7 @@ mod tests {
             semantic_cache: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
+            embedding_cache: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("anything"));
@@ -780,6 +819,7 @@ mod tests {
             semantic_cache: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
+            embedding_cache: OnceLock::new(),
         };
         assert!(!config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("gpt-3.5-turbo"));
@@ -805,6 +845,7 @@ mod tests {
             semantic_cache: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
+            embedding_cache: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("gpt-3.5-turbo"));
@@ -831,6 +872,7 @@ mod tests {
             semantic_cache: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
+            embedding_cache: OnceLock::new(),
         };
         // Block list wins
         assert!(!config.is_model_allowed("gpt-4"));

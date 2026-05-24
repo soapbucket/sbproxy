@@ -146,6 +146,21 @@ static AI_CACHE_RESULTS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+// Cosine similarity score of a semantic-cache hit, per provider
+// (WOR-796). Recorded only on a hit so the dashboard can show the
+// distribution of how close served prompts were to their cached match.
+static AI_SEMANTIC_SIMILARITY: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        HistogramOpts::new(
+            "sbproxy_ai_semantic_cache_similarity",
+            "Cosine similarity of semantic-cache hits"
+        )
+        .buckets(vec![0.5, 0.7, 0.8, 0.85, 0.9, 0.95, 0.98, 0.99, 1.0]),
+        &["provider"]
+    )
+    .unwrap()
+});
+
 static AI_BUDGET_UTILIZATION: LazyLock<GaugeVec> = LazyLock::new(|| {
     register_gauge_vec!(
         Opts::new(
@@ -612,6 +627,13 @@ pub fn record_cache_result(provider: &str, cache_type: &str, hit: bool) {
     AI_CACHE_RESULTS
         .with_label_values(&[provider, cache_type, result])
         .inc();
+}
+
+/// Record the cosine similarity of a semantic-cache hit (WOR-796).
+pub fn record_semantic_similarity(provider: &str, score: f32) {
+    AI_SEMANTIC_SIMILARITY
+        .with_label_values(&[provider])
+        .observe(score as f64);
 }
 
 /// Update budget utilization gauge.

@@ -141,6 +141,14 @@ type PendingSemcacheMiss = (
     Option<String>,
 );
 
+/// Pending OSS embedding-cache write produced by a semantic miss
+/// (WOR-796). Tuple components: (cache handle, prompt key, the prompt's
+/// embedding vector). When populated, the AI relay stores the upstream
+/// response under this key + vector after a successful (200) response.
+/// Mutually exclusive with [`PendingSemcacheMiss`]: the OSS cache only
+/// runs when the enterprise `SemanticLookupHook` is absent.
+type PendingEmbedMiss = (std::sync::Arc<sbproxy_ai::EmbeddingCache>, String, Vec<f32>);
+
 /// The main proxy implementation.
 ///
 /// Implements Pingora's `ProxyHttp` trait to handle incoming HTTP requests,
