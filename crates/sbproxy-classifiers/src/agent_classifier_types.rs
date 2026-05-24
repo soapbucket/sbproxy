@@ -1,4 +1,4 @@
-//! ML agent classifier output types (A5.2).
+//! ML agent classifier output types.
 //!
 //! These are the canonical type definitions for the Wave 5 ML agent
 //! classifier verdict. They live in the OSS classifiers crate so the
@@ -22,7 +22,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Predicted class for a request, output by the ML agent classifier
-/// (A5.2). Stable across the Wave 5 series.
+///. Stable across the Wave 5 series.
 ///
 /// Variant ordering matches the trained ONNX model's softmax output
 /// indices: `Human=0`, `LlmAgent=1`, `Scraper=2`, `Unknown=3`. Do not
@@ -80,7 +80,7 @@ impl std::fmt::Display for MlClass {
     }
 }
 
-/// Output of one ML agent-classifier inference (A5.2).
+/// Output of one ML agent-classifier inference.
 ///
 /// The struct is shipped to scripting layers, the access log, and the
 /// audit pipeline. The fields are deliberately small + Copy-friendly:

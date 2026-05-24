@@ -1,6 +1,6 @@
 //! G4.2 content-negotiate action: resolves content shape from `Accept` headers.
 //!
-//! Implements the two-pass `Accept`-resolution contract (G4.1).
+//! Implements the two-pass `Accept`-resolution contract.
 //!
 //! ## Pass 1: pricing shape
 //! Calls [`ContentShape::from_accept`] (declaration-order, q-values stripped)

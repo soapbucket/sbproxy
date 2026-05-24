@@ -19,7 +19,7 @@
 //!   reply. Stub here. Wave 5 leaves the field as `None`; outbound
 //!   capture lands with the connector hardening in B5.x.
 //! - **JA4T** (TCP fingerprint): SYN-packet TCP options + window
-//!   shape. Slice 7 (WOR-590) lands the field on the struct but
+//!   shape. Slice 7 lands the field on the struct but
 //!   leaves the value as `None` on the inbound path: Pingora 0.8's
 //!   `Session` abstraction does not surface the raw TCP socket
 //!   options block, so the value cannot be computed today. See
@@ -84,7 +84,7 @@ pub struct TlsFingerprint {
     /// inbound-only captures.
     pub ja4s: Option<String>,
     /// SNI server-name hostname the client requested in the
-    /// ClientHello's `server_name` extension (WOR-586). `None` when
+    /// ClientHello's `server_name` extension. `None` when
     /// the extension was absent or the host_name entry could not be
     /// parsed. Lowercased per IDN normalisation expectations; IDN
     /// punycode is left as-is (clients send the A-label on the wire).
@@ -93,10 +93,10 @@ pub struct TlsFingerprint {
     /// `application_layer_protocol_negotiation` extension, in the
     /// order they appeared on the wire and with GREASE entries
     /// filtered. Example: `["h2", "http/1.1"]`. Empty when the
-    /// extension was absent (WOR-586).
+    /// extension was absent.
     pub alpn: Vec<String>,
     /// Whether the ClientHello advertised a post-quantum hybrid
-    /// key share (WOR-501). Akamai enabled PQ-TLS by default on
+    /// key share. Akamai enabled PQ-TLS by default on
     /// 2026-01-31; by early 2026 about 57% of browser-initiated
     /// connections include the `X25519MLKEM768` key share. Stock
     /// Python `requests`, Node `node-fetch`, Go `net/http`, and the
@@ -118,7 +118,7 @@ pub struct TlsFingerprint {
     /// ship alongside the listener-level capture (or an enterprise
     /// sidecar that observes the SYN) so callers can populate the
     /// field without re-walking the FoxIO format.
-    // TODO(WOR-590): wire JA4T capture once Pingora exposes the
+    // TODO: wire JA4T capture once Pingora exposes the
     // raw TCP socket options, or thread it through a SYN-observing
     // sidecar header on the trusted-proxy path.
     pub ja4t: Option<String>,
@@ -132,7 +132,7 @@ pub struct TlsFingerprint {
 }
 
 /// IANA-assigned codepoints for post-quantum hybrid key-exchange
-/// groups (WOR-501). The X25519MLKEM768 hybrid is the one major
+/// groups. The X25519MLKEM768 hybrid is the one major
 /// browsers default to as of early 2026; the SecP256r1MLKEM768
 /// codepoint is recognised for completeness because Cloudflare,
 /// Google, and others have shipped it in interop builds.
@@ -283,13 +283,13 @@ struct ParsedClientHello {
     alpn_last: Option<String>,
     /// Full ALPN protocol-id list in wire order, GREASE filtered.
     /// Populated alongside `alpn_first` / `alpn_last`; consumed by
-    /// the agent-detect signal layer (WOR-586).
+    /// the agent-detect signal layer.
     alpn: Vec<String>,
     /// Named groups the client offered in the `key_share` extension
     /// (0x0033), GREASE filtered. Distinct from `curves`
     /// (`supported_groups`, 0x000a): an entry in `key_share` is one
     /// the client actually generated a public key for. Consumed by
-    /// the PQ-TLS detection signal (WOR-501).
+    /// the PQ-TLS detection signal.
     key_share_groups: Vec<u16>,
     /// Signature algorithms (extension 0x000d), GREASE filtered.
     /// Not currently consumed by JA3 / JA4 emission, but parsed

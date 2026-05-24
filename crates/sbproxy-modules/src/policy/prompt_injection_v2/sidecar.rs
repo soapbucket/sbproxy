@@ -1,4 +1,4 @@
-//! Sidecar-backed detector for `prompt_injection_v2` (WOR-704).
+//! Sidecar-backed detector for `prompt_injection_v2`.
 //!
 //! Routes detection to the out-of-process classifier sidecar over gRPC instead
 //! of running ONNX inference inside the proxy. The sidecar (the minimal OSS one

@@ -272,7 +272,7 @@ pub struct AdminState {
     /// manual reload during a watcher reload serialises cleanly.
     reload_in_progress: AtomicBool,
     /// Per-pillar health registry powering `/healthz` + `/readyz` per
-    /// `docs/AIGOVERNANCE-BUILD.md` § 4.2 (R1.3). Per-wave probes are
+    /// `docs/AIGOVERNANCE-BUILD.md` § 4.2. Per-wave probes are
     /// registered into this registry as their backing services come
     /// online; until then the default seeded set keeps `NotConfigured`
     /// stubs in place so readiness still passes.
@@ -867,7 +867,7 @@ pub fn handle_admin_request(
     state: &AdminState,
     auth_header: Option<&str>,
 ) -> (u16, &'static str, String) {
-    // --- Unauthenticated probe routes (R1.3) ---
+    // --- Unauthenticated probe routes ---
     //
     // `/healthz` and `/readyz` are reached by load balancers that
     // don't carry credentials, so we serve them before the basic-auth
@@ -1924,7 +1924,7 @@ origins:
         assert!(filter.is_allowed("::1"));
     }
 
-    // --- /healthz + /readyz (R1.3) ---
+    // --- /healthz + /readyz ---
 
     #[test]
     fn healthz_is_unauthenticated_and_returns_200() {

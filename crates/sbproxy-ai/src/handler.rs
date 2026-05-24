@@ -693,7 +693,7 @@ pub fn classify_surface(_method: &str, path: &str) -> AiSurface {
         // Reranking has two canonical names.
         ["rerank"] | ["reranking"] => AiSurface::Reranking,
 
-        // Native-format inbound paths (WOR-224). These bridge to the
+        // Native-format inbound paths. These bridge to the
         // hub format and then dispatch through the same upstream
         // pipeline as chat completions.
         ["messages"] => AiSurface::Messages,

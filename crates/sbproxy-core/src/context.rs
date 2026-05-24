@@ -132,7 +132,7 @@ pub struct RequestContext {
     /// guards release their slots when dropped, which happens when the
     /// context is dropped at the end of the request lifecycle.
     pub concurrent_limit_guards: Vec<ConcurrentLimitGuard>,
-    /// Permits issued by `AgentBudgetPolicy` (WOR-506). Same lifecycle
+    /// Permits issued by `AgentBudgetPolicy`. Same lifecycle
     /// as `concurrent_limit_guards`: each guard tracks an in-flight
     /// agent-keyed slot and releases it when the request finishes.
     pub agent_budget_guards: Vec<AgentBudgetGuard>,
@@ -485,7 +485,7 @@ pub struct RequestContext {
     //   - or inference timed out and the timeout path filled `Some` with
     //     `MlClass::Unknown`. (Timeout still produces `Some` so the
     //     access log can distinguish "did not run" from "ran and gave up".)
-    /// Verdict from the ML agent classifier (A5.2).
+    /// Verdict from the ML agent classifier.
     #[cfg(feature = "agent-classifier")]
     pub ml_classification: Option<sbproxy_classifiers::MlClassification>,
 
@@ -611,7 +611,7 @@ pub struct RequestContext {
     pub content_shape_transform: Option<ContentShape>,
     /// Cached Markdown projection (body + title + token estimate) emitted
     /// by `HtmlToMarkdownTransform` when wired into a content-negotiated
-    /// origin. Held so the JSON envelope builder (G4.4) and the Markdown
+    /// origin. Held so the JSON envelope builder and the Markdown
     /// response path can both reach the same projection without re-running
     /// the regex pipeline. The token-estimate sibling field is
     /// `markdown_token_estimate` declared earlier; re-read both surfaces
@@ -643,7 +643,7 @@ pub struct RequestContext {
     /// See [`sbproxy_tls::TlsFingerprint`].
     pub tls_fingerprint: Option<sbproxy_tls::TlsFingerprint>,
 
-    /// Agent-detection verdict for this request (WOR-499). `None` unless
+    /// Agent-detection verdict for this request. `None` unless
     /// `proxy.extensions.agent_detect.enabled` is set, in which case the
     /// pipeline runs the configured scorer in `request_filter` and stores
     /// the result here for the scripting bridges (`request.agent.*`) and the

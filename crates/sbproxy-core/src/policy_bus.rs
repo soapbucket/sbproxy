@@ -80,7 +80,7 @@ pub fn global_bus() -> Option<PolicyBus> {
     GLOBAL_BUS.get().cloned()
 }
 
-/// Upper bound on a single serialized audit line (WOR-609).
+/// Upper bound on a single serialized audit line.
 ///
 /// The OSS [`PolicyVerdictEvent`] is already bounded by construction (the
 /// inbound request id is capped upstream at 256 bytes and the OSS payload

@@ -93,7 +93,7 @@ impl McpHandler {
         // the same regardless of caller identity; anonymous callers
         // simply receive a smaller manifest.
         //
-        // TODO(WOR-827): emit `notifications/resources/list_changed`
+        // TODO: emit `notifications/resources/list_changed`
         // when the manifest regenerates so connected clients refresh
         // automatically. Out of scope for the first ship.
         let experimental = if ctx.has_agent_skills {

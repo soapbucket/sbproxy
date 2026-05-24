@@ -347,7 +347,7 @@ fn collapse_ws(text: &str) -> String {
 
 /// Default tokens-per-byte ratio for the Markdown token estimator.
 ///
-/// `0.25` is the rough English-prose approximation (A4.2). Operators
+/// `0.25` is the rough English-prose approximation. Operators
 /// with non-English or dense technical content can override this on
 /// the per-origin `token_bytes_ratio` knob.
 pub const DEFAULT_TOKEN_BYTES_RATIO: f32 = 0.25;
@@ -1109,7 +1109,7 @@ mod tests {
         assert!(result.contains("A & B < C > D"));
     }
 
-    // --- MarkdownProjection tests (G4.3) ---
+    // --- MarkdownProjection tests ---
 
     #[test]
     fn projection_title_from_h1_heading() {

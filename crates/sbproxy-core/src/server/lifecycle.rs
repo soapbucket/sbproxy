@@ -2,7 +2,7 @@
 //! (`reload_from_config_path`), the file watcher, the SIGHUP handler,
 //! graceful-shutdown config, the `run` entry point, and ARDP discovery.
 //!
-//! Extracted from `server.rs` (WOR-629). Behavior-preserving move;
+//! Extracted from `server.rs`. Behavior-preserving move;
 //! `use super::*` re-imports the parent module's items. The public
 //! `run`, `GraceConfig`, `reload_from_config_path`, and
 //! `install_sighup_handler` stay public and are re-exported by the
@@ -301,7 +301,7 @@ pub(crate) fn resolve_shutdown_grace_seconds(ms_var: Option<&str>, sec_var: Opti
     0
 }
 
-/// Graceful-shutdown grace-period inputs for [`run`] (WOR-646).
+/// Graceful-shutdown grace-period inputs for [`run`].
 ///
 /// The binary (`crates/sbproxy/src/main.rs`) resolves these from its
 /// CLI flags / env (`--shutdown-grace-ms` / `SBPROXY_SHUTDOWN_GRACE_MS`
@@ -311,7 +311,7 @@ pub(crate) fn resolve_shutdown_grace_seconds(ms_var: Option<&str>, sec_var: Opti
 /// shutdown), which the Go e2e runner and dev loops rely on.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GraceConfig {
-    /// Preferred source: shutdown grace in milliseconds (WOR-636).
+    /// Preferred source: shutdown grace in milliseconds.
     pub shutdown_grace_ms: Option<u64>,
     /// Legacy source: grace in whole seconds (`SB_GRACE_TIME`).
     pub grace_time_secs: Option<u64>,
@@ -478,7 +478,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // gzipped catalog otherwise. The registry lives behind an
     // `ArcSwap` so SIGHUP / file-watcher / admin reload paths can
     // swap in a fresh catalog via `reload_provider_registry` without
-    // restarting the process (WOR-173).
+    // restarting the process.
     {
         let override_path = server_config
             .ai_providers_file

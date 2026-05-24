@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-//! Pre-request prompt token estimation for fail-fast TPM enforcement (WOR-232).
+//! Pre-request prompt token estimation for fail-fast TPM enforcement.
 //!
 //! The WOR-223 [`ModelRateLimiter`](crate::ratelimit::ModelRateLimiter) reconciles
 //! the real `usage.prompt_tokens` against a pre-flight reservation after the

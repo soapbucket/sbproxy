@@ -761,7 +761,7 @@ fn validate_one<R: RevisionResolver>(
         }
     }
 
-    // --- spec.skills (WOR-196) ---------------------------------------
+    // --- spec.skills ---------------------------------------
     //
     // Each Listing carries an optional `spec.skills[]` block matching
     // the shape of the top-level `agent_skills:` config block from

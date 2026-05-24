@@ -159,7 +159,7 @@ mod tests {
 
     /// Serializes the tests that mutate the process-global environment so
     /// `std::env::set_var`/`remove_var` never race a concurrent reader in
-    /// this test binary (WOR-648).
+    /// this test binary.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn backend_with(key: &str, value: &str) -> Arc<dyn VaultBackend> {

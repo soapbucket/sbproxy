@@ -1,6 +1,6 @@
 //! The Pingora `request_filter` phase handler for `SbProxy`.
 //!
-//! Extracted from the ProxyHttp impl in `proxy_http.rs` (WOR-629)
+//! Extracted from the ProxyHttp impl in `proxy_http.rs`
 //! because that single method body is ~2,880 lines. The trait method
 //! now delegates here. `SbProxy` is a unit struct, so the handler
 //! needs no `self`; `use super::*` brings every helper into scope.
@@ -675,8 +675,8 @@ pub(super) async fn request_filter(
     // resolver chain has stamped its verdict so the snapshot's
     // `agent_id_source` reflects the rule-based outcome. The OSS
     // pipeline holds every input the enterprise feature builder
-    // consumes: `agent_id` / `agent_id_source` (G1.4),
-    // `tls_fingerprint` (G5.3), `headless_signal` (G5.4), plus the
+    // consumes: `agent_id` / `agent_id_source`,
+    // `tls_fingerprint`, `headless_signal`, plus the
     // request-shape and rate-limit telemetry.
     //
     // Each hook may run inference inline or already have done so;
@@ -1096,7 +1096,7 @@ pub(super) async fn request_filter(
     // artifact bodies the manifest points at. The manifest schema
     // is `https://schemas.agentskills.io/discovery/0.2.0/schema.json`;
     // every artifact `GET` re-hashes the served body and returns
-    // 503 with an audit event on a digest mismatch (WOR-194). The
+    // 503 with an audit event on a digest mismatch. The
     // proxy never executes any pre-/post-hooks or scripts shipped
     // inside an artifact - artifacts are opaque bytes per spec.
     {

@@ -15,7 +15,7 @@
 //!   interrupt handler installed on the QuickJS runtime polls that
 //!   flag and aborts execution with an uncatchable exception, which
 //!   surfaces in Rust as [`JsExecutionError::Interrupt`]. This is the
-//!   guard against scripts like `while (true) {}` (WOR-595).
+//!   guard against scripts like `while (true) {}`.
 //! * **Heap memory cap** (`memory_mb`, default 16 MB): handed to
 //!   QuickJS via `Runtime::set_memory_limit`. Hitting the cap raises
 //!   an allocation error, which surfaces as
@@ -1185,7 +1185,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // --- CPU Budget (WOR-595) ---
+    // --- CPU Budget ---
 
     /// `while (true) {}` must terminate within `budget_ms + slack` and
     /// surface as a structured `Interrupt` error tagged with the
@@ -1444,7 +1444,7 @@ stack_kb: 256
         assert_eq!(result["user"]["roles"][1], "user");
     }
 
-    // --- Agent-class exposure (G1.4) ---
+    // --- Agent-class exposure ---
     //
     // The JS engine consumes a `serde_json::Value` for `request`, so
     // any caller that builds `request` with `agent_id`, `agent_class`,

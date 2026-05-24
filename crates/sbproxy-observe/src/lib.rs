@@ -12,7 +12,7 @@ pub mod audit;
 /// and user IDs.
 pub mod capture;
 pub mod cardinality;
-/// Wave 3 / R3.3 clock-skew monitor: SNTP poller + `/readyz` probe (A3.5).
+/// Wave 3 / R3.3 clock-skew monitor: SNTP poller + `/readyz` probe.
 pub mod clock_skew;
 /// Typed proxy events and the in-process subscriber bus.
 pub mod events;
@@ -25,7 +25,7 @@ pub mod export;
 /// `SBPROXY_TEST_FAKE_SINKS=1` environment variable.
 pub mod fake_sinks;
 pub mod golden_signals;
-/// `/healthz` and `/readyz` registry, probes, and HTTP handlers (R1.3).
+/// `/healthz` and `/readyz` registry, probes, and HTTP handlers.
 pub mod health;
 /// Global tracing subscriber configuration (log level and format).
 pub mod logging;

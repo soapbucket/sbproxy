@@ -119,7 +119,7 @@ impl Default for LoggingConfig {
     }
 }
 
-// --- Structured-log schema v1 (A1.5) ---
+// --- Structured-log schema v1 ---
 
 /// Schema version stamped on every emitted line. Bumped under the
 /// schema-versioning policy (additive only; breaking changes require a
@@ -245,7 +245,7 @@ pub struct StructuredLog {
     /// `none`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rail: Option<String>,
-    /// Content shape discriminator (Wave 4).
+    /// Content shape discriminator.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shape: Option<String>,
     /// HTTP status returned to the client.
@@ -305,7 +305,7 @@ impl StructuredLog {
     }
 }
 
-// --- Sink + redaction profile (A1.5) ---
+// --- Sink + redaction profile ---
 
 /// Where a structured-log line is heading. Per-variant redaction
 /// profile lets us ship the same proxy binary to a strict tenant and
@@ -321,7 +321,7 @@ pub enum Sink {
     /// Outbound trace exporter (span attributes). Stricter profile:
     /// applies the denylist and replaces full URLs with the route.
     TraceExporter,
-    /// Customer-facing external sink (Wave 6). Strictest profile.
+    /// Customer-facing external sink. Strictest profile.
     External,
 }
 

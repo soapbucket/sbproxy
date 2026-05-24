@@ -582,7 +582,7 @@ impl AiCrawlControlPolicy {
                 ConfiguredRail::Mpp { version } => rail_entries.push(RailChallenge::Mpp {
                     version: version.clone(),
                     // Wave 3 placeholder; the real Stripe `pi_*` is created
-                    // by the worker (G3.3) on the redeem path.
+                    // by the worker on the redeem path.
                     stripe_payment_intent: format!("pi_pending_{}", issued.claims.quote_id),
                     amount_micros: price.amount_micros,
                     currency: price.currency.clone(),
@@ -701,7 +701,7 @@ fn user_agent_matches(headers: &http::HeaderMap, needles: &[String]) -> bool {
     needles.iter().any(|n| lc.contains(&n.to_ascii_lowercase()))
 }
 
-// --- Multi-rail plan compilation (G3.4) ---
+// --- Multi-rail plan compilation ---
 
 /// Public test-only wrapper around the private [`ConfiguredRail`] enum.
 /// Lets integration tests inject a fully-formed multi-rail plan without
@@ -831,7 +831,7 @@ fn unix_seconds_to_rfc3339(unix_seconds: u64) -> String {
         .to_string()
 }
 
-// --- HTTP ledger client (G1.3) ---
+// --- HTTP ledger client ---
 
 #[cfg(feature = "http-ledger")]
 pub use http_ledger::{HttpLedger, HttpLedgerConfig};

@@ -1,4 +1,4 @@
-//! Resilient gRPC client for the classifier sidecar `InferenceService` (WOR-704).
+//! Resilient gRPC client for the classifier sidecar `InferenceService`.
 //!
 //! The proxy uses this one client to reach whichever sidecar is deployed -- the
 //! minimal OSS sidecar or the enterprise rich sidecar -- since both implement

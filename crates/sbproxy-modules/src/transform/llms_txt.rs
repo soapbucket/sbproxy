@@ -3,7 +3,7 @@
 //!
 //! This module exists alongside the older `projections::llms` renderer.
 //! The projection variant in `projections/llms.rs` is the AI-crawl-pricing
-//! flavour of `llms.txt` (G4.6): it carries a YAML-like header with
+//! flavour of `llms.txt`: it carries a YAML-like header with
 //! sitename / version / payment lines and is keyed off the
 //! `ai_crawl_control` policy. WOR-130 is the orthogonal flavour described
 //! on `https://llmstxt.org/`: a Markdown-shaped index of the host's

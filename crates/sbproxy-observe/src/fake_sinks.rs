@@ -1,4 +1,4 @@
-//! Test-only in-memory capture for redaction-eligible events (WOR-87).
+//! Test-only in-memory capture for redaction-eligible events.
 //!
 //! When fake-sink mode is enabled (via the `SBPROXY_TEST_FAKE_SINKS=1`
 //! environment variable), every redaction-eligible event the proxy

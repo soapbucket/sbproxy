@@ -2,7 +2,7 @@
 // Copyright 2026 Soap Bucket LLC
 
 //! Newtype wrapper enforcer for the `Policy::AgentBudget` variant
-//! (WOR-506).
+//!.
 //!
 //! Reads the resolved `agent_id` off the request context (the
 //! `agent-class` feature populates it via the resolver chain), keys

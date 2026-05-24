@@ -1,4 +1,4 @@
-//! Generated gRPC types for the sbproxy classifier `InferenceService` (WOR-704).
+//! Generated gRPC types for the sbproxy classifier `InferenceService`.
 //!
 //! This crate is nothing but the compiled, self-contained `classifier.proto`
 //! contract: the tonic client the proxy uses and the tonic server the OSS

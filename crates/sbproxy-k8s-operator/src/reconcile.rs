@@ -375,7 +375,7 @@ fn owner_reference(sbproxy: &SBProxy) -> OwnerReference {
     }
 }
 
-/// Preview-validate an `SBProxyConfig.spec.config` document (WOR-611).
+/// Preview-validate an `SBProxyConfig.spec.config` document.
 ///
 /// Parses the YAML into the config schema and runs the static validator
 /// (`sbproxy_config::validate`, which checks against the `KNOWN_*_TYPES`

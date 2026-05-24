@@ -52,7 +52,7 @@ use crate::{AgentDetection, AgentProvenance, Signals};
 pub const ADRF_VERSION: u32 = 0;
 
 /// Parsed rule pack. Hold this behind an `Arc` and swap it in via
-/// `arc_swap::ArcSwap` when the hot-reload slice (WOR-588) lands.
+/// `arc_swap::ArcSwap` when the hot-reload slice lands.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RulePack {

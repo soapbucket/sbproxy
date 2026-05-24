@@ -2027,7 +2027,7 @@ origins:
 
     // --- Wave 4 day-4 auto-wire tests (G4.1 + G4.10 + G4.4) ---
 
-    // --- Wave 4 day-4 auto-wire tests: content_negotiate (G4.1) ---
+    // --- Wave 4 day-4 auto-wire tests: content_negotiate ---
 
     #[test]
     fn auto_wire_skips_origins_without_ai_crawl_or_wave4_transforms() {

@@ -148,7 +148,7 @@ pub struct SBProxyStatus {
 pub struct SBProxyConfigSpec {
     /// The full `sb.yml` document as a YAML string. Required.
     ///
-    /// Bounded at the CRD schema level to 1 MiB (WOR-611) so the API server
+    /// Bounded at the CRD schema level to 1 MiB so the API server
     /// rejects an oversized or malicious document at admission rather than
     /// mounting it into every proxy pod. Any real `sb.yml` is far smaller.
     #[schemars(length(max = 1_048_576))]

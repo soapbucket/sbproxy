@@ -1,8 +1,8 @@
 //! G4.4 JSON envelope transform: wraps Markdown projection in the v1 schema.
 //!
-//! Implements the JSON envelope schema (A4.2). The envelope is the output
+//! Implements the JSON envelope schema. The envelope is the output
 //! shape for the `ContentShape::Json` branch of the content-negotiation
-//! pipeline (G4.2). It serialises the Markdown body produced by G4.3
+//! pipeline. It serialises the Markdown body produced by G4.3
 //! together with citation metadata, the page's RSL license URN, and any
 //! pass-through JSON-LD extracted from the original HTML.
 //!

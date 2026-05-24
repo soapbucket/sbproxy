@@ -42,7 +42,7 @@ impl Connection {
     /// The timeout is longer than the XREAD block window, so a normal idle
     /// period returns a nil reply first; the socket timeout only fires when
     /// Redis itself stops responding, which keeps the subscriber thread from
-    /// wedging forever in an uninterruptible read (WOR-649).
+    /// wedging forever in an uninterruptible read.
     fn connect_blocking(addr: &str) -> Result<Self> {
         let stream =
             TcpStream::connect(addr).with_context(|| format!("connect to Redis at {}", addr))?;
@@ -88,7 +88,7 @@ pub struct RedisMessenger {
     conn: Mutex<Option<Connection>>,
     /// Shared cancel flag handed to every subscription iterator. Set on drop
     /// (or via [`RedisMessenger::stop`]) so an idle subscriber exits within
-    /// one XREAD block window instead of parking forever (WOR-649).
+    /// one XREAD block window instead of parking forever.
     stop: Arc<AtomicBool>,
 }
 
@@ -175,7 +175,7 @@ impl Drop for RedisMessenger {
 
 /// Milliseconds XREAD blocks before returning a nil reply when no new entries
 /// arrive. Bounded (not `0`) so the subscriber loop regains control roughly
-/// once per window and can observe shutdown between reads (WOR-649).
+/// once per window and can observe shutdown between reads.
 const XREAD_BLOCK_MS: &[u8] = b"1000";
 
 /// Socket read timeout for the blocking subscription. Longer than the XREAD
@@ -193,7 +193,7 @@ struct RedisStreamIterator {
     /// The last-seen stream entry ID; starts as `$` (only new entries).
     last_id: String,
     /// Shared cancel flag. When set, `next` returns `None` (ending iteration)
-    /// at the next block-window boundary (WOR-649).
+    /// at the next block-window boundary.
     stop: Arc<AtomicBool>,
 }
 
@@ -326,7 +326,7 @@ impl Iterator for RedisStreamIterator {
 
     fn next(&mut self) -> Option<Message> {
         loop {
-            // Cancellation check (WOR-649). The bounded XREAD block returns at
+            // Cancellation check. The bounded XREAD block returns at
             // least once per window, so a stop signalled mid-wait is observed
             // here within ~one block window and ends iteration cleanly.
             if self.stop.load(Ordering::Relaxed) {

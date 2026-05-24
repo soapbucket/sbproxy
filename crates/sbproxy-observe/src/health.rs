@@ -323,9 +323,9 @@ impl HealthRegistry {
 ///
 /// - `ledger`: backed by the supplied `Recency`.
 /// - `bot_auth_directory`: backed by the supplied `Recency`.
-/// - `agent_registry` (Wave 2): `NotConfigured` stub.
-/// - `stripe` (Wave 2): `NotConfigured` stub.
-/// - `facilitator_quorum` (Wave 3): `NotConfigured` stub.
+/// - `agent_registry`: `NotConfigured` stub.
+/// - `stripe`: `NotConfigured` stub.
+/// - `facilitator_quorum`: `NotConfigured` stub.
 ///
 /// Operators wire the real `agent_registry`, `stripe`, and
 /// `facilitator_quorum` probes by calling `registry.register(...)`

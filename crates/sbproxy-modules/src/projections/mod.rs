@@ -2,11 +2,11 @@
 //!
 //! A4.1. The four projections are:
 //!
-//! - `robots.txt` (G4.5) per IETF draft-koster-rep-ai
-//! - `llms.txt` and `llms-full.txt` (G4.6) per the Anthropic / Mistral
+//! - `robots.txt` per IETF draft-koster-rep-ai
+//! - `llms.txt` and `llms-full.txt` per the Anthropic / Mistral
 //!   convention
-//! - `/licenses.xml` (G4.7) per RSL 1.0
-//! - `/.well-known/tdmrep.json` (G4.8) per W3C TDMRep
+//! - `/licenses.xml` per RSL 1.0
+//! - `/.well-known/tdmrep.json` per W3C TDMRep
 //!
 //! WOR-193 adds a fifth sibling:
 //!
@@ -68,15 +68,15 @@ pub struct ProjectionDocs {
     /// checks this against the live pipeline's version before
     /// serving).
     pub config_version: u64,
-    /// Per-hostname `robots.txt` bodies (G4.5).
+    /// Per-hostname `robots.txt` bodies.
     pub robots_txt: HashMap<CompactString, Bytes>,
-    /// Per-hostname `llms.txt` bodies (G4.6).
+    /// Per-hostname `llms.txt` bodies.
     pub llms_txt: HashMap<CompactString, Bytes>,
-    /// Per-hostname `llms-full.txt` bodies (G4.6).
+    /// Per-hostname `llms-full.txt` bodies.
     pub llms_full_txt: HashMap<CompactString, Bytes>,
-    /// Per-hostname `/licenses.xml` bodies (G4.7).
+    /// Per-hostname `/licenses.xml` bodies.
     pub licenses_xml: HashMap<CompactString, Bytes>,
-    /// Per-hostname `/.well-known/tdmrep.json` bodies (G4.8).
+    /// Per-hostname `/.well-known/tdmrep.json` bodies.
     pub tdmrep_json: HashMap<CompactString, Bytes>,
     /// Per-hostname RSL URN of the form
     /// `urn:rsl:1.0:<hostname>:<config_version_hash>`. Stamped on
@@ -89,11 +89,11 @@ pub struct ProjectionDocs {
     /// proxy can stamp the optional `TDM-Reservation: 1` header per
     /// A4.1 § "TDMRep" when an origin asserts no `Content-Signal`.
     pub content_signals: HashMap<CompactString, Option<CompactString>>,
-    /// Per-hostname Agent Skills v0.2.0 index (WOR-193). Origins
+    /// Per-hostname Agent Skills v0.2.0 index. Origins
     /// without `agent_skills:` produce no entries; the data-plane
     /// handler 404s the well-known URL for those hostnames.
     pub agent_skills: HashMap<CompactString, agent_skills::AgentSkillsIndex>,
-    /// Per-Listing Agent Skills indices (WOR-196).
+    /// Per-Listing Agent Skills indices.
     ///
     /// Keyed by `Listing.metadata.name`. Each entry carries the set
     /// of origin hostnames the Listing publishes plus the resolved
@@ -123,7 +123,7 @@ pub fn render_projections(config: &CompiledConfig, config_version: u64) -> Proje
 }
 
 /// Compute every projection body for every origin in `config`,
-/// folding the Listing-scoped agent-skills overlay (WOR-196) into the
+/// folding the Listing-scoped agent-skills overlay into the
 /// result.
 ///
 /// Walks `config.origins`, filters for origins with an
@@ -211,24 +211,24 @@ pub fn render_projections_with_listings(
 
         let hostname = origin.hostname.clone();
 
-        // --- robots.txt (G4.5) ---
+        // --- robots.txt ---
         let robots = robots::render(hostname.as_str(), ai_crawl, config_version);
         docs.robots_txt
             .insert(hostname.clone(), Bytes::from(robots));
 
-        // --- llms.txt + llms-full.txt (G4.6) ---
+        // --- llms.txt + llms-full.txt ---
         let (llms, llms_full) = llms::render(hostname.as_str(), ai_crawl, config_version);
         docs.llms_txt.insert(hostname.clone(), Bytes::from(llms));
         docs.llms_full_txt
             .insert(hostname.clone(), Bytes::from(llms_full));
 
-        // --- licenses.xml (G4.7) ---
+        // --- licenses.xml ---
         let (xml, urn) =
             licenses::render(hostname.as_str(), content_signal.as_deref(), config_version);
         docs.licenses_xml.insert(hostname.clone(), Bytes::from(xml));
         docs.rsl_urns.insert(hostname.clone(), urn);
 
-        // --- tdmrep.json (G4.8) ---
+        // --- tdmrep.json ---
         let tdm = tdmrep::render(hostname.as_str(), ai_crawl, content_signal.as_deref());
         docs.tdmrep_json.insert(hostname.clone(), Bytes::from(tdm));
 

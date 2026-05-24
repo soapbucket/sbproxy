@@ -431,7 +431,7 @@ async fn reconcile_one(sbproxy: Arc<SBProxy>, ctx: Arc<Ctx>) -> Result<Action, R
 
     let hash = reconcile::config_hash(&cfg.spec.config);
 
-    // --- Preview-validate the referenced config (WOR-611) ---
+    // --- Preview-validate the referenced config ---
     // A malformed config must not roll out to every replica. Validate it here;
     // on failure record the error in status and requeue without touching the
     // Deployment, so operators see the problem on the CRD instead of a
@@ -563,7 +563,7 @@ async fn reconcile_one(sbproxy: Arc<SBProxy>, ctx: Arc<Ctx>) -> Result<Action, R
 ///
 /// Best-effort: a status write failure is logged and swallowed so it never
 /// fails the reconcile (status is observability, not correctness). Used by
-/// the config preview-validation path (WOR-611) to surface a bad config on
+/// the config preview-validation path to surface a bad config on
 /// the CRD and to clear the error once the config validates again.
 async fn patch_status(client: &Client, ns: &str, name: &str, body: serde_json::Value) {
     let api: Api<SBProxy> = Api::namespaced(client.clone(), ns);

@@ -1,4 +1,4 @@
-//! Newtypes for provider names and model identifiers (WOR-625).
+//! Newtypes for provider names and model identifiers.
 //!
 //! Provider names and model IDs were bare `String` throughout the AI
 //! config, so a typo like `openAI` was indistinguishable from a valid

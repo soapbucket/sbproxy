@@ -102,7 +102,7 @@ pub struct RetryBudget {
     /// so every read observes a consistent `(retries, total)` pair and the
     /// computed ratio is one that actually held at some instant. Two separate
     /// `Relaxed` atomics could be read at different points in time on a weakly
-    /// ordered CPU, yielding a ratio that was never true (WOR-622). A single
+    /// ordered CPU, yielding a ratio that was never true. A single
     /// `fetch_add` also keeps the two fields in lockstep for concurrent
     /// writers. The 32-bit fields are ample for a window that is reset
     /// periodically via [`RetryBudget::reset`].

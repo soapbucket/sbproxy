@@ -1,4 +1,4 @@
-//! Per-origin rate-limit middleware (WOR-66).
+//! Per-origin rate-limit middleware.
 //!
 //! Consumes the `rate_limits:` block on a `CompiledOrigin`
 //! ([`sbproxy_config::OriginRateLimitsConfig`]) and gates traffic ahead

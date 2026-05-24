@@ -2,7 +2,7 @@
 //!
 //! Each token binds a 402 challenge to a specific `(route, shape, price, rail,
 //! quote_id)` tuple with a single-use `nonce`. The proxy issues tokens when
-//! emitting multi-rail challenges (G3.4) and the local ledger service verifies
+//! emitting multi-rail challenges and the local ledger service verifies
 //! them on redeem.
 //!
 //! ## Wire shape

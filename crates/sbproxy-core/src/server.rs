@@ -444,7 +444,7 @@ fn x_markdown_tokens_header_value_with_ratio(
 /// data-plane handler.
 ///
 /// Returns `None` for any path outside the closed set of well-known
-/// projection URLs (A4.1). The five recognised paths are the four
+/// projection URLs. The five recognised paths are the four
 /// projection documents plus the `llms-full.txt` extended variant.
 fn projection_kind_for_path(path: &str) -> Option<&'static str> {
     match path {
@@ -1444,7 +1444,7 @@ struct AcceptRange {
 /// Content negotiation only ever needs a handful of media types; capping the
 /// parse stops an attacker from forcing a large per-request allocation (and the
 /// CPU to build it) by sending tens of thousands of comma-separated entries
-/// (WOR-608).
+///.
 const MAX_ACCEPT_RANGES: usize = 32;
 
 fn parse_accept_ranges(header: &str) -> Vec<AcceptRange> {
@@ -2592,7 +2592,7 @@ fn build_session_cookie(config: &sbproxy_config::SessionConfig, session_id: &str
 // --- Callback firing ---
 //
 // Webhook/callback/mirror dispatch lives in the `callbacks`
-// submodule (WOR-629). The glob re-import keeps call sites unchanged.
+// submodule. The glob re-import keeps call sites unchanged.
 mod callbacks;
 use callbacks::*;
 
@@ -2609,13 +2609,13 @@ mod action_dispatch;
 use action_dispatch::*;
 
 // The ProxyHttp trait impl lives in the `proxy_http` submodule
-// (WOR-629). A trait impl needs no re-import to take effect.
+//. A trait impl needs no re-import to take effect.
 mod proxy_http;
 mod request_phase;
 
 // --- Access log emission helpers ---
 //
-// These live in the `access_log` submodule (WOR-629). The glob
+// These live in the `access_log` submodule. The glob
 // re-import keeps every existing call site in this file unchanged.
 mod access_log;
 use access_log::*;

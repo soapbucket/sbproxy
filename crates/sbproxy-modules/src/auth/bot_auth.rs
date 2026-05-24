@@ -50,7 +50,7 @@ fn default_required_components() -> Vec<String> {
     vec!["@method".to_string(), "@target-uri".to_string()]
 }
 
-/// Operator knob (WOR-502) controlling how the verifier reacts when a
+/// Operator knob controlling how the verifier reacts when a
 /// signature's `nonce` parameter has already been observed.
 ///
 /// The Web Bot Auth deep-dive flagged that Cloudflare's reference
@@ -101,7 +101,7 @@ pub struct BotAuthConfig {
     #[serde(default)]
     pub directory: Option<DirectoryConfig>,
     /// Replay policy applied when the verifier observes a `nonce`
-    /// parameter (WOR-502). Defaults to [`NoncePolicy::Strict`] so
+    /// parameter. Defaults to [`NoncePolicy::Strict`] so
     /// operators get fail-closed behaviour out of the box; flip to
     /// [`NoncePolicy::Permissive`] for shadow rollouts. Inert when no
     /// [`NonceStore`] is injected via
@@ -164,7 +164,7 @@ pub struct BotAuthProvider {
     /// Clock-skew tolerance carried over from config, reused when
     /// constructing on-the-fly verifiers for directory-resolved keys.
     clock_skew_seconds: u64,
-    /// Dynamic directory configuration (G1.7). When set, the
+    /// Dynamic directory configuration. When set, the
     /// `verify_async` path can consult a hosted directory for
     /// `Signature-Agent`-named requests. The static `verify` path
     /// ignores this field and continues to use the inline `agents`
@@ -177,7 +177,7 @@ pub struct BotAuthProvider {
     /// config compile time so directory fetches reuse a pooled
     /// connection across requests.
     directory_client: Option<reqwest::Client>,
-    /// Optional single-use [`NonceStore`] (WOR-502). When set, every
+    /// Optional single-use [`NonceStore`]. When set, every
     /// `Signature-Input` carrying a `nonce` parameter is run through
     /// [`NonceStore::check_and_consume`]; a hit means the nonce has
     /// been seen before and the verifier reacts per
@@ -256,7 +256,7 @@ impl BotAuthProvider {
         })
     }
 
-    /// Inject a [`NonceStore`] for replay-protection (WOR-502).
+    /// Inject a [`NonceStore`] for replay-protection.
     ///
     /// When set, every verified request's `nonce` parameter is
     /// consumed through [`NonceStore::check_and_consume`]. A hit

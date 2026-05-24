@@ -8,7 +8,7 @@
 //! Flow:
 //!
 //! 1. Read the `Idempotency-Key` header.
-//! 2. Absent: pass through. The rate-limit middleware (R2.3) consumes
+//! 2. Absent: pass through. The rate-limit middleware consumes
 //!    a slot per the normal flow.
 //! 3. Present, cache miss: process the request, capture the response,
 //!    persist `(workspace_id, key, body_hash, response, expires_at)`

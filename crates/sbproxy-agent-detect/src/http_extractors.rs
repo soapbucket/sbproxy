@@ -1,4 +1,4 @@
-//! HTTP-layer signal extractors (WOR-587).
+//! HTTP-layer signal extractors.
 //!
 //! The signals here are pure functions over header tuples. They do
 //! not touch the network or any shared state; the proxy hook that

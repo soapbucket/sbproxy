@@ -258,7 +258,7 @@ impl WasmRuntime {
         let mut store: Store<HostState> = Store::new(&self.engine, HostState { wasi, limits });
         store.limiter(|s| &mut s.limits);
 
-        // Fuel-based budget (WOR-613). The engine has `consume_fuel(true)`, so
+        // Fuel-based budget. The engine has `consume_fuel(true)`, so
         // the store must be given an explicit budget or the first instruction
         // traps. This bounds per-call CPU at instruction granularity,
         // independent of the 1 ms epoch tick.
@@ -312,7 +312,7 @@ impl WasmRuntime {
 }
 
 /// Build the JSON input passed to a WASM module's stdin for an HTTP
-/// request transform (G1.4). Mirrors the Lua / JS `request` table
+/// request transform. Mirrors the Lua / JS `request` table
 /// shape and includes the agent-class fields under `request.agent_*`
 /// so wasm32-wasi modules can read the resolved agent identity from
 /// `request.agent_id`, `request.agent_class`, `request.agent_vendor`,
@@ -399,7 +399,7 @@ fn build_engine() -> Result<Engine> {
         let mut config = Config::new();
         config.epoch_interruption(true);
         // Fuel gives a deterministic, instruction-granular budget that
-        // complements the 1 ms epoch tick (WOR-613). Each `Store` sets its
+        // complements the 1 ms epoch tick. Each `Store` sets its
         // per-invocation budget via `set_fuel` from `WasmConfig::fuel()`.
         config.consume_fuel(true);
         let engine = Engine::new(&config).expect("creating wasmtime engine");
@@ -581,7 +581,7 @@ mod tests {
         capture.finish();
     }
 
-    // --- Agent-class input builder (G1.4) tests ---
+    // --- Agent-class input builder tests ---
 
     #[test]
     fn build_request_input_with_agent_class_sets_keys() {

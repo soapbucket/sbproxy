@@ -168,7 +168,7 @@ impl AcmeClient {
     /// The host is parsed rather than substring-matched, so a non-loopback
     /// URL that merely contains the text "localhost" or "127.0.0.1" (in a
     /// query string, subdomain, or userinfo) does not disable certificate
-    /// verification (WOR-597).
+    /// verification.
     pub fn new(directory_url: &str, email: &str, challenge_types: Vec<String>) -> Self {
         let accept_invalid = is_loopback_directory(directory_url);
         let http = reqwest::Client::builder()

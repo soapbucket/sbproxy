@@ -216,14 +216,14 @@ pub struct ProxyMetrics {
     /// labelled by origin.
     pub cache_reserve_evictions: IntCounterVec,
 
-    // --- Synthetic probe metrics (WOR-27) ---
+    // --- Synthetic probe metrics ---
     /// Counter `sbproxy_synthetic_probe_failures_total` of synthetic
     /// readiness probe failures, labelled by failure `reason`. Distinct
     /// from `sbproxy_errors_total` so dashboards can keep synthetic
     /// noise out of real-traffic SLO numerators.
     pub synthetic_probe_failures: IntCounterVec,
 
-    // --- Reliability metrics (WOR-168) ---
+    // --- Reliability metrics ---
     /// Counter `sbproxy_mirror_state_drift_total` incremented when the
     /// request pipeline observes a `mirror_pending` slot that was
     /// expected to be `Some(...)` but turns out to be `None`. The fix
@@ -232,7 +232,7 @@ pub struct ProxyMetrics {
     /// taken so the drift can be diagnosed in production.
     pub mirror_state_drift: prometheus::IntCounter,
 
-    // --- Agent Skills (WOR-194) ---
+    // --- Agent Skills ---
     /// Counter `sbproxy_agent_skill_digest_mismatch_total` of artifact
     /// `GET`s where the served body re-hash did not match the manifest
     /// digest. Labelled by `skill` so operators can dedupe alerts and
@@ -413,7 +413,7 @@ impl ProxyMetrics {
         )
         .unwrap();
 
-        // --- Synthetic probe counters (WOR-27) ---
+        // --- Synthetic probe counters ---
 
         let synthetic_probe_failures = IntCounterVec::new(
             Opts::new(
@@ -424,7 +424,7 @@ impl ProxyMetrics {
         )
         .unwrap();
 
-        // --- Reliability counters (WOR-168) ---
+        // --- Reliability counters ---
 
         let mirror_state_drift = prometheus::IntCounter::new(
             "sbproxy_mirror_state_drift_total",
@@ -432,7 +432,7 @@ impl ProxyMetrics {
         )
         .unwrap();
 
-        // --- Agent Skills counters (WOR-194) ---
+        // --- Agent Skills counters ---
 
         let agent_skill_digest_mismatch = IntCounterVec::new(
             Opts::new(
@@ -893,7 +893,7 @@ pub fn record_a2a_denied(route: &str, reason: &str) {
     counter.with_label_values(&[route.as_str(), reason]).inc();
 }
 
-/// Record a bounded channel drop on a hot-path lane (WOR-169).
+/// Record a bounded channel drop on a hot-path lane.
 ///
 /// `lane` is a fixed identifier for the channel's purpose
 /// (`"hooks"`, `"streaming"`, `"mirror"`, ...). `reason` is one of the
@@ -997,7 +997,7 @@ pub fn record_http_framing_block(reason: &str) {
 }
 
 /// Record a replayed nonce observed by the Web Bot Auth verifier
-/// (WOR-502). `policy` is one of the closed labels `strict` (the
+///. `policy` is one of the closed labels `strict` (the
 /// verifier rejected the request) or `permissive` (the verifier
 /// logged the replay and still returned Verified, the operator
 /// opted in to monitoring without blocking).
@@ -1074,7 +1074,7 @@ pub fn dec_active(origin: &str) {
         .dec();
 }
 
-/// Increment `sbproxy_mirror_state_drift_total` (WOR-168).
+/// Increment `sbproxy_mirror_state_drift_total`.
 ///
 /// Called when the request pipeline expects `mirror_pending` to be
 /// `Some(...)` but finds `None`. Before WOR-168 this path was an

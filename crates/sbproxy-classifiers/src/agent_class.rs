@@ -4,9 +4,9 @@
 //! UA pattern, reverse-DNS suffixes, expected Web Bot Auth keyids,
 //! robots-compliance score). Consumed by:
 //!
-//! * `sbproxy-modules::policy::agent_class` resolver (G1.4).
-//! * `sbproxy-security::agent_verify` reverse-DNS verifier (G1.5).
-//! * Per-agent metric labels (G1.6) and the HTTP ledger payload (A1.2).
+//! * `sbproxy-modules::policy::agent_class` resolver.
+//! * `sbproxy-security::agent_verify` reverse-DNS verifier.
+//! * Per-agent metric labels and the HTTP ledger payload.
 //!
 //! # Reserved sentinels
 //!
@@ -223,7 +223,7 @@ impl std::fmt::Display for AgentId {
 /// produced the [`AgentId`]. Mirrors the user-id source pattern.
 ///
 /// Closed enum per A1.8 Rule 4. Adding a variant is a schema-breaking
-/// change; [`Self::TlsFingerprint`] landed via the Wave 5 amendment (A5.1).
+/// change; [`Self::TlsFingerprint`] landed via the Wave 5 amendment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentIdSource {

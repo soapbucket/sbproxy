@@ -1,7 +1,7 @@
 //! Non-proxy action dispatch: `handle_action` (the request_filter
 //! short-circuit for non-Proxy actions) and the MCP action path.
 //!
-//! Extracted from `server.rs` (WOR-629). Behavior-preserving move:
+//! Extracted from `server.rs`. Behavior-preserving move:
 //! `use super::*` re-imports the parent module's private items and
 //! `use` aliases, so the moved code needs no rewiring.
 
@@ -992,7 +992,7 @@ pub(super) async fn handle_mcp_action(
                                 &format!("tool '{}' is denied by RBAC policy for caller", name,),
                             )
                         } else {
-                            // Per-server timeout (WOR-186). The
+                            // Per-server timeout. The
                             // dispatcher inside `call_tool` shares one
                             // reqwest::Client across upstreams; the
                             // request-level cap is what makes the field
