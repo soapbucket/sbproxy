@@ -299,6 +299,13 @@ static ANOMALY_HOOKS: Mutex<Vec<Arc<dyn AnomalyDetectorHook>>> = Mutex::new(Vec:
 /// impls in registration order. Tests use this instead of
 /// `inventory::submit!` because inventory entries cannot be removed
 /// for cleanup.
+///
+/// ## Panics
+///
+/// Panics if the internal registry mutex is poisoned, which only
+/// happens if a previous caller panicked while holding the lock. The
+/// registry holds the lock only long enough to push one entry, so this
+/// should not occur in practice.
 pub fn register_identity_hook(hook: Arc<dyn IdentityResolverHook>) {
     IDENTITY_HOOKS
         .lock()
@@ -308,6 +315,11 @@ pub fn register_identity_hook(hook: Arc<dyn IdentityResolverHook>) {
 
 /// Register an [`MlClassifierHook`] at runtime. See
 /// [`register_identity_hook`] for the contract.
+///
+/// ## Panics
+///
+/// Panics if the internal registry mutex is poisoned (a prior holder
+/// panicked while holding the lock).
 pub fn register_ml_classifier_hook(hook: Arc<dyn MlClassifierHook>) {
     ML_CLASSIFIER_HOOKS
         .lock()
@@ -317,6 +329,11 @@ pub fn register_ml_classifier_hook(hook: Arc<dyn MlClassifierHook>) {
 
 /// Register an [`AnomalyDetectorHook`] at runtime. See
 /// [`register_identity_hook`] for the contract.
+///
+/// ## Panics
+///
+/// Panics if the internal registry mutex is poisoned (a prior holder
+/// panicked while holding the lock).
 pub fn register_anomaly_hook(hook: Arc<dyn AnomalyDetectorHook>) {
     ANOMALY_HOOKS
         .lock()
@@ -328,6 +345,11 @@ pub fn register_anomaly_hook(hook: Arc<dyn AnomalyDetectorHook>) {
 ///
 /// Returns owned `Arc`s so the iteration stays valid even if the
 /// registry is modified concurrently.
+///
+/// ## Panics
+///
+/// Panics if the internal registry mutex is poisoned (a prior holder
+/// panicked while holding the lock).
 pub fn identity_hooks() -> Vec<Arc<dyn IdentityResolverHook>> {
     IDENTITY_HOOKS
         .lock()
@@ -337,6 +359,11 @@ pub fn identity_hooks() -> Vec<Arc<dyn IdentityResolverHook>> {
 
 /// Snapshot all registered ML classifier hooks. See [`identity_hooks`]
 /// for the contract.
+///
+/// ## Panics
+///
+/// Panics if the internal registry mutex is poisoned (a prior holder
+/// panicked while holding the lock).
 pub fn ml_classifier_hooks() -> Vec<Arc<dyn MlClassifierHook>> {
     ML_CLASSIFIER_HOOKS
         .lock()
@@ -346,6 +373,11 @@ pub fn ml_classifier_hooks() -> Vec<Arc<dyn MlClassifierHook>> {
 
 /// Snapshot all registered anomaly detector hooks. See
 /// [`identity_hooks`] for the contract.
+///
+/// ## Panics
+///
+/// Panics if the internal registry mutex is poisoned (a prior holder
+/// panicked while holding the lock).
 pub fn anomaly_hooks() -> Vec<Arc<dyn AnomalyDetectorHook>> {
     ANOMALY_HOOKS
         .lock()

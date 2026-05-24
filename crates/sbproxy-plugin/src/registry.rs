@@ -46,6 +46,12 @@ pub struct PluginRegistration {
     /// Unique name for this plugin (e.g. "my-custom-action").
     pub name: &'static str,
     /// Factory function that creates an instance from JSON config.
+    ///
+    /// The returned value is type-erased as `Box<dyn Any + Send>`; the
+    /// consumer for this [`PluginKind`] downcasts it to the concrete
+    /// handler type. The factory must return `Err` when the JSON config
+    /// fails to deserialize or fails the plugin's own validation; the
+    /// config compiler surfaces that error to the operator at load time.
     pub factory: fn(serde_json::Value) -> Result<Box<dyn std::any::Any + Send>>,
 }
 
@@ -94,13 +100,31 @@ pub struct AuthPluginRegistration {
     /// Unique name for this auth provider (e.g. `"saml"`).
     pub name: &'static str,
     /// Factory that builds a boxed AuthProvider from JSON config.
+    ///
+    /// Unlike [`PluginRegistration::factory`], this returns the concrete
+    /// `Box<dyn AuthProvider>` so the compile side can build
+    /// `Auth::Plugin(...)` without a downcast. The factory must return
+    /// `Err` when the JSON config fails to deserialize or fails the
+    /// provider's own validation.
     pub factory: fn(serde_json::Value) -> Result<Box<dyn AuthProvider>>,
 }
 
 inventory::collect!(AuthPluginRegistration);
 
-/// Look up a strongly-typed Auth plugin by name. Returns the concrete
+/// Look up a strongly-typed Auth plugin by name and build it from the
+/// given JSON config. On a successful build the inner result holds a
 /// `Box<dyn AuthProvider>` ready to be wrapped in `Auth::Plugin(...)`.
+///
+/// Returns `None` when no auth plugin with `name` is registered. When a
+/// plugin is found, returns `Some(result)` where the inner `result` is
+/// the outcome of running the registered factory.
+///
+/// ## Errors
+///
+/// The inner `Result` is `Err` when the matched factory fails, for
+/// example because `config` does not deserialize into the provider's
+/// config type or fails the provider's validation. A missing
+/// registration is reported as the outer `None`, not as `Err`.
 pub fn build_auth_plugin(
     name: &str,
     config: serde_json::Value,
