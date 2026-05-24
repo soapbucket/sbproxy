@@ -25,6 +25,7 @@ pub mod code_mode;
 pub mod codemode_from_openapi;
 pub mod codemode_ts;
 pub mod context_opt;
+pub mod discovery;
 pub mod federation;
 pub mod guardrails;
 pub mod handler;

@@ -792,6 +792,89 @@ pub(super) async fn handle_mcp_action(
         return Ok(());
     }
 
+    // WOR-806: serve the MCP discovery manifest at
+    // `/.well-known/mcp-server` and the Cloudflare Agent-Readiness
+    // variant `/.well-known/mcp/server-card.json`. An autonomous agent
+    // fetches this to learn the gateway's endpoint, protocol version,
+    // transport, and tool catalogue without first opening a JSON-RPC
+    // session. Served for any origin whose action is the MCP gateway.
+    if method == http::Method::GET
+        && sbproxy_extension::mcp::discovery::SERVER_MANIFEST_PATHS.contains(&req_path)
+    {
+        // Own the path now so its borrow of `session` ends before the
+        // mutable `write_response_*` calls below (used only for audit).
+        let path_for_log = req_path.to_string();
+        let listener_is_tls = session
+            .digest()
+            .and_then(|d| d.ssl_digest.as_ref())
+            .is_some();
+        let scheme = if listener_is_tls { "https" } else { "http" };
+        let endpoint = match session
+            .req_header()
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+        {
+            Some(authority) => format!("{scheme}://{authority}/"),
+            None => "/".to_string(),
+        };
+        // Advertise the gateway's tool catalogue, honouring any
+        // collapsed `tool_allowlist` guardrail so the manifest never
+        // lists a tool the gateway would refuse to call.
+        let tools: Vec<sbproxy_extension::mcp::discovery::DiscoveryTool> = mcp
+            .federation
+            .list_tools()
+            .into_iter()
+            .filter(|t| {
+                mcp.tool_allowlist
+                    .as_ref()
+                    .map(|allow| allow.iter().any(|a| a == &t.name))
+                    .unwrap_or(true)
+            })
+            .map(|t| sbproxy_extension::mcp::discovery::DiscoveryTool {
+                name: t.name,
+                description: t.description,
+            })
+            .collect();
+        let manifest = sbproxy_extension::mcp::discovery::build_server_manifest(
+            &mcp.server_name,
+            &mcp.server_version,
+            "2025-06-18",
+            &endpoint,
+            &tools,
+        );
+        let body = serde_json::to_vec(&manifest).unwrap_or_default();
+        let mut header = pingora_http::ResponseHeader::build(200, Some(2)).map_err(|e| {
+            Error::because(
+                ErrorType::InternalError,
+                "failed to build mcp discovery header",
+                e,
+            )
+        })?;
+        let _ = header.insert_header(
+            "content-type",
+            sbproxy_extension::mcp::discovery::SERVER_MANIFEST_CONTENT_TYPE,
+        );
+        let _ = header.insert_header("content-length", body.len().to_string());
+        let tool_count = tools.len();
+        session
+            .write_response_header(Box::new(header), false)
+            .await?;
+        session
+            .write_response_body(Some(bytes::Bytes::from(body)), true)
+            .await?;
+        tracing::info!(
+            target: "sbproxy::audit",
+            event = "mcp.discovery.served",
+            mcp_server = %mcp.server_name,
+            request_id = %ctx.request_id,
+            path = %path_for_log,
+            tool_count,
+            "served MCP discovery manifest"
+        );
+        return Ok(());
+    }
+
     if method != http::Method::POST {
         send_error(session, 405, "MCP gateway accepts POST only").await?;
         return Ok(());
