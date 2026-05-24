@@ -62,6 +62,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [metrics-stability.md](metrics-stability.md) - Prometheus metric naming and stability.
 - [model-pinning.md](model-pinning.md) - how SHA-256 hashes get computed and pinned for the classifier known-model registry.
 - [adr-ai-hub-format.md](adr-ai-hub-format.md) - hub `ChatFormat` trait and the canonical `ChatRequest` / `ChatResponse` shape that backs `/v1/chat/completions`, `/v1/messages`, and `/v1/responses`.
+- [adr-outbound-credential-resolver.md](adr-outbound-credential-resolver.md) - the OSS vs enterprise line for the outbound credential resolver (RFC 8693 exchange, client-credentials, and vault resolution in OSS).
 - [comparison.md](comparison.md) - how SBproxy compares to other proxies and AI gateways.
 
 ### Contributing

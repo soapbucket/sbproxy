@@ -8,6 +8,9 @@ pub mod bot_auth_directory;
 /// Crawler Authorization Protocol (CAP) verifier.
 pub mod cap;
 pub mod jwks;
+/// Outbound credential resolver (WOR-802): per-upstream RFC 8693 token
+/// exchange, OAuth client-credentials, and vault-resolved secrets.
+pub mod outbound_credential;
 /// Trust-tier combiner: collapses signed / named / scored
 /// signals into a single enum for downstream policy consumption.
 pub mod trust_tier;
