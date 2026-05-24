@@ -261,7 +261,7 @@ pub(crate) fn hub_chunk_to_responses_sse(chunk: &HubChunk) -> Vec<String> {
     }
 }
 
-fn parse_responses_message(obj: &Map<String, Value>) -> Result<HubMessage, ChatError> {
+pub(crate) fn parse_responses_message(obj: &Map<String, Value>) -> Result<HubMessage, ChatError> {
     // WOR-599: missing or unknown role is an error, not a silent default to
     // user. Shared helper lives in the format module.
     let role = super::parse_role(obj)?;
