@@ -39,7 +39,7 @@ base64.workspace = true
 thiserror.workspace = true
 flate2 = "1"
 
-# R1.4 outbound webhook framework: Ed25519 signing (preferred) with
+# Outbound webhook framework: Ed25519 signing (preferred) with
 # HMAC-SHA256 fallback. Already used in
 # sbproxy-middleware; share the version.
 ed25519-dalek = "2"

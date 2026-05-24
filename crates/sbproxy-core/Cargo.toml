@@ -5,21 +5,21 @@ edition = "2021"
 license.workspace = true
 publish = false
 
-# --- Wave 1 AI Governance feature flags ---
+# --- AI Governance feature flags ---
 #
 # Library consumers opt in; the `sbproxy` binary turns these on via its own
-# `default` feature set. See docs/AIGOVERNANCE-BUILD.md task B1.1.
+# `default` feature set.
 #
 # Flags:
-#   - agent-class : `agent_class` resolver on `RequestContext` (G1.4). The
-#     resolver combines UA match, reverse-DNS verification, and bot-auth
-#     keyid; the resolved value is exposed to CEL, Lua, JS, and WASM.
+# - agent-class : `agent_class` resolver on `RequestContext`. The
+# resolver combines UA match, reverse-DNS verification, and bot-auth
+# keyid; the resolved value is exposed to CEL, Lua, JS, and WASM.
 [features]
 default = []
 # Pulls the resolver in `sbproxy-modules::policy::agent_class` and the
 # reverse-DNS verifier in `sbproxy-security::agent_verify` into the
 # request pipeline. Off by default for library consumers; the
-# `sbproxy` binary turns it on via its own default feature set (B1.1).
+# `sbproxy` binary turns it on via its own default feature set.
 agent-class = [
     "dep:sbproxy-classifiers",
     "sbproxy-modules/agent-class",
@@ -32,7 +32,7 @@ agent-class = [
 # context to hold the verdict the enterprise classifier produces. The
 # OSS proxy does not run the classifier itself.
 agent-classifier = ["agent-class"]
-# Wave 5 / G5.3. Forwards through to `sbproxy-tls/tls-fingerprint`,
+# Forwards through to `sbproxy-tls/tls-fingerprint`,
 # enabling JA3 / JA4 / JA4H capture in the request pipeline. The
 # `tls_fingerprint` and `headless_signal` fields on `RequestContext`
 # are present unconditionally (so types resolve either way) but stay
@@ -119,7 +119,7 @@ anyhow.workspace = true
 # Serialization (for action_config access)
 serde_json.workspace = true
 serde.workspace = true
-# Wave 5 day-6 Item 3: TlsFingerprintConfig parses
+# TlsFingerprintConfig parses
 # proxy.extensions.tls_fingerprint from the operator YAML.
 serde_yaml.workspace = true
 
@@ -132,7 +132,7 @@ futures.workspace = true
 
 # UUID generation (for session cookies)
 uuid.workspace = true
-# ULID parsing for Wave 8 P0 session_id / parent_session_id
+# ULID parsing for session_id / parent_session_id
 ulid.workspace = true
 
 # Identity / hashing for webhook envelope (instance_id tag, config_revision)

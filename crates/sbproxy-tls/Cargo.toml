@@ -5,13 +5,13 @@ edition = "2021"
 license.workspace = true
 publish = false
 
-# --- Wave 5 / G5.3 feature flag ---
+# --- feature flag ---
 #
 # `tls-fingerprint` opts in JA3 / JA4 / JA4H ClientHello capture and
 # parsing. Default-off so library consumers do not pay the parse-and-
-# hash cost (50-100 microseconds per handshake, per A5.1) when they do
+# hash cost (50-100 microseconds per handshake) when they do
 # not need agent-fingerprinting. Operators turn it on via Helm value
-# `features.tlsFingerprint = true` (B5.4) which flows through the
+# `features.tlsFingerprint = true` which flows through the
 # binary's default feature set.
 [features]
 default = []
@@ -22,7 +22,7 @@ sbproxy-config.workspace = true
 sbproxy-platform.workspace = true
 
 # CIDR matching for trustworthy / untrusted client IP ranges.
-# Used by the per-origin trustworthy classifier (G5.3).
+# Used by the per-origin trustworthy classifier.
 ipnetwork.workspace = true
 
 # Hex encoding for JA3/JA4 outputs.
