@@ -32,7 +32,7 @@ ed25519-dalek = "2"
 # Base64 decoding for inline PEM SPKI public keys passed to the optional
 # signature-verification path.
 base64 = { workspace = true }
-# Agent-class taxonomy (G1.1): regex compilation + YAML loader for the
+# Agent-class taxonomy: regex compilation + YAML loader for the
 # embedded vendor catalog. `serde_yaml` is the workspace-aliased
 # `yaml_serde` fork; `serde_json` powers the `AgentPurpose` serialiser
 # tests and the public JSON-shaped wire format.

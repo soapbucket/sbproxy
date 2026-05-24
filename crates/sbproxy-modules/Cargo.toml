@@ -5,58 +5,58 @@ edition = "2021"
 license.workspace = true
 publish = false
 
-# --- Wave 1 + Wave 4 AI Governance feature flags ---
+# --- AI Governance feature flags ---
 #
 # Library consumers opt in. The `sbproxy` binary turns these on via its own
 # `default` feature set so end users get the full governance surface out of
-# the box. See docs/AIGOVERNANCE-BUILD.md tasks B1.1 (Wave 1) and B4.1
-# (Wave 4) for the gating strategy.
+# the box.
+# See docs/AIGOVERNANCE-BUILD.md for the gating strategy.
 #
-# Wave 1 flags (each gates a real implementation):
-#   - tiered-pricing : multi-tier pricing in `policy/ai_crawl.rs` (G1.2)
-#   - http-ledger    : HTTP ledger client in `policy/ai_crawl.rs` (G1.3)
-#   - agent-class    : agent-class resolver chain (G1.4)
+# flags (each gates a real implementation):
+# - tiered-pricing : multi-tier pricing in `policy/ai_crawl.rs`
+# - http-ledger : HTTP ledger client in `policy/ai_crawl.rs`
+# - agent-class : agent-class resolver chain
 #
-# Wave 4 flags (default-on; off-mode strips the surface for operators
+# flags (default-on; off-mode strips the surface for operators
 # who want a minimal binary):
-#   - content-negotiate : the `content_negotiate` action (G4.2)
-#   - licensing-rsl     : the `/licenses.xml` projection (G4.7)
-#   - licensing-tdmrep  : the `/.well-known/tdmrep.json` projection (G4.8)
-#   - llms-txt          : the `llms.txt` + `llms-full.txt` projections (G4.6)
+# - content-negotiate : the `content_negotiate` action
+# - licensing-rsl : the `/licenses.xml` projection
+# - licensing-tdmrep : the `/.well-known/tdmrep.json` projection
+# - llms-txt : the `llms.txt` + `llms-full.txt` projections
 #
-# The Wave 4 flags are default-on so the existing default build keeps
+# The flags are default-on so the existing default build keeps
 # working unchanged. Operators that want a stripped binary disable
 # `default-features` and re-enable only the flags they need.
 [features]
 default = ["content-negotiate", "licensing-rsl", "licensing-tdmrep", "llms-txt"]
 tiered-pricing = []
 http-ledger = []
-# Enables the `policy::agent_class` resolver (G1.4). Pulls the
+# Enables the `policy::agent_class` resolver. Pulls the
 # `agent-class` feature on `sbproxy-security` so the reverse-DNS
-# verifier (G1.5) is available to the resolver chain.
+# verifier is available to the resolver chain.
 agent-class = ["sbproxy-security/agent-class"]
-# Wave 4 / G4.2: marker flag for the `content_negotiate` action. Code
+# Marker flag for the `content_negotiate` action. Code
 # is unconditionally compiled today; the flag exists so a future
 # stripped-binary build can `#[cfg]` it out without touching the
-# action's call sites. Tracked in B4.1.
+# action's call sites.
 content-negotiate = []
-# Wave 4 / G4.7: marker flag for the `/licenses.xml` (RSL 1.0)
+# Marker flag for the `/licenses.xml` (RSL 1.0)
 # projection. Same compile-everywhere-for-now contract as
 # `content-negotiate`.
 licensing-rsl = []
-# Wave 4 / G4.8: marker flag for the `/.well-known/tdmrep.json` (W3C
+# Marker flag for the `/.well-known/tdmrep.json` (W3C
 # TDMRep) projection. Same contract as `licensing-rsl`.
 licensing-tdmrep = []
-# Wave 4 / G4.6: marker flag for the `llms.txt` + `llms-full.txt`
+# Marker flag for the `llms.txt` + `llms-full.txt`
 # projections. Same contract as `licensing-rsl`.
 llms-txt = []
-# Wave 6 / R6.1: opt-in wiring of the CAP verifier into the future
-# `sbproxy-rate-limit` middleware (R2.3). Off today because the crate
+# Opt-in wiring of the CAP verifier into the future
+# `sbproxy-rate-limit` middleware. Off today because the crate
 # does not exist on this branch; see WATCH.md for the follow-up. CAP
 # verification still happens with the flag off; the bucket
 # registration is the only gated behaviour.
 rate-limit = []
-# Wave 7 / A7.2 A2A protocol envelope parsers. Detection and policy
+# A2A protocol envelope parsers. Detection and policy
 # enforcement run with these flags off (the proxy treats matched
 # requests as plain POSTs and applies route limits without parsed
 # fields). Each flag opts in one draft; the convenience `a2a` flag
@@ -101,18 +101,18 @@ md-5 = "0.10"
 sha2.workspace = true
 hex.workspace = true
 # HMAC-SHA256 for the WAF rule-feed signature verification path
-# and the HTTP ledger client request signing (G1.3).
+# and the HTTP ledger client request signing.
 hmac.workspace = true
-# Ed25519 for the quote-token JWS signer / verifier (G3.6).
+# Ed25519 for the quote-token JWS signer / verifier.
 # Pinned to 2.x to match the resolved version in sbproxy-middleware
 # and sbproxy-observe so the workspace builds with one copy.
 ed25519-dalek = "2"
-# ULID for ledger Idempotency-Key + envelope request_id (G1.3).
+# ULID for ledger Idempotency-Key + envelope request_id.
 ulid.workspace = true
 # UUID for the CompiledPolicy identifiers in the NL policy compiler
 # pipeline (WOR-203 PR 3a).
 uuid = { workspace = true }
-# Strongly typed LedgerError variants (G1.3).
+# Strongly typed LedgerError variants.
 thiserror.workspace = true
 parking_lot.workspace = true
 jsonwebtoken.workspace = true

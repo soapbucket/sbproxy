@@ -9,25 +9,25 @@ publish = false
 name = "sbproxy"
 path = "src/main.rs"
 
-# --- Wave 1 + Wave 4 AI Governance feature flags ---
+# --- AI Governance feature flags ---
 #
-# The `sbproxy` binary turns the Wave 1 + Wave 4 governance flags on by
+# The `sbproxy` binary turns the governance flags on by
 # default so released builds expose tiered pricing, agent-class
 # resolution, the HTTP ledger client, content negotiation, and the four
 # policy-graph projections without extra cargo flags. Library consumers
 # depending on `sbproxy-modules` or `sbproxy-core` directly leave these
 # OFF and opt in per crate.
 #
-# Forwarded Wave 1 features (B1.1 in docs/AIGOVERNANCE-BUILD.md):
-#   - tiered-pricing    -> sbproxy-modules/tiered-pricing    (G1.2)
-#   - agent-class       -> sbproxy-core/agent-class          (G1.4)
-#   - http-ledger       -> sbproxy-modules/http-ledger       (G1.3)
+# Forwarded features (see docs/AIGOVERNANCE-BUILD.md):
+# - tiered-pricing -> sbproxy-modules/tiered-pricing
+# - agent-class -> sbproxy-core/agent-class
+# - http-ledger -> sbproxy-modules/http-ledger
 #
-# Forwarded Wave 4 features (B4.1 in docs/AIGOVERNANCE-BUILD.md):
-#   - content-negotiate -> sbproxy-modules/content-negotiate (G4.2)
-#   - licensing-rsl     -> sbproxy-modules/licensing-rsl     (G4.7)
-#   - licensing-tdmrep  -> sbproxy-modules/licensing-tdmrep  (G4.8)
-#   - llms-txt          -> sbproxy-modules/llms-txt          (G4.6)
+# Forwarded features (see docs/AIGOVERNANCE-BUILD.md):
+# - content-negotiate -> sbproxy-modules/content-negotiate
+# - licensing-rsl -> sbproxy-modules/licensing-rsl
+# - licensing-tdmrep -> sbproxy-modules/licensing-tdmrep
+# - llms-txt -> sbproxy-modules/llms-txt
 [features]
 default = [
   "tiered-pricing",
@@ -46,7 +46,7 @@ content-negotiate = ["sbproxy-modules/content-negotiate"]
 licensing-rsl = ["sbproxy-modules/licensing-rsl"]
 licensing-tdmrep = ["sbproxy-modules/licensing-tdmrep"]
 llms-txt = ["sbproxy-modules/llms-txt"]
-# Wave 5 / G5.3 + G5.4. Operators turn this off via Helm value
+# Operators turn this off via Helm value
 # `features.tlsFingerprint = false` when running on a tightly-budgeted
 # free tier; on by default for the publishable matrix builds.
 tls-fingerprint = ["sbproxy-core/tls-fingerprint"]
