@@ -7,10 +7,10 @@
 //! - [`context`] - Plugin context passed during provisioning.
 //! - [`registry`] - Inventory-based plugin discovery at link time.
 //! - [`identity`] - Identity, classification, and anomaly hook surface.
-//! - [`mcp`] - MCP pre-tool-call policy hook trait surface (WOR-152).
+//! - [`mcp`] - MCP pre-tool-call policy hook trait surface.
 //! - [`audit`] - Admin-action audit emitter trait surface.
 //! - [`verdict_combine`] - Combine multiple `PolicyDecision` votes
-//!   into a single terminal verdict per the WOR-152 matrix.
+//!   into a single terminal verdict per the combination matrix.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

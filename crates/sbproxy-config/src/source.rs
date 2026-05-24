@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
-//! Config-source loader (WOR-185).
+//! Config-source loader.
 //!
 //! The compiler historically accepted a single string of YAML and went
-//! straight to parsing. WOR-185 adds an optional `source:` discriminator
+//! straight to parsing. The loader adds an optional `source:` discriminator
 //! on [`crate::ConfigFile`] that lets operators load the underlying
 //! text from places other than the inline file:
 //!
@@ -180,7 +180,7 @@ impl FetchContext {
 ///
 /// # Blocking I/O
 ///
-/// WOR-618: resolving a [`ConfigSource::Git`] source does blocking
+/// Resolving a [`ConfigSource::Git`] source does blocking
 /// filesystem work (tempdir creation, `mkdir`, `read_to_string`) and
 /// shells out to `git` synchronously through [`Cloner::clone_into`].
 /// That work runs inline rather than pulling a tokio runtime dependency

@@ -1,4 +1,4 @@
-//! Plan-time semantic validation. Implements step 3 of the WOR-131
+//! Plan-time semantic validation. Implements step 3 of the
 //! ADR (`docs/adr-config-plan-apply.md`): a sync library API that
 //! walks a parsed [`ConfigFile`] and produces a list of
 //! [`PlanFinding`]s the CLI surfaces under the diff.

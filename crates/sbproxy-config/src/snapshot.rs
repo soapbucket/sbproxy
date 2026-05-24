@@ -161,7 +161,7 @@ pub struct CompiledOrigin {
     /// JSON envelope's `token_estimate`, and any downstream synthetic
     /// projection all share one source of truth.
     pub token_bytes_ratio: Option<f32>,
-    /// Per-origin Agent Skills v0.2.0 advertisement (WOR-193).
+    /// Per-origin Agent Skills v0.2.0 advertisement.
     /// Empty when the origin does not opt in. Carried verbatim from
     /// the YAML so the projection module can resolve artifact bytes,
     /// stamp digests, and cache the manifest body.

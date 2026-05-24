@@ -1,4 +1,4 @@
-//! Plan / apply diff engine. Implements steps 1 through 5 of the WOR-131
+//! Plan / apply diff engine. Implements steps 1 through 5 of the
 //! ADR (`docs/adr-config-plan-apply.md`): a sync library API that walks
 //! two parsed [`ConfigFile`] values and produces a stable, JSON-serialisable
 //! [`PlanReport`] describing the differences.
@@ -8,7 +8,7 @@
 //! (the K8s operator, future admin-socket plan-export) per ADR open
 //! question 7.
 //!
-//! Scope today (WOR-180 steps 1 through 5):
+//! Scope today (steps 1 through 5):
 //!
 //! * Diff granularity is per top-level key of [`ConfigFile`]:
 //!   each origin (keyed by hostname) plus a single `proxy` entry that
