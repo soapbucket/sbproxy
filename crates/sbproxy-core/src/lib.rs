@@ -22,7 +22,7 @@ pub mod admin_playground;
 /// otherwise.
 pub mod admin_ui;
 /// Agent-class capture seam between the resolver in `sbproxy-modules`
-/// and the per-request context. Feature-gated by `agent-class` (G1.4).
+/// and the per-request context. Feature-gated by `agent-class`.
 #[cfg(feature = "agent-class")]
 pub mod agent_class;
 /// WOR-201 PR 1c.0: empty-shell registry for built-in policy

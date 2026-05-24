@@ -1,7 +1,7 @@
 //! Crawler Authorization Protocol (CAP) verifier (Wave 6 / R6.1).
 //!
 //! Implements the OSS-side verifier for the CAP token format. Token
-//! issuance lives in a separate component (G6.7); verification is the
+//! issuance lives in a separate component; verification is the
 //! OSS side because it is the latency-critical path that runs on
 //! every request.
 //!

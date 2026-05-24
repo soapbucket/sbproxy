@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 // Copyright 2026 Soap Bucket LLC
 
-//! Agent-class capture wired into the request pipeline (G1.4).
+//! Agent-class capture wired into the request pipeline.
 //!
 //! Companion to `sbproxy-modules::policy::agent_class`. The resolver
 //! itself is pure; this module is the seam between the resolver and
@@ -13,7 +13,7 @@
 //!
 //! Feature-gated: when `agent-class` is off, the helpers compile to
 //! no-ops and the context fields don't exist. The binary's default
-//! feature set turns it on (B1.1).
+//! feature set turns it on.
 
 #![cfg(feature = "agent-class")]
 
@@ -104,7 +104,7 @@ pub fn apply_headless_override(
     true
 }
 
-/// Apply the ML override (A5.2).
+/// Apply the ML override.
 ///
 /// When the ML classifier verdict is [`MlClass::Human`] at confidence
 /// 0.9 or above, the rule-based resolver verdict is overwritten with

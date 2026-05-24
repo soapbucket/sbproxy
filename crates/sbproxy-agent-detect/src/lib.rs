@@ -9,7 +9,7 @@
 //! scorer consulted. The rest of the proxy reads the struct off the
 //! request context.
 //!
-//! This is the first slice (WOR-584): the crate skeleton + the public
+//! This is the first slice: the crate skeleton + the public
 //! shapes + the [`AgentScorer`] trait + a default scorer that returns
 //! [`AgentProvenance::UnsignedAnonymous`] with a score of 0. The signal
 //! extractor types ([`TlsSignals`], [`HttpSignals`], [`PayloadSignals`])
@@ -146,10 +146,10 @@ pub struct Signals {
     pub payload: Option<PayloadSignals>,
 }
 
-/// TLS-layer signals. Slice 2 (WOR-585) seeded the minimal field set;
-/// slice 3 (WOR-586) mirrors the full `sbproxy_tls::fingerprint::TlsFingerprint`
+/// TLS-layer signals. Slice 2 seeded the minimal field set;
+/// slice 3 mirrors the full `sbproxy_tls::fingerprint::TlsFingerprint`
 /// shape: JA4 (ClientHello), JA4H (request), JA4S (ServerHello)
-/// fingerprints plus ALPN list and SNI hostname. Slice 7 (WOR-590)
+/// fingerprints plus ALPN list and SNI hostname. Slice 7
 /// will add JA4T + JA4X.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TlsSignals {
@@ -168,7 +168,7 @@ pub struct TlsSignals {
     /// Empty when the extension was absent.
     pub alpn: Vec<String>,
     /// Whether the ClientHello advertised a post-quantum hybrid key
-    /// share (WOR-501). True for browsers that have rolled out
+    /// share. True for browsers that have rolled out
     /// X25519MLKEM768 (Chrome / Edge default in 2026); false for
     /// stock SDK HTTP stacks, which do not negotiate MLKEM. The
     /// scorer uses the *absence* of this signal on a request whose
@@ -210,8 +210,8 @@ impl From<&sbproxy_tls::fingerprint::TlsFingerprint> for TlsSignals {
 }
 
 /// HTTP-layer signals consumed by the rule-pack matcher and the
-/// future ML scorer. Slice 2 (WOR-585) seeded the matcher fields
-/// (`user_agent`, `headers_present`); slice 4 (WOR-587) extends the
+/// future ML scorer. Slice 2 seeded the matcher fields
+/// (`user_agent`, `headers_present`); slice 4 extends the
 /// shape with the order-sensitive + vendor-aware extractors the
 /// scoring layer needs.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -247,7 +247,7 @@ pub struct HttpSignals {
 }
 
 /// Payload-shaped signals lifted from the request body. Slice 8
-/// (WOR-591) introduces the three fields the scorer reads against
+/// introduces the three fields the scorer reads against
 /// today. See [`crate::payload_extractors`] for the pure-function
 /// extractors that build this struct from a body slice.
 ///

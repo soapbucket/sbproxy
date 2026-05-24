@@ -833,7 +833,7 @@ pub fn default_model_cache_dir() -> PathBuf {
 }
 
 /// Build a blocking HTTP client for model / signature downloads with finite
-/// timeouts, so a hung origin cannot stall startup indefinitely (WOR-602).
+/// timeouts, so a hung origin cannot stall startup indefinitely.
 ///
 /// A connect timeout bounds a no-response-on-connect hang; a generous total
 /// timeout bounds a stalled mid-download while still allowing large models.

@@ -486,7 +486,7 @@ pub fn default_rules() -> Vec<PiiRule> {
             // call PII. The quantifiers are upper-bounded to RFC 5321
             // limits (local part 64, domain 255, TLD 63) so a long
             // non-matching run cannot drive an unbounded scan window
-            // (WOR-606). The regex crate is RE2-style so there is no
+            //. The regex crate is RE2-style so there is no
             // catastrophic backtracking; these bounds are belt-and-
             // suspenders and keep the compiled program small.
             pattern: r"(?i)\b[a-z0-9._%+\-]{1,64}@[a-z0-9.\-]{1,255}\.[a-z]{2,63}\b".to_string(),
@@ -516,7 +516,7 @@ pub fn default_rules() -> Vec<PiiRule> {
             // as "digit then (sep? digit) x12-18" so the separator sits
             // between digits rather than after every digit; equivalent
             // to the prior form but with the quantifier bounded on the
-            // grouped element (WOR-606).
+            // grouped element.
             pattern: r"\b\d(?:[ -]?\d){12,18}\b".to_string(),
             replacement: Some("[REDACTED:CARD]".to_string()),
             validator: Some("luhn".to_string()),

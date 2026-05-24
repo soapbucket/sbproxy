@@ -1,4 +1,4 @@
-//! Synthetic transaction probe state for `/readyz` (WOR-27).
+//! Synthetic transaction probe state for `/readyz`.
 //!
 //! Holds the cached verdict of the most recent in-process synthetic
 //! request. The driver task in `sbproxy-core` fires a request through

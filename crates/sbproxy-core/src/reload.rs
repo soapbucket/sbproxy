@@ -272,7 +272,7 @@ pub fn tls_fingerprint_catalog(
     TLS_FINGERPRINT_CATALOG.get().map(|swap| swap.load())
 }
 
-// --- Agent-detect rule-pack loader singleton (WOR-706) ---
+// --- Agent-detect rule-pack loader singleton ---
 //
 // The binary loads the ADRF rule pack once at startup from
 // `proxy.extensions.agent_detect.rule_pack_path` and installs the loader

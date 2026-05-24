@@ -1,7 +1,7 @@
 //! AI proxy request dispatch: the `handle_ai_proxy` entry point,
 //! response relay (buffered + cached), and the streaming relay path.
 //!
-//! Extracted from `server.rs` (WOR-629). Behavior-preserving move:
+//! Extracted from `server.rs`. Behavior-preserving move:
 //! `use super::*` re-imports the parent module's private items and
 //! `use` aliases, so the moved code needs no rewiring.
 
@@ -301,7 +301,7 @@ pub(super) async fn handle_ai_proxy(
     // proxy is fronting an idiosyncratic inbound URL.
     let native_request_bytes_for_bypass: bytes::Bytes = body_bytes.clone();
 
-    // --- Native-format inbound shim (WOR-224) ---
+    // --- Native-format inbound shim ---
     //
     // Anthropic Messages and OpenAI Responses arrive on their own
     // paths but the rest of the AI pipeline (router, guardrails,
@@ -601,7 +601,7 @@ pub(super) async fn handle_ai_proxy(
         Vec::new()
     };
 
-    // --- Pre-request token estimate + TPM reservation (WOR-232) ---
+    // --- Pre-request token estimate + TPM reservation ---
     //
     // For chat completions only: we have the parsed `messages` array,
     // so we can pass it through the tiktoken-rs estimator. Other
@@ -989,7 +989,7 @@ pub(super) async fn handle_ai_proxy(
     // `provider_idx`.
     let mut last_provider_name: String = String::new();
 
-    // --- Cascade routing (WOR-489) ---
+    // --- Cascade routing ---
     //
     // When the configured strategy is `Cascade`, dispatch through
     // the dedicated tier-by-tier path which reads each response
@@ -1254,7 +1254,7 @@ pub(super) async fn handle_ai_proxy(
                 semcache_miss.as_ref().map(|(_, key, _, _, _)| key.clone());
             let _ = semcache_miss;
             // SSE event-shape translation for non-OpenAI providers
-            // (WOR-226). When the upstream emits Anthropic
+            //. When the upstream emits Anthropic
             // `event: content_block_delta`, Gemini
             // `streamGenerateContent`, or Bedrock Converse-stream
             // payloads, the relay reframes them into the hub
@@ -1534,7 +1534,7 @@ pub(super) async fn relay_ai_response_with_cache(
         raw_body
     };
 
-    // Native-format inbound rewrap (WOR-224). When the client entered
+    // Native-format inbound rewrap. When the client entered
     // on a `/v1/messages` or `/v1/responses` path the cached body stays
     // in OpenAI Chat shape (so cross-format cache hits remain cheap)
     // and only the bytes leaving the gateway are re-emitted in the
@@ -2031,7 +2031,7 @@ pub(super) async fn relay_ai_stream(
         None
     };
 
-    // --- Native-format streaming translator (WOR-226) ---
+    // --- Native-format streaming translator ---
     //
     // When the upstream emits a non-OpenAI native SSE shape we walk
     // every byte through a hub-format translator: native bytes ->

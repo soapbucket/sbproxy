@@ -13,7 +13,7 @@
 //! the request enricher and RSL projection). When `canonical_url` is
 //! absent or empty the transform writes `Source: unknown`. When
 //! `rsl_urn` is absent the transform falls back to `all-rights-reserved`
-//! to mirror the JSON envelope's licence-field rule (G4.4).
+//! to mirror the JSON envelope's licence-field rule.
 //!
 //! The transform is idempotent on the no-citation path: when the flag is
 //! false, the body is unchanged.

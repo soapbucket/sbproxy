@@ -639,7 +639,7 @@ impl SseFramer {
 ///
 /// The enum is kept narrow on purpose. OpenAI Chat Completions
 /// streams pass through unchanged today; the bypass-only ticket
-/// (WOR-229) covers an even shorter no-translation path for that
+/// covers an even shorter no-translation path for that
 /// case. Custom providers that need a fourth shape register a
 /// plugin translator and run outside this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

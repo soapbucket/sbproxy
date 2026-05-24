@@ -50,7 +50,7 @@ impl CardinalityConfig {
 
 // --- Per-label budget table (Wave 1 / A1.1) ---
 
-/// Per-label cardinality budget (A1.1).
+/// Per-label cardinality budget.
 ///
 /// The lookup is closed: a label name not in the table falls back to
 /// the workspace default cap. The regression test in Q1.14 asserts the
@@ -121,7 +121,7 @@ impl CardinalityLimiter {
     /// table. Falls back to the workspace cap when the label is not
     /// in the table.
     ///
-    /// Used by per-metric helpers (G1.6) so each label respects its
+    /// Used by per-metric helpers so each label respects its
     /// own budget, rather than a single global ceiling. Existing
     /// callers of [`sanitize`](Self::sanitize) keep the workspace
     /// default.
@@ -294,7 +294,7 @@ mod tests {
         assert_eq!(lim.unique_count("k"), 2);
     }
 
-    // --- Per-label budget table (A1.1) ---
+    // --- Per-label budget table ---
 
     #[test]
     fn budget_for_known_labels_matches_adr_table() {

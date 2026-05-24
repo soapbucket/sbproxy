@@ -1,4 +1,4 @@
-//! Agent-class resolver (G1.4) and the OSS policy that wraps it.
+//! Agent-class resolver and the OSS policy that wraps it.
 //!
 //! The resolver chain is:
 //!

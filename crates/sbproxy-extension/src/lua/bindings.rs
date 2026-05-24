@@ -81,7 +81,7 @@ pub fn enrich_request_table_with_agent_class(
     }
 }
 
-/// Build the agent-class table for Lua scripts (G1.4). Mirrors the
+/// Build the agent-class table for Lua scripts. Mirrors the
 /// `agent` / `request.agent_*` namespace exposed to CEL
 /// ([`crate::cel::context::populate_agent_class_namespace`]) so scripts
 /// written in either engine see the same surface.
@@ -403,7 +403,7 @@ mod tests {
         assert!(env["properties"].is_object());
     }
 
-    // --- Agent class table (G1.4) tests ---
+    // --- Agent class table tests ---
 
     #[test]
     fn agent_class_table_round_trips_supplied_fields() {

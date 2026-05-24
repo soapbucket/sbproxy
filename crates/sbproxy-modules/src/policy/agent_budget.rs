@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 // Copyright 2026 Soap Bucket LLC
 
-//! `agent_budget` semantic rate-limit primitive (WOR-506).
+//! `agent_budget` semantic rate-limit primitive.
 //!
 //! Standard per-IP / per-user / per-key limits assume humans pause
 //! between requests. Agents driven by an LLM loop fire at network

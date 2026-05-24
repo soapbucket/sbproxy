@@ -742,7 +742,7 @@ mod tests {
         );
     }
 
-    // --- TokenBucket arithmetic property tests (WOR-15) ---
+    // --- TokenBucket arithmetic property tests ---
     //
     // These pair with the loom drain test that landed in PR #47. Loom
     // covers the reload state machine; proptest covers the bucket math.

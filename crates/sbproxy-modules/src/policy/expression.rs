@@ -301,7 +301,7 @@ mod tests {
         assert!(!policy.evaluate("GET", "/health", &headers, None, None, "example.com"));
     }
 
-    // --- ExpressionPolicy with aipref (G4.9) ---
+    // --- ExpressionPolicy with aipref ---
 
     #[test]
     fn expression_policy_evaluate_with_aipref_train_false() {

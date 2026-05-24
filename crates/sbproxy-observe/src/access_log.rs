@@ -212,11 +212,11 @@ pub struct AccessLogEntry {
     /// rails or unsettled traffic.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub txhash: Option<String>,
-    /// `jti` of the OLP license token presented (A6.1). `None` when
+    /// `jti` of the OLP license token presented. `None` when
     /// no license token was presented.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub license_token_id: Option<String>,
-    /// `jti` of the CAP token presented (A6.2). `None` when no CAP
+    /// `jti` of the CAP token presented. `None` when no CAP
     /// token was presented.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cap_token_id: Option<String>,
@@ -962,7 +962,7 @@ mod tests {
         }
     }
 
-    // --- Redaction denylist (A1.5) ---
+    // --- Redaction denylist ---
 
     #[test]
     fn test_a1_5_authorization_header_never_appears_in_emitted_json() {

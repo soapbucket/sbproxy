@@ -1,4 +1,4 @@
-//! Synthetic-transaction probe driver (WOR-27).
+//! Synthetic-transaction probe driver.
 //!
 //! Background task that fires an in-process request through the
 //! compiled handler chain on a fixed cadence and feeds the verdict

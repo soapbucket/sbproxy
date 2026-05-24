@@ -59,7 +59,7 @@ impl AsyncRedisKVStore {
     async fn conn(&self) -> Result<MultiplexedConnection> {
         // Fast path: return the cached multiplexed connection. The guard is
         // released at the end of this block so it is never held across the
-        // connection-setup await below (WOR-621). Holding it there would
+        // connection-setup await below. Holding it there would
         // serialize every concurrent caller behind whichever one is
         // currently establishing the connection.
         {

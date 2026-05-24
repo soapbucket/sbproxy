@@ -138,7 +138,7 @@ pub fn mirror_request(
 /// The previous clock-based version (`subsec_nanos() % 1_000_000`) was biased:
 /// two calls within the same nanosecond returned the same value, and on a
 /// high-RPS proxy the distribution tracked the clock rather than being
-/// uniform (WOR-651). Cryptographic quality is not required here.
+/// uniform. Cryptographic quality is not required here.
 fn random_f64() -> f64 {
     rand::random::<f64>()
 }
@@ -237,7 +237,7 @@ mod tests {
     fn mirror_to_dead_shadow_returns_immediately() {
         // A listener that accepts but never replies models a hung shadow.
         // mirror_request must spawn the work and return at once so a dead
-        // shadow can never delay the primary path (WOR-598); the bounded
+        // shadow can never delay the primary path; the bounded
         // client keeps the detached task from living forever.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

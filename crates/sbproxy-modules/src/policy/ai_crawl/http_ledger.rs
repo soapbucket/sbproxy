@@ -38,7 +38,7 @@ pub struct HttpLedgerConfig {
     /// Workspace tenant key. `default` in OSS, the customer
     /// workspace id in enterprise.
     pub workspace_id: String,
-    /// Agent identifier from the agent-class taxonomy (G1.1). The
+    /// Agent identifier from the agent-class taxonomy. The
     /// Wave 1 caller forwards `unknown` until G1.4 lands; widening
     /// the call site is a follow-up.
     pub agent_id: String,

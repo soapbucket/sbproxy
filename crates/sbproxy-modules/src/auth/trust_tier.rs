@@ -1,4 +1,4 @@
-//! Trust-tier combiner (WOR-504).
+//! Trust-tier combiner.
 //!
 //! The detection and verification surface has grown to where a single
 //! request can pick up evidence from several independent sources: JA4

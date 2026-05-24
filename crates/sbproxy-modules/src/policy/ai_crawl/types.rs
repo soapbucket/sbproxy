@@ -1,7 +1,7 @@
 //! AI Crawl Control types: decisions, rails, tiered pricing, content
 //! signals, multi-rail challenges, and the YAML config + ledger shapes.
 //!
-//! Extracted from the ai_crawl policy module (WOR-631).
+//! Extracted from the ai_crawl policy module.
 
 use super::*;
 
@@ -62,7 +62,7 @@ pub const MULTI_RAIL_CONTENT_TYPE: &str = "application/sbproxy-multi-rail+json";
 
 /// Closed enum of payment rails the proxy can advertise. Mirrors the
 /// `Accept-Payment` token set and the per-tier `rails:` override list.
-/// New rails follow the closed-enum amendment rule (A1.8). Wave 7 added
+/// New rails follow the closed-enum amendment rule. Wave 7 added
 /// `Lightning` to mirror the externally-registered rail named
 /// `"lightning"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -255,7 +255,7 @@ impl Ledger for InMemoryLedger {
     }
 }
 
-// --- Tiered pricing types (G1.2) ---
+// --- Tiered pricing types ---
 
 /// Closed enumeration of the content shapes the policy can price for.
 ///
@@ -367,7 +367,7 @@ pub struct Tier {
     /// the request's resolved `agent_id` (G1.4 resolver chain) equals
     /// the configured value. Supports the reserved sentinels `human`,
     /// `unknown`, `anonymous` (per G1.1 taxonomy) plus any vendor id
-    /// the registry feed (G2.1) returns. Empty string = wildcard.
+    /// the registry feed returns. Empty string = wildcard.
     #[serde(default)]
     pub agent_id: Option<String>,
     /// Optional free-preview byte budget. Zero-price tiers with a
@@ -490,7 +490,7 @@ impl ContentShape {
     }
 }
 
-// --- Content-Signal header value (G4.5) ---
+// --- Content-Signal header value ---
 
 /// Closed enumeration of valid `Content-Signal` response header values.
 ///
@@ -500,7 +500,7 @@ impl ContentShape {
 /// fails config compilation.
 ///
 /// The header is a cooperative signal for standards-compliant crawlers
-/// and a mandatory field surfaced by the JSON envelope (A4.2). It is
+/// and a mandatory field surfaced by the JSON envelope. It is
 /// not security-critical; a motivated crawler can ignore it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentSignal {
@@ -589,13 +589,13 @@ impl std::fmt::Display for ContentSignalParseError {
 
 impl std::error::Error for ContentSignalParseError {}
 
-// --- Multi-rail challenge body (A3.1) ---
+// --- Multi-rail challenge body ---
 
 /// One entry in the multi-rail 402 body's `rails` array.
 ///
 /// Common fields (`amount_micros`, `currency`, `expires_at`, `quote_token`)
 /// live alongside the rail-specific extension fields under one JSON shape.
-/// The enum representation uses a closed `kind` discriminator (A1.8) so a
+/// The enum representation uses a closed `kind` discriminator so a
 /// future third rail can land without breaking existing parsers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase")]

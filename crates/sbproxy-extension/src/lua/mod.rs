@@ -1042,7 +1042,7 @@ mod tests {
         );
     }
 
-    // --- Sandbox enforcement (WOR-594) ---
+    // --- Sandbox enforcement ---
 
     #[test]
     fn sandbox_timeout_aborts_infinite_loop() {

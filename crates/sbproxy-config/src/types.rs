@@ -562,7 +562,7 @@ scripting:
     }
 }
 
-// --- Synthetic probe config (WOR-27) ---
+// --- Synthetic probe config ---
 
 /// Configuration for the in-process synthetic-transaction probe.
 ///
@@ -651,7 +651,7 @@ fn default_synthetic_timeout_ms() -> u64 {
     1000
 }
 
-// --- Lua scripting runtime limits (WOR-594) ---
+// --- Lua scripting runtime limits ---
 
 /// Lua scripting runtime configuration. Wraps the sandbox limits so
 /// future Lua-specific tunables (preloaded libraries, request-binding
@@ -1228,7 +1228,7 @@ fn default_http_port() -> u16 {
     8080
 }
 
-// --- HTTP Client Timeouts (WOR-175) ---
+// --- HTTP Client Timeouts ---
 
 /// Tunable client-side timeouts for the proxy's outbound HTTP helpers.
 ///
@@ -3133,7 +3133,7 @@ http3:
         assert_eq!(config.http_bind_port, 8080);
     }
 
-    // --- ScriptingConfig / LuaSandboxConfig tests (WOR-594) ---
+    // --- ScriptingConfig / LuaSandboxConfig tests ---
 
     #[test]
     fn lua_sandbox_config_default_matches_documented_values() {

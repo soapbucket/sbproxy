@@ -39,7 +39,7 @@ pub struct StorageAction {
     pub prefix: Option<String>,
     /// Local filesystem root path (for the `local` backend). Canonicalized
     /// at build time, so any symlinks in the path are resolved to their real
-    /// target before the object store is rooted there (WOR-601).
+    /// target before the object store is rooted there.
     #[serde(default)]
     pub path: Option<String>,
     /// Default index file served for directory requests (e.g. `index.html`).
@@ -287,7 +287,7 @@ impl CompiledStorage {
                     // Compute it with checked_add + try_from anyway so a future
                     // change to resolve() (or a 32-bit target) cannot silently
                     // overflow or truncate an attacker-influenced range
-                    // (WOR-600).
+                    //.
                     let r = match (
                         usize::try_from(start),
                         end.checked_add(1).and_then(|e| usize::try_from(e).ok()),

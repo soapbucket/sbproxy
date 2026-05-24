@@ -689,7 +689,7 @@ impl TlsFingerprintConfig {
     }
 }
 
-/// Agent-detect engine configuration (WOR-499), read from
+/// Agent-detect engine configuration, read from
 /// `proxy.extensions.agent_detect`.
 ///
 /// `enabled: false` (the default) keeps the scorer out of the request
@@ -855,7 +855,7 @@ pub struct CompiledPipeline {
     /// operator's deployment that lacks a TLS-terminating sidecar does
     /// not pay the parse cost.
     pub tls_fingerprint_config: TlsFingerprintConfig,
-    /// Agent-detect engine config (WOR-499). When `enabled = false`
+    /// Agent-detect engine config. When `enabled = false`
     /// (the default) the scorer never runs in `request_filter`.
     pub agent_detect_config: AgentDetectConfig,
     /// Opt-in switch for raw CSP-report logging.
@@ -886,10 +886,10 @@ pub struct CompiledPipeline {
     /// are not duplicated when several origins point at the same
     /// hostname.
     pub dns_resolver: Arc<sbproxy_platform::RefreshingResolver>,
-    /// Repo-native Listing registry (WOR-136) populated at config
+    /// Repo-native Listing registry populated at config
     /// load.
     ///
-    /// Each Listing's `spec.skills[]` block (WOR-196) feeds the
+    /// Each Listing's `spec.skills[]` block feeds the
     /// per-Listing Agent Skills projection at
     /// `/.well-known/agent-skills/<listing-name>/index.json` plus the
     /// aggregated `/.well-known/agent-skills/index.json` surface on a

@@ -1,6 +1,6 @@
 //! Outbound callback, webhook, and request/response mirror dispatch.
 //!
-//! Extracted from `server.rs` (WOR-629). Behavior-preserving move:
+//! Extracted from `server.rs`. Behavior-preserving move:
 //! `use super::*` re-imports the parent module's private items and
 //! `use` aliases, so the moved code needs no rewiring.
 

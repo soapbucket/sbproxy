@@ -126,7 +126,7 @@ pub fn provider_supports_realtime(provider: &str) -> bool {
 /// The dispatch path uses this matrix to decide whether to return 501
 /// Not Implemented before any upstream call is made.
 ///
-/// ## Contract matrix (WOR-752)
+/// ## Contract matrix
 ///
 /// | surface | openai | anthropic | gemini | vertex | bedrock | cohere | other |
 /// |---|---|---|---|---|---|---|---|
@@ -149,7 +149,7 @@ pub fn provider_supports_surface(provider: &str, surface: &crate::handler::AiSur
     use crate::handler::AiSurface;
     match (provider, surface) {
         // Universal: chat + models. Messages and Responses are
-        // native-format inbound shims (WOR-224) that translate down to
+        // native-format inbound shims that translate down to
         // the same hub shape as chat completions, so every
         // chat-capable provider supports them.
         (_, AiSurface::ChatCompletions) => true,

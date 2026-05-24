@@ -2,7 +2,7 @@
 //! per-request context construction and the request/upstream/response/
 //! body phase handlers.
 //!
-//! Extracted from `server.rs` (WOR-629). A trait impl may live in any
+//! Extracted from `server.rs`. A trait impl may live in any
 //! module of the crate; `use super::*` brings `SbProxy`, the trait, and
 //! every helper into scope. Behavior-preserving move, no logic changes.
 

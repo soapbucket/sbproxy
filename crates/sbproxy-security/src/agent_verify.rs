@@ -1,4 +1,4 @@
-//! Forward-confirmed reverse-DNS verifier for AI-agent identification (G1.5).
+//! Forward-confirmed reverse-DNS verifier for AI-agent identification.
 //!
 //! A request claiming to come from a vendor's crawler is "rDNS verified" when:
 //!

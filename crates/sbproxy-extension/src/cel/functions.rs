@@ -200,7 +200,7 @@ fn cel_regex_match(input: Arc<String>, pattern: Arc<String>) -> bool {
 }
 
 /// Maximum length of a user-supplied regex pattern. Patterns longer than this
-/// are rejected without compiling (WOR-607). The `regex` crate is RE2-style so
+/// are rejected without compiling. The `regex` crate is RE2-style so
 /// there is no catastrophic backtracking, but a multi-KB pattern compiled per
 /// call is still its own DoS on a hot path.
 const MAX_REGEX_PATTERN_LEN: usize = 1024;

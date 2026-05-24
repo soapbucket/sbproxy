@@ -47,7 +47,7 @@ use bytes::{BufMut, BytesMut};
 use sbproxy_plugin::{TransformContext, TransformHandler};
 use serde::Deserialize;
 
-// --- Transform error types (WOR-168) ---
+// --- Transform error types ---
 
 /// Typed transform errors surfaced by the body-buffer pipeline.
 ///
@@ -137,12 +137,12 @@ pub enum Transform {
     /// WebAssembly-based body transform. Pipes the body through a sandboxed
     /// WASI module's stdin/stdout, returning whatever the module writes back.
     Wasm(WasmTransform),
-    /// G4.10 boilerplate strip (Wave 4). Removes nav/footer/aside/ad
+    /// G4.10 boilerplate strip. Removes nav/footer/aside/ad
     /// chrome from HTML before the Markdown projection runs. Runs in
     /// the standard body-buffer pipeline; does not require per-request
     /// context.
     Boilerplate(BoilerplateTransform),
-    /// G4.10 citation block (Wave 4). Prepends an attribution
+    /// G4.10 citation block. Prepends an attribution
     /// blockquote to a Markdown projection. The standard body-buffer
     /// `apply` is a no-op because the transform needs per-request
     /// `RequestContext` fields (`canonical_url`, `rsl_urn`,
@@ -150,7 +150,7 @@ pub enum Transform {
     /// signature can't carry. The day-5 response-filter wiring calls
     /// the typed `CitationBlockTransform::apply` with the ctx fields.
     CitationBlock(CitationBlockTransform),
-    /// G4.4 JSON envelope (Wave 4). Wraps a Markdown projection in
+    /// G4.4 JSON envelope. Wraps a Markdown projection in
     /// the v1 JSON envelope. Same caveat as `CitationBlock`: the
     /// standard body-buffer `apply` is a no-op; day-5 response-filter
     /// wiring calls the typed `JsonEnvelopeTransform::apply` with the
@@ -260,7 +260,7 @@ impl Transform {
 }
 
 /// Hard wall-clock cap on a single plugin transform invocation
-/// (WOR-168). A misbehaving plugin should never be able to stall the
+///. A misbehaving plugin should never be able to stall the
 /// response pipeline indefinitely; once this elapses the dispatcher
 /// surfaces a `TransformError::Plugin` and the body-buffer pipeline
 /// maps it to a 500 with attribution.
@@ -340,7 +340,7 @@ fn dispatch_plugin(
 
     match outcome {
         // Plugin returned a normal result. Map the typed PluginError back into
-        // anyhow for this dispatcher's return type (WOR-620); the error chain
+        // anyhow for this dispatcher's return type; the error chain
         // is preserved.
         Ok(Ok(apply_result)) => apply_result.map_err(anyhow::Error::from),
         // tokio::time::timeout fired before the plugin finished.

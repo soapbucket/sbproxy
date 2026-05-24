@@ -1,6 +1,6 @@
 //! Unit and regression tests for the server module.
 //!
-//! Relocated from `server.rs` (WOR-629). `use super::*` resolves to
+//! Relocated from `server.rs`. `use super::*` resolves to
 //! the `server` module exactly as the inline `mod tests` did.
 
 use super::*;

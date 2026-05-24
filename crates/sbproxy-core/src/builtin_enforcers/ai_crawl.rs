@@ -11,7 +11,7 @@
 //! Per-deny-reason labels:
 //!
 //! - `"ai_crawl_payment"` for the 402 Charge (Wave 1 single-rail).
-//! - `"ai_crawl_multi_rail"` for the 402 MultiRail (G3.4).
+//! - `"ai_crawl_multi_rail"` for the 402 MultiRail.
 //! - `"ai_crawl_no_acceptable_rail"` for the 406 NoAcceptableRail.
 //! - `"ai_crawl_ledger_unavailable"` for the 503 LedgerUnavailable.
 //!

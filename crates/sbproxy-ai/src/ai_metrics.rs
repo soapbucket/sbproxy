@@ -378,7 +378,7 @@ static AI_KEY_COST: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
-// --- AI gateway rate-limit rejection counter (WOR-223) ---
+// --- AI gateway rate-limit rejection counter ---
 //
 // Operators alert on any non-zero rate of this counter to detect a
 // rejected client. `axis` is the bucket that tripped (`rpm`, `tpm`,
@@ -396,7 +396,7 @@ static AI_RATELIMIT_REJECTED: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
-// --- Pre-request token estimate error ratio (WOR-232) ---
+// --- Pre-request token estimate error ratio ---
 //
 // Sampled at reconcile time as `(actual - estimated) / actual` so the
 // histogram captures both over-estimation (negative values) and
@@ -559,7 +559,7 @@ pub fn record_guardrail_block(category: &str) {
     AI_GUARDRAIL_BLOCKS.with_label_values(&[category]).inc();
 }
 
-// --- Context-poisoning guardrail metrics (WOR-159) ---
+// --- Context-poisoning guardrail metrics ---
 
 /// Per-rule, per-action counter of context-poisoning findings. Fires
 /// once for every rule hit regardless of whether the configured
@@ -642,7 +642,7 @@ pub fn ratelimit_rejected_value(axis: &str, key_hash: &str, model: &str) -> f64 
 }
 
 /// Record one observation against the pre-request token-estimate error
-/// histogram (WOR-232). `estimated` is the pre-flight reservation;
+/// histogram. `estimated` is the pre-flight reservation;
 /// `actual` is the reconciled `usage.prompt_tokens` from the upstream
 /// response. A zero-token actual is dropped to keep the ratio
 /// well-defined.

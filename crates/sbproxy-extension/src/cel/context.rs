@@ -102,7 +102,7 @@ pub fn build_request_context(
     ctx
 }
 
-/// Agent-class fields exposed to CEL (G1.4). The caller (proxy
+/// Agent-class fields exposed to CEL. The caller (proxy
 /// pipeline) owns the strings and passes a borrowed view so the
 /// scripting layer avoids cloning. Empty / `None` fields render as
 /// the zero value (`""`) so expressions can call
@@ -191,7 +191,7 @@ pub fn populate_agent_class_namespace(ctx: &mut CelContext, view: &AgentClassVie
 }
 
 /// Borrowed view over the three Wave 4 aipref axes the CEL context
-/// exposes (G4.9). The caller (typically `sbproxy-modules` or
+/// exposes. The caller (typically `sbproxy-modules` or
 /// `sbproxy-core`) owns the parsed signal and constructs this view to
 /// avoid pulling the `sbproxy-modules` crate into `sbproxy-extension`'s
 /// dependency graph (the two crates are siblings).
@@ -469,7 +469,7 @@ pub fn populate_tls_namespace(ctx: &mut CelContext, view: &TlsFingerprintView<'_
 }
 
 /// Borrowed view over the agent-detection verdict exposed to CEL under
-/// `request.agent` (WOR-589). The caller (`sbproxy-core`) owns the
+/// `request.agent`. The caller (`sbproxy-core`) owns the
 /// strings on `RequestContext.agent_detection`, so this borrows rather
 /// than clones.
 ///
@@ -490,7 +490,7 @@ pub struct AgentDetectView<'a> {
     pub signals_used: &'a [String],
 }
 
-/// Stamp the [`AgentDetectView`] under `request.agent.*` (WOR-589).
+/// Stamp the [`AgentDetectView`] under `request.agent.*`.
 ///
 /// Exposed bindings:
 ///
@@ -1192,7 +1192,7 @@ mod tests {
             .unwrap());
     }
 
-    // --- AgentClassView (G1.4) tests ---
+    // --- AgentClassView tests ---
 
     #[test]
     fn agent_class_namespace_round_trips_under_request_and_agent_keys() {
@@ -1247,7 +1247,7 @@ mod tests {
             .unwrap());
     }
 
-    // --- AiprefView (G4.9) tests ---
+    // --- AiprefView tests ---
 
     #[test]
     fn aipref_namespace_round_trips_a_concrete_signal() {
@@ -1290,7 +1290,7 @@ mod tests {
             .unwrap());
     }
 
-    // --- TlsFingerprintView (G5.3) tests ---
+    // --- TlsFingerprintView tests ---
 
     #[test]
     fn tls_namespace_exposes_ja3_ja4_ja4h_and_trustworthy() {
@@ -1337,7 +1337,7 @@ mod tests {
             .unwrap());
     }
 
-    // --- AgentDetectView (WOR-589) tests ---
+    // --- AgentDetectView tests ---
 
     #[test]
     fn agent_detect_namespace_exposes_score_id_provenance_confidence_signals() {
@@ -1400,7 +1400,7 @@ mod tests {
             .unwrap());
     }
 
-    // --- KyaVerdictView (G5.1) tests ---
+    // --- KyaVerdictView tests ---
 
     #[test]
     fn kya_namespace_round_trips_a_verified_token() {
@@ -1467,7 +1467,7 @@ mod tests {
             .unwrap());
     }
 
-    // --- MlClassificationView (A5.2) tests ---
+    // --- MlClassificationView tests ---
 
     #[test]
     fn ml_namespace_round_trips_a_human_verdict() {

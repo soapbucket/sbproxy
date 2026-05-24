@@ -60,7 +60,7 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub disable_forwarded_host_header: bool,
     /// Allow this provider's `base_url` to point at a private/loopback
-    /// address (WOR-603). Defaults to `false`: a `base_url` resolving to
+    /// address. Defaults to `false`: a `base_url` resolving to
     /// a loopback, link-local, or RFC1918 target is rejected at config
     /// load as an SSRF risk. Set `true` for a local model server
     /// (Ollama, vLLM, LM Studio on `127.0.0.1`/LAN). Non-`http(s)`
@@ -91,7 +91,7 @@ impl ProviderConfig {
             .unwrap_or_else(|| "http://localhost:8080/v1".to_string())
     }
 
-    /// Validate an operator-supplied `base_url` for SSRF safety (WOR-603).
+    /// Validate an operator-supplied `base_url` for SSRF safety.
     ///
     /// When no `base_url` is set the provider uses a registry default
     /// (a known-good public URL), so there is nothing to check. When one

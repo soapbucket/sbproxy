@@ -1,4 +1,4 @@
-//! Tests for the AI Crawl Control policy. Relocated from ai_crawl.rs (WOR-631).
+//! Tests for the AI Crawl Control policy. Relocated from ai_crawl.rs.
 
 use super::*;
 
@@ -471,7 +471,7 @@ fn http_ledger_rejects_plain_http_endpoint() {
 #[cfg(feature = "http-ledger")]
 #[test]
 fn ledger_yaml_block_constructs_http_ledger() {
-    // YAML wiring (G1.3): when the operator authors a `ledger:`
+    // YAML wiring: when the operator authors a `ledger:`
     // block on `ai_crawl_control`, `from_config` must swap the
     // bundled InMemoryLedger for an HttpLedger pointing at the
     // configured https endpoint. Plain http:// rejects with the

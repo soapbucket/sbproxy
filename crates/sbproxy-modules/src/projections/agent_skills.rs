@@ -34,9 +34,9 @@
 //!   resolves relative refs against the request authority per
 //!   RFC 3986 at serve time so the manifest's URLs stay portable.
 //! - `digest` - SHA-256 of the artifact body, recomputed at
-//!   config-load time and again on every artifact GET (WOR-194).
+//!   config-load time and again on every artifact GET.
 //!
-//! ## Integrity contract (WOR-194)
+//! ## Integrity contract
 //!
 //! Every artifact `GET` re-hashes the served body and compares to the
 //! manifest digest. A mismatch returns HTTP 503 to the client and emits
@@ -44,7 +44,7 @@
 //! notices a hot-swap or memory corruption. The runtime hash check is
 //! the contract that lets cooperative agents trust the digest.
 //!
-//! ## No script execution (WOR-194)
+//! ## No script execution
 //!
 //! Per the v0.2.0 spec the proxy MUST NOT execute pre-/post-hooks or
 //! any embedded scripts shipped inside an artifact. The proxy serves
@@ -54,7 +54,7 @@
 //! never extracted to disk during a request, and the request handler
 //! never invokes a subprocess on the artifact body.
 //!
-//! ## Archive safety (WOR-194)
+//! ## Archive safety
 //!
 //! `archive` entries point at a `.tar.gz` or `.zip` bundle. The
 //! [`validate_archive_bytes`] helper inspects the bundle once at
@@ -161,7 +161,7 @@ pub struct AgentSkillsIndex {
     pub artifacts: HashMap<CompactString, Bytes>,
     /// Per-entry digest hex (lowercase, no `sha256:` prefix). The
     /// data-plane handler re-hashes the served body and compares
-    /// against this map per request (WOR-194).
+    /// against this map per request.
     pub digests: HashMap<CompactString, String>,
 }
 
@@ -201,7 +201,7 @@ pub fn build_index(entries: &[AgentSkillEntry], workspace_root: &Path) -> AgentS
         };
 
         // Validate archives at config-load time so a zip bomb cannot
-        // pass through to the data plane (WOR-194). `skill-md` entries
+        // pass through to the data plane. `skill-md` entries
         // are served verbatim.
         if entry.kind == "archive" {
             let max_ratio = entry
@@ -406,14 +406,14 @@ fn resolve_url(url: &str, authority: Option<&str>, scheme: &str) -> String {
 ///
 /// Used at config-load time to pin the manifest digest, and at request
 /// time to verify the body the proxy is about to ship still matches
-/// what the manifest advertises (WOR-194).
+/// what the manifest advertises.
 pub fn sha256_hex(body: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(body);
     hex::encode(hasher.finalize())
 }
 
-/// Audit-event payload for a runtime digest mismatch (WOR-194).
+/// Audit-event payload for a runtime digest mismatch.
 ///
 /// Emitted on every `GET` of an artifact whose served body fails the
 /// re-hash check. The proxy returns HTTP 503 to the caller with a
@@ -464,7 +464,7 @@ pub fn render_indices(
     out
 }
 
-// --- Listing-scoped indices (WOR-196) ---
+// --- Listing-scoped indices ---
 
 /// One Listing's resolved Agent Skills index, keyed for serving at
 /// `/.well-known/agent-skills/<listing-name>/index.json`.
@@ -626,7 +626,7 @@ pub fn aggregate_for_hostname(
     merged
 }
 
-// --- Archive validation (WOR-194) ---
+// --- Archive validation ---
 
 /// Validate an archive body at config-load time.
 ///

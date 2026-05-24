@@ -891,7 +891,7 @@ fn load_plan_inputs(
 }
 
 /// Diff `baseline` vs `proposed` and fold in the repo's `listings/*.yaml`
-/// plan-step findings (WOR-136). The repo root is the directory holding
+/// plan-step findings. The repo root is the directory holding
 /// the proposed `sb.yml`. The OSS revision resolver is the no-op
 /// resolver: existence checks require a git-aware caller (the future
 /// k8s controller, the hosted-Catalog surface).

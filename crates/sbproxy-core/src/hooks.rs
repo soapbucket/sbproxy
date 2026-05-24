@@ -541,7 +541,7 @@ pub enum StreamCacheEvent {
     },
 }
 
-/// Default capacity for the bounded recorder channel (WOR-169).
+/// Default capacity for the bounded recorder channel.
 ///
 /// Sized for ~1 second of headroom at 1k events/sec on a typical SSE
 /// stream. The receiver lives inside the enterprise recorder and is

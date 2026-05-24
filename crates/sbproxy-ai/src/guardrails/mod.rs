@@ -60,7 +60,7 @@ pub enum Guardrail {
     Regex(RegexGuardrail),
     /// Context-poisoning detection guardrail. Flags untrusted
     /// retrieval content that tries to influence a subsequent tool
-    /// call (WOR-159).
+    /// call.
     ContextPoisoning(ContextPoisoningGuardrail),
 }
 
@@ -161,7 +161,7 @@ impl GuardrailPipeline {
     /// Each guardrail decides whether it consumes the concatenated
     /// text view or the role-aware messages view via
     /// [`Guardrail::check_messages`]. The context-poisoning guardrail
-    /// (WOR-159) reads message roles to gate its
+    /// reads message roles to gate its
     /// `cp_conflicting_directive` rule; every other guardrail uses
     /// the flat text view of the concatenated message bodies.
     pub fn check_input(&self, messages: &[Message]) -> Option<GuardrailBlock> {

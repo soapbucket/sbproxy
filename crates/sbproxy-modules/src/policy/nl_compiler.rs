@@ -1,7 +1,7 @@
 //! Natural-language to Cedar policy compiler (WOR-203 PR 3b).
 //!
 //! Wraps the [`NlLinter`](crate::policy::nl_linter::NlLinter) (PR 3a) and the
-//! [`JudgeClient`](sbproxy_ai::judge::JudgeClient) (WOR-202) into a
+//! [`JudgeClient`](sbproxy_ai::judge::JudgeClient) into a
 //! single async entry point. The flow follows
 //! `adr-policy-compilation.md` (NLC pillars A and B):
 //!

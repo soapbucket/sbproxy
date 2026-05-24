@@ -1,7 +1,7 @@
 //! Access-log emission, per-agent label bundling, and PII redaction
 //! for the request-logging hook.
 //!
-//! Extracted from `server.rs` (WOR-629). Behavior-preserving move:
+//! Extracted from `server.rs`. Behavior-preserving move:
 //! no logic changes. `use super::*` re-imports the parent module's
 //! private items (statics, sibling helpers) these functions rely on.
 
@@ -688,7 +688,7 @@ pub(super) fn emit_access_log_entry(
         classifier_intent: context.classifier_intent,
         error_class: context.error_class,
         // Wave 1 / G1.6: per-agent dimensions. The agent-class
-        // resolver (G1.4) lands the typed values on `context` in a
+        // resolver lands the typed values on `context` in a
         // follow-up; until then the access log surfaces None and
         // dashboards keying on these fields treat the absence as
         // "unset".

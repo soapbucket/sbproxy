@@ -1,7 +1,7 @@
 //! G4.10 boilerplate-stripping transform.
 //!
 //! Removes navigation chrome, footers, sidebars, ad blocks, and comment
-//! sections from HTML so the downstream Markdown projection (G4.3) sees
+//! sections from HTML so the downstream Markdown projection sees
 //! mainly the article body. This is a Readability-lite stripper, not a
 //! perfect content extractor; the goal is to cut obvious nav and
 //! footer noise without dragging a full HTML parser into the hot path.
@@ -12,7 +12,7 @@
 //! into `ctx.metrics.stripped_bytes` after `apply` returns.
 //!
 //! Run order: this transform must run BEFORE `HtmlToMarkdownTransform`
-//! (G4.3). Doing it after Markdown projection would have nothing to
+//!. Doing it after Markdown projection would have nothing to
 //! strip; the projection has already discarded structural tags.
 //!
 //! ## Stripping rules

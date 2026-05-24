@@ -20,7 +20,7 @@
 //! prefer the `domain_noun_verb` convention from the [AWS Prescriptive
 //! Guidance for MCP] can attach an `x-mcp.name` (or `x-sbproxy-mcp.name`)
 //! override on the operation. The override is parsed by
-//! [`super::openapi_convert::openapi_to_mcp_tools`] (WOR-485) and
+//! [`super::openapi_convert::openapi_to_mcp_tools`] and
 //! surfaces here unchanged.
 //!
 //! [AWS Prescriptive Guidance for MCP]: https://docs.aws.amazon.com/prescriptive-guidance/latest/mcp-strategies/mcp-tool-strategy-organization.html
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn honours_x_mcp_extension_overrides() {
-        // The underlying converter (WOR-485) already recognises
+        // The underlying converter already recognises
         // `x-mcp.name` overrides; verify the rename surfaces through
         // the OpenAPI->codemode path end to end.
         let s = json!({

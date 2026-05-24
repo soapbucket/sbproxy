@@ -1,4 +1,4 @@
-//! Hot-reload loader for ADRF rule packs (WOR-588).
+//! Hot-reload loader for ADRF rule packs.
 //!
 //! The hot path reads a single `arc_swap::ArcSwap<CompiledRulePack>`
 //! per request, so reloading the file behind it does not require any

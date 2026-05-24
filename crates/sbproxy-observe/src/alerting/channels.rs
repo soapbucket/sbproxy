@@ -180,7 +180,7 @@ fn sign_alert(secret: &str, body: &[u8], timestamp: i64) -> String {
     format!("v1={}", hex::encode(bytes))
 }
 
-/// SSRF guard for an alert webhook URL (WOR-604).
+/// SSRF guard for an alert webhook URL.
 ///
 /// Wraps [`sbproxy_security::ssrf::validate_url`]: rejects non-`http(s)`
 /// schemes and URLs whose host is (or resolves to) a loopback, link-local,

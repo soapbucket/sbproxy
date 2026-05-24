@@ -140,7 +140,7 @@ pub struct Admission {
     permit: Option<OwnedSemaphorePermit>,
     reserved_tokens: u64,
     /// Model the reservation was charged to. Stamped here so the
-    /// post-flight estimate-error histogram (WOR-232) can label its
+    /// post-flight estimate-error histogram can label its
     /// observation without the caller having to thread the model
     /// string back through to `reconcile`.
     model: String,
