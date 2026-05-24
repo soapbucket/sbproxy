@@ -515,6 +515,22 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         None => None,
     };
 
+    // WOR-805: validate the Web Bot Auth signing identity up front so a
+    // malformed seed fails config load rather than silently disabling
+    // the hosted directory at runtime. The seed must be 64 hex chars
+    // (32 bytes); the actual key derivation happens in the data plane.
+    if let Some(wba) = &config_file.proxy.web_bot_auth {
+        if wba.key_id.trim().is_empty() {
+            anyhow::bail!("proxy.web_bot_auth.key_id must be non-empty");
+        }
+        let seed = &wba.ed25519_seed_hex;
+        if seed.len() != 64 || !seed.bytes().all(|b| b.is_ascii_hexdigit()) {
+            anyhow::bail!(
+                "proxy.web_bot_auth.ed25519_seed_hex must be 64 hex characters (a 32-byte Ed25519 seed)"
+            );
+        }
+    }
+
     Ok(CompiledConfig {
         origins,
         host_map,
@@ -2294,6 +2310,91 @@ origins:
         let compiled = compile_config(yaml).expect("compile");
         let origin = compiled.resolve_origin("signal.example.com").unwrap();
         assert!(origin.content_signal.is_none());
+    }
+
+    // --- WOR-805: Web Bot Auth signing identity validation ---
+
+    #[test]
+    fn web_bot_auth_valid_seed_compiles() {
+        let yaml = r#"
+proxy:
+  web_bot_auth:
+    key_id: sbproxy-2026
+    ed25519_seed_hex: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+origins:
+  a.example.com:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+"#;
+        let compiled = compile_config(yaml).expect("compile");
+        let wba = compiled.server.web_bot_auth.expect("web_bot_auth present");
+        assert_eq!(wba.key_id, "sbproxy-2026");
+    }
+
+    #[test]
+    fn web_bot_auth_bad_seed_length_fails_config_load() {
+        let yaml = r#"
+proxy:
+  web_bot_auth:
+    key_id: sbproxy-2026
+    ed25519_seed_hex: "deadbeef"
+origins:
+  a.example.com:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+"#;
+        match compile_config(yaml) {
+            Ok(_) => panic!("short seed must fail config load"),
+            Err(e) => assert!(
+                e.to_string().contains("ed25519_seed_hex"),
+                "error must reference the seed field; got: {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn web_bot_auth_non_hex_seed_fails_config_load() {
+        let yaml = r#"
+proxy:
+  web_bot_auth:
+    key_id: sbproxy-2026
+    ed25519_seed_hex: "zzzz456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+origins:
+  a.example.com:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+"#;
+        assert!(compile_config(yaml).is_err(), "non-hex seed must fail");
+    }
+
+    #[test]
+    fn web_bot_auth_empty_key_id_fails_config_load() {
+        let yaml = r#"
+proxy:
+  web_bot_auth:
+    key_id: ""
+    ed25519_seed_hex: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+origins:
+  a.example.com:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+"#;
+        match compile_config(yaml) {
+            Ok(_) => panic!("empty key_id must fail config load"),
+            Err(e) => assert!(e.to_string().contains("key_id"), "got: {e}"),
+        }
     }
 
     // --- WOR-193: agent_skills schema validation ---

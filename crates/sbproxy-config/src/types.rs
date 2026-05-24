@@ -348,6 +348,36 @@ pub struct ProxyServerConfig {
     /// [`HttpClientTimeoutsConfig`] for the field list.
     #[serde(default)]
     pub http_client_timeouts: HttpClientTimeoutsConfig,
+    /// Web Bot Auth signing identity (WOR-805). When set, the proxy
+    /// publishes the derived Ed25519 public key as an HTTP Message
+    /// Signatures directory at
+    /// `/.well-known/http-message-signatures-directory` so verifiers
+    /// (including SBproxy's own inbound `bot_auth` directory client)
+    /// can check the Web Bot Auth signatures the proxy produces. The
+    /// 32-byte seed is also the key the proxy signs its outbound
+    /// requests with. Absent keeps the endpoint off so existing
+    /// configs are unaffected.
+    #[serde(default)]
+    pub web_bot_auth: Option<WebBotAuthConfig>,
+}
+
+/// Web Bot Auth signing identity for the proxy. See the
+/// [`ProxyServerConfig::web_bot_auth`] field.
+///
+/// The proxy holds one Ed25519 keypair, identified by `key_id`. Its
+/// public half is published in the hosted signatures directory; its
+/// private seed signs outbound requests to upstreams that require Web
+/// Bot Auth. Treat `ed25519_seed_hex` as a secret (source it via an
+/// env interpolation rather than committing it).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct WebBotAuthConfig {
+    /// Key id advertised as the JWK `kid` and the RFC 9421 `keyid`.
+    /// Must be non-empty.
+    pub key_id: String,
+    /// Ed25519 private seed as 64 hex characters (32 bytes). The
+    /// public key is derived and published; the seed never leaves the
+    /// proxy. Validated at config-compile time.
+    pub ed25519_seed_hex: String,
 }
 
 impl Default for ProxyServerConfig {
@@ -376,6 +406,7 @@ impl Default for ProxyServerConfig {
             scripting: ScriptingConfig::default(),
             extensions: HashMap::new(),
             http_client_timeouts: HttpClientTimeoutsConfig::default(),
+            web_bot_auth: None,
         }
     }
 }
