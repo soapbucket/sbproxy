@@ -39,6 +39,10 @@ pub struct AiCrawlControlPolicy {
     /// unconditionally; `Some(_)` means the policy emits the multi-rail
     /// body for opted-in agents and falls back to single-rail otherwise.
     multi_rail: Option<Arc<MultiRailPlan>>,
+    /// Cloudflare Content Signals for this origin. When non-empty, a
+    /// crawler whose purpose maps to a disallowed (`=no`) signal is
+    /// blocked with 403 before the pricing path runs.
+    content_signals: ContentSignals,
 }
 
 /// Compiled multi-rail challenge plan. Holds the operator-configured
@@ -105,6 +109,7 @@ impl std::fmt::Debug for AiCrawlControlPolicy {
             .field("tiers", &self.tiers)
             .field("ledger", &self.ledger)
             .field("multi_rail", &self.multi_rail.is_some())
+            .field("content_signals", &self.content_signals)
             .finish()
     }
 }
@@ -166,6 +171,7 @@ impl AiCrawlControlPolicy {
             tiers: config.tiers,
             ledger,
             multi_rail,
+            content_signals: config.content_signals,
         })
     }
 
@@ -338,6 +344,29 @@ impl AiCrawlControlPolicy {
         };
         if !is_crawler {
             return AiCrawlDecision::Allow;
+        }
+        // --- WOR-804: Content Signals enforcement ---
+        //
+        // When the operator declared a signal as disallowed (`=no`), a
+        // crawler whose purpose maps to that signal is blocked outright
+        // with 403, independent of any payment token. Undeclared and
+        // `=yes` signals fall through to the normal pricing path, and a
+        // crawler we cannot confidently classify is never
+        // signal-blocked (it still pays through the tier path). This
+        // runs before tier resolution so a pure signal-gated origin
+        // (no priced tiers) still enforces.
+        if !self.content_signals.is_empty() {
+            if let Some(purpose) = headers
+                .get(http::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .and_then(classify_crawler_purpose)
+            {
+                if self.content_signals.disallows(purpose) {
+                    return AiCrawlDecision::SignalBlocked {
+                        body: signal_blocked_body(purpose),
+                    };
+                }
+            }
         }
         // --- G1.2 Accept-aware tier resolution ---
         //

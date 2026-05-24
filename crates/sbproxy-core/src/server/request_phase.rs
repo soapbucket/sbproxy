@@ -2275,6 +2275,32 @@ pub(super) async fn request_filter(
                 session
                     .write_response_body(Some(bytes::Bytes::copy_from_slice(body.as_bytes())), true)
                     .await?;
+            } else if status == 403 && policy_type == "ai_crawl_signal_blocked" {
+                // WOR-804: a Content Signal the operator declared `=no`
+                // governs this crawler's purpose. Emit the
+                // policy-supplied JSON explanation verbatim with a
+                // generic application/json Content-Type.
+                let body = ctx
+                    .crawl_challenge
+                    .take()
+                    .map(|(_, _, body)| body)
+                    .unwrap_or_else(|| format!("{{\"error\":\"{msg}\"}}"));
+                let mut header =
+                    pingora_http::ResponseHeader::build(status, Some(2)).map_err(|e| {
+                        Error::because(
+                            ErrorType::InternalError,
+                            "failed to build response header",
+                            e,
+                        )
+                    })?;
+                let _ = header.insert_header("content-type", "application/json");
+                let _ = header.insert_header("content-length", body.len().to_string());
+                session
+                    .write_response_header(Box::new(header), false)
+                    .await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::copy_from_slice(body.as_bytes())), true)
+                    .await?;
             } else if status == 503 && policy_type == "ai_crawl_ledger_unavailable" {
                 // AI crawl control: ledger is transiently down. Emit
                 // the policy-supplied JSON body verbatim and stamp

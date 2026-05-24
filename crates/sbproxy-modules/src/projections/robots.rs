@@ -26,6 +26,8 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
+use crate::policy::ai_crawl::ContentSignals;
+
 /// Render the `robots.txt` body for a single origin.
 ///
 /// `ai_crawl` is the JSON snapshot of the origin's
@@ -134,6 +136,18 @@ pub fn render(_hostname: &str, ai_crawl: &Value, config_version: u64) -> String 
     // (Wave 1 single-tier shape) we surface it on the wildcard
     // stanza; otherwise we serve an empty Disallow line.
     out.push_str("User-agent: *\n");
+    // Cloudflare Content Signals directive (WOR-804). Sits in the
+    // wildcard group, before the Disallow/Allow lines, per the
+    // Content Signals Policy. Read leniently from the policy snapshot
+    // so a malformed entry cannot break the whole projection; an
+    // empty / absent set emits no directive at all.
+    let content_signals: ContentSignals = ai_crawl
+        .get("content_signals")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    if let Some(directive) = content_signals.directive_value() {
+        out.push_str(&format!("Content-Signal: {directive}\n"));
+    }
     if top_price > 0 && !by_agent.contains_key("*") {
         out.push_str("Disallow: /\n");
         out.push_str("Crawl-delay: 1\n");
@@ -236,6 +250,26 @@ mod tests {
         });
         let body = render("h.example.com", &cfg, 1);
         assert!(!body.contains("/free/*"));
+    }
+
+    #[test]
+    fn content_signal_directive_emitted_in_wildcard_stanza() {
+        let cfg = serde_json::json!({
+            "type": "ai_crawl_control",
+            "content_signals": { "search": true, "ai_input": false, "ai_train": false },
+        });
+        let body = render("h.example.com", &cfg, 1);
+        assert!(
+            body.contains("User-agent: *\nContent-Signal: search=yes, ai-input=no, ai-train=no\n"),
+            "directive must sit in the wildcard group; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn absent_content_signals_emits_no_directive() {
+        let cfg = serde_json::json!({ "type": "ai_crawl_control" });
+        let body = render("h.example.com", &cfg, 1);
+        assert!(!body.contains("Content-Signal:"));
     }
 
     #[test]

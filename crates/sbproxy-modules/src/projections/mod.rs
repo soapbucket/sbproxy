@@ -41,6 +41,8 @@ use bytes::Bytes;
 use compact_str::CompactString;
 use sbproxy_config::{CompiledConfig, ListingRegistry};
 use sbproxy_plugin::{current_admin_audit_emitter, ProjectionRefreshEvent};
+
+use crate::policy::ai_crawl::ContentSignals;
 use sha2::{Digest, Sha256};
 
 pub mod agent_skills;
@@ -223,8 +225,21 @@ pub fn render_projections_with_listings(
             .insert(hostname.clone(), Bytes::from(llms_full));
 
         // --- licenses.xml ---
-        let (xml, urn) =
-            licenses::render(hostname.as_str(), content_signal.as_deref(), config_version);
+        //
+        // WOR-804: when the `ai_crawl_control` policy declares
+        // structured Content Signals, the same set drives both the
+        // robots.txt directive and the RSL document so they cannot
+        // contradict. Otherwise fall back to the legacy single
+        // `content_signal` value (byte-identical to prior output).
+        let content_signals: ContentSignals = ai_crawl
+            .get("content_signals")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let (xml, urn) = if content_signals.is_empty() {
+            licenses::render(hostname.as_str(), content_signal.as_deref(), config_version)
+        } else {
+            licenses::render_signals(hostname.as_str(), &content_signals, config_version)
+        };
         docs.licenses_xml.insert(hostname.clone(), Bytes::from(xml));
         docs.rsl_urns.insert(hostname.clone(), urn);
 
