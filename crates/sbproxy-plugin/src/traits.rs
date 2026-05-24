@@ -193,6 +193,24 @@ pub trait ActionHandler: Send + Sync + 'static {
     fn handler_type(&self) -> &'static str;
 
     /// Handle an incoming request.
+    ///
+    /// On success the future resolves to an [`ActionOutcome`] telling the
+    /// pipeline whether the request was proxied upstream or already
+    /// responded to directly.
+    ///
+    /// ## Errors
+    ///
+    /// Returns a [`PluginError`](crate::PluginError) when the handler
+    /// cannot produce an outcome: an upstream dependency failed
+    /// ([`PluginError::Upstream`](crate::PluginError::Upstream)), the
+    /// handler was misconfigured
+    /// ([`PluginError::Config`](crate::PluginError::Config)), the work
+    /// exceeded its time budget
+    /// ([`PluginError::Timeout`](crate::PluginError::Timeout)), or any
+    /// other failure folded into
+    /// [`PluginError::Internal`](crate::PluginError::Internal). The
+    /// dispatcher in `sbproxy-core` maps the category onto a client
+    /// response.
     fn handle(
         &self,
         req: &mut http::Request<bytes::Bytes>,
@@ -209,6 +227,27 @@ pub trait AuthProvider: Send + Sync + 'static {
     fn auth_type(&self) -> &'static str;
 
     /// Authenticate an incoming request.
+    ///
+    /// On success the future resolves to an [`AuthDecision`]. A denied
+    /// request is communicated through the
+    /// [`AuthDecision::Deny`] / [`AuthDecision::DenyWithHeaders`]
+    /// variants, not through `Err`; `Err` is reserved for the provider
+    /// failing to reach a decision at all.
+    ///
+    /// ## Errors
+    ///
+    /// Returns a [`PluginError`](crate::PluginError) when the provider
+    /// could not evaluate the request: an identity backend was
+    /// unreachable
+    /// ([`PluginError::Upstream`](crate::PluginError::Upstream)), a
+    /// credential or token could not be parsed or verified
+    /// ([`PluginError::Auth`](crate::PluginError::Auth)), the provider
+    /// was misconfigured
+    /// ([`PluginError::Config`](crate::PluginError::Config)), the work
+    /// timed out
+    /// ([`PluginError::Timeout`](crate::PluginError::Timeout)), or any
+    /// other failure folded into
+    /// [`PluginError::Internal`](crate::PluginError::Internal).
     fn authenticate(
         &self,
         req: &http::Request<bytes::Bytes>,
@@ -224,6 +263,25 @@ pub trait PolicyEnforcer: Send + Sync + 'static {
     fn policy_type(&self) -> &'static str;
 
     /// Enforce the policy against an incoming request.
+    ///
+    /// On success the future resolves to a [`PolicyDecision`]. A blocked
+    /// request is communicated through [`PolicyDecision::Deny`] (or
+    /// [`PolicyDecision::Confirm`] for human-in-the-loop holds), not
+    /// through `Err`; `Err` is reserved for the policy failing to reach
+    /// a decision at all.
+    ///
+    /// ## Errors
+    ///
+    /// Returns a [`PluginError`](crate::PluginError) when the policy
+    /// could not be evaluated: a backing store (rate-limit counter,
+    /// GeoIP database, denylist feed) was unreachable
+    /// ([`PluginError::Upstream`](crate::PluginError::Upstream)), the
+    /// policy was misconfigured
+    /// ([`PluginError::Config`](crate::PluginError::Config)), the work
+    /// timed out
+    /// ([`PluginError::Timeout`](crate::PluginError::Timeout)), or any
+    /// other failure folded into
+    /// [`PluginError::Internal`](crate::PluginError::Internal).
     fn enforce(
         &self,
         req: &http::Request<bytes::Bytes>,
@@ -288,6 +346,20 @@ pub trait TransformHandler: Send + Sync + 'static {
     /// delegate to classification / cache / quality hooks can do so
     /// without hard-coding cross-crate types into the trait signature.
     /// Transforms that don't care about hooks simply ignore `ctx`.
+    ///
+    /// The transform rewrites `body` in place; on success the future
+    /// resolves to `()` and the (possibly mutated) buffer is forwarded
+    /// downstream.
+    ///
+    /// ## Errors
+    ///
+    /// Returns a [`PluginError`](crate::PluginError) when the body could
+    /// not be transformed: the input was malformed for the declared
+    /// `content_type`, a required hook was missing or downcast failed
+    /// ([`PluginError::Config`](crate::PluginError::Config)), or any
+    /// other failure folded into
+    /// [`PluginError::Internal`](crate::PluginError::Internal). On error
+    /// the caller must not forward a partially rewritten buffer.
     fn apply<'a>(
         &'a self,
         body: &'a mut bytes::BytesMut,
@@ -302,6 +374,22 @@ pub trait RequestEnricher: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 
     /// Enrich the request context with additional data.
+    ///
+    /// The enricher writes derived data into `ctx` (downcast to the
+    /// concrete request-context type) and resolves to `()` on success.
+    ///
+    /// ## Errors
+    ///
+    /// Returns a [`PluginError`](crate::PluginError) when enrichment
+    /// could not run: a lookup backend (GeoIP database, parser table)
+    /// was unavailable
+    /// ([`PluginError::Upstream`](crate::PluginError::Upstream)), the
+    /// enricher was misconfigured
+    /// ([`PluginError::Config`](crate::PluginError::Config)), or any
+    /// other failure folded into
+    /// [`PluginError::Internal`](crate::PluginError::Internal).
+    /// Enrichers are advisory, so the dispatcher may log and continue;
+    /// returning `Err` signals that the enriched fields are absent.
     fn enrich(
         &self,
         req: &http::Request<bytes::Bytes>,

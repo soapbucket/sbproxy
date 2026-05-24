@@ -132,6 +132,13 @@ static RUNTIME_HOOKS: Mutex<Vec<Arc<dyn McpPolicyHook>>> = Mutex::new(Vec::new()
 /// impls in registration order. Tests and integration glue use this
 /// instead of [`inventory::submit!`] because inventory entries cannot
 /// be removed.
+///
+/// ## Panics
+///
+/// Panics if the internal registry mutex is poisoned, which only
+/// happens if a previous caller panicked while holding the lock. The
+/// registry holds the lock only long enough to push one entry, so this
+/// should not occur in practice.
 pub fn register_mcp_policy_hook(hook: Arc<dyn McpPolicyHook>) {
     RUNTIME_HOOKS
         .lock()
@@ -146,6 +153,13 @@ pub fn register_mcp_policy_hook(hook: Arc<dyn McpPolicyHook>) {
 /// layer iterates this list and dispatches the first matching hook
 /// (PR β semantics). PR γ will replace the first-hook shortcut with a
 /// verdict combiner that aggregates across every hook in the slice.
+///
+/// ## Panics
+///
+/// Panics if the internal runtime-hook registry mutex is poisoned (a
+/// prior holder panicked while holding the lock). The link-time
+/// inventory feed is read without locking and does not contribute to
+/// this condition.
 pub fn mcp_policy_hooks() -> Vec<Arc<dyn McpPolicyHook>> {
     let mut hooks: Vec<Arc<dyn McpPolicyHook>> = inventory::iter::<McpPolicyHookEntry>()
         .map(|entry| (entry.factory)())
