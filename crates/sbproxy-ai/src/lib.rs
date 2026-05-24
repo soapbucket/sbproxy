@@ -81,7 +81,10 @@ pub use ratelimit::{
 };
 pub use response_dedup::ResponseDedup;
 pub use routing::{Router, RoutingStrategy};
-pub use semantic_cache::{CachedAiResponse, SemanticCache};
+pub use semantic_cache::{
+    CachedAiResponse, CachedHttpResponse, EmbeddingCache, EmbeddingCacheConfig, EmbeddingHit,
+    SemanticCache,
+};
 pub use session::{ConversationSession, SessionStore};
 pub use streaming::*;
 pub use streaming_analytics::{StreamRegistry, StreamTracker};

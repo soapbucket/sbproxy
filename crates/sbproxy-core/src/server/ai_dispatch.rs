@@ -822,6 +822,104 @@ pub(super) async fn handle_ai_proxy(
         }
     }
 
+    // --- WOR-796: OSS embedding semantic cache (lookup) ---
+    //
+    // Runs only when the enterprise `SemanticLookupHook` is absent, so
+    // the two never double-cache. On a miss we embed the prompt once,
+    // cosine-scan the cache, and replay the closest response that meets
+    // the configured threshold. A miss remembers the key + vector so
+    // the relay can store the upstream response. Embedding failures
+    // fail open (proceed to the upstream uncached).
+    let mut embed_miss: Option<PendingEmbedMiss> = None;
+    if pipeline.hooks.semantic_lookup.is_none() {
+        if let Some(cache) = config.embedding_cache() {
+            if !extracted_prompt.is_empty() {
+                match config.providers.iter().find(|p| p.name == cache.provider()) {
+                    Some(provider) => {
+                        let ai_client = AI_CLIENT.load_full();
+                        match sbproxy_ai::semantic_cache::compute_embedding(
+                            &ai_client,
+                            provider,
+                            cache.model(),
+                            &extracted_prompt,
+                        )
+                        .await
+                        {
+                            Ok(query_vec) => {
+                                if let Some(hit) = cache.lookup(&query_vec) {
+                                    sbproxy_ai::ai_metrics::record_cache_result(
+                                        cache.provider(),
+                                        "semantic",
+                                        true,
+                                    );
+                                    sbproxy_ai::ai_metrics::record_semantic_similarity(
+                                        cache.provider(),
+                                        hit.score,
+                                    );
+                                    debug!(
+                                        origin = %hostname,
+                                        score = hit.score,
+                                        status = hit.response.status,
+                                        "AI proxy: embedding semantic cache HIT; replaying"
+                                    );
+                                    let mut header = pingora_http::ResponseHeader::build(
+                                        hit.response.status,
+                                        Some(hit.response.headers.len() + 1),
+                                    )
+                                    .map_err(|e| {
+                                        Error::because(
+                                            ErrorType::InternalError,
+                                            "embedding cache: failed to build response header",
+                                            e,
+                                        )
+                                    })?;
+                                    for (name, value) in &hit.response.headers {
+                                        if name == "transfer-encoding" || name == "connection" {
+                                            continue;
+                                        }
+                                        let _ = header.insert_header(name.clone(), value.clone());
+                                    }
+                                    let _ = header.insert_header("x-semcache", "HIT");
+                                    let body = bytes::Bytes::from(hit.response.body);
+                                    session
+                                        .write_response_header(Box::new(header), false)
+                                        .await?;
+                                    session.write_response_body(Some(body), true).await?;
+                                    return Ok(());
+                                }
+                                sbproxy_ai::ai_metrics::record_cache_result(
+                                    cache.provider(),
+                                    "semantic",
+                                    false,
+                                );
+                                embed_miss = Some((
+                                    std::sync::Arc::clone(cache),
+                                    sbproxy_ai::EmbeddingCache::prompt_key(&extracted_prompt),
+                                    query_vec,
+                                ));
+                            }
+                            Err(e) => {
+                                warn!(
+                                    origin = %hostname,
+                                    error = %e,
+                                    "AI proxy: embedding cache lookup failed (fail-open)"
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        warn!(
+                            origin = %hostname,
+                            provider = %cache.provider(),
+                            "AI proxy: semantic cache embedding provider not found in \
+                             providers list; skipping cache"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // --- Input guardrails: check messages before forwarding ---
     if let Some(ref guardrails_config) = config.guardrails {
         if let Some(pipeline) = cached_guardrails_pipeline(guardrails_config) {
@@ -1350,6 +1448,7 @@ pub(super) async fn handle_ai_proxy(
                 last_format,
                 hostname,
                 semcache_miss,
+                embed_miss,
                 config.max_body_size,
                 recorder,
                 Some(ctx),
@@ -1473,6 +1572,7 @@ pub(super) async fn relay_ai_response_with_cache(
     format: sbproxy_ai::providers::ProviderFormat,
     hostname: &str,
     miss_info: Option<PendingSemcacheMiss>,
+    embed_miss: Option<PendingEmbedMiss>,
     max_body_size: Option<usize>,
     budget_recorder: Option<BudgetRecorderArgs<'_>>,
     mut ctx: Option<&mut RequestContext>,
@@ -1559,6 +1659,32 @@ pub(super) async fn relay_ai_response_with_cache(
             _ => resp_body,
         }
     };
+
+    // --- WOR-796: OSS embedding cache write on miss ---
+    //
+    // Store the upstream response under the prompt's embedding so a
+    // future near-duplicate prompt replays it. Only 200 responses are
+    // cached. Mutually exclusive with the enterprise hook store below
+    // (the lookup gates on the hook being absent). `captured_headers`
+    // is cloned here so the enterprise branch can still move it.
+    if let Some((cache, key, embedding)) = embed_miss {
+        if status == 200 {
+            let cached = sbproxy_ai::CachedHttpResponse {
+                status,
+                headers: captured_headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                body: resp_body.to_vec(),
+            };
+            cache.store(key, &embedding, cached);
+            debug!(
+                origin = %hostname,
+                body_len = resp_body.len(),
+                "AI proxy: embedding semantic cache write-on-miss stored"
+            );
+        }
+    }
 
     // --- Semantic cache write on miss ---
     //
