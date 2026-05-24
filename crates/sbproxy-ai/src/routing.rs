@@ -552,7 +552,7 @@ mod tests {
         enabled: bool,
     ) -> ProviderConfig {
         ProviderConfig {
-            name: name.to_string(),
+            name: name.into(),
             provider_type: None,
             api_key: None,
             base_url: None,

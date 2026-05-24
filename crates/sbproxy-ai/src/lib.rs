@@ -23,6 +23,7 @@ pub mod guardrails;
 pub mod handler;
 pub mod hierarchical_budget;
 pub mod identity;
+pub mod ids;
 pub mod image;
 pub mod judge;
 pub mod key_scoping;
@@ -61,6 +62,7 @@ pub use degradation::{should_degrade, DegradationConfig};
 pub use handler::*;
 pub use hierarchical_budget::{BudgetCheckResult, BudgetScope, HierarchicalBudget};
 pub use identity::{KeyStore, VirtualKeyConfig};
+pub use ids::{ModelId, ProviderName};
 pub use key_scoping::KeyPermissions;
 pub use model_alias::{ModelAlias, ModelAliasRegistry};
 pub use multimodal::{

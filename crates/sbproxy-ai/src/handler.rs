@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 use crate::budget::BudgetConfig;
 use crate::guardrails::GuardrailsConfig;
 use crate::identity::VirtualKeyConfig;
+use crate::ids::ModelId;
 use crate::provider::ProviderConfig;
 use crate::ratelimit::{ModelRateConfig, SurfaceRateConfig};
 use crate::routing::RoutingStrategy;
@@ -21,10 +22,10 @@ pub struct AiHandlerConfig {
     pub routing: RoutingStrategy,
     /// Optional allow-list of model names; empty means allow all.
     #[serde(default)]
-    pub allowed_models: Vec<String>,
+    pub allowed_models: Vec<ModelId>,
     /// Block-list of model names that takes precedence over the allow-list.
     #[serde(default)]
-    pub blocked_models: Vec<String>,
+    pub blocked_models: Vec<ModelId>,
     /// Maximum request body size in bytes accepted by the gateway.
     #[serde(default)]
     pub max_body_size: Option<usize>,
@@ -403,6 +404,65 @@ impl AiHandlerConfig {
                 .validate_base_url()
                 .map_err(|e| anyhow::anyhow!("ai provider {:?} base_url: {e}", provider.name))?;
         }
+        // WOR-625: validate provider names and the model allow-list here
+        // so a typo (`openAI` for `openai`) or an unknown model is caught
+        // at config load rather than silently misrouting at request time.
+        // The provider catalog is open (YAML-driven), so a provider passes
+        // when it carries an explicit `base_url`, or its catalog key (its
+        // `provider_type`, else its `name`) is an exact catalog entry.
+        // Catalog keys are lowercase, so a case mismatch is rejected with a
+        // suggestion.
+        for provider in &config.providers {
+            if provider.base_url.is_some() {
+                continue; // explicit endpoint: any name is fine
+            }
+            // When `provider_type` is set it is the catalog key and `name`
+            // is just a free-form label; otherwise `name` is the key.
+            let (label, key) = match provider.provider_type.as_deref() {
+                Some(pt) => ("provider_type", pt),
+                None => ("provider name", provider.name.as_str()),
+            };
+            let lower = key.to_ascii_lowercase();
+            if key == lower && crate::providers::get_provider_info(key).is_some() {
+                continue; // exact catalog entry (canonical name or alias)
+            }
+            if crate::providers::get_provider_info(key).is_some() {
+                // Resolves case-insensitively but not exactly: an
+                // unambiguous casing typo (`openAI` for `openai`). Exact
+                // names are what routing rules match, so this is rejected.
+                anyhow::bail!(
+                    "ai {label} {key:?} is not a known provider; names are case-sensitive, did you mean {lower:?}?"
+                );
+            }
+            // Completely unknown name with no base_url. This may be an
+            // intentional custom label, so it is a warning rather than a
+            // hard error; without a base_url it falls back to a localhost
+            // endpoint, which is usually a misconfiguration.
+            tracing::warn!(
+                "ai {label} {key:?} is not in the provider catalog and has no base_url; it will fall back to a localhost endpoint. Set base_url for a custom provider, or use a catalog provider name."
+            );
+        }
+        // Validate the model allow-list against the union of the providers'
+        // declared `models` lists, but only when every provider declares one
+        // (an empty list defers to the upstream catalog and accepts any
+        // model, so there is nothing to check against).
+        if !config.allowed_models.is_empty()
+            && !config.providers.is_empty()
+            && config.providers.iter().all(|p| !p.models.is_empty())
+        {
+            let known: std::collections::HashSet<&str> = config
+                .providers
+                .iter()
+                .flat_map(|p| p.models.iter().map(ModelId::as_str))
+                .collect();
+            for model in &config.allowed_models {
+                if !known.contains(model.as_str()) {
+                    anyhow::bail!(
+                        "ai allowed_models entry {model:?} is not served by any configured provider"
+                    );
+                }
+            }
+        }
         Ok(config)
     }
 
@@ -706,7 +766,7 @@ mod tests {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
             allowed_models: Vec::new(),
-            blocked_models: vec!["gpt-4".to_string()],
+            blocked_models: vec!["gpt-4".into()],
             max_body_size: None,
             guardrails: None,
             budget: None,
@@ -730,7 +790,7 @@ mod tests {
         let config = AiHandlerConfig {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
-            allowed_models: vec!["gpt-4".to_string(), "gpt-3.5-turbo".to_string()],
+            allowed_models: vec!["gpt-4".into(), "gpt-3.5-turbo".into()],
             blocked_models: Vec::new(),
             max_body_size: None,
             guardrails: None,
@@ -756,8 +816,8 @@ mod tests {
         let config = AiHandlerConfig {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
-            allowed_models: vec!["gpt-4".to_string()],
-            blocked_models: vec!["gpt-4".to_string()],
+            allowed_models: vec!["gpt-4".into()],
+            blocked_models: vec!["gpt-4".into()],
             max_body_size: None,
             guardrails: None,
             budget: None,
@@ -810,6 +870,77 @@ mod tests {
     fn ai_handler_config_missing_providers() {
         let json = serde_json::json!({});
         assert!(AiHandlerConfig::from_config(json).is_err());
+    }
+
+    // --- WOR-625: provider-name + model-allow-list validation ---
+
+    #[test]
+    fn from_config_rejects_provider_name_case_typo() {
+        // `openAI` resolves case-insensitively for base_url but breaks
+        // exact-name routing, so it is rejected at config load, not at
+        // the first request.
+        let json = serde_json::json!({
+            "providers": [{"name": "openAI", "api_key": "sk-test"}]
+        });
+        let err = AiHandlerConfig::from_config(json).unwrap_err().to_string();
+        assert!(err.contains("openAI"), "error names the bad value: {err}");
+        assert!(
+            err.contains("openai"),
+            "error suggests the canonical name: {err}"
+        );
+    }
+
+    #[test]
+    fn from_config_warns_but_accepts_unknown_provider() {
+        // A completely unknown name (not a casing typo of a catalog
+        // entry) may be an intentional custom label, so it is accepted
+        // with a warning rather than rejected. Casing typos of a real
+        // catalog name are the rejected case (see the test above).
+        let json = serde_json::json!({
+            "providers": [{"name": "my-custom-label", "api_key": "k"}]
+        });
+        assert!(AiHandlerConfig::from_config(json).is_ok());
+    }
+
+    #[test]
+    fn from_config_accepts_custom_provider_with_base_url() {
+        // An unknown name is fine when an explicit endpoint is given.
+        let json = serde_json::json!({
+            "providers": [{
+                "name": "my-llm",
+                "base_url": "http://127.0.0.1:9000/v1",
+                "allow_private_base_url": true,
+                "api_key": "k"
+            }]
+        });
+        assert!(AiHandlerConfig::from_config(json).is_ok());
+    }
+
+    #[test]
+    fn from_config_rejects_unknown_allowed_model() {
+        // Every provider declares a model list, so allowed_models is
+        // checked against their union; an entry no provider serves is
+        // rejected.
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "k", "models": ["gpt-4o"]}],
+            "allowed_models": ["gpt-9-ultra"]
+        });
+        let err = AiHandlerConfig::from_config(json).unwrap_err().to_string();
+        assert!(
+            err.contains("gpt-9-ultra"),
+            "error names the unknown model: {err}"
+        );
+    }
+
+    #[test]
+    fn from_config_allows_models_when_providers_defer_to_catalog() {
+        // openai declares no `models` (defers to the catalog), so the
+        // allow-list is not validated and any model passes.
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "k"}],
+            "allowed_models": ["some-future-model"]
+        });
+        assert!(AiHandlerConfig::from_config(json).is_ok());
     }
 
     // --- Cascade routing deserialization ---
