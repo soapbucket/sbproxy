@@ -385,6 +385,12 @@ pub fn load_listings_from_repo(
 /// [`Listing`]. The header (`apiVersion`, `kind`) is validated before
 /// returning so a misfiled non-Listing YAML produces a clear error
 /// instead of a confusing serde failure deeper down.
+///
+/// # Errors
+///
+/// Returns [`ListingLoadError`] if the file cannot be read, if its YAML
+/// does not deserialize into a [`Listing`], or if its `apiVersion` /
+/// `kind` header does not match the expected Listing schema.
 pub fn load_listing_file(path: &Path) -> Result<Listing, ListingLoadError> {
     let body = std::fs::read_to_string(path).map_err(|source| ListingLoadError::Io {
         path: path.to_path_buf(),

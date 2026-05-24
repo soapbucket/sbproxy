@@ -57,6 +57,12 @@ fn parse_redis_addr(dsn: &str) -> Result<String> {
 }
 
 /// Build a concrete `KVStore` for the given L2 cache config.
+///
+/// # Errors
+///
+/// Returns an error if the configured `driver` is not recognized, or if
+/// the `redis` driver is selected and its DSN cannot be parsed into a
+/// `host:port` address.
 pub fn build_l2_store(cfg: &L2CacheConfig) -> Result<Arc<dyn KVStore>> {
     match cfg.driver.as_str() {
         "redis" => {
@@ -92,6 +98,12 @@ const DEFAULT_MEMORY_MESSENGER_CAPACITY: usize = 1024;
 /// * `redis`      - `dsn` (default `redis://127.0.0.1:6379`).
 /// * `sqs`        - `queue_url`, `region`, `api_key` (all required).
 /// * `gcp_pubsub` - `project`, `topic`, `subscription`, `access_token` (all required).
+///
+/// # Errors
+///
+/// Returns an error if the `driver` is not one of `memory`, `redis`,
+/// `sqs`, or `gcp_pubsub`, if the `redis` DSN cannot be parsed, or if an
+/// `sqs` or `gcp_pubsub` driver is missing any of its required params.
 pub fn build_messenger(settings: &MessengerSettings) -> Result<Arc<dyn Messenger>> {
     match settings.driver.as_str() {
         "memory" => Ok(Arc::new(MemoryMessenger::new(
@@ -165,6 +177,11 @@ pub fn build_messenger(settings: &MessengerSettings) -> Result<Arc<dyn Messenger
 ///
 /// Most plugin configs (actions, policies, etc.) use a `type` discriminator
 /// to select which implementation to use.
+///
+/// # Errors
+///
+/// Returns an error if `value` has no `type` field or its `type` is not
+/// a string.
 pub fn extract_type(value: &serde_json::Value) -> Result<String> {
     value
         .get("type")
@@ -451,6 +468,12 @@ fn migrate_features_to_extensions(yaml: &str) -> Result<String> {
 }
 
 /// Compile a raw YAML config string into a `CompiledConfig`.
+///
+/// # Errors
+///
+/// Returns an error if the YAML fails to parse, if a config mixes the
+/// legacy `features.*` blocks with the canonical `extensions` shape, or
+/// if any origin, L2 cache backend, or messenger fails to compile.
 pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // Interpolate environment variables before parsing YAML.
     let yaml = interpolate_env_vars(yaml);
@@ -522,6 +545,12 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
 ///
 /// `ConfigSource::Local` (or no `source:` field at all) preserves
 /// the historical behaviour: `inline_text` is the config.
+///
+/// # Errors
+///
+/// Returns an error if the top-level `source:` block cannot be parsed,
+/// if resolving a non-local config source fails, or if the resolved
+/// config fails to compile (see [`compile_config`]).
 pub async fn compile_config_from_source(
     inline_text: &str,
     fetch_ctx: &crate::source::FetchContext,
@@ -547,6 +576,12 @@ pub async fn compile_config_from_source(
 }
 
 /// Compile a single origin from its raw config.
+///
+/// # Errors
+///
+/// Returns an error if any of the origin's configured modules (action,
+/// auth, policy, transform, or enricher) names an unknown type or has
+/// invalid parameters, or if a referenced module cannot be built.
 pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<CompiledOrigin> {
     let allowed_methods: SmallVec<[http::Method; 4]> = config
         .allowed_methods
