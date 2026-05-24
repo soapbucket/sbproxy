@@ -1468,6 +1468,37 @@ pub(super) async fn request_filter(
         }
     }
 
+    // --- WOR-809: AGENTS.md + ai.txt agent-web emission ---
+    //
+    // Served verbatim from per-origin config (`agents_md:` / `ai_txt:`),
+    // independently of `ai_crawl_control`. Unlike the pricing-derived
+    // projections below, these intercept ONLY when the origin actually
+    // configured the body; otherwise the path falls through to the
+    // upstream so a real app-level AGENTS.md / ai.txt is not shadowed.
+    {
+        let kind = match session.req_header().uri.path() {
+            "/AGENTS.md" => Some("agents-md"),
+            "/ai.txt" => Some("ai-txt"),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            let docs = sbproxy_modules::projections::current_projections();
+            let host_key = pipeline.config.origins[origin_idx].hostname.as_str();
+            let body_opt = match kind {
+                "agents-md" => docs.agents_md.get(host_key).cloned(),
+                "ai-txt" => docs.ai_txt.get(host_key).cloned(),
+                _ => None,
+            };
+            if let Some(body) = body_opt {
+                let ct = projection_content_type(kind);
+                send_response(session, 200, ct, body.as_ref()).await?;
+                return Ok(true);
+            }
+            // Not configured for this origin: fall through to normal
+            // proxying rather than 404.
+        }
+    }
+
     // --- Wave 4 / G4.5..G4.8 wire: policy-graph projections ---
     //
     // Origins with an `ai_crawl_control` policy have four

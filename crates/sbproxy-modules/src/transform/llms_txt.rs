@@ -633,6 +633,8 @@ mod tests {
             content_signal: None,
             token_bytes_ratio: None,
             agent_skills: Vec::new(),
+            agents_md: None,
+            ai_txt: None,
         }
     }
 

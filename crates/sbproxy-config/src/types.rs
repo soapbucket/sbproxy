@@ -2010,6 +2010,19 @@ pub struct RawOriginConfig {
     /// configs compile unchanged.
     #[serde(default)]
     pub agent_skills: Vec<AgentSkillEntry>,
+    /// Per-origin `/AGENTS.md` body (WOR-809). When set, the proxy
+    /// serves it verbatim at `GET /AGENTS.md` (content type
+    /// `text/markdown`) per the AGENTS.md agent-instructions
+    /// convention. Independent of `ai_crawl_control`. Absent keeps the
+    /// endpoint off.
+    #[serde(default)]
+    pub agents_md: Option<String>,
+    /// Per-origin `/ai.txt` body (WOR-809). When set, the proxy serves
+    /// it verbatim at `GET /ai.txt` per the Spawning ai.txt
+    /// convention. Independent of `ai_crawl_control`. Absent keeps the
+    /// endpoint off.
+    #[serde(default)]
+    pub ai_txt: Option<String>,
 }
 
 // --- Agent Skills v0.2.0 ---

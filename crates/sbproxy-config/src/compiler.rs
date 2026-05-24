@@ -898,6 +898,9 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         token_bytes_ratio,
         // WOR-193: per-origin Agent Skills v0.2.0 advertisement.
         agent_skills: config.agent_skills,
+        // WOR-809: agent-web emission bodies served verbatim.
+        agents_md: config.agents_md,
+        ai_txt: config.ai_txt,
     })
 }
 

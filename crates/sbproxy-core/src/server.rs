@@ -468,6 +468,10 @@ fn projection_content_type(kind: &str) -> &'static str {
         "robots" | "llms" | "llms-full" => "text/plain; charset=utf-8",
         "licenses" => "application/xml",
         "tdmrep" => "application/json",
+        // AGENTS.md is Markdown (agents.md convention); ai.txt is a
+        // plain-text robots-like file (Spawning ai.txt).
+        "agents-md" => "text/markdown; charset=utf-8",
+        "ai-txt" => "text/plain; charset=utf-8",
         _ => "text/plain",
     }
 }

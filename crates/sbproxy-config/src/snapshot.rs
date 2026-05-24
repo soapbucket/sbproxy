@@ -166,6 +166,12 @@ pub struct CompiledOrigin {
     /// the YAML so the projection module can resolve artifact bytes,
     /// stamp digests, and cache the manifest body.
     pub agent_skills: Vec<AgentSkillEntry>,
+    /// Per-origin `/AGENTS.md` body served verbatim (WOR-809). `None`
+    /// keeps the endpoint off for the origin.
+    pub agents_md: Option<String>,
+    /// Per-origin `/ai.txt` body served verbatim (WOR-809). `None`
+    /// keeps the endpoint off for the origin.
+    pub ai_txt: Option<String>,
 }
 
 /// The complete compiled config: all origins plus host-based routing.
