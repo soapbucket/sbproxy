@@ -1016,6 +1016,12 @@ impl PlanFile {
     /// renamed into place. On a crash mid-write, `path` either keeps
     /// its previous contents or is already the new value; it is
     /// never half-written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the plan cannot be serialized to JSON, or if any
+    /// filesystem step (creating, writing, syncing, or renaming the temp
+    /// file) fails.
     pub fn write_to_path(&self, path: &std::path::Path) -> std::io::Result<()> {
         let body = serde_json::to_vec_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -1044,6 +1050,11 @@ impl PlanFile {
     }
 
     /// Read and parse a plan-file written by [`Self::write_to_path`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, or if its contents do
+    /// not deserialize from JSON into a `PlanFile`.
     pub fn read_from_path(path: &std::path::Path) -> std::io::Result<Self> {
         let body = std::fs::read(path)?;
         serde_json::from_slice(&body)

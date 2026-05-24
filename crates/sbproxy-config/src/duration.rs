@@ -26,6 +26,12 @@ use serde::de::{self, Deserializer, Unexpected, Visitor};
 use std::fmt;
 
 /// Deserialize a u64 seconds value, accepting integer or humanized string.
+///
+/// # Errors
+///
+/// Returns a deserialization error if the value is neither a
+/// non-negative integer nor a parseable humanized duration string such
+/// as `"30s"`, `"5m"`, or `"2h30m"`.
 pub fn deserialize_secs<'de, D>(d: D) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
