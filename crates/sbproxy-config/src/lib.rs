@@ -4,7 +4,7 @@
 //! - Parsing YAML config files into typed structs ([`types`])
 //! - Intermediate representation ([`raw`])
 //! - Compiling configs into immutable, performance-optimized snapshots ([`snapshot`], [`compiler`])
-//! - The repo-native [`listing::Listing`] primitive (WOR-136)
+//! - The repo-native [`listing::Listing`] primitive
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

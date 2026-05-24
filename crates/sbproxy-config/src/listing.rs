@@ -1,11 +1,11 @@
-//! Repo-native [`Listing`] primitive (WOR-136).
+//! Repo-native [`Listing`] primitive.
 //!
 //! A `Listing` is a published, versioned view of a Resource that lives
 //! in the same Repo as the rest of the proxy config. The shape is
 //! Kubernetes-flavoured (`apiVersion`, `kind`, `metadata`, `spec`) so
 //! it round-trips cleanly with the rest of the platform's YAML and
-//! lets future agents (the WOR-196 Listing-scoped agent-skills hook,
-//! the WOR-135 hosted-Catalog surface, the future preview-environments
+//! lets future agents (the Listing-scoped agent-skills hook,
+//! the hosted-Catalog surface, the future preview-environments
 //! work) build on a stable shape.
 //!
 //! ## What this module provides
@@ -55,7 +55,7 @@ pub const LISTING_KIND: &str = "Listing";
 ///
 /// Future fields tracked but not yet on this type:
 ///
-/// * `spec.skills`: per-Listing agent-skills extension (WOR-196). It
+/// * `spec.skills`: per-Listing agent-skills extension. It
 ///   lives on the Listing because skills are scoped to a published
 ///   surface, not to the underlying Resource.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -125,10 +125,10 @@ pub struct ListingSpec {
     /// Lifecycle metadata: deprecation note + sunset date.
     #[serde(default)]
     pub lifecycle: ListingLifecycle,
-    /// Per-Listing Agent Skills v0.2.0 advertisement (WOR-196).
+    /// Per-Listing Agent Skills v0.2.0 advertisement.
     ///
-    /// Each entry mirrors the top-level `agent_skills:` block from
-    /// `WOR-193`: `name`, `type`, `description`, `url`, optional
+    /// Each entry mirrors the top-level `agent_skills:` block, namely
+    /// `name`, `type`, `description`, `url`, optional
     /// `visibility`, plus the `path` / `body` / archive-safety knobs.
     /// At config-load time the projection layer resolves the artifact
     /// bytes, hashes them, and exposes the resulting index at two
@@ -805,10 +805,10 @@ fn validate_one<R: RevisionResolver>(
     }
 }
 
-/// Plan-time validation for `Listing.spec.skills[]` (WOR-196).
+/// Plan-time validation for `Listing.spec.skills[]`.
 ///
 /// Walks every entry and emits findings against the existing plan
-/// stream. The rules mirror the AC on WOR-196:
+/// stream. The rules mirror the acceptance criteria:
 ///
 /// - `type` must be `skill-md` or `archive`; other values produce a
 ///   `listing-skill-bad-type` error.

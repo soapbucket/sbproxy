@@ -12,7 +12,7 @@ use std::collections::HashMap;
 /// Top-level config file structure (sb.yml).
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ConfigFile {
-    /// Optional source descriptor (WOR-185).
+    /// Optional source descriptor.
     ///
     /// When set, the config compiler resolves the listed source(s)
     /// before parsing the rest of the file. The remaining fields on
@@ -43,7 +43,7 @@ pub struct ConfigFile {
     pub agent_classes: Option<AgentClassesConfig>,
 }
 
-/// Where to load a `sb.yml` config text from (WOR-185).
+/// Where to load a `sb.yml` config text from.
 ///
 /// The default (no `source:` field at all) means the file is the
 /// config: the surrounding `ConfigFile` is treated as inline content
@@ -323,7 +323,7 @@ pub struct ProxyServerConfig {
     pub device_parser_file: Option<String>,
     /// Optional synthetic-transaction probe driving an in-process
     /// request through the compiled handler chain on a fixed cadence
-    /// and reporting the verdict on `/readyz` (WOR-27). Disabled by
+    /// and reporting the verdict on `/readyz`. Disabled by
     /// default; opt in for deployments that want `/readyz` to fail
     /// when the proxy is unable to service its own requests.
     #[serde(default)]
@@ -385,8 +385,8 @@ impl Default for ProxyServerConfig {
 /// Per-engine scripting sandbox limits, exposed under the
 /// `proxy.scripting:` block of sb.yml.
 ///
-/// Today this block carries sub-blocks for the Lua engine (WOR-594)
-/// and the JavaScript engine (WOR-595). The CEL and WebAssembly
+/// Today this block carries sub-blocks for the Lua engine
+/// and the JavaScript engine. The CEL and WebAssembly
 /// engines manage their own budgets separately. Operators who omit
 /// the block get the documented defaults from each sub-block.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -417,8 +417,8 @@ pub struct JsScriptingConfig {
     pub sandbox: JsSandboxConfig,
 }
 
-/// JavaScript sandbox limits enforced on every script execution
-/// (WOR-595).
+/// JavaScript sandbox limits enforced on every script execution.
+///
 ///
 /// The `budget_ms` field is the CPU time budget for a single
 /// `execute` / `call_function` / `match_request` / `waf_match` call.
@@ -564,8 +564,8 @@ scripting:
 
 // --- Synthetic probe config (WOR-27) ---
 
-/// Configuration for the in-process synthetic-transaction probe
-/// (WOR-27).
+/// Configuration for the in-process synthetic-transaction probe.
+///
 ///
 /// When enabled, a background task fires a request through the
 /// compiled pipeline against the configured `hostname` on a fixed
@@ -587,7 +587,7 @@ pub struct SyntheticProbeConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Sentinel hostname routed to the synthetic origin. Defaults to
-    /// `__synthetic.local` per the WOR-27 spec; pick another value if
+    /// `__synthetic.local` per the synthetic-probe convention; pick another value if
     /// it collides with an existing origin in your deployment.
     #[serde(default = "default_synthetic_hostname")]
     pub hostname: String,
@@ -1971,7 +1971,7 @@ pub struct RawOriginConfig {
     /// `DEFAULT_TOKEN_BYTES_RATIO` (0.25).
     #[serde(default)]
     pub token_bytes_ratio: Option<f32>,
-    /// Per-origin Agent Skills v0.2.0 advertisement (WOR-193). When
+    /// Per-origin Agent Skills v0.2.0 advertisement. When
     /// non-empty, the proxy serves `GET /.well-known/agent-skills/index.json`
     /// for this origin and re-hosts each path-absolute or relative
     /// artifact at the URL declared in the entry. Empty (or absent)
@@ -1983,7 +1983,7 @@ pub struct RawOriginConfig {
 
 // --- Agent Skills v0.2.0 ---
 
-/// One entry in an origin's `agent_skills:` advertisement (WOR-193).
+/// One entry in an origin's `agent_skills:` advertisement.
 ///
 /// The shape mirrors the v0.2.0 manifest entry described at
 /// `https://schemas.agentskills.io/discovery/0.2.0/schema.json`:
@@ -1991,7 +1991,7 @@ pub struct RawOriginConfig {
 /// description, and the URL the agent fetches to retrieve the artifact.
 /// A `digest` field is computed at config-load time by hashing the
 /// resolved artifact bytes; the per-request handler re-hashes the body
-/// on every serve and refuses to ship a tampered artifact (WOR-194).
+/// on every serve and refuses to ship a tampered artifact.
 ///
 /// The optional safety knobs (`max_decompression_ratio`, `max_entries`,
 /// `max_expanded_bytes`, `max_clock_skew_secs`) cap archive parsing so

@@ -3,7 +3,7 @@
 //! When several policies match the same request (typical for MCP tool
 //! calls that fan out across allow-lists, AI guardrails, and tenant
 //! rules), the runtime needs a single terminal verdict per request.
-//! [`combine_verdicts`] implements the WOR-152 combination matrix:
+//! [`combine_verdicts`] implements the combination matrix:
 //!
 //! - Any [`PolicyDecision::Deny`] in the set means the combined
 //!   decision is `Deny`.
@@ -21,7 +21,7 @@
 //! voted to block or to require approval, not just the first.
 //!
 //! See `docs/adr-policy-verdict-shape.md` for the broader verdict
-//! design and WOR-152 for the acceptance gate (allow / confirm / deny
+//! design for the acceptance gate (allow / confirm / deny
 //! matrix documented and unit-tested).
 //!
 //! [`PolicyDecision::Deny`]: crate::PolicyDecision::Deny
@@ -90,7 +90,7 @@ impl CombinedVerdict {
 }
 
 /// Combine multiple per-policy [`PolicyDecision`] values into a single
-/// terminal verdict per the WOR-152 matrix.
+/// terminal verdict per the combination matrix.
 ///
 /// # Semantics
 ///
