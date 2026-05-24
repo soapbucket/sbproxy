@@ -2611,6 +2611,7 @@ use action_dispatch::*;
 // The ProxyHttp trait impl lives in the `proxy_http` submodule
 // (WOR-629). A trait impl needs no re-import to take effect.
 mod proxy_http;
+mod request_phase;
 
 // --- Access log emission helpers ---
 //
