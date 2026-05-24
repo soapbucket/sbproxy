@@ -126,13 +126,7 @@ fn main() {
             .filter(|a| a.as_str() != "--check" && a.as_str() != "validate")
             .cloned()
             .collect();
-        match handle_validate_subcommand(&filtered) {
-            Ok(code) => std::process::exit(code),
-            Err(e) => {
-                eprintln!("validate: {e:#}");
-                std::process::exit(2);
-            }
-        }
+        run_subcommand("validate", 2, handle_validate_subcommand(&filtered));
     }
 
     // --- Wave 4 / G4.5..G4.8 wire: `sbproxy projections render` ---
@@ -142,13 +136,11 @@ fn main() {
     // named document for the named hostname (default the first
     // origin) to stdout. No proxy starts; this is a pure render.
     if matches!(args.get(1).map(String::as_str), Some("projections")) {
-        match handle_projections_subcommand(&args[2..]) {
-            Ok(()) => return,
-            Err(e) => {
-                eprintln!("error: {e:#}");
-                std::process::exit(2);
-            }
-        }
+        run_subcommand(
+            "error",
+            2,
+            handle_projections_subcommand(&args[2..]).map(|()| 0),
+        );
     }
 
     // --- WOR-180 (steps 1+2): `sbproxy plan` and `sbproxy apply` ---
@@ -165,22 +157,10 @@ fn main() {
     // staleness check, and admin-socket `--running` baseline are
     // out-of-scope follow-ups (steps 3 through 5 of WOR-180).
     if matches!(args.get(1).map(String::as_str), Some("plan")) {
-        match handle_plan_subcommand(&args[2..]) {
-            Ok(code) => std::process::exit(code),
-            Err(e) => {
-                eprintln!("plan: {e:#}");
-                std::process::exit(1);
-            }
-        }
+        run_subcommand("plan", 1, handle_plan_subcommand(&args[2..]));
     }
     if matches!(args.get(1).map(String::as_str), Some("apply")) {
-        match handle_apply_subcommand(&args[2..]) {
-            Ok(code) => std::process::exit(code),
-            Err(e) => {
-                eprintln!("apply: {e:#}");
-                std::process::exit(1);
-            }
-        }
+        run_subcommand("apply", 1, handle_apply_subcommand(&args[2..]));
     }
 
     // CLI > SB_CONFIG_FILE env. The env fallback lets containerised
@@ -875,22 +855,53 @@ fn empty_config_file() -> sbproxy_config::ConfigFile {
 ///
 /// Per-flavour CLI / IO errors short-circuit out of the caller via
 /// `anyhow::Result::Err` and exit 1.
-fn handle_plan_subcommand(args: &[String]) -> anyhow::Result<i32> {
+/// Run a subcommand handler that returns an exit code, applying the
+/// shared `<prefix>: <error>` envelope: on success exit with the
+/// handler's code, on failure print the prefixed error and exit
+/// `err_code`. Replaces the four near-identical inline envelopes that
+/// used to wrap the `validate` / `projections` / `plan` / `apply`
+/// handlers in `main`.
+fn run_subcommand(prefix: &str, err_code: i32, result: anyhow::Result<i32>) -> ! {
+    match result {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("{prefix}: {e:#}");
+            std::process::exit(err_code);
+        }
+    }
+}
+
+/// Parse `plan` argv and load + validate both sides of the diff.
+/// Returns `(parsed_args, baseline, proposed)`; the baseline is the
+/// empty config when `--against` is absent.
+fn load_plan_inputs(
+    args: &[String],
+) -> anyhow::Result<(
+    PlanArgs,
+    sbproxy_config::ConfigFile,
+    sbproxy_config::ConfigFile,
+)> {
     let parsed = parse_plan_args(args)?;
     let proposed = load_and_validate(&parsed.config)?;
     let baseline = match parsed.against.as_deref() {
         Some(p) => load_and_validate(p)?,
         None => empty_config_file(),
     };
-    let mut report = sbproxy_config::plan(&baseline, &proposed);
+    Ok((parsed, baseline, proposed))
+}
 
-    // WOR-136: pick up `listings/*.yaml` from the same Repo (the
-    // directory the proposed `sb.yml` lives in) and fold the
-    // plan-step validation findings into the existing stream. The
-    // OSS revision resolver is the no-op resolver: existence checks
-    // require a git-aware caller (the future k8s controller, the
-    // hosted-Catalog surface).
-    let repo_root = std::path::Path::new(&parsed.config)
+/// Diff `baseline` vs `proposed` and fold in the repo's `listings/*.yaml`
+/// plan-step findings (WOR-136). The repo root is the directory holding
+/// the proposed `sb.yml`. The OSS revision resolver is the no-op
+/// resolver: existence checks require a git-aware caller (the future
+/// k8s controller, the hosted-Catalog surface).
+fn collect_plan_findings(
+    config_path: &str,
+    baseline: &sbproxy_config::ConfigFile,
+    proposed: &sbproxy_config::ConfigFile,
+) -> sbproxy_config::PlanReport {
+    let mut report = sbproxy_config::plan(baseline, proposed);
+    let repo_root = std::path::Path::new(config_path)
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -906,11 +917,10 @@ fn handle_plan_subcommand(args: &[String]) -> anyhow::Result<i32> {
     }
     if !loaded.is_empty() {
         let registry = sbproxy_config::ListingRegistry::from_loaded(loaded, &mut report.findings);
-        // Emit a load summary on stderr in the same idiom the rest
-        // of the CLI uses for plan / apply progress.  `sbproxy plan`
-        // is the entry point a future hosted-Catalog surface and the
-        // k8s controller will share, so logging the count here keeps
-        // operator feedback consistent across surfaces.
+        // Emit a load summary on stderr in the same idiom the rest of
+        // the CLI uses for plan / apply progress, so operator feedback
+        // stays consistent across the surfaces that share this entry
+        // point.
         eprintln!(
             "plan: sbproxy.listings.loaded count={} root={}",
             registry.len(),
@@ -918,42 +928,60 @@ fn handle_plan_subcommand(args: &[String]) -> anyhow::Result<i32> {
         );
         sbproxy_config::validate_listings(
             &registry,
-            &proposed,
+            proposed,
             &sbproxy_config::NoopRevisionResolver,
             &mut report.findings,
         );
     }
+    report
+}
 
+/// Render the plan report to stdout in the requested format and, when
+/// `--out` is set, write the plan-file envelope (report +
+/// baseline_revision) atomically via temp-file + `rename(2)` for a
+/// later `apply -p` to consume (WOR-180 step 5).
+fn render_and_write_plan(
+    report: &sbproxy_config::PlanReport,
+    parsed: &PlanArgs,
+    baseline: &sbproxy_config::ConfigFile,
+) -> anyhow::Result<()> {
     match parsed.format {
         PlanFormat::Json => {
-            let body = serde_json::to_string_pretty(&report)
+            let body = serde_json::to_string_pretty(report)
                 .map_err(|e| anyhow::anyhow!("failed to serialise plan: {e}"))?;
             println!("{body}");
         }
         PlanFormat::Text => {
-            print!("{}", sbproxy_config::render_text(&report));
+            print!("{}", sbproxy_config::render_text(report));
         }
     }
-
-    // WOR-180 step 5: when --out is set, write the plan-file envelope
-    // (report + baseline_revision) atomically via temp-file +
-    // rename(2). Apply -p will recompute the plan and reject on
-    // baseline drift.
     if let Some(out_path) = parsed.out.as_deref() {
-        let plan_file = sbproxy_config::PlanFile::new(&baseline, report.clone());
+        let plan_file = sbproxy_config::PlanFile::new(baseline, report.clone());
         plan_file
             .write_to_path(std::path::Path::new(out_path))
             .map_err(|e| anyhow::anyhow!("failed to write plan-file '{out_path}': {e}"))?;
         eprintln!("plan: wrote plan-file to {out_path}");
     }
+    Ok(())
+}
 
+/// Map a plan report to the CLI exit code: 3 on any error finding, 0
+/// when the plan is a no-op, 2 when there are non-error changes.
+fn plan_exit_code(report: &sbproxy_config::PlanReport) -> i32 {
     if report.has_errors() {
-        Ok(3)
+        3
     } else if report.is_noop() {
-        Ok(0)
+        0
     } else {
-        Ok(2)
+        2
     }
+}
+
+fn handle_plan_subcommand(args: &[String]) -> anyhow::Result<i32> {
+    let (parsed, baseline, proposed) = load_plan_inputs(args)?;
+    let report = collect_plan_findings(&parsed.config, &baseline, &proposed);
+    render_and_write_plan(&report, &parsed, &baseline)?;
+    Ok(plan_exit_code(&report))
 }
 
 /// Take an exclusive `flock(2)` on the apply lock for `yaml_path`.
@@ -1391,5 +1419,37 @@ mod tests {
     fn validate_missing_path_is_a_usage_error() {
         // No positional path and no --config: usage error regardless of format.
         assert!(handle_validate_subcommand(&args(&["--format", "json"])).is_err());
+    }
+
+    // --- WOR-635: plan handler split ---
+
+    #[test]
+    fn plan_exit_code_maps_report_state() {
+        // An empty-vs-empty diff is a no-op -> exit 0.
+        let noop = sbproxy_config::plan(&empty_config_file(), &empty_config_file());
+        assert_eq!(plan_exit_code(&noop), 0);
+        // A real config vs the empty baseline has changes -> exit 2.
+        let proposed = load_and_validate(temp_config(MINIMAL_VALID).to_str().unwrap()).unwrap();
+        let changed = sbproxy_config::plan(&empty_config_file(), &proposed);
+        assert_eq!(plan_exit_code(&changed), 2);
+    }
+
+    #[test]
+    fn handle_plan_valid_config_against_empty_reports_changes() {
+        let path = temp_config(MINIMAL_VALID);
+        let p = path.to_str().unwrap();
+        assert_eq!(handle_plan_subcommand(&args(&["-f", p])).unwrap(), 2);
+        // Planned against itself: no changes -> exit 0.
+        assert_eq!(
+            handle_plan_subcommand(&args(&["-f", p, "--against", p])).unwrap(),
+            0
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn handle_plan_missing_config_is_usage_error() {
+        // No -f / --config: usage error from load_plan_inputs.
+        assert!(handle_plan_subcommand(&args(&[])).is_err());
     }
 }
