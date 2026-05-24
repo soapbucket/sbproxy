@@ -939,6 +939,111 @@ fn rails_yaml_without_quote_token_is_a_config_error() {
     assert!(err.to_string().contains("quote_token"), "{err}");
 }
 
+// --- WOR-804: Content Signals enforcement ---
+
+#[test]
+fn content_signal_blocks_disallowed_training_bot() {
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "valid_tokens": ["t1"],
+        "crawler_user_agents": ["ClaudeBot", "Googlebot"],
+        "content_signals": { "search": true, "ai_train": false },
+    }))
+    .unwrap();
+    let h = ua_headers("Mozilla/5.0 (compatible; ClaudeBot/1.0)");
+    match policy.check("GET", "x.com", "/article", &h, None) {
+        AiCrawlDecision::SignalBlocked { body } => {
+            assert!(body.contains("\"signal\":\"ai-train\""));
+        }
+        other => panic!("expected SignalBlocked, got {:?}", other),
+    }
+}
+
+#[test]
+fn content_signal_block_precedes_payment() {
+    // A disallowed training bot is blocked even when it presents an
+    // otherwise-valid token: the signal gate runs before redemption.
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "valid_tokens": ["good-token"],
+        "crawler_user_agents": ["ClaudeBot"],
+        "content_signals": { "ai_train": false },
+    }))
+    .unwrap();
+    let h = payment_headers("ClaudeBot/1.0", "crawler-payment", "good-token");
+    assert!(matches!(
+        policy.check("GET", "x.com", "/", &h, None),
+        AiCrawlDecision::SignalBlocked { .. }
+    ));
+}
+
+#[test]
+fn content_signal_allows_search_bot_through_to_pricing() {
+    // search=yes means the search bot is not signal-blocked; it still
+    // pays through the normal path (402 here, since it has no token).
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "valid_tokens": ["t1"],
+        "crawler_user_agents": ["ClaudeBot", "Googlebot"],
+        "content_signals": { "search": true, "ai_train": false },
+    }))
+    .unwrap();
+    let h = ua_headers("Mozilla/5.0 (compatible; Googlebot/2.1)");
+    assert!(
+        matches!(
+            policy.check("GET", "x.com", "/article", &h, None),
+            AiCrawlDecision::Charge { .. }
+        ),
+        "search bot under search=yes must not be signal-blocked"
+    );
+}
+
+#[test]
+fn search_bot_with_valid_token_passes() {
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "valid_tokens": ["good-token"],
+        "crawler_user_agents": ["ClaudeBot", "Googlebot"],
+        "content_signals": { "search": true, "ai_train": false },
+    }))
+    .unwrap();
+    let h = payment_headers("Googlebot/2.1", "crawler-payment", "good-token");
+    assert_eq!(
+        policy.check("GET", "x.com", "/", &h, None),
+        AiCrawlDecision::Allow
+    );
+}
+
+#[test]
+fn unclassifiable_crawler_is_not_signal_blocked() {
+    // A crawler we cannot place by user-agent falls through to the
+    // pricing path rather than being signal-blocked.
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "valid_tokens": ["t1"],
+        "crawler_user_agents": ["MysteryScraper"],
+        "content_signals": { "ai_train": false },
+    }))
+    .unwrap();
+    let h = ua_headers("MysteryScraper/1.0");
+    assert!(!matches!(
+        policy.check("GET", "x.com", "/", &h, None),
+        AiCrawlDecision::SignalBlocked { .. }
+    ));
+}
+
+#[test]
+fn no_content_signals_keeps_legacy_behavior() {
+    // Without a content_signals block a training bot sees the normal
+    // 402 challenge, unchanged from before WOR-804.
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "valid_tokens": ["t1"],
+    }))
+    .unwrap();
+    let h = ua_headers("Mozilla/5.0 (compatible; GPTBot/1.0)");
+    assert!(matches!(
+        policy.check("GET", "x.com", "/article", &h, None),
+        AiCrawlDecision::Charge { .. }
+    ));
+}
+
 // --- Helpers for the multi-rail tests above ---
 
 fn decode_token_claims(token: &str) -> crate::policy::quote_token::QuoteClaims {

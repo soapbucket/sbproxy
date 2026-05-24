@@ -55,6 +55,193 @@ pub enum AiCrawlDecision {
         /// Seconds to put in the `Retry-After` HTTP header.
         retry_after_seconds: u32,
     },
+    /// The crawler's purpose is governed by a Content Signal the
+    /// operator declared as disallowed (`=no`), so the request is
+    /// blocked with `403` regardless of any payment it carries. A
+    /// training crawler hitting an origin with `ai_train: false` lands
+    /// here; a search crawler on the same origin (`search: true`) does
+    /// not. `body` is the JSON explanation returned to the client.
+    SignalBlocked {
+        /// JSON body returned in the 403 response.
+        body: String,
+    },
+}
+
+/// Cloudflare "Content Signals" preference set for an origin's
+/// managed `robots.txt`. Each signal is independently optional:
+///
+/// - `None` -> not declared; omitted from the `robots.txt` directive
+///   and never triggers signal-based enforcement.
+/// - `Some(true)` -> `=yes` (the use is permitted).
+/// - `Some(false)` -> `=no` (the use is disallowed; a crawler whose
+///   purpose maps to this signal is blocked).
+///
+/// `search` covers indexing for search results, `ai_input` covers
+/// real-time AI answers and RAG, and `ai_train` covers model
+/// training. The directive value uses the hyphenated wire spelling
+/// (`ai-input`, `ai-train`) while the config keys stay snake_case to
+/// match the rest of the schema. See
+/// <https://blog.cloudflare.com/content-signals-policy/>.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentSignals {
+    /// Search indexing (appear in search results).
+    #[serde(default)]
+    pub search: Option<bool>,
+    /// Real-time AI input (answers / RAG / assistant fetches).
+    #[serde(default)]
+    pub ai_input: Option<bool>,
+    /// Model training / fine-tuning.
+    #[serde(default)]
+    pub ai_train: Option<bool>,
+}
+
+impl ContentSignals {
+    /// True when no signal is declared (the all-absent default). Both
+    /// `robots.txt` emission and enforcement skip an empty set.
+    pub fn is_empty(&self) -> bool {
+        self.search.is_none() && self.ai_input.is_none() && self.ai_train.is_none()
+    }
+
+    /// Render the Cloudflare `Content-Signal:` directive value, e.g.
+    /// `search=yes, ai-input=no, ai-train=no`. Returns `None` when no
+    /// signal is declared. Declared signals are emitted in the fixed
+    /// order search, ai-input, ai-train so output is deterministic.
+    pub fn directive_value(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut parts: Vec<String> = Vec::with_capacity(3);
+        if let Some(v) = self.search {
+            parts.push(format!("search={}", yes_no(v)));
+        }
+        if let Some(v) = self.ai_input {
+            parts.push(format!("ai-input={}", yes_no(v)));
+        }
+        if let Some(v) = self.ai_train {
+            parts.push(format!("ai-train={}", yes_no(v)));
+        }
+        Some(parts.join(", "))
+    }
+
+    /// The declared value of the signal that governs `purpose`, if
+    /// any. `None` means the signal was left undeclared.
+    pub fn signal_for(&self, purpose: CrawlerPurpose) -> Option<bool> {
+        match purpose {
+            CrawlerPurpose::Train => self.ai_train,
+            CrawlerPurpose::Search => self.search,
+            CrawlerPurpose::Input => self.ai_input,
+        }
+    }
+
+    /// Whether a crawler with the given purpose is disallowed by an
+    /// explicit `=no` signal. Undeclared and `=yes` signals are not
+    /// disallowing.
+    pub fn disallows(&self, purpose: CrawlerPurpose) -> bool {
+        matches!(self.signal_for(purpose), Some(false))
+    }
+}
+
+fn yes_no(b: bool) -> &'static str {
+    if b {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+/// Coarse crawl purpose used to map a crawler to the Content Signal
+/// that governs it. Deliberately narrower than the agent-class
+/// catalogue's `AgentPurpose`: Content Signals only distinguishes
+/// model training, search indexing, and real-time AI input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrawlerPurpose {
+    /// Training-data collection (governed by `ai-train`).
+    Train,
+    /// Search-index population (governed by `search`).
+    Search,
+    /// Real-time AI input / RAG / assistant fetch (governed by
+    /// `ai-input`).
+    Input,
+}
+
+impl CrawlerPurpose {
+    /// The hyphenated wire name of the governing signal.
+    pub fn signal_name(self) -> &'static str {
+        match self {
+            CrawlerPurpose::Train => "ai-train",
+            CrawlerPurpose::Search => "search",
+            CrawlerPurpose::Input => "ai-input",
+        }
+    }
+}
+
+/// Best-effort purpose classification for the well-known crawlers,
+/// used only by Content Signals enforcement. Returns `None` for
+/// user-agents we cannot confidently place; those fall through to the
+/// normal pricing path rather than being signal-blocked.
+///
+/// This is intentionally a small, conservative table keyed on the
+/// public crawler user-agents that publish a stable purpose. When the
+/// `agent-class` feature is on the proxy already resolves a richer
+/// agent identity, and a future change can defer to that catalogue's
+/// `AgentPurpose` here instead of this list. The training list is
+/// checked first so the `-extended` training variants (e.g.
+/// `Applebot-Extended`) are not mistaken for their search-bot
+/// namesakes (`Applebot`).
+pub fn classify_crawler_purpose(user_agent: &str) -> Option<CrawlerPurpose> {
+    let ua = user_agent.to_ascii_lowercase();
+    const TRAIN: &[&str] = &[
+        "gptbot",
+        "ccbot",
+        "claudebot",
+        "anthropic-ai",
+        "google-extended",
+        "applebot-extended",
+        "bytespider",
+        "amazonbot",
+        "facebookbot",
+        "meta-externalagent",
+        "diffbot",
+        "omgili",
+        "timpibot",
+        "cohere-ai",
+        "perplexitybot",
+    ];
+    const INPUT: &[&str] = &[
+        "chatgpt-user",
+        "oai-searchbot",
+        "perplexity-user",
+        "claude-user",
+        "claude-web",
+    ];
+    const SEARCH: &[&str] = &[
+        "googlebot",
+        "bingbot",
+        "duckduckbot",
+        "applebot",
+        "yandex",
+        "baiduspider",
+    ];
+    if TRAIN.iter().any(|n| ua.contains(n)) {
+        return Some(CrawlerPurpose::Train);
+    }
+    if INPUT.iter().any(|n| ua.contains(n)) {
+        return Some(CrawlerPurpose::Input);
+    }
+    if SEARCH.iter().any(|n| ua.contains(n)) {
+        return Some(CrawlerPurpose::Search);
+    }
+    None
+}
+
+/// Build the JSON body for a [`AiCrawlDecision::SignalBlocked`] 403.
+pub(crate) fn signal_blocked_body(purpose: CrawlerPurpose) -> String {
+    format!(
+        "{{\"error\":\"content_signal_disallowed\",\"signal\":\"{}\",\"detail\":\"this origin's robots.txt Content-Signal disallows {} crawlers\"}}",
+        purpose.signal_name(),
+        purpose.signal_name()
+    )
 }
 
 /// MIME type for the multi-rail 402 body per A3.1.
@@ -990,6 +1177,16 @@ pub struct AiCrawlControlConfig {
     /// `rails:` is set but `quote_token:` is missing or malformed.
     #[serde(default)]
     pub quote_token: Option<QuoteTokenYamlConfig>,
+    /// Cloudflare Content Signals for the managed `robots.txt`
+    /// (`search` / `ai_input` / `ai_train`). When any signal is
+    /// declared, the projection emits a `Content-Signal:` directive
+    /// and the policy blocks a crawler whose purpose maps to a
+    /// disallowed (`=no`) signal. The same set drives the RSL
+    /// `<ai-use>` assertions so the two never contradict. Empty (the
+    /// default) keeps both behaviours off, so existing configs are
+    /// unaffected.
+    #[serde(default)]
+    pub content_signals: ContentSignals,
 }
 
 // --- Ledger YAML shape (G1.3 wire) ---
@@ -1149,4 +1346,96 @@ pub(super) fn default_crawler_uas() -> Vec<String> {
         "CCBot".to_string(),
         "FacebookBot".to_string(),
     ]
+}
+
+#[cfg(test)]
+mod content_signal_tests {
+    use super::*;
+
+    fn signals(
+        search: Option<bool>,
+        ai_input: Option<bool>,
+        ai_train: Option<bool>,
+    ) -> ContentSignals {
+        ContentSignals {
+            search,
+            ai_input,
+            ai_train,
+        }
+    }
+
+    #[test]
+    fn empty_set_emits_no_directive() {
+        let s = ContentSignals::default();
+        assert!(s.is_empty());
+        assert_eq!(s.directive_value(), None);
+    }
+
+    #[test]
+    fn directive_value_uses_wire_spelling_and_fixed_order() {
+        let s = signals(Some(true), Some(false), Some(false));
+        assert_eq!(
+            s.directive_value().as_deref(),
+            Some("search=yes, ai-input=no, ai-train=no")
+        );
+    }
+
+    #[test]
+    fn directive_value_omits_undeclared_signals() {
+        let s = signals(Some(true), None, Some(false));
+        assert_eq!(
+            s.directive_value().as_deref(),
+            Some("search=yes, ai-train=no")
+        );
+    }
+
+    #[test]
+    fn disallows_only_on_explicit_no() {
+        let s = signals(Some(true), None, Some(false));
+        assert!(s.disallows(CrawlerPurpose::Train)); // ai-train=no
+        assert!(!s.disallows(CrawlerPurpose::Search)); // search=yes
+        assert!(!s.disallows(CrawlerPurpose::Input)); // undeclared
+    }
+
+    #[test]
+    fn classify_training_search_and_input_bots() {
+        assert_eq!(
+            classify_crawler_purpose("Mozilla/5.0 (compatible; GPTBot/1.0)"),
+            Some(CrawlerPurpose::Train)
+        );
+        assert_eq!(
+            classify_crawler_purpose("Mozilla/5.0 (compatible; ClaudeBot/1.0)"),
+            Some(CrawlerPurpose::Train)
+        );
+        assert_eq!(
+            classify_crawler_purpose("Mozilla/5.0 (compatible; Googlebot/2.1)"),
+            Some(CrawlerPurpose::Search)
+        );
+        assert_eq!(
+            classify_crawler_purpose("ChatGPT-User/1.0"),
+            Some(CrawlerPurpose::Input)
+        );
+        assert_eq!(classify_crawler_purpose("Mozilla/5.0 (Macintosh)"), None);
+    }
+
+    #[test]
+    fn applebot_extended_is_training_not_search() {
+        // `Applebot-Extended` (training opt-out signal) must not be
+        // mistaken for `Applebot` (search) via substring overlap.
+        assert_eq!(
+            classify_crawler_purpose("Applebot-Extended/1.0"),
+            Some(CrawlerPurpose::Train)
+        );
+        assert_eq!(
+            classify_crawler_purpose("Applebot/0.1"),
+            Some(CrawlerPurpose::Search)
+        );
+    }
+
+    #[test]
+    fn signal_blocked_body_names_the_signal() {
+        let body = signal_blocked_body(CrawlerPurpose::Train);
+        assert!(body.contains("\"signal\":\"ai-train\""));
+        assert!(body.contains("content_signal_disallowed"));
+    }
 }

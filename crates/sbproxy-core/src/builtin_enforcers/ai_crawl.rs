@@ -14,6 +14,8 @@
 //! - `"ai_crawl_multi_rail"` for the 402 MultiRail.
 //! - `"ai_crawl_no_acceptable_rail"` for the 406 NoAcceptableRail.
 //! - `"ai_crawl_ledger_unavailable"` for the 503 LedgerUnavailable.
+//! - `"ai_crawl_signal_blocked"` for the 403 SignalBlocked (a Content
+//!   Signal the operator declared `=no` for this crawler's purpose).
 //!
 //! Cfg-gated on `agent-class` for the resolved-agent-id thread-
 //! through to the quote-token signer. Without the feature the
@@ -126,6 +128,24 @@ impl PolicyEnforcer for AiCrawlEnforcer {
                     Ok(PolicyDecision::Deny {
                         status: 406,
                         message: "no acceptable rail".to_string(),
+                    })
+                })
+            }
+            AiCrawlDecision::SignalBlocked { body } => {
+                // WOR-804: the crawler's purpose maps to a Content
+                // Signal the operator declared as disallowed (`=no`).
+                // Block with 403 and carry the JSON explanation through
+                // the same challenge slot the other deny shapes use.
+                ctx.crawl_challenge = Some((
+                    "Content-Type".to_string(),
+                    "application/json".to_string(),
+                    body,
+                ));
+                ctx.deny_policy_type = Some("ai_crawl_signal_blocked");
+                Box::pin(async move {
+                    Ok(PolicyDecision::Deny {
+                        status: 403,
+                        message: "content signal disallows this crawler".to_string(),
                     })
                 })
             }

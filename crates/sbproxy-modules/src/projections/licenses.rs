@@ -35,6 +35,8 @@
 //! `urn:rsl:1.0:<hostname>:<config_version>` so it is also derivable
 //! without the cache when needed.
 
+use crate::policy::ai_crawl::ContentSignals;
+
 /// Render `(licenses_xml, urn)` for a single origin.
 ///
 /// `content_signal` is the parsed value of the origin's
@@ -97,6 +99,78 @@ pub fn render(
         xml.push_str(&format!(
             "      <content-signal>{}</content-signal>\n",
             escape_xml_text(signal)
+        ));
+    }
+    xml.push_str("    </license>\n");
+    xml.push_str("  </content>\n");
+    xml.push_str("</rsl>\n");
+
+    (xml, urn)
+}
+
+/// Render `(licenses_xml, urn)` from a structured [`ContentSignals`]
+/// set (WOR-804).
+///
+/// This is the multi-signal sibling of [`render`]. When the operator
+/// declares Content Signals on the `ai_crawl_control` policy, the same
+/// set drives both the `robots.txt` `Content-Signal:` directive and
+/// the RSL document, so the two can never contradict. One `<ai-use>`
+/// element is emitted per declared signal:
+///
+/// | signal | RSL `<ai-use type=...>` |
+/// |---|---|
+/// | `search` | `search-index` |
+/// | `ai_input` | `inference` |
+/// | `ai_train` | `training` |
+///
+/// `licensed` is `"true"` for a `=yes` signal and `"false"` for a
+/// `=no` signal. The raw directive value (e.g. `search=yes,
+/// ai-train=no`) is echoed in a `<content-signal>` element for
+/// forensics. Callers use [`render`] (the single-value legacy path)
+/// when no structured signals are configured.
+pub fn render_signals(
+    hostname: &str,
+    signals: &ContentSignals,
+    config_version: u64,
+) -> (String, String) {
+    let urn = format!("urn:rsl:1.0:{hostname}:{config_version}");
+    let content_url = format!("https://{hostname}/*");
+
+    let mut xml = String::with_capacity(512);
+    xml.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+    xml.push('\n');
+    xml.push_str(r#"<rsl xmlns="https://rslstandard.org/rsl" version="1.0">"#);
+    xml.push('\n');
+    xml.push_str(&format!(
+        "  <content url=\"{}\">\n",
+        escape_xml_attr(&content_url)
+    ));
+    xml.push_str(&format!(
+        "    <license urn=\"{}\">\n",
+        escape_xml_attr(&urn)
+    ));
+    xml.push_str(&format!(
+        "      <origin hostname=\"{}\" />\n",
+        escape_xml_attr(hostname)
+    ));
+    // Fixed order (search, inference, training) for deterministic
+    // output. Each declared signal becomes one `<ai-use>` assertion.
+    for (value, ai_type) in [
+        (signals.search, "search-index"),
+        (signals.ai_input, "inference"),
+        (signals.ai_train, "training"),
+    ] {
+        if let Some(v) = value {
+            let licensed = if v { "true" } else { "false" };
+            xml.push_str(&format!(
+                "      <ai-use type=\"{ai_type}\" licensed=\"{licensed}\" />\n"
+            ));
+        }
+    }
+    if let Some(directive) = signals.directive_value() {
+        xml.push_str(&format!(
+            "      <content-signal>{}</content-signal>\n",
+            escape_xml_text(&directive)
         ));
     }
     xml.push_str("    </license>\n");
@@ -236,5 +310,44 @@ mod tests {
         let (a, _) = render("h", Some("ai-train"), 1);
         let (b, _) = render("h", Some("ai-train"), 1);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn render_signals_emits_one_ai_use_per_declared_signal() {
+        let signals = ContentSignals {
+            search: Some(true),
+            ai_input: None,
+            ai_train: Some(false),
+        };
+        let (xml, urn) = render_signals("shop.example.com", &signals, 9);
+        assert_eq!(urn, "urn:rsl:1.0:shop.example.com:9");
+        // search=yes -> search-index licensed true.
+        assert!(xml.contains(r#"<ai-use type="search-index" licensed="true" />"#));
+        // ai_train=no -> training licensed false.
+        assert!(xml.contains(r#"<ai-use type="training" licensed="false" />"#));
+        // ai_input undeclared -> no inference assertion.
+        assert!(!xml.contains(r#"type="inference""#));
+        // Directive echoed for forensics.
+        assert!(xml.contains("<content-signal>search=yes, ai-train=no</content-signal>"));
+    }
+
+    #[test]
+    fn render_signals_is_consistent_with_robots_directive() {
+        // The RSL search-index assertion and the robots directive both
+        // derive from the same ContentSignals, so a `search=yes` can
+        // never appear as `licensed="false"`.
+        let signals = ContentSignals {
+            search: Some(true),
+            ai_input: Some(true),
+            ai_train: Some(false),
+        };
+        let (xml, _) = render_signals("h", &signals, 1);
+        assert!(xml.contains(r#"<ai-use type="search-index" licensed="true" />"#));
+        assert!(xml.contains(r#"<ai-use type="inference" licensed="true" />"#));
+        assert!(xml.contains(r#"<ai-use type="training" licensed="false" />"#));
+        assert_eq!(
+            signals.directive_value().as_deref(),
+            Some("search=yes, ai-input=yes, ai-train=no")
+        );
     }
 }
