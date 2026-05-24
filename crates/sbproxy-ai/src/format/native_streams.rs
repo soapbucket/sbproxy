@@ -87,7 +87,7 @@ use super::{ContentPartDelta, FinishReason, HubChunk, HubToolCallDelta, HubUsage
 ///     for `stop_reason`) so the terminal `message_stop` frame can
 ///     emit a final `HubChunk::MessageStop` with the right reason.
 #[derive(Debug, Default)]
-pub struct AnthropicStreamState {
+pub(crate) struct AnthropicStreamState {
     /// Map from Anthropic content-block index to hub tool-call index.
     tool_call_indices: std::collections::HashMap<usize, usize>,
     /// Next hub tool-call index to allocate.
@@ -297,7 +297,7 @@ fn anthropic_stop_reason_to_hub(reason: &str) -> FinishReason {
 ///   * Emits `MessageStop` when a frame carries a non-`null`
 ///     `candidates[0].finishReason`.
 #[derive(Debug, Default)]
-pub struct GeminiStreamState {
+pub(crate) struct GeminiStreamState {
     /// Whether `MessageStart` has been emitted yet.
     started: bool,
     /// Latest usage snapshot.
@@ -441,7 +441,7 @@ fn gemini_finish_reason_to_hub(reason: &str) -> FinishReason {
 /// The binary envelope decode is the relay's job; this parser sees
 /// already-decoded JSON payloads paired with the event-type string.
 #[derive(Debug, Default)]
-pub struct BedrockStreamState {
+pub(crate) struct BedrockStreamState {
     started: bool,
     finish_reason: FinishReason,
     usage: HubUsage,

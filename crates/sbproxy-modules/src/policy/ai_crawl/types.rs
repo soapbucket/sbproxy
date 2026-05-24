@@ -180,6 +180,11 @@ impl LedgerError {
 /// Implementations mark the token spent on success so a single token
 /// authorises a single request. See [`InMemoryLedger`] (OSS default) and
 /// `HttpLedger` (enabled by the `http-ledger` feature).
+///
+/// This stays a trait rather than an enum: the implementation is selected
+/// at runtime from config (in-memory vs HTTP backend) and tests inject
+/// their own fakes through `Arc<dyn Ledger>`, so it is genuinely
+/// polymorphic.
 pub trait Ledger: Send + Sync + std::fmt::Debug + 'static {
     /// Validate `token` for a request to `(host, path)`.
     ///
