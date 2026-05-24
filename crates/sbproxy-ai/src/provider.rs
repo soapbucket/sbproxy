@@ -3,13 +3,14 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 
+use crate::ids::{ModelId, ProviderName};
 use crate::providers::get_provider_info;
 
 /// Provider configuration from YAML/JSON.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderConfig {
     /// Unique provider name used to reference this provider.
-    pub name: String,
+    pub name: ProviderName,
     /// Optional provider type (e.g. "openai", "anthropic"); inferred from name if absent.
     #[serde(default)]
     pub provider_type: Option<String>,
@@ -20,13 +21,13 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     /// Models served by this provider; empty defers to the provider catalog.
     #[serde(default)]
-    pub models: Vec<String>,
+    pub models: Vec<ModelId>,
     /// Default model used when the request omits an explicit model.
     #[serde(default)]
-    pub default_model: Option<String>,
+    pub default_model: Option<ModelId>,
     /// Per-provider mapping from logical model name to upstream model name.
     #[serde(default)]
-    pub model_map: HashMap<String, String>,
+    pub model_map: HashMap<ModelId, ModelId>,
     /// Weight used by weighted routing strategies.
     #[serde(default = "default_weight")]
     pub weight: u32,
@@ -153,7 +154,7 @@ impl ProviderConfig {
     pub fn map_model(&self, model: &str) -> String {
         self.model_map
             .get(model)
-            .cloned()
+            .map(|m| m.as_str().to_string())
             .unwrap_or_else(|| model.to_string())
     }
 }
@@ -164,7 +165,7 @@ mod tests {
 
     fn make_provider(name: &str) -> ProviderConfig {
         ProviderConfig {
-            name: name.to_string(),
+            name: name.into(),
             provider_type: None,
             api_key: None,
             base_url: None,
@@ -234,8 +235,7 @@ mod tests {
     #[test]
     fn map_model_mapped() {
         let mut p = make_provider("openai");
-        p.model_map
-            .insert("fast".to_string(), "gpt-3.5-turbo".to_string());
+        p.model_map.insert("fast".into(), "gpt-3.5-turbo".into());
         assert_eq!(p.map_model("fast"), "gpt-3.5-turbo");
         assert_eq!(p.map_model("gpt-4"), "gpt-4");
     }

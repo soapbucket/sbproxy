@@ -1078,7 +1078,7 @@ pub(super) async fn handle_ai_proxy(
         // access log captures them even when the upstream errors out
         // before the body decode runs. Token counts land later in
         // the response-handling path (see `extract_usage`).
-        ctx.ai_provider = Some(provider.name.clone());
+        ctx.ai_provider = Some(provider.name.to_string());
         if !resolved_model.is_empty() {
             ctx.ai_model = Some(resolved_model.clone());
         }
@@ -1187,7 +1187,7 @@ pub(super) async fn handle_ai_proxy(
                 last_upstream_host = url::Url::parse(&provider.effective_base_url())
                     .ok()
                     .and_then(|u| u.host_str().map(|h| h.to_string()));
-                last_provider_name = provider.name.clone();
+                last_provider_name = provider.name.to_string();
                 last_resp = Some(resp);
                 break;
             }

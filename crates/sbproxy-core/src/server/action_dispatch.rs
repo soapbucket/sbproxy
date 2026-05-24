@@ -117,14 +117,14 @@ pub(super) async fn handle_action(
                     .unwrap_or(if tls { 443 } else { 80 });
 
                 ctx.ai_realtime_dispatch = Some(crate::context::RealtimeDispatchCtx {
-                    provider_name: provider.name.clone(),
+                    provider_name: provider.name.to_string(),
                     upstream_host: host.clone(),
                     upstream_port: port,
                     upstream_tls: tls,
                     started_at: std::time::Instant::now(),
                     surface_label: "realtime",
                 });
-                ctx.ai_provider = Some(provider.name.clone());
+                ctx.ai_provider = Some(provider.name.to_string());
                 sbproxy_ai::ai_metrics::inc_realtime_sessions_active();
                 info!(
                     ai.surface = surface_label,

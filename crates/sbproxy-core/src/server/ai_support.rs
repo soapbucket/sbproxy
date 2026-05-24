@@ -316,7 +316,7 @@ pub(super) fn budget_preflight(
                     let mut candidates: Vec<String> = Vec::new();
                     for p in providers {
                         for m in &p.models {
-                            candidates.push(m.clone());
+                            candidates.push(m.as_str().to_string());
                         }
                     }
                     sbproxy_ai::cheapest_model(&candidates)
