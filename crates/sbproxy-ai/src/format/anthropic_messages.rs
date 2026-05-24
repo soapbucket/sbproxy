@@ -265,7 +265,7 @@ pub(crate) fn hub_chunk_to_anthropic_sse(chunk: &HubChunk) -> Vec<String> {
     }
 }
 
-fn parse_anthropic_message(obj: &Map<String, Value>) -> Result<HubMessage, ChatError> {
+pub(crate) fn parse_anthropic_message(obj: &Map<String, Value>) -> Result<HubMessage, ChatError> {
     // WOR-599: parse via the shared helper (missing or unknown role -> error,
     // never a silent default to user), then enforce that Anthropic message
     // turns carry only user or assistant roles (system is a top-level field,

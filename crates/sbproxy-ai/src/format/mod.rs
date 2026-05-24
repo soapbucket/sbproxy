@@ -387,3 +387,108 @@ mod native_bypass_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod parity_tests {
+    //! Cross-parser behavioral-parity guard.
+    //!
+    //! The OpenAI Chat, Anthropic Messages, and OpenAI Responses message
+    //! parsers each handle a different wire format, so they are kept
+    //! separate rather than merged behind a shared content/tool-call
+    //! helper: the per-format branches genuinely differ (empty-string
+    //! handling, the Responses `input_text` alias, image source shape, and
+    //! tool-call argument encoding). Role parsing is the one piece they
+    //! share, via [`super::parse_role`].
+    //!
+    //! What this pins: for content the three formats express the same way,
+    //! the parsers must agree on the resulting `HubMessage`, so drift in a
+    //! shared-intent path is caught here rather than by a customer.
+    use super::types::{ContentPart, HubMessage, Role};
+    use serde_json::{json, Map, Value};
+
+    fn obj(v: Value) -> Map<String, Value> {
+        v.as_object()
+            .expect("test input must be a JSON object")
+            .clone()
+    }
+
+    #[test]
+    fn plain_text_string_parses_identically_across_formats() {
+        let input = json!({"role": "user", "content": "hello"});
+        let expected = HubMessage {
+            role: Role::User,
+            content: vec![ContentPart::Text {
+                text: "hello".into(),
+            }],
+            name: None,
+            tool_call_id: None,
+        };
+        assert_eq!(
+            super::openai_chat::parse_openai_message(&obj(input.clone())).unwrap(),
+            expected
+        );
+        assert_eq!(
+            super::anthropic_messages::parse_anthropic_message(&obj(input.clone())).unwrap(),
+            expected
+        );
+        assert_eq!(
+            super::openai_responses::parse_responses_message(&obj(input)).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn text_content_block_parses_identically_across_formats() {
+        let input = json!({"role": "user", "content": [{"type": "text", "text": "hi"}]});
+        let expected = HubMessage {
+            role: Role::User,
+            content: vec![ContentPart::Text { text: "hi".into() }],
+            name: None,
+            tool_call_id: None,
+        };
+        assert_eq!(
+            super::openai_chat::parse_openai_message(&obj(input.clone())).unwrap(),
+            expected
+        );
+        assert_eq!(
+            super::anthropic_messages::parse_anthropic_message(&obj(input.clone())).unwrap(),
+            expected
+        );
+        assert_eq!(
+            super::openai_responses::parse_responses_message(&obj(input)).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn assistant_tool_use_parses_to_same_hub_for_openai_and_anthropic() {
+        // OpenAI: separate `tool_calls` array, arguments as a JSON string.
+        let openai = super::openai_chat::parse_openai_message(&obj(json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "t1",
+                "type": "function",
+                "function": {"name": "f", "arguments": "{\"x\":1}"}
+            }]
+        })))
+        .unwrap();
+        // Anthropic: inline `tool_use` block, `input` already structured.
+        let anthropic = super::anthropic_messages::parse_anthropic_message(&obj(json!({
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {"x": 1}}]
+        })))
+        .unwrap();
+        let expected = HubMessage {
+            role: Role::Assistant,
+            content: vec![ContentPart::ToolUse {
+                id: "t1".into(),
+                name: "f".into(),
+                input: json!({"x": 1}),
+            }],
+            name: None,
+            tool_call_id: None,
+        };
+        assert_eq!(openai, expected);
+        assert_eq!(anthropic, expected);
+    }
+}
