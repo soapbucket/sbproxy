@@ -1361,6 +1361,8 @@ spec:
             content_signal: None,
             token_bytes_ratio: None,
             agent_skills: vec![make_entry("a", "skill-md", "/skills/a.md", "abc")],
+            agents_md: None,
+            ai_txt: None,
         };
         let without = CompiledOrigin {
             hostname: CompactString::new("without.example.com"),
@@ -1403,6 +1405,8 @@ spec:
             content_signal: None,
             token_bytes_ratio: None,
             agent_skills: Vec::new(),
+            agents_md: None,
+            ai_txt: None,
         };
         let mut host_map = HashMap::new();
         host_map.insert(CompactString::new("with.example.com"), 0);

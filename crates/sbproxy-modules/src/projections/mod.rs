@@ -80,6 +80,14 @@ pub struct ProjectionDocs {
     pub licenses_xml: HashMap<CompactString, Bytes>,
     /// Per-hostname `/.well-known/tdmrep.json` bodies.
     pub tdmrep_json: HashMap<CompactString, Bytes>,
+    /// Per-hostname `/AGENTS.md` bodies (WOR-809). Populated from the
+    /// origin's `agents_md:` config, independently of
+    /// `ai_crawl_control`. Origins without the field produce no entry
+    /// and the data-plane handler 404s the path.
+    pub agents_md: HashMap<CompactString, Bytes>,
+    /// Per-hostname `/ai.txt` bodies (WOR-809). Populated from the
+    /// origin's `ai_txt:` config, independently of `ai_crawl_control`.
+    pub ai_txt: HashMap<CompactString, Bytes>,
     /// Per-hostname RSL URN of the form
     /// `urn:rsl:1.0:<hostname>:<config_version_hash>`. Stamped on
     /// `RequestContext.rsl_urn` by the request pipeline so downstream
@@ -175,6 +183,22 @@ pub fn render_projections_with_listings(
     // unions every Listing's entries with the per-origin entries
     // computed above.
     docs.agent_skills_listings = agent_skills::render_listing_indices(listings, &workspace_root);
+
+    // WOR-809: AGENTS.md + ai.txt agent-web emission. These are served
+    // verbatim from per-origin config and, unlike the pricing-derived
+    // projections below, do not require an `ai_crawl_control` policy,
+    // so they are populated here outside the per-origin gate (the same
+    // placement as the agent-skills index above).
+    for origin in &config.origins {
+        if let Some(body) = &origin.agents_md {
+            docs.agents_md
+                .insert(origin.hostname.clone(), Bytes::from(body.clone()));
+        }
+        if let Some(body) = &origin.ai_txt {
+            docs.ai_txt
+                .insert(origin.hostname.clone(), Bytes::from(body.clone()));
+        }
+    }
 
     for origin in &config.origins {
         // --- Discover the ai_crawl_control entry, if any ---
@@ -298,6 +322,8 @@ pub fn install_projections(docs: ProjectionDocs) {
         cv,
     );
     emit_for_kind(emitter.as_ref(), &emit_snapshot.tdmrep_json, "tdmrep", cv);
+    emit_for_kind(emitter.as_ref(), &emit_snapshot.agents_md, "agents-md", cv);
+    emit_for_kind(emitter.as_ref(), &emit_snapshot.ai_txt, "ai-txt", cv);
 
     // WOR-193: emit one ProjectionRefreshEvent per (hostname, agent_skill)
     // pair so audit sinks see a stable record of the manifest digests
@@ -457,6 +483,8 @@ mod tests {
                 content_signal: None,
                 token_bytes_ratio: None,
                 agent_skills: Vec::new(),
+                agents_md: None,
+                ai_txt: None,
             }],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),
