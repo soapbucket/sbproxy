@@ -125,6 +125,26 @@ pub fn provider_supports_realtime(provider: &str) -> bool {
 ///
 /// The dispatch path uses this matrix to decide whether to return 501
 /// Not Implemented before any upstream call is made.
+///
+/// ## Contract matrix (WOR-752)
+///
+/// | surface | openai | anthropic | gemini | vertex | bedrock | cohere | other |
+/// |---|---|---|---|---|---|---|---|
+/// | chat, models, messages, responses | yes | yes | yes | yes | yes | yes | yes |
+/// | embeddings | yes | no | no | yes | no | yes | no |
+/// | reranking | yes | no | no | yes | no | yes | no |
+/// | image generation | yes | no | no | yes | no | no | no |
+/// | audio transcription, audio speech | yes | no | no | yes | no | no | no |
+/// | assistants, threads, batches, fine-tuning, files, moderations, realtime, image edits/variations | yes | no | no | no | no | no | no |
+///
+/// `yes` means the surface is handled: translated for chat on the Google
+/// (gemini) format, passed through unchanged for OpenAI-compatible
+/// formats (openai, vertex). `no` means the gateway returns 501 rather
+/// than verbatim-forwarding a path the upstream does not expose (the
+/// #240 / Finding A class). The exhaustive
+/// `surface_matrix_matches_documented_contract` unit test enforces this
+/// table in the required CI job; the e2e `ai_surface_matrix` suite is the
+/// live-proxy complement.
 pub fn provider_supports_surface(provider: &str, surface: &crate::handler::AiSurface) -> bool {
     use crate::handler::AiSurface;
     match (provider, surface) {
@@ -183,6 +203,90 @@ pub fn provider_supports_surface(provider: &str, surface: &crate::handler::AiSur
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- WOR-752: full surface x provider contract matrix ---
+    //
+    // Locks the request-path contract in the required `build/test` gate
+    // (the e2e `ai_surface_matrix` suite is the occasional live-proxy
+    // complement). The `expected` helper matches every `AiSurface`
+    // variant with no wildcard arm, so adding a surface fails to compile
+    // here and forces a triage decision. The contract: a surface is
+    // either universal (chat / models / messages / responses, supported
+    // by every provider), passed through by an OpenAI-format provider, or
+    // 501'd at the gateway. No cell verbatim-forwards an untranslatable
+    // path to a provider that does not expose it (the #240 class).
+    #[test]
+    fn surface_matrix_matches_documented_contract() {
+        use crate::handler::AiSurface::{self, *};
+
+        fn expected(provider: &str, surface: &AiSurface) -> bool {
+            // Exhaustive (no `_`): a new variant must be triaged here.
+            let universal = match surface {
+                ChatCompletions | Models | Messages | Responses => true,
+                Embeddings | Assistants | Threads | Batches | FineTuning | Files | Realtime
+                | ImageGeneration | ImageEdits | ImageVariations | AudioTranscription
+                | AudioSpeech | Moderations | Reranking | Unknown => false,
+            };
+            if universal {
+                return true;
+            }
+            match provider {
+                // OpenAI wire format: every surface passes through.
+                "openai" => true,
+                // Vertex exposes an OpenAI-compatible endpoint (catalog
+                // `format: openai`), so these pass through unchanged.
+                "vertex" => matches!(
+                    surface,
+                    Embeddings | ImageGeneration | AudioTranscription | AudioSpeech | Reranking
+                ),
+                // Cohere: embeddings + reranking.
+                "cohere" => matches!(surface, Embeddings | Reranking),
+                // anthropic, gemini, bedrock, unknown: universal only.
+                _ => false,
+            }
+        }
+
+        const ALL_SURFACES: [AiSurface; 19] = [
+            ChatCompletions,
+            Models,
+            Embeddings,
+            Assistants,
+            Threads,
+            Batches,
+            FineTuning,
+            Files,
+            Realtime,
+            ImageGeneration,
+            ImageEdits,
+            ImageVariations,
+            AudioTranscription,
+            AudioSpeech,
+            Moderations,
+            Reranking,
+            Messages,
+            Responses,
+            Unknown,
+        ];
+        let providers = [
+            "openai",
+            "anthropic",
+            "gemini",
+            "vertex",
+            "bedrock",
+            "cohere",
+            "some-unknown-provider",
+        ];
+
+        for provider in providers {
+            for surface in &ALL_SURFACES {
+                assert_eq!(
+                    provider_supports_surface(provider, surface),
+                    expected(provider, surface),
+                    "matrix mismatch: provider={provider} surface={surface:?}"
+                );
+            }
+        }
+    }
 
     // --- parse_endpoint tests ---
 
