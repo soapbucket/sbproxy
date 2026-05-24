@@ -1428,6 +1428,46 @@ pub(super) async fn request_filter(
         }
     }
 
+    // --- WOR-805: Web Bot Auth hosted key directory ---
+    //
+    // Serve SBproxy's own Ed25519 public key as an HTTP Message
+    // Signatures directory (draft-meunier-http-message-signatures-
+    // directory) so any verifier, including SBproxy's own inbound
+    // `bot_auth` directory client, can check the Web Bot Auth
+    // signatures the proxy produces. The identity is proxy-wide, so
+    // the directory is served on any origin when configured. Runs
+    // before projections and forward rules so the discovery path is
+    // never shadowed by a wildcard rule. When `web_bot_auth` is not
+    // configured the path falls through to normal proxying.
+    {
+        if session.req_header().uri.path() == "/.well-known/http-message-signatures-directory" {
+            if let Some(wba) = pipeline.config.server.web_bot_auth.as_ref() {
+                // Seed shape is validated at compile time; decode
+                // defensively and fall through on any surprise rather
+                // than 500.
+                if let Some(seed) = hex::decode(&wba.ed25519_seed_hex)
+                    .ok()
+                    .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+                {
+                    let body = sbproxy_middleware::web_bot_auth::build_signature_directory(&[
+                        sbproxy_middleware::web_bot_auth::DirectoryIdentity {
+                            key_id: &wba.key_id,
+                            seed: &seed,
+                        },
+                    ]);
+                    send_response(
+                        session,
+                        200,
+                        sbproxy_middleware::web_bot_auth::DIRECTORY_CONTENT_TYPE,
+                        body.as_bytes(),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
     // --- Wave 4 / G4.5..G4.8 wire: policy-graph projections ---
     //
     // Origins with an `ai_crawl_control` policy have four
