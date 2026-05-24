@@ -1,12 +1,12 @@
-//! R1.4 outbound webhook framework.
+//! Outbound webhook framework.
 //!
-//! A1.9 ships the OSS half of the outbound webhook story: per-tenant
+//! Ships the OSS half of the outbound webhook story: per-tenant
 //! signing (Ed25519 default,
 //! HMAC-SHA256 fallback), dual-key rotation window, exponential-backoff
 //! retries with deadletter handoff, and a per-tenant subscription registry
 //! interface.
 //!
-//! Wave 2 (E2.4) consumes this framework to emit `wallet.low_balance`,
+//! Consumes this framework to emit `wallet.low_balance`,
 //! `agent.registered`, and the rest of the customer notification surface.
 //!
 //! ## Surface area

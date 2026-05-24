@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-//! WOR-188: newtype wrapper enforcer for the
+//! Newtype wrapper enforcer for the
 //! [`Policy::PeerPricingPreflight`](sbproxy_modules::policy::Policy::PeerPricingPreflight)
 //! variant.
 //!

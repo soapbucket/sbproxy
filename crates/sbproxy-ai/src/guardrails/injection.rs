@@ -1,6 +1,6 @@
 //! Prompt injection detection guardrail.
 //!
-//! WOR-191: this module owns the canonical pattern lists used by both
+//! This module owns the canonical pattern lists used by both
 //! the legacy v1 boolean guardrail (this file) and the v2 scored
 //! `Detector` interface in
 //! `sbproxy-modules::policy::prompt_injection_v2`. v2 imports the

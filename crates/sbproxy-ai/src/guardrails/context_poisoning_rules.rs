@@ -1,6 +1,6 @@
 //! Static catalogue of context-poisoning heuristics.
 //!
-//! WOR-159. Each rule carries a stable `id`, a short human-readable
+//! Each rule carries a stable `id`, a short human-readable
 //! `description`, the literature attribution, and a confidence weight
 //! that the guardrail uses to gate `min_confidence` filtering.
 //!

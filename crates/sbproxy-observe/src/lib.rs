@@ -4,15 +4,15 @@
 #![warn(missing_docs)]
 
 pub mod access_log;
-/// Wave 1 / G1.6 per-agent metric label bundle.
+/// Per-agent metric label bundle.
 pub mod agent_labels;
 pub mod alerting;
 pub mod audit;
-/// Wave 8 P0 edge capture helpers: custom properties, session IDs,
+/// P0 edge capture helpers: custom properties, session IDs,
 /// and user IDs.
 pub mod capture;
 pub mod cardinality;
-/// Wave 3 / R3.3 clock-skew monitor: SNTP poller + `/readyz` probe.
+/// Clock-skew monitor: SNTP poller + `/readyz` probe.
 pub mod clock_skew;
 /// Typed proxy events and the in-process subscriber bus.
 pub mod events;
@@ -20,7 +20,7 @@ pub mod events;
 /// onto the request-duration and ledger histograms.
 pub mod exemplars;
 pub mod export;
-/// WOR-87 test-only in-memory capture for the redaction fan-out e2e
+/// Test-only in-memory capture for the redaction fan-out e2e
 /// suite. Disabled by default; opted into via the
 /// `SBPROXY_TEST_FAKE_SINKS=1` environment variable.
 pub mod fake_sinks;
@@ -31,18 +31,18 @@ pub mod health;
 pub mod logging;
 /// Prometheus metrics registry, helpers, and per-origin recorders.
 pub mod metrics;
-/// R1.4 outbound webhook framework. Per-tenant signing (Ed25519
+/// Outbound webhook framework. Per-tenant signing (Ed25519
 /// default, HMAC-SHA256 fallback) with dual-key rotation, exponential
 /// backoff retries, and a deadletter queue.
 pub mod notify;
 pub mod redact;
-/// Wave 8 P0 `RequestEvent` envelope shared by the four streams.
+/// P0 `RequestEvent` envelope shared by the four streams.
 pub mod request_event;
-/// Wave 8 / T4.6 generic transport adapter: a global sink for
+/// Generic transport adapter: a global sink for
 /// completed `RequestEvent` values. Default no-op; enterprise
 /// registers a NATS-backed implementation.
 pub mod request_sink;
-/// WOR-27 in-process synthetic probe state for `/readyz`.
+/// In-process synthetic probe state for `/readyz`.
 pub mod synthetic;
 pub mod telemetry;
 pub mod topology;

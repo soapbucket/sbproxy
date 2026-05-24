@@ -1,4 +1,4 @@
-//! WOR-201 PR 1c.2: newtype wrapper enforcer for the
+//! Newtype wrapper enforcer for the
 //! `Policy::AiCrawl` variant.
 //!
 //! Lifts the body of the `Policy::AiCrawl(p)` arm that lived in

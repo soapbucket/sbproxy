@@ -1,4 +1,4 @@
-//! WOR-201 PR 1c.3: newtype wrapper enforcer for the
+//! Newtype wrapper enforcer for the
 //! `Policy::Ddos` variant.
 //!
 //! Lifts the body of the `Policy::Ddos(p)` arm from

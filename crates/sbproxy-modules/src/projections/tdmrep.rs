@@ -1,4 +1,4 @@
-//! G4.8: `/.well-known/tdmrep.json` projection per W3C TDMRep
+//! `/.well-known/tdmrep.json` projection per W3C TDMRep
 //! CG-FINAL-tdmrep-20240510.
 //!
 //! The W3C TDMRep spec mandates a bare JSON array at the document

@@ -1,7 +1,5 @@
 //! TLS ClientHello fingerprinting (JA3 / JA4 / JA4H / JA4S / JA4T / JA4X).
 //!
-//! Wave 5 / G5.3.
-//!
 //! # What this module produces
 //!
 //! - **JA3** (Salesforce 2017): MD5 of the comma-delimited TLS 1.2
@@ -1081,7 +1079,7 @@ mod tests {
         assert!(ja4.starts_with("t12"), "expected TLS 1.2 prefix in {ja4}");
     }
 
-    /// WOR-586: a ClientHello with a populated SNI host_name + ALPN
+    /// A ClientHello with a populated SNI host_name + ALPN
     /// list must surface the hostname and the full list (not just
     /// first/last) on `TlsFingerprint`.
     fn synthetic_client_hello_with_sni(host: &str) -> Vec<u8> {
@@ -1159,7 +1157,7 @@ mod tests {
         assert!(fp.sni.is_none());
     }
 
-    /// WOR-501: PQ-TLS detection signal.
+    /// PQ-TLS detection signal.
     /// Build a ClientHello with a `key_share` extension carrying the
     /// X25519MLKEM768 group code so the parser flips `pq_tls_present`
     /// to true.

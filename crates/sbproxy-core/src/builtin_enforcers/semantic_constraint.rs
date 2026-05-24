@@ -1,4 +1,4 @@
-//! WOR-201 PR 1c.4: newtype wrapper enforcer for the
+//! Newtype wrapper enforcer for the
 //! `Policy::SemanticConstraint` variant.
 //!
 //! Lifts the body of the `Policy::SemanticConstraint(p)` arm that

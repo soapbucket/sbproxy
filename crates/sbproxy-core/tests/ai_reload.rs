@@ -1,4 +1,4 @@
-//! WOR-173 integration tests: AI provider registry hot-reload and
+//! Integration tests: AI provider registry hot-reload and
 //! deliberate budget tracker preservation across reloads.
 //!
 //! Two properties are pinned here. First, a reload that points at a

@@ -12,11 +12,11 @@
 #![warn(missing_docs)]
 
 pub mod admin;
-/// WOR-227 scaffold. Stub chat-playground handler mounted on the
+/// Stub chat-playground handler mounted on the
 /// admin server. Returns 501 today; the follow-up ticket wires it
 /// through `proxy_router.oneshot`.
 pub mod admin_playground;
-/// WOR-227 scaffold. Static-asset surface for the built-in admin
+/// Static-asset surface for the built-in admin
 /// dashboard at `/admin/ui/*`. Embedded via `include_dir!` when the
 /// `embed-admin-ui` feature is on; serves a one-line operator hint
 /// otherwise.
@@ -25,7 +25,7 @@ pub mod admin_ui;
 /// and the per-request context. Feature-gated by `agent-class`.
 #[cfg(feature = "agent-class")]
 pub mod agent_class;
-/// WOR-201 PR 1c.0: empty-shell registry for built-in policy
+/// Empty-shell registry for built-in policy
 /// enforcer wrappers.
 ///
 /// Holds the eventual single dispatch point that the per-policy
@@ -40,14 +40,14 @@ pub mod hook_registry;
 pub mod hooks;
 pub mod identity;
 pub mod pipeline;
-/// WOR-201 PR 1b: policy verdict audit event bus.
+/// Policy verdict audit event bus.
 ///
 /// Bounded mpsc channel + drain stub for the OSS scope; enterprise
 /// extends the consumer with a NATS-backed audit-chain subscriber
 /// that hash-chains and KMS-signs Merkle roots downstream. See
 /// `docs/adr-policy-audit-binding.md`.
 pub mod policy_bus;
-/// WOR-201 PR 1b: chain reducer + Plugin verdict translation.
+/// Chain reducer + Plugin verdict translation.
 ///
 /// Multi-policy resolution rules from
 /// `docs/adr-policy-verdict-shape.md` (Deny wins, first Confirm
@@ -57,18 +57,18 @@ pub mod policy_bus;
 pub mod policy_dispatch;
 pub mod reload;
 pub mod router;
-/// WOR-114 Phase 1: per-request feature-flag parsing.
+/// Phase 1: per-request feature-flag parsing.
 ///
 /// Parses `x-sb-flags` request header and `?_sb.<key>` query params
 /// into a typed `sb_flags::RequestFlags` struct that the request
 /// pipeline reads to alter behavior on the current request only.
 pub mod sb_flags;
 pub mod server;
-/// WOR-27 synthetic-transaction probe driver. Background task that
+/// Synthetic-transaction probe driver. Background task that
 /// fires an in-process request through the compiled handler chain
 /// and feeds the verdict into the `/readyz` synthetic probe cache.
 pub mod synthetic;
-/// Wave 8 P0 edge capture wired into the request pipeline.
+/// P0 edge capture wired into the request pipeline.
 pub mod wave8;
 
 // Re-export the main entry point for convenience.

@@ -1,4 +1,4 @@
-//! WOR-201 PR 1c.1: newtype wrapper enforcer for the
+//! Newtype wrapper enforcer for the
 //! `Policy::Expression` variant.
 //!
 //! Lifts the body of the `Policy::Expression(p)` arm that lived

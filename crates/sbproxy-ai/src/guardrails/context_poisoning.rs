@@ -1,7 +1,6 @@
 //! Context-poisoning guardrail.
 //!
-//! WOR-159 (sub-issue of WOR-147 Policy Engine epic). Detects
-//! untrusted retrieved content that tries to manipulate the model
+//! Detects untrusted retrieved content that tries to manipulate the model
 //! before a downstream tool call. The motivating threat is the
 //! indirect prompt injection vector from Greshake et al. (2023): a
 //! RAG pipeline pulls a poisoned page into the model's context, and

@@ -1,14 +1,14 @@
 //! Auth module - enum dispatch for built-in auth providers.
 
-/// Wave 7 / A7.2 A2A protocol envelope and feature-gated parsers.
+/// A2A protocol envelope and feature-gated parsers.
 pub mod a2a;
 pub mod bot_auth;
-/// Wave 1 / G1.7 dynamic Web Bot Auth directory cache.
+/// Dynamic Web Bot Auth directory cache.
 pub mod bot_auth_directory;
-/// Wave 6 / R6.1 Crawler Authorization Protocol (CAP) verifier.
+/// Crawler Authorization Protocol (CAP) verifier.
 pub mod cap;
 pub mod jwks;
-/// WOR-504 trust-tier combiner: collapses signed / named / scored
+/// Trust-tier combiner: collapses signed / named / scored
 /// signals into a single enum for downstream policy consumption.
 pub mod trust_tier;
 
@@ -88,7 +88,7 @@ pub enum Auth {
     /// Web Bot Auth: RFC 9421 message signature against an agent
     /// directory.
     BotAuth(crate::auth::bot_auth::BotAuthProvider),
-    /// Wave 6 / R6.1 Crawler Authorization Protocol (CAP) verifier.
+    /// Crawler Authorization Protocol (CAP) verifier.
     Cap(crate::auth::cap::CapVerifier),
     /// No authentication required.
     Noop,

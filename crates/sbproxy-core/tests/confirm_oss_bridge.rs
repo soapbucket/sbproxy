@@ -1,4 +1,4 @@
-//! WOR-201 PR 1b: OSS Confirm-to-AllowWithHeaders bridge.
+//! OSS Confirm-to-AllowWithHeaders bridge.
 //!
 //! Per `docs/adr-policy-verdict-shape.md`, OSS routes a
 //! `PolicyDecision::Confirm` through the existing AllowWithHeaders

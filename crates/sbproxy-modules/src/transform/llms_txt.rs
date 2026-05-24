@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-//! WOR-130: auto-generated `llms.txt` from runtime config.
+//! Auto-generated `llms.txt` from runtime config.
 //!
 //! This module exists alongside the older `projections::llms` renderer.
 //! The projection variant in `projections/llms.rs` is the AI-crawl-pricing

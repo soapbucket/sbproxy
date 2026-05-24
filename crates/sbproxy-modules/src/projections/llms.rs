@@ -1,4 +1,4 @@
-//! G4.6: `llms.txt` and `llms-full.txt` projections.
+//! `llms.txt` and `llms-full.txt` projections.
 //!
 //! Format follows the Anthropic / Mistral convention: a YAML-like header
 //! followed by a Markdown body. `llms.txt` is the concise summary

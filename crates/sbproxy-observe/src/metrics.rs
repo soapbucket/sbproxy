@@ -1503,9 +1503,8 @@ mod tests {
     // These tests use the global metrics() instance. We verify the counters/gauges
     // change by checking the global ProxyMetrics directly after calling helpers.
 
-    /// WOR-168 - the new mirror_state_drift counter must be present
-    /// in the rendered Prometheus output and increment when the
-    /// helper is called.
+    /// The new mirror_state_drift counter must be present in the rendered
+    /// Prometheus output and increment when the helper is called.
     #[test]
     fn test_record_mirror_state_drift_increments_counter() {
         let m = metrics();

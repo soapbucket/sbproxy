@@ -1,4 +1,4 @@
-//! WOR-201 PR 1c.1: newtype wrapper enforcer for the
+//! Newtype wrapper enforcer for the
 //! `Policy::ExposedCreds` variant.
 //!
 //! Lifts the body of the `Policy::ExposedCreds(p)` arm that

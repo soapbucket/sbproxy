@@ -150,20 +150,20 @@ pub enum Transform {
     /// signature can't carry. The day-5 response-filter wiring calls
     /// the typed `CitationBlockTransform::apply` with the ctx fields.
     CitationBlock(CitationBlockTransform),
-    /// G4.4 JSON envelope. Wraps a Markdown projection in
+    /// JSON envelope. Wraps a Markdown projection in
     /// the v1 JSON envelope. Same caveat as `CitationBlock`: the
     /// standard body-buffer `apply` is a no-op; day-5 response-filter
     /// wiring calls the typed `JsonEnvelopeTransform::apply` with the
     /// ctx fields.
     JsonEnvelope(JsonEnvelopeTransform),
-    /// Wave 5 day-5 / Q5.x: CEL response-body transform. Evaluates a
+    /// CEL response-body transform. Evaluates a
     /// CEL expression against `response.body` / `response.status` /
     /// `response.headers` and replaces the body with the result. Used
     /// by the e2e tests to stamp `request.tls.ja4` /
     /// `request.kya.verdict` back into the response body for
     /// assertions.
     CelScript(CelScriptTransform),
-    /// WOR-234: rewrites the `url` / `endpoint` / `agent.url` fields
+    /// Rewrites the `url` / `endpoint` / `agent.url` fields
     /// on A2A agent-card responses so MCP and A2A clients route
     /// follow-up calls through the proxy instead of jumping straight
     /// at the upstream. The standard `apply` here is a no-op; the

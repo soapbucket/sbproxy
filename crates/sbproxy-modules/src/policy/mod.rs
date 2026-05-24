@@ -5,11 +5,11 @@
 //! a new sub-module, registering its variant in [`Policy`], and
 //! routing the wire `type` string in [`crate::compile::compile_policy`].
 
-/// Wave 7 / A7.2 A2A protocol policy module.
+/// A2A protocol policy module.
 pub mod a2a;
 /// `Accept-Payment` header parser (Wave 3 / R3.1, A3.1).
 pub mod accept_payment;
-/// WOR-506 `agent_budget` semantic rate-limit primitive.
+/// `agent_budget` semantic rate-limit primitive.
 pub mod agent_budget;
 #[cfg(feature = "agent-class")]
 pub mod agent_class;
@@ -37,7 +37,7 @@ pub mod nl_compiler;
 pub mod nl_linter;
 pub mod openapi_validation;
 pub mod page_shield;
-/// WOR-188: outbound peer-pricing pre-flight policy.
+/// Outbound peer-pricing pre-flight policy.
 pub mod peer_pricing_preflight;
 pub mod prompt_injection_v2;
 pub mod quote_token;
@@ -209,13 +209,13 @@ pub enum Policy {
     /// request and maps the verdict to a
     /// [`PolicyDecision`](sbproxy_plugin::PolicyDecision).
     SemanticConstraint(SemanticConstraintPolicy),
-    /// WOR-188 outbound peer-pricing pre-flight. The variant carries
+    /// Outbound peer-pricing pre-flight. The variant carries
     /// the configured policy so the config compiler can accept the
     /// `peer_pricing_preflight` type at YAML load time; per-request
     /// enforcement is invoked from the outbound dispatcher (a
     /// separate code path from the inbound `PolicyEnforcer` trait).
     PeerPricingPreflight(std::sync::Arc<PeerPricingPreflightPolicy>),
-    /// WOR-506 `agent_budget`: per-`agent_id` semantic rate limit.
+    /// `agent_budget`: per-`agent_id` semantic rate limit.
     /// Keyed on the resolver-produced agent identity, not the client
     /// IP, so a tight LLM-driven loop hits a single bucket regardless
     /// of how many TCP connections it opens.

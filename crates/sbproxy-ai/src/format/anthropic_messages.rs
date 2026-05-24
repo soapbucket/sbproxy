@@ -12,8 +12,8 @@
 //!   * `stop_reason` strings (`end_turn`, `max_tokens`, `tool_use`,
 //!     `stop_sequence`) normalised to the hub `FinishReason`.
 //!
-//! Streaming for the Anthropic outbound emitter is implemented under
-//! WOR-226: `from_hub_stream` turns each hub chunk into the matching
+//! Streaming for the Anthropic outbound emitter is implemented in
+//! `from_hub_stream`, which turns each hub chunk into the matching
 //! Anthropic Messages SSE frames (`event: message_start`,
 //! `content_block_*`, `message_delta`, `message_stop`).
 

@@ -1,4 +1,4 @@
-//! WOR-201 PR 1c.2: newtype wrapper enforcer for the `Policy::Dlp`
+//! Newtype wrapper enforcer for the `Policy::Dlp`
 //! variant.
 //!
 //! Lifts the body of the `Policy::Dlp(p)` arm that lived in

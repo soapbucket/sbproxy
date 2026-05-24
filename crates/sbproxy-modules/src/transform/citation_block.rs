@@ -1,4 +1,4 @@
-//! G4.10 citation-block transform: prepends a Markdown citation line
+//! Citation-block transform: prepends a Markdown citation line
 //! to the projection body when the operator requires attribution.
 //!
 //! When the per-origin `citation_required` flag is true, the transform

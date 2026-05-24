@@ -1,4 +1,4 @@
-//! WOR-201 PR 1c.3: newtype wrapper enforcer for the
+//! Newtype wrapper enforcer for the
 //! `Policy::OpenApiValidation` variant.
 //!
 //! Lifts the body of the `Policy::OpenApiValidation(_)` arm. Same

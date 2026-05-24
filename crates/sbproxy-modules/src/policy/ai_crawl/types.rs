@@ -23,7 +23,7 @@ pub enum AiCrawlDecision {
         /// Value to set on the `<challenge_header>` response header.
         challenge: String,
     },
-    /// Wave 3 multi-rail challenge. Emitted when the agent opted in via
+    /// Multi-rail challenge. Emitted when the agent opted in via
     /// `Accept-Payment` or one of the multi-rail `Accept` media types
     /// (`application/sbproxy-multi-rail+json`, `application/x402+json`,
     /// `application/mpp+json`). The body is JSON per A3.1 with one rail
@@ -36,7 +36,7 @@ pub enum AiCrawlDecision {
         /// here so the proxy hot path never has to know the literal.
         content_type: &'static str,
     },
-    /// Wave 3 multi-rail negotiation produced no overlap between the
+    /// Multi-rail negotiation produced no overlap between the
     /// agent's `Accept-Payment` list and the route's configured rails.
     /// Per A3.1 the proxy responds `406 Not Acceptable` with the
     /// included body listing the rails the operator does support so

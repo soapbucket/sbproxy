@@ -14,8 +14,8 @@
 //!     see the wire shape they expect.
 //!
 //! Streaming is wired end to end here because the OpenAI SSE format is
-//! the hub's reference shape; other formats grow the same wiring under
-//! WOR-226.
+//! the hub's reference shape; other formats grow the same wiring as
+//! they land.
 
 use serde_json::{json, Map, Value};
 

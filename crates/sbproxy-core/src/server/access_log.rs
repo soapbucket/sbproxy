@@ -541,11 +541,11 @@ pub(super) struct AccessLogContext {
     pub(super) cap_token_id: Option<String>,
     /// Resolved upstream host the request was proxied to.
     pub(super) upstream_host: Option<String>,
-    /// G6.4 captured request headers (lowercased keys, truncated and
+    /// Captured request headers (lowercased keys, truncated and
     /// optionally PII-redacted values). Empty when capture is off or
     /// no allowlisted header was present on the request.
     pub(super) request_headers: std::collections::BTreeMap<String, String>,
-    /// G6.4 captured response headers; same semantics as
+    /// Captured response headers; same semantics as
     /// `request_headers`. Empty when no response was written (early
     /// abort) or no allowlisted header was set on the response.
     pub(super) response_headers: std::collections::BTreeMap<String, String>,

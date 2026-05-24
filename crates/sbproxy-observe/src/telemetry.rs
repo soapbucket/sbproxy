@@ -1,6 +1,6 @@
 //! OpenTelemetry tracing support for sbproxy.
 //!
-//! A1.4 splits the observe crate's responsibilities four ways:
+//! Splits the observe crate's responsibilities four ways:
 //!
 //! 1. **Span context** ([`SpanContext`]): a small W3C Trace Context
 //!    helper used by request handlers to propagate `traceparent`
@@ -76,7 +76,7 @@ pub struct TelemetryConfig {
     #[serde(default = "default_always_sample_errors")]
     pub always_sample_errors: bool,
     /// Propagation format: `"w3c"` (default), `"b3"`, or `"jaeger"`.
-    /// Wave 1 only ships W3C; the other variants land in a follow-up.
+    /// Only ships W3C; the other variants land in a follow-up.
     #[serde(default)]
     pub propagation: Option<String>,
     /// Free-form resource attributes attached to every span. Operators

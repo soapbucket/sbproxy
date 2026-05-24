@@ -539,7 +539,7 @@ pub fn populate_agent_detect_namespace(ctx: &mut CelContext, view: &AgentDetectV
     ctx.set("request", CelValue::Map(request_map));
 }
 
-/// Wave 8 envelope dimensions exposed to CEL. Borrowed view so the
+/// Envelope dimensions exposed to CEL. Borrowed view so the
 /// caller's RequestContext owns the strings and the CEL builder
 /// avoids cloning. Empty / `None` fields render as the zero value
 /// (`""`, `{}`) so expressions can call `size(envelope.user_id) > 0`

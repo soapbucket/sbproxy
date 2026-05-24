@@ -1,4 +1,4 @@
-//! G4.7: `/licenses.xml` projection per the RSL Collective spec at
+//! `/licenses.xml` projection per the RSL Collective spec at
 //! <https://rslstandard.org/rsl>.
 //!
 //! Document shape: a single `<rsl>` root in the canonical

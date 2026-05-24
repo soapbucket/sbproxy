@@ -212,7 +212,7 @@ impl McpFederation {
         self.tools.load().values().cloned().collect()
     }
 
-    /// WOR-410: Emit a Cloudflare-Code-Mode-compatible TypeScript
+    /// Emit a Cloudflare-Code-Mode-compatible TypeScript
     /// module covering every federated tool currently in the
     /// registry.
     ///

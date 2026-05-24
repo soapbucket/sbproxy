@@ -1,4 +1,4 @@
-//! WOR-201 PR 1c.2: newtype wrapper enforcer for the `Policy::A2A`
+//! Newtype wrapper enforcer for the `Policy::A2A`
 //! variant.
 //!
 //! Lifts the body of the `Policy::A2A(p)` arm that lived in

@@ -1,4 +1,4 @@
-//! WOR-201 PR 1b: Plugin dispatch + audit bus integration.
+//! Plugin dispatch + audit bus integration.
 //!
 //! End-to-end coverage for the new wiring: a minimal
 //! [`PolicyEnforcer`] is invoked, the [`policy_bus`] correlates a

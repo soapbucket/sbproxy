@@ -11,20 +11,18 @@
 //! hub-in / bytes-out at the outbound edge. Wire formats never leave
 //! this layer; the rest of the AI gateway speaks hub types only.
 //!
-//! ## Scope of WOR-224
+//! ## Scope
 //!
-//! WOR-224 lands the trait surface, the hub types, three inbound
+//! This module lands the trait surface, the hub types, three inbound
 //! `ChatFormat` implementations (OpenAI Chat, OpenAI Responses,
 //! Anthropic Messages), and the inbound route wiring. The existing
 //! pairwise translators in `crates/sbproxy-ai/src/translators/` keep
-//! working unchanged; a future ticket (WOR-226 for streaming
-//! conformance and the Anthropic / Responses streaming branches,
-//! WOR-229 for the native-format bypass) will migrate them to use this
-//! trait. The `from_hub_stream` method is part of the trait surface
-//! today; only the OpenAI Chat branch returns frames end to end. The
-//! Anthropic and Responses branches return a `not implemented yet`
-//! error pointing at WOR-226 so a future caller wiring streaming
-//! gets a clear pointer rather than silent misbehaviour.
+//! working unchanged; later work migrates them to use this trait. The
+//! `from_hub_stream` method is part of the trait surface today; only
+//! the OpenAI Chat branch returns frames end to end. The Anthropic and
+//! Responses branches return a `not implemented yet` error so a future
+//! caller wiring streaming gets a clear pointer rather than silent
+//! misbehaviour.
 
 pub mod anthropic_messages;
 pub mod native_streams;
@@ -110,7 +108,7 @@ pub fn rewrap_response_for_inbound(inbound_format: Option<&str>, body: &[u8]) ->
     }
 }
 
-/// WOR-229: Native-format bypass classification.
+/// Native-format bypass classification.
 ///
 /// Returned by [`native_bypass_for`] when an inbound format and an
 /// upstream provider's wire format are the same, so the gateway can

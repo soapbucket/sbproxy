@@ -1,7 +1,7 @@
 //! Emit Cloudflare-Code-Mode TypeScript directly from an OpenAPI 3.x
 //! spec, bypassing the MCP federation hop.
 //!
-//! WOR-410 emits codemode.ts from a federated MCP tool registry; this
+//! Emits codemode.ts from a federated MCP tool registry; this
 //! module emits the same shape from an OpenAPI spec so an operator can
 //! point the gateway at a typed REST API and hand agents a typed
 //! codemode module without standing up an intermediate MCP server.
