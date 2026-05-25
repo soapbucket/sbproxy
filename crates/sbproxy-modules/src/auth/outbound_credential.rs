@@ -18,8 +18,12 @@
 //! broker JWT re-sign, DPoP / mTLS binding, multi-source entitlements)
 //! are deliberately out of this module.
 
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
+use dashmap::DashMap;
 use serde::Deserialize;
 
 /// RFC 8693 grant type for token exchange.
@@ -297,6 +301,78 @@ pub async fn resolve(
             })
         }
     }
+}
+
+// --- Minted-token cache (WOR-802) ---
+
+struct CachedCred {
+    cred: MintedCredential,
+    /// `None` for entries that should not be reused (no reported
+    /// lifetime); otherwise the instant the entry goes stale.
+    expires_at: Option<Instant>,
+}
+
+/// Process-wide cache of minted credentials, keyed by origin + subject
+/// fingerprint so the proxy does not call the token endpoint on every
+/// request. Bounded by each entry's TTL (derived from the token's
+/// `expires_in` minus a safety margin).
+static CRED_CACHE: OnceLock<DashMap<String, CachedCred>> = OnceLock::new();
+
+fn cred_cache() -> &'static DashMap<String, CachedCred> {
+    CRED_CACHE.get_or_init(DashMap::new)
+}
+
+/// Like [`resolve`], but caches minted tokens (token-exchange and
+/// client-credentials modes) keyed by `origin_id` + a fingerprint of
+/// the subject token, so repeated requests reuse a live token until it
+/// nears expiry. `vault_secret` is resolved directly each call (a cheap
+/// local format with no network round-trip, and caching a static secret
+/// across config reloads would risk staleness). Tokens whose endpoint
+/// reported no `expires_in` are not cached.
+pub async fn resolve_cached(
+    origin_id: &str,
+    cfg: &OutboundCredentialConfig,
+    http: &reqwest::Client,
+    subject_token: Option<&str>,
+    secret_lookup: &(dyn Fn(&str) -> Result<String> + Sync),
+) -> Result<MintedCredential> {
+    if matches!(cfg, OutboundCredentialConfig::VaultSecret(_)) {
+        return resolve(cfg, http, subject_token, secret_lookup).await;
+    }
+
+    let subject_fp = subject_token
+        .map(|t| {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(t.as_bytes()))
+        })
+        .unwrap_or_default();
+    let key = format!("{origin_id}\u{0}{subject_fp}");
+
+    if let Some(entry) = cred_cache().get(&key) {
+        if entry
+            .expires_at
+            .map(|e| Instant::now() < e)
+            .unwrap_or(false)
+        {
+            return Ok(entry.cred.clone());
+        }
+    }
+
+    let cred = resolve(cfg, http, subject_token, secret_lookup).await?;
+    // Cache only when the endpoint reported a lifetime; reuse it until
+    // 30s before expiry to avoid serving a token that dies in flight.
+    if let Some(secs) = cred.expires_in {
+        if let Some(ttl) = secs.checked_sub(30).filter(|&s| s > 0) {
+            cred_cache().insert(
+                key,
+                CachedCred {
+                    cred: cred.clone(),
+                    expires_at: Some(Instant::now() + Duration::from_secs(ttl)),
+                },
+            );
+        }
+    }
+    Ok(cred)
 }
 
 #[cfg(test)]
