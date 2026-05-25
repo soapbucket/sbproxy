@@ -13,6 +13,17 @@ pub enum AiCrawlDecision {
     /// Request is allowed - either it carried a valid payment token or
     /// it does not match the crawler signature.
     Allow,
+    /// Request is allowed AND was settled through the Cloudflare Pay Per
+    /// Crawl wire contract: the crawler pre-authorized a price it could
+    /// afford (`crawler-exact-price` / `crawler-max-price`) and the
+    /// ledger settled it. The proxy serves the response and stamps a
+    /// `crawler-charged: <currency> <amount>` header so the crawler
+    /// learns exactly what it paid. `charged_header` is the ready-to-set
+    /// header value (e.g. `USD 0.01`).
+    AllowCharged {
+        /// Value for the `crawler-charged` response header.
+        charged_header: String,
+    },
     /// Request must be charged. The proxy returns 402 with this challenge
     /// body and stamps the configured challenge header. This is the Wave 1
     /// single-rail path that legacy crawlers see when they have not opted
@@ -54,6 +65,19 @@ pub enum AiCrawlDecision {
         body: String,
         /// Seconds to put in the `Retry-After` HTTP header.
         retry_after_seconds: u32,
+    },
+    /// Cloudflare Pay Per Crawl 402 challenge. Emitted when
+    /// `cloudflare_compat` is on and the crawler did not pay through.
+    /// The proxy returns `402 Payment Required` with a
+    /// `crawler-price: <currency> <amount>` response header (the exact
+    /// Cloudflare wire header) so a crawler that already speaks PPC can
+    /// retry with `crawler-exact-price` / `crawler-max-price` unchanged.
+    /// A JSON body mirrors the price for clients that introspect it.
+    CloudflareCharge {
+        /// Value for the `crawler-price` response header (e.g. `USD 0.01`).
+        price_header: String,
+        /// JSON body the client receives in the 402 response.
+        body: String,
     },
     /// The crawler's purpose is governed by a Content Signal the
     /// operator declared as disallowed (`=no`), so the request is
@@ -528,6 +552,122 @@ impl Money {
         let minor = (self.amount_micros % 1_000_000) as f64 / 1_000_000.0;
         format!("{:.6}", major + minor)
     }
+
+    /// Render the price in Cloudflare's Pay Per Crawl header form:
+    /// `<currency> <amount>`, e.g. `USD 0.01`. The amount is the major
+    /// unit value with trailing zeros trimmed but a minimum of two
+    /// decimal places kept so a whole-cent price reads `USD 0.01`
+    /// rather than `USD 0.010000`. This is the exact shape Cloudflare's
+    /// `crawler-price`, `crawler-exact-price`, `crawler-max-price`, and
+    /// `crawler-charged` headers carry on the wire.
+    pub fn to_crawler_price_header(&self) -> String {
+        format!(
+            "{} {}",
+            self.currency,
+            format_micros_trimmed(self.amount_micros)
+        )
+    }
+}
+
+/// Format a micros amount as a decimal string with at least two and at
+/// most six fractional digits, trailing zeros beyond the second decimal
+/// trimmed. `1_000` (0.001) renders `0.001`; `10_000` (0.01) renders
+/// `0.01`; `1_500_000` (1.5) renders `1.50`.
+fn format_micros_trimmed(amount_micros: u64) -> String {
+    // Render at full micros precision, then trim trailing zeros down to
+    // the two-decimal floor. Keeping the floor at two decimals matches
+    // Cloudflare's currency convention so a one-cent price is `0.01`,
+    // not `0.010000` and not `0.01000`.
+    let full = {
+        let major = amount_micros / 1_000_000;
+        let minor = amount_micros % 1_000_000;
+        format!("{major}.{minor:06}")
+    };
+    // Trim trailing zeros but never cut below two fractional digits.
+    let trimmed = full.trim_end_matches('0');
+    let trimmed = trimmed.trim_end_matches('.');
+    // Re-pad to a minimum of two decimals.
+    match trimmed.split_once('.') {
+        Some((int_part, frac)) if frac.len() >= 2 => format!("{int_part}.{frac}"),
+        Some((int_part, frac)) => format!("{int_part}.{frac:0<2}"),
+        None => format!("{trimmed}.00"),
+    }
+}
+
+/// Parse a Cloudflare Pay Per Crawl price header value of the form
+/// `<currency> <amount>` (e.g. `USD 0.01`) into a [`Money`]. Returns
+/// `None` when the value is malformed, the amount is not a finite
+/// non-negative decimal, or the currency token is empty. Used to read
+/// the crawler's `crawler-exact-price` / `crawler-max-price`
+/// pre-authorization headers.
+pub fn parse_crawler_price_header(value: &str) -> Option<Money> {
+    let trimmed = value.trim();
+    let (currency, amount) = trimmed.split_once(char::is_whitespace)?;
+    let currency = currency.trim();
+    let amount = amount.trim();
+    if currency.is_empty() {
+        return None;
+    }
+    let parsed: f64 = amount.parse().ok()?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return None;
+    }
+    Some(Money::from_units(parsed, currency))
+}
+
+/// Pluggable pricing model hook. An implementation maps a request's
+/// `(path, agent_id, content_shape)` to a per-crawl [`Money`] price,
+/// letting an operator plug in a learned model (an LM-Tree-style
+/// pricing model is the motivating example) in place of, or layered
+/// over, the static `tiers:` table.
+///
+/// This is intentionally only the seam: the OSS build ships no learned
+/// model. When a policy is configured without a model the static tier
+/// table and the flat `price:` fallback decide the price exactly as
+/// before. An embedder injects a model through
+/// [`AiCrawlControlPolicy::with_pricing_model`].
+pub trait PricingModel: Send + Sync + std::fmt::Debug + 'static {
+    /// Return the price for a request, or `None` to defer to the static
+    /// tier table / flat price fallback. Returning `Some(_)` overrides
+    /// the static resolution for this request.
+    fn price_for(
+        &self,
+        path: &str,
+        agent_id: &str,
+        content_shape: Option<ContentShape>,
+    ) -> Option<Money>;
+}
+
+/// The always-free path allowlist. A crawler is never charged for these
+/// well-known operational endpoints regardless of policy configuration:
+/// `robots.txt`, `sitemap.xml`, `security.txt` (both root and
+/// `.well-known`), and `crawlers.json`. This mirrors Cloudflare's Pay
+/// Per Crawl free-path behaviour so a crawler can always discover the
+/// site's policy without paying to read it.
+pub const ALWAYS_FREE_PATHS: &[&str] = &[
+    "/robots.txt",
+    "/sitemap.xml",
+    "/security.txt",
+    "/.well-known/security.txt",
+    "/crawlers.json",
+];
+
+/// True when `path` is on the built-in always-free allowlist or matches
+/// one of the operator-supplied `free_paths` entries. A configured
+/// entry ending in `*` is a prefix match (e.g. `/public/*`); otherwise
+/// the match is exact. The built-in allowlist is always consulted first
+/// so an operator cannot accidentally start charging for `robots.txt`.
+pub fn path_is_always_free(path: &str, extra_free_paths: &[String]) -> bool {
+    if ALWAYS_FREE_PATHS.contains(&path) {
+        return true;
+    }
+    extra_free_paths.iter().any(|p| {
+        if let Some(prefix) = p.strip_suffix('*') {
+            path.starts_with(prefix)
+        } else {
+            p == path
+        }
+    })
 }
 
 /// One pricing tier: a route pattern and the price + shape + preview
@@ -1187,6 +1327,24 @@ pub struct AiCrawlControlConfig {
     /// unaffected.
     #[serde(default)]
     pub content_signals: ContentSignals,
+    /// Enable Cloudflare Pay Per Crawl wire-contract interop. When on,
+    /// the 402 challenge carries Cloudflare's exact `crawler-price`
+    /// response header (`<currency> <amount>`), the policy honours the
+    /// crawler's `crawler-exact-price` / `crawler-max-price`
+    /// pre-authorization request headers, and a settled request gets a
+    /// `crawler-charged` header on its served response. A crawler that
+    /// already speaks Cloudflare PPC transacts with this origin
+    /// unchanged. Off by default so existing single-rail / multi-rail
+    /// configs are unaffected.
+    #[serde(default)]
+    pub cloudflare_compat: bool,
+    /// Per-path free-list (Cloudflare Configuration-Rules equivalent).
+    /// Paths listed here are never charged, in addition to the built-in
+    /// [`ALWAYS_FREE_PATHS`] allowlist. A trailing `*` is a prefix
+    /// match (`/public/*`); otherwise the entry matches exactly. Empty
+    /// by default; the built-in allowlist applies regardless.
+    #[serde(default)]
+    pub free_paths: Vec<String>,
 }
 
 // --- Ledger YAML shape (G1.3 wire) ---

@@ -1,5 +1,5 @@
 # 402 Challenge contract
-*Last modified: 2026-05-08*
+*Last modified: 2026-05-25*
 
 The wire format the proxy uses when it returns `402 Payment Required`
 to an AI crawler. This document is the canonical reference for the
@@ -152,6 +152,85 @@ Notes:
   `Rail::Lightning` enum variant ships in OSS) and the proxy still
   negotiates against the `lightning` token on the wire; the body just
   carries the next surviving rail (here `x402`).
+
+## Cloudflare Pay Per Crawl interop
+
+Set `cloudflare_compat: true` on the `ai_crawl_control` policy to speak
+Cloudflare's exact Pay Per Crawl wire contract. A crawler that already
+transacts with a Cloudflare origin works against an SBproxy origin
+unchanged, and the differentiator is that SBproxy settles on the
+operator's own rails with no Merchant-of-Record cut.
+
+In this mode the negotiation uses Cloudflare's header set instead of
+the single-rail JSON body:
+
+- The 402 response carries `crawler-price: <currency> <amount>`, for
+  example `crawler-price: USD 0.01`. A JSON body mirrors the price for
+  clients that read the body instead of the header.
+- The crawler retries with `crawler-exact-price` (commit to a precise
+  amount) or `crawler-max-price` (a cap), plus its payment token on the
+  configured header (`crawler-payment` by default). The token settles
+  through the same self-hosted ledger the single-rail path uses.
+- A `crawler-max-price` below the quote, or a `crawler-exact-price`
+  that does not equal the quote, re-quotes with a fresh 402 and does
+  not spend the token.
+- A settled request is served with `crawler-charged: <currency>
+  <amount>` so the crawler learns exactly what it paid.
+
+```yaml
+policies:
+  - type: ai_crawl_control
+    price: 0.01
+    currency: USD
+    cloudflare_compat: true
+    free_paths:
+      - "/feed/*"
+    valid_tokens:
+      - ppc-token-1
+```
+
+### Always-free paths
+
+These well-known operational endpoints are never charged, so a crawler
+can always discover the site's policy without paying to read it:
+
+- `/robots.txt`
+- `/sitemap.xml`
+- `/security.txt`
+- `/.well-known/security.txt`
+- `/crawlers.json`
+
+The per-policy `free_paths:` list extends this built-in allowlist
+(Cloudflare's Configuration-Rules equivalent). A trailing `*` is a
+prefix match (`/feed/*`); otherwise the entry matches exactly. The
+built-in allowlist always applies, so an operator cannot accidentally
+start charging for `robots.txt`.
+
+### Binding the price headers to a Web Bot Auth signature
+
+The crawler's pre-authorization headers (`crawler-max-price` and
+`crawler-exact-price`) are inbound request headers, so an operator who
+also runs the `bot_auth` verifier can require them to be signed
+components by listing the header name in that agent's
+`required_components`. A retry whose Web Bot Auth signature does not
+cover the listed price header is then rejected before the ledger is
+consulted.
+
+Binding the proxy's outbound price headers (`crawler-price`,
+`crawler-charged`) into a signature the crawler can verify is a separate
+piece of work: it needs the outbound response-signing path, which is not
+part of this contract yet.
+
+### Pluggable pricing model
+
+Pricing can be flat (`price:`) or per-path (`tiers:`). For a learned
+model (an LM-Tree-style pricing model is the motivating example), an
+embedder injects a `PricingModel` implementation through
+`AiCrawlControlPolicy::with_pricing_model`. The model is consulted
+before the static tier table; returning a price overrides the static
+resolution for that request, and returning nothing defers to the tier
+table and the flat-price fallback. The OSS build ships only the seam,
+not a model.
 
 ## 406 fallback
 

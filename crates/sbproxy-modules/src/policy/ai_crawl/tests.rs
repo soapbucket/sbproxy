@@ -1059,3 +1059,237 @@ fn decode_token_claims(token: &str) -> crate::policy::quote_token::QuoteClaims {
 fn extract_nonce_from_token(token: &str) -> String {
     decode_token_claims(token).nonce
 }
+
+// --- WOR-803: Cloudflare Pay Per Crawl wire-contract interop ---
+
+#[test]
+fn money_renders_cloudflare_price_header_form() {
+    // One cent reads `USD 0.01` (two-decimal floor), a tenth of a cent
+    // keeps the extra digit (`USD 0.001`), and a buck-fifty trims to
+    // `USD 1.50`.
+    assert_eq!(
+        Money::from_units(0.01, "USD").to_crawler_price_header(),
+        "USD 0.01"
+    );
+    assert_eq!(
+        Money::from_units(0.001, "USD").to_crawler_price_header(),
+        "USD 0.001"
+    );
+    assert_eq!(
+        Money::from_units(1.5, "USD").to_crawler_price_header(),
+        "USD 1.50"
+    );
+    assert_eq!(
+        Money::from_units(2.0, "EUR").to_crawler_price_header(),
+        "EUR 2.00"
+    );
+}
+
+#[test]
+fn parse_crawler_price_header_round_trips() {
+    let parsed = parse_crawler_price_header("USD 0.01").expect("parse");
+    assert_eq!(parsed.currency, "USD");
+    assert_eq!(parsed.amount_micros, 10_000);
+    // Tolerant of extra whitespace.
+    let parsed = parse_crawler_price_header("  USD   0.5 ").expect("parse padded");
+    assert_eq!(parsed.amount_micros, 500_000);
+    // Malformed values yield None.
+    assert!(parse_crawler_price_header("USD").is_none());
+    assert!(parse_crawler_price_header("USD abc").is_none());
+    assert!(parse_crawler_price_header(" 0.01").is_none());
+    assert!(parse_crawler_price_header("USD -1").is_none());
+}
+
+#[test]
+fn built_in_free_paths_are_always_free() {
+    let extra: Vec<String> = vec![];
+    for p in ALWAYS_FREE_PATHS {
+        assert!(path_is_always_free(p, &extra), "{p} should be free");
+    }
+    assert!(!path_is_always_free("/article", &extra));
+}
+
+#[test]
+fn operator_free_paths_extend_the_allowlist() {
+    let extra = vec!["/public/*".to_string(), "/about".to_string()];
+    assert!(path_is_always_free("/public/anything", &extra));
+    assert!(path_is_always_free("/about", &extra));
+    assert!(!path_is_always_free("/private", &extra));
+    // Built-in list still applies regardless of operator config.
+    assert!(path_is_always_free("/robots.txt", &extra));
+}
+
+#[test]
+fn free_path_is_never_charged_even_with_pricing() {
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.01,
+        "valid_tokens": [],
+        "cloudflare_compat": true,
+        "free_paths": ["/feed/*"],
+    }))
+    .unwrap();
+    let h = ua_headers("GPTBot/1.0");
+    // Built-in allowlist.
+    assert_eq!(
+        policy.check("GET", "x.com", "/robots.txt", &h, None),
+        AiCrawlDecision::Allow
+    );
+    // Operator free path.
+    assert_eq!(
+        policy.check("GET", "x.com", "/feed/posts", &h, None),
+        AiCrawlDecision::Allow
+    );
+    // A non-free path is still charged.
+    assert!(matches!(
+        policy.check("GET", "x.com", "/article", &h, None),
+        AiCrawlDecision::CloudflareCharge { .. }
+    ));
+}
+
+#[test]
+fn cloudflare_compat_emits_crawler_price_header() {
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.01,
+        "valid_tokens": [],
+        "cloudflare_compat": true,
+    }))
+    .unwrap();
+    let h = ua_headers("Mozilla/5.0 (compatible; GPTBot/1.0)");
+    match policy.check("GET", "x.com", "/article", &h, None) {
+        AiCrawlDecision::CloudflareCharge { price_header, body } => {
+            assert_eq!(price_header, "USD 0.01");
+            assert!(body.contains("\"crawler_price\":\"USD 0.01\""));
+            assert!(body.contains("\"amount_micros\":10000"));
+        }
+        other => panic!("expected CloudflareCharge, got {other:?}"),
+    }
+}
+
+#[test]
+fn cloudflare_compat_settles_with_max_price_and_returns_charged() {
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.01,
+        "valid_tokens": ["good-token"],
+        "cloudflare_compat": true,
+    }))
+    .unwrap();
+    // Crawler pre-authorizes a cap above the quote and presents a
+    // valid token. It settles and learns what it paid.
+    let mut h = payment_headers("GPTBot/1.0", "crawler-payment", "good-token");
+    h.insert("crawler-max-price", "USD 0.05".parse().unwrap());
+    match policy.check("GET", "x.com", "/article", &h, None) {
+        AiCrawlDecision::AllowCharged { charged_header } => {
+            assert_eq!(charged_header, "USD 0.01");
+        }
+        other => panic!("expected AllowCharged, got {other:?}"),
+    }
+    // The token is single-use: a second settle attempt re-quotes.
+    let mut h2 = payment_headers("GPTBot/1.0", "crawler-payment", "good-token");
+    h2.insert("crawler-max-price", "USD 0.05".parse().unwrap());
+    assert!(matches!(
+        policy.check("GET", "x.com", "/article", &h2, None),
+        AiCrawlDecision::CloudflareCharge { .. }
+    ));
+}
+
+#[test]
+fn cloudflare_compat_settles_with_exact_price() {
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.01,
+        "valid_tokens": ["good-token"],
+        "cloudflare_compat": true,
+    }))
+    .unwrap();
+    let mut h = payment_headers("GPTBot/1.0", "crawler-payment", "good-token");
+    h.insert("crawler-exact-price", "USD 0.01".parse().unwrap());
+    assert!(matches!(
+        policy.check("GET", "x.com", "/article", &h, None),
+        AiCrawlDecision::AllowCharged { .. }
+    ));
+}
+
+#[test]
+fn cloudflare_compat_rejects_underpriced_preauth() {
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.01,
+        "valid_tokens": ["good-token"],
+        "cloudflare_compat": true,
+    }))
+    .unwrap();
+    // Max-price below the quote: the crawler is re-quoted and the
+    // token is NOT spent (it can retry once it raises its cap).
+    let mut h = payment_headers("GPTBot/1.0", "crawler-payment", "good-token");
+    h.insert("crawler-max-price", "USD 0.005".parse().unwrap());
+    assert!(matches!(
+        policy.check("GET", "x.com", "/article", &h, None),
+        AiCrawlDecision::CloudflareCharge { .. }
+    ));
+    // The token survived the under-priced attempt: a proper settle now
+    // succeeds, proving the ledger was not touched above.
+    let mut h2 = payment_headers("GPTBot/1.0", "crawler-payment", "good-token");
+    h2.insert("crawler-max-price", "USD 0.05".parse().unwrap());
+    assert!(matches!(
+        policy.check("GET", "x.com", "/article", &h2, None),
+        AiCrawlDecision::AllowCharged { .. }
+    ));
+}
+
+#[test]
+fn pricing_model_hook_overrides_static_price() {
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct FlatModel(u64);
+    impl PricingModel for FlatModel {
+        fn price_for(
+            &self,
+            _path: &str,
+            _agent_id: &str,
+            _shape: Option<ContentShape>,
+        ) -> Option<Money> {
+            Some(Money {
+                amount_micros: self.0,
+                currency: "USD".to_string(),
+            })
+        }
+    }
+
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.01,
+        "valid_tokens": [],
+    }))
+    .unwrap()
+    .with_pricing_model(Arc::new(FlatModel(42_000)));
+    // The model wins over the flat 0.01 (10_000 micros) price.
+    assert_eq!(policy.resolve_price("/anything").amount_micros, 42_000);
+}
+
+#[test]
+fn pricing_model_none_defers_to_tiers() {
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct DeferModel;
+    impl PricingModel for DeferModel {
+        fn price_for(
+            &self,
+            _path: &str,
+            _agent_id: &str,
+            _shape: Option<ContentShape>,
+        ) -> Option<Money> {
+            None
+        }
+    }
+
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "valid_tokens": [],
+        "tiers": [
+            { "route_pattern": "/*",
+              "price": { "amount_micros": 7000, "currency": "USD" } }
+        ]
+    }))
+    .unwrap()
+    .with_pricing_model(Arc::new(DeferModel));
+    // Model returns None, so the static tier price applies.
+    assert_eq!(policy.resolve_price("/x").amount_micros, 7000);
+}

@@ -313,6 +313,13 @@ pub struct RequestContext {
     /// The 402 response handler reads this to stamp the configured
     /// header and write the JSON body.
     pub crawl_challenge: Option<(String, String, String)>,
+    /// Set by an `ai_crawl_control` policy in Cloudflare Pay Per Crawl
+    /// interop mode when a request settled through the ledger. Carries
+    /// the `crawler-charged` header value (`<currency> <amount>`, e.g.
+    /// `USD 0.01`). The served-response path stamps this onto the 2xx
+    /// response so the crawler learns exactly what it paid. `None` when
+    /// the request was not a paid Cloudflare-compat crawl.
+    pub crawl_charged: Option<String>,
 
     // --- Distributed tracing ---
     /// W3C Trace Context for this request (parsed from `traceparent` or generated fresh).
@@ -802,6 +809,7 @@ impl RequestContext {
             cel_response_header_mutations: Vec::new(),
             transform_error_attribution: None,
             crawl_challenge: None,
+            crawl_charged: None,
             trace_ctx: None,
             cache_key: None,
             cache_body_buf: None,
