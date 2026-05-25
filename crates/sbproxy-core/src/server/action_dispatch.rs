@@ -792,6 +792,52 @@ pub(super) async fn handle_mcp_action(
         return Ok(());
     }
 
+    // WOR-806: RFC 9728 OAuth Protected Resource Metadata. Served only
+    // when the gateway declares `oauth:`, so an agent can discover the
+    // authorization server. Not configured -> not intercepted.
+    if method == http::Method::GET
+        && req_path == sbproxy_extension::mcp::discovery::OAUTH_PROTECTED_RESOURCE_PATH
+    {
+        if let Some(oauth) = mcp.oauth.as_ref() {
+            let listener_is_tls = session
+                .digest()
+                .and_then(|d| d.ssl_digest.as_ref())
+                .is_some();
+            let scheme = if listener_is_tls { "https" } else { "http" };
+            let resource = match session
+                .req_header()
+                .headers
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+            {
+                Some(authority) => format!("{scheme}://{authority}/"),
+                None => "/".to_string(),
+            };
+            let doc = sbproxy_extension::mcp::discovery::build_oauth_protected_resource(
+                &resource,
+                &oauth.authorization_servers,
+                &oauth.scopes_supported,
+            );
+            let body = serde_json::to_vec(&doc).unwrap_or_default();
+            let mut header = pingora_http::ResponseHeader::build(200, Some(2)).map_err(|e| {
+                Error::because(
+                    ErrorType::InternalError,
+                    "failed to build oauth metadata header",
+                    e,
+                )
+            })?;
+            let _ = header.insert_header("content-type", "application/json; charset=utf-8");
+            let _ = header.insert_header("content-length", body.len().to_string());
+            session
+                .write_response_header(Box::new(header), false)
+                .await?;
+            session
+                .write_response_body(Some(bytes::Bytes::from(body)), true)
+                .await?;
+            return Ok(());
+        }
+    }
+
     // WOR-806: serve the MCP discovery manifest at
     // `/.well-known/mcp-server` and the Cloudflare Agent-Readiness
     // variant `/.well-known/mcp/server-card.json`. An autonomous agent
@@ -836,12 +882,22 @@ pub(super) async fn handle_mcp_action(
                 description: t.description,
             })
             .collect();
+        // RFC 9728 auth-discovery pointer when the gateway is
+        // OAuth-protected (WOR-806).
+        let authorization = mcp.oauth.as_ref().map(|_| {
+            let resource_meta = format!(
+                "{}/.well-known/oauth-protected-resource",
+                endpoint.trim_end_matches('/')
+            );
+            serde_json::json!({ "type": "oauth2", "resourceMetadata": resource_meta })
+        });
         let manifest = sbproxy_extension::mcp::discovery::build_server_manifest(
             &mcp.server_name,
             &mcp.server_version,
             "2025-06-18",
             &endpoint,
             &tools,
+            authorization,
         );
         let body = serde_json::to_vec(&manifest).unwrap_or_default();
         let mut header = pingora_http::ResponseHeader::build(200, Some(2)).map_err(|e| {
