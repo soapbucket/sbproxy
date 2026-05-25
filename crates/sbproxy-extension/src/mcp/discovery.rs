@@ -47,6 +47,7 @@ pub fn build_server_manifest(
     protocol_version: &str,
     endpoint: &str,
     tools: &[DiscoveryTool],
+    authorization: Option<serde_json::Value>,
 ) -> serde_json::Value {
     let tool_values: Vec<serde_json::Value> = tools
         .iter()
@@ -57,7 +58,7 @@ pub fn build_server_manifest(
             })
         })
         .collect();
-    serde_json::json!({
+    let mut doc = serde_json::json!({
         "name": name,
         "version": version,
         "protocolVersion": protocol_version,
@@ -65,7 +66,51 @@ pub fn build_server_manifest(
         "endpoint": endpoint,
         "capabilities": { "tools": { "listChanged": false } },
         "tools": tool_values,
-    })
+    });
+    // RFC 9728 auth discovery pointer (WOR-806): when the gateway is
+    // OAuth-protected, advertise where to find the protected-resource
+    // metadata so an agent can discover its authorization server.
+    if let (Some(auth), Some(obj)) = (authorization, doc.as_object_mut()) {
+        obj.insert("authorization".to_string(), auth);
+    }
+    doc
+}
+
+/// Well-known path for RFC 9728 OAuth 2.0 Protected Resource Metadata.
+pub const OAUTH_PROTECTED_RESOURCE_PATH: &str = "/.well-known/oauth-protected-resource";
+
+/// Build an RFC 9728 OAuth 2.0 Protected Resource Metadata document for
+/// an OAuth-protected MCP gateway (WOR-806).
+///
+/// `resource` is the gateway's canonical URL; `authorization_servers`
+/// lists the issuer URLs a client can obtain a token from;
+/// `scopes_supported` is optional. `bearer_methods_supported` is fixed
+/// to `["header"]` (the MCP transport carries the bearer in the
+/// `Authorization` header).
+pub fn build_oauth_protected_resource(
+    resource: &str,
+    authorization_servers: &[String],
+    scopes_supported: &[String],
+) -> serde_json::Value {
+    let mut doc = serde_json::json!({
+        "resource": resource,
+        "authorization_servers": authorization_servers,
+        "bearer_methods_supported": ["header"],
+    });
+    if !scopes_supported.is_empty() {
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert(
+                "scopes_supported".to_string(),
+                serde_json::Value::Array(
+                    scopes_supported
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
+    }
+    doc
 }
 
 #[cfg(test)]
@@ -87,6 +132,7 @@ mod tests {
             "2025-06-18",
             "https://mcp.example.com/",
             &[tool("search"), tool("fetch")],
+            None,
         );
         assert_eq!(m["name"], "sbproxy-mcp");
         assert_eq!(m["version"], "1.0.0");
@@ -94,6 +140,8 @@ mod tests {
         assert_eq!(m["transport"], "streamable-http");
         assert_eq!(m["endpoint"], "https://mcp.example.com/");
         assert!(m["capabilities"]["tools"].is_object());
+        // No authorization block when not OAuth-protected.
+        assert!(m.get("authorization").is_none());
     }
 
     #[test]
@@ -104,6 +152,7 @@ mod tests {
             "2025-06-18",
             "https://h/",
             &[tool("alpha"), tool("beta")],
+            None,
         );
         let tools = m["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
@@ -114,11 +163,48 @@ mod tests {
 
     #[test]
     fn manifest_is_valid_json_with_no_tools() {
-        let m = build_server_manifest("g", "0.1", "2025-06-18", "https://h/", &[]);
+        let m = build_server_manifest("g", "0.1", "2025-06-18", "https://h/", &[], None);
         assert!(m["tools"].as_array().unwrap().is_empty());
         // Round-trips through serialization.
         let s = serde_json::to_string(&m).unwrap();
         let back: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(back["name"], "g");
+    }
+
+    #[test]
+    fn manifest_carries_authorization_pointer_when_present() {
+        let auth = serde_json::json!({
+            "type": "oauth2",
+            "resourceMetadata": "https://h/.well-known/oauth-protected-resource"
+        });
+        let m = build_server_manifest("g", "0.1", "2025-06-18", "https://h/", &[], Some(auth));
+        assert_eq!(m["authorization"]["type"], "oauth2");
+        assert_eq!(
+            m["authorization"]["resourceMetadata"],
+            "https://h/.well-known/oauth-protected-resource"
+        );
+    }
+
+    #[test]
+    fn oauth_protected_resource_has_required_rfc9728_fields() {
+        let doc = build_oauth_protected_resource(
+            "https://mcp.example.com/",
+            &["https://issuer.example.com".to_string()],
+            &["mcp.read".to_string(), "mcp.call".to_string()],
+        );
+        assert_eq!(doc["resource"], "https://mcp.example.com/");
+        assert_eq!(
+            doc["authorization_servers"][0],
+            "https://issuer.example.com"
+        );
+        assert_eq!(doc["bearer_methods_supported"][0], "header");
+        assert_eq!(doc["scopes_supported"][0], "mcp.read");
+    }
+
+    #[test]
+    fn oauth_protected_resource_omits_empty_scopes() {
+        let doc = build_oauth_protected_resource("https://h/", &["https://i".to_string()], &[]);
+        assert!(doc.get("scopes_supported").is_none());
+        assert!(doc["authorization_servers"].is_array());
     }
 }

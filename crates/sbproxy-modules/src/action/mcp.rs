@@ -93,6 +93,23 @@ pub struct McpActionConfig {
     /// Defaults to the full-catalogue listing.
     #[serde(default)]
     pub progressive_discovery: bool,
+    /// OAuth protection metadata for RFC 9728 discovery (WOR-806). When
+    /// set, the gateway serves `/.well-known/oauth-protected-resource`
+    /// and advertises the pointer in its discovery manifest so an agent
+    /// can find the authorization server. Absent means the gateway
+    /// advertises no OAuth auth-discovery surface.
+    #[serde(default)]
+    pub oauth: Option<McpOAuthConfig>,
+}
+
+/// OAuth 2.0 Protected Resource Metadata (RFC 9728) for the MCP gateway.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpOAuthConfig {
+    /// Issuer URLs a client can obtain a token from.
+    pub authorization_servers: Vec<String>,
+    /// Optional list of scopes the resource recognises.
+    #[serde(default)]
+    pub scopes_supported: Vec<String>,
 }
 
 /// Server identity advertised by the gateway during MCP initialization.
@@ -179,6 +196,9 @@ pub struct McpAction {
     /// When `true`, `tools/list` advertises the `search` / `execute`
     /// meta-tools instead of the full catalogue (WOR-806).
     pub progressive_discovery: bool,
+    /// OAuth Protected Resource Metadata (RFC 9728) for auth discovery,
+    /// or `None` when the gateway advertises no OAuth surface (WOR-806).
+    pub oauth: Option<McpOAuthConfig>,
 }
 
 /// Per-upstream metadata captured at compile time. Kept outside
@@ -292,6 +312,7 @@ impl McpAction {
             federation,
             tool_allowlist,
             progressive_discovery: cfg.progressive_discovery,
+            oauth: cfg.oauth,
         })
     }
 
