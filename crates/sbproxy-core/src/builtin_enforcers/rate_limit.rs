@@ -92,7 +92,7 @@ impl PolicyEnforcer for RateLimitEnforcer {
 /// request. Returns the string-coerced result when evaluation
 /// succeeds and produces a non-empty value, otherwise `None` so the
 /// caller can fall back to the default IP-based key.
-fn rate_limit_key_from_cel(
+pub(crate) fn rate_limit_key_from_cel(
     req: &http::Request<Bytes>,
     ctx: &RequestContext,
     expr: &str,

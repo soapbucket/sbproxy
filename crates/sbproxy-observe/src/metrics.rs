@@ -798,6 +798,36 @@ pub fn record_capture_budget_drop(workspace_id: &str, dimension: &'static str) {
         .inc();
 }
 
+/// Record a WAF persistent-block lifecycle event on
+/// `sbproxy_waf_persistent_blocks_total{origin, event, key_kind}`.
+///
+/// `event` is one of the closed strings `escalated` (a client crossed
+/// the strike threshold and was placed in a time-boxed block),
+/// `blocked` (a request was rejected because the client is inside an
+/// active block window), or `strike` (a WAF/challenge deny was counted
+/// toward the threshold without yet escalating). `key_kind` is the
+/// dimension the block is tracked by: `ip`, `api_key`, or `cel`.
+///
+/// The origin label is run through the cardinality limiter; `event`
+/// and `key_kind` are closed sets and pass through unsanitised.
+pub fn record_waf_persistent_block(origin: &str, event: &'static str, key_kind: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_waf_persistent_blocks_total",
+            "WAF persistent (time-boxed) block actions, by lifecycle event and key kind",
+            &["origin", "event", "key_kind"],
+        )
+        .expect("waf persistent block counter registers")
+    });
+    let origin_san = sanitize_label("origin", origin);
+    counter
+        .with_label_values(&[origin_san.as_str(), event, key_kind])
+        .inc();
+}
+
 /// Record drop counters returned by the Wave 8 capture helpers.
 /// `dimension` is `"property"`, `"session"`, or `"user"`; `reason`
 /// is one of the closed strings each helper exposes (e.g. `count`,

@@ -6,13 +6,17 @@
 //! OSS proxy to a signed remote rule feed for hot-loaded signatures;
 //! the publisher side ships separately.
 
+pub mod bundle;
 pub mod feed;
+pub mod persistent;
 pub mod policy;
 
+pub use bundle::{crs_bundle, CrsBundleConfig, CRS_BUNDLE_VERSION};
 pub use feed::{
     FeedRule, FeedRuleAction, FeedRuleSeverity, RuleSet, WafFeedConfig, WafFeedSubscriber,
     WafFeedTransport, WAF_FEED_TASKS,
 };
+pub use persistent::{BlockKeyKind, PersistentBlockConfig, PersistentBlockStore, StrikeOutcome};
 pub use policy::{WafPolicy, WafResult};
 
 /// Drain in-flight WAF rule-feed background tasks. Intended for the

