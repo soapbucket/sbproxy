@@ -13,10 +13,11 @@ use sbproxy_platform::storage::KVStore;
 use smallvec::SmallVec;
 
 use crate::types::{
-    AccessLogConfig, AgentClassesConfig, AgentSkillEntry, CompressionConfig, CorsConfig,
-    ErrorPageEntry, HstsConfig, IdempotencyConfig, MessageSignaturesConfig, MirrorConfig,
-    OriginRateLimitsConfig, ProblemDetailsConfig, ProxyServerConfig, ProxyStatusConfig,
-    RequestModifierConfig, ResponseCacheConfig, ResponseModifierConfig, SessionConfig,
+    AccessLogConfig, AgentClassesConfig, AgentSkillEntry, AgentsJsonConfig, CompressionConfig,
+    CorsConfig, ErrorPageEntry, HstsConfig, IdempotencyConfig, MessageSignaturesConfig,
+    MirrorConfig, OriginRateLimitsConfig, ProblemDetailsConfig, ProxyServerConfig,
+    ProxyStatusConfig, RequestModifierConfig, ResponseCacheConfig, ResponseModifierConfig,
+    SessionConfig,
 };
 
 /// Fully compiled, immutable origin ready for request processing.
@@ -172,6 +173,9 @@ pub struct CompiledOrigin {
     /// Per-origin `/ai.txt` body served verbatim (WOR-809). `None`
     /// keeps the endpoint off for the origin.
     pub ai_txt: Option<String>,
+    /// Per-origin agents.json manifest config (WOR-820). `None` keeps
+    /// `/.well-known/agents.json` off for the origin.
+    pub agents_json: Option<AgentsJsonConfig>,
 }
 
 /// The complete compiled config: all origins plus host-based routing.

@@ -480,6 +480,7 @@ fn projection_content_type(kind: &str) -> &'static str {
         // plain-text robots-like file (Spawning ai.txt).
         "agents-md" => "text/markdown; charset=utf-8",
         "ai-txt" => "text/plain; charset=utf-8",
+        "agents-json" => "application/json; charset=utf-8",
         _ => "text/plain",
     }
 }

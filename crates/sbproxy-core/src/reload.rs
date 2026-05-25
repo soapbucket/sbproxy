@@ -484,6 +484,7 @@ mod tests {
                 agent_skills: Vec::new(),
                 agents_md: None,
                 ai_txt: None,
+                agents_json: None,
             }],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),

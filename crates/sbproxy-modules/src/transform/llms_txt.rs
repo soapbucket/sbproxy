@@ -635,6 +635,7 @@ mod tests {
             agent_skills: Vec::new(),
             agents_md: None,
             ai_txt: None,
+            agents_json: None,
         }
     }
 
