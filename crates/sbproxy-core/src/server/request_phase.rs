@@ -1468,17 +1468,20 @@ pub(super) async fn request_filter(
         }
     }
 
-    // --- WOR-809: AGENTS.md + ai.txt agent-web emission ---
+    // --- WOR-809 / WOR-820: agent-web emission ---
     //
-    // Served verbatim from per-origin config (`agents_md:` / `ai_txt:`),
+    // Served from per-origin config (`agents_md:` / `ai_txt:` verbatim;
+    // `agents_json:` rendered into the agents.json v0.1 manifest),
     // independently of `ai_crawl_control`. Unlike the pricing-derived
     // projections below, these intercept ONLY when the origin actually
-    // configured the body; otherwise the path falls through to the
-    // upstream so a real app-level AGENTS.md / ai.txt is not shadowed.
+    // configured the document; otherwise the path falls through to the
+    // upstream so a real app-level AGENTS.md / ai.txt / agents.json is
+    // not shadowed.
     {
         let kind = match session.req_header().uri.path() {
             "/AGENTS.md" => Some("agents-md"),
             "/ai.txt" => Some("ai-txt"),
+            "/.well-known/agents.json" => Some("agents-json"),
             _ => None,
         };
         if let Some(kind) = kind {
@@ -1487,6 +1490,7 @@ pub(super) async fn request_filter(
             let body_opt = match kind {
                 "agents-md" => docs.agents_md.get(host_key).cloned(),
                 "ai-txt" => docs.ai_txt.get(host_key).cloned(),
+                "agents-json" => docs.agents_json.get(host_key).cloned(),
                 _ => None,
             };
             if let Some(body) = body_opt {

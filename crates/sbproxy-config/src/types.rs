@@ -2023,6 +2023,47 @@ pub struct RawOriginConfig {
     /// endpoint off.
     #[serde(default)]
     pub ai_txt: Option<String>,
+    /// Per-origin agents.json manifest (WOR-820). When set, the proxy
+    /// serves `GET /.well-known/agents.json` (the Wildcard agents.json
+    /// v0.1 spec): operator-authored `info` + `flows`, with `sources`
+    /// defaulting to the origin's emitted OpenAPI document. Independent
+    /// of `ai_crawl_control`. Absent keeps the endpoint off.
+    #[serde(default)]
+    pub agents_json: Option<AgentsJsonConfig>,
+}
+
+/// Per-origin agents.json manifest configuration (WOR-820). See the
+/// [`RawOriginConfig::agents_json`] field and the agents.json v0.1 spec
+/// at <https://github.com/wild-card-ai/agents-json>.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct AgentsJsonConfig {
+    /// `info` block (title, version, description).
+    pub info: AgentsJsonInfo,
+    /// API sources. When omitted, the proxy emits a single source
+    /// pointing at this origin's `/.well-known/openapi.json`. Each
+    /// entry must carry an `id` and a `path` per the spec.
+    #[serde(default)]
+    pub sources: Option<Vec<serde_json::Value>>,
+    /// Operator-authored flow objects, emitted verbatim. Each flow must
+    /// be schema-valid (`id`, `title`, `description`, `actions`,
+    /// `fields`); the proxy does not synthesize flows.
+    #[serde(default)]
+    pub flows: Vec<serde_json::Value>,
+    /// Optional `overrides` array, emitted verbatim when present.
+    #[serde(default)]
+    pub overrides: Option<Vec<serde_json::Value>>,
+}
+
+/// The `info` block of an agents.json manifest.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct AgentsJsonInfo {
+    /// Human-readable manifest title.
+    pub title: String,
+    /// Manifest version string.
+    pub version: String,
+    /// Manifest description.
+    #[serde(default)]
+    pub description: String,
 }
 
 // --- Agent Skills v0.2.0 ---

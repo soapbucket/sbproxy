@@ -229,6 +229,7 @@ mod tests {
             agent_skills: Vec::new(),
             agents_md: None,
             ai_txt: None,
+            agents_json: None,
         };
         let mut host_map = HashMap::new();
         host_map.insert(CompactString::new(hostname), 0);

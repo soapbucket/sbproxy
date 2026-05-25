@@ -901,6 +901,8 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         // WOR-809: agent-web emission bodies served verbatim.
         agents_md: config.agents_md,
         ai_txt: config.ai_txt,
+        // WOR-820: agents.json manifest config.
+        agents_json: config.agents_json,
     })
 }
 
