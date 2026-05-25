@@ -1045,6 +1045,34 @@ pub(super) async fn handle_ai_proxy(
         .into_iter()
         .map(|(i, _)| i)
         .collect();
+
+    // WOR-799: disallow_prompt_training routing filter. When the
+    // request opts out of training (header
+    // `x-sbproxy-disallow-prompt-training: true`), route only to
+    // providers the operator declared `no_prompt_training`. There is
+    // no standardized per-request training opt-out header across
+    // providers, so this gateway-side filter is the enforcement
+    // point: fail closed (400) when no compliant provider qualifies
+    // rather than send the prompt to a training-eligible upstream.
+    let disallow_training = session
+        .req_header()
+        .headers
+        .get("x-sbproxy-disallow-prompt-training")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+    if disallow_training {
+        provider_order.retain(|&i| config.providers[i].no_prompt_training);
+        if provider_order.is_empty() {
+            let err = serde_json::json!({"error": {
+                "message": "disallow_prompt_training requested but no configured provider is marked no_prompt_training",
+                "type": "no_compliant_provider",
+            }});
+            let body_bytes = serde_json::to_vec(&err).unwrap_or_default();
+            send_response(session, 400, "application/json", &body_bytes).await?;
+            return Ok(());
+        }
+    }
     if is_failover {
         provider_order.sort_by_key(|&i| config.providers[i].priority.unwrap_or(u32::MAX));
     }
@@ -1052,7 +1080,7 @@ pub(super) async fn handle_ai_proxy(
     // we dispatch to tier 1 only and let the streaming relay
     // handle the response unchanged. The model substitution is
     // applied to the request body below in the per-provider loop.
-    if let Some(cascade_cfg) = router.cascade_config() {
+    if let Some(cascade_cfg) = router.cascade_config().filter(|_| !disallow_training) {
         if is_stream {
             if let Some(first_tier) = cascade_cfg.tiers.first() {
                 if let Some(idx) = config
@@ -1100,7 +1128,7 @@ pub(super) async fn handle_ai_proxy(
     // skipping `relay_ai_response_with_cache` also means cascade
     // does not engage the semantic cache write or idempotency
     // capture in v1, which is documented in the example README.
-    if let Some(cascade_cfg) = router.cascade_config() {
+    if let Some(cascade_cfg) = router.cascade_config().filter(|_| !disallow_training) {
         if !is_stream {
             let outcome = AI_CLIENT
                 .load()

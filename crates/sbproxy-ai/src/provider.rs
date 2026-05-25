@@ -67,6 +67,15 @@ pub struct ProviderConfig {
     /// schemes (`file://`, ...) are always rejected regardless.
     #[serde(default)]
     pub allow_private_base_url: bool,
+    /// Operator's declaration that this provider does not retain or
+    /// train on the prompts sent to it, per the provider's published
+    /// data-handling agreement. There is no standardized per-request
+    /// training opt-out header across providers, so SBproxy treats
+    /// this as a deployment-level fact: a request that opts out of
+    /// training (the `x-sbproxy-disallow-prompt-training` signal) is
+    /// routed only to providers marked here. Defaults to `false`.
+    #[serde(default)]
+    pub no_prompt_training: bool,
 }
 
 fn default_weight() -> u32 {
@@ -182,6 +191,7 @@ mod tests {
             host_override: None,
             disable_forwarded_host_header: false,
             allow_private_base_url: false,
+            no_prompt_training: false,
         }
     }
 
