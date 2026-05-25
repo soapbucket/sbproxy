@@ -809,6 +809,10 @@ pub struct CompiledPipeline {
     pub bot_detections: Vec<Option<BotDetection>>,
     /// Compiled threat protection for each origin (None if not configured).
     pub threat_protections: Vec<Option<ThreatProtection>>,
+    /// Compiled outbound credential resolver for each origin (None if
+    /// not configured). Parallel to [`Self::config`].`origins`. WOR-802.
+    pub outbound_creds:
+        Vec<Option<sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig>>,
     /// Compiled idempotency middleware for each origin (None when the
     /// origin has no `idempotency:` block or `enabled = false`).
     /// Parallel to [`Self::config`].`origins`.
@@ -915,6 +919,7 @@ impl Default for CompiledPipeline {
             fallbacks: Vec::new(),
             bot_detections: Vec::new(),
             threat_protections: Vec::new(),
+            outbound_creds: Vec::new(),
             idempotencies: Vec::new(),
             cache_store: None,
             cache_reserve: None,
@@ -948,6 +953,7 @@ impl CompiledPipeline {
         let mut fallbacks = Vec::with_capacity(config.origins.len());
         let mut bot_detections = Vec::with_capacity(config.origins.len());
         let mut threat_protections = Vec::with_capacity(config.origins.len());
+        let mut outbound_creds = Vec::with_capacity(config.origins.len());
 
         for origin in &config.origins {
             // Compile action (required for every origin).
@@ -1031,6 +1037,22 @@ impl CompiledPipeline {
                 None => None,
             };
             threat_protections.push(threat);
+
+            // Compile outbound credential resolver (optional per origin).
+            // WOR-802: parse the JSON into the typed closed enum so a bad
+            // mode fails config load rather than silently at request time.
+            let outbound_cred = match &origin.outbound_credential {
+                Some(cfg) => Some(
+                    serde_json::from_value::<
+                        sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig,
+                    >(cfg.clone())
+                    .map_err(|e| {
+                        anyhow::anyhow!("origin {}: outbound_credential: {}", origin.origin_id, e)
+                    })?,
+                ),
+                None => None,
+            };
+            outbound_creds.push(outbound_cred);
         }
 
         // --- Compile per-origin idempotency middleware ---
@@ -1189,6 +1211,7 @@ impl CompiledPipeline {
             fallbacks,
             bot_detections,
             threat_protections,
+            outbound_creds,
             idempotencies,
             cache_store,
             cache_reserve,
@@ -1710,6 +1733,7 @@ mod tests {
                 agents_md: None,
                 ai_txt: None,
                 agents_json: None,
+                outbound_credential: None,
             }],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),
@@ -1854,6 +1878,7 @@ mod tests {
                 agents_md: None,
                 ai_txt: None,
                 agents_json: None,
+                outbound_credential: None,
             }],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),

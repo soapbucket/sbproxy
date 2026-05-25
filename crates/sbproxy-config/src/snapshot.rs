@@ -176,6 +176,10 @@ pub struct CompiledOrigin {
     /// Per-origin agents.json manifest config (WOR-820). `None` keeps
     /// `/.well-known/agents.json` off for the origin.
     pub agents_json: Option<AgentsJsonConfig>,
+    /// Per-origin outbound credential resolver config (WOR-802), kept
+    /// as JSON for deferred compilation in `sbproxy-core`. `None` means
+    /// the proxy adds no minted credential to upstream requests.
+    pub outbound_credential: Option<serde_json::Value>,
 }
 
 /// The complete compiled config: all origins plus host-based routing.

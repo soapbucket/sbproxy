@@ -2030,6 +2030,15 @@ pub struct RawOriginConfig {
     /// of `ai_crawl_control`. Absent keeps the endpoint off.
     #[serde(default)]
     pub agents_json: Option<AgentsJsonConfig>,
+    /// Per-origin outbound credential resolver (WOR-802). When set, the
+    /// proxy mints/resolves a credential and stamps it on the request it
+    /// sends upstream (RFC 8693 token exchange, OAuth client-credentials,
+    /// or a vault-resolved secret). Kept as JSON for deferred
+    /// compilation in `sbproxy-core` (the typed enum lives in
+    /// `sbproxy-modules`). Secret fields use the standard `${ENV}`
+    /// interpolation, resolved at config load.
+    #[serde(default)]
+    pub outbound_credential: Option<serde_json::Value>,
 }
 
 /// Per-origin agents.json manifest configuration (WOR-820). See the

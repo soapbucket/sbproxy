@@ -903,6 +903,9 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         ai_txt: config.ai_txt,
         // WOR-820: agents.json manifest config.
         agents_json: config.agents_json,
+        // WOR-802: outbound credential resolver config (JSON; compiled
+        // in sbproxy-core).
+        outbound_credential: config.outbound_credential,
     })
 }
 

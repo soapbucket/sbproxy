@@ -189,6 +189,7 @@ mod tests {
                 agents_md: None,
                 ai_txt: None,
                 agents_json: None,
+                outbound_credential: None,
             });
         }
         CompiledConfig {

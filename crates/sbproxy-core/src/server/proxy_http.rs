@@ -361,11 +361,18 @@ impl ProxyHttp for SbProxy {
         let mut upstream_host_header: Option<String> = None;
         let mut disable_forwarded_host: bool = false;
         let mut forwarding = ForwardingHeaderControls::default();
+        // WOR-802: outbound credential resolver config for this origin,
+        // cloned out of the pipeline so it can be used (and awaited on)
+        // after the pipeline guard is dropped below.
+        let mut outbound_cred: Option<
+            sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig,
+        > = None;
 
         {
             let pipeline = reload::current_pipeline();
             if let Some(idx) = ctx.origin_idx {
                 let origin = &pipeline.config.origins[idx];
+                outbound_cred = pipeline.outbound_creds.get(idx).and_then(|o| o.clone());
 
                 // Extract the URL path from the proxy action so we can prepend it
                 // to the upstream request path. This ensures that configs like
@@ -729,6 +736,51 @@ impl ProxyHttp for SbProxy {
         if let Some(inject) = ctx.callback_inject_headers.take() {
             for (key, value) in inject {
                 let _ = upstream_request.insert_header(key, &value);
+            }
+        }
+
+        // WOR-802: outbound credential resolver. When the origin
+        // configures `outbound_credential`, mint/resolve the credential
+        // and stamp it on the upstream request, with the inbound
+        // caller's bearer token as the RFC 8693 subject token. Config
+        // secrets are already `${ENV}`-interpolated at load, so the
+        // request-path secret lookup is identity. Minted tokens are
+        // cached (by origin + subject) until they near expiry. On
+        // failure we fail open: the request goes upstream without the
+        // minted credential (the upstream rejects it) rather than the
+        // proxy 500ing; a fail-closed flag can follow.
+        if let Some(cred_cfg) = outbound_cred.as_ref() {
+            let inbound_bearer: Option<String> = session
+                .req_header()
+                .headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| {
+                    s.strip_prefix("Bearer ")
+                        .or_else(|| s.strip_prefix("bearer "))
+                })
+                .map(|s| s.to_string());
+            let lookup = |r: &str| Ok::<String, anyhow::Error>(r.to_string());
+            match sbproxy_modules::auth::outbound_credential::resolve_cached(
+                &ctx.hostname,
+                cred_cfg,
+                forward_auth_client(),
+                inbound_bearer.as_deref(),
+                &lookup,
+            )
+            .await
+            {
+                Ok(minted) => {
+                    let _ =
+                        upstream_request.insert_header(minted.header_name, &minted.header_value);
+                }
+                Err(e) => {
+                    warn!(
+                        origin = %ctx.hostname,
+                        error = %e,
+                        "outbound credential resolution failed; sending upstream request without it (fail-open)"
+                    );
+                }
             }
         }
 

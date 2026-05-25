@@ -502,6 +502,7 @@ mod tests {
                 agents_md: None,
                 ai_txt: None,
                 agents_json: None,
+                outbound_credential: None,
             }],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),
