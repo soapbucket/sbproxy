@@ -637,10 +637,143 @@ impl SseFramer {
 /// One of the three native upstream SSE wire shapes the relay parses
 /// into hub chunks.
 ///
-/// The enum is kept narrow on purpose. OpenAI Chat Completions
-/// streams pass through unchanged today; the bypass-only ticket
-/// covers an even shorter no-translation path for that
-/// case. Custom providers that need a fourth shape register a
+/// Stateful parser for OpenAI Chat Completions SSE streams (WOR-799).
+///
+/// Used when a native-inbound surface (`/v1/messages`, `/v1/responses`)
+/// streams against an OpenAI-format upstream: the upstream emits OpenAI
+/// Chat SSE, which this parses into the hub vocabulary so the inbound
+/// format's `from_hub_stream` emitter can re-frame it in Anthropic or
+/// Responses shape. It is the inverse of
+/// [`super::openai_chat::hub_chunk_to_openai_sse`].
+#[derive(Debug, Default)]
+pub(crate) struct OpenAiChatStreamState {
+    /// Whether `MessageStart` has been emitted (id/model arrive on
+    /// every chunk; we surface them once).
+    emitted_start: bool,
+    /// Whether the terminal `MessageStop` has been emitted.
+    emitted_stop: bool,
+}
+
+impl OpenAiChatStreamState {
+    /// Construct an empty state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one parsed OpenAI Chat SSE `data:` payload (the body after
+    /// `data: `) and return zero or more hub chunks. The `[DONE]`
+    /// sentinel is handled by the caller.
+    pub fn ingest(&mut self, payload: &Value) -> Vec<HubChunk> {
+        let obj = match payload.as_object() {
+            Some(o) => o,
+            None => return Vec::new(),
+        };
+        let mut out: Vec<HubChunk> = Vec::new();
+
+        if !self.emitted_start {
+            let id = obj
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let model = obj
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !id.is_empty() || !model.is_empty() {
+                out.push(HubChunk::MessageStart { id, model });
+                self.emitted_start = true;
+            }
+        }
+
+        let mut pending_stop: Option<FinishReason> = None;
+        if let Some(choices) = obj.get("choices").and_then(|c| c.as_array()) {
+            for choice in choices {
+                let index = choice.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                if let Some(delta) = choice.get("delta").and_then(|d| d.as_object()) {
+                    if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+                        if !text.is_empty() {
+                            out.push(HubChunk::ContentDelta {
+                                index,
+                                delta: ContentPartDelta::Text(text.to_string()),
+                            });
+                        }
+                    }
+                    if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                        for tc in tool_calls {
+                            let tc_index =
+                                tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                            let func = tc.get("function").and_then(|f| f.as_object());
+                            out.push(HubChunk::ToolCallDelta {
+                                index: tc_index,
+                                delta: HubToolCallDelta {
+                                    id: tc.get("id").and_then(|v| v.as_str()).map(String::from),
+                                    name: func
+                                        .and_then(|f| f.get("name"))
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from),
+                                    arguments_chunk: func
+                                        .and_then(|f| f.get("arguments"))
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from),
+                                },
+                            });
+                        }
+                    }
+                }
+                if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                    pending_stop = Some(finish_reason_from_openai(fr));
+                }
+            }
+        }
+
+        // Usage (when present) precedes the terminal stop in the hub
+        // order, matching the contract on `HubChunk::Usage`.
+        if let Some(usage) = obj.get("usage").and_then(|u| u.as_object()) {
+            out.push(HubChunk::Usage(HubUsage {
+                prompt_tokens: usage
+                    .get("prompt_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                completion_tokens: usage
+                    .get("completion_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                total_tokens: usage
+                    .get("total_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+            }));
+        }
+
+        if let Some(fr) = pending_stop {
+            if !self.emitted_stop {
+                out.push(HubChunk::MessageStop { finish_reason: fr });
+                self.emitted_stop = true;
+            }
+        }
+        out
+    }
+}
+
+/// Map an OpenAI `finish_reason` string onto the hub vocabulary (the
+/// inverse of [`super::openai_chat::finish_reason_to_openai`]).
+fn finish_reason_from_openai(s: &str) -> FinishReason {
+    match s {
+        "stop" => FinishReason::Stop,
+        "length" => FinishReason::Length,
+        "tool_calls" => FinishReason::ToolCalls,
+        "content_filter" => FinishReason::ContentFilter,
+        other => FinishReason::Other(other.to_string()),
+    }
+}
+
+/// The enum covers the upstream wire shapes that need translation into
+/// the hub vocabulary. `OpenAiChat` is engaged only for native-inbound
+/// surfaces (`/v1/messages`, `/v1/responses`) against an OpenAI-format
+/// upstream; an OpenAI-in/OpenAI-out stream still passes through
+/// untranslated. Custom providers that need a fourth shape register a
 /// plugin translator and run outside this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeStreamFormat {
@@ -650,6 +783,9 @@ pub enum NativeStreamFormat {
     Gemini,
     /// AWS Bedrock Converse-stream JSON payloads.
     Bedrock,
+    /// OpenAI Chat Completions SSE (parsed back into the hub for a
+    /// non-OpenAI inbound emitter). WOR-799.
+    OpenAiChat,
 }
 
 /// Stateful translator that ingests bytes from a native upstream
@@ -666,6 +802,7 @@ pub struct NativeStreamTranslator {
     anthropic: AnthropicStreamState,
     gemini: GeminiStreamState,
     bedrock: BedrockStreamState,
+    openai_chat: OpenAiChatStreamState,
 }
 
 impl NativeStreamTranslator {
@@ -677,6 +814,7 @@ impl NativeStreamTranslator {
             anthropic: AnthropicStreamState::new(),
             gemini: GeminiStreamState::new(),
             bedrock: BedrockStreamState::new(),
+            openai_chat: OpenAiChatStreamState::new(),
         }
     }
 
@@ -716,6 +854,7 @@ impl NativeStreamTranslator {
                 let ev = event.unwrap_or_default();
                 self.bedrock.ingest(&ev, &payload)
             }
+            NativeStreamFormat::OpenAiChat => self.openai_chat.ingest(&payload),
         }
     }
 }
@@ -751,6 +890,77 @@ pub fn split_sse_frame(frame: &str) -> (Option<String>, String) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn openai_chat_parser_emits_start_deltas_and_stop() {
+        let mut s = OpenAiChatStreamState::new();
+        let first = json!({
+            "id": "chatcmpl-1",
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hel"}, "finish_reason": null}]
+        });
+        let c = s.ingest(&first);
+        assert!(
+            matches!(c[0], HubChunk::MessageStart { .. }),
+            "first chunk is MessageStart"
+        );
+        assert!(
+            matches!(&c[1], HubChunk::ContentDelta { delta: ContentPartDelta::Text(t), .. } if t == "Hel")
+        );
+
+        // A second chunk does not repeat MessageStart.
+        let mid = json!({
+            "id": "chatcmpl-1", "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {"content": "lo"}, "finish_reason": null}]
+        });
+        let c2 = s.ingest(&mid);
+        assert_eq!(c2.len(), 1);
+        assert!(
+            matches!(&c2[0], HubChunk::ContentDelta { delta: ContentPartDelta::Text(t), .. } if t == "lo")
+        );
+
+        // Finish frame -> MessageStop with mapped reason.
+        let last = json!({
+            "id": "chatcmpl-1", "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        });
+        let c3 = s.ingest(&last);
+        assert!(matches!(
+            c3[0],
+            HubChunk::MessageStop {
+                finish_reason: FinishReason::Stop
+            }
+        ));
+        // Stop is emitted once.
+        assert!(s.ingest(&last).is_empty());
+    }
+
+    #[test]
+    fn openai_chat_parser_handles_tool_call_and_usage() {
+        let mut s = OpenAiChatStreamState::new();
+        let f = json!({
+            "id": "c1", "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "call_1", "function": {"name": "get_weather", "arguments": "{\"city\""}
+            }]}, "finish_reason": null}]
+        });
+        let c = s.ingest(&f);
+        // MessageStart then a ToolCallDelta carrying id/name/args fragment.
+        assert!(matches!(c[0], HubChunk::MessageStart { .. }));
+        match &c[1] {
+            HubChunk::ToolCallDelta { index, delta } => {
+                assert_eq!(*index, 0);
+                assert_eq!(delta.id.as_deref(), Some("call_1"));
+                assert_eq!(delta.name.as_deref(), Some("get_weather"));
+                assert_eq!(delta.arguments_chunk.as_deref(), Some("{\"city\""));
+            }
+            other => panic!("expected ToolCallDelta, got {other:?}"),
+        }
+        // Usage frame -> HubChunk::Usage.
+        let usage = json!({"choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 5, "total_tokens": 14}});
+        let cu = s.ingest(&usage);
+        assert!(matches!(&cu[0], HubChunk::Usage(u) if u.total_tokens == 14));
+    }
 
     #[test]
     fn anthropic_parser_handles_basic_text_stream() {

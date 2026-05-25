@@ -2015,8 +2015,15 @@ pub(super) fn build_stream_translator(
         ProviderFormat::Anthropic => Some(NativeStreamFormat::Anthropic),
         ProviderFormat::Google => Some(NativeStreamFormat::Gemini),
         ProviderFormat::Bedrock => Some(NativeStreamFormat::Bedrock),
-        // OpenAI / Custom: zero-cost pass-through.
-        ProviderFormat::OpenAi | ProviderFormat::Custom => None,
+        // OpenAI / Custom: zero-cost pass-through for an OpenAI inbound,
+        // but when a native-inbound surface (/v1/messages, /v1/responses)
+        // streams against an OpenAI-format upstream, parse the OpenAI
+        // SSE back into the hub so the inbound emitter re-frames it in
+        // Anthropic / Responses shape (WOR-799).
+        ProviderFormat::OpenAi | ProviderFormat::Custom => match args.inbound_format.as_deref() {
+            Some("anthropic") | Some("responses") => Some(NativeStreamFormat::OpenAiChat),
+            _ => None,
+        },
     };
     let translator = native.map(NativeStreamTranslator::new);
     let emitter: Option<Box<dyn ChatFormat>> = if translator.is_some() {
