@@ -66,11 +66,12 @@ pub use agent_budget::{
     AgentBudgetOnExceed, AgentBudgetPolicy,
 };
 pub use ai_crawl::{
-    accept_implies_multi_rail, parse_accept_payment, resolve_agent_preferences,
-    AgentRailPreferences, AiCrawlControlPolicy, AiCrawlDecision, ConfiguredRailForTest,
-    ContentShape, ContentSignal, ContentSignalParseError, InMemoryLedger, Ledger as AiCrawlLedger,
-    LedgerError, Money, MultiRailChallenge, PaywallPosition, Rail, RailChallenge, RedeemResult,
-    Tier, MULTI_RAIL_CONTENT_TYPE,
+    accept_implies_multi_rail, parse_accept_payment, parse_crawler_price_header,
+    path_is_always_free, resolve_agent_preferences, AgentRailPreferences, AiCrawlControlPolicy,
+    AiCrawlDecision, ConfiguredRailForTest, ContentShape, ContentSignal, ContentSignalParseError,
+    InMemoryLedger, Ledger as AiCrawlLedger, LedgerError, Money, MultiRailChallenge,
+    PaywallPosition, PricingModel, Rail, RailChallenge, RedeemResult, Tier, ALWAYS_FREE_PATHS,
+    MULTI_RAIL_CONTENT_TYPE,
 };
 #[cfg(feature = "http-ledger")]
 pub use ai_crawl::{HttpLedger, HttpLedgerConfig};

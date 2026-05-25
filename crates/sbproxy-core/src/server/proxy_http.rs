@@ -1122,6 +1122,18 @@ impl ProxyHttp for SbProxy {
                 }
             }
 
+            // WOR-803: Cloudflare Pay Per Crawl. When the request
+            // settled through the ledger in Cloudflare-compat mode, the
+            // policy stashed the charged amount on the context. Stamp
+            // `crawler-charged: <currency> <amount>` on the 2xx so the
+            // crawler learns exactly what it paid, matching Cloudflare's
+            // wire contract. Only 2xx responses carry it.
+            if (200..300).contains(&upstream_response.status.as_u16()) {
+                if let Some(charged) = ctx.crawl_charged.clone() {
+                    to_set.push(("crawler-charged".to_string(), charged));
+                }
+            }
+
             // 3. Security headers
             //
             // When the CSP configuration is the detailed variant with

@@ -43,6 +43,22 @@ pub struct AiCrawlControlPolicy {
     /// crawler whose purpose maps to a disallowed (`=no`) signal is
     /// blocked with 403 before the pricing path runs.
     content_signals: ContentSignals,
+    /// Cloudflare Pay Per Crawl wire-contract interop toggle. When set,
+    /// the 402 carries `crawler-price`, the policy reads the crawler's
+    /// `crawler-exact-price` / `crawler-max-price` pre-authorization
+    /// headers, and a settled request gets `crawler-charged` on its
+    /// served response.
+    cloudflare_compat: bool,
+    /// Operator-supplied per-path free-list, consulted on top of the
+    /// built-in [`ALWAYS_FREE_PATHS`] allowlist. Paths here are never
+    /// charged.
+    free_paths: Vec<String>,
+    /// Optional pluggable pricing model. When set, it is consulted
+    /// before the static tier table; returning `Some(_)` overrides the
+    /// static price for that request. The OSS build ships no model;
+    /// this is the seam an embedder injects an LM-Tree-style model into
+    /// via [`Self::with_pricing_model`].
+    pricing_model: Option<Arc<dyn PricingModel>>,
 }
 
 /// Compiled multi-rail challenge plan. Holds the operator-configured
@@ -110,6 +126,9 @@ impl std::fmt::Debug for AiCrawlControlPolicy {
             .field("ledger", &self.ledger)
             .field("multi_rail", &self.multi_rail.is_some())
             .field("content_signals", &self.content_signals)
+            .field("cloudflare_compat", &self.cloudflare_compat)
+            .field("free_paths", &self.free_paths)
+            .field("pricing_model", &self.pricing_model.is_some())
             .finish()
     }
 }
@@ -172,7 +191,26 @@ impl AiCrawlControlPolicy {
             ledger,
             multi_rail,
             content_signals: config.content_signals,
+            cloudflare_compat: config.cloudflare_compat,
+            free_paths: config.free_paths,
+            pricing_model: None,
         })
+    }
+
+    /// Inject a pluggable [`PricingModel`]. Consulted before the static
+    /// tier table on every price resolution; returning `Some(_)`
+    /// overrides the static price. The OSS build never sets one, so
+    /// static tiers and the flat `price:` fallback decide the price as
+    /// before unless an embedder opts in.
+    pub fn with_pricing_model(mut self, model: Arc<dyn PricingModel>) -> Self {
+        self.pricing_model = Some(model);
+        self
+    }
+
+    /// True when the policy is running in Cloudflare Pay Per Crawl
+    /// wire-contract interop mode.
+    pub fn cloudflare_compat(&self) -> bool {
+        self.cloudflare_compat
     }
 
     /// Replace the policy's ledger. Useful when the embedding binary
@@ -267,6 +305,16 @@ impl AiCrawlControlPolicy {
         agent_id: &str,
         accept: Option<&str>,
     ) -> Money {
+        // Pluggable pricing-model hook (the LM-Tree-style seam). When a
+        // model is injected and returns a price for this request it
+        // overrides the static resolution; otherwise we fall through to
+        // the tier table and flat-price fallback unchanged.
+        if let Some(model) = self.pricing_model.as_ref() {
+            let shape = accept.and_then(ContentShape::from_accept);
+            if let Some(price) = model.price_for(path, agent_id, shape) {
+                return price;
+            }
+        }
         if let Some(tier) = self.matched_tier_for_request(path, agent_id, accept) {
             return tier.price.clone();
         }
@@ -345,6 +393,18 @@ impl AiCrawlControlPolicy {
         if !is_crawler {
             return AiCrawlDecision::Allow;
         }
+        // --- WOR-803: always-free path allowlist ---
+        //
+        // `robots.txt`, `sitemap.xml`, `security.txt`,
+        // `.well-known/security.txt`, and `crawlers.json` (plus any
+        // operator-configured `free_paths:`) are never charged. This
+        // runs before Content Signals enforcement and the pricing path
+        // so a crawler can always discover the site's policy without
+        // paying for it, matching Cloudflare's Pay Per Crawl free-path
+        // behaviour.
+        if path_is_always_free(path, &self.free_paths) {
+            return AiCrawlDecision::Allow;
+        }
         // --- WOR-804: Content Signals enforcement ---
         //
         // When the operator declared a signal as disallowed (`=no`), a
@@ -389,6 +449,20 @@ impl AiCrawlControlPolicy {
             .unwrap_or(false)
         {
             return AiCrawlDecision::Allow;
+        }
+        // --- WOR-803: Cloudflare Pay Per Crawl wire-contract interop ---
+        //
+        // When `cloudflare_compat` is on, the crawler negotiates with
+        // the exact Cloudflare headers: the 402 carries `crawler-price`,
+        // the crawler retries with `crawler-exact-price` /
+        // `crawler-max-price`, and a settled request gets
+        // `crawler-charged` on its served response. Settlement reuses
+        // the existing self-hosted ledger (`crawler-payment` token);
+        // there is no Merchant-of-Record cut. This branch fully owns the
+        // decision when it is on, so the generic single-rail / multi-rail
+        // paths below are skipped.
+        if self.cloudflare_compat {
+            return self.check_cloudflare(host, path, &price, headers);
         }
         if let Some(token) = headers
             .get(self.header.as_str())
@@ -641,6 +715,118 @@ impl AiCrawlControlPolicy {
             body,
             content_type: MULTI_RAIL_CONTENT_TYPE,
         }
+    }
+
+    /// Run the Cloudflare Pay Per Crawl negotiation for a charged
+    /// request. Reads the crawler's `crawler-exact-price` /
+    /// `crawler-max-price` pre-authorization plus the configured payment
+    /// token, settles through the existing ledger, and returns
+    /// [`AiCrawlDecision::AllowCharged`] on success or
+    /// [`AiCrawlDecision::CloudflareCharge`] when the crawler still owes
+    /// a (re)quote. The retryable-ledger path mirrors the single-rail
+    /// flow so a transient ledger outage still surfaces as 503.
+    fn check_cloudflare(
+        &self,
+        host: &str,
+        path: &str,
+        price: &Money,
+        headers: &http::HeaderMap,
+    ) -> AiCrawlDecision {
+        // The crawler signals what it will pay. `crawler-exact-price`
+        // commits to a precise amount; `crawler-max-price` caps it. We
+        // accept either when it covers our quote. A crawler whose
+        // pre-authorization is below the quote is re-quoted with a fresh
+        // 402 (Cloudflare's behaviour: the price moved or the crawler
+        // low-balled).
+        let exact = headers
+            .get("crawler-exact-price")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_crawler_price_header);
+        let max = headers
+            .get("crawler-max-price")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_crawler_price_header);
+        let preauth_covers = match (&exact, &max) {
+            // Exact price must equal the quote exactly.
+            (Some(e), _) => e.currency == price.currency && e.amount_micros == price.amount_micros,
+            // Max price must be at least the quote.
+            (None, Some(m)) => {
+                m.currency == price.currency && m.amount_micros >= price.amount_micros
+            }
+            (None, None) => false,
+        };
+        // The payment token rides the same configured header as the
+        // single-rail path (`crawler-payment` by default), so a crawler
+        // that already holds a self-hosted token settles without a new
+        // round trip.
+        let token = headers
+            .get(self.header.as_str())
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        if preauth_covers {
+            if let Some(token) = token {
+                let redeem_started = std::time::Instant::now();
+                let result =
+                    self.ledger
+                        .redeem(token, host, path, price.amount_micros, &price.currency);
+                let outcome = match &result {
+                    Ok(_) => "success",
+                    Err(e) if e.retryable => "transient_failure",
+                    Err(_) => "hard_failure",
+                };
+                sbproxy_observe::metrics::record_ledger_redeem_duration(
+                    host,
+                    outcome,
+                    redeem_started.elapsed().as_secs_f64(),
+                );
+                match result {
+                    Ok(redeemed) => {
+                        // Charge the crawler at the redeemed amount (the
+                        // ledger is authoritative) and tell it exactly
+                        // what it paid via `crawler-charged`.
+                        let charged = Money {
+                            amount_micros: redeemed.amount_micros,
+                            currency: redeemed.currency,
+                        };
+                        return AiCrawlDecision::AllowCharged {
+                            charged_header: charged.to_crawler_price_header(),
+                        };
+                    }
+                    Err(err) if err.retryable => {
+                        let body = self.unavailable_body(host, path, &err);
+                        let retry_after = err.retry_after_seconds.unwrap_or(5);
+                        return AiCrawlDecision::LedgerUnavailable {
+                            body,
+                            retry_after_seconds: retry_after,
+                        };
+                    }
+                    Err(_) => {
+                        // Hard failure (token unknown / already spent).
+                        // Fall through and re-quote so the crawler can
+                        // obtain a fresh token.
+                    }
+                }
+            }
+        }
+        AiCrawlDecision::CloudflareCharge {
+            price_header: price.to_crawler_price_header(),
+            body: self.cloudflare_challenge_body(host, path, price),
+        }
+    }
+
+    /// Build the JSON body for a Cloudflare Pay Per Crawl 402. Mirrors
+    /// the `crawler-price` header so a client that introspects the body
+    /// instead of the header sees the same price.
+    fn cloudflare_challenge_body(&self, host: &str, path: &str, price: &Money) -> String {
+        format!(
+            "{{\"error\":\"payment_required\",\"crawler_price\":\"{price}\",\"amount_micros\":{micros},\"currency\":\"{currency}\",\"target\":\"{host}{path}\"}}",
+            price = price.to_crawler_price_header(),
+            micros = price.amount_micros,
+            currency = price.currency,
+            host = host,
+            path = path,
+        )
     }
 
     fn challenge_header(&self, price: &Money) -> String {

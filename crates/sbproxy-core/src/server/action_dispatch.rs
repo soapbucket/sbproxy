@@ -525,6 +525,15 @@ pub(super) async fn handle_action(
                     ContentSignalDecision::Skip => {}
                 }
             }
+            // WOR-803: Cloudflare Pay Per Crawl. Stamp `crawler-charged`
+            // on the 2xx static response when the request settled
+            // through the ledger in Cloudflare-compat mode, mirroring
+            // the upstream-proxied path in `proxy_http::response_filter`.
+            if (200..300).contains(&effective_status) {
+                if let Some(charged) = ctx.crawl_charged.as_deref() {
+                    let _ = header.insert_header("crawler-charged", charged);
+                }
+            }
             session
                 .write_response_header(Box::new(header), false)
                 .await?;

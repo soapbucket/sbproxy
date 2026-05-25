@@ -96,6 +96,28 @@ impl PolicyEnforcer for AiCrawlEnforcer {
         let decision = policy.check(method, &hostname, path, req.headers(), agent_id_param);
         match decision {
             AiCrawlDecision::Allow => Box::pin(async move { Ok(PolicyDecision::Allow) }),
+            AiCrawlDecision::AllowCharged { charged_header } => {
+                // WOR-803: Cloudflare Pay Per Crawl settled this request
+                // through the ledger. Stash the `crawler-charged` value
+                // so the served-response path stamps it on the 2xx, then
+                // allow the request through to the origin.
+                ctx.crawl_charged = Some(charged_header);
+                Box::pin(async move { Ok(PolicyDecision::Allow) })
+            }
+            AiCrawlDecision::CloudflareCharge { price_header, body } => {
+                // WOR-803: Cloudflare Pay Per Crawl 402. Carry the
+                // `crawler-price` header through the same challenge slot
+                // the single-rail path uses; the 402 response handler
+                // stamps the literal header name `crawler-price`.
+                ctx.crawl_challenge = Some(("crawler-price".to_string(), price_header, body));
+                ctx.deny_policy_type = Some("ai_crawl_payment");
+                Box::pin(async move {
+                    Ok(PolicyDecision::Deny {
+                        status: 402,
+                        message: "payment required".to_string(),
+                    })
+                })
+            }
             AiCrawlDecision::Charge { body, challenge } => {
                 ctx.crawl_challenge = Some((policy.header_name().to_string(), challenge, body));
                 ctx.deny_policy_type = Some("ai_crawl_payment");
