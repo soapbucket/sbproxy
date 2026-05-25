@@ -990,17 +990,25 @@ pub(super) async fn handle_mcp_action(
             if let Err(e) = mcp.federation.refresh_tools().await {
                 warn!(error = %e, "MCP federation tool refresh failed");
             }
-            let tools = mcp.federation.list_tools();
-            let tool_defs: Vec<serde_json::Value> = tools
-                .into_iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "inputSchema": t.input_schema,
+            // WOR-806: progressive discovery advertises two meta-tools
+            // (`search` / `execute`) instead of the full catalogue, so
+            // a large federated tool set stays out of the model's
+            // context window.
+            let tool_defs: Vec<serde_json::Value> = if mcp.progressive_discovery {
+                mcp_progressive_meta_tools()
+            } else {
+                mcp.federation
+                    .list_tools()
+                    .into_iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "inputSchema": t.input_schema,
+                        })
                     })
-                })
-                .collect();
+                    .collect()
+            };
             JsonRpcResponse::success(
                 request.id.clone(),
                 serde_json::json!({ "tools": tool_defs }),
@@ -1008,119 +1016,157 @@ pub(super) async fn handle_mcp_action(
         }
         "tools/call" => {
             let params = request.params.clone().unwrap_or(serde_json::Value::Null);
-            let tool_name = params
+            let mut tool_name = params
                 .get("name")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            let arguments = params
+            let mut arguments = params
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
 
-            match tool_name {
-                None => JsonRpcResponse::error(
+            // WOR-806: progressive discovery meta-tools. `search`
+            // returns matching catalogue entries (yielding this arm's
+            // value directly); `execute` unwraps to the real tool name +
+            // arguments and then runs the normal allowlist / RBAC /
+            // timeout / dispatch path below.
+            if mcp.progressive_discovery && tool_name.as_deref() == Some("search") {
+                let query = arguments
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let limit = arguments
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(10) as usize;
+                let matches = mcp_progressive_search(mcp, query, limit);
+                let text = serde_json::to_string(&matches).unwrap_or_else(|_| "[]".into());
+                JsonRpcResponse::success(
                     request.id.clone(),
-                    INVALID_PARAMS,
-                    "tools/call requires a 'name' parameter",
-                ),
-                Some(name) => {
-                    if !mcp.is_tool_allowed(&name) {
-                        JsonRpcResponse::error(
-                            request.id.clone(),
-                            INVALID_PARAMS,
-                            &format!("tool '{}' is blocked by tool_allowlist guardrail", name),
-                        )
-                    } else {
-                        // WOR-186: per-server RBAC + timeout enforcement.
-                        //
-                        // 1. Resolve the caller's virtual key from the
-                        //    auth context (`Allow.sub`); fall back to
-                        //    "" (anonymous) when no subject is set so
-                        //    the policy lookup still has a stable key.
-                        // 2. Resolve the tool's owning upstream and
-                        //    check the per-server `ToolAccessPolicy`
-                        //    (when one is wired). A denied tool returns
-                        //    a JSON-RPC error and bumps an audit
-                        //    counter; the upstream is never contacted.
-                        // 3. Wrap `federation.call_tool` in
-                        //    `tokio::time::timeout(server.timeout, ...)`
-                        //    when a per-server timeout is configured.
-                        let virtual_key = mcp_virtual_key(ctx);
-                        let federated = mcp.federation.resolve_tool(&name);
-                        let denied_by_rbac = match &federated {
-                            Some(t) => {
-                                if let Some(policy) = mcp.policy_for_server(&t.server_name) {
-                                    !policy.is_tool_allowed(&virtual_key, &name)
-                                } else {
-                                    false
-                                }
-                            }
-                            None => false,
-                        };
-                        if denied_by_rbac {
-                            tracing::warn!(
-                                target: "sbproxy::mcp::rbac",
-                                tool = %name,
-                                virtual_key = %virtual_key,
-                                "MCP tools/call denied by RBAC policy",
-                            );
-                            sbproxy_observe::metrics::record_policy(
-                                ctx.hostname.as_str(),
-                                "mcp_rbac",
-                                "deny",
-                            );
+                    serde_json::json!({
+                        "content": [{"type": "text", "text": text}],
+                        "isError": false,
+                    }),
+                )
+            } else {
+                if mcp.progressive_discovery && tool_name.as_deref() == Some("execute") {
+                    let inner_name = arguments
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let inner_args = arguments
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    tool_name = inner_name;
+                    arguments = inner_args;
+                }
+
+                match tool_name {
+                    None => JsonRpcResponse::error(
+                        request.id.clone(),
+                        INVALID_PARAMS,
+                        "tools/call requires a 'name' parameter",
+                    ),
+                    Some(name) => {
+                        if !mcp.is_tool_allowed(&name) {
                             JsonRpcResponse::error(
                                 request.id.clone(),
                                 INVALID_PARAMS,
-                                &format!("tool '{}' is denied by RBAC policy for caller", name,),
+                                &format!("tool '{}' is blocked by tool_allowlist guardrail", name),
                             )
                         } else {
-                            // Per-server timeout. The
-                            // dispatcher inside `call_tool` shares one
-                            // reqwest::Client across upstreams; the
-                            // request-level cap is what makes the field
-                            // observable.
-                            let timeout = federated
-                                .as_ref()
-                                .and_then(|t| mcp.timeout_for_server(&t.server_name));
-                            let call = mcp.federation.call_tool(&name, arguments);
-                            let outcome = match timeout {
-                                Some(d) => match tokio::time::timeout(d, call).await {
-                                    Ok(r) => r,
-                                    Err(_elapsed) => {
-                                        tracing::warn!(
-                                            target: "sbproxy::mcp::timeout",
-                                            tool = %name,
-                                            timeout_ms = d.as_millis() as u64,
-                                            "MCP tools/call exceeded per-server timeout",
-                                        );
+                            // WOR-186: per-server RBAC + timeout enforcement.
+                            //
+                            // 1. Resolve the caller's virtual key from the
+                            //    auth context (`Allow.sub`); fall back to
+                            //    "" (anonymous) when no subject is set so
+                            //    the policy lookup still has a stable key.
+                            // 2. Resolve the tool's owning upstream and
+                            //    check the per-server `ToolAccessPolicy`
+                            //    (when one is wired). A denied tool returns
+                            //    a JSON-RPC error and bumps an audit
+                            //    counter; the upstream is never contacted.
+                            // 3. Wrap `federation.call_tool` in
+                            //    `tokio::time::timeout(server.timeout, ...)`
+                            //    when a per-server timeout is configured.
+                            let virtual_key = mcp_virtual_key(ctx);
+                            let federated = mcp.federation.resolve_tool(&name);
+                            let denied_by_rbac = match &federated {
+                                Some(t) => {
+                                    if let Some(policy) = mcp.policy_for_server(&t.server_name) {
+                                        !policy.is_tool_allowed(&virtual_key, &name)
+                                    } else {
+                                        false
+                                    }
+                                }
+                                None => false,
+                            };
+                            if denied_by_rbac {
+                                tracing::warn!(
+                                    target: "sbproxy::mcp::rbac",
+                                    tool = %name,
+                                    virtual_key = %virtual_key,
+                                    "MCP tools/call denied by RBAC policy",
+                                );
+                                sbproxy_observe::metrics::record_policy(
+                                    ctx.hostname.as_str(),
+                                    "mcp_rbac",
+                                    "deny",
+                                );
+                                JsonRpcResponse::error(
+                                    request.id.clone(),
+                                    INVALID_PARAMS,
+                                    &format!("tool '{}' is denied by RBAC policy for caller", name,),
+                                )
+                            } else {
+                                // Per-server timeout. The
+                                // dispatcher inside `call_tool` shares one
+                                // reqwest::Client across upstreams; the
+                                // request-level cap is what makes the field
+                                // observable.
+                                let timeout = federated
+                                    .as_ref()
+                                    .and_then(|t| mcp.timeout_for_server(&t.server_name));
+                                let call = mcp.federation.call_tool(&name, arguments);
+                                let outcome = match timeout {
+                                    Some(d) => match tokio::time::timeout(d, call).await {
+                                        Ok(r) => r,
+                                        Err(_elapsed) => {
+                                            tracing::warn!(
+                                                target: "sbproxy::mcp::timeout",
+                                                tool = %name,
+                                                timeout_ms = d.as_millis() as u64,
+                                                "MCP tools/call exceeded per-server timeout",
+                                            );
+                                            sbproxy_observe::metrics::record_policy(
+                                                ctx.hostname.as_str(),
+                                                "mcp_timeout",
+                                                "deny",
+                                            );
+                                            Err(anyhow::anyhow!(
+                                                "tool call exceeded per-server timeout of {}ms",
+                                                d.as_millis(),
+                                            ))
+                                        }
+                                    },
+                                    None => call.await,
+                                };
+                                match outcome {
+                                    Ok(value) => {
                                         sbproxy_observe::metrics::record_policy(
                                             ctx.hostname.as_str(),
-                                            "mcp_timeout",
-                                            "deny",
+                                            "mcp_rbac",
+                                            "allow",
                                         );
-                                        Err(anyhow::anyhow!(
-                                            "tool call exceeded per-server timeout of {}ms",
-                                            d.as_millis(),
-                                        ))
+                                        JsonRpcResponse::success(request.id.clone(), value)
                                     }
-                                },
-                                None => call.await,
-                            };
-                            match outcome {
-                                Ok(value) => {
-                                    sbproxy_observe::metrics::record_policy(
-                                        ctx.hostname.as_str(),
-                                        "mcp_rbac",
-                                        "allow",
-                                    );
-                                    JsonRpcResponse::success(request.id.clone(), value)
+                                    Err(e) => JsonRpcResponse::error(
+                                        request.id.clone(),
+                                        INTERNAL_ERROR,
+                                        &format!("tool call failed: {}", e),
+                                    ),
                                 }
-                                Err(e) => JsonRpcResponse::error(
-                                    request.id.clone(),
-                                    INTERNAL_ERROR,
-                                    &format!("tool call failed: {}", e),
-                                ),
                             }
                         }
                     }
@@ -1135,6 +1181,67 @@ pub(super) async fn handle_mcp_action(
     };
 
     write_jsonrpc(session, &response).await
+}
+
+/// The two meta-tool definitions advertised by `tools/list` when
+/// progressive discovery is on (WOR-806).
+fn mcp_progressive_meta_tools() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "name": "search",
+            "description": "Search the gateway's tool catalogue by keyword. Returns matching tool names and descriptions. Call this first to find the tool you need, then call `execute`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Keywords to match against tool names and descriptions."},
+                    "limit": {"type": "integer", "description": "Maximum results to return (default 10)."}
+                },
+                "required": ["query"]
+            }
+        }),
+        serde_json::json!({
+            "name": "execute",
+            "description": "Invoke a catalogue tool by name. Use `search` first to discover the tool name and its arguments.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The tool name to invoke."},
+                    "arguments": {"type": "object", "description": "Arguments to pass to the tool."}
+                },
+                "required": ["name"]
+            }
+        }),
+    ]
+}
+
+/// Search the federated tool catalogue for entries whose name or
+/// description matches `query` (case-insensitive substring), honouring
+/// the `tool_allowlist` guardrail and capping at `limit`. An empty
+/// query returns the first `limit` allowed tools. WOR-806.
+fn mcp_progressive_search(
+    mcp: &sbproxy_modules::action::McpAction,
+    query: &str,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let q = query.to_ascii_lowercase();
+    mcp.federation
+        .list_tools()
+        .into_iter()
+        .filter(|t| mcp.is_tool_allowed(&t.name))
+        .filter(|t| {
+            q.is_empty()
+                || t.name.to_ascii_lowercase().contains(&q)
+                || t.description.to_ascii_lowercase().contains(&q)
+        })
+        .take(limit.max(1))
+        .map(|t| {
+            serde_json::json!({
+                "name": t.name,
+                "description": t.description,
+                "inputSchema": t.input_schema,
+            })
+        })
+        .collect()
 }
 
 /// Resolve the caller's virtual key for MCP RBAC lookups.

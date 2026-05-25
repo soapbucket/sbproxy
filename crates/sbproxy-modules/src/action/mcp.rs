@@ -84,6 +84,15 @@ pub struct McpActionConfig {
     /// `tools/call` is forwarded to its upstream.
     #[serde(default)]
     pub guardrails: Vec<McpGuardrailEntry>,
+    /// Progressive tool discovery (WOR-806). When `true`, `tools/list`
+    /// advertises only two meta-tools, `search` and `execute`, instead
+    /// of the full federated catalogue: the agent calls `search` to
+    /// find relevant tools and `execute` to invoke one by name. This
+    /// keeps a large catalogue out of the model's context window (the
+    /// Anthropic code-execution / Cloudflare Code Mode pattern).
+    /// Defaults to the full-catalogue listing.
+    #[serde(default)]
+    pub progressive_discovery: bool,
 }
 
 /// Server identity advertised by the gateway during MCP initialization.
@@ -167,6 +176,9 @@ pub struct McpAction {
     /// Collapsed allowlist (union of every `tool_allowlist` guardrail).
     /// `None` when no allowlist guardrail was configured (open access).
     pub tool_allowlist: Option<Vec<String>>,
+    /// When `true`, `tools/list` advertises the `search` / `execute`
+    /// meta-tools instead of the full catalogue (WOR-806).
+    pub progressive_discovery: bool,
 }
 
 /// Per-upstream metadata captured at compile time. Kept outside
@@ -279,6 +291,7 @@ impl McpAction {
             rbac_policies: cfg.rbac_policies,
             federation,
             tool_allowlist,
+            progressive_discovery: cfg.progressive_discovery,
         })
     }
 
