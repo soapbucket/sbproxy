@@ -89,6 +89,16 @@ pub enum AiCrawlDecision {
         /// JSON body returned in the 403 response.
         body: String,
     },
+    /// WOR-810: serve a tarpit maze (HTTP 200, `text/html`) to an
+    /// unauthorized crawler instead of a hard 402/block, to waste its
+    /// crawl budget. Reached only when the operator enables `tarpit` and
+    /// the crawler has passed every allow check (so verified/paid
+    /// crawlers, which return [`AiCrawlDecision::Allow`] earlier, are
+    /// never tarpitted).
+    Tarpit {
+        /// The generated maze HTML, served with a 200 status.
+        body: String,
+    },
 }
 
 /// Cloudflare "Content Signals" preference set for an origin's
@@ -1345,6 +1355,16 @@ pub struct AiCrawlControlConfig {
     /// by default; the built-in allowlist applies regardless.
     #[serde(default)]
     pub free_paths: Vec<String>,
+    /// WOR-810: serve a deterministic tarpit maze to an unauthorized
+    /// crawler instead of a hard 402/block, to waste its crawl budget.
+    /// Off by default; verified/paid crawlers are allowed before the
+    /// tarpit path runs and are never tarpitted.
+    #[serde(default)]
+    pub tarpit: bool,
+    /// Invisible `nofollow` links per tarpit page (clamped to `[1, 64]`).
+    /// `None` uses the default.
+    #[serde(default)]
+    pub tarpit_links: Option<usize>,
 }
 
 // --- Ledger YAML shape (G1.3 wire) ---

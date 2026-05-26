@@ -171,6 +171,18 @@ impl PolicyEnforcer for AiCrawlEnforcer {
                     })
                 })
             }
+            AiCrawlDecision::Tarpit { body } => {
+                // WOR-810: short-circuit with a 200 + the maze HTML. The
+                // request-phase short-circuit renderer serves
+                // `short_circuit_body` with this status + content-type
+                // without contacting the upstream; we return Allow so the
+                // enforcer chain does not deny the request out from under
+                // the short-circuit.
+                ctx.short_circuit_status = Some(200);
+                ctx.short_circuit_body = Some(bytes::Bytes::from(body));
+                ctx.short_circuit_content_type = Some("text/html; charset=utf-8".to_string());
+                Box::pin(async move { Ok(PolicyDecision::Allow) })
+            }
             AiCrawlDecision::LedgerUnavailable {
                 body,
                 retry_after_seconds,
