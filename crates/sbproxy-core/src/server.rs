@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 use crate::context::RequestContext;
 use crate::pipeline::CompiledPipeline;
 use crate::reload;
-use sbproxy_ai::{AiClient, AiHandlerConfig, Router as AiRouter};
+use sbproxy_ai::{AiClient, AiHandlerConfig};
 use sbproxy_modules::action::ForwardingHeaderControls;
 use sbproxy_modules::{Action, Auth, Policy};
 use sbproxy_observe::metrics;

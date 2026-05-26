@@ -106,6 +106,15 @@ pub struct AiHandlerConfig {
     #[serde(skip)]
     pub(crate) embedding_cache:
         OnceLock<Option<std::sync::Arc<crate::semantic_cache::EmbeddingCache>>>,
+    /// Lazily-built provider router (WOR-798), held in an `Arc` so its
+    /// per-provider latency / token / connection state persists across
+    /// requests for the lifetime of this per-origin config (rebuilt only
+    /// on config reload). Latency- and usage-aware strategies
+    /// (`peak_ewma`, `least_token_usage`, `lowest_latency`, ...) depend on
+    /// this persistence; a per-request router would reset the state every
+    /// call and degrade them to round-robin.
+    #[serde(skip)]
+    pub(crate) router: OnceLock<std::sync::Arc<crate::routing::Router>>,
 }
 
 fn default_usage_parser() -> String {
@@ -164,6 +173,22 @@ impl AiHandlerConfig {
                 crate::semantic_cache::EmbeddingCache::from_config(&cfg).map(std::sync::Arc::new)
             })
             .as_ref()
+    }
+
+    /// Return the shared provider router for this handler, building it
+    /// once (WOR-798). The router holds live per-provider latency / token
+    /// / connection state, so it must be reused across requests rather
+    /// than reconstructed per request; this accessor guarantees a single
+    /// instance per `AiHandlerConfig` (until config reload).
+    pub fn router(&self) -> std::sync::Arc<crate::routing::Router> {
+        self.router
+            .get_or_init(|| {
+                std::sync::Arc::new(crate::routing::Router::new(
+                    self.routing.clone(),
+                    self.providers.len(),
+                ))
+            })
+            .clone()
     }
 
     /// Apply PII redaction to a parsed request body. Returns whether
@@ -804,6 +829,7 @@ mod tests {
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
             embedding_cache: OnceLock::new(),
+            router: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("anything"));
@@ -830,6 +856,7 @@ mod tests {
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
             embedding_cache: OnceLock::new(),
+            router: OnceLock::new(),
         };
         assert!(!config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("gpt-3.5-turbo"));
@@ -856,6 +883,7 @@ mod tests {
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
             embedding_cache: OnceLock::new(),
+            router: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("gpt-3.5-turbo"));
@@ -883,6 +911,7 @@ mod tests {
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
             embedding_cache: OnceLock::new(),
+            router: OnceLock::new(),
         };
         // Block list wins
         assert!(!config.is_model_allowed("gpt-4"));
