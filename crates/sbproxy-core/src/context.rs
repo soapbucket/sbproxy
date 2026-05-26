@@ -115,6 +115,10 @@ pub struct RequestContext {
     pub short_circuit_status: Option<u16>,
     /// Optional body to send with a short-circuit response.
     pub short_circuit_body: Option<bytes::Bytes>,
+    /// Optional `Content-Type` for the short-circuit body. Defaults to
+    /// `text/plain` when unset (e.g. the AI-crawler tarpit sets
+    /// `text/html` so a crawler parses the maze links).
+    pub short_circuit_content_type: Option<String>,
 
     // --- Load balancer state ---
     /// Index of the selected load balancer target (for connection tracking).
@@ -789,6 +793,7 @@ impl RequestContext {
             force_ssl_checked: false,
             short_circuit_status: None,
             short_circuit_body: None,
+            short_circuit_content_type: None,
             request_start: None,
             response_status: None,
             rate_limit_info: None,

@@ -25,6 +25,8 @@ use serde::{Deserialize, Serialize};
 mod types;
 pub use types::*;
 
+mod tarpit;
+
 /// Compiled AI crawl control policy.
 pub struct AiCrawlControlPolicy {
     price: Option<f64>,
@@ -53,6 +55,11 @@ pub struct AiCrawlControlPolicy {
     /// built-in [`ALWAYS_FREE_PATHS`] allowlist. Paths here are never
     /// charged.
     free_paths: Vec<String>,
+    /// WOR-810: tarpit mode. When set, an unauthorized crawler is served
+    /// a deceptive maze (HTTP 200) instead of a hard 402/block.
+    tarpit: bool,
+    /// Invisible `nofollow` links per tarpit page (clamped at generation).
+    tarpit_links: usize,
     /// Optional pluggable pricing model. When set, it is consulted
     /// before the static tier table; returning `Some(_)` overrides the
     /// static price for that request. The OSS build ships no model;
@@ -193,6 +200,8 @@ impl AiCrawlControlPolicy {
             content_signals: config.content_signals,
             cloudflare_compat: config.cloudflare_compat,
             free_paths: config.free_paths,
+            tarpit: config.tarpit,
+            tarpit_links: config.tarpit_links.unwrap_or(tarpit::DEFAULT_TARPIT_LINKS),
             pricing_model: None,
         })
     }
@@ -508,6 +517,19 @@ impl AiCrawlControlPolicy {
                     }
                 }
             }
+        }
+        // --- WOR-810: tarpit ---
+        //
+        // By this point the request is a confirmed unauthorized/unpaid
+        // crawler: it matched the crawler signature and passed (failed)
+        // every allow check above, including the token redeem, so
+        // verified/paid crawlers already returned `Allow`. When the
+        // operator enables `tarpit`, serve a deceptive maze instead of
+        // charging or blocking, to waste the crawler's budget.
+        if self.tarpit {
+            return AiCrawlDecision::Tarpit {
+                body: tarpit::generate_maze(path, self.tarpit_links),
+            };
         }
         // --- G3.4 multi-rail challenge emission ---
         //

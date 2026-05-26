@@ -2910,6 +2910,10 @@ pub(super) async fn request_filter(
     // --- Short-circuit check (set by future middleware phases) ---
     if let Some(status) = ctx.short_circuit_status {
         if let Some(body) = ctx.short_circuit_body.take() {
+            let content_type = ctx
+                .short_circuit_content_type
+                .take()
+                .unwrap_or_else(|| "text/plain".to_string());
             let mut header = pingora_http::ResponseHeader::build(status, Some(1)).map_err(|e| {
                 Error::because(
                     ErrorType::InternalError,
@@ -2918,7 +2922,7 @@ pub(super) async fn request_filter(
                 )
             })?;
             header
-                .insert_header("content-type", "text/plain")
+                .insert_header("content-type", content_type.as_str())
                 .map_err(|e| Error::because(ErrorType::InternalError, "failed to set header", e))?;
             session
                 .write_response_header(Box::new(header), false)

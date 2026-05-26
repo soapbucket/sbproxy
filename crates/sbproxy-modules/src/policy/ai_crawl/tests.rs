@@ -18,6 +18,39 @@ fn payment_headers(ua: &str, header: &str, token: &str) -> http::HeaderMap {
 }
 
 #[test]
+fn tarpit_serves_maze_to_unpaid_crawler() {
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "tarpit": true,
+        "valid_tokens": ["good-token"],
+    }))
+    .unwrap();
+    let h = ua_headers("GPTBot/1.0");
+    match policy.check("GET", "x.com", "/article", &h, None) {
+        AiCrawlDecision::Tarpit { body } => {
+            assert!(body.contains("rel=\"nofollow\""));
+            assert!(body.contains("href=\"/article/"));
+        }
+        other => panic!("expected Tarpit, got {:?}", other),
+    }
+}
+
+#[test]
+fn tarpit_allows_paid_crawler_before_maze() {
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "tarpit": true,
+        "valid_tokens": ["good-token"],
+    }))
+    .unwrap();
+    let h = payment_headers("GPTBot/1.0", "crawler-payment", "good-token");
+    assert_eq!(
+        policy.check("GET", "x.com", "/article", &h, None),
+        AiCrawlDecision::Allow
+    );
+}
+
+#[test]
 fn human_browser_ua_passes_without_payment() {
     let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
         "valid_tokens": ["t1"],
