@@ -2005,6 +2005,51 @@ impl ProxyHttp for SbProxy {
                                         | OpenApiValidationResult::OutOfScope => {}
                                     }
                                 }
+                                Policy::PromptInjectionV2(p) => {
+                                    // WOR-801: body-aware scan. The URI +
+                                    // headers were scanned synchronously by
+                                    // the request_filter enforcer; here we
+                                    // scan the buffered request body. Block
+                                    // mode rejects the request; tag/log are
+                                    // advisory at this phase (the upstream
+                                    // request was already stamped, so a
+                                    // body-only hit cannot apply a trust
+                                    // header).
+                                    use sbproxy_modules::{
+                                        PromptInjectionAction, PromptInjectionV2Outcome,
+                                    };
+                                    let body_text = String::from_utf8_lossy(&collected);
+                                    if let PromptInjectionV2Outcome::Hit { result } =
+                                        p.evaluate(&body_text)
+                                    {
+                                        match p.action() {
+                                            PromptInjectionAction::Block => {
+                                                tracing::warn!(
+                                                    target: "sbproxy::prompt_injection_v2",
+                                                    score = %result.score,
+                                                    label = %result.label,
+                                                    "blocked: detector matched request body"
+                                                );
+                                                failed = Some((
+                                                    403,
+                                                    p.block_body().to_string(),
+                                                    "text/plain; charset=utf-8".to_string(),
+                                                ));
+                                                break;
+                                            }
+                                            PromptInjectionAction::Tag
+                                            | PromptInjectionAction::Log => {
+                                                tracing::warn!(
+                                                    target: "sbproxy::prompt_injection_v2",
+                                                    score = %result.score,
+                                                    label = %result.label,
+                                                    "prompt injection detected in request body \
+                                                     (advisory; upstream already dispatched)"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                                 _ => {}
                             }
                         }
