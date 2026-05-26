@@ -1073,6 +1073,44 @@ pub(super) async fn handle_ai_proxy(
             return Ok(());
         }
     }
+    // WOR-797: cost/quality routing. When configured, score the inbound
+    // prompt's difficulty and pin the routing set to the cheap or
+    // frontier provider. Composes after the disallow filter: if the
+    // chosen provider is not in the (possibly filtered) eligible set, we
+    // log and fall through to the default order rather than override it.
+    if let Some(cq) = router.cost_quality_config() {
+        let prompt = sbproxy_ai::cost_quality::prompt_text_for_scoring(&body);
+        let difficulty = sbproxy_ai::cost_quality::heuristic_difficulty(&prompt);
+        let tier = sbproxy_ai::cost_quality::route_tier(cq, difficulty);
+        let target = match tier {
+            sbproxy_ai::cost_quality::Tier::Cheap => cq.cheap_provider.clone(),
+            sbproxy_ai::cost_quality::Tier::Frontier => cq.frontier_provider.clone(),
+        };
+        match provider_order
+            .iter()
+            .copied()
+            .find(|&i| config.providers[i].name == target)
+        {
+            Some(idx) => {
+                tracing::info!(
+                    event = "ai.cost_quality.route",
+                    tier = tier.label(),
+                    difficulty = difficulty,
+                    provider = %target,
+                    "cost/quality routing selected provider"
+                );
+                provider_order = vec![idx];
+            }
+            None => {
+                tracing::warn!(
+                    event = "ai.cost_quality.route_miss",
+                    tier = tier.label(),
+                    provider = %target,
+                    "cost/quality target provider not eligible; using default order"
+                );
+            }
+        }
+    }
     if is_failover {
         provider_order.sort_by_key(|&i| config.providers[i].priority.unwrap_or(u32::MAX));
     }

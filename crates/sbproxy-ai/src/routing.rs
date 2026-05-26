@@ -46,6 +46,12 @@ pub enum RoutingStrategy {
     /// Cascading for LLMs"). Streaming requests dispatch only to
     /// the first tier; mid-stream retry is out of scope for v1.
     Cascade(CascadeConfig),
+    /// Cost/quality routing (WOR-797): score the prompt's difficulty and
+    /// route simple prompts to a cheap model and hard prompts to a
+    /// frontier model, on a `cost_threshold` dial. The dispatcher reads
+    /// the prompt and applies [`crate::cost_quality`]; `select` returns
+    /// the cheap provider as a deterministic fallback.
+    CostQuality(crate::cost_quality::CostQualityConfig),
 }
 
 /// Configuration for the [`RoutingStrategy::Cascade`] variant.
@@ -503,6 +509,19 @@ impl Router {
                 }
                 Some(enabled[0].0)
             }
+            RoutingStrategy::CostQuality(ref cfg) => {
+                // The cost/quality dispatcher scores the prompt and picks
+                // the cheap or frontier provider itself (via
+                // `cost_quality_config()`); `select` hands back the cheap
+                // provider as a deterministic fallback for callers that do
+                // not engage that path.
+                for &(idx, p) in &enabled {
+                    if p.name == cfg.cheap_provider {
+                        return Some(idx);
+                    }
+                }
+                Some(enabled[0].0)
+            }
         }
     }
 
@@ -524,6 +543,20 @@ impl Router {
     pub fn cascade_config(&self) -> Option<&CascadeConfig> {
         match &self.strategy {
             RoutingStrategy::Cascade(cfg) => Some(cfg),
+            _ => None,
+        }
+    }
+
+    /// Returns true when the configured strategy is `CostQuality`.
+    pub fn is_cost_quality(&self) -> bool {
+        matches!(self.strategy, RoutingStrategy::CostQuality(_))
+    }
+
+    /// Borrow the cost/quality config when the configured strategy is
+    /// [`RoutingStrategy::CostQuality`].
+    pub fn cost_quality_config(&self) -> Option<&crate::cost_quality::CostQualityConfig> {
+        match &self.strategy {
+            RoutingStrategy::CostQuality(cfg) => Some(cfg),
             _ => None,
         }
     }
