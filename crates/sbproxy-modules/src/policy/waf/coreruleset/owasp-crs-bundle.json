@@ -1,0 +1,102 @@
+{
+  "version": "2026-05-25T00:00:00Z",
+  "channel": "owasp-crs-managed",
+  "rules": [
+    {
+      "id": "crs-941-100",
+      "paranoia": 1,
+      "category": "xss",
+      "severity": "critical",
+      "pattern": "(?i)(<script[\\s/>]|javascript:|vbscript:|on(error|load|click|mouseover|focus|submit)\\s*=|document\\.(cookie|location|write)|window\\.(location|name)|<iframe[\\s/>]|<svg[\\s/>][^>]*on|eval\\s*\\(|String\\.fromCharCode\\s*\\()",
+      "action": "block"
+    },
+    {
+      "id": "crs-941-110",
+      "paranoia": 2,
+      "category": "xss",
+      "severity": "high",
+      "pattern": "(?i)(<[a-z][^>]*\\son[a-z]+\\s*=|expression\\s*\\(|@import\\b|<meta[^>]+http-equiv|data:text/html|<object[\\s/>]|<embed[\\s/>]|formaction\\s*=)",
+      "action": "block"
+    },
+    {
+      "id": "crs-942-100",
+      "paranoia": 1,
+      "category": "sqli",
+      "severity": "critical",
+      "pattern": "(?i)(union[\\s/*]+select|select[\\s/*]+.*[\\s/*]+from|insert[\\s/*]+into|drop[\\s/*]+table|delete[\\s/*]+from|update[\\s/*]+\\w+[\\s/*]+set|'\\s*or\\s*'?1'?\\s*=\\s*'?1|\\bor\\b\\s+1\\s*=\\s*1|;\\s*(drop|delete|update|insert)\\b)",
+      "action": "block"
+    },
+    {
+      "id": "crs-942-190",
+      "paranoia": 2,
+      "category": "sqli",
+      "severity": "high",
+      "pattern": "(?i)(\\bwaitfor[\\s/*]+delay\\b|\\bbenchmark[\\s/*]*\\(|\\bsleep[\\s/*]*\\(\\s*\\d|\\bextractvalue[\\s/*]*\\(|\\bupdatexml[\\s/*]*\\(|\\bload_file[\\s/*]*\\(|\\binformation_schema\\b|\\bxp_cmdshell\\b|\\bgroup_concat[\\s/*]*\\(|\\bcase[\\s/*]+when\\b.*\\bthen\\b)",
+      "action": "block"
+    },
+    {
+      "id": "crs-930-100",
+      "paranoia": 1,
+      "category": "lfi",
+      "severity": "critical",
+      "pattern": "(?i)(\\.\\./|\\.\\.\\\\|%2e%2e[/\\\\]|%252e%252e|/etc/(passwd|shadow|hosts)|/proc/self/|c:\\\\windows\\\\|/windows/win\\.ini|file://)",
+      "action": "block"
+    },
+    {
+      "id": "crs-931-100",
+      "paranoia": 2,
+      "category": "rfi",
+      "severity": "high",
+      "pattern": "(?i)(=\\s*(https?|ftp|php|data|expect)://|\\binclude\\s*\\(\\s*['\"]?(https?|ftp)://|allow_url_(include|fopen))",
+      "action": "block"
+    },
+    {
+      "id": "crs-932-100",
+      "paranoia": 1,
+      "category": "rce",
+      "severity": "critical",
+      "pattern": "(?i)(;\\s*(cat|ls|id|whoami|uname|wget|curl|nc|bash|sh|powershell)\\b|\\|\\s*(cat|ls|id|whoami|nc|bash|sh)\\b|`[^`]*`|\\$\\([^)]*\\)|&&\\s*(cat|ls|id|whoami)\\b|\\b(system|exec|passthru|popen|proc_open|shell_exec)\\s*\\()",
+      "action": "block"
+    },
+    {
+      "id": "crs-933-100",
+      "paranoia": 2,
+      "category": "php-injection",
+      "severity": "high",
+      "pattern": "(?i)(<\\?php\\b|\\bphp://(filter|input|stdin)|\\b(base64_decode|gzinflate|str_rot13|assert|create_function|call_user_func)\\s*\\(|\\$_(GET|POST|REQUEST|COOKIE|SERVER|FILES)\\b)",
+      "action": "block"
+    },
+    {
+      "id": "crs-934-100",
+      "paranoia": 2,
+      "category": "node-injection",
+      "severity": "high",
+      "pattern": "(?i)(child_process|require\\s*\\(\\s*['\"]child_process|process\\.(binding|mainModule)|\\bglobal\\.process\\b|__proto__|constructor\\s*\\[\\s*['\"]constructor)",
+      "action": "block"
+    },
+    {
+      "id": "crs-913-100",
+      "paranoia": 1,
+      "category": "scanner-detection",
+      "severity": "low",
+      "pattern": "(?i)(\\b(sqlmap|nikto|nessus|nmap|masscan|acunetix|netsparker|wpscan|dirbuster|gobuster|fuzz faster|burp ?suite|metasploit)\\b)",
+      "action": "block"
+    },
+    {
+      "id": "crs-921-160",
+      "paranoia": 3,
+      "category": "protocol-attack",
+      "severity": "medium",
+      "pattern": "(?i)(%0d%0a|%0a%0d|\\r\\n(set-cookie|location|content-length):|[\\r\\n]\\s*(GET|POST|PUT|HEAD)\\s)",
+      "action": "block"
+    },
+    {
+      "id": "crs-944-100",
+      "paranoia": 2,
+      "category": "java-injection",
+      "severity": "critical",
+      "pattern": "(?i)(java\\.lang\\.(Runtime|ProcessBuilder)|\\$\\{(jndi|env|sys):|\\bognl\\b|com\\.opensymphony|\\bclass\\.module\\.classLoader|TemplatesImpl)",
+      "action": "block"
+    }
+  ]
+}

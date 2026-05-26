@@ -1364,15 +1364,29 @@ fn compile_origin_policy_chain(
         .collect::<anyhow::Result<_>>()?;
     if l2_store.is_some() {
         for p in chain.iter_mut() {
-            if let Policy::RateLimit(rl) = p {
-                // take+replace: with_store consumes self and returns Self.
-                let taken = std::mem::replace(
-                    rl,
-                    sbproxy_modules::RateLimitPolicy::from_config(serde_json::json!({
-                        "requests_per_second": 10.0
-                    }))?,
-                );
-                *rl = taken.with_store(l2_store.clone(), origin_id);
+            match p {
+                Policy::RateLimit(rl) => {
+                    // take+replace: with_store consumes self and returns Self.
+                    let taken = std::mem::replace(
+                        rl,
+                        sbproxy_modules::RateLimitPolicy::from_config(serde_json::json!({
+                            "requests_per_second": 10.0
+                        }))?,
+                    );
+                    *rl = taken.with_store(l2_store.clone(), origin_id);
+                }
+                Policy::Waf(waf) => {
+                    // Attach the same shared L2 store to the WAF
+                    // persistent-block state machine so time-boxed blocks
+                    // are enforced across replicas. No-op when persistent
+                    // blocking is disabled on the policy.
+                    let taken = std::mem::replace(
+                        waf,
+                        sbproxy_modules::policy::WafPolicy::from_config(serde_json::json!({}))?,
+                    );
+                    *waf = taken.with_block_store(l2_store.clone(), origin_id);
+                }
+                _ => {}
             }
         }
     }
