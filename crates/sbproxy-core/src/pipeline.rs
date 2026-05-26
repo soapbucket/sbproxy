@@ -813,6 +813,17 @@ pub struct CompiledPipeline {
     /// not configured). Parallel to [`Self::config`].`origins`. WOR-802.
     pub outbound_creds:
         Vec<Option<sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig>>,
+    /// Per-origin opt-in for outbound Web Bot Auth signing (WOR-805).
+    /// Parallel to [`Self::config`].`origins`.
+    pub outbound_wba: Vec<bool>,
+    /// Shared outbound Web Bot Auth signer, built once from
+    /// `proxy.web_bot_auth`. `None` when no web_bot_auth key is
+    /// configured, in which case `outbound_wba` opt-ins are no-ops.
+    pub web_bot_auth_signer: Option<Arc<sbproxy_middleware::signatures_egress::MessageSigner>>,
+    /// `Signature-Agent` header value (the proxy's published directory
+    /// URL) stamped alongside an outbound Web Bot Auth signature when
+    /// `proxy.web_bot_auth.directory_url` is set.
+    pub web_bot_auth_signature_agent: Option<String>,
     /// Compiled idempotency middleware for each origin (None when the
     /// origin has no `idempotency:` block or `enabled = false`).
     /// Parallel to [`Self::config`].`origins`.
@@ -920,6 +931,9 @@ impl Default for CompiledPipeline {
             bot_detections: Vec::new(),
             threat_protections: Vec::new(),
             outbound_creds: Vec::new(),
+            outbound_wba: Vec::new(),
+            web_bot_auth_signer: None,
+            web_bot_auth_signature_agent: None,
             idempotencies: Vec::new(),
             cache_store: None,
             cache_reserve: None,
@@ -954,6 +968,7 @@ impl CompiledPipeline {
         let mut bot_detections = Vec::with_capacity(config.origins.len());
         let mut threat_protections = Vec::with_capacity(config.origins.len());
         let mut outbound_creds = Vec::with_capacity(config.origins.len());
+        let mut outbound_wba = Vec::with_capacity(config.origins.len());
 
         for origin in &config.origins {
             // Compile action (required for every origin).
@@ -1053,6 +1068,7 @@ impl CompiledPipeline {
                 None => None,
             };
             outbound_creds.push(outbound_cred);
+            outbound_wba.push(origin.outbound_web_bot_auth);
         }
 
         // --- Compile per-origin idempotency middleware ---
@@ -1199,6 +1215,37 @@ impl CompiledPipeline {
             })
             .unwrap_or_default();
 
+        // WOR-805: build the shared outbound Web Bot Auth signer once
+        // from the proxy-level key. Origins opt in per-origin via
+        // `outbound_web_bot_auth` (collected in `outbound_wba`); the
+        // signer and the Signature-Agent directory URL are shared.
+        let (web_bot_auth_signer, web_bot_auth_signature_agent) =
+            match config.server.web_bot_auth.as_ref() {
+                Some(wba) => {
+                    let seed = hex::decode(&wba.ed25519_seed_hex).map_err(|e| {
+                        anyhow::anyhow!("proxy.web_bot_auth.ed25519_seed_hex: invalid hex: {e}")
+                    })?;
+                    let signer = sbproxy_middleware::signatures_egress::MessageSigner::new(
+                        sbproxy_middleware::signatures_egress::SignerConfig {
+                            key_id: wba.key_id.clone(),
+                            algorithm: sbproxy_middleware::signatures::SignatureAlgorithm::Ed25519,
+                            secret: seed,
+                            covered_components: vec![
+                                "@authority".to_string(),
+                                "@method".to_string(),
+                                "@path".to_string(),
+                            ],
+                        },
+                    )
+                    .map_err(|e| anyhow::anyhow!("proxy.web_bot_auth outbound signer: {e}"))?
+                    // Web Bot Auth signatures are short-lived; a 60s window
+                    // is consumed by the immediate upstream verifier.
+                    .with_web_bot_auth_profile("web-bot-auth", 60);
+                    (Some(Arc::new(signer)), wba.directory_url.clone())
+                }
+                None => (None, None),
+            };
+
         let pipeline = Self {
             config,
             router,
@@ -1212,6 +1259,9 @@ impl CompiledPipeline {
             bot_detections,
             threat_protections,
             outbound_creds,
+            outbound_wba,
+            web_bot_auth_signer,
+            web_bot_auth_signature_agent,
             idempotencies,
             cache_store,
             cache_reserve,
@@ -1748,6 +1798,7 @@ mod tests {
                 ai_txt: None,
                 agents_json: None,
                 outbound_credential: None,
+                outbound_web_bot_auth: false,
             }],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),
@@ -1893,6 +1944,7 @@ mod tests {
                 ai_txt: None,
                 agents_json: None,
                 outbound_credential: None,
+                outbound_web_bot_auth: false,
             }],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),

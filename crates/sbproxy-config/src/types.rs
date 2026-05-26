@@ -378,6 +378,14 @@ pub struct WebBotAuthConfig {
     /// public key is derived and published; the seed never leaves the
     /// proxy. Validated at config-compile time.
     pub ed25519_seed_hex: String,
+    /// Absolute URL of this proxy's published key directory
+    /// (`/.well-known/http-message-signatures-directory`). When set, an
+    /// origin that opts into outbound Web Bot Auth signing stamps a
+    /// `Signature-Agent` header with this value so the upstream verifier
+    /// can fetch the key. Optional: omitting it still signs, just without
+    /// the discovery pointer.
+    #[serde(default)]
+    pub directory_url: Option<String>,
 }
 
 impl Default for ProxyServerConfig {
@@ -2039,6 +2047,13 @@ pub struct RawOriginConfig {
     /// interpolation, resolved at config load.
     #[serde(default)]
     pub outbound_credential: Option<serde_json::Value>,
+    /// Opt this origin into outbound Web Bot Auth signing (WOR-805).
+    /// When `true` and `proxy.web_bot_auth` is configured, the proxy
+    /// signs the request it sends upstream with the proxy's Ed25519 key
+    /// (RFC 9421, `tag=web-bot-auth`), so an upstream that demands Web
+    /// Bot Auth accepts SBproxy as a verified agent. Default `false`.
+    #[serde(default)]
+    pub outbound_web_bot_auth: bool,
 }
 
 /// Per-origin agents.json manifest configuration (WOR-820). See the

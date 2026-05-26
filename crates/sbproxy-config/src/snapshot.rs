@@ -180,6 +180,10 @@ pub struct CompiledOrigin {
     /// as JSON for deferred compilation in `sbproxy-core`. `None` means
     /// the proxy adds no minted credential to upstream requests.
     pub outbound_credential: Option<serde_json::Value>,
+    /// Opt this origin into outbound Web Bot Auth signing (WOR-805).
+    /// When `true` and `proxy.web_bot_auth` is set, the proxy signs the
+    /// upstream request with its Ed25519 key (RFC 9421, `tag=web-bot-auth`).
+    pub outbound_web_bot_auth: bool,
 }
 
 /// The complete compiled config: all origins plus host-based routing.
