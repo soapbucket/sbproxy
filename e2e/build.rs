@@ -11,13 +11,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // caches.
     println!("cargo:rerun-if-changed=proto/echo.proto");
 
+    // Emit a compiled FileDescriptorSet alongside the generated Rust
+    // types. `tests/grpc_transcode.rs` feeds this file to the `grpc`
+    // action's `transcode.descriptor_set` so the REST <-> gRPC
+    // transcoder resolves the Echo method at config load. The path is
+    // exported to the test via the `ECHO_DESCRIPTOR_SET` env var.
+    let descriptor_path =
+        std::path::PathBuf::from(std::env::var("OUT_DIR")?).join("echo_descriptor.bin");
+
     tonic_build::configure()
         // The e2e test spawns the server in-process; we do not need
         // a generated client transport, but generating both keeps the
         // ergonomics simple and the cost is negligible.
         .build_server(true)
         .build_client(true)
+        .file_descriptor_set_path(&descriptor_path)
         .compile_protos(&["proto/echo.proto"], &["proto"])?;
+
+    println!(
+        "cargo:rustc-env=ECHO_DESCRIPTOR_SET={}",
+        descriptor_path.display()
+    );
 
     Ok(())
 }
