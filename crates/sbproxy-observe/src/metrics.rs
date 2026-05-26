@@ -828,6 +828,27 @@ pub fn record_waf_persistent_block(origin: &str, event: &'static str, key_kind: 
         .inc();
 }
 
+/// Count an `object_authz` (BOLA/BFLA) authorization violation. `kind`
+/// is one of the closed strings `bola`, `bfla`, or `enumeration`; the
+/// origin label is run through the cardinality limiter.
+pub fn record_object_authz_violation(origin: &str, kind: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_object_authz_violations_total",
+            "Object/function-level authorization violations, by kind (bola, bfla, enumeration)",
+            &["origin", "kind"],
+        )
+        .expect("object_authz violation counter registers")
+    });
+    let origin_san = sanitize_label("origin", origin);
+    counter
+        .with_label_values(&[origin_san.as_str(), kind])
+        .inc();
+}
+
 /// Record drop counters returned by the Wave 8 capture helpers.
 /// `dimension` is `"property"`, `"session"`, or `"user"`; `reason`
 /// is one of the closed strings each helper exposes (e.g. `count`,

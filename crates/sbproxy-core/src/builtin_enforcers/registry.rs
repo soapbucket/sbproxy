@@ -19,8 +19,8 @@ use super::AgentClassEnforcer;
 use super::{
     A2AEnforcer, AgentBudgetEnforcer, AiCrawlEnforcer, AssertionEnforcer, ConcurrentLimitEnforcer,
     CsrfEnforcer, DdosEnforcer, DlpEnforcer, ExposedCredsEnforcer, ExpressionEnforcer,
-    HttpFramingEnforcer, IpFilterEnforcer, OpenApiValidationEnforcer, PageShieldEnforcer,
-    PeerPricingPreflightEnforcer, PromptInjectionV2Enforcer, RateLimitEnforcer,
+    HttpFramingEnforcer, IpFilterEnforcer, ObjectAuthzEnforcer, OpenApiValidationEnforcer,
+    PageShieldEnforcer, PeerPricingPreflightEnforcer, PromptInjectionV2Enforcer, RateLimitEnforcer,
     RequestLimitEnforcer, RequestValidatorEnforcer, SecHeadersEnforcer, SemanticConstraintEnforcer,
     SriEnforcer, WafEnforcer,
 };
@@ -77,6 +77,7 @@ fn compile_one(policy: Policy) -> CompiledEnforcer {
         Policy::OpenApiValidation(p) => builtin(OpenApiValidationEnforcer(Arc::new(p))),
         Policy::PromptInjectionV2(p) => builtin(PromptInjectionV2Enforcer(Arc::new(p))),
         Policy::HttpFraming(p) => builtin(HttpFramingEnforcer(Arc::new(p))),
+        Policy::ObjectAuthz(p) => builtin(ObjectAuthzEnforcer(Arc::new(p))),
         #[cfg(feature = "agent-class")]
         Policy::AgentClass(p) => builtin(AgentClassEnforcer(Arc::new(p))),
         Policy::A2A(p) => builtin(A2AEnforcer(Arc::new(p))),

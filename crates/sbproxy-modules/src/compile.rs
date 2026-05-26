@@ -140,6 +140,9 @@ pub fn compile_policy(config: &serde_json::Value) -> Result<Policy> {
         "ai_crawl_control" | "pay_per_crawl" => Ok(Policy::AiCrawl(
             crate::policy::AiCrawlControlPolicy::from_config(config.clone())?,
         )),
+        "object_authz" | "bola" => Ok(Policy::ObjectAuthz(
+            crate::policy::ObjectAuthzPolicy::from_config(config.clone())?,
+        )),
         "exposed_credentials" | "leaked_credentials" => Ok(Policy::ExposedCreds(
             crate::policy::ExposedCredsPolicy::from_config(config.clone())?,
         )),

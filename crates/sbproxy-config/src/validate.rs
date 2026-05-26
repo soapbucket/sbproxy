@@ -153,6 +153,8 @@ pub const KNOWN_POLICY_TYPES: &[&str] = &[
     "concurrent_limiting",
     "ai_crawl_control",
     "pay_per_crawl",
+    "object_authz",
+    "bola",
     "exposed_credentials",
     "leaked_credentials",
     "page_shield",

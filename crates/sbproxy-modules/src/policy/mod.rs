@@ -35,6 +35,7 @@ pub mod nl_compiler;
 /// Natural-language policy constraint linter (WOR-203 PR 3a;
 /// see `adr-policy-compilation.md` NLC pillar A).
 pub mod nl_linter;
+pub mod object_authz;
 pub mod openapi_validation;
 pub mod page_shield;
 /// Outbound peer-pricing pre-flight policy.
@@ -89,6 +90,10 @@ pub use http_framing::{FramingViolation, HttpFramingPolicy};
 pub use ip_filter::IpFilterPolicy;
 pub use nl_compiler::{NlCompileError, NlCompiler};
 pub use nl_linter::{CharRange, LintViolation, NlLinter, WorkspaceSchema};
+pub use object_authz::{
+    ObjectAuthzPolicy, OwnerSource, Principal as ObjectAuthzPrincipal,
+    Violation as ObjectAuthzViolation, ViolationKind as ObjectAuthzViolationKind,
+};
 pub use openapi_validation::{
     OpenApiValidationMode, OpenApiValidationPolicy, ValidationResult as OpenApiValidationResult,
 };
@@ -192,6 +197,12 @@ pub enum Policy {
     /// CRLF / NUL injection) and rejects the request with a 400 before
     /// it reaches the upstream. See `policy/http_framing.rs`.
     HttpFraming(HttpFramingPolicy),
+    /// Object- and function-level authorization (`object_authz`).
+    /// Blocks cross-scope object access (BOLA, API1:2023) and
+    /// privileged operations invoked without the required role (BFLA,
+    /// API5:2023), and detects object-id enumeration sweeps. See
+    /// `policy/object_authz.rs`.
+    ObjectAuthz(ObjectAuthzPolicy),
     /// Agent-class policy (G1.4 wire). Marker policy that opts an
     /// origin into the agent-class resolver chain. The resolver
     /// itself runs in the request pipeline (`stamp_request_context`);
@@ -248,6 +259,7 @@ impl Policy {
             Self::OpenApiValidation(_) => "openapi_validation",
             Self::PromptInjectionV2(_) => "prompt_injection_v2",
             Self::HttpFraming(_) => "http_framing",
+            Self::ObjectAuthz(_) => "object_authz",
             #[cfg(feature = "agent-class")]
             Self::AgentClass(_) => "agent_class",
             Self::A2A(_) => "a2a",
@@ -281,6 +293,7 @@ impl std::fmt::Debug for Policy {
             Self::OpenApiValidation(r) => f.debug_tuple("OpenApiValidation").field(r).finish(),
             Self::PromptInjectionV2(r) => f.debug_tuple("PromptInjectionV2").field(r).finish(),
             Self::HttpFraming(r) => f.debug_tuple("HttpFraming").field(r).finish(),
+            Self::ObjectAuthz(r) => f.debug_tuple("ObjectAuthz").field(r).finish(),
             #[cfg(feature = "agent-class")]
             Self::AgentClass(r) => f.debug_tuple("AgentClass").field(r).finish(),
             Self::A2A(r) => f.debug_tuple("A2A").field(r).finish(),
