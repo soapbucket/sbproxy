@@ -205,7 +205,13 @@ pub(super) async fn handle_ai_proxy(
             method,
             http::Method::PUT | http::Method::PATCH
         ) {
-            let body_bytes = session.read_request_body().await?.unwrap_or_default();
+            let body_bytes = {
+                let mut buf = bytes::BytesMut::new();
+                while let Some(chunk) = session.read_request_body().await? {
+                    buf.extend_from_slice(&chunk);
+                }
+                buf.freeze()
+            };
             if body_bytes.is_empty() {
                 (None, Vec::new())
             } else {
@@ -292,7 +298,18 @@ pub(super) async fn handle_ai_proxy(
     }
 
     // POST requests: read the body, parse JSON, select provider, forward.
-    let body_bytes = session.read_request_body().await?.unwrap_or_default();
+    // Drain the full body: Pingora returns it one chunk at a time, so a
+    // single read truncates a multi-chunk (large) body and the JSON parse
+    // then fails with a spurious 400 (WOR-795 body-buffering fix). The AI
+    // dispatch builds its own upstream request, so draining here does not
+    // affect forwarding.
+    let body_bytes = {
+        let mut buf = bytes::BytesMut::new();
+        while let Some(chunk) = session.read_request_body().await? {
+            buf.extend_from_slice(&chunk);
+        }
+        buf.freeze()
+    };
 
     // WOR-229: stash the native body so the dispatcher can
     // byte-forward the inbound bytes to the upstream when the
