@@ -166,6 +166,14 @@ pub struct MessageSigner {
     /// Signature label used in the `Signature-Input` / `Signature`
     /// dictionaries. Defaults to [`DEFAULT_SIGNATURE_LABEL`].
     signature_label: String,
+    /// Optional `tag` parameter. The Web Bot Auth profile sets this to
+    /// `web-bot-auth` so a verifier can scope the signature to that
+    /// profile. `None` omits the parameter.
+    tag: Option<String>,
+    /// Optional signature lifetime in seconds. When set, each signature
+    /// carries an `expires` parameter at `created + expires_secs`, after
+    /// which a conforming verifier rejects it.
+    expires_secs: Option<u64>,
 }
 
 enum KeyMaterial {
@@ -181,6 +189,8 @@ impl std::fmt::Debug for MessageSigner {
             .field("covered_components", &self.covered_components)
             .field("digest_algorithm", &self.digest_algorithm)
             .field("signature_label", &self.signature_label)
+            .field("tag", &self.tag)
+            .field("expires_secs", &self.expires_secs)
             // Deliberately omit key_material so debug output never
             // accidentally surfaces the secret.
             .finish()
@@ -234,6 +244,8 @@ impl MessageSigner {
             key_material,
             digest_algorithm: Algorithm::Sha256,
             signature_label: DEFAULT_SIGNATURE_LABEL.to_string(),
+            tag: None,
+            expires_secs: None,
         })
     }
 
@@ -249,6 +261,17 @@ impl MessageSigner {
     /// Web Bot Auth profile.
     pub fn with_digest_algorithm(mut self, algorithm: Algorithm) -> Self {
         self.digest_algorithm = algorithm;
+        self
+    }
+
+    /// Apply the Web Bot Auth signature profile: stamp a `tag` parameter
+    /// (typically `web-bot-auth`) and an `expires` parameter set to
+    /// `created + expires_secs`. A conforming verifier rejects the
+    /// signature once `expires` passes, which bounds replay of a leaked
+    /// outbound signature.
+    pub fn with_web_bot_auth_profile(mut self, tag: impl Into<String>, expires_secs: u64) -> Self {
+        self.tag = Some(tag.into());
+        self.expires_secs = Some(expires_secs);
         self
     }
 
@@ -299,13 +322,18 @@ impl MessageSigner {
         // Step 3: build the canonical Signature-Input header value
         // first; we then re-parse it so the canonical base is built by
         // exactly the same code path the verifier uses.
+        let expires = self
+            .expires_secs
+            .map(|secs| created.saturating_add(secs as i64));
         let signature_input_value = build_signature_input_header(
             &self.signature_label,
             &effective_components,
             &SignatureInputParams {
                 created: Some(created),
+                expires,
                 keyid: self.key_id.clone(),
                 alg: self.algorithm,
+                tag: self.tag.clone(),
             },
         );
 
@@ -361,8 +389,10 @@ impl MessageSigner {
 
 struct SignatureInputParams {
     created: Option<i64>,
+    expires: Option<i64>,
     keyid: String,
     alg: SignatureAlgorithm,
+    tag: Option<String>,
 }
 
 fn algorithm_wire_token(algorithm: SignatureAlgorithm) -> &'static str {
@@ -399,12 +429,21 @@ fn build_signature_input_header(
         out.push_str(";created=");
         out.push_str(&created.to_string());
     }
+    if let Some(expires) = params.expires {
+        out.push_str(";expires=");
+        out.push_str(&expires.to_string());
+    }
     out.push_str(";keyid=\"");
     out.push_str(&params.keyid);
     out.push('"');
     out.push_str(";alg=\"");
     out.push_str(algorithm_wire_token(params.alg));
     out.push('"');
+    if let Some(tag) = &params.tag {
+        out.push_str(";tag=\"");
+        out.push_str(tag);
+        out.push('"');
+    }
     out
 }
 
@@ -504,6 +543,54 @@ mod tests {
             VerifyVerdict::Ok { signature_label } => {
                 assert_eq!(signature_label, DEFAULT_SIGNATURE_LABEL);
             }
+            VerifyVerdict::Failed { reason } => panic!("expected ok, got: {reason}"),
+        }
+    }
+
+    // --- Web Bot Auth profile: tag + expires ---
+
+    #[test]
+    fn web_bot_auth_profile_stamps_tag_and_expires_and_round_trips() {
+        let secret = fresh_ed25519_secret();
+        let signing_key = SigningKey::from_bytes(&secret);
+        let verifying_key = signing_key.verifying_key();
+        let signer = MessageSigner::new(SignerConfig {
+            key_id: "wba-1".to_string(),
+            algorithm: SignatureAlgorithm::Ed25519,
+            secret: secret.to_vec(),
+            covered_components: Vec::new(),
+        })
+        .expect("signer")
+        .with_web_bot_auth_profile("web-bot-auth", 300);
+
+        let signed = signer.sign_request(sample_post_request()).expect("sign");
+        let sig_input = signed
+            .headers()
+            .get("signature-input")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            sig_input.contains(";tag=\"web-bot-auth\""),
+            "signature-input must carry the web-bot-auth tag: {sig_input}"
+        );
+        assert!(
+            sig_input.contains(";expires="),
+            "signature-input must carry an expires param: {sig_input}"
+        );
+
+        // The inbound verifier parses tag/expires; a fresh signature with
+        // a 300s lifetime must round-trip cleanly.
+        let verifier = MessageSignatureVerifier::new(MessageSignatureConfig {
+            algorithm: SignatureAlgorithm::Ed25519,
+            key_id: "wba-1".to_string(),
+            key: hex::encode(verifying_key.to_bytes()),
+            required_components: Vec::new(),
+            clock_skew_seconds: 30,
+        })
+        .expect("verifier");
+        match verifier.verify_request(&signed) {
+            VerifyVerdict::Ok { .. } => {}
             VerifyVerdict::Failed { reason } => panic!("expected ok, got: {reason}"),
         }
     }
