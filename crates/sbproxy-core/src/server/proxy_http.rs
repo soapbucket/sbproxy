@@ -367,12 +367,25 @@ impl ProxyHttp for SbProxy {
         let mut outbound_cred: Option<
             sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig,
         > = None;
+        // WOR-805: outbound Web Bot Auth signer + Signature-Agent for
+        // this origin, cloned (Arc) out of the pipeline so they outlive
+        // the pipeline guard dropped below.
+        let mut wba_signer: Option<
+            std::sync::Arc<sbproxy_middleware::signatures_egress::MessageSigner>,
+        > = None;
+        let mut wba_signature_agent: Option<String> = None;
 
         {
             let pipeline = reload::current_pipeline();
             if let Some(idx) = ctx.origin_idx {
                 let origin = &pipeline.config.origins[idx];
                 outbound_cred = pipeline.outbound_creds.get(idx).and_then(|o| o.clone());
+                // WOR-805: capture the shared outbound signer when this
+                // origin opts into Web Bot Auth signing.
+                if pipeline.outbound_wba.get(idx).copied().unwrap_or(false) {
+                    wba_signer = pipeline.web_bot_auth_signer.clone();
+                    wba_signature_agent = pipeline.web_bot_auth_signature_agent.clone();
+                }
 
                 // Extract the URL path from the proxy action so we can prepend it
                 // to the upstream request path. This ensures that configs like
@@ -808,6 +821,58 @@ impl ProxyHttp for SbProxy {
             }
             // Advance ctx to the child so the response phase can echo the same context.
             ctx.trace_ctx = Some(child);
+        }
+
+        // WOR-805: outbound Web Bot Auth signing. When the origin opted
+        // in and the proxy has a web_bot_auth key, sign the final
+        // outbound request (RFC 9421, tag=web-bot-auth) over
+        // @authority/@method/@path so an upstream demanding Web Bot Auth
+        // accepts SBproxy as a verified agent. No body is covered (the
+        // auth phase does not buffer it). Signing happens last so the
+        // covered components match the request the upstream receives.
+        // Failures fail open: the request goes upstream unsigned.
+        if let Some(signer) = wba_signer.as_ref() {
+            if let Some(authority) = upstream_request
+                .headers
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+            {
+                let signed = http::Request::builder()
+                    .method(upstream_request.method.clone())
+                    .uri(format!(
+                        "https://{}{}",
+                        authority,
+                        upstream_request.uri.path()
+                    ))
+                    .header("host", authority.as_str())
+                    .body(bytes::Bytes::new())
+                    .map_err(|e| anyhow::anyhow!("build sign request: {e}"))
+                    .and_then(|req| {
+                        signer
+                            .sign_request(req)
+                            .map_err(|e| anyhow::anyhow!("sign: {e}"))
+                    });
+                match signed {
+                    Ok(signed) => {
+                        for name in ["signature-input", "signature"] {
+                            if let Some(v) =
+                                signed.headers().get(name).and_then(|v| v.to_str().ok())
+                            {
+                                let _ = upstream_request.insert_header(name.to_string(), v);
+                            }
+                        }
+                        if let Some(agent) = wba_signature_agent.as_ref() {
+                            let _ = upstream_request
+                                .insert_header("signature-agent".to_string(), agent);
+                        }
+                    }
+                    Err(e) => warn!(
+                        error = %e,
+                        "outbound web bot auth signing failed; sending upstream without a signature (fail-open)"
+                    ),
+                }
+            }
         }
 
         Ok(())

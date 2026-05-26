@@ -190,6 +190,7 @@ mod tests {
                 ai_txt: None,
                 agents_json: None,
                 outbound_credential: None,
+                outbound_web_bot_auth: false,
             });
         }
         CompiledConfig {

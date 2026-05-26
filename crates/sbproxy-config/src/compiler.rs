@@ -906,6 +906,8 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         // WOR-802: outbound credential resolver config (JSON; compiled
         // in sbproxy-core).
         outbound_credential: config.outbound_credential,
+        // WOR-805: opt-in for outbound Web Bot Auth signing.
+        outbound_web_bot_auth: config.outbound_web_bot_auth,
     })
 }
 
