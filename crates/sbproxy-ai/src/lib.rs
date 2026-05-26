@@ -15,6 +15,7 @@ pub mod concurrency;
 pub mod context_compress;
 pub mod context_overflow;
 pub mod context_relay;
+pub mod cost_quality;
 pub mod degradation;
 pub mod fill_first;
 pub mod finetune;

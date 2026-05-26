@@ -411,6 +411,16 @@ where
         }));
     }
 
+    // WOR-797: cost/quality routing carries cheap_provider /
+    // frontier_provider / cost_threshold alongside the discriminator.
+    // `learned` is accepted as an alias.
+    if strategy_name == "cost_quality" || strategy_name == "learned" {
+        let cfg: crate::cost_quality::CostQualityConfig =
+            serde_json::from_value(serde_json::Value::Object(obj.clone()))
+                .map_err(Error::custom)?;
+        return Ok(RoutingStrategy::CostQuality(cfg));
+    }
+
     // Re-route every other strategy through the existing
     // unit-enum deserializer so the `snake_case` rename stays in
     // one place.
