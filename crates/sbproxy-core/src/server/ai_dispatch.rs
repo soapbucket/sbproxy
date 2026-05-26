@@ -132,7 +132,11 @@ pub(super) async fn handle_ai_proxy(
     }
 
     // Build a router for provider selection.
-    let router = AiRouter::new(config.routing.clone(), config.providers.len());
+    // WOR-798: the router is shared per-origin (persisted on the handler
+    // config), so its per-provider latency / token / connection state
+    // survives across requests. A per-request router would reset that
+    // state every call and make the latency/usage-aware strategies inert.
+    let router = config.router();
 
     // Handle GET requests (e.g. /v1/models) by forwarding to first enabled provider.
     if method == http::Method::GET {
@@ -1114,6 +1118,21 @@ pub(super) async fn handle_ai_proxy(
     if is_failover {
         provider_order.sort_by_key(|&i| config.providers[i].priority.unwrap_or(u32::MAX));
     }
+    // WOR-798: honor latency/usage/rotation strategies on the failover
+    // path. For strategies that pick a primary via the router
+    // (peak_ewma, least_token_usage, lowest_latency, round_robin, ...),
+    // move the router-selected provider to the front of the failover
+    // order; the remaining providers stay as fallbacks. Failover
+    // (priority sort above), cascade, and cost_quality manage their own
+    // ordering and are left untouched.
+    if !is_failover && router.cascade_config().is_none() && router.cost_quality_config().is_none() {
+        if let Some(primary) = router.select(&config.providers) {
+            if let Some(pos) = provider_order.iter().position(|&i| i == primary) {
+                let p = provider_order.remove(pos);
+                provider_order.insert(0, p);
+            }
+        }
+    }
     // Cascade + streaming: cascade does not retry mid-stream, so
     // we dispatch to tier 1 only and let the streaming relay
     // handle the response unchanged. The model substitution is
@@ -1317,6 +1336,7 @@ pub(super) async fn handle_ai_proxy(
             None => None,
         };
 
+        let attempt_start = std::time::Instant::now();
         let result = if let Some((bypass_body, native_path)) = upstream_call {
             AI_CLIENT
                 .load()
@@ -1331,6 +1351,10 @@ pub(super) async fn handle_ai_proxy(
 
         match result {
             Ok(resp) => {
+                // WOR-798: feed the latency-aware LB. Record the upstream
+                // round-trip latency for this provider so `peak_ewma` /
+                // `lowest_latency` reflect live data on the next request.
+                router.record_latency(provider_idx, attempt_start.elapsed().as_micros() as u64);
                 let status = resp.status().as_u16();
                 if is_failover
                     && status >= 500

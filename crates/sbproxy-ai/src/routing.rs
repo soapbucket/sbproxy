@@ -37,6 +37,15 @@ pub enum RoutingStrategy {
     /// Trades doubled spend for halved latency on the chat-first-token
     /// path; useful when every millisecond of TTFT matters.
     Race,
+    /// Power-of-Two-Choices over observed latency (Helicone-style):
+    /// sample two eligible providers and route to the one with the
+    /// lower recently-observed latency. Cuts tail latency under skewed
+    /// load versus always picking the single lowest-latency provider
+    /// (which herds). An untried provider is explored first; with a
+    /// single eligible provider it is returned directly. The signal is
+    /// the most recent observed latency; an EWMA-decay refinement is a
+    /// follow-up.
+    PeakEwma,
     /// Try a sequence of (provider, model) tiers from cheapest to
     /// most expensive. Each tier's response is graded against a
     /// quality threshold; if the response falls below threshold,
@@ -126,6 +135,15 @@ pub struct Router {
     /// healthy, `2` = unhealthy. Updated by background probe tasks
     /// when an `health_check` config is present.
     health: Vec<AtomicU8>,
+}
+
+impl std::fmt::Debug for Router {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Router")
+            .field("strategy", &self.strategy)
+            .field("num_providers", &self.latencies.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Router {
@@ -415,6 +433,30 @@ impl Router {
                     let counter = self.counter.fetch_add(1, Ordering::Relaxed);
                     Some(enabled[counter as usize % enabled.len()].0)
                 }
+            }
+            RoutingStrategy::PeakEwma => {
+                // Power-of-Two-Choices over observed latency: sample two
+                // distinct eligible providers and route to the lower
+                // latency. An untried provider (latency 0) sorts lowest,
+                // so the pair naturally explores it once. With a single
+                // eligible provider, return it.
+                if enabled.len() == 1 {
+                    return Some(enabled[0].0);
+                }
+                let c = self.counter.fetch_add(1, Ordering::Relaxed);
+                let a =
+                    (c.wrapping_mul(6364136223846793005).wrapping_add(1)) as usize % enabled.len();
+                let mut b = (c.wrapping_mul(2862933555777941757).wrapping_add(3037000493)) as usize
+                    % enabled.len();
+                if b == a {
+                    b = (a + 1) % enabled.len();
+                }
+                let lat = |i: usize| {
+                    self.latencies
+                        .get(enabled[i].0)
+                        .map_or(0, |l| l.load(Ordering::Relaxed))
+                };
+                Some(enabled[if lat(a) <= lat(b) { a } else { b }].0)
             }
             RoutingStrategy::LeastConnections => {
                 // Select provider with fewest in-flight requests
@@ -854,6 +896,37 @@ mod tests {
 
         let idx = router.select(&providers).unwrap();
         assert_eq!(idx, 1, "should skip disabled provider even if faster");
+    }
+
+    // --- PeakEwma (P2C latency) Tests ---
+
+    #[test]
+    fn peak_ewma_two_providers_picks_lower_latency() {
+        let providers = vec![
+            make_provider("slow", 1, None, true),
+            make_provider("fast", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::PeakEwma, providers.len());
+        router.record_latency(0, 5000);
+        router.record_latency(1, 1000);
+        // With two eligible providers, P2C samples both, so it always
+        // routes to the lower-latency one.
+        for _ in 0..10 {
+            assert_eq!(router.select(&providers).unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn peak_ewma_single_provider_returns_it() {
+        let providers = vec![make_provider("only", 1, None, true)];
+        let router = Router::new(RoutingStrategy::PeakEwma, providers.len());
+        assert_eq!(router.select(&providers).unwrap(), 0);
+    }
+
+    #[test]
+    fn peak_ewma_deserializes_from_snake_case() {
+        let s: RoutingStrategy = serde_json::from_value(serde_json::json!("peak_ewma")).unwrap();
+        assert!(matches!(s, RoutingStrategy::PeakEwma));
     }
 
     // --- LeastConnections Tests ---
