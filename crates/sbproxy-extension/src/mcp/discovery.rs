@@ -8,9 +8,10 @@
 //! session.
 //!
 //! This is the inverse of east-west passive discovery (observing
-//! `initialize`): here SBproxy *serves* the discovery surface. DNS TXT
-//! discovery and progressive (search/execute) tool discovery are
-//! tracked as follow-up increments of WOR-806.
+//! `initialize`): here SBproxy *serves* the discovery surface. The
+//! manifest also advertises the recommended DNS TXT record
+//! (`_mcp.{domain}`) an operator publishes for resolver-based
+//! discovery; see [`build_dns_txt_record`].
 
 /// The two well-known paths that serve the same discovery manifest:
 /// the IETF `draft-serra-mcp-discovery-uri` path and the Cloudflare
@@ -67,6 +68,20 @@ pub fn build_server_manifest(
         "capabilities": { "tools": { "listChanged": false } },
         "tools": tool_values,
     });
+    // DNS-based discovery hint (WOR-806): advertise the recommended
+    // `_mcp.{domain}` TXT record an operator publishes so a
+    // resolver-based agent can locate this manifest without a
+    // well-known probe. SBproxy serves HTTP, not DNS, so it emits the
+    // canonical record rather than publishing it.
+    if let Some(host) = host_from_endpoint(endpoint) {
+        let (record, value) = build_dns_txt_record(host);
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert(
+                "dnsDiscovery".to_string(),
+                serde_json::json!({ "record": record, "value": value }),
+            );
+        }
+    }
     // RFC 9728 auth discovery pointer (WOR-806): when the gateway is
     // OAuth-protected, advertise where to find the protected-resource
     // metadata so an agent can discover its authorization server.
@@ -74,6 +89,35 @@ pub fn build_server_manifest(
         obj.insert("authorization".to_string(), auth);
     }
     doc
+}
+
+/// Build the recommended MCP DNS-discovery TXT record for `domain`
+/// (draft-morrison-mcp-dns-discovery style).
+///
+/// Returns the record name (`_mcp.{domain}`) and its value, which points
+/// a resolver-based agent at the gateway's `/.well-known/mcp-server`
+/// discovery manifest over HTTPS. The value uses the `v=mcp1; uri=...`
+/// shape, mirroring the `_dmarc` / `_mta-sts` TXT conventions. SBproxy
+/// serves HTTP, not DNS, so it emits the canonical record for an operator
+/// to publish in their zone rather than publishing it itself.
+pub fn build_dns_txt_record(domain: &str) -> (String, String) {
+    let name = format!("_mcp.{domain}");
+    let value = format!("v=mcp1; uri=https://{domain}/.well-known/mcp-server");
+    (name, value)
+}
+
+/// Extract the host (no scheme, port, or path) from an absolute endpoint
+/// URL such as `https://mcp.example.com:8443/`. Returns `None` when the
+/// endpoint has no parseable host.
+fn host_from_endpoint(endpoint: &str) -> Option<&str> {
+    let after_scheme = endpoint.split("://").nth(1).unwrap_or(endpoint);
+    let host_port = after_scheme.split('/').next().unwrap_or("");
+    let host = host_port.split(':').next().unwrap_or("");
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
 }
 
 /// Well-known path for RFC 9728 OAuth 2.0 Protected Resource Metadata.
@@ -206,5 +250,41 @@ mod tests {
         let doc = build_oauth_protected_resource("https://h/", &["https://i".to_string()], &[]);
         assert!(doc.get("scopes_supported").is_none());
         assert!(doc["authorization_servers"].is_array());
+    }
+
+    #[test]
+    fn dns_txt_record_points_at_well_known_manifest() {
+        let (record, value) = build_dns_txt_record("mcp.example.com");
+        assert_eq!(record, "_mcp.mcp.example.com");
+        assert_eq!(
+            value,
+            "v=mcp1; uri=https://mcp.example.com/.well-known/mcp-server"
+        );
+    }
+
+    #[test]
+    fn manifest_advertises_dns_discovery_record_stripping_port_and_path() {
+        let m = build_server_manifest(
+            "g",
+            "0.1",
+            "2025-06-18",
+            "https://mcp.example.com:8443/mcp",
+            &[],
+            None,
+        );
+        assert_eq!(m["dnsDiscovery"]["record"], "_mcp.mcp.example.com");
+        assert_eq!(
+            m["dnsDiscovery"]["value"],
+            "v=mcp1; uri=https://mcp.example.com/.well-known/mcp-server"
+        );
+    }
+
+    #[test]
+    fn host_parsing_returns_none_for_hostless_endpoint() {
+        assert_eq!(host_from_endpoint("https://"), None);
+        assert_eq!(
+            host_from_endpoint("mcp.example.com/"),
+            Some("mcp.example.com")
+        );
     }
 }
