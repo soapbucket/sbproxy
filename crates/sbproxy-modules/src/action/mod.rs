@@ -1322,7 +1322,10 @@ mod tests {
             tls: false,
             authority: None,
             timeout_secs: 30,
+            grpc_web: false,
+            transcode: None,
             forwarding: Default::default(),
+            transcoder: None,
         });
         assert_eq!(action.action_type(), "grpc");
     }
@@ -1334,7 +1337,10 @@ mod tests {
             tls: true,
             authority: Some("api.example.com".to_string()),
             timeout_secs: 60,
+            grpc_web: false,
+            transcode: None,
             forwarding: Default::default(),
+            transcoder: None,
         });
         let debug = format!("{:?}", action);
         assert!(debug.contains("Grpc"));

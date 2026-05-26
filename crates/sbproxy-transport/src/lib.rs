@@ -10,6 +10,7 @@
 pub mod auto_pool;
 pub mod coalescing;
 pub mod dedup;
+pub mod grpc;
 pub mod hedging;
 pub mod mirroring;
 pub mod ratelimit;
@@ -17,6 +18,10 @@ pub mod retry;
 
 pub use coalescing::{CoalescedResponse, RequestCoalescer};
 pub use dedup::DedupCache;
+pub use grpc::{
+    GrpcStatus, GrpcTrailers, GrpcWebBridge, HttpMethod, PathTemplate, RouteSpec,
+    TranscodedRequest, TranscodedResponse, Transcoder,
+};
 pub use hedging::HedgingConfig;
 pub use mirroring::{mirror_request, MirrorConfig};
 pub use ratelimit::UpstreamRateLimiter;

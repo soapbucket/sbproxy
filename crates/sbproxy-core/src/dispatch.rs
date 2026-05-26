@@ -300,7 +300,11 @@ async fn dispatch_action(
             Ok(text_response(501, &h3_unsupported_message("websocket")))
         }
         Action::Grpc(_) => {
-            warn!("H3: grpc action not yet supported in H3 dispatch");
+            // gRPC mandates HTTP/2 end-to-end, and the REST <-> gRPC
+            // transcoding and gRPC-Web bridging paths are driven from the
+            // HTTP/1.1 and HTTP/2 request flow, so none of the gRPC modes
+            // are served over the HTTP/3 listener.
+            warn!("H3: grpc action (and its transcoding / gRPC-Web modes) not supported in H3 dispatch");
             Ok(text_response(501, &h3_unsupported_message("grpc")))
         }
         Action::GraphQL(_) => {

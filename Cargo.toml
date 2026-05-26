@@ -188,6 +188,17 @@ tonic = "0.12"
 prost = "0.13"
 tonic-build = "0.12"
 
+# Dynamic protobuf reflection for descriptor-driven REST <-> gRPC
+# transcoding (WOR-819). Parses a FileDescriptorSet at config load and
+# builds DynamicMessage values for JSON <-> protobuf at runtime, so the
+# proxy can transcode without compiled stubs. Pinned to the 0.14 line
+# because it tracks prost 0.13 (the workspace prost major); the 0.16
+# line moved to prost 0.14. The `serde` feature provides the proto3 JSON
+# mapping used to convert request/response bodies. Dual MIT/Apache-2.0,
+# so no NOTICE attribution is required.
+prost-reflect = { version = "0.14", features = ["serde"] }
+prost-types = "0.13"
+
 # Background task tracking (graceful shutdown drains).
 tokio-util = { version = "0.7", features = ["rt"] }
 

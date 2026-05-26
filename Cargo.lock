@@ -4830,6 +4830,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost-reflect"
+version = "0.14.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5edd582b62f5cde844716e66d92565d7faf7ab1445c8cebce6e00fba83ddb2"
+dependencies = [
+ "base64 0.22.1",
+ "once_cell",
+ "prost 0.13.5",
+ "prost-types",
+ "serde",
+ "serde-value",
+]
+
+[[package]]
 name = "prost-types"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6232,10 +6246,14 @@ name = "sbproxy-transport"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
  "hex",
  "http",
  "parking_lot",
+ "prost 0.13.5",
+ "prost-reflect",
+ "prost-types",
  "rand 0.8.6",
  "reqwest",
  "sbproxy-plugin",
