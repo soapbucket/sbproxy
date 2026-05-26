@@ -57,6 +57,12 @@ impl PolicyEnforcer for PromptInjectionV2Enforcer {
                 });
             }
         };
+        // WOR-801: body-aware scanning. Flag the request body for
+        // buffering so the body-phase scan (request_body_filter) can run
+        // the detector over the POST body, not just the URI + headers
+        // scanned synchronously below. Harmless for bodyless requests
+        // (the buffer stays empty and the body-phase scan is a no-op).
+        ctx.validate_request_body = true;
         let mut prompt = req.uri().to_string();
         for (name, value) in req.headers().iter() {
             let n = name.as_str();
