@@ -375,6 +375,28 @@ impl ProxyHarness {
         }
         decode(req.send()?)
     }
+
+    /// POST a raw body with an explicit `content-type` (used by the
+    /// gRPC-Web e2e to send a length-prefixed gRPC-Web frame).
+    pub fn post_bytes(
+        &self,
+        path: &str,
+        host: &str,
+        content_type: &str,
+        body: Vec<u8>,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Response> {
+        let mut req = self
+            .http_client()
+            .post(format!("{}{}", self.base_url(), path))
+            .header("host", host)
+            .header("content-type", content_type)
+            .body(body);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        decode(req.send()?)
+    }
 }
 
 impl Drop for ProxyHarness {
