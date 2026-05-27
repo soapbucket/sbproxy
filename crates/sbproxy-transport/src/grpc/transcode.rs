@@ -88,6 +88,19 @@ struct CompiledRoute {
     body: Option<String>,
 }
 
+/// The result of matching a request to a transcode route, without the
+/// body. Carries what the header phase needs to rewrite the upstream
+/// request and to later decode the response.
+#[derive(Debug, Clone)]
+pub struct RouteMatch {
+    /// The gRPC `:path` to send upstream, for example
+    /// `/sbproxy_e2e.echo.Echo/Hello`.
+    pub grpc_path: String,
+    /// Fully-qualified gRPC method, for example
+    /// `sbproxy_e2e.echo.Echo.Hello`.
+    pub grpc_method: String,
+}
+
 /// The gRPC path (`:path` header value) plus the protobuf request bytes
 /// and the framed gRPC body for a transcoded unary call.
 #[derive(Debug, Clone)]
@@ -178,6 +191,28 @@ impl Transcoder {
     /// The gRPC `:path` for a method (`/pkg.Service/Method`).
     fn grpc_path(method: &MethodDescriptor) -> String {
         format!("/{}/{}", method.parent_service().full_name(), method.name())
+    }
+
+    /// Match a request method + path against the configured routes
+    /// without touching the body. Returns the gRPC `:path` to send
+    /// upstream and the fully-qualified gRPC method, or `None` when no
+    /// route matches.
+    ///
+    /// This is the header-phase counterpart to [`Self::transcode_request`]:
+    /// the request pipeline needs the gRPC `:path` to rewrite the
+    /// upstream request header before the body is available, then calls
+    /// `transcode_request` with the buffered body to produce the frame.
+    pub fn match_route(&self, http_method: &str, path: &str) -> Option<RouteMatch> {
+        let method = HttpMethod::parse(http_method)?;
+        let route = self
+            .routes
+            .iter()
+            .find(|r| r.method == method && r.template.match_path(path).is_some())?;
+        let descriptor = Self::lookup_method(&self.pool, &route.grpc_method).ok()?;
+        Some(RouteMatch {
+            grpc_path: Self::grpc_path(&descriptor),
+            grpc_method: route.grpc_method.clone(),
+        })
     }
 
     /// Transcode an inbound HTTP/JSON request into a unary gRPC frame.

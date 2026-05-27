@@ -20,9 +20,59 @@ pub(super) async fn handle_action(
         Action::Proxy(_)
         | Action::LoadBalancer(_)
         | Action::WebSocket(_)
-        | Action::Grpc(_)
         | Action::GraphQL(_)
         | Action::A2a(_) => Ok(false),
+
+        Action::Grpc(g) => {
+            // WOR-819: a REST request (not native `application/grpc`) sent
+            // to a transcode-configured grpc action that matches no route
+            // is a 404. We reject here, in request_filter, rather than
+            // letting it proxy as a native gRPC call. Native gRPC requests
+            // and matched transcode routes proxy normally (`Ok(false)`);
+            // the route is matched again in `upstream_request_filter` to
+            // drive the request/response body rewrite.
+            if let Some(transcoder) = g.transcoder.as_ref() {
+                let is_native_grpc = session
+                    .req_header()
+                    .headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|ct| ct.starts_with("application/grpc"))
+                    .unwrap_or(false);
+                if !is_native_grpc {
+                    let method = session.req_header().method.as_str().to_string();
+                    let path = session.req_header().uri.path().to_string();
+                    if transcoder.match_route(&method, &path).is_none() {
+                        let body = bytes::Bytes::from_static(
+                            b"{\"error\":\"no transcode route for this path\"}",
+                        );
+                        let mut header = pingora_http::ResponseHeader::build(404, Some(1))
+                            .map_err(|e| {
+                                Error::because(
+                                    ErrorType::InternalError,
+                                    "failed to build transcode 404 header",
+                                    e,
+                                )
+                            })?;
+                        header
+                            .insert_header("content-type", "application/json")
+                            .map_err(|e| {
+                                Error::because(
+                                    ErrorType::InternalError,
+                                    "failed to set transcode 404 content-type",
+                                    e,
+                                )
+                            })?;
+                        session
+                            .write_response_header(Box::new(header), false)
+                            .await?;
+                        session.write_response_body(Some(body), true).await?;
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
 
         Action::AiProxy(ai) => {
             // Pull hostname from the resolved origin (if any) so the AI

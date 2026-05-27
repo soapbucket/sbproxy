@@ -34,5 +34,7 @@ pub mod web;
 pub use frame::{decode_all, decode_one, encode_message, Frame};
 pub use status::GrpcStatus;
 pub use template::PathTemplate;
-pub use transcode::{HttpMethod, RouteSpec, TranscodedRequest, TranscodedResponse, Transcoder};
+pub use transcode::{
+    HttpMethod, RouteMatch, RouteSpec, TranscodedRequest, TranscodedResponse, Transcoder,
+};
 pub use web::{is_grpc_web, is_text_encoded, GrpcTrailers, GrpcWebBridge};

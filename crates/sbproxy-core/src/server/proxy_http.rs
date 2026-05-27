@@ -374,6 +374,11 @@ impl ProxyHttp for SbProxy {
             std::sync::Arc<sbproxy_middleware::signatures_egress::MessageSigner>,
         > = None;
         let mut wba_signature_agent: Option<String> = None;
+        // WOR-819: gRPC `:path` to rewrite the upstream request into when
+        // the request matched a `transcode` route on a `grpc` action.
+        // Applied after the pipeline guard drops, alongside the other
+        // header rewrites.
+        let mut transcode_grpc_path: Option<String> = None;
 
         {
             let pipeline = reload::current_pipeline();
@@ -395,6 +400,27 @@ impl ProxyHttp for SbProxy {
                 } else {
                     &pipeline.actions[idx]
                 };
+
+                // WOR-819: REST -> gRPC transcoding. When the resolved
+                // grpc action carries a compiled transcoder and the
+                // request matches a transcode route, capture the gRPC
+                // `:path` + method now so the upstream header is rewritten
+                // after the guard drops, and flag the body filters to
+                // rewrite the request and response bodies. The request
+                // body itself is read in `request_body_filter`, so only a
+                // signal + the resolved gRPC method are carried on ctx.
+                if let Action::Grpc(g) = effective_action {
+                    if let Some(transcoder) = g.transcoder.as_ref() {
+                        if let Some(rm) = transcoder.match_route(
+                            upstream_request.method.as_str(),
+                            upstream_request.uri.path(),
+                        ) {
+                            transcode_grpc_path = Some(rm.grpc_path);
+                            ctx.transcode_active = true;
+                            ctx.transcode_grpc_method = Some(rm.grpc_method);
+                        }
+                    }
+                }
 
                 // Compute the upstream Host header. Default: hostname from the
                 // upstream URL (proxy / lb target / websocket / grpc / a2a /
@@ -515,6 +541,22 @@ impl ProxyHttp for SbProxy {
                 }
             }
         } // pipeline guard dropped here
+
+        // WOR-819: rewrite the upstream request into a unary gRPC call.
+        // gRPC mandates POST; the `:path` is the resolved gRPC method
+        // path; the body becomes a length-prefixed gRPC frame in
+        // `request_body_filter`, so we drop the inbound content-length
+        // (the framed length differs and h2 delimits via END_STREAM) and
+        // ask the upstream for trailers so `grpc-status` comes back.
+        if let Some(grpc_path) = &transcode_grpc_path {
+            upstream_request.set_method(http::Method::POST);
+            if let Ok(uri) = grpc_path.parse::<http::Uri>() {
+                upstream_request.set_uri(uri);
+            }
+            let _ = upstream_request.insert_header("content-type".to_string(), "application/grpc");
+            let _ = upstream_request.insert_header("te".to_string(), "trailers");
+            upstream_request.remove_header("content-length");
+        }
 
         // Prepend the proxy action's URL path to the upstream request path.
         // E.g., if action url is http://backend:8080/fail and client sends /,
@@ -894,6 +936,37 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // --- WOR-819: gRPC -> REST/JSON response header rewrite ---
+        //
+        // A transcoded request gets a gRPC response: `content-type:
+        // application/grpc`, the body a length-prefixed frame, and the
+        // gRPC status in trailers (or, for an immediate error, a
+        // trailers-only response carrying `grpc-status` in the headers).
+        // Rewrite the content-type to JSON and drop the now-wrong
+        // content-length (the body is rewritten in response_body_filter).
+        // Capture a header-borne `grpc-status` so a trailers-only error
+        // maps to the JSON error envelope.
+        if ctx.transcode_active {
+            let _ = upstream_response.insert_header("content-type".to_string(), "application/json");
+            upstream_response.remove_header("content-length");
+            upstream_response.remove_header("grpc-encoding");
+            if let Some(status) = upstream_response
+                .headers
+                .get("grpc-status")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<i32>().ok())
+            {
+                ctx.transcode_grpc_status = Some(status);
+                if let Some(msg) = upstream_response
+                    .headers
+                    .get("grpc-message")
+                    .and_then(|v| v.to_str().ok())
+                {
+                    ctx.transcode_grpc_message = Some(msg.to_string());
+                }
+            }
+        }
+
         // --- WOR-114: x-sb-flags debug response markers ---
         //
         // When the client opted in via `x-sb-flags: debug` (or
@@ -1868,6 +1941,90 @@ impl ProxyHttp for SbProxy {
             }
         }
 
+        // --- WOR-819: REST -> gRPC request body transcoding ---
+        //
+        // When `upstream_request_filter` matched a transcode route, hold
+        // the JSON body back from the upstream and, at end_of_stream,
+        // encode it into a unary gRPC frame via the descriptor-backed
+        // transcoder (re-fetched from the pipeline). The original method
+        // and path are read from the client request header; the upstream
+        // `:path` and headers were already rewritten. A malformed body is
+        // rejected without contacting the upstream. (An unmapped REST path
+        // is rejected earlier, in `handle_action`.)
+        if ctx.transcode_active {
+            let buf = ctx
+                .request_body_buf
+                .get_or_insert_with(bytes::BytesMut::new);
+            if let Some(chunk) = body.take() {
+                buf.extend_from_slice(&chunk);
+            }
+            if end_of_stream {
+                let collected = ctx.request_body_buf.take().unwrap_or_default();
+                let method = session.req_header().method.as_str().to_string();
+                let path = session
+                    .req_header()
+                    .uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str().to_string())
+                    .unwrap_or_else(|| session.req_header().uri.path().to_string());
+                let result = {
+                    let pipeline = reload::current_pipeline();
+                    let action = ctx.origin_idx.and_then(|idx| {
+                        if let Some(fwd_idx) = ctx.forward_rule_idx {
+                            pipeline
+                                .forward_rules
+                                .get(idx)
+                                .and_then(|r| r.get(fwd_idx))
+                                .map(|r| &r.action)
+                        } else {
+                            pipeline.actions.get(idx)
+                        }
+                    });
+                    match action {
+                        Some(Action::Grpc(g)) => match g.transcoder.as_ref() {
+                            Some(t) => t.transcode_request(&method, &path, &collected),
+                            None => Ok(None),
+                        },
+                        _ => Ok(None),
+                    }
+                };
+                match result {
+                    Ok(Some(tr)) => {
+                        *body = Some(Bytes::from(tr.framed_body));
+                    }
+                    Ok(None) => {
+                        // The route vanished (config reload between phases).
+                        // Reject without contacting the upstream.
+                        ctx.validator_failed = Some((
+                            404,
+                            "{\"error\":\"no transcode route\"}".to_string(),
+                            "application/json".to_string(),
+                        ));
+                        *body = None;
+                        return Err(pingora_error::Error::explain(
+                            pingora_error::ErrorType::HTTPStatus(404),
+                            "no matching transcode route",
+                        ));
+                    }
+                    Err(e) => {
+                        let body_str = serde_json::json!({
+                            "error": "invalid request body for gRPC transcoding",
+                            "detail": e.to_string(),
+                        })
+                        .to_string();
+                        ctx.validator_failed =
+                            Some((400, body_str, "application/json".to_string()));
+                        *body = None;
+                        return Err(pingora_error::Error::explain(
+                            pingora_error::ErrorType::HTTPStatus(400),
+                            "gRPC request transcoding failed",
+                        ));
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         // --- Mirror body teeing ---
         //
         // When a mirror is pending and `mirror_body: true`, we need
@@ -2256,6 +2413,90 @@ impl ProxyHttp for SbProxy {
         // billing and abuse models care about.
         if let Some(chunk) = body.as_ref() {
             ctx.response_body_bytes = ctx.response_body_bytes.saturating_add(chunk.len() as u64);
+        }
+
+        // --- WOR-819: gRPC -> REST/JSON response body transcoding ---
+        //
+        // Buffer the upstream gRPC response frame and, at end_of_stream,
+        // decode it to JSON via the descriptor-backed transcoder
+        // (re-fetched from the pipeline). The HTTP status stays as the
+        // upstream sent it (200 for a successful unary call); a
+        // header-borne `grpc-status` (trailers-only error) produces the
+        // JSON error envelope. A successful call carries `grpc-status: 0`
+        // in trailers, which arrive after the body, so it is treated as
+        // OK here; full trailer-driven status remapping is a documented
+        // follow-up.
+        if ctx.transcode_active {
+            // Already emitted the JSON (the frame completed on an earlier
+            // chunk): drop any trailing chunks / the final end_of_stream.
+            if ctx.transcode_response_emitted {
+                *body = None;
+                return Ok(None);
+            }
+            if let Some(chunk) = body.take() {
+                ctx.transcode_response_buf
+                    .get_or_insert_with(bytes::BytesMut::new)
+                    .extend_from_slice(&chunk);
+            }
+            // A unary gRPC frame is `1 compression byte + 4 length bytes +
+            // message`. Emit as soon as a full frame is buffered, because
+            // the DATA frame arrives without END_STREAM (trailers carry
+            // grpc-status), so an `end_of_stream` call carrying the frame
+            // may never come. Also emit on `end_of_stream` for an
+            // empty/trailers-only response.
+            let frame_complete = ctx
+                .transcode_response_buf
+                .as_ref()
+                .map(|b| {
+                    b.len() >= 5
+                        && b.len() >= 5 + u32::from_be_bytes([b[1], b[2], b[3], b[4]]) as usize
+                })
+                .unwrap_or(false);
+            if frame_complete || end_of_stream {
+                let frame = ctx.transcode_response_buf.take().unwrap_or_default();
+                let grpc_method = ctx.transcode_grpc_method.clone().unwrap_or_default();
+                let grpc_status = ctx.transcode_grpc_status.unwrap_or(0);
+                let grpc_message = ctx.transcode_grpc_message.clone();
+                let json: Vec<u8> = {
+                    let pipeline = reload::current_pipeline();
+                    let action = ctx.origin_idx.and_then(|idx| {
+                        if let Some(fwd_idx) = ctx.forward_rule_idx {
+                            pipeline
+                                .forward_rules
+                                .get(idx)
+                                .and_then(|r| r.get(fwd_idx))
+                                .map(|r| &r.action)
+                        } else {
+                            pipeline.actions.get(idx)
+                        }
+                    });
+                    match action {
+                        Some(Action::Grpc(g)) => match g.transcoder.as_ref() {
+                            Some(t) => t
+                                .transcode_response(
+                                    &grpc_method,
+                                    &frame,
+                                    grpc_status,
+                                    grpc_message.as_deref(),
+                                )
+                                .map(|tr| tr.json_body)
+                                .unwrap_or_else(|e| {
+                                    serde_json::json!({
+                                        "error": "gRPC response transcoding failed",
+                                        "detail": e.to_string(),
+                                    })
+                                    .to_string()
+                                    .into_bytes()
+                                }),
+                            None => b"{}".to_vec(),
+                        },
+                        _ => b"{}".to_vec(),
+                    }
+                };
+                ctx.transcode_response_emitted = true;
+                *body = Some(Bytes::from(json));
+            }
+            return Ok(None);
         }
 
         // --- Response cache: accumulate body chunks ---

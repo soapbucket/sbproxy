@@ -97,7 +97,6 @@ origins:
     )
 }
 
-#[ignore = "WOR-819: the REST<->gRPC transcoder library (sbproxy-transport/src/grpc/transcode.rs) and its `grpc` action config (transcode: block) shipped in #304, but the transcoder is NOT wired into the request pipeline: transcode_request/transcode_response have zero call sites in sbproxy-core, so the grpc action always does native passthrough. Activate this test once the wiring lands (buffer the request body in request_body_filter -> transcode_request -> rewrite :path + content-type:application/grpc in upstream_request_filter; buffer the upstream gRPC frame in response_body_filter -> transcode_response -> emit JSON). See the WOR-819 ticket for the implementation plan."]
 #[test]
 fn rest_json_transcodes_to_grpc_and_back() {
     let upstream = spawn_echo_grpc_server();
@@ -121,7 +120,6 @@ fn rest_json_transcodes_to_grpc_and_back() {
     );
 }
 
-#[ignore = "WOR-819: blocked on the same request-path wiring as rest_json_transcodes_to_grpc_and_back. Once wired, an unmapped path on a transcode-configured grpc action must return 4xx rather than fabricating a gRPC passthrough."]
 #[test]
 fn unmapped_path_is_not_transcoded() {
     // A path with no matching transcode route must not be silently
