@@ -438,6 +438,8 @@ pub(super) fn emit_access_log(
         bytes_out: ctx.response_body_bytes,
         provider: ctx.ai_provider.clone(),
         model: ctx.ai_model.clone(),
+        prompt_name: ctx.ai_prompt_name.clone(),
+        prompt_version: ctx.ai_prompt_version.clone(),
         tokens_in: ctx.ai_tokens_in,
         tokens_out: ctx.ai_tokens_out,
         ai_surface: ctx.ai_surface.clone(),
@@ -508,6 +510,9 @@ pub(super) struct AccessLogContext {
     pub(super) provider: Option<String>,
     /// AI model identifier the request was routed to.
     pub(super) model: Option<String>,
+    /// WOR-800: stored prompt name + version the request resolved.
+    pub(super) prompt_name: Option<String>,
+    pub(super) prompt_version: Option<String>,
     /// Prompt / input tokens consumed (from the provider response).
     pub(super) tokens_in: Option<u64>,
     /// Completion / output tokens generated.
@@ -575,6 +580,8 @@ impl AccessLogContext {
             bytes_out: 0,
             provider: None,
             model: None,
+            prompt_name: None,
+            prompt_version: None,
             tokens_in: None,
             tokens_out: None,
             ai_surface: None,
@@ -666,6 +673,8 @@ pub(super) fn emit_access_log_entry(
         client_ip,
         provider: context.provider,
         model: context.model,
+        prompt_name: context.prompt_name,
+        prompt_version: context.prompt_version,
         tokens_in: context.tokens_in,
         tokens_out: context.tokens_out,
         ai_surface: context.ai_surface,

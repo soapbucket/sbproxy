@@ -51,6 +51,14 @@ pub struct AccessLogEntry {
     /// AI model identifier selected for this request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// WOR-800: name of the stored prompt this request resolved, when it
+    /// referenced one via `"prompt": "name@version"`. Ties a run to the
+    /// prompt that produced it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_name: Option<String>,
+    /// WOR-800: resolved version label of [`Self::prompt_name`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_version: Option<String>,
     /// Prompt / input tokens consumed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_in: Option<u64>,
@@ -387,6 +395,8 @@ impl Default for AccessLogEntry {
             client_ip: String::new(),
             provider: None,
             model: None,
+            prompt_name: None,
+            prompt_version: None,
             tokens_in: None,
             tokens_out: None,
             ai_surface: None,
@@ -603,6 +613,8 @@ mod tests {
             client_ip: "10.0.0.1".to_string(),
             provider: None,
             model: None,
+            prompt_name: None,
+            prompt_version: None,
             tokens_in: None,
             tokens_out: None,
             ai_surface: None,

@@ -585,6 +585,13 @@ pub struct RequestContext {
     /// when the AI handler dispatched the request. `None` for
     /// non-AI traffic.
     pub ai_provider: Option<String>,
+    /// WOR-800: name of the stored prompt this request resolved (when it
+    /// referenced one via `"prompt": "name@version"`). Recorded on the
+    /// run metadata / billing event so a run can be traced to the prompt
+    /// version that produced it. `None` when no stored prompt was used.
+    pub ai_prompt_name: Option<String>,
+    /// WOR-800: resolved version label of [`Self::ai_prompt_name`].
+    pub ai_prompt_version: Option<String>,
     /// AI model identifier the request routed to (e.g. `gpt-4o`,
     /// `claude-sonnet-4-6`). Captured before the upstream call so
     /// the access log records the resolved model even when the
@@ -909,6 +916,8 @@ impl RequestContext {
             canonical_url: None,
             metrics: RequestMetrics::default(),
             ai_provider: None,
+            ai_prompt_name: None,
+            ai_prompt_version: None,
             ai_model: None,
             ai_tokens_in: None,
             ai_tokens_out: None,

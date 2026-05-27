@@ -5696,6 +5696,7 @@ dependencies = [
  "futures",
  "hex",
  "lru",
+ "minijinja",
  "parking_lot",
  "prometheus 0.14.0",
  "rand 0.8.6",

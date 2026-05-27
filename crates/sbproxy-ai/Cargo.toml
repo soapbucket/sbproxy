@@ -16,6 +16,8 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
+# WOR-800: prompt-store template rendering.
+minijinja.workspace = true
 tokio.workspace = true
 smallvec.workspace = true
 regex.workspace = true

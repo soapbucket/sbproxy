@@ -80,6 +80,14 @@ pub struct AiHandlerConfig {
     /// passes the value through.
     #[serde(default)]
     pub semantic_cache: Option<serde_json::Value>,
+    /// WOR-800: per-origin versioned prompt store. Named prompts, each
+    /// with one or more numbered versions and optional reusable
+    /// `partials:` fragments, referenced from a request body as
+    /// `"prompt": "name@version"` (or bare `"name"` for the pinned
+    /// default version) and rendered server-side with the request
+    /// variables before the messages reach the provider.
+    #[serde(default)]
+    pub prompts: Option<crate::prompts::PromptStore>,
     /// Selects the SSE usage parser for the streaming relay.
     /// Recognized values: `auto` (default; chooses by upstream URL,
     /// `Content-Type`, or response `X-Provider` header), `openai`,
@@ -826,6 +834,7 @@ mod tests {
             shadow: None,
             pii: None,
             semantic_cache: None,
+            prompts: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
             embedding_cache: OnceLock::new(),
@@ -853,6 +862,7 @@ mod tests {
             shadow: None,
             pii: None,
             semantic_cache: None,
+            prompts: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
             embedding_cache: OnceLock::new(),
@@ -880,6 +890,7 @@ mod tests {
             shadow: None,
             pii: None,
             semantic_cache: None,
+            prompts: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
             embedding_cache: OnceLock::new(),
@@ -908,6 +919,7 @@ mod tests {
             shadow: None,
             pii: None,
             semantic_cache: None,
+            prompts: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
             embedding_cache: OnceLock::new(),
