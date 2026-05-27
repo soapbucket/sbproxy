@@ -176,6 +176,20 @@ pub struct RequestContext {
     /// so the frame is emitted as soon as it is complete rather than
     /// waiting for an `end_of_stream` that may never carry it.
     pub transcode_response_emitted: bool,
+    /// WOR-819: set in `upstream_request_filter` when a gRPC-Web request
+    /// (`content-type: application/grpc-web*`) hits a `grpc` action with
+    /// `grpc_web: true`. The body filters then bridge gRPC-Web <-> native
+    /// gRPC: decode the request frames upstream and re-encode the
+    /// response frames + a trailer frame back to the browser.
+    pub grpc_web_active: bool,
+    /// True when the gRPC-Web request used the base64 `-text` variant, so
+    /// the request body is base64-decoded and the response re-encoded.
+    pub grpc_web_text: bool,
+    /// Accumulator for the upstream gRPC response message frame(s).
+    pub grpc_web_buf: Option<BytesMut>,
+    /// True once the gRPC-Web response body (message frames + trailer
+    /// frame) has been emitted, so later filter calls do not double-emit.
+    pub grpc_web_emitted: bool,
     /// Set by `request_body_filter` when a request body fails schema
     /// validation. The triple is `(status, body, content_type)` and is
     /// surfaced by `fail_to_proxy` (the body filter aborts the
@@ -807,6 +821,10 @@ impl RequestContext {
             transcode_grpc_status: None,
             transcode_grpc_message: None,
             transcode_response_emitted: false,
+            grpc_web_active: false,
+            grpc_web_text: false,
+            grpc_web_buf: None,
+            grpc_web_emitted: false,
             validator_failed: None,
             idempotency_buffering: false,
             idempotency_workspace: None,

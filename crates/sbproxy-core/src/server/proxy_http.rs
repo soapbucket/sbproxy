@@ -379,6 +379,11 @@ impl ProxyHttp for SbProxy {
         // Applied after the pipeline guard drops, alongside the other
         // header rewrites.
         let mut transcode_grpc_path: Option<String> = None;
+        // WOR-819: true when this is a gRPC-Web request on a `grpc_web`-
+        // enabled action, so the upstream content-type is rewritten to
+        // native gRPC after the guard drops (the `:path` is unchanged -
+        // gRPC-Web already uses the native gRPC method path).
+        let mut grpc_web_request = false;
 
         {
             let pipeline = reload::current_pipeline();
@@ -410,7 +415,19 @@ impl ProxyHttp for SbProxy {
                 // body itself is read in `request_body_filter`, so only a
                 // signal + the resolved gRPC method are carried on ctx.
                 if let Action::Grpc(g) = effective_action {
-                    if let Some(transcoder) = g.transcoder.as_ref() {
+                    let req_ct = upstream_request
+                        .headers
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    // gRPC-Web takes precedence: a browser gRPC-Web request
+                    // carries `application/grpc-web*` and uses the native
+                    // gRPC method path, so it is bridged (not transcoded).
+                    if g.grpc_web && sbproxy_transport::grpc::is_grpc_web(req_ct) {
+                        ctx.grpc_web_active = true;
+                        ctx.grpc_web_text = sbproxy_transport::grpc::is_text_encoded(req_ct);
+                        grpc_web_request = true;
+                    } else if let Some(transcoder) = g.transcoder.as_ref() {
                         if let Some(rm) = transcoder.match_route(
                             upstream_request.method.as_str(),
                             upstream_request.uri.path(),
@@ -556,6 +573,21 @@ impl ProxyHttp for SbProxy {
             let _ = upstream_request.insert_header("content-type".to_string(), "application/grpc");
             let _ = upstream_request.insert_header("te".to_string(), "trailers");
             upstream_request.remove_header("content-length");
+        }
+
+        // WOR-819: gRPC-Web request -> native gRPC. The path and method
+        // are already the native gRPC shape (POST /pkg.Service/Method);
+        // only the content-type changes (and the body is de-framed in
+        // request_body_filter). Drop content-length: the `-text` variant
+        // base64-decodes to a different length, and h2 delimits via
+        // END_STREAM anyway.
+        if grpc_web_request {
+            let _ = upstream_request.insert_header("content-type".to_string(), "application/grpc");
+            let _ = upstream_request.insert_header("te".to_string(), "trailers");
+            upstream_request.remove_header("content-length");
+            // X-Grpc-Web is a CORS preflight marker the upstream gRPC
+            // server does not expect.
+            upstream_request.remove_header("x-grpc-web");
         }
 
         // Prepend the proxy action's URL path to the upstream request path.
@@ -948,6 +980,41 @@ impl ProxyHttp for SbProxy {
         // maps to the JSON error envelope.
         if ctx.transcode_active {
             let _ = upstream_response.insert_header("content-type".to_string(), "application/json");
+            upstream_response.remove_header("content-length");
+            upstream_response.remove_header("grpc-encoding");
+            if let Some(status) = upstream_response
+                .headers
+                .get("grpc-status")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<i32>().ok())
+            {
+                ctx.transcode_grpc_status = Some(status);
+                if let Some(msg) = upstream_response
+                    .headers
+                    .get("grpc-message")
+                    .and_then(|v| v.to_str().ok())
+                {
+                    ctx.transcode_grpc_message = Some(msg.to_string());
+                }
+            }
+        }
+
+        // --- WOR-819: gRPC -> gRPC-Web response header rewrite ---
+        //
+        // Set the gRPC-Web response content-type (tracking the request's
+        // text/binary variant), drop content-length (the body gains a
+        // trailer frame), and capture a header-borne `grpc-status` for a
+        // trailers-only error so the trailer frame reports it.
+        if ctx.grpc_web_active {
+            let req_ct = session
+                .req_header()
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/grpc-web+proto")
+                .to_string();
+            let resp_ct = sbproxy_transport::grpc::GrpcWebBridge::response_content_type(&req_ct);
+            let _ = upstream_response.insert_header("content-type".to_string(), resp_ct);
             upstream_response.remove_header("content-length");
             upstream_response.remove_header("grpc-encoding");
             if let Some(status) = upstream_response
@@ -2025,6 +2092,47 @@ impl ProxyHttp for SbProxy {
             return Ok(());
         }
 
+        // --- WOR-819: gRPC-Web -> native gRPC request de-framing ---
+        //
+        // Buffer the gRPC-Web request body and, at end_of_stream, decode
+        // it into native gRPC message frames (base64-decoding the `-text`
+        // variant). The upstream `:path`/method/content-type were already
+        // set to the native gRPC shape in `upstream_request_filter`.
+        if ctx.grpc_web_active {
+            let buf = ctx
+                .request_body_buf
+                .get_or_insert_with(bytes::BytesMut::new);
+            if let Some(chunk) = body.take() {
+                buf.extend_from_slice(&chunk);
+            }
+            if end_of_stream {
+                let collected = ctx.request_body_buf.take().unwrap_or_default();
+                match sbproxy_transport::grpc::GrpcWebBridge::decode_request(
+                    &collected,
+                    ctx.grpc_web_text,
+                ) {
+                    Ok(native) => {
+                        *body = Some(Bytes::from(native));
+                    }
+                    Err(e) => {
+                        let body_str = serde_json::json!({
+                            "error": "invalid gRPC-Web request frame",
+                            "detail": e.to_string(),
+                        })
+                        .to_string();
+                        ctx.validator_failed =
+                            Some((400, body_str, "application/json".to_string()));
+                        *body = None;
+                        return Err(pingora_error::Error::explain(
+                            pingora_error::ErrorType::HTTPStatus(400),
+                            "gRPC-Web request decode failed",
+                        ));
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         // --- Mirror body teeing ---
         //
         // When a mirror is pending and `mirror_body: true`, we need
@@ -2495,6 +2603,50 @@ impl ProxyHttp for SbProxy {
                 };
                 ctx.transcode_response_emitted = true;
                 *body = Some(Bytes::from(json));
+            }
+            return Ok(None);
+        }
+
+        // --- WOR-819: gRPC -> gRPC-Web response re-framing ---
+        //
+        // Buffer the upstream's native gRPC message frame and, once a
+        // complete frame is in hand, append a gRPC-Web trailer frame
+        // (carrying grpc-status) and emit, base64-encoding for the
+        // `-text` variant. Like the transcode path, emit on frame-complete
+        // because gRPC-over-h2 sends the DATA frame without END_STREAM.
+        // The success path uses `grpc-status: 0`; a trailers-only error's
+        // status is captured from the response headers in response_filter.
+        if ctx.grpc_web_active {
+            if ctx.grpc_web_emitted {
+                *body = None;
+                return Ok(None);
+            }
+            if let Some(chunk) = body.take() {
+                ctx.grpc_web_buf
+                    .get_or_insert_with(bytes::BytesMut::new)
+                    .extend_from_slice(&chunk);
+            }
+            let frame_complete = ctx
+                .grpc_web_buf
+                .as_ref()
+                .map(|b| {
+                    b.len() >= 5
+                        && b.len() >= 5 + u32::from_be_bytes([b[1], b[2], b[3], b[4]]) as usize
+                })
+                .unwrap_or(false);
+            if frame_complete || end_of_stream {
+                let frames = ctx.grpc_web_buf.take().unwrap_or_default();
+                let trailers = sbproxy_transport::grpc::GrpcTrailers {
+                    status: ctx.transcode_grpc_status.unwrap_or(0),
+                    message: ctx.transcode_grpc_message.clone(),
+                };
+                let encoded = sbproxy_transport::grpc::GrpcWebBridge::encode_response(
+                    &frames,
+                    &trailers,
+                    ctx.grpc_web_text,
+                );
+                ctx.grpc_web_emitted = true;
+                *body = Some(Bytes::from(encoded));
             }
             return Ok(None);
         }
