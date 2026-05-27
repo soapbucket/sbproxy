@@ -269,10 +269,37 @@ pub fn render_projections_with_listings(
             .get("content_signals")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
+        // WOR-808: derive the RSL `<payment>` terms from the pay-per-crawl
+        // config. A per-crawl price maps to `type="crawl"` with the
+        // configured amount + currency; an unpriced origin is `type="free"`.
+        let payment = match ai_crawl.get("price").and_then(|v| v.as_f64()) {
+            Some(p) if p > 0.0 => licenses::PaymentTerms {
+                payment_type: "crawl".to_string(),
+                amount: Some(p),
+                currency: Some(
+                    ai_crawl
+                        .get("currency")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("USD")
+                        .to_string(),
+                ),
+            },
+            _ => licenses::PaymentTerms::free(),
+        };
         let (xml, urn) = if content_signals.is_empty() {
-            licenses::render(hostname.as_str(), content_signal.as_deref(), config_version)
+            licenses::render(
+                hostname.as_str(),
+                content_signal.as_deref(),
+                Some(&payment),
+                config_version,
+            )
         } else {
-            licenses::render_signals(hostname.as_str(), &content_signals, config_version)
+            licenses::render_signals(
+                hostname.as_str(),
+                &content_signals,
+                Some(&payment),
+                config_version,
+            )
         };
         docs.licenses_xml.insert(hostname.clone(), Bytes::from(xml));
         docs.rsl_urns.insert(hostname.clone(), urn);
