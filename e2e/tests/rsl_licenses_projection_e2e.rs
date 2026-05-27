@@ -157,6 +157,25 @@ fn licenses_xml_maps_content_signal_to_ai_use() {
     );
 }
 
+// --- WOR-808: RSL 1.0 <payment> element derived from pay-per-crawl ---
+
+#[test]
+fn licenses_xml_emits_payment_from_pay_per_crawl() {
+    let harness = start_projections().expect("start proxy");
+    let body = harness
+        .get("/licenses.xml", "blog.localhost")
+        .expect("GET")
+        .text()
+        .expect("utf-8 body");
+
+    // The fixture origin sets ai_crawl_control { price: 0.001, currency: USD },
+    // which maps to the RSL `<payment type="crawl">` with the price + currency.
+    assert!(
+        body.contains(r#"<payment type="crawl" amount="0.001" currency="USD" />"#),
+        "expected an RSL <payment> derived from the pay-per-crawl price; got:\n{body}"
+    );
+}
+
 // --- Test 5: canonical RSL Collective shape ---
 
 #[test]

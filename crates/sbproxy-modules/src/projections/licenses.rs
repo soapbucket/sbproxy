@@ -37,16 +37,69 @@
 
 use crate::policy::ai_crawl::ContentSignals;
 
+/// RSL 1.0 `<payment>` terms for a license element.
+///
+/// `payment_type` is an RSL 1.0 payment-enum value (`free`, `crawl`,
+/// `purchase`, `subscription`, `training`, `use`, `attribution`).
+/// `amount` + `currency` are emitted for priced types and omitted for
+/// `free`. SBproxy derives these from the `ai_crawl_control` policy: a
+/// per-crawl price maps to `type="crawl"` with the configured price /
+/// currency; an unpriced origin maps to `type="free"`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaymentTerms {
+    /// RSL payment-enum value.
+    pub payment_type: String,
+    /// Price amount for a priced type; `None` for `free`.
+    pub amount: Option<f64>,
+    /// Currency code for a priced type; `None` for `free`.
+    pub currency: Option<String>,
+}
+
+impl PaymentTerms {
+    /// Free content: `<payment type="free" />`.
+    pub fn free() -> Self {
+        Self {
+            payment_type: "free".to_string(),
+            amount: None,
+            currency: None,
+        }
+    }
+
+    /// Emit the `<payment ... />` element (indented for the `<license>`
+    /// body). Returns the empty string for an unset type so callers can
+    /// unconditionally concatenate.
+    fn to_xml(&self) -> String {
+        if self.payment_type.is_empty() {
+            return String::new();
+        }
+        let mut s = format!(
+            "      <payment type=\"{}\"",
+            escape_xml_attr(&self.payment_type)
+        );
+        if let Some(amount) = self.amount {
+            s.push_str(&format!(" amount=\"{amount}\""));
+        }
+        if let Some(currency) = &self.currency {
+            s.push_str(&format!(" currency=\"{}\"", escape_xml_attr(currency)));
+        }
+        s.push_str(" />\n");
+        s
+    }
+}
+
 /// Render `(licenses_xml, urn)` for a single origin.
 ///
 /// `content_signal` is the parsed value of the origin's
-/// `extensions["content_signal"]` slot (None when absent). Returns the
-/// canonical RSL document (per <https://rslstandard.org/rsl>) and the
-/// URN that identifies the inner license element; the URN is the same
-/// value the response middleware stamps on `RequestContext.rsl_urn`.
+/// `extensions["content_signal"]` slot (None when absent). `payment`
+/// declares the RSL `<payment>` terms (None omits the element). Returns
+/// the canonical RSL document (per <https://rslstandard.org/rsl>) and
+/// the URN that identifies the inner license element; the URN is the
+/// same value the response middleware stamps on
+/// `RequestContext.rsl_urn`.
 pub fn render(
     hostname: &str,
     content_signal: Option<&str>,
+    payment: Option<&PaymentTerms>,
     config_version: u64,
 ) -> (String, String) {
     let urn = format!("urn:rsl:1.0:{hostname}:{config_version}");
@@ -92,6 +145,9 @@ pub fn render(
         "      <origin hostname=\"{}\" />\n",
         escape_xml_attr(hostname)
     ));
+    if let Some(payment) = payment {
+        xml.push_str(&payment.to_xml());
+    }
     xml.push_str(&format!(
         "      <ai-use type=\"{ai_type}\" licensed=\"{licensed}\" />\n"
     ));
@@ -131,6 +187,7 @@ pub fn render(
 pub fn render_signals(
     hostname: &str,
     signals: &ContentSignals,
+    payment: Option<&PaymentTerms>,
     config_version: u64,
 ) -> (String, String) {
     let urn = format!("urn:rsl:1.0:{hostname}:{config_version}");
@@ -153,6 +210,9 @@ pub fn render_signals(
         "      <origin hostname=\"{}\" />\n",
         escape_xml_attr(hostname)
     ));
+    if let Some(payment) = payment {
+        xml.push_str(&payment.to_xml());
+    }
     // Fixed order (search, inference, training) for deterministic
     // output. Each declared signal becomes one `<ai-use>` assertion.
     for (value, ai_type) in [
@@ -214,32 +274,32 @@ mod tests {
 
     #[test]
     fn urn_format_matches_spec() {
-        let (_xml, urn) = render("shop.example.com", Some("ai-train"), 42);
+        let (_xml, urn) = render("shop.example.com", Some("ai-train"), None, 42);
         assert_eq!(urn, "urn:rsl:1.0:shop.example.com:42");
     }
 
     #[test]
     fn ai_train_maps_to_training_licensed_true() {
-        let (xml, _) = render("h", Some("ai-train"), 1);
+        let (xml, _) = render("h", Some("ai-train"), None, 1);
         assert!(xml.contains(r#"<ai-use type="training" licensed="true" />"#));
         assert!(xml.contains("<content-signal>ai-train</content-signal>"));
     }
 
     #[test]
     fn ai_input_maps_to_inference_licensed_true() {
-        let (xml, _) = render("h", Some("ai-input"), 1);
+        let (xml, _) = render("h", Some("ai-input"), None, 1);
         assert!(xml.contains(r#"<ai-use type="inference" licensed="true" />"#));
     }
 
     #[test]
     fn search_maps_to_search_index_licensed_true() {
-        let (xml, _) = render("h", Some("search"), 1);
+        let (xml, _) = render("h", Some("search"), None, 1);
         assert!(xml.contains(r#"<ai-use type="search-index" licensed="true" />"#));
     }
 
     #[test]
     fn absent_signal_maps_to_default_deny() {
-        let (xml, _) = render("h", None, 1);
+        let (xml, _) = render("h", None, None, 1);
         assert!(xml.contains(r#"<ai-use type="training" licensed="false" />"#));
         // No content-signal element when the signal is absent.
         assert!(!xml.contains("<content-signal>"));
@@ -247,7 +307,7 @@ mod tests {
 
     #[test]
     fn unknown_signal_falls_back_to_default_deny() {
-        let (xml, _) = render("h", Some("custom-future-value"), 1);
+        let (xml, _) = render("h", Some("custom-future-value"), None, 1);
         // Falls into the catch-all branch (default-deny).
         assert!(xml.contains(r#"<ai-use type="training" licensed="false" />"#));
         // We still echo the signal text (escaped) for forensics so
@@ -257,7 +317,7 @@ mod tests {
 
     #[test]
     fn xml_namespace_is_canonical_rsl_collective() {
-        let (xml, _) = render("h", Some("ai-train"), 1);
+        let (xml, _) = render("h", Some("ai-train"), None, 1);
         assert!(xml.starts_with(r#"<?xml version="1.0" encoding="UTF-8"?>"#));
         assert!(
             xml.contains(r#"<rsl xmlns="https://rslstandard.org/rsl" version="1.0">"#),
@@ -272,7 +332,7 @@ mod tests {
 
     #[test]
     fn document_nests_license_under_content_with_url_attr() {
-        let (xml, _) = render("shop.example.com", Some("ai-train"), 1);
+        let (xml, _) = render("shop.example.com", Some("ai-train"), None, 1);
         // The license body must live under a `<content url=...>`
         // element, not be a sibling of `<rsl>`.
         assert!(
@@ -299,7 +359,7 @@ mod tests {
         // Constructed (not realistic) hostname to verify the attribute
         // escaper is wired even though DNS hostnames cannot legally
         // contain `&`.
-        let (xml, _) = render("a&b", Some("ai-train"), 1);
+        let (xml, _) = render("a&b", Some("ai-train"), None, 1);
         assert!(xml.contains("hostname=\"a&amp;b\""));
         // The url attribute must also be escaped.
         assert!(xml.contains("url=\"https://a&amp;b/*\""));
@@ -307,9 +367,45 @@ mod tests {
 
     #[test]
     fn deterministic_output() {
-        let (a, _) = render("h", Some("ai-train"), 1);
-        let (b, _) = render("h", Some("ai-train"), 1);
+        let (a, _) = render("h", Some("ai-train"), None, 1);
+        let (b, _) = render("h", Some("ai-train"), None, 1);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn payment_crawl_emits_type_amount_and_currency() {
+        let p = PaymentTerms {
+            payment_type: "crawl".to_string(),
+            amount: Some(0.002),
+            currency: Some("USD".to_string()),
+        };
+        let (xml, _) = render("h", Some("ai-train"), Some(&p), 1);
+        assert!(
+            xml.contains(r#"<payment type="crawl" amount="0.002" currency="USD" />"#),
+            "priced crawl payment emits amount + currency; got:\n{xml}"
+        );
+        // The <payment> element sits inside the <license> body.
+        let pay_idx = xml.find("<payment ").expect("payment present");
+        let lic_idx = xml.find("<license ").expect("license present");
+        let close_idx = xml.find("</license>").expect("license close");
+        assert!(lic_idx < pay_idx && pay_idx < close_idx);
+    }
+
+    #[test]
+    fn payment_free_omits_amount_and_currency() {
+        let (xml, _) = render("h", None, Some(&PaymentTerms::free()), 1);
+        assert!(
+            xml.contains(r#"<payment type="free" />"#),
+            "free payment is bare; got:\n{xml}"
+        );
+        assert!(!xml.contains("amount="));
+        assert!(!xml.contains("currency="));
+    }
+
+    #[test]
+    fn payment_omitted_when_none() {
+        let (xml, _) = render("h", Some("ai-train"), None, 1);
+        assert!(!xml.contains("<payment"));
     }
 
     #[test]
@@ -319,7 +415,7 @@ mod tests {
             ai_input: None,
             ai_train: Some(false),
         };
-        let (xml, urn) = render_signals("shop.example.com", &signals, 9);
+        let (xml, urn) = render_signals("shop.example.com", &signals, None, 9);
         assert_eq!(urn, "urn:rsl:1.0:shop.example.com:9");
         // search=yes -> search-index licensed true.
         assert!(xml.contains(r#"<ai-use type="search-index" licensed="true" />"#));
@@ -341,7 +437,7 @@ mod tests {
             ai_input: Some(true),
             ai_train: Some(false),
         };
-        let (xml, _) = render_signals("h", &signals, 1);
+        let (xml, _) = render_signals("h", &signals, None, 1);
         assert!(xml.contains(r#"<ai-use type="search-index" licensed="true" />"#));
         assert!(xml.contains(r#"<ai-use type="inference" licensed="true" />"#));
         assert!(xml.contains(r#"<ai-use type="training" licensed="false" />"#));
