@@ -31,6 +31,7 @@ pub mod key_scoping;
 pub mod model_alias;
 pub mod multimodal;
 pub mod prompt_cache;
+pub mod prompts;
 pub mod provider;
 pub mod provider_ratelimit;
 pub mod providers;

@@ -552,6 +552,41 @@ pub(super) async fn handle_ai_proxy(
         }
     }
 
+    // --- WOR-800: versioned prompt store ---
+    //
+    // When the body references a stored prompt via `"prompt":
+    // "name@version"` (or bare `"name"` for the pinned default version),
+    // render it server-side with the request variables and prepend it as
+    // a system message. The resolved name + version are recorded on the
+    // context for the run metadata. A bad reference or a missing template
+    // variable is a 400 (rendering is strict-undefined).
+    if let Some(store) = config.prompts.as_ref() {
+        if let Some(reference) = body
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+        {
+            let request_ctx = build_prompt_request_ctx(session, &body);
+            match store.render(&reference, &request_ctx) {
+                Ok(rendered) => {
+                    prepend_system_message(&mut body, &rendered.text);
+                    ctx.ai_prompt_name = Some(rendered.name);
+                    ctx.ai_prompt_version = Some(rendered.version);
+                    // Drop the gateway-only `prompt` field so it is not
+                    // forwarded to the provider.
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.remove("prompt");
+                    }
+                }
+                Err(e) => {
+                    warn!(reference = %reference, error = %e, "AI proxy: prompt render failed");
+                    send_error(session, 400, &format!("prompt error: {e}")).await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     // Extract model name from the body, or use default.
     let mut model = body
         .get("model")
@@ -2460,4 +2495,39 @@ pub(super) async fn relay_ai_stream(
         }
     }
     Ok(())
+}
+
+/// WOR-800: build the `request.*` context exposed to a prompt template.
+/// Carries the request method, path, query, a lowercased header map, and
+/// the parsed request body (so a template can reference, e.g.,
+/// `request.headers["x-user-id"]` or `request.body.model`).
+fn build_prompt_request_ctx(session: &Session, body: &serde_json::Value) -> serde_json::Value {
+    let req = session.req_header();
+    let headers: serde_json::Map<String, serde_json::Value> = req
+        .headers
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|val| (k.as_str().to_ascii_lowercase(), serde_json::json!(val)))
+        })
+        .collect();
+    serde_json::json!({
+        "method": req.method.as_str(),
+        "path": req.uri.path(),
+        "query": req.uri.query().unwrap_or(""),
+        "headers": serde_json::Value::Object(headers),
+        "body": body,
+    })
+}
+
+/// WOR-800: prepend a rendered prompt to the request as a `system`
+/// message. Creates the `messages` array when the body lacks one.
+fn prepend_system_message(body: &mut serde_json::Value, text: &str) {
+    let sys = serde_json::json!({ "role": "system", "content": text });
+    if let Some(arr) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        arr.insert(0, sys);
+    } else if let Some(obj) = body.as_object_mut() {
+        obj.insert("messages".to_string(), serde_json::json!([sys]));
+    }
 }
