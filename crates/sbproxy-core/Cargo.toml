@@ -55,6 +55,11 @@ sbproxy-plugin.workspace = true
 sbproxy-config.workspace = true
 sbproxy-tls.workspace = true
 sbproxy-modules.workspace = true
+# WOR-819: REST <-> gRPC transcoding is driven from the request pipeline
+# (proxy_http.rs) using the descriptor-backed Transcoder; the compiled
+# transcoder lives on the `grpc` action in sbproxy-modules but its methods
+# are called here.
+sbproxy-transport.workspace = true
 sbproxy-middleware.workspace = true
 sbproxy-httpkit.workspace = true
 sbproxy-observe.workspace = true

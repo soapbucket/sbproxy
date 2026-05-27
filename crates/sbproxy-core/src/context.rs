@@ -150,6 +150,32 @@ pub struct RequestContext {
     /// Buffered request body, populated only when `validate_request_body`
     /// is true.
     pub request_body_buf: Option<BytesMut>,
+    /// WOR-819: set in `upstream_request_filter` when the request matched
+    /// a `transcode` route on a `grpc` action. While true, the body
+    /// filters re-fetch the transcoder from the pipeline and rewrite the
+    /// request body (JSON -> framed gRPC) and the response body (gRPC
+    /// frame -> JSON). The original request (method + path) is read back
+    /// from `session.req_header()`, so only this signal is carried.
+    pub transcode_active: bool,
+    /// Fully-qualified gRPC method the matched transcode route targets,
+    /// needed to decode the response message type.
+    pub transcode_grpc_method: Option<String>,
+    /// Accumulator for the upstream gRPC response frame, drained and
+    /// transcoded to JSON at `end_of_stream` in `response_body_filter`.
+    pub transcode_response_buf: Option<BytesMut>,
+    /// gRPC status captured from a trailers-only error response header
+    /// (`grpc-status`). `None` defaults to OK (0) for the success path,
+    /// where the status arrives in trailers after the body.
+    pub transcode_grpc_status: Option<i32>,
+    /// `grpc-message` captured alongside `transcode_grpc_status`.
+    pub transcode_grpc_message: Option<String>,
+    /// True once the transcoded JSON response body has been emitted, so
+    /// later `response_body_filter` calls (a final `end_of_stream`, or
+    /// post-trailer call) do not emit it twice. gRPC-over-h2 sends the
+    /// message in a DATA frame without `END_STREAM` (trailers follow),
+    /// so the frame is emitted as soon as it is complete rather than
+    /// waiting for an `end_of_stream` that may never carry it.
+    pub transcode_response_emitted: bool,
     /// Set by `request_body_filter` when a request body fails schema
     /// validation. The triple is `(status, body, content_type)` and is
     /// surfaced by `fail_to_proxy` (the body filter aborts the
@@ -775,6 +801,12 @@ impl RequestContext {
             agent_budget_guards: Vec::new(),
             validate_request_body: false,
             request_body_buf: None,
+            transcode_active: false,
+            transcode_grpc_method: None,
+            transcode_response_buf: None,
+            transcode_grpc_status: None,
+            transcode_grpc_message: None,
+            transcode_response_emitted: false,
             validator_failed: None,
             idempotency_buffering: false,
             idempotency_workspace: None,

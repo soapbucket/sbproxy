@@ -5874,6 +5874,7 @@ dependencies = [
  "sbproxy-plugin",
  "sbproxy-security",
  "sbproxy-tls",
+ "sbproxy-transport",
  "serde",
  "serde_json",
  "sha2 0.11.0",
