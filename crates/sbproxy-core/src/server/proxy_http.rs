@@ -968,6 +968,23 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // --- WOR-808: RSL `Link: rel="license"` discovery header ---
+        //
+        // When the origin publishes an RSL document (it has an
+        // `ai_crawl_control` policy, so the projection builder emitted a
+        // `/licenses.xml` + URN for it), advertise that document on every
+        // response via an RFC 8288 `Link` header so a crawler discovers
+        // the license without already knowing the well-known path.
+        // Appended (not inserted) so an upstream's own `Link` headers
+        // survive.
+        if !ctx.hostname.is_empty() {
+            let projections = sbproxy_modules::projections::current_projections();
+            if projections.rsl_urns.contains_key(ctx.hostname.as_str()) {
+                let _ = upstream_response
+                    .append_header("link".to_string(), "</licenses.xml>; rel=\"license\"");
+            }
+        }
+
         // --- WOR-819: gRPC -> REST/JSON response header rewrite ---
         //
         // A transcoded request gets a gRPC response: `content-type:
