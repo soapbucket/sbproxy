@@ -45,6 +45,39 @@ use sbproxy_plugin::{current_admin_audit_emitter, ProjectionRefreshEvent};
 use crate::policy::ai_crawl::ContentSignals;
 use sha2::{Digest, Sha256};
 
+/// RSL 1.0 `<payment type>` enum (the closed set of values the spec
+/// allows). An operator-declared `payment.type:` outside this set falls
+/// back to the derived crawl/free terms.
+const VALID_PAYMENT_TYPES: &[&str] = &[
+    "free",
+    "purchase",
+    "subscription",
+    "training",
+    "crawl",
+    "use",
+    "attribution",
+];
+
+/// Read the operator-declared `payment:` block on an `ai_crawl_control`
+/// entry and turn it into [`licenses::PaymentTerms`]. Returns `None` when
+/// the block is absent or the declared `type` is not in the RSL 1.0
+/// enum, so the caller can fall through to the derived terms.
+fn operator_declared_payment(ai_crawl: &serde_json::Value) -> Option<licenses::PaymentTerms> {
+    let decl = ai_crawl.get("payment").and_then(|v| v.as_object())?;
+    let ptype = decl.get("type").and_then(|v| v.as_str())?;
+    if !VALID_PAYMENT_TYPES.contains(&ptype) {
+        return None;
+    }
+    Some(licenses::PaymentTerms {
+        payment_type: ptype.to_string(),
+        amount: decl.get("amount").and_then(|v| v.as_f64()),
+        currency: decl
+            .get("currency")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    })
+}
+
 pub mod agent_skills;
 pub mod agents_json;
 pub mod licenses;
@@ -269,23 +302,27 @@ pub fn render_projections_with_listings(
             .get("content_signals")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
-        // WOR-808: derive the RSL `<payment>` terms from the pay-per-crawl
-        // config. A per-crawl price maps to `type="crawl"` with the
-        // configured amount + currency; an unpriced origin is `type="free"`.
-        let payment = match ai_crawl.get("price").and_then(|v| v.as_f64()) {
-            Some(p) if p > 0.0 => licenses::PaymentTerms {
-                payment_type: "crawl".to_string(),
-                amount: Some(p),
-                currency: Some(
-                    ai_crawl
-                        .get("currency")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("USD")
-                        .to_string(),
-                ),
-            },
-            _ => licenses::PaymentTerms::free(),
-        };
+        // WOR-808: RSL `<payment>` terms. An operator-declared `payment:`
+        // block on `ai_crawl_control` wins (validated against the RSL 1.0
+        // enum). Otherwise derive from pay-per-crawl: a per-crawl price
+        // maps to `type="crawl"` with the configured amount + currency;
+        // an unpriced origin is `type="free"`.
+        let payment = operator_declared_payment(ai_crawl).unwrap_or_else(|| {
+            match ai_crawl.get("price").and_then(|v| v.as_f64()) {
+                Some(p) if p > 0.0 => licenses::PaymentTerms {
+                    payment_type: "crawl".to_string(),
+                    amount: Some(p),
+                    currency: Some(
+                        ai_crawl
+                            .get("currency")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("USD")
+                            .to_string(),
+                    ),
+                },
+                _ => licenses::PaymentTerms::free(),
+            }
+        });
         let (xml, urn) = if content_signals.is_empty() {
             licenses::render(
                 hostname.as_str(),
@@ -575,6 +612,75 @@ mod tests {
         assert!(docs.licenses_xml.contains_key("shop.example.com"));
         assert!(docs.tdmrep_json.contains_key("shop.example.com"));
         assert!(docs.rsl_urns.contains_key("shop.example.com"));
+    }
+
+    #[test]
+    fn operator_declared_payment_overrides_derived() {
+        // Origin sets price (-> derived "crawl") but explicitly declares
+        // `payment: training`; the operator declaration wins.
+        let cfg = config_with_origin(
+            "h.example.com",
+            serde_json::json!({
+                "type": "ai_crawl_control",
+                "price": 0.001,
+                "currency": "USD",
+                "payment": { "type": "training" }
+            }),
+        );
+        let docs = render_projections(&cfg, 1);
+        let xml = std::str::from_utf8(
+            docs.licenses_xml
+                .get("h.example.com")
+                .expect("licenses.xml present"),
+        )
+        .unwrap();
+        assert!(
+            xml.contains(r#"<payment type="training" />"#),
+            "operator-declared payment.type wins; got:\n{xml}"
+        );
+        // The derived "crawl" must not appear.
+        assert!(
+            !xml.contains(r#"type="crawl""#),
+            "derived crawl payment must not appear when operator overrides; got:\n{xml}"
+        );
+    }
+
+    #[test]
+    fn operator_declared_payment_emits_amount_and_currency() {
+        let cfg = config_with_origin(
+            "h.example.com",
+            serde_json::json!({
+                "type": "ai_crawl_control",
+                "payment": { "type": "subscription", "amount": 9.99, "currency": "EUR" }
+            }),
+        );
+        let docs = render_projections(&cfg, 1);
+        let xml = std::str::from_utf8(docs.licenses_xml.get("h.example.com").unwrap()).unwrap();
+        assert!(
+            xml.contains(r#"<payment type="subscription" amount="9.99" currency="EUR" />"#),
+            "got:\n{xml}"
+        );
+    }
+
+    #[test]
+    fn unknown_payment_type_falls_back_to_derived() {
+        let cfg = config_with_origin(
+            "h.example.com",
+            serde_json::json!({
+                "type": "ai_crawl_control",
+                "price": 0.001,
+                "currency": "USD",
+                "payment": { "type": "totally-not-rsl" }
+            }),
+        );
+        let docs = render_projections(&cfg, 1);
+        let xml = std::str::from_utf8(docs.licenses_xml.get("h.example.com").unwrap()).unwrap();
+        // Invalid operator type is dropped; derived crawl wins.
+        assert!(
+            xml.contains(r#"type="crawl""#),
+            "fallback to derived; got:\n{xml}"
+        );
+        assert!(!xml.contains("totally-not-rsl"));
     }
 
     #[test]
