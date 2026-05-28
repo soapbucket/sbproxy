@@ -1801,12 +1801,31 @@ async fn check_auth(
             // plumbed into this synchronous dispatch site yet; pass
             // None so the verifier skips the binding check. Stamping
             // the resolved id is a follow-up tracked in WATCH.md.
+            // WOR-808: emit RSL 1.0 CAP `WWW-Authenticate: License`
+            // challenge on 401/403 so a crawler discovers the auth
+            // scheme + the specific error code. The challenge mirrors
+            // RFC 6750's bearer format: a bare `License` on a missing
+            // token; `License error="<code>"` on an invalid one, with
+            // the code coming from `CapError::www_auth_code()` (e.g.
+            // `invalid_token`, `path_not_authorized`).
             match verifier.verify(&req, &host, path, None) {
                 CapVerdict::Verified(_view) => AuthResult::allow_anonymous(),
-                CapVerdict::Missing => AuthResult::Deny(401, "cap: token required".to_string()),
+                CapVerdict::Missing => AuthResult::DenyWithHeaders(
+                    401,
+                    "cap: token required".to_string(),
+                    vec![("WWW-Authenticate".to_string(), "License".to_string())],
+                ),
                 CapVerdict::Invalid(err) => {
                     let status = err.http_status();
-                    AuthResult::Deny(status, format!("cap: {}", err.www_auth_code()))
+                    let code = err.www_auth_code();
+                    AuthResult::DenyWithHeaders(
+                        status,
+                        format!("cap: {}", code),
+                        vec![(
+                            "WWW-Authenticate".to_string(),
+                            format!("License error=\"{code}\""),
+                        )],
+                    )
                 }
             }
         }

@@ -117,6 +117,57 @@ fn missing_cap_token_returns_401() {
     );
 }
 
+// --- WOR-808: RSL 1.0 CAP `WWW-Authenticate: License` challenge ---
+
+#[test]
+fn missing_cap_token_carries_www_authenticate_license_challenge() {
+    let (_signing, pubkey) = fresh_keypair();
+    let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
+    let harness =
+        ProxyHarness::start_with_yaml(&cap_config(&upstream.base_url(), &pubkey)).expect("start");
+
+    let resp = harness.get("/blog/article", "cap.localhost").expect("send");
+    assert_eq!(resp.status, 401);
+    // Bare `License` challenge on a missing token (RFC 6750 style).
+    let www = resp
+        .headers
+        .get("www-authenticate")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    assert!(
+        www.trim_start().starts_with("License"),
+        "401 missing-token must carry `WWW-Authenticate: License ...`; got: {www:?}"
+    );
+}
+
+#[test]
+fn invalid_cap_token_carries_www_authenticate_license_error_code() {
+    let (_signing, pubkey) = fresh_keypair();
+    let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
+    let harness =
+        ProxyHarness::start_with_yaml(&cap_config(&upstream.base_url(), &pubkey)).expect("start");
+
+    // A garbage token fails signature/decoding -> CapError::InvalidToken
+    // / BadSignature -> 401 with `error="invalid_token"`.
+    let resp = harness
+        .get_with_headers(
+            "/blog/article",
+            "cap.localhost",
+            &[("cap-token", "not-a-real-jwt")],
+        )
+        .expect("send");
+    assert_eq!(resp.status, 401);
+    let www = resp
+        .headers
+        .get("www-authenticate")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    assert!(
+        www.contains("License") && www.contains("error=\"invalid_token\""),
+        "401 invalid-token must carry `License error=\"invalid_token\"`; got: {www:?}"
+    );
+}
+
 #[test]
 fn valid_cap_token_returns_200() {
     let (signing, pubkey) = fresh_keypair();
