@@ -630,6 +630,22 @@ pub(super) async fn handle_ai_proxy(
                 if !vk.metadata.is_empty() {
                     ctx.ai_metadata = vk.metadata.clone();
                 }
+                // WOR-893: per-key model routing. When the key pins a
+                // model, overwrite the request body's `model` field so
+                // the downstream allow/block, routing, budget, and
+                // model-extraction steps all see the pinned value (and
+                // a client-supplied `model` is ignored). Composes
+                // naturally with `allowed_models` / `blocked_models`:
+                // if the pinned model is itself blocked or not on the
+                // allow-list, the existing gate still rejects.
+                if let Some(route_to) = &vk.route_to_model {
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.insert(
+                            "model".to_string(),
+                            serde_json::Value::String(route_to.clone()),
+                        );
+                    }
+                }
             }
         }
     }

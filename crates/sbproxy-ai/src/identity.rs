@@ -46,6 +46,16 @@ pub struct VirtualKeyConfig {
     /// Kept off metric labels to avoid cardinality blow-up.
     #[serde(default)]
     pub metadata: HashMap<String, String>,
+    /// WOR-893: pin a specific model for requests authenticated by this
+    /// key. When set, the gateway overwrites the request body's `model`
+    /// field with this value before the routing / model-gate / dispatch
+    /// runs - the client cannot pick a different model. Composes with
+    /// the existing `allowed_models` / `blocked_models` gates: if the
+    /// pinned model is itself blocked or not allow-listed, the request
+    /// is rejected with the same 403 a direct client request would
+    /// receive. `None` keeps the client's `model` field unchanged.
+    #[serde(default)]
+    pub route_to_model: Option<String>,
     /// Whether this key is active.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -196,6 +206,7 @@ mod tests {
             project: None,
             user: None,
             metadata: HashMap::new(),
+            route_to_model: None,
             enabled,
             bypass_prompt_injection: false,
         }
@@ -215,6 +226,7 @@ mod tests {
             project: None,
             user: None,
             metadata: HashMap::new(),
+            route_to_model: None,
             enabled: true,
             bypass_prompt_injection: false,
         }
@@ -337,6 +349,18 @@ mod tests {
         assert!(config.project.is_none());
         assert!(config.user.is_none());
         assert!(config.metadata.is_empty());
+        // WOR-893 default.
+        assert!(config.route_to_model.is_none());
+    }
+
+    #[test]
+    fn deserialization_carries_route_to_model() {
+        let json = serde_json::json!({
+            "key": "sk-routed",
+            "route_to_model": "gpt-4o-mini"
+        });
+        let config: VirtualKeyConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.route_to_model.as_deref(), Some("gpt-4o-mini"));
     }
 
     #[test]
