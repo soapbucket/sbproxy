@@ -33,6 +33,19 @@ pub struct VirtualKeyConfig {
     /// Tags for grouping and tracking.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// WOR-894: project this key belongs to. Surfaced on run-metadata
+    /// (access log) so reports can group spend / usage by project.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// WOR-894: user (or principal) this key belongs to. Same path as
+    /// [`Self::project`] for per-user breakdowns.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// WOR-894: arbitrary string-keyed metadata. Surfaced on the access
+    /// log as a JSON object so reports can group by a custom dimension.
+    /// Kept off metric labels to avoid cardinality blow-up.
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
     /// Whether this key is active.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -180,6 +193,9 @@ mod tests {
             max_requests_per_minute: None,
             budget: None,
             tags: vec![],
+            project: None,
+            user: None,
+            metadata: HashMap::new(),
             enabled,
             bypass_prompt_injection: false,
         }
@@ -196,6 +212,9 @@ mod tests {
             max_requests_per_minute: None,
             budget: None,
             tags: vec![],
+            project: None,
+            user: None,
+            metadata: HashMap::new(),
             enabled: true,
             bypass_prompt_injection: false,
         }
@@ -314,5 +333,30 @@ mod tests {
         assert!(config.allowed_models.is_empty());
         assert!(config.tags.is_empty());
         assert!(config.budget.is_none());
+        // WOR-894 defaults.
+        assert!(config.project.is_none());
+        assert!(config.user.is_none());
+        assert!(config.metadata.is_empty());
+    }
+
+    #[test]
+    fn deserialization_carries_project_user_metadata() {
+        let json = serde_json::json!({
+            "key": "sk-virtual-2",
+            "project": "alpha",
+            "user": "alice",
+            "metadata": { "team": "research", "cost_center": "R-12" }
+        });
+        let config: VirtualKeyConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.project.as_deref(), Some("alpha"));
+        assert_eq!(config.user.as_deref(), Some("alice"));
+        assert_eq!(
+            config.metadata.get("team").map(String::as_str),
+            Some("research")
+        );
+        assert_eq!(
+            config.metadata.get("cost_center").map(String::as_str),
+            Some("R-12")
+        );
     }
 }
