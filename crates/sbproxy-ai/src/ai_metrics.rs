@@ -100,6 +100,26 @@ static AI_TTFT: LazyLock<HistogramVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+// WOR-895: streaming output throughput in tokens per second. Recorded
+// once per streaming response, after the upstream usage parser reports
+// final completion tokens, against the generation window
+// (first-token -> stream-end), so TTFT does not depress it. Bucket
+// boundaries span typical model speeds (tiny / chat / fast streaming /
+// frontier accelerators).
+static AI_OUTPUT_THROUGHPUT: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        HistogramOpts::new(
+            "sbproxy_ai_output_throughput_tokens_per_second",
+            "AI streaming output throughput (completion tokens / generation duration)"
+        )
+        .buckets(vec![
+            1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0
+        ]),
+        &["provider", "model"]
+    )
+    .unwrap()
+});
+
 // Per-provider error counter. Incremented at every site that maps a
 // non-success outcome back to a named provider (transport error,
 // timeout, upstream 4xx/5xx, parse failure). The dashboard groups by
@@ -557,6 +577,18 @@ pub fn record_ttft(provider: &str, model: &str, ttft_seconds: f64) {
         .observe(ttft_seconds);
 }
 
+/// Record one streaming response's output throughput in tokens per
+/// second, measured against the generation window (first-token ->
+/// stream-end) so TTFT does not depress it. Caller filters out zero /
+/// non-positive values so the histogram only sees meaningful samples.
+pub fn record_output_throughput(provider: &str, model: &str, tokens_per_second: f64) {
+    if tokens_per_second.is_finite() && tokens_per_second > 0.0 {
+        AI_OUTPUT_THROUGHPUT
+            .with_label_values(&[provider, model])
+            .observe(tokens_per_second);
+    }
+}
+
 /// Record a per-provider error.
 ///
 /// `error_kind` is a short, low-cardinality label (e.g. `transport`,
@@ -923,6 +955,20 @@ mod tests {
             .iter()
             .find(|f| f.name() == "sbproxy_ai_ttft_seconds");
         assert!(ttft.is_some(), "ttft histogram must be registered");
+    }
+
+    #[test]
+    fn test_record_output_throughput() {
+        record_output_throughput("openai", "gpt-4o", 87.5);
+        // Non-positive / non-finite samples are dropped by the helper.
+        record_output_throughput("openai", "gpt-4o", 0.0);
+        record_output_throughput("openai", "gpt-4o", f64::NAN);
+        record_output_throughput("openai", "gpt-4o", -1.0);
+        let families = prometheus::gather();
+        let tput = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_output_throughput_tokens_per_second");
+        assert!(tput.is_some(), "throughput histogram must be registered");
     }
 
     #[test]

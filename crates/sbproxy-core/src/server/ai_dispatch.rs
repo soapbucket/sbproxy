@@ -2290,6 +2290,12 @@ pub(super) async fn relay_ai_stream(
     // SSE body never lands in memory.
     let mut stream = resp.bytes_stream();
     let mut upstream_complete = false;
+    // WOR-895: track TTFT + output throughput. `stream_started` anchors
+    // the generation window; `first_token_at` is set on the first chunk
+    // that carries any payload. Both feed `sbproxy_ai_ttft_seconds` +
+    // `sbproxy_ai_output_throughput_tokens_per_second` at stream close.
+    let stream_started = std::time::Instant::now();
+    let mut first_token_at: Option<std::time::Instant> = None;
     // Build the per-stream usage parser when a budget recorder is
     // wired. `select_parser` returns `None` only when the operator
     // sets `usage_parser: none`; every other branch yields a live
@@ -2325,6 +2331,10 @@ pub(super) async fn relay_ai_stream(
         match stream.next().await {
             Some(Ok(chunk)) => {
                 let chunk_bytes = Bytes::copy_from_slice(&chunk);
+                // WOR-895: first non-empty chunk marks TTFT.
+                if first_token_at.is_none() && !chunk_bytes.is_empty() {
+                    first_token_at = Some(std::time::Instant::now());
+                }
 
                 // --- Per-chunk safety probe (fail-open) ---
                 //
@@ -2481,6 +2491,27 @@ pub(super) async fn relay_ai_stream(
                     cost,
                     scope_keys,
                 );
+
+                // WOR-895: TTFT + output throughput. TTFT only when the
+                // upstream actually sent at least one chunk; throughput
+                // requires both completion tokens and a measurable
+                // generation window (first_token -> now). Both are
+                // recorded against the same provider/model labels the
+                // billing event used.
+                let stream_end = std::time::Instant::now();
+                if let Some(ft) = first_token_at {
+                    let ttft_secs = ft.duration_since(stream_started).as_secs_f64();
+                    sbproxy_ai::ai_metrics::record_ttft(args.provider_name, args.model, ttft_secs);
+                    let gen_secs = stream_end.duration_since(ft).as_secs_f64();
+                    if completion > 0 && gen_secs > 0.0 {
+                        let tps = completion as f64 / gen_secs;
+                        sbproxy_ai::ai_metrics::record_output_throughput(
+                            args.provider_name,
+                            args.model,
+                            tps,
+                        );
+                    }
+                }
             }
         }
     }
