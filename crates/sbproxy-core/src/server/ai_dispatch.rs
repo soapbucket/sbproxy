@@ -602,6 +602,38 @@ pub(super) async fn handle_ai_proxy(
         return Ok(());
     }
 
+    // --- WOR-894: virtual-key identity resolution ---
+    //
+    // When the request's `Authorization: Bearer <key>` (or bare key)
+    // matches a configured virtual key, surface that key's `project`,
+    // `user`, and `metadata` onto the request context so the access log
+    // can attribute spend / usage to them. Missing / unknown keys
+    // silently no-op (auth itself is enforced by the configured auth
+    // provider, not here). Skipped when no virtual_keys are declared.
+    if !config.virtual_keys.is_empty() {
+        let auth_value = req_header_value(session, "authorization");
+        let raw_key = auth_value.as_deref().map(|h| {
+            h.strip_prefix("Bearer ")
+                .or_else(|| h.strip_prefix("bearer "))
+                .unwrap_or(h)
+                .trim()
+                .to_string()
+        });
+        if let Some(key) = raw_key {
+            if let Some(vk) = config
+                .virtual_keys
+                .iter()
+                .find(|vk| vk.enabled && vk.key == key)
+            {
+                ctx.ai_project = vk.project.clone();
+                ctx.ai_user = vk.user.clone();
+                if !vk.metadata.is_empty() {
+                    ctx.ai_metadata = vk.metadata.clone();
+                }
+            }
+        }
+    }
+
     // --- Budget enforcement (pre-dispatch) ---
     //
     // Consult the process-wide BudgetTracker against every configured

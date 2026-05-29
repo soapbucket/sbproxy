@@ -59,6 +59,19 @@ pub struct AccessLogEntry {
     /// WOR-800: resolved version label of [`Self::prompt_name`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_version: Option<String>,
+    /// WOR-894: project the request's virtual key belongs to. Lets
+    /// reports group spend / usage by project.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// WOR-894: user (or principal) the request's virtual key belongs
+    /// to. Same path as [`Self::project`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// WOR-894: arbitrary metadata copied off the matched virtual key.
+    /// Serialized as a JSON object; empty when no key matched or no
+    /// metadata was declared.
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub metadata: std::collections::HashMap<String, String>,
     /// Prompt / input tokens consumed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_in: Option<u64>,
@@ -397,6 +410,9 @@ impl Default for AccessLogEntry {
             model: None,
             prompt_name: None,
             prompt_version: None,
+            project: None,
+            user: None,
+            metadata: std::collections::HashMap::new(),
             tokens_in: None,
             tokens_out: None,
             ai_surface: None,
@@ -615,6 +631,9 @@ mod tests {
             model: None,
             prompt_name: None,
             prompt_version: None,
+            project: None,
+            user: None,
+            metadata: std::collections::HashMap::new(),
             tokens_in: None,
             tokens_out: None,
             ai_surface: None,

@@ -592,6 +592,18 @@ pub struct RequestContext {
     pub ai_prompt_name: Option<String>,
     /// WOR-800: resolved version label of [`Self::ai_prompt_name`].
     pub ai_prompt_version: Option<String>,
+    /// WOR-894: project this request's virtual key belongs to. Surfaced
+    /// on the access log so usage / cost reports can group by project.
+    /// `None` when no virtual key matched or the matched key declared no
+    /// project.
+    pub ai_project: Option<String>,
+    /// WOR-894: user (or principal) this request's virtual key belongs
+    /// to. Same reporting path as [`Self::ai_project`].
+    pub ai_user: Option<String>,
+    /// WOR-894: arbitrary string-keyed metadata copied off the matched
+    /// virtual key, surfaced on the access log as a JSON object so
+    /// reports can group by a custom dimension.
+    pub ai_metadata: std::collections::HashMap<String, String>,
     /// AI model identifier the request routed to (e.g. `gpt-4o`,
     /// `claude-sonnet-4-6`). Captured before the upstream call so
     /// the access log records the resolved model even when the
@@ -918,6 +930,9 @@ impl RequestContext {
             ai_provider: None,
             ai_prompt_name: None,
             ai_prompt_version: None,
+            ai_project: None,
+            ai_user: None,
+            ai_metadata: std::collections::HashMap::new(),
             ai_model: None,
             ai_tokens_in: None,
             ai_tokens_out: None,

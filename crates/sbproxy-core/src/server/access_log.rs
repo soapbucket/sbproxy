@@ -440,6 +440,9 @@ pub(super) fn emit_access_log(
         model: ctx.ai_model.clone(),
         prompt_name: ctx.ai_prompt_name.clone(),
         prompt_version: ctx.ai_prompt_version.clone(),
+        project: ctx.ai_project.clone(),
+        user: ctx.ai_user.clone(),
+        metadata: ctx.ai_metadata.clone(),
         tokens_in: ctx.ai_tokens_in,
         tokens_out: ctx.ai_tokens_out,
         ai_surface: ctx.ai_surface.clone(),
@@ -513,6 +516,11 @@ pub(super) struct AccessLogContext {
     /// WOR-800: stored prompt name + version the request resolved.
     pub(super) prompt_name: Option<String>,
     pub(super) prompt_version: Option<String>,
+    /// WOR-894: project + user + metadata copied off the matched
+    /// virtual key (per-key reporting dimensions).
+    pub(super) project: Option<String>,
+    pub(super) user: Option<String>,
+    pub(super) metadata: std::collections::HashMap<String, String>,
     /// Prompt / input tokens consumed (from the provider response).
     pub(super) tokens_in: Option<u64>,
     /// Completion / output tokens generated.
@@ -582,6 +590,9 @@ impl AccessLogContext {
             model: None,
             prompt_name: None,
             prompt_version: None,
+            project: None,
+            user: None,
+            metadata: std::collections::HashMap::new(),
             tokens_in: None,
             tokens_out: None,
             ai_surface: None,
@@ -675,6 +686,9 @@ pub(super) fn emit_access_log_entry(
         model: context.model,
         prompt_name: context.prompt_name,
         prompt_version: context.prompt_version,
+        project: context.project,
+        user: context.user,
+        metadata: context.metadata,
         tokens_in: context.tokens_in,
         tokens_out: context.tokens_out,
         ai_surface: context.ai_surface,
