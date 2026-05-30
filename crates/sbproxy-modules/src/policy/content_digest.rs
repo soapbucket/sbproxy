@@ -1,11 +1,12 @@
 //! RFC 9530 `Content-Digest` request-body verification (WOR-805).
 //!
-//! Verifies an inbound `Content-Digest:` header against the SHA-256 or
-//! SHA-512 of the request body before forwarding to upstream. On
-//! mismatch, malformed header, or unsupported algorithm, the proxy
-//! rejects with a configurable HTTP status (default 400). Optional
-//! pass-through when the header is absent: `on_missing: skip` is for
-//! origins that mix integrity-required and integrity-optional traffic;
+//! Verifies an inbound `Content-Digest:` (or, since PR2, the
+//! `Repr-Digest:`) header against the SHA-256 or SHA-512 of the
+//! request body before forwarding to upstream. On mismatch, malformed
+//! header, or unsupported algorithm, the proxy rejects with a
+//! configurable HTTP status (default 400). Optional pass-through when
+//! the header is absent: `on_missing: skip` is for origins that mix
+//! integrity-required and integrity-optional traffic;
 //! `on_missing: require` (the default) is the safer posture for
 //! integrity-critical inboxes (webhook receivers, agent endpoints).
 //!
@@ -17,11 +18,29 @@
 //! the RFC 9530 §2 canonical vector. This policy is the body-filter
 //! glue that turns those primitives into a per-origin reject path.
 //!
-//! Out of scope for this PR (deferred, documented in the design brief
-//! on the WOR-805 Linear ticket): RFC 9530 §6.4 trailer-section
-//! digests, `Repr-Digest`, wiring `ctx.content_digest_verified` into
-//! the inbound HTTP Message Signatures verifier so a signed
-//! `content-digest` component is satisfied without re-hashing.
+//! ## PR2 additions (WOR-805 follow-ups)
+//!
+//! * `Repr-Digest` parallel handling. Per RFC 9530 §2 the two headers
+//!   carry the same digest semantics over slightly different
+//!   representations; for inbound traffic where we do not decode
+//!   `Content-Encoding`, they are interchangeable. The policy
+//!   honours either header (`Content-Digest` checked first; falls
+//!   back to `Repr-Digest`).
+//! * `ctx.content_digest_verified` flag set on the `Verified` outcome
+//!   so downstream phases (HTTP Message Signatures audit, billing
+//!   surfaces) can attest that the body matches the signed digest
+//!   component without re-hashing the body themselves.
+//!
+//! ## Still deferred
+//!
+//! * RFC 9530 §6.4 trailer-section digests. Pingora 0.8's
+//!   `ProxyHttp` trait does not expose an `request_trailer_filter`
+//!   hook, only `response_trailer_filter`; reading inbound request
+//!   trailers requires either upgrading Pingora or extending its
+//!   API. Documented limitation; clients that send the digest in
+//!   the trailer section currently get treated as if the header is
+//!   absent (so `on_missing: require` rejects them, which is the
+//!   safer default).
 
 use serde::Deserialize;
 
@@ -374,6 +393,21 @@ mod tests {
         let p =
             ContentDigestPolicy::from_config(serde_json::json!({ "on_missing": "skip" })).unwrap();
         assert_eq!(p.verify(None, b"hi"), VerifyOutcome::Skipped);
+    }
+
+    #[test]
+    fn verify_repr_digest_with_same_value_passes() {
+        // WOR-805 PR2: the policy itself is header-agnostic — it
+        // takes a header value and a body. The body-filter wire site
+        // looks up `Content-Digest` first, then `Repr-Digest`, so a
+        // request that only carries the latter is verified through
+        // the same code path. This test pins the policy half of the
+        // contract: identical body + identical digest value passes
+        // regardless of which header carried it.
+        let p = policy_default();
+        let body = b"{\"hello\": \"world\"}";
+        let header = "sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:";
+        assert_eq!(p.verify(Some(header), body), VerifyOutcome::Verified);
     }
 
     #[test]

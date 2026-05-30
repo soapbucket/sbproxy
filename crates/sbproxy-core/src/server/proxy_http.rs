@@ -2305,12 +2305,34 @@ impl ProxyHttp for SbProxy {
                                             Some((413, body_str, "application/json".to_string()));
                                         break;
                                     }
-                                    let header_value = session
-                                        .req_header()
-                                        .headers
+                                    // WOR-805 PR2: try `Content-Digest`
+                                    // first, fall back to `Repr-Digest`
+                                    // per RFC 9530 §2. For inbound
+                                    // requests where we do not decode
+                                    // `Content-Encoding`, the two
+                                    // headers carry equivalent
+                                    // semantics; we honour whichever
+                                    // the client sent. `Content-Digest`
+                                    // wins on a tie since clients that
+                                    // know to set both prefer it.
+                                    let req_headers = &session.req_header().headers;
+                                    let header_value = req_headers
                                         .get("content-digest")
+                                        .or_else(|| req_headers.get("repr-digest"))
                                         .and_then(|v| v.to_str().ok());
                                     let outcome = cd.verify(header_value, &collected);
+                                    // WOR-805 PR2: on a verified body,
+                                    // stamp the audit flag so the
+                                    // Message Signatures composition
+                                    // check can attest "body matches
+                                    // signed digest" without re-hashing
+                                    // the body.
+                                    if matches!(
+                                        outcome,
+                                        sbproxy_modules::ContentDigestVerifyOutcome::Verified
+                                    ) {
+                                        ctx.content_digest_verified = true;
+                                    }
                                     if let Some(envelope) = cd.rejection_envelope(outcome) {
                                         failed = Some(envelope);
                                         break;
