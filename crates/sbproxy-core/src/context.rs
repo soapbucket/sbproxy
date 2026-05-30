@@ -286,6 +286,19 @@ pub struct RequestContext {
     /// modified.
     pub sri_scan_enabled: bool,
 
+    /// WOR-805 PR2: set to true in `request_body_filter` after the
+    /// `content_digest` policy returns `Verified` (or `Skipped` with
+    /// `on_missing: skip`). Downstream consumers can attest the body
+    /// matched a signed `content-digest` component without re-hashing:
+    /// the HTTP Message Signatures composition check reads this flag
+    /// so an origin that requires both a signature AND a digest gets
+    /// a single audit signal saying "body integrity verified".
+    /// Distinct from `validator_failed`: a `Verified` outcome flips
+    /// the flag, while a `Mismatch` / `Malformed` outcome fills
+    /// `validator_failed` and short-circuits the request before this
+    /// flag is read.
+    pub content_digest_verified: bool,
+
     // --- WOR-808 PR5 / PR6: RSL <link rel="license"> body injection ---
     /// Set in `response_filter` when the origin advertises an RSL
     /// `licenses.xml` projection (i.e. `rsl_urns` has an entry for
@@ -897,6 +910,7 @@ impl RequestContext {
             buffering_body: false,
             upstream_content_type: None,
             sri_scan_enabled: false,
+            content_digest_verified: false,
             rsl_inject_link_pending: false,
             rsl_inject_link_feed: None,
             rsl_inject_link_buf: None,

@@ -208,6 +208,68 @@ fn valid_digest_passes_through_to_upstream() {
 }
 
 #[test]
+fn repr_digest_header_is_accepted_as_fallback() {
+    // WOR-805 PR2: per RFC 9530 §2 the proxy honours `Repr-Digest`
+    // as an equivalent of `Content-Digest` for inbound requests
+    // where we do not decode Content-Encoding. The body-filter wire
+    // tries `Content-Digest` first; this test sends only
+    // `Repr-Digest` and asserts the proxy accepts it.
+    let upstream = StubUpstream::start();
+    let harness = ProxyHarness::start_with_yaml(&config_require(&upstream.url())).expect("start");
+    let body = b"{\"hello\":\"world\"}".to_vec();
+    let header = sha256_digest_header(&body);
+    let resp = harness
+        .post_bytes(
+            "/payload",
+            "digest.localhost",
+            "application/json",
+            body.clone(),
+            &[("repr-digest", header.as_str())],
+        )
+        .expect("post");
+    assert_eq!(
+        resp.status, 200,
+        "repr-digest should verify just like content-digest"
+    );
+    assert_eq!(upstream.captured_body(), body);
+}
+
+#[test]
+fn content_digest_wins_over_repr_digest_on_tie() {
+    // When both headers are sent, the proxy honours `Content-Digest`
+    // (clients that set both prefer it; falling back to `Repr-Digest`
+    // only when the primary header is absent means a typo in the
+    // primary value still produces a clear "Mismatch" rejection
+    // rather than silently using the parallel header).
+    let upstream = StubUpstream::start();
+    let harness = ProxyHarness::start_with_yaml(&config_require(&upstream.url())).expect("start");
+    let body = b"{\"hello\":\"world\"}".to_vec();
+    let real_header = sha256_digest_header(&body);
+    // Content-Digest carries a deliberately-wrong value; Repr-Digest
+    // is correct. Because Content-Digest is tried first, the proxy
+    // should reject.
+    let resp = harness
+        .post_bytes(
+            "/payload",
+            "digest.localhost",
+            "application/json",
+            body,
+            &[
+                (
+                    "content-digest",
+                    "sha-256=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:",
+                ),
+                ("repr-digest", real_header.as_str()),
+            ],
+        )
+        .expect("post");
+    assert_eq!(
+        resp.status, 400,
+        "Content-Digest wins on tie; its bad value rejects the request"
+    );
+}
+
+#[test]
 fn mismatched_digest_is_rejected_400_upstream_does_not_see_body() {
     let upstream = StubUpstream::start();
     let harness = ProxyHarness::start_with_yaml(&config_require(&upstream.url())).expect("start");
