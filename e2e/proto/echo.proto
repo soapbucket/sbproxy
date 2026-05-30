@@ -13,6 +13,25 @@ package sbproxy_e2e.echo;
 service Echo {
   // Echo returns the message it received in the request.
   rpc Hello(EchoRequest) returns (EchoResponse);
+
+  // Server-streaming echo: yields N responses, one per token in the
+  // request message split on whitespace. Used by the gRPC-Web
+  // server-streaming bridge tests (WOR-819).
+  rpc HelloStream(EchoRequest) returns (stream EchoResponse);
+
+  // Always fails with FAILED_PRECONDITION + the request message as
+  // the grpc-message. Reserved for future use; current proxy wiring
+  // cannot inject a body on trailers-only-in-headers responses
+  // (Pingora skips both body and trailer filters for HEADERS frames
+  // with END_STREAM), so this RPC has no corresponding e2e yet.
+  rpc HelloError(EchoRequest) returns (EchoResponse);
+
+  // Server-streaming variant of HelloError: emits ONE message, then
+  // terminates the stream with FAILED_PRECONDITION carrying the
+  // request message as `grpc-message`. The error rides on real
+  // HTTP/2 trailers (after the body), which is the case
+  // `response_trailer_filter` is built to remap. (WOR-819)
+  rpc HelloStreamError(EchoRequest) returns (stream EchoResponse);
 }
 
 message EchoRequest {

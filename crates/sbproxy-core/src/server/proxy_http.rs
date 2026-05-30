@@ -2542,18 +2542,24 @@ impl ProxyHttp for SbProxy {
 
         // --- WOR-819: gRPC -> REST/JSON response body transcoding ---
         //
-        // Buffer the upstream gRPC response frame and, at end_of_stream,
-        // decode it to JSON via the descriptor-backed transcoder
-        // (re-fetched from the pipeline). The HTTP status stays as the
-        // upstream sent it (200 for a successful unary call); a
-        // header-borne `grpc-status` (trailers-only error) produces the
-        // JSON error envelope. A successful call carries `grpc-status: 0`
-        // in trailers, which arrive after the body, so it is treated as
-        // OK here; full trailer-driven status remapping is a documented
-        // follow-up.
+        // Buffer the upstream gRPC response frame. Emission is split
+        // between this filter and `response_trailer_filter` so the
+        // real `grpc-status` (which gRPC normally puts in trailers,
+        // arriving after the body) reaches the JSON envelope:
+        //
+        // * Trailers-only error response: `response_filter` captured
+        //   `grpc-status` from the response headers (no separate
+        //   trailer phase will fire). Emit the JSON envelope here at
+        //   `end_of_stream` while the buffer is in hand.
+        // * Normal response (success, or post-body trailers-only
+        //   error): leave the buffer alone. `response_trailer_filter`
+        //   reads the real `grpc-status` from the trailers and
+        //   produces the JSON via the same `transcode_response` call.
+        //
+        // Suppress every chunk from going downstream while buffering:
+        // the response body sent to the client is the JSON envelope,
+        // not the raw gRPC frame.
         if ctx.transcode_active {
-            // Already emitted the JSON (the frame completed on an earlier
-            // chunk): drop any trailing chunks / the final end_of_stream.
             if ctx.transcode_response_emitted {
                 *body = None;
                 return Ok(None);
@@ -2563,76 +2569,45 @@ impl ProxyHttp for SbProxy {
                     .get_or_insert_with(bytes::BytesMut::new)
                     .extend_from_slice(&chunk);
             }
-            // A unary gRPC frame is `1 compression byte + 4 length bytes +
-            // message`. Emit as soon as a full frame is buffered, because
-            // the DATA frame arrives without END_STREAM (trailers carry
-            // grpc-status), so an `end_of_stream` call carrying the frame
-            // may never come. Also emit on `end_of_stream` for an
-            // empty/trailers-only response.
-            let frame_complete = ctx
-                .transcode_response_buf
-                .as_ref()
-                .map(|b| {
-                    b.len() >= 5
-                        && b.len() >= 5 + u32::from_be_bytes([b[1], b[2], b[3], b[4]]) as usize
-                })
-                .unwrap_or(false);
-            if frame_complete || end_of_stream {
+            if end_of_stream && ctx.transcode_grpc_status.is_some() {
+                // Trailers-only path: emit JSON now using the status
+                // captured from headers.
                 let frame = ctx.transcode_response_buf.take().unwrap_or_default();
-                let grpc_method = ctx.transcode_grpc_method.clone().unwrap_or_default();
-                let grpc_status = ctx.transcode_grpc_status.unwrap_or(0);
-                let grpc_message = ctx.transcode_grpc_message.clone();
-                let json: Vec<u8> = {
-                    let pipeline = reload::current_pipeline();
-                    let action = ctx.origin_idx.and_then(|idx| {
-                        if let Some(fwd_idx) = ctx.forward_rule_idx {
-                            pipeline
-                                .forward_rules
-                                .get(idx)
-                                .and_then(|r| r.get(fwd_idx))
-                                .map(|r| &r.action)
-                        } else {
-                            pipeline.actions.get(idx)
-                        }
-                    });
-                    match action {
-                        Some(Action::Grpc(g)) => match g.transcoder.as_ref() {
-                            Some(t) => t
-                                .transcode_response(
-                                    &grpc_method,
-                                    &frame,
-                                    grpc_status,
-                                    grpc_message.as_deref(),
-                                )
-                                .map(|tr| tr.json_body)
-                                .unwrap_or_else(|e| {
-                                    serde_json::json!({
-                                        "error": "gRPC response transcoding failed",
-                                        "detail": e.to_string(),
-                                    })
-                                    .to_string()
-                                    .into_bytes()
-                                }),
-                            None => b"{}".to_vec(),
-                        },
-                        _ => b"{}".to_vec(),
-                    }
-                };
+                let json = build_transcoded_json(ctx, &frame);
                 ctx.transcode_response_emitted = true;
                 *body = Some(Bytes::from(json));
+            } else {
+                *body = None;
             }
             return Ok(None);
         }
 
         // --- WOR-819: gRPC -> gRPC-Web response re-framing ---
         //
-        // Buffer the upstream's native gRPC message frame and, once a
-        // complete frame is in hand, append a gRPC-Web trailer frame
-        // (carrying grpc-status) and emit, base64-encoding for the
-        // `-text` variant. Like the transcode path, emit on frame-complete
-        // because gRPC-over-h2 sends the DATA frame without END_STREAM.
-        // The success path uses `grpc-status: 0`; a trailers-only error's
-        // status is captured from the response headers in response_filter.
+        // The bridge supports unary (one message frame) and
+        // server-streaming (many message frames) calls, plus a final
+        // trailer frame carrying `grpc-status`. The two text/binary
+        // variants take different paths:
+        //
+        // * Binary (`application/grpc-web+proto`): stream each complete
+        //   message frame downstream as soon as it is buffered. The
+        //   trailer frame is emitted by `response_trailer_filter` (real
+        //   trailers) or here at `end_of_stream` (trailers-only error,
+        //   status already captured by `response_filter` from headers).
+        // * Text (`application/grpc-web-text`): the whole body is a
+        //   single base64 string, so we cannot stream chunks (base64
+        //   has 3-byte alignment). Buffer everything; emit the full
+        //   message-frames+trailer-frame block at `end_of_stream` for
+        //   trailers-only responses, or in `response_trailer_filter`
+        //   otherwise.
+        //
+        // gRPC-over-h2 typically sends the response DATA frame without
+        // `END_STREAM` (the trailers carry `grpc-status` and set
+        // END_STREAM themselves). The body filter still receives an
+        // `end_of_stream` call when the upstream finishes sending body
+        // bytes; whether trailers will follow is signalled by the
+        // presence of `grpc-status` in `ctx.transcode_grpc_status`
+        // (`response_filter` set it from headers iff trailers-only).
         if ctx.grpc_web_active {
             if ctx.grpc_web_emitted {
                 *body = None;
@@ -2643,28 +2618,70 @@ impl ProxyHttp for SbProxy {
                     .get_or_insert_with(bytes::BytesMut::new)
                     .extend_from_slice(&chunk);
             }
-            let frame_complete = ctx
-                .grpc_web_buf
-                .as_ref()
-                .map(|b| {
-                    b.len() >= 5
-                        && b.len() >= 5 + u32::from_be_bytes([b[1], b[2], b[3], b[4]]) as usize
-                })
-                .unwrap_or(false);
-            if frame_complete || end_of_stream {
-                let frames = ctx.grpc_web_buf.take().unwrap_or_default();
+            let trailers_only = ctx.transcode_grpc_status.is_some();
+            if ctx.grpc_web_text {
+                // Text variant: buffer until we know nothing more
+                // is coming. On a trailers-only response there will
+                // be no separate trailer phase, so emit here. The
+                // common success / trailer-driven path is handled by
+                // `response_trailer_filter`, which leaves the buffer
+                // for itself.
+                if end_of_stream && trailers_only {
+                    let frames = ctx.grpc_web_buf.take().unwrap_or_default();
+                    let trailers = sbproxy_transport::grpc::GrpcTrailers {
+                        status: ctx.transcode_grpc_status.unwrap_or(0),
+                        message: ctx.transcode_grpc_message.clone(),
+                    };
+                    let encoded = sbproxy_transport::grpc::GrpcWebBridge::encode_response(
+                        &frames, &trailers, true,
+                    );
+                    ctx.grpc_web_emitted = true;
+                    *body = Some(Bytes::from(encoded));
+                } else {
+                    *body = None;
+                }
+                return Ok(None);
+            }
+            // Binary variant: drain every complete frame from the
+            // buffer and forward it. A frame is 1 compression byte +
+            // 4 length bytes + N message bytes. Partial frames stay
+            // in the buffer for the next chunk.
+            let mut out = bytes::BytesMut::new();
+            if let Some(buf) = ctx.grpc_web_buf.as_mut() {
+                loop {
+                    if buf.len() < 5 {
+                        break;
+                    }
+                    let msg_len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+                    let frame_end = 5 + msg_len;
+                    if buf.len() < frame_end {
+                        break;
+                    }
+                    let frame = buf.split_to(frame_end);
+                    out.extend_from_slice(&frame);
+                }
+            }
+            if end_of_stream && trailers_only {
+                // No separate trailer phase will fire, so append the
+                // trailer frame here. The remaining buffer (if any
+                // unaligned trailing bytes) is dropped: the upstream
+                // sent half a frame on a trailers-only response,
+                // which is malformed.
                 let trailers = sbproxy_transport::grpc::GrpcTrailers {
                     status: ctx.transcode_grpc_status.unwrap_or(0),
                     message: ctx.transcode_grpc_message.clone(),
                 };
-                let encoded = sbproxy_transport::grpc::GrpcWebBridge::encode_response(
-                    &frames,
+                out.extend_from_slice(&sbproxy_transport::grpc::web::encode_trailer_frame_only(
                     &trailers,
-                    ctx.grpc_web_text,
-                );
+                ));
                 ctx.grpc_web_emitted = true;
-                *body = Some(Bytes::from(encoded));
+                ctx.grpc_web_buf = None;
             }
+            *body = if out.is_empty() {
+                None
+            } else {
+                Some(out.freeze())
+            };
             return Ok(None);
         }
 
@@ -3057,6 +3074,92 @@ impl ProxyHttp for SbProxy {
         Ok(None)
     }
 
+    /// WOR-819: handle real HTTP/2 response trailers for the gRPC
+    /// transcoding and gRPC-Web bridge paths. gRPC normally carries
+    /// `grpc-status` and `grpc-message` in the trailers (the headers
+    /// hold them only in trailers-only error responses, which
+    /// `response_filter` already captured). This filter:
+    ///
+    /// * Reads the real `grpc-status` / `grpc-message` into `ctx`.
+    /// * For the transcode path, emits the JSON envelope here when
+    ///   `response_body_filter` deferred it. The returned `Bytes`
+    ///   become the final body chunk before the framework writes
+    ///   trailers downstream.
+    /// * For the gRPC-Web binary path, emits the trailer frame so
+    ///   browser clients see the end-of-stream marker even after a
+    ///   streaming response. The text variant flushes the entire
+    ///   base64 block here for the same reason.
+    /// * Strips `grpc-status` / `grpc-message` from the downstream
+    ///   trailers in either case: the value is now folded into the
+    ///   body (JSON for transcode, trailer frame for gRPC-Web) and
+    ///   forwarding the original trailer would confuse the client.
+    async fn response_trailer_filter(
+        &self,
+        _session: &mut Session,
+        upstream_trailers: &mut http::HeaderMap,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Bytes>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if !ctx.transcode_active && !ctx.grpc_web_active {
+            return Ok(None);
+        }
+        // Real-trailer grpc-status wins over anything previously
+        // captured (the header-borne value was a header-spoofed
+        // synthesis; trailers are the canonical source).
+        if let Some(status) = upstream_trailers
+            .get("grpc-status")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<i32>().ok())
+        {
+            ctx.transcode_grpc_status = Some(status);
+        }
+        if let Some(msg) = upstream_trailers
+            .get("grpc-message")
+            .and_then(|v| v.to_str().ok())
+        {
+            ctx.transcode_grpc_message = Some(msg.to_string());
+        }
+        // The trailer value is folded into the body now; drop the
+        // raw `grpc-status` / `grpc-message` so the downstream client
+        // does not see contradictory signals.
+        upstream_trailers.remove("grpc-status");
+        upstream_trailers.remove("grpc-message");
+
+        if ctx.transcode_active && !ctx.transcode_response_emitted {
+            let frame = ctx.transcode_response_buf.take().unwrap_or_default();
+            let json = build_transcoded_json(ctx, &frame);
+            ctx.transcode_response_emitted = true;
+            return Ok(Some(Bytes::from(json)));
+        }
+
+        if ctx.grpc_web_active && !ctx.grpc_web_emitted {
+            let trailers = sbproxy_transport::grpc::GrpcTrailers {
+                status: ctx.transcode_grpc_status.unwrap_or(0),
+                message: ctx.transcode_grpc_message.clone(),
+            };
+            ctx.grpc_web_emitted = true;
+            if ctx.grpc_web_text {
+                // Text variant: the message frames have been buffered
+                // here (the body filter forwarded nothing for text).
+                // Build message-frames + trailer-frame and base64 the
+                // whole block in one shot.
+                let frames = ctx.grpc_web_buf.take().unwrap_or_default();
+                let encoded = sbproxy_transport::grpc::GrpcWebBridge::encode_response(
+                    &frames, &trailers, true,
+                );
+                return Ok(Some(Bytes::from(encoded)));
+            }
+            // Binary variant: message frames were already streamed in
+            // `response_body_filter`; append just the trailer frame.
+            let trailer_frame = sbproxy_transport::grpc::web::encode_trailer_frame_only(&trailers);
+            return Ok(Some(Bytes::from(trailer_frame)));
+        }
+
+        Ok(None)
+    }
+
     /// Pingora calls this when establishing the upstream TCP/TLS
     /// connection fails. If the action has a `retry` policy that
     /// allows `connect_error` and we are still under `max_attempts`,
@@ -3435,5 +3538,49 @@ impl ProxyHttp for SbProxy {
             latency_ms_envelope,
             error_class,
         );
+    }
+}
+
+/// WOR-819: helper that turns the buffered gRPC response frame plus
+/// the captured `grpc-status` / `grpc-message` into the JSON body the
+/// transcoded REST response should carry. Re-fetches the transcoder
+/// from the live pipeline (it lives on the matched `Action::Grpc`),
+/// so the lookup composes with config hot-reload.
+///
+/// Used from both `response_body_filter` (trailers-only error path,
+/// status known from headers) and `response_trailer_filter` (normal
+/// path, status from trailers).
+fn build_transcoded_json(ctx: &RequestContext, frame: &[u8]) -> Vec<u8> {
+    let grpc_method = ctx.transcode_grpc_method.clone().unwrap_or_default();
+    let grpc_status = ctx.transcode_grpc_status.unwrap_or(0);
+    let grpc_message = ctx.transcode_grpc_message.clone();
+    let pipeline = reload::current_pipeline();
+    let action = ctx.origin_idx.and_then(|idx| {
+        if let Some(fwd_idx) = ctx.forward_rule_idx {
+            pipeline
+                .forward_rules
+                .get(idx)
+                .and_then(|r| r.get(fwd_idx))
+                .map(|r| &r.action)
+        } else {
+            pipeline.actions.get(idx)
+        }
+    });
+    match action {
+        Some(Action::Grpc(g)) => match g.transcoder.as_ref() {
+            Some(t) => t
+                .transcode_response(&grpc_method, frame, grpc_status, grpc_message.as_deref())
+                .map(|tr| tr.json_body)
+                .unwrap_or_else(|e| {
+                    serde_json::json!({
+                        "error": "gRPC response transcoding failed",
+                        "detail": e.to_string(),
+                    })
+                    .to_string()
+                    .into_bytes()
+                }),
+            None => b"{}".to_vec(),
+        },
+        _ => b"{}".to_vec(),
     }
 }
