@@ -977,11 +977,34 @@ impl ProxyHttp for SbProxy {
         // the license without already knowing the well-known path.
         // Appended (not inserted) so an upstream's own `Link` headers
         // survive.
+        //
+        // WOR-808 PR5: when the response is HTML, also arm the body
+        // filter to inject `<link rel="license" ...>` into `<head>`.
+        // Header-only discovery misses consumers that read the
+        // rendered document (some browsers' "view source" tooling,
+        // HTML-parsing scrapers that ignore headers); the inline tag
+        // closes that gap without changing the header behaviour.
         if !ctx.hostname.is_empty() {
             let projections = sbproxy_modules::projections::current_projections();
             if projections.rsl_urns.contains_key(ctx.hostname.as_str()) {
                 let _ = upstream_response
                     .append_header("link".to_string(), "</licenses.xml>; rel=\"license\"");
+                let is_html = upstream_response
+                    .headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|ct| ct.split(';').next())
+                    .map(|t| t.trim().eq_ignore_ascii_case("text/html"))
+                    .unwrap_or(false);
+                if is_html {
+                    ctx.rsl_inject_link_pending = true;
+                    // Body length is about to change; drop
+                    // Content-Length and switch to chunked so the body
+                    // filter can rewrite without producing a
+                    // length-mismatch error downstream.
+                    upstream_response.remove_header("content-length");
+                    let _ = upstream_response.insert_header("transfer-encoding", "chunked");
+                }
             }
         }
 
@@ -2682,6 +2705,36 @@ impl ProxyHttp for SbProxy {
             } else {
                 Some(out.freeze())
             };
+            return Ok(None);
+        }
+
+        // --- WOR-808 PR5: RSL <link rel="license"> HTML injection ---
+        //
+        // When `response_filter` armed this path (HTML response on a
+        // hostname with an RSL `/licenses.xml` projection), buffer the
+        // body and inject the `<link>` tag into the `<head>` once at
+        // end_of_stream. The injection helper is a no-op when the
+        // body already carries a license-rel link or has no parseable
+        // `<head>`, so a re-proxied page is not double-tagged.
+        if ctx.rsl_inject_link_pending {
+            if ctx.rsl_inject_link_emitted {
+                *body = None;
+                return Ok(None);
+            }
+            if let Some(chunk) = body.take() {
+                ctx.rsl_inject_link_buf
+                    .get_or_insert_with(bytes::BytesMut::new)
+                    .extend_from_slice(&chunk);
+            }
+            if end_of_stream {
+                let buf = ctx.rsl_inject_link_buf.take().unwrap_or_default();
+                let injected =
+                    sbproxy_modules::projections::inject_license_link(&buf, "/licenses.xml");
+                ctx.rsl_inject_link_emitted = true;
+                *body = Some(Bytes::from(injected));
+            } else {
+                *body = None;
+            }
             return Ok(None);
         }
 
