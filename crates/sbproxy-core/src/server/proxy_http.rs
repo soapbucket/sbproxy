@@ -978,26 +978,36 @@ impl ProxyHttp for SbProxy {
         // Appended (not inserted) so an upstream's own `Link` headers
         // survive.
         //
-        // WOR-808 PR5: when the response is HTML, also arm the body
-        // filter to inject `<link rel="license" ...>` into `<head>`.
+        // WOR-808 PR5: when the response is HTML, arm the body filter
+        // to inject `<link rel="license" ...>` into `<head>`.
         // Header-only discovery misses consumers that read the
         // rendered document (some browsers' "view source" tooling,
         // HTML-parsing scrapers that ignore headers); the inline tag
         // closes that gap without changing the header behaviour.
+        //
+        // WOR-808 PR6: same treatment for RSS / Atom feeds. The link
+        // slots into `<channel>` (RSS) or `<feed>` (Atom) with the
+        // self-closing XML form so a feed-reading consumer discovers
+        // the license document the same way an HTML reader does.
         if !ctx.hostname.is_empty() {
             let projections = sbproxy_modules::projections::current_projections();
             if projections.rsl_urns.contains_key(ctx.hostname.as_str()) {
                 let _ = upstream_response
                     .append_header("link".to_string(), "</licenses.xml>; rel=\"license\"");
-                let is_html = upstream_response
+                let raw_ct = upstream_response
                     .headers
                     .get("content-type")
                     .and_then(|v| v.to_str().ok())
-                    .and_then(|ct| ct.split(';').next())
+                    .unwrap_or("");
+                let is_html = raw_ct
+                    .split(';')
+                    .next()
                     .map(|t| t.trim().eq_ignore_ascii_case("text/html"))
                     .unwrap_or(false);
-                if is_html {
+                let feed_format = sbproxy_modules::projections::classify_feed_content_type(raw_ct);
+                if is_html || feed_format.is_some() {
                     ctx.rsl_inject_link_pending = true;
+                    ctx.rsl_inject_link_feed = feed_format;
                     // Body length is about to change; drop
                     // Content-Length and switch to chunked so the body
                     // filter can rewrite without producing a
@@ -2728,8 +2738,16 @@ impl ProxyHttp for SbProxy {
             }
             if end_of_stream {
                 let buf = ctx.rsl_inject_link_buf.take().unwrap_or_default();
-                let injected =
-                    sbproxy_modules::projections::inject_license_link(&buf, "/licenses.xml");
+                let injected = match ctx.rsl_inject_link_feed {
+                    Some(format) => sbproxy_modules::projections::inject_license_link_xml(
+                        &buf,
+                        "/licenses.xml",
+                        format,
+                    ),
+                    None => {
+                        sbproxy_modules::projections::inject_license_link(&buf, "/licenses.xml")
+                    }
+                };
                 ctx.rsl_inject_link_emitted = true;
                 *body = Some(Bytes::from(injected));
             } else {

@@ -286,18 +286,26 @@ pub struct RequestContext {
     /// modified.
     pub sri_scan_enabled: bool,
 
-    // --- WOR-808 PR5: RSL HTML <link rel="license"> injection ---
+    // --- WOR-808 PR5 / PR6: RSL <link rel="license"> body injection ---
     /// Set in `response_filter` when the origin advertises an RSL
     /// `licenses.xml` projection (i.e. `rsl_urns` has an entry for
-    /// the hostname) AND the upstream response is `text/html`. Tells
-    /// the body filter to accumulate the response and inject a
-    /// `<link rel="license" href="/licenses.xml">` tag into the
-    /// `<head>` so HTML consumers (browsers, scrapers reading the
-    /// document, not just inspecting headers) can discover the
-    /// license document inline. Injection is a no-op when the body
-    /// already carries a license-rel link or has no parseable `<head>`.
+    /// the hostname) AND the upstream response is HTML, RSS, or Atom.
+    /// Tells the body filter to accumulate the response and inject a
+    /// `<link rel="license" href="/licenses.xml">` (HTML) or self-
+    /// closing `<link rel="license" href="/licenses.xml"/>` (RSS or
+    /// Atom) into the document's container element so consumers
+    /// reading the rendered body discover the license document the
+    /// same way clients reading the `Link` header do. Injection is a
+    /// no-op when the body already carries a license-rel link or has
+    /// no parseable container.
     pub rsl_inject_link_pending: bool,
-    /// Buffer for the HTML body when `rsl_inject_link_pending` is set.
+    /// WOR-808 PR6: when `rsl_inject_link_pending` is set, which
+    /// document family the body filter should run the injection
+    /// against. `None` means HTML (the PR5 default); `Some(FeedFormat)`
+    /// switches to the XML self-closing form, keyed to either RSS
+    /// (`<channel>`) or Atom (`<feed>`).
+    pub rsl_inject_link_feed: Option<sbproxy_modules::projections::FeedFormat>,
+    /// Buffer for the body when `rsl_inject_link_pending` is set.
     /// Drained at `end_of_stream` to perform the one-shot injection.
     pub rsl_inject_link_buf: Option<BytesMut>,
     /// Once-only guard so the body filter does not double-emit the
@@ -890,6 +898,7 @@ impl RequestContext {
             upstream_content_type: None,
             sri_scan_enabled: false,
             rsl_inject_link_pending: false,
+            rsl_inject_link_feed: None,
             rsl_inject_link_buf: None,
             rsl_inject_link_emitted: false,
             forward_rule_idx: None,

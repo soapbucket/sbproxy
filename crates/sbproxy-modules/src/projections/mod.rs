@@ -114,6 +114,94 @@ fn find_head_open(lower_window: &str) -> Option<usize> {
     Some(close + 1)
 }
 
+/// Format hint for [`inject_license_link_xml`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedFormat {
+    /// RSS 2.0 (root element `<rss>`; the license link slots inside
+    /// the first `<channel>` per RSL 1.0's feed-discovery convention).
+    Rss,
+    /// Atom 1.0 (root element `<feed>`; license link slots immediately
+    /// inside the `<feed>` open tag).
+    Atom,
+}
+
+/// WOR-808 PR6: inject `<link rel="license" href="<href>"/>` into the
+/// `<channel>` (RSS) or `<feed>` (Atom) root of a syndication feed so
+/// feed readers and feed-consuming scrapers discover the RSL
+/// `/licenses.xml` projection alongside the HTTP `Link` header and the
+/// HTML `<head>` injection.
+///
+/// Returns the original bytes verbatim when:
+///
+/// - The feed already contains a `rel="license"` link (case-insensitive
+///   attribute name).
+/// - The expected container open tag (`<channel>` / `<feed>`) is missing,
+///   so the document is not the declared format (an empty body, an
+///   error envelope, or a feed format we don't recognise).
+///
+/// Otherwise inserts the self-closing XML link immediately after the
+/// container's open tag, preserving any attributes on the container.
+pub fn inject_license_link_xml(body: &[u8], href: &str, format: FeedFormat) -> Vec<u8> {
+    let scan_window = body.len().min(8192);
+    let head_window = String::from_utf8_lossy(&body[..scan_window]).to_ascii_lowercase();
+    if head_window.contains("rel=\"license\"") || head_window.contains("rel='license'") {
+        return body.to_vec();
+    }
+    let container = match format {
+        FeedFormat::Rss => "<channel",
+        FeedFormat::Atom => "<feed",
+    };
+    let open = match find_container_open(&head_window, container) {
+        Some(span) => span,
+        None => return body.to_vec(),
+    };
+    let tag = format!("<link rel=\"license\" href=\"{href}\"/>");
+    let mut out = Vec::with_capacity(body.len() + tag.len());
+    out.extend_from_slice(&body[..open]);
+    out.extend_from_slice(tag.as_bytes());
+    out.extend_from_slice(&body[open..]);
+    out
+}
+
+/// Locate the byte offset just after a named XML container open tag
+/// (`<channel ...>` or `<feed ...>`) in a lowercase ASCII window.
+/// Returns `None` when no such open tag is present, or when no
+/// occurrence's next byte is one of `>`, whitespace, or `/` (the same
+/// disambiguation `find_head_open` uses, in case a sibling tag shares
+/// the prefix). Skips false matches and continues searching.
+fn find_container_open(lower_window: &str, prefix: &str) -> Option<usize> {
+    let mut search_from = 0;
+    loop {
+        let rel = lower_window[search_from..].find(prefix)?;
+        let start = search_from + rel;
+        let after = start + prefix.len();
+        let next = lower_window.as_bytes().get(after)?;
+        if matches!(*next, b'>' | b' ' | b'\t' | b'\n' | b'\r' | b'/') {
+            let close = after + lower_window[after..].find('>')?;
+            return Some(close + 1);
+        }
+        search_from = after;
+    }
+}
+
+/// Classify a `content-type` header value as one of the supported
+/// syndication feed formats, or `None` when it is neither. Strips
+/// parameters (`; charset=utf-8`) and matches case-insensitively so
+/// `Application/RSS+XML` and `application/rss+xml` both resolve.
+pub fn classify_feed_content_type(content_type: &str) -> Option<FeedFormat> {
+    let main = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match main.as_str() {
+        "application/rss+xml" => Some(FeedFormat::Rss),
+        "application/atom+xml" => Some(FeedFormat::Atom),
+        _ => None,
+    }
+}
+
 /// Read the operator-declared `payment:` block on an `ai_crawl_control`
 /// entry and turn it into [`licenses::PaymentTerms`]. Returns `None` when
 /// the block is absent or the declared `type` is not in the RSL 1.0
@@ -870,6 +958,90 @@ spec:
         assert!(
             s.starts_with("<head/><link rel=\"license\" href=\"/x.xml\">"),
             "got: {s}"
+        );
+    }
+
+    // --- WOR-808 PR6: inject_license_link_xml + classify_feed_content_type ---
+
+    #[test]
+    fn classify_feed_content_type_resolves_rss_and_atom() {
+        assert_eq!(
+            classify_feed_content_type("application/rss+xml"),
+            Some(FeedFormat::Rss)
+        );
+        assert_eq!(
+            classify_feed_content_type("application/atom+xml"),
+            Some(FeedFormat::Atom)
+        );
+        // Case-insensitive on the main type.
+        assert_eq!(
+            classify_feed_content_type("Application/RSS+XML"),
+            Some(FeedFormat::Rss)
+        );
+        // Strips parameters.
+        assert_eq!(
+            classify_feed_content_type("application/atom+xml; charset=utf-8"),
+            Some(FeedFormat::Atom)
+        );
+        // Non-feed types pass through as None.
+        assert_eq!(classify_feed_content_type("text/html"), None);
+        assert_eq!(classify_feed_content_type("application/xml"), None);
+        assert_eq!(classify_feed_content_type(""), None);
+    }
+
+    #[test]
+    fn inject_license_link_xml_rss_inserts_after_channel_open() {
+        let body = b"<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>x</title></channel></rss>";
+        let out = inject_license_link_xml(body, "/licenses.xml", FeedFormat::Rss);
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            s.contains("<channel><link rel=\"license\" href=\"/licenses.xml\"/><title>"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn inject_license_link_xml_atom_inserts_after_feed_open() {
+        let body =
+            b"<?xml version=\"1.0\"?><feed xmlns=\"http://www.w3.org/2005/Atom\"><title>x</title></feed>";
+        let out = inject_license_link_xml(body, "/licenses.xml", FeedFormat::Atom);
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            s.contains(
+                "<feed xmlns=\"http://www.w3.org/2005/Atom\"><link rel=\"license\" href=\"/licenses.xml\"/><title>"
+            ),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn inject_license_link_xml_idempotent_on_existing_license() {
+        let body =
+            b"<rss><channel><link rel=\"license\" href=\"/old.xml\"/><title>x</title></channel></rss>";
+        let out = inject_license_link_xml(body, "/licenses.xml", FeedFormat::Rss);
+        assert_eq!(out, body.to_vec());
+    }
+
+    #[test]
+    fn inject_license_link_xml_skips_when_root_missing() {
+        // Atom format but body has no <feed>; injection is a no-op.
+        let body = b"<rss><channel><title>x</title></channel></rss>";
+        let out = inject_license_link_xml(body, "/licenses.xml", FeedFormat::Atom);
+        assert_eq!(out, body.to_vec());
+    }
+
+    #[test]
+    fn find_container_open_skips_false_prefix_match() {
+        // `<channels>` shares the `<channel` prefix; the search must
+        // skip it and find the real `<channel>` later in the doc.
+        let lower = "<rss><channels-list/><channel><title>";
+        let pos = find_container_open(lower, "<channel").expect("found");
+        // The real `<channel>` open ends at the second `>`; the slice
+        // up to `pos` must include `<channel>`.
+        assert!(
+            &lower[..pos].ends_with("<channel>"),
+            "got prefix: {}",
+            &lower[..pos]
         );
     }
 
