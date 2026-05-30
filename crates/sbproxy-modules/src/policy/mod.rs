@@ -22,6 +22,7 @@ pub mod bot_detection;
 /// (WOR-203 PR 3a; see `adr-policy-compilation.md` NLC pillar C).
 pub mod compiled_policy_store;
 pub mod concurrent_limit;
+pub mod content_digest;
 pub mod csrf;
 pub mod ddos;
 pub mod dlp;
@@ -81,6 +82,10 @@ pub use assertion::AssertionPolicy;
 pub use bot_detection::BotDetection;
 pub use compiled_policy_store::{CompiledPolicy, CompiledPolicyStore};
 pub use concurrent_limit::{ConcurrentLimitGuard, ConcurrentLimitPolicy};
+pub use content_digest::{
+    ContentDigestPolicy, OnMissing as ContentDigestOnMissing,
+    VerifyOutcome as ContentDigestVerifyOutcome,
+};
 pub use csrf::CsrfPolicy;
 pub use ddos::{DdosCheckResult, DdosPolicy};
 pub use dlp::{DlpAction, DlpDirection, DlpPolicy, DlpScanResult};
@@ -163,6 +168,12 @@ pub enum Policy {
     /// reach the upstream. Rejects malformed or non-conforming
     /// payloads at the edge with a configurable status / body.
     RequestValidator(RequestValidatorPolicy),
+    /// WOR-805: verifies the inbound `Content-Digest` header (RFC
+    /// 9530) against the SHA-256 / SHA-512 of the request body
+    /// before forwarding upstream. Rejects malformed headers and
+    /// digest mismatches with a configurable status; `on_missing`
+    /// controls whether absent headers are required or skipped.
+    ContentDigest(ContentDigestPolicy),
     /// Caps in-flight (concurrent) requests per route, per IP, or per
     /// API key. Distinct from RateLimit which throttles RPS.
     ConcurrentLimit(ConcurrentLimitPolicy),
@@ -251,6 +262,7 @@ impl Policy {
             Self::Assertion(_) => "assertion",
             Self::Waf(_) => "waf",
             Self::RequestValidator(_) => "request_validator",
+            Self::ContentDigest(_) => "content_digest",
             Self::ConcurrentLimit(_) => "concurrent_limit",
             Self::AiCrawl(_) => "ai_crawl_control",
             Self::ExposedCreds(_) => "exposed_credentials",
@@ -285,6 +297,7 @@ impl std::fmt::Debug for Policy {
             Self::Assertion(r) => f.debug_tuple("Assertion").field(r).finish(),
             Self::Waf(r) => f.debug_tuple("Waf").field(r).finish(),
             Self::RequestValidator(r) => f.debug_tuple("RequestValidator").field(r).finish(),
+            Self::ContentDigest(c) => f.debug_tuple("ContentDigest").field(c).finish(),
             Self::ConcurrentLimit(r) => f.debug_tuple("ConcurrentLimit").field(r).finish(),
             Self::AiCrawl(r) => f.debug_tuple("AiCrawl").field(r).finish(),
             Self::ExposedCreds(r) => f.debug_tuple("ExposedCreds").field(r).finish(),

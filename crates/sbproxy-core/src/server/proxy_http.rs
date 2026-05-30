@@ -2278,6 +2278,44 @@ impl ProxyHttp for SbProxy {
                                         break;
                                     }
                                 }
+                                Policy::ContentDigest(cd) => {
+                                    // WOR-805: verify inbound RFC 9530
+                                    // `Content-Digest` against the
+                                    // buffered request body. IMPORTANT:
+                                    // this arm runs BEFORE any
+                                    // request-body modifier
+                                    // (transcoders, body modifiers).
+                                    // The digest applies to the
+                                    // pre-transform bytes, so the
+                                    // ordering must not be swapped.
+                                    if collected.len() > cd.max_body_bytes {
+                                        // Mirror the request_limit
+                                        // pattern: reject 413 the
+                                        // moment the cap is exceeded.
+                                        let body_str = serde_json::json!({
+                                            "error": "request body exceeds content_digest max_body_bytes",
+                                            "detail": format!(
+                                                "body length {} > cap {}",
+                                                collected.len(),
+                                                cd.max_body_bytes
+                                            ),
+                                        })
+                                        .to_string();
+                                        failed =
+                                            Some((413, body_str, "application/json".to_string()));
+                                        break;
+                                    }
+                                    let header_value = session
+                                        .req_header()
+                                        .headers
+                                        .get("content-digest")
+                                        .and_then(|v| v.to_str().ok());
+                                    let outcome = cd.verify(header_value, &collected);
+                                    if let Some(envelope) = cd.rejection_envelope(outcome) {
+                                        failed = Some(envelope);
+                                        break;
+                                    }
+                                }
                                 Policy::OpenApiValidation(oa) => {
                                     use sbproxy_modules::{
                                         OpenApiValidationMode, OpenApiValidationResult,
