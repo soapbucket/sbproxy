@@ -19,9 +19,10 @@ edit.
 The example fixes `content_signal: ai-input` so the projected RSL
 document asserts inference-only licensing. Switch to `ai-train` to
 license training and `search` to license search-index inclusion. An
-absent `content_signal` produces a default-deny RSL document
-(`<ai-use licensed="false">`) and a `TDM-Reservation: 1` response
-header on origin traffic.
+absent `content_signal` produces no `<permits>` / `<prohibits>`
+element under the usage tier (RSL 1.0 is silent-permissive when a
+signal is undeclared) and a `TDM-Reservation: 1` response header on
+origin traffic.
 
 ## How it composes
 
@@ -86,8 +87,8 @@ The RSL 1.0 license document. Parses as XML; the root element is
 `<rsl xmlns="https://rslstandard.org/rsl">` and wraps the license
 body in a `<content url="...">` element scoped to the origin. The
 inner `<license>` carries the `urn:rsl:1.0:<hostname>:<config_version>`
-URN and the `<ai-use>` assertion derived from the `Content-Signal`
-value.
+URN plus the `<permits>` / `<prohibits>` token lists derived from the
+`Content-Signal` value (RSL 1.0 §3.5).
 
 ```bash
 curl -s -H 'Host: shop.localhost' \
@@ -97,7 +98,7 @@ curl -s -H 'Host: shop.localhost' \
 #   <content url="https://shop.localhost/*">
 #     <license urn="urn:rsl:1.0:shop.localhost:42">
 #       <origin hostname="shop.localhost" />
-#       <ai-use type="inference" licensed="true" />
+#       <permits type="usage">ai-input</permits>
 #       <content-signal>ai-input</content-signal>
 #     </license>
 #   </content>
@@ -141,20 +142,23 @@ curl -s -H 'Host: shop.localhost' \
 Change `content_signal: ai-input` to `content_signal: ai-train` in
 `sb.yml`, then `docker compose restart sbproxy`. The three
 projections refresh atomically; `licenses.xml` now declares
-`<ai-use type="training" licensed="true" />` and the audit trail logs
+`<permits type="usage">ai-train</permits>` and the audit trail logs
 one `PolicyProjectionRefresh` event per (hostname, projection_kind).
 
 ## How the mapping works
 
-| `content_signal` | `licenses.xml` `<ai-use>`                          |
-|------------------|----------------------------------------------------|
-| `ai-train`       | `<ai-use type="training" licensed="true" />`       |
-| `ai-input`       | `<ai-use type="inference" licensed="true" />`      |
-| `search`         | `<ai-use type="search-index" licensed="true" />`   |
-| (absent)         | `<ai-use type="training" licensed="false" />` (default-deny) |
+| `content_signal` | `licenses.xml` element                                       |
+|------------------|--------------------------------------------------------------|
+| `ai-train`       | `<permits type="usage">ai-train</permits>`                   |
+| `ai-input`       | `<permits type="usage">ai-input</permits>`                   |
+| `search`         | `<permits type="usage">search</permits>`                     |
+| (absent)         | no `<permits>` or `<prohibits>` (RSL is silent-permissive)   |
 
-Per-tier `citation_required: true` adds a `requires-citation="true"`
-attribute to the corresponding RSL `<terms>` element.
+Switching to the structured `content_signals:` block lets the
+operator declare per-token decisions; a `false` value emits
+`<prohibits type="usage">token</prohibits>` instead of `<permits>`.
+The "prohibits wins" rule in RSL §3.1.1 means a token that ends up
+in both lists is treated as prohibited by spec-aware consumers.
 
 ## Audit trail
 

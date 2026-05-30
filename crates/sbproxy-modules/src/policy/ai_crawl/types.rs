@@ -1331,10 +1331,11 @@ pub struct AiCrawlControlConfig {
     /// (`search` / `ai_input` / `ai_train`). When any signal is
     /// declared, the projection emits a `Content-Signal:` directive
     /// and the policy blocks a crawler whose purpose maps to a
-    /// disallowed (`=no`) signal. The same set drives the RSL
-    /// `<ai-use>` assertions so the two never contradict. Empty (the
-    /// default) keeps both behaviours off, so existing configs are
-    /// unaffected.
+    /// disallowed (`=no`) signal. The same set drives the RSL 1.0
+    /// `<permits type="usage">` / `<prohibits type="usage">` token
+    /// lists (WOR-944) so the two surfaces never contradict. Empty
+    /// (the default) keeps both behaviours off, so existing configs
+    /// are unaffected.
     #[serde(default)]
     pub content_signals: ContentSignals,
     /// Enable Cloudflare Pay Per Crawl wire-contract interop. When on,

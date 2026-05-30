@@ -15,14 +15,27 @@
 //! and is carried as a `urn` attribute on the inner `<license>`
 //! element.
 //!
-//! Mapping table (origin-level `Content-Signal` to `<ai-use>`):
+//! Mapping table (origin-level `Content-Signal` to normative RSL 1.0
+//! tokens; see WOR-944). The token vocabulary comes from RSL §3.4.1
+//! and goes inside `<permits type="usage">` / `<prohibits type="usage">`
+//! per §3.5 + the §4.8 example. The earlier `<ai-use>` element this
+//! module emitted was NOT a normative RSL 1.0 element; it has been
+//! replaced with `<permits>` / `<prohibits>`.
 //!
-//! | `Content-Signal` value | RSL `<ai-use>` assertion |
+//! | `Content-Signal` value | RSL element |
 //! |---|---|
-//! | `ai-train` | `<ai-use type="training" licensed="true" />` |
-//! | `ai-input` | `<ai-use type="inference" licensed="true" />` |
-//! | `search` | `<ai-use type="search-index" licensed="true" />` |
-//! | absent | `<ai-use type="training" licensed="false" />` |
+//! | `ai-train` | `<permits type="usage">ai-train</permits>` |
+//! | `ai-input` | `<permits type="usage">ai-input</permits>` |
+//! | `search` | `<permits type="usage">search</permits>` |
+//! | absent | (no `<permits>` or `<prohibits>` element; silent-permissive per spec) |
+//!
+//! The structured `ContentSignals` set (search / ai_input / ai_train
+//! each `Some(true)` / `Some(false)` / `None`) splits the same
+//! vocabulary across `<permits>` and `<prohibits>` per the
+//! "prohibits wins" MUST conflict rule (§3.1.1, §3.6). The operator
+//! can also declare a `rsl_vocab:` block with user (commercial /
+//! non-commercial / education / government / personal per §3.4.1.2)
+//! and geo (ISO 3166-1 alpha-2) tiers.
 //!
 //! ## Internal contract: `RequestContext.rsl_urn`
 //!
@@ -37,6 +50,89 @@
 
 use crate::policy::ai_crawl::ContentSignals;
 
+/// WOR-944 tier-1 vocab tokens declared by the operator on
+/// `ai_crawl_control.rsl_vocab.{user,geo}`. `permit` and `prohibit`
+/// are each rendered as a single `<permits type="<kind>">` /
+/// `<prohibits type="<kind>">` element with the tokens
+/// space-separated per RSL 1.0 §3.5 and the §4.8 example. An empty
+/// list emits no element; both empty means the tier is silent for
+/// that origin.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TokenTier {
+    /// Tokens placed inside the corresponding `<permits>` element.
+    pub permit: Vec<String>,
+    /// Tokens placed inside the corresponding `<prohibits>` element.
+    pub prohibit: Vec<String>,
+}
+
+impl TokenTier {
+    /// True when both lists are empty (the tier is silent).
+    fn is_silent(&self) -> bool {
+        self.permit.is_empty() && self.prohibit.is_empty()
+    }
+}
+
+/// WOR-944 RSL tier-1 vocab the operator declares on
+/// `ai_crawl_control.rsl_vocab`. `user` carries the RSL §3.4.1.2
+/// audience vocabulary (commercial, non-commercial, education,
+/// government, personal); `geo` carries ISO 3166-1 alpha-2 country
+/// codes. The usage tier (`ai-train`, `ai-input`, `search`) is still
+/// driven from the existing `content_signals` block so the two
+/// stay consistent.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RslVocab {
+    /// Tier-1 user/audience tokens.
+    pub user: TokenTier,
+    /// Tier-1 geo tokens (ISO 3166-1 alpha-2).
+    pub geo: TokenTier,
+}
+
+/// Render one `<permits>` / `<prohibits>` pair for a given
+/// `type=<kind>` value. Emits nothing when both lists are empty.
+fn render_tier_pair(kind: &str, tier: &TokenTier) -> String {
+    let mut s = String::new();
+    if !tier.permit.is_empty() {
+        s.push_str(&format!(
+            "      <permits type=\"{}\">{}</permits>\n",
+            escape_xml_attr(kind),
+            escape_xml_text(&tier.permit.join(" "))
+        ));
+    }
+    if !tier.prohibit.is_empty() {
+        s.push_str(&format!(
+            "      <prohibits type=\"{}\">{}</prohibits>\n",
+            escape_xml_attr(kind),
+            escape_xml_text(&tier.prohibit.join(" "))
+        ));
+    }
+    s
+}
+
+/// Render the usage tier from a [`ContentSignals`] set. Each signal
+/// becomes a token inside the corresponding `<permits>` /
+/// `<prohibits>` element. Absent signals are omitted (silent-permissive
+/// per RSL spec); a `Some(false)` is a `<prohibits>` per the "prohibits
+/// wins" MUST conflict rule in §3.1.1/§3.6.
+fn render_usage_tier(signals: &ContentSignals) -> String {
+    let mut tier = TokenTier::default();
+    // Fixed order matches the legacy `<ai-use>` emission order so
+    // dashboards / tests that grep the body in a stable order keep
+    // working (search, inference, training -> RSL tokens
+    // search, ai-input, ai-train).
+    for (value, token) in [
+        (signals.search, "search"),
+        (signals.ai_input, "ai-input"),
+        (signals.ai_train, "ai-train"),
+    ] {
+        match value {
+            Some(true) => tier.permit.push(token.to_string()),
+            Some(false) => tier.prohibit.push(token.to_string()),
+            None => {}
+        }
+    }
+    render_tier_pair("usage", &tier)
+}
+
 /// RSL 1.0 `<payment>` terms for a license element.
 ///
 /// `payment_type` is an RSL 1.0 payment-enum value (`free`, `crawl`,
@@ -45,6 +141,13 @@ use crate::policy::ai_crawl::ContentSignals;
 /// `free`. SBproxy derives these from the `ai_crawl_control` policy: a
 /// per-crawl price maps to `type="crawl"` with the configured price /
 /// currency; an unpriced origin maps to `type="free"`.
+///
+/// `standard` (WOR-944) is the optional `<standard>` child element
+/// that points at the reuse framework for an attribution payment
+/// (typically `https://creativecommons.org/licenses/by/4.0/` or
+/// similar). Omitted when unset; when set, the `<payment>` element
+/// renders as a container with a `<standard>` child rather than as
+/// the self-closing form.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaymentTerms {
     /// RSL payment-enum value.
@@ -53,6 +156,10 @@ pub struct PaymentTerms {
     pub amount: Option<f64>,
     /// Currency code for a priced type; `None` for `free`.
     pub currency: Option<String>,
+    /// Optional `<standard>` URL — the reuse framework an
+    /// attribution payment points to (CC-BY, etc.). Per RSL 1.0
+    /// schema, the `<standard>` child sits inside `<payment>`.
+    pub standard: Option<String>,
 }
 
 impl PaymentTerms {
@@ -62,12 +169,15 @@ impl PaymentTerms {
             payment_type: "free".to_string(),
             amount: None,
             currency: None,
+            standard: None,
         }
     }
 
     /// Emit the `<payment ... />` element (indented for the `<license>`
     /// body). Returns the empty string for an unset type so callers can
-    /// unconditionally concatenate.
+    /// unconditionally concatenate. When `standard` is set, emits the
+    /// container form with a `<standard>` child; otherwise emits the
+    /// self-closing form (backwards-compatible with PR #318).
     fn to_xml(&self) -> String {
         if self.payment_type.is_empty() {
             return String::new();
@@ -82,7 +192,16 @@ impl PaymentTerms {
         if let Some(currency) = &self.currency {
             s.push_str(&format!(" currency=\"{}\"", escape_xml_attr(currency)));
         }
-        s.push_str(" />\n");
+        if let Some(standard) = &self.standard {
+            s.push_str(">\n");
+            s.push_str(&format!(
+                "        <standard>{}</standard>\n",
+                escape_xml_text(standard)
+            ));
+            s.push_str("      </payment>\n");
+        } else {
+            s.push_str(" />\n");
+        }
         s
     }
 }
@@ -104,22 +223,23 @@ pub fn render(
 ) -> (String, String) {
     let urn = format!("urn:rsl:1.0:{hostname}:{config_version}");
 
-    // RSL mapping. Absent signal asserts default-deny (training,
-    // licensed="false").
-    let (ai_type, licensed) = match content_signal {
-        Some("ai-train") => ("training", "true"),
-        Some("ai-input") => ("inference", "true"),
-        Some("search") => ("search-index", "true"),
-        _ => ("training", "false"),
-    };
+    // WOR-944: legacy single-value mapping into RSL 1.0 tokens.
+    // Absent signal is silent-permissive per spec; the old code
+    // synthesised `<ai-use licensed="false">` which is non-conformant
+    // (RSL 1.0 has no `<ai-use>` element at all).
+    let mut usage = TokenTier::default();
+    match content_signal {
+        Some("ai-train") => usage.permit.push("ai-train".to_string()),
+        Some("ai-input") => usage.permit.push("ai-input".to_string()),
+        Some("search") => usage.permit.push("search".to_string()),
+        _ => {}
+    }
 
     // The `<content url>` value is the canonical "every URL on this
     // origin" glob per the RSL Collective spec prose. Wave 4 has a
     // single origin-wide license per origin, so we emit one
     // `<content>` element scoped to `https://<hostname>/*`. Per-route
-    // grouping (one `<content>` per route) is an open extension and
-    // would split this loop along `tier.route_pattern` once Wave 5
-    // wires per-tier licensing.
+    // grouping (one `<content>` per route) is an open extension.
     let content_url = format!("https://{hostname}/*");
 
     // Quick-xml is not pulled into sbproxy-modules directly: the
@@ -148,9 +268,11 @@ pub fn render(
     if let Some(payment) = payment {
         xml.push_str(&payment.to_xml());
     }
-    xml.push_str(&format!(
-        "      <ai-use type=\"{ai_type}\" licensed=\"{licensed}\" />\n"
-    ));
+    xml.push_str(&render_tier_pair("usage", &usage));
+    // Sbproxy-extension `<content-signal>` for the forensic trail.
+    // Spec-aware consumers ignore unknown elements; the audit hook
+    // wants this echo because it ties the projection back to the
+    // operator's declared signal verbatim.
     if let Some(signal) = content_signal {
         xml.push_str(&format!(
             "      <content-signal>{}</content-signal>\n",
@@ -190,6 +312,34 @@ pub fn render_signals(
     payment: Option<&PaymentTerms>,
     config_version: u64,
 ) -> (String, String) {
+    render_signals_with_vocab(
+        hostname,
+        signals,
+        payment,
+        &RslVocab::default(),
+        config_version,
+    )
+}
+
+/// WOR-944: full sibling of [`render_signals`] that also emits the
+/// operator-declared tier-1 user / geo vocab. `vocab` is read from
+/// the `ai_crawl_control.rsl_vocab` config block; the default (no
+/// vocab declared) renders the same document `render_signals` does.
+///
+/// Element order inside `<license>`:
+/// `<origin>`, `<payment>`, `<permits type="usage">` /
+/// `<prohibits type="usage">` (from `signals`),
+/// `<permits type="user">` / `<prohibits type="user">` (from
+/// `vocab.user`), `<permits type="geo">` / `<prohibits type="geo">`
+/// (from `vocab.geo`), then the sbproxy-extension
+/// `<content-signal>` echo for the audit trail.
+pub fn render_signals_with_vocab(
+    hostname: &str,
+    signals: &ContentSignals,
+    payment: Option<&PaymentTerms>,
+    vocab: &RslVocab,
+    config_version: u64,
+) -> (String, String) {
     let urn = format!("urn:rsl:1.0:{hostname}:{config_version}");
     let content_url = format!("https://{hostname}/*");
 
@@ -213,19 +363,16 @@ pub fn render_signals(
     if let Some(payment) = payment {
         xml.push_str(&payment.to_xml());
     }
-    // Fixed order (search, inference, training) for deterministic
-    // output. Each declared signal becomes one `<ai-use>` assertion.
-    for (value, ai_type) in [
-        (signals.search, "search-index"),
-        (signals.ai_input, "inference"),
-        (signals.ai_train, "training"),
-    ] {
-        if let Some(v) = value {
-            let licensed = if v { "true" } else { "false" };
-            xml.push_str(&format!(
-                "      <ai-use type=\"{ai_type}\" licensed=\"{licensed}\" />\n"
-            ));
-        }
+    // WOR-944: emit normative `<permits>`/`<prohibits>` for the
+    // usage tier (from signals) and the user / geo tiers (from
+    // operator vocab). Each pair is omitted entirely when its
+    // tokens are empty so a silent tier produces no element.
+    xml.push_str(&render_usage_tier(signals));
+    if !vocab.user.is_silent() {
+        xml.push_str(&render_tier_pair("user", &vocab.user));
+    }
+    if !vocab.geo.is_silent() {
+        xml.push_str(&render_tier_pair("geo", &vocab.geo));
     }
     if let Some(directive) = signals.directive_value() {
         xml.push_str(&format!(
@@ -279,40 +426,67 @@ mod tests {
     }
 
     #[test]
-    fn ai_train_maps_to_training_licensed_true() {
+    fn ai_train_emits_permits_usage_ai_train() {
         let (xml, _) = render("h", Some("ai-train"), None, 1);
-        assert!(xml.contains(r#"<ai-use type="training" licensed="true" />"#));
+        // WOR-944: normative `<permits type="usage">` per RSL 1.0
+        // §3.5; the legacy `<ai-use>` element does not exist in the
+        // spec.
+        assert!(
+            xml.contains(r#"<permits type="usage">ai-train</permits>"#),
+            "missing permits-usage; got:\n{xml}"
+        );
         assert!(xml.contains("<content-signal>ai-train</content-signal>"));
     }
 
     #[test]
-    fn ai_input_maps_to_inference_licensed_true() {
+    fn ai_input_emits_permits_usage_ai_input() {
         let (xml, _) = render("h", Some("ai-input"), None, 1);
-        assert!(xml.contains(r#"<ai-use type="inference" licensed="true" />"#));
+        assert!(xml.contains(r#"<permits type="usage">ai-input</permits>"#));
     }
 
     #[test]
-    fn search_maps_to_search_index_licensed_true() {
+    fn search_emits_permits_usage_search() {
         let (xml, _) = render("h", Some("search"), None, 1);
-        assert!(xml.contains(r#"<ai-use type="search-index" licensed="true" />"#));
+        assert!(xml.contains(r#"<permits type="usage">search</permits>"#));
     }
 
     #[test]
-    fn absent_signal_maps_to_default_deny() {
+    fn absent_signal_omits_permits_and_prohibits() {
+        // WOR-944 behavior change: the spec is silent-permissive when
+        // no usage tokens are declared. We no longer synthesise a
+        // default-deny `<ai-use licensed="false">` because that
+        // element does not exist in the RSL 1.0 schema and the
+        // synthesis was non-conformant to begin with.
         let (xml, _) = render("h", None, None, 1);
-        assert!(xml.contains(r#"<ai-use type="training" licensed="false" />"#));
-        // No content-signal element when the signal is absent.
+        assert!(!xml.contains("<permits"));
+        assert!(!xml.contains("<prohibits"));
         assert!(!xml.contains("<content-signal>"));
     }
 
     #[test]
-    fn unknown_signal_falls_back_to_default_deny() {
+    fn unknown_signal_omits_permits_but_still_echoes_for_forensics() {
+        // An unrecognised signal value (`custom-future-value`) is
+        // outside the RSL §3.4.1.1 closed enum, so we cannot map it
+        // to a token. Omit the usage tier silently; the sbproxy
+        // extension `<content-signal>` still echoes the raw value
+        // for the audit trail.
         let (xml, _) = render("h", Some("custom-future-value"), None, 1);
-        // Falls into the catch-all branch (default-deny).
-        assert!(xml.contains(r#"<ai-use type="training" licensed="false" />"#));
-        // We still echo the signal text (escaped) for forensics so
-        // the operator can see what value reached the projection.
+        assert!(!xml.contains("<permits"));
+        assert!(!xml.contains("<prohibits"));
         assert!(xml.contains("<content-signal>custom-future-value</content-signal>"));
+    }
+
+    #[test]
+    fn no_ai_use_element_ever_emitted_from_render() {
+        // Regression guard for WOR-944. `<ai-use>` is not a normative
+        // RSL 1.0 element; ensure no code path synthesises it.
+        for sig in [Some("ai-train"), Some("ai-input"), Some("search"), None] {
+            let (xml, _) = render("h", sig, None, 1);
+            assert!(
+                !xml.contains("<ai-use"),
+                "render produced <ai-use> for signal {sig:?}: {xml}"
+            );
+        }
     }
 
     #[test]
@@ -378,6 +552,7 @@ mod tests {
             payment_type: "crawl".to_string(),
             amount: Some(0.002),
             currency: Some("USD".to_string()),
+            standard: None,
         };
         let (xml, _) = render("h", Some("ai-train"), Some(&p), 1);
         assert!(
@@ -389,6 +564,45 @@ mod tests {
         let lic_idx = xml.find("<license ").expect("license present");
         let close_idx = xml.find("</license>").expect("license close");
         assert!(lic_idx < pay_idx && pay_idx < close_idx);
+    }
+
+    #[test]
+    fn payment_attribution_with_standard_emits_nested_standard_child() {
+        // WOR-944: `<payment type="attribution">` switches to the
+        // container form with a `<standard>` child when the operator
+        // points at a reuse framework (CC-BY, etc.).
+        let p = PaymentTerms {
+            payment_type: "attribution".to_string(),
+            amount: None,
+            currency: None,
+            standard: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+        };
+        let (xml, _) = render("h", Some("ai-train"), Some(&p), 1);
+        assert!(
+            xml.contains(r#"<payment type="attribution">"#),
+            "container open tag; got:\n{xml}"
+        );
+        assert!(
+            xml.contains("<standard>https://creativecommons.org/licenses/by/4.0/</standard>"),
+            "standard child must carry the URL verbatim; got:\n{xml}"
+        );
+        assert!(xml.contains("</payment>"));
+    }
+
+    #[test]
+    fn payment_attribution_without_standard_emits_bare_self_closing() {
+        // Backwards-compatible with PR #318: an attribution payment
+        // without a `standard:` URL keeps the self-closing form.
+        let p = PaymentTerms {
+            payment_type: "attribution".to_string(),
+            amount: None,
+            currency: None,
+            standard: None,
+        };
+        let (xml, _) = render("h", Some("ai-train"), Some(&p), 1);
+        assert!(xml.contains(r#"<payment type="attribution" />"#));
+        assert!(!xml.contains("<standard>"));
+        assert!(!xml.contains("</payment>"));
     }
 
     #[test]
@@ -409,7 +623,11 @@ mod tests {
     }
 
     #[test]
-    fn render_signals_emits_one_ai_use_per_declared_signal() {
+    fn render_signals_emits_permits_and_prohibits_grouped_by_type() {
+        // WOR-944: search=yes + ai_train=no splits the usage tier
+        // into a `<permits type="usage">` (search) and a
+        // `<prohibits type="usage">` (ai-train). ai_input undeclared
+        // is silent (omitted from both).
         let signals = ContentSignals {
             search: Some(true),
             ai_input: None,
@@ -417,33 +635,158 @@ mod tests {
         };
         let (xml, urn) = render_signals("shop.example.com", &signals, None, 9);
         assert_eq!(urn, "urn:rsl:1.0:shop.example.com:9");
-        // search=yes -> search-index licensed true.
-        assert!(xml.contains(r#"<ai-use type="search-index" licensed="true" />"#));
-        // ai_train=no -> training licensed false.
-        assert!(xml.contains(r#"<ai-use type="training" licensed="false" />"#));
-        // ai_input undeclared -> no inference assertion.
-        assert!(!xml.contains(r#"type="inference""#));
+        assert!(
+            xml.contains(r#"<permits type="usage">search</permits>"#),
+            "search=yes -> permits-usage; got:\n{xml}"
+        );
+        assert!(
+            xml.contains(r#"<prohibits type="usage">ai-train</prohibits>"#),
+            "ai-train=no -> prohibits-usage; got:\n{xml}"
+        );
+        assert!(
+            !xml.contains("ai-input"),
+            "undeclared signal must be silent"
+        );
         // Directive echoed for forensics.
         assert!(xml.contains("<content-signal>search=yes, ai-train=no</content-signal>"));
     }
 
     #[test]
     fn render_signals_is_consistent_with_robots_directive() {
-        // The RSL search-index assertion and the robots directive both
+        // The RSL `<permits>` set and the robots directive both
         // derive from the same ContentSignals, so a `search=yes` can
-        // never appear as `licensed="false"`.
+        // never appear inside `<prohibits>`.
         let signals = ContentSignals {
             search: Some(true),
             ai_input: Some(true),
             ai_train: Some(false),
         };
         let (xml, _) = render_signals("h", &signals, None, 1);
-        assert!(xml.contains(r#"<ai-use type="search-index" licensed="true" />"#));
-        assert!(xml.contains(r#"<ai-use type="inference" licensed="true" />"#));
-        assert!(xml.contains(r#"<ai-use type="training" licensed="false" />"#));
+        // Permits and prohibits are each rendered as one element
+        // per type=usage; the token order matches ContentSignals's
+        // fixed iteration order (search, ai-input, ai-train).
+        assert!(xml.contains(r#"<permits type="usage">search ai-input</permits>"#));
+        assert!(xml.contains(r#"<prohibits type="usage">ai-train</prohibits>"#));
         assert_eq!(
             signals.directive_value().as_deref(),
             Some("search=yes, ai-input=yes, ai-train=no")
         );
+    }
+
+    #[test]
+    fn render_signals_with_vocab_emits_user_tier() {
+        // WOR-944: declared user vocab (RSL §3.4.1.2 audience tokens)
+        // becomes `<permits type="user">` / `<prohibits type="user">`.
+        let signals = ContentSignals::default();
+        let vocab = RslVocab {
+            user: TokenTier {
+                permit: vec!["non-commercial".to_string(), "education".to_string()],
+                prohibit: vec!["commercial".to_string()],
+            },
+            geo: TokenTier::default(),
+        };
+        let (xml, _) = render_signals_with_vocab("h", &signals, None, &vocab, 1);
+        assert!(
+            xml.contains(r#"<permits type="user">non-commercial education</permits>"#),
+            "user permits; got:\n{xml}"
+        );
+        assert!(
+            xml.contains(r#"<prohibits type="user">commercial</prohibits>"#),
+            "user prohibits; got:\n{xml}"
+        );
+        // Geo silent -> no geo element.
+        assert!(!xml.contains(r#"type="geo""#));
+    }
+
+    #[test]
+    fn render_signals_with_vocab_emits_geo_tier() {
+        let signals = ContentSignals::default();
+        let vocab = RslVocab {
+            user: TokenTier::default(),
+            geo: TokenTier {
+                permit: vec!["US".to_string(), "CA".to_string(), "GB".to_string()],
+                prohibit: vec![],
+            },
+        };
+        let (xml, _) = render_signals_with_vocab("h", &signals, None, &vocab, 1);
+        assert!(
+            xml.contains(r#"<permits type="geo">US CA GB</permits>"#),
+            "geo permits; got:\n{xml}"
+        );
+        // Empty prohibit -> no prohibits-geo element.
+        assert!(!xml.contains(r#"<prohibits type="geo""#));
+    }
+
+    #[test]
+    fn render_signals_with_empty_vocab_matches_render_signals() {
+        // A silent vocab must produce byte-identical output to the
+        // legacy `render_signals` (no extra elements snuck in).
+        let signals = ContentSignals {
+            search: Some(true),
+            ai_input: None,
+            ai_train: Some(false),
+        };
+        let (legacy, _) = render_signals("h", &signals, None, 1);
+        let (with_vocab, _) =
+            render_signals_with_vocab("h", &signals, None, &RslVocab::default(), 1);
+        assert_eq!(legacy, with_vocab);
+    }
+
+    #[test]
+    fn render_signals_with_neither_tier_set_emits_only_origin_and_payment() {
+        // Empty signals AND empty vocab => the `<license>` body has
+        // only the `<origin>` element (and the optional `<payment>`
+        // when supplied). No `<permits>`, no `<prohibits>`, no
+        // legacy `<ai-use>`.
+        let (xml, _) = render_signals_with_vocab(
+            "h",
+            &ContentSignals::default(),
+            Some(&PaymentTerms::free()),
+            &RslVocab::default(),
+            1,
+        );
+        assert!(!xml.contains("<permits"));
+        assert!(!xml.contains("<prohibits"));
+        assert!(!xml.contains("<ai-use"));
+        assert!(xml.contains(r#"<origin hostname="h" />"#));
+        assert!(xml.contains(r#"<payment type="free" />"#));
+    }
+
+    #[test]
+    fn no_ai_use_element_ever_emitted_from_render_signals() {
+        // Regression guard for WOR-944: every shape that flows
+        // through `render_signals` / `render_signals_with_vocab`
+        // must produce zero `<ai-use>` substrings.
+        let cases = [
+            (ContentSignals::default(), RslVocab::default()),
+            (
+                ContentSignals {
+                    search: Some(true),
+                    ai_input: Some(false),
+                    ai_train: Some(true),
+                },
+                RslVocab::default(),
+            ),
+            (
+                ContentSignals::default(),
+                RslVocab {
+                    user: TokenTier {
+                        permit: vec!["personal".to_string()],
+                        prohibit: vec![],
+                    },
+                    geo: TokenTier {
+                        permit: vec!["US".to_string()],
+                        prohibit: vec!["RU".to_string()],
+                    },
+                },
+            ),
+        ];
+        for (sig, vocab) in cases {
+            let (xml, _) = render_signals_with_vocab("h", &sig, None, &vocab, 1);
+            assert!(
+                !xml.contains("<ai-use"),
+                "render_signals_with_vocab produced <ai-use>; sig={sig:?}, vocab={vocab:?}; xml:\n{xml}"
+            );
+        }
     }
 }
