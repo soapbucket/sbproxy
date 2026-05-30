@@ -1239,7 +1239,17 @@ pub(super) async fn handle_ai_proxy(
     // (priority sort above), cascade, and cost_quality manage their own
     // ordering and are left untouched.
     if !is_failover && router.cascade_config().is_none() && router.cost_quality_config().is_none() {
-        if let Some(primary) = router.select(&config.providers) {
+        // WOR-798: prefix-affinity strategies (self-hosted vLLM /
+        // SGLang KV-cache reuse) need the request's prompt prefix
+        // to hash to a sticky upstream. Other strategies ignore the
+        // prefix and select() handles them.
+        let primary = if router.is_prefix_affinity() {
+            let prefix = extract_prefix_key(&body, 1024);
+            router.select_with_prefix(&config.providers, &prefix)
+        } else {
+            router.select(&config.providers)
+        };
+        if let Some(primary) = primary {
             if let Some(pos) = provider_order.iter().position(|&i| i == primary) {
                 let p = provider_order.remove(pos);
                 provider_order.insert(0, p);
@@ -2669,6 +2679,38 @@ pub(super) async fn relay_ai_stream(
         }
     }
     Ok(())
+}
+
+/// WOR-798: extract a stable prefix key from an AI chat / completion
+/// request body for prefix-affinity routing. Preference order:
+///
+/// 1. `body["messages"]` - the chat history is the prefix that
+///    matters for KV-cache reuse on vLLM / SGLang. Two requests
+///    sharing a system + first-user-message hash to the same
+///    upstream and reuse its prefill cache.
+/// 2. `body["prompt"]` - for legacy completion-shaped surfaces.
+/// 3. The whole body, serialized canonically.
+///
+/// Truncated to `max_bytes` so very long histories still hash off
+/// the leading bytes (which is exactly what KV-cache reuse needs;
+/// the divergent tail is the new tokens that won't be cached
+/// anyway). Returns an empty `Vec<u8>` when no JSON-serialisable
+/// prefix exists, in which case `select_with_prefix` falls back to
+/// round-robin so body-less requests do not herd onto one upstream.
+fn extract_prefix_key(body: &serde_json::Value, max_bytes: usize) -> Vec<u8> {
+    let source = body
+        .get("messages")
+        .or_else(|| body.get("prompt"))
+        .unwrap_or(body);
+    let serialized = match serde_json::to_vec(source) {
+        Ok(bytes) => bytes,
+        Err(_) => return Vec::new(),
+    };
+    if serialized.len() > max_bytes {
+        serialized[..max_bytes].to_vec()
+    } else {
+        serialized
+    }
 }
 
 /// WOR-800: build the `request.*` context exposed to a prompt template.

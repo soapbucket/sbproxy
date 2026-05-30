@@ -39,6 +39,21 @@ pub enum RoutingStrategy {
     /// not pre-declare a token cap. Untried providers (zero
     /// observed tokens) sort lowest and are explored first.
     LeastTokenUsage,
+    /// WOR-798: prefix-affinity routing for self-hosted LLM pools
+    /// (vLLM, SGLang) that keep a per-worker KV cache of recently-
+    /// processed prompt prefixes. Hash a stable prefix of the
+    /// request body (the first N bytes of the JSON-serialised
+    /// payload, captured at dispatch time) to an enabled-provider
+    /// index, so two requests sharing the same prefix land on the
+    /// same upstream and reuse its KV cache rather than warming a
+    /// cold one. The hash is deterministic, modular over the
+    /// eligible-providers count, and stable across reloads as long
+    /// as the provider list does not reorder.
+    ///
+    /// Falls back to round-robin when the dispatcher cannot extract
+    /// a prefix (e.g. the surface has no body, or it is an opaque
+    /// upgrade request).
+    PrefixAffinity,
     /// Pin a session key to the same provider across requests.
     Sticky,
     /// Send the request concurrently to every eligible provider and
@@ -567,6 +582,15 @@ impl Router {
 
                 Some(best_idx)
             }
+            RoutingStrategy::PrefixAffinity => {
+                // Basic `select` API has no prefix in hand (the
+                // dispatcher routes through `select_with_prefix` when
+                // it has the request body). Fall back to round-robin
+                // so a callsite that has not been threaded with the
+                // prefix-aware API still gets a deterministic answer.
+                let counter = self.counter.fetch_add(1, Ordering::Relaxed);
+                Some(enabled[counter as usize % enabled.len()].0)
+            }
             RoutingStrategy::LeastTokenUsage => {
                 // WOR-798: select the eligible provider with the
                 // smallest tokens_used in the current minute window.
@@ -643,6 +667,82 @@ impl Router {
         matches!(self.strategy, RoutingStrategy::Race)
     }
 
+    /// WOR-798: returns true when the configured strategy wants the
+    /// dispatcher to route through [`Self::select_with_prefix`]
+    /// (i.e. it benefits from a stable prompt prefix). The
+    /// dispatcher checks this before doing the prefix-extraction
+    /// work; non-prefix strategies skip the extraction entirely.
+    pub fn is_prefix_affinity(&self) -> bool {
+        matches!(self.strategy, RoutingStrategy::PrefixAffinity)
+    }
+
+    /// WOR-798: prefix-aware provider selection. `prefix_key` is a
+    /// stable, request-derived byte slice (e.g. the first N bytes of
+    /// the request body) that hashes deterministically to one
+    /// enabled provider so two requests sharing the prefix land on
+    /// the same upstream and reuse its KV cache.
+    ///
+    /// Uses FxHash for speed (the rule is "same prefix -> same
+    /// provider", not "cryptographic identity"); ineligible
+    /// providers are filtered out the same way [`Self::select`] does
+    /// so the affinity respects circuit-breaker / outlier ejection.
+    /// With a single eligible provider, returns it directly. With an
+    /// empty `prefix_key`, falls back to the same round-robin that
+    /// the basic [`Self::select`] uses for this strategy, so callers
+    /// that get a None-prefix request still progress.
+    pub fn select_with_prefix(
+        &self,
+        providers: &[ProviderConfig],
+        prefix_key: &[u8],
+    ) -> Option<usize> {
+        let enabled: Vec<(usize, &ProviderConfig)> = providers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.enabled)
+            .collect();
+        if enabled.is_empty() {
+            return None;
+        }
+        let eligible: Vec<(usize, &ProviderConfig)> = enabled
+            .iter()
+            .filter(|(idx, p)| self.provider_eligible(*idx, p.name.as_str()))
+            .cloned()
+            .collect();
+        let pool = if eligible.is_empty() {
+            enabled
+        } else {
+            eligible
+        };
+        if pool.len() == 1 || prefix_key.is_empty() {
+            // Sole-provider case OR no prefix in hand: fall through
+            // to a deterministic pick. Sole-provider always returns
+            // that provider; empty prefix uses round-robin so two
+            // body-less requests do not herd onto one upstream.
+            let pool_idx = if prefix_key.is_empty() {
+                let counter = self.counter.fetch_add(1, Ordering::Relaxed);
+                counter as usize % pool.len()
+            } else {
+                0
+            };
+            crate::ai_metrics::record_lb_decision(self.strategy_name(), &pool[pool_idx].1.name);
+            return Some(pool[pool_idx].0);
+        }
+        // Deterministic hash of the prefix mod the eligible-pool
+        // size. FNV-1a 64-bit; small, no_std, and stable across
+        // releases. The pool's order matches `providers` (filtered),
+        // so the result is stable as long as the provider list
+        // does not reorder.
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in prefix_key {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let picked_pool_idx = (hash % pool.len() as u64) as usize;
+        let picked = pool[picked_pool_idx].0;
+        crate::ai_metrics::record_lb_decision(self.strategy_name(), &pool[picked_pool_idx].1.name);
+        Some(picked)
+    }
+
     /// WOR-798: snake_case name of the active strategy, used as the
     /// `strategy` label on `sbproxy_ai_lb_decisions_total` and any
     /// other strategy-tagged telemetry.
@@ -657,6 +757,7 @@ impl Router {
             RoutingStrategy::CostOptimized => "cost_optimized",
             RoutingStrategy::TokenRate => "token_rate",
             RoutingStrategy::LeastTokenUsage => "least_token_usage",
+            RoutingStrategy::PrefixAffinity => "prefix_affinity",
             RoutingStrategy::Sticky => "sticky",
             RoutingStrategy::Race => "race",
             RoutingStrategy::PeakEwma => "peak_ewma",
@@ -889,6 +990,10 @@ mod tests {
         let strategy: RoutingStrategy = serde_json::from_value(json).unwrap();
         assert!(matches!(strategy, RoutingStrategy::LeastTokenUsage));
 
+        let json = serde_json::json!("prefix_affinity");
+        let strategy: RoutingStrategy = serde_json::from_value(json).unwrap();
+        assert!(matches!(strategy, RoutingStrategy::PrefixAffinity));
+
         let json = serde_json::json!("sticky");
         let strategy: RoutingStrategy = serde_json::from_value(json).unwrap();
         assert!(matches!(strategy, RoutingStrategy::Sticky));
@@ -973,6 +1078,129 @@ mod tests {
         assert_eq!(router.select(&providers), Some(0));
     }
 
+    // --- WOR-798 PrefixAffinity ---
+
+    #[test]
+    fn prefix_affinity_same_prefix_same_provider() {
+        let providers = vec![
+            make_provider("a", 1, None, true),
+            make_provider("b", 1, None, true),
+            make_provider("c", 1, None, true),
+            make_provider("d", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::PrefixAffinity, providers.len());
+        // Same prefix repeats to the same provider; routing is
+        // deterministic across calls so vLLM/SGLang upstream keeps
+        // its KV cache warm for that prefix.
+        let prefix = b"You are a helpful assistant. The user asks: ";
+        let first = router.select_with_prefix(&providers, prefix);
+        for _ in 0..50 {
+            assert_eq!(router.select_with_prefix(&providers, prefix), first);
+        }
+    }
+
+    #[test]
+    fn prefix_affinity_different_prefixes_distribute() {
+        let providers = vec![
+            make_provider("a", 1, None, true),
+            make_provider("b", 1, None, true),
+            make_provider("c", 1, None, true),
+            make_provider("d", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::PrefixAffinity, providers.len());
+        // 100 prefix variations should hit more than one provider
+        // (with a 4-way pool and FNV-1a we expect ~uniform).
+        let mut counts = [0u32; 4];
+        for i in 0..100u32 {
+            let key = format!("prompt-variant-{i:03}");
+            let idx = router
+                .select_with_prefix(&providers, key.as_bytes())
+                .expect("select");
+            counts[idx] += 1;
+        }
+        // At least 3 of the 4 providers must have been hit; with FNV-1a
+        // we'd be very unlucky to get a perfect 0 for any single bucket.
+        let nonzero = counts.iter().filter(|c| **c > 0).count();
+        assert!(
+            nonzero >= 3,
+            "expected prefix-affinity to spread across at least 3 providers; counts={counts:?}"
+        );
+    }
+
+    #[test]
+    fn prefix_affinity_empty_prefix_uses_round_robin() {
+        let providers = vec![
+            make_provider("a", 1, None, true),
+            make_provider("b", 1, None, true),
+            make_provider("c", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::PrefixAffinity, providers.len());
+        // Empty prefix means "no prefix in hand" — fall back to a
+        // round-robin so body-less requests do not herd onto provider 0.
+        let mut counts = [0u32; 3];
+        for _ in 0..30 {
+            let idx = router.select_with_prefix(&providers, b"").expect("select");
+            counts[idx] += 1;
+        }
+        assert_eq!(counts, [10, 10, 10]);
+    }
+
+    #[test]
+    fn prefix_affinity_single_provider_always_returns_it() {
+        let providers = vec![make_provider("only", 1, None, true)];
+        let router = Router::new(RoutingStrategy::PrefixAffinity, providers.len());
+        assert_eq!(
+            router.select_with_prefix(&providers, b"any-prefix"),
+            Some(0)
+        );
+        assert_eq!(router.select_with_prefix(&providers, b""), Some(0));
+    }
+
+    #[test]
+    fn prefix_affinity_skips_disabled_providers() {
+        let providers = vec![
+            make_provider("a", 1, None, false),
+            make_provider("b", 1, None, true),
+            make_provider("c", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::PrefixAffinity, providers.len());
+        // Any prefix that hashes into the pool must land on b or c,
+        // never a (which is disabled).
+        for i in 0..20u32 {
+            let key = format!("variant-{i}");
+            let idx = router
+                .select_with_prefix(&providers, key.as_bytes())
+                .expect("select");
+            assert_ne!(idx, 0, "disabled provider a must not be picked");
+        }
+    }
+
+    #[test]
+    fn prefix_affinity_basic_select_falls_back_to_round_robin() {
+        // The basic `select` API has no prefix in hand. For
+        // PrefixAffinity we round-robin so callers that have not been
+        // threaded with the prefix-aware API still get a balanced
+        // distribution rather than always returning provider 0.
+        let providers = vec![
+            make_provider("a", 1, None, true),
+            make_provider("b", 1, None, true),
+            make_provider("c", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::PrefixAffinity, providers.len());
+        let mut counts = [0u32; 3];
+        for _ in 0..30 {
+            counts[router.select(&providers).unwrap()] += 1;
+        }
+        assert_eq!(counts, [10, 10, 10]);
+    }
+
+    #[test]
+    fn is_prefix_affinity_only_true_for_that_variant() {
+        assert!(Router::new(RoutingStrategy::PrefixAffinity, 1).is_prefix_affinity());
+        assert!(!Router::new(RoutingStrategy::RoundRobin, 1).is_prefix_affinity());
+        assert!(!Router::new(RoutingStrategy::LeastTokenUsage, 1).is_prefix_affinity());
+    }
+
     #[test]
     fn strategy_name_covers_every_variant() {
         // The label appears on `sbproxy_ai_lb_decisions_total` so a
@@ -990,6 +1218,10 @@ mod tests {
         assert_eq!(
             Router::new(RoutingStrategy::LeastTokenUsage, 1).strategy_name(),
             "least_token_usage"
+        );
+        assert_eq!(
+            Router::new(RoutingStrategy::PrefixAffinity, 1).strategy_name(),
+            "prefix_affinity"
         );
         assert_eq!(
             Router::new(RoutingStrategy::TokenRate, 1).strategy_name(),
