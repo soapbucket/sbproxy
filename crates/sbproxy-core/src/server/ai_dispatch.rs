@@ -1585,6 +1585,8 @@ pub(super) async fn handle_ai_proxy(
                 model: model.as_str(),
                 surface_label,
                 provider_name: last_provider_name.as_str(),
+                router: &router,
+                config_providers: &config.providers,
                 image_resolution: image_resolution_for_billing.clone(),
                 audio_speech_characters: audio_speech_characters_for_billing,
                 rerank_documents: rerank_documents_for_billing,
@@ -1641,6 +1643,8 @@ pub(super) async fn handle_ai_proxy(
                 model: model.as_str(),
                 surface_label,
                 provider_name: last_provider_name.as_str(),
+                router: &router,
+                config_providers: &config.providers,
                 image_resolution: image_resolution_for_billing.clone(),
                 audio_speech_characters: audio_speech_characters_for_billing,
                 rerank_documents: rerank_documents_for_billing,
@@ -1969,6 +1973,16 @@ pub(super) async fn relay_ai_response_with_cache(
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);
             }
+            // WOR-798: feed the router's per-provider token counter
+            // so the `LeastTokenUsage` / `TokenRate` strategies see
+            // the load this provider just absorbed. The minute
+            // window resets via the existing `reset_tokens` ticker
+            // (sbproxy-ai/src/routing.rs).
+            args.router.record_tokens_for_provider(
+                args.config_providers,
+                args.provider_name,
+                prompt_tokens + completion_tokens,
+            );
             record_budget_usage(
                 args.config,
                 args.keys,
@@ -2092,6 +2106,15 @@ pub(super) struct BudgetRecorderArgs<'a> {
     /// Provider that received the dispatched request. Same source
     /// of truth as the `provider` field in the access log.
     provider_name: &'a str,
+    /// WOR-798: AI router for this origin. The relay charges the
+    /// chosen provider's `tokens_used` counter once the upstream
+    /// `usage` block is in hand, so the `LeastTokenUsage` /
+    /// `TokenRate` strategies see real load on the next pick.
+    router: &'a sbproxy_ai::Router,
+    /// WOR-798: provider list the router was built against; passed
+    /// alongside `router` so `record_tokens_for_provider` can
+    /// resolve `provider_name` -> index without a second lookup.
+    config_providers: &'a [sbproxy_ai::ProviderConfig],
     /// For image generation requests, the resolution requested
     /// (e.g. `1024x1024`, `1024x1792`). Captured from the inbound
     /// request body at dispatch time and threaded here so the
@@ -2534,6 +2557,15 @@ pub(super) async fn relay_ai_stream(
                 );
                 let prompt = tokens.prompt_tokens as u64;
                 let completion = tokens.completion_tokens as u64;
+                // WOR-798: feed the router's per-provider token
+                // counter so streaming responses contribute to the
+                // `LeastTokenUsage` / `TokenRate` signal the same as
+                // unary responses.
+                args.router.record_tokens_for_provider(
+                    args.config_providers,
+                    args.provider_name,
+                    prompt + completion,
+                );
                 let usage = if prompt != 0 || completion != 0 {
                     sbproxy_ai::budget::AiUsage::Tokens {
                         input: prompt,

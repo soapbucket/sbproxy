@@ -144,6 +144,23 @@ static AI_FAILOVERS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// WOR-798: every provider selection by the AI router. `strategy`
+/// is the active `RoutingStrategy` variant name (snake_case); the
+/// `provider` label is the picked provider's configured name.
+/// Cardinality is bounded by the number of strategies (small, fixed)
+/// times the per-origin provider count, both of which are operator-
+/// declared in config.
+static AI_LB_DECISIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_lb_decisions_total",
+            "AI router provider selections by strategy"
+        ),
+        &["strategy", "provider"]
+    )
+    .unwrap()
+});
+
 static AI_GUARDRAIL_BLOCKS: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new(
@@ -564,6 +581,16 @@ impl Drop for AiSurfaceLatencyGuard {
 /// Record a failover event.
 pub fn record_failover(from: &str, to: &str, reason: &str) {
     AI_FAILOVERS.with_label_values(&[from, to, reason]).inc();
+}
+
+/// WOR-798: record one AI router selection. `strategy` is the
+/// active `RoutingStrategy` variant rendered as a snake_case name
+/// (`round_robin`, `peak_ewma`, `least_token_usage`, ...). `provider`
+/// is the picked provider's configured name.
+pub fn record_lb_decision(strategy: &str, provider: &str) {
+    AI_LB_DECISIONS
+        .with_label_values(&[strategy, provider])
+        .inc();
 }
 
 /// Record a streaming time-to-first-token observation, in seconds.
