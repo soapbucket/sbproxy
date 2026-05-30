@@ -86,6 +86,15 @@ impl Algorithm {
             other => Err(DigestError::UnsupportedAlgorithm(other.to_owned())),
         }
     }
+
+    /// Public counterpart to the internal `parse_token` for callers
+    /// that only need to validate a configured algorithm name (e.g.
+    /// the WOR-805 `content_digest` policy's `algorithms:` list).
+    /// Returns `None` for unknown / deprecated tokens so the caller
+    /// can wrap the failure in its own error context.
+    pub fn parse(token: &str) -> Option<Self> {
+        Self::parse_token(token).ok()
+    }
 }
 
 /// Errors produced by the digest parser / verifier.

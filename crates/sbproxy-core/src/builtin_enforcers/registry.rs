@@ -18,11 +18,11 @@ use sbproxy_plugin::PolicyEnforcer;
 use super::AgentClassEnforcer;
 use super::{
     A2AEnforcer, AgentBudgetEnforcer, AiCrawlEnforcer, AssertionEnforcer, ConcurrentLimitEnforcer,
-    CsrfEnforcer, DdosEnforcer, DlpEnforcer, ExposedCredsEnforcer, ExpressionEnforcer,
-    HttpFramingEnforcer, IpFilterEnforcer, ObjectAuthzEnforcer, OpenApiValidationEnforcer,
-    PageShieldEnforcer, PeerPricingPreflightEnforcer, PromptInjectionV2Enforcer, RateLimitEnforcer,
-    RequestLimitEnforcer, RequestValidatorEnforcer, SecHeadersEnforcer, SemanticConstraintEnforcer,
-    SriEnforcer, WafEnforcer,
+    ContentDigestEnforcer, CsrfEnforcer, DdosEnforcer, DlpEnforcer, ExposedCredsEnforcer,
+    ExpressionEnforcer, HttpFramingEnforcer, IpFilterEnforcer, ObjectAuthzEnforcer,
+    OpenApiValidationEnforcer, PageShieldEnforcer, PeerPricingPreflightEnforcer,
+    PromptInjectionV2Enforcer, RateLimitEnforcer, RequestLimitEnforcer, RequestValidatorEnforcer,
+    SecHeadersEnforcer, SemanticConstraintEnforcer, SriEnforcer, WafEnforcer,
 };
 
 /// One compiled policy ready for request-phase dispatch.
@@ -69,6 +69,7 @@ fn compile_one(policy: Policy) -> CompiledEnforcer {
         Policy::Assertion(p) => builtin(AssertionEnforcer(Arc::new(p))),
         Policy::Waf(p) => builtin(WafEnforcer(Arc::new(p))),
         Policy::RequestValidator(p) => builtin(RequestValidatorEnforcer(Arc::new(p))),
+        Policy::ContentDigest(p) => builtin(ContentDigestEnforcer(Arc::new(p))),
         Policy::ConcurrentLimit(p) => builtin(ConcurrentLimitEnforcer(Arc::new(p))),
         Policy::AiCrawl(p) => builtin(AiCrawlEnforcer(Arc::new(p))),
         Policy::ExposedCreds(p) => builtin(ExposedCredsEnforcer(Arc::new(p))),

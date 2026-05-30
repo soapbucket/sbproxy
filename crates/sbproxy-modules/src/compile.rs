@@ -134,6 +134,9 @@ pub fn compile_policy(config: &serde_json::Value) -> Result<Policy> {
         "request_validator" => Ok(Policy::RequestValidator(
             crate::policy::RequestValidatorPolicy::from_config(config.clone())?,
         )),
+        "content_digest" => Ok(Policy::ContentDigest(
+            crate::policy::ContentDigestPolicy::from_config(config.clone())?,
+        )),
         "concurrent_limit" | "concurrent_limiting" => Ok(Policy::ConcurrentLimit(
             crate::policy::ConcurrentLimitPolicy::from_config(config.clone())?,
         )),
