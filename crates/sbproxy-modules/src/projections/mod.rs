@@ -206,6 +206,10 @@ pub fn classify_feed_content_type(content_type: &str) -> Option<FeedFormat> {
 /// entry and turn it into [`licenses::PaymentTerms`]. Returns `None` when
 /// the block is absent or the declared `type` is not in the RSL 1.0
 /// enum, so the caller can fall through to the derived terms.
+///
+/// WOR-944: `standard:` (the URL of a reuse framework for attribution
+/// payments, typically a CC-BY variant) is read here too; the
+/// renderer slots it inside `<payment>` as a `<standard>` child.
 fn operator_declared_payment(ai_crawl: &serde_json::Value) -> Option<licenses::PaymentTerms> {
     let decl = ai_crawl.get("payment").and_then(|v| v.as_object())?;
     let ptype = decl.get("type").and_then(|v| v.as_str())?;
@@ -219,7 +223,43 @@ fn operator_declared_payment(ai_crawl: &serde_json::Value) -> Option<licenses::P
             .get("currency")
             .and_then(|v| v.as_str())
             .map(String::from),
+        standard: decl
+            .get("standard")
+            .and_then(|v| v.as_str())
+            .map(String::from),
     })
+}
+
+/// WOR-944: read the operator-declared `rsl_vocab:` block on an
+/// `ai_crawl_control` entry and turn it into [`licenses::RslVocab`].
+/// Missing block, missing sub-block, or empty token lists all map to
+/// the default (silent tier), which the renderer omits cleanly.
+fn operator_declared_rsl_vocab(ai_crawl: &serde_json::Value) -> licenses::RslVocab {
+    let Some(block) = ai_crawl.get("rsl_vocab").and_then(|v| v.as_object()) else {
+        return licenses::RslVocab::default();
+    };
+    fn read_tier(value: Option<&serde_json::Value>) -> licenses::TokenTier {
+        let Some(obj) = value.and_then(|v| v.as_object()) else {
+            return licenses::TokenTier::default();
+        };
+        fn read_list(v: Option<&serde_json::Value>) -> Vec<String> {
+            v.and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        licenses::TokenTier {
+            permit: read_list(obj.get("permit")),
+            prohibit: read_list(obj.get("prohibit")),
+        }
+    }
+    licenses::RslVocab {
+        user: read_tier(block.get("user")),
+        geo: read_tier(block.get("geo")),
+    }
 }
 
 pub mod agent_skills;
@@ -463,10 +503,16 @@ pub fn render_projections_with_listings(
                             .unwrap_or("USD")
                             .to_string(),
                     ),
+                    standard: None,
                 },
                 _ => licenses::PaymentTerms::free(),
             }
         });
+        // WOR-944: read the tier-1 user / geo vocab. Default (no
+        // declaration) is silent for both tiers so unchanged
+        // configs produce the same `<permits type="usage">`-only
+        // shape that the renamed `render_signals` emits.
+        let rsl_vocab = operator_declared_rsl_vocab(ai_crawl);
         let (xml, urn) = if content_signals.is_empty() {
             licenses::render(
                 hostname.as_str(),
@@ -475,10 +521,11 @@ pub fn render_projections_with_listings(
                 config_version,
             )
         } else {
-            licenses::render_signals(
+            licenses::render_signals_with_vocab(
                 hostname.as_str(),
                 &content_signals,
                 Some(&payment),
+                &rsl_vocab,
                 config_version,
             )
         };

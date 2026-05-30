@@ -39,8 +39,9 @@ origins:
     # tool-use), not for training. The projection cache renders this
     # into:
     #
-    #   licenses.xml -> <ai-use type="inference" licensed="true" />
+    #   licenses.xml -> <permits type="usage">ai-input</permits>
     #                   nested under <rsl xmlns="https://rslstandard.org/rsl">
+    #                   (RSL 1.0 §3.5 normative token vocabulary)
     #   tdmrep.json  -> bare JSON array of
     #                   {"location":"/...","tdm-reservation":1,
     #                    "tdm-policy":"https://shop.localhost/licenses.xml"}

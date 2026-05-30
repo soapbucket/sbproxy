@@ -3,26 +3,31 @@
 //!
 //! Validates the RSL document projected by the Wave 4 G4.8 build
 //! agent against the canonical RSL Collective spec at
-//! <https://rslstandard.org/rsl>:
+//! <https://rslstandard.org/rsl>. Per RSL 1.0 §3.5, the usage tier
+//! is expressed as `<permits type="usage">tokens</permits>` /
+//! `<prohibits type="usage">tokens</prohibits>`; the non-conformant
+//! `<ai-use>` element this projection used to emit has been retired
+//! (WOR-944).
 //!
 //! ```xml
 //! <rsl xmlns="https://rslstandard.org/rsl" version="1.0">
 //!   <content url="https://blog.localhost/*">
 //!     <license urn="urn:rsl:1.0:blog.localhost:<config_version>">
-//!       <ai-use type="training" licensed="true" />
+//!       <origin hostname="blog.localhost" />
+//!       <permits type="usage">ai-train</permits>
 //!     </license>
 //!   </content>
 //! </rsl>
 //! ```
 //!
-//! Mapping table from `Content-Signal` to `<ai-use>`:
+//! Mapping table from `Content-Signal` to the emitted element:
 //!
-//! | content_signal | ai-use type     | licensed |
-//! |----------------|-----------------|----------|
-//! | ai-train       | training        | true     |
-//! | ai-input       | inference       | true     |
-//! | search         | search-index    | true     |
-//! | absent         | training        | false    |
+//! | content_signal | emitted element                                              |
+//! |----------------|--------------------------------------------------------------|
+//! | ai-train       | `<permits type="usage">ai-train</permits>`                   |
+//! | ai-input       | `<permits type="usage">ai-input</permits>`                   |
+//! | search         | `<permits type="usage">search</permits>`                     |
+//! | absent         | (no `<permits>` or `<prohibits>` element; silent-permissive) |
 //!
 //! The XSD validation step is `#[ignore]`'d pending vendoring of the
 //! RSL spec (see `e2e/fixtures/rsl/README.md`).
@@ -138,7 +143,7 @@ fn licenses_xml_uses_correct_urn_format() {
 // --- Test 4: Content-Signal mapping ---
 
 #[test]
-fn licenses_xml_maps_content_signal_to_ai_use() {
+fn licenses_xml_maps_content_signal_to_permits_usage() {
     let harness = start_projections().expect("start proxy");
     let body = harness
         .get("/licenses.xml", "blog.localhost")
@@ -146,14 +151,19 @@ fn licenses_xml_maps_content_signal_to_ai_use() {
         .text()
         .expect("utf-8 body");
 
-    // Fixture has content_signal: ai-train -> RSL `type="training" licensed="true"`.
+    // WOR-944: fixture has `content_signal: ai-train`, which now
+    // maps to the normative `<permits type="usage">ai-train</permits>`
+    // per RSL 1.0 §3.5 / §4.8 (replaces the non-conformant
+    // `<ai-use licensed="true">` element).
     assert!(
-        body.contains("type=\"training\""),
-        "ai-use type=training expected for content_signal: ai-train; got:\n{body}"
+        body.contains(r#"<permits type="usage">ai-train</permits>"#),
+        "permits-usage with ai-train expected; got:\n{body}"
     );
+    // Regression guard: the projection must never emit `<ai-use>`,
+    // which does not exist in RSL 1.0.
     assert!(
-        body.contains("licensed=\"true\""),
-        "ai-use licensed=true expected; got:\n{body}"
+        !body.contains("<ai-use"),
+        "projection must not emit non-conformant <ai-use>; got:\n{body}"
     );
 }
 
