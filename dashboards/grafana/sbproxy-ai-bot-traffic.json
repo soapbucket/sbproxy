@@ -1,0 +1,594 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "10.0.0"
+    },
+    {
+      "type": "datasource",
+      "id": "prometheus",
+      "name": "Prometheus",
+      "version": "1.0.0"
+    },
+    {
+      "type": "panel",
+      "id": "timeseries",
+      "name": "Time series",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "stat",
+      "name": "Stat",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "table",
+      "name": "Table",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "barchart",
+      "name": "Bar chart",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "piechart",
+      "name": "Pie chart",
+      "version": ""
+    }
+  ],
+  "id": null,
+  "uid": "sbproxy-ai-bot-traffic",
+  "title": "SBProxy AI Bot & Agent Traffic",
+  "description": "AI bot / agent inbound traffic: volume by agent class + vendor, Web Bot Auth verification mix (verified vs anonymous vs unknown), paid vs blocked vs tarpitted, AI crawl policy verdicts, and bot-auth integrity (nonce replays, skill digest mismatches). Sourced from the closed-label per-agent metric set (agent_id, agent_class, agent_vendor, payment_rail, content_shape) plus the AI crawl policy triggers.",
+  "tags": [
+    "sbproxy",
+    "ai-bots",
+    "agents",
+    "ai-crawl"
+  ],
+  "style": "dark",
+  "timezone": "browser",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "schemaVersion": 38,
+  "version": 1,
+  "weekStart": "",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      },
+      {
+        "name": "hostname",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "query": "label_values(sbproxy_requests_total, hostname)",
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request Volume by Agent Class",
+      "description": "Per-second request rate broken out by agent_class. `human` is non-agent traffic; `anonymous` is Web Bot Auth without a resolved keyid (draft-rescorla-anonymous); `unknown` is automated traffic that does not match the catalog; named classes (training / search / assistant / ...) come from the agent-class catalog. The empty-string class is requests the resolver has not classified yet (legacy call sites).",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (agent_class) (rate(sbproxy_requests_total{hostname=~\"$hostname\"}[5m]))",
+          "legendFormat": "{{agent_class}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Bot Traffic Share (excluding human)",
+      "description": "Distribution of non-human request traffic over the last hour, grouped by agent_class. Excludes `human` so the chart reflects automated callers only.",
+      "type": "piechart",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "pieType": "donut",
+        "tooltip": {
+          "mode": "single",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (agent_class) (increase(sbproxy_requests_total{hostname=~\"$hostname\", agent_class!=\"human\", agent_class!=\"\"}[1h]))",
+          "legendFormat": "{{agent_class}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Top Agents by Volume (last 1h)",
+      "description": "Top 15 agents by request count over the last hour. `agent_id` is the catalog-stable identifier; `agent_vendor` groups operators. `human` is filtered out so this surfaces bot identity. Sentinel `anonymous` rows are Web Bot Auth callers without a resolved keyid.",
+      "type": "table",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(15, sum by (agent_id, agent_vendor, agent_class) (increase(sbproxy_requests_total{hostname=~\"$hostname\", agent_class!=\"human\", agent_class!=\"\"}[1h])))",
+          "format": "table",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "Value": "Requests (1h)"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Web Bot Auth Verification Mix",
+      "description": "Splits agent-classified traffic into three buckets: `verified` (a catalog-resolved agent — Web Bot Auth signature carried a known keyid), `anonymous` (signed but no resolved keyid, draft-rescorla-anonymous-webbotauth-00), and `unknown` (looks automated but does not match the catalog). `human` is excluded.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(sbproxy_requests_total{hostname=~\"$hostname\", agent_class!~\"human|anonymous|unknown|\"}[5m]))",
+          "legendFormat": "verified",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(sbproxy_requests_total{hostname=~\"$hostname\", agent_class=\"anonymous\"}[5m]))",
+          "legendFormat": "anonymous",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(sbproxy_requests_total{hostname=~\"$hostname\", agent_class=\"unknown\"}[5m]))",
+          "legendFormat": "unknown",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Paid vs Unpaid Bot Traffic",
+      "description": "Bot-class requests split by payment rail. `paid` aggregates the non-`none` rails (x402, mpp_card, mpp_stablecoin, stripe_fiat, lightning); `unpaid` is `payment_rail=none` and the empty sentinel. `human` is excluded.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 17
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(sbproxy_requests_total{hostname=~\"$hostname\", agent_class!=\"human\", agent_class!=\"\", payment_rail!~\"none|\"}[5m]))",
+          "legendFormat": "paid (any rail)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(sbproxy_requests_total{hostname=~\"$hostname\", agent_class!=\"human\", agent_class!=\"\", payment_rail=~\"none|\"}[5m]))",
+          "legendFormat": "unpaid",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (payment_rail) (rate(sbproxy_requests_total{hostname=~\"$hostname\", agent_class!=\"human\", agent_class!=\"\", payment_rail!~\"none|\"}[5m]))",
+          "legendFormat": "rail: {{payment_rail}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "hide": false
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "AI Crawl Policy Verdicts",
+      "description": "Per-second rate of AI crawl policy decisions, broken out by policy_type and action. Reaches across `ai_crawl_control`, `pay_per_crawl`, and the synthesized denial sub-types emitted by the enforcer (`ai_crawl_payment`, `ai_crawl_multi_rail`, `ai_crawl_no_acceptable_rail`, `ai_crawl_signal_blocked`, `ai_crawl_ledger_unavailable`). The `action` label distinguishes allow / block / charge / tarpit / etc.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 17
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (policy_type, action) (rate(sbproxy_policy_triggers_total{policy_type=~\"ai_crawl.*|pay_per_crawl\"}[5m]))",
+          "legendFormat": "{{policy_type}} / {{action}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Bot Request Latency (P95) by Agent Class",
+      "description": "95th-percentile latency of bot-class requests, broken out by agent_class. Useful for spotting when a specific bot class is being slowed down by tarpit or upstream pressure. `human` is excluded.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 25
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, agent_class) (rate(sbproxy_request_duration_seconds_bucket{hostname=~\"$hostname\", agent_class!=\"human\", agent_class!=\"\"}[5m])))",
+          "legendFormat": "p95 - {{agent_class}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Bot-Auth Integrity Signals",
+      "description": "Two correctness signals for the Web Bot Auth ingest path. `nonce_replay_total` counts requests where the bot-auth nonce was seen before (potential replay attack). `agent_skill_digest_mismatch_total` counts agent-skill artifact fetches whose body digest did not match the catalog. Both are normally zero; sustained non-zero is worth investigating.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 25
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(sbproxy_bot_auth_nonce_replay_total[5m]))",
+          "legendFormat": "nonce replays / sec",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(sbproxy_agent_skill_digest_mismatch_total[5m]))",
+          "legendFormat": "skill-digest mismatches / sec",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ]
+    }
+  ]
+}
