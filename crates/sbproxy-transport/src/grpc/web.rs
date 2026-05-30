@@ -112,6 +112,18 @@ impl GrpcWebBridge {
     }
 }
 
+/// Build a standalone gRPC-Web trailer frame from the native trailers,
+/// without prefixing any message frames.
+///
+/// Server-streaming wiring uses this directly: message frames are
+/// forwarded as they arrive in `response_body_filter`, then the trailer
+/// frame is appended once from `response_trailer_filter` when the
+/// real `grpc-status` lands. Unary buffer-and-emit callers go through
+/// [`GrpcWebBridge::encode_response`] instead.
+pub fn encode_trailer_frame_only(trailers: &GrpcTrailers) -> Vec<u8> {
+    encode_trailer_frame(trailers)
+}
+
 /// Build a gRPC-Web trailer frame from the native trailers.
 ///
 /// The trailer payload is an HTTP/1.1-style block: lowercase header

@@ -32,6 +32,10 @@ use echo_pb::{EchoRequest, EchoResponse};
 #[derive(Default)]
 struct EchoSvc;
 
+type EchoStream = std::pin::Pin<
+    Box<dyn futures_util::Stream<Item = Result<EchoResponse, tonic::Status>> + Send + 'static>,
+>;
+
 #[tonic::async_trait]
 impl Echo for EchoSvc {
     async fn hello(
@@ -40,6 +44,52 @@ impl Echo for EchoSvc {
     ) -> Result<tonic::Response<EchoResponse>, tonic::Status> {
         let msg = request.into_inner().message;
         Ok(tonic::Response::new(EchoResponse { message: msg }))
+    }
+
+    type HelloStreamStream = EchoStream;
+
+    async fn hello_stream(
+        &self,
+        request: tonic::Request<EchoRequest>,
+    ) -> Result<tonic::Response<Self::HelloStreamStream>, tonic::Status> {
+        let msg = request.into_inner().message;
+        let chunks: Vec<EchoResponse> = msg
+            .split_whitespace()
+            .map(|s| EchoResponse {
+                message: s.to_string(),
+            })
+            .collect();
+        let stream =
+            futures_util::stream::iter(chunks.into_iter().map(Ok::<EchoResponse, tonic::Status>));
+        Ok(tonic::Response::new(Box::pin(stream)))
+    }
+
+    async fn hello_error(
+        &self,
+        request: tonic::Request<EchoRequest>,
+    ) -> Result<tonic::Response<EchoResponse>, tonic::Status> {
+        Err(tonic::Status::failed_precondition(
+            request.into_inner().message,
+        ))
+    }
+
+    type HelloStreamErrorStream = EchoStream;
+
+    async fn hello_stream_error(
+        &self,
+        request: tonic::Request<EchoRequest>,
+    ) -> Result<tonic::Response<Self::HelloStreamErrorStream>, tonic::Status> {
+        let msg = request.into_inner().message;
+        // Yield one message, then terminate with an error so the
+        // grpc-status lands in real HTTP/2 trailers after the body.
+        let items: Vec<Result<EchoResponse, tonic::Status>> = vec![
+            Ok(EchoResponse {
+                message: "first".into(),
+            }),
+            Err(tonic::Status::failed_precondition(msg)),
+        ];
+        let stream = futures_util::stream::iter(items);
+        Ok(tonic::Response::new(Box::pin(stream)))
     }
 }
 
