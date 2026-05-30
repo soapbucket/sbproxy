@@ -56,6 +56,17 @@ pub struct VirtualKeyConfig {
     /// receive. `None` keeps the client's `model` field unchanged.
     #[serde(default)]
     pub route_to_model: Option<String>,
+    /// WOR-893: tools injected into the request `body["tools"]` when this
+    /// key authenticates the request. Each entry is an opaque JSON
+    /// object (the provider's tool-definition shape: OpenAI
+    /// `{"type":"function","function":{...}}`, Anthropic
+    /// `{"name":...,"input_schema":...}`, etc.) so the gateway stays
+    /// provider-agnostic. Empty (default) leaves the request's `tools`
+    /// untouched. When non-empty the key's set REPLACES any client-
+    /// supplied tools, so the key fully owns the tool surface the
+    /// caller exposes - matching the "key = model + tools" framing.
+    #[serde(default)]
+    pub inject_tools: Vec<serde_json::Value>,
     /// Whether this key is active.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -207,6 +218,7 @@ mod tests {
             user: None,
             metadata: HashMap::new(),
             route_to_model: None,
+            inject_tools: vec![],
             enabled,
             bypass_prompt_injection: false,
         }
@@ -227,6 +239,7 @@ mod tests {
             user: None,
             metadata: HashMap::new(),
             route_to_model: None,
+            inject_tools: vec![],
             enabled: true,
             bypass_prompt_injection: false,
         }
@@ -349,8 +362,27 @@ mod tests {
         assert!(config.project.is_none());
         assert!(config.user.is_none());
         assert!(config.metadata.is_empty());
-        // WOR-893 default.
+        // WOR-893 defaults.
         assert!(config.route_to_model.is_none());
+        assert!(config.inject_tools.is_empty());
+    }
+
+    #[test]
+    fn deserialization_carries_inject_tools() {
+        let json = serde_json::json!({
+            "key": "sk-tools",
+            "inject_tools": [
+                { "type": "function", "function": { "name": "search_docs" } },
+                { "type": "function", "function": { "name": "query_db" } }
+            ]
+        });
+        let config: VirtualKeyConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.inject_tools.len(), 2);
+        assert_eq!(
+            config.inject_tools[0]["function"]["name"], "search_docs",
+            "tool 0 deserializes verbatim"
+        );
+        assert_eq!(config.inject_tools[1]["function"]["name"], "query_db");
     }
 
     #[test]

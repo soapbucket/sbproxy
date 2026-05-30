@@ -646,6 +646,19 @@ pub(super) async fn handle_ai_proxy(
                         );
                     }
                 }
+                // WOR-893 PR2: per-key MCP tool injection. The key's tool
+                // set REPLACES any client-supplied `tools` so the key
+                // fully owns the tool surface the caller exposes. Each
+                // entry is the provider's tool-definition JSON
+                // verbatim, so the gateway stays provider-agnostic.
+                if !vk.inject_tools.is_empty() {
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.insert(
+                            "tools".to_string(),
+                            serde_json::Value::Array(vk.inject_tools.clone()),
+                        );
+                    }
+                }
             }
         }
     }
