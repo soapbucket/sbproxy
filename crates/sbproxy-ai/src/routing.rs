@@ -30,6 +30,15 @@ pub enum RoutingStrategy {
     CostOptimized,
     /// Choose providers by remaining tokens-per-minute headroom.
     TokenRate,
+    /// WOR-798: choose the provider with the lowest recent token
+    /// throughput in the current minute window, regardless of any
+    /// configured TPM limit. Unlike `TokenRate` (which picks by
+    /// remaining headroom against a per-provider limit), this picks
+    /// by absolute observed throughput, so it does the right thing
+    /// for self-hosted vLLM / SGLang pools where the operator does
+    /// not pre-declare a token cap. Untried providers (zero
+    /// observed tokens) sort lowest and are explored first.
+    LeastTokenUsage,
     /// Pin a session key to the same provider across requests.
     Sticky,
     /// Send the request concurrently to every eligible provider and
@@ -296,6 +305,29 @@ impl Router {
         }
     }
 
+    /// WOR-798: record tokens consumed against a provider looked up by
+    /// name. Used by the dispatch path, which knows the provider's
+    /// configured name from `ProviderConfig.name` but not its index.
+    /// Silently no-ops on an unknown name so a config rename or hot
+    /// reload cannot panic an in-flight request.
+    pub fn record_tokens_for_provider(
+        &self,
+        providers: &[ProviderConfig],
+        provider_name: &str,
+        tokens: u64,
+    ) {
+        if tokens == 0 {
+            return;
+        }
+        if let Some((idx, _)) = providers
+            .iter()
+            .enumerate()
+            .find(|(_, p)| p.name == provider_name)
+        {
+            self.record_tokens(idx, tokens);
+        }
+    }
+
     /// Reset token counters (call at the start of each minute window).
     pub fn reset_tokens(&self) {
         for slot in &self.tokens_used {
@@ -347,6 +379,22 @@ impl Router {
     /// theory that sending traffic to a flaky provider beats failing
     /// the request entirely.
     pub fn select(&self, providers: &[ProviderConfig]) -> Option<usize> {
+        let picked = self.select_inner(providers);
+        // WOR-798: emit the LB-decision metric on every successful
+        // pick. The strategy label is the active variant's
+        // snake_case name; the provider label is the chosen
+        // provider's configured name. A `None` return (no enabled
+        // providers) is intentionally not recorded; that surfaces
+        // through error metrics elsewhere.
+        if let Some(idx) = picked {
+            if let Some(p) = providers.get(idx) {
+                crate::ai_metrics::record_lb_decision(self.strategy_name(), &p.name);
+            }
+        }
+        picked
+    }
+
+    fn select_inner(&self, providers: &[ProviderConfig]) -> Option<usize> {
         let enabled: Vec<(usize, &ProviderConfig)> = providers
             .iter()
             .enumerate()
@@ -519,6 +567,28 @@ impl Router {
 
                 Some(best_idx)
             }
+            RoutingStrategy::LeastTokenUsage => {
+                // WOR-798: select the eligible provider with the
+                // smallest tokens_used in the current minute window.
+                // An untried provider has tokens_used = 0 and sorts
+                // first, so an empty pool naturally explores every
+                // upstream before settling. Ties are broken by the
+                // first match in enabled order, which gives stable
+                // routing under no load.
+                let mut best_idx = enabled[0].0;
+                let mut best_used = u64::MAX;
+                for &(idx, _) in &enabled {
+                    let used = self
+                        .tokens_used
+                        .get(idx)
+                        .map_or(0, |t| t.load(Ordering::Relaxed));
+                    if used < best_used {
+                        best_used = used;
+                        best_idx = idx;
+                    }
+                }
+                Some(best_idx)
+            }
             RoutingStrategy::Sticky => {
                 // Sticky without a session key falls back to round robin.
                 // Callers should use select_sticky() instead for session affinity.
@@ -571,6 +641,28 @@ impl Router {
     /// client uses this to decide whether to fan out the request.
     pub fn is_race(&self) -> bool {
         matches!(self.strategy, RoutingStrategy::Race)
+    }
+
+    /// WOR-798: snake_case name of the active strategy, used as the
+    /// `strategy` label on `sbproxy_ai_lb_decisions_total` and any
+    /// other strategy-tagged telemetry.
+    pub fn strategy_name(&self) -> &'static str {
+        match self.strategy {
+            RoutingStrategy::RoundRobin => "round_robin",
+            RoutingStrategy::Weighted => "weighted",
+            RoutingStrategy::FallbackChain => "fallback_chain",
+            RoutingStrategy::Random => "random",
+            RoutingStrategy::LowestLatency => "lowest_latency",
+            RoutingStrategy::LeastConnections => "least_connections",
+            RoutingStrategy::CostOptimized => "cost_optimized",
+            RoutingStrategy::TokenRate => "token_rate",
+            RoutingStrategy::LeastTokenUsage => "least_token_usage",
+            RoutingStrategy::Sticky => "sticky",
+            RoutingStrategy::Race => "race",
+            RoutingStrategy::PeakEwma => "peak_ewma",
+            RoutingStrategy::Cascade(_) => "cascade",
+            RoutingStrategy::CostQuality(_) => "cost_quality",
+        }
     }
 
     /// Returns true when the configured strategy is `Cascade`. The
@@ -793,9 +885,120 @@ mod tests {
         let strategy: RoutingStrategy = serde_json::from_value(json).unwrap();
         assert!(matches!(strategy, RoutingStrategy::TokenRate));
 
+        let json = serde_json::json!("least_token_usage");
+        let strategy: RoutingStrategy = serde_json::from_value(json).unwrap();
+        assert!(matches!(strategy, RoutingStrategy::LeastTokenUsage));
+
         let json = serde_json::json!("sticky");
         let strategy: RoutingStrategy = serde_json::from_value(json).unwrap();
         assert!(matches!(strategy, RoutingStrategy::Sticky));
+    }
+
+    // --- WOR-798: LeastTokenUsage + record_tokens_for_provider ---
+
+    #[test]
+    fn least_token_usage_explores_untried_provider_first() {
+        // With no observations recorded yet, every provider has
+        // tokens_used = 0 and ties on the first key (enabled order).
+        let providers = vec![
+            make_provider("a", 1, None, true),
+            make_provider("b", 1, None, true),
+            make_provider("c", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::LeastTokenUsage, providers.len());
+        // First pick lands on the first enabled provider on the tie.
+        assert_eq!(router.select(&providers), Some(0));
+    }
+
+    #[test]
+    fn least_token_usage_picks_provider_with_smallest_observed_throughput() {
+        let providers = vec![
+            make_provider("a", 1, None, true),
+            make_provider("b", 1, None, true),
+            make_provider("c", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::LeastTokenUsage, providers.len());
+        // Provider 0 has absorbed a big load; 1 has absorbed a little;
+        // 2 is fresh. Selection must favor 2 (zero), then 1 if 2 is
+        // hot.
+        router.record_tokens(0, 10_000);
+        router.record_tokens(1, 200);
+        assert_eq!(router.select(&providers), Some(2));
+        // After charging 2 past 1, the next pick swings to 1.
+        router.record_tokens(2, 500);
+        assert_eq!(router.select(&providers), Some(1));
+    }
+
+    #[test]
+    fn least_token_usage_falls_back_to_first_when_single_provider() {
+        let providers = vec![make_provider("only", 1, None, true)];
+        let router = Router::new(RoutingStrategy::LeastTokenUsage, providers.len());
+        router.record_tokens(0, 50_000);
+        // Sole eligible provider is always returned, regardless of
+        // load.
+        assert_eq!(router.select(&providers), Some(0));
+    }
+
+    #[test]
+    fn record_tokens_for_provider_routes_by_name() {
+        let providers = vec![
+            make_provider("openai", 1, None, true),
+            make_provider("anthropic", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::LeastTokenUsage, providers.len());
+        router.record_tokens_for_provider(&providers, "anthropic", 1234);
+        // Anthropic carries the load now, so a fresh pick goes to
+        // the cheap-by-comparison openai.
+        assert_eq!(router.select(&providers), Some(0));
+    }
+
+    #[test]
+    fn record_tokens_for_provider_silently_skips_unknown_name() {
+        let providers = vec![make_provider("openai", 1, None, true)];
+        let router = Router::new(RoutingStrategy::LeastTokenUsage, providers.len());
+        // A renamed-away or never-existed provider must not panic;
+        // a hot reload could leave a stale provider_name in flight.
+        router.record_tokens_for_provider(&providers, "ghost", 999);
+        // The openai counter stayed at zero, so select returns it.
+        assert_eq!(router.select(&providers), Some(0));
+    }
+
+    #[test]
+    fn record_tokens_for_provider_zero_is_a_no_op() {
+        let providers = vec![make_provider("openai", 1, None, true)];
+        let router = Router::new(RoutingStrategy::LeastTokenUsage, providers.len());
+        router.record_tokens_for_provider(&providers, "openai", 0);
+        // No charge, so a subsequent zero-charge select sees no
+        // accumulated load and still returns the provider.
+        assert_eq!(router.select(&providers), Some(0));
+    }
+
+    #[test]
+    fn strategy_name_covers_every_variant() {
+        // The label appears on `sbproxy_ai_lb_decisions_total` so a
+        // missing arm would silently produce an empty string in the
+        // metric. Spot-check the snake_case mapping for every
+        // variant.
+        assert_eq!(
+            Router::new(RoutingStrategy::RoundRobin, 1).strategy_name(),
+            "round_robin"
+        );
+        assert_eq!(
+            Router::new(RoutingStrategy::PeakEwma, 1).strategy_name(),
+            "peak_ewma"
+        );
+        assert_eq!(
+            Router::new(RoutingStrategy::LeastTokenUsage, 1).strategy_name(),
+            "least_token_usage"
+        );
+        assert_eq!(
+            Router::new(RoutingStrategy::TokenRate, 1).strategy_name(),
+            "token_rate"
+        );
+        assert_eq!(
+            Router::new(cascade_strategy(), 1).strategy_name(),
+            "cascade"
+        );
     }
 
     // --- Cascade Tests ---
