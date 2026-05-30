@@ -58,6 +58,62 @@ const VALID_PAYMENT_TYPES: &[&str] = &[
     "attribution",
 ];
 
+/// WOR-808 PR5: inject `<link rel="license" href="<href>">` into the
+/// `<head>` of an HTML document so HTML consumers can discover the
+/// RSL `/licenses.xml` projection inline.
+///
+/// Pure helper, no I/O. Returns the original bytes verbatim when:
+///
+/// - The body already contains a `rel="license"` link (case-insensitive),
+///   so a second pass through the proxy is a no-op.
+/// - No `<head>` tag is found, so the body is a fragment / non-HTML the
+///   proxy should not rewrite.
+///
+/// Otherwise inserts the tag immediately after the `<head>` open tag,
+/// preserving any attributes on `<head>` itself. Match is
+/// case-insensitive (HTML accepts `<HEAD>` / `<Head>` etc.).
+pub fn inject_license_link(body: &[u8], href: &str) -> Vec<u8> {
+    // Cheap early-out for the no-op cases. The substring check uses
+    // a lower-cased copy of just the first 8 KiB so we don't pay an
+    // O(n) lowercase on a multi-megabyte body for a header-only
+    // search.
+    let scan_window = body.len().min(8192);
+    let head_window = String::from_utf8_lossy(&body[..scan_window]).to_ascii_lowercase();
+    if head_window.contains("rel=\"license\"") || head_window.contains("rel='license'") {
+        return body.to_vec();
+    }
+    let head_open = match find_head_open(&head_window) {
+        Some(span) => span,
+        None => return body.to_vec(),
+    };
+    let tag = format!("<link rel=\"license\" href=\"{href}\">");
+    let mut out = Vec::with_capacity(body.len() + tag.len());
+    out.extend_from_slice(&body[..head_open]);
+    out.extend_from_slice(tag.as_bytes());
+    out.extend_from_slice(&body[head_open..]);
+    out
+}
+
+/// Locate the byte offset just after the `<head ...>` open tag in a
+/// lowercase ASCII window. Returns `None` when no `<head>` open tag is
+/// present or the tag is unclosed.
+fn find_head_open(lower_window: &str) -> Option<usize> {
+    let start = lower_window.find("<head")?;
+    let after = start + "<head".len();
+    // The byte at `after` is either `>` (no attributes) or whitespace
+    // (attributes follow). A tag like `<header` would also match the
+    // `<head` prefix; reject by requiring the next byte to be one of
+    // `>`, space, tab, newline, slash. This is the same disambiguation
+    // every browser parser uses.
+    let next = lower_window.as_bytes().get(after)?;
+    if !matches!(*next, b'>' | b' ' | b'\t' | b'\n' | b'\r' | b'/') {
+        return None;
+    }
+    // Walk forward to the closing `>` of the open tag.
+    let close = after + lower_window[after..].find('>')?;
+    Some(close + 1)
+}
+
 /// Read the operator-declared `payment:` block on an `ai_crawl_control`
 /// entry and turn it into [`licenses::PaymentTerms`]. Returns `None` when
 /// the block is absent or the declared `type` is not in the RSL 1.0
@@ -754,6 +810,67 @@ spec:
         let cfg = config_with_origin("api.example.com", serde_json::json!({"type": "rate_limit"}));
         let docs = render_projections(&cfg, 1);
         assert!(docs.agent_skills_listings.is_empty());
+    }
+
+    // --- WOR-808 PR5: inject_license_link ---
+
+    #[test]
+    fn inject_license_link_inserts_after_head_open() {
+        let body = b"<html><head><title>x</title></head><body>hi</body></html>";
+        let out = inject_license_link(body, "/licenses.xml");
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("<head><link rel=\"license\" href=\"/licenses.xml\"><title>"));
+    }
+
+    #[test]
+    fn inject_license_link_handles_head_with_attributes() {
+        let body = b"<html><HEAD lang=\"en\"><title>x</title></HEAD></html>";
+        let out = inject_license_link(body, "/licenses.xml");
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            s.contains("<HEAD lang=\"en\"><link rel=\"license\" href=\"/licenses.xml\">"),
+            "preserve original head attrs + casing; got: {s}"
+        );
+    }
+
+    #[test]
+    fn inject_license_link_skips_when_license_already_present() {
+        let body = b"<html><head><link REL=\"License\" href=\"/old.xml\"></head></html>";
+        let out = inject_license_link(body, "/licenses.xml");
+        // Match is case-insensitive, so an existing link suppresses
+        // the injection regardless of attribute casing.
+        assert_eq!(out, body.to_vec());
+    }
+
+    #[test]
+    fn inject_license_link_skips_when_no_head_tag() {
+        let body = b"<html><body>fragment</body></html>";
+        let out = inject_license_link(body, "/licenses.xml");
+        assert_eq!(out, body.to_vec());
+    }
+
+    #[test]
+    fn inject_license_link_does_not_match_header_tag() {
+        // `<header>` shares the `<head` prefix; the disambiguation
+        // must reject it so we don't insert the link tag at top-level
+        // content.
+        let body = b"<html><body><header>nav</header></body></html>";
+        let out = inject_license_link(body, "/licenses.xml");
+        assert_eq!(out, body.to_vec());
+    }
+
+    #[test]
+    fn inject_license_link_handles_self_closing_head_attr_quirk() {
+        // Some templating engines emit `<head/>` followed by content;
+        // the open-tag span ends at the `>` regardless, so injection
+        // still slots correctly after the head open.
+        let body = b"<head/><body>x</body>";
+        let out = inject_license_link(body, "/x.xml");
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            s.starts_with("<head/><link rel=\"license\" href=\"/x.xml\">"),
+            "got: {s}"
+        );
     }
 
     #[test]

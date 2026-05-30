@@ -286,6 +286,25 @@ pub struct RequestContext {
     /// modified.
     pub sri_scan_enabled: bool,
 
+    // --- WOR-808 PR5: RSL HTML <link rel="license"> injection ---
+    /// Set in `response_filter` when the origin advertises an RSL
+    /// `licenses.xml` projection (i.e. `rsl_urns` has an entry for
+    /// the hostname) AND the upstream response is `text/html`. Tells
+    /// the body filter to accumulate the response and inject a
+    /// `<link rel="license" href="/licenses.xml">` tag into the
+    /// `<head>` so HTML consumers (browsers, scrapers reading the
+    /// document, not just inspecting headers) can discover the
+    /// license document inline. Injection is a no-op when the body
+    /// already carries a license-rel link or has no parseable `<head>`.
+    pub rsl_inject_link_pending: bool,
+    /// Buffer for the HTML body when `rsl_inject_link_pending` is set.
+    /// Drained at `end_of_stream` to perform the one-shot injection.
+    pub rsl_inject_link_buf: Option<BytesMut>,
+    /// Once-only guard so the body filter does not double-emit the
+    /// injected body if `end_of_stream` arrives in a second filter
+    /// call after the buffer has already been flushed.
+    pub rsl_inject_link_emitted: bool,
+
     // --- Forward rule state ---
     /// If a forward rule matched, this holds the index into the origin's forward_rules vec.
     pub forward_rule_idx: Option<usize>,
@@ -870,6 +889,9 @@ impl RequestContext {
             buffering_body: false,
             upstream_content_type: None,
             sri_scan_enabled: false,
+            rsl_inject_link_pending: false,
+            rsl_inject_link_buf: None,
+            rsl_inject_link_emitted: false,
             forward_rule_idx: None,
             path_params: None,
             fallback_triggered: false,
