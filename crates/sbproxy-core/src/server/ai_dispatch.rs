@@ -1585,12 +1585,15 @@ pub(super) async fn handle_ai_proxy(
                 model: model.as_str(),
                 surface_label,
                 provider_name: last_provider_name.as_str(),
-                router: &router,
-                config_providers: &config.providers,
                 image_resolution: image_resolution_for_billing.clone(),
                 audio_speech_characters: audio_speech_characters_for_billing,
                 rerank_documents: rerank_documents_for_billing,
             });
+            let stream_router_sink = RouterTokenSink {
+                router: &router,
+                config_providers: &config.providers,
+                provider_name: last_provider_name.as_str(),
+            };
             // Capture parser hints from the upstream response before it
             // gets moved into relay_ai_stream. The streaming relay
             // resolves `usage_parser: auto` against these hints.
@@ -1620,6 +1623,7 @@ pub(super) async fn handle_ai_proxy(
                     policy: stream_policy,
                 },
                 stream_recorder,
+                stream_router_sink,
                 StreamUsageParserArgs {
                     configured: usage_parser_cfg,
                     upstream_host,
@@ -1643,12 +1647,15 @@ pub(super) async fn handle_ai_proxy(
                 model: model.as_str(),
                 surface_label,
                 provider_name: last_provider_name.as_str(),
-                router: &router,
-                config_providers: &config.providers,
                 image_resolution: image_resolution_for_billing.clone(),
                 audio_speech_characters: audio_speech_characters_for_billing,
                 rerank_documents: rerank_documents_for_billing,
             });
+            let cache_router_sink = RouterTokenSink {
+                router: &router,
+                config_providers: &config.providers,
+                provider_name: last_provider_name.as_str(),
+            };
             relay_ai_response_with_cache(
                 session,
                 resp,
@@ -1658,6 +1665,7 @@ pub(super) async fn handle_ai_proxy(
                 embed_miss,
                 config.max_body_size,
                 recorder,
+                cache_router_sink,
                 Some(ctx),
                 idem_skip_reason,
                 idem_capture,
@@ -1782,6 +1790,7 @@ pub(super) async fn relay_ai_response_with_cache(
     embed_miss: Option<PendingEmbedMiss>,
     max_body_size: Option<usize>,
     budget_recorder: Option<BudgetRecorderArgs<'_>>,
+    router_sink: RouterTokenSink<'_>,
     mut ctx: Option<&mut RequestContext>,
     idem_skip_reason: Option<&'static str>,
     idem_capture: Option<AiIdempotencyCapture>,
@@ -1978,11 +1987,7 @@ pub(super) async fn relay_ai_response_with_cache(
             // the load this provider just absorbed. The minute
             // window resets via the existing `reset_tokens` ticker
             // (sbproxy-ai/src/routing.rs).
-            args.router.record_tokens_for_provider(
-                args.config_providers,
-                args.provider_name,
-                prompt_tokens + completion_tokens,
-            );
+            router_sink.record(prompt_tokens + completion_tokens);
             record_budget_usage(
                 args.config,
                 args.keys,
@@ -2051,6 +2056,21 @@ pub(super) async fn relay_ai_response_with_cache(
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);
             }
+            // WOR-798: feed the router's per-provider token counter
+            // even on no-budget origins. The previous wire only
+            // fired when `budget_recorder` was Some, which made
+            // `LeastTokenUsage` invisible to origins that opted out
+            // of budgets. The wire is independent of budgeting.
+            router_sink.record(prompt_tokens + completion_tokens);
+        }
+    } else {
+        // No budget AND no ctx (rare; the dispatch path almost always
+        // hands one). Still record router observations off the
+        // upstream usage block so the router stays accurate for
+        // unattached requests.
+        if (200..300).contains(&status) {
+            let (prompt_tokens, completion_tokens) = extract_usage(&resp_body);
+            router_sink.record(prompt_tokens + completion_tokens);
         }
     }
 
@@ -2106,15 +2126,6 @@ pub(super) struct BudgetRecorderArgs<'a> {
     /// Provider that received the dispatched request. Same source
     /// of truth as the `provider` field in the access log.
     provider_name: &'a str,
-    /// WOR-798: AI router for this origin. The relay charges the
-    /// chosen provider's `tokens_used` counter once the upstream
-    /// `usage` block is in hand, so the `LeastTokenUsage` /
-    /// `TokenRate` strategies see real load on the next pick.
-    router: &'a sbproxy_ai::Router,
-    /// WOR-798: provider list the router was built against; passed
-    /// alongside `router` so `record_tokens_for_provider` can
-    /// resolve `provider_name` -> index without a second lookup.
-    config_providers: &'a [sbproxy_ai::ProviderConfig],
     /// For image generation requests, the resolution requested
     /// (e.g. `1024x1024`, `1024x1792`). Captured from the inbound
     /// request body at dispatch time and threaded here so the
@@ -2131,6 +2142,37 @@ pub(super) struct BudgetRecorderArgs<'a> {
     /// so the relay function can emit a `RerankUnits { documents }`
     /// billing event scaled to the provider's per-document rate.
     rerank_documents: Option<u64>,
+}
+
+/// WOR-798: the bundle a relay needs to feed
+/// [`sbproxy_ai::Router::record_tokens_for_provider`] once the
+/// upstream `usage` block is in hand. Always present at the call
+/// site (router / provider list / provider name are all local at
+/// dispatch time), so the relay takes it by value rather than as
+/// `Option<...>`. Lets both the budget-recorder path and the
+/// no-budget path share one wire; previously the wire only fired
+/// when an origin had a configured `budget:` block.
+pub(super) struct RouterTokenSink<'a> {
+    /// AI router for this origin. Owns the `tokens_used` counter
+    /// the `LeastTokenUsage` / `TokenRate` strategies read from.
+    router: &'a sbproxy_ai::Router,
+    /// Provider list the router was built against; passed
+    /// alongside `router` so `record_tokens_for_provider` can
+    /// resolve `provider_name` -> index without a second lookup.
+    config_providers: &'a [sbproxy_ai::ProviderConfig],
+    /// Provider that received the dispatched request. Same source
+    /// of truth as the `provider` field in the access log.
+    provider_name: &'a str,
+}
+
+impl<'a> RouterTokenSink<'a> {
+    /// Charge `tokens` against the chosen provider's `tokens_used`
+    /// counter. Zero is a no-op; an unknown provider name silently
+    /// no-ops (a hot reload mid-flight could leave a stale name).
+    fn record(&self, tokens: u64) {
+        self.router
+            .record_tokens_for_provider(self.config_providers, self.provider_name, tokens);
+    }
 }
 
 /// Inputs to the streaming-cache recorder hook, bundled to keep
@@ -2274,6 +2316,7 @@ pub(super) async fn relay_ai_stream(
     origin_idx: Option<usize>,
     recorder_args: StreamCacheRecorderArgs,
     budget_recorder: Option<BudgetRecorderArgs<'_>>,
+    router_sink: RouterTokenSink<'_>,
     parser_args: StreamUsageParserArgs,
     format_args: StreamFormatArgs,
 ) -> Result<()> {
@@ -2561,11 +2604,7 @@ pub(super) async fn relay_ai_stream(
                 // counter so streaming responses contribute to the
                 // `LeastTokenUsage` / `TokenRate` signal the same as
                 // unary responses.
-                args.router.record_tokens_for_provider(
-                    args.config_providers,
-                    args.provider_name,
-                    prompt + completion,
-                );
+                router_sink.record(prompt + completion);
                 let usage = if prompt != 0 || completion != 0 {
                     sbproxy_ai::budget::AiUsage::Tokens {
                         input: prompt,
@@ -2605,6 +2644,17 @@ pub(super) async fn relay_ai_stream(
                         );
                     }
                 }
+            }
+        }
+    } else if let Some(parser) = usage_parser.as_ref() {
+        // WOR-798: no-budget streaming path. Still feed the router's
+        // per-provider token counter so `LeastTokenUsage` /
+        // `TokenRate` see streaming load even when the origin opted
+        // out of budgets. Mirrors the unary no-budget branch in
+        // `relay_ai_response_with_cache`.
+        if (200..300).contains(&status) {
+            if let Some(tokens) = parser.snapshot() {
+                router_sink.record(tokens.prompt_tokens as u64 + tokens.completion_tokens as u64);
             }
         }
     }
