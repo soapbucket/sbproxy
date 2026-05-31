@@ -1611,6 +1611,60 @@ pub(super) async fn request_filter(
                         send_error(session, 405, "POST only").await?;
                         return Ok(true);
                     }
+                    // When the client sends an RFC 6749 §4.4 form body
+                    // (`application/x-www-form-urlencoded`) we parse it,
+                    // require `grant_type=client_credentials` and a
+                    // non-empty `client_id`, and bind the token's `sub`
+                    // claim to that client_id. Any other content-type
+                    // (or no body) falls back to the legacy anonymous
+                    // path so existing automation still mints tokens.
+                    let content_type = session
+                        .req_header()
+                        .headers
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let is_form_body = content_type
+                        .split(';')
+                        .next()
+                        .map(|t| t.trim().eq_ignore_ascii_case(OLP_TOKEN_FORM_CT))
+                        .unwrap_or(false);
+                    let sub: String = if is_form_body {
+                        // Cap the form body at 4 KiB; client_credentials
+                        // bodies are tiny and a hostile client must not
+                        // tip the issuer into unbounded buffering.
+                        const MAX_TOKEN_FORM_BYTES: usize = 4 * 1024;
+                        let mut form_buf: Vec<u8> = Vec::new();
+                        while let Some(chunk) = session.read_request_body().await? {
+                            let remaining = MAX_TOKEN_FORM_BYTES.saturating_sub(form_buf.len());
+                            if remaining == 0 {
+                                break;
+                            }
+                            let take = std::cmp::min(chunk.len(), remaining);
+                            form_buf.extend_from_slice(&chunk[..take]);
+                            if form_buf.len() >= MAX_TOKEN_FORM_BYTES {
+                                break;
+                            }
+                        }
+                        let form_body = std::str::from_utf8(&form_buf).unwrap_or("");
+                        match parse_olp_token_form(form_body) {
+                            Ok(req) => req.client_id,
+                            Err(err) => {
+                                // RFC 6749 §5.2 error response shape.
+                                let body = serde_json::json!({
+                                    "error": err.code,
+                                    "error_description": err.description,
+                                })
+                                .to_string();
+                                send_response(session, 400, "application/json", body.as_bytes())
+                                    .await?;
+                                return Ok(true);
+                            }
+                        }
+                    } else {
+                        OLP_ANONYMOUS_SUB.to_string()
+                    };
                     let hostname = pipeline.config.origins[origin_idx].hostname.as_str();
                     let projections = sbproxy_modules::projections::current_projections();
                     let license_urn =
@@ -1625,7 +1679,7 @@ pub(super) async fn request_filter(
                                 // license_urn does not resolve.
                                 format!("urn:rsl:1.0:{hostname}:0")
                             });
-                    match issue_olp_token(cfg, hostname, &license_urn) {
+                    match issue_olp_token(cfg, hostname, &license_urn, &sub) {
                         Ok(body) => {
                             send_response(session, 200, "application/json", body.as_bytes())
                                 .await?;
@@ -3074,17 +3128,19 @@ fn build_olp_jwk_set(cfg: &sbproxy_config::OlpConfig) -> Result<String, String> 
 /// response body mirrors RFC 6749 §5.1 (`access_token`, `token_type`,
 /// `expires_in`, `scope`) so existing OAuth-style clients consume it.
 /// `token_type` is pinned to RSL 1.0's `License`.
+///
+/// `sub` is the resolved subject (the `client_id` from the form body
+/// for `grant_type=client_credentials`). The handler validates the
+/// grant and rejects missing/blank `client_id` before reaching here,
+/// so by the time we sign we always have a non-empty subject.
 fn issue_olp_token(
     cfg: &sbproxy_config::OlpConfig,
     hostname: &str,
     license_urn: &str,
+    sub: &str,
 ) -> Result<String, String> {
     let seed = decode_ed25519_seed(&cfg.signing_key)?;
     let signer = sbproxy_modules::olp::OlpTokenSigner::from_seed_bytes(seed, &cfg.key_id);
-    // PR1 issues an anonymous license tied to the configured default
-    // scope. PR2 will accept a `grant_type` + `client_id` form body
-    // and bind the token to a resolved subject.
-    //
     // WOR-808 PR8: when the operator declares `content_key_seed`,
     // derive a per-token EMS content key and attach it as a
     // `cnf.jwk` claim (RFC 7800). Seed accepted as hex for
@@ -3095,7 +3151,7 @@ fn issue_olp_token(
         .as_ref()
         .and_then(|s| decode_hex_bytes(s.as_str()).ok());
     let req = sbproxy_modules::olp::IssueRequest {
-        sub: "anonymous",
+        sub,
         aud: hostname,
         license_urn,
         scope_override: None,
@@ -3149,6 +3205,115 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
         b'A'..=b'F' => Ok(b - b'A' + 10),
         _ => Err(format!("not a hex char: {b:#04x}")),
     }
+}
+
+/// Subject claim used when the client posts an empty or non-form
+/// body. Lets existing JSON-shaped automation keep minting tokens
+/// while opt-in form clients get a bound subject.
+pub(crate) const OLP_ANONYMOUS_SUB: &str = "anonymous";
+
+/// Content-type that gates the RFC 6749 §4.4 form-body path on
+/// `POST /.well-known/olp/token`.
+pub(crate) const OLP_TOKEN_FORM_CT: &str = "application/x-www-form-urlencoded";
+
+/// Parsed `POST /.well-known/olp/token` form body. Carries the
+/// resolved subject so the issuer can bind it as the `sub` claim
+/// without re-parsing.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OlpTokenForm {
+    pub client_id: String,
+}
+
+/// RFC 6749 §5.2 error code + human-readable description. Returned
+/// as a JSON object on a 400 response.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OlpTokenFormError {
+    pub code: &'static str,
+    pub description: &'static str,
+}
+
+/// Parse a `POST /.well-known/olp/token` form body. Requires
+/// `grant_type=client_credentials` (RFC 6749 §4.4) and a non-empty
+/// `client_id`. Unknown extra parameters are ignored so the issuer
+/// stays forward-compatible with audience / scope / resource
+/// indicator extensions.
+///
+/// Errors are RFC 6749 §5.2 codes so the JSON response body uses the
+/// same vocabulary as standard OAuth token endpoints.
+pub(crate) fn parse_olp_token_form(body: &str) -> Result<OlpTokenForm, OlpTokenFormError> {
+    let mut grant_type: Option<String> = None;
+    let mut client_id: Option<String> = None;
+    for pair in body.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (raw_key, raw_val) = match pair.split_once('=') {
+            Some(kv) => kv,
+            None => (pair, ""),
+        };
+        let key = decode_form_component(raw_key);
+        let val = decode_form_component(raw_val);
+        match key.as_str() {
+            "grant_type" => grant_type = Some(val),
+            "client_id" => client_id = Some(val),
+            _ => {}
+        }
+    }
+    match grant_type.as_deref() {
+        Some("client_credentials") => {}
+        Some(_) => {
+            return Err(OlpTokenFormError {
+                code: "unsupported_grant_type",
+                description: "only client_credentials is supported",
+            });
+        }
+        None => {
+            return Err(OlpTokenFormError {
+                code: "invalid_request",
+                description: "grant_type is required",
+            });
+        }
+    }
+    let client_id = client_id.unwrap_or_default();
+    if client_id.is_empty() {
+        return Err(OlpTokenFormError {
+            code: "invalid_request",
+            description: "client_id is required and must be non-empty",
+        });
+    }
+    Ok(OlpTokenForm { client_id })
+}
+
+/// Decode a single `application/x-www-form-urlencoded` component:
+/// `+` -> space, then percent-escape decoding. Invalid escapes are
+/// left as-is so a malformed component never crashes the parser;
+/// callers validate the resulting strings.
+fn decode_form_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'+' {
+            out.push(' ');
+            i += 1;
+        } else if b == b'%' && i + 2 < bytes.len() {
+            match (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                (Ok(hi), Ok(lo)) => {
+                    out.push(char::from((hi << 4) | lo));
+                    i += 3;
+                }
+                _ => {
+                    out.push('%');
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(char::from(b));
+            i += 1;
+        }
+    }
+    out
 }
 
 /// WOR-808 PR8: relaxed-length variant of [`decode_ed25519_seed`] used
@@ -3362,5 +3527,73 @@ mod challenge_tests {
         let out =
             augment_license_challenge(&extra, Some(&cfg), "api.example.com", Some("ev\"il\\host"));
         assert!(out[0].1.contains(r#"realm="ev\"il\\host""#));
+    }
+}
+
+#[cfg(test)]
+mod olp_form_tests {
+    use super::{parse_olp_token_form, OlpTokenForm};
+
+    #[test]
+    fn happy_path_binds_client_id_from_form_body() {
+        let got =
+            parse_olp_token_form("grant_type=client_credentials&client_id=acme-corp").unwrap();
+        assert_eq!(
+            got,
+            OlpTokenForm {
+                client_id: "acme-corp".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn missing_grant_type_returns_invalid_request() {
+        let err = parse_olp_token_form("client_id=acme").unwrap_err();
+        assert_eq!(err.code, "invalid_request");
+    }
+
+    #[test]
+    fn wrong_grant_type_returns_unsupported_grant_type() {
+        let err = parse_olp_token_form("grant_type=password&client_id=acme").unwrap_err();
+        assert_eq!(err.code, "unsupported_grant_type");
+    }
+
+    #[test]
+    fn missing_client_id_returns_invalid_request() {
+        let err = parse_olp_token_form("grant_type=client_credentials").unwrap_err();
+        assert_eq!(err.code, "invalid_request");
+    }
+
+    #[test]
+    fn empty_client_id_returns_invalid_request() {
+        let err = parse_olp_token_form("grant_type=client_credentials&client_id=").unwrap_err();
+        assert_eq!(err.code, "invalid_request");
+    }
+
+    #[test]
+    fn percent_decoding_recovers_client_id_with_special_chars() {
+        // Real publisher client_ids include `:` and `-`. Pin the
+        // percent-decoding path so a colon-bearing client_id survives.
+        let got =
+            parse_olp_token_form("grant_type=client_credentials&client_id=svc%3Aweb-1").unwrap();
+        assert_eq!(got.client_id, "svc:web-1");
+    }
+
+    #[test]
+    fn plus_decodes_to_space_in_client_id() {
+        let got =
+            parse_olp_token_form("grant_type=client_credentials&client_id=acme+corp").unwrap();
+        assert_eq!(got.client_id, "acme corp");
+    }
+
+    #[test]
+    fn unknown_parameters_are_ignored() {
+        // Forward-compat: future RFC 8693 / RFC 8707 params must not
+        // tip the parser into a 400.
+        let got = parse_olp_token_form(
+            "grant_type=client_credentials&client_id=acme&audience=https%3A%2F%2Fapi&resource=urn%3Ar",
+        )
+        .unwrap();
+        assert_eq!(got.client_id, "acme");
     }
 }
