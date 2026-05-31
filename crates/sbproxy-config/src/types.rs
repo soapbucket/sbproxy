@@ -4063,6 +4063,15 @@ pub struct OlpConfig {
     /// `ttl_secs_override == None` use this value.
     #[serde(default = "default_olp_ttl_secs")]
     pub default_ttl_secs: u64,
+    /// WOR-808 PR8: optional Encrypted Media Standard content-key
+    /// seed (hex-encoded). When set, every issued OLP token carries
+    /// an RFC 7800 `cnf.jwk` claim with a per-token AES-256-GCM key
+    /// derived via HKDF(seed, salt=jti, info="ems-content-key").
+    /// Decryptors that retain the jti can recompute the key without
+    /// storing the material. Absent leaves the cnf claim off the
+    /// token so EMS-unaware clients keep working.
+    #[serde(default)]
+    pub content_key_seed: Option<String>,
 }
 
 fn default_olp_scope() -> String {

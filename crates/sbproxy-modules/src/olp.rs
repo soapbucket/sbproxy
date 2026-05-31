@@ -70,9 +70,45 @@ pub struct OlpLicenseClaims {
     /// URN of the RSL `/licenses.xml` document the license operates
     /// under (`urn:rsl:1.0:<hostname>:<config_version>`).
     pub license_urn: String,
-    /// Stable JWT id so an issuer that tracks revocation (PR8) can
-    /// identify the token later.
+    /// Stable JWT id; revocation stores (PR follow-up) key off this.
+    /// Also used as the HKDF salt that derives the per-token EMS
+    /// content key, so two tokens issued from the same content-key
+    /// seed never share an EMS key.
     pub jti: String,
+    /// WOR-808 PR8: RFC 7800 `cnf` confirmation claim carrying the
+    /// EMS (Encrypted Media Standard) content key bound to this
+    /// license. Present only when the operator declared a
+    /// `content_key_seed` on the origin's OLP config; absent
+    /// otherwise so existing clients that ignore `cnf` keep
+    /// working.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cnf: Option<Confirmation>,
+}
+
+/// RFC 7800 `cnf` confirmation claim. Today only the symmetric-jwk
+/// shape is emitted (the EMS content key); RFC 7800 also allows
+/// `jkt` (key thumbprint) and `kid` references which are not used
+/// here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Confirmation {
+    /// Embedded JWK carrying the EMS content key.
+    pub jwk: ConfirmationJwk,
+}
+
+/// Symmetric JWK (RFC 7518 §6.4) embedded in a `cnf.jwk` claim. The
+/// content key is the `k` field, base64url-no-pad-encoded raw bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmationJwk {
+    /// `oct` per RFC 7518 §6.4 (symmetric key).
+    pub kty: String,
+    /// AEAD algorithm the content key is intended for; today fixed
+    /// to `A256GCM` (AES-256-GCM) per the EMS profile sbproxy emits.
+    pub alg: String,
+    /// `enc` per RFC 7517 (key intended for content encryption).
+    #[serde(rename = "use")]
+    pub use_: String,
+    /// Raw content key bytes, base64url no padding.
+    pub k: String,
 }
 
 /// JWS protected header. `typ` is pinned to `olp-license+jws` per
@@ -317,11 +353,18 @@ pub struct IssueRequest<'a> {
     /// Override the operator-configured default TTL. `None` keeps
     /// the default.
     pub ttl_secs_override: Option<u64>,
+    /// WOR-808 PR8: when set, derive a per-token EMS content key
+    /// from this seed and the token's `jti` and attach it as an
+    /// RFC 7800 `cnf.jwk` claim. The seed is the operator's
+    /// `OlpConfig.content_key_seed`; absent here keeps the cnf
+    /// claim off.
+    pub content_key_seed: Option<&'a [u8]>,
 }
 
 /// Build a fresh [`OlpLicenseClaims`] from an issue request, the
 /// issuer URL, and per-issuer defaults. Stamps `iat`/`exp` from the
-/// current wall clock and a fresh `jti`.
+/// current wall clock and a fresh `jti`; derives + attaches the
+/// EMS `cnf.jwk` content key when `content_key_seed` is set.
 pub fn build_claims(
     req: &IssueRequest<'_>,
     issuer: &str,
@@ -334,6 +377,10 @@ pub fn build_claims(
         .unwrap_or(0);
     let ttl = req.ttl_secs_override.unwrap_or(default_ttl_secs);
     let scope = req.scope_override.unwrap_or(default_scope).to_string();
+    let jti = fresh_jti();
+    let cnf = req
+        .content_key_seed
+        .map(|seed| derive_ems_confirmation(seed, &jti));
     OlpLicenseClaims {
         iss: issuer.to_string(),
         sub: req.sub.to_string(),
@@ -342,8 +389,49 @@ pub fn build_claims(
         exp: now.saturating_add(ttl),
         scope,
         license_urn: req.license_urn.to_string(),
-        jti: fresh_jti(),
+        jti,
+        cnf,
     }
+}
+
+/// WOR-808 PR8: derive the per-token EMS content-key confirmation
+/// claim from an operator-configured seed and the token's jti.
+///
+/// HKDF-SHA256 with `ikm = content_key_seed`, `salt = jti.as_bytes()`,
+/// and the `EmsContentKey` purpose's versioned info string. Output
+/// is 32 bytes (AES-256-GCM). Two tokens issued under the same seed
+/// derive different keys (jti is per-token random), and the same
+/// `(seed, jti)` always derives the same key so a decryptor that
+/// retains the jti can recompute the key without storing the
+/// material.
+pub fn derive_ems_confirmation(content_key_seed: &[u8], jti: &str) -> Confirmation {
+    let key_bytes = sbproxy_security::hkdf_derive_purpose(
+        content_key_seed,
+        jti.as_bytes(),
+        sbproxy_security::HkdfPurpose::EmsContentKey,
+        32,
+    );
+    Confirmation {
+        jwk: ConfirmationJwk {
+            kty: "oct".to_string(),
+            alg: "A256GCM".to_string(),
+            use_: "enc".to_string(),
+            k: b64url(&key_bytes),
+        },
+    }
+}
+
+/// WOR-808 PR8: extract the raw EMS content key from a verified
+/// license's `cnf.jwk.k` claim. Returns `None` when the token
+/// carries no `cnf` claim (operator did not enable EMS for the
+/// origin) or when the claim is shaped wrong (wrong kty, malformed
+/// base64).
+pub fn extract_ems_content_key(claims: &OlpLicenseClaims) -> Option<Vec<u8>> {
+    let cnf = claims.cnf.as_ref()?;
+    if cnf.jwk.kty != "oct" {
+        return None;
+    }
+    b64url_decode(&cnf.jwk.k)
 }
 
 /// Generate a 128-bit random JTI as a 22-char base64url string (no
@@ -394,6 +482,7 @@ mod tests {
             scope: "ai-train ai-input".to_string(),
             license_urn: "urn:rsl:1.0:api.example.com:42".to_string(),
             jti: "fixed-jti".to_string(),
+            cnf: None,
         }
     }
 
@@ -512,6 +601,7 @@ mod tests {
                 license_urn: "urn:rsl:1.0:api.example.com:42",
                 scope_override: None,
                 ttl_secs_override: None,
+                content_key_seed: None,
             },
             "https://api.example.com",
             "ai-train",
@@ -524,6 +614,7 @@ mod tests {
                 license_urn: "urn:rsl:1.0:api.example.com:42",
                 scope_override: None,
                 ttl_secs_override: None,
+                content_key_seed: None,
             },
             "https://api.example.com",
             "ai-train",
@@ -535,6 +626,159 @@ mod tests {
         assert_eq!(r1.exp - r1.iat, DEFAULT_TTL_SECS);
     }
 
+    // --- WOR-808 PR8: EMS content-key binding ---
+
+    #[test]
+    fn ems_derives_distinct_key_per_jti() {
+        // Two tokens issued from the same seed but different jtis
+        // must derive different content keys (the jti is the HKDF
+        // salt). A regression here would let one token's key
+        // decrypt another's content.
+        let seed = b"0123456789abcdef0123456789abcdef";
+        let k1 = derive_ems_confirmation(seed, "jti-aaa");
+        let k2 = derive_ems_confirmation(seed, "jti-bbb");
+        assert_ne!(k1.jwk.k, k2.jwk.k);
+    }
+
+    #[test]
+    fn ems_derives_deterministic_key_for_same_inputs() {
+        // Idempotent: a decryptor that retains the jti can
+        // recompute the same content key without storing the
+        // material.
+        let seed = b"0123456789abcdef0123456789abcdef";
+        let a = derive_ems_confirmation(seed, "jti-stable");
+        let b = derive_ems_confirmation(seed, "jti-stable");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn ems_confirmation_jwk_shape_is_oct_a256gcm_enc() {
+        let cnf = derive_ems_confirmation(b"seed", "jti-1");
+        assert_eq!(cnf.jwk.kty, "oct");
+        assert_eq!(cnf.jwk.alg, "A256GCM");
+        assert_eq!(cnf.jwk.use_, "enc");
+        // AES-256-GCM key is 32 raw bytes; base64url no-pad is 43
+        // chars.
+        assert_eq!(cnf.jwk.k.len(), 43);
+    }
+
+    #[test]
+    fn extract_ems_content_key_decodes_jwk_k() {
+        let seed = b"a-seed";
+        let cnf = derive_ems_confirmation(seed, "jti-x");
+        let claims = OlpLicenseClaims {
+            cnf: Some(cnf.clone()),
+            ..sample_claims()
+        };
+        let extracted = extract_ems_content_key(&claims).expect("present");
+        // The extracted bytes match what HKDF produced directly.
+        let direct = sbproxy_security::hkdf_derive_purpose(
+            seed,
+            b"jti-x",
+            sbproxy_security::HkdfPurpose::EmsContentKey,
+            32,
+        );
+        assert_eq!(extracted, direct);
+    }
+
+    #[test]
+    fn extract_ems_content_key_none_when_cnf_absent() {
+        // Operator did not enable EMS for the origin -> no cnf
+        // claim -> the helper returns None so callers know there
+        // is no content key to use.
+        let claims = OlpLicenseClaims {
+            cnf: None,
+            ..sample_claims()
+        };
+        assert!(extract_ems_content_key(&claims).is_none());
+    }
+
+    #[test]
+    fn extract_ems_content_key_none_on_wrong_kty() {
+        // A token whose cnf.jwk.kty is not `oct` is not a content
+        // key; the helper refuses rather than returning garbage.
+        let claims = OlpLicenseClaims {
+            cnf: Some(Confirmation {
+                jwk: ConfirmationJwk {
+                    kty: "EC".to_string(),
+                    alg: "A256GCM".to_string(),
+                    use_: "enc".to_string(),
+                    k: "AAAA".to_string(),
+                },
+            }),
+            ..sample_claims()
+        };
+        assert!(extract_ems_content_key(&claims).is_none());
+    }
+
+    #[test]
+    fn build_claims_emits_cnf_when_content_key_seed_provided() {
+        let r = build_claims(
+            &IssueRequest {
+                sub: "agent:gptbot",
+                aud: "api.example.com",
+                license_urn: "urn:rsl:1.0:api.example.com:42",
+                scope_override: None,
+                ttl_secs_override: None,
+                content_key_seed: Some(b"32-byte-content-encryption-seed!!"),
+            },
+            "https://api.example.com",
+            "ai-train",
+            DEFAULT_TTL_SECS,
+        );
+        let cnf = r.cnf.as_ref().expect("cnf present");
+        assert_eq!(cnf.jwk.kty, "oct");
+        assert_eq!(cnf.jwk.alg, "A256GCM");
+    }
+
+    #[test]
+    fn build_claims_omits_cnf_when_no_seed() {
+        let r = build_claims(
+            &IssueRequest {
+                sub: "agent:gptbot",
+                aud: "api.example.com",
+                license_urn: "urn:rsl:1.0:api.example.com:42",
+                scope_override: None,
+                ttl_secs_override: None,
+                content_key_seed: None,
+            },
+            "https://api.example.com",
+            "ai-train",
+            DEFAULT_TTL_SECS,
+        );
+        assert!(r.cnf.is_none());
+    }
+
+    #[test]
+    fn token_with_cnf_roundtrips_through_signer_and_verifier() {
+        // The full path: build claims with a cnf claim, sign,
+        // verify, extract the key. Pins that the cnf field
+        // survives the JWS payload round-trip.
+        let s = signer();
+        let v = OlpTokenVerifier::new(s.verifying_key(), s.kid());
+        let req = IssueRequest {
+            sub: "agent:gptbot",
+            aud: "api.example.com",
+            license_urn: "urn:rsl:1.0:api.example.com:42",
+            scope_override: None,
+            ttl_secs_override: None,
+            content_key_seed: Some(b"a-32-byte-content-encryption-seed"),
+        };
+        let claims = build_claims(&req, "https://api.example.com", "ai-train", 60);
+        let token = s.sign(&claims).expect("sign");
+        let decoded = v
+            .verify(
+                &token,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )
+            .expect("verify");
+        let extracted = extract_ems_content_key(&decoded).expect("extracted");
+        assert_eq!(extracted.len(), 32);
+    }
+
     #[test]
     fn build_claims_honours_overrides() {
         let r = build_claims(
@@ -544,6 +788,7 @@ mod tests {
                 license_urn: "urn:rsl:1.0:api.example.com:42",
                 scope_override: Some("search"),
                 ttl_secs_override: Some(60),
+                content_key_seed: None,
             },
             "https://api.example.com",
             "ai-train",

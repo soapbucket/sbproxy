@@ -21,6 +21,12 @@ pub enum HkdfPurpose {
     Signing,
     /// Key used for message authentication (HMAC).
     Mac,
+    /// WOR-808 PR8: per-token EMS (Encrypted Media Standard) content
+    /// key derived from the operator's content-key seed and the
+    /// license token's jti. Distinct info string keeps an EMS key
+    /// from colliding with any other purpose for the same `(seed,
+    /// jti)` tuple.
+    EmsContentKey,
 }
 
 impl HkdfPurpose {
@@ -33,6 +39,7 @@ impl HkdfPurpose {
             HkdfPurpose::Encryption => b"sbproxy.hkdf.encryption.v1",
             HkdfPurpose::Signing => b"sbproxy.hkdf.signing.v1",
             HkdfPurpose::Mac => b"sbproxy.hkdf.mac.v1",
+            HkdfPurpose::EmsContentKey => b"sbproxy.hkdf.ems-content-key.v1",
         }
     }
 }
