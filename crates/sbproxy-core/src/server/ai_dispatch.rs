@@ -560,14 +560,31 @@ pub(super) async fn handle_ai_proxy(
     // a system message. The resolved name + version are recorded on the
     // context for the run metadata. A bad reference or a missing template
     // variable is a 400 (rendering is strict-undefined).
-    if let Some(store) = config.prompts.as_ref() {
-        if let Some(reference) = body
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-        {
-            let request_ctx = build_prompt_request_ctx(session, &body);
-            match store.render(&reference, &request_ctx) {
+    //
+    // WOR-800 PR2: lookup order is RUNTIME OVERLAY first, then the
+    // config-declared store. The runtime overlay (mutable via the
+    // library API at sbproxy_ai::prompts) shadows config so an
+    // operator can mint or pin a prompt at runtime without a full
+    // config reload. A miss on both layers leaves the prompt field
+    // untouched (the request proceeds with no synthesized system
+    // message, same as today's "no `prompt` field" path).
+    if let Some(reference) = body
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+    {
+        let request_ctx = build_prompt_request_ctx(session, &body);
+        let overlay = sbproxy_ai::prompts::current_runtime_overlay();
+        let result = overlay
+            .resolve(hostname, &reference, &request_ctx)
+            .or_else(|| {
+                config
+                    .prompts
+                    .as_ref()
+                    .map(|store| store.render(&reference, &request_ctx))
+            });
+        if let Some(outcome) = result {
+            match outcome {
                 Ok(rendered) => {
                     prepend_system_message(&mut body, &rendered.text);
                     ctx.ai_prompt_name = Some(rendered.name);
