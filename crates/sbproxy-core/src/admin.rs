@@ -15,10 +15,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+
+pub mod prompt_persistence;
+pub use prompt_persistence::PromptPersistence;
 
 // --- Config ---
 
@@ -277,6 +280,14 @@ pub struct AdminState {
     /// online; until then the default seeded set keeps `NotConfigured`
     /// stubs in place so readiness still passes.
     pub health_registry: sbproxy_observe::HealthRegistry,
+    /// WOR-800 PR4: optional persistence handle for the prompt
+    /// runtime overlay. When set, every `POST .../versions` and
+    /// `PUT .../pin` mutation also writes the resulting
+    /// [`sbproxy_ai::prompts::NamedPrompt`] to redb so the overlay
+    /// survives restart. `None` means PR3-style ephemeral mutations
+    /// (the default); the binary opts in via
+    /// [`AdminState::with_prompt_persistence`].
+    pub prompt_persistence: Option<Arc<PromptPersistence>>,
 }
 
 impl AdminState {
@@ -294,6 +305,7 @@ impl AdminState {
             loaded_config_content_hash: Mutex::new(None),
             reload_in_progress: AtomicBool::new(false),
             health_registry: sbproxy_observe::default_registry_optional(None, None),
+            prompt_persistence: None,
         }
     }
 
@@ -329,6 +341,17 @@ impl AdminState {
     /// their own probes via `state.health_registry.register(...)`.
     pub fn with_health_registry(mut self, registry: sbproxy_observe::HealthRegistry) -> Self {
         self.health_registry = registry;
+        self
+    }
+
+    /// WOR-800 PR4: install a [`PromptPersistence`] handle so the
+    /// prompt-admin mutators write through to redb. Callers that want
+    /// the runtime overlay to survive restart open the handle (which
+    /// also hydrates the in-memory overlay from the file) and pass
+    /// it here. Tests can call this with an in-memory backing store
+    /// via [`PromptPersistence::from_store`].
+    pub fn with_prompt_persistence(mut self, persistence: Arc<PromptPersistence>) -> Self {
+        self.prompt_persistence = Some(persistence);
         self
     }
 
@@ -949,19 +972,20 @@ fn dispatch_prompt_admin_route(
     name: &str,
     action: &str,
     body: Option<&str>,
+    state: &AdminState,
 ) -> (u16, &'static str, String) {
     match action {
         "versions" => {
             if !method.eq_ignore_ascii_case("POST") {
                 return method_not_allowed();
             }
-            handle_prompt_add_version(host, name, body)
+            handle_prompt_add_version(host, name, body, state)
         }
         "pin" => {
             if !method.eq_ignore_ascii_case("PUT") {
                 return method_not_allowed();
             }
-            handle_prompt_pin(host, name, body)
+            handle_prompt_pin(host, name, body, state)
         }
         _ => (
             404,
@@ -994,6 +1018,7 @@ fn handle_prompt_add_version(
     host: &str,
     name: &str,
     body: Option<&str>,
+    state: &AdminState,
 ) -> (u16, &'static str, String) {
     let raw = match body {
         Some(b) if !b.is_empty() => b,
@@ -1032,6 +1057,11 @@ fn handle_prompt_add_version(
         parsed.template,
         parsed.variables.unwrap_or_default(),
     );
+    // PR4: write through to redb when persistence is configured. A
+    // failure is logged but does not fail the request; the in-memory
+    // mutation has already succeeded and the operator gets the 200.
+    // PR5 / monitoring will surface persistent write failures.
+    persist_named_prompt_if_configured(state, host, name);
     let body = serde_json::json!({
         "host": host,
         "name": name,
@@ -1048,7 +1078,12 @@ struct PinVersionBody {
     version: String,
 }
 
-fn handle_prompt_pin(host: &str, name: &str, body: Option<&str>) -> (u16, &'static str, String) {
+fn handle_prompt_pin(
+    host: &str,
+    name: &str,
+    body: Option<&str>,
+    state: &AdminState,
+) -> (u16, &'static str, String) {
     let raw = match body {
         Some(b) if !b.is_empty() => b,
         _ => {
@@ -1074,6 +1109,10 @@ fn handle_prompt_pin(host: &str, name: &str, body: Option<&str>) -> (u16, &'stat
     };
     match sbproxy_ai::prompts::pin_runtime_prompt(host, name, &parsed.version) {
         Ok(()) => {
+            // PR4: write through on a successful pin (same policy as
+            // add: best-effort, failure is logged but does not 5xx the
+            // operator).
+            persist_named_prompt_if_configured(state, host, name);
             let body = serde_json::json!({
                 "host": host,
                 "name": name,
@@ -1087,6 +1126,32 @@ fn handle_prompt_pin(host: &str, name: &str, body: Option<&str>) -> (u16, &'stat
             "application/json",
             format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
         ),
+    }
+}
+
+/// Re-snapshot the runtime overlay and write the (host, name) entry
+/// to redb when a [`PromptPersistence`] handle is configured. Used by
+/// the two PR3 mutators; an error is logged but the request stays a
+/// 200 so the in-memory mutation is not silently rolled back by a
+/// late storage failure.
+fn persist_named_prompt_if_configured(state: &AdminState, host: &str, name: &str) {
+    let Some(persistence) = state.prompt_persistence.as_ref() else {
+        return;
+    };
+    let overlay = sbproxy_ai::prompts::current_runtime_overlay();
+    let Some(store) = overlay.by_host.get(host) else {
+        return;
+    };
+    let Some(named) = store.templates.get(name) else {
+        return;
+    };
+    if let Err(e) = persistence.write_named_prompt(host, name, named) {
+        tracing::warn!(
+            error = %e,
+            host,
+            name,
+            "prompt persistence write failed; in-memory mutation succeeded but redb is now stale"
+        );
     }
 }
 
@@ -1238,7 +1303,7 @@ pub fn handle_admin_request(
     }
     if let Some(rest) = path.strip_prefix("/admin/prompts/") {
         if let Some((host, name, action)) = parse_prompt_admin_path(rest) {
-            return dispatch_prompt_admin_route(method, host, name, action, body);
+            return dispatch_prompt_admin_route(method, host, name, action, body, state);
         }
         return (
             404,

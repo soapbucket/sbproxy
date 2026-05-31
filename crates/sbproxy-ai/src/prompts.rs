@@ -19,11 +19,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Per-origin prompt store: named, versioned prompts plus reusable
 /// template fragments.
-#[derive(Debug, Clone, Default, Deserialize)]
+///
+/// `Serialize` is implemented so the WOR-800 PR4 redb persistence
+/// layer can round-trip the store via JSON.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct PromptStore {
     /// Named prompts, keyed by prompt name.
     #[serde(default)]
@@ -35,7 +38,7 @@ pub struct PromptStore {
 }
 
 /// One named prompt with its versions.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NamedPrompt {
     /// Version served when a reference omits `@version`. When unset, the
     /// highest numeric version present is used.
@@ -46,7 +49,7 @@ pub struct NamedPrompt {
 }
 
 /// One immutable version of a prompt.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PromptVersion {
     /// The minijinja template source.
     pub template: String,
