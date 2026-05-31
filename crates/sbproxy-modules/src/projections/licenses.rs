@@ -286,6 +286,93 @@ pub fn render(
     (xml, urn)
 }
 
+/// WOR-808: one license tier declared by the operator. The TollBit
+/// model splits the same origin into multiple priced offerings
+/// (summarize vs full-display, for example) so a marketplace can buy
+/// the cheap tier for snippet generation and the expensive tier for
+/// full-page reuse. Each tier renders as its own `<license>` element
+/// under the shared `<content>`, with `urn` carrying a fragment that
+/// disambiguates the tier (`urn:rsl:1.0:<host>:<version>#<name>`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LicenseTier {
+    /// Tier name (e.g. `summarize`, `full-display`). Becomes the URN
+    /// fragment and is preserved verbatim in the rendered URN.
+    pub name: String,
+    /// Payment terms for this tier. Each tier carries its own price
+    /// so the cheap tier and expensive tier render independently.
+    pub payment: PaymentTerms,
+    /// Per-tier usage signals: what the tier permits and prohibits.
+    /// Splits the same way `ContentSignals` does (Some(true) = permit,
+    /// Some(false) = prohibit, None = absent / silent-permissive).
+    pub signals: ContentSignals,
+}
+
+/// Render `(licenses_xml, primary_urn)` for an origin that declares
+/// two or more license tiers.
+///
+/// One `<license>` element is emitted per tier, all inside a single
+/// `<content url="https://<host>/*">` element. Each `<license>` gets
+/// the urn `urn:rsl:1.0:<host>:<version>#<tier-name>`. The returned
+/// `primary_urn` is the un-fragmented form
+/// (`urn:rsl:1.0:<host>:<version>`) so the pipeline's
+/// `rsl_urn` stamping path keeps working unchanged; consumers that
+/// need a specific tier URN read the per-tier fragment off the XML.
+///
+/// `vocab` slots its `user` / `geo` `<permits>`/`<prohibits>` pairs
+/// into every tier's `<license>` body (the user / geo tier vocab is
+/// origin-wide, not per-tier). An empty `tiers` slice falls back to
+/// emitting a single placeholder license; callers should use
+/// [`render_signals_with_vocab`] when no tiers are declared.
+pub fn render_tiered(
+    hostname: &str,
+    tiers: &[LicenseTier],
+    vocab: &RslVocab,
+    config_version: u64,
+) -> (String, String) {
+    let primary_urn = format!("urn:rsl:1.0:{hostname}:{config_version}");
+    let content_url = format!("https://{hostname}/*");
+
+    let mut xml = String::with_capacity(1024);
+    xml.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+    xml.push('\n');
+    xml.push_str(r#"<rsl xmlns="https://rslstandard.org/rsl" version="1.0">"#);
+    xml.push('\n');
+    xml.push_str(&format!(
+        "  <content url=\"{}\">\n",
+        escape_xml_attr(&content_url)
+    ));
+    for tier in tiers {
+        let tier_urn = format!("{primary_urn}#{}", tier.name);
+        xml.push_str(&format!(
+            "    <license urn=\"{}\">\n",
+            escape_xml_attr(&tier_urn)
+        ));
+        xml.push_str(&format!(
+            "      <origin hostname=\"{}\" />\n",
+            escape_xml_attr(hostname)
+        ));
+        xml.push_str(&tier.payment.to_xml());
+        xml.push_str(&render_usage_tier(&tier.signals));
+        if !vocab.user.is_silent() {
+            xml.push_str(&render_tier_pair("user", &vocab.user));
+        }
+        if !vocab.geo.is_silent() {
+            xml.push_str(&render_tier_pair("geo", &vocab.geo));
+        }
+        if let Some(directive) = tier.signals.directive_value() {
+            xml.push_str(&format!(
+                "      <content-signal>{}</content-signal>\n",
+                escape_xml_text(&directive)
+            ));
+        }
+        xml.push_str("    </license>\n");
+    }
+    xml.push_str("  </content>\n");
+    xml.push_str("</rsl>\n");
+
+    (xml, primary_urn)
+}
+
 /// Render `(licenses_xml, urn)` from a structured [`ContentSignals`]
 /// set (WOR-804).
 ///
@@ -788,5 +875,129 @@ mod tests {
                 "render_signals_with_vocab produced <ai-use>; sig={sig:?}, vocab={vocab:?}; xml:\n{xml}"
             );
         }
+    }
+
+    // --- WOR-808 two-license-tier vocabulary ---
+
+    fn tier(name: &str, ptype: &str, amount: f64, currency: &str) -> LicenseTier {
+        LicenseTier {
+            name: name.to_string(),
+            payment: PaymentTerms {
+                payment_type: ptype.to_string(),
+                amount: Some(amount),
+                currency: Some(currency.to_string()),
+                standard: None,
+            },
+            signals: ContentSignals {
+                search: Some(true),
+                ai_input: Some(true),
+                ai_train: None,
+            },
+        }
+    }
+
+    #[test]
+    fn render_tiered_emits_one_license_per_tier_with_distinct_urn_fragments() {
+        let tiers = vec![
+            tier("summarize", "crawl", 0.002, "USD"),
+            tier("full-display", "crawl", 0.010, "USD"),
+        ];
+        let (xml, primary_urn) = render_tiered("shop.example.com", &tiers, &RslVocab::default(), 7);
+        assert_eq!(primary_urn, "urn:rsl:1.0:shop.example.com:7");
+        // One <content> wraps both tiers (a TollBit marketplace can
+        // pick the tier appropriate to the use case from one fetch).
+        assert_eq!(xml.matches("<content ").count(), 1);
+        assert_eq!(xml.matches("<license ").count(), 2);
+        assert!(xml.contains(r#"urn="urn:rsl:1.0:shop.example.com:7#summarize""#));
+        assert!(xml.contains(r#"urn="urn:rsl:1.0:shop.example.com:7#full-display""#));
+        // The two tiers price independently.
+        assert!(xml.contains(r#"amount="0.002""#));
+        assert!(xml.contains(r#"amount="0.01""#));
+    }
+
+    #[test]
+    fn render_tiered_propagates_user_and_geo_vocab_into_each_license() {
+        let tiers = vec![
+            tier("summarize", "crawl", 0.002, "USD"),
+            tier("full-display", "crawl", 0.010, "USD"),
+        ];
+        let vocab = RslVocab {
+            user: TokenTier {
+                permit: vec!["commercial".to_string()],
+                prohibit: vec![],
+            },
+            geo: TokenTier {
+                permit: vec!["US".to_string(), "CA".to_string()],
+                prohibit: vec![],
+            },
+        };
+        let (xml, _) = render_tiered("shop.example.com", &tiers, &vocab, 1);
+        // user + geo vocab is origin-wide; each <license> repeats
+        // them so a tier consumer reads them off its own URN.
+        assert_eq!(
+            xml.matches(r#"<permits type="user">commercial</permits>"#)
+                .count(),
+            2
+        );
+        assert_eq!(
+            xml.matches(r#"<permits type="geo">US CA</permits>"#)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn render_tiered_emits_per_tier_signals_inside_their_own_license() {
+        // The first tier permits ai-input + search; the second adds
+        // ai-train. Both must render inside their own <license> body
+        // so a consumer reading one tier never sees the other tier's
+        // signals.
+        let cheap = LicenseTier {
+            name: "summarize".to_string(),
+            payment: PaymentTerms::free(),
+            signals: ContentSignals {
+                search: Some(true),
+                ai_input: Some(true),
+                ai_train: None,
+            },
+        };
+        let pricey = LicenseTier {
+            name: "full-display".to_string(),
+            payment: PaymentTerms::free(),
+            signals: ContentSignals {
+                search: Some(true),
+                ai_input: Some(true),
+                ai_train: Some(true),
+            },
+        };
+        let (xml, _) = render_tiered("h", &[cheap, pricey], &RslVocab::default(), 1);
+        // Extract the body between the two <license ...> tags. The
+        // first license body is everything up to "</license>"; the
+        // second is everything between the second "<license " and
+        // the final "</license>". A naive split is fine since the
+        // renderer is deterministic.
+        let first_close = xml.find("</license>").expect("first close");
+        let first_body = &xml[..first_close];
+        let after_first = &xml[first_close + "</license>".len()..];
+        let second_open = after_first.find("<license ").expect("second open");
+        let second_body = &after_first[second_open..];
+        assert!(first_body.contains("search ai-input"));
+        assert!(!first_body.contains("ai-train"));
+        assert!(second_body.contains("ai-train"));
+    }
+
+    #[test]
+    fn render_tiered_escapes_xml_metacharacters_in_tier_name() {
+        // Operator misconfigures a tier name with `<` or `"`. The URN
+        // attribute MUST escape those characters so the resulting XML
+        // stays parseable.
+        let t = LicenseTier {
+            name: "weird\"<name>".to_string(),
+            payment: PaymentTerms::free(),
+            signals: ContentSignals::default(),
+        };
+        let (xml, _) = render_tiered("h", &[t], &RslVocab::default(), 1);
+        assert!(!xml.contains("\"<name>"));
+        assert!(xml.contains("weird&quot;&lt;name&gt;"));
     }
 }

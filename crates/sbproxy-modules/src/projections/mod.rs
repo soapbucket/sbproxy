@@ -262,6 +262,79 @@ fn operator_declared_rsl_vocab(ai_crawl: &serde_json::Value) -> licenses::RslVoc
     }
 }
 
+/// WOR-808: read the operator-declared `license_tiers:` block on an
+/// `ai_crawl_control` entry and turn it into a list of
+/// [`licenses::LicenseTier`]. Each tier carries its own
+/// payment + signals; the same `payment.standard` URL slot used by
+/// the single-tier path applies (an attribution payment can still
+/// point at a reuse framework). An absent block or an empty array
+/// returns the empty vec; the caller falls through to single-tier
+/// rendering then.
+///
+/// The key is deliberately `license_tiers:` (not `tiers:`) to avoid
+/// collision with the pre-existing `ai_crawl_control.tiers` block,
+/// which carries per-agent pricing for the pay-per-crawl flow.
+///
+/// Recognised tier shape:
+///
+/// ```yaml
+/// license_tiers:
+///   - name: summarize
+///     payment: { type: crawl, amount: 0.002, currency: USD }
+///     signals: { search: true, ai_input: true }
+///   - name: full-display
+///     payment: { type: crawl, amount: 0.01, currency: USD }
+///     signals: { search: true, ai_input: true, ai_train: false }
+/// ```
+fn operator_declared_license_tiers(ai_crawl: &serde_json::Value) -> Vec<licenses::LicenseTier> {
+    let Some(arr) = ai_crawl.get("license_tiers").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let Some(name) = entry.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        // Payment defaults to free when the tier omits the block.
+        let payment = entry
+            .get("payment")
+            .and_then(|v| v.as_object())
+            .map(|decl| {
+                let ptype = decl
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .filter(|t| VALID_PAYMENT_TYPES.contains(t))
+                    .unwrap_or("free");
+                licenses::PaymentTerms {
+                    payment_type: ptype.to_string(),
+                    amount: decl.get("amount").and_then(|v| v.as_f64()),
+                    currency: decl
+                        .get("currency")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    standard: decl
+                        .get("standard")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                }
+            })
+            .unwrap_or_else(licenses::PaymentTerms::free);
+        let signals: ContentSignals = entry
+            .get("signals")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        out.push(licenses::LicenseTier {
+            name: name.to_string(),
+            payment,
+            signals,
+        });
+    }
+    out
+}
+
 pub mod agent_skills;
 pub mod agents_json;
 pub mod licenses;
@@ -513,7 +586,22 @@ pub fn render_projections_with_listings(
         // configs produce the same `<permits type="usage">`-only
         // shape that the renamed `render_signals` emits.
         let rsl_vocab = operator_declared_rsl_vocab(ai_crawl);
-        let (xml, urn) = if content_signals.is_empty() {
+        // WOR-808: when the operator declares `tiers:` on this
+        // origin, the projection emits one `<license>` per tier
+        // (TollBit summarize vs full-display, etc). Each tier gets
+        // its own `<payment>` so a marketplace can buy the cheap
+        // tier for snippet generation and the expensive tier for
+        // full-page reuse. Falls through to the single-tier path
+        // when no `tiers:` is declared.
+        let license_tiers = operator_declared_license_tiers(ai_crawl);
+        let (xml, urn) = if !license_tiers.is_empty() {
+            licenses::render_tiered(
+                hostname.as_str(),
+                &license_tiers,
+                &rsl_vocab,
+                config_version,
+            )
+        } else if content_signals.is_empty() {
             licenses::render(
                 hostname.as_str(),
                 content_signal.as_deref(),
