@@ -27,6 +27,15 @@ pub enum HkdfPurpose {
     /// from colliding with any other purpose for the same `(seed,
     /// jti)` tuple.
     EmsContentKey,
+    /// WOR-892 PR1: AES-256-GCM key for the OIDC session cookie
+    /// (`__Host-sbproxy_session`). Carries the authenticated user
+    /// subject across requests after a successful login.
+    OidcSessionCookie,
+    /// WOR-892 PR1: AES-256-GCM key for the short-lived OIDC
+    /// transaction cookie (`__Host-sbproxy_oidc_tx`). Carries
+    /// `state` + `nonce` + `pkce_verifier` + `return_to` between
+    /// the auth-code redirect and the callback.
+    OidcTxCookie,
 }
 
 impl HkdfPurpose {
@@ -40,6 +49,8 @@ impl HkdfPurpose {
             HkdfPurpose::Signing => b"sbproxy.hkdf.signing.v1",
             HkdfPurpose::Mac => b"sbproxy.hkdf.mac.v1",
             HkdfPurpose::EmsContentKey => b"sbproxy.hkdf.ems-content-key.v1",
+            HkdfPurpose::OidcSessionCookie => b"sbproxy.hkdf.oidc-session-cookie.v1",
+            HkdfPurpose::OidcTxCookie => b"sbproxy.hkdf.oidc-tx-cookie.v1",
         }
     }
 }
