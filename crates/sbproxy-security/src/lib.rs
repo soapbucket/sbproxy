@@ -5,6 +5,7 @@
 
 #[cfg(feature = "agent-class")]
 pub mod agent_verify;
+pub mod cookie;
 pub mod crypto;
 #[cfg(feature = "tls-fingerprint")]
 pub mod headless_detect;

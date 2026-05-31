@@ -27,6 +27,11 @@ sha2.workspace = true
 hmac.workspace = true
 hex.workspace = true
 url.workspace = true
+# WOR-892 PR1: sealed OIDC session cookies.
+aes-gcm.workspace = true
+ciborium.workspace = true
+base64.workspace = true
+rand.workspace = true
 
 # PII detection & redaction
 regex.workspace = true

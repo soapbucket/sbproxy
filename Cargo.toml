@@ -219,6 +219,13 @@ hmac = "0.13"
 # (RFC-out, weak hash, but the JA3 spec mandates MD5). The `md-5` crate
 # is the RustCrypto family member and matches the `sha2` API.
 md-5 = "0.10"
+# WOR-892 PR1: AES-256-GCM AEAD for sealed OIDC session cookies.
+# RustCrypto family, default features keep it pure-Rust.
+aes-gcm = "0.10"
+# CBOR encoder for the sealed-cookie payload. Smaller wire size than
+# JSON and avoids percent-encoding gymnastics inside the Set-Cookie
+# header value.
+ciborium = "0.2"
 
 # JWT verification (HS*, RS*, ES* etc.).
 jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
