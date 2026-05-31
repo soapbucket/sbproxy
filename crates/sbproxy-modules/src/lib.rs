@@ -11,6 +11,7 @@
 pub mod action;
 pub mod auth;
 pub mod compile;
+pub mod olp;
 pub mod policy;
 pub mod projections;
 pub mod transform;

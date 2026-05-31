@@ -1558,6 +1558,96 @@ pub(super) async fn request_filter(
         }
     }
 
+    // --- WOR-808 PR7: OLP /.well-known/olp/{token,key} ---
+    //
+    // When the origin opts in (`olp.enabled: true`), serve two
+    // well-known endpoints:
+    //
+    // * `GET /.well-known/olp/key` -> JWK Set (RFC 7517) carrying the
+    //   verification public key so external introspectors can verify
+    //   issued license tokens without contacting the issuer.
+    // * `POST /.well-known/olp/token` -> issues a JWS license token
+    //   per RSL 1.0 OLP (`typ: olp-license+jws`, `token_type:
+    //   "License"`). The response body shape mirrors RFC 6749's token
+    //   response: `{"access_token":..., "token_type":"License",
+    //   "expires_in":..., "scope":...}`.
+    //
+    // `/introspect` (RFC 7662) is deferred to PR8 because it requires
+    // a revocation / nonce store. Origins that disable OLP
+    // (`enabled: false` or no `olp:` block) fall through.
+    {
+        let req_path = session.req_header().uri.path();
+        let req_method = session.req_header().method.clone();
+        let is_olp_path =
+            req_path == "/.well-known/olp/key" || req_path == "/.well-known/olp/token";
+        if is_olp_path {
+            let olp_cfg = pipeline.config.origins[origin_idx].olp.as_ref();
+            match olp_cfg {
+                Some(cfg) if cfg.enabled => {
+                    if req_path == "/.well-known/olp/key" {
+                        if req_method != http::Method::GET {
+                            send_error(session, 405, "GET only").await?;
+                            return Ok(true);
+                        }
+                        match build_olp_jwk_set(cfg) {
+                            Ok(body) => {
+                                send_response(
+                                    session,
+                                    200,
+                                    "application/jwk-set+json",
+                                    body.as_bytes(),
+                                )
+                                .await?;
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "olp: failed to build JWK set");
+                                send_error(session, 500, "olp key unavailable").await?;
+                            }
+                        }
+                        return Ok(true);
+                    }
+                    // /.well-known/olp/token
+                    if req_method != http::Method::POST {
+                        send_error(session, 405, "POST only").await?;
+                        return Ok(true);
+                    }
+                    let hostname = pipeline.config.origins[origin_idx].hostname.as_str();
+                    let projections = sbproxy_modules::projections::current_projections();
+                    let license_urn =
+                        projections
+                            .rsl_urns
+                            .get(hostname)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                // No RSL projection on this origin yet;
+                                // synthesise an URN so the token is still
+                                // well-formed. Audit will warn when the
+                                // license_urn does not resolve.
+                                format!("urn:rsl:1.0:{hostname}:0")
+                            });
+                    match issue_olp_token(cfg, hostname, &license_urn) {
+                        Ok(body) => {
+                            send_response(session, 200, "application/json", body.as_bytes())
+                                .await?;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "olp: failed to issue token");
+                            send_error(session, 500, "olp issuance failed").await?;
+                        }
+                    }
+                    return Ok(true);
+                }
+                _ => {
+                    // OLP disabled or absent on this origin: 404 the
+                    // well-known URL rather than letting it fall
+                    // through to the upstream proxy.
+                    send_error(session, 404, "olp not enabled on this origin").await?;
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
     // --- Wave 4 day-5 wire: stamp content_shape_pricing / transform ---
     //
     // When the origin authors `auto_content_negotiate` (synthesised
@@ -2945,4 +3035,88 @@ pub(super) async fn request_filter(
 
     // Continue to upstream_peer for proxy action.
     Ok(false)
+}
+
+// --- WOR-808 PR7: OLP helpers ---
+
+/// Build the JWK Set body for `GET /.well-known/olp/key`. The set
+/// contains one verification key for the configured signing key.
+/// Rotation overlap would push a second key with a different `kid`;
+/// PR1 ships single-key only.
+fn build_olp_jwk_set(cfg: &sbproxy_config::OlpConfig) -> Result<String, String> {
+    let seed = decode_ed25519_seed(&cfg.signing_key)?;
+    let signer = sbproxy_modules::olp::OlpTokenSigner::from_seed_bytes(seed, &cfg.key_id);
+    let jwk = sbproxy_modules::olp::jwk_from_verifying_key(&signer.verifying_key(), &cfg.key_id);
+    let set = sbproxy_modules::olp::OlpJwkSet { keys: vec![jwk] };
+    serde_json::to_string(&set).map_err(|e| format!("jwk set encode failed: {e}"))
+}
+
+/// Issue an OLP license token for `POST /.well-known/olp/token`. The
+/// response body mirrors RFC 6749 §5.1 (`access_token`, `token_type`,
+/// `expires_in`, `scope`) so existing OAuth-style clients consume it.
+/// `token_type` is pinned to RSL 1.0's `License`.
+fn issue_olp_token(
+    cfg: &sbproxy_config::OlpConfig,
+    hostname: &str,
+    license_urn: &str,
+) -> Result<String, String> {
+    let seed = decode_ed25519_seed(&cfg.signing_key)?;
+    let signer = sbproxy_modules::olp::OlpTokenSigner::from_seed_bytes(seed, &cfg.key_id);
+    // PR1 issues an anonymous license tied to the configured default
+    // scope. PR2 will accept a `grant_type` + `client_id` form body
+    // and bind the token to a resolved subject.
+    let req = sbproxy_modules::olp::IssueRequest {
+        sub: "anonymous",
+        aud: hostname,
+        license_urn,
+        scope_override: None,
+        ttl_secs_override: None,
+    };
+    let claims = sbproxy_modules::olp::build_claims(
+        &req,
+        &cfg.issuer,
+        &cfg.default_scope,
+        cfg.default_ttl_secs,
+    );
+    let token = signer
+        .sign(&claims)
+        .map_err(|e| format!("olp sign failed: {e:?}"))?;
+    let body = serde_json::json!({
+        "access_token": token,
+        "token_type": sbproxy_modules::olp::OLP_TOKEN_TYPE,
+        "expires_in": cfg.default_ttl_secs,
+        "scope": claims.scope,
+        "license_urn": claims.license_urn,
+    });
+    serde_json::to_string(&body).map_err(|e| format!("token body encode failed: {e}"))
+}
+
+/// Decode a 32-byte Ed25519 seed from the operator-configured
+/// `signing_key` string. PR1 accepts a 64-char lowercase hex string;
+/// the secret-resolver pass at config-load time substitutes any
+/// `vault://` reference into the raw bytes upstream of this point.
+fn decode_ed25519_seed(s: &str) -> Result<[u8; 32], String> {
+    let trimmed = s.trim();
+    if trimmed.len() != 64 {
+        return Err(format!(
+            "ed25519 signing_key must be 32 bytes hex (64 chars); got {} chars",
+            trimmed.len()
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in trimmed.as_bytes().chunks(2).enumerate() {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(format!("not a hex char: {b:#04x}")),
+    }
 }

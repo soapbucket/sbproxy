@@ -1948,6 +1948,13 @@ pub struct RawOriginConfig {
     /// HTTP message signatures configuration (RFC 9421).
     #[serde(default)]
     pub message_signatures: Option<MessageSignaturesConfig>,
+    /// WOR-808 PR7: RSL Open License Protocol issuer configuration.
+    /// When set, the proxy serves `/.well-known/olp/token` (issuance)
+    /// and `/.well-known/olp/key` (JWK publication) on the origin so
+    /// crawlers following a `WWW-Authenticate: License` challenge can
+    /// obtain and verify license tokens.
+    #[serde(default)]
+    pub olp: Option<OlpConfig>,
     /// RFC 8594-style idempotency-key middleware. Opt in per origin to
     /// have the proxy short-circuit retries of POST/PUT/PATCH (or any
     /// configured method) carrying a repeated `Idempotency-Key`
@@ -4015,4 +4022,53 @@ pub struct MessageSignaturesConfig {
 
 fn default_signature_clock_skew_seconds() -> u64 {
     30
+}
+
+/// WOR-808 PR7: Open License Protocol (OLP) issuer configuration.
+///
+/// When set, the proxy stands up two well-known endpoints on the
+/// origin:
+///
+/// - `POST /.well-known/olp/token` — issues a license token signed
+///   with the configured Ed25519 key, body shaped per RFC 6749
+///   (`access_token` + `token_type: "License"` + `expires_in`).
+/// - `GET /.well-known/olp/key` — publishes the verification JWK
+///   set (RFC 7517) so external introspectors can verify tokens
+///   without contacting the issuer per-token.
+///
+/// `/introspect` (RFC 7662) is deferred to a follow-up PR because
+/// it requires a revocation / nonce store.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct OlpConfig {
+    /// Master toggle. When false the well-known endpoints 404.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Ed25519 signing key, hex-encoded 32-byte seed. Operators
+    /// generate one with `openssl rand -hex 32` or read it from a
+    /// secret store (the `vault://` reference syntax is honoured by
+    /// the secret-resolver pass at config-load time, mirroring how
+    /// other key-material fields work).
+    pub signing_key: String,
+    /// `kid` the JWS header advertises. Rotation appends a new key
+    /// with a new kid and trusts both for the cutover window.
+    pub key_id: String,
+    /// Issuer URL stamped onto issued tokens (typically the proxy's
+    /// public base URL such as `https://api.example.com`).
+    pub issuer: String,
+    /// Default scope token list (space-separated, per RFC 8693
+    /// §2.2.1). Mints with `scope_override == None` use this value.
+    #[serde(default = "default_olp_scope")]
+    pub default_scope: String,
+    /// Default TTL applied to issued tokens (seconds). Mints with
+    /// `ttl_secs_override == None` use this value.
+    #[serde(default = "default_olp_ttl_secs")]
+    pub default_ttl_secs: u64,
+}
+
+fn default_olp_scope() -> String {
+    "ai-input".to_string()
+}
+
+fn default_olp_ttl_secs() -> u64 {
+    3600
 }

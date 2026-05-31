@@ -15,7 +15,7 @@ use smallvec::SmallVec;
 use crate::types::{
     AccessLogConfig, AgentClassesConfig, AgentSkillEntry, AgentsJsonConfig, CompressionConfig,
     CorsConfig, ErrorPageEntry, HstsConfig, IdempotencyConfig, MessageSignaturesConfig,
-    MirrorConfig, OriginRateLimitsConfig, ProblemDetailsConfig, ProxyServerConfig,
+    MirrorConfig, OlpConfig, OriginRateLimitsConfig, ProblemDetailsConfig, ProxyServerConfig,
     ProxyStatusConfig, RequestModifierConfig, ResponseCacheConfig, ResponseModifierConfig,
     SessionConfig,
 };
@@ -95,6 +95,11 @@ pub struct CompiledOrigin {
     /// on every inbound request to this origin ahead of any downstream auth
     /// provider. See [`MessageSignaturesConfig`].
     pub message_signatures: Option<MessageSignaturesConfig>,
+    /// WOR-808 PR7: Open License Protocol (OLP) issuer config. When
+    /// `Some` with `enabled = true`, the data-plane serves
+    /// `/.well-known/olp/token` (issuance) and
+    /// `/.well-known/olp/key` (JWK publication). See [`OlpConfig`].
+    pub olp: Option<OlpConfig>,
     /// RFC 8594-style idempotency middleware configuration. When
     /// `Some` with `enabled = true`, the request body filter buffers
     /// the request body for the configured methods, hashes it, and
