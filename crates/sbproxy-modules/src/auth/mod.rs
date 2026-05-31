@@ -8,6 +8,7 @@ pub mod bot_auth_directory;
 /// Crawler Authorization Protocol (CAP) verifier.
 pub mod cap;
 pub mod jwks;
+pub mod oidc;
 /// Outbound credential resolver (WOR-802): per-upstream RFC 8693 token
 /// exchange, OAuth client-credentials, and vault-resolved secrets.
 pub mod outbound_credential;
@@ -93,6 +94,12 @@ pub enum Auth {
     BotAuth(crate::auth::bot_auth::BotAuthProvider),
     /// Crawler Authorization Protocol (CAP) verifier.
     Cap(crate::auth::cap::CapVerifier),
+    /// OIDC Relying-Party login. Drives the auth-code + PKCE flow,
+    /// validates the ID token, and mints a sealed session cookie.
+    /// WOR-892 PR1 step 2/3 ships the types + helpers; step 3/3
+    /// wires the `/oidc/callback` synthetic endpoint + challenge
+    /// redirect.
+    Oidc(crate::auth::oidc::OidcAuth),
     /// No authentication required.
     Noop,
     /// Third-party plugin (only case using dynamic dispatch).
@@ -111,6 +118,7 @@ impl Auth {
             Self::ForwardAuth(_) => "forward_auth",
             Self::BotAuth(_) => "bot_auth",
             Self::Cap(_) => "cap",
+            Self::Oidc(_) => "oidc",
             Self::Noop => "noop",
             Self::Plugin(p) => p.auth_type(),
         }
@@ -128,6 +136,7 @@ impl std::fmt::Debug for Auth {
             Self::ForwardAuth(a) => f.debug_tuple("ForwardAuth").field(a).finish(),
             Self::BotAuth(a) => f.debug_tuple("BotAuth").field(a).finish(),
             Self::Cap(a) => f.debug_tuple("Cap").field(a).finish(),
+            Self::Oidc(a) => f.debug_tuple("Oidc").field(a).finish(),
             Self::Noop => write!(f, "Noop"),
             Self::Plugin(_) => write!(f, "Plugin(...)"),
         }

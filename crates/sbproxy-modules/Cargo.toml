@@ -73,6 +73,8 @@ sbproxy-extension.workspace = true
 sbproxy-ai.workspace = true
 sbproxy-transport.workspace = true
 sbproxy-security.workspace = true
+# WOR-892 PR1 step 2/3: CBOR encoder for sealed OIDC session cookies.
+ciborium.workspace = true
 sbproxy-cache.workspace = true
 sbproxy-platform.workspace = true
 sbproxy-classifiers.workspace = true

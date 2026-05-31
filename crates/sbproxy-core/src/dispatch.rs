@@ -165,6 +165,13 @@ fn check_auth(auth: &Auth, headers: &http::HeaderMap, uri: &http::Uri) -> bool {
             false
         }
         Auth::Noop => true,
+        Auth::Oidc(_) => {
+            // WOR-892 PR1 step 2/3: OIDC requires the H1 / H2 request
+            // pipeline for the auth-code redirect + cookie round-trip.
+            // H3 dispatch denies until the wiring lands.
+            warn!("H3: oidc auth not supported in H3 dispatch; denying request");
+            false
+        }
         Auth::Plugin(_) => {
             // Plugin auth not supported in H3 dispatch; fail closed for safety.
             warn!("H3: plugin auth not supported in H3 dispatch; denying request");
