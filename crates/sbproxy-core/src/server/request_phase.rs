@@ -1558,22 +1558,20 @@ pub(super) async fn request_filter(
         }
     }
 
-    // --- WOR-892 PR1 step 3/3: OIDC /oidc/callback ---
+    // --- WOR-892 PR2: OIDC /oidc/callback ---
     //
     // The browser hits this path after the IdP redirects back from
     // the authorization endpoint. Intercept BEFORE the normal auth
     // check so the request does not loop on `oidc_check` returning
     // yet another IdP redirect.
-    //
-    // WOR-892 PR1 step 3/3 ships only the loop-breaker stub: the
-    // path is recognised, the tx cookie is read for observability,
-    // and the handler returns 501 with a structured error pointing
-    // at the follow-up PR. WOR-892 PR2 ships the actual token-
-    // endpoint POST + ID-token validation + session-cookie minting.
     {
         let req_path = session.req_header().uri.path();
-        let auth_cfg = pipeline.config.origins[origin_idx].auth_config.as_ref();
-        let is_oidc_callback = auth_cfg
+        let auth_cfg_value = pipeline.config.origins[origin_idx]
+            .auth_config
+            .as_ref()
+            .cloned();
+        let is_oidc_callback = auth_cfg_value
+            .as_ref()
             .and_then(|c| c.as_object())
             .filter(|c| c.get("type").and_then(|v| v.as_str()) == Some("oidc"))
             .map(|c| {
@@ -1584,12 +1582,16 @@ pub(super) async fn request_filter(
             .map(|p| p == req_path)
             .unwrap_or(false);
         if is_oidc_callback {
-            warn!(
-                "oidc callback received but token-exchange wiring lands in WOR-892 PR2; \
-                 returning 501 to break the redirect loop"
-            );
-            let body = br#"{"error":"not_implemented","error_description":"oidc callback token-endpoint exchange + ID-token validation ship in WOR-892 PR2"}"#;
-            send_response(session, 501, "application/json", body).await?;
+            let cfg_json = auth_cfg_value.expect("oidc callback gated on auth_config Some");
+            let oidc_cfg = match sbproxy_modules::auth::oidc::OidcAuth::from_config(cfg_json) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, "oidc callback: bad config");
+                    send_error(session, 500, "oidc misconfigured").await?;
+                    return Ok(true);
+                }
+            };
+            handle_oidc_callback(session, &oidc_cfg).await?;
             return Ok(true);
         }
     }
@@ -3833,6 +3835,305 @@ fn decode_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
         out.push((hi << 4) | lo);
     }
     Ok(out)
+}
+
+// --- WOR-892 PR2: OIDC callback handler ---
+
+/// Handle a `POST` (some IdPs) or `GET` (most IdPs) to the operator-
+/// configured `redirect_path`. Exchanges the IdP-supplied auth code
+/// for an ID token, validates the token, mints a sealed session
+/// cookie, and 302s to the original return URL.
+///
+/// All wire-shaped outcomes return `Ok`; the caller has already
+/// returned `true` to the pipeline. Errors map to 4xx/5xx responses
+/// in line with the OIDC Core 1.0 §3.1.2.7 step list.
+async fn handle_oidc_callback(
+    session: &mut pingora_proxy::Session,
+    cfg: &sbproxy_modules::auth::oidc::OidcAuth,
+) -> Result<()> {
+    use sbproxy_modules::auth::oidc::{callback, session as oidc_session};
+
+    // --- parse query + cookie ---
+    let query = session.req_header().uri.query().unwrap_or("");
+    let mut code: Option<String> = None;
+    let mut state_q: Option<String> = None;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            match k {
+                "code" => code = Some(decode_form_component(v)),
+                "state" => state_q = Some(decode_form_component(v)),
+                _ => {}
+            }
+        }
+    }
+    let code = match code {
+        Some(c) if !c.is_empty() => c,
+        _ => {
+            send_response(
+                session,
+                400,
+                "application/json",
+                br#"{"error":"invalid_request","error_description":"code query parameter is required"}"#,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let state_q = state_q.unwrap_or_default();
+
+    let tx_cookie_value = read_request_cookie(session, &cfg.tx_cookie_name);
+    let tx_cookie = match tx_cookie_value {
+        Some(c) => c,
+        None => {
+            send_response(
+                session,
+                400,
+                "application/json",
+                br#"{"error":"invalid_request","error_description":"oidc tx cookie missing; restart the login"}"#,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let tx_claims = match oidc_session::open_tx(&tx_cookie, cfg.cookie_secret.as_bytes(), now) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "oidc callback: tx cookie open failed");
+            send_response(
+                session,
+                400,
+                "application/json",
+                br#"{"error":"invalid_request","error_description":"oidc tx cookie invalid or expired"}"#,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    // --- state CSRF check ---
+    // Constant-time-ish: equal-length check + byte-wise XOR.
+    if tx_claims.state.len() != state_q.len() || state_q.is_empty() {
+        warn!("oidc callback: state mismatch (length)");
+        send_response(
+            session,
+            400,
+            "application/json",
+            br#"{"error":"invalid_request","error_description":"state mismatch"}"#,
+        )
+        .await?;
+        return Ok(());
+    }
+    let mut diff: u8 = 0;
+    for (a, b) in tx_claims.state.bytes().zip(state_q.bytes()) {
+        diff |= a ^ b;
+    }
+    if diff != 0 {
+        warn!("oidc callback: state mismatch");
+        send_response(
+            session,
+            400,
+            "application/json",
+            br#"{"error":"invalid_request","error_description":"state mismatch"}"#,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // --- compute redirect_uri identical to challenge time ---
+    let host = session
+        .req_header()
+        .headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let redirect_uri = format!("https://{host}{}", cfg.redirect_path);
+
+    // --- POST to the IdP token endpoint (async reqwest, in-context) ---
+    let form =
+        callback::build_token_exchange_form(cfg, &redirect_uri, &code, &tx_claims.pkce_verifier);
+    let async_client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "oidc callback: reqwest client build failed");
+            send_error(session, 500, "internal").await?;
+            return Ok(());
+        }
+    };
+    let token_response = async_client
+        .post(&cfg.token_endpoint)
+        .basic_auth(&cfg.client_id, Some(&cfg.client_secret))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(form)
+        .send()
+        .await;
+    let body = match token_response {
+        Ok(resp) if resp.status().is_success() => match resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "oidc callback: token response body read failed");
+                send_error(session, 502, "oidc token endpoint failed").await?;
+                return Ok(());
+            }
+        },
+        Ok(resp) => {
+            warn!(status = %resp.status(), "oidc callback: token endpoint non-2xx");
+            send_error(session, 502, "oidc token endpoint failed").await?;
+            return Ok(());
+        }
+        Err(e) => {
+            warn!(error = %e, "oidc callback: token endpoint POST failed");
+            send_error(session, 502, "oidc token endpoint failed").await?;
+            return Ok(());
+        }
+    };
+    let id_token = match parse_id_token_from_response(&body) {
+        Some(t) => t,
+        None => {
+            warn!("oidc callback: token response missing id_token");
+            send_error(session, 502, "oidc response invalid").await?;
+            return Ok(());
+        }
+    };
+
+    // --- verify ID-token signature via JwksCache ---
+    let jwks_url = cfg.jwks_uri.clone();
+    let id_token_for_verify = id_token.clone();
+    let expected_iss = cfg.issuer.clone();
+    let claims_value: anyhow::Result<serde_json::Value> = tokio::task::spawn_blocking(move || {
+        let cache = sbproxy_modules::auth::jwks::get_or_init_cache(
+            &jwks_url,
+            sbproxy_modules::auth::jwks::DEFAULT_REFRESH_SECS,
+        );
+        let header = jsonwebtoken::decode_header(&id_token_for_verify)
+            .map_err(|e| anyhow::anyhow!("decode header failed: {e}"))?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        let decoding_key = cache
+            .lookup_decoding_key_with_unknown_kid_refresh(header.kid.as_deref(), &client)
+            .ok_or_else(|| anyhow::anyhow!("no decoding key for kid {:?}", header.kid))?;
+        let mut validation = jsonwebtoken::Validation::new(header.alg);
+        // We do aud + nonce ourselves via the sbproxy_modules helper
+        // (aud can be a string or array; our helper tolerates both);
+        // ask jsonwebtoken to skip its own aud check so a multi-aud
+        // token is not rejected here. iss check stays in
+        // jsonwebtoken so the signature verify and iss pin happen
+        // together.
+        validation.validate_aud = false;
+        validation.set_issuer(&[&expected_iss]);
+        let data = jsonwebtoken::decode::<serde_json::Value>(
+            &id_token_for_verify,
+            &decoding_key,
+            &validation,
+        )
+        .map_err(|e| anyhow::anyhow!("id token verify failed: {e}"))?;
+        Ok(data.claims)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("spawn_blocking join failed: {e}"))
+    .and_then(|inner| inner);
+    let claims_value = match claims_value {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "oidc callback: id token signature verify failed");
+            send_error(session, 401, "id token invalid").await?;
+            return Ok(());
+        }
+    };
+
+    // --- validate ID-token claims (iss / aud / exp / nonce) ---
+    let id_claims: callback::IdTokenClaims = match serde_json::from_value(claims_value) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "oidc callback: id token claim shape invalid");
+            send_error(session, 401, "id token claims invalid").await?;
+            return Ok(());
+        }
+    };
+    if let Err(e) = callback::validate_id_token_claims(
+        &id_claims,
+        &cfg.issuer,
+        &cfg.client_id,
+        &tx_claims.nonce,
+        now,
+    ) {
+        warn!(error = %e, "oidc callback: id token claims rejected");
+        send_error(session, 401, "id token claims invalid").await?;
+        return Ok(());
+    }
+
+    // --- mint the session cookie ---
+    let session_claims = oidc_session::SessionClaims {
+        sub: id_claims.sub.clone(),
+        iss: id_claims.iss.clone(),
+        aud: cfg.client_id.clone(),
+        iat: now,
+        exp: now + cfg.session_ttl_secs,
+    };
+    let sealed_session =
+        match oidc_session::seal_session(&session_claims, cfg.cookie_secret.as_bytes()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "oidc callback: session seal failed");
+                send_error(session, 500, "session seal failed").await?;
+                return Ok(());
+            }
+        };
+
+    // --- 302 to return_to with Set-Cookie session + tx=deleted ---
+    let session_cookie = format!(
+        "{}={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={}",
+        cfg.session_cookie_name, sealed_session, cfg.session_ttl_secs
+    );
+    let tx_delete_cookie = format!(
+        "{}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0",
+        cfg.tx_cookie_name
+    );
+    let mut header = pingora_http::ResponseHeader::build(302, None)?;
+    header.insert_header("location", tx_claims.return_to.clone())?;
+    header.append_header("set-cookie", session_cookie)?;
+    header.append_header("set-cookie", tx_delete_cookie)?;
+    header.insert_header("content-length", "0")?;
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(bytes::Bytes::new()), true)
+        .await?;
+    Ok(())
+}
+
+/// Read a cookie value out of the request's `Cookie` header. Returns
+/// the first matching `name=value` pair; multiple cookies with the
+/// same name are not permitted by RFC 6265 so taking the first is
+/// safe.
+fn read_request_cookie(session: &pingora_proxy::Session, name: &str) -> Option<String> {
+    let raw = session
+        .req_header()
+        .headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())?;
+    let needle = format!("{name}=");
+    for pair in raw.split(';') {
+        let trimmed = pair.trim();
+        if let Some(rest) = trimmed.strip_prefix(&needle) {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
+/// Extract `id_token` from an RFC 6749 §5.1 token response body.
+fn parse_id_token_from_response(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("id_token").and_then(|t| t.as_str()).map(String::from)
 }
 
 #[cfg(test)]

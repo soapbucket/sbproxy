@@ -5993,6 +5993,7 @@ dependencies = [
  "include_dir",
  "inventory",
  "ipnetwork",
+ "jsonwebtoken",
  "loom",
  "notify",
  "pingora-core",

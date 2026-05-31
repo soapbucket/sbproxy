@@ -134,6 +134,8 @@ regex.workspace = true
 # HTTP client (for AI proxy forwarding)
 reqwest.workspace = true
 futures.workspace = true
+# WOR-892 PR2: ID-token signature verification on /oidc/callback.
+jsonwebtoken.workspace = true
 
 # UUID generation (for session cookies)
 uuid.workspace = true
