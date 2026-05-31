@@ -1830,6 +1830,18 @@ async fn check_auth(
             }
         }
         Auth::Noop => AuthResult::allow_anonymous(),
+        Auth::Oidc(_) => {
+            // WOR-892 PR1 step 2/3: the OIDC auth provider's config
+            // is wired, but the request-time auth-code / callback
+            // flow (step 3/3) is not yet plumbed through. Until that
+            // lands, requests against an OIDC-protected origin deny
+            // 401 with a placeholder body so misconfiguration is
+            // surfaced loudly rather than silently allowing.
+            AuthResult::Deny(
+                401,
+                "oidc auth wiring lands in WOR-892 PR1 step 3/3".to_string(),
+            )
+        }
         Auth::Plugin(provider) => {
             // Build a synthetic http::Request the provider can read
             // method / target-uri / headers from. We deliberately pass

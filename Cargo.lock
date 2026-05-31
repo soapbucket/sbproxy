@@ -6180,6 +6180,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "ciborium",
  "compact_str",
  "dashmap",
  "ed25519-dalek",
