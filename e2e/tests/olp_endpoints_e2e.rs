@@ -258,6 +258,109 @@ origins:
     assert_eq!(raw.len(), 32);
 }
 
+/// Decode an OLP JWS payload (the middle compact segment) so a test
+/// can assert claim fields without the verifier ceremony.
+fn decode_jws_payload(token: &str) -> serde_json::Value {
+    let payload_b64 = token.split('.').nth(1).expect("middle segment");
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64.as_bytes())
+        .expect("payload b64");
+    serde_json::from_slice(&bytes).expect("payload JSON")
+}
+
+#[test]
+fn token_endpoint_binds_subject_from_form_body_client_id() {
+    // RFC 6749 §4.4 client_credentials grant: the resolved client_id
+    // becomes the issued token's `sub` claim. Pins that the form
+    // path actually rebinds away from the legacy anonymous default.
+    let harness = ProxyHarness::start_with_yaml(&olp_config()).expect("start");
+    let resp = harness
+        .post_bytes(
+            "/.well-known/olp/token",
+            "olp.localhost",
+            "application/x-www-form-urlencoded",
+            b"grant_type=client_credentials&client_id=acme-publisher".to_vec(),
+            &[],
+        )
+        .expect("POST token");
+    assert_eq!(resp.status, 200);
+    let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("body");
+    let token = body["access_token"].as_str().expect("token");
+    let payload = decode_jws_payload(token);
+    assert_eq!(payload["sub"], "acme-publisher");
+}
+
+#[test]
+fn token_endpoint_rejects_form_body_missing_grant_type() {
+    let harness = ProxyHarness::start_with_yaml(&olp_config()).expect("start");
+    let resp = harness
+        .post_bytes(
+            "/.well-known/olp/token",
+            "olp.localhost",
+            "application/x-www-form-urlencoded",
+            b"client_id=acme".to_vec(),
+            &[],
+        )
+        .expect("POST token");
+    assert_eq!(resp.status, 400);
+    let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("error body");
+    assert_eq!(body["error"], "invalid_request");
+}
+
+#[test]
+fn token_endpoint_rejects_form_body_with_unsupported_grant_type() {
+    let harness = ProxyHarness::start_with_yaml(&olp_config()).expect("start");
+    let resp = harness
+        .post_bytes(
+            "/.well-known/olp/token",
+            "olp.localhost",
+            "application/x-www-form-urlencoded",
+            b"grant_type=password&client_id=acme".to_vec(),
+            &[],
+        )
+        .expect("POST token");
+    assert_eq!(resp.status, 400);
+    let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("error body");
+    assert_eq!(body["error"], "unsupported_grant_type");
+}
+
+#[test]
+fn token_endpoint_rejects_form_body_with_blank_client_id() {
+    let harness = ProxyHarness::start_with_yaml(&olp_config()).expect("start");
+    let resp = harness
+        .post_bytes(
+            "/.well-known/olp/token",
+            "olp.localhost",
+            "application/x-www-form-urlencoded",
+            b"grant_type=client_credentials&client_id=".to_vec(),
+            &[],
+        )
+        .expect("POST token");
+    assert_eq!(resp.status, 400);
+    let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("error body");
+    assert_eq!(body["error"], "invalid_request");
+}
+
+#[test]
+fn token_endpoint_keeps_anonymous_subject_on_non_form_post() {
+    // Backward compat: existing automation that POSTs an empty JSON
+    // body keeps minting tokens, and they still carry sub=anonymous.
+    let harness = ProxyHarness::start_with_yaml(&olp_config()).expect("start");
+    let resp = harness
+        .post_json(
+            "/.well-known/olp/token",
+            "olp.localhost",
+            &serde_json::json!({}),
+            &[],
+        )
+        .expect("POST token");
+    assert_eq!(resp.status, 200);
+    let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("body");
+    let token = body["access_token"].as_str().expect("token");
+    let payload = decode_jws_payload(token);
+    assert_eq!(payload["sub"], "anonymous");
+}
+
 #[test]
 fn well_known_olp_404s_when_origin_has_no_olp_block() {
     // Origin without an olp: block must 404 the well-known paths
