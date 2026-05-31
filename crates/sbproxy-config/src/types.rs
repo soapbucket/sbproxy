@@ -1245,6 +1245,14 @@ pub struct AdminConfig {
     /// Defaults to 1000.
     #[serde(default = "default_max_log")]
     pub max_log_entries: usize,
+    /// WOR-800 PR5: filesystem path to a redb file that persists the
+    /// prompt-store runtime overlay. When set, every successful
+    /// `POST /admin/prompts/.../versions` and `PUT /admin/prompts/.../pin`
+    /// also writes through to the file, and the file's existing
+    /// contents are hydrated into the in-memory overlay at boot.
+    /// Absent means PR3-style ephemeral mutations.
+    #[serde(default)]
+    pub prompt_persistence_path: Option<std::path::PathBuf>,
 }
 
 fn default_admin_port() -> u16 {
