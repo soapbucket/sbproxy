@@ -1972,7 +1972,26 @@ pub(super) async fn request_filter(
                         ctx,
                         session,
                     );
-                    send_error_with_extra_headers(session, status, msg, extra_headers).await?;
+                    // WOR-808: when OLP is enabled on this origin
+                    // AND the auth challenge is a `License` scheme,
+                    // augment `WWW-Authenticate` with `realm=...` +
+                    // `token_url="https://<host>/.well-known/olp/token"`
+                    // so the client auto-discovers the issuer
+                    // endpoint instead of guessing. RFC 6750 §3
+                    // syntax. Other auth providers' headers
+                    // (Digest, Basic, etc.) pass through
+                    // unchanged.
+                    let augmented = augment_license_challenge(
+                        extra_headers,
+                        origin.olp.as_ref(),
+                        origin.hostname.as_str(),
+                        session
+                            .req_header()
+                            .headers
+                            .get("host")
+                            .and_then(|v| v.to_str().ok()),
+                    );
+                    send_error_with_extra_headers(session, status, msg, &augmented).await?;
                     return Ok(true);
                 }
                 AuthResult::DigestChallenge(challenge) => {
@@ -3137,6 +3156,80 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
 /// of at least 32 bytes (HKDF will widen / narrow as needed). Reject
 /// anything shorter so the operator does not accidentally configure
 /// a key with less entropy than a single AES-256 block.
+/// WOR-808: augment a `WWW-Authenticate: License` challenge with
+/// `realm=` + `token_url=` parameters per RFC 6750 §3 syntax so the
+/// CAP client auto-discovers the OLP issuer endpoint.
+///
+/// Returns a fresh header vec; non-License headers (and origins
+/// without OLP enabled) pass through unchanged. The added params:
+///
+/// * `realm="<hostname>"` — the protected resource identifier.
+/// * `token_url="<scheme>://<host>/.well-known/olp/token"` — the
+///   POST endpoint shipped in #336. Scheme is derived from the
+///   request's `host` header convention: `https` when the host
+///   header carries a port (`api.example.com:8443`) we still use
+///   `https` to match the OLP issuer URL in cfg; HTTP-only
+///   deployments live behind an opaque proxy where the public URL
+///   already comes from the operator's `olp.issuer` config, which
+///   we surface verbatim when present.
+pub(crate) fn augment_license_challenge(
+    extra_headers: &[(String, String)],
+    olp: Option<&sbproxy_config::OlpConfig>,
+    fallback_hostname: &str,
+    host: Option<&str>,
+) -> Vec<(String, String)> {
+    let olp = match olp {
+        Some(cfg) if cfg.enabled => cfg,
+        _ => return extra_headers.to_vec(),
+    };
+    let token_url = format!("{}/.well-known/olp/token", olp.issuer.trim_end_matches('/'));
+    let realm = host.unwrap_or(fallback_hostname);
+    extra_headers
+        .iter()
+        .map(|(name, value)| {
+            if name.eq_ignore_ascii_case("WWW-Authenticate") && value.starts_with("License") {
+                // Avoid clobbering an existing `error=` param.
+                // RFC 6750 §3 ordering: scheme, params in any
+                // order; concatenate ours after the existing
+                // value with a separator.
+                let augmented = if value == "License" {
+                    format!(
+                        "License realm=\"{}\", token_url=\"{}\"",
+                        escape_quoted_string(realm),
+                        escape_quoted_string(&token_url)
+                    )
+                } else {
+                    format!(
+                        "{}, realm=\"{}\", token_url=\"{}\"",
+                        value,
+                        escape_quoted_string(realm),
+                        escape_quoted_string(&token_url)
+                    )
+                };
+                (name.clone(), augmented)
+            } else {
+                (name.clone(), value.clone())
+            }
+        })
+        .collect()
+}
+
+/// Escape `"` and `\` per RFC 7230 §3.2.6 quoted-string syntax so
+/// the appended params parse correctly.
+fn escape_quoted_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn decode_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
     let trimmed = s.trim();
     if trimmed.len() < 64 || !trimmed.len().is_multiple_of(2) {
@@ -3152,4 +3245,122 @@ fn decode_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
         out.push((hi << 4) | lo);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod challenge_tests {
+    use super::*;
+    use sbproxy_config::OlpConfig;
+
+    fn olp_cfg(enabled: bool, issuer: &str) -> OlpConfig {
+        OlpConfig {
+            enabled,
+            signing_key: "00".repeat(32),
+            key_id: "test-kid".into(),
+            issuer: issuer.into(),
+            default_scope: "ai-input".into(),
+            default_ttl_secs: 60,
+            content_key_seed: None,
+        }
+    }
+
+    #[test]
+    fn augment_adds_realm_and_token_url_to_bare_license_challenge() {
+        let cfg = olp_cfg(true, "https://api.example.com");
+        let extra = vec![("WWW-Authenticate".to_string(), "License".to_string())];
+        let out = augment_license_challenge(
+            &extra,
+            Some(&cfg),
+            "api.example.com",
+            Some("api.example.com:443"),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "WWW-Authenticate");
+        assert!(out[0].1.starts_with("License realm=\""));
+        assert!(out[0]
+            .1
+            .contains("token_url=\"https://api.example.com/.well-known/olp/token\""));
+        assert!(out[0].1.contains("realm=\"api.example.com:443\""));
+    }
+
+    #[test]
+    fn augment_preserves_error_param_on_invalid_challenge() {
+        // CAP's invalid-token challenge looks like `License
+        // error="invalid_token"`; augmenting must keep the error
+        // param visible and append realm + token_url.
+        let cfg = olp_cfg(true, "https://api.example.com");
+        let extra = vec![(
+            "WWW-Authenticate".to_string(),
+            "License error=\"invalid_token\"".to_string(),
+        )];
+        let out = augment_license_challenge(
+            &extra,
+            Some(&cfg),
+            "api.example.com",
+            Some("api.example.com"),
+        );
+        assert!(out[0].1.contains("error=\"invalid_token\""));
+        assert!(out[0].1.contains("realm=\"api.example.com\""));
+        assert!(out[0].1.contains("token_url=\""));
+    }
+
+    #[test]
+    fn augment_no_op_when_olp_disabled() {
+        let cfg = olp_cfg(false, "https://api.example.com");
+        let extra = vec![("WWW-Authenticate".to_string(), "License".to_string())];
+        let out = augment_license_challenge(
+            &extra,
+            Some(&cfg),
+            "api.example.com",
+            Some("api.example.com"),
+        );
+        assert_eq!(out, extra);
+    }
+
+    #[test]
+    fn augment_no_op_when_olp_absent() {
+        let extra = vec![("WWW-Authenticate".to_string(), "License".to_string())];
+        let out =
+            augment_license_challenge(&extra, None, "api.example.com", Some("api.example.com"));
+        assert_eq!(out, extra);
+    }
+
+    #[test]
+    fn augment_passes_through_non_license_headers() {
+        // A Digest or Basic challenge on the same origin must NOT
+        // grow OLP params (those are License-scheme specific).
+        let cfg = olp_cfg(true, "https://api.example.com");
+        let extra = vec![
+            (
+                "WWW-Authenticate".to_string(),
+                "Basic realm=\"x\"".to_string(),
+            ),
+            ("X-Custom".to_string(), "value".to_string()),
+        ];
+        let out = augment_license_challenge(
+            &extra,
+            Some(&cfg),
+            "api.example.com",
+            Some("api.example.com"),
+        );
+        assert_eq!(out, extra);
+    }
+
+    #[test]
+    fn augment_falls_back_to_origin_hostname_when_no_host_header() {
+        let cfg = olp_cfg(true, "https://api.example.com");
+        let extra = vec![("WWW-Authenticate".to_string(), "License".to_string())];
+        let out = augment_license_challenge(&extra, Some(&cfg), "api.example.com", None);
+        assert!(out[0].1.contains("realm=\"api.example.com\""));
+    }
+
+    #[test]
+    fn augment_escapes_quotes_and_backslashes_in_realm() {
+        // RFC 7230 §3.2.6 quoted-string: " and \ MUST be escaped.
+        let cfg = olp_cfg(true, "https://api.example.com");
+        let extra = vec![("WWW-Authenticate".to_string(), "License".to_string())];
+        let out =
+            augment_license_challenge(&extra, Some(&cfg), "api.example.com", Some("ev\"il\\host"));
+        assert!(out[0].1.contains(r#"realm="ev\"il\\host""#));
+    }
 }
