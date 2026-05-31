@@ -3280,9 +3280,10 @@ fn revocation_store_registry() -> &'static std::sync::Mutex<
 }
 
 /// Look up (or lazily create) the revocation-store instance for
-/// `audience` per the operator-declared backend. Returns `None` when
-/// the configured backend is not yet supported (PR10 / PR11 fill
-/// these in).
+/// `audience` per the operator-declared backend. WOR-808 PR10 wires
+/// the redb backend. PR11 wires Redis. Returns `None` when the
+/// backend file / connection cannot be opened so the handler can
+/// surface a 503 instead of silently allowing every token through.
 fn get_or_init_revocation_store(
     audience: &str,
     cfg: &sbproxy_config::OlpRevocationStoreConfig,
@@ -3304,16 +3305,124 @@ fn get_or_init_revocation_store(
         sbproxy_config::OlpRevocationStoreConfig::Memory => {
             std::sync::Arc::new(sbproxy_platform::storage::MemoryKVStore::new(64 * 1024))
         }
-        // PR10 + PR11 wire redb + redis. For now the operator gets a
-        // structured warn! in the handler and the endpoint reports
-        // 503 so they can detect the misconfiguration.
-        sbproxy_config::OlpRevocationStoreConfig::Redb { .. }
-        | sbproxy_config::OlpRevocationStoreConfig::Redis { .. } => {
+        sbproxy_config::OlpRevocationStoreConfig::Redb { path } => {
+            // WOR-808 PR10: open the operator-declared redb file.
+            // RedbKVStore wants a &str; surface a None on the open
+            // error so the handler returns 503 rather than crashing.
+            let path_str = path.to_str()?;
+            match sbproxy_platform::storage::RedbKVStore::new(path_str) {
+                Ok(s) => std::sync::Arc::new(s),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        path = %path.display(),
+                        "olp revocation: failed to open redb file"
+                    );
+                    return None;
+                }
+            }
+        }
+        // PR11 wires Redis. For now the operator gets a 503 so
+        // misconfiguration is loud.
+        sbproxy_config::OlpRevocationStoreConfig::Redis { .. } => {
             return None;
         }
     };
     reg.insert(key, new_store.clone());
     Some(new_store)
+}
+
+/// WOR-808 PR10: per-IP token-bucket rate limiter for the
+/// `active: false` path on `/.well-known/olp/introspect`. RFC 7662
+/// §2.1 calls out token-scanning attacks against introspect
+/// endpoints; a per-IP cap on inactive responses denies the
+/// scanner the oracle without blocking legitimate RPs (who hit
+/// the active path on their own tokens).
+///
+/// Bucket: 60 tokens, refill 60/minute (one per second). A scanner
+/// firing >60 inactive lookups per minute from one IP gets 429'd;
+/// burst up to 60 is allowed. Per-origin instance so multi-tenant
+/// deployments cannot cross-contaminate.
+struct IntrospectRateLimiter {
+    buckets: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, IntrospectBucket>>,
+}
+
+struct IntrospectBucket {
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
+
+/// Maximum burst of `active:false` responses per source IP before
+/// the limiter trips. The same value sets the steady-state cap:
+/// the bucket refills at `INTROSPECT_CAPACITY / 60` tokens per
+/// second so a sustained scanner sees roughly one allowed inactive
+/// per second.
+const INTROSPECT_CAPACITY: f64 = 60.0;
+
+/// Refill rate, tokens per second. Tied to `INTROSPECT_CAPACITY`
+/// for the one-per-second cadence above.
+const INTROSPECT_REFILL_PER_SEC: f64 = INTROSPECT_CAPACITY / 60.0;
+
+impl IntrospectRateLimiter {
+    fn new() -> Self {
+        Self {
+            buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Returns `true` when the IP is within budget. Consumes one
+    /// token; refills on the wall clock since the last call.
+    fn check_and_consume(&self, ip: std::net::IpAddr) -> bool {
+        let now = std::time::Instant::now();
+        let mut buckets = match self.buckets.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let bucket = buckets.entry(ip).or_insert(IntrospectBucket {
+            tokens: INTROSPECT_CAPACITY,
+            last_refill: now,
+        });
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens =
+            (bucket.tokens + elapsed * INTROSPECT_REFILL_PER_SEC).min(INTROSPECT_CAPACITY);
+        bucket.last_refill = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn introspect_rate_limiter() -> &'static IntrospectRateLimiter {
+    static L: std::sync::OnceLock<IntrospectRateLimiter> = std::sync::OnceLock::new();
+    L.get_or_init(IntrospectRateLimiter::new)
+}
+
+/// Extract the client IP from the session. Honours
+/// `X-Forwarded-For` first (left-most) and falls back to the
+/// connection-level remote addr. The CIDR-trusted-proxy check is
+/// not enforced here because the introspect endpoint is operator-
+/// scoped; an attacker who could spoof XFF would already be on the
+/// trusted segment.
+fn introspect_client_ip(session: &pingora_proxy::Session) -> Option<std::net::IpAddr> {
+    if let Some(xff) = session
+        .req_header()
+        .headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(first) = xff.split(',').next() {
+            if let Ok(ip) = first.trim().parse::<std::net::IpAddr>() {
+                return Some(ip);
+            }
+        }
+    }
+    session
+        .client_addr()
+        .and_then(|a| a.as_inet())
+        .map(|s| s.ip())
 }
 
 /// Single-pass handler for `POST /.well-known/olp/introspect` (RFC
@@ -3478,6 +3587,27 @@ async fn handle_olp_introspect_or_revoke(
             return Ok(());
         }
     };
+    // WOR-808 PR10: rate-limit `active:false` responses per source
+    // IP. RFC 7662 §2.1 calls out token-scanning attacks; this is
+    // the scan-defence belt-and-suspenders that complements the
+    // mandatory caller-auth check above. Only inactive responses
+    // are limited so a legitimate RP introspecting its own valid
+    // tokens never hits the cap.
+    if !response.active {
+        if let Some(ip) = introspect_client_ip(session) {
+            if !introspect_rate_limiter().check_and_consume(ip) {
+                warn!(client_ip = %ip, "olp introspect: rate limit tripped on active:false");
+                send_response(
+                    session,
+                    429,
+                    "application/json",
+                    br#"{"error":"too_many_requests","error_description":"introspect inactive-response rate limit"}"#,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
     let body = serde_json::to_vec(&response).unwrap_or_else(|_| br#"{"active":false}"#.to_vec());
     send_response(session, 200, "application/json", &body).await?;
     Ok(())
