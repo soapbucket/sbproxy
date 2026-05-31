@@ -1,0 +1,40 @@
+# WOR-808 two-license-tier fixture: a single origin declares
+# two licensed tiers (summarize vs full-display) so the
+# /licenses.xml projection emits two <license> elements under one
+# <content>, each with its own price and URN fragment.
+#
+# The TollBit marketplace model: a buyer picks the cheap tier for
+# snippet generation and the expensive tier for full-page reuse.
+
+proxy:
+  http_bind_port: 0  # overridden by the harness
+
+origins:
+  "tiered.localhost":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/html
+      body: "<h1>tiered article</h1>"
+    policies:
+      - type: ai_crawl_control
+        currency: USD
+        price: 0.001
+        license_tiers:
+          - name: summarize
+            payment:
+              type: crawl
+              amount: 0.002
+              currency: USD
+            signals:
+              search: true
+              ai_input: true
+          - name: full-display
+            payment:
+              type: crawl
+              amount: 0.01
+              currency: USD
+            signals:
+              search: true
+              ai_input: true
+              ai_train: true
