@@ -176,7 +176,7 @@ wasmtime = { version = "44.0.1", default-features = false, features = ["cranelif
 wasi-common = "44"
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
 
 # gRPC for the classifier sidecar (WOR-704). The proxy speaks one
 # InferenceService contract to either the minimal OSS sidecar or the
