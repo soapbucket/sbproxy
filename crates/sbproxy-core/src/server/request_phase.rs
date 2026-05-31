@@ -3065,12 +3065,23 @@ fn issue_olp_token(
     // PR1 issues an anonymous license tied to the configured default
     // scope. PR2 will accept a `grant_type` + `client_id` form body
     // and bind the token to a resolved subject.
+    //
+    // WOR-808 PR8: when the operator declares `content_key_seed`,
+    // derive a per-token EMS content key and attach it as a
+    // `cnf.jwk` claim (RFC 7800). Seed accepted as hex for
+    // compactness; non-hex / wrong length disables the binding
+    // (the issuer keeps working, just without EMS).
+    let content_key_seed = cfg
+        .content_key_seed
+        .as_ref()
+        .and_then(|s| decode_hex_bytes(s.as_str()).ok());
     let req = sbproxy_modules::olp::IssueRequest {
         sub: "anonymous",
         aud: hostname,
         license_urn,
         scope_override: None,
         ttl_secs_override: None,
+        content_key_seed: content_key_seed.as_deref(),
     };
     let claims = sbproxy_modules::olp::build_claims(
         &req,
@@ -3119,4 +3130,26 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
         b'A'..=b'F' => Ok(b - b'A' + 10),
         _ => Err(format!("not a hex char: {b:#04x}")),
     }
+}
+
+/// WOR-808 PR8: relaxed-length variant of [`decode_ed25519_seed`] used
+/// for the EMS content-key seed. Accepts any even-length hex string
+/// of at least 32 bytes (HKDF will widen / narrow as needed). Reject
+/// anything shorter so the operator does not accidentally configure
+/// a key with less entropy than a single AES-256 block.
+fn decode_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
+    let trimmed = s.trim();
+    if trimmed.len() < 64 || !trimmed.len().is_multiple_of(2) {
+        return Err(format!(
+            "content_key_seed must be at least 32 bytes hex (64+ even chars); got {} chars",
+            trimmed.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(trimmed.len() / 2);
+    for chunk in trimmed.as_bytes().chunks(2) {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
 }

@@ -176,6 +176,89 @@ fn token_endpoint_405_on_get() {
 }
 
 #[test]
+fn ems_content_key_is_bound_to_token_when_seed_configured() {
+    // WOR-808 PR8: when the operator declares `content_key_seed`
+    // on the origin's OLP config, every issued token carries an
+    // RFC 7800 `cnf.jwk` claim with a per-token AES-256-GCM key
+    // (HKDF-derived from the seed + the token's jti). Pins the
+    // claim shape and that two issuances under the same seed get
+    // distinct keys.
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "ems.localhost":
+    olp:
+      enabled: true
+      signing_key: "{TEST_KEY_HEX}"
+      key_id: "{TEST_KID}"
+      issuer: "https://ems.localhost"
+      default_scope: "ai-input"
+      default_ttl_secs: 60
+      content_key_seed: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+    action:
+      type: static
+      status_code: 200
+      body: "ems origin"
+"#
+    );
+    let harness = ProxyHarness::start_with_yaml(&yaml).expect("start");
+
+    // Pull the verification key.
+    let jwk_resp = harness
+        .get("/.well-known/olp/key", "ems.localhost")
+        .expect("GET key");
+    let jwk_set: serde_json::Value = serde_json::from_slice(&jwk_resp.body).expect("JWK Set");
+    let x_b64 = jwk_set["keys"][0]["x"].as_str().expect("x").to_string();
+    let kid = jwk_set["keys"][0]["kid"].as_str().expect("kid").to_string();
+    let x_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(x_b64.as_bytes())
+        .unwrap();
+    let x_arr: [u8; 32] = x_bytes.as_slice().try_into().unwrap();
+    let verifier = sbproxy_modules::olp::OlpTokenVerifier::new(
+        ed25519_dalek::VerifyingKey::from_bytes(&x_arr).unwrap(),
+        &kid,
+    );
+
+    // Issue two tokens.
+    let mint = || -> sbproxy_modules::olp::OlpLicenseClaims {
+        let resp = harness
+            .post_json(
+                "/.well-known/olp/token",
+                "ems.localhost",
+                &serde_json::json!({}),
+                &[],
+            )
+            .expect("POST token");
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        let token = body["access_token"].as_str().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        verifier.verify(token, now).expect("verify")
+    };
+    let claims_a = mint();
+    let claims_b = mint();
+
+    // Both tokens MUST carry a cnf claim; both shapes must be the
+    // documented oct/A256GCM/enc combo.
+    let cnf_a = claims_a.cnf.as_ref().expect("cnf on first token");
+    let cnf_b = claims_b.cnf.as_ref().expect("cnf on second token");
+    assert_eq!(cnf_a.jwk.kty, "oct");
+    assert_eq!(cnf_a.jwk.alg, "A256GCM");
+    assert_eq!(cnf_a.jwk.use_, "enc");
+    // Per-token jtis differ -> per-token keys differ. A regression
+    // here would let token A's key decrypt token B's content.
+    assert_ne!(cnf_a.jwk.k, cnf_b.jwk.k, "EMS keys MUST differ per token");
+    // Extract returns the 32-byte raw key.
+    let raw = sbproxy_modules::olp::extract_ems_content_key(&claims_a).expect("extract");
+    assert_eq!(raw.len(), 32);
+}
+
+#[test]
 fn well_known_olp_404s_when_origin_has_no_olp_block() {
     // Origin without an olp: block must 404 the well-known paths
     // rather than letting them fall through to the upstream / static
