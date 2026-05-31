@@ -964,9 +964,37 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         // reload paths share the in-process single-flight guard on
         // the AdminState so a manual reload during a watcher reload
         // serialises cleanly.
-        let admin_state_inner = crate::admin::AdminState::new(admin_cfg)
+        // WOR-800 PR5: open the prompt persistence handle when the
+        // operator configured a path. Hydrating reads the existing
+        // file into the in-memory overlay; subsequent admin mutators
+        // write through. A failure to open is logged but does NOT
+        // abort startup: an unreadable persistence file should not
+        // brick the proxy. PR3-style ephemeral mutations keep
+        // working on the failed path.
+        let prompt_persistence = server_config
+            .admin
+            .as_ref()
+            .and_then(|a| a.prompt_persistence_path.as_ref())
+            .and_then(|path| match crate::admin::PromptPersistence::open(path) {
+                Ok(p) => {
+                    tracing::info!(path = %path.display(), "opened prompt persistence");
+                    Some(std::sync::Arc::new(p))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to open prompt persistence; mutations will be ephemeral"
+                    );
+                    None
+                }
+            });
+        let mut admin_state_inner = crate::admin::AdminState::new(admin_cfg)
             .with_config_path(config_path)
             .with_loaded_config_content_hash(initial_content_hash.clone());
+        if let Some(p) = prompt_persistence {
+            admin_state_inner = admin_state_inner.with_prompt_persistence(p);
+        }
 
         // WOR-27: register the synthetic-pipeline probe and spawn its
         // driver loop when the operator opted in. Registration runs
