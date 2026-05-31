@@ -455,6 +455,201 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
+// --- WOR-808 PR9: RFC 7662 / 7009 introspection + revocation ---
+
+/// RFC 7662 §2.2 introspection response. Constructed by [`introspect`].
+///
+/// The `active` field is the only REQUIRED member. Every other field
+/// is OPTIONAL and is omitted from the JSON when absent so a
+/// well-formed `{"active": false}` response really is just that
+/// (§2.2 forbids leaking why a token is inactive).
+#[derive(Debug, Clone, Serialize)]
+pub struct IntrospectResponse {
+    /// RFC 7662 §2.2: REQUIRED. Whether the token is active right now.
+    pub active: bool,
+    /// RFC 7662 §2.2: issuer URL. Omitted when inactive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iss: Option<String>,
+    /// RFC 7662 §2.2: subject the token authorizes. Omitted when inactive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub: Option<String>,
+    /// RFC 7662 §2.2: audience identifier. Omitted when inactive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aud: Option<String>,
+    /// RFC 7662 §2.2: issued-at, unix seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iat: Option<u64>,
+    /// RFC 7662 §2.2: expiration, unix seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exp: Option<u64>,
+    /// RFC 7662 §2.2: space-separated scope list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// RFC 7662 §2.2: token id (matches the JWS `jti` claim).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
+    /// RSL 1.0 OLP extension: URN of the license document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license_urn: Option<String>,
+    /// RFC 7662 §2.2: client identifier. OLP today binds this to `sub`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// RFC 7662 §2.2: token type. RSL 1.0 OLP pins this to `License`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_type: Option<String>,
+    /// RFC 7800 confirmation claim. Mirrored from the token when
+    /// `mirror_cnf` is enabled; omitted on inactive tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cnf: Option<Confirmation>,
+}
+
+impl IntrospectResponse {
+    /// The §2.2 "inactive" shape: just `{"active": false}`. Used for
+    /// every token that fails to verify, has expired, or has been
+    /// revoked; the operator's structured log can still emit the
+    /// discriminator at `debug` level.
+    pub fn inactive() -> Self {
+        Self {
+            active: false,
+            iss: None,
+            sub: None,
+            aud: None,
+            iat: None,
+            exp: None,
+            scope: None,
+            jti: None,
+            license_urn: None,
+            client_id: None,
+            token_type: None,
+            cnf: None,
+        }
+    }
+}
+
+/// Revocation-list contract. Implementations write `jti` → "revoked"
+/// with a TTL that matches the token's remaining lifetime so the
+/// entry self-evicts once the token would expire anyway.
+pub trait RevocationStore: Send + Sync + 'static {
+    /// Return `true` when `jti` has been revoked. A storage error
+    /// MUST propagate (the introspect endpoint translates it to a
+    /// `503 temporarily_unavailable`); silently returning `false`
+    /// would let an attacker fault-inject the store to bypass
+    /// revocation.
+    fn is_revoked(&self, jti: &str) -> anyhow::Result<bool>;
+
+    /// Mark `jti` as revoked. `ttl_secs` is how long the entry
+    /// should be retained; once the underlying token expires there
+    /// is no value in keeping the revocation around since the
+    /// verifier rejects it on `exp` anyway. `reason` is operator
+    /// free text for audit / log purposes; backends MAY drop it
+    /// when they only need the presence bit.
+    fn revoke(&self, jti: &str, ttl_secs: u64, reason: &str) -> anyhow::Result<()>;
+}
+
+/// Wrap any [`sbproxy_platform::storage::KVStore`] as a
+/// [`RevocationStore`]. Keys are scoped per-audience so the same
+/// backing file or Redis instance can host revocations for multiple
+/// origins without cross-origin enumeration.
+pub struct KvRevocationStore {
+    store: std::sync::Arc<dyn sbproxy_platform::storage::KVStore>,
+    aud: String,
+}
+
+impl KvRevocationStore {
+    /// Construct over a `KVStore` instance scoped to `aud`. The
+    /// `aud` value lifts into the key prefix `olp/rev/<aud>/`.
+    pub fn new(
+        store: std::sync::Arc<dyn sbproxy_platform::storage::KVStore>,
+        aud: impl Into<String>,
+    ) -> Self {
+        Self {
+            store,
+            aud: aud.into(),
+        }
+    }
+
+    fn key(&self, jti: &str) -> String {
+        format!("olp/rev/{}/{}", self.aud, jti)
+    }
+}
+
+impl RevocationStore for KvRevocationStore {
+    fn is_revoked(&self, jti: &str) -> anyhow::Result<bool> {
+        let key = self.key(jti);
+        Ok(self.store.get(key.as_bytes())?.is_some())
+    }
+
+    fn revoke(&self, jti: &str, ttl_secs: u64, reason: &str) -> anyhow::Result<()> {
+        let key = self.key(jti);
+        let payload = serde_json::json!({
+            "revoked_at": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            "reason": reason,
+        })
+        .to_string();
+        // Backends that lack TTL support (in-memory) fall back to a
+        // plain put — the entry will live for process lifetime, which
+        // is fine for dev / CI use.
+        match self
+            .store
+            .put_with_ttl(key.as_bytes(), payload.as_bytes(), ttl_secs)
+        {
+            Ok(()) => Ok(()),
+            Err(_) => self.store.put(key.as_bytes(), payload.as_bytes()),
+        }
+    }
+}
+
+/// Decide whether `token` is currently active under `verifier` and
+/// `revocation`, and build the RFC 7662 §2.2 response.
+///
+/// `now` is the current Unix time the caller wants the verifier to
+/// use; production callers pass `SystemTime::now()`, tests pin a
+/// fixed value. `mirror_cnf` controls whether an RFC 7800 `cnf`
+/// claim on the token is propagated to the response (per the
+/// `OlpIntrospectConfig` field of the same name).
+///
+/// Returns a response with `active: false` for every token that
+/// fails to verify, has expired, or has been revoked. `active: true`
+/// responses mirror every OLP claim per the agreed PR9 contract.
+/// A storage error from the revocation store propagates so the
+/// caller can surface it as a `503`.
+pub fn introspect(
+    verifier: &OlpTokenVerifier,
+    revocation: &dyn RevocationStore,
+    token: &str,
+    now: u64,
+    mirror_cnf: bool,
+) -> anyhow::Result<IntrospectResponse> {
+    let claims = match verifier.verify(token, now) {
+        Ok(c) => c,
+        Err(_) => return Ok(IntrospectResponse::inactive()),
+    };
+    if revocation.is_revoked(&claims.jti)? {
+        return Ok(IntrospectResponse::inactive());
+    }
+    Ok(IntrospectResponse {
+        active: true,
+        iss: Some(claims.iss.clone()),
+        sub: Some(claims.sub.clone()),
+        aud: Some(claims.aud.clone()),
+        iat: Some(claims.iat),
+        exp: Some(claims.exp),
+        scope: Some(claims.scope.clone()),
+        jti: Some(claims.jti.clone()),
+        license_urn: Some(claims.license_urn.clone()),
+        // OLP today binds the OAuth `client_id` to the same value as
+        // `sub` (the form-body `client_id` from `/token` becomes the
+        // claim's `sub`); mirror it so RP libraries that key off
+        // `client_id` see what they expect.
+        client_id: Some(claims.sub.clone()),
+        token_type: Some(OLP_TOKEN_TYPE.to_string()),
+        cnf: if mirror_cnf { claims.cnf.clone() } else { None },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,5 +991,139 @@ mod tests {
         );
         assert_eq!(r.scope, "search");
         assert_eq!(r.exp - r.iat, 60);
+    }
+
+    // --- WOR-808 PR9 introspect + revocation ---
+
+    fn mint(now: u64, exp_offset: u64, sub: &str) -> (String, OlpTokenVerifier) {
+        let signer = OlpTokenSigner::from_seed_bytes(fixed_seed(), "kid-1");
+        let claims = OlpLicenseClaims {
+            iss: "https://api.example.com".to_string(),
+            sub: sub.to_string(),
+            aud: "api.example.com".to_string(),
+            iat: now,
+            exp: now + exp_offset,
+            jti: format!("jti-{sub}"),
+            scope: "ai-input".to_string(),
+            license_urn: "urn:rsl:1.0:api.example.com:1".to_string(),
+            cnf: None,
+        };
+        let token = signer.sign(&claims).expect("sign");
+        let verifier = OlpTokenVerifier::new(signer.verifying_key(), "kid-1");
+        (token, verifier)
+    }
+
+    fn mem_store() -> std::sync::Arc<dyn sbproxy_platform::storage::KVStore> {
+        std::sync::Arc::new(sbproxy_platform::storage::MemoryKVStore::new(1024))
+    }
+
+    #[test]
+    fn introspect_returns_active_true_for_valid_token() {
+        let now = 1_700_000_000;
+        let (token, verifier) = mint(now, 300, "alice");
+        let rev = KvRevocationStore::new(mem_store(), "api.example.com");
+        let r = introspect(&verifier, &rev, &token, now, true).unwrap();
+        assert!(r.active);
+        assert_eq!(r.sub.as_deref(), Some("alice"));
+        assert_eq!(r.client_id.as_deref(), Some("alice"));
+        assert_eq!(r.token_type.as_deref(), Some(OLP_TOKEN_TYPE));
+        assert_eq!(r.scope.as_deref(), Some("ai-input"));
+        assert_eq!(r.iss.as_deref(), Some("https://api.example.com"));
+        assert_eq!(r.aud.as_deref(), Some("api.example.com"));
+        assert_eq!(r.exp, Some(now + 300));
+    }
+
+    #[test]
+    fn introspect_returns_active_false_for_bad_signature() {
+        // Flip a character in the middle segment to break the JWS.
+        let now = 1_700_000_000;
+        let (token, verifier) = mint(now, 300, "alice");
+        let mut bad = token.clone();
+        // Flip one character of the JWS payload segment.
+        let parts: Vec<&str> = bad.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        let mut payload = parts[1].to_string();
+        let last = payload.len() - 1;
+        let c = payload.as_bytes()[last];
+        let flipped = if c == b'A' { 'B' } else { 'A' };
+        payload.replace_range(last.., &flipped.to_string());
+        bad = format!("{}.{}.{}", parts[0], payload, parts[2]);
+        let rev = KvRevocationStore::new(mem_store(), "api.example.com");
+        let r = introspect(&verifier, &rev, &bad, now, true).unwrap();
+        assert!(!r.active);
+        assert!(r.sub.is_none(), "inactive must not leak claims");
+    }
+
+    #[test]
+    fn introspect_returns_active_false_for_expired_token() {
+        let now = 1_700_000_000;
+        let (token, verifier) = mint(now, 60, "alice");
+        let rev = KvRevocationStore::new(mem_store(), "api.example.com");
+        // Verifier clock skipped past exp.
+        let r = introspect(&verifier, &rev, &token, now + 120, true).unwrap();
+        assert!(!r.active);
+        assert!(r.exp.is_none());
+    }
+
+    #[test]
+    fn introspect_returns_active_false_after_revoke() {
+        let now = 1_700_000_000;
+        let (token, verifier) = mint(now, 300, "alice");
+        let rev = KvRevocationStore::new(mem_store(), "api.example.com");
+        let r = introspect(&verifier, &rev, &token, now, true).unwrap();
+        assert!(r.active);
+        rev.revoke("jti-alice", 300, "operator action").unwrap();
+        let r = introspect(&verifier, &rev, &token, now, true).unwrap();
+        assert!(!r.active);
+        assert!(r.jti.is_none(), "inactive response leaks jti");
+    }
+
+    #[test]
+    fn introspect_mirrors_cnf_when_configured() {
+        let now = 1_700_000_000;
+        let signer = OlpTokenSigner::from_seed_bytes(fixed_seed(), "kid-1");
+        let cnf = derive_ems_confirmation(b"a-seed-of-at-least-32-bytes-1234", "jti-cnf");
+        let claims = OlpLicenseClaims {
+            iss: "i".into(),
+            sub: "s".into(),
+            aud: "a".into(),
+            iat: now,
+            exp: now + 60,
+            jti: "jti-cnf".into(),
+            scope: "x".into(),
+            license_urn: "u".into(),
+            cnf: Some(cnf.clone()),
+        };
+        let token = signer.sign(&claims).unwrap();
+        let verifier = OlpTokenVerifier::new(signer.verifying_key(), "kid-1");
+        let rev = KvRevocationStore::new(mem_store(), "a");
+
+        let with_cnf = introspect(&verifier, &rev, &token, now, true).unwrap();
+        assert!(with_cnf.cnf.is_some(), "mirror_cnf=true must surface cnf");
+
+        let without_cnf = introspect(&verifier, &rev, &token, now, false).unwrap();
+        assert!(without_cnf.cnf.is_none(), "mirror_cnf=false must strip cnf");
+    }
+
+    #[test]
+    fn revocation_store_scopes_keys_by_audience() {
+        let store = mem_store();
+        let rev_a = KvRevocationStore::new(store.clone(), "alpha.example.com");
+        let rev_b = KvRevocationStore::new(store.clone(), "beta.example.com");
+        rev_a.revoke("jti-1", 300, "test").unwrap();
+        assert!(rev_a.is_revoked("jti-1").unwrap());
+        assert!(
+            !rev_b.is_revoked("jti-1").unwrap(),
+            "revoking under alpha must not affect beta's view"
+        );
+    }
+
+    #[test]
+    fn inactive_response_serializes_to_minimal_json() {
+        // RFC 7662 §2.2: SHOULD NOT include additional information
+        // about an inactive token. The on-the-wire JSON must be
+        // literally `{"active":false}`.
+        let body = serde_json::to_string(&IntrospectResponse::inactive()).unwrap();
+        assert_eq!(body, r#"{"active":false}"#);
     }
 }

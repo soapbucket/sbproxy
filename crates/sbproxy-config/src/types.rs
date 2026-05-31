@@ -4080,6 +4080,165 @@ pub struct OlpConfig {
     /// token so EMS-unaware clients keep working.
     #[serde(default)]
     pub content_key_seed: Option<String>,
+
+    /// WOR-808 PR9: introspect / revoke surface. Absent leaves both
+    /// `/.well-known/olp/introspect` (RFC 7662) and
+    /// `/.well-known/olp/revoke` (RFC 7009) 404'd. Set to enable.
+    #[serde(default)]
+    pub introspect: Option<OlpIntrospectConfig>,
+}
+
+/// WOR-808 PR9: RFC 7662 OAuth Token Introspection + RFC 7009 Token
+/// Revocation configuration for the OLP issuer.
+///
+/// When this block is present the proxy exposes:
+///
+/// * `POST /.well-known/olp/introspect` — RFC 7662 §2 introspection.
+///   Returns `{ "active": true, ... }` for valid + un-revoked tokens
+///   issued by this origin's signing key, mirroring every OLP claim.
+///   Returns `{ "active": false }` for any token that does not
+///   verify, has expired, or has been revoked (§2.2 forbids leaking
+///   the reason).
+/// * `POST /.well-known/olp/revoke` — RFC 7009 §2. Writes the token's
+///   `jti` to the configured revocation store with a TTL that matches
+///   the token's remaining lifetime, so subsequent introspections
+///   return `active: false`.
+///
+/// Both endpoints share one `auth` policy because the same actor that
+/// can ask "is this token active" should also be able to assert "this
+/// token is no longer trusted." Rate-limiting on `active: false`
+/// responses (RFC 7662 §2.1 scan-attack defence) and DPoP-bound
+/// confirmation checks ship in a follow-up PR.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq, Default)]
+pub struct OlpIntrospectConfig {
+    /// Master toggle. When false the well-known endpoints 404 even if
+    /// the rest of the block is configured. Lets an operator wire the
+    /// auth + store ahead of time and flip it on later.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path the introspection endpoint binds to. Defaults to
+    /// `/.well-known/olp/introspect` so the OLP cluster of endpoints
+    /// stays under one prefix.
+    #[serde(default = "default_introspect_path")]
+    pub introspect_path: String,
+    /// Path the revocation endpoint binds to. Defaults to
+    /// `/.well-known/olp/revoke`.
+    #[serde(default = "default_revoke_path")]
+    pub revoke_path: String,
+    /// Caller auth policy. Required for both endpoints; RFC 7662 §2.1
+    /// MUSTs "some form of authorization" to prevent token-scanning.
+    /// Defaults to `mode: self` which uses the token-being-introspected
+    /// as its own proof of possession (works without any operator
+    /// configuration).
+    #[serde(default)]
+    pub auth: OlpIntrospectAuth,
+    /// `Basic` realm advertised on 401 challenges. Defaults to
+    /// `"olp-introspect"`; operators with multi-tenant deployments
+    /// often want one realm per tenant for log clarity.
+    #[serde(default = "default_introspect_realm")]
+    pub realm: String,
+    /// Revocation-store backend. Without a store, `/revoke` 503s and
+    /// `/introspect` reports `active: true` for every otherwise-valid
+    /// token (RFC 7662 §2.2's "active" is only signature + exp). The
+    /// `memory` default is sufficient for a single-process dev box
+    /// but does NOT survive restart; production deployments should
+    /// pick `redb` or `redis`.
+    #[serde(default)]
+    pub revocation_store: OlpRevocationStoreConfig,
+    /// Whether to mirror the token's optional `cnf` (RFC 7800)
+    /// confirmation claim onto the introspect response. Defaults to
+    /// true so EMS-bound tokens carry their content key through to
+    /// the relying party in one round trip; operators concerned about
+    /// disclosing the key over a shared introspect connection can
+    /// flip to false to require the RP to fetch the JWS directly.
+    #[serde(default = "default_olp_introspect_mirror_cnf")]
+    pub mirror_cnf: bool,
+}
+
+fn default_introspect_path() -> String {
+    "/.well-known/olp/introspect".to_string()
+}
+
+fn default_revoke_path() -> String {
+    "/.well-known/olp/revoke".to_string()
+}
+
+fn default_introspect_realm() -> String {
+    "olp-introspect".to_string()
+}
+
+fn default_olp_introspect_mirror_cnf() -> bool {
+    true
+}
+
+/// Auth policy for the introspect + revoke endpoints. Three modes:
+///
+/// * `self` (default) — the caller proves possession of the token by
+///   sending the same value in `Authorization: License <token>`
+///   *and* in the `token=` form parameter. Reasonable for the common
+///   "RP introspects tokens it already holds" case and requires no
+///   operator credential management.
+/// * `basic` — HTTP Basic with operator-managed credentials. Pass
+///   `{ username, password_hash }` pairs in `clients`; passwords are
+///   stored as Argon2id hashes. RFC 7662 §2.1's "client
+///   authentication" path.
+/// * `none` — no auth. ONLY appropriate for fully-private deployments
+///   behind a service mesh that already authenticates the caller.
+///   The proxy logs a `warn!` at startup when this is selected.
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum OlpIntrospectAuth {
+    /// Caller proves possession of the token they are introspecting.
+    #[default]
+    #[serde(rename = "self")]
+    SelfProof,
+    /// HTTP Basic with operator-managed credentials.
+    Basic {
+        /// One entry per authorized caller. Empty list rejects every
+        /// request with 401 so an operator cannot accidentally
+        /// deploy `mode: basic` without setting up any credentials.
+        clients: Vec<OlpIntrospectBasicClient>,
+    },
+    /// No auth (private-deployment escape hatch).
+    None,
+}
+
+/// One `mode: basic` credential.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct OlpIntrospectBasicClient {
+    /// Username sent over Basic auth.
+    pub username: String,
+    /// Argon2id hash of the password (PHC string format, as produced
+    /// by `argon2 -t 3 -m 65536 -p 4 -i`). The proxy verifies with
+    /// the same parameters; supports `vault://` references via the
+    /// secret-resolver pass.
+    pub password_hash: String,
+}
+
+/// Revocation-store backend selector.
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(tag = "backend", rename_all = "snake_case")]
+pub enum OlpRevocationStoreConfig {
+    /// Process-local, lost on restart. Default; appropriate for dev
+    /// and CI only.
+    #[default]
+    Memory,
+    /// On-disk redb file. Single-process; survives restart, ACID.
+    /// Production default for single-replica deployments.
+    Redb {
+        /// Filesystem path to the redb file. The path is created on
+        /// first use; the operator MUST ensure the directory is
+        /// writable by the proxy user.
+        path: std::path::PathBuf,
+    },
+    /// Redis (shared across replicas). Use for horizontally-scaled
+    /// deployments where a token revoked on one replica must be
+    /// observed by all the others.
+    Redis {
+        /// `redis://` connection URL. Pool size and timeouts inherit
+        /// the workspace `redis` defaults.
+        url: String,
+    },
 }
 
 fn default_olp_scope() -> String {

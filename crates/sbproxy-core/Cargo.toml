@@ -153,10 +153,12 @@ chrono.workspace = true
 # deployment.
 include_dir = { workspace = true, optional = true }
 
+argon2.workspace = true
+base64.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile = "3"
-base64 = "0.22"
 loom = "0.7"
 # WOR-169: hooks tests scrape `sbproxy_hooks_channel_dropped_total` from
 # the global Prometheus registry to assert the bounded-channel drop
