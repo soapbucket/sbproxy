@@ -3322,10 +3322,25 @@ fn get_or_init_revocation_store(
                 }
             }
         }
-        // PR11 wires Redis. For now the operator gets a 503 so
-        // misconfiguration is loud.
-        sbproxy_config::OlpRevocationStoreConfig::Redis { .. } => {
-            return None;
+        sbproxy_config::OlpRevocationStoreConfig::Redis { url } => {
+            // WOR-808 PR11: open the operator-declared Redis store.
+            // RedisConfig wants a `host:port` address, not a
+            // `redis://` URL; tolerate either by stripping the
+            // scheme prefix. Bad URL / unreachable Redis returns
+            // None so the handler 503s (introspect MUST NOT
+            // silently allow when the revocation store is down).
+            let addr = url
+                .strip_prefix("redis://")
+                .or_else(|| url.strip_prefix("rediss://"))
+                .unwrap_or(url.as_str())
+                .trim_end_matches('/')
+                .to_string();
+            let redis_cfg = sbproxy_platform::storage::RedisConfig {
+                addr,
+                pool_size: 8,
+                acquire_timeout: std::time::Duration::from_secs(5),
+            };
+            std::sync::Arc::new(sbproxy_platform::storage::RedisKVStore::new(redis_cfg))
         }
     };
     reg.insert(key, new_store.clone());
