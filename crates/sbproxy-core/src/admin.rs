@@ -854,6 +854,258 @@ fn handle_drift(state: &AdminState) -> (u16, &'static str, String) {
     (200, "application/json", body)
 }
 
+// --- WOR-800 PR3: prompt-store runtime overlay handlers ---
+
+/// `GET /admin/prompts`: snapshot the current runtime overlay as a
+/// JSON document. Shape:
+///
+/// ```json
+/// {
+///   "hosts": {
+///     "example.com": {
+///       "prompts": {
+///         "summary": {
+///           "default_version": "2",
+///           "effective_version": "2",
+///           "versions": ["1", "2"]
+///         }
+///       }
+///     }
+///   }
+/// }
+/// ```
+///
+/// `default_version` is the pinned version (null when no pin has been
+/// set). `effective_version` mirrors the runtime's fallback rule
+/// (pin if present, otherwise the highest numeric label) so operators
+/// can tell at a glance which template a render would actually pick.
+/// The response is intentionally compact: it lists version labels but
+/// does not echo the template source. Templates can be large and
+/// echoing them back on every read would dominate the response; if an
+/// operator needs the source, PR4's persistence layer is the source
+/// of truth.
+fn handle_prompts_list() -> (u16, &'static str, String) {
+    let overlay = sbproxy_ai::prompts::current_runtime_overlay();
+    let mut hosts = serde_json::Map::new();
+    for (host, store) in &overlay.by_host {
+        let mut prompts = serde_json::Map::new();
+        for (name, named) in &store.templates {
+            let mut versions: Vec<&String> = named.versions.keys().collect();
+            versions.sort_by(|a, b| match (a.parse::<u64>(), b.parse::<u64>()) {
+                (Ok(x), Ok(y)) => x.cmp(&y),
+                _ => a.cmp(b),
+            });
+            let effective_version = named
+                .default_version
+                .clone()
+                .or_else(|| highest_numeric_version_label(&versions));
+            prompts.insert(
+                name.clone(),
+                serde_json::json!({
+                    "default_version": named.default_version,
+                    "effective_version": effective_version,
+                    "versions": versions,
+                }),
+            );
+        }
+        hosts.insert(host.clone(), serde_json::json!({ "prompts": prompts }));
+    }
+    let body = serde_json::json!({ "hosts": hosts }).to_string();
+    (200, "application/json", body)
+}
+
+/// Mirror of the runtime's "highest numeric version" rule. Used to
+/// expose `effective_version` so the list endpoint shows what
+/// `PromptStore::render` would actually pick.
+fn highest_numeric_version_label(versions: &[&String]) -> Option<String> {
+    versions
+        .iter()
+        .filter_map(|k| k.parse::<u64>().ok().map(|n| (n, *k)))
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, k)| k.clone())
+}
+
+/// Decompose `<host>/<name>/<action>` (e.g. `example.com/summary/versions`)
+/// into its three parts. Returns `None` when the segment count is wrong
+/// so the dispatcher 404s with a helpful error.
+pub(crate) fn parse_prompt_admin_path(rest: &str) -> Option<(&str, &str, &str)> {
+    let mut iter = rest.splitn(3, '/');
+    let host = iter.next()?;
+    let name = iter.next()?;
+    let action = iter.next()?;
+    if host.is_empty() || name.is_empty() || action.is_empty() {
+        return None;
+    }
+    Some((host, name, action))
+}
+
+/// Dispatch the two mutation routes:
+///
+/// * `POST /admin/prompts/<host>/<name>/versions` adds a version.
+/// * `PUT  /admin/prompts/<host>/<name>/pin` pins the default version.
+fn dispatch_prompt_admin_route(
+    method: &str,
+    host: &str,
+    name: &str,
+    action: &str,
+    body: Option<&str>,
+) -> (u16, &'static str, String) {
+    match action {
+        "versions" => {
+            if !method.eq_ignore_ascii_case("POST") {
+                return method_not_allowed();
+            }
+            handle_prompt_add_version(host, name, body)
+        }
+        "pin" => {
+            if !method.eq_ignore_ascii_case("PUT") {
+                return method_not_allowed();
+            }
+            handle_prompt_pin(host, name, body)
+        }
+        _ => (
+            404,
+            "application/json",
+            r#"{"error":"unknown prompt admin action"}"#.to_string(),
+        ),
+    }
+}
+
+fn method_not_allowed() -> (u16, &'static str, String) {
+    (
+        405,
+        "application/json",
+        r#"{"error":"method not allowed"}"#.to_string(),
+    )
+}
+
+/// Body shape for `POST /admin/prompts/<host>/<name>/versions`. The
+/// `variables` field is the static variables map exposed to the
+/// template under `variables.*`; absent or null means an empty map.
+#[derive(serde::Deserialize)]
+struct AddVersionBody {
+    version: String,
+    template: String,
+    #[serde(default)]
+    variables: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+fn handle_prompt_add_version(
+    host: &str,
+    name: &str,
+    body: Option<&str>,
+) -> (u16, &'static str, String) {
+    let raw = match body {
+        Some(b) if !b.is_empty() => b,
+        _ => {
+            return (
+                400,
+                "application/json",
+                r#"{"error":"missing JSON body"}"#.to_string(),
+            );
+        }
+    };
+    let parsed: AddVersionBody = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                400,
+                "application/json",
+                format!(
+                    r#"{{"error":"invalid JSON body: {}"}}"#,
+                    escape_json(&e.to_string())
+                ),
+            );
+        }
+    };
+    if parsed.version.is_empty() || parsed.template.is_empty() {
+        return (
+            400,
+            "application/json",
+            r#"{"error":"version and template are required and must be non-empty"}"#.to_string(),
+        );
+    }
+    let effective_default = sbproxy_ai::prompts::add_runtime_prompt_version(
+        host,
+        name,
+        &parsed.version,
+        parsed.template,
+        parsed.variables.unwrap_or_default(),
+    );
+    let body = serde_json::json!({
+        "host": host,
+        "name": name,
+        "version": parsed.version,
+        "default_version": effective_default,
+    })
+    .to_string();
+    (200, "application/json", body)
+}
+
+/// Body shape for `PUT /admin/prompts/<host>/<name>/pin`.
+#[derive(serde::Deserialize)]
+struct PinVersionBody {
+    version: String,
+}
+
+fn handle_prompt_pin(host: &str, name: &str, body: Option<&str>) -> (u16, &'static str, String) {
+    let raw = match body {
+        Some(b) if !b.is_empty() => b,
+        _ => {
+            return (
+                400,
+                "application/json",
+                r#"{"error":"missing JSON body"}"#.to_string(),
+            );
+        }
+    };
+    let parsed: PinVersionBody = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                400,
+                "application/json",
+                format!(
+                    r#"{{"error":"invalid JSON body: {}"}}"#,
+                    escape_json(&e.to_string())
+                ),
+            );
+        }
+    };
+    match sbproxy_ai::prompts::pin_runtime_prompt(host, name, &parsed.version) {
+        Ok(()) => {
+            let body = serde_json::json!({
+                "host": host,
+                "name": name,
+                "default_version": parsed.version,
+            })
+            .to_string();
+            (200, "application/json", body)
+        }
+        Err(e) => (
+            404,
+            "application/json",
+            format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+        ),
+    }
+}
+
+/// Minimal JSON-string escape: backslashes and double quotes only,
+/// enough for safely embedding error text in our JSON envelope.
+fn escape_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 // --- Request Handler ---
 
 /// Handle an admin API request.
@@ -866,6 +1118,7 @@ pub fn handle_admin_request(
     path: &str,
     state: &AdminState,
     auth_header: Option<&str>,
+    body: Option<&str>,
 ) -> (u16, &'static str, String) {
     // --- Unauthenticated probe routes ---
     //
@@ -960,6 +1213,37 @@ pub fn handle_admin_request(
             405,
             "application/json",
             r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+
+    // --- WOR-800 PR3: prompt-store runtime overlay admin API ---
+    //
+    // The PR2 runtime overlay (sbproxy_ai::prompts) lets operators
+    // add and pin prompt versions at runtime. These three routes are
+    // the HTTP mutation surface; PR4 will add redb persistence so
+    // mutations survive restart.
+    //
+    // * GET  /admin/prompts                              -> snapshot
+    // * POST /admin/prompts/<host>/<name>/versions       -> add version
+    // * PUT  /admin/prompts/<host>/<name>/pin            -> pin default
+    if path == "/admin/prompts" {
+        if method.eq_ignore_ascii_case("GET") {
+            return handle_prompts_list();
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+    if let Some(rest) = path.strip_prefix("/admin/prompts/") {
+        if let Some((host, name, action)) = parse_prompt_admin_path(rest) {
+            return dispatch_prompt_admin_route(method, host, name, action, body);
+        }
+        return (
+            404,
+            "application/json",
+            r#"{"error":"unknown prompt admin route"}"#.to_string(),
         );
     }
 
@@ -1141,13 +1425,64 @@ async fn handle_admin_connection(
     state: std::sync::Arc<AdminState>,
 ) {
     use tokio::io::AsyncReadExt;
-    let mut buf = [0u8; 8192];
-    let n = match sock.read(&mut buf).await {
-        Ok(0) => return,
-        Ok(n) => n,
-        Err(_) => return,
-    };
-    let request = String::from_utf8_lossy(&buf[..n]);
+    // 64 KiB is enough for every admin route the proxy ships, including
+    // a few-KiB prompt template POST. Larger bodies (a giant template,
+    // a SBOM upload) would need streaming reads gated on Content-Length;
+    // none of the current routes need that and growing the buffer
+    // hot-path is preferable to per-byte plumbing.
+    const MAX_ADMIN_REQUEST_BYTES: usize = 64 * 1024;
+    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut tmp = [0u8; 8192];
+    // Read at least the headers (everything up to the \r\n\r\n). For
+    // a body-bearing request, keep reading until we have the full
+    // Content-Length or hit the cap.
+    let mut content_length: Option<usize> = None;
+    let mut header_end: Option<usize> = None;
+    loop {
+        match sock.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.len() >= MAX_ADMIN_REQUEST_BYTES {
+                    break;
+                }
+                if header_end.is_none() {
+                    if let Some(p) = find_header_end(&buf) {
+                        header_end = Some(p);
+                        let head = String::from_utf8_lossy(&buf[..p]);
+                        for line in head.lines() {
+                            let rest = match line
+                                .strip_prefix("Content-Length:")
+                                .or_else(|| line.strip_prefix("content-length:"))
+                            {
+                                Some(r) => r,
+                                None => continue,
+                            };
+                            if let Ok(v) = rest.trim().parse::<usize>() {
+                                content_length = Some(v);
+                            }
+                        }
+                    }
+                }
+                if let (Some(end), Some(cl)) = (header_end, content_length) {
+                    // header bytes + 4 for "\r\n\r\n" + cl body bytes
+                    if buf.len() >= end + 4 + cl {
+                        break;
+                    }
+                }
+                if header_end.is_some() && content_length.is_none() {
+                    // No Content-Length means no body to wait on (a
+                    // bare GET, or a HEAD). Stop after the headers.
+                    break;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+    if buf.is_empty() {
+        return;
+    }
+    let request = String::from_utf8_lossy(&buf);
     let mut lines = request.lines();
     let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
@@ -1164,6 +1499,21 @@ async fn handle_admin_connection(
             auth_header = Some(rest.trim().to_string());
         }
     }
+    // Slice the body off the back of the buffer. Only valid when the
+    // headers actually terminated; a malformed pre-header read falls
+    // back to no body (the route's parser then 400s on missing JSON).
+    let body_owned: Option<String> = match (header_end, content_length) {
+        (Some(end), Some(cl)) => {
+            let start = end + 4;
+            let stop = (start + cl).min(buf.len());
+            if start < buf.len() {
+                Some(String::from_utf8_lossy(&buf[start..stop]).into_owned())
+            } else {
+                Some(String::new())
+            }
+        }
+        _ => None,
+    };
     // WOR-618: `handle_admin_request` does blocking std::fs reads for
     // `POST /admin/reload` (re-read the config file) and
     // `GET /admin/drift` (re-hash the on-disk config). Both routes can
@@ -1173,6 +1523,7 @@ async fn handle_admin_connection(
     let method_owned = method.to_string();
     let path_owned = path.to_string();
     let auth_owned = auth_header.clone();
+    let body_for_task = body_owned.clone();
     let state_for_task = state.clone();
     let (status, content_type, body) = match tokio::task::spawn_blocking(move || {
         handle_admin_request(
@@ -1180,6 +1531,7 @@ async fn handle_admin_connection(
             &path_owned,
             &state_for_task,
             auth_owned.as_deref(),
+            body_for_task.as_deref(),
         )
     })
     .await
@@ -1195,6 +1547,18 @@ async fn handle_admin_connection(
         }
     };
     let _ = write_admin_response(sock, status, content_type, &body).await;
+}
+
+/// Locate the byte offset of the `\r\n\r\n` (or LF-only `\n\n` for
+/// tolerance) header terminator inside `buf`. Returns the index of the
+/// first terminator byte so the caller adds 4 (or 2) to skip past it.
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    for i in 0..buf.len().saturating_sub(3) {
+        if &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some(i);
+        }
+    }
+    None
 }
 
 async fn write_admin_response(
@@ -1402,7 +1766,7 @@ mod tests {
     #[test]
     fn unauthorized_returns_401() {
         let state = make_state();
-        let (status, _, _) = handle_admin_request("GET", "/api/stats", &state, None);
+        let (status, _, _) = handle_admin_request("GET", "/api/stats", &state, None, None);
         assert_eq!(status, 401);
     }
 
@@ -1410,7 +1774,7 @@ mod tests {
     fn bad_credentials_returns_401() {
         let state = make_state();
         let auth = basic_auth("admin", "wrong");
-        let (status, _, _) = handle_admin_request("GET", "/api/stats", &state, Some(&auth));
+        let (status, _, _) = handle_admin_request("GET", "/api/stats", &state, Some(&auth), None);
         assert_eq!(status, 401);
     }
 
@@ -1418,7 +1782,8 @@ mod tests {
     fn unknown_path_returns_404() {
         let state = make_state();
         let auth = basic_auth("admin", "secret");
-        let (status, _, _) = handle_admin_request("GET", "/unknown/path", &state, Some(&auth));
+        let (status, _, _) =
+            handle_admin_request("GET", "/unknown/path", &state, Some(&auth), None);
         assert_eq!(status, 404);
     }
 
@@ -1426,7 +1791,8 @@ mod tests {
     fn api_requests_returns_200_json() {
         let state = make_state();
         let auth = basic_auth("admin", "secret");
-        let (status, ct, body) = handle_admin_request("GET", "/api/requests", &state, Some(&auth));
+        let (status, ct, body) =
+            handle_admin_request("GET", "/api/requests", &state, Some(&auth), None);
         assert_eq!(status, 200);
         assert_eq!(ct, "application/json");
         // Empty log returns JSON array.
@@ -1437,7 +1803,7 @@ mod tests {
     fn api_health_returns_200() {
         let state = make_state();
         let auth = basic_auth("admin", "secret");
-        let (status, ct, _) = handle_admin_request("GET", "/api/health", &state, Some(&auth));
+        let (status, ct, _) = handle_admin_request("GET", "/api/health", &state, Some(&auth), None);
         assert_eq!(status, 200);
         assert_eq!(ct, "application/json");
     }
@@ -1447,7 +1813,7 @@ mod tests {
         let state = make_state();
         let auth = basic_auth("admin", "secret");
         let (status, ct, body) =
-            handle_admin_request("GET", "/api/health/targets", &state, Some(&auth));
+            handle_admin_request("GET", "/api/health/targets", &state, Some(&auth), None);
         assert_eq!(status, 200);
         assert_eq!(ct, "application/json");
         // Empty pipeline => empty origins array; the shape is what we promise.
@@ -1475,7 +1841,8 @@ mod tests {
             client_ip: "127.0.0.1".to_string(),
         });
         let auth = basic_auth("admin", "secret");
-        let (status, _, body) = handle_admin_request("GET", "/api/stats", &state, Some(&auth));
+        let (status, _, body) =
+            handle_admin_request("GET", "/api/stats", &state, Some(&auth), None);
         assert_eq!(status, 200);
         assert!(body.contains("1"), "expected count 1 in: {body}");
     }
@@ -1484,7 +1851,7 @@ mod tests {
     fn root_returns_html() {
         let state = make_state();
         let auth = basic_auth("admin", "secret");
-        let (status, ct, body) = handle_admin_request("GET", "/", &state, Some(&auth));
+        let (status, ct, body) = handle_admin_request("GET", "/", &state, Some(&auth), None);
         assert_eq!(status, 200);
         assert!(ct.starts_with("text/html"), "expected text/html, got: {ct}");
         assert!(body.contains("<html"), "expected HTML body");
@@ -1524,14 +1891,15 @@ origins:
         let state = make_state();
         let auth = basic_auth("admin", "secret");
         // GET is rejected with 405.
-        let (status, _, _) = handle_admin_request("GET", "/admin/reload", &state, Some(&auth));
+        let (status, _, _) =
+            handle_admin_request("GET", "/admin/reload", &state, Some(&auth), None);
         assert_eq!(status, 405);
     }
 
     #[test]
     fn admin_reload_unauthorized_returns_401() {
         let state = make_state();
-        let (status, _, _) = handle_admin_request("POST", "/admin/reload", &state, None);
+        let (status, _, _) = handle_admin_request("POST", "/admin/reload", &state, None, None);
         assert_eq!(status, 401);
     }
 
@@ -1539,7 +1907,8 @@ origins:
     fn admin_reload_without_config_path_returns_503() {
         let state = make_state();
         let auth = basic_auth("admin", "secret");
-        let (status, _, body) = handle_admin_request("POST", "/admin/reload", &state, Some(&auth));
+        let (status, _, body) =
+            handle_admin_request("POST", "/admin/reload", &state, Some(&auth), None);
         assert_eq!(status, 503);
         assert!(body.contains("config_path"), "got: {body}");
     }
@@ -1556,7 +1925,8 @@ origins:
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
-        let (status, ct, body) = handle_admin_request("POST", "/admin/reload", &state, Some(&auth));
+        let (status, ct, body) =
+            handle_admin_request("POST", "/admin/reload", &state, Some(&auth), None);
         assert_eq!(status, 200, "body: {body}");
         assert_eq!(ct, "application/json");
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid json");
@@ -1590,7 +1960,8 @@ origins:
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
-        let (status, _, body) = handle_admin_request("POST", "/admin/reload", &state, Some(&auth));
+        let (status, _, body) =
+            handle_admin_request("POST", "/admin/reload", &state, Some(&auth), None);
         assert_eq!(status, 400, "body: {body}");
         // Sanitised: the file name may appear, but not the absolute path.
         let abs = f.path().to_string_lossy().to_string();
@@ -1631,7 +2002,7 @@ origins:
         let a1 = auth.clone();
         let h1 = tokio::spawn(async move {
             tokio::task::spawn_blocking(move || {
-                handle_admin_request("POST", "/admin/reload", &s1, Some(&a1))
+                handle_admin_request("POST", "/admin/reload", &s1, Some(&a1), None)
             })
             .await
             .unwrap()
@@ -1640,7 +2011,7 @@ origins:
         let a2 = auth.clone();
         let h2 = tokio::spawn(async move {
             tokio::task::spawn_blocking(move || {
-                handle_admin_request("POST", "/admin/reload", &s2, Some(&a2))
+                handle_admin_request("POST", "/admin/reload", &s2, Some(&a2), None)
             })
             .await
             .unwrap()
@@ -1675,7 +2046,7 @@ origins:
     #[test]
     fn admin_drift_unauthorized_returns_401() {
         let state = make_state();
-        let (status, _, _) = handle_admin_request("GET", "/admin/drift", &state, None);
+        let (status, _, _) = handle_admin_request("GET", "/admin/drift", &state, None, None);
         assert_eq!(status, 401);
     }
 
@@ -1683,7 +2054,8 @@ origins:
     fn admin_drift_rejects_post() {
         let state = make_state();
         let auth = basic_auth("admin", "secret");
-        let (status, _, _) = handle_admin_request("POST", "/admin/drift", &state, Some(&auth));
+        let (status, _, _) =
+            handle_admin_request("POST", "/admin/drift", &state, Some(&auth), None);
         assert_eq!(status, 405);
     }
 
@@ -1691,7 +2063,8 @@ origins:
     fn admin_drift_without_config_path_returns_503() {
         let state = make_state();
         let auth = basic_auth("admin", "secret");
-        let (status, _, body) = handle_admin_request("GET", "/admin/drift", &state, Some(&auth));
+        let (status, _, body) =
+            handle_admin_request("GET", "/admin/drift", &state, Some(&auth), None);
         assert_eq!(status, 503);
         assert!(body.contains("no on-disk config path"), "got: {body}");
     }
@@ -1711,7 +2084,8 @@ origins:
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
-        let (status, _, body) = handle_admin_request("GET", "/admin/drift", &state, Some(&auth));
+        let (status, _, body) =
+            handle_admin_request("GET", "/admin/drift", &state, Some(&auth), None);
         assert_eq!(status, 503);
         assert!(
             body.contains("no loaded config content hash baseline"),
@@ -1737,7 +2111,8 @@ origins:
         .with_config_path(&bogus)
         .with_loaded_config_content_hash("deadbeefcafe");
         let auth = basic_auth("admin", "secret");
-        let (status, ct, body) = handle_admin_request("GET", "/admin/drift", &state, Some(&auth));
+        let (status, ct, body) =
+            handle_admin_request("GET", "/admin/drift", &state, Some(&auth), None);
         assert_eq!(status, 500, "body: {body}");
         assert_eq!(ct, "application/json");
         let abs = bogus.to_string_lossy().to_string();
@@ -1762,10 +2137,12 @@ origins:
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
-        let (rstatus, _, _) = handle_admin_request("POST", "/admin/reload", &state, Some(&auth));
+        let (rstatus, _, _) =
+            handle_admin_request("POST", "/admin/reload", &state, Some(&auth), None);
         assert_eq!(rstatus, 200);
 
-        let (status, ct, body) = handle_admin_request("GET", "/admin/drift", &state, Some(&auth));
+        let (status, ct, body) =
+            handle_admin_request("GET", "/admin/drift", &state, Some(&auth), None);
         assert_eq!(status, 200, "body: {body}");
         assert_eq!(ct, "application/json");
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid json");
@@ -1805,7 +2182,8 @@ origins:
         })
         .with_config_path(f.path());
         let auth = basic_auth("admin", "secret");
-        let (rstatus, _, _) = handle_admin_request("POST", "/admin/reload", &state, Some(&auth));
+        let (rstatus, _, _) =
+            handle_admin_request("POST", "/admin/reload", &state, Some(&auth), None);
         assert_eq!(rstatus, 200);
 
         // Edit the file in place. The loaded pipeline still has the
@@ -1816,7 +2194,8 @@ origins:
         )
         .expect("rewrite yaml");
 
-        let (status, _, body) = handle_admin_request("GET", "/admin/drift", &state, Some(&auth));
+        let (status, _, body) =
+            handle_admin_request("GET", "/admin/drift", &state, Some(&auth), None);
         assert_eq!(status, 200, "body: {body}");
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid json");
         assert_eq!(parsed.get("drift").and_then(|v| v.as_bool()), Some(true));
@@ -1929,7 +2308,7 @@ origins:
     #[test]
     fn healthz_is_unauthenticated_and_returns_200() {
         let state = make_state();
-        let (status, ct, body) = handle_admin_request("GET", "/healthz", &state, None);
+        let (status, ct, body) = handle_admin_request("GET", "/healthz", &state, None, None);
         assert_eq!(status, 200, "healthz must not require auth");
         assert_eq!(ct, "application/json");
         assert!(body.contains("ok"), "body: {}", body);
@@ -1938,7 +2317,7 @@ origins:
     #[test]
     fn readyz_is_unauthenticated_and_returns_200_when_empty() {
         let state = make_state();
-        let (status, ct, body) = handle_admin_request("GET", "/readyz", &state, None);
+        let (status, ct, body) = handle_admin_request("GET", "/readyz", &state, None, None);
         assert_eq!(
             status, 200,
             "default unconfigured registry should be ready: {}",
@@ -1954,7 +2333,7 @@ origins:
     fn live_and_livez_return_alive_true() {
         let state = make_state();
         for path in ["/live", "/livez"] {
-            let (status, ct, body) = handle_admin_request("GET", path, &state, None);
+            let (status, ct, body) = handle_admin_request("GET", path, &state, None, None);
             assert_eq!(status, 200, "{} must not require auth", path);
             assert_eq!(ct, "application/json");
             assert!(body.contains("\"alive\":true"), "{} body: {}", path, body);
@@ -1964,13 +2343,13 @@ origins:
     #[test]
     fn ready_alias_matches_readyz_and_health_is_rich() {
         let state = make_state();
-        let (rs, _, rb) = handle_admin_request("GET", "/readyz", &state, None);
-        let (as_, _, ab) = handle_admin_request("GET", "/ready", &state, None);
+        let (rs, _, rb) = handle_admin_request("GET", "/readyz", &state, None, None);
+        let (as_, _, ab) = handle_admin_request("GET", "/ready", &state, None, None);
         assert_eq!(rs, as_, "/ready must mirror /readyz status");
         assert_eq!(rb, ab, "/ready must mirror /readyz body");
 
-        let (hs, _, hb) = handle_admin_request("GET", "/healthz", &state, None);
-        let (ps, _, pb) = handle_admin_request("GET", "/health", &state, None);
+        let (hs, _, hb) = handle_admin_request("GET", "/healthz", &state, None, None);
+        let (ps, _, pb) = handle_admin_request("GET", "/health", &state, None, None);
         assert_eq!(hs, 200, "/healthz remains trivial liveness: {hb}");
         assert_eq!(ps, 200, "/health rich endpoint ready status: {pb}");
         let rich: serde_json::Value = serde_json::from_str(&pb).unwrap();
@@ -1998,7 +2377,7 @@ origins:
             max_log_entries: 5,
         })
         .with_health_registry(registry);
-        let (status, _, body) = handle_admin_request("GET", "/readyz", &state, None);
+        let (status, _, body) = handle_admin_request("GET", "/readyz", &state, None, None);
         assert_eq!(status, 503, "ledger never marked => unready: {}", body);
         assert!(body.contains("\"name\":\"ledger\""), "body: {}", body);
         assert!(body.contains("\"status\":\"unhealthy\""), "body: {}", body);
@@ -2019,7 +2398,7 @@ origins:
             max_log_entries: 5,
         })
         .with_health_registry(registry);
-        let (status, _, body) = handle_admin_request("GET", "/readyz", &state, None);
+        let (status, _, body) = handle_admin_request("GET", "/readyz", &state, None, None);
         assert_eq!(status, 200, "fresh recencies + stubs => ready: {}", body);
         // All five Wave 1 components show up.
         assert!(body.contains("ledger"));
@@ -2034,7 +2413,7 @@ origins:
         let state = make_state();
         // POST /healthz isn't a probe path; the auth gate kicks in
         // and we get 401. This documents that we only fast-path GET.
-        let (status, _, _) = handle_admin_request("POST", "/healthz", &state, None);
+        let (status, _, _) = handle_admin_request("POST", "/healthz", &state, None, None);
         assert_eq!(status, 401);
     }
 
@@ -2151,8 +2530,13 @@ origins:
         // pipeline through `current_pipeline()` so we don't need a
         // dedicated AdminState for the JWKS path.
         let state = make_state();
-        let (status, ct, body) =
-            handle_admin_request("GET", "/.well-known/sbproxy/quote-keys.json", &state, None);
+        let (status, ct, body) = handle_admin_request(
+            "GET",
+            "/.well-known/sbproxy/quote-keys.json",
+            &state,
+            None,
+            None,
+        );
         assert_eq!(status, 200, "JWKS route must return 200: {}", body);
         assert_eq!(ct, "application/json");
 
@@ -2191,8 +2575,13 @@ origins:
         // Pinned: the JWKS path is unauthenticated. Requests without
         // an Authorization header must NOT receive 401.
         let state = make_state();
-        let (status, _, _) =
-            handle_admin_request("GET", "/.well-known/sbproxy/quote-keys.json", &state, None);
+        let (status, _, _) = handle_admin_request(
+            "GET",
+            "/.well-known/sbproxy/quote-keys.json",
+            &state,
+            None,
+            None,
+        );
         // Either 200 (a pipeline with kids is installed) or 200 with an
         // empty `{"keys":[]}` body (default pipeline). 401 is the
         // failure mode this test guards against.
@@ -2201,5 +2590,276 @@ origins:
             "JWKS route must not require basic-auth credentials"
         );
         assert_eq!(status, 200);
+    }
+
+    // --- WOR-800 PR3: prompt-store admin endpoints ---
+
+    /// The runtime overlay is process-global; tests that mutate it
+    /// serialise to avoid clobbering each other.
+    fn prompts_admin_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn reset_runtime_overlay() {
+        sbproxy_ai::prompts::install_runtime_overlay(
+            sbproxy_ai::prompts::RuntimePromptOverlay::default(),
+        );
+    }
+
+    #[test]
+    fn parse_prompt_admin_path_happy_path() {
+        let (h, n, a) = parse_prompt_admin_path("example.com/summary/versions").unwrap();
+        assert_eq!(h, "example.com");
+        assert_eq!(n, "summary");
+        assert_eq!(a, "versions");
+    }
+
+    #[test]
+    fn parse_prompt_admin_path_rejects_short_paths() {
+        assert!(parse_prompt_admin_path("example.com").is_none());
+        assert!(parse_prompt_admin_path("example.com/summary").is_none());
+        assert!(parse_prompt_admin_path("").is_none());
+        // Trailing slash leaves an empty action segment.
+        assert!(parse_prompt_admin_path("example.com/summary/").is_none());
+    }
+
+    #[test]
+    fn list_prompts_is_authenticated_only() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let (status, _, _) = handle_admin_request("GET", "/admin/prompts", &state, None, None);
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn list_prompts_empty_overlay_returns_empty_hosts() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, ct, body) =
+            handle_admin_request("GET", "/admin/prompts", &state, Some(&auth), None);
+        assert_eq!(status, 200);
+        assert_eq!(ct, "application/json");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["hosts"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn add_version_then_list_round_trips_through_overlay() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let add_body = r#"{"version":"1","template":"hello {{ request.tool }}"}"#;
+        let (status, _, body) = handle_admin_request(
+            "POST",
+            "/admin/prompts/example.com/greet/versions",
+            &state,
+            Some(&auth),
+            Some(add_body),
+        );
+        assert_eq!(status, 200, "add version response: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["host"], "example.com");
+        assert_eq!(v["name"], "greet");
+        assert_eq!(v["version"], "1");
+        assert_eq!(v["default_version"], "1");
+
+        // List should now show the new prompt. `default_version` is
+        // null until pinned; `effective_version` mirrors the runtime
+        // fallback (highest numeric label) so an unpinned add still
+        // shows what a render would pick.
+        let (status, _, list_body) =
+            handle_admin_request("GET", "/admin/prompts", &state, Some(&auth), None);
+        assert_eq!(status, 200);
+        let v: serde_json::Value = serde_json::from_str(&list_body).unwrap();
+        let greet = &v["hosts"]["example.com"]["prompts"]["greet"];
+        assert_eq!(greet["default_version"], serde_json::Value::Null);
+        assert_eq!(greet["effective_version"], "1");
+        assert_eq!(greet["versions"], serde_json::json!(["1"]));
+    }
+
+    #[test]
+    fn add_version_rejects_missing_body() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, _) = handle_admin_request(
+            "POST",
+            "/admin/prompts/example.com/greet/versions",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn add_version_rejects_blank_version_or_template() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, _) = handle_admin_request(
+            "POST",
+            "/admin/prompts/example.com/greet/versions",
+            &state,
+            Some(&auth),
+            Some(r#"{"version":"","template":"x"}"#),
+        );
+        assert_eq!(status, 400);
+        let (status, _, _) = handle_admin_request(
+            "POST",
+            "/admin/prompts/example.com/greet/versions",
+            &state,
+            Some(&auth),
+            Some(r#"{"version":"1","template":""}"#),
+        );
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn add_version_rejects_malformed_json() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, _) = handle_admin_request(
+            "POST",
+            "/admin/prompts/example.com/greet/versions",
+            &state,
+            Some(&auth),
+            Some("{not json"),
+        );
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn add_version_rejects_get() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, _) = handle_admin_request(
+            "GET",
+            "/admin/prompts/example.com/greet/versions",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 405);
+    }
+
+    #[test]
+    fn pin_changes_default_version() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        // Seed two versions.
+        for v in &["1", "2"] {
+            let body = format!(r#"{{"version":"{v}","template":"v{v}"}}"#);
+            handle_admin_request(
+                "POST",
+                "/admin/prompts/example.com/greet/versions",
+                &state,
+                Some(&auth),
+                Some(&body),
+            );
+        }
+        let (status, _, body) = handle_admin_request(
+            "PUT",
+            "/admin/prompts/example.com/greet/pin",
+            &state,
+            Some(&auth),
+            Some(r#"{"version":"1"}"#),
+        );
+        assert_eq!(status, 200, "pin response: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["default_version"], "1");
+
+        // The render-time view honours the pin.
+        let overlay = sbproxy_ai::prompts::current_runtime_overlay();
+        let store = overlay.by_host.get("example.com").unwrap();
+        let prompt = store.templates.get("greet").unwrap();
+        assert_eq!(prompt.default_version.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn pin_returns_404_on_unknown_host() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, _) = handle_admin_request(
+            "PUT",
+            "/admin/prompts/unknown.com/greet/pin",
+            &state,
+            Some(&auth),
+            Some(r#"{"version":"1"}"#),
+        );
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn pin_returns_404_on_unknown_version() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        handle_admin_request(
+            "POST",
+            "/admin/prompts/example.com/greet/versions",
+            &state,
+            Some(&auth),
+            Some(r#"{"version":"1","template":"v1"}"#),
+        );
+        let (status, _, _) = handle_admin_request(
+            "PUT",
+            "/admin/prompts/example.com/greet/pin",
+            &state,
+            Some(&auth),
+            Some(r#"{"version":"7"}"#),
+        );
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn pin_rejects_post() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, _) = handle_admin_request(
+            "POST",
+            "/admin/prompts/example.com/greet/pin",
+            &state,
+            Some(&auth),
+            Some(r#"{"version":"1"}"#),
+        );
+        assert_eq!(status, 405);
+    }
+
+    #[test]
+    fn unknown_prompt_admin_action_returns_404() {
+        let _lock = prompts_admin_lock();
+        reset_runtime_overlay();
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, _) = handle_admin_request(
+            "POST",
+            "/admin/prompts/example.com/greet/teleport",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 404);
     }
 }
