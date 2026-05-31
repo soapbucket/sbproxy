@@ -1627,6 +1627,116 @@ impl AuthResult {
     }
 }
 
+/// WOR-892 PR1 step 3/3: OIDC Relying-Party request-time check.
+///
+/// Two outcomes:
+///
+/// 1. The request carries a valid, unexpired session cookie sealed
+///    under the operator's `cookie_secret`. The session's `sub`
+///    becomes the authenticated subject; the request is allowed.
+/// 2. No session cookie (or one that fails to decrypt / has
+///    expired). The proxy generates a PKCE verifier, state, nonce,
+///    seals a tx cookie carrying them plus the caller's intended
+///    URL, and returns a 302 redirect to the IdP's
+///    `authorization_endpoint`. Set-Cookie on the tx cookie ships
+///    in the same response.
+///
+/// Token-endpoint exchange + ID-token validation live in the
+/// `/oidc/callback` synthetic endpoint (request_phase.rs). When the
+/// IdP redirects back, that handler mints the session cookie and
+/// redirects to the caller's original target.
+fn oidc_check(
+    cfg: &sbproxy_modules::auth::oidc::OidcAuth,
+    headers: &http::HeaderMap,
+) -> AuthResult {
+    use sbproxy_modules::auth::oidc::{callback, pkce, session};
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // --- session cookie check (happy path) ---
+    if let Some(cookie_value) = read_cookie(headers, &cfg.session_cookie_name) {
+        if let Ok(claims) = session::open_session(&cookie_value, cfg.cookie_secret.as_bytes(), now)
+        {
+            // The session was issued for this proxy's client_id +
+            // issuer; reject a cookie cross-pollinated from a
+            // sibling OIDC origin whose iss / aud differs.
+            if claims.iss == cfg.issuer && claims.aud == cfg.client_id {
+                return AuthResult::Allow {
+                    sub: Some(claims.sub),
+                    source: Some(sbproxy_plugin::AuthSubjectSource::Cookie),
+                };
+            }
+        }
+    }
+
+    // --- no valid session: build the IdP redirect challenge ---
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if host.is_empty() {
+        return AuthResult::Deny(400, "oidc: missing Host header".to_string());
+    }
+    let redirect_uri = format!("https://{host}{}", cfg.redirect_path);
+
+    let verifier = pkce::generate_code_verifier();
+    let challenge = pkce::derive_code_challenge(&verifier);
+    let state = pkce::generate_code_verifier(); // 43-char base64url is fine for state too
+    let nonce = pkce::generate_code_verifier(); // same shape for nonce
+
+    let tx = session::TxClaims {
+        state: state.clone(),
+        nonce: nonce.clone(),
+        pkce_verifier: verifier,
+        return_to: "/".to_string(),
+        exp: now + cfg.tx_ttl_secs,
+    };
+    let sealed_tx = match session::seal_tx(&tx, cfg.cookie_secret.as_bytes()) {
+        Ok(s) => s,
+        Err(e) => {
+            return AuthResult::Deny(500, format!("oidc: tx cookie seal failed: {e}"));
+        }
+    };
+
+    let redirect =
+        callback::build_authorize_redirect_url(cfg, &redirect_uri, &challenge, &state, &nonce);
+    // RFC 6265bis __Host- prefix forces Secure + Path=/ + no Domain.
+    // SameSite=Lax lets the cookie survive the cross-site redirect
+    // back from the IdP (Strict would drop it on the callback hop
+    // and break the entire login). HttpOnly because no client JS
+    // should touch the tx cookie.
+    let set_cookie = format!(
+        "{}={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={}",
+        cfg.tx_cookie_name, sealed_tx, cfg.tx_ttl_secs
+    );
+    AuthResult::DenyWithHeaders(
+        302,
+        String::new(),
+        vec![
+            ("Location".to_string(), redirect),
+            ("Set-Cookie".to_string(), set_cookie),
+        ],
+    )
+}
+
+/// Look up `name` in the request's `Cookie` header. Cookie syntax
+/// is `name=value; name2=value2`; we split on `;`, trim each pair,
+/// and return the first matching value. Returns None when the
+/// header is missing or no pair matches.
+fn read_cookie(headers: &http::HeaderMap, name: &str) -> Option<String> {
+    let raw = headers.get("cookie").and_then(|v| v.to_str().ok())?;
+    for pair in raw.split(';') {
+        let trimmed = pair.trim();
+        if let Some(rest) = trimmed.strip_prefix(&format!("{name}=")) {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
 /// Run the auth check for a given origin. Returns AuthResult. `path`
 /// is the request-line path (no scheme/authority); for BotAuth it
 /// reconstructs `@target-uri` so the verifier sees the same canonical
@@ -1830,18 +1940,7 @@ async fn check_auth(
             }
         }
         Auth::Noop => AuthResult::allow_anonymous(),
-        Auth::Oidc(_) => {
-            // WOR-892 PR1 step 2/3: the OIDC auth provider's config
-            // is wired, but the request-time auth-code / callback
-            // flow (step 3/3) is not yet plumbed through. Until that
-            // lands, requests against an OIDC-protected origin deny
-            // 401 with a placeholder body so misconfiguration is
-            // surfaced loudly rather than silently allowing.
-            AuthResult::Deny(
-                401,
-                "oidc auth wiring lands in WOR-892 PR1 step 3/3".to_string(),
-            )
-        }
+        Auth::Oidc(cfg) => oidc_check(cfg, headers),
         Auth::Plugin(provider) => {
             // Build a synthetic http::Request the provider can read
             // method / target-uri / headers from. We deliberately pass
