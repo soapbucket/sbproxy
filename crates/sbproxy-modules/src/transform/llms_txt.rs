@@ -618,6 +618,7 @@ mod tests {
             problem_details: None,
             proxy_status: None,
             message_signatures: None,
+            olp: None,
             idempotency: None,
             bot_detection: None,
             threat_protection: None,
