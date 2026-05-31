@@ -15,9 +15,10 @@
 //! ciphertext captured from one can never be decrypted as the other.
 //!
 //! NIST SP 800-38D requires the 96-bit GCM nonce to never repeat under
-//! the same key. A 12-byte CSPRNG draw via [`getrandom`] makes the
-//! collision probability negligible (~2^-32 after 2^32 seals under one
-//! key); rotate the operator secret if you expect that many seals.
+//! the same key. A 12-byte CSPRNG draw via the `aes_gcm` AEAD's
+//! `OsRng` makes the collision probability negligible (~2^-32 after
+//! 2^32 seals under one key); rotate the operator secret if you
+//! expect that many seals.
 
 use aes_gcm::aead::{rand_core::RngCore, Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -152,7 +153,7 @@ mod tests {
         // 8 bytes < 12-byte nonce length. The error must be the size
         // check, not the AEAD verify (which would panic on an out-of-
         // range slice).
-        let too_short = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&[0u8; 8]);
+        let too_short = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 8]);
         let err = open(&too_short, IKM, HkdfPurpose::OidcSessionCookie).unwrap_err();
         assert!(format!("{err}").contains("shorter than a 12-byte GCM nonce"));
     }

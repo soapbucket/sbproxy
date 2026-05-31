@@ -1578,10 +1578,48 @@ pub(super) async fn request_filter(
     {
         let req_path = session.req_header().uri.path();
         let req_method = session.req_header().method.clone();
-        let is_olp_path =
-            req_path == "/.well-known/olp/key" || req_path == "/.well-known/olp/token";
+        let olp_cfg_for_route = pipeline.config.origins[origin_idx].olp.as_ref();
+        let introspect_path = olp_cfg_for_route
+            .and_then(|c| c.introspect.as_ref())
+            .filter(|i| i.enabled)
+            .map(|i| i.introspect_path.as_str())
+            .unwrap_or("");
+        let revoke_path = olp_cfg_for_route
+            .and_then(|c| c.introspect.as_ref())
+            .filter(|i| i.enabled)
+            .map(|i| i.revoke_path.as_str())
+            .unwrap_or("");
+        let is_olp_path = req_path == "/.well-known/olp/key"
+            || req_path == "/.well-known/olp/token"
+            || (!introspect_path.is_empty() && req_path == introspect_path)
+            || (!revoke_path.is_empty() && req_path == revoke_path);
         if is_olp_path {
             let olp_cfg = pipeline.config.origins[origin_idx].olp.as_ref();
+            // WOR-808 PR9: introspect + revoke routing. Both endpoints
+            // share the same auth + revocation store; handlers below
+            // dispatch based on the path.
+            if let Some(cfg) = olp_cfg {
+                if let Some(introspect_cfg) = cfg.introspect.as_ref() {
+                    if introspect_cfg.enabled
+                        && (req_path == introspect_cfg.introspect_path
+                            || req_path == introspect_cfg.revoke_path)
+                    {
+                        if req_method != http::Method::POST {
+                            send_error(session, 405, "POST only").await?;
+                            return Ok(true);
+                        }
+                        let is_revoke = req_path == introspect_cfg.revoke_path;
+                        return handle_olp_introspect_or_revoke(
+                            session,
+                            cfg,
+                            introspect_cfg,
+                            is_revoke,
+                        )
+                        .await
+                        .map(|_| true);
+                    }
+                }
+            }
             match olp_cfg {
                 Some(cfg) if cfg.enabled => {
                     if req_path == "/.well-known/olp/key" {
@@ -3177,6 +3215,355 @@ fn issue_olp_token(
     serde_json::to_string(&body).map_err(|e| format!("token body encode failed: {e}"))
 }
 
+// --- WOR-808 PR9: /introspect + /revoke handlers ---
+
+/// Body cap for `POST /.well-known/olp/{introspect,revoke}`. Form
+/// bodies are tiny (a token plus a hint); 8 KiB is the upper bound
+/// so a misconfigured client cannot tip the endpoint into unbounded
+/// buffering. The base64url JWS plus headers easily fit.
+const MAX_OLP_INTROSPECT_BODY_BYTES: usize = 8 * 1024;
+
+/// Process-global revocation-store registry. Keyed by hostname so
+/// the same store is reused across requests on one origin; reloads
+/// that do not change the backend keep the in-memory revocation set.
+/// PR9 ships the Memory backend; redb + redis are PR10.
+fn revocation_store_registry() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, std::sync::Arc<dyn sbproxy_platform::storage::KVStore>>,
+> {
+    static REG: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                std::sync::Arc<dyn sbproxy_platform::storage::KVStore>,
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Look up (or lazily create) the revocation-store instance for
+/// `audience` per the operator-declared backend. Returns `None` when
+/// the configured backend is not yet supported (PR10 / PR11 fill
+/// these in).
+fn get_or_init_revocation_store(
+    audience: &str,
+    cfg: &sbproxy_config::OlpRevocationStoreConfig,
+) -> Option<std::sync::Arc<dyn sbproxy_platform::storage::KVStore>> {
+    let key = match cfg {
+        sbproxy_config::OlpRevocationStoreConfig::Memory => format!("mem:{audience}"),
+        sbproxy_config::OlpRevocationStoreConfig::Redb { path } => {
+            format!("redb:{audience}:{}", path.display())
+        }
+        sbproxy_config::OlpRevocationStoreConfig::Redis { url } => {
+            format!("redis:{audience}:{url}")
+        }
+    };
+    let mut reg = revocation_store_registry().lock().ok()?;
+    if let Some(existing) = reg.get(&key) {
+        return Some(existing.clone());
+    }
+    let new_store: std::sync::Arc<dyn sbproxy_platform::storage::KVStore> = match cfg {
+        sbproxy_config::OlpRevocationStoreConfig::Memory => {
+            std::sync::Arc::new(sbproxy_platform::storage::MemoryKVStore::new(64 * 1024))
+        }
+        // PR10 + PR11 wire redb + redis. For now the operator gets a
+        // structured warn! in the handler and the endpoint reports
+        // 503 so they can detect the misconfiguration.
+        sbproxy_config::OlpRevocationStoreConfig::Redb { .. }
+        | sbproxy_config::OlpRevocationStoreConfig::Redis { .. } => {
+            return None;
+        }
+    };
+    reg.insert(key, new_store.clone());
+    Some(new_store)
+}
+
+/// Single-pass handler for `POST /.well-known/olp/introspect` (RFC
+/// 7662) and `POST /.well-known/olp/revoke` (RFC 7009). Auth + body
+/// parsing are shared; the `is_revoke` flag flips the terminal
+/// behaviour. Returns Ok on every wire-shaped outcome; the caller
+/// has already returned `true` to the pipeline.
+async fn handle_olp_introspect_or_revoke(
+    session: &mut pingora_proxy::Session,
+    olp: &sbproxy_config::OlpConfig,
+    introspect_cfg: &sbproxy_config::OlpIntrospectConfig,
+    is_revoke: bool,
+) -> Result<()> {
+    // --- read body ---
+    let mut body_buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = session.read_request_body().await? {
+        let remaining = MAX_OLP_INTROSPECT_BODY_BYTES.saturating_sub(body_buf.len());
+        if remaining == 0 {
+            break;
+        }
+        let take = std::cmp::min(chunk.len(), remaining);
+        body_buf.extend_from_slice(&chunk[..take]);
+        if body_buf.len() >= MAX_OLP_INTROSPECT_BODY_BYTES {
+            break;
+        }
+    }
+    let body_str = std::str::from_utf8(&body_buf).unwrap_or("");
+
+    // --- parse form ---
+    let mut token: Option<String> = None;
+    for pair in body_str.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == "token" {
+                token = Some(decode_form_component(v));
+            }
+        }
+    }
+    let token = match token {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            let body = serde_json::json!({
+                "error": "invalid_request",
+                "error_description": "token form parameter is required",
+            })
+            .to_string();
+            send_response(session, 400, "application/json", body.as_bytes()).await?;
+            return Ok(());
+        }
+    };
+
+    // --- caller auth (RFC 7662 §2.1 MUSTs some form of authorization) ---
+    let auth_outcome = check_introspect_auth(session, &introspect_cfg.auth, &token);
+    match auth_outcome {
+        IntrospectAuthOutcome::Allowed => {}
+        IntrospectAuthOutcome::Unauthorized => {
+            let mut headers = Vec::new();
+            headers.push((
+                "WWW-Authenticate".to_string(),
+                format!(
+                    "Basic realm=\"{}\"",
+                    escape_quoted_string(&introspect_cfg.realm)
+                ),
+            ));
+            send_response_with_headers(
+                session,
+                401,
+                "application/json",
+                br#"{"error":"invalid_client"}"#,
+                &headers,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
+    // --- build verifier + revocation store ---
+    let seed = match decode_ed25519_seed(&olp.signing_key) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "olp introspect: signing key invalid");
+            send_error(session, 500, "olp key invalid").await?;
+            return Ok(());
+        }
+    };
+    let signer = sbproxy_modules::olp::OlpTokenSigner::from_seed_bytes(seed, &olp.key_id);
+    let verifier = sbproxy_modules::olp::OlpTokenVerifier::new(signer.verifying_key(), &olp.key_id);
+    let aud_hint = olp.issuer.trim_end_matches('/');
+    let store = match get_or_init_revocation_store(aud_hint, &introspect_cfg.revocation_store) {
+        Some(s) => s,
+        None => {
+            warn!("olp introspect: revocation store backend not yet implemented (PR10/PR11)");
+            let body = br#"{"error":"temporarily_unavailable"}"#;
+            send_response(session, 503, "application/json", body).await?;
+            return Ok(());
+        }
+    };
+    use sbproxy_modules::olp::RevocationStore as _;
+    let revocation = sbproxy_modules::olp::KvRevocationStore::new(store, aud_hint);
+
+    // --- /revoke branch ---
+    if is_revoke {
+        let claims = match verifier.verify(
+            &token,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        ) {
+            Ok(c) => c,
+            // RFC 7009 §2.2: invalid tokens get a 200 anyway (so a
+            // caller cannot enumerate which tokens were valid).
+            Err(_) => {
+                send_response(session, 200, "application/json", b"{}").await?;
+                return Ok(());
+            }
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let ttl = claims.exp.saturating_sub(now);
+        if let Err(e) = revocation.revoke(&claims.jti, ttl, "operator-issued revoke") {
+            warn!(error = %e, "olp revoke: store write failed");
+            send_response(
+                session,
+                503,
+                "application/json",
+                br#"{"error":"temporarily_unavailable"}"#,
+            )
+            .await?;
+            return Ok(());
+        }
+        send_response(session, 200, "application/json", b"{}").await?;
+        return Ok(());
+    }
+
+    // --- /introspect branch ---
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let response = match sbproxy_modules::olp::introspect(
+        &verifier,
+        &revocation,
+        &token,
+        now,
+        introspect_cfg.mirror_cnf,
+    ) {
+        Ok(r) => r,
+        // Storage error path (RFC 7662 §2.2: NOT 200 active:false,
+        // since that would let an attacker fault-inject the store
+        // to bypass revocation).
+        Err(e) => {
+            warn!(error = %e, "olp introspect: revocation store unavailable");
+            send_response(
+                session,
+                503,
+                "application/json",
+                br#"{"error":"temporarily_unavailable"}"#,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let body = serde_json::to_vec(&response).unwrap_or_else(|_| br#"{"active":false}"#.to_vec());
+    send_response(session, 200, "application/json", &body).await?;
+    Ok(())
+}
+
+/// Result of the caller-authentication check on the introspect /
+/// revoke endpoints. Only two outcomes today; PR follow-up may add
+/// `Throttled` once the per-IP rate limiter ships.
+enum IntrospectAuthOutcome {
+    Allowed,
+    Unauthorized,
+}
+
+/// Validate the caller credentials per the configured policy.
+///
+/// `mode: self` succeeds when the caller presents
+/// `Authorization: License <token>` whose value equals the form-body
+/// `token` (so the caller proves possession). `mode: basic` requires
+/// matching Basic credentials. `mode: none` allows everyone.
+fn check_introspect_auth(
+    session: &pingora_proxy::Session,
+    auth: &sbproxy_config::OlpIntrospectAuth,
+    form_token: &str,
+) -> IntrospectAuthOutcome {
+    match auth {
+        sbproxy_config::OlpIntrospectAuth::None => IntrospectAuthOutcome::Allowed,
+        sbproxy_config::OlpIntrospectAuth::SelfProof => {
+            let header_token = session
+                .req_header()
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("License "))
+                .map(str::trim)
+                .unwrap_or("");
+            // Constant-time-ish comparison: both strings to bytes,
+            // length check first then byte-by-byte. The token values
+            // are not secrets in the usual sense (the caller already
+            // holds them), but matching on the same identity twice
+            // closes the loop without leaking timing on length.
+            if header_token.len() != form_token.len() || header_token.is_empty() {
+                return IntrospectAuthOutcome::Unauthorized;
+            }
+            let mut diff: u8 = 0;
+            for (a, b) in header_token.bytes().zip(form_token.bytes()) {
+                diff |= a ^ b;
+            }
+            if diff == 0 {
+                IntrospectAuthOutcome::Allowed
+            } else {
+                IntrospectAuthOutcome::Unauthorized
+            }
+        }
+        sbproxy_config::OlpIntrospectAuth::Basic { clients } => {
+            use base64::Engine as _;
+            let header = session
+                .req_header()
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("Basic "))
+                .map(str::trim)
+                .unwrap_or("");
+            let decoded: Vec<u8> = match base64::engine::general_purpose::STANDARD.decode(header) {
+                Ok(d) => d,
+                Err(_) => return IntrospectAuthOutcome::Unauthorized,
+            };
+            let creds = std::str::from_utf8(&decoded).unwrap_or("");
+            let (user, pass) = match creds.split_once(':') {
+                Some(kv) => kv,
+                None => return IntrospectAuthOutcome::Unauthorized,
+            };
+            for client in clients {
+                if client.username != user {
+                    continue;
+                }
+                if verify_argon2_password(&client.password_hash, pass) {
+                    return IntrospectAuthOutcome::Allowed;
+                }
+            }
+            IntrospectAuthOutcome::Unauthorized
+        }
+    }
+}
+
+/// Verify an Argon2id PHC-format hash against a plaintext password.
+/// Returns false on any parse / verify failure (the caller maps both
+/// to 401).
+fn verify_argon2_password(phc_hash: &str, password: &str) -> bool {
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    use argon2::Argon2;
+    let parsed = match PasswordHash::new(phc_hash) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
+}
+
+/// Send a JSON response with extra response headers. Used by the
+/// introspect 401 path to attach `WWW-Authenticate`.
+async fn send_response_with_headers(
+    session: &mut pingora_proxy::Session,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &[(String, String)],
+) -> Result<()> {
+    let mut header = pingora_http::ResponseHeader::build(status, None)?;
+    header.insert_header("content-type", content_type)?;
+    header.insert_header("content-length", body.len().to_string())?;
+    for (name, value) in extra_headers {
+        header.append_header(name.clone(), value.clone())?;
+    }
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(bytes::Bytes::copy_from_slice(body)), true)
+        .await?;
+    Ok(())
+}
+
 /// Decode a 32-byte Ed25519 seed from the operator-configured
 /// `signing_key` string. PR1 accepts a 64-char lowercase hex string;
 /// the secret-resolver pass at config-load time substitutes any
@@ -3426,6 +3813,7 @@ mod challenge_tests {
             default_scope: "ai-input".into(),
             default_ttl_secs: 60,
             content_key_seed: None,
+            introspect: None,
         }
     }
 

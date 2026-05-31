@@ -226,6 +226,11 @@ aes-gcm = "0.10"
 # JSON and avoids percent-encoding gymnastics inside the Set-Cookie
 # header value.
 ciborium = "0.2"
+# WOR-808 PR9: Argon2id password hashing for the OLP /introspect
+# Basic-auth credentials. Operators paste the PHC string output of
+# `argon2 -t 3 -m 65536 -p 4 -i` into the config; the proxy verifies
+# without re-deriving the parameters.
+argon2 = "0.5"
 
 # JWT verification (HS*, RS*, ES* etc.).
 jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
