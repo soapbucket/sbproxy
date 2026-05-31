@@ -33,6 +33,9 @@ pub enum AuthSubjectSource {
     /// Subject came from a forward-auth response header the upstream
     /// trust gateway returned.
     ForwardAuth,
+    /// Subject came from a sealed session cookie minted by the proxy
+    /// itself (WOR-892 OIDC Relying-Party login).
+    Cookie,
 }
 
 /// Auth decision returned by an [`AuthProvider`].

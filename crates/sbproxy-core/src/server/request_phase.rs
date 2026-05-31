@@ -1558,6 +1558,42 @@ pub(super) async fn request_filter(
         }
     }
 
+    // --- WOR-892 PR1 step 3/3: OIDC /oidc/callback ---
+    //
+    // The browser hits this path after the IdP redirects back from
+    // the authorization endpoint. Intercept BEFORE the normal auth
+    // check so the request does not loop on `oidc_check` returning
+    // yet another IdP redirect.
+    //
+    // WOR-892 PR1 step 3/3 ships only the loop-breaker stub: the
+    // path is recognised, the tx cookie is read for observability,
+    // and the handler returns 501 with a structured error pointing
+    // at the follow-up PR. WOR-892 PR2 ships the actual token-
+    // endpoint POST + ID-token validation + session-cookie minting.
+    {
+        let req_path = session.req_header().uri.path();
+        let auth_cfg = pipeline.config.origins[origin_idx].auth_config.as_ref();
+        let is_oidc_callback = auth_cfg
+            .and_then(|c| c.as_object())
+            .filter(|c| c.get("type").and_then(|v| v.as_str()) == Some("oidc"))
+            .map(|c| {
+                c.get("redirect_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("/oidc/callback")
+            })
+            .map(|p| p == req_path)
+            .unwrap_or(false);
+        if is_oidc_callback {
+            warn!(
+                "oidc callback received but token-exchange wiring lands in WOR-892 PR2; \
+                 returning 501 to break the redirect loop"
+            );
+            let body = br#"{"error":"not_implemented","error_description":"oidc callback token-endpoint exchange + ID-token validation ship in WOR-892 PR2"}"#;
+            send_response(session, 501, "application/json", body).await?;
+            return Ok(true);
+        }
+    }
+
     // --- WOR-808 PR7: OLP /.well-known/olp/{token,key} ---
     //
     // When the origin opts in (`olp.enabled: true`), serve two
