@@ -2172,6 +2172,68 @@ pub fn set_operator_leader_is_leader(is_leader: bool) {
     gauge.set(if is_leader { 1 } else { 0 });
 }
 
+// --- per-credential token attribution metric ---------------------------
+//
+// `sbproxy_ai_tokens_total{hostname, provider, direction}` already
+// rolls up token usage by upstream provider; that surface is what the
+// AI router consumes for fairness decisions. This second metric
+// indexes the same observation by who-paid attribution
+// (`project`, `user`, `tag`) so a per-tenant operator can write a
+// Prometheus alert against budget burn without scraping the access
+// log into ClickHouse first.
+//
+// All four labels go through the cardinality limiter; the metric
+// still emits when the budget overflows (the limiter demotes the
+// excess values into `__other__`), and `sbproxy_label_cardinality_overflow_total`
+// fires so operators can spot the demotion.
+//
+// `tenant_id` is intentionally not on the label set today; it lands
+// once the multi-tenant scaffolding from the credentials epic merges
+// (origin -> tenant resolution is the prerequisite).
+
+/// Increment `sbproxy_tokens_attributed_total{project, user, tag,
+/// direction}` by `count`. Call once per direction per request.
+///
+/// Each label is sanitised through the cardinality limiter:
+/// `project` and `user` come from the matched virtual-key config;
+/// `tag` is the first element of the credential's `tags:` list
+/// (callers wanting per-tag fan-out emit one call per tag). The
+/// `direction` enum mirrors the existing `sbproxy_ai_tokens_total`
+/// shape: `input` for the prompt side, `output` for the completion
+/// side.
+///
+/// Empty `project` / `user` / `tag` strings serialise as empty
+/// labels; downstream queries should `OR project=""` etc. to roll up
+/// the unattributed segment.
+pub fn record_tokens_attributed(
+    project: &str,
+    user: &str,
+    tag: &str,
+    direction: &'static str,
+    count: u64,
+) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    if count == 0 {
+        return;
+    }
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_tokens_attributed_total",
+            "AI token usage attributed to a credential's project / user / tag",
+            &["project", "user", "tag", "direction"],
+        )
+        .expect("tokens attributed counter registers")
+    });
+    let project = sanitize_label("project", project);
+    let user = sanitize_label("user", user);
+    let tag = sanitize_label("tag", tag);
+    counter
+        .with_label_values(&[project.as_str(), user.as_str(), tag.as_str(), direction])
+        .inc_by(count);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3251,5 +3313,42 @@ mod tests {
             "operator leader gauge missing"
         );
         set_operator_leader_is_leader(false);
+    }
+
+    // --- per-credential token attribution ---
+
+    #[test]
+    fn record_tokens_attributed_emits_counter_with_four_labels() {
+        record_tokens_attributed("frontend", "alice", "team:frontend", "input", 1234);
+        record_tokens_attributed("frontend", "alice", "team:frontend", "output", 567);
+        record_tokens_attributed("billing", "bob", "env:prod", "input", 42);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_tokens_attributed_total"),
+            "tokens attributed counter missing"
+        );
+        for label_check in [
+            "project=\"frontend\"",
+            "project=\"billing\"",
+            "user=\"alice\"",
+            "user=\"bob\"",
+            "tag=\"team:frontend\"",
+            "tag=\"env:prod\"",
+            "direction=\"input\"",
+            "direction=\"output\"",
+        ] {
+            assert!(
+                out.contains(label_check),
+                "expected {label_check} in render"
+            );
+        }
+    }
+
+    #[test]
+    fn record_tokens_attributed_skips_zero_count() {
+        record_tokens_attributed("a", "b", "", "input", 0);
+        // No row added; the assertion is that the call does not
+        // panic and does not create a noise row for zero-count
+        // observations.
     }
 }

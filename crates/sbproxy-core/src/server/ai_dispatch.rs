@@ -647,6 +647,9 @@ pub(super) async fn handle_ai_proxy(
                 if !vk.metadata.is_empty() {
                     ctx.ai_metadata = vk.metadata.clone();
                 }
+                if !vk.tags.is_empty() {
+                    ctx.ai_tags = vk.tags.clone();
+                }
                 // WOR-893: per-key model routing. When the key pins a
                 // model, overwrite the request body's `model` field so
                 // the downstream allow/block, routing, budget, and
@@ -2028,9 +2031,51 @@ pub(super) async fn relay_ai_response_with_cache(
             // Stamp the token counts onto the request context so the
             // access log records them alongside the rest of the AI
             // gateway envelope.
+            //
+            // Emit per-credential attribution to Prometheus alongside
+            // the access-log stamp. One row per direction; tag-bearing
+            // virtual keys fan out so a multi-tag key shows up under
+            // each declared tag. Empty `project` / `user` / `tag`
+            // serialise as empty labels and roll up to a Prometheus
+            // catch-all bucket.
             if let Some(ctx) = ctx.as_mut() {
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);
+                let project = ctx.ai_project.as_deref().unwrap_or("");
+                let user = ctx.ai_user.as_deref().unwrap_or("");
+                if ctx.ai_tags.is_empty() {
+                    sbproxy_observe::metrics::record_tokens_attributed(
+                        project,
+                        user,
+                        "",
+                        "input",
+                        prompt_tokens,
+                    );
+                    sbproxy_observe::metrics::record_tokens_attributed(
+                        project,
+                        user,
+                        "",
+                        "output",
+                        completion_tokens,
+                    );
+                } else {
+                    for tag in &ctx.ai_tags {
+                        sbproxy_observe::metrics::record_tokens_attributed(
+                            project,
+                            user,
+                            tag,
+                            "input",
+                            prompt_tokens,
+                        );
+                        sbproxy_observe::metrics::record_tokens_attributed(
+                            project,
+                            user,
+                            tag,
+                            "output",
+                            completion_tokens,
+                        );
+                    }
+                }
             }
             // WOR-798: feed the router's per-provider token counter
             // so the `LeastTokenUsage` / `TokenRate` strategies see
