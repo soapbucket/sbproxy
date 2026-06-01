@@ -6170,6 +6170,7 @@ dependencies = [
  "rand 0.8.6",
  "sbproxy-cache",
  "sbproxy-config",
+ "sbproxy-observe",
  "sbproxy-platform",
  "sbproxy-plugin",
  "sbproxy-security",

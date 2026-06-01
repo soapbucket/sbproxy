@@ -175,18 +175,26 @@ pub fn check_request(
     body: &[u8],
 ) -> IdempotencyOutcome {
     let Some(key) = extract_idempotency_key(headers) else {
+        sbproxy_observe::metrics::record_idempotency_cache_result("default", "not_applicable");
         return IdempotencyOutcome::NotApplicable;
     };
 
     let body_hash = hash_body(body);
+    let start = std::time::Instant::now();
+    let lookup = cache.get(workspace_id, &key);
+    let elapsed = start.elapsed().as_secs_f64();
+    sbproxy_observe::metrics::record_idempotency_cache_duration("default", elapsed);
 
-    if let Some(existing) = cache.get(workspace_id, &key) {
+    if let Some(existing) = lookup {
         if existing.request_body_hash == body_hash {
+            sbproxy_observe::metrics::record_idempotency_cache_result("default", "hit");
             return IdempotencyOutcome::CacheHit(existing);
         }
+        sbproxy_observe::metrics::record_idempotency_cache_result("default", "conflict");
         return IdempotencyOutcome::Conflict;
     }
 
+    sbproxy_observe::metrics::record_idempotency_cache_result("default", "miss");
     IdempotencyOutcome::Miss { key, body_hash }
 }
 

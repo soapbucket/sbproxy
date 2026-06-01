@@ -1551,6 +1551,77 @@ pub fn record_script_reload(engine: &'static str, result: &'static str) {
     counter.with_label_values(&[engine, result]).inc();
 }
 
+// --- rate-limit + idempotency metrics ------------------------------------
+//
+// The two request-shaping middlewares (rate_limit, idempotency) expose
+// counters and a histogram so operators can see throttle decisions
+// distinct from rejections and idempotency cache health independently
+// of overall response cache hits.
+//
+// `policy` is sanitised so a misconfigured route does not explode the
+// label space; `result` is a closed enum from the middleware itself
+// and passes through unsanitised. The same holds for `backend` and
+// `result` on the idempotency family.
+
+/// Record a rate-limit decision on
+/// `sbproxy_rate_limit_decisions_total{policy, result}`. `policy` is
+/// the route-pattern the decision was scoped to (sanitised). `result`
+/// is one of the closed strings `allow`, `throttle_route`,
+/// `throttle_tenant`, or `disabled`.
+pub fn record_rate_limit_decision(policy: &str, result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_rate_limit_decisions_total",
+            "Rate-limit middleware decisions, by policy and outcome",
+            &["policy", "result"],
+        )
+        .expect("rate-limit decision counter registers")
+    });
+    let policy = sanitize_label("policy", policy);
+    counter.with_label_values(&[policy.as_str(), result]).inc();
+}
+
+/// Record an idempotency-cache outcome on
+/// `sbproxy_idempotency_cache_results_total{backend, result}`. `result`
+/// is one of `hit`, `miss`, `conflict`, `not_applicable`.
+pub fn record_idempotency_cache_result(backend: &'static str, result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_idempotency_cache_results_total",
+            "Idempotency cache outcomes, by backend and result",
+            &["backend", "result"],
+        )
+        .expect("idempotency cache result counter registers")
+    });
+    counter.with_label_values(&[backend, result]).inc();
+}
+
+/// Record an idempotency-cache lookup duration on
+/// `sbproxy_idempotency_cache_duration_seconds{backend}`. Buckets
+/// cover the typical local-memory and remote-redis envelopes:
+/// 50 microseconds through 1 second.
+pub fn record_idempotency_cache_duration(backend: &'static str, duration_secs: f64) {
+    use prometheus::{register_histogram_vec, HistogramVec};
+    use std::sync::OnceLock;
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    let hist = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_idempotency_cache_duration_seconds",
+            "Idempotency cache lookup duration, by backend",
+            &["backend"],
+            vec![0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0,],
+        )
+        .expect("idempotency cache duration histogram registers")
+    });
+    hist.with_label_values(&[backend]).observe(duration_secs);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2248,6 +2319,57 @@ mod tests {
         assert!(
             out.contains("sbproxy_script_reloads_total"),
             "reload counter missing from render"
+        );
+    }
+
+    // --- rate-limit + idempotency ---
+
+    #[test]
+    fn record_rate_limit_decision_emits_counter() {
+        record_rate_limit_decision("/api/*", "allow");
+        record_rate_limit_decision("/api/*", "throttle_route");
+        record_rate_limit_decision("/billing", "throttle_tenant");
+        record_rate_limit_decision("__default__", "disabled");
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_rate_limit_decisions_total"),
+            "rate-limit counter missing from render"
+        );
+        for result in ["allow", "throttle_route", "throttle_tenant", "disabled"] {
+            assert!(
+                out.contains(&format!("result=\"{result}\"")),
+                "result={result} label missing"
+            );
+        }
+    }
+
+    #[test]
+    fn record_idempotency_cache_result_emits_counter() {
+        record_idempotency_cache_result("default", "hit");
+        record_idempotency_cache_result("default", "miss");
+        record_idempotency_cache_result("default", "conflict");
+        record_idempotency_cache_result("default", "not_applicable");
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_idempotency_cache_results_total"),
+            "idempotency results counter missing from render"
+        );
+        for result in ["hit", "miss", "conflict", "not_applicable"] {
+            assert!(
+                out.contains(&format!("result=\"{result}\"")),
+                "result={result} label missing"
+            );
+        }
+    }
+
+    #[test]
+    fn record_idempotency_cache_duration_emits_histogram() {
+        record_idempotency_cache_duration("default", 0.0005);
+        record_idempotency_cache_duration("default", 0.02);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_idempotency_cache_duration_seconds_bucket"),
+            "idempotency duration buckets missing"
         );
     }
 }
