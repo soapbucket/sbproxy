@@ -488,6 +488,13 @@ pub struct AgentDetectView<'a> {
     pub confidence: f32,
     /// Names of the signals the scorer consulted (audit trail).
     pub signals_used: &'a [String],
+    /// WOR-817: headless / stealth-browser indicator score, 0-100.
+    /// Rendered under `request.agent.headless_score`. Zero when no
+    /// indicator fired or the extractor was not run.
+    pub headless_score: u8,
+    /// WOR-817: ordered list of indicator names that fired.
+    /// Rendered under `request.agent.headless_indicators`.
+    pub headless_indicators: &'a [String],
 }
 
 /// Stamp the [`AgentDetectView`] under `request.agent.*`.
@@ -499,11 +506,13 @@ pub struct AgentDetectView<'a> {
 /// - `request.agent.provenance` - tier string.
 /// - `request.agent.confidence` - float 0.0-1.0.
 /// - `request.agent.signals_used` - list of strings.
+/// - `request.agent.headless_score` - int 0-100 (WOR-817).
+/// - `request.agent.headless_indicators` - list of strings (WOR-817).
 ///
 /// Idempotent: re-invoking overwrites the previous values so request-
 /// and response-time CEL evaluations can share one context.
 pub fn populate_agent_detect_namespace(ctx: &mut CelContext, view: &AgentDetectView<'_>) {
-    let mut agent_map = HashMap::with_capacity(5);
+    let mut agent_map = HashMap::with_capacity(7);
     agent_map.insert("score".to_string(), CelValue::Int(i64::from(view.score)));
     agent_map.insert(
         "id".to_string(),
@@ -521,6 +530,22 @@ pub fn populate_agent_detect_namespace(ctx: &mut CelContext, view: &AgentDetectV
         "signals_used".to_string(),
         CelValue::List(
             view.signals_used
+                .iter()
+                .map(|s| CelValue::String(s.clone()))
+                .collect(),
+        ),
+    );
+    // WOR-817: headless / stealth indicator surface. `score` is the
+    // 0-100 weighted score; `indicators` is the list of indicator
+    // names that fired. CEL policies key off either or both.
+    agent_map.insert(
+        "headless_score".to_string(),
+        CelValue::Int(i64::from(view.headless_score)),
+    );
+    agent_map.insert(
+        "headless_indicators".to_string(),
+        CelValue::List(
+            view.headless_indicators
                 .iter()
                 .map(|s| CelValue::String(s.clone()))
                 .collect(),
@@ -1346,12 +1371,15 @@ mod tests {
             "http.user_agent".to_string(),
             "http.header_order".to_string(),
         ];
+        let headless_inds = vec!["claims_chrome_without_client_hints".to_string()];
         let view = AgentDetectView {
             score: 95,
             agent_id: Some("claude-code-cli"),
             provenance: "unsigned-named",
             confidence: 0.9,
             signals_used: &signals,
+            headless_score: 25,
+            headless_indicators: &headless_inds,
         };
         populate_agent_detect_namespace(&mut ctx, &view);
 
@@ -1371,6 +1399,14 @@ mod tests {
         assert!(engine
             .eval_bool_source("size(request.agent.signals_used) == 2", &ctx)
             .unwrap());
+        // WOR-817: headless verdict renders alongside the rule-based
+        // fields so a single CEL policy can branch on either.
+        assert!(engine
+            .eval_bool_source("request.agent.headless_score == 25", &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source("size(request.agent.headless_indicators) == 1", &ctx)
+            .unwrap());
     }
 
     #[test]
@@ -1379,12 +1415,15 @@ mod tests {
         // still evaluate without nil errors.
         let mut ctx = build_request_context("GET", "/", &HeaderMap::new(), None, None, "h.com");
         let signals: Vec<String> = Vec::new();
+        let headless_inds: Vec<String> = Vec::new();
         let view = AgentDetectView {
             score: 0,
             agent_id: None,
             provenance: "unsigned-anonymous",
             confidence: 0.0,
             signals_used: &signals,
+            headless_score: 0,
+            headless_indicators: &headless_inds,
         };
         populate_agent_detect_namespace(&mut ctx, &view);
 
@@ -1397,6 +1436,14 @@ mod tests {
             .unwrap());
         assert!(engine
             .eval_bool_source("size(request.agent.signals_used) == 0", &ctx)
+            .unwrap());
+        // Headless namespace defaults to zero / empty so policies do
+        // not need to probe presence.
+        assert!(engine
+            .eval_bool_source("request.agent.headless_score == 0", &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source("size(request.agent.headless_indicators) == 0", &ctx)
             .unwrap());
     }
 

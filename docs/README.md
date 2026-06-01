@@ -41,6 +41,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [openapi-emission.md](openapi-emission.md) - publishing an OpenAPI 3.0 document from the live config.
 - [policy.md](policy.md) - the policy engine: `semantic_constraint`, the NL linter L001-L009, and the OSS / enterprise capability boundary.
 - [object-authz.md](object-authz.md) - `object_authz` policy: BOLA + BFLA enforcement with tenant-isolation and enumeration detection.
+- [headless-detection.md](headless-detection.md) - header-only headless / stealth-browser indicator heuristics surfaced under `request.agent.headless_*`.
 - [content-digest.md](content-digest.md) - `content_digest` policy: RFC 9530 request-body verification for integrity-critical inboxes.
 - [agent-budget.md](agent-budget.md) - `agent_budget` policy: semantic rate-limit primitive keyed on resolved agent identity.
 - [performance.md](performance.md) - tuning guide, benchmark methodology, profiling.

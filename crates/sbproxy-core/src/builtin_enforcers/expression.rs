@@ -118,6 +118,12 @@ impl PolicyEnforcer for ExpressionEnforcer {
                 provenance: ad.provenance.as_str(),
                 confidence: ad.confidence,
                 signals_used: &ad.signals_used,
+                // WOR-817: surface the headless score + indicator
+                // names so CEL policies can branch on
+                // `request.agent.headless_score >= 50` alongside
+                // the existing rule-based fields.
+                headless_score: ad.headless_score,
+                headless_indicators: &ad.headless_indicators,
             }
         });
         let views = sbproxy_modules::ExpressionViews {

@@ -317,6 +317,13 @@ impl CompiledRulePack {
                 provenance: rule.provenance,
                 confidence: rule.confidence,
                 signals_used: used,
+                // The rule-pack matcher does not own headless
+                // signals; the request-phase wire site stamps them
+                // on the resulting AgentDetection after evaluate
+                // returns. Defaults keep this matcher path
+                // unaffected.
+                headless_score: 0,
+                headless_indicators: Vec::new(),
             });
         }
         None
