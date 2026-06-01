@@ -37,7 +37,7 @@
 use std::collections::HashMap;
 
 use base64::Engine;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use hmac::{Hmac, KeyInit, Mac};
 use http::{HeaderMap, Method, Uri};
 use serde::Deserialize;
@@ -706,6 +706,179 @@ fn dummy_method() -> Method {
     Method::GET
 }
 
+// --- Sign side (WOR-805 AC#3) ---
+
+/// Sign a request per RFC 9421.
+///
+/// The verifier already lives above; the signer is the "we are the
+/// signing agent" counterpart. Construct with an Ed25519 signing
+/// key, then call [`Self::sign_request`] on the outbound request to
+/// attach the `Signature-Input` and `Signature` headers Cloudflare,
+/// AWS WAF, and other Web Bot Auth verifiers expect.
+///
+/// Today only Ed25519 is supported (HmacSha256 is asymmetric-by-
+/// configuration for the verifier but symmetric-keyed shared-secret
+/// signing is rarely what an outbound agent wants).
+pub struct MessageSignatureSigner {
+    signing_key: ed25519_dalek::SigningKey,
+    key_id: String,
+    /// Optional `tag` parameter the Web Bot Auth draft pins to
+    /// `"web-bot-auth"`. None omits the parameter.
+    tag: Option<String>,
+}
+
+/// One signed-request invocation's inputs. Pulled into a struct so
+/// the `sign_request` signature stays one positional arg.
+#[derive(Debug, Clone)]
+pub struct SignRequestParams {
+    /// Covered components in declaration order (e.g.
+    /// `["@method", "@authority", "@path", "content-digest"]`).
+    /// Verbatim into the signature base inner list.
+    pub components: Vec<String>,
+    /// Dictionary label (e.g. `"sig1"`). Identifies this signature
+    /// in the `Signature-Input` and `Signature` headers.
+    pub label: String,
+    /// `created` parameter as unix-seconds. The verifier checks
+    /// this against its `max_clock_skew_secs`; pass
+    /// `SystemTime::now()` from the caller to avoid embedding a
+    /// clock in this module.
+    pub created_unix: u64,
+    /// Optional `expires` parameter, unix-seconds. None omits the
+    /// parameter so the signature is treated as never-expiring by
+    /// the verifier (which falls back to its own skew window).
+    pub expires_unix: Option<u64>,
+    /// Optional `nonce` parameter for replay defence. None omits
+    /// it; verifiers that require it will reject.
+    pub nonce: Option<String>,
+}
+
+impl MessageSignatureSigner {
+    /// Build a signer from a raw 32-byte Ed25519 secret key + the
+    /// `kid` the directory publishes. `tag` is the optional Web
+    /// Bot Auth tag (`"web-bot-auth"` for that protocol; None for
+    /// generic RFC 9421 signing).
+    pub fn new_ed25519(
+        secret_key_bytes: &[u8; 32],
+        key_id: impl Into<String>,
+        tag: Option<String>,
+    ) -> Self {
+        Self {
+            signing_key: ed25519_dalek::SigningKey::from_bytes(secret_key_bytes),
+            key_id: key_id.into(),
+            tag,
+        }
+    }
+
+    /// Public-key bytes for the kid this signer holds. Surface so
+    /// the publish side ([`crate::digest`] and the
+    /// `bot_auth_publish` module on top) can build the directory
+    /// JWK without re-deriving the key.
+    pub fn public_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.verifying_key().to_bytes()
+    }
+
+    /// The `kid` this signer advertises.
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    /// Sign `req` and attach `Signature-Input` + `Signature`
+    /// headers per RFC 9421. Returns the canonical signature base
+    /// the request was signed over so callers can audit-log it
+    /// (without having to recompute).
+    pub fn sign_request(
+        &self,
+        req: &mut http::Request<bytes::Bytes>,
+        params: &SignRequestParams,
+    ) -> anyhow::Result<String> {
+        if params.components.is_empty() {
+            anyhow::bail!("sign_request: components must not be empty");
+        }
+        if params.label.is_empty() {
+            anyhow::bail!("sign_request: label must not be empty");
+        }
+        let inner_list = build_inner_list(&params.components);
+        let raw_params = build_raw_params(
+            &self.key_id,
+            &self.tag,
+            params.created_unix,
+            params.expires_unix,
+            params.nonce.as_deref(),
+        );
+        let entry = SignatureInputEntry {
+            components: params.components.clone(),
+            params: SignatureInputParams::default(),
+            raw_params: raw_params.clone(),
+            raw_inner_list: inner_list.clone(),
+        };
+        let base = build_signature_base(req, &entry)?;
+        let signature = self.signing_key.sign(base.as_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+
+        let signature_input_value = format!(
+            "{}=({}){}",
+            params.label,
+            inner_list,
+            if raw_params.is_empty() {
+                String::new()
+            } else {
+                format!(";{raw_params}")
+            }
+        );
+        let signature_value = format!("{}=:{}:", params.label, sig_b64);
+
+        req.headers_mut().insert(
+            http::HeaderName::from_static("signature-input"),
+            http::HeaderValue::from_str(&signature_input_value)?,
+        );
+        req.headers_mut().insert(
+            http::HeaderName::from_static("signature"),
+            http::HeaderValue::from_str(&signature_value)?,
+        );
+        Ok(base)
+    }
+}
+
+/// Compose the parenthesised inner list of `Signature-Input`. The
+/// build-side counterpart of the parser; the parser stores the
+/// inner list verbatim so the verifier sees byte-identical bases
+/// across implementations.
+fn build_inner_list(components: &[String]) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(components.len());
+    for c in components {
+        let trimmed = c.trim_matches('"');
+        parts.push(format!("\"{trimmed}\""));
+    }
+    parts.join(" ")
+}
+
+/// Compose the parameter section that follows the inner list in
+/// `Signature-Input`. `tag` is the Web Bot Auth draft's extension;
+/// `created` is required when the verifier enforces freshness;
+/// `expires` and `nonce` are optional.
+fn build_raw_params(
+    key_id: &str,
+    tag: &Option<String>,
+    created_unix: u64,
+    expires_unix: Option<u64>,
+    nonce: Option<&str>,
+) -> String {
+    let mut bits: Vec<String> = Vec::with_capacity(5);
+    bits.push(format!("keyid=\"{}\"", key_id));
+    bits.push("alg=\"ed25519\"".to_string());
+    bits.push(format!("created={created_unix}"));
+    if let Some(exp) = expires_unix {
+        bits.push(format!("expires={exp}"));
+    }
+    if let Some(nonce) = nonce {
+        bits.push(format!("nonce=\"{nonce}\""));
+    }
+    if let Some(tag) = tag {
+        bits.push(format!("tag=\"{tag}\""));
+    }
+    bits.join(";")
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -1103,5 +1276,188 @@ mod tests {
         assert_eq!(cfg.key_id, "proxy-key-1");
         assert_eq!(cfg.required_components.len(), 2);
         assert_eq!(cfg.clock_skew_seconds, 30);
+    }
+
+    // --- Signer round-trip tests (WOR-805 AC#3) ---
+
+    fn fixed_ed25519_keypair() -> (ed25519_dalek::SigningKey, [u8; 32]) {
+        // Deterministic seed so the test is reproducible.
+        let seed: [u8; 32] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ];
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        (sk, seed)
+    }
+
+    fn fresh_signed_request() -> http::Request<bytes::Bytes> {
+        http::Request::builder()
+            .method("POST")
+            .uri("/echo")
+            .header("host", "api.example.com")
+            .header("content-type", "application/json")
+            .body(bytes::Bytes::from_static(b"{\"hello\":\"world\"}"))
+            .unwrap()
+    }
+
+    #[test]
+    fn signer_round_trips_through_verifier() {
+        let (_sk, seed) = fixed_ed25519_keypair();
+        let signer = MessageSignatureSigner::new_ed25519(&seed, "proxy-key-1", None);
+        // The verifier needs the public key in hex/base64; pull it
+        // from the signer's accessor.
+        let pk = signer.public_key_bytes();
+        let mut req = fresh_signed_request();
+        let now = 1_700_000_000;
+        let params = SignRequestParams {
+            components: vec![
+                "@method".to_string(),
+                "@target-uri".to_string(),
+                "host".to_string(),
+            ],
+            label: "sig1".to_string(),
+            created_unix: now,
+            expires_unix: None,
+            nonce: None,
+        };
+        signer.sign_request(&mut req, &params).unwrap();
+        assert!(req.headers().get("signature-input").is_some());
+        assert!(req.headers().get("signature").is_some());
+
+        // Independent verifier instance, given only the public key.
+        let verifier = MessageSignatureVerifier::new(MessageSignatureConfig {
+            algorithm: SignatureAlgorithm::Ed25519,
+            key_id: "proxy-key-1".to_string(),
+            key: hex::encode(pk),
+            required_components: Vec::new(),
+            clock_skew_seconds: 1_000_000_000, // disable freshness for the deterministic now
+        })
+        .unwrap();
+        match verifier.verify_request(&req) {
+            VerifyVerdict::Ok { signature_label } => {
+                assert_eq!(signature_label, "sig1");
+            }
+            VerifyVerdict::Failed { reason } => panic!("verify failed: {reason}"),
+        }
+    }
+
+    #[test]
+    fn signer_attaches_web_bot_auth_tag_when_supplied() {
+        let (_sk, seed) = fixed_ed25519_keypair();
+        let signer = MessageSignatureSigner::new_ed25519(
+            &seed,
+            "proxy-key-1",
+            Some("web-bot-auth".to_string()),
+        );
+        let mut req = fresh_signed_request();
+        signer
+            .sign_request(
+                &mut req,
+                &SignRequestParams {
+                    components: vec!["@method".to_string(), "host".to_string()],
+                    label: "sig1".to_string(),
+                    created_unix: 1_700_000_000,
+                    expires_unix: Some(1_700_003_600),
+                    nonce: Some("n-42".to_string()),
+                },
+            )
+            .unwrap();
+        let sig_input = req
+            .headers()
+            .get("signature-input")
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_string();
+        assert!(sig_input.contains("tag=\"web-bot-auth\""));
+        assert!(sig_input.contains("keyid=\"proxy-key-1\""));
+        assert!(sig_input.contains("alg=\"ed25519\""));
+        assert!(sig_input.contains("created=1700000000"));
+        assert!(sig_input.contains("expires=1700003600"));
+        assert!(sig_input.contains("nonce=\"n-42\""));
+    }
+
+    #[test]
+    fn signer_rejects_empty_components() {
+        let (_sk, seed) = fixed_ed25519_keypair();
+        let signer = MessageSignatureSigner::new_ed25519(&seed, "k", None);
+        let mut req = fresh_signed_request();
+        let err = signer
+            .sign_request(
+                &mut req,
+                &SignRequestParams {
+                    components: Vec::new(),
+                    label: "sig1".to_string(),
+                    created_unix: 0,
+                    expires_unix: None,
+                    nonce: None,
+                },
+            )
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("components"));
+    }
+
+    #[test]
+    fn signer_rejects_empty_label() {
+        let (_sk, seed) = fixed_ed25519_keypair();
+        let signer = MessageSignatureSigner::new_ed25519(&seed, "k", None);
+        let mut req = fresh_signed_request();
+        let err = signer
+            .sign_request(
+                &mut req,
+                &SignRequestParams {
+                    components: vec!["@method".to_string()],
+                    label: String::new(),
+                    created_unix: 0,
+                    expires_unix: None,
+                    nonce: None,
+                },
+            )
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("label"));
+    }
+
+    #[test]
+    fn signer_public_key_accessor_returns_32_bytes() {
+        let (_sk, seed) = fixed_ed25519_keypair();
+        let signer = MessageSignatureSigner::new_ed25519(&seed, "k", None);
+        assert_eq!(signer.public_key_bytes().len(), 32);
+        assert_eq!(signer.key_id(), "k");
+    }
+
+    #[test]
+    fn signer_round_trip_with_changed_component_fails_verification() {
+        // Cross-check: if the request body changes after signing,
+        // the verifier MUST reject. We approximate by changing the
+        // method on the wire (the @method component is covered).
+        let (_sk, seed) = fixed_ed25519_keypair();
+        let signer = MessageSignatureSigner::new_ed25519(&seed, "proxy-key-1", None);
+        let mut req = fresh_signed_request();
+        signer
+            .sign_request(
+                &mut req,
+                &SignRequestParams {
+                    components: vec!["@method".to_string(), "host".to_string()],
+                    label: "sig1".to_string(),
+                    created_unix: 1_700_000_000,
+                    expires_unix: None,
+                    nonce: None,
+                },
+            )
+            .unwrap();
+        // Tamper.
+        *req.method_mut() = http::Method::GET;
+        let verifier = MessageSignatureVerifier::new(MessageSignatureConfig {
+            algorithm: SignatureAlgorithm::Ed25519,
+            key_id: "proxy-key-1".to_string(),
+            key: hex::encode(signer.public_key_bytes()),
+            required_components: Vec::new(),
+            clock_skew_seconds: 1_000_000_000,
+        })
+        .unwrap();
+        assert!(matches!(
+            verifier.verify_request(&req),
+            VerifyVerdict::Failed { .. }
+        ));
     }
 }
