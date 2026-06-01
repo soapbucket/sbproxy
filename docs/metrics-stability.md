@@ -82,6 +82,33 @@ All metrics below are currently `stable`.
 
 ---
 
+#### `sbproxy_phase_duration_seconds`
+
+| Property | Value |
+|---|---|
+| Type | Histogram |
+| Stability | **stable** |
+| Description | Intra-request phase duration in seconds. Splits `sbproxy_request_duration_seconds` into the parts of the pipeline that contributed: time in the auth provider, time waiting for the first upstream byte, time running response transforms. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `phase` | Phase name (closed enum, additive) | `auth`, `upstream_ttfb`, `response_filter` |
+| `origin` | Virtual hostname | `api.example.com` |
+
+**Bucket schedule:** `0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0`. Identical to `sbproxy_request_duration_seconds` so dashboards can overlay phase vs end-to-end without bucket interpolation.
+
+**Phase definitions:**
+
+* `auth` is from the request's first byte to the moment the auth provider returns (allow, deny, or challenge). Not emitted for origins without an auth provider.
+* `upstream_ttfb` is from the request's first byte to the first byte of the upstream response header. Not emitted for requests that never reach an upstream (early auth/policy short-circuit, cache hit).
+* `response_filter` is from the first upstream byte to the end of `response_filter`. Not emitted when no response_filter ran.
+
+The same observations appear as `auth_ms` / `upstream_ttfb_ms` / `response_filter_ms` on the access log; this histogram is the aggregate view.
+
+---
+
 #### `sbproxy_active_connections`
 
 | Property | Value |

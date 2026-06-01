@@ -2098,7 +2098,13 @@ pub(super) async fn request_filter(
             let query = session.req_header().uri.query();
             let method = session.req_header().method.as_str();
             let path = session.req_header().uri.path();
-            match check_auth(auth, req_headers, query, method, path).await {
+            let auth_result = check_auth(auth, req_headers, query, method, path).await;
+            // Phase-timing capture: snapshot the moment the auth
+            // provider returned (success, deny, or challenge). The
+            // access-log + `sbproxy_phase_duration_seconds{phase="auth"}`
+            // histogram derive `auth_ms` from this delta.
+            ctx.auth_finished_at = Some(std::time::Instant::now());
+            match auth_result {
                 AuthResult::Allow { sub, source } => {
                     ctx.auth_result = Some(sbproxy_plugin::AuthDecision::Allow { sub, source });
                     sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, true);

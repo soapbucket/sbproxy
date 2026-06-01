@@ -434,6 +434,18 @@ pub(super) fn emit_access_log(
         classifier_prompt: ctx.classifier_prompt.as_ref().map(classifier_label),
         classifier_intent: ctx.classifier_intent.map(intent_label),
         error_class: classify_error_class(status),
+        auth_ms: ctx
+            .request_start
+            .zip(ctx.auth_finished_at)
+            .map(|(s, e)| e.saturating_duration_since(s).as_secs_f64() * 1000.0),
+        upstream_ttfb_ms: ctx
+            .request_start
+            .zip(ctx.upstream_first_byte_at)
+            .map(|(s, e)| e.saturating_duration_since(s).as_secs_f64() * 1000.0),
+        response_filter_ms: ctx
+            .upstream_first_byte_at
+            .zip(ctx.response_filter_finished_at)
+            .map(|(s, e)| e.saturating_duration_since(s).as_secs_f64() * 1000.0),
         bytes_in: ctx.request_body_bytes,
         bytes_out: ctx.response_body_bytes,
         provider: ctx.ai_provider.clone(),
@@ -503,6 +515,19 @@ pub(super) struct AccessLogContext {
     pub(super) classifier_prompt: Option<String>,
     pub(super) classifier_intent: Option<String>,
     pub(super) error_class: Option<String>,
+    /// Auth-phase latency in milliseconds, derived from
+    /// `ctx.auth_finished_at - ctx.request_start`. `None` for
+    /// origins without an auth provider.
+    pub(super) auth_ms: Option<f64>,
+    /// Upstream TTFB in milliseconds, derived from
+    /// `ctx.upstream_first_byte_at - ctx.request_start`. `None`
+    /// for requests that never hit an upstream (early auth/policy
+    /// short-circuit, cache hit).
+    pub(super) upstream_ttfb_ms: Option<f64>,
+    /// Response-filter phase latency in milliseconds, derived from
+    /// `ctx.response_filter_finished_at - ctx.upstream_first_byte_at`.
+    /// `None` when no response_filter ran.
+    pub(super) response_filter_ms: Option<f64>,
     /// Total request body bytes seen by `request_body_filter`.
     pub(super) bytes_in: u64,
     /// Total response body bytes sent to the client by
@@ -584,6 +609,9 @@ impl AccessLogContext {
             classifier_prompt: None,
             classifier_intent: None,
             error_class: None,
+            auth_ms: None,
+            upstream_ttfb_ms: None,
+            response_filter_ms: None,
             bytes_in: 0,
             bytes_out: 0,
             provider: None,
@@ -679,6 +707,9 @@ pub(super) fn emit_access_log_entry(
         path: path.to_string(),
         status,
         latency_ms,
+        auth_ms: context.auth_ms,
+        upstream_ttfb_ms: context.upstream_ttfb_ms,
+        response_filter_ms: context.response_filter_ms,
         bytes_in: context.bytes_in,
         bytes_out: context.bytes_out,
         client_ip,

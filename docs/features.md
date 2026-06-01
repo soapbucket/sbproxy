@@ -1476,7 +1476,7 @@ A representative slice of the catalog appears below. The canonical, exhaustive r
 
 SBproxy emits structured JSON logs to stderr. Verbosity is controlled (in precedence order) by the `--log-level` flag, the `SB_LOG_LEVEL` environment variable, or the `RUST_LOG` environment variable. Default is `info`. Accepted values: `trace`, `debug`, `info`, `warn`, `error`.
 
-Each access log line carries: `timestamp`, `level`, `msg`, `origin`, `method`, `path`, `status`, `latency_ms`, `client_ip`, `request_id`, `trace_id`, `cache_result`. The canonical access-log schema (with optional fields and stability rules) is [access-log.md](./access-log.md).
+Each access log line carries: `timestamp`, `level`, `msg`, `origin`, `method`, `path`, `status`, `latency_ms`, `client_ip`, `request_id`, `trace_id`, `cache_result`, plus three phase-timing fields (`auth_ms`, `upstream_ttfb_ms`, `response_filter_ms`) that split `latency_ms` into the parts of the pipeline that produced it. The canonical access-log schema (with optional fields and stability rules) is [access-log.md](./access-log.md); the same phase observations appear as `sbproxy_phase_duration_seconds` in [metrics-stability.md](./metrics-stability.md).
 
 ### Request envelope: properties, sessions, users
 
