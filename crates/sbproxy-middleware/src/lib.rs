@@ -15,6 +15,17 @@ pub mod hsts;
 /// Idempotency-Key middleware with cached-retry vs conflict semantics
 /// (Wave 3 / R3.2, A3.4).
 pub mod idempotency;
+/// L402 (Lightning HTTP 402) bearer credential surface: issuer side
+/// builds the `WWW-Authenticate: L402 macaroon=..., invoice=...`
+/// challenge; verifier side accepts
+/// `Authorization: L402 <macaroon>:<preimage>` and confirms the
+/// preimage hash matches the macaroon's `payment_hash` caveat.
+/// Stateless once the root key is fixed. WOR-807.
+pub mod l402;
+/// Macaroon bearer credentials (Birgisson et al. 2014). HMAC-SHA256
+/// chained signature with first-party caveat attenuation. Backs the
+/// L402 flow above and is reusable as a stand-alone token primitive.
+pub mod macaroon;
 pub mod modifiers;
 pub mod problem_details;
 pub mod proxy_status;
