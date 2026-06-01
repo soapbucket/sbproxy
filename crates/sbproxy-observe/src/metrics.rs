@@ -1922,6 +1922,100 @@ pub fn record_vault_resolution(backend: &str, result: &'static str, duration_sec
         .observe(duration_secs);
 }
 
+// --- transport metrics -------------------------------------------------
+//
+// Three families cover the non-HTTP/1.1 transport surface. `protocol`
+// is the closed enum `h1 | h2 | h3 | grpc | grpc_web | graphql |
+// websocket`. The H1 / H2 paths already have rich coverage from the
+// generic request metrics; the families below let an operator alert
+// on protocol-specific failure modes (gRPC status drift, websocket
+// frame errors, H3 session churn) without double-counting requests
+// from the generic path.
+//
+// gRPC status codes are emitted under
+// `sbproxy_grpc_status_total{code}` where `code` is the canonical
+// tonic::Code lowercase name (`ok`, `cancelled`, `unknown`,
+// `invalid_argument`, ...). The label space is bounded by tonic's
+// closed enum, so no sanitisation is required.
+
+/// Record a transport-layer request outcome on
+/// `sbproxy_transport_requests_total{protocol, result}` and its
+/// matching duration histogram. `result` is one of `ok`,
+/// `client_error`, `upstream_error`, `timeout`.
+pub fn record_transport_request(protocol: &'static str, result: &'static str, duration_secs: f64) {
+    use prometheus::{
+        register_histogram_vec, register_int_counter_vec, HistogramVec, IntCounterVec,
+    };
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_transport_requests_total",
+            "Transport-layer requests, by protocol and outcome",
+            &["protocol", "result"],
+        )
+        .expect("transport requests counter registers")
+    });
+    let hist = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_transport_duration_seconds",
+            "Transport-layer request duration, by protocol and outcome",
+            &["protocol", "result"],
+            vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,],
+        )
+        .expect("transport duration histogram registers")
+    });
+    counter.with_label_values(&[protocol, result]).inc();
+    hist.with_label_values(&[protocol, result])
+        .observe(duration_secs);
+}
+
+/// Record a gRPC status code on `sbproxy_grpc_status_total{code}`.
+/// `code` is the canonical tonic-style lowercase name (`ok`,
+/// `not_found`, `unauthenticated`, ...). Useful for spotting a
+/// `failed_precondition` burst after a deploy or an `unavailable`
+/// spike from an upstream pool.
+pub fn record_grpc_status(code: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_grpc_status_total",
+            "Observed gRPC status codes, by canonical name",
+            &["code"],
+        )
+        .expect("grpc status counter registers")
+    });
+    counter.with_label_values(&[code]).inc();
+}
+
+/// Map a gRPC numeric status code (RFC-style, 0..16) to the closed
+/// `code` label set. Out-of-range codes report as `unknown`.
+pub fn grpc_status_label(code: u32) -> &'static str {
+    match code {
+        0 => "ok",
+        1 => "cancelled",
+        2 => "unknown",
+        3 => "invalid_argument",
+        4 => "deadline_exceeded",
+        5 => "not_found",
+        6 => "already_exists",
+        7 => "permission_denied",
+        8 => "resource_exhausted",
+        9 => "failed_precondition",
+        10 => "aborted",
+        11 => "out_of_range",
+        12 => "unimplemented",
+        13 => "internal",
+        14 => "unavailable",
+        15 => "data_loss",
+        16 => "unauthenticated",
+        _ => "unknown",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2847,5 +2941,57 @@ mod tests {
                 "result={result} label missing"
             );
         }
+    }
+
+    // --- transport ---
+
+    #[test]
+    fn record_transport_request_emits_counter_and_histogram() {
+        record_transport_request("grpc", "ok", 0.005);
+        record_transport_request("grpc", "upstream_error", 0.1);
+        record_transport_request("websocket", "timeout", 2.0);
+        record_transport_request("h3", "client_error", 0.001);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_transport_requests_total"),
+            "transport requests counter missing"
+        );
+        assert!(
+            out.contains("sbproxy_transport_duration_seconds_bucket"),
+            "transport duration buckets missing"
+        );
+        for protocol in ["grpc", "websocket", "h3"] {
+            assert!(
+                out.contains(&format!("protocol=\"{protocol}\"")),
+                "protocol={protocol} label missing"
+            );
+        }
+    }
+
+    #[test]
+    fn record_grpc_status_emits_counter() {
+        record_grpc_status("ok");
+        record_grpc_status("not_found");
+        record_grpc_status("unavailable");
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_grpc_status_total"),
+            "grpc status counter missing"
+        );
+        for code in ["ok", "not_found", "unavailable"] {
+            assert!(
+                out.contains(&format!("code=\"{code}\"")),
+                "code={code} label missing"
+            );
+        }
+    }
+
+    #[test]
+    fn grpc_status_label_covers_canonical_codes() {
+        assert_eq!(grpc_status_label(0), "ok");
+        assert_eq!(grpc_status_label(5), "not_found");
+        assert_eq!(grpc_status_label(14), "unavailable");
+        assert_eq!(grpc_status_label(16), "unauthenticated");
+        assert_eq!(grpc_status_label(99), "unknown");
     }
 }
