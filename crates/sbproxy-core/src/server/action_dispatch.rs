@@ -1218,6 +1218,21 @@ pub(super) async fn handle_mcp_action(
         }
         "tools/call" => {
             let params = request.params.clone().unwrap_or(serde_json::Value::Null);
+            // WOR-818 PR2: extract the OpenAI Apps SDK
+            // `params.audit.cause` so it reaches the policy hook
+            // and the audit chain. Absent on base-MCP calls.
+            let audit_cause = params
+                .get("audit")
+                .and_then(|a| a.get("cause"))
+                .and_then(|c| c.as_str())
+                .map(str::to_string);
+            if let Some(cause) = audit_cause.as_deref() {
+                tracing::debug!(
+                    target: "sbproxy::mcp::audit_cause",
+                    cause = %cause,
+                    "mcp tools/call carries audit.cause (SEP-1865)"
+                );
+            }
             let mut tool_name = params
                 .get("name")
                 .and_then(|v| v.as_str())

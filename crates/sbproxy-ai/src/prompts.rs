@@ -232,6 +232,39 @@ fn overlay_handle() -> &'static ArcSwap<RuntimePromptOverlay> {
     H.get_or_init(|| ArcSwap::from_pointee(RuntimePromptOverlay::default()))
 }
 
+/// Mutator serialization. The mutator functions below all do
+/// read-modify-write against `overlay_handle()`: load the current
+/// snapshot, clone, mutate the clone, store it back. Two concurrent
+/// calls without serialization both observe the same `load`, both
+/// mutate disjoint clones, and the second `store` silently loses
+/// the first call's mutation. Holding this mutex across the whole
+/// read-modify-write keeps every write linearizable. Reads bypass
+/// the mutex via the lock-free `load_full()` so the hot dispatch
+/// path is unaffected.
+fn overlay_mutator_lock() -> &'static std::sync::Mutex<()> {
+    static M: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Test-only serialization lock for the process-global runtime
+/// overlay. Two different modules' tests can both call
+/// [`install_runtime_overlay`] + [`add_runtime_prompt_version`] +
+/// observe the result; without a shared lock they interleave and
+/// flake (the internal production mutator lock keeps each call
+/// atomic but does NOT serialize the test's "reset + mutate +
+/// observe" sequence). Every test that resets or mutates the
+/// overlay MUST take this guard for its duration.
+///
+/// Returns the guard so tests can hold it via RAII (`let _g =
+/// lock_for_tests();`). Idempotent under panics: poisoned locks
+/// recover the inner guard rather than propagating the panic.
+pub fn lock_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    static L: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 /// Load the current runtime overlay snapshot. Cheap; a single atomic
 /// load + an `Arc` clone.
 pub fn current_runtime_overlay() -> Arc<RuntimePromptOverlay> {
@@ -244,6 +277,9 @@ pub fn current_runtime_overlay() -> Arc<RuntimePromptOverlay> {
 /// requests that already snapshotted the old overlay finish against
 /// it.
 pub fn install_runtime_overlay(overlay: RuntimePromptOverlay) {
+    let _guard = overlay_mutator_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     overlay_handle().store(Arc::new(overlay));
 }
 
@@ -261,6 +297,9 @@ pub fn add_runtime_prompt_version(
     template: String,
     variables: serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
+    let _guard = overlay_mutator_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let handle = overlay_handle();
     let cur = handle.load();
     let mut next = (**cur).clone();
@@ -291,6 +330,9 @@ pub fn add_runtime_prompt_version(
 /// reference omits `@version`). Returns `Ok(())` on success or an
 /// error string when the prompt or version is unknown.
 pub fn pin_runtime_prompt(host: &str, name: &str, version: &str) -> Result<(), String> {
+    let _guard = overlay_mutator_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let handle = overlay_handle();
     let cur = handle.load();
     let mut next = (**cur).clone();

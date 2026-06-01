@@ -169,13 +169,12 @@ mod tests {
     }
 
     /// The runtime overlay is process-global; tests that install
-    /// into it serialize via this lock.
+    /// into it serialize via the shared lock from `sbproxy_ai`.
+    /// Both this module and `admin::tests` mutate the same overlay,
+    /// so they must share one mutex or the "reset + mutate + observe"
+    /// sequences interleave and flake.
     fn overlay_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::OnceLock;
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        sbproxy_ai::prompts::lock_for_tests()
     }
 
     fn reset_overlay() {

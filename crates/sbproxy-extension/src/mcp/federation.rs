@@ -550,6 +550,33 @@ impl McpFederation {
         correlation_id: &str,
         workspace_id: &str,
     ) -> anyhow::Result<McpCallOutcome> {
+        self.call_tool_with_policy_and_cause(
+            tool_name,
+            arguments,
+            agent_id,
+            correlation_id,
+            workspace_id,
+            None,
+        )
+        .await
+    }
+
+    /// WOR-818 PR2 variant of [`Self::call_tool_with_policy`] that
+    /// additionally threads the OpenAI Apps SDK `params.audit.cause`
+    /// value to the policy hooks. Existing callers stay on the
+    /// `_with_policy` shim and lose no behaviour; new callers that
+    /// have extracted the cause from the inbound JSON-RPC envelope
+    /// surface it here so an enterprise hook can audit which UI
+    /// element triggered the call.
+    pub async fn call_tool_with_policy_and_cause(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        agent_id: Option<&str>,
+        correlation_id: &str,
+        workspace_id: &str,
+        audit_cause: Option<&str>,
+    ) -> anyhow::Result<McpCallOutcome> {
         let federated = self
             .resolve_tool(tool_name)
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", tool_name))?;
@@ -585,6 +612,7 @@ impl McpFederation {
                     arguments: &arguments,
                     correlation_id,
                     workspace_id,
+                    audit_cause,
                 };
                 let v = hook.evaluate(ctx).await;
                 if !matches!(v, PolicyDecision::Allow) {
