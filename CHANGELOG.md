@@ -13,6 +13,89 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **Phase-timing breakdown on the access log + new
+  `sbproxy_phase_duration_seconds` Prometheus histogram.** The
+  access log carried `latency_ms` end to end and that was it; an
+  operator looking at a slow request could not tell from the log
+  whether the time went to the auth provider, the upstream, or a
+  response transform. Three new optional fields land on every
+  `AccessLogEntry`: `auth_ms` (request_start → auth provider
+  returned), `upstream_ttfb_ms` (request_start → first upstream
+  response byte), `response_filter_ms` (first upstream byte → end
+  of `response_filter`). All three are `Option<f64>` and
+  `serde-skip` when None, so origins that short-circuit (cache
+  hit, auth deny) keep compact lines. The same observations also
+  feed a new `sbproxy_phase_duration_seconds{phase, origin}`
+  histogram with buckets identical to
+  `sbproxy_request_duration_seconds` for cross-cut dashboards. See
+  `docs/access-log.md` and `docs/metrics-stability.md`.
+
+- **Nine standard HTTP fields on the access log: `host`, `query`,
+  `protocol`, `scheme`, `user_agent`, `referer`, `upstream_status`,
+  `response_content_type`, `response_content_encoding`.** The log
+  was missing the canonical fields most HTTP access-log consumers
+  expect (Apache, NGINX, Envoy, the cookie-cutter ELK pipeline).
+  `host` is the client-supplied Host header (distinct from
+  `origin`, the matched virtual-host pattern); `upstream_status`
+  is the upstream's response code when the proxy rewrote the
+  status the client sees. All nine are `Option`, `serde-skip` when
+  not applicable. Promoted from the generic header allowlist
+  because nearly every analytics consumer wants them. See
+  `docs/access-log.md`.
+
+- **Opt-in OpenTelemetry metrics mirror alongside the canonical
+  Prometheus surface.** New `telemetry.export_metrics: true`
+  (with `telemetry.metrics_interval_secs` cadence, default 30s)
+  installs an OTel `MeterProvider` that ships observations to the
+  same OTLP collector the trace pipeline targets. The first two
+  mirrored instruments are `sbproxy.phase.duration` and
+  `sbproxy.request.duration`; record-paths fall back to OTel's
+  global no-op meter when the export is off, so operators pay
+  nothing for the mirror unless they opt in. The Prometheus
+  surface remains canonical; this is for operators who already
+  aggregate via Mimir / Datadog / Honeycomb and want to skip the
+  Prometheus scrape.
+
+- **OIDC Relying-Party stack (WOR-892) shipped end to end.**
+  `/oidc/callback` (auth-code + PKCE + sealed session cookie)
+  plus the helpers + config wiring for
+  `/.well-known/openid-configuration` discovery, refresh-token
+  rotation, RP-initiated logout at `/oidc/logout`, userinfo →
+  `X-Auth-*` trust headers, an optional server-side session store
+  (in-memory + KV-backed redb/file/Redis) for targeted revocation.
+  See `docs/configuration.md` § OIDC auth.
+
+- **OpenAI Apps SDK / MCP Apps (SEP-1865) compatibility (WOR-818).**
+  Gateway-side `_meta.mcpApps` passthrough for tool definitions,
+  `params.audit.cause` plumbing on `tools/call`, and a typed
+  validator set (`apps.template_declared`, `apps.iframe_sandbox`,
+  `apps.csp_present`, `apps.cache_metadata`) usable by sbproxy,
+  the enterprise extension, and any CI gate over the
+  `sbproxy-plugin` surface.
+
+- **Web Bot Auth full conformance, publish + sign sides
+  (WOR-805).** SBproxy now publishes its own JWKS-shaped
+  directory at `/.well-known/http-message-signatures-directory`
+  and a Signature Agent Card at
+  `/.well-known/web-bot-auth/agent-card` (opt in via
+  `web_bot_auth_publish` per origin). New
+  `sbproxy-middleware::signatures::MessageSignatureSigner`
+  primitive signs outbound requests per RFC 9421, round-trips
+  through the existing verifier. See `docs/web-bot-auth.md` and
+  `examples/web-bot-auth-publish/`.
+
+- **Three previously-undocumented OSS policies now have docs +
+  runnable examples:** `object_authz` (BOLA + BFLA with
+  enumeration detection), `content_digest` (RFC 9530 request-body
+  verification), `agent_budget` (per-agent semantic rate limit).
+  See `docs/object-authz.md`, `docs/content-digest.md`,
+  `docs/agent-budget.md`.
+
+- **Discoverable FAQ.** `docs/faq.md` covers install, common
+  401 causes, OIDC minimal config, log levels, OSS-vs-enterprise
+  scope, and pointers into the rest of `docs/`. Wired into
+  `docs/README.md` under "Getting started".
+
 - **Explicit SIGINT/SIGTERM handling with a structured shutdown
   event and a 30s default drain budget.** Pingora's
   `Server::run_forever` already trapped SIGTERM and SIGINT, but
