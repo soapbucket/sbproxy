@@ -246,7 +246,7 @@ The sliding window is one minute, shared across all configured origins (state is
 
 ## Guardrails
 
-The proxy supports eight guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, `regex`, and `context_poisoning`. Guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. See the CEL guardrails section below for inline CEL conditions, and `features.md` for the higher-level configuration of each guardrail type.
+The proxy supports nine guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, `regex`, `context_poisoning`, and `agent_alignment`. Guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. See the CEL guardrails section below for inline CEL conditions, and `features.md` for the higher-level configuration of each guardrail type.
 
 Input guardrails apply to whichever body field the surface carries user text in:
 
@@ -274,6 +274,7 @@ A guardrail is *streaming-safe* when its block decision is stable as soon as the
 | `toxicity` | no | full-text classifier; partial-window scores are misleading |
 | `jailbreak` | no | multi-pattern + multi-token detector |
 | `content_safety` | no | full-text classifier (self-harm, violence, etc.) |
+| `agent_alignment` | no | runs on the input body only (it inspects assistant tool_calls); streaming output is not in scope |
 
 On the buffered (non-streaming) path the proxy runs every configured output guardrail against the full response. On the streaming output path the proxy runs only the streaming-safe guardrails on each chunk; non-safe guardrails are skipped because evaluating them against a partial window produces both false positives (tripping on benign mid-stream substrings) and false negatives (missing late-stream signal). Input guardrails always run against the full request regardless of `stream`.
 
@@ -311,6 +312,30 @@ The rule catalogue covers four families:
 Every hit emits `sbproxy_ai_context_poisoning_findings_total{rule_id, action}`. When `action: deny`, the request is also counted in `sbproxy_ai_context_poisoning_blocked_total` and the proxy returns a 4xx before any upstream call. `action: log` and `action: score` keep the request flowing; they differ only in the metric label so dashboards can separate observability volume from scoring volume.
 
 See `examples/ai-context-poisoning/` for a complete sample configuration and curl commands.
+
+### Agent-alignment guardrail
+
+The `agent_alignment` input guardrail audits the assistant's `tool_calls` array against operator-declared rules: an allow list of tools the agent is permitted to invoke, an explicit deny list that always trips even when allowed elsewhere, a forbidden-substring scan over the tool arguments, and a per-turn budget on the number of tool calls. The check is the LlamaFirewall (arXiv:2505.03574) "Agent Alignment Check" use case rendered as a deterministic ruleset so the per-request cost is bounded; an LLM-judge advisory variant rides a follow-up and slots into the same configuration.
+
+Unlike the other guardrails this one runs against the raw request body so it can read the OpenAI / Anthropic / MCP tool-call shapes; the flat-text view that backs `pii` / `injection` / etc. strips `tool_calls` and would silently miss the goal-divergence cases.
+
+```yaml
+guardrails:
+  input:
+    - type: agent_alignment
+      enabled: true
+      mode: flag                # flag (default, observability only) | block
+      allowed_tools: [search, fetch]
+      denied_tools: [delete_account]
+      forbidden_arg_substrings:
+        - "/etc/passwd"
+        - "AKIA"                # leaked AWS-key shapes
+      max_tool_calls_per_turn: 4
+```
+
+`mode: flag` records every violation as a log line + access-log entry but lets the request through; once the operator has tuned the rule lists they flip to `mode: block` so the dispatch loop short-circuits to a 400 on the next violation. Tool calls in any of three shapes are recognised: OpenAI (`tool_calls[*].function.name` + `function.arguments`), Anthropic (`tool_calls[*].name` + `input`), and MCP (`tool_calls[*].tool` or `tool_calls[*].name` + `arguments`). The forbidden-substring scan is case-insensitive against the JSON encoding of whichever argument field is present.
+
+See `examples/ai-agent-alignment/` for a runnable configuration that exercises every rule.
 
 ## Lua hooks
 

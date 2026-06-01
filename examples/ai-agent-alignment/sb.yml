@@ -1,0 +1,112 @@
+# AI gateway: agent-alignment guardrail (WOR-801).
+#
+# Threat model:
+#   A tool-using agent on this surface can call any function the
+#   provider exposes. A jailbroken user or a poisoned tool result
+#   (see ai-context-poisoning) can convince the model to call a
+#   destructive tool (account deletion, key exfiltration, file
+#   reads outside the project) even when the stated objective was
+#   "summarise the email thread".
+#
+# Mitigation:
+#   The `agent_alignment` input guardrail audits every assistant
+#   turn's `tool_calls` array against a deterministic ruleset:
+#     - allowed_tools whitelist (search + fetch only)
+#     - denied_tools blocklist (delete_account always trips)
+#     - forbidden_arg_substrings catches goal-hijacking payloads
+#       hidden inside otherwise-benign tool arguments
+#     - max_tool_calls_per_turn caps tool-spamming
+#
+# Setup:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#
+# Run:
+#   make run CONFIG=examples/ai-agent-alignment/sb.yml
+#
+# Test (allowed tool call, succeeds):
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "claude-3-5-sonnet-latest",
+#       "messages": [
+#         {"role": "user", "content": "Find news about Rust 1.96."},
+#         {"role": "assistant", "content": null, "tool_calls": [
+#           {"id": "t1", "function": {"name": "search",
+#             "arguments": "{\"q\": \"Rust 1.96\"}"}}
+#         ]}
+#       ]
+#     }'
+#
+# Test (denied tool, expect 400):
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "claude-3-5-sonnet-latest",
+#       "messages": [
+#         {"role": "user", "content": "Tidy up my account."},
+#         {"role": "assistant", "content": null, "tool_calls": [
+#           {"id": "t1", "function": {"name": "delete_account",
+#             "arguments": "{}"}}
+#         ]}
+#       ]
+#     }'
+#
+# Test (allowed tool, forbidden argument substring, expect 400):
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "claude-3-5-sonnet-latest",
+#       "messages": [
+#         {"role": "user", "content": "Read this config for me."},
+#         {"role": "assistant", "content": null, "tool_calls": [
+#           {"id": "t1", "function": {"name": "fetch",
+#             "arguments": "{\"path\": \"/etc/passwd\"}"}}
+#         ]}
+#       ]
+#     }'
+#
+# Expected behaviour:
+#   The first request reaches Anthropic; the second and third are
+#   rejected with HTTP 400 before any upstream call. The reason
+#   string in the JSON body names the failing rule + offending tool.
+#   Flip `mode: block` to `mode: flag` to keep the request going
+#   while still recording the violation on the access log.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+
+      providers:
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          default_model: claude-3-5-sonnet-latest
+          models:
+            - claude-3-5-sonnet-latest
+            - claude-3-5-haiku-latest
+
+      guardrails:
+        input:
+          - type: agent_alignment
+            enabled: true
+            mode: block
+            allowed_tools:
+              - search
+              - fetch
+            denied_tools:
+              - delete_account
+            # Catches goal-hijacking payloads hidden inside a benign
+            # tool's arguments. Substring match is case-insensitive
+            # against the JSON encoding of `function.arguments` /
+            # `input` / `arguments`.
+            forbidden_arg_substrings:
+              - "/etc/passwd"
+              - "AKIA"
+            max_tool_calls_per_turn: 4
