@@ -20,6 +20,7 @@
 //! - [`verify_before_commit`] - VIGIL-pattern verify-before-commit checks for tool calls.
 
 pub mod access_control;
+pub mod apps_validators;
 pub mod audit;
 pub mod code_mode;
 pub mod codemode_from_openapi;
