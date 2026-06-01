@@ -44,6 +44,18 @@ pub struct SessionClaims {
     /// Absolute issued-at, unix seconds. Used by audit / event logs
     /// to compute session age.
     pub iat: u64,
+    /// Trust-header projection from the IdP's userinfo response,
+    /// captured at login time. Pairs of (header-name, value) like
+    /// `("X-Auth-Email", "alice@example.com")`. Empty when userinfo
+    /// is not configured or the OP did not release any projectable
+    /// claims. The request-time auth check replays these onto the
+    /// upstream request so the origin sees a stable trust view
+    /// regardless of which OP issued the session.
+    ///
+    /// Serde-defaulted so cookies issued before this field existed
+    /// continue to deserialise; they simply project no headers.
+    #[serde(default)]
+    pub trust_headers: Vec<(String, String)>,
 }
 
 /// Claims carried in the short-lived OIDC transaction cookie. Set
@@ -138,6 +150,7 @@ mod tests {
             aud: "sbproxy-client-id".to_string(),
             iat: now,
             exp: now + ttl,
+            trust_headers: Vec::new(),
         }
     }
 
@@ -158,6 +171,26 @@ mod tests {
         let sealed = seal_session(&claims, IKM).unwrap();
         let opened = open_session(&sealed, IKM, now).unwrap();
         assert_eq!(opened, claims);
+    }
+
+    #[test]
+    fn session_round_trip_preserves_trust_headers() {
+        // The userinfo follow-up stashes trust-header projections in
+        // the session cookie; the round-trip must preserve them
+        // verbatim or the request-time replay sends the wrong values.
+        let now = 1_700_000_000;
+        let mut claims = session_at(now, 3600);
+        claims.trust_headers = vec![
+            (
+                "X-Auth-Subject".to_string(),
+                "alice@example.com".to_string(),
+            ),
+            ("X-Auth-Email".to_string(), "alice@example.com".to_string()),
+            ("X-Auth-Groups".to_string(), "eng,platform".to_string()),
+        ];
+        let sealed = seal_session(&claims, IKM).unwrap();
+        let opened = open_session(&sealed, IKM, now).unwrap();
+        assert_eq!(opened.trust_headers, claims.trust_headers);
     }
 
     #[test]

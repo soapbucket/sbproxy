@@ -89,6 +89,16 @@ pub struct OidcAuth {
     /// [`OidcAuth::post_logout_redirect_default`] (or `/`).
     #[serde(default)]
     pub end_session_endpoint: Option<String>,
+    /// Optional OP `userinfo_endpoint`. When set, the callback
+    /// handler calls userinfo after a successful token exchange,
+    /// passes the resulting claims through
+    /// [`userinfo::trust_headers_from_claims`], and stashes the
+    /// projection in [`session::SessionClaims::trust_headers`] so
+    /// the request-time auth check can replay them onto the
+    /// upstream request. Unset disables the call (the gateway then
+    /// projects only what the ID token carries).
+    #[serde(default)]
+    pub userinfo_endpoint: Option<String>,
     /// Default URI to send the browser to after a logout completes,
     /// when the caller did not supply (or did not allowlist) one of
     /// their own. Defaults to `/`.

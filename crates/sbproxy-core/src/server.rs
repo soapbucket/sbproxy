@@ -1940,7 +1940,7 @@ async fn check_auth(
             }
         }
         Auth::Noop => AuthResult::allow_anonymous(),
-        Auth::Oidc(cfg) => oidc_check(cfg, headers),
+        Auth::Oidc(cfg) => oidc_check(cfg.as_ref(), headers),
         Auth::Plugin(provider) => {
             // Build a synthetic http::Request the provider can read
             // method / target-uri / headers from. We deliberately pass
