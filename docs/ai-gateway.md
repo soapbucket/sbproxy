@@ -262,7 +262,7 @@ A single guardrail block on the AI handler config covers every supported surface
 
 ### Streaming policy
 
-A guardrail is *streaming-safe* when its block decision is stable as soon as the chunk it sees is decided. The proxy classifies the built-in guardrails per the WOR-235 hub-format ADR:
+A guardrail is *streaming-safe* when its block decision is stable as soon as the chunk it sees is decided. The proxy classifies the built-in guardrails as follows:
 
 | Guardrail | Streaming-safe | Reason |
 |---|---|---|

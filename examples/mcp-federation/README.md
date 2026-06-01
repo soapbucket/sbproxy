@@ -73,14 +73,14 @@ curl -s -X POST http://127.0.0.1:8080 \
 
 ### Planned but not yet enforced
 
-These knobs parse but the dispatch layer does not honour them yet. Tracked in [WOR-119](https://linear.app/12345r/issue/WOR-119).
+These knobs parse but the dispatch layer does not honour them yet.
 
 - `federated_servers[].rbac` - per-server RBAC label
 - `federated_servers[].timeout` - per-server request budget
 
 ### Caveat: cannot be run end-to-end as-shipped
 
-The federated origins (`github.example.com`, `postgres.example.com`) are RFC 2606 placeholders, not live MCP servers. `tools/list` against this config hits DNS errors. A docker-compose stack with mock MCP servers is tracked in [WOR-123](https://linear.app/12345r/issue/WOR-123).
+The federated origins (`github.example.com`, `postgres.example.com`) are RFC 2606 placeholders, not live MCP servers. `tools/list` against this config hits DNS errors. A docker-compose stack with mock MCP servers is a planned follow-up.
 
 ## See also
 

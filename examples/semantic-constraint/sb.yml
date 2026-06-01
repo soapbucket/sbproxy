@@ -1,4 +1,4 @@
-# semantic_constraint policy (WOR-203 PR 3b).
+# semantic_constraint policy.
 #
 # Routes every request through the configured LLM-as-judge backend
 # and maps the verdict to allow / deny. The prompt template is

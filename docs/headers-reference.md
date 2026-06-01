@@ -127,7 +127,7 @@ The following names sometimes appear in older docs or marketing
 copy. They are not implemented and not on the v1.0 surface:
 
 - `x-sb-flags`: per-request feature-flag system documented in
-  `docs/manual.md` §10. Tracked in [WOR-114](https://linear.app/12345r/issue/WOR-114).
+  `docs/manual.md` §10. Not implemented in v1.0.
 - `x-sbproxy-debug`: there is no debug header. Set `RUST_LOG=debug`
   on the proxy process for verbose logs.
 - Any header beginning with `x-sb-debug-*`: same.

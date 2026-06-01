@@ -14,7 +14,7 @@ of the new YAML fields below until the version that ships them.
 ### Added
 
 - **Explicit SIGINT/SIGTERM handling with a structured shutdown
-  event and a 30s default drain budget (WOR-636).** Pingora's
+  event and a 30s default drain budget.** Pingora's
   `Server::run_forever` already trapped SIGTERM and SIGINT, but
   the proxy emitted no operator-facing log line on receipt, so a
   pod eviction or `docker stop` looked the same as a crash in the
@@ -244,7 +244,7 @@ of the new YAML fields below until the version that ships them.
     documents the new surface, methods, guardrails, and rate-limit
     knobs.
 
-- **Policy verdict audit bus + Plugin dispatch (WOR-201 PR 1b).**
+- **Policy verdict audit bus + Plugin dispatch.**
   Wires the previously-dead `Policy::Plugin` arm in `server.rs` to
   call the trait's `enforce()`, folds the returned `PolicyDecision`
   into the existing chain reducer, and emits a
@@ -273,7 +273,7 @@ of the new YAML fields below until the version that ships them.
   [crates/sbproxy-plugin/src/traits.rs],
   [dashboards/grafana/sbproxy-policy-verdicts.json])
 
-- **Synthetic-transaction `/readyz` probe (WOR-27).** Optional
+- **Synthetic-transaction `/readyz` probe.** Optional
   background driver that fires an in-process request through the
   compiled handler chain on a fixed cadence and reports the verdict as
   a `synthetic_pipeline` component on `/readyz`. Disabled by default;
@@ -289,7 +289,7 @@ of the new YAML fields below until the version that ships them.
   [crates/sbproxy-observe/src/metrics.rs],
   [e2e/tests/synthetic_probe.rs])
 
-- **`GET /admin/drift` config drift endpoint (WOR-132).** Returns
+- **`GET /admin/drift` config drift endpoint.** Returns
   whether the on-disk config file has diverged from what the running
   proxy has loaded, without triggering a reload. Compares a
   content-hash baseline captured at startup (and refreshed on every
@@ -357,7 +357,7 @@ of the new YAML fields below until the version that ships them.
   failure.
   ([.github/workflows/reproducible-build.yml], [SUPPLY-CHAIN.md])
 
-- **WOR-114 Phase 2: CEL `features[...]` namespace.** Per-request
+- **Phase 2: CEL `features[...]` namespace.** Per-request
   flags parsed from the `x-sb-flags` header and `?_sb.<key>` query
   prefix are now exposed to CEL expressions. Built-in flags surface
   as bools (`features.debug`, `features.trace`,
@@ -473,8 +473,7 @@ of the new YAML fields below until the version that ships them.
 
 ### Fixed
 
-- **Licensing-projection wire formats now match the canonical specs
-  (WOR-179) [BREAKING].** Two projection emitters were producing
+- **Licensing-projection wire formats now match the canonical specs [BREAKING].** Two projection emitters were producing
   document shapes that didn't match their cited specifications.
   `/licenses.xml` previously declared the namespace
   `https://rsl.ai/spec/1.0` and emitted a flat
@@ -494,7 +493,7 @@ of the new YAML fields below until the version that ships them.
   in-process JSON envelope and the response middleware that stamps
   `TDM-Reservation: 1` and the URN-bearing `license` field are
   unaffected. The schema-validation e2e tests remain `#[ignore]`'d
-  per WOR-178 (no canonical XSD or JSON Schema has been vendored yet);
+  per the upstream issue (no canonical XSD or JSON Schema has been vendored yet);
   the structure-shape tests are now updated and active.
   ([crates/sbproxy-modules/src/projections/licenses.rs],
   [crates/sbproxy-modules/src/projections/tdmrep.rs],
@@ -592,13 +591,13 @@ of the new YAML fields below until the version that ships them.
 
 Tracked in Linear, not in this changeset:
 
-- [WOR-27](https://linear.app/12345r/issue/WOR-27) full configurable
+- the upstream issue full configurable
   synthetic transaction through the live request pipeline. The
   `SyntheticProbe` readiness primitive has landed; config and pipeline
   execution remain.
-- WOR-114 Phase 2.5: Lua / JS / WASM `features` namespace, plus
+- Phase 2.5: Lua / JS / WASM `features` namespace, plus
   workspace-level flags via messenger pub/sub
-- [WOR-15](https://linear.app/12345r/issue/WOR-15) remaining
+- the upstream issue remaining
   rate-limiter proptest coverage. The reload-drain loom portion has
   landed.
 

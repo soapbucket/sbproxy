@@ -89,9 +89,8 @@ Field reference:
 | `spec.lifecycle.deprecation` | no | Free-form deprecation note. |
 | `spec.lifecycle.sunsetDate` | no | `YYYY-MM-DD`. Future Catalog surfaces will parse this. |
 
-The schema is additive: future tickets will add fields under `spec.`
-(WOR-196 wires per-Listing agent-skills there) without breaking
-existing manifests.
+The schema is additive: future work will add fields under `spec.`
+(per-Listing agent-skills, etc.) without breaking existing manifests.
 
 ## Pinning modes
 
@@ -187,13 +186,13 @@ finding the next time `sbproxy plan` runs against the Repo.
   Listing can advertise.
 - **Projections** (`docs/llms.md`, robots.txt, RSL): runtime
   surfaces emitted from the live config. Listings are an input to a
-  future Catalog projection (out of scope for this PR; tracked under
-  WOR-135). The shape lands here so projections can read from a
-  stable Listing surface when the work starts.
-- **Agent-skills** (WOR-196): a per-Listing extension that lets a
-  Listing publish skill manifests scoped to its surface. The schema
-  reserves space for `spec.skills[]` so the WOR-196 ticket can land
-  without a breaking change here.
+  future Catalog projection (out of scope here). The shape lands here
+  so projections can read from a stable Listing surface when the
+  work starts.
+- **Agent-skills**: a per-Listing extension lets a Listing publish
+  skill manifests scoped to its surface. The schema reserves space
+  for `spec.skills[]` so the follow-up can land without a breaking
+  change here.
 
 ## Example
 

@@ -1,6 +1,6 @@
 # Listing primitive
 
-A minimal example of the repo-native `Listing` primitive (WOR-136).
+A minimal example of the repo-native `Listing` primitive.
 
 The directory holds:
 
@@ -19,5 +19,5 @@ make run CONFIG=examples/listing-primitive/sb.yml
 ```
 
 The Listing is not on the data path in OSS today: it is the
-foundation the future hosted-Catalog surface (WOR-135) and the
-Listing-scoped agent-skills extension (WOR-196) build on.
+foundation the future hosted-Catalog surface and the
+Listing-scoped agent-skills extension build on.
