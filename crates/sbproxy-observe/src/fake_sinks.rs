@@ -41,7 +41,7 @@ use std::sync::{Mutex, OnceLock};
 pub const FAKE_SINKS_ENV: &str = "SBPROXY_TEST_FAKE_SINKS";
 
 /// Sink names recognised by the fake-sink capture. Mirrors the four
-/// real sinks the redactor fans into per A1.5 (`access_log`,
+/// real sinks the redactor fans into (`access_log`,
 /// `error_log`, `audit_log`, `trace_exporter`). The `external` sink
 /// is intentionally absent because the redaction e2e tests target the
 /// internal-profile fan-out only.

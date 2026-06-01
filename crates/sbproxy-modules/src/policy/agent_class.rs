@@ -13,7 +13,7 @@
 //! resolution logic feeds the OSS request pipeline, the enterprise
 //! webhook envelope, and offline analyses (e.g. log replay).
 //!
-//! # The `agent_class` policy (G1.4 wire)
+//! # The `agent_class` policy
 //!
 //! [`AgentClassPolicy`] is the YAML-addressable policy operators write
 //! into `policies: - type: agent_class`. It is intentionally thin: the
@@ -163,7 +163,7 @@ impl AgentClassResolver {
     /// - rDNS verdicts are cached per-IP; a hot crawler hits the
     ///   cache after the first verified request.
     /// - UA regex is iterative across catalog entries (~10 entries
-    ///   in Wave 1; tractable).
+    ///   in the default catalog; tractable).
     pub fn resolve(&self, inputs: &ResolveInputs<'_>) -> Resolved {
         // --- Step 1: bot-auth keyid match. Highest confidence. ---
         if let Some(keyid) = inputs.bot_auth_keyid {

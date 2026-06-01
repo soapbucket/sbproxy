@@ -1,11 +1,11 @@
-//! Prometheus / OpenMetrics exemplar wiring (R1.1 / A1.4).
+//! Prometheus / OpenMetrics exemplar wiring.
 //!
 //! The `prometheus` 0.13 crate does not expose exemplar storage on its
-//! `HistogramVec` collector, so Wave 1 ships a side-store: we record
+//! `HistogramVec` collector, so this ships a side-store: we record
 //! one exemplar per `(metric_name, label_set, bucket_le)` slot and
 //! splice them into the rendered metrics output before scrape.
 //!
-//! The Wave 1 exemplar set is:
+//! The exemplar set is:
 //!
 //! - `sbproxy_request_duration_seconds_bucket`
 //! - `sbproxy_ledger_redeem_duration_seconds_bucket`
@@ -135,7 +135,7 @@ pub const STANDARD_LATENCY_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
-/// Allow-list of histograms that emit exemplars. Pinned by A1.4.
+/// Allow-list of histograms that emit exemplars.
 fn is_exemplar_metric(metric: &str) -> bool {
     matches!(
         metric,

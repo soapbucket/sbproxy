@@ -137,12 +137,12 @@ pub enum Transform {
     /// WebAssembly-based body transform. Pipes the body through a sandboxed
     /// WASI module's stdin/stdout, returning whatever the module writes back.
     Wasm(WasmTransform),
-    /// G4.10 boilerplate strip. Removes nav/footer/aside/ad
+    /// Boilerplate strip. Removes nav/footer/aside/ad
     /// chrome from HTML before the Markdown projection runs. Runs in
     /// the standard body-buffer pipeline; does not require per-request
     /// context.
     Boilerplate(BoilerplateTransform),
-    /// G4.10 citation block. Prepends an attribution
+    /// Citation block. Prepends an attribution
     /// blockquote to a Markdown projection. The standard body-buffer
     /// `apply` is a no-op because the transform needs per-request
     /// `RequestContext` fields (`canonical_url`, `rsl_urn`,

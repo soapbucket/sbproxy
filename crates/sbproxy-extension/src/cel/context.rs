@@ -190,7 +190,7 @@ pub fn populate_agent_class_namespace(ctx: &mut CelContext, view: &AgentClassVie
     ctx.set("agent", CelValue::Map(agent));
 }
 
-/// Borrowed view over the three Wave 4 aipref axes the CEL context
+/// Borrowed view over the three aipref axes the CEL context
 /// exposes. The caller (typically `sbproxy-modules` or
 /// `sbproxy-core`) owns the parsed signal and constructs this view to
 /// avoid pulling the `sbproxy-modules` crate into `sbproxy-extension`'s
@@ -209,7 +209,7 @@ pub struct AiprefView {
 impl AiprefView {
     /// Default-permissive view: every axis `true`. Used when the
     /// request had no `aipref` header or the header was malformed
-    /// (A4.1's "absence of a signal is not a signal" rule).
+    /// ("absence of a signal is not a signal" rule).
     pub fn permissive() -> Self {
         Self {
             train: true,
@@ -220,13 +220,13 @@ impl AiprefView {
 }
 
 /// Populate the `request.aipref` namespace with the parsed aipref
-/// signal from the inbound request header (Wave 4 / G4.9).
+/// signal from the inbound request header.
 ///
 /// CEL expressions read `request.aipref.train`,
 /// `request.aipref.search`, and `request.aipref.ai_input` as booleans
 /// to gate AI-use opt-outs. When the request had no `aipref` header
 /// or the header was malformed, the caller passes `None` and every
-/// axis defaults to `true` (default-permissive) per A4.1's "absence
+/// axis defaults to `true` (default-permissive) per the "absence
 /// of a signal is not a signal" contract.
 ///
 /// Idempotent: re-invoking with a different signal overwrites the
@@ -258,7 +258,7 @@ pub fn populate_aipref_namespace(ctx: &mut CelContext, aipref: Option<&AiprefVie
 
 // --- Wave 5 / G5.1 KYA verifier namespace ---
 
-/// Borrowed view over the Wave 5 / G5.1 KYA verifier verdict exposed
+/// Borrowed view over the KYA verifier verdict exposed
 /// to CEL under `request.kya`. The caller (`sbproxy-core`) owns the
 /// strings on the `RequestContext` KYA fields.
 ///
@@ -285,7 +285,7 @@ pub struct KyaVerdictView<'a> {
 }
 
 /// Populate the `request.kya` namespace with the verdict produced by
-/// the enterprise KYA verifier (Wave 5 / G5.1).
+/// the enterprise KYA verifier.
 ///
 /// CEL expressions read `request.kya.verdict` (string) to gate routes
 /// without owning the verifier itself. The pipeline calls this once
@@ -345,7 +345,7 @@ pub fn populate_kya_namespace(ctx: &mut CelContext, view: &KyaVerdictView<'_>) {
 
 // --- Wave 5 / A5.2 ML classifier namespace ---
 
-/// Borrowed view over the Wave 5 / A5.2 ML agent classifier verdict
+/// Borrowed view over the ML agent classifier verdict
 /// exposed to CEL under `request.ml_classification`.
 ///
 /// Empty / `None` fields render as the zero value so expressions can
@@ -365,7 +365,7 @@ pub struct MlClassificationView<'a> {
 }
 
 /// Populate the `request.ml_classification` namespace with the verdict
-/// produced by the enterprise ML agent classifier (Wave 5 / A5.2).
+/// produced by the enterprise ML agent classifier.
 ///
 /// CEL expressions read:
 ///
@@ -409,7 +409,7 @@ pub fn populate_ml_namespace(ctx: &mut CelContext, view: &MlClassificationView<'
     ctx.set("request", CelValue::Map(request_map));
 }
 
-/// Borrowed view over the Wave 5 / G5.3 TLS fingerprint exposed to
+/// Borrowed view over the TLS fingerprint exposed to
 /// CEL under `request.tls`. The caller (`sbproxy-core`) owns the
 /// strings on `RequestContext.tls_fingerprint`.
 ///
@@ -425,13 +425,13 @@ pub struct TlsFingerprintView<'a> {
     /// JA4H HTTP fingerprint or `None`.
     pub ja4h: Option<&'a str>,
     /// Whether the fingerprint reflects the actual client (per-origin
-    /// CIDR resolution; default `false` per A5.1).
+    /// CIDR resolution; default `false`).
     pub trustworthy: bool,
 }
 
 /// Stamp the [`TlsFingerprintView`] under `request.tls.*`.
 ///
-/// Exposed bindings (Wave 5 / G5.3, A5.1 §"Scripting surface"):
+/// Exposed bindings:
 ///
 /// - `request.tls.ja3` - 32-char hex string or `""`.
 /// - `request.tls.ja4` - JA4 structured prefix string or `""`.
@@ -585,7 +585,7 @@ pub struct EnvelopeView<'a> {
     pub properties: Option<&'a std::collections::BTreeMap<String, String>>,
 }
 
-/// Stamp the Wave 8 envelope namespace onto a CEL context. Idempotent:
+/// Stamp the capture envelope namespace onto a CEL context. Idempotent:
 /// callers may invoke once for both request- and response-time CEL
 /// evaluation, or call again to overwrite fields if the envelope
 /// resolved later in the pipeline.

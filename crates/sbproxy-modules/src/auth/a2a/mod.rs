@@ -1,4 +1,4 @@
-//! A2A protocol envelope (Wave 7 / A7.2).
+//! A2A protocol envelope.
 //!
 //! The module exposes the shared `A2AContext` populated by the
 //! request filter and the detection function that runs before
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 /// Closed enum of the A2A specs the proxy understands.
 ///
-/// New variants extend the wire envelope per A1.8 (closed-enum
+/// New variants extend the wire envelope (closed-enum
 /// amendment rules). Today both variants carry the `v0` designation
 /// because the upstream drafts are unstable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -44,7 +44,7 @@ impl A2ASpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainHop {
     /// Resolved agent identifier of the hop. The string form mirrors
-    /// the catalog `id` values produced by the G1.4 resolver.
+    /// the catalog `id` values produced by the agent-class resolver.
     pub agent_id: String,
     /// Per-hop request id (the request id of the hop, not the parent).
     pub request_id: String,
@@ -64,7 +64,7 @@ pub struct A2AContext {
     /// Which spec this envelope was decoded under.
     pub spec: A2ASpec,
     /// Resolved agent id of the caller (the agent that initiated the
-    /// hop). String form mirrors the G1.4 resolver output.
+    /// hop). String form mirrors the agent-class resolver output.
     pub caller_agent_id: String,
     /// Resolved agent id of the callee, when the parser could
     /// determine it from the envelope. None when the callee is

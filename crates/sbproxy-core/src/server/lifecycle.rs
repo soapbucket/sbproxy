@@ -21,11 +21,11 @@ use super::*;
 /// The single source of truth for reload semantics shared by:
 ///
 /// - The notify-based file watcher (auto-reload on `sb.yml` change).
-/// - The Wave 5 day-6 SIGHUP signal handler (operator-driven reload
+/// - The SIGHUP signal handler (operator-driven reload
 ///   via `kill -HUP $(pgrep sbproxy)`).
 ///
-/// Reads the file, runs `compile_config` (which now also drives the
-/// Wave 5 day-6 features.* migration in Item 2), constructs a fresh
+/// Reads the file, runs `compile_config` (which also drives the
+/// features.* migration), constructs a fresh
 /// [`CompiledPipeline`], invokes the enterprise reload hook
 /// (best-effort), and atomically swaps the live pipeline. Returns
 /// `Ok(())` on success; logs and returns `Err` on any step's failure
@@ -195,7 +195,7 @@ pub(super) fn start_config_watcher(config_path: String) {
 }
 
 /// Install a SIGHUP signal handler that reloads the proxy pipeline
-/// from `config_path` (Wave 5 day-6 Item 4).
+/// from `config_path`.
 ///
 /// SIGHUP is the canonical "rerun bootstrap" signal in traditional
 /// reverse proxies (nginx, haproxy). This function spawns a tokio

@@ -1,9 +1,9 @@
-//! Per-agent metric labels (Wave 1 / G1.6).
+//! Per-agent metric labels.
 //!
 //! Defines [`AgentLabels`], the typed bundle that carries `agent_id`,
 //! `agent_class`, `agent_vendor`, `payment_rail`, and `content_shape`
-//! into the metric helpers. The label set is fixed by A1.1 and the value
-//! space comes from G1.1.
+//! into the metric helpers. The label set and value space are fixed
+//! by the agent-class taxonomy.
 //!
 //! Three sentinels stand in when the resolver has no concrete entry:
 //!

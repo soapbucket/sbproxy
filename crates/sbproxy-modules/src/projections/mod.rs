@@ -20,11 +20,11 @@
 //! pays one atomic load and one hash-map lookup per request. Cache
 //! refresh runs once per config reload, atomically.
 //!
-//! ## Crate placement (A4.1 open question 1)
+//! ## Crate placement
 //!
 //! The substrate (cache + render entrypoint) lives in `sbproxy-modules`
-//! rather than `sbproxy-core` to avoid the circular-dep risk A4.1's
-//! open question 1 flagged: `sbproxy-modules` already depends on
+//! rather than `sbproxy-core` to avoid a circular-dep risk:
+//! `sbproxy-modules` already depends on
 //! `sbproxy-config` and `sbproxy-platform`, so projections walk
 //! `CompiledConfig` without a back-edge into `sbproxy-core`. The
 //! `sbproxy-core::reload` path drives the install via a small
@@ -386,13 +386,13 @@ pub struct ProjectionDocs {
     /// Per-hostname RSL URN of the form
     /// `urn:rsl:1.0:<hostname>:<config_version_hash>`. Stamped on
     /// `RequestContext.rsl_urn` by the request pipeline so downstream
-    /// serialisers (the A4.2 JSON envelope, agent-facing responses)
+    /// serialisers (the JSON envelope, agent-facing responses)
     /// can surface the URN without re-reading the projection body.
     pub rsl_urns: HashMap<CompactString, String>,
     /// Per-hostname `Content-Signal` value (or `None` when the origin
     /// asserts no signal). Surfaced to the response middleware so the
     /// proxy can stamp the optional `TDM-Reservation: 1` header per
-    /// A4.1 § "TDMRep" when an origin asserts no `Content-Signal`.
+    /// the TDMRep convention when an origin asserts no `Content-Signal`.
     pub content_signals: HashMap<CompactString, Option<CompactString>>,
     /// Per-hostname Agent Skills v0.2.0 index. Origins
     /// without `agent_skills:` produce no entries; the data-plane
@@ -434,8 +434,8 @@ pub fn render_projections(config: &CompiledConfig, config_version: u64) -> Proje
 /// Walks `config.origins`, filters for origins with an
 /// `ai_crawl_control` policy entry in `policy_configs`, extracts the
 /// pricing tiers and the `Content-Signal` value (read from the
-/// origin's `extensions["content_signal"]` slot per A4.1's open
-/// question 1.5 / G4.2 hand-off), and renders the four documents.
+/// origin's `extensions["content_signal"]` slot), and renders the
+/// four documents.
 ///
 /// Origins without `ai_crawl_control` produce no entries; readers
 /// treat the absence as a 404.
@@ -649,7 +649,7 @@ fn projections_store() -> &'static ArcSwap<ProjectionDocs> {
 /// Also emits one `ProjectionRefreshEvent` per `(hostname,
 /// projection_kind)` pair through the
 /// [`sbproxy_plugin::AdminAuditEmitter`] so registered audit sinks
-/// capture an `AdminAuditEvent` per A1.7 / A4.1 § "Audit trail".
+/// capture an `AdminAuditEvent` § "Audit trail".
 /// When no emitter is registered the calls are no-ops.
 pub fn install_projections(docs: ProjectionDocs) {
     // Snapshot for audit emission before installing; cloning is cheap
@@ -785,9 +785,9 @@ fn sha256_hex(body: &Bytes) -> String {
 /// Borrow the current projection cache.
 ///
 /// Returns an `Arc` so callers can hold it across `await` points
-/// without blocking the reload writer. Per A4.1 the readers pay one
-/// atomic load per request (plus one HashMap lookup by hostname); no
-/// allocations on the hot path.
+/// without blocking the reload writer. Readers pay one atomic load
+/// per request (plus one HashMap lookup by hostname); no allocations
+/// on the hot path.
 pub fn current_projections() -> Arc<ProjectionDocs> {
     projections_store().load_full()
 }

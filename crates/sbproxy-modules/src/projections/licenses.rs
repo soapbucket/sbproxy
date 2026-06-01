@@ -5,7 +5,7 @@
 //! `https://rslstandard.org/rsl` namespace, with one `<content>`
 //! element per licensed scope. Each `<content>` carries a `url`
 //! attribute identifying the route (or hostname-wide globs) the
-//! enclosed `<license>` body applies to. Wave 4 emits a single
+//! enclosed `<license>` body applies to. Today this emits a single
 //! origin-wide entry; the `<content url>` is set to the wildcard
 //! `https://<hostname>/*`, matching the spec's globbing convention
 //! for "every URL on this origin". Per-route licensing is a future
@@ -40,9 +40,9 @@
 //! ## Internal contract: `RequestContext.rsl_urn`
 //!
 //! The data-plane handler that serves this projection stamps the URN
-//! returned by `render` onto `RequestContext.rsl_urn` so the Wave 4
-//! JSON envelope (rust-A's G4.4) can read it for the `license` field
-//! without re-parsing the projection body. Any caller that wants to
+//! returned by `render` onto `RequestContext.rsl_urn` so the JSON
+//! envelope can read it for the `license` field without re-parsing
+//! the projection body. Any caller that wants to
 //! emit an RSL-aware response on the same hostname should consult
 //! `current_projections().rsl_urns` for the URN; the URN equals
 //! `urn:rsl:1.0:<hostname>:<config_version>` so it is also derivable

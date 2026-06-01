@@ -1,5 +1,5 @@
 //! Global tracing subscriber config + structured-log schema v1
-//! scaffolding (Wave 1 / A1.5).
+//! scaffolding.
 //!
 //! Two layers:
 //!
@@ -10,10 +10,10 @@
 //!    schema-v1 envelope every emitter (access, error, audit, trace
 //!    attributes) routes through. The redaction middleware in
 //!    [`apply_redaction`] runs at sink-write time so a single
-//!    regression test (`Q1.9`) covers every sink via one harness.
+//!    regression test covers every sink via one harness.
 //!
-//! Per A1.5 we ship two redaction profiles in Wave 1: `internal`
-//! (denylist only) and `external` (denylist + JA3/JA4 + URL → route).
+//! Two redaction profiles ship today: `internal` (denylist only) and
+//! `external` (denylist + JA3/JA4 + URL → route).
 
 use std::collections::BTreeMap;
 
@@ -38,7 +38,7 @@ pub struct LoggingConfig {
     pub sampling: SamplingConfig,
 }
 
-/// Per-level emission sampling rates per A1.5.
+/// Per-level emission sampling rates.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SamplingConfig {
     /// Fraction of `info` lines to emit (default 1.0).
@@ -126,7 +126,7 @@ impl Default for LoggingConfig {
 /// dual-emit window).
 pub const SCHEMA_VERSION: &str = "1";
 
-/// Pinned event-type enum per A1.5. Renaming or removing a variant is
+/// Pinned event-type enum. Renaming or removing a variant is
 /// a breaking change.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -161,7 +161,7 @@ pub enum EventType {
 
 impl EventType {
     /// Whether this event MUST be emitted regardless of sampling.
-    /// Audit lines (per A1.5 § Sampling) are never sampled.
+    /// Audit lines are never sampled.
     pub fn is_unsampleable(self) -> bool {
         matches!(self, EventType::AuditEmit)
     }
@@ -199,7 +199,7 @@ impl LogLevel {
     }
 }
 
-/// One JSON-line structured-log record. Top-level fields match A1.5
+/// One JSON-line structured-log record. Top-level fields match
 /// schema v1 verbatim. `extra` carries the per-event payload.
 #[derive(Debug, Clone, Serialize)]
 pub struct StructuredLog {
@@ -235,10 +235,10 @@ pub struct StructuredLog {
     pub route: Option<String>,
 
     // --- Per-request lifecycle (request_started / completed / error) ---
-    /// Resolved agent identifier (per G1.4).
+    /// Resolved agent identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
-    /// Agent class (`vendor:purpose` per G1.1).
+    /// Agent class (`vendor:purpose`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_class: Option<String>,
     /// Payment rail discriminator (`stripe`, `x402`, `mpp`, `lightning`,
@@ -327,7 +327,7 @@ pub enum Sink {
 
 impl Sink {
     /// Whether this sink requires the strict `external` redaction
-    /// profile per A1.5.
+    /// profile.
     pub fn is_external(self) -> bool {
         matches!(self, Sink::TraceExporter | Sink::External)
     }
@@ -335,9 +335,9 @@ impl Sink {
 
 // --- Redaction middleware ---
 
-/// Apply the A1.5 denylist + per-sink overrides to an in-progress JSON
+/// Apply the denylist + per-sink overrides to an in-progress JSON
 /// rendering. The function is the single chokepoint every emitter
-/// routes through, so the regression test in `Q1.9` only has to fuzz
+/// routes through, so the regression test only has to fuzz
 /// one entry point to cover access / error / audit / trace exporter.
 ///
 /// Today's implementation reuses the existing
@@ -362,7 +362,7 @@ pub fn apply_redaction(json: &str, sink: Sink) -> String {
 }
 
 /// Recursively walk a JSON value and redact any field whose key is on
-/// the A1.5 denylist. Replacements use the typed `<redacted:foo>`
+/// the denylist. Replacements use the typed `<redacted:foo>`
 /// marker per the ADR.
 fn redact_value(value: &mut serde_json::Value, sink: Sink) {
     match value {
@@ -389,7 +389,7 @@ fn redact_value(value: &mut serde_json::Value, sink: Sink) {
     }
 }
 
-/// Match a JSON field key against the A1.5 denylist. Returns the
+/// Match a JSON field key against the denylist. Returns the
 /// typed marker that should replace the value, or `None` to leave it
 /// alone.
 fn match_denylist(key: &str, sink: Sink) -> Option<&'static str> {

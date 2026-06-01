@@ -1,4 +1,4 @@
-//! Anthropic A2A parser (Wave 7 / A7.2, `draft-anthropic-a2a-v0`).
+//! Anthropic A2A parser for the `draft-anthropic-a2a-v0` envelope.
 //!
 //! The Anthropic draft models A2A invocation as an MCP method call
 //! where the tool is another agent. The `MCP-Method: agents.invoke`
@@ -31,7 +31,7 @@ use super::{A2AContext, A2ASpec, ChainHop};
 /// Parse an Anthropic A2A request body into an [`A2AContext`].
 ///
 /// `caller_agent_id` is the resolved identity of the calling agent
-/// (typically from the G1.4 resolver chain); the parser stamps it
+/// (typically from the agent-class resolver chain); the parser stamps it
 /// onto the context because the wire envelope does not echo the
 /// caller (the receiving agent infers it from the connection).
 ///

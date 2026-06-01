@@ -14,7 +14,7 @@
 //! When the `tiered-pricing` feature is enabled, [`AiCrawlControlConfig`]
 //! accepts a `tiers:` list with per-route pricing, per-shape pricing, a
 //! free-preview byte budget, and a paywall position hint per
-//! `docs/AIGOVERNANCE-BUILD.md` § G1.2.
+//! `docs/AIGOVERNANCE-BUILD.md`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -37,7 +37,7 @@ pub struct AiCrawlControlPolicy {
     ledger: Arc<dyn Ledger>,
     /// Optional multi-rail challenge plan compiled from
     /// `ai_crawl_control.rails:` and `ai_crawl_control.quote_token:`.
-    /// `None` means the policy emits the Wave 1 single-rail format
+    /// `None` means the policy emits the single-rail format
     /// unconditionally; `Some(_)` means the policy emits the multi-rail
     /// body for opted-in agents and falls back to single-rail otherwise.
     multi_rail: Option<Arc<MultiRailPlan>>,
@@ -283,7 +283,7 @@ impl AiCrawlControlPolicy {
     /// Resolve the price the policy will quote for `path`.
     ///
     /// Path-only convenience that treats every request as matching
-    /// any agent_id. Wave 2 call sites that have an agent_id resolved
+    /// any agent_id. Call sites that have an agent_id resolved
     /// in the request context should call [`Self::resolve_price_for`]
     /// instead so per-vendor tiers can fire.
     pub fn resolve_price(&self, path: &str) -> Money {
@@ -306,7 +306,7 @@ impl AiCrawlControlPolicy {
 
     /// Resolve the price for `(path, agent_id, accept)`. Like
     /// [`Self::resolve_price_for`] but additionally consults the request
-    /// `Accept` header to steer per-shape tiers (G1.2 wire). Path-only
+    /// `Accept` header to steer per-shape tiers. Path-only
     /// callers continue to work via [`Self::resolve_price_for`].
     pub fn resolve_price_for_request(
         &self,
@@ -373,11 +373,11 @@ impl AiCrawlControlPolicy {
 
     /// Inspect the request and decide whether it pays through.
     ///
-    /// `agent_id` is the resolved agent identifier from G1.4's resolver
+    /// `agent_id` is the resolved agent identifier from the resolver
     /// chain (`stamp_request_context`). When `Some`, it threads onto the
     /// quote-token JWS `sub` claim so the wallet redeem path can audit
     /// which agent paid. When `None`, the policy stamps `"unknown"` as
-    /// before. Pre-G1.4 callers (and unit tests that do not exercise
+    /// before. Older callers (and unit tests that do not exercise
     /// agent-class) can pass `None` and behave identically.
     pub fn check(
         &self,
@@ -568,7 +568,7 @@ impl AiCrawlControlPolicy {
     }
 
     /// Build a [`AiCrawlDecision::MultiRail`] (or [`AiCrawlDecision::NoAcceptableRail`])
-    /// per A3.1's filter / sort / emit flow.
+    /// via the filter / sort / emit flow.
     //
     // The argument count is high because the multi-rail emission binds
     // together pieces from three different layers (the request, the
@@ -949,7 +949,7 @@ pub struct ConfiguredRailForTest(ConfiguredRail);
 impl ConfiguredRailForTest {
     /// Wrap an x402 rail with the operator-supplied chain / facilitator
     /// / asset / pay_to. The version string defaults to `"2"` to match
-    /// the Wave 3 x402 v2 ship.
+    /// the x402 v2 ship.
     pub fn x402(
         chain: impl Into<String>,
         facilitator: impl Into<String>,
@@ -979,7 +979,7 @@ impl ConfiguredRailForTest {
 
 /// Compile the YAML `rails:` + `quote_token:` blocks into a runtime plan.
 /// Returns `Ok(None)` when neither block is present (the policy stays on
-/// the Wave 1 single-rail path); returns `Err` when one block is present
+/// the single-rail path); returns `Err` when one block is present
 /// without the other or when key resolution fails.
 fn build_multi_rail_plan(
     rails_yaml: Option<RailsYamlConfig>,

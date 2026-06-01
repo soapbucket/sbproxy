@@ -1,6 +1,6 @@
-//! Idempotency-Key middleware (Wave 3 / R3.2).
+//! Idempotency-Key middleware.
 //!
-//! Implements the cached-retry vs conflict semantics fixed by A3.4.
+//! Implements the cached-retry vs conflict semantics.
 //! The middleware sits ahead of policies in the handler chain.
 //! It is opt-in per origin via
 //! the `idempotency:` config block.
@@ -19,7 +19,7 @@
 //!    skips token-bucket consumption.
 //! 5. Present, cache hit, body hash differs: return 409
 //!    `ledger.idempotency_conflict`. Set `IdempotencyOutcome::Conflict`;
-//!    the rate-limit middleware DOES consume a slot per the A3.4 DoS
+//!    the rate-limit middleware DOES consume a slot DoS
 //!    protection rule.
 //!
 //! Cache backends:
@@ -42,7 +42,7 @@ use sha2::{Digest, Sha256};
 
 // --- Public surface ---
 
-/// Default TTL for idempotency entries: 24 h, per A3.4 layer 2.
+/// Default TTL for idempotency entries: 24 h layer 2.
 pub const DEFAULT_TTL_SECS: u64 = 24 * 60 * 60;
 
 /// HTTP header carrying the agent's idempotency key.
@@ -113,7 +113,7 @@ impl IdempotencyOutcome {
     }
 }
 
-/// Cache backend trait pinned by R3.2.
+/// Cache backend trait.
 ///
 /// Implementations are scoped per `(workspace_id, key)` so two
 /// workspaces using the same idempotency key never collide. The
@@ -235,7 +235,7 @@ pub fn record_response(
     cache.put(workspace_id, key, resp);
 }
 
-/// Build the 409 conflict body documented in A3.4 / A1.2:
+/// Build the 409 conflict body:
 /// `{"error":"ledger.idempotency_conflict", ...}`.
 ///
 /// Returned as `(status, content_type, body_bytes)` so the calling

@@ -358,7 +358,7 @@ fn default_token_bytes_ratio() -> f32 {
 
 /// Result of an HTML-to-Markdown projection.
 ///
-/// G4.3 (Markdown response) and G4.4 (JSON envelope) both consume the
+/// The Markdown response and the JSON envelope both consume the
 /// same projection so the `token_estimate` field never diverges between
 /// the body and the `x-markdown-tokens` response header. The `title` is
 /// extracted from the first H1 in the produced Markdown body, falling
@@ -388,10 +388,9 @@ pub struct HtmlToMarkdownTransform {
     /// Heading style: "atx" (# style, default) or "setext" (underline).
     #[serde(default)]
     pub heading_style: Option<String>,
-    /// Tokens-per-byte ratio for the projection's `token_estimate` field
-    /// (G4.3 / A4.2). Defaults to [`DEFAULT_TOKEN_BYTES_RATIO`]; operators
-    /// can override per-origin to calibrate for non-English or dense
-    /// technical content.
+    /// Tokens-per-byte ratio for the projection's `token_estimate` field.
+    /// Defaults to [`DEFAULT_TOKEN_BYTES_RATIO`]; operators can override
+    /// per-origin to calibrate for non-English or dense technical content.
     #[serde(default = "default_token_bytes_ratio")]
     pub token_bytes_ratio: f32,
 }
@@ -415,7 +414,7 @@ impl HtmlToMarkdownTransform {
     ///
     /// Equivalent to running [`Self::project`] and writing only the body
     /// back into the buffer. Callers that need the title and token
-    /// estimate (G4.4 JSON envelope, G4.3 `x-markdown-tokens` header)
+    /// estimate (JSON envelope, `x-markdown-tokens` header)
     /// should call `project` instead and stash the result in
     /// `RequestContext::markdown_projection`.
     pub fn apply(&self, body: &mut BytesMut) -> anyhow::Result<()> {

@@ -53,8 +53,8 @@ impl CardinalityConfig {
 /// Per-label cardinality budget.
 ///
 /// The lookup is closed: a label name not in the table falls back to
-/// the workspace default cap. The regression test in Q1.14 asserts the
-/// budget by name.
+/// the workspace default cap. The regression test asserts the budget
+/// by name.
 pub fn budget_for_label(label_name: &str) -> usize {
     match label_name {
         // Workspace-scoped traffic dimensions.

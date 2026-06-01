@@ -116,12 +116,12 @@ fn pipeline_store() -> &'static ArcSwap<CompiledPipeline> {
 /// In-flight requests that already loaded the old pipeline will continue
 /// using it until they complete.
 ///
-/// Also re-renders the Wave 4 / G4.5..G4.10 policy-graph projections
+/// Also re-renders the policy-graph projections
 /// (`robots.txt`, `llms.txt`, `llms-full.txt`, `/licenses.xml`,
 /// `/.well-known/tdmrep.json`) and atomically swaps the projection
 /// cache before returning. The two atomics happen back-to-back: a
 /// reader that observes the new pipeline may briefly see the old
-/// projection cache and vice versa, but per A4.1 the projections are
+/// projection cache and vice versa, but the projections are
 /// derived from the pipeline's compiled config so any reader on the
 /// new path sees consistent data within sub-microsecond skew.
 pub fn load_pipeline(new_pipeline: CompiledPipeline) {

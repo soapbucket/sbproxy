@@ -833,7 +833,7 @@ pub fn record_policy_with_labels(
         .inc();
 }
 
-/// Record a Wave 8 capture-budget drop (T2.3 / T3.3). `dimension` is
+/// Record a capture-budget drop. `dimension` is
 /// `"session"` or `"user"`; the workspace label is sanitized through
 /// the cardinality limiter so an attacker cannot blow up label space
 /// by spraying tenant ids.
@@ -906,7 +906,7 @@ pub fn record_object_authz_violation(origin: &str, kind: &'static str) {
         .inc();
 }
 
-/// Record drop counters returned by the Wave 8 capture helpers.
+/// Record drop counters returned by the capture helpers.
 /// `dimension` is `"property"`, `"session"`, or `"user"`; `reason`
 /// is one of the closed strings each helper exposes (e.g. `count`,
 /// `key_len`, `value_len`, `payload_size`, `regex` for properties;
@@ -939,7 +939,7 @@ pub fn record_capture_drop(
         .inc_by(n);
 }
 
-/// Record one A2A hop (Wave 7 / A7.2). `decision` is `"allow"` or
+/// Record one A2A hop. `decision` is `"allow"` or
 /// `"deny:<reason>"`; `spec` is one of the closed strings from
 /// `A2ASpec::as_label`. Cardinality is bounded by route + spec +
 /// decision and is safe for dashboards.
@@ -961,7 +961,7 @@ pub fn record_a2a_hop(route: &str, spec: &str, decision: &str) {
         .inc();
 }
 
-/// Record an A2A chain depth observation (Wave 7 / A7.2). Surfaces
+/// Record an A2A chain depth observation. Surfaces
 /// the depth distribution per route + spec so dashboards can spot
 /// runaway recursion before the depth-cap policy denies.
 pub fn record_a2a_chain_depth(route: &str, spec: &str, depth: u32) {
@@ -982,7 +982,7 @@ pub fn record_a2a_chain_depth(route: &str, spec: &str, depth: u32) {
         .observe(depth as f64);
 }
 
-/// Record an A2A denial (Wave 7 / A7.2). `reason` is one of
+/// Record an A2A denial. `reason` is one of
 /// `depth`, `cycle`, `callee_not_allowed`, `caller_denied` per the
 /// ADR's Failure Modes section.
 pub fn record_a2a_denied(route: &str, reason: &str) {

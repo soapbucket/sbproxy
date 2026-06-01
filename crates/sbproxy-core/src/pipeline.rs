@@ -520,7 +520,7 @@ fn build_cache_reserve(
     }
 }
 
-/// TLS-fingerprint capture mode (Wave 5 day-6 Item 3).
+/// TLS-fingerprint capture mode.
 ///
 /// `passive` and `sidecar` are wire-equivalent today; the OSS path
 /// captures fingerprints exclusively from the sidecar header pattern
@@ -546,7 +546,7 @@ pub enum TlsFingerprintMode {
     Disabled,
 }
 
-/// TLS-fingerprint capture configuration (Wave 5 day-6 Item 3).
+/// TLS-fingerprint capture configuration.
 ///
 /// Lifted onto [`CompiledPipeline`] from the
 /// `proxy.extensions.tls_fingerprint` block (canonical) or the legacy
@@ -861,11 +861,11 @@ pub struct CompiledPipeline {
     /// and recovers the real client IP from them. Otherwise those headers
     /// are stripped on ingress (they cannot be trusted).
     pub trusted_proxy_cidrs: Vec<ipnetwork::IpNetwork>,
-    /// TLS fingerprint capture configuration (Wave 5 day-6 Item 3).
+    /// TLS fingerprint capture configuration.
     ///
     /// Lifted from `proxy.extensions.tls_fingerprint` (or the migrated
-    /// legacy `features.tls_fingerprint` shape, see Wave 5 day-6 Item
-    /// 2). When `enabled = false` (the default), the request entry
+    /// legacy `features.tls_fingerprint` shape). When `enabled = false`
+    /// (the default), the request entry
     /// hook ignores sidecar TLS-fingerprint headers entirely so an
     /// operator's deployment that lacks a TLS-terminating sidecar does
     /// not pay the parse cost.

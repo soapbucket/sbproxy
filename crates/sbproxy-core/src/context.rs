@@ -77,14 +77,14 @@ pub struct MirrorParams {
 
 /// Per-request metrics counters populated by transforms and policies.
 ///
-/// Wave 4 introduces a small bag of counters that the Q4.14 audit
-/// regression and operator dashboards consume. New fields land here
+/// A small bag of counters that the audit regression and operator
+/// dashboards consume. New fields land here
 /// rather than widening [`RequestContext`] every time a transform
 /// wants to surface a number.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RequestMetrics {
     /// Bytes removed from the upstream response body by the
-    /// boilerplate-stripping transform (G4.10). `0` when the
+    /// boilerplate-stripping transform. `0` when the
     /// transform did not run or removed nothing.
     pub stripped_bytes: u64,
 }
@@ -517,7 +517,7 @@ pub struct RequestContext {
     /// optional geo-enrichment policy (PORTAL.md gap 3.1 P2). Stays
     /// `None` when the policy is not configured.
     pub request_geo: Option<String>,
-    /// ULID for the Wave 8 envelope.
+    /// ULID for the capture envelope.
     /// Minted alongside the existing UUID-based [`Self::request_id`]
     /// at request entry; the UUID stays for backward-compatible
     /// correlation headers, the ULID feeds the typed envelope which
@@ -640,12 +640,12 @@ pub struct RequestContext {
     /// reserved".
     pub rsl_urn: Option<String>,
     /// Approximate token count for the Markdown projection. Set by
-    /// G4.3 / G4.4 once the projection runs. Read by G4.5's
-    /// `x-markdown-tokens` header emitter. Owned by rust-A.
+    /// the projection once it runs. Read by the
+    /// `x-markdown-tokens` header emitter.
     pub markdown_token_estimate: Option<u32>,
 
     // --- Wave 4 metrics (G4.10) ---
-    /// Per-request metrics counters surfaced for the Q4.14 audit.
+    /// Per-request metrics counters surfaced for the audit.
     /// Adds up bytes stripped by the boilerplate transform, etc.
     pub metrics: RequestMetrics,
 
@@ -812,8 +812,8 @@ pub struct RequestContext {
     // this field and never recomputes it.
     /// Per-request A2A envelope. `None` for non-A2A traffic.
     pub a2a: Option<sbproxy_modules::A2AContext>,
-    /// JSON denial body produced by the A2A policy module (Wave 7 /
-    /// A7.2). Populated by the policy enforcer when a denial fires
+    /// JSON denial body produced by the A2A policy module.
+    /// Populated by the policy enforcer when a denial fires
     /// so the response handler can stamp the spec-pinned body
     /// verbatim instead of falling through to the generic
     /// `send_error` template.
@@ -867,7 +867,7 @@ pub struct RequestContext {
 /// Verdict produced by the headless-browser detector
 /// (`sbproxy_security::headless_detect`).
 ///
-/// Wave 5 / G5.4. The detector compares the request's JA4 fingerprint
+/// The detector compares the request's JA4 fingerprint
 /// against the vendored TLS-fingerprint catalogue
 /// (`crates/sbproxy-classifiers/data/tls-fingerprints.json`); a
 /// match yields [`Self::Detected`] with the library name (e.g.
@@ -882,7 +882,7 @@ pub enum HeadlessSignal {
         /// across releases; safe for metric labels.
         library: String,
         /// Confidence in `[0.0, 1.0]`. Halved (capped at 0.5) when
-        /// `tls_fingerprint.trustworthy = false` per A5.1.
+        /// `tls_fingerprint.trustworthy = false`.
         confidence: f32,
     },
     /// Detector ran and did NOT match any known headless library.

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 // Copyright 2026 Soap Bucket LLC
 
-//! The `RequestEvent` envelope that the four Wave 8 P0 streams populate.
+//! The `RequestEvent` envelope that the four capture streams populate.
 //!
 //! This module is the canonical Rust shape; the protobuf wire format
 //! used by the ingest pipeline mirrors it field-for-field.
@@ -49,7 +49,7 @@ impl UserIdSource {
 }
 
 /// The canonical request envelope. One struct populated by all four
-/// Wave 8 P0 streams (T1 properties, T2 sessions, T3 users, T4 ingest)
+/// capture streams (properties, sessions, users, ingest)
 /// and consumed verbatim by the ingest pipeline.
 ///
 /// Adding a new top-level field is a schema-breaking change plus a

@@ -16,7 +16,7 @@ pub mod cardinality;
 pub mod clock_skew;
 /// Typed proxy events and the in-process subscriber bus.
 pub mod events;
-/// OpenMetrics exemplar side-store used by R1.1 to wire trace IDs
+/// OpenMetrics exemplar side-store used to wire trace IDs
 /// onto the request-duration and ledger histograms.
 pub mod exemplars;
 pub mod export;

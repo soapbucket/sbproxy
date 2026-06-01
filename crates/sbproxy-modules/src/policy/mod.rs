@@ -7,14 +7,14 @@
 
 /// A2A protocol policy module.
 pub mod a2a;
-/// `Accept-Payment` header parser (Wave 3 / R3.1, A3.1).
+/// `Accept-Payment` header parser.
 pub mod accept_payment;
 /// `agent_budget` semantic rate-limit primitive.
 pub mod agent_budget;
 #[cfg(feature = "agent-class")]
 pub mod agent_class;
 pub mod ai_crawl;
-/// aipref preference signal parser (Wave 4 / G4.9).
+/// aipref preference signal parser.
 pub mod aipref;
 pub mod assertion;
 pub mod bot_detection;
@@ -214,14 +214,14 @@ pub enum Policy {
     /// API5:2023), and detects object-id enumeration sweeps. See
     /// `policy/object_authz.rs`.
     ObjectAuthz(ObjectAuthzPolicy),
-    /// Agent-class policy (G1.4 wire). Marker policy that opts an
+    /// Agent-class policy. Marker policy that opts an
     /// origin into the agent-class resolver chain. The resolver
     /// itself runs in the request pipeline (`stamp_request_context`);
     /// this policy carries the per-origin knobs (forward-to-upstream
     /// header names, rDNS override). Feature-gated via `agent-class`.
     #[cfg(feature = "agent-class")]
     AgentClass(agent_class::AgentClassPolicy),
-    /// A2A (agent-to-agent) policy module (Wave 7 / A7.2). Per-route
+    /// A2A (agent-to-agent) policy module. Per-route
     /// chain-depth cap, cycle detection, callee allowlist, caller
     /// denylist. Evaluation reads `RequestContext.a2a` populated by
     /// the request filter.

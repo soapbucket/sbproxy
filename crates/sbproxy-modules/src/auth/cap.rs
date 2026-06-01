@@ -1,4 +1,4 @@
-//! Crawler Authorization Protocol (CAP) verifier (Wave 6 / R6.1).
+//! Crawler Authorization Protocol (CAP) verifier.
 //!
 //! Implements the OSS-side verifier for the CAP token format. Token
 //! issuance lives in a separate component; verification is the
@@ -12,18 +12,18 @@
 //!   static JWKS document configured inline in YAML.
 //! * Validates standard claims: `exp`, `iat` not in future, `iss`
 //!   present, `aud` matches the request `Host`, `cap_v == 1`.
-//! * Verifies `sub` matches the resolved `agent_id` from the Wave 1
-//!   resolver chain (when present on the request context).
+//! * Verifies `sub` matches the resolved `agent_id` from the resolver
+//!   chain (when present on the request context).
 //! * Verifies the request path matches the token's `glob` allow-list.
 //! * Optionally registers / consults a per-token rate-limit bucket
 //!   keyed by `jti` with capacity `rps` and a daily byte budget. The
 //!   rate-limit binding lives behind a `cfg(feature = "rate-limit")`
-//!   stub today (R2.3 middleware lands later). When the feature is off
+//!   stub today (the middleware lands later). When the feature is off
 //!   the verifier degrades to verify-only mode and emits a warning so
 //!   operators see the gap.
 //! * Returns a [`CapVerdict`] capturing the result. The `Verified`
 //!   arm carries a [`CapTokenView`] suitable for stamping onto
-//!   `RequestContext.cap_token` (the field is added by the Wave 6
+//!   `RequestContext.cap_token` (the field is added by a separate
 //!   plumbing task; this verifier returns the typed view independent
 //!   of context wiring).
 //!
@@ -55,7 +55,7 @@ use crate::auth::jwks::{self, JwksCache};
 
 /// View of a verified CAP token suitable for stamping onto
 /// `RequestContext.cap_token` so downstream policies (rate limiting,
-/// access-log attribution per G6.2) can read the budget claims without
+/// access-log attribution) can read the budget claims without
 /// re-decoding the JWT.
 ///
 /// `Eq` is intentionally not derived because `max_rps` is `f64` per
@@ -78,7 +78,7 @@ pub struct CapTokenView {
 
 /// Verdict produced by [`CapVerifier::verify`].
 ///
-/// The closed set mirrors the OSS R6.1 verifier failure modes.
+/// The closed set mirrors the OSS verifier failure modes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CapVerdict {
     /// The token verified end-to-end. Carries the typed view for
@@ -160,8 +160,8 @@ impl CapError {
 ///
 /// One of `jwks_url` or `jwks_static` MUST be set. `jwks_url` is the
 /// production path; `jwks_static` is the offline / pre-issued-token
-/// deployment shape described in the ADR § "Issuance (enterprise,
-/// G6.7)" closing paragraph.
+/// deployment shape described in the ADR's "Issuance (enterprise)"
+/// closing paragraph.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CapConfig {
     /// JWKS endpoint URL (typically
@@ -294,7 +294,7 @@ impl CapVerifier {
     /// `request_host` is the request's `Host` header value (used for
     /// `aud` matching). `request_path` is the request path (used for
     /// `glob` matching). `resolved_agent_id` is the request's resolved
-    /// agent identifier from the Wave 1 resolver chain; pass `None`
+    /// agent identifier from the resolver chain; pass `None`
     /// when no resolver ran. The verifier rejects any token whose
     /// `sub` does not match a present `resolved_agent_id`; when
     /// `resolved_agent_id` is `None`, the binding check is skipped

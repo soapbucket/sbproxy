@@ -1,4 +1,4 @@
-//! Web Bot Auth hosted directory cache (Wave 1 / G1.7).
+//! Web Bot Auth hosted directory cache.
 //!
 //! Implements the dynamic side of the `bot_auth` provider:
 //!

@@ -1,9 +1,9 @@
-//! CEL response-body transform (Wave 5 day-5 / Q5.x reactivation).
+//! CEL response-body transform.
 //!
 //! Evaluates a CEL expression against the response body + status +
 //! headers and replaces the body with the result. The transform is
 //! intended for the trust-bounded sidecar capture path's tests
-//! (G5.3 / G5.4): the e2e harness needs a tiny response-side scripting
+//! the e2e harness needs a tiny response-side scripting
 //! lane so it can stamp `request.tls.ja4` / `request.kya.verdict` back
 //! into the response body for assertions, without bringing the full
 //! Lua / JS / WASM stack.
@@ -21,9 +21,9 @@
 //! ```
 //!
 //! The `on_response` expression runs at body-buffer time and rewrites
-//! the response body. The `headers` array runs alongside it (Wave 5
-//! day-6 Item 1) and lets operators set / append / remove response
-//! headers from CEL. Either field is independently optional; supplying
+//! the response body. The `headers` array runs alongside it and lets
+//! operators set / append / remove response headers from CEL. Either
+//! field is independently optional; supplying
 //! neither is an error.
 //!
 //! ## CEL surface
@@ -126,8 +126,8 @@ pub struct CelScriptTransform {
     /// CEL expression that runs at response-body time. Optional when
     /// `headers` is supplied.
     pub on_response: Option<String>,
-    /// Header mutation rules evaluated at response time (Wave 5 day-6
-    /// Item 1). May be empty when only `on_response` is configured.
+    /// Header mutation rules evaluated at response time. May be empty
+    /// when only `on_response` is configured.
     pub headers: Vec<CelHeaderRule>,
 }
 

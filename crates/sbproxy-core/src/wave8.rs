@@ -30,7 +30,7 @@ use ulid::Ulid;
 
 use crate::context::RequestContext;
 
-/// Capture all four Wave 8 dimensions and stamp them on the context.
+/// Capture all four capture dimensions and stamp them on the context.
 ///
 /// Order matters: user_id resolves first so the
 /// `auto_generate: Anonymous` session policy can see whether a user

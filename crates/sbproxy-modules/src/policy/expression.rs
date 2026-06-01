@@ -73,13 +73,12 @@ impl ExpressionPolicy {
     /// Evaluate the expression with an optional [`AiprefSignal`] stamped
     /// into the CEL context under `request.aipref.{train,search,ai_input}`.
     ///
-    /// Wave 4 / G4.9 follow-up: the proxy's request enricher parses
-    /// the inbound `aipref:` header and threads the result here so
-    /// CEL expressions can author route gates like
-    /// `request.aipref.train == false` without re-parsing the header.
-    /// `None` leaves the namespace at the default-permissive zero
-    /// value (every axis `true`) per A4.1's "absence of a signal is
-    /// not a signal" rule.
+    /// The proxy's request enricher parses the inbound `aipref:`
+    /// header and threads the result here so CEL expressions can
+    /// author route gates like `request.aipref.train == false`
+    /// without re-parsing the header. `None` leaves the namespace at
+    /// the default-permissive zero value (every axis `true`) per the
+    /// "absence of a signal is not a signal" rule.
     #[allow(clippy::too_many_arguments)] // Mirrors `evaluate` plus the optional aipref signal; refactoring to a struct argument is a separate cleanup.
     pub fn evaluate_with_aipref(
         &self,
@@ -105,7 +104,7 @@ impl ExpressionPolicy {
         )
     }
 
-    /// Evaluate the expression with the full bundle of Wave 5 / Wave 4
+    /// Evaluate the expression with the full bundle of
     /// view objects available to the CEL surface.
     ///
     /// New code should call this method directly so the
@@ -179,7 +178,7 @@ impl ExpressionPolicy {
     }
 }
 
-/// Bundle of optional Wave 4 / Wave 5 view objects that an
+/// Bundle of optional view objects that an
 /// `ExpressionPolicy` (and similar CEL evaluators) can read at
 /// evaluation time.
 ///

@@ -2,8 +2,9 @@
 //!
 //! Implements the JSON envelope schema. The envelope is the output
 //! shape for the `ContentShape::Json` branch of the content-negotiation
-//! pipeline. It serialises the Markdown body produced by G4.3
-//! together with citation metadata, the page's RSL license URN, and any
+//! pipeline. It serialises the Markdown body produced by the
+//! HTML-to-Markdown projection together with citation metadata, the
+//! page's RSL license URN, and any
 //! pass-through JSON-LD extracted from the original HTML.
 //!
 //! The transform is a no-op unless `ctx.content_shape_transform` is
@@ -37,7 +38,7 @@ use crate::policy::ContentShape;
 use crate::transform::MarkdownProjection;
 
 /// Pinned envelope schema version. Bumped only via the breaking-change
-/// window per A1.8.
+/// window.
 pub const JSON_ENVELOPE_SCHEMA_VERSION: &str = "1";
 
 /// Profile URL stamped into the response `Content-Type` header so
@@ -52,15 +53,15 @@ pub const JSON_ENVELOPE_CONTENT_TYPE: &str =
 
 // --- Envelope shape ---
 
-/// JSON envelope body (A4.2 v1 schema).
+/// JSON envelope body (v1 schema).
 ///
 /// Field order matches the ADR's locked shape. `serde` preserves the
 /// declaration order in the serialised output so agents that pretty-
 /// print or hash the body see a stable byte sequence.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct JsonEnvelope {
-    /// Always `"1"` in Wave 4. String-typed per A1.8 access-log
-    /// convention; bumps to `"2"` only via the deprecation window.
+    /// Always `"1"` today. String-typed access-log convention; bumps
+    /// to `"2"` only via the deprecation window.
     pub schema_version: &'static str,
     /// Page title. Empty string when the source had no `<title>` and no
     /// H1. Required field.
@@ -72,7 +73,7 @@ pub struct JsonEnvelope {
     /// RSL license URN, or `"all-rights-reserved"` when no RSL policy
     /// is configured.
     pub license: String,
-    /// Markdown body produced by G4.3's projection. Same content as the
+    /// Markdown body produced by the projection. Same content as the
     /// `text/markdown` response for the same request.
     pub content_md: String,
     /// RFC 3339 timestamp at which the proxy fetched the upstream
@@ -145,7 +146,7 @@ impl JsonEnvelope {
 /// state. The `apply` method takes the `ctx` fields it needs as
 /// explicit parameters so the transform stays usable from the existing
 /// pure body-buffer pipeline. Callers thread the values from
-/// `RequestContext` (G4.2 stamps `content_shape_transform`,
+/// `RequestContext` (stamping `content_shape_transform`,
 /// `markdown_projection`, `canonical_url`, `rsl_urn`,
 /// `citation_required`).
 ///

@@ -37,8 +37,8 @@ pub fn register_all(ctx: &mut cel::Context<'_>) {
 /// `sbproxy_security::TlsFingerprintCatalog::matches`.
 pub trait TlsFingerprintMatcher: Send + Sync {
     /// Return `true` when `ja4` matches the catalog entry for
-    /// `agent_class_id`. Per A5.1: `true` is also the conservative
-    /// answer for an uncatalogued class.
+    /// `agent_class_id`. `true` is also the conservative answer for
+    /// an uncatalogued class.
     fn matches(&self, ja4: &str, agent_class_id: &str) -> bool;
 }
 
@@ -67,10 +67,10 @@ pub fn set_tls_fingerprint_matcher(matcher: std::sync::Arc<dyn TlsFingerprintMat
     *TLS_MATCHER.write() = matcher;
 }
 
-/// CEL function `tls_fingerprint_matches(ja4, agent_class_id)` per
-/// A5.1. Returns true when `ja4` is a known fingerprint for the
-/// catalogued agent class, or when the catalogue has no entry for
-/// the agent class (conservative).
+/// CEL function `tls_fingerprint_matches(ja4, agent_class_id)`.
+/// Returns true when `ja4` is a known fingerprint for the catalogued
+/// agent class, or when the catalogue has no entry for the agent
+/// class (conservative).
 fn cel_tls_fingerprint_matches(
     ja4: Arc<String>,
     agent_class_id: Arc<String>,

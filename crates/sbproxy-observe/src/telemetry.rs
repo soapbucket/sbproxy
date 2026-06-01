@@ -46,9 +46,9 @@ pub enum OtlpTransport {
 
 /// Configuration for the OpenTelemetry pipeline.
 ///
-/// The Wave 1 substrate ships head-based sampling (parent-based +
+/// The substrate ships head-based sampling (parent-based +
 /// always-sample errors + ratio for unsampled roots); tail-based
-/// sampling is deferred to Wave 6 per A1.4.
+/// sampling is deferred.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelemetryConfig {
     /// Whether tracing is enabled.
@@ -66,13 +66,13 @@ pub struct TelemetryConfig {
     #[serde(default = "default_service_name")]
     pub service_name: String,
     /// Head-based sampling probability for unsampled roots. Default is
-    /// 10% per A1.4. Errors and parent-sampled requests are always
+    /// 10%. Errors and parent-sampled requests are always
     /// captured regardless of this value.
     #[serde(default)]
     pub sample_rate: Option<f64>,
     /// When `true`, every 5xx / policy-block / ledger-denial root span
     /// is sampled at 100% even if the head ratio would have dropped it.
-    /// Default `true` per A1.4.
+    /// Default `true`.
     #[serde(default = "default_always_sample_errors")]
     pub always_sample_errors: bool,
     /// Propagation format: `"w3c"` (default), `"b3"`, or `"jaeger"`.
@@ -371,7 +371,7 @@ pub fn init_propagator() {
 
 /// Inject the active OTel context into outbound HTTP headers.
 ///
-/// Wave 1 propagation invariant (per A1.4): every HTTP request leaving
+/// Propagation invariant: every HTTP request leaving
 /// the proxy MUST carry `traceparent`. Outbound clients (ledger, Stripe,
 /// facilitators, registry feeds, KYA token verifier, OAuth, webhook
 /// delivery) call this to satisfy that invariant in one line.
@@ -380,7 +380,7 @@ pub fn init_propagator() {
 /// `tracing-opentelemetry` layer is installed. Falls back to the global
 /// `opentelemetry::Context::current()` (which `extract_from_headers`
 /// populates) so propagation works even when no OTLP tracer is wired,
-/// satisfying the A1.4 invariant for the disabled path.
+/// satisfying the invariant for the disabled path.
 ///
 /// Quietly does nothing when no propagator has been registered (the
 /// global default is a no-op propagator).
@@ -507,7 +507,7 @@ pub fn extract_from_headers(
 // the standard `tracing` macros (record! / in_scope) so the same
 // emission path works whether OTLP is enabled or not.
 
-/// One of the eight pillars defined by A1.4. Used to build span names
+/// One of the eight standard pillars. Used to build span names
 /// of the form `sbproxy.<pillar>.<verb>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pillar {
