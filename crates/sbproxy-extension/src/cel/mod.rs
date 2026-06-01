@@ -143,14 +143,23 @@ impl CelEngine {
         Self { _private: () }
     }
 
-    /// Compile a CEL expression from a source string.
+    /// Compile a CEL expression from a source string. Emits
+    /// `sbproxy_script_compile_total{engine="cel", result}` so
+    /// operators can alert on a runaway parse-error rate.
     pub fn compile(&self, source: &str) -> Result<CelExpression> {
-        let program =
-            cel::Program::compile(source).map_err(|e| anyhow::anyhow!("CEL parse error: {}", e))?;
-        Ok(CelExpression {
-            source: source.to_string(),
-            program,
-        })
+        match cel::Program::compile(source) {
+            Ok(program) => {
+                sbproxy_observe::metrics::record_script_compile("cel", "ok");
+                Ok(CelExpression {
+                    source: source.to_string(),
+                    program,
+                })
+            }
+            Err(e) => {
+                sbproxy_observe::metrics::record_script_compile("cel", "parse_error");
+                Err(anyhow::anyhow!("CEL parse error: {}", e))
+            }
+        }
     }
 
     /// Build a cel::Context with variables and custom functions.
@@ -171,31 +180,52 @@ impl CelEngine {
     /// Evaluate a CEL expression as a boolean.
     ///
     /// Returns an error if the expression does not evaluate to a boolean or
-    /// if evaluation fails.
+    /// if evaluation fails. Stamps `sbproxy_script_invocations_total` and
+    /// `sbproxy_script_duration_seconds` regardless of outcome.
     pub fn eval_bool(&self, expr: &CelExpression, ctx: &CelContext) -> Result<bool> {
         let cel_ctx = self.build_cel_context(ctx);
-        let result = expr
-            .program
-            .execute(&cel_ctx)
-            .map_err(|e| anyhow::anyhow!("CEL execution error: {}", e))?;
-
+        let start = std::time::Instant::now();
+        let outcome = expr.program.execute(&cel_ctx);
+        let elapsed = start.elapsed().as_secs_f64();
+        sbproxy_observe::metrics::record_script_duration("cel", elapsed);
+        let result = match outcome {
+            Ok(v) => v,
+            Err(e) => {
+                sbproxy_observe::metrics::record_script_invocation("cel", "runtime_error");
+                return Err(anyhow::anyhow!("CEL execution error: {}", e));
+            }
+        };
         match result {
-            cel::Value::Bool(b) => Ok(b),
-            other => Err(anyhow::anyhow!(
-                "CEL expression did not return bool, got: {:?}",
-                other
-            )),
+            cel::Value::Bool(b) => {
+                sbproxy_observe::metrics::record_script_invocation("cel", "ok");
+                Ok(b)
+            }
+            other => {
+                sbproxy_observe::metrics::record_script_invocation("cel", "runtime_error");
+                Err(anyhow::anyhow!(
+                    "CEL expression did not return bool, got: {:?}",
+                    other
+                ))
+            }
         }
     }
 
     /// Evaluate a CEL expression and return the result as a CelValue.
+    /// Stamps the same script-invocation metrics as [`Self::eval_bool`].
     pub fn eval(&self, expr: &CelExpression, ctx: &CelContext) -> Result<CelValue> {
         let cel_ctx = self.build_cel_context(ctx);
-        let result = expr
-            .program
-            .execute(&cel_ctx)
-            .map_err(|e| anyhow::anyhow!("CEL execution error: {}", e))?;
-
+        let start = std::time::Instant::now();
+        let outcome = expr.program.execute(&cel_ctx);
+        let elapsed = start.elapsed().as_secs_f64();
+        sbproxy_observe::metrics::record_script_duration("cel", elapsed);
+        let result = match outcome {
+            Ok(v) => v,
+            Err(e) => {
+                sbproxy_observe::metrics::record_script_invocation("cel", "runtime_error");
+                return Err(anyhow::anyhow!("CEL execution error: {}", e));
+            }
+        };
+        sbproxy_observe::metrics::record_script_invocation("cel", "ok");
         Ok(from_cel_value(&result))
     }
 

@@ -1463,6 +1463,94 @@ pub fn record_audit_emit_duration(channel: &str, outcome: &str, duration_secs: f
     );
 }
 
+// --- script-engine metrics (CEL / Lua / JS / WASM) -----------------------
+//
+// Four counters / histograms cover the script-engine lifecycle so an
+// operator can alert on sandbox kills, runaway execution time, and
+// compile churn from a hot-reload watcher.
+//
+// `engine` is the closed enum `cel|lua|js|wasm`. The `result` and
+// `outcome` labels are also closed enums; everything passes through
+// unsanitised because the label space is bounded by the schema.
+
+/// Count a script compile attempt on
+/// `sbproxy_script_compile_total{engine, result}`. `engine` is one of
+/// `cel`, `lua`, `js`, `wasm`. `result` is one of `ok`, `parse_error`,
+/// `sandbox_reject`.
+pub fn record_script_compile(engine: &'static str, result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_script_compile_total",
+            "Script-engine compile attempts, by engine and outcome",
+            &["engine", "result"],
+        )
+        .expect("script compile counter registers")
+    });
+    counter.with_label_values(&[engine, result]).inc();
+}
+
+/// Count a script invocation on
+/// `sbproxy_script_invocations_total{engine, result}`. `result` is one
+/// of `ok`, `runtime_error`, `timeout`, `memory_cap`,
+/// `instruction_cap`. The matching duration histogram is emitted by
+/// [`record_script_duration`].
+pub fn record_script_invocation(engine: &'static str, result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_script_invocations_total",
+            "Script-engine invocations, by engine and outcome",
+            &["engine", "result"],
+        )
+        .expect("script invocations counter registers")
+    });
+    counter.with_label_values(&[engine, result]).inc();
+}
+
+/// Record a script-engine invocation duration on
+/// `sbproxy_script_duration_seconds{engine}`. Buckets cover the typical
+/// per-request budget envelope: 100 microseconds through 10 seconds.
+pub fn record_script_duration(engine: &'static str, duration_secs: f64) {
+    use prometheus::{register_histogram_vec, HistogramVec};
+    use std::sync::OnceLock;
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    let hist = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_script_duration_seconds",
+            "Script-engine invocation duration, by engine",
+            &["engine"],
+            vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,],
+        )
+        .expect("script duration histogram registers")
+    });
+    hist.with_label_values(&[engine]).observe(duration_secs);
+}
+
+/// Count a hot-reload event on
+/// `sbproxy_script_reloads_total{engine, result}`. `result` is one of
+/// `ok`, `parse_error`, `sandbox_reject`. The reload counter is
+/// distinct from the compile counter so operators can spot reload
+/// churn separately from cold-start compile failures.
+pub fn record_script_reload(engine: &'static str, result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_script_reloads_total",
+            "Script-engine hot-reload events, by engine and outcome",
+            &["engine", "result"],
+        )
+        .expect("script reloads counter registers")
+    });
+    counter.with_label_values(&[engine, result]).inc();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2092,6 +2180,74 @@ mod tests {
         assert!(
             ex.is_some(),
             "expected an exemplar for audit_emit; store entry missing"
+        );
+    }
+
+    // --- script-engine metrics (CEL / Lua / JS / WASM) ---
+
+    #[test]
+    fn record_script_compile_emits_counter() {
+        record_script_compile("cel", "ok");
+        record_script_compile("cel", "parse_error");
+        record_script_compile("lua", "ok");
+        record_script_compile("js", "sandbox_reject");
+        record_script_compile("wasm", "ok");
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_script_compile_total"),
+            "compile counter missing from render"
+        );
+        for engine in ["cel", "lua", "js", "wasm"] {
+            assert!(
+                out.contains(&format!("engine=\"{engine}\"")),
+                "engine={engine} label missing from render"
+            );
+        }
+    }
+
+    #[test]
+    fn record_script_invocation_emits_counter() {
+        record_script_invocation("cel", "ok");
+        record_script_invocation("lua", "runtime_error");
+        record_script_invocation("js", "timeout");
+        record_script_invocation("wasm", "memory_cap");
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_script_invocations_total"),
+            "invocations counter missing from render"
+        );
+        for result in ["ok", "runtime_error", "timeout", "memory_cap"] {
+            assert!(
+                out.contains(&format!("result=\"{result}\"")),
+                "result={result} label missing"
+            );
+        }
+    }
+
+    #[test]
+    fn record_script_duration_emits_histogram_buckets() {
+        record_script_duration("cel", 0.002);
+        record_script_duration("cel", 0.150);
+        record_script_duration("wasm", 1.5);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_script_duration_seconds_bucket"),
+            "duration buckets missing from render"
+        );
+        assert!(
+            out.contains("sbproxy_script_duration_seconds_count"),
+            "duration count missing from render"
+        );
+    }
+
+    #[test]
+    fn record_script_reload_emits_counter() {
+        record_script_reload("lua", "ok");
+        record_script_reload("js", "parse_error");
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_script_reloads_total"),
+            "reload counter missing from render"
         );
     }
 }
