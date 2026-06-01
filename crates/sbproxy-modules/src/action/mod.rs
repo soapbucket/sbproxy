@@ -1,6 +1,7 @@
 //! Action module - enum dispatch for built-in action handlers.
 
 pub mod a2a;
+pub mod a2a_card;
 mod aiproxy;
 pub mod content_negotiate;
 pub mod graphql;
@@ -13,6 +14,7 @@ pub mod storage;
 pub mod versioning;
 pub mod websocket;
 pub use a2a::*;
+pub use a2a_card::{AgentCapabilities, AgentCard, NegotiationOutcome};
 pub use aiproxy::*;
 pub use content_negotiate::{resolve_shapes, ContentNegotiateConfig, NegotiatedShapes};
 pub use graphql::*;
