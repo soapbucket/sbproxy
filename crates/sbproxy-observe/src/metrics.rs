@@ -1622,6 +1622,89 @@ pub fn record_idempotency_cache_duration(backend: &'static str, duration_secs: f
     hist.with_label_values(&[backend]).observe(duration_secs);
 }
 
+// --- body size + compression metrics --------------------------------------
+//
+// Three families let an operator see how load-shaped traffic is:
+// response body sizes before and after compression, the per-codec
+// distribution of compression decisions, and the achieved compression
+// ratio when compression was applied.
+//
+// `codec` is the closed enum `gzip | br | zstd | identity`; `result`
+// is a closed enum off the compression decision site; `direction` is
+// closed too. No sanitisation is required.
+
+const BODY_BYTES_BUCKETS: &[f64] = &[
+    256.0,
+    1024.0,
+    4096.0,
+    16_384.0,
+    65_536.0,
+    262_144.0,
+    1_048_576.0,
+    4_194_304.0,
+    16_777_216.0,
+];
+
+/// Record a response body size on
+/// `sbproxy_response_body_bytes{direction}`. `direction` is
+/// `pre_compress` or `post_compress`. Buckets span 256 bytes through
+/// 16 MiB so dashboards can spot tiny payloads (where compression
+/// wastes CPU) and the long tail (where it shrinks bytes the most).
+pub fn record_response_body_bytes(direction: &'static str, bytes: u64) {
+    use prometheus::{register_histogram_vec, HistogramVec};
+    use std::sync::OnceLock;
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    let hist = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_response_body_bytes",
+            "Response body size, by compression direction",
+            &["direction"],
+            BODY_BYTES_BUCKETS.to_vec(),
+        )
+        .expect("response body bytes histogram registers")
+    });
+    hist.with_label_values(&[direction]).observe(bytes as f64);
+}
+
+/// Record a compression decision on
+/// `sbproxy_compression_decisions_total{codec, result}`. `codec` is
+/// one of `gzip`, `br`, `zstd`, `identity`. `result` is one of
+/// `applied`, `skipped_size`, `skipped_accept`, `disabled`.
+pub fn record_compression_decision(codec: &'static str, result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_compression_decisions_total",
+            "Compression middleware decisions, by codec and outcome",
+            &["codec", "result"],
+        )
+        .expect("compression decision counter registers")
+    });
+    counter.with_label_values(&[codec, result]).inc();
+}
+
+/// Record an observed compression ratio on
+/// `sbproxy_compression_ratio{codec}`. Buckets cover the expected
+/// envelope from no shrinkage (1.0) down to 25x shrinkage (0.04).
+/// Lower is better. Only emitted when compression was applied.
+pub fn record_compression_ratio(codec: &'static str, ratio: f64) {
+    use prometheus::{register_histogram_vec, HistogramVec};
+    use std::sync::OnceLock;
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    let hist = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_compression_ratio",
+            "Achieved compression ratio (post_size / pre_size) when compression was applied",
+            &["codec"],
+            vec![0.04, 0.08, 0.16, 0.25, 0.33, 0.5, 0.66, 0.8, 0.9, 1.0],
+        )
+        .expect("compression ratio histogram registers")
+    });
+    hist.with_label_values(&[codec]).observe(ratio);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2370,6 +2453,61 @@ mod tests {
         assert!(
             out.contains("sbproxy_idempotency_cache_duration_seconds_bucket"),
             "idempotency duration buckets missing"
+        );
+    }
+
+    // --- body + compression ---
+
+    #[test]
+    fn record_response_body_bytes_emits_histogram() {
+        record_response_body_bytes("pre_compress", 4096);
+        record_response_body_bytes("post_compress", 1200);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_response_body_bytes_bucket"),
+            "response body bytes buckets missing"
+        );
+        for direction in ["pre_compress", "post_compress"] {
+            assert!(
+                out.contains(&format!("direction=\"{direction}\"")),
+                "direction={direction} label missing"
+            );
+        }
+    }
+
+    #[test]
+    fn record_compression_decision_emits_counter() {
+        record_compression_decision("gzip", "applied");
+        record_compression_decision("br", "skipped_size");
+        record_compression_decision("zstd", "skipped_accept");
+        record_compression_decision("identity", "disabled");
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_compression_decisions_total"),
+            "compression decision counter missing"
+        );
+        for codec in ["gzip", "br", "zstd", "identity"] {
+            assert!(
+                out.contains(&format!("codec=\"{codec}\"")),
+                "codec={codec} label missing"
+            );
+        }
+        for result in ["applied", "skipped_size", "skipped_accept", "disabled"] {
+            assert!(
+                out.contains(&format!("result=\"{result}\"")),
+                "result={result} label missing"
+            );
+        }
+    }
+
+    #[test]
+    fn record_compression_ratio_emits_histogram() {
+        record_compression_ratio("gzip", 0.3);
+        record_compression_ratio("zstd", 0.15);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_compression_ratio_bucket"),
+            "compression ratio buckets missing"
         );
     }
 }

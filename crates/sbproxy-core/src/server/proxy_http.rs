@@ -1869,6 +1869,22 @@ impl ProxyHttp for SbProxy {
                     Some(n) => n >= comp_cfg.min_size,
                     None => true,
                 };
+                if !comp_cfg.enabled {
+                    sbproxy_observe::metrics::record_compression_decision("identity", "disabled");
+                } else if !ct_ok || upstream_already_encoded {
+                    // Already-compressed upstream or excluded media
+                    // type. Treat as a skip; the codec label is
+                    // identity because no codec was selected.
+                    sbproxy_observe::metrics::record_compression_decision(
+                        "identity",
+                        "skipped_accept",
+                    );
+                } else if !size_ok {
+                    sbproxy_observe::metrics::record_compression_decision(
+                        "identity",
+                        "skipped_size",
+                    );
+                }
                 if !upstream_already_encoded && ct_ok && size_ok {
                     let accept = session
                         .req_header()
@@ -1889,6 +1905,12 @@ impl ProxyHttp for SbProxy {
                         upstream_response.remove_header("content-length");
                         let _ = upstream_response.insert_header("transfer-encoding", "chunked");
                         let _ = upstream_response.append_header("vary", "Accept-Encoding");
+                    } else if comp_cfg.enabled {
+                        // Client did not advertise any supported codec.
+                        sbproxy_observe::metrics::record_compression_decision(
+                            "identity",
+                            "skipped_accept",
+                        );
                     }
                 }
             }
@@ -3236,11 +3258,31 @@ impl ProxyHttp for SbProxy {
                 // to identity from here. The floor is a CPU optimisation,
                 // not a correctness requirement.
                 if let Some(encoding) = ctx.compression_encoding.take() {
+                    let pre = buf.len();
+                    sbproxy_observe::metrics::record_response_body_bytes(
+                        "pre_compress",
+                        pre as u64,
+                    );
                     if buf.len() >= ctx.compression_min_size {
                         match sbproxy_middleware::compression::compress_body(&buf[..], encoding) {
                             Ok(compressed) => {
+                                let post = compressed.len();
                                 buf.clear();
                                 buf.extend_from_slice(&compressed);
+                                sbproxy_observe::metrics::record_response_body_bytes(
+                                    "post_compress",
+                                    post as u64,
+                                );
+                                sbproxy_observe::metrics::record_compression_decision(
+                                    encoding.as_str(),
+                                    "applied",
+                                );
+                                if pre > 0 {
+                                    sbproxy_observe::metrics::record_compression_ratio(
+                                        encoding.as_str(),
+                                        post as f64 / pre as f64,
+                                    );
+                                }
                             }
                             Err(e) => {
                                 warn!(
@@ -3251,7 +3293,22 @@ impl ProxyHttp for SbProxy {
                                 );
                             }
                         }
+                    } else {
+                        // Buf is below the floor at end-of-stream;
+                        // we set the Content-Encoding header earlier
+                        // but the encoder is bypassed. Count this as
+                        // a size skip so dashboards can flag origins
+                        // configured at too high a `min_size`.
+                        sbproxy_observe::metrics::record_compression_decision(
+                            encoding.as_str(),
+                            "skipped_size",
+                        );
                     }
+                } else {
+                    sbproxy_observe::metrics::record_response_body_bytes(
+                        "pre_compress",
+                        buf.len() as u64,
+                    );
                 }
 
                 *body = Some(buf.freeze());
