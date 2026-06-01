@@ -112,6 +112,10 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 | `sbproxy_transport_requests_total` | 28 | Labels: `protocol` (h1\|h2\|h3\|grpc\|grpc_web\|graphql\|websocket), `result` (ok\|client_error\|upstream_error\|timeout). |
 | `sbproxy_transport_duration_seconds_bucket` | 364 | Same labels plus 13 histogram buckets 100us..10s. |
 | `sbproxy_grpc_status_total` | 17 | Labels: `code` (canonical lowercase name; closed enum from tonic). |
+| `sbproxy_mcp_tool_dispatch_total` | 4 000 | Labels: `tool` (sanitised), `result` (ok\|tool_error\|tool_not_found\|policy_denied). |
+| `sbproxy_mcp_tool_dispatch_duration_seconds_bucket` | 12 000 | `tool` label plus 12 histogram buckets 100us..10s. |
+| `sbproxy_mcp_resource_fetch_total` | 4 | Labels: `result` (ok\|not_found\|upstream_error\|policy_denied). |
+| `sbproxy_mcp_federation_peers_up` | 1 | Gauge; live federation peer count as of the last refresh. |
 
 Hard rule: `agent_id`, `request_id`, `session_id`, and `user_id` are never label values on Prometheus metrics. They live as span attributes (under traces) and log fields (under logs).
 
