@@ -5,6 +5,10 @@ pub mod a2a;
 pub mod bot_auth;
 /// Dynamic Web Bot Auth directory cache.
 pub mod bot_auth_directory;
+/// WOR-805 AC#4: publish SBproxy's own directory JWKS + Signature
+/// Agent Card so third-party verifiers can discover the keys
+/// SBproxy signs outbound requests with.
+pub mod bot_auth_publish;
 /// Crawler Authorization Protocol (CAP) verifier.
 pub mod cap;
 pub mod jwks;
