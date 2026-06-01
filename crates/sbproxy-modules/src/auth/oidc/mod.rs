@@ -32,6 +32,7 @@ pub mod callback;
 pub mod discovery;
 pub mod logout;
 pub mod pkce;
+pub mod refresh;
 pub mod session;
 pub mod userinfo;
 
