@@ -240,8 +240,8 @@ fn directory_response_unsigned_when_signing_key_absent() {
     // enforce signed directories can fail cleanly.
     for missing in ["content-digest", "signature-input", "signature"] {
         assert!(
-            resp.headers.get(missing).is_none()
-                && resp.headers.get(&missing.to_ascii_uppercase()).is_none(),
+            !resp.headers.contains_key(missing)
+                && !resp.headers.contains_key(&missing.to_ascii_uppercase()),
             "expected no {missing} header on unsigned directory; got {:?}",
             resp.headers.get(missing)
         );
