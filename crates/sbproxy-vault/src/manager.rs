@@ -33,11 +33,19 @@ impl VaultManager {
 
     /// Get a secret from a specific named backend.
     pub fn get(&self, backend: &str, key: &str) -> Result<Option<String>> {
-        let vault = self
-            .vaults
-            .get(backend)
-            .ok_or_else(|| anyhow!("vault backend not found: {}", backend))?;
-        vault.get(key)
+        let start = std::time::Instant::now();
+        let outcome = match self.vaults.get(backend) {
+            Some(vault) => vault.get(key),
+            None => Err(anyhow!("vault backend not found: {}", backend)),
+        };
+        let elapsed = start.elapsed().as_secs_f64();
+        let result_label = match &outcome {
+            Ok(Some(_)) => "ok",
+            Ok(None) => "not_found",
+            Err(e) => classify_vault_error(&format!("{e:#}")),
+        };
+        sbproxy_observe::metrics::record_vault_resolution(backend, result_label, elapsed);
+        outcome
     }
 
     /// Set a secret in a specific named backend.
@@ -58,6 +66,22 @@ impl VaultManager {
 impl Default for VaultManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Map a vault error message (already formatted via `{:#}`) to the
+/// closed `result` label set the metrics expose. The classification
+/// is heuristic; the goal is to let dashboards split `denied`
+/// (authorisation failure) and `not_found` (which the Ok-None arm
+/// already covers) out from the catch-all `backend_error` bucket.
+fn classify_vault_error(msg: &str) -> &'static str {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("denied") || lower.contains("permission") || lower.contains("forbidden") {
+        "denied"
+    } else if lower.contains("not found") {
+        "not_found"
+    } else {
+        "backend_error"
     }
 }
 
