@@ -83,6 +83,19 @@ pub struct TelemetryConfig {
     /// stamp `deployment.environment`, `service.version`, etc. here.
     #[serde(default)]
     pub resource_attrs: std::collections::BTreeMap<String, String>,
+    /// When `true`, additionally export OTel metrics over OTLP via a
+    /// PeriodicReader. The Prometheus surface (scraped from the
+    /// embedded admin server's `/metrics`) is unaffected and remains
+    /// the canonical surface; this is an opt-in mirror for operators
+    /// who already aggregate via an OTel-aware backend (Mimir,
+    /// Datadog, Honeycomb) and want the same observations without
+    /// standing up a separate Prometheus scrape. Default `false`.
+    #[serde(default)]
+    pub export_metrics: bool,
+    /// Period for the OTLP metric exporter, seconds. Default 30s.
+    /// Only consulted when `export_metrics` is `true`.
+    #[serde(default)]
+    pub metrics_interval_secs: Option<u64>,
 }
 
 fn default_service_name() -> String {
@@ -114,6 +127,8 @@ impl Default for TelemetryConfig {
             always_sample_errors: true,
             propagation: None,
             resource_attrs: std::collections::BTreeMap::new(),
+            export_metrics: false,
+            metrics_interval_secs: None,
         }
     }
 }
@@ -244,6 +259,103 @@ pub fn init_otlp_pipeline(config: &TelemetryConfig) -> Result<()> {
 /// exit so any pending span batches get flushed.
 pub fn shutdown_otlp_pipeline() {
     global::shutdown_tracer_provider();
+}
+
+// --- OTLP metrics pipeline ---
+//
+// The proxy's first-class metric surface is Prometheus (every
+// metric in `metrics-stability.md` is registered on the Prometheus
+// `Registry` and scraped by the embedded admin server). The OTLP
+// metric pipeline shipped here is an OPTIONAL mirror: when an
+// operator configures `telemetry.export_metrics: true`, the same
+// observations also reach an OTel-aware backend (Tempo + Mimir,
+// Datadog, New Relic, Honeycomb) without standing up a separate
+// Prometheus scrape.
+//
+// The mirror is opt-in for two reasons:
+//
+// 1. The Prometheus path is the canonical surface; not every
+//    operator wants the duplicate export.
+// 2. The OTLP collector add-on can be a significant deployment
+//    weight if you do not already run one for traces.
+
+/// Initialise the OTLP metrics pipeline. No-op when
+/// `config.export_metrics` is false; otherwise builds a
+/// `MeterProvider` that ships the registered instruments to the
+/// configured OTLP endpoint on a `interval_secs` cadence.
+///
+/// Returns `Err` when the exporter cannot be built. Operators
+/// should log and continue rather than fail boot, mirroring the
+/// trace pipeline.
+pub fn init_otlp_metrics_pipeline(config: &TelemetryConfig) -> Result<()> {
+    if !config.enabled || !config.export_metrics {
+        return Ok(());
+    }
+    let endpoint_owned = config
+        .endpoint
+        .clone()
+        .filter(|e| !e.is_empty())
+        .unwrap_or_else(|| DEFAULT_OTLP_ENDPOINT.to_string());
+    let endpoint = endpoint_owned.as_str();
+
+    let mut resource_kv = vec![
+        KeyValue::new(semconv::resource::SERVICE_NAME, config.service_name.clone()),
+        KeyValue::new(
+            semconv::resource::SERVICE_VERSION,
+            env!("CARGO_PKG_VERSION"),
+        ),
+    ];
+    for (k, v) in &config.resource_attrs {
+        resource_kv.push(KeyValue::new(k.clone(), v.clone()));
+    }
+    let resource = Resource::new(resource_kv);
+
+    let exporter = match config.transport {
+        OtlpTransport::Http => opentelemetry_otlp::MetricExporter::builder()
+            .with_http()
+            .with_endpoint(endpoint)
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to build OTLP/HTTP metric exporter: {}", e))?,
+        OtlpTransport::Grpc => opentelemetry_otlp::MetricExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to build OTLP/gRPC metric exporter: {}", e))?,
+    };
+
+    let interval = std::time::Duration::from_secs(config.metrics_interval_secs.unwrap_or(30));
+    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(
+        exporter,
+        opentelemetry_sdk::runtime::Tokio,
+    )
+    .with_interval(interval)
+    .build();
+
+    let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+        .with_reader(reader)
+        .with_resource(resource)
+        .build();
+    global::set_meter_provider(provider);
+
+    tracing::info!(
+        endpoint = %endpoint,
+        interval_secs = %interval.as_secs(),
+        service = %config.service_name,
+        "OTLP metrics pipeline initialised"
+    );
+    Ok(())
+}
+
+/// Shut down the OTLP metric pipeline cleanly. The 0.27 OTel API
+/// has no global meter-provider shutdown; the `SdkMeterProvider`
+/// installed in [`init_otlp_metrics_pipeline`] is flushed on its
+/// own `Drop` when the process exits. This function exists as a
+/// symmetry point with [`shutdown_otlp_pipeline`] so a shutdown
+/// handler can call both without conditional compilation; today it
+/// is a no-op. When upstream exposes a global flush, this fn
+/// becomes the seam.
+pub fn shutdown_otlp_metrics_pipeline() {
+    // Intentionally empty; see fn-doc.
 }
 
 // --- W3C TraceContext propagation ---
