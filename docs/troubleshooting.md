@@ -8,7 +8,7 @@ When something breaks, this is the first place to look. For *why* these things h
 The `Host` header on the request does not match any configured origin.
 
 Check:
-- Run `sbproxy validate -c sb.yml` to confirm the config parses.
+- Run `sbproxy validate --config sb.yml` to confirm the config parses.
 - Confirm the request's `Host` header matches the origin name exactly, including any port suffix.
 - SBproxy uses a bloom filter for fast hostname lookup. If you just added an origin via hot reload, wait a second and retry.
 
@@ -17,7 +17,7 @@ Check:
 Usually one of: file watcher debounce, ConfigMap symlink swap, or a validation failure.
 
 Check:
-- A config with a validation error gets logged and rejected. The old config keeps running. Run `sbproxy validate -c sb.yml` to see the error.
+- A config with a validation error gets logged and rejected. The old config keeps running. Run `sbproxy validate --config sb.yml` to see the error.
 - Kubernetes ConfigMaps swap via atomic symlink. The watcher catches this, but detection can lag up to 2 seconds.
 - If your editor writes to a temp file and renames, make sure the watcher sees the final filename, not the temp.
 
@@ -25,7 +25,7 @@ Check:
 
 Check in order:
 1. Confirm the provider API key is set correctly. Check the `api_key` field or the environment variable it references.
-2. Run `sbproxy validate -c sb.yml` to confirm the provider block parses correctly.
+2. Run `sbproxy validate --config sb.yml` to confirm the provider block parses correctly.
 3. Check the structured log for `provider` and `status_code` fields on the failed request.
 4. If using a fallback chain, check that at least one provider in the chain has available capacity. The log will show which provider was attempted last.
 5. If the error is "context window exceeded," the requested model does not support the token count in the prompt. Add a model with a larger context window to the provider list.
@@ -66,16 +66,18 @@ Check:
 
 ## Structured log fields reference
 
+The fields below are the ones most useful when triage-grepping the JSON access log. The canonical, exhaustive schema (with optional fields and stability rules) is [access-log.md](./access-log.md); names here mirror that file exactly.
+
 | Field | Meaning |
 |---|---|
-| `host` | Origin name matched. |
+| `timestamp` | RFC 3339 UTC time of the log line. |
+| `origin` | Origin name matched. |
 | `method`, `path`, `status` | Request summary. |
-| `upstream_latency_ms` | Time waiting for upstream response. |
-| `total_latency_ms` | Full request duration including all middleware. |
-| `auth_type` | Auth method applied (`api_key`, `jwt`, etc.). |
-| `policy` | Policy that triggered a rejection. |
-| `provider` | AI provider selected for this request. |
-| `model` | AI model used. |
-| `tokens_in`, `tokens_out` | Token counts for AI requests. |
-| `cache_status` | `hit`, `miss`, or `stale`. |
-| `client_ip` | Resolved client IP after trusted proxy unwrapping. |
+| `latency_ms` | End-to-end request duration, milliseconds. |
+| `client_ip` | Resolved client IP after trusted-proxy unwrapping. |
+| `request_id`, `trace_id` | Correlation ids; `trace_id` is set when an OTLP exporter is wired. |
+| `cache_result` | `hit`, `miss`, `stale`, or `bypass`. |
+| `auth_provider` | Auth method that ran (`api_key`, `jwt`, etc.). |
+| `policy_action` | When a policy intervened, the action it took. |
+| `provider`, `model` | AI-gateway selection for the request (only on AI requests). |
+| `tokens_in`, `tokens_out` | Token counts (only on AI requests). |
