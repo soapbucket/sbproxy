@@ -35,11 +35,13 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod headless_indicators;
 pub mod http_extractors;
 pub mod loader;
 pub mod payload_extractors;
 pub mod rules;
 
+pub use headless_indicators::{extract_headless_indicators, score_headless, HeadlessIndicators};
 pub use http_extractors::{
     extract_http_signals, header_order_hash, user_agent_bucket, vendor_headers, UserAgentBucket,
 };
@@ -82,6 +84,20 @@ pub struct AgentDetection {
     /// reconstruct the why behind a decision; rule-pack authors use
     /// it to find which extractors are populated for their cohort.
     pub signals_used: Vec<String>,
+    /// WOR-817: headless / stealth-browser indicator score, 0-100.
+    /// Computed by [`crate::score_headless`] over the
+    /// [`HeadlessIndicators`] bag and stamped here so policy + audit
+    /// can read both the agent verdict and the headless verdict
+    /// from the same struct. Defaults to 0 when no headless
+    /// indicator fired or the extractor was not run.
+    #[serde(default)]
+    pub headless_score: u8,
+    /// WOR-817: ordered list of indicator names that fired (one
+    /// entry per `HeadlessIndicators::names`). Empty when no
+    /// indicator fired. Lifted to CEL via
+    /// `request.agent.headless_indicators`.
+    #[serde(default)]
+    pub headless_indicators: Vec<String>,
 }
 
 impl AgentDetection {
@@ -95,6 +111,8 @@ impl AgentDetection {
             provenance: AgentProvenance::UnsignedAnonymous,
             confidence: 0.0,
             signals_used: Vec::new(),
+            headless_score: 0,
+            headless_indicators: Vec::new(),
         }
     }
 }
@@ -319,6 +337,8 @@ impl AgentScorer for DefaultScorer {
             provenance: AgentProvenance::UnsignedAnonymous,
             confidence: 0.0,
             signals_used,
+            headless_score: 0,
+            headless_indicators: Vec::new(),
         }
     }
 }

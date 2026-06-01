@@ -647,23 +647,45 @@ pub(super) async fn request_filter(
                     .map(sbproxy_agent_detect::TlsSignals::from);
                 let req = session.req_header();
                 let cookie_persistence = req.headers.contains_key(http::header::COOKIE);
-                let http = Some(sbproxy_agent_detect::extract_http_signals(
-                    req.headers
-                        .iter()
-                        .map(|(name, value)| (name.as_str(), value.to_str().unwrap_or(""))),
+                let header_pairs: Vec<(String, String)> = req
+                    .headers
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_string(),
+                            value.to_str().unwrap_or("").to_string(),
+                        )
+                    })
+                    .collect();
+                let http_signals = sbproxy_agent_detect::extract_http_signals(
+                    header_pairs.iter().map(|(n, v)| (n.as_str(), v.as_str())),
                     cookie_persistence,
-                ));
+                );
+                // WOR-817: deterministic headless / stealth indicator
+                // bag, computed off the same headers the rule pack
+                // already walked. Cheap (header re-iteration only)
+                // and orthogonal to the rule pack so a rule-miss
+                // still carries the headless verdict.
+                let headless = sbproxy_agent_detect::extract_headless_indicators(
+                    &http_signals,
+                    header_pairs.iter().map(|(n, v)| (n.as_str(), v.as_str())),
+                );
+                let headless_score = sbproxy_agent_detect::score_headless(&headless);
+                let headless_names: Vec<String> =
+                    headless.names().into_iter().map(str::to_string).collect();
                 let signals = sbproxy_agent_detect::Signals {
                     tls,
-                    http,
+                    http: Some(http_signals),
                     payload: None,
                 };
                 // A rule miss is a clean unsigned-anonymous verdict
                 // (score 0), not the absence of a result.
-                let detection = loader
+                let mut detection = loader
                     .pack()
                     .evaluate(&signals)
                     .unwrap_or_else(sbproxy_agent_detect::AgentDetection::unscored);
+                detection.headless_score = headless_score;
+                detection.headless_indicators = headless_names;
                 ctx.agent_detection = Some(detection);
             }
         }
