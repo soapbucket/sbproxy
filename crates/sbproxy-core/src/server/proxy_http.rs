@@ -3621,6 +3621,11 @@ impl ProxyHttp for SbProxy {
                 .request_duration
                 .with_label_values(&[hostname.as_str()])
                 .observe(duration);
+            // Mirror to OTel when the operator enabled the OTLP
+            // metrics pipeline; no-op when the meter provider is
+            // the global default no-op.
+            sbproxy_observe::otel::request_duration_histogram()
+                .record(duration, &[sbproxy_observe::otel::origin_label(&hostname)]);
         }
 
         // Phase-duration histogram. Same source-of-truth as the

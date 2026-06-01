@@ -35,6 +35,7 @@ pub mod metrics;
 /// default, HMAC-SHA256 fallback) with dual-key rotation, exponential
 /// backoff retries, and a deadletter queue.
 pub mod notify;
+pub mod otel;
 pub mod redact;
 /// P0 `RequestEvent` envelope shared by the four streams.
 pub mod request_event;
