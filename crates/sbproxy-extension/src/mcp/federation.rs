@@ -146,10 +146,12 @@ impl McpFederation {
     /// Returns the total number of federated tools.
     pub async fn refresh_tools(&self) -> anyhow::Result<usize> {
         let mut registry: HashMap<String, FederatedTool> = HashMap::new();
+        let mut peers_up: i64 = 0;
 
         for server in &self.servers {
             match self.fetch_tools_from_server(server).await {
                 Ok(tools) => {
+                    peers_up += 1;
                     info!(
                         server = %server.name,
                         count = tools.len(),
@@ -180,6 +182,8 @@ impl McpFederation {
                 }
             }
         }
+
+        sbproxy_observe::metrics::set_mcp_federation_peers_up(peers_up);
 
         let count = registry.len();
         self.tools.store(Arc::new(registry));
@@ -426,6 +430,23 @@ impl McpFederation {
     /// vendor servers do not have to know about the gateway's
     /// collision-avoidance scheme.
     pub async fn read_resource(&self, uri: &str) -> anyhow::Result<serde_json::Value> {
+        let outcome = self.read_resource_inner(uri).await;
+        let label = match &outcome {
+            Ok(_) => "ok",
+            Err(e) => {
+                let msg = format!("{e:#}").to_ascii_lowercase();
+                if msg.contains("unknown resource uri") || msg.contains("unknown server") {
+                    "not_found"
+                } else {
+                    "upstream_error"
+                }
+            }
+        };
+        sbproxy_observe::metrics::record_mcp_resource_fetch(label);
+        outcome
+    }
+
+    async fn read_resource_inner(&self, uri: &str) -> anyhow::Result<serde_json::Value> {
         let resource = self
             .resolve_resource(uri)
             .ok_or_else(|| anyhow::anyhow!("unknown resource uri: {uri}"))?;

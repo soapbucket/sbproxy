@@ -142,10 +142,11 @@ impl McpHandler {
     }
 
     fn handle_tools_call(&self, req: &JsonRpcRequest) -> JsonRpcResponse {
+        let start = std::time::Instant::now();
         let params = req.params.as_ref();
         let tool_name = params.and_then(|p| p.get("name")).and_then(|n| n.as_str());
 
-        match tool_name {
+        let (response, result_label, metric_tool) = match tool_name {
             Some(name) => match self.registry.get(name) {
                 Some(registered) => match &registered.handler {
                     super::registry::ToolHandlerType::Static(value) => {
@@ -155,9 +156,13 @@ impl McpHandler {
                             }],
                             is_error: false,
                         };
-                        JsonRpcResponse::success(
-                            req.id.clone(),
-                            serde_json::to_value(result).unwrap(),
+                        (
+                            JsonRpcResponse::success(
+                                req.id.clone(),
+                                serde_json::to_value(result).unwrap(),
+                            ),
+                            "ok",
+                            name.to_string(),
                         )
                     }
                     super::registry::ToolHandlerType::Proxy { origin } => {
@@ -168,19 +173,34 @@ impl McpHandler {
                             }],
                             is_error: false,
                         };
-                        JsonRpcResponse::success(
-                            req.id.clone(),
-                            serde_json::to_value(result).unwrap(),
+                        (
+                            JsonRpcResponse::success(
+                                req.id.clone(),
+                                serde_json::to_value(result).unwrap(),
+                            ),
+                            "ok",
+                            name.to_string(),
                         )
                     }
                 },
-                None => JsonRpcResponse::error(
-                    req.id.clone(),
-                    INVALID_PARAMS,
-                    &format!("tool not found: {}", name),
+                None => (
+                    JsonRpcResponse::error(
+                        req.id.clone(),
+                        INVALID_PARAMS,
+                        &format!("tool not found: {}", name),
+                    ),
+                    "tool_not_found",
+                    name.to_string(),
                 ),
             },
-            None => JsonRpcResponse::error(req.id.clone(), INVALID_PARAMS, "missing tool name"),
-        }
+            None => (
+                JsonRpcResponse::error(req.id.clone(), INVALID_PARAMS, "missing tool name"),
+                "tool_not_found",
+                "__missing__".to_string(),
+            ),
+        };
+        let elapsed = start.elapsed().as_secs_f64();
+        sbproxy_observe::metrics::record_mcp_tool_dispatch(&metric_tool, result_label, elapsed);
+        response
     }
 }

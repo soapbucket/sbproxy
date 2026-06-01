@@ -2016,6 +2016,84 @@ pub fn grpc_status_label(code: u32) -> &'static str {
     }
 }
 
+// --- MCP server metrics -------------------------------------------------
+//
+// Today `sbproxy_mcp_policy_hook_invocations_total` is the only MCP
+// counter (`metrics.rs:1074`). These three families let operators see
+// tool-dispatch volume, resource-fetch volume, and federation health
+// without scraping the audit log.
+
+/// Record an MCP tool dispatch on
+/// `sbproxy_mcp_tool_dispatch_total{tool, result}` and its matching
+/// duration histogram. `tool` is sanitised so a misconfigured tool
+/// registry cannot blow the label space. `result` is one of `ok`,
+/// `tool_error`, `tool_not_found`, `policy_denied`.
+pub fn record_mcp_tool_dispatch(tool: &str, result: &'static str, duration_secs: f64) {
+    use prometheus::{
+        register_histogram_vec, register_int_counter_vec, HistogramVec, IntCounterVec,
+    };
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_tool_dispatch_total",
+            "MCP tool dispatch attempts, by tool name and outcome",
+            &["tool", "result"],
+        )
+        .expect("mcp tool dispatch counter registers")
+    });
+    let hist = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_mcp_tool_dispatch_duration_seconds",
+            "MCP tool dispatch duration, by tool name",
+            &["tool"],
+            vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 10.0],
+        )
+        .expect("mcp tool dispatch duration histogram registers")
+    });
+    let tool = sanitize_label("tool", tool);
+    counter.with_label_values(&[tool.as_str(), result]).inc();
+    hist.with_label_values(&[tool.as_str()])
+        .observe(duration_secs);
+}
+
+/// Record an MCP resource-fetch attempt on
+/// `sbproxy_mcp_resource_fetch_total{result}`. `result` is one of
+/// `ok`, `not_found`, `upstream_error`, `policy_denied`.
+pub fn record_mcp_resource_fetch(result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_resource_fetch_total",
+            "MCP resource-fetch attempts, by outcome",
+            &["result"],
+        )
+        .expect("mcp resource fetch counter registers")
+    });
+    counter.with_label_values(&[result]).inc();
+}
+
+/// Set the live federation-peer count on
+/// `sbproxy_mcp_federation_peers_up`. A periodic refresh task in the
+/// federation aggregator publishes this so an operator can alert on
+/// `< 1` for a federation that needs >0 live upstreams.
+pub fn set_mcp_federation_peers_up(count: i64) {
+    use prometheus::{register_int_gauge, IntGauge};
+    use std::sync::OnceLock;
+    static G: OnceLock<IntGauge> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge!(
+            "sbproxy_mcp_federation_peers_up",
+            "Live MCP federation peers as of the last refresh",
+        )
+        .expect("mcp federation peers gauge registers")
+    });
+    gauge.set(count);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2993,5 +3071,53 @@ mod tests {
         assert_eq!(grpc_status_label(14), "unavailable");
         assert_eq!(grpc_status_label(16), "unauthenticated");
         assert_eq!(grpc_status_label(99), "unknown");
+    }
+
+    // --- MCP server metrics ---
+
+    #[test]
+    fn record_mcp_tool_dispatch_emits_counter_and_histogram() {
+        record_mcp_tool_dispatch("get_user", "ok", 0.012);
+        record_mcp_tool_dispatch("get_user", "tool_error", 0.5);
+        record_mcp_tool_dispatch("delete_user", "policy_denied", 0.0001);
+        record_mcp_tool_dispatch("unknown_tool", "tool_not_found", 0.0001);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_mcp_tool_dispatch_total"),
+            "mcp tool dispatch counter missing"
+        );
+        assert!(
+            out.contains("sbproxy_mcp_tool_dispatch_duration_seconds_bucket"),
+            "mcp tool dispatch duration buckets missing"
+        );
+        for result in ["ok", "tool_error", "policy_denied", "tool_not_found"] {
+            assert!(
+                out.contains(&format!("result=\"{result}\"")),
+                "result={result} label missing"
+            );
+        }
+    }
+
+    #[test]
+    fn record_mcp_resource_fetch_emits_counter() {
+        record_mcp_resource_fetch("ok");
+        record_mcp_resource_fetch("not_found");
+        record_mcp_resource_fetch("upstream_error");
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_mcp_resource_fetch_total"),
+            "mcp resource fetch counter missing"
+        );
+    }
+
+    #[test]
+    fn set_mcp_federation_peers_up_emits_gauge() {
+        set_mcp_federation_peers_up(3);
+        set_mcp_federation_peers_up(0);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_mcp_federation_peers_up"),
+            "mcp federation peers gauge missing"
+        );
     }
 }
