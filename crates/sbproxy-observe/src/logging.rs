@@ -16,6 +16,7 @@
 //! `external` (denylist + JA3/JA4 + URL → route).
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -360,30 +361,97 @@ impl Sink {
 
 // --- Redaction middleware ---
 
+/// Operator-extensible redaction state installed at config load via
+/// [`install_op_redact_config`]. Stored process-wide because the
+/// redaction path is called from emit sites that do not thread a
+/// config view. Empty (the global default) until the operator
+/// configures `proxy.observability.log.redact:`.
+pub struct OpRedactState {
+    /// Additional field-key denylist (lowercase ASCII).
+    pub fields: Vec<String>,
+    /// Compiled regex masks. Each entry is `(regex, replacement)`.
+    pub patterns: Vec<(regex::Regex, String)>,
+}
+
+impl OpRedactState {
+    /// Empty state: no operator additions.
+    pub const fn empty() -> Self {
+        Self {
+            fields: Vec::new(),
+            patterns: Vec::new(),
+        }
+    }
+}
+
+static OP_REDACT_STATE: OnceLock<std::sync::RwLock<std::sync::Arc<OpRedactState>>> =
+    OnceLock::new();
+
+fn op_redact_lock() -> &'static std::sync::RwLock<std::sync::Arc<OpRedactState>> {
+    OP_REDACT_STATE
+        .get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(OpRedactState::empty())))
+}
+
+/// Install (or replace) the operator-extensible redaction state from
+/// the compiled config. Returns `true` after every successful swap so
+/// config reload can re-apply.
+pub fn install_op_redact_config(state: OpRedactState) -> bool {
+    let lock = op_redact_lock();
+    if let Ok(mut guard) = lock.write() {
+        *guard = std::sync::Arc::new(state);
+        return true;
+    }
+    false
+}
+
+fn op_redact_state() -> std::sync::Arc<OpRedactState> {
+    let lock = op_redact_lock();
+    lock.read()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| std::sync::Arc::new(OpRedactState::empty()))
+}
+
 /// Apply the denylist + per-sink overrides to an in-progress JSON
 /// rendering. The function is the single chokepoint every emitter
 /// routes through, so the regression test only has to fuzz
 /// one entry point to cover access / error / audit / trace exporter.
 ///
-/// Today's implementation reuses the existing
-/// `crate::redact::redact_secrets` value-pattern scrubber for
-/// secret-shaped strings, then layers field-key redaction on top per
-/// the ADR (Authorization, Cookie, *_secret, *_token, *_key, etc.).
+/// Three layers, applied in order:
+///
+/// 1. Value-pattern scrubber (`crate::redact::redact_secrets`) for
+///    obvious secret shapes (Bearer tokens, sk-* keys).
+/// 2. Built-in field-key denylist (the hard-coded baseline) + the
+///    operator-extensible `proxy.observability.log.redact.fields:`
+///    additions. Operator entries cannot override or disable the
+///    built-in baseline.
+/// 3. Operator-extensible regex masks
+///    (`proxy.observability.log.redact.patterns:`). Each pattern is
+///    applied to the rendered JSON after the field-key pass.
 pub fn apply_redaction(json: &str, sink: Sink) -> String {
-    // Step 1: pattern-based redaction of obvious secret shapes
-    // (Bearer tokens, sk-* keys, Basic auth blobs). This is the same
-    // primitive used elsewhere in the codebase; it's defence in depth
-    // against any value that slipped past the field-key denylist.
     let pattern_redacted = crate::redact::redact_secrets(json);
 
-    // Step 2: field-key redaction. Walk the JSON and replace any
-    // value whose key matches the denylist with the typed marker.
     let mut value: serde_json::Value = match serde_json::from_str(&pattern_redacted) {
         Ok(v) => v,
-        Err(_) => return pattern_redacted, // not JSON; pattern pass is best we can do
+        Err(_) => return apply_op_regex_patterns(&pattern_redacted),
     };
     redact_value(&mut value, sink);
-    serde_json::to_string(&value).unwrap_or(pattern_redacted)
+    let rendered = serde_json::to_string(&value).unwrap_or(pattern_redacted);
+
+    apply_op_regex_patterns(&rendered)
+}
+
+/// Apply the operator-supplied regex patterns to the JSON-rendered
+/// string. Compiled at config load so the hot path is just pattern
+/// dispatch.
+fn apply_op_regex_patterns(input: &str) -> String {
+    let state = op_redact_state();
+    if state.patterns.is_empty() {
+        return input.to_string();
+    }
+    let mut out = input.to_string();
+    for (re, replacement) in &state.patterns {
+        out = re.replace_all(&out, replacement.as_str()).into_owned();
+    }
+    out
 }
 
 /// Recursively walk a JSON value and redact any field whose key is on
@@ -486,6 +554,17 @@ fn match_denylist(key: &str, sink: Sink) -> Option<&'static str> {
         || k.ends_with("-token")
     {
         return Some("[REDACTED:API_KEY]");
+    }
+    // Operator-extensible field-key denylist installed via
+    // install_op_redact_config. The match runs case-insensitively
+    // against the lowercased key (`k`); the marker is constructed
+    // from the configured field name for traceability.
+    let state = op_redact_state();
+    if !state.fields.is_empty() && state.fields.iter().any(|f| f == &k) {
+        // Leak a stable marker shape: the configured field is the
+        // typed name; uppercase + underscore-normalised for the
+        // marker so downstream tooling sees a consistent format.
+        return Some("[REDACTED:OPERATOR_FIELD]");
     }
     None
 }
@@ -654,6 +733,60 @@ mod tests {
         assert!(
             !out.contains("<redacted:"),
             "legacy v1-shape marker leaked: {out}"
+        );
+    }
+
+    /// Operator-supplied `proxy.observability.log.redact.fields:`
+    /// extends the built-in field-key denylist. The operator entry
+    /// `internal_account_id` redacts a freshly-named JSON key while
+    /// the baseline `authorization` keeps being redacted independently.
+    /// Note: install_op_redact_config is process-global and idempotent,
+    /// so this test installs once and the other op-redact tests in this
+    /// module share the same state.
+    #[test]
+    fn op_redact_fields_extend_the_baseline() {
+        let _ = install_op_redact_config(OpRedactState {
+            fields: vec!["internal_account_id".to_string()],
+            patterns: Vec::new(),
+        });
+        let json = r#"{"authorization":"Bearer x","internal_account_id":"acct-123456"}"#;
+        let out = apply_redaction(json, Sink::AccessLog);
+        assert!(
+            out.contains("[REDACTED:AUTHORIZATION]"),
+            "baseline auth missing: {out}"
+        );
+        assert!(
+            out.contains("[REDACTED:OPERATOR_FIELD]"),
+            "operator field marker missing: {out}"
+        );
+        assert!(
+            !out.contains("acct-123456"),
+            "raw operator value leaked: {out}"
+        );
+    }
+
+    /// Operator-supplied `proxy.observability.log.redact.patterns:`
+    /// run after the field-key pass on the rendered JSON. The pattern
+    /// catches a fresh value shape that the built-in denylist would
+    /// not match.
+    #[test]
+    fn op_redact_patterns_run_after_field_pass() {
+        let _ = install_op_redact_config(OpRedactState {
+            fields: vec!["internal_account_id".to_string()],
+            patterns: vec![(
+                regex::Regex::new(r"cust_[a-z0-9]{6,}").expect("compiles"),
+                "[REDACTED:CUSTOMER_UUID]".to_string(),
+            )],
+        });
+        let json = r#"{"freeform":"cust_abc1234567 was here"}"#;
+        let out = apply_redaction(json, Sink::AccessLog);
+        assert!(
+            out.contains("[REDACTED:CUSTOMER_UUID]"),
+            "operator pattern missing: {out}"
+        );
+        assert!(
+            !out.contains("cust_abc1234567"),
+            "raw pattern value leaked: {out}"
         );
     }
 

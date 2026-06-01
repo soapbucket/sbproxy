@@ -49,6 +49,11 @@ pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<()> {
         &compiled.server.scripting.lua.sandbox,
     ));
 
+    // Refresh the operator-extensible log redactor on reload so
+    // SIGHUP picks up changes to `proxy.observability.log.redact:`
+    // without restarting the process.
+    install_op_redact_state(&compiled.server);
+
     // WOR-173: refresh the AI provider catalog and rebuild the AI
     // client alongside the pipeline. Both globals live behind an
     // `ArcSwap`, so this is a lock-free atomic swap from the reload
@@ -461,6 +466,14 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
             },
         );
     }
+
+    // Install operator-extensible redaction state into the global
+    // log redactor. Compiled patterns + the extra field-key denylist
+    // come from `proxy.observability.log.redact:`; an absent block
+    // installs an empty state so the call site stays uniform across
+    // single-tenant and multi-tenant deployments. The hook accepts
+    // re-install so config reloads flow through.
+    install_op_redact_state(&server_config);
 
     // Walk the inventory-based plugin registry once at startup and
     // emit one `sbproxy_plugin_registered_total{kind, plugin}` row
@@ -1201,4 +1214,53 @@ fn report_plugin_registrations() {
     for reg in inventory::iter::<sbproxy_plugin::AuthPluginRegistration>() {
         sbproxy_observe::metrics::record_plugin_registered("auth", reg.name);
     }
+}
+
+/// Read `proxy.observability.log.redact:` off the compiled config and
+/// install the operator-extensible redaction state. Empty when the
+/// block is absent so the redactor short-circuits the operator-pass
+/// at zero allocation. An invalid regex is logged at `warn` and the
+/// pattern is dropped; the rest of the block still installs.
+fn install_op_redact_state(server: &sbproxy_config::ProxyServerConfig) {
+    let cfg = match server
+        .observability
+        .as_ref()
+        .and_then(|o| o.log.as_ref())
+        .and_then(|l| l.redact.as_ref())
+    {
+        Some(c) => c,
+        None => {
+            sbproxy_observe::logging::install_op_redact_config(
+                sbproxy_observe::logging::OpRedactState::empty(),
+            );
+            return;
+        }
+    };
+
+    let fields: Vec<String> = cfg.fields.iter().map(|f| f.to_ascii_lowercase()).collect();
+
+    let mut patterns = Vec::with_capacity(cfg.patterns.len());
+    for p in &cfg.patterns {
+        match regex::Regex::new(&p.pattern) {
+            Ok(re) => {
+                let replacement = p
+                    .replacement
+                    .clone()
+                    .unwrap_or_else(|| format!("[REDACTED:{}]", p.name.to_ascii_uppercase()));
+                patterns.push((re, replacement));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    pattern = %p.name,
+                    error = %e,
+                    "skipping invalid redact pattern; install continues without it"
+                );
+            }
+        }
+    }
+
+    sbproxy_observe::logging::install_op_redact_config(sbproxy_observe::logging::OpRedactState {
+        fields,
+        patterns,
+    });
 }

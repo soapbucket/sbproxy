@@ -158,13 +158,39 @@ Event types pinned for Wave 1: `request_started`, `request_completed`, `request_
 
 Sensitive fields are matched by **field key**, not by value heuristics. Field names that the redactor matches: `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-stripe-signature`, `stripe-signature`, `*_secret`, `*_token`, `*_key`, `prompt`, `messages`, `ja3`, `ja4`.
 
-Each match replaces the value with a marker:
+Each match replaces the value with a marker. As of schema v2, every marker uses the `[REDACTED:<NAME>]` shape (the pre-v2 `<redacted:name>` form is gone):
 
 ```json
-{ "headers": { "authorization": "<redacted:authorization>" } }
-{ "stripe_sk": "<redacted:stripe-secret-key>" }
-{ "messages": "<redacted:prompt-body>" }
+{ "headers": { "authorization": "[REDACTED:AUTHORIZATION]" } }
+{ "stripe_sk": "[REDACTED:STRIPE_SECRET_KEY]" }
+{ "messages": "[REDACTED:PROMPT_BODY]" }
 ```
+
+### Operator-extensible redaction
+
+The built-in denylist above is the security baseline and runs first. Operators add their own field-key entries and regex masks under `proxy.observability.log.redact:`:
+
+```yaml
+proxy:
+  observability:
+    log:
+      redact:
+        fields:
+          - x-internal-token
+          - internal_account_id
+        patterns:
+          - name: customer_uuid
+            pattern: 'cust_[a-z0-9]{20}'
+            replacement: '[REDACTED:CUSTOMER_UUID]'
+          - name: internal_account
+            pattern: 'acct-\d{6,12}'
+            # replacement omitted: defaults to [REDACTED:INTERNAL_ACCOUNT]
+```
+
+* `fields:` is additive on the built-in baseline. Matched lowercase. Cannot disable a built-in entry.
+* `patterns:` is a list of named regexes applied to the rendered JSON after the field-key pass. Compiled once at config load; an invalid regex is logged at `warn` and skipped (the rest of the block still installs). `replacement:` defaults to `[REDACTED:<NAME_UPPER>]` when omitted.
+
+Per-tenant and per-origin redact blocks are a planned follow-up; today operators land all rules at the proxy scope.
 
 Two profiles ship in Wave 1:
 
