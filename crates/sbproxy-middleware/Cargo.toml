@@ -10,6 +10,7 @@ sbproxy-plugin.workspace = true
 sbproxy-config.workspace = true
 sbproxy-security.workspace = true
 sbproxy-cache.workspace = true
+sbproxy-observe.workspace = true
 # Idempotency middleware: KVStore trait used as the OSS-friendly
 # backend abstraction so the middleware doesn't pull a redis client of
 # its own. Redis-backed deployments wire RedisKVStore from the platform

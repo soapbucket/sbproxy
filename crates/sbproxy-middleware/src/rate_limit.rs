@@ -289,7 +289,10 @@ impl RateLimitMiddleware {
     pub fn check(&self, client_key: &str, path: &str) -> Outcome {
         let inner = match self.inner.as_ref() {
             Some(i) => i,
-            None => return Outcome::Disabled,
+            None => {
+                sbproxy_observe::metrics::record_rate_limit_decision("__default__", "disabled");
+                return Outcome::Disabled;
+            }
         };
 
         let (route_ceiling, route_pattern) = Self::route_ceiling(&inner.config, path);
@@ -322,6 +325,7 @@ impl RateLimitMiddleware {
             }
         };
         if let Some(retry_after_secs) = route_outcome {
+            sbproxy_observe::metrics::record_rate_limit_decision(&route_pattern, "throttle_route");
             return Outcome::Deny {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 retry_after_secs,
@@ -350,12 +354,14 @@ impl RateLimitMiddleware {
             }
         };
         if let Some(retry_after_secs) = tenant_outcome {
+            sbproxy_observe::metrics::record_rate_limit_decision(&route_pattern, "throttle_tenant");
             return Outcome::Deny {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 retry_after_secs,
             };
         }
 
+        sbproxy_observe::metrics::record_rate_limit_decision(&route_pattern, "allow");
         Outcome::Allow
     }
 }
