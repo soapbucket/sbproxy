@@ -371,14 +371,19 @@ pub struct OpRedactState {
     pub fields: Vec<String>,
     /// Compiled regex masks. Each entry is `(regex, replacement)`.
     pub patterns: Vec<(regex::Regex, String)>,
+    /// Optional PII redactor (rule-driven, with Aho-Corasick anchor
+    /// prefilter). Built once from the resolved rule set; `None` when
+    /// the operator does not enable PII at the proxy scope.
+    pub pii: Option<sbproxy_security::pii::PiiRedactor>,
 }
 
 impl OpRedactState {
     /// Empty state: no operator additions.
-    pub const fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             fields: Vec::new(),
             patterns: Vec::new(),
+            pii: None,
         }
     }
 }
@@ -439,19 +444,31 @@ pub fn apply_redaction(json: &str, sink: Sink) -> String {
     apply_op_regex_patterns(&rendered)
 }
 
-/// Apply the operator-supplied regex patterns to the JSON-rendered
-/// string. Compiled at config load so the hot path is just pattern
-/// dispatch.
+/// Apply the operator-supplied regex patterns and, when configured,
+/// the PII redactor to the JSON-rendered string. Compiled at config
+/// load so the hot path is just pattern dispatch.
 fn apply_op_regex_patterns(input: &str) -> String {
     let state = op_redact_state();
-    if state.patterns.is_empty() {
+    let needs_regex = !state.patterns.is_empty();
+    let needs_pii = state.pii.is_some();
+    if !needs_regex && !needs_pii {
         return input.to_string();
     }
-    let mut out = input.to_string();
-    for (re, replacement) in &state.patterns {
-        out = re.replace_all(&out, replacement.as_str()).into_owned();
+    let mut out: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(input);
+    if needs_regex {
+        let mut owned = out.into_owned();
+        for (re, replacement) in &state.patterns {
+            owned = re.replace_all(&owned, replacement.as_str()).into_owned();
+        }
+        out = std::borrow::Cow::Owned(owned);
     }
-    out
+    if let Some(pii) = &state.pii {
+        // PiiRedactor::redact returns Cow::Borrowed on clean input
+        // (no allocation when there is no PII to redact) and
+        // Cow::Owned on a match.
+        out = pii.redact(out.as_ref()).into_owned().into();
+    }
+    out.into_owned()
 }
 
 /// Recursively walk a JSON value and redact any field whose key is on
@@ -736,18 +753,28 @@ mod tests {
         );
     }
 
+    /// Serialise the operator-redact tests because they swap a
+    /// process-global slot installed by `install_op_redact_config`.
+    /// Each test installs the state it needs and asserts, then resets
+    /// to empty so a parallel cargo-test run does not see a state
+    /// installed by a sibling. Before WOR-1042 PR1 the slot was a
+    /// `OnceLock::set`, so the first-installer-wins kept ordering
+    /// from mattering; the hot-swap now requires explicit serialisation.
+    static OP_REDACT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Operator-supplied `proxy.observability.log.redact.fields:`
     /// extends the built-in field-key denylist. The operator entry
     /// `internal_account_id` redacts a freshly-named JSON key while
     /// the baseline `authorization` keeps being redacted independently.
-    /// Note: install_op_redact_config is process-global and idempotent,
-    /// so this test installs once and the other op-redact tests in this
-    /// module share the same state.
     #[test]
     fn op_redact_fields_extend_the_baseline() {
+        let _guard = OP_REDACT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _ = install_op_redact_config(OpRedactState {
             fields: vec!["internal_account_id".to_string()],
             patterns: Vec::new(),
+            pii: None,
         });
         let json = r#"{"authorization":"Bearer x","internal_account_id":"acct-123456"}"#;
         let out = apply_redaction(json, Sink::AccessLog);
@@ -763,6 +790,7 @@ mod tests {
             !out.contains("acct-123456"),
             "raw operator value leaked: {out}"
         );
+        let _ = install_op_redact_config(OpRedactState::empty());
     }
 
     /// Operator-supplied `proxy.observability.log.redact.patterns:`
@@ -771,12 +799,16 @@ mod tests {
     /// not match.
     #[test]
     fn op_redact_patterns_run_after_field_pass() {
+        let _guard = OP_REDACT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _ = install_op_redact_config(OpRedactState {
             fields: vec!["internal_account_id".to_string()],
             patterns: vec![(
                 regex::Regex::new(r"cust_[a-z0-9]{6,}").expect("compiles"),
                 "[REDACTED:CUSTOMER_UUID]".to_string(),
             )],
+            pii: None,
         });
         let json = r#"{"freeform":"cust_abc1234567 was here"}"#;
         let out = apply_redaction(json, Sink::AccessLog);
@@ -788,6 +820,47 @@ mod tests {
             !out.contains("cust_abc1234567"),
             "raw pattern value leaked: {out}"
         );
+        let _ = install_op_redact_config(OpRedactState::empty());
+    }
+
+    /// Operator-supplied `proxy.observability.log.redact.pii:` runs as
+    /// a fourth pass after the field-key and regex passes. The
+    /// built-in `email` rule fires on a freeform string field that no
+    /// other redaction layer would catch.
+    #[test]
+    fn op_redact_pii_runs_email_rule() {
+        let _guard = OP_REDACT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let email_rule = sbproxy_security::pii::default_rules()
+            .into_iter()
+            .find(|r| r.name == "email")
+            .expect("email is a built-in default rule");
+        let pii_cfg = sbproxy_security::pii::PiiConfig {
+            enabled: true,
+            defaults: false,
+            redact_request: false,
+            redact_response: false,
+            rules: vec![email_rule],
+        };
+        let pii = sbproxy_security::pii::PiiRedactor::from_config(&pii_cfg).expect("rule compiles");
+
+        let _ = install_op_redact_config(OpRedactState {
+            fields: Vec::new(),
+            patterns: Vec::new(),
+            pii: Some(pii),
+        });
+        let json = r#"{"freeform":"ping alice@example.com please"}"#;
+        let out = apply_redaction(json, Sink::AccessLog);
+        assert!(
+            out.contains("[REDACTED:EMAIL]"),
+            "operator PII pass missed email: {out}"
+        );
+        assert!(
+            !out.contains("alice@example.com"),
+            "raw email leaked through PII pass: {out}"
+        );
+        let _ = install_op_redact_config(OpRedactState::empty());
     }
 
     // --- Redaction ---

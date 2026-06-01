@@ -1259,8 +1259,65 @@ fn install_op_redact_state(server: &sbproxy_config::ProxyServerConfig) {
         }
     }
 
+    let pii = cfg.pii.as_ref().and_then(build_pii_redactor);
+
     sbproxy_observe::logging::install_op_redact_config(sbproxy_observe::logging::OpRedactState {
         fields,
         patterns,
+        pii,
     });
+}
+
+/// Build a `PiiRedactor` from the operator config block. Returns
+/// `None` when the redactor is disabled or no rules resolve. The
+/// `rules:` list is intersected with `sbproxy_security::pii::default_rules()`;
+/// names that do not match a built-in rule are logged at `warn` and
+/// dropped (the install continues with the rest).
+fn build_pii_redactor(
+    cfg: &sbproxy_config::ObservabilityPiiConfig,
+) -> Option<sbproxy_security::pii::PiiRedactor> {
+    if !cfg.enabled {
+        return None;
+    }
+
+    let defaults = sbproxy_security::pii::default_rules();
+    let want_all = cfg.rules.is_empty();
+
+    // Warn on unknown rule names so an operator typo does not silently
+    // drop a rule the operator thought was installed. Has to happen
+    // before `selected` is moved into the config.
+    let known: std::collections::HashSet<&str> = defaults.iter().map(|r| r.name.as_str()).collect();
+    for want in &cfg.rules {
+        if !known.contains(want.as_str()) {
+            tracing::warn!(
+                rule = %want,
+                "unknown PII rule name; skipping (typo or removed default?)"
+            );
+        }
+    }
+
+    let selected: Vec<_> = defaults
+        .into_iter()
+        .filter(|r| want_all || cfg.rules.iter().any(|w| w == &r.name))
+        .filter(|r| !cfg.disable.iter().any(|d| d == &r.name))
+        .collect();
+
+    if selected.is_empty() {
+        return None;
+    }
+
+    let pii_config = sbproxy_security::pii::PiiConfig {
+        enabled: true,
+        defaults: false,
+        rules: selected,
+        redact_request: false,
+        redact_response: false,
+    };
+    match sbproxy_security::pii::PiiRedactor::from_config(&pii_config) {
+        Ok(redactor) => Some(redactor),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to build operator PII redactor; PII pass disabled");
+            None
+        }
+    }
 }

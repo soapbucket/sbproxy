@@ -1820,6 +1820,37 @@ pub struct ObservabilityRedactConfig {
     /// is a `compile_config` error.
     #[serde(default)]
     pub patterns: Vec<ObservabilityRedactPattern>,
+    /// Optional rule-driven PII redactor. When enabled, the global
+    /// `sbproxy-security::pii::PiiRedactor` runs as a fourth pass
+    /// after the value pattern scrubber, the field denylist + operator
+    /// fields, and the operator regex patterns. Rules are looked up
+    /// in `sbproxy-security::pii::default_rules()` by name (`email`,
+    /// `credit_card`, `us_ssn`, `phone_us`, `ipv4`, `openai_key`,
+    /// `anthropic_key`, `aws_access`, `github_token`, `slack_token`,
+    /// `iban`).
+    #[serde(default)]
+    pub pii: Option<ObservabilityPiiConfig>,
+}
+
+/// Operator-controlled PII redaction at the log layer. Mirrors the
+/// per-origin `PiiConfig` used by the AI handler but applies to every
+/// emitted log line, regardless of origin.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ObservabilityPiiConfig {
+    /// Master switch. When `false`, the redactor is never built and
+    /// the pipeline shorts the PII pass.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Names of the built-in rules to enable. When empty, all default
+    /// rules are enabled (the spirit of "PII redaction on" is the
+    /// least-surprising default).
+    #[serde(default)]
+    pub rules: Vec<String>,
+    /// Names of built-in rules to opt out of even when included by
+    /// `rules:` or by the default-all behaviour. The matching name is
+    /// case-sensitive.
+    #[serde(default)]
+    pub disable: Vec<String>,
 }
 
 /// One named regex mask. `name` is reported on cardinality / counter
