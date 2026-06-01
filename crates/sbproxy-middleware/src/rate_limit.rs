@@ -464,21 +464,18 @@ mod tests {
     //    key admits requests again.
     #[test]
     fn bucket_refills_after_window() {
-        // High-rate refill so the test does not have to sleep a real
-        // second to observe the bucket recovering. Both tenant and
-        // route buckets configured at 1000 rps with burst 1 so the
-        // first request is admitted, the second is denied, and a
-        // 20 ms sleep refills well above one full token.
-        let mw = RateLimitMiddleware::new(Some(cfg(1, 1000, 1000)));
-        // Override the route burst by using a route that triggers the
-        // default; we built `cfg` with tenant_burst=1 so the tenant
-        // bucket is what runs out first.
+        // Tenant refill at 10 rps so two consecutive synchronous
+        // checks cannot race the refill (would need ~100ms of CPU
+        // delay between calls), while a 250 ms sleep accrues 2.5
+        // tokens which is well above the single token the third call
+        // needs. The previous 1000-rps configuration was flaky under
+        // CI load because two checks taking >= 1 ms produced a fresh
+        // token between them.
+        let mw = RateLimitMiddleware::new(Some(cfg(1, 10, 1000)));
         assert!(mw.check("client-a", "/api").is_allow());
         assert!(mw.check("client-a", "/api").is_deny());
 
-        // Sleep for slightly longer than one tick at 1000 rps so we are
-        // guaranteed at least one fresh token.
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(250));
         assert!(mw.check("client-a", "/api").is_allow());
     }
 

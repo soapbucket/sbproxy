@@ -153,6 +153,8 @@ pub async fn acquire_lease(client: &Client, cfg: &LeaderConfig) -> anyhow::Resul
                     identity = %cfg.identity,
                     "acquired leader lease"
                 );
+                sbproxy_observe::metrics::record_operator_leader_transition("elected");
+                sbproxy_observe::metrics::set_operator_leader_is_leader(true);
                 return Ok(());
             }
             Ok(AcquireOutcome::Held) => {
@@ -264,9 +266,14 @@ pub async fn renew_loop(client: Client, cfg: LeaderConfig) -> anyhow::Result<()>
         .await;
 
         match renew {
-            Ok(Ok(())) => continue,
+            Ok(Ok(())) => {
+                sbproxy_observe::metrics::record_operator_leader_transition("renewed");
+                continue;
+            }
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "renew failed; stepping down");
+                sbproxy_observe::metrics::record_operator_leader_transition("lost");
+                sbproxy_observe::metrics::set_operator_leader_is_leader(false);
                 return Err(e);
             }
             Err(_) => {
@@ -274,6 +281,8 @@ pub async fn renew_loop(client: Client, cfg: LeaderConfig) -> anyhow::Result<()>
                     "renew API call exceeded {:?}; stepping down",
                     RENEW_DEADLINE
                 );
+                sbproxy_observe::metrics::record_operator_leader_transition("lost");
+                sbproxy_observe::metrics::set_operator_leader_is_leader(false);
                 anyhow::bail!("renew exceeded RENEW_DEADLINE");
             }
         }

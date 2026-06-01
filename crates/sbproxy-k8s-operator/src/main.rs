@@ -406,6 +406,26 @@ async fn run_controller(client: Client, cli: &Cli) -> Result<()> {
 /// so simultaneous reloads (e.g. file-watcher + admin route) never
 /// race.
 async fn reconcile_one(sbproxy: Arc<SBProxy>, ctx: Arc<Ctx>) -> Result<Action, ReconcileError> {
+    let start = std::time::Instant::now();
+    let outcome = reconcile_one_inner(sbproxy, ctx).await;
+    let elapsed = start.elapsed().as_secs_f64();
+    let result_label = match &outcome {
+        Ok(_) => "ok",
+        Err(ReconcileError::MissingNamespace) | Err(ReconcileError::MissingName) => "crd_invalid",
+        Err(ReconcileError::ConfigFetch { source, .. }) => match source {
+            kube::Error::Api(e) if e.code == 409 => "conflict",
+            _ => "backend_error",
+        },
+        Err(_) => "backend_error",
+    };
+    sbproxy_observe::metrics::record_operator_reconcile("sbproxy", result_label, elapsed);
+    outcome
+}
+
+async fn reconcile_one_inner(
+    sbproxy: Arc<SBProxy>,
+    ctx: Arc<Ctx>,
+) -> Result<Action, ReconcileError> {
     let ns = sbproxy
         .metadata
         .namespace
