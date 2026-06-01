@@ -1705,6 +1705,93 @@ pub fn record_compression_ratio(codec: &'static str, ratio: f64) {
     hist.with_label_values(&[codec]).observe(ratio);
 }
 
+// --- plugin registry metrics --------------------------------------------
+//
+// Two families cover the plugin-registry surface today:
+//
+// * `sbproxy_plugin_registered_total{kind, plugin}`: a counter
+//   incremented once per known registration. Callers walk the
+//   `inventory::iter` set at startup and call this helper for each
+//   row.
+// * `sbproxy_plugin_init_duration_seconds{kind, plugin, result}` plus
+//   its `sbproxy_plugin_init_total{kind, plugin, result}` sibling:
+//   timed and counted at every factory call, so an operator can
+//   alert on config-invalid factories or panicking plugin init.
+//
+// `kind` is the closed enum
+// `policy | action | auth | transform | enricher`. `plugin` is
+// sanitised through the cardinality limiter so a hostile or
+// misconfigured deployment cannot blow up the label space by
+// registering thousands of distinct plugin names. `result` is a
+// closed enum from the factory side.
+//
+// Per-invocation counters (calls into the plugin at request time)
+// are deferred: instrumenting every plugin trait call site is a
+// follow-up because it touches every transform / policy / auth /
+// action call path.
+
+/// Record a known plugin registration on
+/// `sbproxy_plugin_registered_total{kind, plugin}`. Callers walk the
+/// `inventory::iter` set once at startup and call this helper for
+/// each row.
+pub fn record_plugin_registered(kind: &'static str, plugin: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_plugin_registered_total",
+            "Known plugin registrations, by kind and plugin name",
+            &["kind", "plugin"],
+        )
+        .expect("plugin registered counter registers")
+    });
+    let plugin = sanitize_label("plugin", plugin);
+    counter.with_label_values(&[kind, plugin.as_str()]).inc();
+}
+
+/// Record a plugin factory invocation outcome on
+/// `sbproxy_plugin_init_total{kind, plugin, result}` and its matching
+/// `sbproxy_plugin_init_duration_seconds{kind, plugin, result}`
+/// histogram. `result` is one of `ok`, `config_invalid`, `panic`.
+/// Buckets cover the typical config-time envelope: 100us through 10s.
+pub fn record_plugin_init(
+    kind: &'static str,
+    plugin: &str,
+    result: &'static str,
+    duration_secs: f64,
+) {
+    use prometheus::{
+        register_histogram_vec, register_int_counter_vec, HistogramVec, IntCounterVec,
+    };
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_plugin_init_total",
+            "Plugin factory init attempts, by kind, plugin name, and outcome",
+            &["kind", "plugin", "result"],
+        )
+        .expect("plugin init counter registers")
+    });
+    let hist = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_plugin_init_duration_seconds",
+            "Plugin factory init duration, by kind, plugin name, and outcome",
+            &["kind", "plugin", "result"],
+            vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 10.0],
+        )
+        .expect("plugin init duration histogram registers")
+    });
+    let plugin = sanitize_label("plugin", plugin);
+    counter
+        .with_label_values(&[kind, plugin.as_str(), result])
+        .inc();
+    hist.with_label_values(&[kind, plugin.as_str(), result])
+        .observe(duration_secs);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2509,5 +2596,42 @@ mod tests {
             out.contains("sbproxy_compression_ratio_bucket"),
             "compression ratio buckets missing"
         );
+    }
+
+    // --- plugin registry ---
+
+    #[test]
+    fn record_plugin_registered_emits_counter() {
+        record_plugin_registered("auth", "saml");
+        record_plugin_registered("action", "my-action");
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_plugin_registered_total"),
+            "plugin registered counter missing"
+        );
+        assert!(out.contains("kind=\"auth\""), "kind=auth label missing");
+        assert!(out.contains("kind=\"action\""), "kind=action label missing");
+    }
+
+    #[test]
+    fn record_plugin_init_emits_counter_and_histogram() {
+        record_plugin_init("auth", "saml", "ok", 0.012);
+        record_plugin_init("auth", "saml", "config_invalid", 0.001);
+        record_plugin_init("action", "my-action", "panic", 0.5);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_plugin_init_total"),
+            "plugin init counter missing"
+        );
+        assert!(
+            out.contains("sbproxy_plugin_init_duration_seconds_bucket"),
+            "plugin init duration buckets missing"
+        );
+        for result in ["ok", "config_invalid", "panic"] {
+            assert!(
+                out.contains(&format!("result=\"{result}\"")),
+                "result={result} label missing"
+            );
+        }
     }
 }
