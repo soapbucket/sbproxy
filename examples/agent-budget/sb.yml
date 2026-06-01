@@ -1,0 +1,34 @@
+# agent_budget policy: per-agent semantic rate limit.
+#
+# A bucket per resolved agent_id. Cursor's 60/min coding loop and an
+# anonymous flooder cannot share the same bucket the way per-IP
+# limits would force.
+#
+# Run:
+#   make run CONFIG=examples/agent-budget/sb.yml
+#
+# Try it: 60+ requests with the same Cursor-shaped User-Agent get
+# 429s on the 61st in a 60s window.
+#   for i in $(seq 1 70); do
+#     curl -s -o /dev/null -w '%{http_code}\n' \
+#       -H 'Host: ai.local' \
+#       -H 'User-Agent: Cursor/0.42.0' \
+#       http://127.0.0.1:8080/echo
+#   done
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    policies:
+      - type: agent_budget
+        requests_per_minute: 60
+        tokens_per_hour: 100000
+        burst: 10
+        on_exceed: deny
+        on_anonymous: skip

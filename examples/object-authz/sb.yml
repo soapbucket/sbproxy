@@ -1,0 +1,46 @@
+# object_authz policy: BOLA + BFLA + enumeration detection.
+#
+# Run:
+#   make run CONFIG=examples/object-authz/sb.yml
+#
+# Try the BOLA path. With a JWT whose `sub` is `tenant-A`, accessing
+# `/tenants/tenant-A/orders/42` succeeds; accessing
+# `/tenants/tenant-B/orders/42` is blocked 403.
+#
+# Try the BFLA path. A JWT without the `admin` role gets 403 on
+# `DELETE /admin/users/u1`.
+#
+# Try enumeration. More than 100 distinct order ids from the same
+# `sub` inside 60s flips that principal into a 403 for the rest of
+# the window.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    authentication:
+      type: jwt
+      secret: dev-secret-change-me
+      issuer: https://issuer.local
+      audience: sbproxy-demo
+      algorithms: [HS256]
+
+    policies:
+      - type: object_authz
+        object_rules:
+          - path: /tenants/{owner}/orders/{order_id}
+            owner_segment: owner
+            owner_source: sub
+        function_rules:
+          - path: /admin/users/{user_id}
+            methods: [DELETE, PUT]
+            required_role: admin
+        enumeration:
+          enabled: true
+          window_secs: 60
+          distinct_ids_threshold: 100

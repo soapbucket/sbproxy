@@ -1,0 +1,40 @@
+# content_digest policy: RFC 9530 request-body verification.
+#
+# Run:
+#   make run CONFIG=examples/content-digest/sb.yml
+#
+# Test (matching digest):
+#   BODY='{"event":"order.created","id":"ord-42"}'
+#   DIGEST=$(printf '%s' "$BODY" | openssl dgst -sha256 -binary | openssl base64)
+#   curl -X POST -H 'Host: webhook.local' \
+#     -H "Content-Digest: sha-256=:${DIGEST}:" \
+#     -H 'Content-Type: application/json' \
+#     -d "$BODY" \
+#     http://127.0.0.1:8080/echo
+#
+# Test (mismatch -> 400):
+#   curl -X POST -H 'Host: webhook.local' \
+#     -H 'Content-Digest: sha-256=:wronghashbase64==:' \
+#     -H 'Content-Type: application/json' \
+#     -d "$BODY" \
+#     http://127.0.0.1:8080/echo
+#
+# Test (missing header with on_missing: require -> 400):
+#   curl -X POST -H 'Host: webhook.local' \
+#     -H 'Content-Type: application/json' \
+#     -d "$BODY" \
+#     http://127.0.0.1:8080/echo
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "webhook.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    policies:
+      - type: content_digest
+        on_missing: require
+        reject_status: 400
