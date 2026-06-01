@@ -24,7 +24,7 @@
 //!    re-resolves on its own), emit `tracing::error!` if the dialed peer
 //!    address turns out to be private and abort the upstream call.
 //!
-//! ### Caller status (as of agent A3 in the Wave 1 audit)
+//! ### Caller status
 //!
 //! - `validate_url` / `validate_url_with_allowlist` and
 //!   `validate_url_resolved` have **no external callers** in the

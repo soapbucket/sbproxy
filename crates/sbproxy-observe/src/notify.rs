@@ -16,7 +16,7 @@
 //!   an event to every matching subscription.
 //! - [`NotifierStore`] is the subscription + deadletter persistence trait.
 //!   The OSS crate ships [`InMemoryStore`]; a Postgres adapter is provided
-//!   out of tree (Wave 2, E2.4).
+//!   out of tree.
 //! - [`SigningKey`] selects between Ed25519 and HMAC-SHA256 per
 //!   subscription. [`Subscription`] carries an optional `previous_key`
 //!   that drives the dual-key 30-day rotation window.
@@ -43,7 +43,7 @@
 //! - `Sbproxy-Timestamp: <unix-ms>`
 //! - `Sbproxy-Signature: <kid>=<base64-sig>[, <prev-kid>=<base64-prev-sig>]`
 //! - W3C TraceContext (`traceparent`, `tracestate`) when `OutboundEvent`
-//!   carries one. R1.1 propagates the active span; we just forward.
+//!   carries one. Propagation forwards the active span; we just forward.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -60,7 +60,7 @@ use crate::trace_ctx::w3c::TraceContext;
 
 // --- Constants ---
 
-/// Default exponential-backoff schedule per ADR A1.9 §"Retry policy".
+/// Default exponential-backoff schedule per the ADR's "Retry policy".
 /// Each entry is the delay between successive attempts. After this list is
 /// exhausted the event moves to the deadletter queue.
 pub const DEFAULT_RETRY_SCHEDULE: &[Duration] = &[
@@ -170,8 +170,8 @@ impl VerificationKey {
 
 /// A customer-registered webhook subscription.
 ///
-/// Wave 1 ships only the in-memory representation; Wave 2 adds the
-/// Postgres-backed registry behind the [`NotifierStore`] trait.
+/// Today ships only the in-memory representation; a Postgres-backed
+/// registry behind the [`NotifierStore`] trait lands later.
 #[derive(Debug, Clone)]
 pub struct Subscription {
     /// Tenant that owns this subscription.
@@ -243,7 +243,7 @@ pub struct OutboundEvent {
     /// and the signing input.
     pub created_at: DateTime<Utc>,
     /// Optional W3C TraceContext to propagate to the customer endpoint.
-    /// R1.1 (OTel) populates this from the active span when available.
+    /// OTel propagation populates this from the active span when available.
     pub trace_context: Option<TraceContext>,
 }
 
@@ -264,7 +264,7 @@ impl OutboundEvent {
         }
     }
 
-    /// Attach a W3C TraceContext (R1.1 propagation hook).
+    /// Attach a W3C TraceContext.
     pub fn with_trace_context(mut self, ctx: TraceContext) -> Self {
         self.trace_context = Some(ctx);
         self
@@ -297,7 +297,7 @@ pub struct DeadletterItem {
 ///
 /// The OSS crate ships [`InMemoryStore`] for tests and single-process
 /// deployments. A Postgres adapter (matching the schema in ADR §
-/// "Deadletter queue") is provided out of tree in Wave 2.
+/// "Deadletter queue") is provided out of tree.
 pub trait NotifierStore: Send + Sync {
     /// Return every subscription that matches `(tenant_id, event_type)`.
     fn list_subscriptions(&self, tenant_id: &str, event_type: &str) -> Vec<Subscription>;
@@ -325,7 +325,7 @@ impl InMemoryStore {
         }
     }
 
-    /// Insert a subscription. Used by tests and the Wave 2 registry CRUD
+    /// Insert a subscription. Used by tests and the registry CRUD
     /// path until the Postgres adapter ships.
     pub fn add_subscription(&self, sub: Subscription) {
         self.subscriptions

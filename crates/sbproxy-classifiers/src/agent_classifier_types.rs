@@ -1,6 +1,6 @@
 //! ML agent classifier output types.
 //!
-//! These are the canonical type definitions for the Wave 5 ML agent
+//! These are the canonical type definitions for the ML agent
 //! classifier verdict. They live in the OSS classifiers crate so the
 //! OSS [`crate`]'s downstream consumers (`sbproxy-core::RequestContext`,
 //! the CEL/Lua/JS scripting layers, the access log emitter, ...) can
@@ -21,8 +21,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Predicted class for a request, output by the ML agent classifier
-///. Stable across the Wave 5 series.
+/// Predicted class for a request, output by the ML agent classifier.
 ///
 /// Variant ordering matches the trained ONNX model's softmax output
 /// indices: `Human=0`, `LlmAgent=1`, `Scraper=2`, `Unknown=3`. Do not
@@ -92,8 +91,8 @@ pub struct MlClassification {
     /// The argmax class.
     pub class: MlClass,
     /// Maximum softmax probability across the four output indices, in
-    /// `[0.0, 1.0]`. Used by the G1.4 override threshold (>= 0.9 for
-    /// `Human`-only override per A5.2) and by response-phase CEL rules.
+    /// `[0.0, 1.0]`. Used by the override threshold (>= 0.9 for
+    /// `Human`-only override) and by response-phase CEL rules.
     pub confidence: f32,
     /// Identifier of the loaded model file (typically the SHA-256 hex
     /// prefix or a semver tag). `'static` because the registry holds
@@ -120,9 +119,9 @@ impl MlClassification {
         }
     }
 
-    /// Confidence-gated test for the G1.4 ML-override condition per
-    /// A5.2: only a `Human` verdict with confidence >= 0.9 should
-    /// override the rule-based resolver.
+    /// Confidence-gated test for the ML-override condition: only a
+    /// `Human` verdict with confidence >= 0.9 should override the
+    /// rule-based resolver.
     pub fn is_human_override(&self) -> bool {
         matches!(self.class, MlClass::Human) && self.confidence >= 0.9
     }

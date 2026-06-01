@@ -335,10 +335,10 @@ impl AdminState {
         self
     }
 
-    /// Replace the health registry. Wave 1 callers seed the registry
-    /// with `sbproxy_observe::default_registry(...)` so `/readyz`
-    /// reports the standard pillar set; subsequent waves register
-    /// their own probes via `state.health_registry.register(...)`.
+    /// Replace the health registry. Callers seed the registry with
+    /// `sbproxy_observe::default_registry(...)` so `/readyz` reports
+    /// the standard pillar set; additional probes are registered via
+    /// `state.health_registry.register(...)`.
     pub fn with_health_registry(mut self, registry: sbproxy_observe::HealthRegistry) -> Self {
         self.health_registry = registry;
         self

@@ -115,6 +115,18 @@ jobs:
         if: steps.filter.outputs.code == 'true'
         run: cargo fmt --all -- --check
 
+      # Reject internal tracker placeholders in source-available rustdoc.
+      # A literal `WOR-XXX` is an unfinished TODO that announces incomplete
+      # work without making it trackable. If a tracker reference is needed,
+      # use a full URL or replace it with a descriptive sentence.
+      - name: no internal tracker placeholders
+        if: steps.filter.outputs.code == 'true'
+        run: |
+          if grep -rn 'WOR-XXX' crates/ --include='*.rs' --include='*.toml'; then
+            echo "::error::WOR-XXX placeholders are not allowed; open a real ticket or rewrite as prose"
+            exit 1
+          fi
+
       - name: clippy
         if: steps.filter.outputs.code == 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings

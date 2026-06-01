@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 // Copyright 2026 Soap Bucket LLC
 
-//! A2A policy module (Wave 7 / A7.2).
+//! A2A policy module.
 //!
 //! Per-route enforcement for agent-to-agent calls.
 //!
-//! The policy fires after authentication and after the G1.4 resolver
-//! chain has populated `caller_agent_id`. It evaluates against an
+//! The policy fires after authentication and after the agent-class
+//! resolver chain has populated `caller_agent_id`. It evaluates against an
 //! `A2AContext` populated by detection + the optional spec parsers;
 //! denial paths surface as typed `A2APolicyDecision` variants that
 //! the request filter maps to HTTP responses with the spec-pinned

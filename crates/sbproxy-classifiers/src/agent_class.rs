@@ -1,4 +1,4 @@
-//! Agent-class taxonomy (G1.1 / G1.4).
+//! Agent-class taxonomy.
 //!
 //! Canonical record describing an automated agent (vendor, purpose,
 //! UA pattern, reverse-DNS suffixes, expected Web Bot Auth keyids,
@@ -92,8 +92,8 @@ pub struct AgentClass {
     /// compliance, in `[0.0, 1.0]`.
     #[serde(default)]
     pub robots_compliance_score: Option<f32>,
-    /// Latest measured crawl-to-refer ratio (Wave 2 hosted feed; Wave
-    /// 1 leaves this `null`).
+    /// Latest measured crawl-to-refer ratio from the hosted feed. Left
+    /// as `null` when the feed is not configured.
     #[serde(default)]
     pub crawl_to_refer_ratio: Option<f32>,
     /// Alternate UA substrings or historical IDs that resolve to this
@@ -169,8 +169,8 @@ fn is_kebab_id(s: &str) -> bool {
 /// Stable identifier emitted by the resolver. Either one of the three
 /// reserved sentinels (`human`, `anonymous`, `unknown`) or a catalog
 /// `id`. Stored as a `Cow`-like string but kept as `String` for the
-/// Wave 1 OSS surface; the small allocation per request is amortised
-/// against the per-request HTTP work.
+/// OSS surface; the small allocation per request is amortised against
+/// the per-request HTTP work.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct AgentId(pub String);
 
@@ -222,16 +222,16 @@ impl std::fmt::Display for AgentId {
 /// Diagnostic stamp recording which signal in the resolver chain
 /// produced the [`AgentId`]. Mirrors the user-id source pattern.
 ///
-/// Closed enum per A1.8 Rule 4. Adding a variant is a schema-breaking
-/// change; [`Self::TlsFingerprint`] landed via the Wave 5 amendment.
+/// Closed enum Rule 4. Adding a variant is a schema-breaking
+/// change; [`Self::TlsFingerprint`] landed via a later amendment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentIdSource {
     /// Verified Web Bot Auth `keyid` matched a catalog entry.
     BotAuth,
-    /// Verified Skyfire KYA token (Wave 5 / G5.1, G5.2). Sits at
+    /// Verified Skyfire KYA token. Sits at
     /// resolver step 1.5 between `BotAuth` and `Rdns`. Bot-auth wins
-    /// over KYA on conflict per the G5.1 ADR.
+    /// over KYA on conflict.
     Kya,
     /// Forward-confirmed reverse-DNS suffix matched a catalog entry.
     Rdns,
@@ -240,14 +240,13 @@ pub enum AgentIdSource {
     /// Anonymous Web Bot Auth signature, no matching `keyid`.
     AnonymousBotAuth,
     /// Verified TLS fingerprint (JA3/JA4) matched a catalog entry.
-    /// Wave 5 / G5.3.
     TlsFingerprint,
     /// Resolver fell through (`human` or `unknown`).
     Fallback,
-    /// ML classifier verdict overrode the rule-based resolver. Per
-    /// A5.2, this only fires when the ML verdict is `Human` with
-    /// confidence >= 0.9; in every other case the rule-based resolver
-    /// verdict is authoritative.
+    /// ML classifier verdict overrode the rule-based resolver. This
+    /// only fires when the ML verdict is `Human` with confidence >= 0.9;
+    /// in every other case the rule-based resolver verdict is
+    /// authoritative.
     MlOverride,
 }
 

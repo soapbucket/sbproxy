@@ -95,7 +95,7 @@ pub struct BotAuthConfig {
     /// seconds. Defaults to 30s.
     #[serde(default = "default_skew_seconds")]
     pub clock_skew_seconds: u64,
-    /// Optional dynamic directory configuration (Wave 1 / G1.7).
+    /// Optional dynamic directory configuration.
     /// When set, the provider can resolve `Signature-Agent` headers
     /// by fetching the JWKS-shaped hosted directory.
     #[serde(default)]

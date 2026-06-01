@@ -123,7 +123,7 @@ pub fn build_agent_class_table(
     serde_json::Value::Object(t)
 }
 
-/// Splice the Wave 5 / G5.3 TLS fingerprint into an existing request
+/// Splice the TLS fingerprint into an existing request
 /// table built by [`build_request_table`]. Adds a nested `tls`
 /// sub-table with `ja3`, `ja4`, `ja4h`, and `trustworthy` keys so
 /// Lua / JS / WASM scripts read `request.tls.ja4` exactly like the
@@ -157,7 +157,7 @@ pub fn enrich_request_table_with_tls_fingerprint(
     }
 }
 
-/// Build the Wave 8 envelope table for Lua scripts. Mirrors the
+/// Build the capture envelope table for Lua scripts. Mirrors the
 /// `envelope` namespace exposed to CEL ([`crate::cel::context`]) so
 /// scripts written in either engine see the same dimension surface.
 ///
@@ -198,7 +198,7 @@ pub fn build_envelope_table(
     serde_json::Value::Object(env)
 }
 
-/// Splice the Wave 5 / G5.1 KYA verifier verdict into an existing
+/// Splice the KYA verifier verdict into an existing
 /// request table built by [`build_request_table`]. Adds a nested
 /// `kya` sub-table mirroring the CEL surface
 /// (`crate::cel::context::populate_kya_namespace`) so Lua / JS / WASM
@@ -247,7 +247,7 @@ pub fn enrich_request_table_with_kya(
     }
 }
 
-/// Splice the Wave 5 / A5.2 ML agent classifier verdict into an
+/// Splice the ML agent classifier verdict into an
 /// existing request table built by [`build_request_table`]. Adds a
 /// nested `ml_classification` sub-table mirroring the CEL surface
 /// (`crate::cel::context::populate_ml_namespace`).

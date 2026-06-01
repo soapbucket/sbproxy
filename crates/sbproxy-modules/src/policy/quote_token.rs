@@ -1,4 +1,4 @@
-//! Quote-token JWS signer + verifier (Wave 3 / G3.6).
+//! Quote-token JWS signer + verifier.
 //!
 //! Each token binds a 402 challenge to a specific `(route, shape, price, rail,
 //! quote_id)` tuple with a single-use `nonce`. The proxy issues tokens when
@@ -46,7 +46,7 @@ pub struct QuoteClaims {
     pub iss: String,
     /// Subject: the agent identity from the agent-class taxonomy.
     pub sub: String,
-    /// Audience: always `"ledger"` in Wave 3.
+    /// Audience: always `"ledger"`.
     pub aud: String,
     /// Issued-at, unix seconds.
     pub iat: u64,
@@ -77,7 +77,7 @@ pub struct QuoteClaims {
 /// signature work happens.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct QuoteHeader {
-    /// Algorithm; always `"EdDSA"` in Wave 3.
+    /// Algorithm; always `"EdDSA"`.
     pub alg: String,
     /// Type tag; always `"sbproxy-quote+jws"`.
     pub typ: String,

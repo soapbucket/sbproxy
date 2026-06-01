@@ -158,7 +158,7 @@ pub struct AccessLogEntry {
     pub cache_result: Option<String>,
 
     // --- Wave 8 envelope linkage ---
-    /// Wave 8 envelope ULID. Distinct from `request_id` (UUIDv4); the
+    /// Capture envelope ULID. Distinct from `request_id` (UUIDv4); the
     /// ULID feeds the typed envelope stream and the access log so portal
     /// queries can join the two sources.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -170,7 +170,7 @@ pub struct AccessLogEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id_source: Option<UserIdSource>,
     /// Session identifier (caller-supplied or auto-generated for
-    /// anonymous traffic per the Wave 8 ADR).
+    /// anonymous traffic).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     /// Parent session identifier; never auto-generated.
@@ -291,8 +291,8 @@ pub struct AccessLogEntry {
     /// records the rail decision); `rail` records the actual settler.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rail: Option<String>,
-    /// `jti` of the quote token presented and redeemed for this request
-    /// (Wave 3 / A3.2). `None` when no quote token was redeemed.
+    /// `jti` of the quote token presented and redeemed for this
+    /// request. `None` when no quote token was redeemed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redeemed_token_id: Option<String>,
     /// On-chain settlement hash when the rail produced one (x402,
@@ -444,7 +444,7 @@ fn gzip_file(src: &Path, dest: &Path) -> anyhow::Result<()> {
 
 /// Incremental builder for [`AccessLogEntry`].
 ///
-/// Wave 6 / G6.2 surface. Call sites stamp fields as a request flows
+/// Call sites stamp fields as a request flows
 /// through the pipeline (request filter, auth, action, response filter)
 /// and call [`Self::emit`] once at request completion.
 ///
@@ -638,7 +638,7 @@ impl AccessLogEntryBuilder {
 
     // --- Wave 1 / G1.4 agent-class fields ---
 
-    /// Set the resolved agent identifier from G1.4.
+    /// Set the resolved agent identifier from the resolver.
     pub fn agent_id(mut self, agent_id: impl Into<String>) -> Self {
         self.inner.agent_id = Some(agent_id.into());
         self

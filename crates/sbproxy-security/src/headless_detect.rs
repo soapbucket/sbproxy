@@ -11,7 +11,7 @@
 //!
 //! # Trustworthy gating
 //!
-//! Per A5.1, when the request's TLS fingerprint is NOT trustworthy
+//! When the request's TLS fingerprint is NOT trustworthy
 //! (e.g. arrived via Cloudflare, where the proxy sees the CDN's TLS
 //! library, not the agent's), the detector still records the signal
 //! but halves the confidence and caps it at 0.5. This makes the
@@ -20,8 +20,8 @@
 //!
 //! # Agent classes added
 //!
-//! The Wave 5 catalog update ships three new entries that the G1.4
-//! resolver chain emits when this detector matches:
+//! The catalog ships three entries that the resolver chain emits
+//! when this detector matches:
 //!
 //! - `headless-browser` (generic fallthrough)
 //! - `headless-puppeteer`
@@ -49,7 +49,7 @@ pub enum HeadlessSignal {
         /// across releases; safe for metric labels.
         library: String,
         /// Confidence in `[0.0, 1.0]`. Halved (capped at 0.5) when
-        /// `trustworthy = false` per A5.1.
+        /// `trustworthy = false`.
         confidence: f32,
     },
     /// Detector ran and did NOT match any known headless library.
@@ -60,8 +60,8 @@ pub enum HeadlessSignal {
 
 /// One entry in the vendored TLS-fingerprint catalogue.
 ///
-/// Mirrors the JSON schema documented in A5.1 §"Reference fingerprint
-/// catalogue". Every field defaults to empty so partial entries (e.g.
+/// Mirrors the JSON schema for the reference fingerprint catalogue.
+/// Every field defaults to empty so partial entries (e.g.
 /// agents with no published JA4 yet) parse without error.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TlsFingerprintEntry {
@@ -174,7 +174,7 @@ impl TlsFingerprintCatalog {
     /// CEL helper: return `true` when `ja4` is associated with
     /// `agent_class_id` in the catalogue. When the catalogue has no
     /// entry for `agent_class_id`, returns `true` (conservative; do
-    /// not penalise uncatalogued agents). Per A5.1.
+    /// not penalise uncatalogued agents).
     pub fn matches(&self, ja4: &str, agent_class_id: &str) -> bool {
         // Find the entry for this agent_class.
         let entry = self
@@ -202,7 +202,7 @@ impl TlsFingerprintCatalog {
 /// - [`HeadlessSignal::Detected`] when `ja4` matches a catalogue
 ///   entry whose `agent_class` starts with `headless-`. Confidence
 ///   is set from the entry's library tier (currently fixed at
-///   `0.95` for known matches per A5.1) and halved (capped at 0.5)
+///   `0.95` for known matches) and halved (capped at 0.5)
 ///   when `trustworthy = false`.
 /// - [`HeadlessSignal::NotDetected`] when `ja4` is `None` or no
 ///   match is found.

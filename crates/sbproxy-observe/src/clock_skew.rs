@@ -1,4 +1,4 @@
-//! Clock-skew detection (Wave 3 / R3.3) per A3.5:
+//! Clock-skew detection:
 //!
 //! - The proxy queries an SNTP source (default `pool.ntp.org`) every
 //!   60 s, computes `local_now - ntp_now` as `current_skew_seconds`,
@@ -7,9 +7,9 @@
 //!   the absolute skew exceeds the SBproxy-internal envelope of
 //!   ±2 minutes (120 s). At that point the load balancer drains the
 //!   host.
-//! - JWS verification (per A3.2) reads the current skew so it can
+//! - JWS verification reads the current skew so it can
 //!   reject tokens whose `iat` is more than `5 min + skew` in the
-//!   future. The integration lives in the parallel G3.6 task; this
+//!   future. The integration lives in a parallel task; this
 //!   module ships the API surface for it to consume.
 //!
 //! The SNTP client is a minimal RFC 4330 implementation: 48-byte
@@ -31,10 +31,10 @@ use crate::health::{ComponentStatus, Probe};
 
 // --- Constants ---
 
-/// Default polling cadence per A3.5: every 60 s.
+/// Default polling cadence: every 60 s.
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
 
-/// Default SNTP source per A3.5 ("default `pool.ntp.org`").
+/// Default SNTP source ("default `pool.ntp.org`").
 pub const DEFAULT_NTP_SOURCE: &str = "pool.ntp.org:123";
 
 /// Per-query timeout for the SNTP exchange. UDP can drop both ways;
@@ -42,7 +42,7 @@ pub const DEFAULT_NTP_SOURCE: &str = "pool.ntp.org:123";
 /// the readyz probe.
 pub const SNTP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// SBproxy-internal allowed-skew envelope per A3.5 ("Two
+/// SBproxy-internal allowed-skew envelope ("Two
 /// SBproxy-controlled hosts (proxy ↔ ledger ↔ ...): ±2 minutes").
 pub const TOLERANCE_SECS: f64 = 120.0;
 
@@ -302,9 +302,9 @@ pub enum ProbeError {
 /// Returns the local-minus-server skew in seconds. The implementation
 /// uses RFC 4330's "transmit timestamp" only; we do NOT compute the
 /// full client-server-server-client offset because the SNTP source we
-/// poll (pool.ntp.org) is not assumed to be a strict NTP peer. Per
-/// A3.5 the metric is "good enough to detect 60 s skew", not a
-/// precision time service.
+/// poll (pool.ntp.org) is not assumed to be a strict NTP peer. The
+/// metric is "good enough to detect 60 s skew", not a precision time
+/// service.
 pub async fn sntp_query(addr: &str) -> Result<f64, ProbeError> {
     sntp_query_with_clock(addr, &SystemClock).await
 }

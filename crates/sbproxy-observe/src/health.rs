@@ -1,4 +1,4 @@
-//! `/healthz` and `/readyz` endpoints (Wave 1 / R1.3).
+//! `/healthz` and `/readyz` endpoints.
 //!
 //! Per `docs/AIGOVERNANCE-BUILD.md` § 4.2:
 //!
@@ -10,8 +10,8 @@
 //!   to route traffic. Failing dependencies are listed in the body.
 //!
 //! Ships hooks for the dependencies that exist today and stub
-//! variants for the ones landing in later waves (Stripe in Wave 2,
-//! facilitator quorum in Wave 3, agent registry in Wave 2). The stubs
+//! variants for the ones landing later (Stripe, facilitator quorum,
+//! agent registry). The stubs
 //! return `Healthy` so they don't break readiness in builds where
 //! their backing service isn't wired yet.
 
@@ -37,9 +37,9 @@ pub enum ComponentStatus {
     /// Dependency is unreachable or returned a hard failure;
     /// readiness fails so the load balancer drains us.
     Unhealthy,
-    /// Dependency is not yet wired into this build (Wave 2 hooks for
-    /// Stripe, Wave 3 hooks for facilitator quorum, ...). Treated as
-    /// `Healthy` for readiness purposes.
+    /// Dependency is not yet wired into this build (hooks for Stripe,
+    /// facilitator quorum, ...). Treated as `Healthy` for readiness
+    /// purposes.
     NotConfigured,
 }
 
@@ -61,7 +61,7 @@ pub struct ComponentReport {
     /// Verdict for the component.
     pub status: ComponentStatus,
     /// Optional human-readable detail (cause of failure, last-success
-    /// timestamp, etc.). Redaction is applied per the A1.5 denylist
+    /// timestamp, etc.). Redaction is applied denylist
     /// before emission.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -205,10 +205,9 @@ impl Probe for RecencyProbe {
     }
 }
 
-/// Stub probe for dependencies that ship in a later wave (Stripe in
-/// Wave 2, facilitator quorum in Wave 3). Reports `NotConfigured`
-/// which counts as ready, so the binary stays usable while the
-/// downstream integration is unfinished.
+/// Stub probe for dependencies that ship later (Stripe, facilitator
+/// quorum). Reports `NotConfigured` which counts as ready, so the
+/// binary stays usable while the downstream integration is unfinished.
 pub struct NotConfiguredProbe {
     name: String,
 }
@@ -319,7 +318,7 @@ impl HealthRegistry {
 
 // --- Default registry helper ---
 
-/// Build a registry seeded with the Wave 1 standard probe set:
+/// Build a registry seeded with the standard probe set:
 ///
 /// - `ledger`: backed by the supplied `Recency`.
 /// - `bot_auth_directory`: backed by the supplied `Recency`.

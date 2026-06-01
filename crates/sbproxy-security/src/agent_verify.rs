@@ -13,7 +13,7 @@
 //! context as the agent-id source diagnostic; we never silently fall
 //! back to `User-Agent` matching.
 //!
-//! # Per-vendor expected suffixes (Wave 1 OSS catalog)
+//! # Per-vendor expected suffixes
 //!
 //! | Vendor       | Suffix                     |
 //! |--------------|----------------------------|

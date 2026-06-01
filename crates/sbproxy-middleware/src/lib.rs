@@ -12,8 +12,7 @@ pub mod cors;
 pub mod digest;
 pub mod error_pages;
 pub mod hsts;
-/// Idempotency-Key middleware with cached-retry vs conflict semantics
-/// (Wave 3 / R3.2, A3.4).
+/// Idempotency-Key middleware with cached-retry vs conflict semantics.
 pub mod idempotency;
 /// L402 (Lightning HTTP 402) bearer credential surface: issuer side
 /// builds the `WWW-Authenticate: L402 macaroon=..., invoice=...`

@@ -25,7 +25,7 @@ pub enum AiCrawlDecision {
         charged_header: String,
     },
     /// Request must be charged. The proxy returns 402 with this challenge
-    /// body and stamps the configured challenge header. This is the Wave 1
+    /// body and stamps the configured challenge header. This is the
     /// single-rail path that legacy crawlers see when they have not opted
     /// in to multi-rail content negotiation.
     Charge {
@@ -37,19 +37,19 @@ pub enum AiCrawlDecision {
     /// Multi-rail challenge. Emitted when the agent opted in via
     /// `Accept-Payment` or one of the multi-rail `Accept` media types
     /// (`application/sbproxy-multi-rail+json`, `application/x402+json`,
-    /// `application/mpp+json`). The body is JSON per A3.1 with one rail
+    /// `application/mpp+json`). The body is JSON with one rail
     /// entry per offered rail, each carrying its own quote-token JWS.
     MultiRail {
         /// JSON body the client receives in the 402 response.
         body: String,
         /// Content-Type to stamp on the response. Always
-        /// `application/sbproxy-multi-rail+json` in Wave 3; pinned
+        /// `application/sbproxy-multi-rail+json`; pinned
         /// here so the proxy hot path never has to know the literal.
         content_type: &'static str,
     },
     /// Multi-rail negotiation produced no overlap between the
     /// agent's `Accept-Payment` list and the route's configured rails.
-    /// Per A3.1 the proxy responds `406 Not Acceptable` with the
+    /// The proxy responds `406 Not Acceptable` with the
     /// included body listing the rails the operator does support so
     /// the agent can recover.
     NoAcceptableRail {
@@ -278,14 +278,13 @@ pub(crate) fn signal_blocked_body(purpose: CrawlerPurpose) -> String {
     )
 }
 
-/// MIME type for the multi-rail 402 body per A3.1.
+/// MIME type for the multi-rail 402 body.
 pub const MULTI_RAIL_CONTENT_TYPE: &str = "application/sbproxy-multi-rail+json";
 
 /// Closed enum of payment rails the proxy can advertise. Mirrors the
 /// `Accept-Payment` token set and the per-tier `rails:` override list.
-/// New rails follow the closed-enum amendment rule. Wave 7 added
-/// `Lightning` to mirror the externally-registered rail named
-/// `"lightning"`.
+/// New rails follow the closed-enum amendment rule. `Lightning` was
+/// added to mirror the externally-registered rail named `"lightning"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Rail {
@@ -293,7 +292,7 @@ pub enum Rail {
     X402,
     /// Stripe MPP (`2026-03-04.preview`; multi-method via `payment_intent`).
     Mpp,
-    /// Lightning Network rail (Wave 7 A7.4). Settled by an external
+    /// Lightning Network rail. Settled by an external
     /// BillingRail impl which registers the canonical name `"lightning"`.
     /// The OSS enum carries the variant so policy decisions and
     /// `Accept-Payment` negotiation can reference the rail without
@@ -684,7 +683,7 @@ pub fn path_is_always_free(path: &str, extra_free_paths: &[String]) -> bool {
 /// behaviour it triggers when matched. The first tier whose pattern
 /// matches the request path wins; later tiers act as fallbacks.
 ///
-/// `route_pattern` is a Wave 1 prefix matcher. A trailing `*` matches
+/// `route_pattern` is a prefix matcher. A trailing `*` matches
 /// any suffix (e.g. `/articles/*`); an exact pattern matches only that
 /// path. Future waves may layer regex / template support without
 /// changing the wire shape.
@@ -701,9 +700,9 @@ pub struct Tier {
     #[serde(default)]
     pub content_shape: Option<ContentShape>,
     /// Optional agent-id selector. When set, the tier only matches if
-    /// the request's resolved `agent_id` (G1.4 resolver chain) equals
-    /// the configured value. Supports the reserved sentinels `human`,
-    /// `unknown`, `anonymous` (per G1.1 taxonomy) plus any vendor id
+    /// the request's resolved `agent_id` (from the resolver chain)
+    /// equals the configured value. Supports the reserved sentinels
+    /// `human`, `unknown`, `anonymous` plus any vendor id
     /// the registry feed returns. Empty string = wildcard.
     #[serde(default)]
     pub agent_id: Option<String>,
@@ -716,15 +715,15 @@ pub struct Tier {
     /// Optional paywall position hint surfaced to the crawler.
     #[serde(default)]
     pub paywall_position: Option<PaywallPosition>,
-    /// Optional per-tier rail override (G3.4 / A3.1). When set, the tier
+    /// Optional per-tier rail override. When set, the tier
     /// offers only the listed rails; when unset, the tier inherits the
     /// policy-level default (every rail configured under
     /// `ai_crawl_control.rails:`). The closed enum is the same set as
     /// the agent's `Accept-Payment` header so adding a third rail goes
-    /// through the A1.8 deprecation window.
+    /// through the deprecation window.
     #[serde(default)]
     pub rails: Option<Vec<Rail>>,
-    /// Per-tier citation requirement (G4.4 + G4.10 closeout). When the
+    /// Per-tier citation requirement. When the
     /// tier resolver matches a request, this flag is written into
     /// `RequestContext::citation_required` so downstream transforms
     /// (`citation_block`, `json_envelope`) can read a single source of
@@ -831,9 +830,9 @@ impl ContentShape {
 
 /// Closed enumeration of valid `Content-Signal` response header values.
 ///
-/// G4.1: the proxy stamps `Content-Signal: <value>`
+/// The proxy stamps `Content-Signal: <value>`
 /// on 200 responses when the origin's `content_signal:` config key is
-/// set; the value vocabulary is closed per A1.8 so any unknown value
+/// set; the value vocabulary is closed so any unknown value
 /// fails config compilation.
 ///
 /// The header is a cooperative signal for standards-compliant crawlers
@@ -906,7 +905,7 @@ impl<'de> serde::Deserialize<'de> for ContentSignal {
 ///
 /// Carries the offending value so config-load errors point at the
 /// exact YAML token. Used by the `RawOriginConfig` content-signal
-/// field validator to fail config compilation per A1.8 closed-enum
+/// field validator to fail config compilation closed-enum
 /// rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentSignalParseError {
@@ -941,7 +940,7 @@ pub enum RailChallenge {
     /// (USDC, USDT, ...), and the merchant address that the agent's
     /// EIP-3009 signed authorization must pay into.
     X402 {
-        /// Wire-protocol version. `"2"` for x402 v2 in Wave 3.
+        /// Wire-protocol version. `"2"` for x402 v2.
         version: String,
         /// Chain identifier (`base`, `solana`, `eth-l2`, ...).
         chain: String,
@@ -957,16 +956,16 @@ pub enum RailChallenge {
         pay_to: String,
         /// RFC 3339 expiry mirroring the quote-token TTL.
         expires_at: String,
-        /// Per-rail quote-token JWS (G3.6 / A3.2).
+        /// Per-rail quote-token JWS.
         quote_token: String,
     },
     /// MPP / Stripe challenge entry. Carries the placeholder
     /// `payment_intent` id; real PI creation happens in the worker.
     Mpp {
-        /// Wire-protocol version. `"1"` for MPP in Wave 3.
+        /// Wire-protocol version. `"1"` for MPP.
         version: String,
-        /// Stripe `pi_*` identifier the agent confirms against. Wave 3
-        /// emits a placeholder id; G3.3's worker replaces it with the
+        /// Stripe `pi_*` identifier the agent confirms against. The
+        /// proxy emits a placeholder id; the worker replaces it with the
         /// real PI on the redeem path.
         stripe_payment_intent: String,
         /// Price in micros of `currency`.
@@ -975,7 +974,7 @@ pub enum RailChallenge {
         currency: String,
         /// RFC 3339 expiry mirroring the quote-token TTL.
         expires_at: String,
-        /// Per-rail quote-token JWS (G3.6 / A3.2).
+        /// Per-rail quote-token JWS.
         quote_token: String,
     },
 }
@@ -999,12 +998,12 @@ impl RailChallenge {
     }
 }
 
-/// Top-level multi-rail 402 body per A3.1. Serialised with
+/// Top-level multi-rail 402 body. Serialised with
 /// `Content-Type: application/sbproxy-multi-rail+json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MultiRailChallenge {
     /// One entry per offered rail. Empty array is invalid; the proxy MUST
-    /// emit at least one rail or fall back to the Wave 1 single-rail format.
+    /// emit at least one rail or fall back to the single-rail format.
     pub rails: Vec<RailChallenge>,
     /// Currently always `"header_negotiation"`; reserved for future
     /// `out_of_band` and `wallet_handshake` values.
@@ -1015,7 +1014,7 @@ pub struct MultiRailChallenge {
 }
 
 impl MultiRailChallenge {
-    /// Serialise to the wire JSON shape pinned by A3.1.
+    /// Serialise to the canonical wire JSON shape.
     pub fn to_json(&self) -> String {
         // serde_json::to_string is sufficient here; the body is small (one
         // entry per rail) and the proxy hot path already allocates a body
@@ -1025,9 +1024,9 @@ impl MultiRailChallenge {
 }
 
 /// Parsed agent preference set from the `Accept-Payment` header (or the
-/// equivalent multi-rail `Accept` MIME types per A3.1's opt-in rules).
+/// equivalent multi-rail `Accept` MIME types per the opt-in rules).
 ///
-/// `None` means the agent did not opt in: the proxy serves the Wave 1
+/// `None` means the agent did not opt in: the proxy serves the
 /// single-rail format. `Some(set)` means the agent opted in; the proxy
 /// filters its configured rails through `set` and emits the multi-rail
 /// body. An empty inner set (after parsing a header that listed only
@@ -1040,16 +1039,16 @@ pub struct AgentRailPreferences {
     /// sort the emitted rail entries.
     pub accepted: Vec<Rail>,
     /// True when at least one closed-enum token in the source header was
-    /// outside the Wave 3 set. Distinct from `accepted.is_empty()`
+    /// outside the closed set. Distinct from `accepted.is_empty()`
     /// because an empty `accepted` after seeing an unknown rail is the
-    /// 406 case, while an absent header is the Wave 1 fallback.
+    /// 406 case, while an absent header is the single-rail fallback.
     pub had_unknown: bool,
 }
 
 /// Parse the `Accept-Payment` header value into a preference set.
 ///
 /// Returns `None` when the header is absent or empty. The parser follows
-/// the Accept-style q-value syntax pinned in A3.1: comma-separated tokens,
+/// the Accept-style q-value syntax: comma-separated tokens,
 /// each optionally followed by `;q=<float>` parameters. Tokens outside
 /// the closed `Rail` enum are recorded in `had_unknown` and dropped from
 /// `accepted`.
@@ -1104,7 +1103,7 @@ pub fn parse_accept_payment(header: Option<&str>) -> Option<AgentRailPreferences
 /// Examine the request `Accept` header(s) and decide whether the agent
 /// opted in to the multi-rail body via a content negotiation MIME.
 ///
-/// Per A3.1 any of `application/sbproxy-multi-rail+json`,
+/// Any of `application/sbproxy-multi-rail+json`,
 /// `application/x402+json`, or `application/mpp+json` counts as an opt-in.
 /// The MIME-type opt-in is independent of the `Accept-Payment` header; an
 /// agent that sends `Accept: application/x402+json` without
@@ -1178,8 +1177,8 @@ pub fn resolve_agent_preferences(
 /// asset, facilitator URL, and merchant `pay_to` address that the proxy
 /// stamps into each x402 entry of a multi-rail 402 body.
 ///
-/// Wave 3 ships a single x402 instance per origin; multi-chain support
-/// (separate Base + Solana entries in one challenge) is a Wave 4 follow-up
+/// Ships a single x402 instance per origin today; multi-chain support
+/// (separate Base + Solana entries in one challenge) is a follow-up
 /// that will widen this to a list. The single-instance shape is the right
 /// floor: every operator who wants to advertise x402 needs exactly these
 /// fields.
@@ -1207,9 +1206,9 @@ pub(super) fn default_x402_version() -> String {
     "2".to_string()
 }
 
-/// Operator-supplied configuration for the MPP rail. Wave 3 just needs
-/// the version pin; the actual `pi_*` identifier is generated at redeem
-/// time by G3.3's worker. This struct is here so the YAML schema has a
+/// Operator-supplied configuration for the MPP rail. Just needs the
+/// version pin today; the actual `pi_*` identifier is generated at
+/// redeem time by the worker. This struct is here so the YAML schema has a
 /// stable place to grow into when MPP gains operator-tunable knobs.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct MppRailYamlConfig {
@@ -1253,7 +1252,7 @@ pub struct QuoteTokenYamlConfig {
     /// thread the proxy's external base URL.
     #[serde(default = "default_quote_issuer")]
     pub issuer: String,
-    /// Default TTL in seconds. Per A3.2 the default is 300 (5 min) and
+    /// Default TTL in seconds. The default is 300 (5 min) and
     /// the verifier ceiling is 3600 (1 h).
     #[serde(default = "default_quote_ttl")]
     pub default_ttl_seconds: u64,
@@ -1300,7 +1299,7 @@ pub struct AiCrawlControlConfig {
     /// the top-level `price` / `currency`.
     #[serde(default)]
     pub tiers: Vec<Tier>,
-    /// Optional HTTP ledger configuration (G1.3 wire). When present,
+    /// Optional HTTP ledger configuration. When present,
     /// the policy redeems tokens against a network ledger instead of
     /// the bundled in-memory ledger. `valid_tokens` stays valid as a
     /// dev-mode
@@ -1313,15 +1312,15 @@ pub struct AiCrawlControlConfig {
     /// policy construction.
     #[serde(default)]
     pub ledger: Option<LedgerYamlConfig>,
-    /// Optional multi-rail challenge configuration (G3.4 / A3.1). When
+    /// Optional multi-rail challenge configuration. When
     /// present and at least one rail is configured, the policy emits a
     /// multi-rail 402 body for opted-in agents and falls back to the
-    /// Wave 1 single-rail format for agents that did not opt in. When
-    /// absent, the policy emits the Wave 1 single-rail format
+    /// single-rail format for agents that did not opt in. When
+    /// absent, the policy emits the single-rail format
     /// unconditionally.
     #[serde(default)]
     pub rails: Option<RailsYamlConfig>,
-    /// Optional quote-token signing config (G3.6 / A3.2). When the
+    /// Optional quote-token signing config. When the
     /// `rails:` block is set, this must be present so the proxy can
     /// sign per-rail quote tokens. Construction returns an error if
     /// `rails:` is set but `quote_token:` is missing or malformed.

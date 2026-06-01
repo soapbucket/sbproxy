@@ -200,7 +200,7 @@ fn forwarded_node(ip: &str) -> String {
 ///
 /// `neg_cfg` is the JSON value lifted from
 /// `CompiledOrigin.auto_content_negotiate`. `None` means the origin
-/// did not author `ai_crawl_control` or any Wave 4 content-shaping
+/// did not author `ai_crawl_control` or any content-shaping
 /// transform; in that case the helper is a no-op and both ctx fields
 /// stay `None` so legacy origins are unaffected.
 ///
@@ -230,14 +230,14 @@ fn stamp_content_negotiation(
     }
 }
 
-/// Apply a single compiled transform with Wave 4 typed dispatch.
+/// Apply a single compiled transform with typed dispatch.
 ///
 /// The standard `CompiledTransform::apply` entry point in
 /// `sbproxy-modules` is content-type and (`body`, `content_type`)
-/// based. The Wave 4 day-5 wiring needs to override two cases:
+/// based. The typed dispatch here needs to override two cases:
 ///
 /// - `Boilerplate` reports the byte-count it stripped; surface the
-///   number on `ctx.metrics.stripped_bytes` so the Q4.14 audit and
+///   number on `ctx.metrics.stripped_bytes` so the audit and
 ///   operator dashboards can read it.
 /// - `HtmlToMarkdown` is gated on `ctx.content_shape_transform`
 ///   (Markdown / Json shapes only). When the gate is open the
@@ -421,7 +421,7 @@ fn x_markdown_tokens_header_value(
 }
 
 /// Variant of `x_markdown_tokens_header_value` that accepts an
-/// explicit per-origin tokens-per-byte ratio (A4.2 follow-up). When
+/// explicit per-origin tokens-per-byte ratio. When
 /// `ratio_override` is `Some`, the fallback computation uses it
 /// instead of [`sbproxy_modules::DEFAULT_TOKEN_BYTES_RATIO`]. The
 /// override is ignored when `cached_estimate` is `Some(_)` because
@@ -488,7 +488,7 @@ fn projection_content_type(kind: &str) -> &'static str {
 /// Resolve the tokens-per-byte ratio the proxy uses for a given
 /// origin's Markdown projection.
 ///
-/// Per A4.2 the ratio is a per-origin knob defaulting to
+/// The ratio is a per-origin knob defaulting to
 /// [`sbproxy_modules::DEFAULT_TOKEN_BYTES_RATIO`] (0.25) for English
 /// prose. Operators set `token_bytes_ratio:` at the origin level to
 /// calibrate non-English or dense technical content. When the field
@@ -501,8 +501,7 @@ fn resolved_token_bytes_ratio(origin: Option<&sbproxy_config::CompiledOrigin>) -
         .unwrap_or(sbproxy_modules::DEFAULT_TOKEN_BYTES_RATIO)
 }
 
-/// Outcome of the Content-Signal / TDM-Reservation header decision
-/// (G4.1 + A4.1).
+/// Outcome of the Content-Signal / TDM-Reservation header decision.
 ///
 /// Surfaced as an enum so the response_filter and the static-action
 /// short-circuit path can share one source of truth and the unit
@@ -521,7 +520,7 @@ enum ContentSignalDecision {
 /// Decide which (if any) of `Content-Signal` / `TDM-Reservation` to
 /// stamp.
 ///
-/// `is_2xx` gates the entire decision per G4.1 ("on 200 responses
+/// `is_2xx` gates the entire decision ("on 200 responses
 /// only"). `origin_signal` is the validated `&'static str` form from
 /// the compiled origin (closed enum, so any value is wire-safe).
 /// `projection_signal` is the optional value the projection cache

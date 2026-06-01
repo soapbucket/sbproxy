@@ -1,4 +1,4 @@
-//! Google A2A parser (Wave 7 / A7.2, `draft-google-a2a-v0`).
+//! Google A2A parser for the `draft-google-a2a-v0` envelope.
 //!
 //! The Google draft uses a dedicated `application/a2a+json` content
 //! type with a top-level envelope. Body shape under the v0 draft:
@@ -28,8 +28,8 @@ use super::{A2AContext, A2ASpec, ChainHop};
 /// Parse a Google A2A request body into an [`A2AContext`].
 ///
 /// `caller_fallback` is used when the envelope's `caller_agent_id`
-/// field is missing; the resolved identity from the G1.4 chain is
-/// the natural fallback.
+/// field is missing; the resolved identity from the resolver chain
+/// is the natural fallback.
 ///
 /// Returns `None` when the body is not valid JSON; missing fields
 /// inside a valid object still produce a usable context.

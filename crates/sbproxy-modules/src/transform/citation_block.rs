@@ -50,7 +50,7 @@ pub struct CitationBlockConfig {
 
 // --- Transform ---
 
-/// G4.10 citation-block transform. Stateless; reads the citation flag
+/// Citation-block transform. Stateless; reads the citation flag
 /// from per-request context (preferred) and falls back to its own
 /// optional [`Self::force_citation`] config when no tier matched. See
 /// `docs/AIGOVERNANCE.md` § 9 (2026-05-02 entry) for why the flag lives

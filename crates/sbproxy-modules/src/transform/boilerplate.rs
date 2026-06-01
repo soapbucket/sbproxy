@@ -8,7 +8,7 @@
 //!
 //! The transform records the number of bytes removed so the
 //! `RequestMetrics::stripped_bytes` counter can be stamped on the
-//! per-request audit log (Q4.14). Callers thread the returned `u64`
+//! per-request audit log. Callers thread the returned `u64`
 //! into `ctx.metrics.stripped_bytes` after `apply` returns.
 //!
 //! Run order: this transform must run BEFORE `HtmlToMarkdownTransform`
@@ -36,15 +36,15 @@ use serde::Deserialize;
 
 // --- Config ---
 
-/// YAML configuration shape for the boilerplate transform. Wave 4 ships
-/// no knobs; the field is reserved for a future `extra_selectors`
+/// YAML configuration shape for the boilerplate transform. Ships with
+/// no knobs today; the field is reserved for a future `extra_selectors`
 /// expansion without breaking config compatibility.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BoilerplateConfig {}
 
 // --- Transform ---
 
-/// G4.10 boilerplate-stripping transform.
+/// Boilerplate-stripping transform.
 ///
 /// Stateless: the regexes are built once per `apply` call. Reasonable
 /// for the typical N-transforms-per-origin setup; if profiling shows

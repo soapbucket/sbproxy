@@ -1,6 +1,6 @@
-//! `Accept-Payment` header parser (Wave 3 / R3.1).
+//! `Accept-Payment` header parser.
 //!
-//! Per A3.1:
+//! Behaviour:
 //!
 //! - Wire format: `Accept-Payment: x402;q=1, mpp;q=0.9` (Accept-style
 //!   q-value list, RFC 9110 § 12.4.2 shape).
@@ -36,9 +36,9 @@ pub struct RailPreference {
     pub q: f32,
 }
 
-/// Closed-with-escape rail-kind enumeration per A1.8 schema rules.
+/// Closed-with-escape rail-kind enumeration schema rules.
 ///
-/// `X402` and `Mpp` are the Wave 3 closed set. `Other(String)` carries
+/// `X402` and `Mpp` are the closed set today. `Other(String)` carries
 /// any unknown rail token verbatim so future extensions (Lightning,
 /// custom MPP variants) round-trip without the parser dropping them.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -97,7 +97,7 @@ pub struct AcceptPayment {
 
 /// Parser error.
 ///
-/// Wave 3 keeps this enum small. The proxy's hot path treats any
+/// This enum is intentionally small. The proxy's hot path treats any
 /// parse error as "the agent did not opt in" (empty preferences), so
 /// these variants surface only when callers explicitly want the
 /// distinction (e.g. for diagnostics).

@@ -11,7 +11,7 @@ use super::*;
 
 /// Pull the per-agent label bundle off the request context.
 ///
-/// Wave 3 / G1.6 wire: when the `agent-class` feature is on the
+/// When the `agent-class` feature is on the
 /// request pipeline runs the `AgentClassResolver` early in
 /// `request_filter`, stamping `agent_id`, `agent_vendor`, etc. onto
 /// the context. The hot-path `logging` callback feeds those values
@@ -22,7 +22,7 @@ use super::*;
 /// label set (no demotions, no overhead).
 ///
 /// `payment_rail` and `content_shape` are intentionally left empty
-/// here: payment-rail resolution is a Wave 3 follow-up (the rail is
+/// here: payment-rail resolution is a follow-up (the rail is
 /// known after the AI handler dispatches but before the response
 /// completes; threading it through the logging hook is a separate
 /// task). `content_shape` is observed at response-time and lives on
@@ -78,9 +78,9 @@ pub(super) fn agent_class_label(ctx: &RequestContext) -> &'static str {
 /// - `None` (no top-level block) or `catalog: builtin`: use
 ///   `AgentClassCatalog::defaults()`.
 /// - `catalog: hosted-feed`: reserved for the registry fetcher landing
-///   in G2.2; for now we log a warning and fall back to defaults so
-///   YAML written against the larger schema still boots.
-/// - `catalog: merged`: same as `hosted-feed` until G2.2 ships the
+///   in the registry fetcher; for now we log a warning and fall back
+///   to defaults so YAML written against the larger schema still boots.
+/// - `catalog: merged`: same as `hosted-feed` until the registry ships the
 ///   overlay path. Falls back to defaults with the same warning.
 /// - Any other catalog string: warns and falls back to defaults.
 ///
@@ -744,7 +744,7 @@ impl AccessLogContext {
 }
 
 /// Compact stable label for the prompt classifier verdict. The full
-/// score map lives on the Wave 8 envelope event; the access log only
+/// score map lives on the capture envelope event; the access log only
 /// carries the top label so downstream ML pipelines have a bounded
 /// feature dimension. Empty `labels` falls back to `"unknown"`.
 pub(super) fn classifier_label(verdict: &crate::hooks::ClassifyVerdict) -> String {

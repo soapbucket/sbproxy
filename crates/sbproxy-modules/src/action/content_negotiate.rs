@@ -5,7 +5,7 @@
 //! ## Pass 1: pricing shape
 //! Calls [`ContentShape::from_accept`] (declaration-order, q-values stripped)
 //! and stores the result in `RequestContext::content_shape_pricing`. This
-//! preserves the existing tier-lookup semantics from G3.5.
+//! preserves the existing tier-lookup semantics.
 //!
 //! ## Pass 2: transformation shape
 //! A q-value-aware scan over the same `Accept` header. Each MIME type is
@@ -23,7 +23,7 @@
 //!
 //! The action does not touch the response body; it only stamps `ctx`. The
 //! downstream pipeline reads `ctx.content_shape_transform` to drive which
-//! response transform runs (G4.3 markdown projection vs G4.4 JSON envelope
+//! response transform runs (markdown projection vs JSON envelope
 //! vs HTML pass-through).
 
 use serde::Deserialize;
@@ -44,7 +44,7 @@ use crate::policy::ContentShape;
 ///
 /// Both fields are optional. When `default_content_shape` is unset, the
 /// wildcard `*/*` (or an absent `Accept` header) resolves to
-/// [`ContentShape::Html`] per G4.1.
+/// [`ContentShape::Html`].
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ContentNegotiateConfig {
     /// Per-origin default shape used when the agent's `Accept` header
@@ -67,8 +67,7 @@ impl ContentNegotiateConfig {
 /// Both shapes are returned so the caller can stamp them onto the
 /// per-request context (`content_shape_pricing` and
 /// `content_shape_transform`). The two values may differ; see
-/// [`crate::action::content_negotiate`] module docs and G4.1 for the
-/// rationale.
+/// [`crate::action::content_negotiate`] module docs for the rationale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NegotiatedShapes {
     /// Pass 1 shape (declaration-order, q-values stripped). Drives the
@@ -219,8 +218,8 @@ fn recognise_mime(media: &str) -> Option<ContentShape> {
     None
 }
 
-/// Canonical preference order from G4.1: Markdown < Json < Html < Pdf
-/// < Other. Lower number wins on q-value tie.
+/// Canonical preference order: Markdown < Json < Html < Pdf < Other.
+/// Lower number wins on q-value tie.
 fn preference_rank(shape: ContentShape) -> u8 {
     match shape {
         ContentShape::Markdown => 1,

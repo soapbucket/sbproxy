@@ -55,7 +55,7 @@ pub fn stamp_request_context(
     ctx.agent_rdns_hostname = resolved.rdns_hostname;
 }
 
-/// Apply the headless-detection override per A5.1 § "Worked example:
+/// Apply the headless-detection override § "Worked example:
 /// headless Puppeteer detection".
 ///
 /// When the headless detector returned `HeadlessSignal::Detected` AND
@@ -67,7 +67,7 @@ pub fn stamp_request_context(
 /// `AgentIdSource::TlsFingerprint`.
 ///
 /// Any non-`Fallback` source survives untouched: bot-auth, KYA, rDNS,
-/// and UA-regex matches outrank the headless detector per A5.1.
+/// and UA-regex matches outrank the headless detector.
 ///
 /// `library` comes from the detector's verdict label (e.g.
 /// `"puppeteer"`, `"playwright"`). The function returns `true` when

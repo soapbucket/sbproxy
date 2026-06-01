@@ -1,8 +1,8 @@
-//! aipref signal parsing (Wave 4 / G4.9).
+//! aipref signal parsing.
 //!
 //! aipref is a draft IETF preference signal expressing AI-use opt-out
-//! at the resource level. It rides on three transports; Wave 4 only
-//! handles the request-side header form:
+//! at the resource level. It rides on three transports; this module
+//! only handles the request-side header form:
 //!
 //! ```text
 //! aipref: train=no, search=yes, ai-input=yes
@@ -16,8 +16,8 @@
 //! values are unrecognised.
 //!
 //! The `<meta name="aipref" ...>` and robots.txt forms are not parsed
-//! here; they are addressed in a later wave when the response-side
-//! signal pipeline lands.
+//! here; they are addressed when the response-side signal pipeline
+//! lands.
 //!
 //! ## IETF reference
 //! - draft-ietf-aipref-prefs (preference signals)
@@ -27,7 +27,7 @@ use std::fmt::Write;
 
 // --- AiprefSignal ---
 
-/// Flattened view of the three Wave 4 aipref axes.
+/// Flattened view of the three aipref axes.
 ///
 /// All three fields default to `true` (permissive); a concrete `false`
 /// must be expressed by the publisher via `train=no`, `search=no`, or

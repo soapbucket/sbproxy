@@ -14,8 +14,8 @@
 //!   pure helper so the request pipeline can call it without a TLS
 //!   crate dep.
 //! - **JA4S** (ServerHello): outbound fingerprint of the upstream's
-//!   reply. Stub here. Wave 5 leaves the field as `None`; outbound
-//!   capture lands with the connector hardening in B5.x.
+//!   reply. Stub here. The field is left as `None` today; outbound
+//!   capture lands with the connector hardening.
 //! - **JA4T** (TCP fingerprint): SYN-packet TCP options + window
 //!   shape. Slice 7 lands the field on the struct but
 //!   leaves the value as `None` on the inbound path: Pingora 0.8's
@@ -42,9 +42,9 @@
 //! Behind the `tls-fingerprint` cargo feature (default off). When the
 //! feature is disabled, the type definitions still exist (so
 //! `RequestContext::tls_fingerprint: Option<TlsFingerprint>` compiles
-//! either way) but none of the parsing paths run. Per A5.1 the
-//! capture cost is 50-100 microseconds per handshake on a typical
-//! 300-500 byte ClientHello.
+//! either way) but none of the parsing paths run. The capture cost
+//! is 50-100 microseconds per handshake on a typical 300-500 byte
+//! ClientHello.
 
 use std::net::IpAddr;
 
@@ -60,7 +60,7 @@ use std::net::IpAddr;
 /// - [`Self::ja4h`] is populated mid-pipeline by [`compute_ja4h`]
 ///   once the request headers are available.
 /// - [`Self::ja4s`] is populated on the outbound TLS session to the
-///   upstream (Wave 5 leaves it `None`; outbound lands with B5.x).
+///   upstream (left as `None` today; outbound lands later).
 /// - [`Self::trustworthy`] is computed from the per-origin CIDR
 ///   config in `sb.yml` by [`classify_trustworthy`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -105,7 +105,7 @@ pub struct TlsFingerprint {
     /// Whether the fingerprint reflects the actual client rather
     /// than an intermediate proxy / CDN. Computed from per-origin
     /// CIDR rules; defaults to `false` when no rule matches
-    /// (conservative, per A5.1).
+    /// (conservative).
     pub trustworthy: bool,
     /// JA4T TCP fingerprint (SYN packet window size + window
     /// scaling + TCP options list + MSS + IP TTL) per the FoxIO
@@ -599,9 +599,9 @@ fn ja4_cipher_hash(ciphers: &[u16]) -> String {
 /// Compute the JA4H fingerprint from request method + version +
 /// ordered header names.
 ///
-/// Per A5.1: "the input is the ordered list of request header names
-/// (values excluded) concatenated with a method-and-version prefix.
-/// The hash is a 12-character truncated SHA-256."
+/// The input is the ordered list of request header names (values
+/// excluded) concatenated with a method-and-version prefix. The hash
+/// is a 12-character truncated SHA-256.
 ///
 /// `method` is the HTTP method string (e.g. `"GET"`).
 /// `version` is the HTTP version label (`"1.1"`, `"2"`, `"3"`).
@@ -643,7 +643,7 @@ where
 ///    `false`.
 /// 2. Else if `client_ip` matches any entry in `trustworthy`, return
 ///    `true`.
-/// 3. Else default to `false` (conservative, per A5.1).
+/// 3. Else default to `false` (conservative).
 #[derive(Debug, Clone, Default)]
 pub struct TrustworthyConfig {
     /// CIDR ranges where direct clients arrive (no CDN / MITM).
