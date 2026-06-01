@@ -334,7 +334,41 @@ pub(super) fn emit_access_log(
         return;
     };
 
-    let path = session.req_header().uri.path().to_string();
+    let req_header = session.req_header();
+    let path = req_header.uri.path().to_string();
+    // Capture standard HTTP fields once so the JSON shape stays
+    // close to what every other access-log consumer (Apache, NGINX,
+    // Envoy, the cookie-cutter ELK pipeline) expects without making
+    // the operator opt them in through the header allowlist.
+    let query = req_header
+        .uri
+        .query()
+        .filter(|q| !q.is_empty())
+        .map(|q| q.to_string());
+    let protocol = Some(format!("{:?}", req_header.version));
+    let scheme = req_header
+        .uri
+        .scheme_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let host = req_header
+        .headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let user_agent = req_header
+        .headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let referer = req_header
+        .headers
+        .get("referer")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     let trace_id = ctx.trace_ctx.as_ref().map(|t| t.trace_id.clone());
     let request_id = if !ctx.request_id.is_empty() {
         ctx.request_id.to_string()
@@ -417,6 +451,27 @@ pub(super) fn emit_access_log(
             (req_headers, resp_headers)
         };
 
+    // Capture the headline response fields once. `response_content_type`
+    // + `response_content_encoding` are primary fields rather than
+    // generic-allowlist captures because every analytics consumer
+    // slices on them; making the operator opt them in through the
+    // header allowlist is brittle. `upstream_status` only surfaces
+    // when the proxy rewrote the status the client sees (retry,
+    // fallback, response_modifier).
+    let response_content_type = session
+        .response_written()
+        .and_then(|w| w.headers.get("content-type"))
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let response_content_encoding = session
+        .response_written()
+        .and_then(|w| w.headers.get("content-encoding"))
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let upstream_status = ctx.response_status.filter(|upstream| *upstream != status);
+
     let context = AccessLogContext {
         envelope_request_id: ctx.envelope_request_id.map(|u| u.to_string()),
         user_id: ctx.user_id.clone(),
@@ -490,8 +545,55 @@ pub(super) fn emit_access_log(
         request_id,
         client_ip,
         trace_id,
+        HttpFields {
+            query,
+            protocol,
+            scheme,
+            host,
+            user_agent,
+            referer,
+            upstream_status,
+            response_content_type,
+            response_content_encoding,
+        },
         context,
     );
+}
+
+/// Standard HTTP request + response fields lifted out of the wire
+/// headers for stamping onto the access-log entry. Pulled into a
+/// struct so the `emit_access_log_entry` signature does not grow by
+/// an argument per HTTP field.
+pub(super) struct HttpFields {
+    pub(super) query: Option<String>,
+    pub(super) protocol: Option<String>,
+    pub(super) scheme: Option<String>,
+    pub(super) host: Option<String>,
+    pub(super) user_agent: Option<String>,
+    pub(super) referer: Option<String>,
+    pub(super) upstream_status: Option<u16>,
+    pub(super) response_content_type: Option<String>,
+    pub(super) response_content_encoding: Option<String>,
+}
+
+impl HttpFields {
+    /// All-None HttpFields for tests that do not exercise these
+    /// fields. Production callers always construct from
+    /// `session.req_header()` + `session.response_written()`.
+    #[cfg(test)]
+    pub(super) fn empty() -> Self {
+        Self {
+            query: None,
+            protocol: None,
+            scheme: None,
+            host: None,
+            user_agent: None,
+            referer: None,
+            upstream_status: None,
+            response_content_type: None,
+            response_content_encoding: None,
+        }
+    }
 }
 
 /// Bundle of `RequestContext`-derived fields that flow into the
@@ -689,6 +791,7 @@ pub(super) fn emit_access_log_entry(
     request_id: String,
     client_ip: String,
     trace_id: Option<String>,
+    http_fields: HttpFields,
     context: AccessLogContext,
 ) {
     let latency_ms = duration_secs * 1000.0;
@@ -705,7 +808,16 @@ pub(super) fn emit_access_log_entry(
         origin: hostname.to_string(),
         method: method.to_string(),
         path: path.to_string(),
+        query: http_fields.query,
+        protocol: http_fields.protocol,
+        scheme: http_fields.scheme,
+        host: http_fields.host,
+        user_agent: http_fields.user_agent,
+        referer: http_fields.referer,
         status,
+        upstream_status: http_fields.upstream_status,
+        response_content_type: http_fields.response_content_type,
+        response_content_encoding: http_fields.response_content_encoding,
         latency_ms,
         auth_ms: context.auth_ms,
         upstream_ttfb_ms: context.upstream_ttfb_ms,
