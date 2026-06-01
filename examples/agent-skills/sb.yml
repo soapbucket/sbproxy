@@ -1,5 +1,4 @@
-# 99 - Agent Skills v0.2.0 well-known projection
-# (WOR-193 + WOR-194 + WOR-195).
+# Agent Skills v0.2.0 well-known projection.
 #
 # Demonstrates the Agent Skills v0.2.0 discovery endpoint at
 # `GET /.well-known/agent-skills/index.json`. Cooperative agents fetch
@@ -53,7 +52,7 @@ origins:
         </body>
         </html>
 
-    # WOR-193: Agent Skills v0.2.0 advertisement. Each entry becomes
+    # Agent Skills v0.2.0 advertisement. Each entry becomes
     # one row in the served manifest, with a SHA-256 digest pinned at
     # config-load time and re-verified on every artifact GET.
     agent_skills:
@@ -71,7 +70,7 @@ origins:
         type: skill-md
         description: "Rotate a service credential using vault."
         url: "/skills/internal-rotate-secret.md"
-        # WOR-193: authenticated-only entry. Anonymous callers receive
+        # authenticated-only entry. Anonymous callers receive
         # the public-only manifest; callers that present an
         # `Authorization` header see this entry too.
         visibility: authenticated

@@ -1,7 +1,7 @@
 # ADR: outbound credential resolver, OSS vs enterprise line
 *Last modified: 2026-05-24*
 
-Status: accepted. Drives WOR-802 (move outbound-credential-resolver basics into OSS).
+Status: accepted. Drives the move of outbound-credential-resolver basics into OSS.
 
 ## Context
 

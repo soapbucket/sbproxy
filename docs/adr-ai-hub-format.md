@@ -1,7 +1,7 @@
 # ADR: AI gateway hub format and the `ChatFormat` trait
 *Last modified: 2026-05-12*
 
-Status: proposed. Drives WOR-224 (hub `ChatFormat` trait + `/v1/messages` + `/v1/responses` inbound).
+Status: proposed. Drives the hub `ChatFormat` trait plus `/v1/messages` and `/v1/responses` inbound surfaces.
 
 ## Context
 
@@ -189,7 +189,7 @@ The `extensions` map is the escape valve for provider-specific knobs the hub doe
 
 ## Inbound endpoints
 
-WOR-224 ships three inbound parsers, registered into a parser registry keyed by inbound path:
+Three inbound parsers, registered into a parser registry keyed by inbound path:
 
 - `/v1/chat/completions` (OpenAI): the existing route, refactored to call `OpenAiFormat::parse_request`. This is the pass-through path; the registry can short-circuit it when both inbound and outbound are OpenAI, skipping the hub entirely so the no-translation hot path is byte-for-byte identical.
 - `/v1/messages` (Anthropic): new route. Backed by `AnthropicFormat::parse_request`. Existing Anthropic clients (the Anthropic SDK, Claude Code, Cursor) point at this path and Just Work, including when the configured upstream is OpenAI or Gemini.
@@ -315,7 +315,7 @@ Six chunks ship a working hub with three inbound shapes and three outbound shape
 
 ## Open questions
 
-These are genuinely undecided and need an answer before WOR-224 closes; do not treat the absence of an answer as a sign the design will not change.
+These are genuinely undecided and need an answer before this ADR closes; do not treat the absence of an answer as a sign the design will not change.
 
 1. **Cost routing and inbound model names.** Today the cost router keys on the OpenAI model name. When the inbound is Anthropic Messages with `model: claude-3-5-sonnet`, does the router look up Anthropic pricing, or does it expect the operator's `ai_providers.yml` to declare an alias? Probably the latter, but the alias-resolution path needs a design.
 

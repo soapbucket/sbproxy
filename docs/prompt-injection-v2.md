@@ -126,8 +126,8 @@ classifier lands.
 The OSS build ships only the heuristic detector in-process. Model
 inference runs out of process in the classifier sidecar, never inside
 the proxy: parsing and running a model graph on the proxy's own heap
-lets a malformed or oversized model exhaust proxy memory (WOR-612), so
-that path was removed. `detector: sidecar` is the supported way to run a
+lets a malformed or oversized model exhaust proxy memory, so that path
+was removed. `detector: sidecar` is the supported way to run a
 learned classifier; `detector: onnx` is no longer accepted and fails at
 config load with a pointer to the sidecar.
 

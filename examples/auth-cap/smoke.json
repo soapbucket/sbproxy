@@ -63,7 +63,7 @@
   "_notes": [
     "This example does not ship a docker-compose.yml, so the smoke",
     "runner skips it silently. The cases[] block above documents the",
-    "four scenarios called out in the WOR-101 acceptance criteria so",
+    "four scenarios called out in the acceptance criteria so",
     "that operators eyeballing the example see the full assertion",
     "matrix without booting the proxy. The two ${...} placeholders",
     "are intentional: the smoke runner does not currently mint CAP",

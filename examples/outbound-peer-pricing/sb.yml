@@ -1,4 +1,4 @@
-# Outbound peer-pricing pre-flight (WOR-188).
+# Outbound peer-pricing pre-flight.
 #
 # When an internal agent calls a cooperating peer through this
 # origin, the `peer_pricing_preflight` policy:

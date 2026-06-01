@@ -17,6 +17,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 
 ### AI gateway
 - [ai-gateway.md](ai-gateway.md) - providers, routing strategies, guardrails, budgets, streaming.
+- [ai-lb-benchmark.md](ai-lb-benchmark.md) - P50/P95/P99/P99.9 latency comparison across AI router strategies under skewed load.
 - [providers.md](providers.md) - the catalog of supported LLM providers.
 - [scripting.md](scripting.md) - CEL, Lua, JavaScript, and WASM scripting reference.
 - [wasm-development.md](wasm-development.md) - writing WebAssembly modules for the `wasm` transform against the WASI preview-1 contract.

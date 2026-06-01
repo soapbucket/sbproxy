@@ -1,4 +1,4 @@
-# Repo-native Listing primitive (WOR-136).
+# Repo-native Listing primitive.
 #
 # A Listing is a published, versioned view of an existing Resource (an
 # origin, an MCP server, or a docs surface). Listings live in
@@ -19,8 +19,8 @@
 #   curl -H 'Host: api.example.com' http://127.0.0.1:8080/get
 #
 # The Listing itself is not served on the data path in OSS; it is the
-# input the future hosted-Catalog surface (WOR-135) and the
-# Listing-scoped agent-skills extension (WOR-196) build on.
+# input the future hosted-Catalog surface and the
+# Listing-scoped agent-skills extension build on.
 
 proxy:
   http_bind_port: 8080

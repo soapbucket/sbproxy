@@ -70,7 +70,7 @@ services:
       # the upstream entrypoint script `10-listen-on-ipv6-by-default.sh`
       # cannot modify the read-only-mounted /etc/nginx/conf.d/default.conf.
       # 127.0.0.1 forces IPv4 resolution and avoids the mismatch.
-      # See WOR-187 for the regression history.
+      #
       test: ["CMD-SHELL", "wget -q -O /dev/null --tries=1 http://127.0.0.1/__ledger_health"]
       interval: 5s
       timeout: 3s
@@ -92,7 +92,7 @@ services:
       # the upstream entrypoint script `10-listen-on-ipv6-by-default.sh`
       # cannot modify the read-only-mounted /etc/nginx/conf.d/default.conf.
       # 127.0.0.1 forces IPv4 resolution and avoids the mismatch.
-      # See WOR-187 for the regression history.
+      #
       test: ["CMD-SHELL", "wget -q -O /dev/null --tries=1 http://127.0.0.1/__origin_health"]
       interval: 5s
       timeout: 3s

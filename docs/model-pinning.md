@@ -64,6 +64,6 @@ The `no_known_model_has_unpinned_sha256` test in
 - or the lowercase hex form of a 32-byte zero buffer.
 
 The test is marked `#[ignore]` while the registry still ships an
-unpinned entry; the WOR-190 follow-up that pastes the computed hashes
-also drops the `#[ignore]`, at which point any future PR that
+unpinned entry; the follow-up that pastes the computed hashes also
+drops the `#[ignore]`, at which point any future PR that
 re-introduces an empty hash trips the gate at CI time.
