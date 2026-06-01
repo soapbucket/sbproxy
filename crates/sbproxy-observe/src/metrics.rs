@@ -2234,6 +2234,44 @@ pub fn record_tokens_attributed(
         .inc_by(count);
 }
 
+// --- WOR-1044: reversible PII redaction miss ---
+//
+// Incremented when a `<placeholder:...>` shape appears in the upstream
+// response body but is NOT present in the request-scoped capture map
+// (i.e. the LLM hallucinated a placeholder string the gateway never
+// inserted). The placeholder is left in the response so the caller
+// can see the synthetic value rather than have the gateway silently
+// drop it.
+//
+// Label `rule` is the slug parsed out of the `<placeholder:<rule>:N>`
+// shape (or `unknown` when the slug does not match a known shape).
+// Both labels go through the cardinality limiter.
+
+/// Increment `sbproxy_ai_reversible_redaction_miss_total{rule}` by one.
+///
+/// Called by the response handler whenever it spots a placeholder in
+/// the inbound LLM response that the request-side capture did not
+/// produce. The metric exists so operators can spot prompt-injection
+/// attempts or model hallucinations that probe the placeholder
+/// vocabulary; the unmatched placeholder is left in the response
+/// rather than substituted out, so the caller sees the synthetic
+/// value verbatim.
+pub fn record_reversible_redaction_miss(rule: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_ai_reversible_redaction_miss_total",
+            "Reversible PII placeholders that appeared in the upstream response but did not match a request-side capture entry",
+            &["rule"],
+        )
+        .expect("reversible redaction miss counter registers")
+    });
+    let rule = sanitize_label("rule", rule);
+    counter.with_label_values(&[rule.as_str()]).inc();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -732,6 +732,15 @@ pub struct RequestContext {
     /// session-end `AiBillingEvent`.
     pub ai_realtime_dispatch: Option<RealtimeDispatchCtx>,
 
+    /// WOR-1044: reversible PII redaction map for this request.
+    /// Each entry is `(rule_name, placeholder, original)` recorded by
+    /// the request-side `redact_json_with_capture` pass. The response
+    /// handler walks this once to restore originals before the body
+    /// is written back to the client. The vector lives only for the
+    /// request lifetime so the original values never reach the access
+    /// log, audit log, trace span, or any persisted artefact.
+    pub ai_reversible_redactions: Vec<(String, String, String)>,
+
     // --- Wave 4 content negotiation (G4.2 / G4.3 / G4.4) ---
     //
     // The two-pass `Accept` resolver in `sbproxy-modules::action::content_negotiate`
@@ -1028,6 +1037,7 @@ impl RequestContext {
             ai_admission: None,
             ai_realtime_session: None,
             ai_realtime_dispatch: None,
+            ai_reversible_redactions: Vec::new(),
             content_shape_pricing: None,
             content_shape_transform: None,
             markdown_token_estimate: None,

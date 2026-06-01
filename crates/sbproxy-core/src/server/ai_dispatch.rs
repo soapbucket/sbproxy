@@ -546,7 +546,17 @@ pub(super) async fn handle_ai_proxy(
     if let Some(pii_cfg) = config.pii.as_ref() {
         if pii_cfg.enabled && pii_cfg.redact_request {
             if let Some(redactor) = config.pii_redactor() {
-                redactor.redact_json(&mut body);
+                // WOR-1044: capture-aware path so reversible rules can be
+                // restored on the response. Capture lives on the request
+                // context; the response handler reads it via `ctx`.
+                // Non-reversible rules behave identically to the old
+                // `redact_json` (replace with the static replacement;
+                // capture is unused for them).
+                let mut capture = sbproxy_security::pii::ReversibleCapture::new();
+                redactor.redact_json_with_capture(&mut body, &mut capture);
+                if !capture.is_empty() {
+                    ctx.ai_reversible_redactions = capture.pairs;
+                }
                 tracing::debug!("AI proxy: applied request-body PII redaction");
             }
         }
@@ -1915,6 +1925,14 @@ pub(super) async fn relay_ai_response_with_cache(
     // upstream path), so the rewrap step is skipped.
     let inbound_format: Option<String> = ctx.as_ref().and_then(|c| c.ai_inbound_format.clone());
     let native_bypass = ctx.as_ref().map(|c| c.ai_native_bypass).unwrap_or(false);
+    // WOR-1044: snapshot the reversible redaction pairs before any
+    // later branch in this function moves `ctx`. The vec is small
+    // (one entry per reversible match this request fired), so the
+    // clone is cheap and the borrow rules stay simple.
+    let reversible_pairs: Vec<(String, String, String)> = ctx
+        .as_ref()
+        .map(|c| c.ai_reversible_redactions.clone())
+        .unwrap_or_default();
     let resp_body: bytes::Bytes = if native_bypass {
         resp_body
     } else {
@@ -2195,8 +2213,91 @@ pub(super) async fn relay_ai_response_with_cache(
         None => idem_skip_reason,
     };
 
+    // WOR-1044: reversible PII restoration. The request-side capture
+    // recorded `(rule, placeholder, original)` triples on `ctx`; walk
+    // the body once and replace each placeholder with its original.
+    // After replacement, scan for any remaining `<placeholder:...>`
+    // shapes; each is a synthetic placeholder the LLM emitted that
+    // the gateway never inserted (hallucination or prompt injection
+    // probe), so increment the miss counter and leave the shape in
+    // the body. The cache write above stores the masked body, which
+    // is the right behaviour when reversible is opt-in per rule (see
+    // the known-limitation note in docs/observability.md).
+    let resp_body = restore_reversible_pii(&resp_body, &reversible_pairs);
+
     let extra: Option<(&str, &str)> = final_skip_reason.map(|r| ("x-sbproxy-idempotency", r));
     send_response_with_extra(session, status, &content_type, &resp_body, extra).await
+}
+
+/// WOR-1044: restore reversible PII placeholders. Walks the body and
+/// replaces every `placeholder` from `pairs` with the captured
+/// `original`. After the substitution pass scans the body for any
+/// remaining `<placeholder:<rule>:<n>>` shape; each match increments
+/// `sbproxy_ai_reversible_redaction_miss_total{rule}` so operators
+/// can see when the LLM emitted a synthetic placeholder the gateway
+/// never inserted. The unmatched placeholder is left in the body so
+/// the caller sees the synthetic value verbatim rather than have the
+/// gateway silently substitute it.
+///
+/// The pairs vector is the request-scoped capture from the context;
+/// when it is empty (the common no-reversible-rules case) the
+/// function short-circuits before touching the body.
+fn restore_reversible_pii(body: &bytes::Bytes, pairs: &[(String, String, String)]) -> bytes::Bytes {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    // Format mirrors the default `mask_template` shape so the miss
+    // scan catches both the default and any operator-supplied
+    // template that follows the `<placeholder:<rule>:<digits>>`
+    // convention. Operator templates that deviate from the
+    // convention are not scanned for misses; they still get restored
+    // when present in the capture.
+    static PLACEHOLDER_RE: OnceLock<Regex> = OnceLock::new();
+    let placeholder_re = PLACEHOLDER_RE
+        .get_or_init(|| Regex::new(r"<placeholder:([a-zA-Z0-9_\-]+):\d+>").expect("static regex"));
+
+    if pairs.is_empty() {
+        return body.clone();
+    }
+
+    // Restore: walk the body once per (placeholder, original) pair.
+    // A reversible request has a small handful of pairs; this is
+    // cheaper than building an Aho-Corasick over them.
+    let text = match std::str::from_utf8(body) {
+        Ok(s) => s,
+        Err(_) => {
+            // Body is not UTF-8; do not attempt restoration. This is
+            // expected for non-text upstreams (e.g. binary tool
+            // outputs) which would not have been masked in the first
+            // place.
+            return body.clone();
+        }
+    };
+    let mut out = text.to_string();
+    let mut known_placeholders: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (_rule, placeholder, original) in pairs {
+        known_placeholders.insert(placeholder.as_str());
+        if out.contains(placeholder.as_str()) {
+            out = out.replace(placeholder.as_str(), original.as_str());
+        }
+    }
+
+    // Miss scan: any default-shape placeholder still in the output
+    // is a miss. We label the metric by the rule slug parsed out of
+    // the placeholder shape so dashboards can attribute hallucinated
+    // placeholders to specific rules.
+    for caps in placeholder_re.captures_iter(&out) {
+        // The full match did not get restored above (it would have
+        // been replaced) and was not in the known set (we already
+        // restored those). Treat as a miss.
+        let full = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+        if known_placeholders.contains(full) {
+            continue;
+        }
+        let rule = caps.get(1).map(|m| m.as_str()).unwrap_or("unknown");
+        sbproxy_observe::metrics::record_reversible_redaction_miss(rule);
+    }
+
+    bytes::Bytes::from(out)
 }
 
 /// Bundled inputs for post-dispatch budget recording on a relayed AI
@@ -2830,5 +2931,100 @@ fn prepend_system_message(body: &mut serde_json::Value, text: &str) {
         arr.insert(0, sys);
     } else if let Some(obj) = body.as_object_mut() {
         obj.insert("messages".to_string(), serde_json::json!([sys]));
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::restore_reversible_pii;
+
+    /// Empty capture short-circuits: the body comes through unchanged
+    /// and the function pays no allocation for the regex scan.
+    #[test]
+    fn empty_capture_passes_body_through() {
+        let body = bytes::Bytes::from(r#"{"reply":"hello"}"#);
+        let out = restore_reversible_pii(&body, &[]);
+        assert_eq!(out, body);
+    }
+
+    /// Single round-trip: a placeholder the request captured gets
+    /// restored to the original on the response side.
+    #[test]
+    fn single_placeholder_restored() {
+        let body =
+            bytes::Bytes::from(r#"{"reply":"hi <placeholder:email:0>, your order is ready"}"#);
+        let pairs = vec![(
+            "email".to_string(),
+            "<placeholder:email:0>".to_string(),
+            "alice@example.com".to_string(),
+        )];
+        let out = restore_reversible_pii(&body, &pairs);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("alice@example.com"));
+        assert!(!s.contains("<placeholder:email:0>"));
+    }
+
+    /// Multiple captures, all present in the response: each
+    /// placeholder is restored to its captured original.
+    #[test]
+    fn multiple_placeholders_all_restored() {
+        let body =
+            bytes::Bytes::from(r#"{"reply":"cc <placeholder:email:0> bcc <placeholder:email:1>"}"#);
+        let pairs = vec![
+            (
+                "email".to_string(),
+                "<placeholder:email:0>".to_string(),
+                "alice@example.com".to_string(),
+            ),
+            (
+                "email".to_string(),
+                "<placeholder:email:1>".to_string(),
+                "bob@example.com".to_string(),
+            ),
+        ];
+        let out = restore_reversible_pii(&body, &pairs);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("alice@example.com"));
+        assert!(s.contains("bob@example.com"));
+        assert!(!s.contains("<placeholder:email:"));
+    }
+
+    /// Hallucinated placeholder: the LLM emits a `<placeholder:...:N>`
+    /// shape the request never captured. The function leaves it in
+    /// place (caller sees the synthetic value) and the miss metric
+    /// fires. We only assert the body is unchanged for the unknown
+    /// placeholder; the metric side-effect is global state and is
+    /// covered by the metric helper's own tests.
+    #[test]
+    fn hallucinated_placeholder_is_left_in_place() {
+        let body = bytes::Bytes::from(r#"{"reply":"hi <placeholder:email:99>, see token"}"#);
+        // Pairs are non-empty (a different rule fired earlier on the
+        // request) so the function does NOT short-circuit.
+        let pairs = vec![(
+            "phone".to_string(),
+            "<placeholder:phone:0>".to_string(),
+            "555-1234".to_string(),
+        )];
+        let out = restore_reversible_pii(&body, &pairs);
+        let s = std::str::from_utf8(&out).unwrap();
+        // The captured pair was not in the body, so nothing was
+        // substituted. The hallucinated placeholder is preserved
+        // verbatim so the caller can see the synthetic value.
+        assert!(s.contains("<placeholder:email:99>"));
+    }
+
+    /// Non-UTF-8 body short-circuits (some upstreams return binary
+    /// content the request-side redactor never touched in the first
+    /// place). The body is returned unchanged.
+    #[test]
+    fn non_utf8_body_passes_through() {
+        let body = bytes::Bytes::from(vec![0xff, 0xfe, 0x00]);
+        let pairs = vec![(
+            "email".to_string(),
+            "<placeholder:email:0>".to_string(),
+            "alice@example.com".to_string(),
+        )];
+        let out = restore_reversible_pii(&body, &pairs);
+        assert_eq!(out, body);
     }
 }

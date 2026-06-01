@@ -220,6 +220,42 @@ proxy:
 
 Per-tenant and per-origin redact blocks (including PII) are a planned follow-up; today operators land all rules at the proxy scope.
 
+#### Reversible PII redaction (AI origins)
+
+Customer copilots and internal assistants need the LLM to personalise its response with the same value the user typed (the customer's name, order number, or email). A destructive redactor would replace that value with `[REDACTED:EMAIL]` on the way out, the LLM would echo the marker back, and the response would no longer feel personal. The reversible pass solves this: the request body is masked with a placeholder before forwarding upstream, the LLM responds with the placeholder echoed in its reply, and the gateway restores the original value before writing the response to the client. The original lives only in memory for the request lifetime; it is never written to access log, audit log, or trace span.
+
+Opt-in per rule via `reversible: true` on an AI origin's `pii:` block:
+
+```yaml
+origins:
+  - name: customer-copilot
+    action: ai_proxy
+    pii:
+      enabled: true
+      defaults: false
+      rules:
+        - name: email
+          pattern: '\b[a-z0-9._%+-]{1,64}@[a-z0-9.-]{1,255}\.[a-z]{2,63}\b'
+          reversible: true
+          mask_template: "<placeholder:email:%d>"
+        - name: credit_card
+          pattern: '\b\d(?:[ -]?\d){12,18}\b'
+          validator: luhn
+          reversible: false   # never restored; PCI scope
+```
+
+* `reversible: false` (default) is the destructive behaviour described above.
+* `reversible: true` records a `(placeholder, original)` pair for every match into the request context.
+* `mask_template:` defaults to `<placeholder:<rule_name>:%d>`; `%d` is substituted with a per-request, per-rule counter starting at 0 so two matches of the same rule get distinct placeholders.
+* On the response side the gateway walks the body once and replaces every recorded placeholder with the original.
+* If the LLM emits a `<placeholder:<rule>:N>` shape that the request did not capture (model hallucination or prompt-injection probe), the placeholder is left in the response and `sbproxy_ai_reversible_redaction_miss_total{rule}` is incremented. The caller sees the synthetic value verbatim.
+
+Known limitations (tracked as PR2 follow-ups under WOR-1044):
+
+* The semantic / response cache stores the masked body. A future request that cache-hits on the same prompt shape but has different captured originals would see the prior request's placeholders restored against its own map, which is not semantically correct. Disable semantic caching at the same origin when reversible rules are enabled.
+* SSE / streaming responses are not restored today; the streaming path will land token-buffering for cross-chunk placeholders in PR2.
+* The idempotency cache path does not restore yet; only `relay_ai_response_with_cache` (the primary chat-completions path) restores in PR1.
+
 Two profiles ship in Wave 1:
 
 - **`internal`** applies the denylist above. Allows `agent_id`, `tenant_id`, JA3/JA4, request paths.

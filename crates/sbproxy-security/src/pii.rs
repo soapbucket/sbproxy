@@ -39,6 +39,7 @@
 //! `[REDACTED:<NAME>]` keyed on the rule's name.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aho_corasick::AhoCorasick;
@@ -102,7 +103,7 @@ pub fn mask_ip(ip: &str) -> String {
 /// Decoded from sb.yml under `pii: { rules: [...] }`. The `name`
 /// drives the default replacement (`[REDACTED:NAME]`) when no
 /// explicit `replacement` is set.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct PiiRule {
     /// Stable rule identifier, used in the default replacement and
     /// in metrics labels.
@@ -121,6 +122,24 @@ pub struct PiiRule {
     /// the input does not contain any anchor. Skipped when absent.
     #[serde(default)]
     pub anchor: Option<String>,
+    /// WOR-1044: opt-in reversible redaction. When `true`, the
+    /// redactor records `(placeholder, original)` for every match
+    /// into the caller-supplied [`ReversibleCapture`] so the response
+    /// handler can restore the original on the way out. Has no effect
+    /// when the rule is invoked through [`PiiRedactor::redact`] or
+    /// [`PiiRedactor::redact_json`] (those throw away captures).
+    /// Defaults to `false` so today's destructive behaviour is the
+    /// safe default.
+    #[serde(default)]
+    pub reversible: bool,
+    /// WOR-1044: placeholder template for reversible rules. `%d` is
+    /// substituted with a per-request, per-rule counter so multiple
+    /// matches of the same rule get distinct placeholders. Defaults
+    /// to `<placeholder:<name>:%d>` (using the rule name) when
+    /// `reversible: true` and the template is omitted. Ignored for
+    /// non-reversible rules.
+    #[serde(default)]
+    pub mask_template: Option<String>,
 }
 
 /// Top-level PII redactor configuration as it appears in sb.yml.
@@ -203,6 +222,61 @@ pub struct CompiledRule {
     pub validator: Option<RuleValidator>,
     /// Optional anchor literal. Used by the prefilter.
     pub anchor: Option<String>,
+    /// WOR-1044: whether this rule participates in reversible
+    /// redaction. Compiled from `PiiRule::reversible`.
+    pub reversible: bool,
+    /// WOR-1044: literal placeholder template carried verbatim from
+    /// `PiiRule::mask_template`, defaulted to `<placeholder:<name>:%d>`
+    /// at compile time when the rule is reversible. `%d` is rewritten
+    /// per match; no other substitutions are performed.
+    pub mask_template: String,
+}
+
+/// WOR-1044: per-request capture of reversible redactions. The
+/// request handler builds one of these, passes it into
+/// [`PiiRedactor::redact_json_with_capture`], then hands the
+/// resulting pairs to the response handler so the original values
+/// can be restored before the body is written back to the client.
+///
+/// The capture is intentionally request-scoped: the originals never
+/// outlive a single request, so there is no global store, no TTL,
+/// and no persisted artefact (access log, audit log, trace span)
+/// ever sees them. Restoration is a single substring substitution
+/// pass over the response body.
+///
+/// Counter semantics: each reversible rule has an independent
+/// counter starting at 0; the first match of `email` produces
+/// `<placeholder:email:0>`, the second `<placeholder:email:1>`, and
+/// so on. A second rule `phone` starts its own counter at 0.
+#[derive(Debug, Default, Clone)]
+pub struct ReversibleCapture {
+    /// `(rule_name, placeholder, original)`. Order matches the order
+    /// in which the redactor encountered the matches; the response
+    /// handler can iterate it in any order because placeholders are
+    /// unique per request.
+    pub pairs: Vec<(String, String, String)>,
+    /// Per-rule next-counter index. Hidden state for the redactor;
+    /// not consulted on the response side.
+    counters: BTreeMap<String, u32>,
+}
+
+impl ReversibleCapture {
+    /// Build an empty capture for a new request.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the capture is empty (no reversible match fired). The
+    /// response handler uses this to skip the restoration pass on
+    /// the hot path when the request had nothing to mask.
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
+    /// Number of captured `(placeholder, original)` pairs.
+    pub fn len(&self) -> usize {
+        self.pairs.len()
+    }
 }
 
 /// Compiled redactor: rule set + Aho-Corasick prefilter.
@@ -393,6 +467,69 @@ impl PiiRedactor {
             Err(_) => body.to_vec(),
         }
     }
+
+    /// WOR-1044: capture-aware variant of [`Self::redact`]. Each
+    /// reversible rule records `(rule_name, placeholder, original)`
+    /// into `capture` for every match; non-reversible rules behave
+    /// identically to [`Self::redact`]. The capture is intentionally
+    /// the caller's value so the request-scoped pairs never leak
+    /// into a shared store.
+    ///
+    /// Skips the anchored-prefilter optimisation: reversible mode is
+    /// opt-in and operators only flip it on rules they actually need
+    /// restored, so running every rule unconditionally on the
+    /// capture path keeps the logic simple and the matched-text
+    /// accounting straightforward.
+    pub fn redact_with_capture<'a>(
+        &self,
+        input: &'a str,
+        capture: &mut ReversibleCapture,
+    ) -> Cow<'a, str> {
+        if self.is_empty() {
+            return Cow::Borrowed(input);
+        }
+        let mut current = Cow::Borrowed(input);
+        for rule in &self.inner.unanchored_rules {
+            current = apply_rule_with_capture(rule, current, capture);
+        }
+        for rule in &self.inner.anchored_rules {
+            current = apply_rule_with_capture(rule, current, capture);
+        }
+        current
+    }
+
+    /// WOR-1044: capture-aware variant of [`Self::redact_json`]. Walks
+    /// the value in place; every string leaf is fed through
+    /// [`Self::redact_with_capture`] so reversible rules surface
+    /// their `(placeholder, original)` pairs on `capture`.
+    pub fn redact_json_with_capture(
+        &self,
+        value: &mut serde_json::Value,
+        capture: &mut ReversibleCapture,
+    ) {
+        if self.is_empty() {
+            return;
+        }
+        match value {
+            serde_json::Value::String(s) => {
+                let redacted = self.redact_with_capture(s, capture);
+                if let Cow::Owned(new_s) = redacted {
+                    *s = new_s;
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for v in arr.iter_mut() {
+                    self.redact_json_with_capture(v, capture);
+                }
+            }
+            serde_json::Value::Object(obj) => {
+                for (_k, v) in obj.iter_mut() {
+                    self.redact_json_with_capture(v, capture);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn apply_rule<'a>(rule: &CompiledRule, input: Cow<'a, str>) -> Cow<'a, str> {
@@ -410,6 +547,49 @@ fn apply_rule<'a>(rule: &CompiledRule, input: Cow<'a, str>) -> Cow<'a, str> {
                 }
             }
             replacement.to_string()
+        });
+    match result {
+        Cow::Borrowed(_) => input,
+        Cow::Owned(s) => Cow::Owned(s),
+    }
+}
+
+/// WOR-1044: capture-aware rule application. Reversible rules
+/// generate a fresh placeholder per match (via `mask_template` with
+/// `%d` substituted to the rule's running counter on `capture`) and
+/// record the `(rule_name, placeholder, original)` triple. Non-
+/// reversible rules behave like [`apply_rule`].
+///
+/// Validator semantics match [`apply_rule`]: a `validator` set to
+/// `luhn` filters out matches that fail the checksum so a 16-digit
+/// non-card number is neither redacted nor captured.
+fn apply_rule_with_capture<'a>(
+    rule: &CompiledRule,
+    input: Cow<'a, str>,
+    capture: &mut ReversibleCapture,
+) -> Cow<'a, str> {
+    let validator = rule.validator;
+    let replacement = rule.replacement.as_str();
+    let result = rule
+        .regex
+        .replace_all(input.as_ref(), |caps: &regex::Captures| {
+            let matched = &caps[0];
+            if let Some(v) = validator {
+                if !run_validator(v, matched) {
+                    return matched.to_string();
+                }
+            }
+            if rule.reversible {
+                let counter = capture.counters.entry(rule.name.clone()).or_insert(0);
+                let placeholder = rule.mask_template.replace("%d", &counter.to_string());
+                *counter += 1;
+                capture
+                    .pairs
+                    .push((rule.name.clone(), placeholder.clone(), matched.to_string()));
+                placeholder
+            } else {
+                replacement.to_string()
+            }
         });
     match result {
         Cow::Borrowed(_) => input,
@@ -463,12 +643,22 @@ fn compile_rule(rule: &PiiRule) -> anyhow::Result<CompiledRule> {
             anyhow::bail!("PII rule '{}' has unknown validator '{}'", rule.name, other)
         }
     };
+    // WOR-1044: the placeholder template is only consulted when the
+    // rule is reversible; default to `<placeholder:<name>:%d>` so
+    // operators who flip `reversible: true` without supplying a
+    // template still get an unambiguous, restorable shape.
+    let mask_template = rule
+        .mask_template
+        .clone()
+        .unwrap_or_else(|| format!("<placeholder:{}:%d>", rule.name));
     Ok(CompiledRule {
         name: rule.name.clone(),
         regex,
         replacement,
         validator,
         anchor: rule.anchor.clone(),
+        reversible: rule.reversible,
+        mask_template,
     })
 }
 
@@ -493,6 +683,8 @@ pub fn default_rules() -> Vec<PiiRule> {
             replacement: Some("[REDACTED:EMAIL]".to_string()),
             validator: None,
             anchor: Some("@".to_string()),
+            reversible: false,
+            mask_template: None,
         },
         PiiRule {
             name: "us_ssn".to_string(),
@@ -507,6 +699,8 @@ pub fn default_rules() -> Vec<PiiRule> {
             replacement: Some("[REDACTED:SSN]".to_string()),
             validator: None,
             anchor: None,
+            reversible: false,
+            mask_template: None,
         },
         PiiRule {
             name: "credit_card".to_string(),
@@ -521,6 +715,8 @@ pub fn default_rules() -> Vec<PiiRule> {
             replacement: Some("[REDACTED:CARD]".to_string()),
             validator: Some("luhn".to_string()),
             anchor: None,
+            reversible: false,
+            mask_template: None,
         },
         PiiRule {
             name: "phone_us".to_string(),
@@ -539,6 +735,8 @@ pub fn default_rules() -> Vec<PiiRule> {
             replacement: Some("[REDACTED:PHONE]".to_string()),
             validator: None,
             anchor: None,
+            reversible: false,
+            mask_template: None,
         },
         PiiRule {
             name: "ipv4".to_string(),
@@ -547,6 +745,8 @@ pub fn default_rules() -> Vec<PiiRule> {
             replacement: Some("[REDACTED:IP]".to_string()),
             validator: None,
             anchor: None,
+            reversible: false,
+            mask_template: None,
         },
         PiiRule {
             name: "openai_key".to_string(),
@@ -554,6 +754,8 @@ pub fn default_rules() -> Vec<PiiRule> {
             replacement: Some("[REDACTED:APIKEY]".to_string()),
             validator: None,
             anchor: Some("sk-".to_string()),
+            reversible: false,
+            mask_template: None,
         },
         PiiRule {
             name: "anthropic_key".to_string(),
@@ -561,6 +763,8 @@ pub fn default_rules() -> Vec<PiiRule> {
             replacement: Some("[REDACTED:APIKEY]".to_string()),
             validator: None,
             anchor: Some("sk-ant-".to_string()),
+            reversible: false,
+            mask_template: None,
         },
         PiiRule {
             name: "aws_access".to_string(),
@@ -568,6 +772,8 @@ pub fn default_rules() -> Vec<PiiRule> {
             replacement: Some("[REDACTED:APIKEY]".to_string()),
             validator: None,
             anchor: Some("AKIA".to_string()),
+            reversible: false,
+            mask_template: None,
         },
         PiiRule {
             name: "github_token".to_string(),
@@ -575,6 +781,8 @@ pub fn default_rules() -> Vec<PiiRule> {
             replacement: Some("[REDACTED:APIKEY]".to_string()),
             validator: None,
             anchor: Some("gh".to_string()),
+            reversible: false,
+            mask_template: None,
         },
         PiiRule {
             name: "slack_token".to_string(),
@@ -586,6 +794,8 @@ pub fn default_rules() -> Vec<PiiRule> {
             replacement: Some("[REDACTED:APIKEY]".to_string()),
             validator: None,
             anchor: Some("xox".to_string()),
+            reversible: false,
+            mask_template: None,
         },
         PiiRule {
             name: "iban".to_string(),
@@ -598,6 +808,8 @@ pub fn default_rules() -> Vec<PiiRule> {
             replacement: Some("[REDACTED:IBAN]".to_string()),
             validator: None,
             anchor: None,
+            reversible: false,
+            mask_template: None,
         },
     ]
 }
@@ -830,6 +1042,8 @@ mod tests {
                 replacement: Some("[REDACTED:TICKET]".to_string()),
                 validator: None,
                 anchor: Some("TICKET".to_string()),
+                reversible: false,
+                mask_template: None,
             }],
         };
         let r = PiiRedactor::from_config(&cfg).unwrap();
@@ -850,6 +1064,8 @@ mod tests {
                 replacement: None,
                 validator: None,
                 anchor: None,
+                reversible: false,
+                mask_template: None,
             }],
         };
         let r = PiiRedactor::from_config(&cfg).unwrap();
@@ -874,6 +1090,8 @@ mod tests {
                 replacement: None,
                 validator: None,
                 anchor: None,
+                reversible: false,
+                mask_template: None,
             }],
         };
         assert!(PiiRedactor::from_config(&cfg).is_err());
@@ -892,6 +1110,8 @@ mod tests {
                 replacement: None,
                 validator: Some("not-a-validator".to_string()),
                 anchor: None,
+                reversible: false,
+                mask_template: None,
             }],
         };
         let err = PiiRedactor::from_config(&cfg).unwrap_err();
@@ -931,5 +1151,190 @@ mod tests {
         // 999.999.999.999 is not a valid IPv4 -> not redacted.
         let out = r.redact("not an ip: 999.999.999.999");
         assert!(out.contains("999.999.999.999"));
+    }
+
+    // --- WOR-1044 reversible redaction ---
+
+    fn reversible_email_redactor() -> PiiRedactor {
+        let cfg = PiiConfig {
+            enabled: true,
+            defaults: false,
+            redact_request: true,
+            redact_response: false,
+            rules: vec![PiiRule {
+                name: "email".to_string(),
+                pattern: r"(?i)\b[a-z0-9._%+\-]{1,64}@[a-z0-9.\-]{1,255}\.[a-z]{2,63}\b"
+                    .to_string(),
+                replacement: Some("[REDACTED:EMAIL]".to_string()),
+                validator: None,
+                anchor: Some("@".to_string()),
+                reversible: true,
+                mask_template: Some("<placeholder:email:%d>".to_string()),
+            }],
+        };
+        PiiRedactor::from_config(&cfg).expect("rule compiles")
+    }
+
+    /// Single reversible rule firing once on a string surfaces one
+    /// `(rule_name, placeholder, original)` triple on the capture and
+    /// rewrites the input with the templated placeholder.
+    #[test]
+    fn reversible_single_match_captures_pair() {
+        let r = reversible_email_redactor();
+        let mut cap = ReversibleCapture::new();
+        let out = r.redact_with_capture("ping alice@example.com please", &mut cap);
+        assert_eq!(out.as_ref(), "ping <placeholder:email:0> please");
+        assert_eq!(cap.len(), 1);
+        assert_eq!(cap.pairs[0].0, "email");
+        assert_eq!(cap.pairs[0].1, "<placeholder:email:0>");
+        assert_eq!(cap.pairs[0].2, "alice@example.com");
+    }
+
+    /// Multiple matches of the same reversible rule increment the
+    /// per-rule counter so each placeholder is distinct. Restoration
+    /// can replace each placeholder with its captured original.
+    #[test]
+    fn reversible_multiple_matches_advance_counter() {
+        let r = reversible_email_redactor();
+        let mut cap = ReversibleCapture::new();
+        let out = r.redact_with_capture("cc alice@example.com bcc bob@example.com end", &mut cap);
+        assert_eq!(
+            out.as_ref(),
+            "cc <placeholder:email:0> bcc <placeholder:email:1> end"
+        );
+        assert_eq!(cap.len(), 2);
+        assert_eq!(cap.pairs[0].1, "<placeholder:email:0>");
+        assert_eq!(cap.pairs[0].2, "alice@example.com");
+        assert_eq!(cap.pairs[1].1, "<placeholder:email:1>");
+        assert_eq!(cap.pairs[1].2, "bob@example.com");
+    }
+
+    /// Restoration: applying the capture pairs back to the redacted
+    /// string yields the original. The response handler's restoration
+    /// pass is a single substring substitution.
+    #[test]
+    fn reversible_capture_round_trips_via_substitution() {
+        let r = reversible_email_redactor();
+        let mut cap = ReversibleCapture::new();
+        let masked = r
+            .redact_with_capture("ping alice@example.com please", &mut cap)
+            .into_owned();
+        let mut restored = masked.clone();
+        for (_rule, placeholder, original) in &cap.pairs {
+            restored = restored.replace(placeholder, original);
+        }
+        assert_eq!(restored, "ping alice@example.com please");
+    }
+
+    /// A non-reversible rule mixed with a reversible rule: the non-
+    /// reversible rule replaces with its static `replacement` and
+    /// does not record on the capture. The reversible rule still
+    /// captures.
+    #[test]
+    fn reversible_only_captures_reversible_rules() {
+        let cfg = PiiConfig {
+            enabled: true,
+            defaults: false,
+            redact_request: true,
+            redact_response: false,
+            rules: vec![
+                PiiRule {
+                    name: "email".to_string(),
+                    pattern: r"(?i)\b[a-z0-9._%+\-]{1,64}@[a-z0-9.\-]{1,255}\.[a-z]{2,63}\b"
+                        .to_string(),
+                    replacement: Some("[REDACTED:EMAIL]".to_string()),
+                    validator: None,
+                    anchor: Some("@".to_string()),
+                    reversible: true,
+                    mask_template: Some("<placeholder:email:%d>".to_string()),
+                },
+                PiiRule {
+                    name: "ssn".to_string(),
+                    pattern: r"\b\d{3}-\d{2}-\d{4}\b".to_string(),
+                    replacement: Some("[REDACTED:SSN]".to_string()),
+                    validator: None,
+                    anchor: None,
+                    reversible: false,
+                    mask_template: None,
+                },
+            ],
+        };
+        let r = PiiRedactor::from_config(&cfg).unwrap();
+        let mut cap = ReversibleCapture::new();
+        let out = r.redact_with_capture("alice@example.com ssn 123-45-6789 end", &mut cap);
+        // Email got the placeholder; SSN got the static marker; only
+        // the email surfaces on the capture.
+        assert!(out.contains("<placeholder:email:0>"));
+        assert!(out.contains("[REDACTED:SSN]"));
+        assert_eq!(cap.len(), 1);
+        assert_eq!(cap.pairs[0].0, "email");
+        assert_eq!(cap.pairs[0].2, "alice@example.com");
+    }
+
+    /// `redact_json_with_capture` walks nested JSON and surfaces
+    /// every reversible match across leaves, while leaving non-
+    /// string nodes untouched.
+    #[test]
+    fn reversible_json_walks_nested_leaves() {
+        let r = reversible_email_redactor();
+        let mut cap = ReversibleCapture::new();
+        let mut body: serde_json::Value = serde_json::from_str(
+            r#"{
+                "messages": [
+                    {"role": "user", "content": "email me at alice@example.com"},
+                    {"role": "system", "content": "also notify bob@example.com"}
+                ],
+                "temperature": 0.7
+            }"#,
+        )
+        .unwrap();
+        r.redact_json_with_capture(&mut body, &mut cap);
+        let rendered = body.to_string();
+        assert!(rendered.contains("<placeholder:email:0>"));
+        assert!(rendered.contains("<placeholder:email:1>"));
+        assert!(!rendered.contains("alice@example.com"));
+        assert!(!rendered.contains("bob@example.com"));
+        // temperature is numeric -> untouched.
+        assert!(rendered.contains("0.7"));
+        assert_eq!(cap.len(), 2);
+    }
+
+    /// An empty capture short-circuits restoration on the response
+    /// side; the response handler skips the pass entirely.
+    #[test]
+    fn reversible_capture_is_empty_when_nothing_matches() {
+        let r = reversible_email_redactor();
+        let mut cap = ReversibleCapture::new();
+        let out = r.redact_with_capture("no email here", &mut cap);
+        assert_eq!(out.as_ref(), "no email here");
+        assert!(cap.is_empty());
+    }
+
+    /// The Luhn validator still gates reversible rules: a 16-digit
+    /// non-card value (e.g. an order ID) is neither redacted nor
+    /// captured.
+    #[test]
+    fn reversible_respects_validator_gate() {
+        let cfg = PiiConfig {
+            enabled: true,
+            defaults: false,
+            redact_request: true,
+            redact_response: false,
+            rules: vec![PiiRule {
+                name: "card".to_string(),
+                pattern: r"\b\d(?:[ -]?\d){12,18}\b".to_string(),
+                replacement: Some("[REDACTED:CARD]".to_string()),
+                validator: Some("luhn".to_string()),
+                anchor: None,
+                reversible: true,
+                mask_template: Some("<placeholder:card:%d>".to_string()),
+            }],
+        };
+        let r = PiiRedactor::from_config(&cfg).unwrap();
+        let mut cap = ReversibleCapture::new();
+        // 1234... fails Luhn -> rule must NOT fire.
+        let out = r.redact_with_capture("order 1234567812345678 done", &mut cap);
+        assert!(out.contains("1234567812345678"));
+        assert!(cap.is_empty());
     }
 }
