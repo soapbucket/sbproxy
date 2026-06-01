@@ -30,6 +30,7 @@
 
 pub mod callback;
 pub mod discovery;
+pub mod kv_store;
 pub mod logout;
 pub mod pkce;
 pub mod refresh;
