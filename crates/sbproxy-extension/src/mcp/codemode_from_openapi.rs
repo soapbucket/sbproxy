@@ -95,6 +95,10 @@ pub fn openapi_to_federated_tools(spec: &serde_json::Value) -> Vec<FederatedTool
             input_schema,
             server_name: OPENAPI_SOURCE_NAME.to_string(),
             streaming,
+            // OpenAPI-sourced tools never carry SEP-1865 UI
+            // metadata; the field is filled when the federation
+            // pulls from an Apps-SDK MCP server.
+            meta: None,
         });
     }
     // Sort lexicographically for reproducible output, mirroring the

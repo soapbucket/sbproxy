@@ -76,6 +76,35 @@ pub struct FederatedTool {
     /// extension, or an `outputContentType` of `text/event-stream` or
     /// `application/x-ndjson`.
     pub streaming: bool,
+    /// WOR-818: opaque `_meta` block per the OpenAI Apps SDK /
+    /// MCP Apps (SEP-1865) extension. Preserved verbatim from the
+    /// upstream so an Apps-SDK client receives any vendor-specific
+    /// UI template id, version, etag, or audit-cause field unchanged.
+    /// Base-MCP clients ignore the unknown key per the spec.
+    pub meta: Option<serde_json::Value>,
+}
+
+/// A resource federated from an upstream MCP server. Mirrors
+/// [`FederatedTool`] but for the `resources/list` + `resources/read`
+/// surface, which Apps-SDK / SEP-1865 clients use to fetch UI
+/// templates declared on tools.
+#[derive(Debug, Clone)]
+pub struct FederatedResource {
+    /// Resource URI (may be prefixed with server name on conflict).
+    pub uri: String,
+    /// Display name shown to clients.
+    pub name: String,
+    /// Optional description.
+    pub description: Option<String>,
+    /// Optional IANA mime type.
+    pub mime_type: Option<String>,
+    /// Name of the upstream server that owns this resource.
+    pub server_name: String,
+    /// Original upstream URI (pre-prefix) so the gateway can
+    /// forward `resources/read` to the right server with the URI
+    /// the upstream advertised. Equal to `uri` when no collision
+    /// triggered the prefix.
+    pub upstream_uri: String,
 }
 
 // --- McpFederation ---
@@ -85,6 +114,15 @@ pub struct McpFederation {
     servers: Vec<McpServerConfig>,
     /// tool_name -> FederatedTool
     tools: ArcSwap<HashMap<String, FederatedTool>>,
+    /// resource_uri -> FederatedResource. WOR-818: populated by
+    /// `refresh_resources` so OpenAI Apps SDK clients can fetch
+    /// UI templates declared on tools through the gateway.
+    resources: ArcSwap<HashMap<String, FederatedResource>>,
+    /// WOR-818: mcpApps capability values mirrored from any
+    /// upstream that advertised one. Empty when no upstream
+    /// supports SEP-1865. The first non-empty value is what the
+    /// gateway re-advertises on its own `initialize`.
+    mcp_apps_capability: ArcSwap<Option<serde_json::Value>>,
     client: reqwest::Client,
 }
 
@@ -94,6 +132,8 @@ impl McpFederation {
         Self {
             servers,
             tools: ArcSwap::from_pointee(HashMap::new()),
+            resources: ArcSwap::from_pointee(HashMap::new()),
+            mcp_apps_capability: ArcSwap::from_pointee(None),
             client: reqwest::Client::new(),
         }
     }
@@ -189,12 +229,14 @@ impl McpFederation {
                     .cloned()
                     .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
                 let streaming = tool_advertises_streaming(&t);
+                let meta = t.get("_meta").cloned();
                 Some(FederatedTool {
                     name,
                     description,
                     input_schema,
                     server_name: server.name.clone(),
                     streaming,
+                    meta,
                 })
             })
             .collect();
@@ -210,6 +252,210 @@ impl McpFederation {
     /// List all federated tools.
     pub fn list_tools(&self) -> Vec<FederatedTool> {
         self.tools.load().values().cloned().collect()
+    }
+
+    /// WOR-818: fetch the `mcpApps` capability mirrored from the
+    /// upstream initialize fan-out. None when no upstream has
+    /// advertised SEP-1865 yet. The gateway re-advertises whatever
+    /// shape it gets so vendor-specific sub-keys reach the client.
+    pub fn mcp_apps_capability(&self) -> Option<serde_json::Value> {
+        self.mcp_apps_capability.load().as_ref().clone()
+    }
+
+    /// List all federated resources.
+    pub fn list_resources(&self) -> Vec<FederatedResource> {
+        self.resources.load().values().cloned().collect()
+    }
+
+    /// Look up which server owns a resource URI.
+    pub fn resolve_resource(&self, uri: &str) -> Option<FederatedResource> {
+        self.resources.load().get(uri).cloned()
+    }
+
+    /// WOR-818: fetch resource lists from every server plus any
+    /// `mcpApps` capability they advertise during `initialize`. The
+    /// resource registry mirrors the tool registry: server-name
+    /// prefix on URI collisions, ArcSwap publishing for the hot
+    /// `resources/list` path.
+    ///
+    /// Returns the total resource count. Per-server failures log
+    /// and continue; one bad upstream does not blank the registry
+    /// (same policy as `refresh_tools`).
+    pub async fn refresh_resources(&self) -> anyhow::Result<usize> {
+        let mut registry: HashMap<String, FederatedResource> = HashMap::new();
+        let mut apps_cap: Option<serde_json::Value> = None;
+
+        for server in &self.servers {
+            // Pull capabilities first so we always know whether the
+            // server speaks SEP-1865, even when its resources/list
+            // is empty.
+            if apps_cap.is_none() {
+                if let Ok(Some(cap)) = self.fetch_mcp_apps_capability(server).await {
+                    apps_cap = Some(cap);
+                }
+            }
+            match self.fetch_resources_from_server(server).await {
+                Ok(resources) => {
+                    info!(
+                        server = %server.name,
+                        count = resources.len(),
+                        "fetched resources from upstream MCP server"
+                    );
+                    for resource in resources {
+                        let key = if registry.contains_key(&resource.uri) {
+                            warn!(
+                                uri = %resource.uri,
+                                server = %server.name,
+                                "resource uri collision, using prefixed key"
+                            );
+                            format!("{}/{}", server.name, resource.uri)
+                        } else {
+                            resource.uri.clone()
+                        };
+                        registry.insert(key, resource);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        server = %server.name,
+                        error = %e,
+                        "failed to fetch resources from upstream MCP server"
+                    );
+                }
+            }
+        }
+
+        let count = registry.len();
+        self.resources.store(Arc::new(registry));
+        self.mcp_apps_capability.store(Arc::new(apps_cap));
+        debug!(
+            total_resources = count,
+            "MCP federation resources refreshed"
+        );
+        Ok(count)
+    }
+
+    /// Initialize the upstream and extract its `mcpApps` capability,
+    /// if any. Returns Ok(None) for upstreams that complete
+    /// initialize but do not advertise SEP-1865.
+    async fn fetch_mcp_apps_capability(
+        &self,
+        server: &McpServerConfig,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "initialize".to_string(),
+            params: Some(json!({
+                "protocolVersion": "2025-06-18",
+                "clientInfo": { "name": "sbproxy", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": {},
+            })),
+            id: Some(json!(1)),
+        };
+        let resp = self.dispatch_request(server, &req).await?;
+        if let Some(err) = resp.error {
+            anyhow::bail!(
+                "initialize error from {}: {} (code {})",
+                server.name,
+                err.message,
+                err.code
+            );
+        }
+        let result = resp.result.unwrap_or_default();
+        Ok(result
+            .get("capabilities")
+            .and_then(|c| c.get("mcpApps"))
+            .cloned())
+    }
+
+    /// Fetch the resource list from one upstream server. Pure
+    /// pass-through: the gateway does not validate URI shape, mime
+    /// type, or template metadata here.
+    async fn fetch_resources_from_server(
+        &self,
+        server: &McpServerConfig,
+    ) -> anyhow::Result<Vec<FederatedResource>> {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "resources/list".to_string(),
+            params: None,
+            id: Some(json!(1)),
+        };
+        let resp = self.dispatch_request(server, &req).await?;
+        if let Some(err) = resp.error {
+            anyhow::bail!(
+                "resources/list error from {}: {} (code {})",
+                server.name,
+                err.message,
+                err.code
+            );
+        }
+        let result = resp.result.unwrap_or_default();
+        let list = result.get("resources").cloned().unwrap_or_default();
+        let defs: Vec<serde_json::Value> = serde_json::from_value(list).unwrap_or_default();
+        let federated = defs
+            .into_iter()
+            .filter_map(|r| {
+                let uri = r.get("uri")?.as_str()?.to_string();
+                let name = r
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&uri)
+                    .to_string();
+                let description = r
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let mime_type = r.get("mimeType").and_then(|v| v.as_str()).map(String::from);
+                Some(FederatedResource {
+                    uri: uri.clone(),
+                    upstream_uri: uri,
+                    name,
+                    description,
+                    mime_type,
+                    server_name: server.name.clone(),
+                })
+            })
+            .collect();
+        Ok(federated)
+    }
+
+    /// Read a resource through the federation. Routes to the
+    /// correct upstream server based on the URI; the upstream
+    /// receives the original (pre-prefix) URI it advertised so
+    /// vendor servers do not have to know about the gateway's
+    /// collision-avoidance scheme.
+    pub async fn read_resource(&self, uri: &str) -> anyhow::Result<serde_json::Value> {
+        let resource = self
+            .resolve_resource(uri)
+            .ok_or_else(|| anyhow::anyhow!("unknown resource uri: {uri}"))?;
+        let server = self
+            .servers
+            .iter()
+            .find(|s| s.name == resource.server_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "resource {} maps to unknown server {}",
+                    uri,
+                    resource.server_name
+                )
+            })?;
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "resources/read".to_string(),
+            params: Some(json!({ "uri": resource.upstream_uri })),
+            id: Some(json!(1)),
+        };
+        let resp = self.dispatch_request(server, &req).await?;
+        if let Some(err) = resp.error {
+            anyhow::bail!(
+                "resources/read error from {}: {} (code {})",
+                server.name,
+                err.message,
+                err.code
+            );
+        }
+        Ok(resp.result.unwrap_or_default())
     }
 
     /// Emit a Cloudflare-Code-Mode-compatible TypeScript
@@ -527,7 +773,86 @@ mod tests {
             input_schema: json!({"type": "object", "properties": {}}),
             server_name: server.to_string(),
             streaming: false,
+            meta: None,
         }
+    }
+
+    // --- WOR-818 OpenAI Apps SDK / SEP-1865 ---
+
+    fn make_apps_resource(uri: &str, server: &str) -> FederatedResource {
+        FederatedResource {
+            uri: uri.to_string(),
+            upstream_uri: uri.to_string(),
+            name: format!("Resource {uri}"),
+            description: Some("UI template".to_string()),
+            mime_type: Some("text/html".to_string()),
+            server_name: server.to_string(),
+        }
+    }
+
+    #[test]
+    fn wor_818_federated_resource_lookup_round_trips() {
+        let fed = McpFederation::new(vec![mock_server("ui", "http://ui.test")]);
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "ui://widgets/checkout".to_string(),
+            make_apps_resource("ui://widgets/checkout", "ui"),
+        );
+        fed.resources.store(std::sync::Arc::new(map));
+
+        let resolved = fed.resolve_resource("ui://widgets/checkout").unwrap();
+        assert_eq!(resolved.server_name, "ui");
+        assert_eq!(resolved.upstream_uri, "ui://widgets/checkout");
+        assert_eq!(fed.list_resources().len(), 1);
+    }
+
+    #[test]
+    fn wor_818_resolve_unknown_resource_is_none() {
+        let fed = McpFederation::new(vec![]);
+        assert!(fed.resolve_resource("ui://missing").is_none());
+    }
+
+    #[test]
+    fn wor_818_mcp_apps_capability_starts_unset() {
+        let fed = McpFederation::new(vec![]);
+        assert!(fed.mcp_apps_capability().is_none());
+    }
+
+    #[test]
+    fn wor_818_mcp_apps_capability_round_trips_through_arc_swap() {
+        let fed = McpFederation::new(vec![]);
+        fed.mcp_apps_capability
+            .store(std::sync::Arc::new(Some(json!({"templates": ["card"]}))));
+        let cap = fed.mcp_apps_capability().unwrap();
+        assert_eq!(cap["templates"][0], "card");
+    }
+
+    #[test]
+    fn wor_818_meta_field_round_trips_on_federated_tool() {
+        // Pin that the _meta block survives the FederatedTool clone
+        // path; this is the field used by the apps-sdk dispatcher to
+        // re-emit unchanged.
+        let mut t = make_tool("widget", "ui");
+        t.meta = Some(json!({"openai/widget": {"templateId": "card", "version": 2}}));
+        let cloned = t.clone();
+        assert_eq!(cloned.meta.unwrap()["openai/widget"]["templateId"], "card");
+    }
+
+    #[test]
+    fn wor_818_read_resource_routes_to_upstream_uri() {
+        // When the URI collided with another server during refresh,
+        // the gateway prefixes the registry key but the upstream still
+        // receives its original URI. Pin that behaviour.
+        let fed = McpFederation::new(vec![mock_server("ui", "http://ui.test")]);
+        let mut map = std::collections::HashMap::new();
+        // Registry key (prefixed); upstream sees the bare URI.
+        let mut r = make_apps_resource("ui://shared/card", "ui");
+        r.upstream_uri = "card".to_string();
+        map.insert("ui/ui://shared/card".to_string(), r);
+        fed.resources.store(std::sync::Arc::new(map));
+
+        let resolved = fed.resolve_resource("ui/ui://shared/card").unwrap();
+        assert_eq!(resolved.upstream_uri, "card");
     }
 
     // --- Federation construction ---
@@ -582,6 +907,7 @@ mod tests {
                 }),
                 server_name: "docs".to_string(),
                 streaming: false,
+                meta: None,
             },
         );
         map.insert(
@@ -599,6 +925,7 @@ mod tests {
                 }),
                 server_name: "gh".to_string(),
                 streaming: false,
+                meta: None,
             },
         );
         fed.tools.store(Arc::new(map));
@@ -653,6 +980,7 @@ mod tests {
             input_schema: json!({"type": "object", "properties": {"query": {"type": "string"}}}),
             server_name: "web_server".to_string(),
             streaming: false,
+            meta: None,
         };
         assert_eq!(tool.name, "search");
         assert_eq!(tool.server_name, "web_server");

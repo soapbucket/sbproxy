@@ -99,6 +99,15 @@ pub struct Tool {
     /// Optional behavioural hints exposed to the client.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<ToolAnnotations>,
+    /// Opaque `_meta` block per the OpenAI Apps SDK / MCP Apps
+    /// (SEP-1865) extension. When an upstream advertises a tool
+    /// with a UI template id and version under `_meta`, the
+    /// gateway preserves the entire JSON value verbatim so an
+    /// Apps-SDK client receives the field unchanged. Base-MCP
+    /// clients ignore the unknown key per the MCP spec, so the
+    /// graceful-degradation contract is automatic.
+    #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
 }
 
 /// Optional hints about tool behavior.
@@ -193,14 +202,24 @@ pub struct ServerCapabilities {
     /// Capability descriptor for prompt methods, when supported.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompts: Option<serde_json::Value>,
-    /// Experimental, non-stable capability descriptors. WOR-195 uses
-    /// this slot to advertise an Agent Skills v0.2.0 manifest URL via
-    /// the `agentSkillsUrl` key, so MCP clients that have learned how
-    /// to fetch and verify the manifest can discover skills without
-    /// out-of-band configuration. Omitted when the origin does not
-    /// configure `agent_skills`.
+    /// Experimental, non-stable capability descriptors. The Agent
+    /// Skills v0.2.0 wiring uses this slot to advertise a manifest
+    /// URL via the `agentSkillsUrl` key, so MCP clients that have
+    /// learned how to fetch and verify the manifest can discover
+    /// skills without out-of-band configuration. Omitted when the
+    /// origin does not configure `agent_skills`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<serde_json::Value>,
+    /// OpenAI Apps SDK / MCP Apps (SEP-1865) capability. Advertised
+    /// (mirrored from any upstream that exposes it) so Apps-SDK
+    /// clients know to look for UI templates on tools and to read
+    /// resources via `resources/list` + `resources/read`. The exact
+    /// JSON shape of this object is opaque to the gateway today: we
+    /// pass through whatever the upstream sent so a vendor-specific
+    /// sub-key (template ids, cache hints) reaches the client
+    /// unchanged. Absent when no upstream advertises it.
+    #[serde(default, rename = "mcpApps", skip_serializing_if = "Option::is_none")]
+    pub mcp_apps: Option<serde_json::Value>,
 }
 
 /// "initialize" response result body.
