@@ -1792,6 +1792,88 @@ pub fn record_plugin_init(
         .observe(duration_secs);
 }
 
+// --- TLS / ACME / OCSP metrics ------------------------------------------
+//
+// The TLS subsystem ran without any sbproxy_* metric until this PR.
+// An expired ACME account or a stale OCSP staple was invisible until
+// handshake failures started surfacing. These families let an
+// operator alert before the first user-visible 5xx.
+//
+// `result` labels are all closed enums.
+
+/// Record an ACME certificate renewal outcome on
+/// `sbproxy_acme_renewals_total{result}` and its matching duration
+/// histogram. `result` is one of `ok`, `http_error`, `order_invalid`,
+/// `account_invalid`, `rate_limited`, `other`. Buckets cover 100ms
+/// through 5 minutes, matching the ACME poll-and-finalise envelope.
+pub fn record_acme_renewal(result: &'static str, duration_secs: f64) {
+    use prometheus::{
+        register_histogram_vec, register_int_counter_vec, HistogramVec, IntCounterVec,
+    };
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_acme_renewals_total",
+            "ACME certificate renewal attempts, by outcome",
+            &["result"],
+        )
+        .expect("acme renewal counter registers")
+    });
+    let hist = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_acme_renewal_duration_seconds",
+            "ACME renewal full-flow duration, by outcome",
+            &["result"],
+            vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0],
+        )
+        .expect("acme renewal duration histogram registers")
+    });
+    counter.with_label_values(&[result]).inc();
+    hist.with_label_values(&[result]).observe(duration_secs);
+}
+
+/// Record an OCSP fetch outcome on
+/// `sbproxy_ocsp_fetch_total{result}`. `result` is one of `ok`,
+/// `http_error`, `parse_error`, `unknown_status`, `no_responder`.
+pub fn record_ocsp_fetch(result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_ocsp_fetch_total",
+            "OCSP fetch attempts, by outcome",
+            &["result"],
+        )
+        .expect("ocsp fetch counter registers")
+    });
+    counter.with_label_values(&[result]).inc();
+}
+
+/// Record the seconds-until-expiry for the active certificate of
+/// `host` on `sbproxy_cert_expiry_seconds{host}`. Negative values
+/// indicate the cert has already expired. `host` is sanitised so the
+/// label space stays bounded.
+pub fn record_cert_expiry(host: &str, seconds_until_expiry: f64) {
+    use prometheus::{register_gauge_vec, GaugeVec};
+    use std::sync::OnceLock;
+    static G: OnceLock<GaugeVec> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_gauge_vec!(
+            "sbproxy_cert_expiry_seconds",
+            "Seconds until the active certificate for the host expires; negative when expired",
+            &["host"],
+        )
+        .expect("cert expiry gauge registers")
+    });
+    let host = sanitize_label("host", host);
+    gauge
+        .with_label_values(&[host.as_str()])
+        .set(seconds_until_expiry);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2631,6 +2713,65 @@ mod tests {
             assert!(
                 out.contains(&format!("result=\"{result}\"")),
                 "result={result} label missing"
+            );
+        }
+    }
+
+    // --- TLS / ACME / OCSP ---
+
+    #[test]
+    fn record_acme_renewal_emits_counter_and_histogram() {
+        record_acme_renewal("ok", 12.4);
+        record_acme_renewal("http_error", 2.0);
+        record_acme_renewal("rate_limited", 0.5);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_acme_renewals_total"),
+            "acme renewal counter missing"
+        );
+        assert!(
+            out.contains("sbproxy_acme_renewal_duration_seconds_bucket"),
+            "acme renewal duration buckets missing"
+        );
+        for result in ["ok", "http_error", "rate_limited"] {
+            assert!(
+                out.contains(&format!("result=\"{result}\"")),
+                "result={result} label missing"
+            );
+        }
+    }
+
+    #[test]
+    fn record_ocsp_fetch_emits_counter() {
+        record_ocsp_fetch("ok");
+        record_ocsp_fetch("parse_error");
+        record_ocsp_fetch("no_responder");
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_ocsp_fetch_total"),
+            "ocsp fetch counter missing"
+        );
+        for result in ["ok", "parse_error", "no_responder"] {
+            assert!(
+                out.contains(&format!("result=\"{result}\"")),
+                "result={result} label missing"
+            );
+        }
+    }
+
+    #[test]
+    fn record_cert_expiry_emits_gauge() {
+        record_cert_expiry("api.example.com", 7.0 * 86_400.0);
+        record_cert_expiry("static.example.com", -100.0);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_cert_expiry_seconds"),
+            "cert expiry gauge missing"
+        );
+        for host in ["api.example.com", "static.example.com"] {
+            assert!(
+                out.contains(&format!("host=\"{host}\"")),
+                "host={host} label missing"
             );
         }
     }
