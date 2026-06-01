@@ -27,7 +27,7 @@ Each `sb.yml` opens with a comment block listing the curl commands to drive it.
 ## Catalog
 
 Auto-generated index of every example. Each row links to the example's
-directory (with its `sb.yml` and README). Generated from `examples/` on 2026-05-10; the 15 entries below the original alphabetical block were appended on 2026-05-31 to cover examples that landed after the original sweep.
+directory (with its `sb.yml` and README). Generated from `examples/` on 2026-05-10; the 19 entries below the original alphabetical block were appended on 2026-05-31 to cover examples that landed after the original sweep (15 backfilled, then 4 added the same day: `object-authz`, `content-digest`, `agent-budget`, `web-bot-auth-publish`).
 
 | Example | Description |
 |---|---|
@@ -150,5 +150,9 @@ directory (with its `sb.yml` and README). Generated from `examples/` on 2026-05-
 | [problem-details](problem-details/) | The origin on `api.local` is protected by API key authentication. The `problem_details` middleware reshapes the proxy's error responses to RFC 9457 Pr |
 | [rail-lightning](rail-lightning/) | Lightning rail in the `Accept-Payment` negotiation contract alongside the existing on-chain L1 rails. Demonstrates the LNURL-pay quote flow, the BOLT- |
 | [semantic-constraint](semantic-constraint/) | A natural-language policy enforced by an LLM-as-judge backend. The `semantic_constraint` policy renders a prompt template against the request envelope |
+| [object-authz](object-authz/) | Demonstrates the `object_authz` policy. The gateway enforces a declarative ownership rule (`{owner}` path segment must equal the JWT `sub`) so a request for one tenant's data signed |
+| [content-digest](content-digest/) | Demonstrates the `content_digest` policy on a webhook receiver. The proxy hashes every inbound body and compares the result to the `Content-Digest:` header the sender supplied. Mismatch |
+| [agent-budget](agent-budget/) | Demonstrates the `agent_budget` policy. Per-agent rate-limit primitive keyed on the resolved `agent_id` (from the agent-class resolver). One bucket per named agent collapses |
+| [web-bot-auth-publish](web-bot-auth-publish/) | Demonstrates the `web_bot_auth_publish` per-origin config. SBproxy serves its own JWKS-shaped signing-key directory at `/.well-known/http-message-signatures-directory` and a Signature Agent |
 
-_119 examples on disk._
+_123 examples on disk._
