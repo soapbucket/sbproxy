@@ -92,9 +92,9 @@ pub fn compile_auth(config: &serde_json::Value) -> Result<Auth> {
         "cap" => Ok(Auth::Cap(crate::auth::cap::CapVerifier::from_config(
             config.clone(),
         )?)),
-        "oidc" => Ok(Auth::Oidc(crate::auth::oidc::OidcAuth::from_config(
-            config.clone(),
-        )?)),
+        "oidc" => Ok(Auth::Oidc(Box::new(
+            crate::auth::oidc::OidcAuth::from_config(config.clone())?,
+        ))),
         "noop" => Ok(Auth::Noop),
         other => {
             if let Some(result) = sbproxy_plugin::build_auth_plugin(other, config.clone()) {

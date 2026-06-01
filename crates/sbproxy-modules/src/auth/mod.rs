@@ -98,8 +98,12 @@ pub enum Auth {
     /// validates the ID token, and mints a sealed session cookie.
     /// WOR-892 PR1 step 2/3 ships the types + helpers; step 3/3
     /// wires the `/oidc/callback` synthetic endpoint + challenge
-    /// redirect.
-    Oidc(crate::auth::oidc::OidcAuth),
+    /// redirect. Boxed so the `Auth` enum stays the size of the
+    /// smaller variants — the OIDC config has grown a lot of
+    /// optional URLs (logout, end-session, userinfo, allowlist) and
+    /// inline storage would force every other Auth variant to carry
+    /// the same footprint.
+    Oidc(Box<crate::auth::oidc::OidcAuth>),
     /// No authentication required.
     Noop,
     /// Third-party plugin (only case using dynamic dispatch).

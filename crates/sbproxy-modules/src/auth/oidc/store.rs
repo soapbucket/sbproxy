@@ -180,6 +180,7 @@ mod tests {
             aud: "sbproxy".to_string(),
             iat,
             exp: iat + 3600,
+            trust_headers: Vec::new(),
         }
     }
 

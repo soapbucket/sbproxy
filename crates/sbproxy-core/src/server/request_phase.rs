@@ -4247,6 +4247,52 @@ async fn handle_oidc_callback(
         return Ok(());
     }
 
+    // --- optional userinfo fetch + trust-header projection ---
+    //
+    // When the operator configured `userinfo_endpoint` AND the
+    // token response carried an `access_token`, call the OP for the
+    // verified claims (email + groups + preferred_username), then
+    // project to `X-Auth-*` trust headers per
+    // `userinfo::trust_headers_from_claims`. Failure to fetch
+    // userinfo is logged but NOT fatal: the session still mints with
+    // only the ID-token-derived projection. This matches the OIDC
+    // spec's stance that userinfo is auxiliary, not required for
+    // session establishment.
+    let mut trust_headers: Vec<(String, String)> = Vec::new();
+    if let Some(uinfo_url) = cfg.userinfo_endpoint.as_deref() {
+        if let Some(access_token) = parse_access_token_from_response(&body) {
+            let auth_header =
+                sbproxy_modules::auth::oidc::userinfo::build_userinfo_authorization_header(
+                    &access_token,
+                );
+            let userinfo_result = async_client
+                .get(uinfo_url)
+                .header("authorization", auth_header)
+                .send()
+                .await;
+            match userinfo_result {
+                Ok(resp) if resp.status().is_success() => match resp.text().await {
+                    Ok(uinfo_body) => {
+                        match sbproxy_modules::auth::oidc::userinfo::parse_userinfo(&uinfo_body) {
+                            Ok(claims) => {
+                                trust_headers = sbproxy_modules::auth::oidc::userinfo::trust_headers_from_claims(&claims)
+                                .into_iter()
+                                .map(|(k, v)| (k.to_string(), v))
+                                .collect();
+                            }
+                            Err(e) => warn!(error = %e, "oidc callback: userinfo parse failed"),
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "oidc callback: userinfo body read failed"),
+                },
+                Ok(resp) => warn!(status = %resp.status(), "oidc callback: userinfo non-2xx"),
+                Err(e) => warn!(error = %e, "oidc callback: userinfo request failed"),
+            }
+        } else {
+            warn!("oidc callback: userinfo configured but token response had no access_token");
+        }
+    }
+
     // --- mint the session cookie ---
     let session_claims = oidc_session::SessionClaims {
         sub: id_claims.sub.clone(),
@@ -4254,6 +4300,7 @@ async fn handle_oidc_callback(
         aud: cfg.client_id.clone(),
         iat: now,
         exp: now + cfg.session_ttl_secs,
+        trust_headers,
     };
     let sealed_session =
         match oidc_session::seal_session(&session_claims, cfg.cookie_secret.as_bytes()) {
@@ -4393,6 +4440,16 @@ fn read_request_cookie(session: &pingora_proxy::Session, name: &str) -> Option<S
 fn parse_id_token_from_response(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     v.get("id_token").and_then(|t| t.as_str()).map(String::from)
+}
+
+/// Extract `access_token` from an RFC 6749 §5.1 token response body.
+/// Used by the userinfo follow-up: the OP requires this token in the
+/// `Authorization: Bearer` header on the userinfo GET.
+fn parse_access_token_from_response(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("access_token")
+        .and_then(|t| t.as_str())
+        .map(String::from)
 }
 
 #[cfg(test)]
