@@ -12,9 +12,9 @@ SBproxy is a reverse proxy and AI gateway shipped as a single binary, built on C
 
 Core capabilities:
 - Reverse proxy with hot reload, path routing, and forward rules
-- AI gateway with 20+ native provider integrations (route through OpenRouter for 200+ models), model routing, and budget enforcement
+- AI gateway with 43 native provider integrations (route through OpenRouter for 200+ models), model routing, and budget enforcement
 - Load balancer with multiple algorithms, health checks, and circuit breakers
-- 7 authentication methods, 10 security policies, 19 response transforms
+- 7 authentication methods, 10 security policies, 25 response transforms
 - CEL, Lua, JavaScript, and WASM scripting for custom logic
 - MCP server for AI agent tool use
 
@@ -35,8 +35,7 @@ docker pull ghcr.io/soapbucket/sbproxy:latest
 ```bash
 make run CONFIG=sb.yml           # Convenience runner
 sbproxy serve -f sb.yml          # Start from config file
-sbproxy serve -d ./configs/      # Start from config directory
-sbproxy validate -c sb.yml       # Validate config without starting
+sbproxy validate --config sb.yml # Validate config without starting
 sbproxy version                  # Show version
 ```
 
@@ -1090,7 +1089,7 @@ window if write-after-read freshness matters.
 
 ## 8. Content transforms
 
-Transforms modify request or response bodies. Multiple transforms run in order. SBproxy ships nineteen transform types; the common ones are documented here.
+Transforms modify request or response bodies. Multiple transforms run in order. SBproxy ships 25 transform types; the common ones are documented here.
 
 ### JSON field filtering
 
@@ -1456,26 +1455,28 @@ curl http://localhost:9090/metrics
 
 Metrics exported:
 
+A representative slice of the catalog appears below. The canonical, exhaustive reference (with label sets and stability promises) is [metrics-stability.md](./metrics-stability.md); do not derive label cardinality from this table.
+
 | Metric | Type | Description |
 |---|---|---|
 | `sbproxy_requests_total` | counter | Total requests by origin, method, status |
-| `sbproxy_request_duration_seconds` | histogram | Request latency |
+| `sbproxy_request_duration_seconds` | histogram | End-to-end request latency |
 | `sbproxy_active_connections` | gauge | Active connections by protocol |
-| `sbproxy_upstream_requests_total` | counter | Requests forwarded to upstreams |
-| `sbproxy_upstream_duration_seconds` | histogram | Upstream response latency |
-| `sbproxy_cache_hits_total` | counter | Cache hit count |
-| `sbproxy_cache_misses_total` | counter | Cache miss count |
-| `sbproxy_rate_limit_total` | counter | Rate limited request count |
-| `sbproxy_waf_blocks_total` | counter | WAF-blocked request count |
-| `sbproxy_ai_tokens_in_total` | counter | AI input token count |
-| `sbproxy_ai_tokens_out_total` | counter | AI output token count |
-| `sbproxy_ai_cost_usd_total` | counter | AI spend in USD |
+| `sbproxy_bytes_total` | counter | Bytes transferred, partitioned by direction |
+| `sbproxy_auth_results_total` | counter | Auth decisions by provider and outcome |
+| `sbproxy_policy_triggers_total` | counter | Policy triggers by type and action (covers WAF blocks, rate-limit triggers, etc.) |
+| `sbproxy_cache_results_total` | counter | Cache outcomes (hit, miss, stale, bypass) |
+| `sbproxy_circuit_breaker_transitions_total` | counter | Circuit-breaker state transitions per upstream |
+| `sbproxy_ai_requests_total` | counter | AI gateway requests by provider and model |
+| `sbproxy_ai_tokens_total` | counter | AI tokens by direction (input/output) |
+| `sbproxy_ai_cost_dollars_total` | counter | AI spend in USD |
+| `sbproxy_ai_ttft_seconds` | histogram | Time to first AI token, by provider |
 
 ### Structured logging
 
-SBproxy emits structured JSON logs to stderr. Set `SBPROXY_LOG_LEVEL` to control verbosity (`debug`, `info`, `warn`, `error`).
+SBproxy emits structured JSON logs to stderr. Verbosity is controlled (in precedence order) by the `--log-level` flag, the `SB_LOG_LEVEL` environment variable, or the `RUST_LOG` environment variable. Default is `info`. Accepted values: `trace`, `debug`, `info`, `warn`, `error`.
 
-Log output includes: `time`, `level`, `msg`, `origin`, `method`, `path`, `status`, `duration_ms`, `remote_addr`, `request_id`.
+Each access log line carries: `timestamp`, `level`, `msg`, `origin`, `method`, `path`, `status`, `latency_ms`, `client_ip`, `request_id`, `trace_id`, `cache_result`. The canonical access-log schema (with optional fields and stability rules) is [access-log.md](./access-log.md).
 
 ### Request envelope: properties, sessions, users
 
