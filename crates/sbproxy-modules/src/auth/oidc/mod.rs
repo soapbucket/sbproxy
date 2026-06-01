@@ -32,6 +32,7 @@ pub mod callback;
 pub mod discovery;
 pub mod pkce;
 pub mod session;
+pub mod userinfo;
 
 use serde::Deserialize;
 
