@@ -82,3 +82,13 @@ serde_json.workspace = true
 # same reload. fs2 is the cross-platform flock wrapper used by
 # rustup, cargo, and others.
 fs2.workspace = true
+
+# CLI parsing. The binary uses clap derive for argv parsing, env-var
+# fallbacks, `--help`/`--version`, and shell completions. Pinned at
+# the workspace level via `version = "4"` so security bumps land in
+# one place. `wrap_help` re-flows long doc strings to the terminal
+# width; `env` enables `#[arg(env = "...")]` fallbacks; `string`
+# lets clap take owned `String` defaults at runtime (used for the
+# log-level resolver).
+clap = { version = "4", features = ["derive", "env", "wrap_help", "string"] }
+clap_complete = "4"
