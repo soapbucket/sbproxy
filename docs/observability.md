@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-05-04*
+*Last modified: 2026-06-01*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -191,7 +191,34 @@ proxy:
 * `fields:` is additive on the built-in baseline. Matched lowercase. Cannot disable a built-in entry.
 * `patterns:` is a list of named regexes applied to the rendered JSON after the field-key pass. Compiled once at config load; an invalid regex is logged at `warn` and skipped (the rest of the block still installs). `replacement:` defaults to `[REDACTED:<NAME_UPPER>]` when omitted.
 
-Per-tenant and per-origin redact blocks are a planned follow-up; today operators land all rules at the proxy scope.
+#### Built-in PII detector
+
+Operators can enable the rule-driven PII detector from `sbproxy-security` as a fourth redaction pass. It runs after the field-key pass and the regex pass against the rendered JSON. The detector ships with built-in rules for email, US SSN, credit card (Luhn-validated), US phone, IPv4, IBAN, and common API key shapes (OpenAI, Anthropic, AWS access key, GitHub PAT, Slack token).
+
+```yaml
+proxy:
+  observability:
+    log:
+      redact:
+        pii:
+          enabled: true
+          # rules: select a subset by name; empty means "all defaults"
+          rules:
+            - email
+            - us_ssn
+            - credit_card
+          # disable: subtract from the selected set
+          disable:
+            - ipv4
+```
+
+* `enabled: false` (or absent) is the default; the PII pass is skipped entirely.
+* `rules:` selects which built-in rules to install. Empty means all defaults. Unknown names are logged at `warn` and skipped (the install continues with the rest).
+* `disable:` subtracts names from the resolved set. Useful when `rules:` is empty but you want everything except, say, `ipv4`.
+* Default replacement is `[REDACTED:<RULE_NAME_UPPER>]` (e.g. `[REDACTED:EMAIL]`).
+* The PII pass is anchor-prefilter accelerated (Aho-Corasick), so adding rules carries no measurable overhead on logs that contain none of them.
+
+Per-tenant and per-origin redact blocks (including PII) are a planned follow-up; today operators land all rules at the proxy scope.
 
 Two profiles ship in Wave 1:
 
