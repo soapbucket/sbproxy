@@ -27,7 +27,7 @@ Each `sb.yml` opens with a comment block listing the curl commands to drive it.
 ## Catalog
 
 Auto-generated index of every example. Each row links to the example's
-directory (with its `sb.yml` and README). Generated from `examples/` on 2026-05-10.
+directory (with its `sb.yml` and README). Generated from `examples/` on 2026-05-10; the 15 entries below the original alphabetical block were appended on 2026-05-31 to cover examples that landed after the original sweep.
 
 | Example | Description |
 |---|---|
@@ -135,5 +135,20 @@ directory (with its `sb.yml` and README). Generated from `examples/` on 2026-05-
 | [wasm](wasm/) | Reference modules for the SBproxy WASM transform. A WASM transform is a sandboxed module loaded by the `wasm` transform action; SBproxy invo |
 | [web-bot-auth](web-bot-auth/) | Cryptographic agent verification under RFC 9421 HTTP Message Signatures and the IETF Web Bot Auth draft. AI agents (crawlers, indexers, rese |
 | [webhook-signing](webhook-signing/) | Every lifecycle webhook the proxy fires (`on_request`, `on_response`) carries a structured envelope and, when `secret` is set on the callbac |
+| [a2a-protocol](a2a-protocol/) | The `a2a` policy enforces per-route safety on agent-to-agent traffic. Detection runs once per request and matches three signals: `Content-Type: applic |
+| [agent-skills](agent-skills/) | Demonstrates the Agent Skills v0.2.0 well-known projection. SBproxy stamps `/.well-known/agent-skills/manifest.json` plus per-skill artifacts so MCP cl |
+| [ai-bedrock-direct](ai-bedrock-direct/) | Direct integration with AWS Bedrock's model-agnostic Converse API. Clients send OpenAI-shaped chat completion requests; SBproxy translates them to the |
+| [ai-cascade-routing](ai-cascade-routing/) | The `cascade` strategy walks an ordered list of `(provider, model)` tiers from cheapest to most expensive. Each tier's response is graded against a `q |
+| [ai-context-poisoning](ai-context-poisoning/) | A single Anthropic origin with the `context_poisoning` input guardrail enabled. The guardrail inspects the full input, including any retrieved content |
+| [ai-gemini-direct](ai-gemini-direct/) | Direct integration with the Google Gemini API. Clients send OpenAI-shaped chat completion requests; SBproxy translates them to Gemini's `:generateCont |
+| [ai-per-surface-rate-limits](ai-per-surface-rate-limits/) | Different OpenAI surfaces have different cost and capacity profiles. Chat completions are cheap and high volume; image generation is slow and expensiv |
+| [auth-cap](auth-cap/) | Validates Crawler Authorization Protocol (CAP) tokens on every request. CAP tokens are EdDSA-signed JWTs bound to an agent identity (`sub`), a request |
+| [content-shape-negotiation](content-shape-negotiation/) | Same URL, three response shapes. The proxy reads the agent's `Accept` header on the way in, resolves a single content shape per request, and the respo |
+| [idempotency](idempotency/) | The origin on `api.local` opts in to RFC 8594-style idempotency: every request carrying an `Idempotency-Key` header is cached against that key for a c |
+| [listing-primitive](listing-primitive/) | A minimal example of the repo-native `Listing` primitive: a per-origin descriptor that names the routes, payment rails, and quotas a hosted Catalog wo |
+| [outbound-peer-pricing](outbound-peer-pricing/) | Demonstrates the `peer_pricing_preflight` policy: when an internal request fans out to a paid peer, the proxy pre-fetches the price quote and asserts  |
+| [problem-details](problem-details/) | The origin on `api.local` is protected by API key authentication. The `problem_details` middleware reshapes the proxy's error responses to RFC 9457 Pr |
+| [rail-lightning](rail-lightning/) | Lightning rail in the `Accept-Payment` negotiation contract alongside the existing on-chain L1 rails. Demonstrates the LNURL-pay quote flow, the BOLT- |
+| [semantic-constraint](semantic-constraint/) | A natural-language policy enforced by an LLM-as-judge backend. The `semantic_constraint` policy renders a prompt template against the request envelope |
 
-_104 examples on disk._
+_119 examples on disk._
