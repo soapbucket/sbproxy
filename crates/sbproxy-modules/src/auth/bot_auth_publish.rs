@@ -183,6 +183,82 @@ impl SignatureAgentCard {
     }
 }
 
+/// Self-sign a directory or agent-card HTTP response body per
+/// RFC 9421 over `("content-digest")` with `tag="web-bot-auth"`.
+///
+/// Returns the three response headers a Web Bot Auth verifier needs
+/// to confirm the body came from the holder of the published key:
+/// `Content-Digest`, `Signature-Input`, and `Signature`. The covered
+/// component set is intentionally minimal — only `content-digest` —
+/// so the helper works equally well for the JWKS directory and the
+/// agent card without depending on response-side derived components
+/// (`@status` is not yet supported by the shared signature-base
+/// builder, which is request-oriented).
+///
+/// `seed` is the 32-byte raw Ed25519 secret seed (the private half
+/// of the keypair whose public half the directory advertises).
+/// `key_id` MUST match the `kid` on the published JWK so a verifier
+/// looking up `Signature-Input`'s `keyid=` finds the right key.
+///
+/// Failures fall into two categories: malformed input (the body is
+/// empty, or the operator-supplied seed is the wrong length) and
+/// internal signer errors (essentially impossible given how the
+/// inputs are validated up front; surfaced as `String` so the
+/// caller can log them without pulling in the signer's error
+/// type).
+pub fn sign_directory_response(
+    seed: &[u8; 32],
+    key_id: &str,
+    body: &[u8],
+) -> Result<Vec<(String, String)>, String> {
+    use sbproxy_middleware::signatures::SignatureAlgorithm;
+    use sbproxy_middleware::signatures_egress::{MessageSigner, SignerConfig};
+
+    if body.is_empty() {
+        // RFC 9421 §2.1 forbids covering a component that is not
+        // present on the message; the signer would silently drop
+        // `content-digest` from the covered set and emit a
+        // signature with zero covered components. Refuse instead.
+        return Err("sign_directory_response: empty body".to_string());
+    }
+    if key_id.is_empty() {
+        return Err("sign_directory_response: empty key_id".to_string());
+    }
+
+    let signer = MessageSigner::new(SignerConfig {
+        key_id: key_id.to_string(),
+        algorithm: SignatureAlgorithm::Ed25519,
+        secret: seed.to_vec(),
+        covered_components: vec!["content-digest".to_string()],
+    })
+    .map_err(|e| format!("sign_directory_response: signer init: {e}"))?
+    .with_web_bot_auth_profile("web-bot-auth", 60);
+
+    // The signature base for a response covering only `content-digest`
+    // depends solely on the body bytes; building the signer's request
+    // shape with a placeholder URI is harmless because no @-prefixed
+    // derived component is in the covered set.
+    let req = http::Request::builder()
+        .method("GET")
+        .uri("https://signed-body.invalid/")
+        .body(bytes::Bytes::copy_from_slice(body))
+        .map_err(|e| format!("sign_directory_response: build req: {e}"))?;
+
+    let signed = signer
+        .sign_request(req)
+        .map_err(|e| format!("sign_directory_response: sign: {e}"))?;
+
+    let mut out: Vec<(String, String)> = Vec::with_capacity(3);
+    for name in ["content-digest", "signature-input", "signature"] {
+        if let Some(v) = signed.headers().get(name).and_then(|v| v.to_str().ok()) {
+            out.push((name.to_string(), v.to_string()));
+        } else {
+            return Err(format!("sign_directory_response: signer omitted {name}"));
+        }
+    }
+    Ok(out)
+}
+
 /// Validate that an operator-supplied directory URL is acceptable
 /// for publishing. Web Bot Auth verifiers MUST refuse plaintext
 /// directories; the publish side enforces the same invariant so an
@@ -296,5 +372,96 @@ mod tests {
     #[test]
     fn validate_directory_url_rejects_empty() {
         assert!(validate_directory_url("").is_err());
+    }
+
+    fn sample_seed() -> [u8; 32] {
+        // Deterministic seed so the test does not rely on entropy.
+        // The matching public key falls out of ed25519-dalek; tests
+        // below derive it on the fly rather than hard-coding it.
+        let mut k = [0u8; 32];
+        for (i, b) in k.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(11).wrapping_add(3);
+        }
+        k
+    }
+
+    #[test]
+    fn sign_directory_response_emits_three_headers() {
+        let headers =
+            sign_directory_response(&sample_seed(), "kid-1", b"{\"keys\":[]}").expect("sign");
+        let names: Vec<&str> = headers.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["content-digest", "signature-input", "signature"]
+        );
+        let by_name: std::collections::HashMap<_, _> = headers
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .collect();
+        // sha-256=:...: per RFC 9530 §3
+        assert!(by_name["content-digest"].starts_with("sha-256=:"));
+        // Signature-Input advertises the Web Bot Auth tag and the
+        // operator-configured kid.
+        assert!(by_name["signature-input"].contains("tag=\"web-bot-auth\""));
+        assert!(by_name["signature-input"].contains("keyid=\"kid-1\""));
+        assert!(by_name["signature-input"].contains("\"content-digest\""));
+        // RFC 9421 dictionary entry with the canonical sig1 label.
+        assert!(by_name["signature"].starts_with("sig1=:"));
+    }
+
+    #[test]
+    fn sign_directory_response_round_trips_through_verifier() {
+        use ed25519_dalek::SigningKey;
+        use sbproxy_middleware::signatures::{
+            MessageSignatureConfig, MessageSignatureVerifier, SignatureAlgorithm, VerifyVerdict,
+        };
+
+        let seed = sample_seed();
+        let signing_key = SigningKey::from_bytes(&seed);
+        let verifying_key = signing_key.verifying_key();
+
+        let body = b"{\"keys\":[{\"kid\":\"kid-1\"}]}";
+        let headers = sign_directory_response(&seed, "kid-1", body).expect("sign");
+
+        // Reassemble the signed response as a `Request<Bytes>` so the
+        // existing inbound verifier can check it. The verifier covers
+        // only header-based components, so `content-digest` + the
+        // round-trip works out of the box.
+        let mut req = http::Request::builder()
+            .method("GET")
+            .uri("https://signed-body.invalid/")
+            .body(bytes::Bytes::copy_from_slice(body))
+            .unwrap();
+        for (name, value) in &headers {
+            req.headers_mut().insert(
+                http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+
+        let verifier = MessageSignatureVerifier::new(MessageSignatureConfig {
+            algorithm: SignatureAlgorithm::Ed25519,
+            key_id: "kid-1".to_string(),
+            key: hex::encode(verifying_key.to_bytes()),
+            required_components: vec!["content-digest".to_string()],
+            clock_skew_seconds: 30,
+        })
+        .expect("verifier");
+        match verifier.verify_request(&req) {
+            VerifyVerdict::Ok { .. } => {}
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sign_directory_response_rejects_empty_body() {
+        let err = sign_directory_response(&sample_seed(), "kid-1", b"").unwrap_err();
+        assert!(err.contains("empty body"), "got: {err}");
+    }
+
+    #[test]
+    fn sign_directory_response_rejects_empty_key_id() {
+        let err = sign_directory_response(&sample_seed(), "", b"x").unwrap_err();
+        assert!(err.contains("empty key_id"), "got: {err}");
     }
 }

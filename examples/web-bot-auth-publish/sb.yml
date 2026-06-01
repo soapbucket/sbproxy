@@ -40,3 +40,13 @@ origins:
       directory_url: "https://agent.local/.well-known/http-message-signatures-directory"
       description: "Example SBproxy deployment with outbound Web Bot Auth signing."
       contact_url: "mailto:abuse@example.com"
+      # Optional self-signature on the directory and agent-card
+      # response bodies (RFC 9421 over `("content-digest")` with
+      # `tag="web-bot-auth"`). When set, both responses gain
+      # `Content-Digest`, `Signature-Input`, and `Signature` headers
+      # a verifier can check against the published JWK above. Use
+      # `vault://` or any other secret reference in production; the
+      # raw seed below is the literal `[1..32]` byte sequence used
+      # by the signer round-trip tests and MUST NOT be reused for a
+      # real key.
+      signing_key_hex: "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"

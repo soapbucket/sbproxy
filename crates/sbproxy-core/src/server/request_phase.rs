@@ -4472,7 +4472,7 @@ async fn handle_web_bot_auth_publish(
     path: &str,
 ) -> Result<()> {
     use sbproxy_modules::auth::bot_auth_publish::{
-        validate_directory_url, DirectoryDocument, SignatureAgentCard,
+        sign_directory_response, validate_directory_url, DirectoryDocument, SignatureAgentCard,
     };
 
     // Validate the operator-supplied directory_url at request time
@@ -4502,14 +4502,45 @@ async fn handle_web_bot_auth_publish(
         }
     };
 
+    // Optional self-signature on the response body. When the
+    // operator supplies `signing_key_hex` (the private half of the
+    // advertised public key), the directory and agent-card responses
+    // gain `Content-Digest`, `Signature-Input`, and `Signature`
+    // headers per RFC 9421 so a verifier can confirm the body was
+    // emitted by the holder of the advertised key. Failures here
+    // fail open: the response still ships unsigned, just like when
+    // no signing key is configured.
+    let signing_seed: Option<[u8; 32]> = cfg.signing_key_hex.as_ref().and_then(|s| {
+        match decode_ed25519_seed(s) {
+            Ok(seed) => Some(seed),
+            Err(e) => {
+                warn!(error = %e, "web_bot_auth_publish: bad signing_key_hex; serving unsigned");
+                None
+            }
+        }
+    });
+
     if path == "/.well-known/http-message-signatures-directory" {
         let doc = DirectoryDocument::build(vec![(pk_bytes, cfg.key_id.clone())]);
         let body = doc.to_json();
-        send_response(
+        let extra = signing_seed
+            .as_ref()
+            .and_then(|seed| {
+                match sign_directory_response(seed, &cfg.key_id, body.as_bytes()) {
+                    Ok(headers) => Some(headers),
+                    Err(e) => {
+                        warn!(error = %e, "web_bot_auth_publish: directory self-sign failed; serving unsigned");
+                        None
+                    }
+                }
+            })
+            .unwrap_or_default();
+        send_response_with_headers(
             session,
             200,
             "application/http-message-signatures-directory+json",
             body.as_bytes(),
+            &extra,
         )
         .await?;
         return Ok(());
@@ -4524,7 +4555,19 @@ async fn handle_web_bot_auth_publish(
         card = card.with_contact_url(c.clone());
     }
     let body = card.to_json();
-    send_response(session, 200, "application/json", body.as_bytes()).await?;
+    let extra = signing_seed
+        .as_ref()
+        .and_then(
+            |seed| match sign_directory_response(seed, &cfg.key_id, body.as_bytes()) {
+                Ok(headers) => Some(headers),
+                Err(e) => {
+                    warn!(error = %e, "web_bot_auth_publish: agent-card self-sign failed; serving unsigned");
+                    None
+                }
+            },
+        )
+        .unwrap_or_default();
+    send_response_with_headers(session, 200, "application/json", body.as_bytes(), &extra).await?;
     Ok(())
 }
 

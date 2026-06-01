@@ -6058,6 +6058,7 @@ dependencies = [
  "rustls",
  "sbproxy-cache",
  "sbproxy-config",
+ "sbproxy-middleware",
  "sbproxy-modules",
  "sbproxy-observe",
  "serde",

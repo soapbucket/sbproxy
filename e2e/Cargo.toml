@@ -40,6 +40,12 @@ base64.workspace = true
 # stub. Dev-only because no other harness path needs it.
 sbproxy-modules.workspace = true
 
+# WOR-805 publish-signed e2e (web_bot_auth_publish_signed_e2e.rs)
+# rehydrates the signed JWKS response as an http::Request and runs
+# the production verifier against the published JWK as the trust
+# anchor. Dev-only because no other test harness path needs it.
+sbproxy-middleware.workspace = true
+
 # JWT signing for auth_jwt.rs (replaces hand-encoded HS256 tokens with
 # real `jsonwebtoken::encode` calls so failure modes show up cleanly).
 jsonwebtoken = { workspace = true }
