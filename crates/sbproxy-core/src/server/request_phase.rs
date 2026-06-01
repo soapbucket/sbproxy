@@ -1594,6 +1594,39 @@ pub(super) async fn request_filter(
             handle_oidc_callback(session, &oidc_cfg).await?;
             return Ok(true);
         }
+
+        // --- WOR-892 follow-up: OIDC /oidc/logout ---
+        //
+        // RP-initiated logout: delete the session cookie and (when
+        // the operator configured `end_session_endpoint`) redirect
+        // the browser to the OP per OpenID Connect RP-Initiated
+        // Logout 1.0 §2. Recognised BEFORE the normal auth check so
+        // it works for already-expired sessions too. Pure helpers
+        // live in `sbproxy_modules::auth::oidc::logout`.
+        let is_oidc_logout = auth_cfg_value
+            .as_ref()
+            .and_then(|c| c.as_object())
+            .filter(|c| c.get("type").and_then(|v| v.as_str()) == Some("oidc"))
+            .map(|c| {
+                c.get("logout_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("/oidc/logout")
+            })
+            .map(|p| p == req_path)
+            .unwrap_or(false);
+        if is_oidc_logout {
+            let cfg_json = auth_cfg_value.expect("oidc logout gated on auth_config Some");
+            let oidc_cfg = match sbproxy_modules::auth::oidc::OidcAuth::from_config(cfg_json) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, "oidc logout: bad config");
+                    send_error(session, 500, "oidc misconfigured").await?;
+                    return Ok(true);
+                }
+            };
+            handle_oidc_logout(session, &oidc_cfg).await?;
+            return Ok(true);
+        }
     }
 
     // --- WOR-808 PR7: OLP /.well-known/olp/{token,key} ---
@@ -4245,6 +4278,87 @@ async fn handle_oidc_callback(
     header.insert_header("location", tx_claims.return_to.clone())?;
     header.append_header("set-cookie", session_cookie)?;
     header.append_header("set-cookie", tx_delete_cookie)?;
+    header.insert_header("content-length", "0")?;
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(bytes::Bytes::new()), true)
+        .await?;
+    Ok(())
+}
+
+/// Handle `/oidc/logout` per OpenID Connect RP-Initiated Logout 1.0.
+///
+/// Always sets the session-cookie-deletion `Set-Cookie` header so the
+/// browser drops the cookie regardless of whether the OP supports
+/// end-session. Then:
+///
+/// * If `cfg.end_session_endpoint` is configured: 302 to the OP with
+///   `id_token_hint` (when we can recover it), `post_logout_redirect_uri`
+///   (when the caller supplied one in the query and it appears in
+///   `cfg.post_logout_redirect_allowlist`, else the configured
+///   default), and the round-tripped `state` (when supplied).
+/// * Otherwise: 302 to `cfg.post_logout_redirect_default` (or the
+///   caller's allowlisted URI).
+///
+/// `id_token_hint` is currently always `None` because the session
+/// cookie shape does not carry the original ID token; recovering it
+/// requires the server-side session store wiring that lands in a
+/// follow-up PR. OPs that REQUIRE `id_token_hint` will then reject
+/// the redirect with an error, which is the documented behaviour;
+/// most OPs accept the redirect without the hint and prompt the user
+/// once more before clearing their session.
+async fn handle_oidc_logout(
+    session: &mut pingora_proxy::Session,
+    cfg: &sbproxy_modules::auth::oidc::OidcAuth,
+) -> Result<()> {
+    use sbproxy_modules::auth::oidc::logout;
+
+    // --- parse query for caller-supplied post-logout target + state ---
+    let query = session.req_header().uri.query().unwrap_or("");
+    let mut requested_uri: Option<String> = None;
+    let mut state_q: Option<String> = None;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            match k {
+                "post_logout_redirect_uri" => requested_uri = Some(decode_form_component(v)),
+                "state" => state_q = Some(decode_form_component(v)),
+                _ => {}
+            }
+        }
+    }
+
+    // --- resolve post-logout target through the allowlist ---
+    let resolved = logout::resolve_post_logout_redirect(
+        requested_uri.as_deref(),
+        &cfg.post_logout_redirect_allowlist,
+        Some(&cfg.post_logout_redirect_default),
+    );
+
+    // --- compose the 302 target ---
+    // When end_session_endpoint is configured, build the OP redirect.
+    // Otherwise the proxy is the terminal redirect target; the
+    // resolved post-logout URI becomes the final hop.
+    let location = if cfg.end_session_endpoint.is_some() {
+        logout::build_end_session_redirect_url(
+            cfg.end_session_endpoint.as_deref(),
+            // id_token_hint is unavailable until the session store
+            // wiring lands; OPs that require it will reject and the
+            // operator will see the failure in their browser tools.
+            "",
+            resolved,
+            state_q.as_deref(),
+        )
+        .unwrap_or_else(|| resolved.unwrap_or("/").to_string())
+    } else {
+        resolved.unwrap_or("/").to_string()
+    };
+
+    let deletion = logout::build_session_deletion_cookie(cfg);
+    let mut header = pingora_http::ResponseHeader::build(302, None)?;
+    header.insert_header("location", location)?;
+    header.append_header("set-cookie", deletion)?;
     header.insert_header("content-length", "0")?;
     session
         .write_response_header(Box::new(header), false)

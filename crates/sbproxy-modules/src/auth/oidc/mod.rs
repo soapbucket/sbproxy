@@ -73,6 +73,33 @@ pub struct OidcAuth {
     /// IdP under `redirect_uris`.
     #[serde(default = "default_redirect_path")]
     pub redirect_path: String,
+    /// Path on the proxy that triggers RP-initiated logout. Default
+    /// `/oidc/logout`. The handler always deletes the session cookie;
+    /// when [`OidcAuth::end_session_endpoint`] is configured the
+    /// browser is then 302'd to the OP per OpenID Connect
+    /// RP-Initiated Logout 1.0 §2.
+    #[serde(default = "default_logout_path")]
+    pub logout_path: String,
+    /// Optional OP `end_session_endpoint`. When set, the
+    /// `/oidc/logout` handler redirects to it (with the session
+    /// cookie deleted) so the OP terminates its own session too. When
+    /// unset, `/oidc/logout` only deletes the cookie and 302's to
+    /// [`OidcAuth::post_logout_redirect_default`] (or `/`).
+    #[serde(default)]
+    pub end_session_endpoint: Option<String>,
+    /// Default URI to send the browser to after a logout completes,
+    /// when the caller did not supply (or did not allowlist) one of
+    /// their own. Defaults to `/`.
+    #[serde(default = "default_post_logout_uri")]
+    pub post_logout_redirect_default: String,
+    /// Allowlist of permitted `post_logout_redirect_uri` values that
+    /// `/oidc/logout` will honour when supplied via the
+    /// `post_logout_redirect_uri` query parameter. Without this gate
+    /// the endpoint becomes an open-redirect; the resolver in
+    /// [`logout::resolve_post_logout_redirect`] enforces verbatim
+    /// match before forwarding.
+    #[serde(default)]
+    pub post_logout_redirect_allowlist: Vec<String>,
     /// Space-separated OIDC scope list sent on the auth redirect.
     /// Defaults to `"openid"` (the minimum that produces an ID
     /// token); operators add `email profile groups` etc. as needed.
@@ -109,6 +136,14 @@ pub struct OidcAuth {
 
 fn default_redirect_path() -> String {
     "/oidc/callback".to_string()
+}
+
+fn default_logout_path() -> String {
+    "/oidc/logout".to_string()
+}
+
+fn default_post_logout_uri() -> String {
+    "/".to_string()
 }
 
 fn default_scope() -> String {
@@ -193,11 +228,36 @@ mod tests {
     fn from_config_accepts_minimal_input_with_defaults() {
         let cfg = OidcAuth::from_config(good_config()).unwrap();
         assert_eq!(cfg.redirect_path, "/oidc/callback");
+        assert_eq!(cfg.logout_path, "/oidc/logout");
         assert_eq!(cfg.scope, "openid");
         assert_eq!(cfg.session_ttl_secs, 3600);
         assert_eq!(cfg.tx_ttl_secs, 300);
         assert_eq!(cfg.session_cookie_name, "__Host-sbproxy_session");
         assert_eq!(cfg.tx_cookie_name, "__Host-sbproxy_oidc_tx");
+        assert!(cfg.end_session_endpoint.is_none());
+        assert_eq!(cfg.post_logout_redirect_default, "/");
+        assert!(cfg.post_logout_redirect_allowlist.is_empty());
+    }
+
+    #[test]
+    fn from_config_carries_optional_logout_fields() {
+        let mut v = good_config();
+        v["end_session_endpoint"] = serde_json::json!("https://idp.example.com/logout");
+        v["post_logout_redirect_default"] = serde_json::json!("https://app.example.com/goodbye");
+        v["post_logout_redirect_allowlist"] = serde_json::json!([
+            "https://app.example.com/bye",
+            "https://app.example.com/sso/exit"
+        ]);
+        let cfg = OidcAuth::from_config(v).unwrap();
+        assert_eq!(
+            cfg.end_session_endpoint.as_deref(),
+            Some("https://idp.example.com/logout")
+        );
+        assert_eq!(
+            cfg.post_logout_redirect_default,
+            "https://app.example.com/goodbye"
+        );
+        assert_eq!(cfg.post_logout_redirect_allowlist.len(), 2);
     }
 
     #[test]
