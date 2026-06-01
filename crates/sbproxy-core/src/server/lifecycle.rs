@@ -462,6 +462,12 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         );
     }
 
+    // Walk the inventory-based plugin registry once at startup and
+    // emit one `sbproxy_plugin_registered_total{kind, plugin}` row
+    // per known registration. Subsequent reloads do not re-walk
+    // because the inventory set is fixed at link time.
+    report_plugin_registrations();
+
     // WOR-594: install the operator-configured Lua sandbox limits
     // into the extension crate's process-wide handle. Every
     // `LuaEngine::new()` after this point (request modifiers, response
@@ -1169,4 +1175,30 @@ pub(super) fn render_ardp_discovery(
         }
     });
     serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Walk the inventory-based plugin registry and emit one
+/// `sbproxy_plugin_registered_total{kind, plugin}` counter row per
+/// known registration. Called once from `run` so an operator scraping
+/// `/metrics` immediately after startup sees the registration set
+/// without waiting for a request to flow.
+fn report_plugin_registrations() {
+    use sbproxy_plugin::{PluginKind, PluginRegistration};
+    for reg in inventory::iter::<PluginRegistration>() {
+        let kind = match reg.kind {
+            PluginKind::Action => "action",
+            PluginKind::Auth => "auth",
+            PluginKind::Policy => "policy",
+            PluginKind::Transform => "transform",
+            PluginKind::Enricher => "enricher",
+        };
+        sbproxy_observe::metrics::record_plugin_registered(kind, reg.name);
+    }
+    // AuthPluginRegistration is the strongly-typed sibling channel
+    // used by auth providers; report them under kind=auth too so
+    // `kind=auth` matches what `build_auth_plugin` actually
+    // dispatches against.
+    for reg in inventory::iter::<sbproxy_plugin::AuthPluginRegistration>() {
+        sbproxy_observe::metrics::record_plugin_registered("auth", reg.name);
+    }
 }

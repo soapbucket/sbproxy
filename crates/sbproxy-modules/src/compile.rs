@@ -97,12 +97,29 @@ pub fn compile_auth(config: &serde_json::Value) -> Result<Auth> {
         ))),
         "noop" => Ok(Auth::Noop),
         other => {
-            if let Some(result) = sbproxy_plugin::build_auth_plugin(other, config.clone()) {
-                let provider =
-                    result.with_context(|| format!("auth plugin {other:?} factory failed"))?;
-                Ok(Auth::Plugin(provider))
-            } else {
-                anyhow::bail!("unknown auth type: {}", other)
+            // Time + emit the factory invocation so operators can spot
+            // panics or config-invalid plugins at config-compile time
+            // (before traffic flows). The metric only fires when the
+            // plugin name is one a registered factory recognises;
+            // unknown names short-circuit with the existing bail.
+            let start = std::time::Instant::now();
+            let outcome = sbproxy_plugin::build_auth_plugin(other, config.clone());
+            let elapsed = start.elapsed().as_secs_f64();
+            match outcome {
+                Some(Ok(provider)) => {
+                    sbproxy_observe::metrics::record_plugin_init("auth", other, "ok", elapsed);
+                    Ok(Auth::Plugin(provider))
+                }
+                Some(Err(e)) => {
+                    sbproxy_observe::metrics::record_plugin_init(
+                        "auth",
+                        other,
+                        "config_invalid",
+                        elapsed,
+                    );
+                    Err(e).with_context(|| format!("auth plugin {other:?} factory failed"))
+                }
+                None => anyhow::bail!("unknown auth type: {}", other),
             }
         }
     }
