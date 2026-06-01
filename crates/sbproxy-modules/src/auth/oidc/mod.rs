@@ -29,6 +29,7 @@
 //! of WOR-892.
 
 pub mod callback;
+pub mod discovery;
 pub mod pkce;
 pub mod session;
 
