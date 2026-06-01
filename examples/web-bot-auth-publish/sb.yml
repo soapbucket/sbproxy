@@ -1,0 +1,42 @@
+# Web Bot Auth publish: SBproxy serves its own JWKS directory +
+# Signature Agent Card so verifiers can discover the keys SBproxy
+# signs outbound requests with.
+#
+# Run:
+#   make run CONFIG=examples/web-bot-auth-publish/sb.yml
+#
+# Fetch the directory JWKS:
+#   curl -i -H 'Host: agent.local' \
+#     http://127.0.0.1:8080/.well-known/http-message-signatures-directory
+#
+# Fetch the Signature Agent Card:
+#   curl -i -H 'Host: agent.local' \
+#     http://127.0.0.1:8080/.well-known/web-bot-auth/agent-card
+#
+# Disable the publish surface by removing the `web_bot_auth_publish`
+# block; the proxy then 404s both paths instead of falling through
+# to the upstream.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "agent.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    # Deterministic Ed25519 public key (DO NOT REUSE IN PRODUCTION;
+    # this is the public half of the test seed used by the signer
+    # round-trip test in `sbproxy-middleware::signatures`). In a
+    # real deployment the operator generates a fresh keypair and
+    # keeps the secret in a vault / HSM; only the public half lives
+    # in YAML.
+    web_bot_auth_publish:
+      enabled: true
+      key_id: "sbproxy-key-2026-05-31"
+      public_key_hex: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+      agent_name: "SBproxy"
+      directory_url: "https://agent.local/.well-known/http-message-signatures-directory"
+      description: "Example SBproxy deployment with outbound Web Bot Auth signing."
+      contact_url: "mailto:abuse@example.com"
