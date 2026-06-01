@@ -15,36 +15,34 @@ All three speak the same correlation triple: every log line and every span attri
 
 ## Configuration
 
+The currently shipped schema lives under `proxy.observability:` and groups the `log` (tracing-subscriber filter + format + sampling) and `telemetry` (OTLP exporter) blocks. When the block is absent, CLI flags and env vars are the only source of truth.
+
 ```yaml
-observability:
-  tracing:
-    enabled: false
-    exporter: otlp                  # otlp | stdout | none
-    endpoint: "http://localhost:4317"
-    protocol: grpc                  # grpc (default) | http/protobuf
-    service_name: "sbproxy"
-    sampling:
-      parent_based: true
-      head_rate: 0.1                # 10% of unsampled roots
-      always_sample_errors: true    # 100% on 5xx and policy block paths
-    resource_attrs:
-      deployment.environment: "prod"
-      service.version: "${SBPROXY_VERSION}"
-  log:
-    level: info
-    pretty: false
-    sinks:
-      - name: stdout
-        format: json
-        profile: internal
-      - name: loki_internal
-        endpoint: "http://loki.internal:3100"
-        profile: internal
-      - name: loki_external
-        endpoint: "https://loki.customer.example/api/v1/push"
-        profile: external
-        tenant_label: "${WORKSPACE_ID}"
+proxy:
+  observability:
+    log:
+      level: info                  # debug | info | warn | error
+      format: compact              # compact | pretty | json
+      sampling:
+        info: 1.0                  # fraction of info lines kept
+        debug: 0.1
+        trace: 0.01
+    telemetry:
+      enabled: true
+      endpoint: "http://otel-collector:4317"
+      transport: grpc              # grpc | http
+      service_name: "sbproxy"
+      sample_rate: 0.1             # head ratio for unsampled roots
+      always_sample_errors: true   # 100% on 5xx / policy block paths
+      propagation: w3c             # w3c | b3 | jaeger
+      resource_attrs:
+        deployment.environment: "prod"
+        service.version: "${SBPROXY_VERSION}"
+      export_metrics: false        # mirror metrics over OTLP
+      metrics_interval_secs: 30
 ```
+
+A multi-sink `log.sinks:` block is on the roadmap under the Logging v2 epic; today's log routing is per-tracing-target (`access_log`, `audit_log`, etc.) and stdout / file via the access-log output config.
 
 ## Metrics
 

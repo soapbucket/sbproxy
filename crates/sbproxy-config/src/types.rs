@@ -246,6 +246,16 @@ pub struct ProxyServerConfig {
     /// Metrics collection settings, including cardinality limiting.
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
+    /// Top-level observability block: groups `log` (tracing-subscriber
+    /// filter / format / sampling) and `telemetry` (OTLP exporter)
+    /// under one block so an operator configures the whole surface
+    /// from YAML instead of CLI flags + env vars.
+    ///
+    /// When absent, CLI / env precedence still applies; the YAML
+    /// fields are a third source of truth that wins over the existing
+    /// `RUST_LOG` default but loses to `--log-level` / `SB_LOG_LEVEL`.
+    #[serde(default)]
+    pub observability: Option<ObservabilityConfig>,
     /// Alert notification channel configuration.
     #[serde(default)]
     pub alerting: Option<AlertingConfig>,
@@ -399,6 +409,7 @@ impl Default for ProxyServerConfig {
             acme: None,
             http3: None,
             metrics: None,
+            observability: None,
             alerting: None,
             admin: None,
             secrets: None,
@@ -1751,6 +1762,89 @@ pub struct AlertingConfig {
     pub channels: Vec<AlertChannelConfig>,
 }
 
+/// Top-level observability block: groups the `log` and `telemetry`
+/// sub-blocks so an operator can configure both from YAML rather than
+/// CLI flags + env vars. Re-uses the existing `LoggingConfig` and
+/// `TelemetryConfig` shapes from `sbproxy-observe`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ObservabilityConfig {
+    /// `tracing-subscriber` configuration: level, format, per-level
+    /// sampling. CLI / env still wins where applicable; this block is
+    /// the YAML source-of-truth for everything else.
+    #[serde(default)]
+    pub log: Option<ObservabilityLogConfig>,
+    /// OTLP exporter configuration. When `enabled = true`, the
+    /// configured endpoint receives traces and (optionally) metrics.
+    #[serde(default)]
+    pub telemetry: Option<ObservabilityTelemetryConfig>,
+}
+
+/// Subset of `sbproxy-observe::LoggingConfig` that lands in the public
+/// config schema. Kept in `sbproxy-config` so the YAML round-trips
+/// through serde without dragging a serde dependency back into the
+/// observe crate.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ObservabilityLogConfig {
+    /// Log level filter. `debug | info | warn | error`. Default `info`.
+    #[serde(default)]
+    pub level: Option<String>,
+    /// Output format. `compact | pretty | json`. Default `compact`.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// Per-level emission sampling rates. Default 1.0 / 0.1 / 0.01.
+    #[serde(default)]
+    pub sampling: Option<ObservabilitySamplingConfig>,
+}
+
+/// Per-level sample rates for the structured-log emitter.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ObservabilitySamplingConfig {
+    /// Fraction of `info` lines to emit (default 1.0).
+    #[serde(default)]
+    pub info: Option<f64>,
+    /// Fraction of `debug` lines to emit (default 0.1).
+    #[serde(default)]
+    pub debug: Option<f64>,
+    /// Fraction of `trace` lines to emit (default 0.01).
+    #[serde(default)]
+    pub trace: Option<f64>,
+}
+
+/// Subset of `sbproxy-observe::TelemetryConfig` exposed in the YAML.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ObservabilityTelemetryConfig {
+    /// Whether OTLP export is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// OTLP collector endpoint URL.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Transport: `http` or `grpc`. Default `grpc`.
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// `service.name` resource attribute. Default `sbproxy`.
+    #[serde(default)]
+    pub service_name: Option<String>,
+    /// Head-based sampling probability for unsampled roots. Default 0.1.
+    #[serde(default)]
+    pub sample_rate: Option<f64>,
+    /// Always-sample errors / policy blocks / ledger denials. Default true.
+    #[serde(default)]
+    pub always_sample_errors: Option<bool>,
+    /// Propagation format: `w3c` (default), `b3`, `jaeger`.
+    #[serde(default)]
+    pub propagation: Option<String>,
+    /// Free-form resource attributes attached to every span.
+    #[serde(default)]
+    pub resource_attrs: std::collections::BTreeMap<String, String>,
+    /// Mirror metrics over OTLP in addition to the Prometheus scrape.
+    #[serde(default)]
+    pub export_metrics: bool,
+    /// Period for the OTLP metric exporter, seconds. Default 30s.
+    #[serde(default)]
+    pub metrics_interval_secs: Option<u64>,
+}
+
 /// Configuration for a single alert notification channel.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AlertChannelConfig {
@@ -2939,6 +3033,52 @@ pub enum IdempotencyBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_observability_log_block() {
+        let yaml = r#"
+log:
+  level: debug
+  format: json
+  sampling:
+    info: 1.0
+    debug: 0.5
+    trace: 0.01
+telemetry:
+  enabled: true
+  endpoint: http://otel-collector:4317
+  transport: grpc
+  service_name: sbproxy-dev
+  sample_rate: 0.2
+  always_sample_errors: true
+  resource_attrs:
+    deployment.environment: dev
+"#;
+        let obs: ObservabilityConfig = serde_yaml::from_str(yaml).unwrap();
+        let log = obs.log.expect("log block parses");
+        assert_eq!(log.level.as_deref(), Some("debug"));
+        assert_eq!(log.format.as_deref(), Some("json"));
+        let sampling = log.sampling.expect("sampling parses");
+        assert_eq!(sampling.info, Some(1.0));
+        assert_eq!(sampling.debug, Some(0.5));
+        let telemetry = obs.telemetry.expect("telemetry parses");
+        assert!(telemetry.enabled);
+        assert_eq!(telemetry.transport.as_deref(), Some("grpc"));
+        assert_eq!(telemetry.service_name.as_deref(), Some("sbproxy-dev"));
+        assert_eq!(
+            telemetry.resource_attrs.get("deployment.environment"),
+            Some(&"dev".to_string())
+        );
+    }
+
+    #[test]
+    fn observability_defaults_to_none() {
+        // ProxyServerConfig::default sets observability to None so an
+        // operator who never wrote the YAML block keeps existing
+        // behaviour (CLI / env only).
+        let proxy: ProxyServerConfig = ProxyServerConfig::default();
+        assert!(proxy.observability.is_none());
+    }
 
     #[test]
     fn parse_url_rewrite_modifier() {
