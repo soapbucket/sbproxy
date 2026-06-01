@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-When sbproxy sits behind another LB or CDN (Cloudflare, AWS ALB, Fly.io edge, internal LB), the immediate TCP peer is the LB, not the real client. The real client IP lives in the inbound `X-Forwarded-For` chain. `proxy.trusted_proxies` is the allowlist of source ranges whose forwarding headers the proxy trusts. Connections from inside the allowlist keep their `X-Forwarded-*`, `X-Real-IP`, and `Forwarded` headers; connections from outside have those headers stripped on ingress so external clients cannot spoof a source identity. IPv6 CIDRs work the same way.
+When SBproxy sits behind another LB or CDN (Cloudflare, AWS ALB, Fly.io edge, internal LB), the immediate TCP peer is the LB, not the real client. The real client IP lives in the inbound `X-Forwarded-For` chain. `proxy.trusted_proxies` is the allowlist of source ranges whose forwarding headers the proxy trusts. Connections from inside the allowlist keep their `X-Forwarded-*`, `X-Real-IP`, and `Forwarded` headers; connections from outside have those headers stripped on ingress so external clients cannot spoof a source identity. IPv6 CIDRs work the same way.
 
 ## Run
 

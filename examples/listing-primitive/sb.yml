@@ -16,7 +16,7 @@
 #   make run CONFIG=examples/listing-primitive/sb.yml
 #
 # Test the underlying origin:
-#   curl -H 'Host: api.example.com' http://127.0.0.1:8080/get
+#   curl -H 'Host: api.example.com' http://127.0.0.1:8080/echo
 #
 # The Listing itself is not served on the data path in OSS; it is the
 # input the future hosted-Catalog surface and the

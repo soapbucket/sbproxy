@@ -2,7 +2,7 @@
 
 > The AI gateway built like a real proxy. One binary, built on Pingora. Source available under BSL 1.1.
 
-Most teams run nginx or Traefik for HTTP traffic, then route AI requests through a separate LiteLLM or Portkey instance. sbproxy handles both in a single binary. One config file covers everything.
+Most teams run nginx or Traefik for HTTP traffic, then route AI requests through a separate LiteLLM or Portkey instance. SBproxy handles both in a single binary. One config file covers everything.
 
 ## Key facts
 

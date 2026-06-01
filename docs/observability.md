@@ -302,14 +302,16 @@ Then open:
 - Loki ready endpoint at http://localhost:3100/ready
 - Tempo via Grafana (no first-class UI)
 
-Point SBproxy at the stack with two extra flags:
+Point SBproxy at the stack:
 
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4327 \
-  sbproxy run --config sb.yml --metrics-listen 127.0.0.1:9091
+  sbproxy serve --config sb.yml
 ```
 
-The OTLP endpoint targets the OTel Collector (host port 4327, mapped to the container's 4317). Prometheus scrapes the proxy at `host.docker.internal:9091`. The dashboards from `deploy/dashboards/` are pre-provisioned, so you see metrics, logs, and traces flow as soon as the proxy starts handling requests.
+The proxy exposes Prometheus metrics on the address configured under the top-level `admin:` block (`admin.enabled: true`, `admin.port: 9090` by default). The reference Compose stack's example config sets `admin.port: 9091` so the Compose Prometheus job can scrape `host.docker.internal:9091`. Override the bind via YAML, not a CLI flag.
+
+The OTLP endpoint targets the OTel Collector (host port 4327, mapped to the container's 4317). The dashboards from `deploy/dashboards/` are pre-provisioned, so you see metrics, logs, and traces flow as soon as the proxy starts handling requests.
 
 `docker compose down -v` drops the four named volumes (`prometheus_data`, `grafana_data`, `tempo_data`, `loki_data`) for a fresh start.
 

@@ -346,14 +346,47 @@ someone hand-edited the file out of band.
 
 ---
 
-## SPA root (`GET /`)
+## Admin UI (`GET /admin/ui`, `GET /`)
 
-Returns a minimal HTML placeholder pointing operators at the API
-routes above. The admin SPA is not part of the OSS distribution; the
-route exists so browsing to the admin port does not return a `404`.
+The OSS admin server serves a minimal browser UI at `/admin/ui` for
+configuration inspection, drift status, recent requests, and the
+runtime prompt-store overlay (see `/admin/prompts` below). `GET /`
+redirects to `/admin/ui` so browsing to the admin port lands on the
+UI without typing the path. Both routes are authenticated like the
+rest of `/api/*` and `/admin/*`.
 
-Response: `200 text/html`. Authenticated like the rest of `/api/*`
-and `/admin/*`.
+Response: `200 text/html`. The UI is a static SPA bundled into the
+binary; it does not require a separate build step or asset directory.
+
+---
+
+## Prompt store admin (`GET /admin/prompts`, `POST /admin/prompts/...`)
+
+Exposes the runtime prompt-store overlay. `GET /admin/prompts`
+returns the in-memory snapshot (every active prompt + pinned
+version + last-mutation metadata) as JSON. `POST /admin/prompts`
+mutators add a new version, pin a version, or roll back; mutations
+persist to the operator-configured redb file when `admin.prompt_store_path`
+is set, so changes survive restart.
+
+The full set of POST shapes and request schemas is documented in
+[ai-gateway.md](./ai-gateway.md) under "Stored prompts". This
+reference only catalogues the route surface; the request/response
+contracts live with the feature.
+
+---
+
+## User directory (`GET /api/users`, `POST /api/users`)
+
+Lists and provisions admin users (separate from the
+`admin.username` / `admin.password` Basic credentials, which are
+the bootstrap operator). The OSS implementation stores users
+in-memory; the enterprise build swaps in a SQLite-backed store.
+
+`GET /api/users` returns the list. `POST /api/users` creates a
+user (body: `{"username": "...", "password": "..."}`). Updates and
+deletes are issued via `PUT` / `DELETE` against the same path with
+the user id. All routes carry the standard error envelope.
 
 ---
 

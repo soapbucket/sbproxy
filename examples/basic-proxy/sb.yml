@@ -12,8 +12,9 @@
 #   make run CONFIG=examples/basic-proxy/sb.yml
 #
 # Test:
-#   curl -H 'Host: myapp.example.com' http://127.0.0.1:8080/get
-#   curl -H 'Host: myapp.example.com' http://127.0.0.1:8080/headers
+#   curl -H 'Host: myapp.example.com' http://127.0.0.1:8080/echo
+#   curl -H 'Host: myapp.example.com' http://127.0.0.1:8080/health
+#   curl -H 'Host: myapp.example.com' http://127.0.0.1:8080/status/418
 
 proxy:
   http_bind_port: 8080
