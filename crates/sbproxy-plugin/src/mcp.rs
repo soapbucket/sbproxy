@@ -85,6 +85,13 @@ pub struct McpToolCallCtx<'a> {
     /// the call site has not threaded one through; the enterprise
     /// dispatcher (PR ε) treats empty as the default tenant.
     pub workspace_id: &'a str,
+    /// WOR-818 PR2: OpenAI Apps SDK / SEP-1865 `params.audit.cause`.
+    /// When the client carries this string on the inbound
+    /// `tools/call` (typically the id of the UI element that
+    /// triggered the call), hook impls and the audit chain pick it
+    /// up here. `None` on base-MCP calls; hooks must not branch on
+    /// presence except for diagnostic purposes.
+    pub audit_cause: Option<&'a str>,
 }
 
 /// Pre-tool-call policy hook for MCP federation.
@@ -213,6 +220,7 @@ mod tests {
             arguments: &args,
             correlation_id: "",
             workspace_id: "",
+            audit_cause: None,
         };
         let verdict = hook.evaluate(ctx).await;
         assert!(matches!(verdict, PolicyDecision::Allow));
@@ -233,6 +241,7 @@ mod tests {
             arguments: &args,
             correlation_id: "",
             workspace_id: "",
+            audit_cause: None,
         };
         let verdict = hook.evaluate(ctx).await;
         assert_eq!(verdict, PolicyDecision::Allow);
@@ -287,6 +296,7 @@ mod tests {
             arguments: &args,
             correlation_id: "corr-abc",
             workspace_id: "ws-1",
+            audit_cause: None,
         };
         let verdict = hook.evaluate(ctx).await;
         match verdict {

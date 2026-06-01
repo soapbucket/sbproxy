@@ -2660,13 +2660,13 @@ origins:
     // --- WOR-800 PR3: prompt-store admin endpoints ---
 
     /// The runtime overlay is process-global; tests that mutate it
-    /// serialise to avoid clobbering each other.
+    /// serialise to avoid clobbering each other. Defers to the
+    /// shared lock in `sbproxy_ai::prompts::lock_for_tests` so this
+    /// module and `admin::prompt_persistence::tests` (the other
+    /// in-binary caller that touches the overlay) never run
+    /// interleaved sequences.
     fn prompts_admin_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        sbproxy_ai::prompts::lock_for_tests()
     }
 
     fn reset_runtime_overlay() {

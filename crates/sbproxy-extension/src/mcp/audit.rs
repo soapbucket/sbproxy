@@ -26,6 +26,16 @@ pub struct McpAuditEntry {
     pub result_status: String,
     /// Wall-clock duration of the call in milliseconds.
     pub duration_ms: u64,
+    /// WOR-818 PR2: OpenAI Apps SDK / SEP-1865 `params.audit.cause`.
+    /// When the inbound `tools/call` carries this field (a string
+    /// identifying which UI element triggered the call), it lands
+    /// in the audit chain so an operator can trace
+    /// widget-button -> tool-invocation -> upstream-response.
+    /// Absent on base-MCP calls; omitted from the JSON envelope
+    /// when None so legacy log consumers do not see an unexpected
+    /// key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_cause: Option<String>,
 }
 
 impl McpAuditEntry {
@@ -55,6 +65,7 @@ pub struct McpAuditBuilder {
     server_name: String,
     caller_id: Option<String>,
     arguments: serde_json::Value,
+    audit_cause: Option<String>,
     started_at: std::time::Instant,
 }
 
@@ -71,8 +82,17 @@ impl McpAuditBuilder {
             server_name: server_name.into(),
             caller_id,
             arguments,
+            audit_cause: None,
             started_at: std::time::Instant::now(),
         }
+    }
+
+    /// WOR-818 PR2: attach the OpenAI Apps SDK `audit.cause` value
+    /// (read off `params.audit.cause` on the inbound `tools/call`)
+    /// before finishing. Idempotent; the most recent call wins.
+    pub fn with_audit_cause(mut self, cause: Option<String>) -> Self {
+        self.audit_cause = cause;
+        self
     }
 
     /// Finish recording, build the entry, and emit it.
@@ -88,6 +108,7 @@ impl McpAuditBuilder {
             arguments: self.arguments,
             result_status: status.to_string(),
             duration_ms,
+            audit_cause: self.audit_cause,
         };
         entry.emit();
         entry
@@ -120,6 +141,7 @@ mod tests {
             arguments: json!({"query": "hello world"}),
             result_status: status.to_string(),
             duration_ms: 42,
+            audit_cause: None,
         }
     }
 
@@ -163,9 +185,52 @@ mod tests {
             arguments: json!({}),
             result_status: "success".to_string(),
             duration_ms: 1,
+            audit_cause: None,
         };
         let value: serde_json::Value = serde_json::to_value(&entry).unwrap();
         assert!(value["caller_id"].is_null());
+    }
+
+    #[test]
+    fn wor_818_pr2_audit_cause_round_trips_to_json() {
+        let entry = McpAuditEntry {
+            timestamp: "2026-05-31T00:00:00Z".to_string(),
+            tool_name: "open_pr".to_string(),
+            server_name: "github".to_string(),
+            caller_id: Some("alice".to_string()),
+            arguments: json!({"title": "fix"}),
+            result_status: "success".to_string(),
+            duration_ms: 120,
+            audit_cause: Some("widget:checkout-button".to_string()),
+        };
+        let value: serde_json::Value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(value["audit_cause"], "widget:checkout-button");
+    }
+
+    #[test]
+    fn wor_818_pr2_audit_cause_omitted_when_none() {
+        // Backwards-compat pin: base-MCP calls (no Apps-SDK UI) must
+        // not introduce an `audit_cause: null` key that legacy log
+        // consumers would have to add a parser branch for.
+        let entry = make_entry("success");
+        let value: serde_json::Value = serde_json::to_value(&entry).unwrap();
+        assert!(
+            !value.as_object().unwrap().contains_key("audit_cause"),
+            "audit_cause must be omitted when None; got: {value}"
+        );
+    }
+
+    #[test]
+    fn wor_818_pr2_builder_attaches_audit_cause() {
+        let entry = McpAuditBuilder::start(
+            "open_pr",
+            "github",
+            Some("alice".to_string()),
+            json!({"title": "fix"}),
+        )
+        .with_audit_cause(Some("widget:checkout-button".to_string()))
+        .success();
+        assert_eq!(entry.audit_cause.as_deref(), Some("widget:checkout-button"));
     }
 
     #[test]
@@ -197,6 +262,7 @@ mod tests {
             }),
             result_status: "success".to_string(),
             duration_ms: 150,
+            audit_cause: None,
         };
         let value: serde_json::Value = serde_json::to_value(&entry).unwrap();
         assert_eq!(value["arguments"]["path"], "/tmp/test.txt");
