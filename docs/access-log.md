@@ -150,6 +150,15 @@ restricts the rule set; accepted names are `email`, `us_ssn`,
 | `auth_ms` | float? | Time spent in the auth check (provider dispatch, JWT verify, forward-auth subrequest, OIDC cookie open). Absent when the origin has no auth provider. |
 | `upstream_ttfb_ms` | float? | Time from request start to the first byte of the upstream response header. Absent when the request never reached an upstream (early auth/policy short-circuit, cache hit). |
 | `response_filter_ms` | float? | Time spent running response transforms between first upstream byte and end of `response_filter`. Absent when no response_filter ran. |
+| `query` | string? | Request query string without the leading `?`. Captured separately from `path` so per-route aggregations on `path` are not split by every distinct query. Absent when no query was supplied. |
+| `protocol` | string? | HTTP version on the wire (`HTTP/1.1`, `HTTP/2.0`, `HTTP/3.0`). |
+| `scheme` | string? | Scheme the client used to reach the proxy (`http` or `https`). Distinct from `upstream_host`'s scheme. |
+| `host` | string? | Client-supplied `Host` header. May differ from `origin` (the matched virtual-host pattern, which can be a wildcard) and from `upstream_host` (where the proxy forwarded to). |
+| `user_agent` | string? | Client `User-Agent` header. Pulled out as a primary field because nearly every analytics consumer wants it; the header allowlist still works as a redundant capture path. |
+| `referer` | string? | Client `Referer` header (the canonical RFC 7231 misspelling). |
+| `upstream_status` | int? | Upstream's response status code, when it differs from `status`. Populated when a retry chain, fallback, or `response_modifier` rewrote the status the client sees; absent when the proxy passed the upstream status through unchanged. |
+| `response_content_type` | string? | Response `Content-Type` as sent to the client. |
+| `response_content_encoding` | string? | Response `Content-Encoding` (`gzip`, `br`, `zstd`, ...) when the body was compressed; absent when uncompressed. |
 | `bytes_in` | int | Inbound request body bytes (post header-decode). |
 | `bytes_out` | int | Bytes written to the client. |
 | `client_ip` | string | Post-trust-boundary client IP. |

@@ -1219,6 +1219,7 @@ fn access_log_emits_json_line_when_enabled() {
             "req-001".to_string(),
             "10.0.0.1".to_string(),
             None,
+            HttpFields::empty(),
             AccessLogContext::empty(),
         );
     });
@@ -1255,6 +1256,7 @@ fn access_log_skips_when_disabled() {
             "req".to_string(),
             "1.1.1.1".to_string(),
             None,
+            HttpFields::empty(),
             AccessLogContext::empty(),
         );
     });
@@ -1282,6 +1284,7 @@ fn access_log_status_filter_drops_unmatched() {
             "r1".to_string(),
             "1.1.1.1".to_string(),
             None,
+            HttpFields::empty(),
             AccessLogContext::empty(),
         );
         emit_access_log_entry(
@@ -1294,6 +1297,7 @@ fn access_log_status_filter_drops_unmatched() {
             "r2".to_string(),
             "1.1.1.1".to_string(),
             None,
+            HttpFields::empty(),
             AccessLogContext::empty(),
         );
     });
@@ -1323,6 +1327,7 @@ fn access_log_method_filter_drops_unmatched() {
             "r1".to_string(),
             "1.1.1.1".to_string(),
             None,
+            HttpFields::empty(),
             AccessLogContext::empty(),
         );
         emit_access_log_entry(
@@ -1335,6 +1340,7 @@ fn access_log_method_filter_drops_unmatched() {
             "r2".to_string(),
             "1.1.1.1".to_string(),
             None,
+            HttpFields::empty(),
             AccessLogContext::empty(),
         );
     });
@@ -1360,6 +1366,7 @@ fn access_log_sampling_emits_roughly_target_fraction() {
                 format!("r{i}"),
                 "1.1.1.1".to_string(),
                 None,
+                HttpFields::empty(),
                 AccessLogContext::empty(),
             );
         }
@@ -1386,6 +1393,7 @@ fn access_log_zero_sample_rate_drops_all() {
                 format!("r{i}"),
                 "1.1.1.1".to_string(),
                 None,
+                HttpFields::empty(),
                 AccessLogContext::empty(),
             );
         }
@@ -1408,6 +1416,7 @@ fn access_log_slow_request_bypasses_sampler() {
             "slow".to_string(),
             "1.1.1.1".to_string(),
             None,
+            HttpFields::empty(),
             AccessLogContext::empty(),
         );
     });
@@ -1429,6 +1438,7 @@ fn access_log_error_bypasses_sampler() {
             "err".to_string(),
             "1.1.1.1".to_string(),
             None,
+            HttpFields::empty(),
             AccessLogContext::empty(),
         );
     });
@@ -1458,6 +1468,7 @@ fn access_log_file_output_writes_file() {
         "file".to_string(),
         "1.1.1.1".to_string(),
         None,
+        HttpFields::empty(),
         AccessLogContext::empty(),
     );
 
@@ -1479,6 +1490,7 @@ fn access_log_propagates_trace_id_when_present() {
             "req".to_string(),
             "1.1.1.1".to_string(),
             Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string()),
+            HttpFields::empty(),
             AccessLogContext::empty(),
         );
     });
@@ -1522,6 +1534,7 @@ fn wor_118_redacts_path_when_other_fields_knob_is_on() {
             "req-path".to_string(),
             "10.0.0.1".to_string(),
             None,
+            HttpFields::empty(),
             AccessLogContext::empty(),
         );
     });
@@ -1557,6 +1570,7 @@ fn wor_118_redacts_user_id_model_and_properties_when_knob_is_on() {
             "req-other".to_string(),
             "10.0.0.1".to_string(),
             None,
+            HttpFields::empty(),
             ctx_with_pii(),
         );
     });
@@ -1611,6 +1625,7 @@ fn wor_118_default_off_leaves_typed_fields_alone() {
             "req-default".to_string(),
             "10.0.0.1".to_string(),
             None,
+            HttpFields::empty(),
             ctx_with_pii(),
         );
     });
@@ -1643,6 +1658,7 @@ fn wor_118_scoped_rules_only_redact_matching_fields() {
             "req-scoped".to_string(),
             "10.0.0.1".to_string(),
             None,
+            HttpFields::empty(),
             ctx_with_pii(),
         );
     });
@@ -1683,6 +1699,7 @@ fn wor_118_unknown_rule_names_are_a_safe_noop() {
             "req-noop".to_string(),
             "10.0.0.1".to_string(),
             None,
+            HttpFields::empty(),
             ctx_with_pii(),
         );
     });

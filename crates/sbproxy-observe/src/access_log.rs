@@ -33,10 +33,58 @@ pub struct AccessLogEntry {
     pub origin: String,
     /// HTTP method (GET, POST, ...).
     pub method: String,
-    /// Request path (without query string).
+    /// Request path (without query string; see `query`).
     pub path: String,
-    /// HTTP response status code.
+    /// Query string from the request URI (without the leading `?`),
+    /// when one was supplied. Captured separately from `path` so
+    /// per-route aggregations on `path` are not split by every
+    /// distinct query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// HTTP version on the wire (`HTTP/1.1`, `HTTP/2.0`, `HTTP/3.0`).
+    /// Useful for protocol-level slicing of latency and error rates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// Scheme the client used to reach the proxy (`http` or `https`).
+    /// Distinct from `upstream_host`'s scheme.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
+    /// Client-supplied `Host` header (`api.example.com:443`). May
+    /// differ from `origin` (the matched virtual-host pattern, which
+    /// can be a wildcard) and from `upstream_host` (the destination
+    /// the proxy forwarded to).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Client `User-Agent` header. Also discoverable via the header
+    /// allowlist, but pulled out as a primary field because nearly
+    /// every analytics consumer wants it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    /// Client `Referer` header (note: the misspelling is the
+    /// canonical RFC 7231 header name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub referer: Option<String>,
+    /// HTTP response status code as sent to the client.
     pub status: u16,
+    /// Upstream's response status code, when it differs from
+    /// `status`. Populated when a response_modifier, retry chain, or
+    /// fallback rewrote the status the client sees; absent when the
+    /// proxy passed the upstream status through unchanged. Lets an
+    /// operator distinguish "upstream returned 500, retry rewrote to
+    /// 200" from "upstream returned 200".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_status: Option<u16>,
+    /// Response `Content-Type` as sent to the client. Captured
+    /// because nearly every analytics consumer slices on shape
+    /// (HTML vs JSON vs streaming) and pulling it out of a generic
+    /// header allowlist is fragile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_content_type: Option<String>,
+    /// Response `Content-Encoding` (`gzip`, `br`, `zstd`, ...) when
+    /// the upstream or middleware compressed the body. Absent when
+    /// the response was sent uncompressed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_content_encoding: Option<String>,
     /// End-to-end latency in milliseconds (wall time).
     pub latency_ms: f64,
     /// Time spent in the auth check (provider dispatch, JWT verify,
@@ -420,7 +468,16 @@ impl Default for AccessLogEntry {
             origin: String::new(),
             method: String::new(),
             path: String::new(),
+            query: None,
+            protocol: None,
+            scheme: None,
+            host: None,
+            user_agent: None,
+            referer: None,
             status: 0,
+            upstream_status: None,
+            response_content_type: None,
+            response_content_encoding: None,
             latency_ms: 0.0,
             auth_ms: None,
             upstream_ttfb_ms: None,
@@ -509,6 +566,36 @@ impl AccessLogEntryBuilder {
     /// Set the HTTP response status code.
     pub fn status(mut self, status: u16) -> Self {
         self.inner.status = status;
+        self
+    }
+    /// Set the request query string (without leading `?`).
+    pub fn query(mut self, q: Option<String>) -> Self {
+        self.inner.query = q;
+        self
+    }
+    /// Set the HTTP-on-the-wire version (`HTTP/1.1`, `HTTP/2.0`, ...).
+    pub fn protocol(mut self, p: Option<String>) -> Self {
+        self.inner.protocol = p;
+        self
+    }
+    /// Set the scheme the client used (`http` or `https`).
+    pub fn scheme(mut self, s: Option<String>) -> Self {
+        self.inner.scheme = s;
+        self
+    }
+    /// Set the client-supplied `Host` header.
+    pub fn host(mut self, h: Option<String>) -> Self {
+        self.inner.host = h;
+        self
+    }
+    /// Set the client `User-Agent` header.
+    pub fn user_agent(mut self, ua: Option<String>) -> Self {
+        self.inner.user_agent = ua;
+        self
+    }
+    /// Set the client `Referer` header.
+    pub fn referer(mut self, r: Option<String>) -> Self {
+        self.inner.referer = r;
         self
     }
     /// Set end-to-end latency in milliseconds.
@@ -661,7 +748,16 @@ mod tests {
             origin: "api.example.com".to_string(),
             method: "GET".to_string(),
             path: "/health".to_string(),
+            query: None,
+            protocol: None,
+            scheme: None,
+            host: None,
+            user_agent: None,
+            referer: None,
             status: 200,
+            upstream_status: None,
+            response_content_type: None,
+            response_content_encoding: None,
             latency_ms: 3.5,
             auth_ms: None,
             upstream_ttfb_ms: None,
