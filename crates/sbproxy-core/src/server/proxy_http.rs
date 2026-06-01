@@ -1054,6 +1054,10 @@ impl ProxyHttp for SbProxy {
                 {
                     ctx.transcode_grpc_message = Some(msg.to_string());
                 }
+                let code_u32 = if status >= 0 { status as u32 } else { 2 };
+                sbproxy_observe::metrics::record_grpc_status(
+                    sbproxy_observe::metrics::grpc_status_label(code_u32),
+                );
             }
         }
 
@@ -1082,6 +1086,10 @@ impl ProxyHttp for SbProxy {
                 .and_then(|s| s.parse::<i32>().ok())
             {
                 ctx.transcode_grpc_status = Some(status);
+                let code_u32 = if status >= 0 { status as u32 } else { 2 };
+                sbproxy_observe::metrics::record_grpc_status(
+                    sbproxy_observe::metrics::grpc_status_label(code_u32),
+                );
                 if let Some(msg) = upstream_response
                     .headers
                     .get("grpc-message")
