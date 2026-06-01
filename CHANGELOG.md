@@ -13,6 +13,19 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **Structured-log schema v2 (`SCHEMA_VERSION = "2"`).** Three changes
+  land together so downstream tooling can read them in one swing:
+  optional `session_id` and `user_id` top-level fields parallel the
+  `RequestEvent` envelope (cross-surface JOIN no longer relies on
+  `request_id` alone); the field-key redaction marker is normalised
+  to `[REDACTED:<NAME>]` everywhere (was `<redacted:name>` in v1) so
+  the schema-v1 layer matches the existing PII-rule replacement
+  shape; the schema bump is additive on the field set (a v1 reader
+  parsing a v2 line keeps working because every new field is
+  `skip_serializing_if = Option::is_none`). Marker normalisation is
+  a string change; downstream tooling that greps for the old
+  `<redacted:...>` form must update.
+
 - **Phase-timing breakdown on the access log + new
   `sbproxy_phase_duration_seconds` Prometheus histogram.** The
   access log carried `latency_ms` end to end and that was it; an
