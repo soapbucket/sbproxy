@@ -772,6 +772,11 @@ pub fn record_auth(origin: &str, auth_type: &str, allowed: bool) {
 /// `duration_secs` is wall-clock seconds; pass derived deltas from
 /// `Instant::saturating_duration_since` to avoid negative values on
 /// clock skew. Helper is a no-op when `duration_secs <= 0.0`.
+///
+/// Observed on both the canonical Prometheus surface AND, when the
+/// operator opted into `telemetry.export_metrics`, the parallel
+/// OTel histogram. The two surfaces share the same `phase` /
+/// `origin` label vocabulary so dashboards bridge cleanly.
 pub fn record_phase_duration(phase: &str, origin: &str, duration_secs: f64) {
     if duration_secs <= 0.0 {
         return;
@@ -781,6 +786,13 @@ pub fn record_phase_duration(phase: &str, origin: &str, duration_secs: f64) {
         .phase_duration
         .with_label_values(&[phase, origin.as_str()])
         .observe(duration_secs);
+    crate::otel::phase_duration_histogram().record(
+        duration_secs,
+        &[
+            opentelemetry::KeyValue::new("phase", phase.to_string()),
+            opentelemetry::KeyValue::new("origin", origin),
+        ],
+    );
 }
 
 /// Record a policy trigger (allow or deny) for an origin.
