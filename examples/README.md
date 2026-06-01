@@ -127,7 +127,7 @@ directory (with its `sb.yml` and README). Generated from `examples/` on 2026-05-
 | [transform-payload-limit](transform-payload-limit/) | Demonstrates the `payload_limit` transform. The proxy fetches `https://httpbin.org/bytes/4096`, which returns 4096 random bytes, and clips t |
 | [transform-replace-strings](transform-replace-strings/) | Demonstrates the `replace_strings` transform. Two find-and-replace rules run against the upstream body: a literal substring swap that rewrit |
 | [transform-template](transform-template/) | Demonstrates the `template` transform. A `static` action emits a JSON document describing an order; the `template` transform parses that JSO |
-| [trusted-proxies](trusted-proxies/) | When sbproxy sits behind another LB or CDN (Cloudflare, AWS ALB, Fly.io edge, internal LB), the immediate TCP peer is the LB, not the real c |
+| [trusted-proxies](trusted-proxies/) | When SBproxy sits behind another LB or CDN (Cloudflare, AWS ALB, Fly.io edge, internal LB), the immediate TCP peer is the LB, not the real c |
 | [upstream-retries](upstream-retries/) | When the proxy cannot establish a TCP/TLS connection to the upstream (DNS failure, refused, unreachable, TLS handshake fail), Pingora calls  |
 | [variables-template](variables-template/) | The `variables` block declares static, per-origin key-value pairs that the template engine exposes as `{{ variables.<name> }}`. Environment  |
 | [waf](waf/) | Demonstrates the `waf` policy with the OWASP Core Rule Set enabled. Each request is screened for common attack signatures (SQL injection, cr |
