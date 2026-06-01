@@ -88,9 +88,10 @@ pub use synthetic::{
     DEFAULT_SYNTHETIC_INTERVAL_SECS, DEFAULT_SYNTHETIC_PATH, DEFAULT_SYNTHETIC_TIMEOUT_MS,
 };
 pub use telemetry::{
-    extract_from_headers, init_otlp_pipeline, init_propagator, inject_into_headers,
-    inject_into_reqwest, shutdown_otlp_pipeline, span as pillar_span, tracing_helper,
-    OtlpTransport, Pillar, TelemetryConfig,
+    extract_from_headers, init_otlp_metrics_pipeline, init_otlp_pipeline, init_propagator,
+    inject_into_headers, inject_into_reqwest, shutdown_otlp_metrics_pipeline,
+    shutdown_otlp_pipeline, span as pillar_span, tracing_helper, OtlpTransport, Pillar,
+    TelemetryConfig,
 };
 pub use topology::{Edge, EdgeStats, TopologyTracker};
 pub use trace_ctx::w3c::TraceContext;
