@@ -72,4 +72,4 @@ The signing primitive that consumes the private side is `sbproxy_middleware::sig
 ## See also
 
 * [docs/web-bot-auth.md](../../docs/web-bot-auth.md) — the buyer-facing Web Bot Auth doc.
-* [examples/bot-auth/](../bot-auth/) — the inbound verify side (SBproxy as the verifier).
+* [examples/web-bot-auth/](../web-bot-auth/) — the inbound verify side (SBproxy as the verifier).

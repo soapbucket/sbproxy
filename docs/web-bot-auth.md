@@ -89,6 +89,33 @@ origins:
 
 A signed crawler still pays per request unless its `Crawler-Payment` token redeems. An unsigned client never reaches the policy. This gives operators two independent gates: identity (bot_auth) and metering (ai_crawl_control).
 
+## Publishing SBproxy's own directory
+
+When SBproxy signs its own outbound requests (e.g. fanning out to AI APIs that demand Web Bot Auth), verifiers need to discover the key SBproxy signs with. Opt the origin into publishing its own JWKS-shaped directory + Signature Agent Card:
+
+```yaml
+origins:
+  "agent.example.com":
+    action:
+      type: proxy
+      url: https://upstream.example.com
+    web_bot_auth_publish:
+      enabled: true
+      key_id: "sbproxy-key-2026-05-31"
+      public_key_hex: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+      agent_name: "SBproxy"
+      directory_url: "https://agent.example.com/.well-known/http-message-signatures-directory"
+      description: "Outbound AI gateway with Web Bot Auth signing."
+      contact_url: "mailto:abuse@example.com"
+```
+
+This serves two unauthenticated GET endpoints on the origin:
+
+* `/.well-known/http-message-signatures-directory` returns the JWKS document. Content-Type is `application/http-message-signatures-directory+json` per the Web Bot Auth IETF draft.
+* `/.well-known/web-bot-auth/agent-card` returns the Signature Agent Card.
+
+Only the public key lives in YAML. The matching private side belongs in a vault / HSM and is consumed by the `MessageSignatureSigner` primitive (`sbproxy-middleware::signatures`) when signing outbound requests. See `examples/web-bot-auth-publish/` for a runnable fixture with the expected curl output.
+
 ## Limitations
 
 - The OSS directory is inline in YAML. Dynamic directory refresh from a hosted JWKS-shaped document is on the roadmap; the same `Directory` trait will back both shapes.
@@ -100,4 +127,6 @@ A signed crawler still pays per request unless its `Crawler-Payment` token redee
 - [configuration.md](configuration.md#authentication) - schema reference (`bot_auth` provider).
 - [RFC 9421](https://www.rfc-editor.org/rfc/rfc9421.html) - the underlying signature standard.
 - `crates/sbproxy-modules/src/auth/bot_auth.rs` - source.
-- `examples/web-bot-auth/sb.yml` - runnable example.
+- `crates/sbproxy-modules/src/auth/bot_auth_publish.rs` - the publish-side composer.
+- `examples/web-bot-auth/sb.yml` - inbound verify, runnable example.
+- `examples/web-bot-auth-publish/sb.yml` - outbound publish, runnable example.
