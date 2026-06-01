@@ -119,12 +119,27 @@ impl Default for LoggingConfig {
     }
 }
 
-// --- Structured-log schema v1 ---
+// --- Structured-log schema v2 ---
 
-/// Schema version stamped on every emitted line. Bumped under the
-/// schema-versioning policy (additive only; breaking changes require a
-/// dual-emit window).
-pub const SCHEMA_VERSION: &str = "1";
+/// Schema version stamped on every emitted line. v2 is additive over
+/// v1 (every v1 reader keeps working with strict-mode JSON parsers
+/// because every new field is `skip_serializing_if = "Option::is_none"`):
+///
+/// * Adds optional `session_id` and `user_id` so cross-surface
+///   correlation no longer relies on `request_id` alone. Both surface
+///   the same identifiers the `RequestEvent` envelope already
+///   carries (`crates/sbproxy-observe/src/request_event.rs`).
+/// * Normalises the field-key redaction marker to `[REDACTED:<NAME>]`
+///   so the schema-v1 layer matches the existing PII-rule replacement
+///   shape (`crates/sbproxy-security/src/pii.rs:458`). Downstream
+///   tooling no longer has to handle two marker conventions.
+///
+/// Breaking changes still require a dual-emit window; this version is
+/// purely additive on the field set and changes only the redaction
+/// marker string (callers that grep for the old `<redacted:...>`
+/// shape need to update; the schema check at parse time still
+/// accepts both forms during the rollout window).
+pub const SCHEMA_VERSION: &str = "2";
 
 /// Pinned event-type enum. Renaming or removing a variant is
 /// a breaking change.
@@ -233,6 +248,14 @@ pub struct StructuredLog {
     /// Origin route key (`hostname` plus path-prefix).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route: Option<String>,
+    /// Per-session identifier (schema v2). Mirrors
+    /// `RequestEvent.session_id`. Absent for non-session traffic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Resolved end-user identifier (schema v2). Mirrors
+    /// `RequestEvent.user_id`. Absent for anonymous traffic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 
     // --- Per-request lifecycle (request_started / completed / error) ---
     /// Resolved agent identifier.
@@ -280,6 +303,8 @@ impl StructuredLog {
             span_id: None,
             tenant_id: None,
             route: None,
+            session_id: None,
+            user_id: None,
             agent_id: None,
             agent_class: None,
             rail: None,
@@ -362,8 +387,8 @@ pub fn apply_redaction(json: &str, sink: Sink) -> String {
 }
 
 /// Recursively walk a JSON value and redact any field whose key is on
-/// the denylist. Replacements use the typed `<redacted:foo>`
-/// marker per the ADR.
+/// the denylist. Replacements use the typed `[REDACTED:FOO]` marker
+/// (schema v2).
 fn redact_value(value: &mut serde_json::Value, sink: Sink) {
     match value {
         serde_json::Value::Object(map) => {
@@ -396,13 +421,13 @@ fn match_denylist(key: &str, sink: Sink) -> Option<&'static str> {
     let k = key.to_ascii_lowercase();
     // Authorization headers + cookies: every sink redacts these.
     if k == "authorization" || k == "proxy-authorization" {
-        return Some("<redacted:authorization>");
+        return Some("[REDACTED:AUTHORIZATION]");
     }
     if k == "cookie" || k == "set-cookie" {
-        return Some("<redacted:cookie>");
+        return Some("[REDACTED:COOKIE]");
     }
     if k == "x-stripe-signature" || k == "stripe-signature" {
-        return Some("<redacted:stripe-signature>");
+        return Some("[REDACTED:STRIPE_SIGNATURE]");
     }
     // Stripe SK fields under any key. Includes the request-header
     // shape `x-stripe-key` (and its underscore-normalised form
@@ -414,37 +439,37 @@ fn match_denylist(key: &str, sink: Sink) -> Option<&'static str> {
         || k == "x-stripe-key"
         || k == "x_stripe_key"
     {
-        return Some("<redacted:stripe-secret-key>");
+        return Some("[REDACTED:STRIPE_SECRET_KEY]");
     }
     if k == "ledger_hmac_key" || k == "sbproxy_ledger_hmac_key" {
-        return Some("<redacted:ledger-hmac-key>");
+        return Some("[REDACTED:LEDGER_HMAC_KEY]");
     }
     // KYA tokens. The historical match handled `kya_*` prefixed
     // fields; the request-header shape is `x-kya` (so the lowercased
     // / underscore-normalised key is `x_kya` or `x-kya`). Match both.
     if k == "kya_token" || k.starts_with("kya_") || k == "x-kya" || k == "x_kya" {
-        return Some("<redacted:kya-token>");
+        return Some("[REDACTED:KYA_TOKEN]");
     }
     if k == "oauth_client_secret" {
-        return Some("<redacted:oauth-client-secret>");
+        return Some("[REDACTED:OAUTH_CLIENT_SECRET]");
     }
     // Receipt secrets. Request-header form is `x-sb-receipt-secret`
     // (underscore-normalised: `x_sb_receipt_secret`). Without this
     // explicit match, the generic `_secret` suffix would route the
     // value through the wrong typed marker.
     if k == "payment_receipt_secret" || k == "x-sb-receipt-secret" || k == "x_sb_receipt_secret" {
-        return Some("<redacted:payment-receipt-secret>");
+        return Some("[REDACTED:PAYMENT_RECEIPT_SECRET]");
     }
     if k == "prompt" || k == "messages" {
-        return Some("<redacted:prompt-body>");
+        return Some("[REDACTED:PROMPT_BODY]");
     }
     if k == "envelope_payload_raw" {
-        return Some("<redacted:envelope-payload-raw>");
+        return Some("[REDACTED:ENVELOPE_PAYLOAD_RAW]");
     }
     // External-only: JA3 / JA4 fingerprints are kept on internal
     // sinks but redacted outbound.
     if sink.is_external() && (k == "ja3" || k == "ja3_hash" || k == "ja4" || k == "ja4_hash") {
-        return Some("<redacted:ja-fingerprint>");
+        return Some("[REDACTED:JA_FINGERPRINT]");
     }
     // Generic suffix match: *_secret / *_token / *_key / api_key.
     // Also covers the hyphenated request-header form `x-api-key`
@@ -460,7 +485,7 @@ fn match_denylist(key: &str, sink: Sink) -> Option<&'static str> {
         || k.ends_with("-secret")
         || k.ends_with("-token")
     {
-        return Some("<redacted:api-key>");
+        return Some("[REDACTED:API_KEY]");
     }
     None
 }
@@ -587,8 +612,49 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["level"], "info");
         assert_eq!(v["event_type"], "request_completed");
-        assert_eq!(v["schema_version"], "1");
+        assert_eq!(v["schema_version"], "2");
         assert_eq!(v["target"], "sbproxy_modules::policy::ai_crawl");
+    }
+
+    /// Schema v2 adds optional `session_id` and `user_id` so a
+    /// downstream ClickHouse / SIEM JOIN against the RequestEvent
+    /// envelope no longer relies on `request_id` alone.
+    #[test]
+    fn schema_v2_surfaces_session_and_user_ids() {
+        let mut rec = StructuredLog::new(
+            LogLevel::Info,
+            "request completed",
+            EventType::RequestCompleted,
+        );
+        rec.session_id = Some("sess_acme_42".to_string());
+        rec.user_id = Some("user_acme_alice".to_string());
+        let json = serde_json::to_string(&rec).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["schema_version"], "2");
+        assert_eq!(v["session_id"], "sess_acme_42");
+        assert_eq!(v["user_id"], "user_acme_alice");
+    }
+
+    /// Schema v2 normalises every field-key redaction marker to
+    /// `[REDACTED:<NAME>]`. A v1-shape marker must never leak
+    /// through.
+    #[test]
+    fn schema_v2_uses_bracket_uppercase_redaction_markers() {
+        let json = r#"{"authorization":"Bearer x","cookie":"session=y","stripe_sk":"sk_live_a","payment_receipt_secret":"pq","prompt":"hello"}"#;
+        let out = apply_redaction(json, Sink::AccessLog);
+        for marker in [
+            "[REDACTED:AUTHORIZATION]",
+            "[REDACTED:COOKIE]",
+            "[REDACTED:STRIPE_SECRET_KEY]",
+            "[REDACTED:PAYMENT_RECEIPT_SECRET]",
+            "[REDACTED:PROMPT_BODY]",
+        ] {
+            assert!(out.contains(marker), "missing {marker} in {out}");
+        }
+        assert!(
+            !out.contains("<redacted:"),
+            "legacy v1-shape marker leaked: {out}"
+        );
     }
 
     // --- Redaction ---
@@ -597,7 +663,7 @@ mod tests {
     fn redaction_replaces_authorization_header() {
         let json = r#"{"headers":{"authorization":"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.veryreallong"}}"#;
         let out = apply_redaction(json, Sink::AccessLog);
-        assert!(out.contains("<redacted:authorization>"), "got: {}", out);
+        assert!(out.contains("[REDACTED:AUTHORIZATION]"), "got: {}", out);
         assert!(!out.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"));
     }
 
@@ -614,7 +680,7 @@ mod tests {
         ] {
             let out = apply_redaction(json, sink);
             assert!(
-                out.contains("<redacted:"),
+                out.contains("[REDACTED:"),
                 "redaction missing for sink {:?}: {}",
                 sink,
                 out
@@ -638,7 +704,7 @@ mod tests {
             "internal sink should keep JA3"
         );
         assert!(
-            external.contains("<redacted:ja-fingerprint>"),
+            external.contains("[REDACTED:JA_FINGERPRINT]"),
             "external sink should redact JA3: {}",
             external
         );
@@ -648,7 +714,7 @@ mod tests {
     fn redaction_redacts_nested_secret_keys() {
         let json = r#"{"a":{"b":{"stripe_sk":"sk_live_abcdef"}}}"#;
         let out = apply_redaction(json, Sink::AuditLog);
-        assert!(out.contains("<redacted:stripe-secret-key>"));
+        assert!(out.contains("[REDACTED:STRIPE_SECRET_KEY]"));
         assert!(!out.contains("sk_live_abcdef"));
     }
 

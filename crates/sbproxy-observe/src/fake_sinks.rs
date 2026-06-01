@@ -263,7 +263,7 @@ mod tests {
             for &name in SINK_NAMES {
                 let buf = read(name);
                 assert!(
-                    buf.contains("<redacted:authorization>"),
+                    buf.contains("[REDACTED:AUTHORIZATION]"),
                     "sink {name} missing marker: {buf}"
                 );
                 assert!(
