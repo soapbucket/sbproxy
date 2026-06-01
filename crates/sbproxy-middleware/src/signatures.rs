@@ -383,6 +383,37 @@ pub struct SignatureInputEntry {
 
 /// Parse the dictionary form of `Signature-Input`.
 ///
+/// Whether any signature in the request's `Signature-Input` header
+/// covers the `content-digest` component. WOR-805 F1.6.1: callers
+/// that verify a Web Bot Auth signature need to know up front whether
+/// the body has to be buffered for a follow-on
+/// [`crate::digest::verify_content_digest`] check against the
+/// `Content-Digest` header value the signature attests to. The check
+/// is deliberately case-insensitive so `"Content-Digest"` and
+/// `"content-digest"` both trip it.
+///
+/// Returns `false` when the header is absent, unparseable, or carries
+/// only signatures whose covered component list does not include
+/// `content-digest`. Returns `true` otherwise.
+pub fn signature_input_covers_content_digest(headers: &HeaderMap) -> bool {
+    let Some(raw) = headers.get("signature-input").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let Ok(entries) = parse_signature_input(raw) else {
+        return false;
+    };
+    for (_label, entry) in entries {
+        if entry
+            .components
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case("content-digest"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Example input: `sig1=("@method" "@authority");keyid="k1";alg="ed25519"`
 ///
 /// Returns a vector of `(label, entry)` preserving order.
@@ -1459,5 +1490,60 @@ mod tests {
             verifier.verify_request(&req),
             VerifyVerdict::Failed { .. }
         ));
+    }
+
+    // --- WOR-805 F1.6.1 helper tests -------------------------------------
+
+    fn build_headers(sig_input: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(v) = sig_input {
+            h.insert("signature-input", v.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn signature_input_covers_content_digest_returns_true_when_listed() {
+        let h = build_headers(Some(
+            "sig1=(\"@method\" \"@authority\" \"content-digest\");keyid=\"k1\";alg=\"ed25519\"",
+        ));
+        assert!(signature_input_covers_content_digest(&h));
+    }
+
+    #[test]
+    fn signature_input_covers_content_digest_case_insensitive() {
+        let h = build_headers(Some(
+            "sig1=(\"@method\" \"Content-Digest\");keyid=\"k1\";alg=\"ed25519\"",
+        ));
+        assert!(signature_input_covers_content_digest(&h));
+    }
+
+    #[test]
+    fn signature_input_covers_content_digest_returns_false_when_absent() {
+        let h = build_headers(Some(
+            "sig1=(\"@method\" \"@authority\");keyid=\"k1\";alg=\"ed25519\"",
+        ));
+        assert!(!signature_input_covers_content_digest(&h));
+    }
+
+    #[test]
+    fn signature_input_covers_content_digest_returns_false_when_header_missing() {
+        let h = build_headers(None);
+        assert!(!signature_input_covers_content_digest(&h));
+    }
+
+    #[test]
+    fn signature_input_covers_content_digest_returns_false_when_unparseable() {
+        let h = build_headers(Some("not a signature-input value"));
+        assert!(!signature_input_covers_content_digest(&h));
+    }
+
+    #[test]
+    fn signature_input_covers_content_digest_finds_match_across_multiple_signatures() {
+        let h = build_headers(Some(
+            "sig1=(\"@method\");keyid=\"k1\";alg=\"ed25519\", \
+             sig2=(\"content-digest\");keyid=\"k2\";alg=\"ed25519\"",
+        ));
+        assert!(signature_input_covers_content_digest(&h));
     }
 }

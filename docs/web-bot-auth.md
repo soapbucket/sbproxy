@@ -133,10 +133,15 @@ web_bot_auth_publish:
 
 When set, both response bodies gain `Content-Digest`, `Signature-Input`, and `Signature` headers per RFC 9421 over `("content-digest")` with `tag="web-bot-auth"`. A verifier that already trusts the published JWK can confirm the body it fetched was emitted by the holder of the advertised key, closing the trust loop without relying on TLS alone. With `signing_key_hex` omitted the endpoints still serve, just without the three signature headers; that lets a verifier that wants to enforce signed directories detect the absence cleanly.
 
+## Content-Digest body binding
+
+When a signed POST covers `content-digest`, the synchronous auth phase verifies the signature header but the request body is not yet buffered. The proxy defers a body-vs-`Content-Digest` check to `request_body_filter`: the body is buffered as `validate_request_body` already does for other policies, `SHA-256(body)` is computed, and the digest is compared against the `Content-Digest` (or fallback `Repr-Digest`) header value the signature attests to. A mismatch is treated as an authentication failure, surfaces as 401, and the body bytes never reach the upstream.
+
+The deferred check fires only when `Signature-Input` actually covers `content-digest`, so a plain `bot_auth` request on header-only signed traffic pays no buffering cost. The flag also stamps `ctx.content_digest_verified` on success so the same audit signal is used as the `content_digest` policy emits.
+
 ## Limitations
 
 - The OSS directory is inline in YAML. Dynamic directory refresh from a hosted JWKS-shaped document is on the roadmap; the same `Directory` trait will back both shapes.
-- Verification runs in the synchronous auth phase, before the request body is buffered. Signatures that cover `content-digest` therefore fail when the body is non-empty (the verifier sees an empty body). Track the buffered-body wiring under F1.6.1.
 - HTTP/3 / QUIC requests deny by default until the H3 dispatch path is plumbed with the full request shape needed for signature reconstruction.
 
 ## See also
