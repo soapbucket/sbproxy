@@ -118,6 +118,7 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 | `sbproxy_operator_reconcile_duration_seconds_bucket` | 22 | `kind` label plus 11 histogram buckets 1ms..60s. |
 | `sbproxy_operator_leader_transitions_total` | 3 | Labels: `result` (elected\|renewed\|lost). |
 | `sbproxy_operator_leader_is_leader` | 1 | Gauge; 1 when this replica holds the lease. |
+| `sbproxy_tokens_attributed_total` | 8 000 | Labels: `project` (sanitised), `user` (sanitised), `tag` (sanitised; first element of the virtual key's `tags:` list with fan-out per tag), `direction` (input\|output). Cardinality not bounded by a fixed cap; the existing `sbproxy_label_cardinality_overflow_total` counter fires when any label exceeds budget. Sits next to `sbproxy_ai_tokens_total{hostname,provider,direction}` and indexes the same observation by who-paid attribution. |
 
 Hard rule: `agent_id`, `request_id`, `session_id`, and `user_id` are never label values on Prometheus metrics. They live as span attributes (under traces) and log fields (under logs).
 

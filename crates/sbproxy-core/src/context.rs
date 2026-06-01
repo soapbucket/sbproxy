@@ -673,6 +673,13 @@ pub struct RequestContext {
     /// virtual key, surfaced on the access log as a JSON object so
     /// reports can group by a custom dimension.
     pub ai_metadata: std::collections::HashMap<String, String>,
+    /// Tags lifted off the matched virtual key. Surfaced as labels
+    /// on the per-credential attribution metric
+    /// `sbproxy_tokens_attributed_total{tag}` so a Prometheus query
+    /// can fan out spend per declared tag (`team:frontend`,
+    /// `env:prod`, etc.). Empty when no key matched or the matched
+    /// key declared no tags.
+    pub ai_tags: Vec<String>,
     /// AI model identifier the request routed to (e.g. `gpt-4o`,
     /// `claude-sonnet-4-6`). Captured before the upstream call so
     /// the access log records the resolved model even when the
@@ -1011,6 +1018,7 @@ impl RequestContext {
             ai_project: None,
             ai_user: None,
             ai_metadata: std::collections::HashMap::new(),
+            ai_tags: Vec::new(),
             ai_model: None,
             ai_tokens_in: None,
             ai_tokens_out: None,
