@@ -245,6 +245,15 @@ pub struct ProxyMetrics {
     /// `DedupCache` (see `sbproxy-transport`); lets operators spot a cache
     /// that is growing unexpectedly under a stream of unique request hashes.
     pub dedup_cache_size: IntGauge,
+    /// Histogram `sbproxy_phase_duration_seconds` of intra-request
+    /// phase durations. Labelled by `phase` (currently `auth`,
+    /// `upstream_ttfb`, `response_filter`) and `origin`. Lets
+    /// dashboards split where end-to-end latency comes from
+    /// (slow auth provider vs slow upstream vs heavy transform).
+    /// Same observation appears as fields on the access-log entry
+    /// (`auth_ms`, `upstream_ttfb_ms`, `response_filter_ms`); the
+    /// histogram is the aggregate view.
+    pub phase_duration: HistogramVec,
 }
 
 impl ProxyMetrics {
@@ -449,6 +458,23 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        // Phase-duration histogram. Buckets match `request_duration`
+        // so cross-cut dashboards (phase vs end-to-end) align by le
+        // label without bucket interpolation. `phase` label values
+        // today: `auth`, `upstream_ttfb`, `response_filter`. New
+        // phases append to the closed enum; never reorder.
+        let phase_duration = HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "sbproxy_phase_duration_seconds",
+                "Intra-request phase duration, partitioned by phase + origin",
+            )
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
+            &["phase", "origin"],
+        )
+        .unwrap();
+
         // --- Register all metrics ---
 
         registry.register(Box::new(requests_total.clone())).unwrap();
@@ -505,6 +531,7 @@ impl ProxyMetrics {
         registry
             .register(Box::new(dedup_cache_size.clone()))
             .unwrap();
+        registry.register(Box::new(phase_duration.clone())).unwrap();
 
         Self {
             registry,
@@ -530,6 +557,7 @@ impl ProxyMetrics {
             mirror_state_drift,
             agent_skill_digest_mismatch,
             dedup_cache_size,
+            phase_duration,
         }
     }
 
@@ -736,6 +764,23 @@ pub fn record_auth(origin: &str, auth_type: &str, allowed: bool) {
         .auth_results
         .with_label_values(&[origin.as_str(), auth_type, result])
         .inc();
+}
+
+/// Observe one phase-duration sample on `sbproxy_phase_duration_seconds`.
+/// `phase` is the closed-enum slice (`auth`, `upstream_ttfb`,
+/// `response_filter`); `origin` is the matched origin hostname.
+/// `duration_secs` is wall-clock seconds; pass derived deltas from
+/// `Instant::saturating_duration_since` to avoid negative values on
+/// clock skew. Helper is a no-op when `duration_secs <= 0.0`.
+pub fn record_phase_duration(phase: &str, origin: &str, duration_secs: f64) {
+    if duration_secs <= 0.0 {
+        return;
+    }
+    let origin = sanitize_label("origin", origin);
+    metrics()
+        .phase_duration
+        .with_label_values(&[phase, origin.as_str()])
+        .observe(duration_secs);
 }
 
 /// Record a policy trigger (allow or deny) for an origin.

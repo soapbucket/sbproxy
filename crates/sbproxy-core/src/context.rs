@@ -263,6 +263,24 @@ pub struct RequestContext {
     // --- Timing ---
     /// Request start time for latency measurement.
     pub request_start: Option<Instant>,
+    /// Instant the auth check finished (success or denial), set just
+    /// after `auth_check` returns in `request_filter`. Difference
+    /// from `request_start` is `auth_ms` on the access log + the
+    /// `auth` slice of `sbproxy_phase_duration_seconds`. `None` for
+    /// origins with no auth provider.
+    pub auth_finished_at: Option<Instant>,
+    /// Instant the proxy received the first response header byte
+    /// from the upstream. Set at the top of `response_filter`.
+    /// Difference from `request_start` is `upstream_ttfb_ms` on the
+    /// access log + the `upstream_ttfb` slice of
+    /// `sbproxy_phase_duration_seconds`.
+    pub upstream_first_byte_at: Option<Instant>,
+    /// Instant the `response_filter` hook returned for the final
+    /// transform. Difference from `upstream_first_byte_at` is
+    /// `response_filter_ms` on the access log + the
+    /// `response_filter` slice of `sbproxy_phase_duration_seconds`.
+    /// `None` when no response_filter ran (e.g. early auth rejection).
+    pub response_filter_finished_at: Option<Instant>,
     /// HTTP status code from the upstream response (set in response_filter).
     pub response_status: Option<u16>,
 
@@ -904,6 +922,9 @@ impl RequestContext {
             short_circuit_body: None,
             short_circuit_content_type: None,
             request_start: None,
+            auth_finished_at: None,
+            upstream_first_byte_at: None,
+            response_filter_finished_at: None,
             response_status: None,
             rate_limit_info: None,
             response_body_buf: None,

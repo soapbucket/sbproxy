@@ -32,8 +32,19 @@ origins:
 A request to `api.example.com` now produces a line such as:
 
 ```json
-{"timestamp":"2026-04-27T12:00:03.521Z","request_id":"7f7c","origin":"api.example.com","method":"GET","path":"/health","status":200,"latency_ms":3.4,"bytes_in":0,"bytes_out":1024,"client_ip":"203.0.113.10"}
+{"timestamp":"2026-04-27T12:00:03.521Z","request_id":"7f7c","origin":"api.example.com","method":"GET","path":"/health","status":200,"latency_ms":24.7,"auth_ms":1.2,"upstream_ttfb_ms":18.9,"response_filter_ms":4.1,"bytes_in":0,"bytes_out":1024,"client_ip":"203.0.113.10"}
 ```
+
+The three `*_ms` phase fields (`auth_ms`, `upstream_ttfb_ms`,
+`response_filter_ms`) split `latency_ms` into the parts of the
+pipeline that contributed to it. They are emitted whenever the
+matching phase ran on the request; an origin with no auth provider
+omits `auth_ms`, an early WAF block omits `upstream_ttfb_ms` and
+`response_filter_ms`, a cache hit served from the proxy omits both
+upstream fields. The same observations also feed the
+`sbproxy_phase_duration_seconds` Prometheus histogram (see
+[metrics-stability.md](./metrics-stability.md)) so the aggregate
+view does not require log scraping.
 
 Optional fields (`provider`, `model`, `tokens_in`, `tokens_out`,
 `cache_result`, `trace_id`, `request_headers`, `response_headers`,
@@ -136,6 +147,9 @@ restricts the rule set; accepted names are `email`, `us_ssn`,
 | `path` | string | Request path, no query string. |
 | `status` | int | HTTP response status code. |
 | `latency_ms` | float | Wall-clock end-to-end latency in milliseconds. |
+| `auth_ms` | float? | Time spent in the auth check (provider dispatch, JWT verify, forward-auth subrequest, OIDC cookie open). Absent when the origin has no auth provider. |
+| `upstream_ttfb_ms` | float? | Time from request start to the first byte of the upstream response header. Absent when the request never reached an upstream (early auth/policy short-circuit, cache hit). |
+| `response_filter_ms` | float? | Time spent running response transforms between first upstream byte and end of `response_filter`. Absent when no response_filter ran. |
 | `bytes_in` | int | Inbound request body bytes (post header-decode). |
 | `bytes_out` | int | Bytes written to the client. |
 | `client_ip` | string | Post-trust-boundary client IP. |

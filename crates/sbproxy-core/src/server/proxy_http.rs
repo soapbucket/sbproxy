@@ -968,6 +968,14 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // Phase-timing capture: snapshot the moment the upstream's
+        // response header arrived. `request_start -> here` is TTFB;
+        // `here -> end of this fn` is response_filter latency. Both
+        // feed `sbproxy_phase_duration_seconds` and the access log.
+        // Set unconditionally because a single request only enters
+        // this hook once per upstream response.
+        ctx.upstream_first_byte_at = Some(std::time::Instant::now());
+
         // --- WOR-808: RSL `Link: rel="license"` discovery header ---
         //
         // When the origin publishes an RSL document (it has an
@@ -2003,6 +2011,13 @@ impl ProxyHttp for SbProxy {
                 let _ = upstream_response.insert_header("x-markdown-tokens", estimate.to_string());
             }
         }
+
+        // Phase-timing capture: snapshot the moment response_filter
+        // returns. Paired with `ctx.upstream_first_byte_at` (set at
+        // the top of this hook), this is the response-filter phase
+        // latency in the access log and in
+        // `sbproxy_phase_duration_seconds{phase="response_filter"}`.
+        ctx.response_filter_finished_at = Some(std::time::Instant::now());
 
         Ok(())
     }
@@ -3606,6 +3621,37 @@ impl ProxyHttp for SbProxy {
                 .request_duration
                 .with_label_values(&[hostname.as_str()])
                 .observe(duration);
+        }
+
+        // Phase-duration histogram. Same source-of-truth as the
+        // per-phase fields on the access log; this is the aggregate
+        // view a Grafana dashboard slices by `phase` to spot
+        // regressions in one component (slow auth, slow upstream,
+        // slow transform) without staring at line logs.
+        if let Some(start) = ctx.request_start {
+            if let Some(end) = ctx.auth_finished_at {
+                sbproxy_observe::metrics::record_phase_duration(
+                    "auth",
+                    hostname.as_str(),
+                    end.saturating_duration_since(start).as_secs_f64(),
+                );
+            }
+            if let Some(ttfb) = ctx.upstream_first_byte_at {
+                sbproxy_observe::metrics::record_phase_duration(
+                    "upstream_ttfb",
+                    hostname.as_str(),
+                    ttfb.saturating_duration_since(start).as_secs_f64(),
+                );
+            }
+        }
+        if let (Some(ttfb), Some(rf_end)) =
+            (ctx.upstream_first_byte_at, ctx.response_filter_finished_at)
+        {
+            sbproxy_observe::metrics::record_phase_duration(
+                "response_filter",
+                hostname.as_str(),
+                rf_end.saturating_duration_since(ttfb).as_secs_f64(),
+            );
         }
 
         // Per-origin active-connection bookkeeping. The actual request

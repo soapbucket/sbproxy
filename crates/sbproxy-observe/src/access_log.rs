@@ -39,6 +39,25 @@ pub struct AccessLogEntry {
     pub status: u16,
     /// End-to-end latency in milliseconds (wall time).
     pub latency_ms: f64,
+    /// Time spent in the auth check (provider dispatch, JWT verify,
+    /// forward-auth subrequest, OIDC cookie open, ...). `None` when
+    /// the origin has no auth provider configured. Sum across the
+    /// auth chain; not a per-provider breakdown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_ms: Option<f64>,
+    /// Time-to-first-byte from the upstream: from request start to
+    /// the moment the proxy received the first byte of the upstream
+    /// response header. `None` when the request never reached an
+    /// upstream (early auth/policy short-circuit, cache hit served
+    /// from the proxy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_ttfb_ms: Option<f64>,
+    /// Time spent running response transforms after the upstream
+    /// responded. From the first byte of upstream response headers
+    /// to the end of `response_filter`. `None` when no
+    /// response_filter ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_filter_ms: Option<f64>,
     /// Bytes received from the client (request body + headers).
     pub bytes_in: u64,
     /// Bytes sent to the client (response body + headers).
@@ -403,6 +422,9 @@ impl Default for AccessLogEntry {
             path: String::new(),
             status: 0,
             latency_ms: 0.0,
+            auth_ms: None,
+            upstream_ttfb_ms: None,
+            response_filter_ms: None,
             bytes_in: 0,
             bytes_out: 0,
             client_ip: String::new(),
@@ -492,6 +514,23 @@ impl AccessLogEntryBuilder {
     /// Set end-to-end latency in milliseconds.
     pub fn latency_ms(mut self, ms: f64) -> Self {
         self.inner.latency_ms = ms;
+        self
+    }
+    /// Set auth-phase latency in milliseconds. Pass `None` (or skip
+    /// the call) when the origin has no auth provider.
+    pub fn auth_ms(mut self, ms: Option<f64>) -> Self {
+        self.inner.auth_ms = ms;
+        self
+    }
+    /// Set upstream TTFB in milliseconds. `None` when the request
+    /// never hit an upstream.
+    pub fn upstream_ttfb_ms(mut self, ms: Option<f64>) -> Self {
+        self.inner.upstream_ttfb_ms = ms;
+        self
+    }
+    /// Set response-filter phase latency in milliseconds.
+    pub fn response_filter_ms(mut self, ms: Option<f64>) -> Self {
+        self.inner.response_filter_ms = ms;
         self
     }
     /// Set request body bytes received.
@@ -624,6 +663,9 @@ mod tests {
             path: "/health".to_string(),
             status: 200,
             latency_ms: 3.5,
+            auth_ms: None,
+            upstream_ttfb_ms: None,
+            response_filter_ms: None,
             bytes_in: 128,
             bytes_out: 512,
             client_ip: "10.0.0.1".to_string(),
