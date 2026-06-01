@@ -216,7 +216,24 @@ impl LuaEngine {
     ///
     /// Each key in `globals` is set as a Lua global variable before execution.
     /// The return value of the script is converted back to a JSON value.
+    ///
+    /// Stamps `sbproxy_script_invocations_total{engine="lua"}` and
+    /// `sbproxy_script_duration_seconds{engine="lua"}` regardless of outcome.
     pub fn execute(
+        &self,
+        script: &str,
+        globals: HashMap<String, serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let out = self.execute_inner(script, globals);
+        let elapsed = start.elapsed().as_secs_f64();
+        sbproxy_observe::metrics::record_script_duration("lua", elapsed);
+        let result_label = if out.is_ok() { "ok" } else { "runtime_error" };
+        sbproxy_observe::metrics::record_script_invocation("lua", result_label);
+        out
+    }
+
+    fn execute_inner(
         &self,
         script: &str,
         globals: HashMap<String, serde_json::Value>,
@@ -241,6 +258,21 @@ impl LuaEngine {
     /// `modify_request(req, ctx)`, `modify_response(resp, ctx)`, or
     /// `modify_json(data, ctx)` instead of using bare top-level code.
     pub fn call_function(
+        &self,
+        script: &str,
+        func_name: &str,
+        args: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let out = self.call_function_inner(script, func_name, args);
+        let elapsed = start.elapsed().as_secs_f64();
+        sbproxy_observe::metrics::record_script_duration("lua", elapsed);
+        let result_label = if out.is_ok() { "ok" } else { "runtime_error" };
+        sbproxy_observe::metrics::record_script_invocation("lua", result_label);
+        out
+    }
+
+    fn call_function_inner(
         &self,
         script: &str,
         func_name: &str,

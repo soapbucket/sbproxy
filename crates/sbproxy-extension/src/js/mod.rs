@@ -102,6 +102,18 @@ pub struct JsEngine {
     sandbox: JsSandboxConfig,
 }
 
+/// Map a [`JsExecutionError`] outcome to the closed `result` label set
+/// the script metrics expose. Keeps the surface to a single source of
+/// truth so the four `execute` / `call_function` / `match_request` /
+/// `waf_match` paths stamp consistent labels.
+fn js_result_label<T>(out: &std::result::Result<T, JsExecutionError>) -> &'static str {
+    match out {
+        Ok(_) => "ok",
+        Err(JsExecutionError::Interrupt { .. }) => "timeout",
+        Err(JsExecutionError::Other(_)) => "runtime_error",
+    }
+}
+
 impl JsEngine {
     /// Create a new sandboxed JS engine with default sandbox limits.
     ///
@@ -302,7 +314,8 @@ impl JsEngine {
         script: &str,
         globals: HashMap<String, serde_json::Value>,
     ) -> std::result::Result<serde_json::Value, JsExecutionError> {
-        self.with_budget(|| {
+        let start = std::time::Instant::now();
+        let out = self.with_budget(|| {
             self.context.with(|ctx| {
                 let global = ctx.globals();
 
@@ -317,7 +330,11 @@ impl JsEngine {
 
                 js_to_json(&ctx, &result)
             })
-        })
+        });
+        let elapsed = start.elapsed().as_secs_f64();
+        sbproxy_observe::metrics::record_script_duration("js", elapsed);
+        sbproxy_observe::metrics::record_script_invocation("js", js_result_label(&out));
+        out
     }
 
     /// Execute a script that defines a named function, then call that function.
@@ -330,6 +347,20 @@ impl JsEngine {
     /// like `modify_request(req, ctx)`, `modify_response(resp, ctx)`, or
     /// `modify_json(data, ctx)`.
     pub fn call_function(
+        &self,
+        script: &str,
+        func_name: &str,
+        args: Vec<serde_json::Value>,
+    ) -> std::result::Result<serde_json::Value, JsExecutionError> {
+        let start = std::time::Instant::now();
+        let out = self.call_function_inner(script, func_name, args);
+        let elapsed = start.elapsed().as_secs_f64();
+        sbproxy_observe::metrics::record_script_duration("js", elapsed);
+        sbproxy_observe::metrics::record_script_invocation("js", js_result_label(&out));
+        out
+    }
+
+    fn call_function_inner(
         &self,
         script: &str,
         func_name: &str,

@@ -196,15 +196,27 @@ impl WasmRuntime {
         // error and rebuild via `anyhow::anyhow!` to keep messages chainable
         // through the rest of the proxy's error stack.
         let module = if let Some(bytes) = config.module_bytes.as_ref() {
-            Some(
-                Module::from_binary(&engine, bytes)
-                    .map_err(|e| anyhow::anyhow!("compiling WASM bytes: {e:?}"))?,
-            )
+            match Module::from_binary(&engine, bytes) {
+                Ok(m) => {
+                    sbproxy_observe::metrics::record_script_compile("wasm", "ok");
+                    Some(m)
+                }
+                Err(e) => {
+                    sbproxy_observe::metrics::record_script_compile("wasm", "parse_error");
+                    return Err(anyhow::anyhow!("compiling WASM bytes: {e:?}"));
+                }
+            }
         } else if let Some(path) = config.module_path.as_ref() {
-            Some(
-                Module::from_file(&engine, path)
-                    .map_err(|e| anyhow::anyhow!("loading WASM from {path}: {e:?}"))?,
-            )
+            match Module::from_file(&engine, path) {
+                Ok(m) => {
+                    sbproxy_observe::metrics::record_script_compile("wasm", "ok");
+                    Some(m)
+                }
+                Err(e) => {
+                    sbproxy_observe::metrics::record_script_compile("wasm", "parse_error");
+                    return Err(anyhow::anyhow!("loading WASM from {path}: {e:?}"));
+                }
+            }
         } else {
             None
         };
@@ -228,6 +240,32 @@ impl WasmRuntime {
     /// retained for source compatibility with the previous stub. A
     /// future ABI variant may dispatch on function names.
     pub fn execute(&self, _function: &str, input: &[u8]) -> Result<Vec<u8>> {
+        let start_ts = std::time::Instant::now();
+        let out = self.execute_inner(input);
+        let elapsed = start_ts.elapsed().as_secs_f64();
+        sbproxy_observe::metrics::record_script_duration("wasm", elapsed);
+        let label = match &out {
+            Ok(_) => "ok",
+            Err(e) => {
+                let msg = format!("{e}");
+                // Classify common wasmtime trap shapes so dashboards can
+                // distinguish runaway scripts from genuine runtime errors.
+                if msg.contains("epoch") || msg.contains("interrupt") {
+                    "timeout"
+                } else if msg.contains("fuel") {
+                    "instruction_cap"
+                } else if msg.contains("memory") {
+                    "memory_cap"
+                } else {
+                    "runtime_error"
+                }
+            }
+        };
+        sbproxy_observe::metrics::record_script_invocation("wasm", label);
+        out
+    }
+
+    fn execute_inner(&self, input: &[u8]) -> Result<Vec<u8>> {
         let module = self
             .module
             .as_ref()
