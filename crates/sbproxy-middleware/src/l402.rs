@@ -1,11 +1,11 @@
 //! WOR-807: L402 (Lightning HTTP 402) bearer credential surface.
 //!
 //! Implements the wire surface of the Lightning Labs L402 protocol on
-//! top of the [`crate::macaroon`] primitive. SBproxy is the *server*
+//! top of the `crate::macaroon` primitive. SBproxy is the *server*
 //! half: it mints a macaroon + Lightning invoice and challenges the
 //! caller, then accepts a `Authorization: L402 <macaroon>:<preimage>`
 //! header on the retry. Lightning invoice issuance is handed off to a
-//! caller-supplied [`InvoiceProvider`] so the same code drives an LND,
+//! caller-supplied `InvoiceProvider` so the same code drives an LND,
 //! CLN, or Phoenixd backend.
 //!
 //! # Wire shape
@@ -40,8 +40,8 @@
 //!
 //! # What this module is not
 //!
-//! - A Lightning client. [`InvoiceProvider`] is the seam to LND / CLN
-//!   / Phoenixd; this module never talks to a Lightning node directly.
+//! - A Lightning client. `InvoiceProvider` is the seam to LND / CLN /
+//!   Phoenixd; this module never talks to a Lightning node directly.
 //! - A request-pipeline integration. The auth provider that arms
 //!   `L402Verifier` on the request path lands in `sbproxy-modules`
 //!   alongside the other auth providers.
@@ -79,7 +79,7 @@ pub trait InvoiceProvider: Send + Sync {
     fn create_invoice(&self, amount_msat: u64, memo: &str) -> Result<Invoice, InvoiceError>;
 }
 
-/// Errors an [`InvoiceProvider`] can return. The L402 layer surfaces
+/// Errors an `InvoiceProvider` can return. The L402 layer surfaces
 /// these as 503s so the caller knows to retry against the upstream
 /// payment broker rather than the gateway.
 #[derive(Debug, Clone)]

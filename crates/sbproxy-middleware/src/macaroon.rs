@@ -36,7 +36,7 @@
 //!
 //! # Serialisation
 //!
-//! [`Macaroon::serialize`] produces a base64url-no-pad-encoded JSON
+//! `Macaroon::serialize` produces a base64url-no-pad-encoded JSON
 //! body. The JSON shape is intentionally simple; this module is a
 //! self-contained protocol primitive, not a libmacaroons-binary-format
 //! mirror. A future drop-in compatibility layer for the Aperture wire
