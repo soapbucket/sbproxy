@@ -61,6 +61,7 @@ fn tool_serialization_with_annotations() {
             open_world_hint: true,
             ..Default::default()
         }),
+        meta: None,
     };
     let json = serde_json::to_value(&tool).unwrap();
     assert_eq!(json["name"], "get_weather");
@@ -136,6 +137,7 @@ fn make_tool(name: &str) -> Tool {
         description: Some(format!("{} tool", name)),
         input_schema: serde_json::json!({"type": "object"}),
         annotations: None,
+        meta: None,
     }
 }
 

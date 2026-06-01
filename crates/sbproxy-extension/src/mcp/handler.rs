@@ -121,6 +121,12 @@ impl McpHandler {
                 resources: None,
                 prompts: None,
                 experimental,
+                // The embedded standalone handler has no federation
+                // context and therefore no upstream `mcpApps`
+                // capability to mirror. The federation-aware
+                // dispatcher in sbproxy-core advertises it when an
+                // upstream supports SEP-1865.
+                mcp_apps: None,
             },
             server_info: ServerInfo {
                 name: self.server_name.clone(),

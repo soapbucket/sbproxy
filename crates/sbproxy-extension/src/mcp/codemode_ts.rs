@@ -685,6 +685,7 @@ mod tests {
             input_schema,
             server_name: "test-server".to_string(),
             streaming: false,
+            meta: None,
         }
     }
 
@@ -699,6 +700,7 @@ mod tests {
             input_schema,
             server_name: "test-server".to_string(),
             streaming: true,
+            meta: None,
         }
     }
 

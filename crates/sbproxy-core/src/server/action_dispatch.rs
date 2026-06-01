@@ -1078,13 +1078,32 @@ pub(super) async fn handle_mcp_action(
             } else {
                 None
             };
+            // WOR-818: lazy-prime the resource registry on the
+            // first initialize so the mcpApps capability mirrors
+            // from any upstream that advertised SEP-1865. A failure
+            // here logs and continues; the rest of the initialize
+            // response is still useful for base-MCP clients.
+            if let Err(e) = mcp.federation.refresh_resources().await {
+                warn!(error = %e, "MCP federation resource refresh failed");
+            }
+            let mcp_apps = mcp.federation.mcp_apps_capability();
+            let resources = if mcp.federation.list_resources().is_empty() {
+                None
+            } else {
+                Some(serde_json::json!({}))
+            };
             let result = InitializeResult {
                 protocol_version: "2025-06-18".to_string(),
                 capabilities: ServerCapabilities {
                     tools: Some(serde_json::json!({})),
-                    resources: None,
+                    resources,
                     prompts: None,
                     experimental,
+                    // WOR-818: mirror SEP-1865 capability from
+                    // upstreams. Apps-SDK clients use this to know
+                    // they should look for UI templates on tools and
+                    // fetch them via resources/read.
+                    mcp_apps,
                 },
                 server_info: ServerInfo {
                     name: mcp.server_name.clone(),
@@ -1116,11 +1135,22 @@ pub(super) async fn handle_mcp_action(
                     .list_tools()
                     .into_iter()
                     .map(|t| {
-                        serde_json::json!({
+                        // WOR-818: preserve the upstream `_meta`
+                        // block (SEP-1865 UI-template metadata, etc.)
+                        // by inserting it conditionally; absent
+                        // keeps the JSON shape unchanged for
+                        // base-MCP clients.
+                        let mut entry = serde_json::json!({
                             "name": t.name,
                             "description": t.description,
                             "inputSchema": t.input_schema,
-                        })
+                        });
+                        if let Some(m) = t.meta {
+                            if let Some(obj) = entry.as_object_mut() {
+                                obj.insert("_meta".to_string(), m);
+                            }
+                        }
+                        entry
                     })
                     .collect()
             };
@@ -1128,6 +1158,63 @@ pub(super) async fn handle_mcp_action(
                 request.id.clone(),
                 serde_json::json!({ "tools": tool_defs }),
             )
+        }
+        "resources/list" => {
+            // WOR-818: pass-through the federated resource list. The
+            // refresh runs lazily on the first call (same pattern as
+            // `tools/list`). Failures fall through to an empty list.
+            if let Err(e) = mcp.federation.refresh_resources().await {
+                warn!(error = %e, "MCP federation resource refresh failed");
+            }
+            let resources: Vec<serde_json::Value> = mcp
+                .federation
+                .list_resources()
+                .into_iter()
+                .map(|r| {
+                    let mut entry = serde_json::json!({
+                        "uri": r.uri,
+                        "name": r.name,
+                    });
+                    if let Some(d) = r.description {
+                        entry["description"] = serde_json::Value::String(d);
+                    }
+                    if let Some(m) = r.mime_type {
+                        entry["mimeType"] = serde_json::Value::String(m);
+                    }
+                    entry
+                })
+                .collect();
+            JsonRpcResponse::success(
+                request.id.clone(),
+                serde_json::json!({ "resources": resources }),
+            )
+        }
+        "resources/read" => {
+            // WOR-818: forward to the upstream that owns the URI.
+            // Pass-through only -- the gateway does not enforce
+            // CSP / iframe-sandbox / cache-metadata at this layer;
+            // those validators ship in the enterprise tier.
+            let params = request.params.clone().unwrap_or(serde_json::Value::Null);
+            let uri = params.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+            if uri.is_empty() {
+                JsonRpcResponse::error(
+                    request.id.clone(),
+                    INVALID_PARAMS,
+                    "resources/read requires `uri` param",
+                )
+            } else {
+                match mcp.federation.read_resource(uri).await {
+                    Ok(value) => JsonRpcResponse::success(request.id.clone(), value),
+                    Err(e) => {
+                        warn!(error = %e, uri = %uri, "resources/read failed");
+                        JsonRpcResponse::error(
+                            request.id.clone(),
+                            INTERNAL_ERROR,
+                            &format!("resources/read failed: {e}"),
+                        )
+                    }
+                }
+            }
         }
         "tools/call" => {
             let params = request.params.clone().unwrap_or(serde_json::Value::Null);
