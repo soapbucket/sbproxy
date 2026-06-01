@@ -373,7 +373,11 @@ pub(super) fn emit_access_log(
     let request_id = if !ctx.request_id.is_empty() {
         ctx.request_id.to_string()
     } else {
-        uuid::Uuid::new_v4().to_string()
+        // Fallback when the request_phase generator never ran (in-process
+        // synthetic call, missing X-Request-Id and disabled correlation
+        // middleware). Use the same UUIDv7 generator as the main path so
+        // a downstream ClickHouse / SIEM JOIN sees one column shape.
+        crate::identity::new_request_id()
     };
     let client_ip = ctx.client_ip.map(|ip| ip.to_string()).unwrap_or_default();
 

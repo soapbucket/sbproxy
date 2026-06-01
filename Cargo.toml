@@ -251,8 +251,9 @@ fs2 = "0.4"
 # macro resolvable in checkouts that have not run a UI build yet.
 include_dir = "0.7"
 
-# UUID
-uuid = { version = "1", features = ["v4"] }
+# UUID. v7 is the canonical request-id shape (RFC 9562 monotonic +
+# time-ordered); v4 stays available for legacy random-id sites.
+uuid = { version = "1", features = ["v4", "v7"] }
 
 # ULID (lexicographically sortable IDs). The Wave 8 envelope uses ULIDs
 # for request_id / session_id / parent_session_id. The `serde` feature
