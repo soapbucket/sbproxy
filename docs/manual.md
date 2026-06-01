@@ -101,17 +101,23 @@ config (log filter, shutdown timing, validation-only mode).
 ```
 sbproxy --config <path>
 sbproxy serve -f <path> [--log-level <level>] [--request-log-level <level>]
+                        [--log-format compact|pretty|json]
                         [--shutdown-grace-ms <ms>] [--grace-time <secs>]
                         [--disable-sb-flags]
-sbproxy validate <path>
+sbproxy validate <path> [--format text|json]
 sbproxy --config <path> --check
 sbproxy plan -f <yaml> [--against <yaml>] [--format json|text] [--out <plan-file>]
 sbproxy apply -f <yaml>
 sbproxy apply -p <plan-file>
 sbproxy projections render --kind <kind> --config <path> [--hostname <h>]
+sbproxy completions {bash|zsh|fish|powershell|elvish}
 sbproxy --version
 sbproxy --help
 ```
+
+Argv parsing is `clap` derive, so every subcommand also accepts
+`--help` for a focused usage block (`sbproxy plan --help`,
+`sbproxy projections render --help`, etc.).
 
 ### `serve` - start the proxy
 
@@ -218,6 +224,38 @@ Exit codes:
 | 3 | Semantic-validation errors. Apply refused. |
 | 5 | Plan file is stale. Rerun `plan` and re-apply. |
 | 6 | Another `apply` already holds the applylock. |
+
+### `projections render` - serve-time documents on demand
+
+Renders the per-origin projection document (robots.txt, llms.txt,
+llms-full.txt, licenses, TDMRep) to stdout without binding any
+listener. Useful for previewing the surface a crawler will see, or for
+piping into a CI fixture comparison.
+
+```bash
+sbproxy projections render --kind robots --config sb.yml
+sbproxy projections render --kind llms-full --config sb.yml --hostname api.example.com
+```
+
+When `--hostname` is omitted, the first origin in the config is
+chosen. Accepted `--kind` values: `robots`, `llms`, `llms-full`,
+`licenses`, `tdmrep`.
+
+### `completions` - shell tab-completion scripts
+
+Writes a `clap_complete`-generated completion script to stdout for
+the requested shell. Pipe it into the shell's completion sink and the
+binary, every subcommand, and every flag become tab-completable.
+
+```bash
+sbproxy completions bash > /etc/bash_completion.d/sbproxy
+sbproxy completions zsh > "${fpath[1]}/_sbproxy"
+sbproxy completions fish > ~/.config/fish/completions/sbproxy.fish
+```
+
+Accepted shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`.
+Homebrew users get completions wired automatically at install time;
+the manual paths above are for source builds.
 
 ### Flags
 
