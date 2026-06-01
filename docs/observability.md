@@ -107,6 +107,8 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 | `sbproxy_acme_renewal_duration_seconds_bucket` | 60 | Same `result` plus 10 histogram buckets 100ms..5min. |
 | `sbproxy_ocsp_fetch_total` | 5 | Labels: `result` (ok\|http_error\|parse_error\|unknown_status\|no_responder). |
 | `sbproxy_cert_expiry_seconds` | 256 | Labels: `host` (sanitised). Gauge; negative means already expired. |
+| `sbproxy_vault_resolution_total` | 200 | Labels: `backend` (sanitised), `result` (ok\|not_found\|backend_error\|denied). |
+| `sbproxy_vault_resolution_duration_seconds_bucket` | 2 400 | Same labels plus 12 histogram buckets 100us..5s. |
 
 Hard rule: `agent_id`, `request_id`, `session_id`, and `user_id` are never label values on Prometheus metrics. They live as span attributes (under traces) and log fields (under logs).
 

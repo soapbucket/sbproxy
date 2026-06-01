@@ -1874,6 +1874,54 @@ pub fn record_cert_expiry(host: &str, seconds_until_expiry: f64) {
         .set(seconds_until_expiry);
 }
 
+// --- vault / secret-resolver metrics ------------------------------------
+//
+// The vault subsystem ran without any sbproxy_* metric until this PR.
+// Backend errors and slow resolutions were invisible until requests
+// started failing. The two families below let an operator alert on
+// slow secret reads and on backend availability.
+//
+// `backend` is the user-controlled registered name (HashiCorp vault
+// instance, AWS Secrets Manager, GCP Secret Manager, local file, env)
+// so it is sanitised through the cardinality limiter. `result` is a
+// closed enum derived from the resolver's own outcome.
+
+/// Record a vault resolution outcome on
+/// `sbproxy_vault_resolution_total{backend, result}` and its matching
+/// `sbproxy_vault_resolution_duration_seconds{backend, result}`
+/// histogram. `result` is one of `ok`, `not_found`, `backend_error`,
+/// `denied`. Buckets cover 100 microseconds through 5 seconds (the
+/// typical local + remote resolution envelope).
+pub fn record_vault_resolution(backend: &str, result: &'static str, duration_secs: f64) {
+    use prometheus::{
+        register_histogram_vec, register_int_counter_vec, HistogramVec, IntCounterVec,
+    };
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_vault_resolution_total",
+            "Vault resolution attempts, by backend and outcome",
+            &["backend", "result"],
+        )
+        .expect("vault resolution counter registers")
+    });
+    let hist = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_vault_resolution_duration_seconds",
+            "Vault resolution duration, by backend and outcome",
+            &["backend", "result"],
+            vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
+        )
+        .expect("vault resolution duration histogram registers")
+    });
+    let backend = sanitize_label("backend", backend);
+    counter.with_label_values(&[backend.as_str(), result]).inc();
+    hist.with_label_values(&[backend.as_str(), result])
+        .observe(duration_secs);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2772,6 +2820,31 @@ mod tests {
             assert!(
                 out.contains(&format!("host=\"{host}\"")),
                 "host={host} label missing"
+            );
+        }
+    }
+
+    // --- vault ---
+
+    #[test]
+    fn record_vault_resolution_emits_counter_and_histogram() {
+        record_vault_resolution("hashicorp", "ok", 0.012);
+        record_vault_resolution("hashicorp", "backend_error", 1.5);
+        record_vault_resolution("aws_secrets_manager", "not_found", 0.05);
+        record_vault_resolution("file", "denied", 0.0001);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_vault_resolution_total"),
+            "vault resolution counter missing"
+        );
+        assert!(
+            out.contains("sbproxy_vault_resolution_duration_seconds_bucket"),
+            "vault resolution duration buckets missing"
+        );
+        for result in ["ok", "backend_error", "not_found", "denied"] {
+            assert!(
+                out.contains(&format!("result=\"{result}\"")),
+                "result={result} label missing"
             );
         }
     }
