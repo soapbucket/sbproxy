@@ -34,6 +34,7 @@ pub mod logout;
 pub mod pkce;
 pub mod refresh;
 pub mod session;
+pub mod store;
 pub mod userinfo;
 
 use serde::Deserialize;
