@@ -6142,6 +6142,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest",
  "sbproxy-config",
+ "sbproxy-observe",
  "schemars",
  "serde",
  "serde_json",

@@ -2094,6 +2094,84 @@ pub fn set_mcp_federation_peers_up(count: i64) {
     gauge.set(count);
 }
 
+// --- k8s operator metrics ----------------------------------------------
+//
+// The operator runs a reconcile loop + a leader-election session. These
+// three families let an operator alert on a stuck reconcile, a noisy
+// retry pattern, and a leader transition that signals a pod restart.
+//
+// `kind` is the CRD short name (`sbproxy` or `sbproxyconfig`). `result`
+// is a closed enum on both families.
+
+/// Record a reconcile outcome on
+/// `sbproxy_operator_reconcile_total{kind, result}` and the matching
+/// duration histogram. `result` is one of `ok`, `conflict`,
+/// `backend_error`, `crd_invalid`. Buckets cover 1ms..60s (the
+/// reconcile envelope including server-side apply round-trips).
+pub fn record_operator_reconcile(kind: &'static str, result: &'static str, duration_secs: f64) {
+    use prometheus::{
+        register_histogram_vec, register_int_counter_vec, HistogramVec, IntCounterVec,
+    };
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_operator_reconcile_total",
+            "Operator reconcile attempts, by CRD kind and outcome",
+            &["kind", "result"],
+        )
+        .expect("operator reconcile counter registers")
+    });
+    let hist = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_operator_reconcile_duration_seconds",
+            "Operator reconcile duration, by CRD kind",
+            &["kind"],
+            vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0],
+        )
+        .expect("operator reconcile duration histogram registers")
+    });
+    counter.with_label_values(&[kind, result]).inc();
+    hist.with_label_values(&[kind]).observe(duration_secs);
+}
+
+/// Record a leader-election transition on
+/// `sbproxy_operator_leader_transitions_total{result}`. `result` is
+/// one of `elected` (acquired the lease for the first time on this
+/// replica), `lost` (held the lease then exited the renew loop), or
+/// `renewed` (refreshed an existing lease).
+pub fn record_operator_leader_transition(result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_operator_leader_transitions_total",
+            "Leader-election lifecycle events on this replica",
+            &["result"],
+        )
+        .expect("operator leader transitions counter registers")
+    });
+    counter.with_label_values(&[result]).inc();
+}
+
+/// Set the leader gauge on `sbproxy_operator_leader_is_leader`. `1`
+/// when this replica currently holds the lease, `0` otherwise.
+pub fn set_operator_leader_is_leader(is_leader: bool) {
+    use prometheus::{register_int_gauge, IntGauge};
+    use std::sync::OnceLock;
+    static G: OnceLock<IntGauge> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge!(
+            "sbproxy_operator_leader_is_leader",
+            "1 when this operator replica currently holds the leader lease",
+        )
+        .expect("operator leader gauge registers")
+    });
+    gauge.set(if is_leader { 1 } else { 0 });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3119,5 +3197,59 @@ mod tests {
             out.contains("sbproxy_mcp_federation_peers_up"),
             "mcp federation peers gauge missing"
         );
+    }
+
+    // --- k8s operator metrics ---
+
+    #[test]
+    fn record_operator_reconcile_emits_counter_and_histogram() {
+        record_operator_reconcile("sbproxy", "ok", 0.12);
+        record_operator_reconcile("sbproxy", "conflict", 0.001);
+        record_operator_reconcile("sbproxyconfig", "backend_error", 2.5);
+        record_operator_reconcile("sbproxy", "crd_invalid", 0.005);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_operator_reconcile_total"),
+            "operator reconcile counter missing"
+        );
+        assert!(
+            out.contains("sbproxy_operator_reconcile_duration_seconds_bucket"),
+            "operator reconcile duration buckets missing"
+        );
+        for result in ["ok", "conflict", "backend_error", "crd_invalid"] {
+            assert!(
+                out.contains(&format!("result=\"{result}\"")),
+                "result={result} label missing"
+            );
+        }
+    }
+
+    #[test]
+    fn record_operator_leader_transition_emits_counter() {
+        record_operator_leader_transition("elected");
+        record_operator_leader_transition("renewed");
+        record_operator_leader_transition("lost");
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_operator_leader_transitions_total"),
+            "operator leader transitions counter missing"
+        );
+        for result in ["elected", "renewed", "lost"] {
+            assert!(
+                out.contains(&format!("result=\"{result}\"")),
+                "result={result} label missing"
+            );
+        }
+    }
+
+    #[test]
+    fn set_operator_leader_is_leader_emits_gauge() {
+        set_operator_leader_is_leader(true);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_operator_leader_is_leader"),
+            "operator leader gauge missing"
+        );
+        set_operator_leader_is_leader(false);
     }
 }

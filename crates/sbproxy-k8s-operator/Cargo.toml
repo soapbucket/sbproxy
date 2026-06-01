@@ -19,6 +19,11 @@ path = "src/main.rs"
 tokio = { workspace = true }
 futures = { workspace = true }
 
+# Operator metrics: reconcile loop duration + outcome, leader-election
+# transitions, leader-is-leader gauge. Helpers live in sbproxy-observe
+# alongside the rest of the metric surface.
+sbproxy-observe = { workspace = true }
+
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
