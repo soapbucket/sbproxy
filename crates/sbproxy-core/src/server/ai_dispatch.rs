@@ -1082,6 +1082,29 @@ pub(super) async fn handle_ai_proxy(
                     return Ok(());
                 }
 
+                // WOR-801: body-aware input guardrails (today only
+                // `agent_alignment`, which reads `messages[].tool_calls`
+                // out of the raw body because the `Message` struct
+                // strips them). Runs after the text-shaped check so
+                // the cheap path short-circuits first.
+                if let Some(block) = pipeline.check_input_body(&body) {
+                    warn!(
+                        guardrail = %block.name,
+                        reason = %block.reason,
+                        "AI proxy: body-aware input guardrail blocked request"
+                    );
+                    let error_body = serde_json::json!({
+                        "error": {
+                            "message": block.reason,
+                            "type": "guardrail_violation",
+                            "code": block.name,
+                        }
+                    });
+                    let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+                    send_response(session, 400, "application/json", &body_bytes).await?;
+                    return Ok(());
+                }
+
                 // Per-surface input guardrails: image generation,
                 // audio speech, reranking, and moderations carry user
                 // input in a non-messages field (`prompt`, `input`,

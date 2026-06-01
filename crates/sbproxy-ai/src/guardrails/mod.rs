@@ -1,5 +1,6 @@
 //! AI guardrails pipeline - input/output content safety checks.
 
+mod agent_alignment;
 mod content_safety;
 mod context_poisoning;
 mod context_poisoning_rules;
@@ -14,6 +15,7 @@ mod regex_guard;
 mod schema;
 mod toxicity;
 
+pub use agent_alignment::{AgentAlignmentConfig, AgentAlignmentGuardrail, AgentAlignmentMode};
 pub use content_safety::ContentSafetyGuardrail;
 pub use context_poisoning::{
     ContextPoisoningConfig, ContextPoisoningGuardrail, Finding as ContextPoisoningFinding,
@@ -62,6 +64,13 @@ pub enum Guardrail {
     /// retrieval content that tries to influence a subsequent tool
     /// call.
     ContextPoisoning(ContextPoisoningGuardrail),
+    /// WOR-801: agent-alignment guardrail. Inspects the assistant's
+    /// `tool_calls` array against operator-declared allow / deny /
+    /// budget rules and flags goal-divergent invocations. Unlike
+    /// the other guardrails this one runs against the raw request
+    /// body so it can read the structured tool-call shape, which
+    /// `Message` would otherwise strip.
+    AgentAlignment(AgentAlignmentGuardrail),
 }
 
 impl Guardrail {
@@ -76,6 +85,7 @@ impl Guardrail {
             Self::Schema(_) => "schema",
             Self::Regex(_) => "regex",
             Self::ContextPoisoning(_) => "context_poisoning",
+            Self::AgentAlignment(_) => "agent_alignment",
         }
     }
 
@@ -90,6 +100,11 @@ impl Guardrail {
             Self::Schema(g) => g.check(content),
             Self::Regex(g) => g.check(content),
             Self::ContextPoisoning(g) => g.check(content),
+            // Alignment is body-shape-aware; the text view of
+            // assistant messages loses `tool_calls`, so the
+            // text-only check is inert here. See
+            // [`Guardrail::check_body`] for the actual entry point.
+            Self::AgentAlignment(_) => None,
         }
     }
 
@@ -98,7 +113,24 @@ impl Guardrail {
     pub fn check_messages(&self, messages: &[Message]) -> Option<GuardrailBlock> {
         match self {
             Self::ContextPoisoning(g) => g.check_messages(messages),
+            // Alignment needs the raw body to see `tool_calls`;
+            // the `Vec<Message>` view drops them. Skip the
+            // text-fallback path so alignment does not flag on
+            // every benign user message.
+            Self::AgentAlignment(_) => None,
             _ => self.check(&extract_text_from_messages(messages)),
+        }
+    }
+
+    /// Body-aware check for the agent-alignment guardrail. Other
+    /// guardrails return `None`. Called from
+    /// [`GuardrailPipeline::check_input_body`] so the dispatch loop
+    /// can run the structured-tool-call rules without bypassing
+    /// the rest of the input pipeline.
+    pub fn check_body(&self, body: &serde_json::Value) -> Option<GuardrailBlock> {
+        match self {
+            Self::AgentAlignment(g) => g.check_body(body),
+            _ => None,
         }
     }
 
@@ -132,6 +164,9 @@ impl Guardrail {
             Self::Jailbreak(_) => false,
             Self::Toxicity(_) => false,
             Self::Injection(_) => false,
+            // Alignment runs on the input body (not streamed
+            // chunks); the streaming relay never calls it.
+            Self::AgentAlignment(_) => false,
         }
     }
 }
@@ -182,6 +217,21 @@ impl GuardrailPipeline {
     pub fn check_input_text(&self, content: &str) -> Option<GuardrailBlock> {
         for guard in &self.input {
             if let Some(block) = guard.check(content) {
+                return Some(block);
+            }
+        }
+        None
+    }
+
+    /// Body-aware input check. Dispatches each input guardrail's
+    /// body-shape-aware entry point (today only
+    /// `agent_alignment` opts in); other guardrails are no-ops on
+    /// this path so the dispatch loop can call it unconditionally.
+    /// Runs AFTER [`Self::check_input`] in the dispatch path so
+    /// text-only guardrails still drive the first short-circuit.
+    pub fn check_input_body(&self, body: &serde_json::Value) -> Option<GuardrailBlock> {
+        for guard in &self.input {
+            if let Some(block) = guard.check_body(body) {
                 return Some(block);
             }
         }
@@ -290,6 +340,15 @@ pub fn compile_guardrail(config: &serde_json::Value) -> Result<Guardrail> {
             Ok(Guardrail::ContextPoisoning(ContextPoisoningGuardrail::new(
                 cfg,
             )))
+        }
+        "agent_alignment" => {
+            // WOR-801: alignment guardrail. Accepts the standard
+            // operator block + falls back to default config when the
+            // entry is `{ "type": "agent_alignment" }` alone, which
+            // produces a Flag-mode no-op so an operator can stage
+            // the integration before populating the rule lists.
+            let cfg: AgentAlignmentConfig = serde_json::from_value(config.clone())?;
+            Ok(Guardrail::AgentAlignment(AgentAlignmentGuardrail::new(cfg)))
         }
         "schema" => Ok(Guardrail::Schema(schema::SchemaGuardrail::from_config(
             config,
@@ -688,6 +747,47 @@ mod tests {
 
         // Clean content passes all guards.
         let messages = vec![make_msg("What is the weather like today?")];
+        assert!(pipeline.check_input(&messages).is_none());
+    }
+
+    #[test]
+    fn compile_agent_alignment_registers_via_registry() {
+        // WOR-801: the 9th guardrail type plugs into the same
+        // `compile_guardrail` registry as the other eight. This test
+        // pins both the type-name -> variant mapping and that
+        // `check_input_body` routes the body through to the right
+        // arm.
+        let cfg = serde_json::json!({
+            "type": "agent_alignment",
+            "mode": "block",
+            "allowed_tools": ["search"],
+        });
+        let guard = compile_guardrail(&cfg).expect("agent_alignment compiles");
+        assert_eq!(guard.name(), "agent_alignment");
+
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.input.push(guard);
+
+        let bad_body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "do it"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {"id": "t1", "function": {"name": "delete_account", "arguments": "{}"}}
+                    ]
+                }
+            ]
+        });
+        let block = pipeline
+            .check_input_body(&bad_body)
+            .expect("expected block");
+        assert_eq!(block.name, "agent_alignment");
+
+        // Plain-text checks are still inert for agent_alignment so the
+        // existing `check_input` path is unaffected.
+        let messages = vec![make_msg("any user text")];
         assert!(pipeline.check_input(&messages).is_none());
     }
 }
