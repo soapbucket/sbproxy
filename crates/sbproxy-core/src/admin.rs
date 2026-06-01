@@ -2549,6 +2549,7 @@ origins:
                 proxy_status: None,
                 message_signatures: None,
                 olp: None,
+                web_bot_auth_publish: None,
                 idempotency: None,
                 bot_detection: None,
                 threat_protection: None,

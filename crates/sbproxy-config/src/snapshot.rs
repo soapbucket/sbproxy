@@ -17,7 +17,7 @@ use crate::types::{
     CorsConfig, ErrorPageEntry, HstsConfig, IdempotencyConfig, MessageSignaturesConfig,
     MirrorConfig, OlpConfig, OriginRateLimitsConfig, ProblemDetailsConfig, ProxyServerConfig,
     ProxyStatusConfig, RequestModifierConfig, ResponseCacheConfig, ResponseModifierConfig,
-    SessionConfig,
+    SessionConfig, WebBotAuthPublishConfig,
 };
 
 /// Fully compiled, immutable origin ready for request processing.
@@ -100,6 +100,12 @@ pub struct CompiledOrigin {
     /// `/.well-known/olp/token` (issuance) and
     /// `/.well-known/olp/key` (JWK publication). See [`OlpConfig`].
     pub olp: Option<OlpConfig>,
+    /// WOR-805 AC#4: Web Bot Auth publish config. When `Some` with
+    /// `enabled = true`, the data-plane serves
+    /// `/.well-known/http-message-signatures-directory` and
+    /// `/.well-known/web-bot-auth/agent-card`. See
+    /// [`WebBotAuthPublishConfig`].
+    pub web_bot_auth_publish: Option<WebBotAuthPublishConfig>,
     /// RFC 8594-style idempotency middleware configuration. When
     /// `Some` with `enabled = true`, the request body filter buffers
     /// the request body for the configured methods, hashes it, and

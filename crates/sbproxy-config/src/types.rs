@@ -1963,6 +1963,15 @@ pub struct RawOriginConfig {
     /// obtain and verify license tokens.
     #[serde(default)]
     pub olp: Option<OlpConfig>,
+    /// WOR-805 AC#4: opt in to publishing SBproxy's own Web Bot
+    /// Auth signing-key directory at
+    /// `/.well-known/http-message-signatures-directory` and the
+    /// Signature Agent Card discovery doc. Verifiers that fetch
+    /// the directory can then verify the signatures SBproxy attaches
+    /// to outbound requests when the corresponding
+    /// `MessageSignatureSigner` runs upstream of the proxy.
+    #[serde(default)]
+    pub web_bot_auth_publish: Option<WebBotAuthPublishConfig>,
     /// RFC 8594-style idempotency-key middleware. Opt in per origin to
     /// have the proxy short-circuit retries of POST/PUT/PATCH (or any
     /// configured method) carrying a repeated `Idempotency-Key`
@@ -4044,6 +4053,53 @@ fn default_signature_clock_skew_seconds() -> u64 {
 ///   set (RFC 7517) so external introspectors can verify tokens
 ///   without contacting the issuer per-token.
 ///
+/// WOR-805 AC#4: Web Bot Auth publish config. When enabled the
+/// proxy serves two unauthenticated well-known endpoints on this
+/// origin:
+///
+/// * `GET /.well-known/http-message-signatures-directory` — JWKS
+///   document carrying SBproxy's own Ed25519 signing-key public
+///   key. Verifiers (Cloudflare, AWS WAF, any third-party origin
+///   that runs a Web Bot Auth verifier) fetch this to verify the
+///   `Signature-Input` + `Signature` headers SBproxy attaches to
+///   outbound requests.
+/// * `GET /.well-known/web-bot-auth/agent-card` — the discovery
+///   document that points verifiers at the directory; carries the
+///   operator-facing agent name, description, and contact URL.
+///
+/// `public_key_hex` is the 32-byte Ed25519 public key, hex-encoded
+/// (the SECRET side never crosses this config; the signer that
+/// runs upstream of the proxy holds it). `key_id` is the `kid` the
+/// signer advertises and the directory JWK publishes.
+///
+/// Operators who do not configure this block expose neither
+/// endpoint; requests to those paths fall through to the upstream
+/// proxy (or return 404 if no route matches).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WebBotAuthPublishConfig {
+    /// Whether the publish endpoints are enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// `kid` the JWK + Signature Agent Card advertise. Stable
+    /// across rotations of unrelated keys so an old `keyid=`
+    /// reference in a signed request still resolves.
+    pub key_id: String,
+    /// Ed25519 public key, hex-encoded (32 bytes → 64 hex chars).
+    pub public_key_hex: String,
+    /// Operator-facing agent name on the Signature Agent Card.
+    pub agent_name: String,
+    /// `directory_url` the agent card points at. Must be `https://`;
+    /// every Web Bot Auth verifier rejects plaintext.
+    pub directory_url: String,
+    /// Optional description shown alongside the agent name.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Optional contact URL (mailto:, https://, etc.) for misuse
+    /// reports.
+    #[serde(default)]
+    pub contact_url: Option<String>,
+}
+
 /// `/introspect` (RFC 7662) is deferred to a follow-up PR because
 /// it requires a revocation / nonce store.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
