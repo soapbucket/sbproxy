@@ -1794,6 +1794,46 @@ pub struct ObservabilityLogConfig {
     /// Per-level emission sampling rates. Default 1.0 / 0.1 / 0.01.
     #[serde(default)]
     pub sampling: Option<ObservabilitySamplingConfig>,
+    /// Operator-extensible redaction block. `fields` extends the
+    /// built-in field-key denylist; `patterns` adds regex masks that
+    /// run after the field-key pass. The built-in baseline (the
+    /// hard-coded denylist in `sbproxy-observe::logging::apply_redaction`)
+    /// always runs first and is not disable-able from YAML.
+    #[serde(default)]
+    pub redact: Option<ObservabilityRedactConfig>,
+}
+
+/// Operator-extensible redaction config. Sits under
+/// `proxy.observability.log.redact:` (today) and will surface at
+/// tenant and origin scopes once multi-tenant scaffolding lands.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ObservabilityRedactConfig {
+    /// Additional JSON field keys whose values are replaced with
+    /// `[REDACTED:<NAME>]`. Matched case-insensitively against the
+    /// keys produced by `serde_json`'s renderer. Always additive on
+    /// top of the built-in denylist; tenants and origins cannot
+    /// disable the baseline.
+    #[serde(default)]
+    pub fields: Vec<String>,
+    /// Regex masks applied to the rendered JSON after the field-key
+    /// pass. Each pattern is compiled at config-load; invalid regex
+    /// is a `compile_config` error.
+    #[serde(default)]
+    pub patterns: Vec<ObservabilityRedactPattern>,
+}
+
+/// One named regex mask. `name` is reported on cardinality / counter
+/// metrics; `replacement` defaults to `[REDACTED:<NAME>]` when empty.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ObservabilityRedactPattern {
+    /// Operator-supplied label; appears in metrics + the marker.
+    pub name: String,
+    /// PCRE-style regex (Rust `regex` crate flavour).
+    pub pattern: String,
+    /// Replacement string. Defaults to `[REDACTED:<NAME_UPPER>]` when
+    /// empty; can include `$1` backrefs if the pattern has groups.
+    #[serde(default)]
+    pub replacement: Option<String>,
 }
 
 /// Per-level sample rates for the structured-log emitter.
