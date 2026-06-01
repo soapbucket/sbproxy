@@ -11,7 +11,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use clap::{ArgAction, CommandFactory, Parser, Subcommand};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 // mimalloc is Microsoft's high-performance allocator. Typically 5-10% faster
@@ -92,12 +92,20 @@ struct GlobalArgs {
     )]
     request_log_level: Option<String>,
 
-    /// Reserved log-format selector (`text`, `json`, etc.). Accepted
-    /// and currently ignored. TODO: wire this through to the
-    /// tracing-subscriber builder so operators can pick the wire
-    /// format without recompiling.
-    #[arg(long = "log-format", global = true)]
-    log_format: Option<String>,
+    /// Output format for the `tracing` subscriber.
+    ///
+    /// * `compact` (default): one short line per event. Best for tail
+    ///   in a terminal.
+    /// * `pretty`: multi-line with span trees. Best for local debugging.
+    /// * `json`: structured records. Best for shipping to a log
+    ///   aggregator (Loki, Datadog, CloudWatch).
+    ///
+    /// Falls back to `SB_LOG_FORMAT` and finally `compact`. Invalid
+    /// values fail the parse with a clap error listing the accepted
+    /// names, so an operator never starts the proxy with a silently
+    /// ignored selector.
+    #[arg(long = "log-format", env = "SB_LOG_FORMAT", value_enum, global = true)]
+    log_format: Option<LogFormat>,
 
     /// Graceful-shutdown timeout in seconds (legacy). Wins over
     /// `SB_GRACE_TIME`. Superseded by `--shutdown-grace-ms`.
@@ -233,6 +241,21 @@ enum OutputFormat {
     Json,
 }
 
+/// `tracing-subscriber` output format, selected by `--log-format`
+/// (or `SB_LOG_FORMAT`). Closed enum so clap rejects unknown values
+/// at parse time.
+#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LogFormat {
+    /// One short line per event. Default; matches the historical
+    /// behaviour before the flag was wired.
+    #[default]
+    Compact,
+    /// Multi-line with span trees. Best for local debugging.
+    Pretty,
+    /// Structured JSON records. Best for a log aggregator.
+    Json,
+}
+
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
 enum ProjectionKind {
     Robots,
@@ -289,10 +312,7 @@ fn main() {
     //   2. `RUST_LOG` env var (rustc-style filter syntax)
     //   3. `info`
     let log_filter = resolve_log_filter(&cli.globals);
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter))
-        .compact()
-        .init();
+    init_tracing(log_filter, cli.globals.log_format.unwrap_or_default());
 
     // Resolve the graceful-shutdown grace period from the CLI flags / env
     // the operator set (`--grace-time` / `SB_GRACE_TIME`, and
@@ -429,6 +449,22 @@ fn resolve_log_filter(g: &GlobalArgs) -> String {
     match g.request_log_level.as_deref().filter(|s| !s.is_empty()) {
         Some(request_level) => format!("{base},access_log={request_level}"),
         None => base,
+    }
+}
+
+/// Install the global `tracing` subscriber with the resolved env
+/// filter and the operator-selected wire format. Each `LogFormat`
+/// arm picks a distinct `Subscriber` implementation, so the choice
+/// is fixed for the lifetime of the process (re-running with a
+/// different value requires a restart, which matches every other
+/// tracing-subscriber consumer).
+fn init_tracing(log_filter: String, format: LogFormat) {
+    let builder =
+        tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::new(log_filter));
+    match format {
+        LogFormat::Compact => builder.compact().init(),
+        LogFormat::Pretty => builder.pretty().init(),
+        LogFormat::Json => builder.json().init(),
     }
 }
 
@@ -1217,6 +1253,56 @@ mod tests {
                 other => panic!("expected Completions for {}, got {other:?}", s.0),
             }
         }
+    }
+
+    // --- --log-format ---
+
+    #[test]
+    fn log_format_accepts_compact_pretty_json() {
+        for (name, expected) in [
+            ("compact", LogFormat::Compact),
+            ("pretty", LogFormat::Pretty),
+            ("json", LogFormat::Json),
+        ] {
+            let cli = Cli::try_parse_from(["sbproxy", "--log-format", name, "cfg.yml"])
+                .expect("parse should succeed");
+            assert_eq!(
+                cli.globals.log_format,
+                Some(expected),
+                "--log-format {name} should parse to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn log_format_rejects_unknown_values() {
+        let err = Cli::try_parse_from(["sbproxy", "--log-format", "yaml", "cfg.yml"])
+            .expect_err("unknown --log-format must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("yaml") && msg.contains("compact"),
+            "error must name the bad value and list accepted ones, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn log_format_env_fallback_works() {
+        let _g = ENV_LOCK.lock().unwrap();
+        env::set_var("SB_LOG_FORMAT", "json");
+        let cli = Cli::try_parse_from(["sbproxy", "cfg.yml"]).expect("env fallback should parse");
+        assert_eq!(cli.globals.log_format, Some(LogFormat::Json));
+        env::remove_var("SB_LOG_FORMAT");
+    }
+
+    #[test]
+    fn log_format_unset_yields_compact_default() {
+        let _g = ENV_LOCK.lock().unwrap();
+        env::remove_var("SB_LOG_FORMAT");
+        let cli = Cli::try_parse_from(["sbproxy", "cfg.yml"]).expect("parse should succeed");
+        assert_eq!(cli.globals.log_format, None);
+        // The defaulting happens at init_tracing's call site; verify the
+        // Default impl returns Compact so the call site can rely on it.
+        assert_eq!(LogFormat::default(), LogFormat::Compact);
     }
 
     /// The version line is load-bearing: the marketing site `Hero.vue`
