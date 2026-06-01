@@ -253,6 +253,28 @@ sbproxy --config sb.yml --log-level debug
 SB_LOG_LEVEL=sbproxy=trace sbproxy --config sb.yml
 ```
 
+#### `--log-format` (`compact`, `pretty`, `json`)
+
+Selects the `tracing-subscriber` output format.
+
+- `compact` (default): one short line per event. Best for tailing a
+  terminal.
+- `pretty`: multi-line with span trees. Best for local debugging.
+- `json`: structured records. Best for shipping to a log aggregator
+  (Loki, Datadog, CloudWatch).
+
+Invalid values fail the parse with a clap error listing the accepted
+names, so the proxy never starts with a silently ignored selector.
+
+- **Default:** `compact`.
+- **Priority:** `--log-format` > `SB_LOG_FORMAT` > `compact`.
+- **Environment:** `SB_LOG_FORMAT`
+
+```bash
+sbproxy --config sb.yml --log-format json
+SB_LOG_FORMAT=pretty sbproxy --config sb.yml
+```
+
 #### `--request-log-level` (string)
 
 Convenience filter for the `access_log` tracing target. This is appended
