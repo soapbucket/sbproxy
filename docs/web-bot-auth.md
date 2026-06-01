@@ -116,6 +116,23 @@ This serves two unauthenticated GET endpoints on the origin:
 
 Only the public key lives in YAML. The matching private side belongs in a vault / HSM and is consumed by the `MessageSignatureSigner` primitive (`sbproxy-middleware::signatures`) when signing outbound requests. See `examples/web-bot-auth-publish/` for a runnable fixture with the expected curl output.
 
+### Self-signing the published directory
+
+The Web Bot Auth IETF draft permits unsigned directories (verifiers fall back to TLS as the trust anchor), but a verifier can pin a stronger claim if the directory response itself is signed by the key it advertises. Set the optional `signing_key_hex` field to the 32-byte Ed25519 seed whose public half is already in `public_key_hex`:
+
+```yaml
+web_bot_auth_publish:
+  enabled: true
+  key_id: "sbproxy-key-2026-05-31"
+  public_key_hex: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+  agent_name: "SBproxy"
+  directory_url: "https://agent.example.com/.well-known/http-message-signatures-directory"
+  # Optional. Hex-encoded 32-byte Ed25519 seed; `vault://` refs work.
+  signing_key_hex: "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+```
+
+When set, both response bodies gain `Content-Digest`, `Signature-Input`, and `Signature` headers per RFC 9421 over `("content-digest")` with `tag="web-bot-auth"`. A verifier that already trusts the published JWK can confirm the body it fetched was emitted by the holder of the advertised key, closing the trust loop without relying on TLS alone. With `signing_key_hex` omitted the endpoints still serve, just without the three signature headers; that lets a verifier that wants to enforce signed directories detect the absence cleanly.
+
 ## Limitations
 
 - The OSS directory is inline in YAML. Dynamic directory refresh from a hosted JWKS-shaped document is on the roadmap; the same `Directory` trait will back both shapes.

@@ -4098,6 +4098,19 @@ pub struct WebBotAuthPublishConfig {
     /// reports.
     #[serde(default)]
     pub contact_url: Option<String>,
+    /// Optional 32-byte Ed25519 private seed, hex-encoded (64 hex
+    /// chars). When set, the directory and agent-card HTTP responses
+    /// are self-signed per RFC 9421 over `("content-digest")` with
+    /// `tag="web-bot-auth"` and `keyid=key_id`. Verifiers can then
+    /// confirm the body they fetched was emitted by the holder of
+    /// the key the directory advertises, closing the trust loop
+    /// without relying solely on TLS. Absent leaves the responses
+    /// unsigned; the Web Bot Auth IETF draft permits both shapes and
+    /// verifiers MAY treat unsigned directories as lower-trust. The
+    /// secret-resolver pass honours `vault://` references at config
+    /// load so the raw seed never has to live in the YAML.
+    #[serde(default)]
+    pub signing_key_hex: Option<String>,
 }
 
 /// `/introspect` (RFC 7662) is deferred to a follow-up PR because
