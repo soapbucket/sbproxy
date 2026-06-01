@@ -1811,6 +1811,47 @@ pub(super) async fn request_filter(
         }
     }
 
+    // --- WOR-805 AC#4 wire: Web Bot Auth publish well-known ---
+    //
+    // When the origin opts in (`web_bot_auth_publish.enabled: true`),
+    // serve two unauthenticated GET endpoints:
+    //
+    // * `/.well-known/http-message-signatures-directory` — JWKS doc
+    //   carrying SBproxy's own Ed25519 signing-key public key.
+    //   Verifiers (Cloudflare, AWS WAF, third-party origins) fetch
+    //   this to verify the signatures SBproxy attaches to outbound
+    //   requests.
+    // * `/.well-known/web-bot-auth/agent-card` — discovery doc
+    //   pointing verifiers at the directory; carries operator name +
+    //   description + contact URL.
+    //
+    // Both paths short-circuit the normal auth + proxy pipeline.
+    {
+        let req_path = session.req_header().uri.path().to_string();
+        let is_wba_publish = req_path == "/.well-known/http-message-signatures-directory"
+            || req_path == "/.well-known/web-bot-auth/agent-card";
+        if is_wba_publish {
+            let wba_cfg = pipeline.config.origins[origin_idx]
+                .web_bot_auth_publish
+                .clone();
+            match wba_cfg {
+                Some(cfg) if cfg.enabled => {
+                    handle_web_bot_auth_publish(session, &cfg, &req_path).await?;
+                    return Ok(true);
+                }
+                _ => {
+                    send_error(
+                        session,
+                        404,
+                        "web_bot_auth_publish not enabled on this origin",
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
     // --- Wave 4 day-5 wire: stamp content_shape_pricing / transform ---
     //
     // When the origin authors `auto_content_negotiate` (synthesised
@@ -4419,6 +4460,71 @@ async fn handle_oidc_logout(
     session
         .write_response_body(Some(bytes::Bytes::new()), true)
         .await?;
+    Ok(())
+}
+
+/// Handle the two Web Bot Auth publish endpoints. `path` has
+/// already been narrowed to one of the two known values; everything
+/// else is a bug in the caller's recognizer.
+async fn handle_web_bot_auth_publish(
+    session: &mut pingora_proxy::Session,
+    cfg: &sbproxy_config::WebBotAuthPublishConfig,
+    path: &str,
+) -> Result<()> {
+    use sbproxy_modules::auth::bot_auth_publish::{
+        validate_directory_url, DirectoryDocument, SignatureAgentCard,
+    };
+
+    // Validate the operator-supplied directory_url at request time
+    // (config-load validation is the next refinement; the cost here
+    // is bounded by request rate against this well-known path, which
+    // is essentially zero in production).
+    if let Err(e) = validate_directory_url(&cfg.directory_url) {
+        warn!(error = %e, "web_bot_auth_publish: bad directory_url");
+        send_error(session, 500, "web_bot_auth_publish misconfigured").await?;
+        return Ok(());
+    }
+    let pk_bytes = match hex::decode(cfg.public_key_hex.trim()) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        Ok(b) => {
+            warn!(len = b.len(), "web_bot_auth_publish: bad public key length");
+            send_error(session, 500, "web_bot_auth_publish misconfigured").await?;
+            return Ok(());
+        }
+        Err(e) => {
+            warn!(error = %e, "web_bot_auth_publish: bad public key hex");
+            send_error(session, 500, "web_bot_auth_publish misconfigured").await?;
+            return Ok(());
+        }
+    };
+
+    if path == "/.well-known/http-message-signatures-directory" {
+        let doc = DirectoryDocument::build(vec![(pk_bytes, cfg.key_id.clone())]);
+        let body = doc.to_json();
+        send_response(
+            session,
+            200,
+            "application/http-message-signatures-directory+json",
+            body.as_bytes(),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Otherwise: the agent card.
+    let mut card = SignatureAgentCard::new(cfg.agent_name.clone(), cfg.directory_url.clone());
+    if let Some(d) = &cfg.description {
+        card = card.with_description(d.clone());
+    }
+    if let Some(c) = &cfg.contact_url {
+        card = card.with_contact_url(c.clone());
+    }
+    let body = card.to_json();
+    send_response(session, 200, "application/json", body.as_bytes()).await?;
     Ok(())
 }
 
