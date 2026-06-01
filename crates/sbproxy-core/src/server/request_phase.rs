@@ -2167,6 +2167,23 @@ pub(super) async fn request_filter(
             // access-log + `sbproxy_phase_duration_seconds{phase="auth"}`
             // histogram derive `auth_ms` from this delta.
             ctx.auth_finished_at = Some(std::time::Instant::now());
+            // WOR-805 F1.6.1: when bot_auth verified a signature that
+            // covered `content-digest`, the body-vs-digest binding
+            // could not be checked yet (the body was not buffered at
+            // the auth phase). Stamp the deferred-check flag so
+            // `request_body_filter` buffers the body and runs
+            // `verify_content_digest` against the Content-Digest
+            // header value the signature attests to.
+            let auth_succeeded = matches!(auth_result, AuthResult::Allow { .. });
+            if auth_succeeded
+                && matches!(auth, Auth::BotAuth(_))
+                && sbproxy_middleware::signatures::signature_input_covers_content_digest(
+                    req_headers,
+                )
+            {
+                ctx.bot_auth_digest_check_required = true;
+                ctx.validate_request_body = true;
+            }
             match auth_result {
                 AuthResult::Allow { sub, source } => {
                     ctx.auth_result = Some(sbproxy_plugin::AuthDecision::Allow { sub, source });

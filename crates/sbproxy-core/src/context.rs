@@ -317,6 +317,17 @@ pub struct RequestContext {
     /// flag is read.
     pub content_digest_verified: bool,
 
+    /// WOR-805 F1.6.1: a successful `bot_auth` verdict carried a
+    /// `Signature-Input` that covered `content-digest`. The auth
+    /// phase verified the signature header but the body was not
+    /// available yet, so the body-vs-`Content-Digest`-header check
+    /// is deferred to `request_body_filter`. The body filter sets
+    /// `validate_request_body` alongside this flag so the buffer
+    /// path runs; on `end_of_stream` it runs
+    /// `verify_content_digest(header_value, body)` and rejects with
+    /// 401 if the body does not match the signed digest.
+    pub bot_auth_digest_check_required: bool,
+
     // --- WOR-808 PR5 / PR6: RSL <link rel="license"> body injection ---
     /// Set in `response_filter` when the origin advertises an RSL
     /// `licenses.xml` projection (i.e. `rsl_urns` has an entry for
@@ -932,6 +943,7 @@ impl RequestContext {
             upstream_content_type: None,
             sri_scan_enabled: false,
             content_digest_verified: false,
+            bot_auth_digest_check_required: false,
             rsl_inject_link_pending: false,
             rsl_inject_link_feed: None,
             rsl_inject_link_buf: None,

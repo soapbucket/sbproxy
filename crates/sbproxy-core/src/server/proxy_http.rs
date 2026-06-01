@@ -2457,6 +2457,51 @@ impl ProxyHttp for SbProxy {
                         "request body failed schema validation",
                     ));
                 }
+                // WOR-805 F1.6.1: the auth phase flagged that
+                // `bot_auth` verified a signature covering
+                // `content-digest`, so the body's actual SHA-256 has
+                // to match the `Content-Digest` header value the
+                // signature attests to. Run the deferred check now
+                // that the body is fully buffered. A failure here is
+                // an authentication failure (the body the client
+                // sent does not match the body the client signed),
+                // so map it to 401 with a generic message.
+                if ctx.bot_auth_digest_check_required {
+                    let header_value = session
+                        .req_header()
+                        .headers
+                        .get("content-digest")
+                        .or_else(|| session.req_header().headers.get("repr-digest"))
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    let ok = match header_value.as_deref() {
+                        Some(hv) => {
+                            sbproxy_middleware::digest::verify_content_digest(hv, &collected)
+                        }
+                        // A signature that covered `content-digest`
+                        // without a corresponding header is a wire-
+                        // shape contradiction; reject.
+                        None => false,
+                    };
+                    if !ok {
+                        debug!(
+                            "bot_auth content-digest body binding check failed; rejecting request"
+                        );
+                        let body_str = serde_json::json!({
+                            "error": "bot_auth: content-digest body mismatch",
+                        })
+                        .to_string();
+                        ctx.validator_failed = Some((401, body_str, "application/json".into()));
+                        return Err(pingora_error::Error::explain(
+                            pingora_error::ErrorType::HTTPStatus(401),
+                            "bot_auth: content-digest body binding failed",
+                        ));
+                    }
+                    // Mirror the content_digest-policy path: surface
+                    // a single audit flag so downstream composition
+                    // can attest "body matches signed digest".
+                    ctx.content_digest_verified = true;
+                }
                 // Validation passed - release the buffered body as one
                 // chunk so the upstream sees the full payload.
                 let frozen = if !collected.is_empty() {
