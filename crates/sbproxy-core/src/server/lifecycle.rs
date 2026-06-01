@@ -54,6 +54,12 @@ pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<()> {
     // without restarting the process.
     install_op_redact_state(&compiled.server);
 
+    // WOR-1045 PR1: validate the declared sinks block. PR1 only
+    // warn-logs duplicates and unknown targets; dispatch wiring lands
+    // in PR2 so today's behaviour (single global tracing subscriber
+    // writing stdout) is preserved regardless of the sinks block.
+    validate_sinks_config(&compiled.server);
+
     // WOR-173: refresh the AI provider catalog and rebuild the AI
     // client alongside the pipeline. Both globals live behind an
     // `ArcSwap`, so this is a lock-free atomic swap from the reload
@@ -474,6 +480,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // single-tenant and multi-tenant deployments. The hook accepts
     // re-install so config reloads flow through.
     install_op_redact_state(&server_config);
+    validate_sinks_config(&server_config);
 
     // Walk the inventory-based plugin registry once at startup and
     // emit one `sbproxy_plugin_registered_total{kind, plugin}` row
@@ -1320,4 +1327,71 @@ fn build_pii_redactor(
             None
         }
     }
+}
+
+/// WOR-1045 PR1: validate the declared `proxy.observability.log.sinks:`
+/// block. PR1 does NOT wire dispatch; this is a soundness check so
+/// operators see issues before PR2 lights up the fan-out.
+///
+/// Reports:
+///
+/// * Duplicate `name` within the scope (rejected by PR2; warned here).
+/// * Unknown `target` (`access_log` / `error_log` / `audit_log` /
+///   `trace_exporter` / `external_log`). PR2 will reject these.
+/// * Unknown `profile` (`internal` / `external`). PR2 will reject these.
+///
+/// Per-tenant and per-origin sink scopes land alongside the
+/// WOR-1051 credentials epic; this helper covers only the proxy scope
+/// today.
+fn validate_sinks_config(server: &sbproxy_config::ProxyServerConfig) {
+    let sinks = match server
+        .observability
+        .as_ref()
+        .and_then(|o| o.log.as_ref())
+        .map(|l| &l.sinks)
+    {
+        Some(s) if !s.is_empty() => s,
+        _ => return,
+    };
+
+    const KNOWN_TARGETS: &[&str] = &[
+        "access_log",
+        "error_log",
+        "audit_log",
+        "trace_exporter",
+        "external_log",
+    ];
+    const KNOWN_PROFILES: &[&str] = &["internal", "external"];
+
+    let mut seen: std::collections::HashSet<&str> =
+        std::collections::HashSet::with_capacity(sinks.len());
+    for sink in sinks {
+        if !seen.insert(sink.name.as_str()) {
+            tracing::warn!(
+                sink = %sink.name,
+                "duplicate sink name at proxy scope; PR2 will reject (PR1 only warns)"
+            );
+        }
+        if !KNOWN_TARGETS.contains(&sink.target.as_str()) {
+            tracing::warn!(
+                sink = %sink.name,
+                target = %sink.target,
+                "unknown sink target; PR2 will reject (PR1 only warns)"
+            );
+        }
+        if let Some(profile) = sink.profile.as_deref() {
+            if !KNOWN_PROFILES.contains(&profile) {
+                tracing::warn!(
+                    sink = %sink.name,
+                    profile = %profile,
+                    "unknown sink profile; PR2 will reject (PR1 only warns)"
+                );
+            }
+        }
+    }
+
+    tracing::info!(
+        count = sinks.len(),
+        "WOR-1045 PR1: parsed sinks block; dispatch wiring lands in PR2"
+    );
 }

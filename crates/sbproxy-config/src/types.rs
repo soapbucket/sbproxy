@@ -1801,6 +1801,18 @@ pub struct ObservabilityLogConfig {
     /// always runs first and is not disable-able from YAML.
     #[serde(default)]
     pub redact: Option<ObservabilityRedactConfig>,
+    /// WOR-1045: log sink fan-out (`stdout`, `stderr`, `file`, ...).
+    /// When empty, the legacy single-tracing-subscriber path keeps
+    /// driving stdout. Each declared sink has a unique `name` within
+    /// this scope; duplicates fail config compilation. Tenant + origin
+    /// sink scopes are blocked on the WOR-1051 credentials epic.
+    ///
+    /// Dispatch wiring (writing each emitted line to each matching
+    /// sink) lands in PR2. PR1 parses + validates the schema so an
+    /// operator's e2e fixture (`e2e/tests/redaction.rs`) no longer
+    /// errors at parse time.
+    #[serde(default)]
+    pub sinks: Vec<ObservabilitySinkConfig>,
 }
 
 /// Operator-extensible redaction config. Sits under
@@ -1865,6 +1877,89 @@ pub struct ObservabilityRedactPattern {
     /// empty; can include `$1` backrefs if the pattern has groups.
     #[serde(default)]
     pub replacement: Option<String>,
+}
+
+/// WOR-1045: one declared log sink. Multiple sinks fan out from a
+/// single emit; a tenant-scoped sink only receives lines whose
+/// resolved `Principal.tenant_id` matches the tenant scope. PR1 lands
+/// the schema and uniqueness validation; dispatch wiring lands in PR2.
+///
+/// ## Field schema
+///
+/// * `name` is unique within the declaring scope. The same name may
+///   appear once at proxy scope and once at tenant scope; cross-scope
+///   collisions are intentional (a tenant `acme-loki` sink is a
+///   different thing from the proxy `acme-loki` sink).
+/// * `target` selects which internal channel feeds this sink:
+///   `access_log`, `error_log`, `audit_log`, `trace_exporter`,
+///   `external_log`. The channel maps 1:1 onto the existing
+///   `sbproxy_observe::logging::Sink` enum.
+/// * `format` is the wire shape: `compact | pretty | json`. When omitted
+///   the parent `proxy.observability.log.format` decides.
+/// * `output` is the where: `stdout | stderr | file`. `otlp` lands
+///   under WOR-1046; `syslog` is a planned follow-up.
+/// * `profile` is the redaction shape: `internal` keeps JA3/JA4 and
+///   raw query strings; `external` strips them. Tenant-scoped sinks
+///   default to `external` because the operator usually does not
+///   control the downstream backend.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ObservabilitySinkConfig {
+    /// Unique name within the declaring scope (proxy / tenant / origin).
+    /// Duplicates within a scope are rejected at config compile.
+    pub name: String,
+    /// Which internal channel feeds this sink. One of
+    /// `access_log | error_log | audit_log | trace_exporter | external_log`.
+    /// Unknown values fail compilation.
+    pub target: String,
+    /// Wire format. One of `compact | pretty | json`. Defaults to
+    /// the parent `observability.log.format` when omitted.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// Where the line goes. `output: { type: stdout }` keeps the
+    /// legacy stdout behaviour; `file` reuses the access-log rotation
+    /// stack; `otlp` lands under WOR-1046.
+    pub output: ObservabilitySinkOutput,
+    /// Redaction profile applied to this sink's lines. One of
+    /// `internal | external`. `external` strips JA3/JA4 fingerprints
+    /// and raw query strings in addition to the standard redactions.
+    /// Tenant-scoped sinks default to `external`.
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
+/// WOR-1045: tagged-union of supported sink output types. Each
+/// variant carries its own configuration.
+///
+/// Today's variants: `stdout`, `stderr`, `file`. `otlp` lands under
+/// WOR-1046; `syslog` is a planned follow-up. Unknown `type:` values
+/// fail compilation.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ObservabilitySinkOutput {
+    /// Write to process stdout. The default for a freshly-installed
+    /// proxy.
+    #[default]
+    Stdout,
+    /// Write to process stderr. Useful for routing the audit channel
+    /// separately from access on systemd-journald.
+    Stderr,
+    /// Append to a file with optional rotation. Reuses the
+    /// access-log rotation stack
+    /// (`sbproxy_observe::access_log` rotation + gzip path).
+    File {
+        /// Absolute path to the output file. The parent directory
+        /// must exist; the file is created on first write.
+        path: String,
+        /// Maximum file size before rotation. Defaults to 100 MiB.
+        #[serde(default)]
+        max_size_mb: Option<u64>,
+        /// Number of rotated backups to keep. Defaults to 7.
+        #[serde(default)]
+        max_backups: Option<u32>,
+        /// Whether to gzip rotated backups. Defaults to true.
+        #[serde(default)]
+        compress: Option<bool>,
+    },
 }
 
 /// Per-level sample rates for the structured-log emitter.
@@ -3140,6 +3235,101 @@ telemetry:
             telemetry.resource_attrs.get("deployment.environment"),
             Some(&"dev".to_string())
         );
+    }
+
+    /// WOR-1045 PR1: the proxy-scoped sinks block parses with stdout,
+    /// stderr, and file output variants. Per-sink `format` and
+    /// `profile` are optional (inherit from the parent). The
+    /// untagged-enum dispatch on `output: { type: ... }` picks the
+    /// right variant; unknown types fail at parse time (covered by
+    /// `parse_observability_sinks_rejects_unknown_output_type`).
+    #[test]
+    fn parse_observability_sinks_block() {
+        let yaml = r#"
+log:
+  level: info
+  format: json
+  sinks:
+    - name: stdout
+      target: access_log
+      format: json
+      output: { type: stdout }
+      profile: internal
+    - name: stderr-audit
+      target: audit_log
+      output: { type: stderr }
+    - name: file-archive
+      target: audit_log
+      format: json
+      output:
+        type: file
+        path: /var/log/sbproxy/audit.json
+        max_size_mb: 100
+        max_backups: 7
+        compress: true
+      profile: internal
+"#;
+        let obs: ObservabilityConfig = serde_yaml::from_str(yaml).unwrap();
+        let log = obs.log.expect("log block parses");
+        assert_eq!(log.sinks.len(), 3);
+        assert_eq!(log.sinks[0].name, "stdout");
+        assert_eq!(log.sinks[0].target, "access_log");
+        assert!(matches!(
+            log.sinks[0].output,
+            ObservabilitySinkOutput::Stdout
+        ));
+        assert!(matches!(
+            log.sinks[1].output,
+            ObservabilitySinkOutput::Stderr
+        ));
+        match &log.sinks[2].output {
+            ObservabilitySinkOutput::File {
+                path,
+                max_size_mb,
+                max_backups,
+                compress,
+            } => {
+                assert_eq!(path, "/var/log/sbproxy/audit.json");
+                assert_eq!(*max_size_mb, Some(100));
+                assert_eq!(*max_backups, Some(7));
+                assert_eq!(*compress, Some(true));
+            }
+            other => panic!("expected file output variant, got {other:?}"),
+        }
+    }
+
+    /// WOR-1045 PR1: an unknown `output.type` value fails at parse
+    /// time. The tagged-enum dispatch means we get a serde error
+    /// without needing a post-parse validation pass.
+    #[test]
+    fn parse_observability_sinks_rejects_unknown_output_type() {
+        let yaml = r#"
+log:
+  sinks:
+    - name: bogus
+      target: access_log
+      output: { type: pigeon_carrier }
+"#;
+        let err = serde_yaml::from_str::<ObservabilityConfig>(yaml)
+            .expect_err("unknown output type should fail to parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pigeon_carrier") || msg.contains("variant"),
+            "unhelpful error: {msg}"
+        );
+    }
+
+    /// WOR-1045 PR1: empty `sinks:` field is the default. An operator
+    /// who never wrote a sinks block keeps the legacy stdout behaviour.
+    #[test]
+    fn observability_sinks_defaults_empty() {
+        let yaml = r#"
+log:
+  level: info
+"#;
+        let obs: ObservabilityConfig = serde_yaml::from_str(yaml).unwrap();
+        let log = obs.log.expect("log block parses");
+        assert!(log.sinks.is_empty());
     }
 
     #[test]
