@@ -123,6 +123,26 @@ pub struct Challenge {
 ///
 /// Pulled out as a free function so tests can exercise selection
 /// without standing up a full ACME client.
+/// Map an ACME error message (already formatted via `{:#}`) to the
+/// closed `result` label set the metrics expose. The classification
+/// is heuristic; the goal is to let dashboards split out the
+/// `rate_limited` and `account_invalid` cases that operators tune
+/// retries around, rather than burying everything under `other`.
+fn classify_acme_error(msg: &str) -> &'static str {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("rate limit") || lower.contains("ratelimit") {
+        "rate_limited"
+    } else if lower.contains("account") {
+        "account_invalid"
+    } else if lower.contains("order") || lower.contains("authorization") {
+        "order_invalid"
+    } else if lower.contains("http") || lower.contains("connect") || lower.contains("timeout") {
+        "http_error"
+    } else {
+        "other"
+    }
+}
+
 fn pick_challenge<'a>(challenges: &'a [Challenge], preferred: &[String]) -> Option<&'a Challenge> {
     for want in preferred {
         if let Some(c) = challenges
@@ -768,6 +788,25 @@ impl AcmeClient {
     ///
     /// Returns `(cert_pem, key_pem)`.
     pub async fn issue_cert(
+        &mut self,
+        key_pair: &EcdsaKeyPair,
+        hostname: &str,
+        challenge_store: &Http01ChallengeStore,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let start = std::time::Instant::now();
+        let outcome = self
+            .issue_cert_inner(key_pair, hostname, challenge_store)
+            .await;
+        let elapsed = start.elapsed().as_secs_f64();
+        let result_label = match &outcome {
+            Ok(_) => "ok",
+            Err(e) => classify_acme_error(&format!("{e:#}")),
+        };
+        sbproxy_observe::metrics::record_acme_renewal(result_label, elapsed);
+        outcome
+    }
+
+    async fn issue_cert_inner(
         &mut self,
         key_pair: &EcdsaKeyPair,
         hostname: &str,

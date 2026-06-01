@@ -39,6 +39,25 @@ impl OcspStapler {
     ///
     /// Returns the raw DER-encoded OCSP response bytes on success.
     pub async fn fetch_ocsp_response(cert_pem: &[u8]) -> Result<Vec<u8>> {
+        let outcome = Self::fetch_ocsp_response_inner(cert_pem).await;
+        let result_label = match &outcome {
+            Ok(_) => "ok",
+            Err(e) => {
+                let lower = format!("{e:#}").to_ascii_lowercase();
+                if lower.contains("no ocsp responder") || lower.contains("aia extension") {
+                    "no_responder"
+                } else if lower.contains("parse") || lower.contains("certificate") {
+                    "parse_error"
+                } else {
+                    "http_error"
+                }
+            }
+        };
+        sbproxy_observe::metrics::record_ocsp_fetch(result_label);
+        outcome
+    }
+
+    async fn fetch_ocsp_response_inner(cert_pem: &[u8]) -> Result<Vec<u8>> {
         use rustls::pki_types::{pem::PemObject as _, CertificateDer};
         use x509_parser::prelude::*;
 
