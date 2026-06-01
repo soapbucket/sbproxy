@@ -67,11 +67,17 @@ fn hostname() -> Option<String> {
 /// Generate a fresh request identifier suitable for correlation across
 /// the proxy's webhook envelope, response headers, and access logs.
 ///
-/// Uses UUID v4 rendered without hyphens (`hex32`) so it is compact and
-/// safe in URLs and header values.
+/// Uses UUID v7 (RFC 9562: 48-bit Unix-millisecond timestamp + 74 bits
+/// of random data) rendered without hyphens (`hex32`) so it is compact
+/// and safe in URLs and header values. The leading 48 bits are
+/// monotonic, so two ids generated milliseconds apart sort in order;
+/// a ClickHouse / SIEM JOIN on request_id stays partition-friendly,
+/// and the same generator backs every persisted artefact (audit log,
+/// access log, callback envelope) so cross-surface correlation is
+/// trivial.
 pub fn new_request_id() -> String {
     let mut buf = [0u8; 32];
-    let uuid = uuid::Uuid::new_v4();
+    let uuid = uuid::Uuid::now_v7();
     let bytes = uuid.as_bytes();
     for (i, b) in bytes.iter().enumerate() {
         let hi = b >> 4;
@@ -157,6 +163,28 @@ mod tests {
         assert!(id
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    /// UUIDv7 packs a 48-bit Unix-millisecond timestamp into the
+    /// leading bits, so two ids generated a millisecond apart sort
+    /// in time order when compared lexicographically. The version
+    /// nibble (the 13th hex character) must be `7`.
+    #[test]
+    fn new_request_id_is_uuidv7_monotonic_and_versioned() {
+        let a = new_request_id();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = new_request_id();
+        assert!(b > a, "expected {b} > {a}");
+        // The version nibble lives in the high half of byte 6, i.e.
+        // hex char index 12.
+        for id in [&a, &b] {
+            assert_eq!(
+                id.as_bytes()[12],
+                b'7',
+                "expected UUIDv7 version nibble at index 12, got {}",
+                &id[12..13]
+            );
+        }
     }
 
     #[test]

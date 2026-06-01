@@ -11,7 +11,7 @@ SBproxy ships metrics, logs, and traces from one process. This guide covers the 
 | Logs | `stdout` and configurable sinks | Always on, JSON-line | Loki, S3, customer collectors |
 | Traces | OTLP exporter | Off by default; opt in per deployment | Tempo, Jaeger via the OTel Collector |
 
-All three speak the same correlation triple: every log line and every span attribute carries `request_id` (ULID), `trace_id` (32-hex), and `span_id` (16-hex). One inbound 402 with one trace stitches metrics, logs, and traces together without join-by-timestamp.
+All three speak the same correlation triple: every log line and every span attribute carries `request_id` (UUIDv7 rendered as 32 lowercase hex chars without hyphens; RFC 9562 monotonic + time-ordered), `trace_id` (32-hex), and `span_id` (16-hex). One inbound 402 with one trace stitches metrics, logs, and traces together without join-by-timestamp. The UUIDv7 leading 48 bits are a Unix-millisecond timestamp so a ClickHouse `ORDER BY request_id` partitions naturally by ingest time.
 
 ## Configuration
 
