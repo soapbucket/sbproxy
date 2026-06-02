@@ -1369,6 +1369,7 @@ spec:
             agents_json: None,
             outbound_credential: None,
             outbound_web_bot_auth: false,
+            observability: None,
         };
         let without = CompiledOrigin {
             hostname: CompactString::new("without.example.com"),
@@ -1419,6 +1420,7 @@ spec:
             agents_json: None,
             outbound_credential: None,
             outbound_web_bot_auth: false,
+            observability: None,
         };
         let mut host_map = HashMap::new();
         host_map.insert(CompactString::new("with.example.com"), 0);

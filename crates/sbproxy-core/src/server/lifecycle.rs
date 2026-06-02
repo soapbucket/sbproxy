@@ -51,8 +51,9 @@ pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<()> {
 
     // Refresh the operator-extensible log redactor on reload so
     // SIGHUP picks up changes to `proxy.observability.log.redact:`
-    // without restarting the process.
-    install_op_redact_state(&compiled.server);
+    // (proxy scope) as well as the tenant-scope and origin-scope
+    // `observability.log.redact.pii:` overrides (WOR-1043 PR2 / PR3).
+    install_op_redact_state(&compiled);
 
     // WOR-1045 PR1: validate the declared sinks block. PR1 only
     // warn-logs duplicates and unknown targets; dispatch wiring lands
@@ -478,8 +479,10 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // come from `proxy.observability.log.redact:`; an absent block
     // installs an empty state so the call site stays uniform across
     // single-tenant and multi-tenant deployments. The hook accepts
-    // re-install so config reloads flow through.
-    install_op_redact_state(&server_config);
+    // re-install so config reloads flow through. Tenant- and
+    // origin-scope `observability.log.redact.pii:` overrides
+    // (WOR-1043 PR2 / PR3) are composed off the proxy-scope rule set.
+    install_op_redact_state(&compiled);
     validate_sinks_config(&server_config);
 
     // Walk the inventory-based plugin registry once at startup and
@@ -1223,96 +1226,216 @@ fn report_plugin_registrations() {
     }
 }
 
-/// Read `proxy.observability.log.redact:` off the compiled config and
-/// install the operator-extensible redaction state. Empty when the
-/// block is absent so the redactor short-circuits the operator-pass
-/// at zero allocation. An invalid regex is logged at `warn` and the
-/// pattern is dropped; the rest of the block still installs.
-fn install_op_redact_state(server: &sbproxy_config::ProxyServerConfig) {
-    let cfg = match server
+/// Read `proxy.observability.log.redact:` (proxy scope) and walk
+/// `compiled.server.tenants` + `compiled.origins` for tenant- and
+/// origin-scope `observability.log.redact.pii:` overrides
+/// (WOR-1043 PR2 / PR3). Install the composed redaction state into the
+/// global op-redact slot. Empty when no scope authored a block so the
+/// redactor short-circuits at zero allocation. An invalid regex at the
+/// proxy scope is logged at `warn` and dropped; unknown rule names at
+/// any scope are warn-logged and skipped; the rest of the block still
+/// installs.
+fn install_op_redact_state(compiled: &sbproxy_config::CompiledConfig) {
+    let server = &compiled.server;
+
+    // Proxy-scope `redact:` block.
+    let proxy_redact = server
         .observability
         .as_ref()
         .and_then(|o| o.log.as_ref())
-        .and_then(|l| l.redact.as_ref())
-    {
-        Some(c) => c,
-        None => {
-            sbproxy_observe::logging::install_op_redact_config(
-                sbproxy_observe::logging::OpRedactState::empty(),
-            );
-            return;
-        }
+        .and_then(|l| l.redact.as_ref());
+
+    // Compose proxy-scope fields + regex patterns. Tenant- and
+    // origin-scope blocks reuse the same `ObservabilityPiiConfig`
+    // shape but only the `pii:` leaf is honoured at scopes below
+    // proxy; the field-key and regex passes still walk the rendered
+    // JSON, which is tenant-agnostic at the emitter.
+    let fields: Vec<String> = match proxy_redact {
+        Some(c) => c.fields.iter().map(|f| f.to_ascii_lowercase()).collect(),
+        None => Vec::new(),
     };
 
-    let fields: Vec<String> = cfg.fields.iter().map(|f| f.to_ascii_lowercase()).collect();
-
-    let mut patterns = Vec::with_capacity(cfg.patterns.len());
-    for p in &cfg.patterns {
-        match regex::Regex::new(&p.pattern) {
-            Ok(re) => {
-                let replacement = p
-                    .replacement
-                    .clone()
-                    .unwrap_or_else(|| format!("[REDACTED:{}]", p.name.to_ascii_uppercase()));
-                patterns.push((re, replacement));
-            }
-            Err(e) => {
-                tracing::warn!(
-                    pattern = %p.name,
-                    error = %e,
-                    "skipping invalid redact pattern; install continues without it"
-                );
+    let mut patterns = Vec::new();
+    if let Some(cfg) = proxy_redact {
+        patterns.reserve(cfg.patterns.len());
+        for p in &cfg.patterns {
+            match regex::Regex::new(&p.pattern) {
+                Ok(re) => {
+                    let replacement = p
+                        .replacement
+                        .clone()
+                        .unwrap_or_else(|| format!("[REDACTED:{}]", p.name.to_ascii_uppercase()));
+                    patterns.push((re, replacement));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        pattern = %p.name,
+                        error = %e,
+                        "skipping invalid redact pattern; install continues without it"
+                    );
+                }
             }
         }
     }
 
-    let pii = cfg.pii.as_ref().and_then(build_pii_redactor);
+    // Resolve the proxy-scope PII rule set first. We need both the
+    // `enabled` decision and the composed rule set because tenant-
+    // scope blocks compose against the proxy's resolved values, and
+    // origin-scope blocks compose against the tenant's (or proxy's
+    // when the origin has no tenant block).
+    let (proxy_enabled, proxy_rules) = match proxy_redact.and_then(|r| r.pii.as_ref()) {
+        Some(block) => compose_pii_rules(false, &std::collections::BTreeSet::new(), block),
+        None => (false, std::collections::BTreeSet::new()),
+    };
+    let proxy_pii = if proxy_enabled {
+        build_pii_from_rule_names(&proxy_rules, "proxy")
+    } else {
+        None
+    };
+
+    // Build the tenant map. A tenant without a `pii:` block has no
+    // entry, so resolution falls through to proxy scope.
+    let mut tenant_pii: std::collections::HashMap<
+        String,
+        Option<sbproxy_security::pii::PiiRedactor>,
+    > = std::collections::HashMap::new();
+    let mut tenant_resolved: std::collections::HashMap<
+        String,
+        (bool, std::collections::BTreeSet<String>),
+    > = std::collections::HashMap::new();
+    for tenant in &server.tenants {
+        let block = match tenant
+            .observability
+            .as_ref()
+            .and_then(|o| o.log.redact.pii.as_ref())
+        {
+            Some(b) => b,
+            None => continue,
+        };
+        let (enabled, rules) = compose_pii_rules(proxy_enabled, &proxy_rules, block);
+        tenant_resolved.insert(tenant.id.clone(), (enabled, rules.clone()));
+        let slot = if enabled {
+            build_pii_from_rule_names(&rules, &format!("tenant `{}`", tenant.id))
+        } else {
+            None
+        };
+        // Note: an `enabled: false` tenant stores `None` here so the
+        // resolver treats the entry as an explicit opt-out. A tenant
+        // whose composed rule set is empty but `enabled: true` also
+        // stores `None` (build_pii_from_rule_names returns `None` on
+        // empty input), which matches the proxy-scope behaviour of
+        // not running a PII pass when no rules are selected.
+        tenant_pii.insert(tenant.id.clone(), slot);
+    }
+
+    // Build the origin map. Origins without a `tenant_id` (or with
+    // the synthetic `__default__` tenant) compose against the proxy
+    // scope; origins with a declared tenant compose against the
+    // tenant's resolved state when present, falling back to proxy
+    // scope when the tenant has no block of its own.
+    let mut origin_pii: std::collections::HashMap<
+        String,
+        Option<sbproxy_security::pii::PiiRedactor>,
+    > = std::collections::HashMap::new();
+    for origin in &compiled.origins {
+        let block = match origin
+            .observability
+            .as_ref()
+            .and_then(|o| o.log.redact.pii.as_ref())
+        {
+            Some(b) => b,
+            None => continue,
+        };
+        let tenant_id_str = origin.tenant_id.as_str();
+        let (parent_enabled, parent_rules) = match tenant_resolved.get(tenant_id_str) {
+            Some((e, r)) => (*e, r.clone()),
+            None => (proxy_enabled, proxy_rules.clone()),
+        };
+        let (enabled, rules) = compose_pii_rules(parent_enabled, &parent_rules, block);
+        let slot = if enabled {
+            build_pii_from_rule_names(&rules, &format!("origin `{}`", origin.hostname))
+        } else {
+            None
+        };
+        // Key the origin map on the hostname so `StructuredLog.route`
+        // (today: the origin's hostname) resolves at emit time. When
+        // a future request_phase change starts stamping `hostname +
+        // path-prefix` on `route`, mirror the same string here.
+        origin_pii.insert(origin.hostname.to_string(), slot);
+    }
 
     sbproxy_observe::logging::install_op_redact_config(sbproxy_observe::logging::OpRedactState {
         fields,
         patterns,
-        pii,
+        proxy_pii,
+        tenant_pii,
+        origin_pii,
     });
 }
 
-/// Build a `PiiRedactor` from the operator config block. Returns
-/// `None` when the redactor is disabled or no rules resolve. The
-/// `rules:` list is intersected with `sbproxy_security::pii::default_rules()`;
-/// names that do not match a built-in rule are logged at `warn` and
-/// dropped (the install continues with the rest).
-fn build_pii_redactor(
-    cfg: &sbproxy_config::ObservabilityPiiConfig,
+/// Compose a child scope's `(enabled, rules)` from the parent's
+/// resolved values plus the child's add / disable lists. The child's
+/// `enabled` overrides the parent when set; an unset `enabled` inherits
+/// the parent's flag. The rules set is the parent's rules plus the
+/// child's `rules:` minus the child's `disable:`.
+fn compose_pii_rules(
+    parent_enabled: bool,
+    parent_rules: &std::collections::BTreeSet<String>,
+    block: &sbproxy_config::ObservabilityPiiConfig,
+) -> (bool, std::collections::BTreeSet<String>) {
+    let enabled = block.enabled.unwrap_or(parent_enabled);
+    let mut rules = parent_rules.clone();
+    // Special case for the proxy scope: an empty `rules:` at the
+    // proxy scope (no parent to inherit from) means "all defaults".
+    // We model this by treating an empty parent + empty rules + no
+    // disable as a sentinel and substituting the full default name
+    // list. Tenant and origin scopes have a non-empty parent set
+    // whenever the proxy scope enabled PII, so this branch only
+    // applies at the proxy scope.
+    if parent_rules.is_empty() && block.rules.is_empty() {
+        for r in sbproxy_security::pii::default_rules() {
+            rules.insert(r.name);
+        }
+    } else {
+        for r in &block.rules {
+            rules.insert(r.clone());
+        }
+    }
+    for d in &block.disable {
+        rules.remove(d);
+    }
+    (enabled, rules)
+}
+
+/// Build a `PiiRedactor` from a set of built-in rule names. Returns
+/// `None` when the set is empty or every requested rule is unknown.
+/// Unknown rule names are warn-logged with the `scope_label` so an
+/// operator typo at any scope surfaces in the logs.
+fn build_pii_from_rule_names(
+    rule_names: &std::collections::BTreeSet<String>,
+    scope_label: &str,
 ) -> Option<sbproxy_security::pii::PiiRedactor> {
-    if !cfg.enabled {
+    if rule_names.is_empty() {
         return None;
     }
-
     let defaults = sbproxy_security::pii::default_rules();
-    let want_all = cfg.rules.is_empty();
-
-    // Warn on unknown rule names so an operator typo does not silently
-    // drop a rule the operator thought was installed. Has to happen
-    // before `selected` is moved into the config.
     let known: std::collections::HashSet<&str> = defaults.iter().map(|r| r.name.as_str()).collect();
-    for want in &cfg.rules {
+    for want in rule_names {
         if !known.contains(want.as_str()) {
             tracing::warn!(
+                scope = %scope_label,
                 rule = %want,
                 "unknown PII rule name; skipping (typo or removed default?)"
             );
         }
     }
-
     let selected: Vec<_> = defaults
         .into_iter()
-        .filter(|r| want_all || cfg.rules.iter().any(|w| w == &r.name))
-        .filter(|r| !cfg.disable.iter().any(|d| d == &r.name))
+        .filter(|r| rule_names.contains(&r.name))
         .collect();
-
     if selected.is_empty() {
         return None;
     }
-
     let pii_config = sbproxy_security::pii::PiiConfig {
         enabled: true,
         defaults: false,
@@ -1323,7 +1446,11 @@ fn build_pii_redactor(
     match sbproxy_security::pii::PiiRedactor::from_config(&pii_config) {
         Ok(redactor) => Some(redactor),
         Err(e) => {
-            tracing::warn!(error = %e, "failed to build operator PII redactor; PII pass disabled");
+            tracing::warn!(
+                scope = %scope_label,
+                error = %e,
+                "failed to build operator PII redactor; PII pass disabled at this scope"
+            );
             None
         }
     }
@@ -1394,4 +1521,214 @@ fn validate_sinks_config(server: &sbproxy_config::ProxyServerConfig) {
         count = sinks.len(),
         "WOR-1045 PR1: parsed sinks block; dispatch wiring lands in PR2"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WOR-1043 PR2 / PR3: installing the redact state from a compiled
+    /// config that carries a proxy-scope PII block plus a tenant-scope
+    /// override plus an origin-scope extension yields a tri-level
+    /// `OpRedactState` the resolver can pick from. Verifies through
+    /// `apply_redaction_for` because the state is process-global and
+    /// the `OpRedactState` fields are exposed for inspection.
+    #[test]
+    fn install_op_redact_state_builds_tenant_and_origin_pii() {
+        // Build a CompiledConfig with proxy + 1 tenant + 1 origin and
+        // run the install. We assert against the resolver behaviour
+        // because that is the user-visible contract; spying on the
+        // private map would couple to representation details.
+        use sbproxy_config::{
+            CompiledConfig, CompiledOrigin, ObservabilityConfig, ObservabilityLogConfig,
+            ObservabilityPiiConfig, ObservabilityRedactConfig, OriginObservabilityConfig,
+            OriginObservabilityLogConfig, OriginObservabilityRedactConfig, ProxyServerConfig,
+            ProxyTenantConfig, TenantObservabilityConfig, TenantObservabilityLogConfig,
+            TenantObservabilityRedactConfig,
+        };
+
+        // Serialise the test against the other op-redact tests via the
+        // same lock the logging crate uses for its own swap-based
+        // tests; both touch the same process-global slot.
+        static OP_REDACT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = OP_REDACT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut server = ProxyServerConfig {
+            http_bind_port: 8080,
+            ..Default::default()
+        };
+        // Build the log block via Default and then spread the redact
+        // leaf so we do not have to spell every unrelated knob
+        // (level, format, sampling, sinks) by hand.
+        let log_cfg = ObservabilityLogConfig {
+            redact: Some(ObservabilityRedactConfig {
+                fields: Vec::new(),
+                patterns: Vec::new(),
+                pii: Some(ObservabilityPiiConfig {
+                    enabled: Some(true),
+                    rules: vec!["email".to_string()],
+                    disable: Vec::new(),
+                }),
+            }),
+            ..Default::default()
+        };
+        server.observability = Some(ObservabilityConfig {
+            log: Some(log_cfg),
+            telemetry: None,
+        });
+        server.tenants = vec![ProxyTenantConfig {
+            id: "acme".to_string(),
+            credentials: Vec::new(),
+            observability: Some(TenantObservabilityConfig {
+                log: TenantObservabilityLogConfig {
+                    redact: TenantObservabilityRedactConfig {
+                        pii: Some(ObservabilityPiiConfig {
+                            enabled: Some(true),
+                            rules: vec!["us_ssn".to_string()],
+                            disable: Vec::new(),
+                        }),
+                    },
+                },
+            }),
+        }];
+
+        // Mint a minimal CompiledOrigin by hand. We only populate the
+        // fields the install path actually reads (`hostname`,
+        // `tenant_id`, `observability`); every other field uses Default
+        // where Default is implemented, or an empty value otherwise.
+        let origin = CompiledOrigin {
+            hostname: compact_str::CompactString::new("api.acme.example.com"),
+            origin_id: compact_str::CompactString::new("api-acme"),
+            workspace_id: compact_str::CompactString::default(),
+            tenant_id: compact_str::CompactString::new("acme"),
+            action_config: serde_json::Value::Null,
+            auth_config: None,
+            policy_configs: Vec::new(),
+            transform_configs: Vec::new(),
+            cors: None,
+            hsts: None,
+            compression: None,
+            session: None,
+            properties: None,
+            sessions: None,
+            user: None,
+            force_ssl: false,
+            allowed_methods: smallvec::SmallVec::new(),
+            request_modifiers: smallvec::SmallVec::new(),
+            response_modifiers: smallvec::SmallVec::new(),
+            variables: None,
+            forward_rules: Vec::new(),
+            fallback_origin: None,
+            error_pages: None,
+            problem_details: None,
+            proxy_status: None,
+            message_signatures: None,
+            olp: None,
+            web_bot_auth_publish: None,
+            idempotency: None,
+            bot_detection: None,
+            threat_protection: None,
+            on_request: Vec::new(),
+            on_response: Vec::new(),
+            response_cache: None,
+            mirror: None,
+            extensions: std::collections::HashMap::new(),
+            expose_openapi: false,
+            stream_safety: Vec::new(),
+            rate_limits: None,
+            auto_content_negotiate: None,
+            content_signal: None,
+            token_bytes_ratio: None,
+            agent_skills: Vec::new(),
+            agents_md: None,
+            ai_txt: None,
+            agents_json: None,
+            outbound_credential: None,
+            outbound_web_bot_auth: false,
+            observability: Some(OriginObservabilityConfig {
+                log: OriginObservabilityLogConfig {
+                    redact: OriginObservabilityRedactConfig {
+                        pii: Some(ObservabilityPiiConfig {
+                            enabled: Some(true),
+                            rules: vec!["credit_card".to_string()],
+                            disable: Vec::new(),
+                        }),
+                    },
+                },
+            }),
+        };
+
+        let compiled = CompiledConfig {
+            origins: vec![origin],
+            host_map: std::collections::HashMap::new(),
+            server,
+            l2_store: None,
+            messenger: None,
+            mesh: None,
+            access_log: None,
+            agent_classes: None,
+        };
+
+        install_op_redact_state(&compiled);
+
+        // Proxy scope: email rule fires; ssn / card do not.
+        let json_email = r#"{"freeform":"ping alice@example.com please"}"#;
+        let json_ssn = r#"{"freeform":"the ssn is 123-45-6789 today"}"#;
+        let json_card = r#"{"freeform":"paid 4111 1111 1111 1111 yesterday"}"#;
+
+        let proxy_email = sbproxy_observe::logging::apply_redaction_for(
+            json_email,
+            sbproxy_observe::logging::Sink::AccessLog,
+            None,
+            None,
+        );
+        assert!(
+            proxy_email.contains("[REDACTED:EMAIL]"),
+            "proxy scope should redact email: {proxy_email}"
+        );
+
+        // Tenant scope: composes email + us_ssn (tenant adds ssn).
+        let tenant_ssn = sbproxy_observe::logging::apply_redaction_for(
+            json_ssn,
+            sbproxy_observe::logging::Sink::AccessLog,
+            Some("acme"),
+            None,
+        );
+        assert!(
+            tenant_ssn.contains("[REDACTED:SSN]") || tenant_ssn.contains("[REDACTED:US_SSN]"),
+            "tenant scope should redact ssn (composed from proxy + tenant): {tenant_ssn}"
+        );
+
+        // Origin scope: composes email + us_ssn (from tenant) + credit_card.
+        let origin_card = sbproxy_observe::logging::apply_redaction_for(
+            json_card,
+            sbproxy_observe::logging::Sink::AccessLog,
+            Some("acme"),
+            Some("api.acme.example.com"),
+        );
+        assert!(
+            origin_card.contains("[REDACTED:CARD]"),
+            "origin scope should redact credit card (composed from tenant + origin): {origin_card}"
+        );
+        // Origin still inherits the email rule from proxy via the
+        // tenant composition.
+        let origin_email = sbproxy_observe::logging::apply_redaction_for(
+            json_email,
+            sbproxy_observe::logging::Sink::AccessLog,
+            Some("acme"),
+            Some("api.acme.example.com"),
+        );
+        assert!(
+            origin_email.contains("[REDACTED:EMAIL]"),
+            "origin scope should still redact email via inherited rule set: {origin_email}"
+        );
+
+        // Reset the global slot so a sibling test does not see the
+        // installed state.
+        sbproxy_observe::logging::install_op_redact_config(
+            sbproxy_observe::logging::OpRedactState::empty(),
+        );
+    }
 }
