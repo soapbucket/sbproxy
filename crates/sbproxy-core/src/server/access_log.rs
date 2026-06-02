@@ -386,6 +386,21 @@ pub(super) fn emit_access_log(
         .and_then(|idx| pipeline.auths.get(idx))
         .and_then(|opt| opt.as_ref())
         .map(|auth| auth.auth_type().to_string());
+    // WOR-1047: principal_kind = the auth_type slug, with two extras
+    // the auth-provider enum cannot express on its own:
+    //   * `virtual_key` when an AI virtual key matched (detected by
+    //     the AI-VK fields stamped on ctx by `handle_ai_proxy`);
+    //   * `none` when the origin has no auth provider configured.
+    // The AI virtual key case takes precedence over the auth-provider
+    // case because a configured auth provider can sit in front of the
+    // AI handler; the attribution-relevant principal is the matched
+    // VK, not the bearer / api_key that the request used to reach the
+    // AI handler.
+    let principal_kind = if ctx.ai_project.is_some() || ctx.ai_user.is_some() {
+        Some("virtual_key".to_string())
+    } else {
+        Some(auth_type.clone().unwrap_or_else(|| "none".to_string()))
+    };
     let workspace_id = ctx
         .origin_idx
         .and_then(|idx| pipeline.config.origins.get(idx))
@@ -485,6 +500,7 @@ pub(super) fn emit_access_log(
         properties: ctx.properties.clone(),
         workspace_id,
         auth_type,
+        principal_kind,
         served_from_cache: Some(ctx.served_from_cache),
         fallback_triggered: Some(ctx.fallback_triggered),
         retry_count: Some(ctx.retry_count),
@@ -613,6 +629,12 @@ pub(super) struct AccessLogContext {
     pub(super) properties: std::collections::BTreeMap<String, String>,
     pub(super) workspace_id: String,
     pub(super) auth_type: Option<String>,
+    /// WOR-1047: closed-enum principal kind. Mirrors `auth_type` for
+    /// the auth-provider variants and adds `virtual_key` (AI-gateway
+    /// VK match) and `none` (no auth provider configured). Used by
+    /// downstream ClickHouse / Grafana queries to partition the log
+    /// by principal source without joining on `auth_type IS NULL`.
+    pub(super) principal_kind: Option<String>,
     pub(super) served_from_cache: Option<bool>,
     pub(super) fallback_triggered: Option<bool>,
     pub(super) retry_count: Option<u32>,
@@ -707,6 +729,7 @@ impl AccessLogContext {
             properties: std::collections::BTreeMap::new(),
             workspace_id: String::new(),
             auth_type: None,
+            principal_kind: None,
             served_from_cache: None,
             fallback_triggered: None,
             retry_count: None,
@@ -849,6 +872,7 @@ pub(super) fn emit_access_log_entry(
         properties: context.properties,
         workspace_id: context.workspace_id,
         auth_type: context.auth_type,
+        principal_kind: context.principal_kind,
         served_from_cache: context.served_from_cache,
         fallback_triggered: context.fallback_triggered,
         retry_count: context.retry_count,
