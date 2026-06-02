@@ -42,7 +42,43 @@ proxy:
       metrics_interval_secs: 30
 ```
 
-A multi-sink `log.sinks:` block is on the roadmap under the Logging v2 epic; today's log routing is per-tracing-target (`access_log`, `audit_log`, etc.) and stdout / file via the access-log output config.
+The multi-sink `log.sinks:` block is now declared (WOR-1045 PR1): the schema parses and validates, while the dispatch fan-out lands in PR2. Until PR2 ships, today's log routing is still per-tracing-target (`access_log`, `audit_log`, etc.) and stdout / file via the access-log output config.
+
+```yaml
+proxy:
+  observability:
+    log:
+      sinks:
+        - name: stdout
+          target: access_log
+          format: json
+          output: { type: stdout }
+          profile: internal
+        - name: stderr-audit
+          target: audit_log
+          format: json
+          output: { type: stderr }
+        - name: file-archive
+          target: audit_log
+          format: json
+          output:
+            type: file
+            path: /var/log/sbproxy/audit.json
+            max_size_mb: 100
+            max_backups: 7
+            compress: true
+          profile: internal
+```
+
+Field schema:
+
+* `name` is unique within the declaring scope. PR2 rejects duplicates; PR1 only warns.
+* `target` selects the internal channel: `access_log | error_log | audit_log | trace_exporter | external_log`.
+* `format` overrides the parent `proxy.observability.log.format` for this sink.
+* `output` is the where: `stdout | stderr | file` ship in PR1. `otlp` lands under WOR-1046; `syslog` is a planned follow-up.
+* `profile` is the redaction shape: `internal` keeps JA3/JA4; `external` strips them. Tenant-scoped sinks (planned PR3 once WOR-1051 lands) default to `external`.
+
+Per-tenant + per-origin sink scopes are blocked on the WOR-1051 credentials epic; today operators land all sinks at the proxy scope.
 
 ## Metrics
 
