@@ -4,6 +4,7 @@
 // Volatile zeroization uses narrowly-scoped unsafe writes so secrets are not optimized away.
 #![warn(missing_docs)]
 
+pub mod aws;
 pub mod convergent;
 pub mod hashicorp;
 pub mod local;
@@ -15,6 +16,7 @@ pub mod scope;
 pub mod secret_string;
 pub mod vault_ref;
 
+pub use aws::{AwsAuth, AwsSecretsManagerBackend, AwsSecretsManagerConfig, DEFAULT_AWS_CACHE_TTL};
 pub use convergent::ConvergentFingerprinter;
 pub use hashicorp::{
     HashiCorpAuth, HashiCorpConfig, HashiCorpVaultBackend, KvEngine, DEFAULT_CACHE_TTL,

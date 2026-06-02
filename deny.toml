@@ -58,6 +58,28 @@ ignore = [
   # Cargo.lock updates.
   "RUSTSEC-2024-0437",
 
+  # --- AWS SDK: transitive rustls 0.21 -> rustls-webpki 0.101.7 ---
+  # The three advisories below all flag `rustls-webpki 0.101.7`, which the
+  # `aws-smithy-http-client 1.1.13` HTTP client pins through `rustls 0.21`.
+  # The upstream AWS SDK has not yet bumped the smithy http client to the
+  # rustls 0.23 line. None of the three advisories applies to the
+  # `aws-sdk-secretsmanager` / `aws-sdk-sts` use case: we connect to
+  # AWS-issued certificates over standard TLS chains and do not parse CA
+  # certs with name constraints, do not consume Certificate Revocation
+  # Lists, and do not verify wildcard DNS-name SANs against permitted
+  # subtree constraints. Resolves when the AWS SDK bumps smithy-http-client
+  # to a rustls 0.23 base; CI re-gates automatically once Cargo.lock updates.
+  #
+  # RUSTSEC-2026-0098: URI name constraints ignored on CA verification.
+  "RUSTSEC-2026-0098",
+  # RUSTSEC-2026-0099: permitted DNS subtree constraints accepted on
+  # wildcard certs. We do not run a custom PKI; AWS service certs are
+  # served from public CAs that do not use this constraint.
+  "RUSTSEC-2026-0099",
+  # RUSTSEC-2026-0104: panic when parsing empty CRLs. We do not configure
+  # CRL parsing in the SDK; the default chain skips it entirely.
+  "RUSTSEC-2026-0104",
+
   # --- WOR-616: unmaintained transitive crates -----------------------------
   # The following six advisories are all `unmaintained`-class warnings (not
   # active vulnerabilities; `cargo audit` reports 0 vulnerabilities). Each
