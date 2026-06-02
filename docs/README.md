@@ -36,6 +36,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [access-log.md](access-log.md) - structured JSON access log: filters, sampling, header capture, redaction.
 - [audit-log.md](audit-log.md) - tamper-evident audit log of admin actions.
 - [observability.md](observability.md) - metrics, logs, traces, and the bundled dashboards.
+- [clickhouse-attribution.md](clickhouse-attribution.md) - access-log schema, pre-aggregations, and sample attribution queries.
 - [operator-runbook.md](operator-runbook.md) - dashboard triage and rollback actions.
 - [threat-model.md](threat-model.md) - OSS trust boundaries and per-wave review checklist.
 - [events.md](events.md) - the event bus, callback hooks, and emitted event types.
