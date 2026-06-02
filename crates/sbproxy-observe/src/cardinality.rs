@@ -94,6 +94,18 @@ pub struct CardinalityLimiter {
     config: CardinalityConfig,
     /// label_name -> set of accepted unique values.
     seen: Mutex<HashMap<String, HashSet<String>>>,
+    /// WOR-1067: per-tenant tracking sets. Keyed on
+    /// `(tenant_id, label_name)`. A tenant declared in
+    /// `tenants[].observability.cardinality.max_series` gets its own
+    /// budget; the synthetic `__default__` tenant continues to share
+    /// the proxy-wide `seen` set above so single-tenant deployments
+    /// stay bit-for-bit identical to pre-WOR-1067 behaviour.
+    tenant_seen: Mutex<HashMap<(String, String), HashSet<String>>>,
+    /// Per-tenant cap override. `(tenant_id) -> max_unique_values`.
+    /// A tenant without an entry falls back to `config.max_per_label`.
+    /// Populated at config-compile by
+    /// `lifecycle::install_tenant_cardinality_state`.
+    tenant_caps: Mutex<HashMap<String, usize>>,
 }
 
 impl CardinalityLimiter {
@@ -102,7 +114,73 @@ impl CardinalityLimiter {
         Self {
             config,
             seen: Mutex::new(HashMap::new()),
+            tenant_seen: Mutex::new(HashMap::new()),
+            tenant_caps: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// WOR-1067: install a per-tenant cap. Called from
+    /// `lifecycle::install_tenant_cardinality_state` at boot and on
+    /// SIGHUP. A tenant without an entry falls back to the
+    /// proxy-wide `config.max_per_label`.
+    pub fn set_tenant_cap(&self, tenant_id: impl Into<String>, max_series: usize) {
+        let mut guard = self
+            .tenant_caps
+            .lock()
+            .expect("cardinality limiter tenant_caps mutex poisoned");
+        guard.insert(tenant_id.into(), max_series);
+    }
+
+    /// WOR-1067: tenant-scoped sanitize. The synthetic `__default__`
+    /// tenant falls through to the proxy-wide
+    /// [`sanitize_budget`](Self::sanitize_budget) path so single-tenant
+    /// deployments stay bit-for-bit identical. Declared tenants get
+    /// their own accepted-value set so a noisy tenant cannot demote
+    /// labels for every other tenant.
+    pub fn sanitize_tenant(&self, tenant_id: &str, label_name: &str, value: &str) -> String {
+        if tenant_id.is_empty() || tenant_id == "__default__" {
+            return self.sanitize_budget(label_name, value);
+        }
+        let cap = {
+            let guard = self
+                .tenant_caps
+                .lock()
+                .expect("cardinality limiter tenant_caps mutex poisoned");
+            guard
+                .get(tenant_id)
+                .copied()
+                .unwrap_or(self.config.max_per_label)
+        };
+        let mut guard = self
+            .tenant_seen
+            .lock()
+            .expect("cardinality limiter tenant_seen mutex poisoned");
+        let key = (tenant_id.to_string(), label_name.to_string());
+        let set = guard.entry(key).or_default();
+        if set.contains(value) {
+            return value.to_string();
+        }
+        if set.len() < cap {
+            set.insert(value.to_string());
+            value.to_string()
+        } else {
+            log_demotion(label_name, value);
+            OTHER_LABEL.to_string()
+        }
+    }
+
+    /// WOR-1067: count of unique accepted values for a tenant + label
+    /// pair. Used by the regression test that asserts per-tenant
+    /// independence.
+    pub fn tenant_unique_count(&self, tenant_id: &str, label_name: &str) -> usize {
+        let guard = self
+            .tenant_seen
+            .lock()
+            .expect("cardinality limiter tenant_seen mutex poisoned");
+        guard
+            .get(&(tenant_id.to_string(), label_name.to_string()))
+            .map(|s| s.len())
+            .unwrap_or(0)
     }
 
     /// Sanitize a label value against the cardinality cap.
@@ -169,6 +247,16 @@ impl CardinalityLimiter {
             .lock()
             .expect("cardinality limiter mutex poisoned");
         guard.clear();
+        let mut tenant_guard = self
+            .tenant_seen
+            .lock()
+            .expect("cardinality limiter tenant_seen mutex poisoned");
+        tenant_guard.clear();
+        let mut caps_guard = self
+            .tenant_caps
+            .lock()
+            .expect("cardinality limiter tenant_caps mutex poisoned");
+        caps_guard.clear();
     }
 }
 
@@ -423,5 +511,53 @@ mod tests {
             "cardinality cap exceeded: {}",
             lim.unique_count("concurrent_label")
         );
+    }
+
+    /// WOR-1067: per-tenant accepted-value sets are independent. A
+    /// noisy tenant cannot demote labels for any other tenant.
+    #[test]
+    fn tenant_cardinality_per_tenant_independent() {
+        let lim = CardinalityLimiter::new(CardinalityConfig {
+            max_per_label: 1000,
+            hostname_cap: None,
+        });
+        lim.set_tenant_cap("a", 5);
+        lim.set_tenant_cap("b", 5);
+
+        // Tenant A: 4 values fit, 5th fits, 6th demotes.
+        for i in 0..5 {
+            let v = format!("a-value-{i}");
+            assert_eq!(lim.sanitize_tenant("a", "agent", &v), v);
+        }
+        assert_eq!(lim.sanitize_tenant("a", "agent", "overflow"), OTHER_LABEL);
+
+        // Tenant B's accepted set is untouched by A's overflow.
+        for i in 0..5 {
+            let v = format!("b-value-{i}");
+            assert_eq!(lim.sanitize_tenant("b", "agent", &v), v);
+        }
+        assert_eq!(lim.tenant_unique_count("b", "agent"), 5);
+        assert_eq!(lim.tenant_unique_count("a", "agent"), 5);
+        // A's overflow attempt did not bleed into B.
+        assert_eq!(lim.sanitize_tenant("b", "agent", "b-value-3"), "b-value-3");
+    }
+
+    /// WOR-1067: the synthetic `__default__` tenant falls through to
+    /// the proxy-wide accepted-value set so single-tenant deployments
+    /// stay bit-for-bit identical.
+    #[test]
+    fn tenant_cardinality_default_falls_through_to_proxy_scope() {
+        let lim = CardinalityLimiter::new(CardinalityConfig {
+            max_per_label: 1000,
+            hostname_cap: None,
+        });
+        // `__default__` shares the proxy-wide `seen` set so reading
+        // it back via `unique_count` (not `tenant_unique_count`)
+        // sees the same value.
+        let v = lim.sanitize_tenant("__default__", "agent", "claude");
+        assert_eq!(v, "claude");
+        assert_eq!(lim.unique_count("agent"), 1);
+        // The per-tenant map remains empty for the default tenant.
+        assert_eq!(lim.tenant_unique_count("__default__", "agent"), 0);
     }
 }

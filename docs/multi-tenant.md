@@ -102,7 +102,38 @@ What is NOT guaranteed:
 
 ## Per-tenant cardinality budgets
 
-Prometheus metric label cardinality is the single biggest operational risk in a multi-tenant deployment. SBproxy's cardinality limiter caps the unique label sets per metric family; a tenant that would push the proxy past the cap sees its newest label combinations demoted to a catch-all bucket. The per-tenant budget is documented in `docs/observability.md`.
+Prometheus metric label cardinality is the single biggest operational risk in a multi-tenant deployment. SBproxy's cardinality limiter caps the unique label sets per metric family; a tenant that would push the proxy past the cap sees its newest label combinations demoted to a `__other__` catch-all. WOR-1067 split this budget per tenant so a single noisy tenant cannot demote labels for every other tenant.
+
+Configure the per-tenant cap on the tenant's observability block:
+
+```yaml
+proxy:
+  tenants:
+    - id: acme
+      observability:
+        cardinality:
+          max_series: 5000   # cap unique label values per (metric, label) for this tenant
+    - id: noisy-corp
+      observability:
+        cardinality:
+          max_series: 1000   # tighter cap for a tenant known to send wide cardinality
+```
+
+Omitting the block leaves the tenant on the per-tenant default (10000 unique values per label). The synthetic `__default__` tenant continues to share the proxy-wide budget so single-tenant deployments stay bit-for-bit identical to pre-WOR-1067 behaviour.
+
+Overflows fire the `sbproxy_label_cardinality_overflow_total{tenant_id, metric, label}` counter so dashboards can spot which tenant is approaching its cap.
+
+## Audit log `tenant_id`
+
+Every `SecurityAuditEntry` (policy denies, auth failures, framing violations) and every `ConfigAuditEntry` (config reloads, origin diffs) carries an optional `tenant_id` field. Stamp it on construction:
+
+```rust
+SecurityAuditEntry::policy_violation(...)
+    .with_tenant_id(ctx.tenant_id.to_string())
+    .emit();
+```
+
+The field is `#[serde(skip_serializing_if = "Option::is_none")]` so proxy-wide events (a config reload across all tenants) omit it and existing SIEM ingest pipelines stay backward-compatible. Downstream ClickHouse / Splunk / Elastic partitions can now `WHERE tenant_id = 'acme'` to scope investigations to one tenant.
 
 ## Adoption path
 

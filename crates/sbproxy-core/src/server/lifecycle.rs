@@ -1835,6 +1835,7 @@ mod tests {
             id: "acme".to_string(),
             credentials: Vec::new(),
             observability: Some(TenantObservabilityConfig {
+                cardinality: None,
                 log: TenantObservabilityLogConfig {
                     sinks: Vec::new(),
                     redact: TenantObservabilityRedactConfig {
