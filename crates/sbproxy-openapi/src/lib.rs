@@ -463,6 +463,7 @@ mod tests {
             hostname: compact_str::CompactString::new(host),
             origin_id: compact_str::CompactString::new(id),
             workspace_id: compact_str::CompactString::default(),
+            tenant_id: compact_str::CompactString::const_new("__default__"),
             action_config: serde_json::json!({"type": "proxy", "url": "http://127.0.0.1/"}),
             auth_config: None,
             policy_configs: Vec::new(),

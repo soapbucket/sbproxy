@@ -188,6 +188,13 @@ pub struct AccessLogEntry {
     /// the resolved tenant.
     #[serde(skip_serializing_if = "String::is_empty", default)]
     pub workspace_id: String,
+    /// WOR-1053: tenant resolved from `origin.tenant_id`. `__default__`
+    /// for single-tenant deployments. ClickHouse / Grafana queries
+    /// partition on this column to surface per-tenant usage and
+    /// cost. Stays empty for log rows emitted before the request
+    /// matched an origin (e.g. early 404s on an unknown host).
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub tenant_id: String,
     /// Authentication scheme that produced the auth decision
     /// (`api_key`, `basic_auth`, `jwt`, `forward_auth`, `oauth`,
     /// `noop`, ...). Absent when no auth was configured for the
@@ -522,6 +529,7 @@ impl Default for AccessLogEntry {
             parent_session_id: None,
             properties: BTreeMap::new(),
             workspace_id: String::new(),
+            tenant_id: String::new(),
             auth_type: None,
             principal_kind: None,
             served_from_cache: None,
@@ -803,6 +811,7 @@ mod tests {
             parent_session_id: None,
             properties: BTreeMap::new(),
             workspace_id: String::new(),
+            tenant_id: String::new(),
             auth_type: None,
             principal_kind: None,
             served_from_cache: None,

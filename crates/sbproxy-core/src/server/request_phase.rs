@@ -1036,6 +1036,16 @@ pub(super) async fn request_filter(
         }
     };
     ctx.origin_idx = Some(origin_idx);
+    // WOR-1053: stamp the matched origin's tenant on the request
+    // context so downstream auth / policy / vault resolution can
+    // partition by tenant. The compiler defaults the field to
+    // `__default__` when no explicit `tenant_id` was declared, so
+    // single-tenant configs see the same default they had before
+    // this PR.
+    {
+        let pipeline_guard = reload::current_pipeline();
+        ctx.tenant_id = pipeline_guard.config.origins[origin_idx].tenant_id.clone();
+    }
 
     // --- RFC 9421 HTTP Message Signatures verification ---
     //

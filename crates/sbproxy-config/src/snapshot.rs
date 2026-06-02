@@ -31,6 +31,13 @@ pub struct CompiledOrigin {
     pub origin_id: CompactString,
     /// Workspace that owns this origin (used for multi-tenant isolation).
     pub workspace_id: CompactString,
+    /// WOR-1053: tenant this origin resolves to. `__default__` for
+    /// single-tenant deployments; an explicit id when
+    /// `origin.tenant_id` matches a declared `proxy.tenants[].id`.
+    /// Stamped on every `RequestContext` the origin serves so
+    /// downstream auth / policy / vault resolution can pick the
+    /// tenant-scoped block.
+    pub tenant_id: CompactString,
 
     /// Action configuration (proxy, redirect, static, etc.) as JSON until module-layer compilation.
     pub action_config: serde_json::Value,
