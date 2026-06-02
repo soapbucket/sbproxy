@@ -24,8 +24,9 @@ use serde_json::json;
 
 /// Every `RedactedField` member from A1.5, paired with the literal
 /// secret value the test injects and the marker the redactor MUST emit
-/// in its place. Marker format is `<redacted:` + kebab-cased member +
-/// `>` (verbatim from the ADR).
+/// in its place. Marker format is `[REDACTED:` + uppercased member +
+/// `]` (schema-v2 normalised marker; the legacy `<redacted:foo>`
+/// shape was retired alongside the structured-log schema-v2 bump).
 struct RedactionFixture {
     /// Human label for assertion error messages.
     label: &'static str,
@@ -59,7 +60,7 @@ fn fixtures() -> Vec<RedactionFixture> {
         RedactionFixture {
             label: "AuthorizationHeader (Bearer)",
             secret: "Bearer s3cret-bearer-token-aaaaaaaaaaaaaaaa",
-            marker: "<redacted:authorization>",
+            marker: "[REDACTED:AUTHORIZATION]",
             site: SecretSite::RequestHeader {
                 name: "authorization",
             },
@@ -67,7 +68,7 @@ fn fixtures() -> Vec<RedactionFixture> {
         RedactionFixture {
             label: "AuthorizationHeader (Basic)",
             secret: "Basic dXNlcjpwYXNzd29yZHNlY3JldA==",
-            marker: "<redacted:authorization>",
+            marker: "[REDACTED:AUTHORIZATION]",
             site: SecretSite::RequestHeader {
                 name: "authorization",
             },
@@ -75,7 +76,7 @@ fn fixtures() -> Vec<RedactionFixture> {
         RedactionFixture {
             label: "StripeSecretKey",
             secret: "sk_live_51HjklmNopQrsTuvWxyZ0123456789AbCdEfGhIjKlMnOpQrStUvWxYz",
-            marker: "<redacted:stripe-secret-key>",
+            marker: "[REDACTED:STRIPE_SECRET_KEY]",
             site: SecretSite::RequestHeader {
                 name: "x-stripe-key",
             },
@@ -83,7 +84,7 @@ fn fixtures() -> Vec<RedactionFixture> {
         RedactionFixture {
             label: "LedgerHmacKey",
             secret: "ledger-hmac-key-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            marker: "<redacted:ledger-hmac-key>",
+            marker: "[REDACTED:LEDGER_HMAC_KEY]",
             site: SecretSite::EnvVar {
                 name: "SBPROXY_LEDGER_HMAC_KEY",
             },
@@ -91,13 +92,13 @@ fn fixtures() -> Vec<RedactionFixture> {
         RedactionFixture {
             label: "KyaToken",
             secret: "kya_token_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            marker: "<redacted:kya-token>",
+            marker: "[REDACTED:KYA_TOKEN]",
             site: SecretSite::RequestHeader { name: "x-kya" },
         },
         RedactionFixture {
             label: "PromptBody",
             secret: "PROMPT_PII_alice@example.com SSN=123-45-6789",
-            marker: "<redacted:prompt-body>",
+            marker: "[REDACTED:PROMPT_BODY]",
             site: SecretSite::RequestBodyField {
                 path: "messages.0.content",
             },
@@ -105,13 +106,13 @@ fn fixtures() -> Vec<RedactionFixture> {
         RedactionFixture {
             label: "Cookie",
             secret: "session=cookie-value-must-not-leak-aaaaaa",
-            marker: "<redacted:cookie>",
+            marker: "[REDACTED:COOKIE]",
             site: SecretSite::RequestHeader { name: "cookie" },
         },
         RedactionFixture {
             label: "OAuthClientSecret",
             secret: "oauth-client-secret-aaaaaaaaaaaaaaaaaaaa",
-            marker: "<redacted:oauth-client-secret>",
+            marker: "[REDACTED:OAUTH_CLIENT_SECRET]",
             site: SecretSite::RequestBodyField {
                 path: "oauth_client_secret",
             },
@@ -119,7 +120,7 @@ fn fixtures() -> Vec<RedactionFixture> {
         RedactionFixture {
             label: "PaymentReceiptSecret",
             secret: "rcpt_secret_aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            marker: "<redacted:payment-receipt-secret>",
+            marker: "[REDACTED:PAYMENT_RECEIPT_SECRET]",
             site: SecretSite::RequestHeader {
                 name: "x-sb-receipt-secret",
             },
@@ -127,7 +128,7 @@ fn fixtures() -> Vec<RedactionFixture> {
         RedactionFixture {
             label: "ApiKey",
             secret: "api_key=ak_aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            marker: "<redacted:api-key>",
+            marker: "[REDACTED:API_KEY]",
             site: SecretSite::RequestHeader { name: "x-api-key" },
         },
     ]
@@ -150,7 +151,8 @@ const SINKS: &[&str] = &["access_log", "error_log", "audit_log", "trace_exporter
 ///    knows about (Bearer, Basic, sk_live_, api_key=, etc).
 /// 2. Every fixture entry has a non-empty marker string. This catches
 ///    "added a new variant, forgot the marker" before the typed
-///    redactor lands.
+///    redactor lands. Markers now use the schema-v2 shape
+///    `[REDACTED:FIELD_UPPER]`.
 #[test]
 fn redaction_fixture_floor_no_secret_leaks_through_legacy_redactor() {
     use sbproxy_observe::redact::redact_secrets;
@@ -178,7 +180,7 @@ fn redaction_fixture_floor_no_secret_leaks_through_legacy_redactor() {
         }
         assert!(!fx.marker.is_empty(), "marker empty for {}", fx.label);
         assert!(
-            fx.marker.starts_with("<redacted:") && fx.marker.ends_with('>'),
+            fx.marker.starts_with("[REDACTED:") && fx.marker.ends_with(']'),
             "marker shape wrong for {}: {}",
             fx.label,
             fx.marker
@@ -190,7 +192,7 @@ fn redaction_fixture_floor_no_secret_leaks_through_legacy_redactor() {
 /// secret in the documented site, then read the captured output of
 /// every sink and assert (a) the marker is present and (b) the secret
 /// is absent. Mirrors the ADR's "marker variant matches the field
-/// type" rule (Authorization gets `<redacted:authorization>`, not a
+/// type" rule (Authorization gets `[REDACTED:AUTHORIZATION]`, not a
 /// generic marker).
 #[test]
 fn redaction_per_sink_fan_out() {
@@ -310,7 +312,7 @@ origins:
     for &sink in SINKS {
         let buf = read_sink_buffer(&harness, sink).unwrap_or_default();
         assert!(
-            !buf.contains("<redacted:"),
+            !buf.contains("[REDACTED:"),
             "sink {sink}: false-positive redaction on non-secret request: {buf}"
         );
     }
