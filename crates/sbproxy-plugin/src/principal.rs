@@ -248,6 +248,19 @@ impl Principal {
         }
     }
 
+    /// Anonymous principal scoped to a specific tenant. Used by Noop
+    /// auth and by providers that authenticate without binding to a
+    /// subject (shared bearer token, anonymous API key match).
+    pub fn anonymous_for(tenant_id: TenantId) -> Self {
+        Self {
+            tenant_id,
+            sub: String::new(),
+            source: PrincipalSource::Plugin,
+            virtual_key: None,
+            attrs: PrincipalAttrs::default(),
+        }
+    }
+
     /// True when the principal carries no subject and no attribution
     /// surface. Hot-path policies use this to short-circuit before
     /// allocating selector strings.
@@ -381,6 +394,17 @@ mod tests {
         let mut p = Principal::anonymous();
         p.attrs.project = Some("foundation".to_string());
         assert!(!p.is_anonymous());
+    }
+
+    /// `Principal::anonymous_for` carries the supplied tenant and is
+    /// otherwise indistinguishable from `Principal::anonymous` under
+    /// the `is_anonymous` predicate.
+    #[test]
+    fn anonymous_for_tenant_is_anonymous_predicate() {
+        let p = Principal::anonymous_for(TenantId::from("acme"));
+        assert!(p.is_anonymous());
+        assert_eq!(p.tenant_id.as_str(), "acme");
+        assert!(!p.tenant_id.is_default());
     }
 
     /// `SecretRef` round-trips through serde with the tagged-enum

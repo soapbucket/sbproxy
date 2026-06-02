@@ -1736,10 +1736,18 @@ fn read_cookie(headers: &http::HeaderMap, name: &str) -> Option<String> {
     None
 }
 
-/// Run the auth check for a given origin. Returns AuthResult. `path`
-/// is the request-line path (no scheme/authority); for BotAuth it
-/// reconstructs `@target-uri` so the verifier sees the same canonical
-/// component the signer covered.
+/// Run the auth check for a given origin. Returns the legacy
+/// `AuthResult` plus the matched `Principal` (when the result is an
+/// `Allow`). `path` is the request-line path (no scheme/authority);
+/// for BotAuth it reconstructs `@target-uri` so the verifier sees
+/// the same canonical component the signer covered.
+///
+/// The `tenant_id` is stamped onto every returned principal. Pass
+/// the resolved tenant for the matched origin (clone from
+/// `RequestContext.tenant_id` at the call site); WOR-1047 PR2 keeps
+/// the legacy `AuthResult` alongside the new principal carrier so
+/// the migration to a principal-only return type can happen in a
+/// follow-up.
 ///
 /// `Auth::Plugin(provider)` dispatches into the third-party
 /// [`sbproxy_plugin::AuthProvider`] supplied by the inventory-based
@@ -1754,54 +1762,79 @@ async fn check_auth(
     query: Option<&str>,
     method: &str,
     path: &str,
-) -> AuthResult {
+    tenant_id: sbproxy_plugin::TenantId,
+) -> (AuthResult, Option<sbproxy_plugin::Principal>) {
     match auth {
         Auth::ApiKey(a) => {
-            if a.check_request(headers, query) {
-                AuthResult::allow_anonymous()
-            } else {
-                AuthResult::Deny(401, "unauthorized".to_string())
+            match a.check_request_with_principal(headers, query, tenant_id.clone()) {
+                Some(principal) => (AuthResult::allow_anonymous(), Some(principal)),
+                None => (AuthResult::Deny(401, "unauthorized".to_string()), None),
             }
         }
-        Auth::BasicAuth(a) => match a.check_request_with_subject(headers) {
-            Some(username) => AuthResult::Allow {
-                sub: Some(username),
-                source: Some(sbproxy_plugin::AuthSubjectSource::Header),
-            },
-            None => AuthResult::Deny(401, "unauthorized".to_string()),
+        Auth::BasicAuth(a) => match a.check_request_with_principal(headers, tenant_id.clone()) {
+            Some(principal) => {
+                let sub = principal.sub.clone();
+                (
+                    AuthResult::Allow {
+                        sub: Some(sub),
+                        source: Some(sbproxy_plugin::AuthSubjectSource::Header),
+                    },
+                    Some(principal),
+                )
+            }
+            None => (AuthResult::Deny(401, "unauthorized".to_string()), None),
         },
-        Auth::Bearer(a) => {
-            if a.check_request(headers) {
-                AuthResult::allow_anonymous()
-            } else {
-                AuthResult::Deny(401, "unauthorized".to_string())
+        Auth::Bearer(a) => match a.check_request_with_principal(headers, tenant_id.clone()) {
+            Some(principal) => (AuthResult::allow_anonymous(), Some(principal)),
+            None => (AuthResult::Deny(401, "unauthorized".to_string()), None),
+        },
+        Auth::Jwt(a) => match a.check_request_with_principal(headers, tenant_id.clone()) {
+            Some(principal) => {
+                let sub = principal.sub.clone();
+                let auth_result = if sub.is_empty() {
+                    // Token validated but carried no `sub` claim:
+                    // still authenticated, just without an
+                    // identifiable subject. Keep the legacy
+                    // `AuthResult` anonymous; the principal still
+                    // carries the JWT source + provider attrs.
+                    AuthResult::allow_anonymous()
+                } else {
+                    AuthResult::Allow {
+                        sub: Some(sub),
+                        source: Some(sbproxy_plugin::AuthSubjectSource::Jwt),
+                    }
+                };
+                (auth_result, Some(principal))
             }
-        }
-        Auth::Jwt(a) => match a.check_request_with_subject(headers) {
-            Some(sub) if !sub.is_empty() => AuthResult::Allow {
-                sub: Some(sub),
-                source: Some(sbproxy_plugin::AuthSubjectSource::Jwt),
-            },
-            // Token validated but carried no `sub` claim: still
-            // authenticated, just without an identifiable subject.
-            Some(_) => AuthResult::allow_anonymous(),
-            None => AuthResult::Deny(401, "unauthorized".to_string()),
+            None => (AuthResult::Deny(401, "unauthorized".to_string()), None),
         },
         Auth::Digest(d) => {
             if headers.get(http::header::AUTHORIZATION).is_some() {
                 match d.check_request_with_subject(headers, method) {
-                    Some(username) => AuthResult::Allow {
-                        sub: Some(username),
-                        source: Some(sbproxy_plugin::AuthSubjectSource::Header),
-                    },
+                    Some(username) => {
+                        let principal = sbproxy_plugin::Principal {
+                            tenant_id: tenant_id.clone(),
+                            sub: username.clone(),
+                            source: sbproxy_plugin::PrincipalSource::Basic,
+                            virtual_key: None,
+                            attrs: sbproxy_plugin::PrincipalAttrs::default(),
+                        };
+                        (
+                            AuthResult::Allow {
+                                sub: Some(username),
+                                source: Some(sbproxy_plugin::AuthSubjectSource::Header),
+                            },
+                            Some(principal),
+                        )
+                    }
                     None => {
                         let nonce = sbproxy_modules::auth::DigestAuth::generate_nonce();
-                        AuthResult::DigestChallenge(d.challenge(&nonce))
+                        (AuthResult::DigestChallenge(d.challenge(&nonce)), None)
                     }
                 }
             } else {
                 let nonce = sbproxy_modules::auth::DigestAuth::generate_nonce();
-                AuthResult::DigestChallenge(d.challenge(&nonce))
+                (AuthResult::DigestChallenge(d.challenge(&nonce)), None)
             }
         }
         // ForwardAuth runs as a separate async subrequest in the
@@ -1810,7 +1843,10 @@ async fn check_auth(
         // function returns. Treat it as an anonymous allow at the
         // dispatch layer; the post-auth capture step picks the user
         // out of `ctx.trust_headers` instead.
-        Auth::ForwardAuth(_) => AuthResult::allow_anonymous(),
+        Auth::ForwardAuth(_) => (
+            AuthResult::allow_anonymous(),
+            Some(sbproxy_plugin::Principal::anonymous_for(tenant_id.clone())),
+        ),
         Auth::BotAuth(b) => {
             use sbproxy_modules::auth::BotAuthVerdict;
             // Synthesize a minimal http::Request the verifier can read
@@ -1831,7 +1867,12 @@ async fn check_auth(
             let builder = http::Request::builder().method(method);
             let mut req = match builder.uri(target_uri.as_str()).body(bytes::Bytes::new()) {
                 Ok(r) => r,
-                Err(_) => return AuthResult::Deny(500, "bot_auth: bad request".to_string()),
+                Err(_) => {
+                    return (
+                        AuthResult::Deny(500, "bot_auth: bad request".to_string()),
+                        None,
+                    );
+                }
             };
             *req.headers_mut() = headers.clone();
             let verdict = if b.has_directory()
@@ -1850,18 +1891,30 @@ async fn check_auth(
             match verdict {
                 BotAuthVerdict::Verified { agent_name } => {
                     tracing::info!(agent = %agent_name, "bot_auth verified");
-                    AuthResult::allow_anonymous()
+                    let principal = sbproxy_plugin::Principal {
+                        tenant_id: tenant_id.clone(),
+                        sub: agent_name,
+                        source: sbproxy_plugin::PrincipalSource::BotAuth,
+                        virtual_key: None,
+                        attrs: sbproxy_plugin::PrincipalAttrs::default(),
+                    };
+                    (AuthResult::allow_anonymous(), Some(principal))
                 }
-                BotAuthVerdict::Missing => {
-                    AuthResult::Deny(401, "bot_auth: signature required".to_string())
-                }
-                BotAuthVerdict::UnknownAgent { key_id } => {
-                    AuthResult::Deny(401, format!("bot_auth: unknown agent keyid {}", key_id))
-                }
+                BotAuthVerdict::Missing => (
+                    AuthResult::Deny(401, "bot_auth: signature required".to_string()),
+                    None,
+                ),
+                BotAuthVerdict::UnknownAgent { key_id } => (
+                    AuthResult::Deny(401, format!("bot_auth: unknown agent keyid {}", key_id)),
+                    None,
+                ),
                 BotAuthVerdict::Failed { agent_name, reason } => {
                     let agent = agent_name.unwrap_or_else(|| "<unknown>".to_string());
                     tracing::warn!(agent = %agent, reason = %reason, "bot_auth verification failed");
-                    AuthResult::Deny(401, "bot_auth: verification failed".to_string())
+                    (
+                        AuthResult::Deny(401, "bot_auth: verification failed".to_string()),
+                        None,
+                    )
                 }
                 BotAuthVerdict::DirectoryUnavailable { reason } => {
                     // Wave 1 / G1.7: directory-side failure (HTTPS
@@ -1871,7 +1924,10 @@ async fn check_auth(
                     // the deny message stays generic so it does not
                     // leak directory state to a probing client.
                     tracing::warn!(reason = %reason, "bot_auth directory unavailable");
-                    AuthResult::Deny(401, "bot_auth: directory unavailable".to_string())
+                    (
+                        AuthResult::Deny(401, "bot_auth: directory unavailable".to_string()),
+                        None,
+                    )
                 }
             }
         }
@@ -1903,7 +1959,9 @@ async fn check_auth(
             let builder = http::Request::builder().method(method);
             let mut req = match builder.uri(target_uri.as_str()).body(bytes::Bytes::new()) {
                 Ok(r) => r,
-                Err(_) => return AuthResult::Deny(500, "cap: bad request".to_string()),
+                Err(_) => {
+                    return (AuthResult::Deny(500, "cap: bad request".to_string()), None);
+                }
             };
             *req.headers_mut() = headers.clone();
             // Resolved agent_id from the Wave 1 resolver chain is not
@@ -1918,28 +1976,57 @@ async fn check_auth(
             // the code coming from `CapError::www_auth_code()` (e.g.
             // `invalid_token`, `path_not_authorized`).
             match verifier.verify(&req, &host, path, None) {
-                CapVerdict::Verified(_view) => AuthResult::allow_anonymous(),
-                CapVerdict::Missing => AuthResult::DenyWithHeaders(
-                    401,
-                    "cap: token required".to_string(),
-                    vec![("WWW-Authenticate".to_string(), "License".to_string())],
+                CapVerdict::Verified(_view) => {
+                    let principal = sbproxy_plugin::Principal {
+                        tenant_id: tenant_id.clone(),
+                        sub: String::new(),
+                        source: sbproxy_plugin::PrincipalSource::Cap,
+                        virtual_key: None,
+                        attrs: sbproxy_plugin::PrincipalAttrs::default(),
+                    };
+                    (AuthResult::allow_anonymous(), Some(principal))
+                }
+                CapVerdict::Missing => (
+                    AuthResult::DenyWithHeaders(
+                        401,
+                        "cap: token required".to_string(),
+                        vec![("WWW-Authenticate".to_string(), "License".to_string())],
+                    ),
+                    None,
                 ),
                 CapVerdict::Invalid(err) => {
                     let status = err.http_status();
                     let code = err.www_auth_code();
-                    AuthResult::DenyWithHeaders(
-                        status,
-                        format!("cap: {}", code),
-                        vec![(
-                            "WWW-Authenticate".to_string(),
-                            format!("License error=\"{code}\""),
-                        )],
+                    (
+                        AuthResult::DenyWithHeaders(
+                            status,
+                            format!("cap: {}", code),
+                            vec![(
+                                "WWW-Authenticate".to_string(),
+                                format!("License error=\"{code}\""),
+                            )],
+                        ),
+                        None,
                     )
                 }
             }
         }
-        Auth::Noop => AuthResult::allow_anonymous(),
-        Auth::Oidc(cfg) => oidc_check(cfg.as_ref(), headers),
+        Auth::Noop => (
+            AuthResult::allow_anonymous(),
+            Some(sbproxy_plugin::Principal::anonymous_for(tenant_id.clone())),
+        ),
+        Auth::Oidc(cfg) => {
+            let result = oidc_check(cfg.as_ref(), headers);
+            // The OIDC happy path stamps the principal on `Allow`;
+            // pull the sub off the AuthResult before we return so
+            // the call site can copy the full principal onto ctx.
+            let principal = if let AuthResult::Allow { sub: Some(sub), .. } = &result {
+                Some(cfg.to_principal(sub.clone(), tenant_id.clone()))
+            } else {
+                None
+            };
+            (result, principal)
+        }
         Auth::Plugin(provider) => {
             // Build a synthetic http::Request the provider can read
             // method / target-uri / headers from. We deliberately pass
@@ -1957,12 +2044,15 @@ async fn check_auth(
             let mut req = match builder.uri(target_uri.as_str()).body(bytes::Bytes::new()) {
                 Ok(r) => r,
                 Err(_) => {
-                    return AuthResult::Deny(
-                        500,
-                        format!(
-                            "auth plugin {:?}: failed to build request",
-                            provider.auth_type()
+                    return (
+                        AuthResult::Deny(
+                            500,
+                            format!(
+                                "auth plugin {:?}: failed to build request",
+                                provider.auth_type()
+                            ),
                         ),
+                        None,
                     );
                 }
             };
@@ -1976,23 +2066,43 @@ async fn check_auth(
             let mut ctx: () = ();
             match provider.authenticate(&req, &mut ctx).await {
                 Ok(sbproxy_plugin::AuthDecision::Allow { sub, source }) => {
-                    AuthResult::Allow { sub, source }
+                    // WOR-1047 PR2: build a minimal Principal for
+                    // out-of-tree plugins so the access-log + policy
+                    // pipeline sees the same shape every built-in
+                    // provider produces. Plugins that want richer
+                    // attribution will move to the principal-only
+                    // return type in the final PR of the credentials
+                    // epic; until then `attrs` is empty.
+                    let principal = sbproxy_plugin::Principal {
+                        tenant_id: tenant_id.clone(),
+                        sub: sub.clone().unwrap_or_default(),
+                        source: sbproxy_plugin::PrincipalSource::Plugin,
+                        virtual_key: None,
+                        attrs: sbproxy_plugin::PrincipalAttrs::default(),
+                    };
+                    (AuthResult::Allow { sub, source }, Some(principal))
                 }
                 Ok(sbproxy_plugin::AuthDecision::Deny { status, message }) => {
-                    AuthResult::Deny(status, message)
+                    (AuthResult::Deny(status, message), None)
                 }
                 Ok(sbproxy_plugin::AuthDecision::DenyWithHeaders {
                     status,
                     message,
                     headers,
-                }) => AuthResult::DenyWithHeaders(status, message, headers),
+                }) => (AuthResult::DenyWithHeaders(status, message, headers), None),
                 Err(err) => {
                     tracing::warn!(
                         plugin = %provider.auth_type(),
                         error = %err,
                         "auth plugin returned error; denying request",
                     );
-                    AuthResult::Deny(500, format!("auth plugin {:?} error", provider.auth_type()))
+                    (
+                        AuthResult::Deny(
+                            500,
+                            format!("auth plugin {:?} error", provider.auth_type()),
+                        ),
+                        None,
+                    )
                 }
             }
         }

@@ -31,9 +31,53 @@ pub use trust_tier::{compute_trust_tier, TrustSignals, TrustTier, NAMED_AGENT_SC
 
 use base64::Engine;
 use md5::{Digest as Md5Digest, Md5};
-use sbproxy_plugin::AuthProvider;
+use sbproxy_plugin::{AuthProvider, Principal, PrincipalAttrs, PrincipalSource, TenantId};
 use serde::Deserialize;
 use std::collections::HashMap;
+
+/// Operator-attached metadata that travels onto a matched principal.
+/// Reused across `Bearer`, `ApiKey`, `BasicAuth`, `Jwt`, `Oidc` provider
+/// configs (WOR-1047 PR2). The shape mirrors `PrincipalAttrs` so a
+/// matched credential can stamp its attribution directly onto the
+/// principal without a translation layer.
+///
+/// `metadata` is a `BTreeMap` for stable serde ordering so log lines
+/// round-trip identically across runs.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct CredentialAttrs {
+    /// Project the credential belongs to.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// User the credential represents (or its owner).
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Team / cost-center grouping.
+    #[serde(default)]
+    pub team: Option<String>,
+    /// Operator-supplied tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Free-form metadata copied off the credential.
+    #[serde(default)]
+    pub metadata: std::collections::BTreeMap<String, String>,
+}
+
+impl CredentialAttrs {
+    /// Translate into a `PrincipalAttrs`. `roles` and `claims` stay
+    /// empty here; providers that observe roles/claims (JWT, OIDC)
+    /// stamp those fields separately on the resulting principal.
+    pub fn to_principal_attrs(&self) -> PrincipalAttrs {
+        PrincipalAttrs {
+            project: self.project.clone(),
+            user: self.user.clone(),
+            team: self.team.clone(),
+            tags: self.tags.clone(),
+            metadata: self.metadata.clone(),
+            roles: Vec::new(),
+            claims: None,
+        }
+    }
+}
 
 /// Constant-time byte equality.
 ///
@@ -57,19 +101,6 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[inline]
 fn ct_str_eq(a: &str, b: &str) -> bool {
     constant_time_eq(a.as_bytes(), b.as_bytes())
-}
-
-/// Returns true if any candidate equals `needle` in constant time.
-///
-/// The loop runs over every candidate so the total time depends on the
-/// configured key set size, not on which (if any) entry matched.
-#[inline]
-fn ct_any_match(needle: &str, candidates: &[String]) -> bool {
-    let mut matched = false;
-    for c in candidates {
-        matched |= ct_str_eq(c, needle);
-    }
-    matched
 }
 
 // --- Auth Enum ---
@@ -153,18 +184,83 @@ impl std::fmt::Debug for Auth {
 
 // --- ApiKeyAuth ---
 
+/// One entry in the `api_keys:` list of an `ApiKeyAuth` config. Each
+/// entry carries the secret plus the optional per-credential
+/// attribution metadata that gets stamped onto the resolved
+/// `Principal` on a successful match (WOR-1047 PR2). The YAML accepts
+/// either a bare string (back-compat) or a full struct of
+/// `{secret, project, ...}`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ApiKeyEntry {
+    /// The API key secret a caller presents in the configured header
+    /// or query parameter.
+    pub secret: String,
+    /// Operator-attached metadata copied onto the matched
+    /// `Principal`'s `attrs` block.
+    #[serde(flatten, default)]
+    pub attrs: CredentialAttrs,
+}
+
 /// API key auth config - validates requests carry a known key
 /// in a header or query parameter.
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct ApiKeyAuth {
     /// HTTP header carrying the API key. Defaults to `X-Api-Key`.
-    #[serde(default = "default_header")]
     pub header_name: String,
     /// List of accepted API keys.
-    pub api_keys: Vec<String>,
+    pub api_keys: Vec<ApiKeyEntry>,
     /// Optional query parameter name; when set, keys can also be supplied via the URL.
-    #[serde(default)]
     pub query_param: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ApiKeyAuth {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default = "default_header")]
+            header_name: String,
+            #[serde(deserialize_with = "deserialize_api_keys")]
+            api_keys: Vec<ApiKeyEntry>,
+            #[serde(default)]
+            query_param: Option<String>,
+        }
+        let raw = Raw::deserialize(d)?;
+        Ok(Self {
+            header_name: raw.header_name,
+            api_keys: raw.api_keys,
+            query_param: raw.query_param,
+        })
+    }
+}
+
+/// Accept `api_keys:` as either a list of bare strings (back-compat
+/// with the pre-PR2 shape) or a list of `{secret, ...}` objects so
+/// operators can attach per-credential metadata without forcing a
+/// schema migration.
+fn deserialize_api_keys<'de, D>(d: D) -> Result<Vec<ApiKeyEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Bare(String),
+        Full(ApiKeyEntry),
+    }
+    let raw: Vec<Entry> = Vec::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .map(|e| match e {
+            Entry::Bare(secret) => ApiKeyEntry {
+                secret,
+                attrs: CredentialAttrs::default(),
+            },
+            Entry::Full(t) => t,
+        })
+        .collect())
 }
 
 fn default_header() -> String {
@@ -180,10 +276,45 @@ impl ApiKeyAuth {
     /// Check if the request has a valid API key in the header or query string.
     /// Returns true if a matching key is found.
     pub fn check_request(&self, headers: &http::HeaderMap, query: Option<&str>) -> bool {
+        self.match_key(headers, query).is_some()
+    }
+
+    /// Match the inbound API key and return a `Principal` stamped with
+    /// the matched entry's metadata. `sub` is empty (API keys are
+    /// shared across callers), `tenant_id` is the resolved tenant.
+    pub fn check_request_with_principal(
+        &self,
+        headers: &http::HeaderMap,
+        query: Option<&str>,
+        tenant_id: TenantId,
+    ) -> Option<Principal> {
+        let entry = self.match_key(headers, query)?;
+        Some(Principal {
+            tenant_id,
+            sub: String::new(),
+            source: PrincipalSource::ApiKey,
+            virtual_key: None,
+            attrs: entry.attrs.to_principal_attrs(),
+        })
+    }
+
+    /// Constant-time scan that returns the matched entry so a caller
+    /// can also pull its metadata. Both the header and the optional
+    /// query parameter are checked; the loop runs over every entry on
+    /// each side so the total time depends on the configured key-set
+    /// size, not on which (if any) entry matched.
+    fn match_key(&self, headers: &http::HeaderMap, query: Option<&str>) -> Option<&ApiKeyEntry> {
         // Check header
         if let Some(key) = headers.get(&self.header_name).and_then(|v| v.to_str().ok()) {
-            if ct_any_match(key, &self.api_keys) {
-                return true;
+            let mut matched: Option<&ApiKeyEntry> = None;
+            for entry in &self.api_keys {
+                let eq = ct_str_eq(&entry.secret, key);
+                if eq && matched.is_none() {
+                    matched = Some(entry);
+                }
+            }
+            if matched.is_some() {
+                return matched;
             }
         }
 
@@ -192,13 +323,22 @@ impl ApiKeyAuth {
         // %41bc decodes to Abc before comparison).
         if let (Some(param_name), Some(query_str)) = (&self.query_param, query) {
             for (name, value) in url::form_urlencoded::parse(query_str.as_bytes()) {
-                if name.as_ref() == param_name && ct_any_match(value.as_ref(), &self.api_keys) {
-                    return true;
+                if name.as_ref() == param_name {
+                    let mut matched: Option<&ApiKeyEntry> = None;
+                    for entry in &self.api_keys {
+                        let eq = ct_str_eq(&entry.secret, value.as_ref());
+                        if eq && matched.is_none() {
+                            matched = Some(entry);
+                        }
+                    }
+                    if matched.is_some() {
+                        return matched;
+                    }
                 }
             }
         }
 
-        false
+        None
     }
 }
 
@@ -222,6 +362,12 @@ pub struct BasicAuthUser {
     pub username: String,
     /// Password portion of the credential.
     pub password: String,
+    /// Operator-attached metadata copied onto the matched
+    /// `Principal`'s `attrs` block on a successful auth (WOR-1047
+    /// PR2). The flattened YAML shape lets operators write
+    /// `{username, password, project, ...}` without nesting.
+    #[serde(flatten, default)]
+    pub attrs: CredentialAttrs,
 }
 
 impl BasicAuthProvider {
@@ -243,6 +389,32 @@ impl BasicAuthProvider {
     /// the user table ensures total time depends only on
     /// `users.len()`, not on which entry matched (or if none did).
     pub fn check_request_with_subject(&self, headers: &http::HeaderMap) -> Option<String> {
+        self.match_user(headers).map(|u| u.username.clone())
+    }
+
+    /// Match basic auth credentials and return a `Principal` stamped
+    /// with the matched user's metadata. `sub` is the matched
+    /// username, `tenant_id` is the resolved tenant.
+    pub fn check_request_with_principal(
+        &self,
+        headers: &http::HeaderMap,
+        tenant_id: TenantId,
+    ) -> Option<Principal> {
+        let user = self.match_user(headers)?;
+        Some(Principal {
+            tenant_id,
+            sub: user.username.clone(),
+            source: PrincipalSource::Basic,
+            virtual_key: None,
+            attrs: user.attrs.to_principal_attrs(),
+        })
+    }
+
+    /// Constant-time scan that returns the matched user entry so a
+    /// caller can pull both the username and the attached metadata.
+    /// The loop runs over every entry so the total time depends only
+    /// on `users.len()`.
+    fn match_user(&self, headers: &http::HeaderMap) -> Option<&BasicAuthUser> {
         let auth_value = headers
             .get(http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())?;
@@ -253,25 +425,96 @@ impl BasicAuthProvider {
         let decoded = std::str::from_utf8(&decoded_bytes).ok()?;
         let (username, password) = decoded.split_once(':')?;
 
-        let mut matched_username: Option<String> = None;
+        let mut matched: Option<&BasicAuthUser> = None;
         for u in &self.users {
             let user_ok = ct_str_eq(&u.username, username) & ct_str_eq(&u.password, password);
-            if user_ok && matched_username.is_none() {
-                matched_username = Some(u.username.clone());
+            if user_ok && matched.is_none() {
+                matched = Some(u);
             }
         }
-        matched_username
+        matched
     }
 }
 
 // --- BearerAuth ---
 
+/// One entry in the `tokens:` list of a `BearerAuth` config. Each
+/// entry carries the secret plus the optional per-credential
+/// attribution metadata that gets stamped onto the resolved
+/// `Principal` on a successful match (WOR-1047 PR2).
+///
+/// The YAML accepts either a bare string (back-compat with the
+/// pre-PR2 shape) or a full struct:
+///
+/// ```yaml
+/// tokens:
+///   - "shared-token-no-metadata"
+///   - secret: ${SERVICE_TOKEN_1}
+///     project: foundation
+///     team: platform
+///     tags: [internal]
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct BearerToken {
+    /// The bearer secret a caller presents in
+    /// `Authorization: Bearer <secret>`.
+    pub secret: String,
+    /// Operator-attached metadata copied onto the matched
+    /// `Principal`'s `attrs` block.
+    #[serde(flatten, default)]
+    pub attrs: CredentialAttrs,
+}
+
 /// Bearer token authentication.
 /// Validates a token from the `Authorization: Bearer <token>` header.
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct BearerAuth {
-    /// Accepted bearer tokens.
-    pub tokens: Vec<String>,
+    /// Accepted bearer token entries. Stored in declaration order so
+    /// the constant-time scan is deterministic; the matching helper is
+    /// crate-private (see `match_token`).
+    pub tokens: Vec<BearerToken>,
+}
+
+impl<'de> Deserialize<'de> for BearerAuth {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(deserialize_with = "deserialize_bearer_tokens")]
+            tokens: Vec<BearerToken>,
+        }
+        let raw = Raw::deserialize(d)?;
+        Ok(Self { tokens: raw.tokens })
+    }
+}
+
+/// Accept `tokens:` as either a list of bare strings (back-compat
+/// with the pre-PR2 shape) or a list of `{secret, ...}` objects so
+/// operators can attach per-credential metadata without forcing a
+/// schema migration.
+fn deserialize_bearer_tokens<'de, D>(d: D) -> Result<Vec<BearerToken>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Bare(String),
+        Full(BearerToken),
+    }
+    let raw: Vec<Entry> = Vec::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .map(|e| match e {
+            Entry::Bare(secret) => BearerToken {
+                secret,
+                attrs: CredentialAttrs::default(),
+            },
+            Entry::Full(t) => t,
+        })
+        .collect())
 }
 
 impl BearerAuth {
@@ -282,18 +525,44 @@ impl BearerAuth {
 
     /// Check if the request carries a valid bearer token.
     pub fn check_request(&self, headers: &http::HeaderMap) -> bool {
-        let Some(auth_value) = headers
+        self.match_token(headers).is_some()
+    }
+
+    /// Match the inbound token and return a `Principal` stamped with
+    /// the matched entry's metadata. `sub` is empty (bearer tokens are
+    /// shared across callers), `tenant_id` is the resolved tenant.
+    pub fn check_request_with_principal(
+        &self,
+        headers: &http::HeaderMap,
+        tenant_id: TenantId,
+    ) -> Option<Principal> {
+        let entry = self.match_token(headers)?;
+        Some(Principal {
+            tenant_id,
+            sub: String::new(),
+            source: PrincipalSource::Bearer,
+            virtual_key: None,
+            attrs: entry.attrs.to_principal_attrs(),
+        })
+    }
+
+    /// Constant-time scan that returns the matched entry so a caller
+    /// can also pull its metadata. The loop runs over every entry so
+    /// the total time depends on the configured token-set size, not
+    /// on which (if any) entry matched.
+    fn match_token(&self, headers: &http::HeaderMap) -> Option<&BearerToken> {
+        let auth_value = headers
             .get(http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-        else {
-            return false;
-        };
-
-        let Some(token) = auth_value.strip_prefix("Bearer ") else {
-            return false;
-        };
-
-        ct_any_match(token, &self.tokens)
+            .and_then(|v| v.to_str().ok())?;
+        let token = auth_value.strip_prefix("Bearer ")?;
+        let mut matched: Option<&BearerToken> = None;
+        for t in &self.tokens {
+            let eq = ct_str_eq(&t.secret, token);
+            if eq && matched.is_none() {
+                matched = Some(t);
+            }
+        }
+        matched
     }
 }
 
@@ -330,6 +599,21 @@ pub struct JwtAuth {
     /// validate, which is the safe default if the config is malformed.
     #[serde(default)]
     pub algorithms: Vec<String>,
+    /// Provider-level metadata stamped onto the resolved `Principal`
+    /// on a successful validation (WOR-1047 PR2). Nested rather than
+    /// flattened because the JWT config already carries optional
+    /// top-level fields (`secret`, `audience`, ...) and a flatten
+    /// would collide with operator-supplied claim names. Operators
+    /// write it as a nested `attrs:` block in YAML.
+    #[serde(default)]
+    pub attrs: CredentialAttrs,
+    /// Claim names to copy as `Principal.attrs.roles`. Common values
+    /// are `roles`, `groups`, `realm_access.roles`. The first claim
+    /// present (in declaration order) wins; absent fields are
+    /// skipped silently. Each name is a top-level claim key on the
+    /// JWT payload; nested-claim resolution is out of scope for PR2.
+    #[serde(default)]
+    pub roles_claim: Vec<String>,
 }
 
 impl JwtAuth {
@@ -355,11 +639,58 @@ impl JwtAuth {
     /// The wrapper preserves [`Self::check_request`] semantics for
     /// callers that only need a yes/no answer.
     pub fn check_request_with_subject(&self, headers: &http::HeaderMap) -> Option<String> {
+        self.validate_request(headers).map(|(sub, _)| sub)
+    }
+
+    /// Validate the request's JWT and, on success, return a
+    /// `Principal` stamped with the provider-level metadata, any
+    /// roles pulled off `roles_claim`, and the full claims payload
+    /// on `attrs.claims`. `sub` is the JWT `sub` claim (empty when
+    /// the token validated but carried no `sub`).
+    pub fn check_request_with_principal(
+        &self,
+        headers: &http::HeaderMap,
+        tenant_id: TenantId,
+    ) -> Option<Principal> {
+        let (sub, claims) = self.validate_request(headers)?;
+        let mut attrs = self.attrs.to_principal_attrs();
+        // First-name-wins resolution across `roles_claim`. The
+        // configured names are checked in declaration order; the
+        // first one that resolves to a string-array claim populates
+        // `attrs.roles`. Non-array values are ignored so a mis-typed
+        // claim does not surface as a single-element role list.
+        for name in &self.roles_claim {
+            if let Some(arr) = claims.get(name).and_then(|v| v.as_array()) {
+                attrs.roles = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect();
+                if !attrs.roles.is_empty() {
+                    break;
+                }
+            }
+        }
+        if let serde_json::Value::Object(map) = claims {
+            attrs.claims = Some(map);
+        }
+        Some(Principal {
+            tenant_id,
+            sub,
+            source: PrincipalSource::Jwt,
+            virtual_key: None,
+            attrs,
+        })
+    }
+
+    /// Internal validation that returns both the resolved `sub` and
+    /// the full claims `Value` so the principal path can pull roles
+    /// and verbatim claims off the same decoded payload.
+    fn validate_request(&self, headers: &http::HeaderMap) -> Option<(String, serde_json::Value)> {
         let auth_value = headers
             .get(http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())?;
         let token = auth_value.strip_prefix("Bearer ")?;
-        self.validate_token_extract_sub(token)
+        self.validate_token_extract_claims(token)
     }
 
     /// Return the `jsonwebtoken` algorithms that should be accepted for
@@ -394,10 +725,10 @@ impl JwtAuth {
     }
 
     /// Validate JWT signature + standard / configured claims and
-    /// return the resolved `sub` claim on success (empty string when
-    /// the token validated but carried no `sub`). Returns `None` on
-    /// any validation failure.
-    fn validate_token_extract_sub(&self, token: &str) -> Option<String> {
+    /// return the resolved `sub` claim plus the full decoded claims
+    /// payload on success (empty string when the token validated but
+    /// carried no `sub`). Returns `None` on any validation failure.
+    fn validate_token_extract_claims(&self, token: &str) -> Option<(String, serde_json::Value)> {
         use jsonwebtoken::{decode, DecodingKey, Validation};
 
         let algorithms = self.allowed_algorithms();
@@ -452,7 +783,7 @@ impl JwtAuth {
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .unwrap_or_default();
-        Some(sub)
+        Some((sub, token_data.claims))
     }
 }
 
@@ -827,11 +1158,35 @@ mod tests {
 
     // --- Auth enum tests ---
 
+    /// Helper that turns a `&[&str]` of bare secrets into the new
+    /// `Vec<ApiKeyEntry>` shape so the legacy tests in this module
+    /// keep their original surface (a sequence of plain strings).
+    fn api_key_entries(secrets: &[&str]) -> Vec<ApiKeyEntry> {
+        secrets
+            .iter()
+            .map(|s| ApiKeyEntry {
+                secret: s.to_string(),
+                attrs: CredentialAttrs::default(),
+            })
+            .collect()
+    }
+
+    /// Same helper for `BearerToken` entries.
+    fn bearer_entries(secrets: &[&str]) -> Vec<BearerToken> {
+        secrets
+            .iter()
+            .map(|s| BearerToken {
+                secret: s.to_string(),
+                attrs: CredentialAttrs::default(),
+            })
+            .collect()
+    }
+
     #[test]
     fn api_key_auth_type() {
         let auth = Auth::ApiKey(ApiKeyAuth {
             header_name: "X-Api-Key".to_string(),
-            api_keys: vec!["secret123".to_string()],
+            api_keys: api_key_entries(&["secret123"]),
             query_param: None,
         });
         assert_eq!(auth.auth_type(), "api_key");
@@ -855,7 +1210,7 @@ mod tests {
     #[test]
     fn bearer_auth_type() {
         let auth = Auth::Bearer(BearerAuth {
-            tokens: vec!["tok".to_string()],
+            tokens: bearer_entries(&["tok"]),
         });
         assert_eq!(auth.auth_type(), "bearer");
     }
@@ -869,6 +1224,8 @@ mod tests {
             audience: None,
             issuer: None,
             algorithms: Vec::new(),
+            attrs: CredentialAttrs::default(),
+            roles_claim: Vec::new(),
         });
         assert_eq!(auth.auth_type(), "jwt");
     }
@@ -898,7 +1255,7 @@ mod tests {
     fn auth_debug_api_key() {
         let auth = Auth::ApiKey(ApiKeyAuth {
             header_name: "Authorization".to_string(),
-            api_keys: vec!["key1".to_string()],
+            api_keys: api_key_entries(&["key1"]),
             query_param: None,
         });
         let debug = format!("{:?}", auth);
@@ -923,7 +1280,7 @@ mod tests {
     #[test]
     fn auth_debug_bearer() {
         let auth = Auth::Bearer(BearerAuth {
-            tokens: vec!["tok".to_string()],
+            tokens: bearer_entries(&["tok"]),
         });
         let debug = format!("{:?}", auth);
         assert!(debug.contains("Bearer"));
@@ -938,6 +1295,8 @@ mod tests {
             audience: None,
             issuer: None,
             algorithms: Vec::new(),
+            attrs: CredentialAttrs::default(),
+            roles_claim: Vec::new(),
         });
         let debug = format!("{:?}", auth);
         assert!(debug.contains("Jwt"));
@@ -978,7 +1337,8 @@ mod tests {
         });
         let auth = ApiKeyAuth::from_config(json).unwrap();
         assert_eq!(auth.header_name, "Authorization");
-        assert_eq!(auth.api_keys, vec!["key-abc", "key-def"]);
+        let secrets: Vec<&str> = auth.api_keys.iter().map(|e| e.secret.as_str()).collect();
+        assert_eq!(secrets, vec!["key-abc", "key-def"]);
         assert_eq!(auth.query_param.as_deref(), Some("token"));
     }
 
@@ -1005,7 +1365,7 @@ mod tests {
     fn check_request_valid_header() {
         let auth = ApiKeyAuth {
             header_name: "X-Api-Key".to_string(),
-            api_keys: vec!["secret123".to_string(), "secret456".to_string()],
+            api_keys: api_key_entries(&["secret123", "secret456"]),
             query_param: None,
         };
         let mut headers = http::HeaderMap::new();
@@ -1017,7 +1377,7 @@ mod tests {
     fn check_request_invalid_header() {
         let auth = ApiKeyAuth {
             header_name: "X-Api-Key".to_string(),
-            api_keys: vec!["secret123".to_string()],
+            api_keys: api_key_entries(&["secret123"]),
             query_param: None,
         };
         let mut headers = http::HeaderMap::new();
@@ -1029,7 +1389,7 @@ mod tests {
     fn check_request_missing_header() {
         let auth = ApiKeyAuth {
             header_name: "X-Api-Key".to_string(),
-            api_keys: vec!["secret123".to_string()],
+            api_keys: api_key_entries(&["secret123"]),
             query_param: None,
         };
         let headers = http::HeaderMap::new();
@@ -1040,7 +1400,7 @@ mod tests {
     fn check_request_valid_query_param() {
         let auth = ApiKeyAuth {
             header_name: "X-Api-Key".to_string(),
-            api_keys: vec!["secret123".to_string()],
+            api_keys: api_key_entries(&["secret123"]),
             query_param: Some("token".to_string()),
         };
         let headers = http::HeaderMap::new();
@@ -1051,7 +1411,7 @@ mod tests {
     fn check_request_invalid_query_param() {
         let auth = ApiKeyAuth {
             header_name: "X-Api-Key".to_string(),
-            api_keys: vec!["secret123".to_string()],
+            api_keys: api_key_entries(&["secret123"]),
             query_param: Some("token".to_string()),
         };
         let headers = http::HeaderMap::new();
@@ -1062,7 +1422,7 @@ mod tests {
     fn check_request_no_query_param_configured() {
         let auth = ApiKeyAuth {
             header_name: "X-Api-Key".to_string(),
-            api_keys: vec!["secret123".to_string()],
+            api_keys: api_key_entries(&["secret123"]),
             query_param: None,
         };
         let headers = http::HeaderMap::new();
@@ -1073,7 +1433,7 @@ mod tests {
     fn check_request_header_takes_precedence() {
         let auth = ApiKeyAuth {
             header_name: "X-Api-Key".to_string(),
-            api_keys: vec!["secret123".to_string()],
+            api_keys: api_key_entries(&["secret123"]),
             query_param: Some("token".to_string()),
         };
         let mut headers = http::HeaderMap::new();
@@ -1123,10 +1483,12 @@ mod tests {
                 BasicAuthUser {
                     username: "admin".to_string(),
                     password: "secret".to_string(),
+                    attrs: CredentialAttrs::default(),
                 },
                 BasicAuthUser {
                     username: "user".to_string(),
                     password: "pass".to_string(),
+                    attrs: CredentialAttrs::default(),
                 },
             ],
             realm: Some("Test".to_string()),
@@ -1233,7 +1595,8 @@ mod tests {
             "tokens": ["tok-abc", "tok-def"]
         });
         let auth = BearerAuth::from_config(json).unwrap();
-        assert_eq!(auth.tokens, vec!["tok-abc", "tok-def"]);
+        let secrets: Vec<&str> = auth.tokens.iter().map(|t| t.secret.as_str()).collect();
+        assert_eq!(secrets, vec!["tok-abc", "tok-def"]);
     }
 
     #[test]
@@ -1247,7 +1610,7 @@ mod tests {
     #[test]
     fn bearer_valid_token() {
         let auth = BearerAuth {
-            tokens: vec!["valid-token".to_string(), "also-valid".to_string()],
+            tokens: bearer_entries(&["valid-token", "also-valid"]),
         };
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -1260,7 +1623,7 @@ mod tests {
     #[test]
     fn bearer_invalid_token() {
         let auth = BearerAuth {
-            tokens: vec!["valid-token".to_string()],
+            tokens: bearer_entries(&["valid-token"]),
         };
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -1273,7 +1636,7 @@ mod tests {
     #[test]
     fn bearer_missing_header() {
         let auth = BearerAuth {
-            tokens: vec!["tok".to_string()],
+            tokens: bearer_entries(&["tok"]),
         };
         let headers = http::HeaderMap::new();
         assert!(!auth.check_request(&headers));
@@ -1282,7 +1645,7 @@ mod tests {
     #[test]
     fn bearer_wrong_scheme() {
         let auth = BearerAuth {
-            tokens: vec!["tok".to_string()],
+            tokens: bearer_entries(&["tok"]),
         };
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -1343,6 +1706,8 @@ mod tests {
             audience: None,
             issuer: None,
             algorithms: Vec::new(),
+            attrs: CredentialAttrs::default(),
+            roles_claim: Vec::new(),
         }
     }
 
@@ -1767,5 +2132,201 @@ mod tests {
         // A lower nc arriving after a higher one means either a reorder
         // or an attempted replay; RFC 7616 says reject.
         assert!(!auth.check_request(&h_low, "GET"));
+    }
+
+    // --- WOR-1047 PR2: per-credential metadata round-trip tests ---
+
+    /// Bare-string token shape is back-compat with the pre-PR2
+    /// `tokens: ["abc"]` shorthand and leaves the attribution block
+    /// empty.
+    #[test]
+    fn bearer_token_string_shorthand_parses() {
+        let json = serde_json::json!({
+            "type": "bearer",
+            "tokens": ["abc"],
+        });
+        let auth = BearerAuth::from_config(json).unwrap();
+        assert_eq!(auth.tokens.len(), 1);
+        assert_eq!(auth.tokens[0].secret, "abc");
+        assert!(auth.tokens[0].attrs.project.is_none());
+        assert!(auth.tokens[0].attrs.metadata.is_empty());
+    }
+
+    /// Full-shape token entry carries the project / team / metadata
+    /// off the YAML straight onto the `attrs` block.
+    #[test]
+    fn bearer_token_full_shape_parses() {
+        let json = serde_json::json!({
+            "type": "bearer",
+            "tokens": [
+                {"secret": "abc", "project": "foundation", "team": "platform",
+                 "tags": ["internal"], "metadata": {"cost_center": "eng-001"}}
+            ],
+        });
+        let auth = BearerAuth::from_config(json).unwrap();
+        assert_eq!(auth.tokens.len(), 1);
+        assert_eq!(auth.tokens[0].secret, "abc");
+        assert_eq!(auth.tokens[0].attrs.project.as_deref(), Some("foundation"));
+        assert_eq!(auth.tokens[0].attrs.team.as_deref(), Some("platform"));
+        assert_eq!(auth.tokens[0].attrs.tags, vec!["internal".to_string()]);
+        assert_eq!(
+            auth.tokens[0]
+                .attrs
+                .metadata
+                .get("cost_center")
+                .map(|s| s.as_str()),
+            Some("eng-001")
+        );
+    }
+
+    /// On a matched bearer token the resolved principal carries the
+    /// per-credential attribution + the bearer source + the supplied
+    /// tenant id.
+    #[test]
+    fn bearer_check_request_with_principal_stamps_metadata() {
+        let json = serde_json::json!({
+            "type": "bearer",
+            "tokens": [
+                {"secret": "abc", "project": "foundation"}
+            ],
+        });
+        let auth = BearerAuth::from_config(json).unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::AUTHORIZATION, "Bearer abc".parse().unwrap());
+        let principal = auth
+            .check_request_with_principal(&headers, TenantId::from("acme"))
+            .expect("matched token should yield a principal");
+        assert_eq!(principal.tenant_id.as_str(), "acme");
+        assert_eq!(principal.source, PrincipalSource::Bearer);
+        assert_eq!(principal.sub, "");
+        assert_eq!(principal.attrs.project.as_deref(), Some("foundation"));
+    }
+
+    /// Same back-compat path for the API key list.
+    #[test]
+    fn api_key_string_shorthand_parses() {
+        let json = serde_json::json!({
+            "type": "api_key",
+            "api_keys": ["abc"],
+        });
+        let auth = ApiKeyAuth::from_config(json).unwrap();
+        assert_eq!(auth.api_keys.len(), 1);
+        assert_eq!(auth.api_keys[0].secret, "abc");
+        assert!(auth.api_keys[0].attrs.project.is_none());
+    }
+
+    /// Full-shape API key entry carries the attribution onto `attrs`.
+    #[test]
+    fn api_key_full_shape_parses() {
+        let json = serde_json::json!({
+            "type": "api_key",
+            "api_keys": [
+                {"secret": "abc", "project": "foundation", "user": "ada"}
+            ],
+        });
+        let auth = ApiKeyAuth::from_config(json).unwrap();
+        assert_eq!(auth.api_keys.len(), 1);
+        assert_eq!(
+            auth.api_keys[0].attrs.project.as_deref(),
+            Some("foundation")
+        );
+        assert_eq!(auth.api_keys[0].attrs.user.as_deref(), Some("ada"));
+    }
+
+    /// Matched API key produces a principal stamped with the
+    /// attribution + the api_key source + the supplied tenant.
+    #[test]
+    fn api_key_check_request_with_principal_stamps_metadata() {
+        let json = serde_json::json!({
+            "type": "api_key",
+            "api_keys": [
+                {"secret": "abc", "project": "foundation"}
+            ],
+        });
+        let auth = ApiKeyAuth::from_config(json).unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("X-Api-Key", "abc".parse().unwrap());
+        let principal = auth
+            .check_request_with_principal(&headers, None, TenantId::from("acme"))
+            .expect("matched key should yield a principal");
+        assert_eq!(principal.tenant_id.as_str(), "acme");
+        assert_eq!(principal.source, PrincipalSource::ApiKey);
+        assert_eq!(principal.sub, "");
+        assert_eq!(principal.attrs.project.as_deref(), Some("foundation"));
+    }
+
+    /// `users:` list accepts the bare `{username, password}` shape
+    /// without an explicit `attrs` block.
+    #[test]
+    fn basic_auth_user_shorthand_parses() {
+        let json = serde_json::json!({
+            "type": "basic_auth",
+            "users": [{"username": "ada", "password": "p"}],
+        });
+        let auth = BasicAuthProvider::from_config(json).unwrap();
+        assert_eq!(auth.users.len(), 1);
+        assert_eq!(auth.users[0].username, "ada");
+        assert!(auth.users[0].attrs.project.is_none());
+    }
+
+    /// `users:` entry carries the metadata fields flatly alongside
+    /// `username` + `password`.
+    #[test]
+    fn basic_auth_user_full_shape_parses() {
+        let json = serde_json::json!({
+            "type": "basic_auth",
+            "users": [
+                {"username": "ada", "password": "p", "project": "foundation"}
+            ],
+        });
+        let auth = BasicAuthProvider::from_config(json).unwrap();
+        assert_eq!(auth.users[0].attrs.project.as_deref(), Some("foundation"));
+    }
+
+    /// Matched basic-auth user produces a principal whose `sub` is
+    /// the matched username and whose `attrs` carry the matched
+    /// user's per-credential metadata.
+    #[test]
+    fn basic_auth_check_request_with_principal_stamps_metadata() {
+        let json = serde_json::json!({
+            "type": "basic_auth",
+            "users": [
+                {"username": "ada", "password": "p", "project": "foundation"}
+            ],
+        });
+        let auth = BasicAuthProvider::from_config(json).unwrap();
+        let mut headers = http::HeaderMap::new();
+        let encoded = base64::engine::general_purpose::STANDARD.encode("ada:p");
+        headers.insert(
+            http::header::AUTHORIZATION,
+            format!("Basic {}", encoded).parse().unwrap(),
+        );
+        let principal = auth
+            .check_request_with_principal(&headers, TenantId::from("acme"))
+            .expect("matched user should yield a principal");
+        assert_eq!(principal.tenant_id.as_str(), "acme");
+        assert_eq!(principal.source, PrincipalSource::Basic);
+        assert_eq!(principal.sub, "ada");
+        assert_eq!(principal.attrs.project.as_deref(), Some("foundation"));
+    }
+
+    /// JWT provider-level metadata round-trips through a nested
+    /// `attrs:` block in the YAML (not flattened, because the JWT
+    /// config has its own optional top-level fields).
+    #[test]
+    fn jwt_provider_attrs_round_trip() {
+        let json = serde_json::json!({
+            "type": "jwt",
+            "secret": "k",
+            "attrs": {"project": "foundation", "team": "platform"},
+            "roles_claim": ["roles", "groups"],
+        });
+        let auth = JwtAuth::from_config(json).unwrap();
+        assert_eq!(auth.attrs.project.as_deref(), Some("foundation"));
+        assert_eq!(auth.attrs.team.as_deref(), Some("platform"));
+        assert_eq!(
+            auth.roles_claim,
+            vec!["roles".to_string(), "groups".to_string()]
+        );
     }
 }

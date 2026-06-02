@@ -386,18 +386,22 @@ pub(super) fn emit_access_log(
         .and_then(|idx| pipeline.auths.get(idx))
         .and_then(|opt| opt.as_ref())
         .map(|auth| auth.auth_type().to_string());
-    // WOR-1047: principal_kind = the auth_type slug, with two extras
-    // the auth-provider enum cannot express on its own:
+    // WOR-1047 PR2: prefer the resolved principal's source slug over
+    // the configured auth-provider slug; both match by design (the
+    // `PrincipalSource::as_str` and `Auth::auth_type` enums share the
+    // same closed set). The two extras the principal source cannot
+    // express on its own:
     //   * `virtual_key` when an AI virtual key matched (detected by
-    //     the AI-VK fields stamped on ctx by `handle_ai_proxy`);
-    //   * `none` when the origin has no auth provider configured.
-    // The AI virtual key case takes precedence over the auth-provider
-    // case because a configured auth provider can sit in front of the
-    // AI handler; the attribution-relevant principal is the matched
-    // VK, not the bearer / api_key that the request used to reach the
-    // AI handler.
+    //     the AI-VK field stamped on ctx by `handle_ai_proxy`); this
+    //     takes precedence over the inbound auth provider because the
+    //     attribution-relevant principal is the matched VK, not the
+    //     bearer / api_key that reached the AI handler;
+    //   * `none` when the origin has no auth provider configured and
+    //     the principal is still anonymous.
     let principal_kind = if ctx.principal.virtual_key.is_some() {
         Some("virtual_key".to_string())
+    } else if !ctx.principal.is_anonymous() {
+        Some(ctx.principal.source.as_str().to_string())
     } else {
         Some(auth_type.clone().unwrap_or_else(|| "none".to_string()))
     };
