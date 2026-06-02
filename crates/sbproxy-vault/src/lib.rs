@@ -6,6 +6,7 @@
 
 pub mod aws;
 pub mod convergent;
+pub mod file;
 pub mod hashicorp;
 pub mod k8s;
 pub mod local;
@@ -19,6 +20,7 @@ pub mod vault_ref;
 
 pub use aws::{AwsAuth, AwsSecretsManagerBackend, AwsSecretsManagerConfig, DEFAULT_AWS_CACHE_TTL};
 pub use convergent::ConvergentFingerprinter;
+pub use file::{FileFormat, FileVaultBackend, FileVaultConfig};
 pub use hashicorp::{
     HashiCorpAuth, HashiCorpConfig, HashiCorpVaultBackend, KvEngine, DEFAULT_CACHE_TTL,
 };
