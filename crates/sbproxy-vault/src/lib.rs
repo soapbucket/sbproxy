@@ -5,6 +5,7 @@
 #![warn(missing_docs)]
 
 pub mod convergent;
+pub mod hashicorp;
 pub mod local;
 pub mod manager;
 pub mod metadata;
@@ -15,6 +16,9 @@ pub mod secret_string;
 pub mod vault_ref;
 
 pub use convergent::ConvergentFingerprinter;
+pub use hashicorp::{
+    HashiCorpAuth, HashiCorpConfig, HashiCorpVaultBackend, KvEngine, DEFAULT_CACHE_TTL,
+};
 pub use local::LocalVault;
 pub use manager::{VaultBackend, VaultManager};
 pub use metadata::{SecretMeta, SecretMetadataTracker};
