@@ -38,6 +38,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [observability.md](observability.md) - metrics, logs, traces, and the bundled dashboards.
 - [clickhouse-attribution.md](clickhouse-attribution.md) - access-log schema, pre-aggregations, and sample attribution queries.
 - [migration-credentials.md](migration-credentials.md) - migrating the legacy `virtual_keys:` shape to the unified `credentials:` block.
+- [migration-mcp-rbac.md](migration-mcp-rbac.md) - upgrading MCP `ToolAccessPolicy` to the principal-aware ACL and the WOR-1066 default-deny flip.
 - [secrets.md](secrets.md) - vault backend setup for HashiCorp Vault, AWS Secrets Manager, and Kubernetes Secrets.
 - [multi-tenant.md](multi-tenant.md) - when to use the multi-tenant shape, the three scopes, isolation guarantees, the synthetic `__default__` tenant.
 - [operator-runbook.md](operator-runbook.md) - dashboard triage and rollback actions.

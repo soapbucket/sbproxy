@@ -19,11 +19,18 @@
 //!         version: "1.0.0"
 //!       rbac_policies:
 //!         read_only:
-//!           key_permissions:
-//!             "alice": ["gh.search_repos", "db.query"]
+//!           default_allow: false
+//!           tool_access:
+//!             - principals:
+//!                 - virtual_key: vk_frontend_*
+//!                   team: frontend
+//!               allowed: [gh.search_repos, db.query]
 //!         admin:
-//!           key_permissions:
-//!             "ops": []  # empty list = allow all tools
+//!           default_allow: false
+//!           tool_access:
+//!             - principals:
+//!                 - role: admin
+//!               allowed: ["*"]
 //!       federated_servers:
 //!         - origin: github.example.com
 //!           prefix: gh
@@ -41,10 +48,15 @@
 //! The `rbac:` field on each `federated_servers[]` references a key
 //! in the top-level `rbac_policies` map. The matching
 //! `ToolAccessPolicy` is consulted for every `tools/call` against
-//! that upstream, using the caller's resolved virtual key (auth
-//! `sub`) as the policy key. The `timeout:` field caps each upstream
-//! `tools/call` at the request layer (not just the connection layer)
-//! via `tokio::time::timeout`.
+//! that upstream, using the inbound `Principal` (tenant, virtual
+//! key, team, role, project, sub) to pick the matching ACL row.
+//! WOR-1065 + WOR-1066: the policy is default-deny; an operator who
+//! wants the legacy open-by-default behaviour sets
+//! `default_allow: true` on each policy. See
+//! `docs/migration-mcp-rbac.md` for upgrade examples.
+//! The `timeout:` field caps each upstream `tools/call` at the
+//! request layer (not just the connection layer) via
+//! `tokio::time::timeout`.
 //!
 //! The action is a thin adapter on top of
 //! [`sbproxy_extension::mcp::McpFederation`]. Tool aggregation, name
@@ -56,7 +68,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sbproxy_extension::mcp::{McpFederation, McpServerConfig, ToolAccessPolicy};
+use sbproxy_extension::mcp::{McpFederation, McpServerConfig, ToolAccessPolicy, ToolQuotaStore};
 use serde::Deserialize;
 
 // --- Wire format ---
@@ -199,6 +211,12 @@ pub struct McpAction {
     /// OAuth Protected Resource Metadata (RFC 9728) for auth discovery,
     /// or `None` when the gateway advertises no OAuth surface (WOR-806).
     pub oauth: Option<McpOAuthConfig>,
+    /// Process-wide sliding-window quota store for per-tool quotas
+    /// declared on `rbac_policies[].tool_quotas[]` (WOR-1065). One
+    /// store per action so the counters live for the lifetime of
+    /// the compiled origin chain; counters are wiped on hot reload
+    /// since reload rebuilds the action.
+    pub quota_store: Arc<ToolQuotaStore>,
 }
 
 /// Per-upstream metadata captured at compile time. Kept outside
@@ -313,6 +331,7 @@ impl McpAction {
             tool_allowlist,
             progressive_discovery: cfg.progressive_discovery,
             oauth: cfg.oauth,
+            quota_store: Arc::new(ToolQuotaStore::new()),
         })
     }
 
@@ -504,24 +523,32 @@ mod tests {
 
     #[test]
     fn parses_full_marketing_shape() {
-        // WOR-186: `rbac` and `timeout` are now part of the
-        // happy-path fixture. The dispatcher enforces both fields at
-        // request time, so the wire shape that ships in marketing
-        // copy must compile end-to-end.
+        // WOR-186 + WOR-1065 + WOR-1066: `rbac` and `timeout` are now
+        // part of the happy-path fixture, and the RBAC policy uses
+        // the principal-aware selector shape (default-deny, with
+        // `principals[]` + `allowed[]` on every rule).
         let value = json!({
             "type": "mcp",
             "mode": "gateway",
             "server_info": { "name": "my-mcp", "version": "1.0.0" },
             "rbac_policies": {
                 "read_only": {
-                    "key_permissions": {
-                        "alice": ["gh.search_repos", "db.query"]
-                    }
+                    "default_allow": false,
+                    "tool_access": [
+                        {
+                            "principals": [{ "virtual_key": "alice" }],
+                            "allowed": ["gh.search_repos", "db.query"]
+                        }
+                    ]
                 },
                 "admin": {
-                    "key_permissions": {
-                        "ops": []
-                    }
+                    "default_allow": false,
+                    "tool_access": [
+                        {
+                            "principals": [{ "role": "admin" }],
+                            "allowed": ["*"]
+                        }
+                    ]
                 }
             },
             "federated_servers": [
@@ -558,15 +585,17 @@ mod tests {
         assert_eq!(db.rbac.as_deref(), Some("admin"));
         assert_eq!(db.timeout, Some(Duration::from_secs(5)));
 
-        // RBAC labels resolve to the correct policy.
+        // RBAC labels resolve to the correct policy. The new schema
+        // carries `tool_access` rules with principal selectors; the
+        // legacy `key_permissions` map is gone.
         let read_only = action.policy_for_server("gh").expect("gh policy");
-        assert!(read_only.is_tool_allowed("alice", "gh.search_repos"));
-        assert!(!read_only.is_tool_allowed("alice", "gh.delete_repo"));
+        assert!(!read_only.default_allow);
+        assert_eq!(read_only.tool_access.len(), 1);
 
         let admin = action.policy_for_server("db").expect("db policy");
-        // Empty allowlist on the admin key means "allow all".
-        assert!(admin.is_tool_allowed("ops", "db.query"));
-        assert!(admin.is_tool_allowed("ops", "db.drop_table"));
+        assert!(!admin.default_allow);
+        assert_eq!(admin.tool_access.len(), 1);
+        assert_eq!(admin.tool_access[0].allowed, vec!["*".to_string()]);
 
         // Per-server timeout helper.
         assert_eq!(
@@ -593,7 +622,7 @@ mod tests {
         let value = json!({
             "type": "mcp",
             "rbac_policies": {
-                "read_only": { "key_permissions": {} }
+                "read_only": { "default_allow": false, "tool_access": [] }
             },
             "federated_servers": [
                 { "origin": "github.example.com", "rbac": "admin" }
