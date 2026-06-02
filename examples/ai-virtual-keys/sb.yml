@@ -70,30 +70,44 @@ origins:
             - claude-3-5-haiku-latest
             - claude-3-5-sonnet-latest
 
-      virtual_keys:
-        - key: ${TEAM_FRONTEND_KEY}
-          name: team-frontend
-          enabled: true
-          allowed_providers: [anthropic]
-          allowed_models:
-            - claude-3-5-haiku-latest
-          max_requests_per_minute: 30
-          max_tokens_per_minute: 60000
+    # Per-team credentials. Migrated from the legacy
+    # `action.virtual_keys:` shape to the unified credentials block.
+    # The compile-time lowering materialises each `ai_provider`
+    # credential as a virtual-key entry on the AI handler so the
+    # runtime dispatch keeps working unchanged.
+    credentials:
+      - name: team-frontend
+        type: ai_provider
+        provider: anthropic
+        key: ${TEAM_FRONTEND_KEY}
+        attrs:
+          project: frontend
+          tags: [team-frontend, tier-haiku]
           budget:
             max_tokens: 500000
             max_cost_usd: 10
-          tags: [team-frontend, tier-haiku]
+        models:
+          allow: [claude-3-5-haiku-latest]
+        policies:
+          - type: rate_limit
+            rpm: 30
+            tpm: 60000
 
-        - key: ${TEAM_DATA_KEY}
-          name: team-data
-          enabled: true
-          allowed_providers: [anthropic]
-          allowed_models:
-            - claude-3-5-haiku-latest
-            - claude-3-5-sonnet-latest
-          max_requests_per_minute: 120
-          max_tokens_per_minute: 400000
+      - name: team-data
+        type: ai_provider
+        provider: anthropic
+        key: ${TEAM_DATA_KEY}
+        attrs:
+          project: data
+          tags: [team-data, tier-sonnet]
           budget:
             max_tokens: 10000000
             max_cost_usd: 250
-          tags: [team-data, tier-sonnet]
+        models:
+          allow:
+            - claude-3-5-haiku-latest
+            - claude-3-5-sonnet-latest
+        policies:
+          - type: rate_limit
+            rpm: 120
+            tpm: 400000

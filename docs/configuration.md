@@ -450,9 +450,9 @@ origins:
 - An origin that names an undeclared tenant fails config compile so an operator's typo surfaces at startup rather than at request time.
 - An empty `proxy.tenants:` list is the same as omitting it; every origin resolves to `__default__`.
 
-### What lands here later (PR2+)
+### Credentials at the tenant scope
 
-The credentials epic adds per-tenant `credentials`, `policies`, and `vault` blocks under each tenant, plus origin-level overrides for the same blocks. Resolution at request time becomes `proxy <- tenant <- origin`, with origin overrides winning where a selector matches. PR1 lands the tenant scope itself so the rest of the epic can land against a stable resolver.
+Each tenant can declare its own `credentials:` block alongside the proxy default. Resolution at request time walks origin → tenant → proxy. The same credential `name:` re-declared at a more specific scope shadows the broader scope, so a tenant can override the proxy default key + budget without rewriting the rest. See [Credentials block](#credentials-block) below and `docs/migration-credentials.md` for the worked migration from the legacy `virtual_keys:` shape.
 
 ---
 

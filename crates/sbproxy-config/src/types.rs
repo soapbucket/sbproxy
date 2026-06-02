@@ -381,6 +381,18 @@ pub struct ProxyServerConfig {
     /// here fails config compile.
     #[serde(default)]
     pub tenants: Vec<ProxyTenantConfig>,
+    /// Canonical credentials block at proxy scope. The full schema
+    /// lives in [`CredentialBlock`]. Tenant and origin scopes carry
+    /// matching `credentials:` fields; resolution at request time
+    /// walks origin -> tenant -> proxy, with most-restrictive
+    /// policies winning across the merged set.
+    ///
+    /// The legacy `virtual_keys:` YAML key under
+    /// `origins[].action.providers` is rejected at config compile;
+    /// operators migrate to the canonical block per
+    /// `docs/migration-credentials.md`.
+    #[serde(default)]
+    pub credentials: Vec<CredentialBlock>,
 }
 
 /// Web Bot Auth signing identity for the proxy. See the
@@ -439,6 +451,7 @@ impl Default for ProxyServerConfig {
             http_client_timeouts: HttpClientTimeoutsConfig::default(),
             web_bot_auth: None,
             tenants: Vec::new(),
+            credentials: Vec::new(),
         }
     }
 }
@@ -2130,6 +2143,181 @@ pub struct ProxyTenantConfig {
     /// `origin.tenant_id` and stamped on every request the origin
     /// serves. Length capped to 256 ASCII characters at compile.
     pub id: String,
+    /// Tenant-scoped credentials block. Inherits proxy-scope
+    /// credentials of the same name unless overridden here.
+    #[serde(default)]
+    pub credentials: Vec<CredentialBlock>,
+}
+
+/// Canonical credentials block. Sits under
+/// `proxy.credentials`, `tenants[].credentials`, or
+/// `origins[].credentials`. A request resolves matching credentials
+/// by walking origin -> tenant -> proxy scopes; the first scope that
+/// produces a match for the request's principal serves the credential.
+///
+/// The credential carries:
+///
+/// * Which provider produces it (`type`, `provider`).
+/// * Where the secret material lives (`key`, a `vault://` /
+///   `${ENV}` / `file:` / `secret:` reference).
+/// * Which inbound principals can use it (`principals` selectors).
+/// * Per-credential attribution metadata (`attrs`).
+/// * Allow / deny model lists that stack on top of the origin-level
+///   allowlist (most-restrictive wins).
+/// * Per-credential sub-policies (rate limit, PII redaction, ...).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CredentialBlock {
+    /// Operator-supplied stable name. Unique within the declaring
+    /// scope. Used to identify the credential in metrics and logs.
+    pub name: String,
+    /// Credential kind. Closed enum (`ai_provider`, `bearer`,
+    /// `api_key`, `jwt`, `basic`, `oidc_client`,
+    /// `outbound_token_exchange`, `outbound_client_credentials`).
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Provider name for `type: ai_provider` credentials. Matches an
+    /// entry in the origin's `providers:` list. Ignored for non-AI
+    /// credential kinds.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Secret material reference (`vault://...`, `${ENV}`, `file:`,
+    /// `secret:`). The resolver dispatches at runtime; the config
+    /// parser carries it as a string.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Principal selectors that match this credential to inbound
+    /// principals. An empty list matches every principal; downstream
+    /// resolution then uses the first credential whose selectors
+    /// match the request.
+    #[serde(default)]
+    pub principals: Vec<PrincipalSelector>,
+    /// Attribution attributes copied onto matched principals.
+    #[serde(default)]
+    pub attrs: CredentialAttrs,
+    /// Model allow / deny lists. Stacks on top of the origin-level
+    /// allowlist (most-restrictive wins).
+    #[serde(default)]
+    pub models: Option<CredentialModels>,
+    /// Sub-policies that only fire when this credential matches.
+    #[serde(default)]
+    pub policies: Vec<CredentialPolicy>,
+}
+
+/// Selector matching an inbound principal to a credential. At least
+/// one field must be set; an entirely empty selector is rejected at
+/// compile.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PrincipalSelector {
+    /// Glob matching `Principal.virtual_key.name`. `*` matches any
+    /// virtual key. `vk_frontend_*` matches every key with that
+    /// prefix.
+    #[serde(default)]
+    pub virtual_key: Option<String>,
+    /// Match `Principal.attrs.team`.
+    #[serde(default)]
+    pub team: Option<String>,
+    /// Match `Principal.attrs.project`.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Match `Principal.attrs.user`.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Match any of the principal's `attrs.roles`.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Match an exact key=value entry on `Principal.attrs.claims`.
+    /// Serialised as a flat map for readability.
+    #[serde(default)]
+    pub claim: std::collections::BTreeMap<String, String>,
+}
+
+/// Attribution attributes copied onto matched principals.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CredentialAttrs {
+    /// Project the credential's spend rolls up to.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// User the credential is owned by (independent of who the
+    /// inbound request authenticates as).
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Team grouping. Drives the team partition on the
+    /// per-credential attribution metric.
+    #[serde(default)]
+    pub team: Option<String>,
+    /// Cost center. Lifted onto `Principal.attrs.metadata` under
+    /// the `cost_center` key for back-compat with the existing
+    /// access-log surface.
+    #[serde(default)]
+    pub cost_center: Option<String>,
+    /// Operator-supplied tags. Each tag becomes a separate
+    /// attribution row.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Free-form metadata copied verbatim onto
+    /// `Principal.attrs.metadata`.
+    #[serde(default)]
+    pub metadata: std::collections::BTreeMap<String, String>,
+    /// Per-credential budget. Sits inside `attrs:` because budget
+    /// is an attribution-side concern; the budget enforcer reads
+    /// the matched principal's attrs to apply caps.
+    #[serde(default)]
+    pub budget: Option<CredentialBudget>,
+}
+
+/// Per-credential budget. Reset windows use the LiteLLM-style
+/// `30s|30m|30h|30d` syntax.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CredentialBudget {
+    /// Maximum tokens (input + output combined) per reset window.
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    /// Maximum USD spend per reset window.
+    #[serde(default)]
+    pub max_cost_usd: Option<f64>,
+    /// Reset window. Parsed at config-load.
+    #[serde(default)]
+    pub reset: Option<String>,
+}
+
+/// Model allow / deny lists scoped to this credential. Stacks on top
+/// of the origin-level allowlist. Most-restrictive wins.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CredentialModels {
+    /// Models this credential is allowed to use. Empty allows all
+    /// origin-allowed models.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Models this credential is explicitly denied. Stacks on top of
+    /// `allow`: a model that is in `allow` but also in `deny` is
+    /// denied.
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+/// Sub-policy attached to a credential. Closed enum; out-of-tree
+/// policies plug in through the existing plugin registry rather than
+/// widening this enum.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CredentialPolicy {
+    /// Per-credential rate limit. Stacks on top of the origin-level
+    /// rate limit (most-restrictive wins).
+    RateLimit {
+        /// Requests per minute cap.
+        #[serde(default)]
+        rpm: Option<u64>,
+        /// Tokens per minute cap.
+        #[serde(default)]
+        tpm: Option<u64>,
+    },
+    /// Require PII redaction for the named rule set on every request
+    /// served by this credential. The names match
+    /// `sbproxy_security::pii::default_rules`.
+    RequirePiiRedaction {
+        /// Rule names that MUST run on every request.
+        rules: Vec<String>,
+    },
 }
 
 /// A single origin config as it appears in YAML.
@@ -2144,6 +2332,10 @@ pub struct RawOriginConfig {
     /// working unchanged.
     #[serde(default)]
     pub tenant_id: Option<String>,
+    /// Canonical credentials block at origin scope. Overrides + adds
+    /// to the tenant + proxy scopes. See [`CredentialBlock`].
+    #[serde(default)]
+    pub credentials: Vec<CredentialBlock>,
     /// Authentication block (also accepted under YAML alias `auth`).
     #[serde(default, alias = "auth")]
     pub authentication: Option<serde_json::Value>,
