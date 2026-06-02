@@ -2171,7 +2171,17 @@ pub(super) async fn request_filter(
             let query = session.req_header().uri.query();
             let method = session.req_header().method.as_str();
             let path = session.req_header().uri.path();
-            let auth_result = check_auth(auth, req_headers, query, method, path).await;
+            let tenant_id = sbproxy_plugin::TenantId::from(ctx.tenant_id.to_string());
+            let (auth_result, principal_opt) =
+                check_auth(auth, req_headers, query, method, path, tenant_id).await;
+            // WOR-1047 PR2: every built-in provider returns a
+            // `Principal` on Allow. Stamp it on `ctx.principal` so
+            // downstream policy / access-log paths read attribution
+            // off a single carrier instead of re-deriving it from
+            // the auth provider's slug.
+            if let Some(principal) = principal_opt {
+                ctx.principal = principal;
+            }
             // Phase-timing capture: snapshot the moment the auth
             // provider returned (success, deny, or challenge). The
             // access-log + `sbproxy_phase_duration_seconds{phase="auth"}`

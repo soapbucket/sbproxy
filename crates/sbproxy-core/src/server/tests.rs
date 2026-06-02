@@ -307,7 +307,8 @@ async fn bot_auth_accepts_signature_bound_to_real_request_path() {
     headers.insert("signature-input", sig_input.parse().unwrap());
     headers.insert("signature", sig_value.parse().unwrap());
 
-    let result = check_auth(&auth, &headers, None, "GET", "/api/foo").await;
+    let (result, _principal) =
+        check_auth(&auth, &headers, None, "GET", "/api/foo", test_tenant()).await;
     assert!(
         matches!(result, AuthResult::Allow { .. }),
         "expected Allow when path matches signed @target-uri"
@@ -329,7 +330,8 @@ async fn bot_auth_rejects_signature_bound_to_different_path() {
     headers.insert("signature-input", sig_input.parse().unwrap());
     headers.insert("signature", sig_value.parse().unwrap());
 
-    let result = check_auth(&auth, &headers, None, "GET", "/api/foo").await;
+    let (result, _principal) =
+        check_auth(&auth, &headers, None, "GET", "/api/foo", test_tenant()).await;
     assert!(
         matches!(result, AuthResult::Deny(401, _)),
         "expected Deny(401) when @target-uri does not match signed path; got {:?}",
@@ -357,7 +359,15 @@ async fn bot_auth_includes_query_string_in_target_uri() {
     headers.insert("signature-input", sig_input.parse().unwrap());
     headers.insert("signature", sig_value.parse().unwrap());
 
-    let result = check_auth(&auth, &headers, Some("x=1"), "GET", "/api/foo").await;
+    let (result, _principal) = check_auth(
+        &auth,
+        &headers,
+        Some("x=1"),
+        "GET",
+        "/api/foo",
+        test_tenant(),
+    )
+    .await;
     assert!(
         matches!(result, AuthResult::Allow { .. }),
         "expected Allow when path+query matches signed @target-uri"
@@ -382,7 +392,8 @@ async fn bot_auth_signature_agent_uses_async_directory_path() {
         );
     headers.insert("signature", "sig1=:AAAA:".parse().unwrap());
 
-    let result = check_auth(&auth, &headers, None, "GET", "/api/foo").await;
+    let (result, _principal) =
+        check_auth(&auth, &headers, None, "GET", "/api/foo", test_tenant()).await;
 
     assert!(
             matches!(result, AuthResult::Deny(401, ref msg) if msg == "bot_auth: directory unavailable"),
@@ -404,6 +415,13 @@ async fn bot_auth_signature_agent_uses_async_directory_path() {
 use sbproxy_plugin::{AuthDecision, AuthProvider};
 use std::future::Future;
 use std::pin::Pin;
+
+/// Synthetic tenant id used by the auth tests in this file. The
+/// principal-aware `check_auth` signature requires one; the tests
+/// here do not exercise per-tenant routing so the value is opaque.
+fn test_tenant() -> sbproxy_plugin::TenantId {
+    sbproxy_plugin::TenantId::default_tenant()
+}
 
 /// Test double that records every authenticate call and returns a
 /// configured [`AuthDecision`].
@@ -470,7 +488,7 @@ async fn plugin_allow_decision_maps_to_auth_result_allow() {
     let auth = sbproxy_modules::Auth::Plugin(Box::new(provider));
     let headers = http::HeaderMap::new();
 
-    let result = check_auth(&auth, &headers, None, "GET", "/").await;
+    let (result, _principal) = check_auth(&auth, &headers, None, "GET", "/", test_tenant()).await;
     assert!(
         matches!(result, AuthResult::Allow { .. }),
         "Allow decision must map to AuthResult::Allow; got {}",
@@ -497,7 +515,8 @@ async fn plugin_deny_decision_maps_to_auth_result_deny() {
     let auth = sbproxy_modules::Auth::Plugin(Box::new(provider));
     let headers = http::HeaderMap::new();
 
-    let result = check_auth(&auth, &headers, None, "POST", "/api/x").await;
+    let (result, _principal) =
+        check_auth(&auth, &headers, None, "POST", "/api/x", test_tenant()).await;
     match result {
         AuthResult::Deny(status, msg) => {
             assert_eq!(status, 403);
@@ -528,7 +547,7 @@ async fn plugin_deny_with_headers_propagates_custom_response_headers() {
     let auth = sbproxy_modules::Auth::Plugin(Box::new(provider));
     let headers = http::HeaderMap::new();
 
-    let result = check_auth(&auth, &headers, None, "GET", "/").await;
+    let (result, _principal) = check_auth(&auth, &headers, None, "GET", "/", test_tenant()).await;
     match result {
         AuthResult::DenyWithHeaders(status, msg, hdrs) => {
             assert_eq!(status, 401);
@@ -552,7 +571,7 @@ async fn plugin_authenticate_error_denies_with_500() {
     let auth = sbproxy_modules::Auth::Plugin(Box::new(ErrorAuthProvider));
     let headers = http::HeaderMap::new();
 
-    let result = check_auth(&auth, &headers, None, "GET", "/").await;
+    let (result, _principal) = check_auth(&auth, &headers, None, "GET", "/", test_tenant()).await;
     match result {
         AuthResult::Deny(status, msg) => {
             assert_eq!(status, 500);
@@ -625,7 +644,15 @@ async fn plugin_receives_method_path_query_and_headers() {
     headers.insert("authorization", "Bearer test-token".parse().unwrap());
     headers.insert("x-trace-id", "abc123".parse().unwrap());
 
-    let _ = check_auth(&auth, &headers, Some("foo=bar&baz=1"), "POST", "/api/v1/x").await;
+    let _ = check_auth(
+        &auth,
+        &headers,
+        Some("foo=bar&baz=1"),
+        "POST",
+        "/api/v1/x",
+        test_tenant(),
+    )
+    .await;
 
     let guard = provider.captured.lock().unwrap();
     let (method, uri, hdrs) = guard.as_ref().expect("provider was invoked");
@@ -674,7 +701,7 @@ async fn registered_auth_plugin_is_discoverable_by_name() {
     // Wrap in Auth::Plugin and verify dispatch works end to end.
     let auth = sbproxy_modules::Auth::Plugin(built);
     let headers = http::HeaderMap::new();
-    let result = check_auth(&auth, &headers, None, "GET", "/").await;
+    let (result, _principal) = check_auth(&auth, &headers, None, "GET", "/", test_tenant()).await;
     assert!(
         matches!(result, AuthResult::Allow { .. }),
         "registered plugin must dispatch to Allow; got {}",

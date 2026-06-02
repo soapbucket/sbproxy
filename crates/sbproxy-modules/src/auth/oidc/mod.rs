@@ -39,6 +39,8 @@ pub mod session;
 pub mod store;
 pub mod userinfo;
 
+use crate::auth::CredentialAttrs;
+use sbproxy_plugin::{Principal, PrincipalSource, TenantId};
 use serde::Deserialize;
 
 /// Compiled OIDC auth provider config. Constructed by
@@ -144,6 +146,14 @@ pub struct OidcAuth {
     /// `__Host-sbproxy_oidc_tx` for the same reason.
     #[serde(default = "default_tx_cookie_name")]
     pub tx_cookie_name: String,
+    /// Provider-level attribution metadata stamped onto the resolved
+    /// `Principal` on a successful OIDC session validation (WOR-1047
+    /// PR2). Nested rather than flattened so the attribution block
+    /// does not clash with the long list of optional top-level OIDC
+    /// fields above (endpoints, allowlists, cookie names, ...).
+    /// Operators write it as a nested `attrs:` block in YAML.
+    #[serde(default)]
+    pub attrs: CredentialAttrs,
 }
 
 fn default_redirect_path() -> String {
@@ -216,6 +226,21 @@ impl OidcAuth {
             );
         }
         Ok(parsed)
+    }
+
+    /// Build a [`Principal`] stamped with the provider-level
+    /// attribution. The session cookie path in the request pipeline
+    /// calls this after a sealed session opens cleanly so the rest
+    /// of the request sees the same shape every other auth provider
+    /// produces (WOR-1047 PR2).
+    pub fn to_principal(&self, claims_sub: String, tenant_id: TenantId) -> Principal {
+        Principal {
+            tenant_id,
+            sub: claims_sub,
+            source: PrincipalSource::Oidc,
+            virtual_key: None,
+            attrs: self.attrs.to_principal_attrs(),
+        }
     }
 }
 
@@ -294,5 +319,23 @@ mod tests {
         v["client_id"] = serde_json::json!("");
         let err = OidcAuth::from_config(v).unwrap_err();
         assert!(format!("{err:#}").contains("client_id"));
+    }
+
+    /// WOR-1047 PR2: provider-level `attrs` block round-trips
+    /// through the config compiler and lands on the resolved
+    /// `Principal` via `to_principal`.
+    #[test]
+    fn oidc_provider_attrs_round_trip() {
+        let mut v = good_config();
+        v["attrs"] = serde_json::json!({"project": "foundation", "team": "platform"});
+        let cfg = OidcAuth::from_config(v).unwrap();
+        assert_eq!(cfg.attrs.project.as_deref(), Some("foundation"));
+        assert_eq!(cfg.attrs.team.as_deref(), Some("platform"));
+
+        let principal = cfg.to_principal("ada@example.com".to_string(), TenantId::from("acme"));
+        assert_eq!(principal.tenant_id.as_str(), "acme");
+        assert_eq!(principal.source, PrincipalSource::Oidc);
+        assert_eq!(principal.sub, "ada@example.com");
+        assert_eq!(principal.attrs.project.as_deref(), Some("foundation"));
     }
 }

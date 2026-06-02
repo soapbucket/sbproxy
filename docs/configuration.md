@@ -1270,6 +1270,105 @@ authentication:
   type: noop
 ```
 
+### Per-credential metadata
+
+Every inbound auth provider accepts an optional metadata block on each credential entry. When a credential matches, its metadata travels onto the request principal and surfaces in the access log under `principal_kind`, in metrics labels, and in policy scripts that read `principal.attrs.*`. The metadata fields are:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `project` | string | Project the credential belongs to. Drives the `project` column on the access log and metric labels. |
+| `user` | string | User the credential represents or its owner. |
+| `team` | string | Team or cost-center grouping. |
+| `tags` | list of strings | Operator-supplied tags. Stamped on `principal.attrs.tags`. |
+| `metadata` | map of strings | Free-form metadata copied off the credential. Stored as a sorted map for deterministic log lines. |
+
+The block is optional on every provider; existing configs that use the bare-string shorthand (a list of plain secrets) continue to parse unchanged. Operators opt in per credential.
+
+#### Bearer
+
+The full-shape entry replaces a bare string. Mixed lists are allowed.
+
+```yaml
+authentication:
+  type: bearer
+  tokens:
+    - "shared-token-no-metadata"
+    - secret: ${SERVICE_TOKEN_1}
+      project: foundation
+      team: platform
+      tags: [internal]
+      metadata:
+        cost_center: eng-001
+```
+
+#### API key
+
+```yaml
+authentication:
+  type: api_key
+  header_name: X-Api-Key
+  api_keys:
+    - "bare-key"
+    - secret: ${TEAM_FRONTEND_KEY}
+      project: foundation
+      team: frontend
+```
+
+#### Basic auth
+
+Metadata fields sit flat alongside `username` and `password` on each user entry.
+
+```yaml
+authentication:
+  type: basic_auth
+  realm: "Admin Panel"
+  users:
+    - username: admin
+      password: ${ADMIN_PASSWORD}
+      project: foundation
+      team: platform
+      tags: [admin]
+```
+
+#### JWT
+
+The JWT provider takes a single nested `attrs:` block (rather than per-token metadata) because the secret material is the JWKS or shared secret, not a list of static tokens. The optional `roles_claim:` list names the claims to copy onto `principal.attrs.roles`; the first claim present wins.
+
+```yaml
+authentication:
+  type: jwt
+  jwks_url: https://auth.example.com/.well-known/jwks.json
+  issuer: https://auth.example.com
+  audience: my-api
+  attrs:
+    project: foundation
+    team: platform
+  roles_claim:
+    - roles
+    - groups
+```
+
+#### OIDC
+
+Same nested `attrs:` shape as JWT.
+
+```yaml
+authentication:
+  type: oidc
+  authorization_endpoint: https://idp.example.com/authorize
+  token_endpoint: https://idp.example.com/oauth/token
+  jwks_uri: https://idp.example.com/.well-known/jwks.json
+  issuer: https://idp.example.com
+  client_id: sbproxy
+  client_secret: ${OIDC_CLIENT_SECRET}
+  cookie_secret: ${OIDC_COOKIE_SECRET}
+  attrs:
+    project: foundation
+    team: platform
+```
+
+The access log records the matched principal's source under the `principal_kind` column (`bearer`, `api_key`, `basic_auth`, `jwt`, `oidc`, `virtual_key`, `bot_auth`, `cap`, `forward_auth`, `plugin`, or `none` when no provider is configured). See [access-log.md](access-log.md) for the full column reference.
+
 ---
 
 ## Policies
