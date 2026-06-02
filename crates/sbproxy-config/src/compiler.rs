@@ -497,6 +497,50 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         origins.push(origin);
     }
 
+    // WOR-1053: validate that every `origin.tenant_id` references a
+    // declared `proxy.tenants[].id`. `__default__` is the synthetic
+    // tenant for single-tenant configs and is never declared by the
+    // operator; it falls through the validation. An operator that
+    // explicitly declares a `__default__` tenant gets a compile
+    // error so the reserved name stays unambiguous.
+    {
+        let declared: std::collections::HashSet<&str> = config_file
+            .proxy
+            .tenants
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        if declared.contains("__default__") {
+            anyhow::bail!(
+                "proxy.tenants[].id `__default__` is reserved for the synthetic single-tenant fallback; pick a different id"
+            );
+        }
+        for tenant in &config_file.proxy.tenants {
+            if tenant.id.is_empty() {
+                anyhow::bail!("proxy.tenants[].id must not be empty");
+            }
+            if tenant.id.len() > 256 {
+                anyhow::bail!(
+                    "proxy.tenants[].id `{}` exceeds 256 character cap",
+                    &tenant.id[..tenant.id.len().min(64)]
+                );
+            }
+        }
+        for origin in &origins {
+            let tid = origin.tenant_id.as_str();
+            if tid == "__default__" {
+                continue;
+            }
+            if !declared.contains(tid) {
+                anyhow::bail!(
+                    "origin `{}` references tenant_id `{}` which is not declared under proxy.tenants",
+                    origin.hostname,
+                    tid,
+                );
+            }
+        }
+    }
+
     // Instantiate the L2 cache backend (Redis) if configured. The store is
     // created lazily, so this call just records the target address without
     // opening a connection yet. Any concrete failure surfaces the first
@@ -838,10 +882,24 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         }
     }
 
+    // WOR-1053: resolve the origin's declared tenant against the
+    // `proxy.tenants[]` list. Absent declarations fall back to the
+    // synthetic `__default__` tenant so existing single-tenant
+    // configs keep working without a YAML change. The validator is
+    // declared at the compile boundary so a typo at the operator's
+    // YAML surfaces as a compile error rather than a silent
+    // `__default__` stamp at request time.
+    let tenant_id = config
+        .tenant_id
+        .as_ref()
+        .map(|s| CompactString::new(s.as_str()))
+        .unwrap_or_else(|| CompactString::const_new("__default__"));
+
     Ok(CompiledOrigin {
         hostname: CompactString::new(hostname),
         origin_id: CompactString::new(hostname),
         workspace_id: CompactString::default(),
+        tenant_id,
         action_config: config.action,
         auth_config: config.authentication,
         policy_configs: config.policies,
@@ -1086,6 +1144,94 @@ origins:
         assert_eq!(origin.allowed_methods.len(), 2);
         assert!(origin.allowed_methods.contains(&http::Method::GET));
         assert!(origin.allowed_methods.contains(&http::Method::POST));
+    }
+
+    /// WOR-1053 PR1: an origin with no `tenant_id:` resolves to the
+    /// synthetic `__default__` tenant so existing single-tenant
+    /// configs keep working unchanged.
+    #[test]
+    fn compile_origin_defaults_to_default_tenant() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+"#;
+        let compiled = compile_config(yaml).unwrap();
+        let origin = compiled.resolve_origin("api.example.com").unwrap();
+        assert_eq!(origin.tenant_id.as_str(), "__default__");
+    }
+
+    /// WOR-1053 PR1: an origin's explicit `tenant_id` resolves to the
+    /// declared tenant when the id matches a `proxy.tenants[]` entry.
+    #[test]
+    fn compile_origin_resolves_declared_tenant() {
+        let yaml = r#"
+proxy:
+  tenants:
+    - id: acme-corp
+origins:
+  api.acme.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    tenant_id: acme-corp
+"#;
+        let compiled = compile_config(yaml).unwrap();
+        let origin = compiled.resolve_origin("api.acme.example.com").unwrap();
+        assert_eq!(origin.tenant_id.as_str(), "acme-corp");
+    }
+
+    /// WOR-1053 PR1: an origin that references an undeclared tenant
+    /// fails config compile with an actionable error so an operator's
+    /// typo surfaces at startup rather than at request time.
+    #[test]
+    fn compile_origin_rejects_undeclared_tenant() {
+        let yaml = r#"
+proxy:
+  tenants:
+    - id: acme-corp
+origins:
+  api.bogus.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    tenant_id: typo-corp
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("undeclared tenant should fail compile");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("typo-corp") && msg.contains("not declared"),
+            "unhelpful error: {msg}"
+        );
+    }
+
+    /// WOR-1053 PR1: declaring a tenant named `__default__` clashes
+    /// with the reserved single-tenant fallback name and fails
+    /// compile.
+    #[test]
+    fn compile_rejects_reserved_default_tenant_name() {
+        let yaml = r#"
+proxy:
+  tenants:
+    - id: __default__
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("declaring __default__ should fail compile");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("__default__") && msg.contains("reserved"),
+            "unhelpful error: {msg}"
+        );
     }
 
     #[test]

@@ -98,6 +98,12 @@ pub struct RequestContext {
     pub client_ip: Option<IpAddr>,
     /// Hostname extracted from the Host header (without port).
     pub hostname: CompactString,
+    /// WOR-1053: tenant the matched origin resolves to. Stamped on
+    /// route match from `CompiledOrigin.tenant_id`; defaults to
+    /// `__default__` for un-routed requests and single-tenant
+    /// deployments. Downstream auth / policy / vault resolution
+    /// picks the tenant-scoped config block off this field.
+    pub tenant_id: CompactString,
 
     // --- Origin routing ---
     /// Index into `CompiledConfig.origins`, set after host routing.
@@ -912,6 +918,7 @@ impl RequestContext {
             request_id: CompactString::default(),
             client_ip: None,
             hostname: CompactString::default(),
+            tenant_id: CompactString::const_new("__default__"),
             origin_idx: None,
             lb_target_idx: None,
             retry_count: 0,

@@ -186,6 +186,7 @@ mod tests {
             hostname: CompactString::new(hostname),
             origin_id: CompactString::new(hostname),
             workspace_id: CompactString::default(),
+            tenant_id: compact_str::CompactString::const_new("__default__"),
             action_config: serde_json::json!({
                 "type": "static",
                 "status": 200,

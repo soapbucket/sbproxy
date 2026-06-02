@@ -499,6 +499,7 @@ pub(super) fn emit_access_log(
         parent_session_id: ctx.parent_session_id.map(|u| u.to_string()),
         properties: ctx.properties.clone(),
         workspace_id,
+        tenant_id: ctx.tenant_id.to_string(),
         auth_type,
         principal_kind,
         served_from_cache: Some(ctx.served_from_cache),
@@ -628,6 +629,9 @@ pub(super) struct AccessLogContext {
     pub(super) parent_session_id: Option<String>,
     pub(super) properties: std::collections::BTreeMap<String, String>,
     pub(super) workspace_id: String,
+    /// WOR-1053: resolved tenant from `origin.tenant_id`. `__default__`
+    /// when the operator never declared tenants.
+    pub(super) tenant_id: String,
     pub(super) auth_type: Option<String>,
     /// WOR-1047: closed-enum principal kind. Mirrors `auth_type` for
     /// the auth-provider variants and adds `virtual_key` (AI-gateway
@@ -728,6 +732,7 @@ impl AccessLogContext {
             parent_session_id: None,
             properties: std::collections::BTreeMap::new(),
             workspace_id: String::new(),
+            tenant_id: String::new(),
             auth_type: None,
             principal_kind: None,
             served_from_cache: None,
@@ -871,6 +876,7 @@ pub(super) fn emit_access_log_entry(
         parent_session_id: context.parent_session_id,
         properties: context.properties,
         workspace_id: context.workspace_id,
+        tenant_id: context.tenant_id,
         auth_type: context.auth_type,
         principal_kind: context.principal_kind,
         served_from_cache: context.served_from_cache,

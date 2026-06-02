@@ -369,6 +369,18 @@ pub struct ProxyServerConfig {
     /// configs are unaffected.
     #[serde(default)]
     pub web_bot_auth: Option<WebBotAuthConfig>,
+    /// WOR-1053: declared tenants. Each entry carries an `id`
+    /// referenced by `origin.tenant_id`. Future PRs add per-tenant
+    /// `credentials`, `policies`, and `vault` blocks; PR1 lands the
+    /// scope so the rest of the credentials epic can land against a
+    /// stable tenant resolver.
+    ///
+    /// When empty, every origin resolves to the synthetic
+    /// `__default__` tenant. Existing single-tenant configs see no
+    /// behaviour change. An origin that names a tenant not declared
+    /// here fails config compile.
+    #[serde(default)]
+    pub tenants: Vec<ProxyTenantConfig>,
 }
 
 /// Web Bot Auth signing identity for the proxy. See the
@@ -426,6 +438,7 @@ impl Default for ProxyServerConfig {
             extensions: HashMap::new(),
             http_client_timeouts: HttpClientTimeoutsConfig::default(),
             web_bot_auth: None,
+            tenants: Vec::new(),
         }
     }
 }
@@ -2103,12 +2116,34 @@ impl Default for ConnectionPoolConfig {
     }
 }
 
+/// WOR-1053: declared tenant. PR1 only carries the `id`; PR2+ adds
+/// per-tenant `credentials`, `policies`, `vault`, and `observability`
+/// blocks alongside the multi-tenant inheritance fan-out.
+///
+/// A reserved tenant id of `__default__` is the synthetic default
+/// every origin resolves to when `origin.tenant_id` is absent. The
+/// operator never declares `__default__` explicitly; doing so fails
+/// config compile.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ProxyTenantConfig {
+    /// Operator-supplied stable identifier. Referenced from
+    /// `origin.tenant_id` and stamped on every request the origin
+    /// serves. Length capped to 256 ASCII characters at compile.
+    pub id: String,
+}
+
 /// A single origin config as it appears in YAML.
 /// Plugin-specific fields are kept as `serde_json::Value` for deferred parsing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RawOriginConfig {
     /// Action describing what the origin does (proxy, redirect, static, etc.).
     pub action: serde_json::Value,
+    /// WOR-1053: declared tenant for this origin. Must match an `id`
+    /// under `proxy.tenants[]`; absent resolves to the synthetic
+    /// `__default__` tenant so existing single-tenant configs keep
+    /// working unchanged.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     /// Authentication block (also accepted under YAML alias `auth`).
     #[serde(default, alias = "auth")]
     pub authentication: Option<serde_json::Value>,
@@ -3317,6 +3352,32 @@ log:
             msg.contains("pigeon_carrier") || msg.contains("variant"),
             "unhelpful error: {msg}"
         );
+    }
+
+    /// WOR-1053 PR1: an empty `proxy.tenants:` field is the default;
+    /// every origin resolves to the synthetic `__default__` tenant
+    /// and existing single-tenant configs see no behaviour change.
+    #[test]
+    fn proxy_tenants_defaults_empty() {
+        let proxy: ProxyServerConfig = ProxyServerConfig::default();
+        assert!(proxy.tenants.is_empty());
+    }
+
+    /// WOR-1053 PR1: a declared tenant parses with just an `id`. The
+    /// future per-tenant blocks (credentials / policies / vault) land
+    /// in later PRs against the same type.
+    #[test]
+    fn parse_proxy_tenants_block() {
+        let yaml = r#"
+http_bind_port: 8080
+tenants:
+  - id: acme-corp
+  - id: beta-corp
+"#;
+        let proxy: ProxyServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(proxy.tenants.len(), 2);
+        assert_eq!(proxy.tenants[0].id, "acme-corp");
+        assert_eq!(proxy.tenants[1].id, "beta-corp");
     }
 
     /// WOR-1045 PR1: empty `sinks:` field is the default. An operator

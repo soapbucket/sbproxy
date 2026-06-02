@@ -413,6 +413,49 @@ Supported drivers and their `params` keys:
 
 ---
 
+## Tenants
+
+SBproxy is a multi-tenant gateway. A tenant scope groups an operator's tenant of record (a customer, a deployment slice, a regulatory boundary) so the same proxy binary can serve isolated configurations. Every origin resolves to exactly one tenant; downstream auth, policy, and vault resolution picks the tenant-scoped config block before falling back to proxy-level defaults.
+
+For single-tenant deployments the synthetic `__default__` tenant is used implicitly; no operator action is required and existing configs see no behaviour change.
+
+```yaml
+proxy:
+  tenants:
+    - id: acme-corp
+    - id: beta-corp
+
+origins:
+  api.acme.example.com:
+    tenant_id: acme-corp
+    action:
+      type: ai_proxy
+      url: https://api.openai.com
+  api.beta.example.com:
+    tenant_id: beta-corp
+    action:
+      type: ai_proxy
+      url: https://api.anthropic.com
+```
+
+### Field schema
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `proxy.tenants[].id` | string | required | Stable identifier. Referenced from `origin.tenant_id` and stamped on every request the origin serves. Max 256 ASCII characters. The literal `__default__` is reserved and cannot be declared. |
+
+### Resolution rules
+
+- A request matches an origin by hostname. The origin's `tenant_id` (or `__default__`) becomes `RequestContext.tenant_id` for the rest of the request lifecycle.
+- An origin that names an undeclared tenant fails config compile so an operator's typo surfaces at startup rather than at request time.
+- An empty `proxy.tenants:` list is the same as omitting it; every origin resolves to `__default__`.
+
+### What lands here later (PR2+)
+
+The credentials epic adds per-tenant `credentials`, `policies`, and `vault` blocks under each tenant, plus origin-level overrides for the same blocks. Resolution at request time becomes `proxy <- tenant <- origin`, with origin overrides winning where a selector matches. PR1 lands the tenant scope itself so the rest of the epic can land against a stable resolver.
+
+---
+
 ## Origins
 
 Each key under `origins` is a hostname. When a request arrives, SBproxy matches the `Host` header to an origin key and applies that origin's configuration. Every origin must have an `action` block.
@@ -438,6 +481,7 @@ origins:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `action` | object | required | What to do with the request (proxy, redirect, static, etc.). |
+| `tenant_id` | string | `__default__` | Tenant this origin resolves to. Must match a `proxy.tenants[].id`; absent uses the synthetic `__default__` tenant. Stamped on the request context for auth / policy / vault resolution. See [Tenants](#tenants). |
 | `authentication` | object | | Auth provider. Alias: `auth`. |
 | `policies` | list | | Policy enforcers (rate limit, IP filter, WAF, etc.). |
 | `transforms` | list | | Body transforms applied in order. |
