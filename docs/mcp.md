@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-05-10*
+*Last modified: 2026-06-02*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -172,26 +172,93 @@ handshake (an `endpoint` event followed by a POST to that endpoint),
 the client handles that path too. Source:
 `crates/sbproxy-extension/src/mcp/sse_client.rs:send_via_sse`.
 
-### `access_control`: virtual-key allowlists
+### `access_control`: principal-aware tool ACL
 
-`ToolAccessPolicy` maps a virtual API key (the caller's resolved
-auth subject) to the set of tool names it may invoke. An absent key
-or empty allowlist means "allow all". Configured under
-`rbac_policies` and bound per upstream via `federated_servers[].rbac`.
+`ToolAccessPolicy` is the per-upstream ACL that gates every
+`tools/call` and filters `tools/list`. The policy reads off the
+inbound `Principal` (tenant, virtual key, team, project, role, sub),
+walks an ordered `tool_access[]` rule list, and either allows or
+denies the named tool. The policy is **default-deny**: an unknown
+caller (no matching rule) is denied; an empty `allowed: []` is
+"deny all". Operators who want the legacy open-by-default behaviour
+add `default_allow: true` to the policy.
+
+The legacy `key_permissions: { key: [tools] }` shape is gone.
+See [`migration-mcp-rbac.md`](migration-mcp-rbac.md) for upgrade
+walk-throughs.
+
+#### Per-team allowlist
 
 ```yaml
 rbac_policies:
   read_only:
-    key_permissions:
-      alice: [gh.search_repos, db.query]
-  admin:
-    key_permissions:
-      ops: []   # empty list = allow all tools
+    default_allow: false
+    tool_access:
+      - principals:
+          - team: frontend            # exact match on attrs.team
+            tenant_id: acme           # exact match on tenant_id
+        allowed: [search_docs, list_projects]
+      - principals:
+          - role: admin               # any of attrs.roles
+        allowed: ["*"]
 federated_servers:
   - origin: github.example.com
     prefix: gh
     rbac: read_only
 ```
+
+#### Virtual-key glob
+
+```yaml
+rbac_policies:
+  frontend:
+    default_allow: false
+    tool_access:
+      - principals:
+          - virtual_key: vk_frontend_*    # trailing-* glob
+        allowed: [search, list_projects]
+```
+
+#### Legacy open behaviour
+
+```yaml
+rbac_policies:
+  legacy_open:
+    default_allow: true               # opt back in to allow-by-default
+```
+
+#### `tools/list` RBAC filter
+
+`tools/list` now returns only the subset of the federated catalogue
+the inbound principal can call. The legacy schema returned the full
+catalogue even when the matching `tools/call` would be denied,
+leaking tool names to callers that could not invoke them.
+
+#### Per-tool quotas
+
+`tool_quotas[]` enforces sliding-window quotas keyed on
+`(tenant_id, principal_id, tool_name)`. A caller over quota gets
+JSON-RPC error code `-32099`; the upstream is never contacted.
+
+```yaml
+rbac_policies:
+  ops:
+    default_allow: false
+    tool_access:
+      - principals:
+          - role: admin
+        allowed: ["*"]
+    tool_quotas:
+      - tool_name: delete_user
+        principals:
+          - team: frontend
+        rate:
+          per: 24h                   # accepts ms / s / m / h / d
+          max: 5
+```
+
+The store is per-action and lives in process memory; SIGHUP reload
+rebuilds the action and resets the counters.
 
 Source: `crates/sbproxy-extension/src/mcp/access_control.rs:ToolAccessPolicy`.
 
@@ -270,6 +337,9 @@ and `tools/call`.
 
 ## See also
 
+- [`migration-mcp-rbac.md`](migration-mcp-rbac.md): upgrade
+  walk-through for the WOR-1065 + WOR-1066 principal-aware ACL
+  and default-deny flip.
 - [`agent-skills.md`](agent-skills.md): Agent Skills manifest
   advertised via `experimental.agentSkillsUrl`.
 - [`features.md`](features.md): feature overview that covers the

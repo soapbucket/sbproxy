@@ -198,12 +198,11 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
 
 fn config_yaml(upstream_url: &str, timeout: &str) -> String {
     // The api_key auth provider does not surface a per-request
-    // subject, so the virtual key resolves to "" (anonymous). The
-    // RBAC policy is therefore keyed on "" so the test still drives
-    // the deny / allow decision through the real
-    // `ToolAccessPolicy::is_tool_allowed` path. Once an upstream auth
-    // provider that emits a `sub` lands, this fixture can pin the
-    // policy on a real key.
+    // subject, so the inbound principal stays anonymous. The RBAC
+    // policy therefore matches every principal (empty `principals`
+    // list = catch-all) and gates only on the tool name. WOR-1066:
+    // we set `default_allow: false` and an explicit `allowed:`
+    // list; an unknown tool falls through to the default-deny.
     format!(
         r#"
 proxy:
@@ -223,8 +222,10 @@ origins:
         version: "1.0.0"
       rbac_policies:
         read_only:
-          key_permissions:
-            "": ["search"]
+          default_allow: false
+          tool_access:
+            - principals: []
+              allowed: ["search"]
       federated_servers:
         - origin: "{upstream_url}"
           prefix: gh

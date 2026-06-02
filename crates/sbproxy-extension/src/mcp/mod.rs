@@ -39,7 +39,11 @@ pub mod streamable;
 pub mod types;
 pub mod verify_before_commit;
 
-pub use access_control::ToolAccessPolicy;
+pub use access_control::{
+    parse_quota_window, McpPrincipalSelector, QuotaClock, QuotaExceeded, QuotaKey, SystemClock,
+    ToolAccessDecision, ToolAccessPolicy, ToolAccessRule, ToolQuotaRate, ToolQuotaRule,
+    ToolQuotaStore,
+};
 pub use audit::{McpAuditBuilder, McpAuditEntry};
 pub use code_mode::{compress_tool_schema, estimate_token_reduction};
 pub use codemode_from_openapi::{emit_codemode_from_openapi, openapi_to_federated_tools};

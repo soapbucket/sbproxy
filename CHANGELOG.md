@@ -11,6 +11,32 @@ Work that has merged to `main` since the v1.0.1 tag and is queued for
 the next version cut. No promises about backward compatibility for any
 of the new YAML fields below until the version that ships them.
 
+### Breaking
+
+- **MCP default-deny** (WOR-1066): `ToolAccessPolicy` flipped from
+  open-by-default to closed-by-default. An unknown caller (no
+  matching ACL rule) is denied every tool. An empty `allowed: []`
+  list under an ACL rule means "deny all", not "allow all".
+  Operators who want the legacy behaviour add `default_allow: true`
+  on the origin's MCP action. The legacy `key_permissions: { key: [tools] }`
+  shape is gone; rewrite to the principal-aware `tool_access[]`
+  selector list. See `docs/migration-mcp-rbac.md`.
+
+- **MCP principal-aware ACL** (WOR-1065): `ToolAccessPolicy` now
+  carries `tool_access[]` rules with `principals[]` selectors
+  (`virtual_key`, `sub`, `team`, `project`, `user`, `role`,
+  `tenant_id`) plus an `allowed[]` tool list. The legacy
+  `key_permissions: HashMap<String, Vec<String>>` map is removed
+  along with `ToolAccessPolicy::is_tool_allowed(key, tool)`; the new
+  surface is `policy.check(&principal, tool) -> ToolAccessDecision`
+  and `policy.filter_tools(&principal, &tools)`. `tools/list` now
+  filters by RBAC against the inbound principal (the legacy schema
+  leaked tool names through `tools/list` even when the gate would
+  deny the matching `tools/call`). A new `tool_quotas[]` table
+  enforces per-tool sliding-window quotas keyed on
+  `(tenant_id, principal_id, tool_name)`. See
+  `docs/migration-mcp-rbac.md`.
+
 ### Added
 
 - **Structured-log schema v2 (`SCHEMA_VERSION = "2"`).** Three changes

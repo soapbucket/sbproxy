@@ -707,9 +707,13 @@ pub(super) async fn handle_action(
 /// Speaks the MCP wire protocol over HTTP POST + JSON-RPC 2.0:
 ///
 /// * `initialize` returns the configured `server_info` plus `tools` capability.
-/// * `tools/list` aggregates the federated upstream tool catalogue.
-/// * `tools/call` enforces the inline `tool_allowlist` guardrail and
-///   forwards to the owning upstream via `McpFederation::call_tool`.
+/// * `tools/list` aggregates the federated upstream tool catalogue,
+///   filtered by the per-server RBAC policy against the inbound
+///   principal (WOR-1065).
+/// * `tools/call` enforces the inline `tool_allowlist` guardrail, the
+///   per-server `ToolAccessPolicy` (default-deny per WOR-1066), and
+///   per-tool sliding-window quotas, then forwards to the owning
+///   upstream via `McpFederation::call_tool`.
 /// * `ping` returns `"pong"`.
 ///
 /// Methods other than `POST` produce a 405. Malformed JSON-RPC bodies
@@ -923,9 +927,11 @@ pub(super) async fn handle_mcp_action(
             Some(authority) => format!("{scheme}://{authority}/"),
             None => "/".to_string(),
         };
-        // Advertise the gateway's tool catalogue, honouring any
-        // collapsed `tool_allowlist` guardrail so the manifest never
-        // lists a tool the gateway would refuse to call.
+        // Advertise the gateway's tool catalogue, honouring the
+        // collapsed `tool_allowlist` guardrail and the per-server
+        // RBAC policy against the inbound principal (WOR-1065) so
+        // the manifest never lists a tool the gateway would refuse
+        // to call for this caller.
         let tools: Vec<sbproxy_extension::mcp::discovery::DiscoveryTool> = mcp
             .federation
             .list_tools()
@@ -935,6 +941,13 @@ pub(super) async fn handle_mcp_action(
                     .as_ref()
                     .map(|allow| allow.iter().any(|a| a == &t.name))
                     .unwrap_or(true)
+            })
+            .filter(|t| match mcp.policy_for_server(&t.server_name) {
+                Some(policy) => matches!(
+                    policy.check(&ctx.principal, &t.name),
+                    sbproxy_extension::mcp::ToolAccessDecision::Allow,
+                ),
+                None => true,
             })
             .map(|t| sbproxy_extension::mcp::discovery::DiscoveryTool {
                 name: t.name,
@@ -1134,6 +1147,24 @@ pub(super) async fn handle_mcp_action(
                 mcp.federation
                     .list_tools()
                     .into_iter()
+                    // WOR-1065: RBAC filter. The legacy schema returned
+                    // the full catalogue here even when the gate would
+                    // deny the matching `tools/call`, leaking tool
+                    // names to callers that could not invoke them. Now
+                    // each tool is filtered by its owning upstream's
+                    // policy against the inbound principal. A tool
+                    // whose owning upstream has no `rbac:` label keeps
+                    // the open-by-default behaviour for that upstream
+                    // (the action-level allowlist guardrail still
+                    // applies).
+                    .filter(|t| mcp.is_tool_allowed(&t.name))
+                    .filter(|t| match mcp.policy_for_server(&t.server_name) {
+                        Some(policy) => matches!(
+                            policy.check(&ctx.principal, &t.name),
+                            sbproxy_extension::mcp::ToolAccessDecision::Allow,
+                        ),
+                        None => true,
+                    })
                     .map(|t| {
                         // WOR-818: preserve the upstream `_meta`
                         // block (SEP-1865 UI-template metadata, etc.)
@@ -1256,7 +1287,7 @@ pub(super) async fn handle_mcp_action(
                     .get("limit")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(10) as usize;
-                let matches = mcp_progressive_search(mcp, query, limit);
+                let matches = mcp_progressive_search(mcp, ctx, query, limit);
                 let text = serde_json::to_string(&matches).unwrap_or_else(|_| "[]".into());
                 JsonRpcResponse::success(
                     request.id.clone(),
@@ -1293,37 +1324,55 @@ pub(super) async fn handle_mcp_action(
                                 &format!("tool '{}' is blocked by tool_allowlist guardrail", name),
                             )
                         } else {
-                            // WOR-186: per-server RBAC + timeout enforcement.
+                            // WOR-186 + WOR-1065 + WOR-1066: per-server
+                            // RBAC + per-tool quota + timeout enforcement.
                             //
-                            // 1. Resolve the caller's virtual key from the
-                            //    auth context (`Allow.sub`); fall back to
-                            //    "" (anonymous) when no subject is set so
-                            //    the policy lookup still has a stable key.
-                            // 2. Resolve the tool's owning upstream and
+                            // 1. Resolve the tool's owning upstream and
                             //    check the per-server `ToolAccessPolicy`
-                            //    (when one is wired). A denied tool returns
-                            //    a JSON-RPC error and bumps an audit
-                            //    counter; the upstream is never contacted.
+                            //    against `ctx.principal`. The policy is
+                            //    default-deny per WOR-1066; a request
+                            //    that matches no rule is rejected. A
+                            //    denied tool returns a JSON-RPC error
+                            //    and bumps an audit counter; the
+                            //    upstream is never contacted.
+                            // 2. Check the per-tool sliding-window
+                            //    quota on the same policy. Quotas are
+                            //    keyed on
+                            //    `(tenant_id, principal_id, tool_name)`,
+                            //    so tenant A's traffic cannot starve
+                            //    tenant B's of the same tool. On
+                            //    exceed, return JSON-RPC error code
+                            //    `-32099` with a human-readable
+                            //    message.
                             // 3. Wrap `federation.call_tool` in
                             //    `tokio::time::timeout(server.timeout, ...)`
                             //    when a per-server timeout is configured.
-                            let virtual_key = mcp_virtual_key(ctx);
                             let federated = mcp.federation.resolve_tool(&name);
-                            let denied_by_rbac = match &federated {
-                                Some(t) => {
-                                    if let Some(policy) = mcp.policy_for_server(&t.server_name) {
-                                        !policy.is_tool_allowed(&virtual_key, &name)
-                                    } else {
-                                        false
-                                    }
-                                }
+                            let server_policy = federated
+                                .as_ref()
+                                .and_then(|t| mcp.policy_for_server(&t.server_name));
+                            let denied_by_rbac = match server_policy {
+                                Some(policy) => matches!(
+                                    policy.check(&ctx.principal, &name),
+                                    sbproxy_extension::mcp::ToolAccessDecision::Deny,
+                                ),
                                 None => false,
+                            };
+                            let quota_error = if denied_by_rbac {
+                                None
+                            } else if let Some(policy) = server_policy {
+                                mcp.quota_store
+                                    .check_quota(policy, &ctx.principal, &name)
+                                    .err()
+                            } else {
+                                None
                             };
                             if denied_by_rbac {
                                 tracing::warn!(
                                     target: "sbproxy::mcp::rbac",
                                     tool = %name,
-                                    virtual_key = %virtual_key,
+                                    tenant = %ctx.principal.tenant_id,
+                                    principal = %ctx.principal.sub,
                                     "MCP tools/call denied by RBAC policy",
                                 );
                                 sbproxy_observe::metrics::record_policy(
@@ -1335,6 +1384,31 @@ pub(super) async fn handle_mcp_action(
                                     request.id.clone(),
                                     INVALID_PARAMS,
                                     &format!("tool '{}' is denied by RBAC policy for caller", name,),
+                                )
+                            } else if let Some(err) = quota_error {
+                                tracing::warn!(
+                                    target: "sbproxy::mcp::quota",
+                                    tool = %name,
+                                    tenant = %ctx.principal.tenant_id,
+                                    principal = %ctx.principal.sub,
+                                    "MCP tools/call denied by per-tool quota",
+                                );
+                                sbproxy_observe::metrics::record_policy(
+                                    ctx.hostname.as_str(),
+                                    "mcp_quota",
+                                    "deny",
+                                );
+                                // JSON-RPC application-defined error code
+                                // `-32099`: per the JSON-RPC 2.0 spec, the
+                                // range `-32000..=-32099` is reserved for
+                                // implementation-defined server errors.
+                                // We pick the top of the range for the
+                                // quota lane so future per-tool gates
+                                // (cost, concurrency) can sit beside it.
+                                JsonRpcResponse::error(
+                                    request.id.clone(),
+                                    -32099,
+                                    &format!("tool quota exceeded for {}", err.tool_name),
                                 )
                             } else {
                                 // Per-server timeout. The
@@ -1433,10 +1507,12 @@ fn mcp_progressive_meta_tools() -> Vec<serde_json::Value> {
 
 /// Search the federated tool catalogue for entries whose name or
 /// description matches `query` (case-insensitive substring), honouring
-/// the `tool_allowlist` guardrail and capping at `limit`. An empty
-/// query returns the first `limit` allowed tools. WOR-806.
+/// the `tool_allowlist` guardrail, the per-server RBAC policy
+/// (WOR-1065), and capping at `limit`. An empty query returns the
+/// first `limit` allowed tools. WOR-806.
 fn mcp_progressive_search(
     mcp: &sbproxy_modules::action::McpAction,
+    ctx: &RequestContext,
     query: &str,
     limit: usize,
 ) -> Vec<serde_json::Value> {
@@ -1445,6 +1521,13 @@ fn mcp_progressive_search(
         .list_tools()
         .into_iter()
         .filter(|t| mcp.is_tool_allowed(&t.name))
+        .filter(|t| match mcp.policy_for_server(&t.server_name) {
+            Some(policy) => matches!(
+                policy.check(&ctx.principal, &t.name),
+                sbproxy_extension::mcp::ToolAccessDecision::Allow,
+            ),
+            None => true,
+        })
         .filter(|t| {
             q.is_empty()
                 || t.name.to_ascii_lowercase().contains(&q)
@@ -1459,19 +1542,6 @@ fn mcp_progressive_search(
             })
         })
         .collect()
-}
-
-/// Resolve the caller's virtual key for MCP RBAC lookups.
-///
-/// Pulls the resolved subject from the auth decision when the request
-/// authenticated; returns the empty string for anonymous traffic so a
-/// `ToolAccessPolicy` keyed on `""` can still encode an explicit
-/// "anonymous" lane.
-pub(super) fn mcp_virtual_key(ctx: &RequestContext) -> String {
-    match ctx.auth_result.as_ref() {
-        Some(sbproxy_plugin::AuthDecision::Allow { sub: Some(s), .. }) => s.clone(),
-        _ => String::new(),
-    }
 }
 
 /// Serialise a JSON-RPC response and write it to the session.
