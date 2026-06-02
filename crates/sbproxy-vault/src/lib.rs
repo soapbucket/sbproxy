@@ -7,6 +7,7 @@
 pub mod aws;
 pub mod convergent;
 pub mod hashicorp;
+pub mod k8s;
 pub mod local;
 pub mod manager;
 pub mod metadata;
@@ -20,6 +21,9 @@ pub use aws::{AwsAuth, AwsSecretsManagerBackend, AwsSecretsManagerConfig, DEFAUL
 pub use convergent::ConvergentFingerprinter;
 pub use hashicorp::{
     HashiCorpAuth, HashiCorpConfig, HashiCorpVaultBackend, KvEngine, DEFAULT_CACHE_TTL,
+};
+pub use k8s::{
+    KubernetesAuth, KubernetesSecretsBackend, KubernetesSecretsConfig, DEFAULT_K8S_CACHE_TTL,
 };
 pub use local::LocalVault;
 pub use manager::{VaultBackend, VaultManager};
