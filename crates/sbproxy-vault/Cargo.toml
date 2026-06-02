@@ -23,5 +23,16 @@ tokio = { workspace = true, features = ["rt"] }
 # Blocking HTTP client for HashiCorp Vault, AWS KMS, and GCP Cloud KMS backends
 ureq = { version = "2", features = ["json"] }
 
+# AWS SDK: Secrets Manager backend uses the official SDK so the
+# default credential chain (env / instance-profile / SSO / SSO+role)
+# and STS-assumed roles are supported without re-implementing sigv4.
+# `rustls` feature pinned so we link against the same TLS stack the
+# rest of the workspace uses.
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+aws-credential-types = { version = "1" }
+aws-types = { version = "1" }
+
 [dev-dependencies]
 tempfile = "3"
