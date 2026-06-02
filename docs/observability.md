@@ -42,7 +42,9 @@ proxy:
       metrics_interval_secs: 30
 ```
 
-The multi-sink `log.sinks:` block is now declared (WOR-1045 PR1): the schema parses and validates, while the dispatch fan-out lands in PR2. Until PR2 ships, today's log routing is still per-tracing-target (`access_log`, `audit_log`, etc.) and stdout / file via the access-log output config.
+### Sinks
+
+The `observability.log.sinks:` block fans every emitted structured-log record out to one or more declared sinks. Each sink picks its own destination (stdout, stderr, rotating file, OTLP collector), wire format, and redaction profile. When no sinks are declared the legacy single tracing subscriber drives stdout exactly as it did before; the fan-out path only lights up once the operator declares at least one sink.
 
 ```yaml
 proxy:
@@ -68,17 +70,112 @@ proxy:
             max_backups: 7
             compress: true
           profile: internal
+        - name: otel-collector
+          target: access_log
+          format: json
+          output:
+            type: otlp
+            endpoint: http://otel-collector:4318/v1/logs
+            transport: http
+            timeout_secs: 5
+          profile: external
 ```
 
 Field schema:
 
-* `name` is unique within the declaring scope. PR2 rejects duplicates; PR1 only warns.
-* `target` selects the internal channel: `access_log | error_log | audit_log | trace_exporter | external_log`.
-* `format` overrides the parent `proxy.observability.log.format` for this sink.
-* `output` is the where: `stdout | stderr | file` ship in PR1. `otlp` lands under WOR-1046; `syslog` is a planned follow-up.
-* `profile` is the redaction shape: `internal` keeps JA3/JA4; `external` strips them. Tenant-scoped sinks (planned PR3 once WOR-1051 lands) default to `external`.
+* `name` is unique within the declaring scope. Duplicates within a scope are warn-logged today and reserved for a hard reject in a follow-up patch.
+* `target` selects the internal channel: `access_log | error_log | audit_log | trace_exporter | external_log`. A sink only sees records emitted on the channel it subscribes to.
+* `format` overrides the parent `proxy.observability.log.format` for this sink. Today every variant emits one JSON object per line; `pretty` re-renders with indentation.
+* `output` is the where: see the four output types below.
+* `profile` is the redaction shape: `internal` keeps JA3/JA4 fingerprints and raw query strings; `external` strips them. Proxy-scope sinks default to `internal`; tenant- and origin-scope sinks default to `external` because the downstream backend is usually outside the operator's trust boundary.
 
-Per-tenant + per-origin sink scopes are blocked on the WOR-1051 credentials epic; today operators land all sinks at the proxy scope.
+### Output types
+
+| `type` | Fields | Notes |
+|---|---|---|
+| `stdout` | (none) | Locks the process stdout per write. Default for a freshly-installed proxy. |
+| `stderr` | (none) | Useful for routing the audit channel separately from access on systemd-journald. |
+| `file` | `path`, `max_size_mb`, `max_backups`, `compress` | Reuses the access-log rotation + gzip stack. Defaults: 100 MiB rotation, 7 backups, gzip on. |
+| `otlp` | `endpoint`, `transport`, `timeout_secs` | Wraps `opentelemetry_otlp::LogExporter` behind a batch processor. Inherits `service_name`, `resource_attrs`, and (when omitted) `transport` from the top-level `telemetry:` block. |
+
+### Sink scopes
+
+Sinks can be declared at three scopes, each with a different filter:
+
+* `proxy.observability.log.sinks:` (proxy scope) receives every record. This is where general-purpose stdout / file / OTLP sinks live.
+* `tenants[].observability.log.sinks:` (tenant scope) receives only records whose resolved `Principal.tenant_id` matches the tenant `id`. Cross-tenant records never reach a tenant-scoped sink.
+* `origins[].observability.log.sinks:` (origin scope) receives only records whose stamped `route` matches the origin's hostname. Useful for an origin that ships its logs to a tenant-specific Loki instance.
+
+A worked example with two tenants:
+
+```yaml
+proxy:
+  tenants:
+    - id: acme
+      observability:
+        log:
+          sinks:
+            - name: acme-loki
+              target: access_log
+              output:
+                type: otlp
+                endpoint: http://loki-acme:4318/v1/logs
+                transport: http
+    - id: beta
+      observability:
+        log:
+          sinks:
+            - name: beta-stdout
+              target: access_log
+              output: { type: stdout }
+              profile: external
+```
+
+A record emitted with `tenant_id = Some("acme")` reaches only `acme-loki`; a record with `tenant_id = Some("beta")` reaches only `beta-stdout`; a record without a tenant id reaches neither tenant sink but still reaches any proxy-scope sinks.
+
+### OTLP-logs exporter
+
+The `otlp` output ships each line through an OpenTelemetry `BatchLogProcessor` to the configured collector. Every record stamps the OTel resource attributes `service.name = sbproxy` (or the operator's override), `service.version = <crate version>`, and `service.instance.id = <hostname>`; any `telemetry.resource_attrs:` entries layer on top.
+
+The level-to-severity mapping follows the OTel spec:
+
+| Structured-log level | OTel `SeverityNumber` |
+|---|---|
+| `trace` | 1 |
+| `debug` | 5 |
+| `info` | 9 |
+| `warn` | 13 |
+| `error`, `fatal` | 17 |
+
+A reference Collector pipeline that accepts these logs and forwards them on to Loki:
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+exporters:
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [loki]
+```
+
+Operators that already run an OTel Collector for traces can add the `logs` pipeline above and point the proxy's OTLP-logs sink at the same endpoint. The batch processor in the sink keeps the proxy's hot path non-blocking; flushes happen on SIGHUP and on shutdown.
 
 ## Metrics
 

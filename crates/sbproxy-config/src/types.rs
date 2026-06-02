@@ -1960,12 +1960,11 @@ pub struct ObservabilitySinkConfig {
     pub profile: Option<String>,
 }
 
-/// WOR-1045: tagged-union of supported sink output types. Each
-/// variant carries its own configuration.
+/// WOR-1045 + WOR-1046: tagged-union of supported sink output types.
+/// Each variant carries its own configuration.
 ///
-/// Today's variants: `stdout`, `stderr`, `file`. `otlp` lands under
-/// WOR-1046; `syslog` is a planned follow-up. Unknown `type:` values
-/// fail compilation.
+/// Variants: `stdout`, `stderr`, `file`, `otlp`. `syslog` remains a
+/// planned follow-up. Unknown `type:` values fail compilation.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ObservabilitySinkOutput {
@@ -1992,6 +1991,30 @@ pub enum ObservabilitySinkOutput {
         /// Whether to gzip rotated backups. Defaults to true.
         #[serde(default)]
         compress: Option<bool>,
+    },
+    /// WOR-1046: forward the rendered structured-log line to an OTLP
+    /// log collector. The exporter wraps `opentelemetry_otlp::LogExporter`
+    /// and ships records through a `BatchLogProcessor`. When `transport`
+    /// and `timeout_secs` are omitted the sink inherits the values
+    /// already declared on the top-level `telemetry:` block so a single
+    /// operator config does not have to repeat collector coordinates.
+    Otlp {
+        /// OTLP collector endpoint (e.g.
+        /// `http://otel-collector:4318/v1/logs` for HTTP/proto,
+        /// `http://otel-collector:4317` for gRPC). The path component
+        /// is honoured for HTTP transport; the gRPC variant uses the
+        /// host:port only.
+        endpoint: String,
+        /// Transport selector: `http` or `grpc`. Defaults to whatever
+        /// the top-level `telemetry.transport` declares; `grpc` when
+        /// that block is absent.
+        #[serde(default)]
+        transport: Option<String>,
+        /// Per-export timeout in seconds. Defaults to 10 seconds when
+        /// omitted; honoured by the underlying OTLP exporter's HTTP /
+        /// gRPC client.
+        #[serde(default)]
+        timeout_secs: Option<u64>,
     },
 }
 
@@ -2180,13 +2203,24 @@ pub struct TenantObservabilityConfig {
 }
 
 /// Tenant-scope `log:` sub-block. Mirrors the proxy-scope
-/// `ObservabilityLogConfig` but exposes only the redaction leaf today.
+/// `ObservabilityLogConfig`; today exposes the redaction leaf plus the
+/// tenant-scoped sinks fan-out (WOR-1045 PR2). The dispatcher routes
+/// every record whose resolved `Principal.tenant_id` matches this
+/// tenant into each declared sink; cross-tenant records never reach
+/// here.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TenantObservabilityLogConfig {
     /// Tenant-scope `redact:` sub-block. See
     /// [`TenantObservabilityRedactConfig`].
     #[serde(default)]
     pub redact: TenantObservabilityRedactConfig,
+    /// Tenant-scoped log sinks. Each sink's `name` is unique within
+    /// this tenant; the same name may also appear at proxy scope (they
+    /// are different sinks). Sinks at this scope default to the
+    /// `external` redaction profile because the downstream backend is
+    /// usually outside the operator's trust boundary.
+    #[serde(default)]
+    pub sinks: Vec<ObservabilitySinkConfig>,
 }
 
 /// Tenant-scope `redact:` sub-block. Today only `pii:` is honoured;
@@ -2640,13 +2674,21 @@ pub struct OriginObservabilityConfig {
 }
 
 /// Origin-scope `log:` sub-block. Mirrors the proxy-scope and
-/// tenant-scope shape but exposes only the redaction leaf today.
+/// tenant-scope shape; exposes redaction plus origin-scoped sinks
+/// (WOR-1045 PR2). The dispatcher routes every record whose stamped
+/// `route` matches this origin's hostname into each declared sink.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct OriginObservabilityLogConfig {
     /// Origin-scope `redact:` sub-block. See
     /// [`OriginObservabilityRedactConfig`].
     #[serde(default)]
     pub redact: OriginObservabilityRedactConfig,
+    /// Origin-scoped log sinks. Each sink's `name` is unique within
+    /// this origin; cross-scope collisions with a tenant or proxy
+    /// `sinks:` entry are intentional (they are different sinks).
+    /// Sinks at this scope default to the `external` redaction profile.
+    #[serde(default)]
+    pub sinks: Vec<ObservabilitySinkConfig>,
 }
 
 /// Origin-scope `redact:` sub-block. Today only `pii:` is honoured;
@@ -3643,6 +3685,106 @@ log:
             msg.contains("pigeon_carrier") || msg.contains("variant"),
             "unhelpful error: {msg}"
         );
+    }
+
+    /// WOR-1046: an `otlp` output variant round-trips through the
+    /// untagged enum. Endpoint, transport, and timeout all parse as
+    /// expected; the dispatcher uses these to build an OTLP-logs
+    /// exporter at startup.
+    #[test]
+    fn otlp_output_round_trips() {
+        let yaml = r#"
+log:
+  sinks:
+    - name: otel-collector
+      target: access_log
+      output:
+        type: otlp
+        endpoint: http://otel-collector:4318/v1/logs
+        transport: http
+        timeout_secs: 5
+"#;
+        let obs: ObservabilityConfig = serde_yaml::from_str(yaml).unwrap();
+        let log = obs.log.expect("log block parses");
+        assert_eq!(log.sinks.len(), 1);
+        assert_eq!(log.sinks[0].name, "otel-collector");
+        match &log.sinks[0].output {
+            ObservabilitySinkOutput::Otlp {
+                endpoint,
+                transport,
+                timeout_secs,
+            } => {
+                assert_eq!(endpoint, "http://otel-collector:4318/v1/logs");
+                assert_eq!(transport.as_deref(), Some("http"));
+                assert_eq!(*timeout_secs, Some(5));
+            }
+            other => panic!("expected otlp output variant, got {other:?}"),
+        }
+    }
+
+    /// WOR-1045 PR2: a tenant `observability.log.sinks:` block
+    /// deserialises with the same `ObservabilitySinkConfig` shape as
+    /// the proxy scope. The dispatcher reads this list at config
+    /// compile and routes records whose `tenant_id` matches into each
+    /// declared sink.
+    #[test]
+    fn tenant_sinks_block_round_trips() {
+        let yaml = r#"
+http_bind_port: 8080
+tenants:
+  - id: acme
+    observability:
+      log:
+        sinks:
+          - name: acme-stdout
+            target: access_log
+            output: { type: stdout }
+"#;
+        let proxy: ProxyServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(proxy.tenants.len(), 1);
+        let tenant = &proxy.tenants[0];
+        let obs = tenant.observability.as_ref().expect("tenant obs parses");
+        assert_eq!(obs.log.sinks.len(), 1);
+        assert_eq!(obs.log.sinks[0].name, "acme-stdout");
+        assert_eq!(obs.log.sinks[0].target, "access_log");
+        assert!(matches!(
+            obs.log.sinks[0].output,
+            ObservabilitySinkOutput::Stdout
+        ));
+    }
+
+    /// WOR-1045 PR2: an origin `observability.log.sinks:` block
+    /// deserialises with the same shape. The dispatcher resolves the
+    /// origin scope by matching the record's `route` against the
+    /// origin's hostname.
+    #[test]
+    fn origin_sinks_block_round_trips() {
+        let yaml = r#"
+action:
+  type: proxy
+  url: https://upstream.local
+observability:
+  log:
+    sinks:
+      - name: per-origin-file
+        target: audit_log
+        output:
+          type: file
+          path: /var/log/sbproxy/origin-acme.json
+"#;
+        let origin: RawOriginConfig = serde_yaml::from_str(yaml).unwrap();
+        let obs = origin
+            .observability
+            .as_ref()
+            .expect("origin obs block parses");
+        assert_eq!(obs.log.sinks.len(), 1);
+        assert_eq!(obs.log.sinks[0].name, "per-origin-file");
+        match &obs.log.sinks[0].output {
+            ObservabilitySinkOutput::File { path, .. } => {
+                assert_eq!(path, "/var/log/sbproxy/origin-acme.json");
+            }
+            other => panic!("expected file output variant, got {other:?}"),
+        }
     }
 
     /// WOR-1053 PR1: an empty `proxy.tenants:` field is the default;

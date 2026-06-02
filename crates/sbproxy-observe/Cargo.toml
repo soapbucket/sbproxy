@@ -46,11 +46,12 @@ ed25519-dalek = "2"
 
 # OpenTelemetry OTLP export pipeline. Pinned together: each
 # opentelemetry sub-crate version must align across the SDK,
-# protocol, and tracing bridge. We use the HTTP / proto-encoded
-# transport rather than gRPC to avoid pulling in tonic again.
-opentelemetry = { version = "0.27", features = ["trace", "metrics"] }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace", "metrics"] }
-opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client", "grpc-tonic", "trace", "metrics"] }
+# protocol, and tracing bridge. The `logs` feature flips on the
+# OTLP-logs surface that WOR-1046 plumbs into the sink dispatcher;
+# the trace + metrics surfaces remain wired the same way as before.
+opentelemetry = { version = "0.27", features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace", "metrics", "logs"] }
+opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client", "grpc-tonic", "trace", "metrics", "logs"] }
 opentelemetry-semantic-conventions = "0.27"
 tracing-opentelemetry = "0.28"
 

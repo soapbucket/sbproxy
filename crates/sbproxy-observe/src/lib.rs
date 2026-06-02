@@ -36,6 +36,10 @@ pub mod metrics;
 /// backoff retries, and a deadletter queue.
 pub mod notify;
 pub mod otel;
+/// WOR-1046 OTLP-logs sink output. Wraps `opentelemetry_otlp::LogExporter`
+/// behind the [`sink_dispatcher::SinkOutput`] trait so the dispatcher
+/// can forward records to an OTLP collector.
+pub mod otlp_logs;
 pub mod redact;
 /// P0 `RequestEvent` envelope shared by the four streams.
 pub mod request_event;
@@ -43,6 +47,10 @@ pub mod request_event;
 /// completed `RequestEvent` values. Default no-op; enterprise
 /// registers a NATS-backed implementation.
 pub mod request_sink;
+/// WOR-1045 PR2 sink dispatcher. Replaces the single tracing
+/// subscriber with a multi-writer fan-out filtered by proxy / tenant /
+/// origin scope.
+pub mod sink_dispatcher;
 /// In-process synthetic probe state for `/readyz`.
 pub mod synthetic;
 pub mod telemetry;
@@ -80,9 +88,14 @@ pub use notify::{
     event_type_matches, verify_signature, DeadletterItem, InMemoryStore, Notifier, NotifierStore,
     OutboundEvent, SigningKey, Subscription, VerificationKey, VerifyError,
 };
+pub use otlp_logs::{OtlpLogSink, OtlpLogSinkOptions};
 pub use request_event::{RequestEvent, UserIdSource};
 pub use request_sink::{
     dispatch_request_event, set_request_event_sink, LoggingSink, NoopSink, RequestEventSink,
+};
+pub use sink_dispatcher::{
+    current_sink_dispatcher, install_sink_dispatcher, CompiledSink, Profile, SinkDispatcher,
+    SinkFormat, SinkOutput, SinkScope,
 };
 pub use synthetic::{
     SyntheticProbeRegistration, SyntheticProbeState, DEFAULT_SYNTHETIC_HOSTNAME,

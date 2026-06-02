@@ -2322,6 +2322,14 @@ fn missing_hooks_are_no_op() {
 #[test]
 fn reload_from_config_path_is_idempotent_under_repeat_invocation() {
     use std::io::Write as _;
+    // Reload writes through `install_op_redact_state` which swaps the
+    // process-global `OP_REDACT_STATE`. Serialise against any sibling
+    // test that asserts on that slot
+    // (see `install_op_redact_state_builds_tenant_and_origin_pii`)
+    // so we do not clobber its installed state mid-flight.
+    let _guard = super::lifecycle::OP_REDACT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // Bootstrap install function must produce the same observable
     // pipeline state when invoked multiple times against the same
     // unchanged config file. This pins the day-6 SIGHUP contract:
