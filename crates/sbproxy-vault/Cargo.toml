@@ -34,5 +34,20 @@ aws-sdk-sts = { version = "1", default-features = false, features = ["rt-tokio",
 aws-credential-types = { version = "1" }
 aws-types = { version = "1" }
 
+# Kubernetes Secrets backend uses the official `kube` client. `client`
+# enables the Kubernetes API client; `rustls-tls` keeps us off OpenSSL.
+# Version pinned to match the sbproxy-k8s-operator crate so the same
+# k8s-openapi target Kubernetes API version applies workspace-wide.
+kube = { version = "0.95", default-features = false, features = [
+    "client",
+    "rustls-tls",
+] }
+# rustls 0.23 (pulled transitively by `kube` 0.95) requires a process-
+# global CryptoProvider to be installed before any TLS handshake. We
+# install `ring` at backend construction; pinning the dep here makes
+# the install path discoverable from the call site.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+k8s-openapi = { version = "0.23", default-features = false, features = ["v1_30"] }
+
 [dev-dependencies]
 tempfile = "3"
