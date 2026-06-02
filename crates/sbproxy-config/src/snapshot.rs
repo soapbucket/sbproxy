@@ -202,6 +202,11 @@ pub struct CompiledOrigin {
     /// When `true` and `proxy.web_bot_auth` is set, the proxy signs the
     /// upstream request with its Ed25519 key (RFC 9421, `tag=web-bot-auth`).
     pub outbound_web_bot_auth: bool,
+    /// WOR-1043 PR3: origin-scope observability overrides. Today the
+    /// only nested surface is `log.redact.pii`, composed against the
+    /// tenant-scope (or proxy-scope) PII pass at config-load. `None`
+    /// keeps the origin inheriting whatever the parent scope decided.
+    pub observability: Option<crate::types::OriginObservabilityConfig>,
 }
 
 /// The complete compiled config: all origins plus host-based routing.

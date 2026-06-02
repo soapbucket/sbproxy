@@ -71,9 +71,9 @@ pub use health::{
     NotConfiguredProbe, Probe, ReadinessReport, Recency, RecencyProbe, SyntheticProbe,
 };
 pub use logging::{
-    apply_redaction, emit as emit_structured, should_sample as should_sample_log,
-    EventType as LogEventType, LogLevel, LoggingConfig, SamplingConfig, Sink, StructuredLog,
-    SCHEMA_VERSION,
+    apply_redaction, apply_redaction_for, emit as emit_structured,
+    should_sample as should_sample_log, EventType as LogEventType, LogLevel, LoggingConfig,
+    SamplingConfig, Sink, StructuredLog, SCHEMA_VERSION,
 };
 pub use metrics::{metrics, sanitize_label, ProxyMetrics};
 pub use notify::{

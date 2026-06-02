@@ -254,7 +254,58 @@ proxy:
 * Default replacement is `[REDACTED:<RULE_NAME_UPPER>]` (e.g. `[REDACTED:EMAIL]`).
 * The PII pass is anchor-prefilter accelerated (Aho-Corasick), so adding rules carries no measurable overhead on logs that contain none of them.
 
-Per-tenant and per-origin redact blocks (including PII) are a planned follow-up; today operators land all rules at the proxy scope.
+#### Tenant-scope PII
+
+A tenant can author its own `pii:` block under `tenants[].observability.log.redact.pii`. The tenant-scope block composes on top of the proxy-scope block: the tenant inherits the proxy's `enabled` flag and its rule set, adds the tenant's `rules:` entries, and subtracts the tenant's `disable:` entries. An explicit `enabled: false` opts the tenant out even when proxy scope has the pass on, useful when one tenant is a regulated workload (HIPAA, PCI) that wants a stricter or laxer rule set than the rest of the fleet:
+
+```yaml
+proxy:
+  observability:
+    log:
+      redact:
+        pii:
+          enabled: true
+          rules: [email, us_ssn]
+  tenants:
+    - id: hipaa-tenant
+      observability:
+        log:
+          redact:
+            pii:
+              enabled: true
+              rules: [email, us_ssn, hipaa_mrn, hipaa_patient_id]
+              disable: [phone_us]
+```
+
+In this example, `hipaa-tenant` inherits `email + us_ssn` from the proxy, adds `hipaa_mrn + hipaa_patient_id`, and drops `phone_us` from the active set. Every other tenant continues to run only the proxy-scope set. A tenant id appearing here that is not declared under `proxy.tenants[].id` is rejected by config compile (the same rule that governs `origin.tenant_id`).
+
+#### Origin-scope PII
+
+An origin can author its own `pii:` block under `origins[hostname].observability.log.redact.pii`. The origin-scope block composes on top of the tenant-scope block (or the proxy-scope block when the origin has no `tenant_id`). The same inherit + extend + disable rules apply, one level deeper:
+
+```yaml
+origins:
+  "api.acme.example.com":
+    tenant_id: hipaa-tenant
+    action:
+      type: proxy
+      url: https://acme-upstream.internal
+    observability:
+      log:
+        redact:
+          pii:
+            rules: [billing_account]
+```
+
+`api.acme.example.com` resolves the tenant `hipaa-tenant` first (which itself inherits from the proxy scope), then adds `billing_account` on top, giving an active rule set of `email + us_ssn + hipaa_mrn + hipaa_patient_id + billing_account` (with `phone_us` still disabled, inherited from the tenant).
+
+#### Resolution rules
+
+* Resolution at emit time walks origin scope first, then the origin's tenant scope, then the proxy scope. The most-specific scope that authored a block wins on the `enabled` flag.
+* A scope that omits `enabled:` inherits the parent scope's flag. A scope that sets `enabled: false` explicitly opts out, even when the parent enables the pass.
+* The rule set inherits + extends + subtracts at each level: parent rules carry through, the child's `rules:` are added, the child's `disable:` is removed last.
+* Unknown rule names at any scope are warn-logged at startup and skipped. The install continues with the rest of the resolved set so an operator typo does not silently disable the whole pass.
+* The field-key denylist and regex masks under `proxy.observability.log.redact.fields:` / `patterns:` remain proxy-scope only today; they touch the rendered JSON, which is tenant-agnostic at the emitter.
 
 #### Reversible PII redaction (AI origins)
 

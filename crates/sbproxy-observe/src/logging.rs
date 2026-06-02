@@ -371,10 +371,24 @@ pub struct OpRedactState {
     pub fields: Vec<String>,
     /// Compiled regex masks. Each entry is `(regex, replacement)`.
     pub patterns: Vec<(regex::Regex, String)>,
-    /// Optional PII redactor (rule-driven, with Aho-Corasick anchor
-    /// prefilter). Built once from the resolved rule set; `None` when
-    /// the operator does not enable PII at the proxy scope.
-    pub pii: Option<sbproxy_security::pii::PiiRedactor>,
+    /// Resolved PII redactor at proxy scope (the PR1 path). `None`
+    /// when the operator has not enabled PII at proxy scope. Built
+    /// once from the resolved rule set with Aho-Corasick anchor
+    /// prefiltering so the hot path is allocation-free on clean
+    /// input.
+    pub proxy_pii: Option<sbproxy_security::pii::PiiRedactor>,
+    /// Pre-built per-tenant redactor. Keyed by tenant id. A tenant
+    /// without an entry inherits the proxy-scope redactor. A tenant
+    /// with an entry whose stored value is `None` opts out of all
+    /// PII redaction (the explicit-disable case); a `Some(redactor)`
+    /// is the composed rule set (parent inheritance plus this scope's
+    /// add list minus the disable list).
+    pub tenant_pii: std::collections::HashMap<String, Option<sbproxy_security::pii::PiiRedactor>>,
+    /// Pre-built per-origin redactor. Keyed by the route string the
+    /// emitter stamps on `StructuredLog.route` (today: the origin's
+    /// `hostname`). Resolution at emit time is origin > tenant >
+    /// proxy. A `Some(None)` slot is the explicit-disable case.
+    pub origin_pii: std::collections::HashMap<String, Option<sbproxy_security::pii::PiiRedactor>>,
 }
 
 impl OpRedactState {
@@ -383,8 +397,35 @@ impl OpRedactState {
         Self {
             fields: Vec::new(),
             patterns: Vec::new(),
-            pii: None,
+            proxy_pii: None,
+            tenant_pii: std::collections::HashMap::new(),
+            origin_pii: std::collections::HashMap::new(),
         }
+    }
+
+    /// Resolve the active PII redactor for a (tenant, route) pair.
+    /// Most-specific scope wins: an origin entry (even one that opts
+    /// out with `Some(None)`) overrides the tenant entry, which in
+    /// turn overrides the proxy-scope redactor. A scope that has no
+    /// entry at all inherits the next scope up. Returns `None` when
+    /// no scope has a redactor installed or the most-specific scope
+    /// explicitly opted out.
+    pub fn resolve_pii(
+        &self,
+        tenant_id: Option<&str>,
+        route: Option<&str>,
+    ) -> Option<&sbproxy_security::pii::PiiRedactor> {
+        if let Some(r) = route {
+            if let Some(slot) = self.origin_pii.get(r) {
+                return slot.as_ref();
+            }
+        }
+        if let Some(t) = tenant_id {
+            if let Some(slot) = self.tenant_pii.get(t) {
+                return slot.as_ref();
+            }
+        }
+        self.proxy_pii.as_ref()
     }
 }
 
@@ -432,25 +473,45 @@ fn op_redact_state() -> std::sync::Arc<OpRedactState> {
 ///    (`proxy.observability.log.redact.patterns:`). Each pattern is
 ///    applied to the rendered JSON after the field-key pass.
 pub fn apply_redaction(json: &str, sink: Sink) -> String {
+    apply_redaction_for(json, sink, None, None)
+}
+
+/// Tenant- and route-aware variant of [`apply_redaction`]. The hot
+/// emit path threads `StructuredLog.tenant_id` and `StructuredLog.route`
+/// into the resolver so the PII pass can pick a tenant- or origin-scope
+/// rule set (per WOR-1043 PR2 / PR3). `None, None` reproduces the
+/// legacy behaviour and is what [`apply_redaction`] passes for callers
+/// without a scope.
+pub fn apply_redaction_for(
+    json: &str,
+    sink: Sink,
+    tenant_id: Option<&str>,
+    route: Option<&str>,
+) -> String {
     let pattern_redacted = crate::redact::redact_secrets(json);
 
     let mut value: serde_json::Value = match serde_json::from_str(&pattern_redacted) {
         Ok(v) => v,
-        Err(_) => return apply_op_regex_patterns(&pattern_redacted),
+        Err(_) => return apply_op_regex_patterns(&pattern_redacted, tenant_id, route),
     };
     redact_value(&mut value, sink);
     let rendered = serde_json::to_string(&value).unwrap_or(pattern_redacted);
 
-    apply_op_regex_patterns(&rendered)
+    apply_op_regex_patterns(&rendered, tenant_id, route)
 }
 
 /// Apply the operator-supplied regex patterns and, when configured,
 /// the PII redactor to the JSON-rendered string. Compiled at config
-/// load so the hot path is just pattern dispatch.
-fn apply_op_regex_patterns(input: &str) -> String {
+/// load so the hot path is just pattern dispatch. The PII redactor
+/// is selected by walking origin -> tenant -> proxy via
+/// [`OpRedactState::resolve_pii`]; an explicit opt-out at a
+/// more-specific scope (the `Some(None)` slot) skips the PII pass
+/// entirely.
+fn apply_op_regex_patterns(input: &str, tenant_id: Option<&str>, route: Option<&str>) -> String {
     let state = op_redact_state();
     let needs_regex = !state.patterns.is_empty();
-    let needs_pii = state.pii.is_some();
+    let pii = state.resolve_pii(tenant_id, route);
+    let needs_pii = pii.is_some();
     if !needs_regex && !needs_pii {
         return input.to_string();
     }
@@ -462,11 +523,11 @@ fn apply_op_regex_patterns(input: &str) -> String {
         }
         out = std::borrow::Cow::Owned(owned);
     }
-    if let Some(pii) = &state.pii {
+    if let Some(p) = pii {
         // PiiRedactor::redact returns Cow::Borrowed on clean input
         // (no allocation when there is no PII to redact) and
         // Cow::Owned on a match.
-        out = pii.redact(out.as_ref()).into_owned().into();
+        out = p.redact(out.as_ref()).into_owned().into();
     }
     out.into_owned()
 }
@@ -628,7 +689,17 @@ pub fn emit(record: &StructuredLog, sink: Sink) {
         Ok(s) => s,
         Err(_) => return,
     };
-    let redacted = apply_redaction(&json, sink);
+    // Route the PII pass through the record's tenant + origin
+    // identifiers so a tenant- or origin-scope override can win
+    // over the proxy-scope rule set (WOR-1043 PR2 / PR3). Records
+    // without a tenant / route fall back to the proxy-scope behaviour
+    // exactly as PR1 emitted them.
+    let redacted = apply_redaction_for(
+        &json,
+        sink,
+        record.tenant_id.as_deref(),
+        record.route.as_deref(),
+    );
     // `tracing::*!` requires a literal target. Branch on the
     // (sink, level) pair so each call site is a static literal.
     match (sink, record.level) {
@@ -774,7 +845,9 @@ mod tests {
         let _ = install_op_redact_config(OpRedactState {
             fields: vec!["internal_account_id".to_string()],
             patterns: Vec::new(),
-            pii: None,
+            proxy_pii: None,
+            tenant_pii: std::collections::HashMap::new(),
+            origin_pii: std::collections::HashMap::new(),
         });
         let json = r#"{"authorization":"Bearer x","internal_account_id":"acct-123456"}"#;
         let out = apply_redaction(json, Sink::AccessLog);
@@ -808,7 +881,9 @@ mod tests {
                 regex::Regex::new(r"cust_[a-z0-9]{6,}").expect("compiles"),
                 "[REDACTED:CUSTOMER_UUID]".to_string(),
             )],
-            pii: None,
+            proxy_pii: None,
+            tenant_pii: std::collections::HashMap::new(),
+            origin_pii: std::collections::HashMap::new(),
         });
         let json = r#"{"freeform":"cust_abc1234567 was here"}"#;
         let out = apply_redaction(json, Sink::AccessLog);
@@ -848,7 +923,9 @@ mod tests {
         let _ = install_op_redact_config(OpRedactState {
             fields: Vec::new(),
             patterns: Vec::new(),
-            pii: Some(pii),
+            proxy_pii: Some(pii),
+            tenant_pii: std::collections::HashMap::new(),
+            origin_pii: std::collections::HashMap::new(),
         });
         let json = r#"{"freeform":"ping alice@example.com please"}"#;
         let out = apply_redaction(json, Sink::AccessLog);
@@ -860,6 +937,210 @@ mod tests {
             !out.contains("alice@example.com"),
             "raw email leaked through PII pass: {out}"
         );
+        let _ = install_op_redact_config(OpRedactState::empty());
+    }
+
+    /// Helper for the tenant- / origin-scope tests below. Builds a
+    /// `PiiRedactor` that runs exactly the named built-in rules.
+    /// Panics on an unknown rule name so the test fixtures fail loud
+    /// instead of silently dropping a rule.
+    fn build_pii_for_test(rule_names: &[&str]) -> sbproxy_security::pii::PiiRedactor {
+        let defaults = sbproxy_security::pii::default_rules();
+        let mut selected = Vec::new();
+        for want in rule_names {
+            let r = defaults
+                .iter()
+                .find(|r| r.name.as_str() == *want)
+                .unwrap_or_else(|| panic!("rule `{want}` is not a built-in default"))
+                .clone();
+            selected.push(r);
+        }
+        let cfg = sbproxy_security::pii::PiiConfig {
+            enabled: true,
+            defaults: false,
+            redact_request: false,
+            redact_response: false,
+            rules: selected,
+        };
+        sbproxy_security::pii::PiiRedactor::from_config(&cfg).expect("rules compile")
+    }
+
+    /// WOR-1043 PR2: a tenant-scope `pii:` block overrides the
+    /// proxy-scope decision. Proxy scope ships no PII pass; tenant
+    /// `acme` enables the `email` rule. A record carrying
+    /// `tenant_id = Some("acme")` must redact the email; a record at
+    /// any other tenant must not (covered by
+    /// `proxy_pii_isolated_from_other_tenant` below).
+    #[test]
+    fn tenant_pii_overrides_proxy_runs_email_rule() {
+        let _guard = OP_REDACT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut tenant_pii: std::collections::HashMap<
+            String,
+            Option<sbproxy_security::pii::PiiRedactor>,
+        > = std::collections::HashMap::new();
+        tenant_pii.insert("acme".to_string(), Some(build_pii_for_test(&["email"])));
+
+        let _ = install_op_redact_config(OpRedactState {
+            fields: Vec::new(),
+            patterns: Vec::new(),
+            proxy_pii: None,
+            tenant_pii,
+            origin_pii: std::collections::HashMap::new(),
+        });
+
+        let json = r#"{"freeform":"ping alice@example.com please"}"#;
+        let out = apply_redaction_for(json, Sink::AccessLog, Some("acme"), None);
+        assert!(
+            out.contains("[REDACTED:EMAIL]"),
+            "tenant-scope PII pass missed email: {out}"
+        );
+        assert!(
+            !out.contains("alice@example.com"),
+            "raw email leaked through tenant PII pass: {out}"
+        );
+
+        let _ = install_op_redact_config(OpRedactState::empty());
+    }
+
+    /// WOR-1043 PR2: a tenant-scope `pii:` block does NOT leak to a
+    /// sibling tenant. Proxy scope is off; only tenant `acme` enables
+    /// the `email` rule; a record at tenant `other` must keep its
+    /// email verbatim.
+    #[test]
+    fn proxy_pii_isolated_from_other_tenant() {
+        let _guard = OP_REDACT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut tenant_pii: std::collections::HashMap<
+            String,
+            Option<sbproxy_security::pii::PiiRedactor>,
+        > = std::collections::HashMap::new();
+        tenant_pii.insert("acme".to_string(), Some(build_pii_for_test(&["email"])));
+
+        let _ = install_op_redact_config(OpRedactState {
+            fields: Vec::new(),
+            patterns: Vec::new(),
+            proxy_pii: None,
+            tenant_pii,
+            origin_pii: std::collections::HashMap::new(),
+        });
+
+        let json = r#"{"freeform":"ping alice@example.com please"}"#;
+        let out = apply_redaction_for(json, Sink::AccessLog, Some("other"), None);
+        assert!(
+            !out.contains("[REDACTED:EMAIL]"),
+            "sibling tenant should not have run PII pass: {out}"
+        );
+        assert!(
+            out.contains("alice@example.com"),
+            "raw email expected to remain at sibling tenant: {out}"
+        );
+
+        let _ = install_op_redact_config(OpRedactState::empty());
+    }
+
+    /// WOR-1043 PR3: an origin-scope `pii:` block extends the
+    /// tenant-scope rule set. Tenant `acme` enables `email`; origin
+    /// `api.acme.example.com` adds `credit_card`. A record at both
+    /// scopes must redact both shapes.
+    #[test]
+    fn origin_pii_extends_tenant_rules() {
+        let _guard = OP_REDACT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut tenant_pii: std::collections::HashMap<
+            String,
+            Option<sbproxy_security::pii::PiiRedactor>,
+        > = std::collections::HashMap::new();
+        tenant_pii.insert("acme".to_string(), Some(build_pii_for_test(&["email"])));
+        let mut origin_pii: std::collections::HashMap<
+            String,
+            Option<sbproxy_security::pii::PiiRedactor>,
+        > = std::collections::HashMap::new();
+        origin_pii.insert(
+            "api.acme.example.com".to_string(),
+            Some(build_pii_for_test(&["email", "credit_card"])),
+        );
+
+        let _ = install_op_redact_config(OpRedactState {
+            fields: Vec::new(),
+            patterns: Vec::new(),
+            proxy_pii: None,
+            tenant_pii,
+            origin_pii,
+        });
+
+        let json = r#"{"freeform":"alice@example.com paid via 4111 1111 1111 1111 last week"}"#;
+        let out = apply_redaction_for(
+            json,
+            Sink::AccessLog,
+            Some("acme"),
+            Some("api.acme.example.com"),
+        );
+        assert!(
+            out.contains("[REDACTED:EMAIL]"),
+            "origin-scope PII pass missed email: {out}"
+        );
+        assert!(
+            out.contains("[REDACTED:CARD]"),
+            "origin-scope PII pass missed credit card: {out}"
+        );
+        assert!(
+            !out.contains("alice@example.com"),
+            "raw email leaked: {out}"
+        );
+        assert!(
+            !out.contains("4111 1111 1111 1111"),
+            "raw credit card leaked: {out}"
+        );
+
+        let _ = install_op_redact_config(OpRedactState::empty());
+    }
+
+    /// WOR-1043 PR2: an explicit opt-out at tenant scope wins over a
+    /// proxy-scope `enabled: true`. Proxy enables `email`; tenant
+    /// `hipaa` stores `Some(None)` (the explicit-disable case). A
+    /// record at tenant `hipaa` keeps its email verbatim; a record
+    /// outside the tenant still gets redacted by the proxy default.
+    #[test]
+    fn pii_resolution_explicit_disable_at_tenant_overrides_proxy() {
+        let _guard = OP_REDACT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let proxy_pii = build_pii_for_test(&["email"]);
+        let mut tenant_pii: std::collections::HashMap<
+            String,
+            Option<sbproxy_security::pii::PiiRedactor>,
+        > = std::collections::HashMap::new();
+        tenant_pii.insert("hipaa".to_string(), None);
+
+        let _ = install_op_redact_config(OpRedactState {
+            fields: Vec::new(),
+            patterns: Vec::new(),
+            proxy_pii: Some(proxy_pii),
+            tenant_pii,
+            origin_pii: std::collections::HashMap::new(),
+        });
+
+        let json = r#"{"freeform":"ping alice@example.com please"}"#;
+        let at_hipaa = apply_redaction_for(json, Sink::AccessLog, Some("hipaa"), None);
+        assert!(
+            !at_hipaa.contains("[REDACTED:EMAIL]"),
+            "tenant explicit-disable should have skipped the PII pass: {at_hipaa}"
+        );
+        assert!(
+            at_hipaa.contains("alice@example.com"),
+            "raw email expected at opted-out tenant: {at_hipaa}"
+        );
+
+        let at_default = apply_redaction_for(json, Sink::AccessLog, None, None);
+        assert!(
+            at_default.contains("[REDACTED:EMAIL]"),
+            "proxy-scope default should still redact: {at_default}"
+        );
+
         let _ = install_op_redact_config(OpRedactState::empty());
     }
 

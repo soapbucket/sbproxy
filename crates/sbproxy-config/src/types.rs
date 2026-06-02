@@ -1875,18 +1875,25 @@ pub struct ObservabilityRedactConfig {
 /// emitted log line, regardless of origin.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ObservabilityPiiConfig {
-    /// Master switch. When `false`, the redactor is never built and
-    /// the pipeline shorts the PII pass.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Names of the built-in rules to enable. When empty, all default
-    /// rules are enabled (the spirit of "PII redaction on" is the
-    /// least-surprising default).
+    /// Master switch. When `Some(false)`, the redactor is never built
+    /// and the pipeline shorts the PII pass at this scope (and any
+    /// more-specific scope that inherits without overriding).
+    /// When `None`, the scope inherits its parent's `enabled` flag
+    /// (proxy default is "off"); `Some(true)` turns the pass on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Names of the built-in rules to enable. When empty at the proxy
+    /// scope, all default rules are enabled (the spirit of "PII
+    /// redaction on" is the least-surprising default). At a tenant or
+    /// origin scope the list is ADDED to the parent's resolved set,
+    /// not replaced.
     #[serde(default)]
     pub rules: Vec<String>,
     /// Names of built-in rules to opt out of even when included by
     /// `rules:` or by the default-all behaviour. The matching name is
-    /// case-sensitive.
+    /// case-sensitive. At a tenant or origin scope the list is
+    /// SUBTRACTED from the resolved set (parent inheritance plus this
+    /// scope's `rules:` additions).
     #[serde(default)]
     pub disable: Vec<String>,
 }
@@ -2147,6 +2154,55 @@ pub struct ProxyTenantConfig {
     /// credentials of the same name unless overridden here.
     #[serde(default)]
     pub credentials: Vec<CredentialBlock>,
+    /// Tenant-scoped observability block. Today the only nested
+    /// surface is `log.redact.pii`, which composes against the
+    /// proxy-scope `observability.log.redact.pii` block (see
+    /// [`ObservabilityPiiConfig`]). Origin-scope and proxy-scope
+    /// values compose in the same shape; resolution at emit time
+    /// walks origin -> tenant -> proxy with most-specific-wins on
+    /// `enabled` and a rules set that inherits + extends + disables.
+    /// Absent leaves the tenant inheriting whatever proxy scope
+    /// declared (or no PII pass at all).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observability: Option<TenantObservabilityConfig>,
+}
+
+/// Tenant-scope observability sub-tree. Currently only the
+/// `log.redact.pii` leaf is consumed at runtime; the nested layers
+/// exist so the on-disk schema mirrors `proxy.observability.log.redact.pii`
+/// and we can extend the tree (e.g. tenant-scoped sinks) without a
+/// breaking shape change.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct TenantObservabilityConfig {
+    /// Tenant-scoped log block. See [`TenantObservabilityLogConfig`].
+    #[serde(default)]
+    pub log: TenantObservabilityLogConfig,
+}
+
+/// Tenant-scope `log:` sub-block. Mirrors the proxy-scope
+/// `ObservabilityLogConfig` but exposes only the redaction leaf today.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct TenantObservabilityLogConfig {
+    /// Tenant-scope `redact:` sub-block. See
+    /// [`TenantObservabilityRedactConfig`].
+    #[serde(default)]
+    pub redact: TenantObservabilityRedactConfig,
+}
+
+/// Tenant-scope `redact:` sub-block. Today only `pii:` is honoured;
+/// the field-key and pattern overrides remain proxy-scope only because
+/// they touch the rendered JSON, which is tenant-agnostic in the
+/// emitter.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct TenantObservabilityRedactConfig {
+    /// Tenant-scope override for the proxy-scope PII pass. Resolution
+    /// rules: the tenant inherits the proxy-scope `enabled` flag and
+    /// the proxy-scope rule set, then ADDS its own `rules:` entries
+    /// and SUBTRACTS its own `disable:` entries. An explicit
+    /// `enabled: false` opts the tenant out even when proxy-scope
+    /// enables PII. See [`ObservabilityPiiConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pii: Option<ObservabilityPiiConfig>,
 }
 
 /// Canonical credentials block. Sits under
@@ -2565,6 +2621,49 @@ pub struct RawOriginConfig {
     /// Bot Auth accepts SBproxy as a verified agent. Default `false`.
     #[serde(default)]
     pub outbound_web_bot_auth: bool,
+    /// Origin-scope observability block. Today the only nested surface
+    /// is `log.redact.pii`, which composes against the tenant-scope
+    /// block (or proxy-scope when the origin has no tenant). See
+    /// [`OriginObservabilityConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observability: Option<OriginObservabilityConfig>,
+}
+
+/// Origin-scope observability sub-tree. Currently only the
+/// `log.redact.pii` leaf is consumed at runtime; the nested layers
+/// exist so the on-disk schema mirrors the tenant + proxy shape.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct OriginObservabilityConfig {
+    /// Origin-scope log block. See [`OriginObservabilityLogConfig`].
+    #[serde(default)]
+    pub log: OriginObservabilityLogConfig,
+}
+
+/// Origin-scope `log:` sub-block. Mirrors the proxy-scope and
+/// tenant-scope shape but exposes only the redaction leaf today.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct OriginObservabilityLogConfig {
+    /// Origin-scope `redact:` sub-block. See
+    /// [`OriginObservabilityRedactConfig`].
+    #[serde(default)]
+    pub redact: OriginObservabilityRedactConfig,
+}
+
+/// Origin-scope `redact:` sub-block. Today only `pii:` is honoured;
+/// the field-key and pattern overrides remain proxy-scope only because
+/// they touch the rendered JSON, which is hostname-agnostic in the
+/// emitter.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct OriginObservabilityRedactConfig {
+    /// Origin-scope override for the tenant-scope (or proxy-scope
+    /// when the origin has no tenant) PII pass. Resolution rules:
+    /// the origin inherits the parent scope's `enabled` flag and rule
+    /// set, then ADDS its own `rules:` entries and SUBTRACTS its own
+    /// `disable:` entries. An explicit `enabled: false` opts the
+    /// origin out even when parent scopes enable PII. See
+    /// [`ObservabilityPiiConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pii: Option<ObservabilityPiiConfig>,
 }
 
 /// Per-origin agents.json manifest configuration (WOR-820). See the
@@ -4653,6 +4752,81 @@ error_pages:
         assert!(pages[0].status.matches(401));
         assert!(pages[1].status.matches(403));
         assert!(pages[1].status.matches(404));
+    }
+
+    /// WOR-1043 PR2: a `tenants[].observability.log.redact.pii:` block
+    /// deserialises into [`TenantObservabilityConfig`] and the rule
+    /// list survives. Round-trip ensures the nested `log.redact.pii`
+    /// path matches the on-disk YAML shape the ticket spelled out.
+    #[test]
+    fn tenant_observability_redact_pii_round_trips() {
+        let yaml = r#"
+id: hipaa-tenant
+observability:
+  log:
+    redact:
+      pii:
+        enabled: true
+        rules: [email, us_ssn]
+        disable: [phone_us]
+"#;
+        let tenant: ProxyTenantConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(tenant.id, "hipaa-tenant");
+        let pii = tenant
+            .observability
+            .as_ref()
+            .expect("observability block parses")
+            .log
+            .redact
+            .pii
+            .as_ref()
+            .expect("pii block parses");
+        assert_eq!(pii.enabled, Some(true));
+        assert_eq!(pii.rules, vec!["email".to_string(), "us_ssn".to_string()]);
+        assert_eq!(pii.disable, vec!["phone_us".to_string()]);
+    }
+
+    /// WOR-1043 PR3: an `origins[hostname].observability.log.redact.pii:`
+    /// block deserialises into [`OriginObservabilityConfig`] and the
+    /// rule list survives. Origin scope mirrors the tenant shape; the
+    /// composer at startup intersects the lists.
+    #[test]
+    fn origin_observability_redact_pii_round_trips() {
+        let yaml = r#"
+action:
+  type: proxy
+  url: http://upstream
+tenant_id: hipaa-tenant
+observability:
+  log:
+    redact:
+      pii:
+        rules: [billing_account]
+"#;
+        let origin: RawOriginConfig = serde_yaml::from_str(yaml).unwrap();
+        let pii = origin
+            .observability
+            .as_ref()
+            .expect("observability block parses")
+            .log
+            .redact
+            .pii
+            .as_ref()
+            .expect("pii block parses");
+        assert_eq!(pii.enabled, None);
+        assert_eq!(pii.rules, vec!["billing_account".to_string()]);
+        assert!(pii.disable.is_empty());
+    }
+
+    /// WOR-1043 PR1 back-compat: a tenant with no `observability`
+    /// block parses cleanly. Belt-and-suspenders coverage so the new
+    /// optional field doesn't accidentally require an empty stub.
+    #[test]
+    fn tenant_without_observability_parses() {
+        let yaml = "id: plain-tenant";
+        let tenant: ProxyTenantConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(tenant.id, "plain-tenant");
+        assert!(tenant.observability.is_none());
     }
 }
 

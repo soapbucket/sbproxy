@@ -850,6 +850,7 @@ mod tests {
                 agents_json: None,
                 outbound_credential: None,
                 outbound_web_bot_auth: false,
+                observability: None,
             }],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),
