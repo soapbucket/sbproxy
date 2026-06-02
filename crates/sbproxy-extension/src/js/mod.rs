@@ -556,6 +556,47 @@ fn json_to_js<'js>(
     }
 }
 
+/// Build the `principal` global the JS engine reads at policy
+/// evaluation time. Returns a JSON object the caller can splice into
+/// the `globals` map passed to [`JsEngine::execute`] or set on the
+/// `ctx` argument of `call_function`. Mirrors the CEL
+/// `principal.*` namespace and the Lua `build_principal_table`
+/// helper so a policy written for CEL ports unchanged to JS.
+///
+/// Empty / missing fields render as empty strings / arrays / objects
+/// so a script can read `principal.attrs.team` and branch on the
+/// value without first probing for presence.
+#[allow(clippy::too_many_arguments)]
+pub fn build_principal_json(
+    tenant_id: Option<&str>,
+    sub: Option<&str>,
+    source: Option<&str>,
+    virtual_key_name: Option<&str>,
+    virtual_key_allowed_providers: &[String],
+    project: Option<&str>,
+    user: Option<&str>,
+    team: Option<&str>,
+    tags: &[String],
+    metadata: &std::collections::BTreeMap<String, String>,
+    roles: &[String],
+    claims: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> serde_json::Value {
+    crate::lua::bindings::build_principal_table(
+        tenant_id,
+        sub,
+        source,
+        virtual_key_name,
+        virtual_key_allowed_providers,
+        project,
+        user,
+        team,
+        tags,
+        metadata,
+        roles,
+        claims,
+    )
+}
+
 /// Convert a `rquickjs::Value` to `serde_json::Value`.
 ///
 /// Uses `JSON.stringify` for reliable conversion of all JS value types,
