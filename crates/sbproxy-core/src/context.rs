@@ -667,25 +667,18 @@ pub struct RequestContext {
     pub ai_prompt_name: Option<String>,
     /// WOR-800: resolved version label of [`Self::ai_prompt_name`].
     pub ai_prompt_version: Option<String>,
-    /// WOR-894: project this request's virtual key belongs to. Surfaced
-    /// on the access log so usage / cost reports can group by project.
-    /// `None` when no virtual key matched or the matched key declared no
-    /// project.
-    pub ai_project: Option<String>,
-    /// WOR-894: user (or principal) this request's virtual key belongs
-    /// to. Same reporting path as [`Self::ai_project`].
-    pub ai_user: Option<String>,
-    /// WOR-894: arbitrary string-keyed metadata copied off the matched
-    /// virtual key, surfaced on the access log as a JSON object so
-    /// reports can group by a custom dimension.
-    pub ai_metadata: std::collections::HashMap<String, String>,
-    /// Tags lifted off the matched virtual key. Surfaced as labels
-    /// on the per-credential attribution metric
-    /// `sbproxy_tokens_attributed_total{tag}` so a Prometheus query
-    /// can fan out spend per declared tag (`team:frontend`,
-    /// `env:prod`, etc.). Empty when no key matched or the matched
-    /// key declared no tags.
-    pub ai_tags: Vec<String>,
+    /// Unified inbound identity carrier. Populated by the auth
+    /// pipeline (today: AI virtual-key match writes the
+    /// `virtual_key` field + `attrs` from the matched key). Reads
+    /// across the codebase walk `principal.attrs.project`,
+    /// `principal.attrs.user`, `principal.attrs.metadata`,
+    /// `principal.attrs.tags` rather than maintaining a parallel
+    /// `ai_*` shape.
+    ///
+    /// Defaults to [`sbproxy_plugin::Principal::anonymous`] for
+    /// un-matched requests; access-log + metric paths short-circuit
+    /// on `is_anonymous` to skip attribution work.
+    pub principal: sbproxy_plugin::Principal,
     /// AI model identifier the request routed to (e.g. `gpt-4o`,
     /// `claude-sonnet-4-6`). Captured before the upstream call so
     /// the access log records the resolved model even when the
@@ -1031,10 +1024,7 @@ impl RequestContext {
             ai_provider: None,
             ai_prompt_name: None,
             ai_prompt_version: None,
-            ai_project: None,
-            ai_user: None,
-            ai_metadata: std::collections::HashMap::new(),
-            ai_tags: Vec::new(),
+            principal: sbproxy_plugin::Principal::anonymous(),
             ai_model: None,
             ai_tokens_in: None,
             ai_tokens_out: None,

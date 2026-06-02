@@ -140,10 +140,19 @@ pub(super) async fn handle_ai_proxy(
 
     // Handle GET requests (e.g. /v1/models) by forwarding to first enabled provider.
     if method == http::Method::GET {
-        let provider_idx = router.select(&config.providers).ok_or_else(|| {
-            warn!("AI proxy: no enabled providers");
-            Error::new(ErrorType::HTTPStatus(502))
-        })?;
+        let provider_idx = router
+            .select_with_allowed(
+                &config.providers,
+                ctx.principal
+                    .virtual_key
+                    .as_ref()
+                    .map(|vk| vk.allowed_providers.as_slice())
+                    .unwrap_or(&[]),
+            )
+            .ok_or_else(|| {
+                warn!("AI proxy: no enabled providers");
+                Error::new(ErrorType::HTTPStatus(502))
+            })?;
         let provider = &config.providers[provider_idx];
 
         let resp = AI_CLIENT
@@ -191,10 +200,19 @@ pub(super) async fn handle_ai_proxy(
             | http::Method::PATCH
             | http::Method::OPTIONS
     ) {
-        let provider_idx = router.select(&config.providers).ok_or_else(|| {
-            warn!("AI proxy: no enabled providers");
-            Error::new(ErrorType::HTTPStatus(502))
-        })?;
+        let provider_idx = router
+            .select_with_allowed(
+                &config.providers,
+                ctx.principal
+                    .virtual_key
+                    .as_ref()
+                    .map(|vk| vk.allowed_providers.as_slice())
+                    .unwrap_or(&[]),
+            )
+            .ok_or_else(|| {
+                warn!("AI proxy: no enabled providers");
+                Error::new(ErrorType::HTTPStatus(502))
+            })?;
         let provider = &config.providers[provider_idx];
 
         // Read the body for methods that typically carry one. DELETE,
@@ -433,10 +451,19 @@ pub(super) async fn handle_ai_proxy(
     };
 
     if is_multipart_request {
-        let provider_idx = router.select(&config.providers).ok_or_else(|| {
-            warn!("AI proxy: no enabled providers");
-            Error::new(ErrorType::HTTPStatus(502))
-        })?;
+        let provider_idx = router
+            .select_with_allowed(
+                &config.providers,
+                ctx.principal
+                    .virtual_key
+                    .as_ref()
+                    .map(|vk| vk.allowed_providers.as_slice())
+                    .unwrap_or(&[]),
+            )
+            .ok_or_else(|| {
+                warn!("AI proxy: no enabled providers");
+                Error::new(ErrorType::HTTPStatus(502))
+            })?;
         let provider = &config.providers[provider_idx];
 
         let resp = AI_CLIENT
@@ -652,14 +679,40 @@ pub(super) async fn handle_ai_proxy(
                 .iter()
                 .find(|vk| vk.enabled && vk.key == key)
             {
-                ctx.ai_project = vk.project.clone();
-                ctx.ai_user = vk.user.clone();
-                if !vk.metadata.is_empty() {
-                    ctx.ai_metadata = vk.metadata.clone();
-                }
-                if !vk.tags.is_empty() {
-                    ctx.ai_tags = vk.tags.clone();
-                }
+                // Stamp the matched VK onto the unified Principal so
+                // the rest of the pipeline (access log, attribution
+                // metric, policy scripts, MCP RBAC) all read through
+                // one shape. The Principal carries the attribution
+                // attrs plus a `virtual_key` reference that downstream
+                // code uses to enforce `allowed_providers`.
+                let mut attrs = sbproxy_plugin::PrincipalAttrs {
+                    project: vk.project.clone(),
+                    user: vk.user.clone(),
+                    team: None,
+                    tags: vk.tags.clone(),
+                    metadata: vk
+                        .metadata
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                    roles: Vec::new(),
+                    claims: None,
+                };
+                // Reflect the matched key name into `sub` so the
+                // access-log + principal_kind columns can show which
+                // VK served the request.
+                let vk_name = vk.name.clone().unwrap_or_else(|| vk.key.clone());
+                let _ = &mut attrs;
+                ctx.principal = sbproxy_plugin::Principal {
+                    tenant_id: sbproxy_plugin::TenantId::from(ctx.tenant_id.as_str()),
+                    sub: vk_name.clone(),
+                    source: sbproxy_plugin::PrincipalSource::VirtualKey,
+                    virtual_key: Some(sbproxy_plugin::VirtualKeyRef {
+                        name: vk_name,
+                        allowed_providers: vk.allowed_providers.clone(),
+                    }),
+                    attrs,
+                };
                 // WOR-893: per-key model routing. When the key pins a
                 // model, overwrite the request body's `model` field so
                 // the downstream allow/block, routing, budget, and
@@ -1300,7 +1353,14 @@ pub(super) async fn handle_ai_proxy(
             let prefix = extract_prefix_key(&body, 1024);
             router.select_with_prefix(&config.providers, &prefix)
         } else {
-            router.select(&config.providers)
+            router.select_with_allowed(
+                &config.providers,
+                ctx.principal
+                    .virtual_key
+                    .as_ref()
+                    .map(|vk| vk.allowed_providers.as_slice())
+                    .unwrap_or(&[]),
+            )
         };
         if let Some(primary) = primary {
             if let Some(pos) = provider_order.iter().position(|&i| i == primary) {
@@ -2059,9 +2119,9 @@ pub(super) async fn relay_ai_response_with_cache(
             if let Some(ctx) = ctx.as_mut() {
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);
-                let project = ctx.ai_project.as_deref().unwrap_or("");
-                let user = ctx.ai_user.as_deref().unwrap_or("");
-                if ctx.ai_tags.is_empty() {
+                let project = ctx.principal.attrs.project.as_deref().unwrap_or("");
+                let user = ctx.principal.attrs.user.as_deref().unwrap_or("");
+                if ctx.principal.attrs.tags.is_empty() {
                     sbproxy_observe::metrics::record_tokens_attributed(
                         project,
                         user,
@@ -2077,7 +2137,7 @@ pub(super) async fn relay_ai_response_with_cache(
                         completion_tokens,
                     );
                 } else {
-                    for tag in &ctx.ai_tags {
+                    for tag in &ctx.principal.attrs.tags {
                         sbproxy_observe::metrics::record_tokens_attributed(
                             project,
                             user,

@@ -396,7 +396,7 @@ pub(super) fn emit_access_log(
     // AI handler; the attribution-relevant principal is the matched
     // VK, not the bearer / api_key that the request used to reach the
     // AI handler.
-    let principal_kind = if ctx.ai_project.is_some() || ctx.ai_user.is_some() {
+    let principal_kind = if ctx.principal.virtual_key.is_some() {
         Some("virtual_key".to_string())
     } else {
         Some(auth_type.clone().unwrap_or_else(|| "none".to_string()))
@@ -528,9 +528,15 @@ pub(super) fn emit_access_log(
         model: ctx.ai_model.clone(),
         prompt_name: ctx.ai_prompt_name.clone(),
         prompt_version: ctx.ai_prompt_version.clone(),
-        project: ctx.ai_project.clone(),
-        user: ctx.ai_user.clone(),
-        metadata: ctx.ai_metadata.clone(),
+        project: ctx.principal.attrs.project.clone(),
+        user: ctx.principal.attrs.user.clone(),
+        metadata: ctx
+            .principal
+            .attrs
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
         tokens_in: ctx.ai_tokens_in,
         tokens_out: ctx.ai_tokens_out,
         ai_surface: ctx.ai_surface.clone(),
