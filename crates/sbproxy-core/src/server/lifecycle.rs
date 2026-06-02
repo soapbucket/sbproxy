@@ -55,11 +55,13 @@ pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<()> {
     // `observability.log.redact.pii:` overrides (WOR-1043 PR2 / PR3).
     install_op_redact_state(&compiled);
 
-    // WOR-1045 PR1: validate the declared sinks block. PR1 only
-    // warn-logs duplicates and unknown targets; dispatch wiring lands
-    // in PR2 so today's behaviour (single global tracing subscriber
-    // writing stdout) is preserved regardless of the sinks block.
+    // WOR-1045 PR1 + PR2: validate the declared sinks block and (PR2)
+    // build a SinkDispatcher from proxy + tenant + origin scopes so
+    // every declared sink receives the matching records. When no
+    // sinks block is declared, the dispatcher slot stays empty and
+    // the legacy `tracing::*!` fallback continues to drive stdout.
     validate_sinks_config(&compiled.server);
+    install_sink_dispatcher_from_config(&compiled);
 
     // WOR-173: refresh the AI provider catalog and rebuild the AI
     // client alongside the pipeline. Both globals live behind an
@@ -484,6 +486,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // (WOR-1043 PR2 / PR3) are composed off the proxy-scope rule set.
     install_op_redact_state(&compiled);
     validate_sinks_config(&server_config);
+    install_sink_dispatcher_from_config(&compiled);
 
     // Walk the inventory-based plugin registry once at startup and
     // emit one `sbproxy_plugin_registered_total{kind, plugin}` row
@@ -1226,6 +1229,15 @@ fn report_plugin_registrations() {
     }
 }
 
+/// Shared process-global mutex any test that touches the global
+/// `OP_REDACT_STATE` (directly via `install_op_redact_config` or
+/// indirectly via `reload_from_config_path` -> `install_op_redact_state`)
+/// must hold for the duration of its assertions. Without this guard
+/// two tests in the same binary race on the global slot and one
+/// clobbers the other's installed state mid-flight.
+#[cfg(test)]
+pub(crate) static OP_REDACT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Read `proxy.observability.log.redact:` (proxy scope) and walk
 /// `compiled.server.tenants` + `compiled.origins` for tenant- and
 /// origin-scope `observability.log.redact.pii:` overrides
@@ -1523,6 +1535,246 @@ fn validate_sinks_config(server: &sbproxy_config::ProxyServerConfig) {
     );
 }
 
+/// WOR-1045 PR2: build a [`sbproxy_observe::SinkDispatcher`] from the
+/// compiled config and install it process-wide. The dispatcher walks
+/// three scope lists:
+///
+/// * `proxy.observability.log.sinks:` (proxy scope, receives every record).
+/// * `tenants[].observability.log.sinks:` (tenant scope, filtered by
+///   `record.tenant_id`).
+/// * `origins[].observability.log.sinks:` (origin scope, filtered by
+///   `record.route`).
+///
+/// When zero sinks are declared the dispatcher installs an empty
+/// snapshot so `current_sink_dispatcher()` returns `None`; the
+/// `emit()` path then falls back to the legacy single `tracing::*!`
+/// subscriber and stdout behaviour is preserved.
+fn install_sink_dispatcher_from_config(compiled: &sbproxy_config::CompiledConfig) {
+    use sbproxy_observe::sink_dispatcher::{
+        install_sink_dispatcher, CompiledSink, SinkDispatcher, SinkScope,
+    };
+
+    // Resolve the top-level telemetry block once so OTLP sinks
+    // inherit `transport`, `service_name`, `resource_attrs` without
+    // re-deriving the defaults per sink.
+    let telemetry_defaults = compiled
+        .server
+        .observability
+        .as_ref()
+        .and_then(|o| o.telemetry.as_ref());
+
+    let mut compiled_sinks: Vec<CompiledSink> = Vec::new();
+
+    // Proxy scope.
+    let proxy_sinks: &[sbproxy_config::ObservabilitySinkConfig] = compiled
+        .server
+        .observability
+        .as_ref()
+        .and_then(|o| o.log.as_ref())
+        .map(|l| l.sinks.as_slice())
+        .unwrap_or(&[]);
+    for raw in proxy_sinks {
+        if let Some(sink) = compile_one_sink(raw, SinkScope::Proxy, false, telemetry_defaults) {
+            compiled_sinks.push(sink);
+        }
+    }
+
+    // Tenant scope.
+    for tenant in &compiled.server.tenants {
+        let Some(obs) = tenant.observability.as_ref() else {
+            continue;
+        };
+        for raw in &obs.log.sinks {
+            if let Some(sink) = compile_one_sink(
+                raw,
+                SinkScope::Tenant(tenant.id.clone()),
+                true,
+                telemetry_defaults,
+            ) {
+                compiled_sinks.push(sink);
+            }
+        }
+    }
+
+    // Origin scope.
+    for origin in &compiled.origins {
+        let Some(obs) = origin.observability.as_ref() else {
+            continue;
+        };
+        for raw in &obs.log.sinks {
+            if let Some(sink) = compile_one_sink(
+                raw,
+                SinkScope::Origin(origin.hostname.to_string()),
+                true,
+                telemetry_defaults,
+            ) {
+                compiled_sinks.push(sink);
+            }
+        }
+    }
+
+    let count = compiled_sinks.len();
+    install_sink_dispatcher(SinkDispatcher::new(compiled_sinks));
+    if count > 0 {
+        tracing::info!(
+            count,
+            "WOR-1045 PR2: installed sink dispatcher with declared sinks"
+        );
+    } else {
+        tracing::debug!(
+            "WOR-1045 PR2: no sinks declared; emit() falls back to the legacy tracing subscriber"
+        );
+    }
+}
+
+/// Compile a single declared sink. Returns `None` when the YAML
+/// declared an unknown target or output type the dispatcher cannot
+/// honour; we keep this lenient (warn + skip) rather than abort the
+/// whole reload because a single misconfigured sink should not take
+/// down the proxy.
+fn compile_one_sink(
+    raw: &sbproxy_config::ObservabilitySinkConfig,
+    scope: sbproxy_observe::sink_dispatcher::SinkScope,
+    default_external_profile: bool,
+    telemetry: Option<&sbproxy_config::ObservabilityTelemetryConfig>,
+) -> Option<sbproxy_observe::sink_dispatcher::CompiledSink> {
+    use sbproxy_observe::sink_dispatcher::{
+        CompiledSink, FileSink, Profile, SinkFormat, SinkOutput, StderrSink, StdoutSink,
+    };
+    use sbproxy_observe::Sink;
+
+    let target = match raw.target.as_str() {
+        "access_log" => Sink::AccessLog,
+        "error_log" => Sink::ErrorLog,
+        "audit_log" => Sink::AuditLog,
+        "trace_exporter" => Sink::TraceExporter,
+        "external_log" => Sink::External,
+        other => {
+            tracing::warn!(
+                sink = %raw.name,
+                target = %other,
+                "unknown sink target; skipping sink"
+            );
+            return None;
+        }
+    };
+
+    let format = match raw.format.as_deref().unwrap_or("compact") {
+        "pretty" => SinkFormat::Pretty,
+        "json" => SinkFormat::Json,
+        _ => SinkFormat::Compact,
+    };
+
+    let profile = match raw.profile.as_deref() {
+        Some("external") => Profile::External,
+        Some("internal") => Profile::Internal,
+        Some(other) => {
+            tracing::warn!(
+                sink = %raw.name,
+                profile = %other,
+                "unknown sink profile; defaulting to scope's default"
+            );
+            if default_external_profile {
+                Profile::External
+            } else {
+                Profile::Internal
+            }
+        }
+        None => {
+            if default_external_profile {
+                Profile::External
+            } else {
+                Profile::Internal
+            }
+        }
+    };
+
+    let output: Box<dyn SinkOutput> = match &raw.output {
+        sbproxy_config::ObservabilitySinkOutput::Stdout => Box::new(StdoutSink),
+        sbproxy_config::ObservabilitySinkOutput::Stderr => Box::new(StderrSink),
+        sbproxy_config::ObservabilitySinkOutput::File {
+            path,
+            max_size_mb,
+            max_backups,
+            compress,
+        } => {
+            let mut fs = FileSink::new(std::path::PathBuf::from(path));
+            if let Some(mb) = *max_size_mb {
+                fs.max_size_bytes = mb.saturating_mul(1024 * 1024);
+            }
+            if let Some(b) = *max_backups {
+                fs.max_backups = b as usize;
+            }
+            if let Some(c) = *compress {
+                fs.compress = c;
+            }
+            Box::new(fs)
+        }
+        sbproxy_config::ObservabilitySinkOutput::Otlp {
+            endpoint,
+            transport,
+            timeout_secs,
+        } => {
+            // The OTel BatchLogProcessor spawns a worker via
+            // `tokio::spawn`, which requires an ambient runtime. The
+            // first-boot install path runs before Pingora installs its
+            // runtime, so we skip with a warn there; the SIGHUP and
+            // file-watcher reload paths execute inside the running
+            // runtime and pick the sink up. Operators who want OTLP
+            // logs from the very first request can SIGHUP after boot.
+            if tokio::runtime::Handle::try_current().is_err() {
+                tracing::warn!(
+                    sink = %raw.name,
+                    "OTLP log sink declared but no tokio runtime is active; the sink will activate after the first SIGHUP / hot reload",
+                );
+                return None;
+            }
+            let transport_default = telemetry
+                .and_then(|t| t.transport.as_deref())
+                .unwrap_or("grpc");
+            let transport_str = transport.as_deref().unwrap_or(transport_default);
+            let transport = match transport_str {
+                "http" => sbproxy_observe::telemetry::OtlpTransport::Http,
+                _ => sbproxy_observe::telemetry::OtlpTransport::Grpc,
+            };
+            let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(10).max(1));
+            let service_name = telemetry
+                .and_then(|t| t.service_name.clone())
+                .unwrap_or_else(|| "sbproxy".to_string());
+            let resource_attrs = telemetry
+                .map(|t| t.resource_attrs.clone())
+                .unwrap_or_default();
+            let opts = sbproxy_observe::OtlpLogSinkOptions {
+                endpoint: endpoint.clone(),
+                transport,
+                service_name,
+                timeout,
+                resource_attrs,
+            };
+            match sbproxy_observe::OtlpLogSink::new(opts) {
+                Ok(s) => Box::new(s),
+                Err(e) => {
+                    tracing::warn!(
+                        sink = %raw.name,
+                        error = %e,
+                        "failed to build OTLP log sink; skipping"
+                    );
+                    return None;
+                }
+            }
+        }
+    };
+
+    Some(CompiledSink {
+        name: raw.name.clone(),
+        scope,
+        target,
+        format,
+        profile,
+        output,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1547,11 +1799,12 @@ mod tests {
             TenantObservabilityRedactConfig,
         };
 
-        // Serialise the test against the other op-redact tests via the
-        // same lock the logging crate uses for its own swap-based
-        // tests; both touch the same process-global slot.
-        static OP_REDACT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = OP_REDACT_TEST_LOCK
+        // Serialise the test against every other sbproxy-core test
+        // that touches the process-global `OP_REDACT_STATE` (directly
+        // or via `reload_from_config_path`). Without this guard,
+        // `reload_from_config_path_is_idempotent_under_repeat_invocation`
+        // races with us and clobbers the installed state mid-flight.
+        let _guard = super::OP_REDACT_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
@@ -1583,6 +1836,7 @@ mod tests {
             credentials: Vec::new(),
             observability: Some(TenantObservabilityConfig {
                 log: TenantObservabilityLogConfig {
+                    sinks: Vec::new(),
                     redact: TenantObservabilityRedactConfig {
                         pii: Some(ObservabilityPiiConfig {
                             enabled: Some(true),
@@ -1649,6 +1903,7 @@ mod tests {
             outbound_web_bot_auth: false,
             observability: Some(OriginObservabilityConfig {
                 log: OriginObservabilityLogConfig {
+                    sinks: Vec::new(),
                     redact: OriginObservabilityRedactConfig {
                         pii: Some(ObservabilityPiiConfig {
                             enabled: Some(true),

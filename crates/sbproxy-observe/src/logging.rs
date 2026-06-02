@@ -680,11 +680,31 @@ pub fn should_sample(
     (hash % 1000) < (rate * 1000.0) as u64
 }
 
-/// Render + redact + emit a structured log line through the
-/// `tracing` macros. The `target` is set per-sink so log routers can
-/// fan the same line out to access / error / audit / trace exporter
-/// pipes independently.
+/// Render + redact + emit a structured log line.
+///
+/// When an operator-installed [`crate::sink_dispatcher::SinkDispatcher`]
+/// is live (WOR-1045 PR2), the record fans out to every matching
+/// declared sink via [`crate::sink_dispatcher::SinkDispatcher::dispatch`].
+/// Each sink picks its own redaction profile (tenant- and origin-scope
+/// sinks default to `external`) and its own format.
+///
+/// When no dispatcher is installed (boot time, tests, single-tenant
+/// deployments without a sinks block), the legacy `tracing::*!`
+/// fallback below keeps driving stdout. The `target` is set per-sink
+/// so log routers continue to fan the same line out to access /
+/// error / audit / trace exporter pipes independently.
 pub fn emit(record: &StructuredLog, sink: Sink) {
+    // WOR-1045 PR2: when the operator declared a sinks block, hand
+    // the record off to the dispatcher and skip the legacy
+    // `tracing::*!` fallback. This is the only behavioural change
+    // for an existing single-stdout deployment is "no change" because
+    // a deployment without a sinks block keeps `current_sink_dispatcher`
+    // returning `None`.
+    if let Some(dispatcher) = crate::sink_dispatcher::current_sink_dispatcher() {
+        dispatcher.dispatch(record, sink);
+        return;
+    }
+
     let json = match serde_json::to_string(record) {
         Ok(s) => s,
         Err(_) => return,

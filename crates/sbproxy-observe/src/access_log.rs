@@ -416,6 +416,15 @@ impl AccessLogEntry {
     }
 }
 
+/// WOR-1045 PR2: shared rotation helper. Exposed so the sink
+/// dispatcher's [`crate::sink_dispatcher::FileSink`] reuses the same
+/// rotation + gzip stack the access log already exercises. Behaviour
+/// is identical to the previously crate-private `rotate_access_log`
+/// helper this delegates to; the rename is purely a visibility flip.
+pub fn rotate_log_file(path: &Path, max_backups: usize, compress: bool) -> anyhow::Result<()> {
+    rotate_access_log(path, max_backups, compress)
+}
+
 fn rotate_access_log(path: &Path, max_backups: usize, compress: bool) -> anyhow::Result<()> {
     if max_backups == 0 {
         if path.exists() {
