@@ -12,6 +12,7 @@ pub mod resolver;
 pub mod rotation;
 pub mod scope;
 pub mod secret_string;
+pub mod vault_ref;
 
 pub use convergent::ConvergentFingerprinter;
 pub use local::LocalVault;
@@ -21,3 +22,4 @@ pub use resolver::{ResolveFallback, SecretResolver};
 pub use rotation::RotationManager;
 pub use scope::{auto_scope, parse_scope, validate_access, SecretScope};
 pub use secret_string::SecretString;
+pub use vault_ref::{looks_like_vault_uri, VaultRef, VaultRefError};

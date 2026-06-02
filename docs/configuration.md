@@ -3231,6 +3231,78 @@ proxy:
 
 The `extensions` map at both the proxy and the origin level holds opaque blocks consumed by enterprise / third-party crates. OSS does not parse them.
 
+### `vault://` reference URI
+
+In addition to `${ENV}`, `file:`, and `secret:`, secret-bearing fields accept a unified `vault://` reference URI that names a backend + path + optional sub-field. The parser ships in `sbproxy-vault`; the resolver will dispatch into the configured backend once the per-backend implementations land.
+
+#### Grammar
+
+```
+vault://<backend>/<path>[?version=<n>][&key=<json-field>]
+```
+
+* `<backend>` is the registered backend name (operator-chosen identifier under `proxy.vault:`, `tenants[].vault:`, or `origins[].vault:` once those scopes ship).
+* `<path>` is the backend-specific path inside the vault. The parser carries it verbatim; each backend validates its own shape at resolve time.
+* `version=<n>` pins a secret version where the backend supports versioning (HashiCorp KVv2, AWS Secrets Manager). Ignored by versionless backends.
+* `key=<json-field>` extracts a sub-field from a JSON secret payload. When omitted the entire payload is returned.
+* Additional query parameters carry through to the backend as opaque hints; the parser does not interpret them.
+
+#### Examples
+
+```yaml
+authentication:
+  type: bearer
+  tokens:
+    - vault://hashi/secret/data/openai-prod?key=api_key
+    - vault://aws/prod/openai-keys?version=3&key=api_key
+    - vault://k8s/default/sbproxy-secrets/openai-key
+    - vault://file/etc/sbproxy/secrets/openai
+    - vault://env/OPENAI_API_KEY
+    - vault://sqlite/credentials/openai?version=3&key=current
+```
+
+#### Backward compatibility
+
+Existing `${ENV}`, `file:/path/to/secret`, and `secret:<name>` shapes keep working unchanged. The resolver tries each parser in turn: a string that does not start with `vault://` falls through to the legacy resolvers exactly as before.
+
+#### Multi-tenant resolution
+
+The URI itself is tenant-agnostic. The `<backend>` segment names a backend block; the block is configured per-scope at `proxy.vault`, `tenants[].vault`, or `origins[].vault`. Resolution order at request time is origin scope, then tenant scope, then proxy scope; the first scope that declares the named backend serves the reference.
+
+```yaml
+proxy:
+  vault:
+    - name: hashi
+      type: hashicorp
+      addr: https://vault.shared.example/v1
+      token: vault://env/VAULT_TOKEN_SHARED
+  tenants:
+    - id: acme-corp
+      vault:
+        - name: hashi              # same name, different Vault instance
+          type: hashicorp
+          addr: https://vault.acme.example/v1
+          token: vault://env/VAULT_TOKEN_ACME
+    - id: beta-corp
+      vault:
+        - name: hashi
+          type: hashicorp
+          addr: https://vault.beta.example/v1
+          token: vault://env/VAULT_TOKEN_BETA
+origins:
+  api.acme.example.com:
+    tenant_id: acme-corp
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: vault://hashi/secret/data/openai-prod?key=api_key
+```
+
+The `vault://hashi/secret/data/openai-prod` reference in the origin above resolves against acme-corp's hashi block (Vault at `vault.acme.example`). A tenant that does not redeclare a named backend transparently inherits the proxy default, so single-tenant configs need no changes. The request's `tenant_id` (stamped by the routing layer) is the resolution context, not part of the URI.
+
+Tenant and origin vault scopes land alongside the credentials epic; today's vault block is proxy-scope only.
+
 ---
 
 ## Environment variables

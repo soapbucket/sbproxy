@@ -1,0 +1,106 @@
+# Unified `vault://` reference URI with tenant-scoped backends.
+#
+# Every config field that holds a secret accepts a `vault://` URI in
+# addition to the legacy `${ENV}`, `file:`, and `secret:` shapes. The
+# URI itself is tenant-agnostic; the named backend it references is
+# configured per-scope so the same URI resolves to different vaults
+# depending on which tenant's request is being served.
+#
+# Grammar:
+#
+#   vault://<backend>/<path>[?version=<n>][&key=<json-field>]
+#
+# Resolution at request time: origin scope -> tenant scope -> proxy
+# scope. First scope that declares the named backend serves the
+# reference. A tenant that does not redeclare a named backend
+# transparently inherits the proxy default.
+#
+# Setup:
+#
+#   export OPENAI_API_KEY=sk-...
+#   export VAULT_TOKEN_SHARED=root-shared-...
+#   export VAULT_TOKEN_ACME=acme-token-...
+#   export INTERNAL_BEARER_TOKEN=test-bearer-1
+#
+# Test (the acme-scoped reference reads from acme-corp's hashi vault,
+# the shared reference reads from the proxy default):
+#
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: api.acme.example.com' \
+#     -H 'Authorization: Bearer test-bearer-1' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+
+proxy:
+  http_bind_port: 8080
+
+  # Proxy-scope vault backends are the fallback for any tenant that
+  # does not redeclare the named backend below.
+  #
+  # Status: the `vault:` block at proxy scope is shipped as the parser
+  # target; the actual backend implementations (hashi, aws, k8s,
+  # sqlite) land in follow-up tickets. The `env`/`file` backends are
+  # already served by the legacy resolver paths.
+  #
+  # NOTE: this block is illustrative; the proxy config schema does not
+  # parse `vault:` at proxy/tenant scope yet (the schema lands with
+  # the credentials block). It is shown here so the multi-tenant
+  # resolution model is clear from a single file.
+  #
+  # vault:
+  #   - name: hashi
+  #     type: hashicorp
+  #     addr: https://vault.shared.example/v1
+  #     token: vault://env/VAULT_TOKEN_SHARED
+
+  # Tenant scope. Each declared tenant carries its own vault backends.
+  # The acme-corp `hashi` block redeclares the proxy default with a
+  # tenant-specific endpoint so references resolved in an acme-corp
+  # context hit acme's Vault, not the shared one.
+  tenants:
+    - id: acme-corp
+      # vault:
+      #   - name: hashi   # same NAME as proxy default, different instance
+      #     type: hashicorp
+      #     addr: https://vault.acme.example/v1
+      #     token: vault://env/VAULT_TOKEN_ACME
+
+origins:
+  "api.acme.example.com":
+    tenant_id: acme-corp
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          # Two backend prefixes used here:
+          #
+          # `vault://env/...` is the universal env-var indirection
+          # served by the legacy resolver path. Tenant-agnostic by
+          # nature (env vars belong to the proxy process).
+          api_key: vault://env/OPENAI_API_KEY
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+            - gpt-4o
+      routing: round_robin
+
+    authentication:
+      type: bearer
+      tokens:
+        # `vault://env/...` resolves to the proxy process env. Same
+        # across tenants by construction.
+        - vault://env/INTERNAL_BEARER_TOKEN
+        # `vault://hashi/...`: resolution looks at acme-corp's `hashi`
+        # block first (when declared), then the proxy default. PR1
+        # ships the parser; the dispatch into the named backend lands
+        # alongside the first backend implementation.
+        - vault://hashi/secret/data/inbound/admin-token?key=token
+        # `vault://aws/...`, `vault://k8s/...`, `vault://sqlite/...`:
+        # same lookup model. The named backend block selects the
+        # backend implementation type.
+        - vault://aws/prod/sbproxy-inbound-tokens?version=3&key=admin
+        - vault://k8s/default/sbproxy-secrets/inbound-token
+        - vault://sqlite/credentials/inbound-admin?key=current
+        # Legacy shapes keep working unchanged.
+        - ${INTERNAL_BEARER_TOKEN_LEGACY}
+        - secret:inbound-admin-token

@@ -13,6 +13,10 @@ base64.workspace = true
 ring.workspace = true
 hex.workspace = true
 parking_lot.workspace = true
+# `thiserror` is the error backing for the `vault://` URI parser.
+# Already a workspace dep; opting in here so the `#[derive(Error)]`
+# resolves.
+thiserror = { workspace = true }
 # `spawn_blocking` for the async file-resolver wrapper.
 tokio = { workspace = true, features = ["rt"] }
 
