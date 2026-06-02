@@ -303,6 +303,10 @@ pub(super) async fn handle_ai_proxy(
             0.0,
             Vec::new(),
         );
+        // WOR-1044 PR3: the GET-method-aware path runs before the
+        // request body is read, so there is no reversible PII
+        // capture yet. Pass an empty pairs vector; restore is a
+        // no-op short-circuit.
         return relay_ai_response_with_idempotency(
             session,
             resp,
@@ -311,6 +315,7 @@ pub(super) async fn handle_ai_proxy(
             idem_skip_reason,
             idem_capture,
             ctx.ai_inbound_format.as_deref(),
+            Vec::new(),
         )
         .await;
     }
@@ -542,6 +547,10 @@ pub(super) async fn handle_ai_proxy(
         // Multipart never captures for idempotency (engagement
         // skipped with SKIPPED-MULTIPART). Pass the skip reason
         // through so the marker still lands on the response.
+        //
+        // WOR-1044 PR3: multipart bodies are not JSON-parsed for
+        // reversible PII capture (the redactor walks JSON), so the
+        // capture is empty and the restore call short-circuits.
         return relay_ai_response_with_idempotency(
             session,
             resp,
@@ -550,6 +559,7 @@ pub(super) async fn handle_ai_proxy(
             idem_skip_reason,
             None,
             ctx.ai_inbound_format.as_deref(),
+            ctx.ai_reversible_redactions.clone(),
         )
         .await;
     }
@@ -1732,6 +1742,16 @@ pub(super) async fn handle_ai_proxy(
                 .map(|s| s.to_string());
             let usage_parser_cfg = config.usage_parser.clone();
             let upstream_host = last_upstream_host.clone();
+            // WOR-1044 PR2: snapshot the reversible-PII capture for
+            // the streaming relay. The chunk loop reads it through
+            // `StreamingReversibleRestore`. Cloned because the
+            // streaming relay owns the vec for the life of the SSE
+            // session and the dispatcher still needs `ctx` after
+            // this call returns. The vec is small (one entry per
+            // reversible match this request fired) so the clone is
+            // cheap.
+            let stream_reversible_pairs: Vec<(String, String, String)> =
+                ctx.ai_reversible_redactions.clone();
             relay_ai_stream(
                 session,
                 resp,
@@ -1757,6 +1777,7 @@ pub(super) async fn handle_ai_proxy(
                     upstream_format: last_format,
                     inbound_format: stream_inbound_format,
                 },
+                stream_reversible_pairs,
             )
             .await
         } else {
@@ -2247,6 +2268,32 @@ pub(super) async fn relay_ai_response_with_cache(
         }
     }
 
+    // WOR-1044: reversible PII restoration. The request-side capture
+    // recorded `(rule, placeholder, original)` triples on `ctx`; walk
+    // the body once and replace each placeholder with its original.
+    // After replacement, scan for any remaining `<placeholder:...>`
+    // shapes; each is a synthetic placeholder the LLM emitted that
+    // the gateway never inserted (hallucination or prompt injection
+    // probe), so increment the miss counter and leave the shape in
+    // the body.
+    //
+    // WOR-1044 PR3: restore runs BEFORE the idempotency cache write
+    // so a replay surfaces the same restored bytes the original
+    // caller saw. The idempotency cache keys on a hash of the
+    // request body, so a genuine hit guarantees byte-identical
+    // request body which guarantees the same capture map; caching
+    // the restored body avoids running restore on every replay and
+    // keeps placeholder shapes out of the cache surface.
+    //
+    // WOR-1044 PR4: the semantic-cache write above is unreachable
+    // for reversible-PII origins because the AI handler config
+    // disables `semantic_cache` at compile time when any rule on
+    // the same origin sets `reversible: true` (see
+    // `AiHandlerConfig::from_config`). So the masked body never
+    // reaches the semantic cache even though it is written above
+    // in the order-of-operations sense.
+    let resp_body = restore_reversible_pii(&resp_body, &reversible_pairs);
+
     // --- Idempotency record on miss ---
     //
     // Honour the per-origin response body cap; bodies above the cap
@@ -2273,18 +2320,6 @@ pub(super) async fn relay_ai_response_with_cache(
         None => idem_skip_reason,
     };
 
-    // WOR-1044: reversible PII restoration. The request-side capture
-    // recorded `(rule, placeholder, original)` triples on `ctx`; walk
-    // the body once and replace each placeholder with its original.
-    // After replacement, scan for any remaining `<placeholder:...>`
-    // shapes; each is a synthetic placeholder the LLM emitted that
-    // the gateway never inserted (hallucination or prompt injection
-    // probe), so increment the miss counter and leave the shape in
-    // the body. The cache write above stores the masked body, which
-    // is the right behaviour when reversible is opt-in per rule (see
-    // the known-limitation note in docs/observability.md).
-    let resp_body = restore_reversible_pii(&resp_body, &reversible_pairs);
-
     let extra: Option<(&str, &str)> = final_skip_reason.map(|r| ("x-sbproxy-idempotency", r));
     send_response_with_extra(session, status, &content_type, &resp_body, extra).await
 }
@@ -2302,7 +2337,10 @@ pub(super) async fn relay_ai_response_with_cache(
 /// The pairs vector is the request-scoped capture from the context;
 /// when it is empty (the common no-reversible-rules case) the
 /// function short-circuits before touching the body.
-fn restore_reversible_pii(body: &bytes::Bytes, pairs: &[(String, String, String)]) -> bytes::Bytes {
+pub(super) fn restore_reversible_pii(
+    body: &bytes::Bytes,
+    pairs: &[(String, String, String)],
+) -> bytes::Bytes {
     use regex::Regex;
     use std::sync::OnceLock;
     // Format mirrors the default `mask_template` shape so the miss
@@ -2358,6 +2396,173 @@ fn restore_reversible_pii(body: &bytes::Bytes, pairs: &[(String, String, String)
     }
 
     bytes::Bytes::from(out)
+}
+
+/// WOR-1044 PR2: state for restoring reversible PII placeholders
+/// across SSE chunk boundaries. A placeholder like
+/// `<placeholder:email:3>` can land half in one chunk and half in the
+/// next; this state buffers the trailing bytes of each chunk that
+/// might be the start of a placeholder and prepends them to the next
+/// chunk before restoring.
+///
+/// The buffer is bounded by [`StreamingReversibleRestore::MAX_PLACEHOLDER_LEN`].
+/// Once the trailing buffer contains a closing `>` (a complete
+/// placeholder candidate) or grows past the cap, the buffer flushes:
+/// the closer case runs the substitution pass, the cap case emits the
+/// buffer verbatim (it was not a placeholder after all).
+pub(super) struct StreamingReversibleRestore {
+    pairs: Vec<(String, String, String)>,
+    /// Bytes we held back from the previous chunk because they could
+    /// be the prefix of a placeholder shape. Empty when the previous
+    /// chunk ended on a complete-or-no-placeholder boundary.
+    carry: String,
+}
+
+impl StreamingReversibleRestore {
+    /// Maximum bytes we ever buffer waiting for a placeholder closer.
+    /// `<placeholder:` is 13 chars + rule slug (capped to 32) + `:` +
+    /// up to 10 digits + `>` = 57. Round up to 64 for slack.
+    pub const MAX_PLACEHOLDER_LEN: usize = 64;
+
+    /// Construct from the request-time capture. No-op semantics when
+    /// the capture is empty (callers can short-circuit with
+    /// [`Self::is_noop`]).
+    pub fn new(pairs: Vec<(String, String, String)>) -> Self {
+        Self {
+            pairs,
+            carry: String::new(),
+        }
+    }
+
+    /// True when no restoration is configured. Hot-path callers
+    /// short-circuit on this to skip the chunk-buffer machinery for
+    /// the common no-reversible-rules case.
+    pub fn is_noop(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
+    /// Process one chunk of bytes. Returns the bytes ready for emit;
+    /// any tail bytes that might be the prefix of a placeholder are
+    /// held in `self.carry` and prepended to the next call.
+    ///
+    /// Non-UTF-8 chunks bypass restoration (no placeholder text in a
+    /// binary stream) and are returned unchanged. The carry from the
+    /// previous chunk is flushed verbatim ahead of the binary chunk
+    /// so emit order is preserved.
+    pub fn process_chunk(&mut self, chunk: &[u8]) -> bytes::Bytes {
+        if self.pairs.is_empty() {
+            return bytes::Bytes::copy_from_slice(chunk);
+        }
+        // Attach any carry from the previous chunk.
+        let mut buf = std::mem::take(&mut self.carry);
+        match std::str::from_utf8(chunk) {
+            Ok(s) => buf.push_str(s),
+            Err(_) => {
+                // Non-UTF-8: emit carry + chunk verbatim. We give up
+                // on placeholder restoration the moment we see binary
+                // bytes because a placeholder shape is ASCII text.
+                let mut out = bytes::BytesMut::with_capacity(buf.len() + chunk.len());
+                out.extend_from_slice(buf.as_bytes());
+                out.extend_from_slice(chunk);
+                return out.freeze();
+            }
+        }
+
+        // Find the last `<` in the combined buffer. Anything after it
+        // (including the `<`) might be the start of an unterminated
+        // placeholder; hold it back. Everything before is safe to
+        // restore-and-emit.
+        let split = match buf.rfind('<') {
+            Some(idx) => {
+                // Check whether the suffix could still be an open
+                // placeholder. If it already contains a closer (`>`)
+                // the placeholder is complete and we can emit the
+                // whole buffer through restore. If the suffix is
+                // already at or past the cap, it cannot be a real
+                // placeholder either; flush it.
+                let suffix = &buf[idx..];
+                if suffix.contains('>') || suffix.len() >= Self::MAX_PLACEHOLDER_LEN {
+                    buf.len()
+                } else {
+                    idx
+                }
+            }
+            None => buf.len(),
+        };
+
+        let emit_slice = &buf[..split];
+        let restored = if emit_slice.is_empty() {
+            String::new()
+        } else {
+            let mut out = emit_slice.to_string();
+            let mut known: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for (_rule, placeholder, original) in &self.pairs {
+                known.insert(placeholder.as_str());
+                if out.contains(placeholder.as_str()) {
+                    out = out.replace(placeholder.as_str(), original.as_str());
+                }
+            }
+            // Miss scan: any default-shape placeholder still in the
+            // emit slice after restore is a synthetic placeholder
+            // the LLM produced that the request never captured.
+            // Mirrors the non-streaming `restore_reversible_pii`
+            // behaviour so streaming dashboards see hallucinated
+            // placeholders too. The shape is left verbatim in the
+            // emitted bytes; only the metric fires.
+            use regex::Regex;
+            use std::sync::OnceLock;
+            static PLACEHOLDER_RE: OnceLock<Regex> = OnceLock::new();
+            let re = PLACEHOLDER_RE.get_or_init(|| {
+                Regex::new(r"<placeholder:([a-zA-Z0-9_\-]+):\d+>").expect("static regex")
+            });
+            for caps in re.captures_iter(&out) {
+                let full = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                if known.contains(full) {
+                    continue;
+                }
+                let rule = caps.get(1).map(|m| m.as_str()).unwrap_or("unknown");
+                sbproxy_observe::metrics::record_reversible_redaction_miss(rule);
+            }
+            out
+        };
+
+        // Carry the tail (might be a placeholder prefix). When the
+        // emit slice covered the whole buffer the tail is empty.
+        self.carry = buf[split..].to_string();
+
+        bytes::Bytes::copy_from_slice(restored.as_bytes())
+    }
+
+    /// Flush any remaining carry. Called when the upstream stream
+    /// ends. Any unmatched placeholder shape is left as-is and
+    /// emitted; the miss counter is incremented per rule slug found
+    /// so dashboards still see synthetic placeholders that landed in
+    /// the final chunk.
+    pub fn finish(mut self) -> bytes::Bytes {
+        if self.carry.is_empty() {
+            return bytes::Bytes::new();
+        }
+        let mut out = std::mem::take(&mut self.carry);
+        for (_rule, placeholder, original) in &self.pairs {
+            if out.contains(placeholder.as_str()) {
+                out = out.replace(placeholder.as_str(), original.as_str());
+            }
+        }
+        // Miss scan against the default placeholder shape so any
+        // shape that did not match a captured pair still increments
+        // the miss counter.
+        use regex::Regex;
+        use std::sync::OnceLock;
+        static PLACEHOLDER_RE: OnceLock<Regex> = OnceLock::new();
+        let re = PLACEHOLDER_RE.get_or_init(|| {
+            Regex::new(r"<placeholder:([a-zA-Z0-9_\-]+):\d+>").expect("static regex")
+        });
+        for caps in re.captures_iter(&out) {
+            let rule = caps.get(1).map(|m| m.as_str()).unwrap_or("unknown");
+            sbproxy_observe::metrics::record_reversible_redaction_miss(rule);
+        }
+        bytes::Bytes::copy_from_slice(out.as_bytes())
+    }
 }
 
 /// Bundled inputs for post-dispatch budget recording on a relayed AI
@@ -2575,6 +2780,11 @@ pub(super) async fn relay_ai_stream(
     router_sink: RouterTokenSink<'_>,
     parser_args: StreamUsageParserArgs,
     format_args: StreamFormatArgs,
+    // WOR-1044 PR2: request-time reversible PII capture. Empty for
+    // requests with no reversible rule matches; in that case the
+    // streaming restorer short-circuits per-chunk via
+    // `StreamingReversibleRestore::is_noop`.
+    reversible_pairs: Vec<(String, String, String)>,
 ) -> Result<()> {
     let status = resp.status().as_u16();
 
@@ -2710,6 +2920,18 @@ pub(super) async fn relay_ai_stream(
         stream: true,
         ..Default::default()
     };
+
+    // --- WOR-1044 PR2: streaming reversible PII restorer ---
+    //
+    // When the request captured reversible PII placeholders we run
+    // each outbound chunk through a buffer that holds back any
+    // trailing bytes that might be the prefix of a placeholder shape
+    // straddling a chunk boundary. The buffer is bounded at 64 bytes
+    // so a malformed `<` that never closes flushes verbatim instead
+    // of blocking the stream. The common no-reversible-rules path is
+    // a per-chunk `is_noop` short-circuit so byte-forward streaming
+    // stays zero-overhead.
+    let mut reversible_restore = StreamingReversibleRestore::new(reversible_pairs);
     loop {
         match stream.next().await {
             Some(Ok(chunk)) => {
@@ -2793,6 +3015,21 @@ pub(super) async fn relay_ai_stream(
                 } else {
                     chunk_bytes
                 };
+                // WOR-1044 PR2: run the outbound bytes through the
+                // reversible PII restorer before writing to the
+                // client. The restorer is a no-op (clone-only) when
+                // the request has no captured placeholders.
+                let outbound_bytes = if reversible_restore.is_noop() {
+                    outbound_bytes
+                } else {
+                    reversible_restore.process_chunk(&outbound_bytes)
+                };
+                if outbound_bytes.is_empty() {
+                    // The restorer held the entire chunk back as
+                    // potential placeholder prefix. Skip the write
+                    // and wait for the next chunk to flush.
+                    continue;
+                }
                 session
                     .write_response_body(Some(outbound_bytes), false)
                     .await?;
@@ -2819,11 +3056,29 @@ pub(super) async fn relay_ai_stream(
                             }
                         }
                         if !translated.is_empty() {
-                            let _ = session
-                                .write_response_body(Some(Bytes::from(translated)), false)
-                                .await;
+                            let bytes = Bytes::from(translated);
+                            let bytes = if reversible_restore.is_noop() {
+                                bytes
+                            } else {
+                                reversible_restore.process_chunk(&bytes)
+                            };
+                            if !bytes.is_empty() {
+                                let _ = session.write_response_body(Some(bytes), false).await;
+                            }
                         }
                     }
+                }
+                // WOR-1044 PR2: flush any bytes the restorer held back
+                // as potential placeholder prefix. Replaces
+                // `reversible_restore` with an empty value so the
+                // `finish()` move is sound.
+                let tail = std::mem::replace(
+                    &mut reversible_restore,
+                    StreamingReversibleRestore::new(Vec::new()),
+                )
+                .finish();
+                if !tail.is_empty() {
+                    let _ = session.write_response_body(Some(tail), false).await;
                 }
                 break;
             }
@@ -3086,5 +3341,150 @@ mod restore_tests {
         )];
         let out = restore_reversible_pii(&body, &pairs);
         assert_eq!(out, body);
+    }
+}
+
+/// WOR-1044 PR2: streaming reversible PII restorer tests. The chunk
+/// loop in [`relay_ai_stream`] feeds bytes through
+/// [`StreamingReversibleRestore`] before writing them to the client;
+/// the restorer must surface placeholders that span chunk boundaries,
+/// bound its carry buffer, and degrade gracefully on malformed input.
+#[cfg(test)]
+mod streaming_restore_tests {
+    use super::StreamingReversibleRestore;
+
+    fn email_pair() -> Vec<(String, String, String)> {
+        vec![(
+            "email".to_string(),
+            "<placeholder:email:1>".to_string(),
+            "alice@example.com".to_string(),
+        )]
+    }
+
+    /// A placeholder that lands across two chunk boundaries still
+    /// surfaces with the captured original. We split between the
+    /// rule slug and the counter (`:1`) so the first chunk's
+    /// trailing `<placeholder:em` is held back and the second
+    /// chunk's `ail:1>` completes the shape.
+    #[test]
+    fn streaming_restore_handles_placeholder_spanning_two_chunks() {
+        let mut restore = StreamingReversibleRestore::new(email_pair());
+        let first = restore.process_chunk(b"Hello <placeholder:em");
+        let second = restore.process_chunk(b"ail:1>!");
+        let combined = format!(
+            "{}{}",
+            std::str::from_utf8(&first).unwrap(),
+            std::str::from_utf8(&second).unwrap(),
+        );
+        assert!(
+            combined.contains("alice@example.com"),
+            "restored email missing from combined output: {combined}"
+        );
+        assert!(
+            !combined.contains("<placeholder:email:1>"),
+            "placeholder leaked into client stream: {combined}"
+        );
+    }
+
+    /// The first chunk holds back the open-brace plus partial
+    /// placeholder tail (anything from the last `<` onward). When
+    /// the second chunk closes the shape the restorer emits the
+    /// restored placeholder with the original.
+    #[test]
+    fn streaming_restore_buffers_tail_until_closer() {
+        let mut restore = StreamingReversibleRestore::new(email_pair());
+        let first = restore.process_chunk(b"Hello <placehol");
+        let first_str = std::str::from_utf8(&first).unwrap();
+        assert!(
+            !first_str.contains("<placehol"),
+            "carry leaked on the first chunk: {first_str}"
+        );
+        assert_eq!(first_str, "Hello ");
+        let second = restore.process_chunk(b"der:email:1>!");
+        let second_str = std::str::from_utf8(&second).unwrap();
+        assert!(
+            second_str.contains("alice@example.com"),
+            "second chunk missing restored email: {second_str}"
+        );
+    }
+
+    /// A `<` that never closes must not stall the stream. After 64
+    /// bytes of un-terminated suffix the restorer flushes the buffer
+    /// verbatim. We feed a chunk ending in `<` plus 100 bytes of
+    /// non-`>` garbage; the next chunk drains everything.
+    #[test]
+    fn streaming_restore_caps_carry_at_64_bytes() {
+        let mut restore = StreamingReversibleRestore::new(email_pair());
+        let mut chunk = String::from("payload <");
+        // 100 bytes of placeholder-shaped garbage that never closes.
+        chunk.push_str(&"x".repeat(100));
+        let first = restore.process_chunk(chunk.as_bytes());
+        let first_str = std::str::from_utf8(&first).unwrap();
+        // The buffer must have flushed at least the `<` plus the
+        // bytes past the 64-byte cap; the suffix from the cap onward
+        // can stay in carry. Either way the emit must have advanced
+        // past the `payload ` prefix.
+        assert!(
+            first_str.starts_with("payload "),
+            "prefix did not flush past the open-brace: {first_str}"
+        );
+        // Push a closing newline so the buffer (if any) finishes
+        // draining; total observed output equals input.
+        let second = restore.process_chunk(b"\n");
+        let combined = format!("{}{}", first_str, std::str::from_utf8(&second).unwrap());
+        let expected = format!("{chunk}\n");
+        assert_eq!(combined, expected, "lost bytes around the carry cap");
+    }
+
+    /// `finish()` emits any remaining carry on a clean stream end.
+    /// An unterminated `<placehol` tail is surfaced verbatim so the
+    /// caller still receives every byte the upstream produced.
+    #[test]
+    fn streaming_restore_finish_emits_remaining_carry() {
+        let mut restore = StreamingReversibleRestore::new(email_pair());
+        let first = restore.process_chunk(b"Hello <placehol");
+        assert_eq!(std::str::from_utf8(&first).unwrap(), "Hello ");
+        let tail = restore.finish();
+        assert_eq!(std::str::from_utf8(&tail).unwrap(), "<placehol");
+    }
+
+    /// A complete placeholder shape that is NOT in the capture pairs
+    /// is treated as a miss: the body keeps the placeholder verbatim
+    /// and the miss counter increments. We assert the verbatim
+    /// behaviour and rely on the metric helper's own tests for the
+    /// counter side-effect (global state).
+    #[test]
+    fn streaming_restore_increments_miss_counter_on_unmatched_placeholder() {
+        // Pairs map `email:1` but the LLM emitted `email:99` (a
+        // hallucinated counter the request never captured).
+        let mut restore = StreamingReversibleRestore::new(email_pair());
+        // Send the hallucinated placeholder in two chunks to exercise
+        // the boundary path; both halves are surfaced as-is.
+        let first = restore.process_chunk(b"prefix <placeholder:email:99");
+        let second = restore.process_chunk(b">!");
+        let combined = format!(
+            "{}{}",
+            std::str::from_utf8(&first).unwrap(),
+            std::str::from_utf8(&second).unwrap(),
+        );
+        assert!(
+            combined.contains("<placeholder:email:99>"),
+            "hallucinated placeholder must surface verbatim: {combined}"
+        );
+        // finish() also runs the miss scan over any remaining carry.
+        let tail = restore.finish();
+        assert!(tail.is_empty(), "no carry should remain after a closer");
+    }
+
+    /// Empty pairs short-circuit per-chunk: bytes copy through
+    /// unchanged and no carry is built up.
+    #[test]
+    fn streaming_restore_is_noop_when_no_pairs() {
+        let mut restore = StreamingReversibleRestore::new(Vec::new());
+        assert!(restore.is_noop());
+        let out = restore.process_chunk(b"data: {\"x\": 1}\n\n");
+        assert_eq!(out.as_ref(), b"data: {\"x\": 1}\n\n");
+        let tail = restore.finish();
+        assert!(tail.is_empty());
     }
 }

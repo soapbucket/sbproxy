@@ -434,11 +434,21 @@ origins:
 * On the response side the gateway walks the body once and replaces every recorded placeholder with the original.
 * If the LLM emits a `<placeholder:<rule>:N>` shape that the request did not capture (model hallucination or prompt-injection probe), the placeholder is left in the response and `sbproxy_ai_reversible_redaction_miss_total{rule}` is incremented. The caller sees the synthetic value verbatim.
 
-Known limitations (tracked as PR2 follow-ups under WOR-1044):
+##### Streaming responses
 
-* The semantic / response cache stores the masked body. A future request that cache-hits on the same prompt shape but has different captured originals would see the prior request's placeholders restored against its own map, which is not semantically correct. Disable semantic caching at the same origin when reversible rules are enabled.
-* SSE / streaming responses are not restored today; the streaming path will land token-buffering for cross-chunk placeholders in PR2.
-* The idempotency cache path does not restore yet; only `relay_ai_response_with_cache` (the primary chat-completions path) restores in PR1.
+The SSE streaming relay restores placeholders before each chunk is written to the client. Restoration is chunk-aware: a placeholder shape that lands across two network reads is held back at the chunk boundary until the closer arrives, then surfaced as the restored original in the next emitted chunk. The hold-back buffer is bounded at 64 bytes; a lone `<` that never closes (binary stream interleaved with text, or a truncated placeholder shape) is flushed verbatim once the buffer hits the cap so the stream never stalls waiting on a synthetic closer. On a clean stream end the relay flushes any final carry as-is; a malformed `<placeholder:...` left in the carry is emitted verbatim, with the miss counter incremented for any complete-but-uncaptured shape found in the flushed bytes.
+
+When no reversible PII rule fires on the request the streaming path short-circuits per chunk and pays no overhead. Origins that never configure reversible rules see byte-forward streaming unchanged.
+
+##### Idempotency and reversible PII
+
+When an AI origin has both an `idempotency:` block and reversible PII rules, the idempotency cache stores the **restored** response body, not the placeholder shape. The cache key includes a hash of the request body, so a genuine hit guarantees the replay request is byte-identical and would produce the same capture map; storing the restored bytes avoids re-running restoration on every replay and keeps placeholder shapes out of the cache (which dashboards and audit replays sometimes surface). The same logic applies to the non-streaming chat-completions relay: restore runs before both the cache write and the response send.
+
+##### Semantic cache co-existence
+
+Reversible PII redaction and semantic caching cannot safely co-exist on the same origin. The semantic cache keys responses on a similarity hash of the prompt, so two requests that share a prompt shape but carry different captured originals (different customer names, different order numbers) can hash to the same cache key. A cache hit would surface the prior request's placeholders restored against the new request's capture map, which is the wrong customer's data on the wire.
+
+The gateway resolves this at config validation: when an AI origin declares any `pii.rules[].reversible: true` AND a `semantic_cache:` block, the semantic cache is dropped from the compiled config and a warning is logged. The cache is silently disabled rather than rejected at config load so an operator who turns reversible PII on partway through a rollout does not break their config. Re-enable semantic caching by removing reversible from every rule on that origin, or by moving the reversible workload to a separate origin without a semantic cache.
 
 Two profiles ship in Wave 1:
 

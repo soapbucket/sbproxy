@@ -476,7 +476,31 @@ impl AiResilienceConfig {
 impl AiHandlerConfig {
     /// Build from a generic JSON value.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
-        let config: Self = serde_json::from_value(value)?;
+        let mut config: Self = serde_json::from_value(value)?;
+        // WOR-1044 PR4: reversible PII and semantic caching cannot
+        // safely co-exist on the same origin. The semantic cache
+        // keys responses on a similarity hash of the prompt; two
+        // requests that hash to the same key can carry different
+        // captured originals (different customer names, order
+        // numbers, ...). A cache hit would restore the prior
+        // request's placeholders against the new request's capture
+        // map, surfacing the wrong customer's data. The safer
+        // disposition is to disable semantic caching whenever any
+        // configured PII rule on the same origin is reversible.
+        // Out-of-band placeholder maps (a per-request side channel
+        // keyed off the cache hit) would re-enable both at once but
+        // are out of scope for v1.
+        let has_reversible = config
+            .pii
+            .as_ref()
+            .map(|p| p.rules.iter().any(|r| r.reversible))
+            .unwrap_or(false);
+        if has_reversible && config.semantic_cache.is_some() {
+            tracing::warn!(
+                "ai handler: semantic cache disabled because reversible PII would cross requests"
+            );
+            config.semantic_cache = None;
+        }
         // WOR-603: validate each provider's base_url at config load so an
         // SSRF target (file://, link-local metadata, loopback, ...) fails
         // fast here rather than being dispatched at request time.
@@ -963,6 +987,63 @@ mod tests {
     fn ai_handler_config_missing_providers() {
         let json = serde_json::json!({});
         assert!(AiHandlerConfig::from_config(json).is_err());
+    }
+
+    /// WOR-1044 PR4: an origin that declares any reversible PII rule
+    /// AND configures a semantic_cache block has the semantic cache
+    /// dropped at compile time. The cache would otherwise restore a
+    /// prior request's placeholders against a different request's
+    /// capture map.
+    #[test]
+    fn semantic_cache_disabled_when_reversible_pii_enabled() {
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "semantic_cache": {"enabled": true, "ttl_secs": 600},
+            "pii": {
+                "enabled": true,
+                "defaults": false,
+                "rules": [
+                    {
+                        "name": "email",
+                        "pattern": r"\b[a-z0-9._%+\-]{1,64}@[a-z0-9.\-]{1,255}\.[a-z]{2,63}\b",
+                        "reversible": true,
+                        "mask_template": "<placeholder:email:%d>"
+                    }
+                ]
+            }
+        });
+        let config = AiHandlerConfig::from_config(json).expect("compile");
+        assert!(
+            config.semantic_cache.is_none(),
+            "semantic_cache should be dropped when a reversible rule is configured"
+        );
+    }
+
+    /// Inverse: a non-reversible PII config leaves semantic_cache
+    /// alone so the auto-disable does not over-fire on origins that
+    /// only run destructive redaction.
+    #[test]
+    fn semantic_cache_kept_when_pii_is_not_reversible() {
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "semantic_cache": {"enabled": true, "ttl_secs": 600},
+            "pii": {
+                "enabled": true,
+                "defaults": false,
+                "rules": [
+                    {
+                        "name": "email",
+                        "pattern": r"\b[a-z0-9._%+\-]{1,64}@[a-z0-9.\-]{1,255}\.[a-z]{2,63}\b",
+                        "reversible": false
+                    }
+                ]
+            }
+        });
+        let config = AiHandlerConfig::from_config(json).expect("compile");
+        assert!(
+            config.semantic_cache.is_some(),
+            "semantic_cache should survive when no reversible rule is configured"
+        );
     }
 
     // --- WOR-625: provider-name + model-allow-list validation ---

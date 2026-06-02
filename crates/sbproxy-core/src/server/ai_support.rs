@@ -975,6 +975,34 @@ impl AiIdempotencyCapture {
     }
 }
 
+/// WOR-1044 PR3: run reversible PII restoration over a non-streaming
+/// AI gateway response body for the idempotency relay path.
+///
+/// Storage-choice reasoning. The idempotency cache keys on
+/// `(workspace_id, Idempotency-Key, body_hash)` and treats a body-hash
+/// mismatch as a conflict, not a hit (see
+/// [`sbproxy_middleware::idempotency::check_request`]). A genuine hit
+/// therefore guarantees the new request body is byte-identical to the
+/// original, which guarantees the reversible PII capture map for the
+/// replay would be identical (the redactor is deterministic in match
+/// order). Caching the **restored** body is sound: it avoids
+/// re-running restore on every replay, and it avoids leaving raw
+/// placeholder shapes inside the cache where they could leak through
+/// debug dashboards or audit replays.
+///
+/// Returns owned bytes. When `pairs` is empty the function avoids
+/// the additional copy by repackaging the `translated` String's
+/// buffer into [`bytes::Bytes`].
+pub(super) fn restore_for_idempotency(
+    translated: Vec<u8>,
+    pairs: &[(String, String, String)],
+) -> bytes::Bytes {
+    if pairs.is_empty() {
+        return bytes::Bytes::from(translated);
+    }
+    crate::server::ai_dispatch::restore_reversible_pii(&bytes::Bytes::from(translated), pairs)
+}
+
 /// Send a non-streaming AI gateway response, optionally stamping the
 /// `x-sbproxy-idempotency` skip marker when the middleware
 /// disengaged. Returns the response bytes so the caller can record
@@ -985,6 +1013,7 @@ impl AiIdempotencyCapture {
 /// returned via the marker out-parameter so the response_filter still
 /// stamps it (best-effort visible via logs since headers have already
 /// flushed).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn relay_ai_response_with_idempotency(
     session: &mut Session,
     resp: reqwest::Response,
@@ -993,6 +1022,13 @@ pub(super) async fn relay_ai_response_with_idempotency(
     idem_skip_reason: Option<&'static str>,
     capture: Option<AiIdempotencyCapture>,
     inbound_format: Option<&str>,
+    // WOR-1044 PR3: request-time reversible PII capture. Empty for
+    // requests with no reversible rule matches; the restore call
+    // then short-circuits with no allocation. Threaded through so
+    // the idempotency relay restores placeholders before sending
+    // the body to the client AND before recording it into the
+    // idempotency cache.
+    reversible_pairs: Vec<(String, String, String)>,
 ) -> Result<()> {
     let status = resp.status().as_u16();
     let content_type = resp
@@ -1005,6 +1041,11 @@ pub(super) async fn relay_ai_response_with_idempotency(
     let translated = sbproxy_ai::translators::translate_response_bytes(format, &resp_body);
     let translated = sbproxy_ai::format::rewrap_response_for_inbound(inbound_format, &translated);
 
+    // WOR-1044 PR3: restore reversible PII placeholders before both
+    // the cache write and the response send. See
+    // [`restore_for_idempotency`] for the storage-choice reasoning.
+    let translated_bytes = restore_for_idempotency(translated, &reversible_pairs);
+
     // Record into the idempotency cache before serving the response
     // so the cache entry is durable even if the client disconnects
     // mid-body. Honour the response body cap: bodies above the cap
@@ -1012,9 +1053,9 @@ pub(super) async fn relay_ai_response_with_idempotency(
     // stamped instead.
     let (final_skip_reason, capture_for_record) = match capture {
         Some(cap) => {
-            if translated.len() > cap.idem.max_response_body_bytes {
+            if translated_bytes.len() > cap.idem.max_response_body_bytes {
                 debug!(
-                    body_len = translated.len(),
+                    body_len = translated_bytes.len(),
                     cap = cap.idem.max_response_body_bytes,
                     "AI proxy: idempotency response body exceeds cap; abandoning cache record"
                 );
@@ -1031,16 +1072,17 @@ pub(super) async fn relay_ai_response_with_idempotency(
     // stamp the skip marker so dashboards see the disengagement.
     let extra: Option<(&'static str, &'static str)> =
         final_skip_reason.map(|r| ("x-sbproxy-idempotency", r));
-    send_response_with_extra(session, status, &content_type, &translated, extra).await?;
+    send_response_with_extra(session, status, &content_type, &translated_bytes, extra).await?;
 
     if let Some(cap) = capture_for_record {
-        // Capture the bytes the client actually saw (post-translation).
-        // Headers in the cached entry mirror what we send back: at
-        // minimum the content-type so a replay surfaces the same
-        // shape. Skip framing headers Pingora will recompute.
+        // Capture the bytes the client actually saw (post-translation,
+        // post-restoration). Headers in the cached entry mirror what
+        // we send back: at minimum the content-type so a replay
+        // surfaces the same shape. Skip framing headers Pingora will
+        // recompute.
         let headers: Vec<(String, String)> =
             vec![("content-type".to_string(), content_type.clone())];
-        cap.record(status, headers, translated);
+        cap.record(status, headers, translated_bytes.to_vec());
     }
 
     Ok(())
@@ -1117,4 +1159,44 @@ pub(super) fn make_native_bypass_body(
     parsed["model"] = serde_json::Value::String(resolved_model.to_string());
     let remapped = serde_json::to_vec(&parsed)?;
     Ok(bytes::Bytes::from(remapped))
+}
+
+#[cfg(test)]
+mod idempotency_restore_tests {
+    use super::restore_for_idempotency;
+
+    /// WOR-1044 PR3: an upstream body carrying a reversible PII
+    /// placeholder lands at the idempotency relay with the captured
+    /// original restored. The bytes the client sees and the bytes
+    /// the cache stores are identical: the placeholder shape never
+    /// reaches the wire or the cache row.
+    #[test]
+    fn idempotency_relay_restores_reversible_pii_before_send() {
+        let upstream =
+            String::from(r#"{"choices":[{"message":{"content":"Hi <placeholder:email:1>"}}]}"#);
+        let pairs = vec![(
+            "email".to_string(),
+            "<placeholder:email:1>".to_string(),
+            "alice@example.com".to_string(),
+        )];
+        let out = restore_for_idempotency(upstream.into_bytes(), &pairs);
+        let s = std::str::from_utf8(&out).expect("utf-8");
+        assert!(s.contains("alice@example.com"), "email missing: {s}");
+        assert!(
+            !s.contains("<placeholder:email:1>"),
+            "placeholder leaked: {s}"
+        );
+    }
+
+    /// Empty capture is a zero-allocation hand-off: the same bytes
+    /// come through. We assert by value identity on the post-call
+    /// bytes since `restore_for_idempotency` is the only branch the
+    /// idempotency relay takes for placeholder handling.
+    #[test]
+    fn idempotency_relay_short_circuits_with_no_capture() {
+        let upstream = String::from(r#"{"reply":"hello"}"#);
+        let expected = upstream.clone();
+        let out = restore_for_idempotency(upstream.into_bytes(), &[]);
+        assert_eq!(out.as_ref(), expected.as_bytes());
+    }
 }
