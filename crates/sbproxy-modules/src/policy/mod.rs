@@ -30,6 +30,7 @@ pub mod exposed_creds;
 pub mod expression;
 pub mod http_framing;
 pub mod ip_filter;
+pub mod match_principal;
 /// Natural-language to Cedar policy compiler (WOR-203 PR 3b;
 /// see `adr-policy-compilation.md` NLC pillar B).
 pub mod nl_compiler;
