@@ -29,6 +29,11 @@ pub struct ConfigAuditEntry {
     pub origins_removed: Vec<String>,
     /// Hostnames of origins whose configuration was modified in this update.
     pub origins_modified: Vec<String>,
+    /// WOR-1067: tenant the audited change resolves to. Empty for
+    /// proxy-wide config changes (no tenant scope). Downstream
+    /// SIEM / ClickHouse can partition by this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 impl ConfigAuditEntry {
@@ -107,6 +112,12 @@ pub struct SecurityAuditEntry {
     /// HTTP status the proxy will return (always `400` for
     /// framing violations today).
     pub status_code: u16,
+    /// WOR-1067: tenant the offending request resolves to. Empty
+    /// when the request never reached origin routing (early-stage
+    /// framing violation, no Host header). Downstream SIEM partitions
+    /// by this field for per-tenant deny dashboards.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 impl SecurityAuditEntry {
@@ -129,6 +140,7 @@ impl SecurityAuditEntry {
             request_id,
             method,
             status_code: 400,
+            tenant_id: None,
         }
     }
 
@@ -158,6 +170,7 @@ impl SecurityAuditEntry {
             request_id,
             method,
             status_code,
+            tenant_id: None,
         }
     }
 
@@ -184,7 +197,15 @@ impl SecurityAuditEntry {
             request_id,
             method,
             status_code,
+            tenant_id: None,
         }
+    }
+
+    /// WOR-1067: builder-style setter for the tenant id. Returns
+    /// `self` so call sites can chain `SecurityAuditEntry::policy_violation(...).with_tenant_id(ctx.tenant_id.to_string())`.
+    pub fn with_tenant_id(mut self, tenant_id: impl Into<String>) -> Self {
+        self.tenant_id = Some(tenant_id.into());
+        self
     }
 
     /// Serialize the entry to JSON and emit it via tracing at WARN
@@ -228,7 +249,16 @@ impl ConfigAuditEntry {
             origins_added,
             origins_removed,
             origins_modified,
+            tenant_id: None,
         }
+    }
+
+    /// WOR-1067: builder-style setter for the tenant id. Returns
+    /// `self` so call sites can chain
+    /// `ConfigAuditEntry::new(...).with_tenant_id("acme")`.
+    pub fn with_tenant_id(mut self, tenant_id: impl Into<String>) -> Self {
+        self.tenant_id = Some(tenant_id.into());
+        self
     }
 }
 
@@ -243,6 +273,7 @@ mod tests {
             origins_added: vec!["api.example.com".to_string()],
             origins_removed: vec![],
             origins_modified: vec!["legacy.example.com".to_string()],
+            tenant_id: None,
         }
     }
 
@@ -335,6 +366,7 @@ mod tests {
             origins_added: vec!["a.com".to_string(), "b.com".to_string()],
             origins_removed: vec!["c.com".to_string()],
             origins_modified: vec!["d.com".to_string(), "e.com".to_string()],
+            tenant_id: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -351,5 +383,48 @@ mod tests {
 
         let modified = v["origins_modified"].as_array().unwrap();
         assert_eq!(modified.len(), 2);
+    }
+
+    /// WOR-1067: config audit entry carries tenant_id when set; the
+    /// field is omitted from the rendered JSON when None so existing
+    /// downstream parsers stay happy.
+    #[test]
+    fn config_audit_entry_carries_tenant_id_round_trip() {
+        let entry =
+            ConfigAuditEntry::new("file_watcher", vec![], vec![], vec![]).with_tenant_id("acme");
+        let json = serde_json::to_string(&entry).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["tenant_id"], "acme");
+
+        let entry_anon = ConfigAuditEntry::new("file_watcher", vec![], vec![], vec![]);
+        let json_anon = serde_json::to_string(&entry_anon).unwrap();
+        let v_anon: serde_json::Value = serde_json::from_str(&json_anon).unwrap();
+        assert!(v_anon.get("tenant_id").is_none());
+    }
+
+    /// WOR-1067: security audit entry carries tenant_id when set; the
+    /// field is omitted when None to keep existing SIEM ingest pipelines
+    /// unchanged for proxy-wide events.
+    #[test]
+    fn security_audit_entry_carries_tenant_id_round_trip() {
+        let entry = SecurityAuditEntry::policy_violation(
+            "rate_limit",
+            "exceeded",
+            429,
+            Some("api.acme.example".to_string()),
+            None,
+            None,
+            None,
+        )
+        .with_tenant_id("acme");
+        let json = serde_json::to_string(&entry).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["tenant_id"], "acme");
+
+        let entry_anon =
+            SecurityAuditEntry::framing_violation("duplicate_cl", None, None, None, None);
+        let json_anon = serde_json::to_string(&entry_anon).unwrap();
+        let v_anon: serde_json::Value = serde_json::from_str(&json_anon).unwrap();
+        assert!(v_anon.get("tenant_id").is_none());
     }
 }

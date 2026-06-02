@@ -2200,7 +2200,40 @@ pub struct TenantObservabilityConfig {
     /// Tenant-scoped log block. See [`TenantObservabilityLogConfig`].
     #[serde(default)]
     pub log: TenantObservabilityLogConfig,
+    /// WOR-1067: per-tenant cardinality budget. Caps the unique label
+    /// value count across `sbproxy_requests_total` and friends for
+    /// just this tenant so a noisy tenant cannot demote labels for
+    /// every other tenant. Omitting the block leaves this tenant on
+    /// the proxy-wide budget (today's behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cardinality: Option<TenantCardinalityConfig>,
 }
+
+/// WOR-1067: per-tenant cardinality budget. The runtime installs one
+/// dedicated label-value tracker per declared tenant; overflows on
+/// tenant B do not touch tenant A's accepted-value set. The
+/// `__default__` tenant continues to use the proxy-wide
+/// `CardinalityLimiter` (in `sbproxy-observe`) so single-tenant
+/// deployments stay bit-for-bit identical to pre-WOR-1067 behaviour.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct TenantCardinalityConfig {
+    /// Maximum unique label values per metric, per label name, for
+    /// requests resolving to this tenant. When omitted the
+    /// observability stack falls back to its per-tenant default cap
+    /// ([`crate::types::TENANT_CARDINALITY_DEFAULT_MAX_SERIES`]) so
+    /// an operator can declare an `observability.cardinality:` block
+    /// with no fields to opt this tenant in to the default per-tenant
+    /// budget without having to pick a number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_series: Option<u32>,
+}
+
+/// WOR-1067: default per-tenant cardinality cap used when a tenant
+/// declares an `observability.cardinality:` block with no
+/// `max_series:` value. Picked so a noisy tenant can still cover a
+/// reasonable agent / route fan-out without taking the proxy-wide
+/// budget down with it.
+pub const TENANT_CARDINALITY_DEFAULT_MAX_SERIES: u32 = 10_000;
 
 /// Tenant-scope `log:` sub-block. Mirrors the proxy-scope
 /// `ObservabilityLogConfig`; today exposes the redaction leaf plus the
