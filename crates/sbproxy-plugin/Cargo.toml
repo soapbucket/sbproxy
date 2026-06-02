@@ -10,6 +10,12 @@ publish = false
 
 [dependencies]
 inventory = { workspace = true }
+# `serde` is the (de)serialization framework behind the credentials-epic
+# Principal / Credential / SecretRef types. Already pulled transitively
+# by `serde_json` but listed explicitly here so
+# `#[derive(Serialize, Deserialize)]` resolves without relying on a
+# transitive feature.
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

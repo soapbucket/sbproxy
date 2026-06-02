@@ -21,6 +21,7 @@ pub mod error;
 pub mod identity;
 pub mod lifecycle;
 pub mod mcp;
+pub mod principal;
 pub mod registry;
 pub mod traits;
 pub mod verdict_combine;
@@ -41,6 +42,9 @@ pub use lifecycle::*;
 pub use mcp::{
     default_no_op_hook, mcp_policy_hooks, register_mcp_policy_hook, McpPolicyHook,
     McpPolicyHookEntry, McpToolCallCtx, NoOpMcpPolicyHook,
+};
+pub use principal::{
+    Credential, Principal, PrincipalAttrs, PrincipalSource, SecretRef, TenantId, VirtualKeyRef,
 };
 pub use registry::*;
 pub use traits::*;
