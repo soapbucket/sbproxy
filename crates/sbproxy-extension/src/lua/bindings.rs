@@ -198,6 +198,76 @@ pub fn build_envelope_table(
     serde_json::Value::Object(env)
 }
 
+/// Build the `principal` table exposed to Lua scripts. Mirrors the CEL
+/// `principal.*` namespace so a policy written against one engine
+/// ports unchanged to the other. Empty / missing fields render as
+/// empty strings or empty tables.
+#[allow(clippy::too_many_arguments)]
+pub fn build_principal_table(
+    tenant_id: Option<&str>,
+    sub: Option<&str>,
+    source: Option<&str>,
+    virtual_key_name: Option<&str>,
+    virtual_key_allowed_providers: &[String],
+    project: Option<&str>,
+    user: Option<&str>,
+    team: Option<&str>,
+    tags: &[String],
+    metadata: &std::collections::BTreeMap<String, String>,
+    roles: &[String],
+    claims: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> serde_json::Value {
+    let mut p = serde_json::Map::new();
+    p.insert(
+        "tenant_id".to_string(),
+        serde_json::Value::String(tenant_id.unwrap_or("").to_string()),
+    );
+    p.insert(
+        "sub".to_string(),
+        serde_json::Value::String(sub.unwrap_or("").to_string()),
+    );
+    p.insert(
+        "source".to_string(),
+        serde_json::Value::String(source.unwrap_or("").to_string()),
+    );
+
+    let mut vk = serde_json::Map::new();
+    vk.insert(
+        "name".to_string(),
+        serde_json::Value::String(virtual_key_name.unwrap_or("").to_string()),
+    );
+    vk.insert(
+        "allowed_providers".to_string(),
+        serde_json::json!(virtual_key_allowed_providers),
+    );
+    p.insert("virtual_key".to_string(), serde_json::Value::Object(vk));
+
+    let mut attrs = serde_json::Map::new();
+    attrs.insert(
+        "project".to_string(),
+        serde_json::Value::String(project.unwrap_or("").to_string()),
+    );
+    attrs.insert(
+        "user".to_string(),
+        serde_json::Value::String(user.unwrap_or("").to_string()),
+    );
+    attrs.insert(
+        "team".to_string(),
+        serde_json::Value::String(team.unwrap_or("").to_string()),
+    );
+    attrs.insert("tags".to_string(), serde_json::json!(tags));
+    attrs.insert("metadata".to_string(), serde_json::json!(metadata));
+    attrs.insert("roles".to_string(), serde_json::json!(roles));
+    p.insert("attrs".to_string(), serde_json::Value::Object(attrs));
+
+    let claims_map: serde_json::Map<String, serde_json::Value> = claims
+        .map(|c| c.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    p.insert("claims".to_string(), serde_json::Value::Object(claims_map));
+
+    serde_json::Value::Object(p)
+}
+
 /// Splice the KYA verifier verdict into an existing
 /// request table built by [`build_request_table`]. Adds a nested
 /// `kya` sub-table mirroring the CEL surface

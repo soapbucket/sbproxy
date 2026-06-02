@@ -171,6 +171,17 @@ impl ExpressionPolicy {
             sbproxy_extension::cel::context::populate_agent_detect_namespace(&mut ctx, agent);
         }
 
+        // Capture envelope and principal namespaces. Both are
+        // opt-in views; an evaluator that has not threaded them
+        // through compiles unchanged and reads the engine's zero
+        // value for `envelope.*` / `principal.*`.
+        if let Some(envelope) = views.envelope.as_ref() {
+            sbproxy_extension::cel::context::populate_envelope_namespace(&mut ctx, envelope);
+        }
+        if let Some(principal) = views.principal.as_ref() {
+            sbproxy_extension::cel::context::populate_principal_namespace(&mut ctx, principal);
+        }
+
         match engine.compile(&self.expression) {
             Ok(expr) => engine.eval_bool(&expr, &ctx).unwrap_or(false),
             Err(_) => true, // Fail open on compile error only
@@ -206,6 +217,16 @@ pub struct ExpressionViews<'a> {
     /// `None` leaves the namespace unset (every `request.agent.*` access
     /// yields the engine's zero value).
     pub agent_detect: Option<sbproxy_extension::cel::context::AgentDetectView<'a>>,
+    /// Capture envelope view. When `Some`, `populate_envelope_namespace`
+    /// runs and policy expressions can branch on `envelope.user_id`,
+    /// `envelope.session_id`, etc. Default `None` keeps the namespace
+    /// unset.
+    pub envelope: Option<sbproxy_extension::cel::context::EnvelopeView<'a>>,
+    /// Unified principal view. When `Some`,
+    /// `populate_principal_namespace` runs and policy expressions can
+    /// branch on `principal.tenant_id`, `principal.attrs.team`, etc.
+    /// Default `None` keeps the namespace unset.
+    pub principal: Option<sbproxy_extension::cel::context::PrincipalView<'a>>,
 }
 
 #[cfg(test)]

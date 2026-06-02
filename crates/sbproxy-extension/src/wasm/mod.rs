@@ -349,6 +349,46 @@ impl WasmRuntime {
     }
 }
 
+/// Build the `principal` JSON the WASM module reads on its
+/// per-invocation stdin envelope. Returns a JSON object the caller
+/// splices into the existing input envelope alongside `request`.
+/// Mirrors the CEL `principal.*` namespace and the Lua + JS
+/// builders so a policy ports unchanged across engines.
+///
+/// Empty / missing fields render as empty strings / arrays / objects
+/// so a WASM module can branch on `input.principal.attrs.team`
+/// without first probing for presence.
+#[allow(clippy::too_many_arguments)]
+pub fn build_principal_input(
+    tenant_id: Option<&str>,
+    sub: Option<&str>,
+    source: Option<&str>,
+    virtual_key_name: Option<&str>,
+    virtual_key_allowed_providers: &[String],
+    project: Option<&str>,
+    user: Option<&str>,
+    team: Option<&str>,
+    tags: &[String],
+    metadata: &std::collections::BTreeMap<String, String>,
+    roles: &[String],
+    claims: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> serde_json::Value {
+    crate::lua::bindings::build_principal_table(
+        tenant_id,
+        sub,
+        source,
+        virtual_key_name,
+        virtual_key_allowed_providers,
+        project,
+        user,
+        team,
+        tags,
+        metadata,
+        roles,
+        claims,
+    )
+}
+
 /// Build the JSON input passed to a WASM module's stdin for an HTTP
 /// request transform. Mirrors the Lua / JS `request` table
 /// shape and includes the agent-class fields under `request.agent_*`
@@ -362,6 +402,7 @@ impl WasmRuntime {
 /// The function is intentionally narrow: it builds the JSON shape
 /// that the OSS proxy passes today. Callers who need a different
 /// shape can construct it directly and call [`WasmRuntime::execute`].
+//
 // Argument count exceeds the 7-arg clippy lint by two; each agent_*
 // field is a flat optional drawn from RequestContext and bundling
 // them into a struct adds an indirection layer with no readability

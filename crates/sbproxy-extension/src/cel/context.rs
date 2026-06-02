@@ -632,6 +632,129 @@ pub fn populate_envelope_namespace(ctx: &mut CelContext, envelope: &EnvelopeView
     ctx.set("envelope", CelValue::Map(env));
 }
 
+/// Borrowed view onto the unified Principal for the CEL builder.
+/// Mirrors [`EnvelopeView`]: the caller's `RequestContext` owns the
+/// strings; the builder avoids cloning by holding `&str` and
+/// borrowed maps / slices.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PrincipalView<'a> {
+    /// Tenant the request resolved to.
+    pub tenant_id: Option<&'a str>,
+    /// Subject identifier (JWT sub, VK name, basic-auth username).
+    pub sub: Option<&'a str>,
+    /// Source slug (`bearer`, `api_key`, `virtual_key`, ...).
+    pub source: Option<&'a str>,
+    /// Virtual-key name when an AI virtual key matched.
+    pub virtual_key_name: Option<&'a str>,
+    /// VK-scoped allowed providers.
+    pub virtual_key_allowed_providers: Option<&'a [String]>,
+    /// Attribution: project.
+    pub project: Option<&'a str>,
+    /// Attribution: user.
+    pub user: Option<&'a str>,
+    /// Attribution: team.
+    pub team: Option<&'a str>,
+    /// Operator-supplied tags.
+    pub tags: Option<&'a [String]>,
+    /// Metadata fan-out.
+    pub metadata: Option<&'a std::collections::BTreeMap<String, String>>,
+    /// Roles claimed by the principal.
+    pub roles: Option<&'a [String]>,
+    /// Verbatim claims map (when JWT auth or OIDC stamped them).
+    pub claims: Option<&'a serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Stamp the principal namespace onto a CEL context. The same
+/// shape is mirrored on every script engine so a policy written for
+/// CEL ports unchanged to Lua / JS / WASM.
+///
+/// # Namespace
+///
+/// - `principal.tenant_id` - tenant the request resolved to (string)
+/// - `principal.sub` - subject identifier (string, may be `""`)
+/// - `principal.source` - provider slug (string)
+/// - `principal.virtual_key` - map: `{ name, allowed_providers: [...] }`
+///   or `{}` when no virtual key matched
+/// - `principal.attrs.project` - project string
+/// - `principal.attrs.user` - user string
+/// - `principal.attrs.team` - team string
+/// - `principal.attrs.tags` - list of strings
+/// - `principal.attrs.metadata` - map of strings
+/// - `principal.attrs.roles` - list of strings
+/// - `principal.claims` - map of claim name to claim value
+pub fn populate_principal_namespace(ctx: &mut CelContext, view: &PrincipalView<'_>) {
+    let mut p = HashMap::new();
+    p.insert(
+        "tenant_id".to_string(),
+        CelValue::String(view.tenant_id.unwrap_or("").to_string()),
+    );
+    p.insert(
+        "sub".to_string(),
+        CelValue::String(view.sub.unwrap_or("").to_string()),
+    );
+    p.insert(
+        "source".to_string(),
+        CelValue::String(view.source.unwrap_or("").to_string()),
+    );
+
+    // Virtual key sub-map.
+    let mut vk_map = HashMap::new();
+    vk_map.insert(
+        "name".to_string(),
+        CelValue::String(view.virtual_key_name.unwrap_or("").to_string()),
+    );
+    let allowed: Vec<CelValue> = view
+        .virtual_key_allowed_providers
+        .map(|s| s.iter().map(|p| CelValue::String(p.clone())).collect())
+        .unwrap_or_default();
+    vk_map.insert("allowed_providers".to_string(), CelValue::List(allowed));
+    p.insert("virtual_key".to_string(), CelValue::Map(vk_map));
+
+    // attrs sub-map (mirrors the PrincipalAttrs shape).
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "project".to_string(),
+        CelValue::String(view.project.unwrap_or("").to_string()),
+    );
+    attrs.insert(
+        "user".to_string(),
+        CelValue::String(view.user.unwrap_or("").to_string()),
+    );
+    attrs.insert(
+        "team".to_string(),
+        CelValue::String(view.team.unwrap_or("").to_string()),
+    );
+    let tags: Vec<CelValue> = view
+        .tags
+        .map(|s| s.iter().map(|t| CelValue::String(t.clone())).collect())
+        .unwrap_or_default();
+    attrs.insert("tags".to_string(), CelValue::List(tags));
+    let metadata: HashMap<String, CelValue> = view
+        .metadata
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| (k.clone(), CelValue::String(v.clone())))
+                .collect()
+        })
+        .unwrap_or_default();
+    attrs.insert("metadata".to_string(), CelValue::Map(metadata));
+    let roles: Vec<CelValue> = view
+        .roles
+        .map(|s| s.iter().map(|r| CelValue::String(r.clone())).collect())
+        .unwrap_or_default();
+    attrs.insert("roles".to_string(), CelValue::List(roles));
+    p.insert("attrs".to_string(), CelValue::Map(attrs));
+
+    // Verbatim claims (JWT / OIDC payload). Empty map when absent.
+    let claims_map: HashMap<String, CelValue> = view
+        .claims
+        .map(|c| c.iter().map(|(k, v)| (k.clone(), json_to_cel(v))).collect())
+        .unwrap_or_default();
+    p.insert("claims".to_string(), CelValue::Map(claims_map));
+
+    ctx.set("principal", CelValue::Map(p));
+}
+
 /// Decode the claims segment of `Authorization: Bearer <jwt>`. Returns
 /// `None` when no header, no Bearer prefix, fewer than three segments,
 /// invalid base64, or non-object JSON. **Does not verify the signature.**
@@ -1111,6 +1234,75 @@ mod tests {
         let engine = CelEngine::new();
         assert!(engine
             .eval_bool_source(r#"response.body_size == 4096"#, &ctx)
+            .unwrap());
+    }
+
+    /// `principal.*` namespace is reachable in CEL and the
+    /// attribution fields render with the expected zero values when
+    /// the view is empty.
+    #[test]
+    fn principal_namespace_default_is_empty_strings() {
+        let headers = HeaderMap::new();
+        let mut ctx = build_request_context("GET", "/", &headers, None, None, "example.com");
+        populate_principal_namespace(&mut ctx, &PrincipalView::default());
+        let engine = CelEngine::new();
+        assert!(engine
+            .eval_bool_source(r#"principal.tenant_id == """#, &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source(r#"principal.attrs.team == """#, &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source(r#"principal.virtual_key.name == """#, &ctx)
+            .unwrap());
+    }
+
+    /// `principal.attrs.team` returns the populated value so a CEL
+    /// `ExpressionPolicy` can branch on it.
+    #[test]
+    fn principal_namespace_carries_team_field() {
+        let headers = HeaderMap::new();
+        let mut ctx = build_request_context("GET", "/", &headers, None, None, "example.com");
+        let view = PrincipalView {
+            tenant_id: Some("acme-corp"),
+            sub: Some("vk-frontend"),
+            source: Some("virtual_key"),
+            virtual_key_name: Some("team-frontend"),
+            project: Some("frontend"),
+            team: Some("frontend"),
+            ..PrincipalView::default()
+        };
+        populate_principal_namespace(&mut ctx, &view);
+        let engine = CelEngine::new();
+        assert!(engine
+            .eval_bool_source(r#"principal.tenant_id == "acme-corp""#, &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source(r#"principal.attrs.team == "frontend""#, &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source(r#"principal.virtual_key.name == "team-frontend""#, &ctx)
+            .unwrap());
+    }
+
+    /// `principal.attrs.tags` is a list; in-list membership is the
+    /// canonical pattern for tag-based gating.
+    #[test]
+    fn principal_namespace_tags_render_as_list() {
+        let headers = HeaderMap::new();
+        let mut ctx = build_request_context("GET", "/", &headers, None, None, "example.com");
+        let tags = vec!["team-frontend".to_string(), "tier-haiku".to_string()];
+        let view = PrincipalView {
+            tags: Some(&tags),
+            ..PrincipalView::default()
+        };
+        populate_principal_namespace(&mut ctx, &view);
+        let engine = CelEngine::new();
+        assert!(engine
+            .eval_bool_source(r#"size(principal.attrs.tags) == 2"#, &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source(r#""tier-haiku" in principal.attrs.tags"#, &ctx)
             .unwrap());
     }
 

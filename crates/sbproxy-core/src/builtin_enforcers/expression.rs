@@ -132,6 +132,8 @@ impl PolicyEnforcer for ExpressionEnforcer {
             ml: ml_view,
             features: Some(features_view),
             agent_detect: agent_detect_view,
+            envelope: None,
+            principal: None,
         };
 
         let allowed = policy.evaluate_with_views(
