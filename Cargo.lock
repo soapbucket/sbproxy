@@ -6924,6 +6924,7 @@ dependencies = [
  "aws-sdk-sts",
  "aws-types",
  "base64 0.22.1",
+ "filetime",
  "hex",
  "k8s-openapi",
  "kube",
@@ -6936,6 +6937,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "ureq",
+ "yaml_serde",
 ]
 
 [[package]]
