@@ -194,6 +194,24 @@ pub struct AccessLogEntry {
     /// origin.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_type: Option<String>,
+    /// WOR-1047: which kind of principal produced this request.
+    /// Closed enum: `bearer | api_key | jwt | basic_auth | oidc |
+    /// forward_auth | bot_auth | digest | cap | noop |
+    /// virtual_key | none`. `virtual_key` covers AI-gateway requests
+    /// that matched a configured `VirtualKeyConfig`; `none` covers
+    /// origins with no auth provider configured. The kind is the
+    /// log-time distinguishing label between AI attribution
+    /// (project / user / tags / metadata from the AI virtual key)
+    /// and non-AI attribution (the same fields from any other auth
+    /// provider once PR2 wires those schemas).
+    ///
+    /// `auth_type` carries the same slug for the auth-provider cases
+    /// today; `principal_kind` extends it with the `virtual_key` and
+    /// `none` cases so downstream ClickHouse / Grafana queries can
+    /// partition the entire log by principal source without joining
+    /// on `auth_type IS NULL`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal_kind: Option<String>,
     /// True when this request was served from cache (hot or reserve)
     /// without contacting the upstream. Mirrors `cache_result == "hit"`
     /// but distinguishes hit-then-revalidated paths.
@@ -505,6 +523,7 @@ impl Default for AccessLogEntry {
             properties: BTreeMap::new(),
             workspace_id: String::new(),
             auth_type: None,
+            principal_kind: None,
             served_from_cache: None,
             fallback_triggered: None,
             retry_count: None,
@@ -785,6 +804,7 @@ mod tests {
             properties: BTreeMap::new(),
             workspace_id: String::new(),
             auth_type: None,
+            principal_kind: None,
             served_from_cache: None,
             fallback_triggered: None,
             retry_count: None,
@@ -917,6 +937,28 @@ mod tests {
 
         assert!(!redacted.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"));
         assert!(redacted.contains("Bearer [REDACTED]"));
+    }
+
+    /// WOR-1047 PR1: `principal_kind` is `None` on the minimal entry
+    /// and round-trips through serde without a value when set.
+    #[test]
+    fn principal_kind_round_trips_through_serde() {
+        let mut entry = minimal_entry();
+        // None case: field is `skip_serializing_if = "Option::is_none"`,
+        // so the rendered JSON does not contain the key at all.
+        let rendered_none = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !rendered_none.contains("principal_kind"),
+            "None should skip the key entirely: {rendered_none}"
+        );
+
+        // Set case: the slug is preserved verbatim.
+        entry.principal_kind = Some("virtual_key".to_string());
+        let rendered_some = serde_json::to_string(&entry).unwrap();
+        assert!(
+            rendered_some.contains(r#""principal_kind":"virtual_key""#),
+            "missing principal_kind in rendered JSON: {rendered_some}"
+        );
     }
 
     #[test]
