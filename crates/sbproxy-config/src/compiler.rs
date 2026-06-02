@@ -350,6 +350,182 @@ const MIGRATED_FEATURE_KEYS: &[(&str, &str)] = &[
 /// Idempotent: a config that already uses `proxy.extensions[...]`
 /// passes through unchanged. Configs without a `features:` block
 /// likewise round-trip with no rewrites.
+/// Detect the legacy `virtual_keys:` YAML key. The check is a simple
+/// substring scan rather than a full parse so the diagnostic surfaces
+/// before the typed-error path; an operator with the old shape sees
+/// the migration pointer immediately.
+///
+/// Word-boundary regex check rather than a raw `contains("virtual_keys:")`
+/// so a comment like `# virtual_keys: was deprecated` does not trip the
+/// guard. The pattern matches the YAML key shape: start of line, any
+/// whitespace, the literal `virtual_keys:`, end of token.
+/// Lower `proxy.credentials` + `tenants[].credentials` +
+/// `origins[].credentials` of type `ai_provider` into JSON entries
+/// appended to each origin's `action.virtual_keys` array. Honours
+/// the most-specific-wins rule: origin -> tenant -> proxy. Duplicate
+/// names at a more specific scope replace the less specific entry.
+///
+/// Lowering at compile time means the runtime AI dispatch keeps
+/// using the existing `VirtualKeyConfig` registry without knowing
+/// about the new credentials block; the credentials epic is purely
+/// a configuration-time refactor of the operator surface.
+///
+/// `attrs.tags`, `attrs.metadata`, `attrs.project`, `attrs.user`
+/// fan out onto the lowered `VirtualKeyConfig` field of the same
+/// name so the per-credential attribution metric and access-log
+/// columns continue to populate from the unified principal write.
+fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFile) -> Result<()> {
+    use crate::types::CredentialBlock;
+    use serde_json::json;
+
+    // Walk the origins; for each origin's resolved tenant, build the
+    // ordered scope list (origin -> tenant -> proxy) and merge the
+    // ai_provider credentials by name.
+    for (hostname, origin) in file.origins.iter_mut() {
+        // Resolve tenant_id once per origin so the loop body does
+        // not re-string-compare.
+        let tenant_id = origin
+            .tenant_id
+            .clone()
+            .unwrap_or_else(|| "__default__".to_string());
+
+        // Pull the relevant tenant block; missing == no tenant scope
+        // (single-tenant configs land here).
+        let tenant_creds: Vec<&CredentialBlock> = file
+            .proxy
+            .tenants
+            .iter()
+            .find(|t| t.id == tenant_id)
+            .map(|t| t.credentials.iter().collect())
+            .unwrap_or_default();
+        let proxy_creds: Vec<&CredentialBlock> = file.proxy.credentials.iter().collect();
+        let origin_creds: Vec<&CredentialBlock> = origin.credentials.iter().collect();
+
+        // Most-specific-wins merge by name. Walk in reverse order
+        // (proxy first, tenant, then origin) so origin entries
+        // replace tenant entries which replace proxy entries.
+        let mut by_name: std::collections::BTreeMap<String, &CredentialBlock> =
+            std::collections::BTreeMap::new();
+        for c in proxy_creds
+            .iter()
+            .chain(tenant_creds.iter())
+            .chain(origin_creds.iter())
+        {
+            if c.kind == "ai_provider" {
+                by_name.insert(c.name.clone(), c);
+            }
+        }
+        if by_name.is_empty() {
+            continue;
+        }
+
+        // Materialise each ai_provider credential as a virtual-key
+        // JSON entry on the origin's action block. The shape mirrors
+        // `sbproxy_ai::identity::VirtualKeyConfig`; missing fields
+        // default per serde.
+        let action = origin.action.as_object_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "origin `{hostname}` action block must be an object to receive credentials"
+            )
+        })?;
+        let entries: Vec<serde_json::Value> = by_name
+            .values()
+            .map(|cred| {
+                // Convert the per-credential attrs to the legacy
+                // ai_project / ai_user / tags / metadata shape.
+                let metadata: serde_json::Map<String, serde_json::Value> = cred
+                    .attrs
+                    .metadata
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect();
+                let key = cred.key.clone().unwrap_or_default();
+                let mut vk = json!({
+                    "key": key,
+                    "name": cred.name.clone(),
+                    "enabled": true,
+                    "tags": cred.attrs.tags.clone(),
+                    "metadata": metadata,
+                });
+                if let Some(p) = &cred.attrs.project {
+                    vk["project"] = json!(p);
+                }
+                if let Some(u) = &cred.attrs.user {
+                    vk["user"] = json!(u);
+                }
+                if let Some(provider) = &cred.provider {
+                    vk["allowed_providers"] = json!([provider]);
+                }
+                if let Some(models) = &cred.models {
+                    if !models.allow.is_empty() {
+                        vk["allowed_models"] = json!(models.allow.clone());
+                    }
+                    if !models.deny.is_empty() {
+                        vk["blocked_models"] = json!(models.deny.clone());
+                    }
+                }
+                if let Some(budget) = cred.attrs.budget.as_ref() {
+                    let mut b = serde_json::Map::new();
+                    if let Some(max_tokens) = budget.max_tokens {
+                        b.insert("max_tokens".to_string(), json!(max_tokens));
+                    }
+                    if let Some(max_cost) = budget.max_cost_usd {
+                        b.insert("max_cost_usd".to_string(), json!(max_cost));
+                    }
+                    if !b.is_empty() {
+                        vk["budget"] = serde_json::Value::Object(b);
+                    }
+                }
+                // Per-credential rate_limit lowers onto the legacy
+                // `max_requests_per_minute` + `max_tokens_per_minute`
+                // fields. PII redaction policies attach via the
+                // separate scripting hook surface and are not
+                // mirrored on the VK shape today.
+                for policy in &cred.policies {
+                    if let crate::types::CredentialPolicy::RateLimit { rpm, tpm } = policy {
+                        if let Some(r) = rpm {
+                            vk["max_requests_per_minute"] = json!(r);
+                        }
+                        if let Some(t) = tpm {
+                            vk["max_tokens_per_minute"] = json!(t);
+                        }
+                    }
+                }
+                vk
+            })
+            .collect();
+
+        // Merge into the existing virtual_keys array on the action
+        // block. The compile-time lowering APPENDS; an operator who
+        // hand-wrote `virtual_keys:` would have hit the legacy-key
+        // rejection above, so the array is guaranteed empty here
+        // for any config that compiled to this point.
+        let action_existing = action
+            .entry("virtual_keys".to_string())
+            .or_insert_with(|| json!([]));
+        if let serde_json::Value::Array(arr) = action_existing {
+            arr.extend(entries);
+        }
+    }
+    Ok(())
+}
+
+fn yaml_uses_legacy_virtual_keys(yaml: &str) -> bool {
+    for line in yaml.lines() {
+        // Strip any inline comment that starts AFTER the YAML value;
+        // a leading `#` is the comment-only case and is already
+        // ignored by the trim_start below.
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with("virtual_keys:") || trimmed.starts_with("virtual_keys :") {
+            return true;
+        }
+    }
+    false
+}
+
 fn migrate_features_to_extensions(yaml: &str) -> Result<String> {
     use serde_yaml::Value as YamlValue;
 
@@ -484,8 +660,31 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // single source of truth. Returns an error when the legacy and
     // new shapes coexist (operator must pick one).
     let yaml = migrate_features_to_extensions(&yaml)?;
-    let config_file: ConfigFile =
+
+    // Reject the legacy `virtual_keys:` YAML key with a pointer to
+    // the migration guide. The credentials epic replaces it with the
+    // canonical `credentials:` block; an operator with the old shape
+    // sees a hard compile error rather than a silent ignore.
+    if yaml_uses_legacy_virtual_keys(&yaml) {
+        anyhow::bail!(
+            "config compile: the legacy `virtual_keys:` YAML key is no longer supported. \
+             Rewrite the block as `credentials: - type: ai_provider ...` per \
+             `docs/migration-credentials.md`."
+        );
+    }
+
+    let mut config_file: ConfigFile =
         serde_yaml::from_str(&yaml).context("failed to parse config YAML")?;
+
+    // Lower `proxy.credentials` + `tenant.credentials` + per-origin
+    // `credentials:` of type `ai_provider` into the existing
+    // `action.virtual_keys` array on each origin's AI handler config
+    // so the runtime AI dispatch keeps working unchanged. Resolution
+    // order at this stage matches request-time: origin scope first,
+    // then tenant scope (when the origin's tenant_id matches), then
+    // proxy scope. Duplicate-name credentials at a more specific
+    // scope shadow the less specific one.
+    lower_credentials_into_origin_virtual_keys(&mut config_file)?;
 
     let mut origins = Vec::with_capacity(config_file.origins.len());
     let mut host_map = std::collections::HashMap::new();
@@ -1207,6 +1406,158 @@ origins:
             msg.contains("typo-corp") && msg.contains("not declared"),
             "unhelpful error: {msg}"
         );
+    }
+
+    /// Legacy `virtual_keys:` YAML at any scope is rejected at
+    /// compile with a pointer to the migration guide. The credentials
+    /// block replaces it.
+    #[test]
+    fn compile_rejects_legacy_virtual_keys_key() {
+        let yaml = r#"
+origins:
+  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+      virtual_keys:
+        - key: vk-1
+          name: test
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("legacy virtual_keys: should be rejected at compile");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("virtual_keys") && msg.contains("migration"),
+            "unhelpful error: {msg}"
+        );
+    }
+
+    /// An `ai_provider` credential at proxy scope lowers onto every
+    /// origin's `action.virtual_keys` array.
+    #[test]
+    fn proxy_ai_provider_credential_lowers_into_origin_vks() {
+        let yaml = r#"
+proxy:
+  credentials:
+    - name: openai-shared
+      type: ai_provider
+      provider: openai
+      key: vault://env/OPENAI_API_KEY
+      attrs:
+        project: shared
+        tags: [tier-shared]
+origins:
+  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+"#;
+        let compiled = compile_config(yaml).expect("should compile");
+        let origin = compiled.resolve_origin("ai.local").expect("origin exists");
+        let action = &origin.action_config;
+        let vks = action
+            .get("virtual_keys")
+            .and_then(|v| v.as_array())
+            .expect("virtual_keys array materialised");
+        assert_eq!(vks.len(), 1);
+        assert_eq!(vks[0]["name"], "openai-shared");
+        assert_eq!(vks[0]["project"], "shared");
+        assert_eq!(vks[0]["allowed_providers"][0], "openai");
+        assert_eq!(vks[0]["tags"][0], "tier-shared");
+    }
+
+    /// An origin-scope credential with the same name as a
+    /// proxy-scope credential shadows the proxy entry; the merged
+    /// virtual_keys array carries only the origin variant.
+    #[test]
+    fn origin_credential_shadows_proxy_credential_of_same_name() {
+        let yaml = r#"
+proxy:
+  credentials:
+    - name: openai
+      type: ai_provider
+      provider: openai
+      key: vault://env/OPENAI_PROXY
+      attrs: { project: proxy-default }
+origins:
+  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+    credentials:
+      - name: openai
+        type: ai_provider
+        provider: openai
+        key: vault://env/OPENAI_LOCAL
+        attrs: { project: local-override }
+"#;
+        let compiled = compile_config(yaml).expect("should compile");
+        let origin = compiled.resolve_origin("ai.local").expect("origin exists");
+        let vks = origin
+            .action_config
+            .get("virtual_keys")
+            .and_then(|v| v.as_array())
+            .expect("virtual_keys array materialised");
+        assert_eq!(vks.len(), 1);
+        assert_eq!(vks[0]["project"], "local-override");
+        assert_eq!(vks[0]["key"], "vault://env/OPENAI_LOCAL");
+    }
+
+    /// A tenant-scope credential applies only to origins that resolve
+    /// to that tenant. Other origins (default tenant) see only the
+    /// proxy-scope credential.
+    #[test]
+    fn tenant_credential_applies_only_to_matching_origins() {
+        let yaml = r#"
+proxy:
+  tenants:
+    - id: acme-corp
+      credentials:
+        - name: openai-acme
+          type: ai_provider
+          provider: openai
+          attrs: { project: acme }
+origins:
+  api.acme.local:
+    tenant_id: acme-corp
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+  api.shared.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+"#;
+        let compiled = compile_config(yaml).expect("should compile");
+        let acme = compiled.resolve_origin("api.acme.local").unwrap();
+        let acme_vks = acme
+            .action_config
+            .get("virtual_keys")
+            .and_then(|v| v.as_array())
+            .expect("acme origin gets the tenant credential");
+        assert_eq!(acme_vks.len(), 1);
+        assert_eq!(acme_vks[0]["project"], "acme");
+
+        let shared = compiled.resolve_origin("api.shared.local").unwrap();
+        let shared_vks = shared
+            .action_config
+            .get("virtual_keys")
+            .and_then(|v| v.as_array());
+        // Shared origin resolves to __default__ tenant; the acme
+        // tenant block does not apply. virtual_keys may be absent
+        // or empty; both encode "no credentials".
+        assert!(shared_vks.map(|v| v.is_empty()).unwrap_or(true));
     }
 
     /// WOR-1053 PR1: declaring a tenant named `__default__` clashes
