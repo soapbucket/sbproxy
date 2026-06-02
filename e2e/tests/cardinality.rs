@@ -47,7 +47,7 @@ const DEMOTION_SENTINELS: &[&str] = &["__other__", "overflow"];
 /// Each (agent_id, tenant_id) tuple sees one request so the cardinality
 /// is exactly the product of distinct values.
 #[test]
-#[ignore = "TODO(wave3): G1.6 per-agent labels (agent_id, agent_class, agent_vendor, payment_rail, content_shape) are wired on sbproxy_requests_total but `tenant_id` is not on the label set yet. Test expects tenant_id label demotion which requires the multi-tenant label landing planned for Wave 3."]
+#[ignore = "TODO(WOR-1067 PR2): `tenant_id` is not yet on `sbproxy_requests_total`. WOR-1067 PR1 (commit a3bb2ace) shipped the per-tenant cardinality limiter API; PR2 wires the metric label dimension so this test can run. The per-tenant accepted-value sets are independent today (covered by `tenant_cardinality_per_tenant_independent` unit test in sbproxy-observe::cardinality)."]
 fn cardinality_caps_are_respected_under_multi_tenant_load() {
     let upstream = MockUpstream::start(json!({"ok": true})).expect("start mock upstream");
     let yaml = build_config(&upstream.base_url());
