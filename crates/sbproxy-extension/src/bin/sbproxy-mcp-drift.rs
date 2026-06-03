@@ -31,25 +31,23 @@ use sbproxy_extension::mcp::schema_drift::{diff_openapi, DriftSeverity};
 
 fn print_usage() {
     eprintln!(
-        "{}",
-        r#"sbproxy-mcp-drift: classify OpenAPI changes by severity (WOR-486)
-
-USAGE:
-    sbproxy-mcp-drift --previous <FILE> --current <FILE> [--format text|json]
-
-EXIT CODES:
-    0   no drift
-    1   informational changes only (description / optional-added / enum-widened)
-    2   breaking changes (operation removed / required-removed / type-changed / enum-narrowed)
-
-FORMATS:
-    text  (default) human-readable summary grouped by severity
-    json  structured `DriftReport` suitable for downstream tooling
-
-EXAMPLES:
-    # CI gate: refuse to regenerate the MCP surface on a breaking change.
-    sbproxy-mcp-drift --previous last.openapi.json --current current.openapi.json || exit $?
-"#
+        "sbproxy-mcp-drift: classify OpenAPI changes by severity (WOR-486)\n\
+        \n\
+        USAGE:\n    \
+            sbproxy-mcp-drift --previous <FILE> --current <FILE> [--format text|json]\n\
+        \n\
+        EXIT CODES:\n    \
+            0   no drift\n    \
+            1   informational changes only (description / optional-added / enum-widened)\n    \
+            2   breaking changes (operation removed / required-removed / type-changed / enum-narrowed)\n\
+        \n\
+        FORMATS:\n    \
+            text  (default) human-readable summary grouped by severity\n    \
+            json  structured DriftReport suitable for downstream tooling\n\
+        \n\
+        EXAMPLES:\n    \
+            # CI gate: refuse to regenerate the MCP surface on a breaking change.\n    \
+            sbproxy-mcp-drift --previous last.openapi.json --current current.openapi.json || exit $?"
     );
 }
 
