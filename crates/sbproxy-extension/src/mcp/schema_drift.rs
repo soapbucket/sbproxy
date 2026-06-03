@@ -16,11 +16,11 @@
 //!
 //! ## Severity model
 //!
-//! * [`DriftSeverity::None`]: identical specs.
-//! * [`DriftSeverity::Informational`]: tool added, description
+//! * `DriftSeverity::None`: identical specs.
+//! * `DriftSeverity::Informational`: tool added, description
 //!   changed, required field made optional. Operators see these
 //!   but they do not break existing callers.
-//! * [`DriftSeverity::Breaking`]: tool removed, required field
+//! * `DriftSeverity::Breaking`: tool removed, required field
 //!   removed, type narrowed on a required field, enum narrowed.
 //!   Existing callers WILL break.
 //!
