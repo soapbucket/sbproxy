@@ -324,6 +324,56 @@ proxy:
 * `fields:` is additive on the built-in baseline. Matched lowercase. Cannot disable a built-in entry.
 * `patterns:` is a list of named regexes applied to the rendered JSON after the field-key pass. Compiled once at config load; an invalid regex is logged at `warn` and skipped (the rest of the block still installs). `replacement:` defaults to `[REDACTED:<NAME_UPPER>]` when omitted.
 
+#### Tenant-scope and origin-scope redact additions (WOR-1042)
+
+The `fields:` and `patterns:` blocks above also accept tenant-scope and origin-scope additions. Each scope inherits the parent and adds its own entries; `patterns:` additionally honours a `disable:` opt-out by pattern name. `fields:` is additive-only at every scope; a tenant or origin cannot disable a proxy-level field denylist entry because the security baseline always applies.
+
+```yaml
+proxy:
+  observability:
+    log:
+      redact:
+        fields: [x-internal-token]
+        patterns:
+          - name: customer_uuid
+            pattern: 'cust_[a-z0-9]{20}'
+  tenants:
+    - id: acme-corp
+      observability:
+        log:
+          redact:
+            fields: [x-acme-license]
+            patterns:
+              - name: acme_account
+                pattern: 'acct-\d{6,12}'
+            disable: [customer_uuid]   # opt out of a proxy-level rule
+origins:
+  - hostname: api.acme.example.com
+    tenant_id: acme-corp
+    observability:
+      log:
+        redact:
+          patterns:
+            - name: internal_id
+              pattern: '\binternal-[a-f0-9]{16}\b'
+          disable: [acme_account]      # opt out of a tenant-level rule
+```
+
+Resolution order at emit time:
+
+```
+built_in_denylist
+  → proxy.fields
+    → tenant.fields           (inherited additive)
+      → origin.fields         (inherited additive)
+        → proxy.patterns
+          → tenant.patterns   (proxy minus tenant.disable, then add tenant.patterns)
+            → origin.patterns (parent minus origin.disable, then add origin.patterns)
+              → pii.rules     (composed per the pii: block; see below)
+```
+
+The composition runs once per (tenant, origin) pair at config-compile so the hot path is a single HashMap lookup keyed on `(record.tenant_id, record.route)`. Unknown rule names + invalid regexes are warn-logged with the scope label (`proxy` / `tenant <id>` / `origin <hostname>`) and the rest of the block still installs.
+
 #### Built-in PII detector
 
 Operators can enable the rule-driven PII detector from `sbproxy-security` as a fourth redaction pass. It runs after the field-key pass and the regex pass against the rendered JSON. The detector ships with built-in rules for email, US SSN, credit card (Luhn-validated), US phone, IPv4, IBAN, and common API key shapes (OpenAI, Anthropic, AWS access key, GitHub PAT, Slack token).

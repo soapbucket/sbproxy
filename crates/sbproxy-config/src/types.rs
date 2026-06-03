@@ -2262,6 +2262,22 @@ pub struct TenantObservabilityLogConfig {
 /// emitter.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TenantObservabilityRedactConfig {
+    /// WOR-1042: tenant-scope additions to the field-key denylist.
+    /// Additive only; a tenant CANNOT disable a proxy-level field
+    /// denylist entry because the security baseline always applies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+    /// WOR-1042: tenant-scope additions to the regex pattern set.
+    /// Additive on top of the proxy-scope patterns. Use `disable:`
+    /// (below) to opt out of a more-general proxy-scope pattern by
+    /// name (e.g. a healthcare tenant disabling a `phone_us` mask).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patterns: Vec<ObservabilityRedactPattern>,
+    /// WOR-1042: names of proxy-scope `patterns:` entries to opt out
+    /// of at this tenant. Targets only the operator-supplied regex
+    /// pass; the built-in field-key denylist is never disable-able.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disable: Vec<String>,
     /// Tenant-scope override for the proxy-scope PII pass. Resolution
     /// rules: the tenant inherits the proxy-scope `enabled` flag and
     /// the proxy-scope rule set, then ADDS its own `rules:` entries
@@ -2724,12 +2740,27 @@ pub struct OriginObservabilityLogConfig {
     pub sinks: Vec<ObservabilitySinkConfig>,
 }
 
-/// Origin-scope `redact:` sub-block. Today only `pii:` is honoured;
-/// the field-key and pattern overrides remain proxy-scope only because
-/// they touch the rendered JSON, which is hostname-agnostic in the
-/// emitter.
+/// Origin-scope `redact:` sub-block. Carries the per-origin overrides
+/// for the field-key denylist (WOR-1042 `fields:`, additive), the
+/// operator regex pass (WOR-1042 `patterns:` + `disable:`), and the
+/// rule-driven PII redactor (WOR-1043 `pii:`).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct OriginObservabilityRedactConfig {
+    /// WOR-1042: origin-scope additions to the field-key denylist.
+    /// Additive only on top of the merged proxy + tenant set; an
+    /// origin cannot disable a parent denylist entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+    /// WOR-1042: origin-scope additions to the regex pattern set.
+    /// Additive on top of proxy + tenant. Use `disable:` to opt out
+    /// of a more-general pattern by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patterns: Vec<ObservabilityRedactPattern>,
+    /// WOR-1042: pattern names to opt out of at this origin. Resolved
+    /// against the merged proxy + tenant pattern set; the built-in
+    /// field-key denylist is never disable-able.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disable: Vec<String>,
     /// Origin-scope override for the tenant-scope (or proxy-scope
     /// when the origin has no tenant) PII pass. Resolution rules:
     /// the origin inherits the parent scope's `enabled` flag and rule

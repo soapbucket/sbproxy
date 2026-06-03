@@ -1413,9 +1413,162 @@ fn install_op_redact_state(compiled: &sbproxy_config::CompiledConfig) {
         origin_pii.insert(origin.hostname.to_string(), slot);
     }
 
+    // WOR-1042: compose per-tenant + per-origin field-key denylists
+    // and regex pattern sets. `fields:` is additive only at every
+    // scope; `patterns:` is additive with a per-scope `disable:` opt
+    // out keyed on the pattern name (built-in denylist + proxy
+    // patterns are never disable-able by tenant/origin scope).
+    let mut tenant_fields: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut tenant_patterns: std::collections::HashMap<String, Vec<(regex::Regex, String)>> =
+        std::collections::HashMap::new();
+    // Keep the parent compiled set keyed by name so child scope
+    // `disable:` lookups are O(1). Parent (proxy) names + compiled
+    // entries cached for re-use by the origin walk.
+    let proxy_pattern_names: Vec<String> = proxy_redact
+        .map(|c| c.patterns.iter().map(|p| p.name.clone()).collect())
+        .unwrap_or_default();
+    let proxy_compiled_by_name: std::collections::HashMap<String, (regex::Regex, String)> =
+        proxy_pattern_names
+            .iter()
+            .cloned()
+            .zip(patterns.iter().cloned())
+            .collect();
+
+    for tenant in &server.tenants {
+        let redact = match tenant.observability.as_ref().map(|o| &o.log.redact) {
+            Some(r) => r,
+            None => continue,
+        };
+        // Fields: additive on top of the proxy set.
+        let mut merged_fields = fields.clone();
+        for f in &redact.fields {
+            let lower = f.to_ascii_lowercase();
+            if !merged_fields.contains(&lower) {
+                merged_fields.push(lower);
+            }
+        }
+        // Patterns: start from proxy minus this tenant's `disable:`
+        // set, then add tenant patterns.
+        let disable: std::collections::HashSet<&str> =
+            redact.disable.iter().map(|s| s.as_str()).collect();
+        let mut merged_patterns: Vec<(regex::Regex, String)> = proxy_pattern_names
+            .iter()
+            .filter_map(|name| {
+                if disable.contains(name.as_str()) {
+                    None
+                } else {
+                    proxy_compiled_by_name.get(name).cloned()
+                }
+            })
+            .collect();
+        for p in &redact.patterns {
+            match regex::Regex::new(&p.pattern) {
+                Ok(re) => {
+                    let replacement = p
+                        .replacement
+                        .clone()
+                        .unwrap_or_else(|| format!("[REDACTED:{}]", p.name.to_ascii_uppercase()));
+                    merged_patterns.push((re, replacement));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        scope = %format!("tenant `{}`", tenant.id),
+                        pattern = %p.name,
+                        error = %e,
+                        "skipping invalid redact pattern; install continues without it"
+                    );
+                }
+            }
+        }
+        tenant_fields.insert(tenant.id.clone(), merged_fields);
+        tenant_patterns.insert(tenant.id.clone(), merged_patterns);
+    }
+
+    let mut origin_fields: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut origin_patterns_map: std::collections::HashMap<String, Vec<(regex::Regex, String)>> =
+        std::collections::HashMap::new();
+    for origin in &compiled.origins {
+        let redact = match origin.observability.as_ref().map(|o| &o.log.redact) {
+            Some(r) => r,
+            None => continue,
+        };
+        let tenant_id_str = origin.tenant_id.as_str();
+        // Parent fields: tenant if present, else proxy.
+        let parent_fields = tenant_fields
+            .get(tenant_id_str)
+            .cloned()
+            .unwrap_or_else(|| fields.clone());
+        let mut merged_fields = parent_fields;
+        for f in &redact.fields {
+            let lower = f.to_ascii_lowercase();
+            if !merged_fields.contains(&lower) {
+                merged_fields.push(lower);
+            }
+        }
+        // Parent patterns: tenant if present, else proxy. Build a
+        // name-keyed map on the fly so this scope's `disable:` can
+        // remove parent entries by name.
+        let parent_compiled = tenant_patterns
+            .get(tenant_id_str)
+            .cloned()
+            .unwrap_or_else(|| patterns.clone());
+        let disable: std::collections::HashSet<&str> =
+            redact.disable.iter().map(|s| s.as_str()).collect();
+        // We do not carry pattern names through the compiled list,
+        // so origin `disable:` can only remove patterns the operator
+        // re-named at the proxy scope. Honour the disable list by
+        // name against proxy + tenant-declared pattern names.
+        let mut tenant_pattern_names: Vec<String> = proxy_pattern_names.clone();
+        if let Some(t) = server.tenants.iter().find(|t| t.id == tenant_id_str) {
+            if let Some(o) = t.observability.as_ref() {
+                for p in &o.log.redact.patterns {
+                    tenant_pattern_names.push(p.name.clone());
+                }
+            }
+        }
+        let mut merged_patterns: Vec<(regex::Regex, String)> = parent_compiled
+            .into_iter()
+            .zip(tenant_pattern_names.iter())
+            .filter_map(|(entry, name)| {
+                if disable.contains(name.as_str()) {
+                    None
+                } else {
+                    Some(entry)
+                }
+            })
+            .collect();
+        for p in &redact.patterns {
+            match regex::Regex::new(&p.pattern) {
+                Ok(re) => {
+                    let replacement = p
+                        .replacement
+                        .clone()
+                        .unwrap_or_else(|| format!("[REDACTED:{}]", p.name.to_ascii_uppercase()));
+                    merged_patterns.push((re, replacement));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        scope = %format!("origin `{}`", origin.hostname),
+                        pattern = %p.name,
+                        error = %e,
+                        "skipping invalid redact pattern; install continues without it"
+                    );
+                }
+            }
+        }
+        origin_fields.insert(origin.hostname.to_string(), merged_fields);
+        origin_patterns_map.insert(origin.hostname.to_string(), merged_patterns);
+    }
+
     sbproxy_observe::logging::install_op_redact_config(sbproxy_observe::logging::OpRedactState {
         fields,
         patterns,
+        tenant_fields,
+        tenant_patterns,
+        origin_fields,
+        origin_patterns: origin_patterns_map,
         proxy_pii,
         tenant_pii,
         origin_pii,
@@ -1876,6 +2029,9 @@ mod tests {
                 log: TenantObservabilityLogConfig {
                     sinks: Vec::new(),
                     redact: TenantObservabilityRedactConfig {
+                        fields: Vec::new(),
+                        patterns: Vec::new(),
+                        disable: Vec::new(),
                         pii: Some(ObservabilityPiiConfig {
                             enabled: Some(true),
                             rules: vec!["us_ssn".to_string()],
@@ -1943,6 +2099,9 @@ mod tests {
                 log: OriginObservabilityLogConfig {
                     sinks: Vec::new(),
                     redact: OriginObservabilityRedactConfig {
+                        fields: Vec::new(),
+                        patterns: Vec::new(),
+                        disable: Vec::new(),
                         pii: Some(ObservabilityPiiConfig {
                             enabled: Some(true),
                             rules: vec!["credit_card".to_string()],

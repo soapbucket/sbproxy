@@ -367,10 +367,29 @@ impl Sink {
 /// config view. Empty (the global default) until the operator
 /// configures `proxy.observability.log.redact:`.
 pub struct OpRedactState {
-    /// Additional field-key denylist (lowercase ASCII).
+    /// Proxy-scope additional field-key denylist (lowercase ASCII).
+    /// Always additive on top of the built-in baseline; never
+    /// disable-able at any scope.
     pub fields: Vec<String>,
-    /// Compiled regex masks. Each entry is `(regex, replacement)`.
+    /// Proxy-scope compiled regex masks. Each entry is
+    /// `(regex, replacement)`. WOR-1042 PR1 (this is the proxy path).
     pub patterns: Vec<(regex::Regex, String)>,
+    /// WOR-1042: pre-composed per-tenant field-key denylist additions
+    /// (proxy ∪ tenant). Keyed by tenant id. A tenant without an
+    /// entry inherits the proxy-scope `fields` only.
+    pub tenant_fields: std::collections::HashMap<String, Vec<String>>,
+    /// WOR-1042: pre-composed per-tenant pattern set
+    /// ((proxy ∪ tenant) − tenant.disable). Keyed by tenant id.
+    pub tenant_patterns: std::collections::HashMap<String, Vec<(regex::Regex, String)>>,
+    /// WOR-1042: pre-composed per-origin field-key denylist additions
+    /// (proxy ∪ tenant ∪ origin). Keyed by the route string the
+    /// emitter stamps on `StructuredLog.route` (today: the origin's
+    /// hostname).
+    pub origin_fields: std::collections::HashMap<String, Vec<String>>,
+    /// WOR-1042: pre-composed per-origin pattern set
+    /// (((proxy ∪ tenant) − tenant.disable) ∪ origin) − origin.disable.
+    /// Keyed by route (origin hostname today).
+    pub origin_patterns: std::collections::HashMap<String, Vec<(regex::Regex, String)>>,
     /// Resolved PII redactor at proxy scope (the PR1 path). `None`
     /// when the operator has not enabled PII at proxy scope. Built
     /// once from the resolved rule set with Aho-Corasick anchor
@@ -397,6 +416,10 @@ impl OpRedactState {
         Self {
             fields: Vec::new(),
             patterns: Vec::new(),
+            tenant_fields: std::collections::HashMap::new(),
+            tenant_patterns: std::collections::HashMap::new(),
+            origin_fields: std::collections::HashMap::new(),
+            origin_patterns: std::collections::HashMap::new(),
             proxy_pii: None,
             tenant_pii: std::collections::HashMap::new(),
             origin_pii: std::collections::HashMap::new(),
@@ -426,6 +449,46 @@ impl OpRedactState {
             }
         }
         self.proxy_pii.as_ref()
+    }
+
+    /// WOR-1042: resolve the active field-key denylist additions for a
+    /// (tenant, route) pair. Most-specific scope wins; an absent scope
+    /// falls through. The returned slice is ADDITIVE on top of the
+    /// built-in baseline (never replaces it).
+    pub fn resolve_fields(&self, tenant_id: Option<&str>, route: Option<&str>) -> &[String] {
+        if let Some(r) = route {
+            if let Some(v) = self.origin_fields.get(r) {
+                return v;
+            }
+        }
+        if let Some(t) = tenant_id {
+            if let Some(v) = self.tenant_fields.get(t) {
+                return v;
+            }
+        }
+        &self.fields
+    }
+
+    /// WOR-1042: resolve the active regex pattern set for a (tenant,
+    /// route) pair. Most-specific scope wins. The composition + the
+    /// per-scope `disable:` subtraction happens at install time so
+    /// this is just a HashMap lookup on the hot path.
+    pub fn resolve_patterns(
+        &self,
+        tenant_id: Option<&str>,
+        route: Option<&str>,
+    ) -> &[(regex::Regex, String)] {
+        if let Some(r) = route {
+            if let Some(v) = self.origin_patterns.get(r) {
+                return v;
+            }
+        }
+        if let Some(t) = tenant_id {
+            if let Some(v) = self.tenant_patterns.get(t) {
+                return v;
+            }
+        }
+        &self.patterns
     }
 }
 
@@ -490,14 +553,31 @@ pub fn apply_redaction_for(
 ) -> String {
     let pattern_redacted = crate::redact::redact_secrets(json);
 
+    // WOR-1042: resolve the per-scope field-key denylist + regex
+    // pattern set ONCE per emit so the recursive `redact_value` walk
+    // and the regex pass both see the same composed set. Holding the
+    // state `Arc` for the duration of the emit pins the lookup; the
+    // Arc clone is cheap.
+    let state = op_redact_state();
+    let extra_fields = state.resolve_fields(tenant_id, route);
+    let patterns = state.resolve_patterns(tenant_id, route);
+
     let mut value: serde_json::Value = match serde_json::from_str(&pattern_redacted) {
         Ok(v) => v,
-        Err(_) => return apply_op_regex_patterns(&pattern_redacted, tenant_id, route),
+        Err(_) => {
+            return apply_op_regex_patterns_with(
+                &pattern_redacted,
+                tenant_id,
+                route,
+                patterns,
+                &state,
+            )
+        }
     };
-    redact_value(&mut value, sink);
+    redact_value(&mut value, sink, extra_fields);
     let rendered = serde_json::to_string(&value).unwrap_or(pattern_redacted);
 
-    apply_op_regex_patterns(&rendered, tenant_id, route)
+    apply_op_regex_patterns_with(&rendered, tenant_id, route, patterns, &state)
 }
 
 /// Apply the operator-supplied regex patterns and, when configured,
@@ -507,9 +587,16 @@ pub fn apply_redaction_for(
 /// [`OpRedactState::resolve_pii`]; an explicit opt-out at a
 /// more-specific scope (the `Some(None)` slot) skips the PII pass
 /// entirely.
-fn apply_op_regex_patterns(input: &str, tenant_id: Option<&str>, route: Option<&str>) -> String {
-    let state = op_redact_state();
-    let needs_regex = !state.patterns.is_empty();
+/// WOR-1042: variant that takes a pre-resolved pattern slice and state
+/// snapshot so `apply_redaction_for` does not re-resolve per call.
+fn apply_op_regex_patterns_with(
+    input: &str,
+    tenant_id: Option<&str>,
+    route: Option<&str>,
+    patterns: &[(regex::Regex, String)],
+    state: &std::sync::Arc<OpRedactState>,
+) -> String {
+    let needs_regex = !patterns.is_empty();
     let pii = state.resolve_pii(tenant_id, route);
     let needs_pii = pii.is_some();
     if !needs_regex && !needs_pii {
@@ -518,7 +605,7 @@ fn apply_op_regex_patterns(input: &str, tenant_id: Option<&str>, route: Option<&
     let mut out: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(input);
     if needs_regex {
         let mut owned = out.into_owned();
-        for (re, replacement) in &state.patterns {
+        for (re, replacement) in patterns {
             owned = re.replace_all(&owned, replacement.as_str()).into_owned();
         }
         out = std::borrow::Cow::Owned(owned);
@@ -535,25 +622,25 @@ fn apply_op_regex_patterns(input: &str, tenant_id: Option<&str>, route: Option<&
 /// Recursively walk a JSON value and redact any field whose key is on
 /// the denylist. Replacements use the typed `[REDACTED:FOO]` marker
 /// (schema v2).
-fn redact_value(value: &mut serde_json::Value, sink: Sink) {
+fn redact_value(value: &mut serde_json::Value, sink: Sink, extra_fields: &[String]) {
     match value {
         serde_json::Value::Object(map) => {
             // Collect keys first so we can mutate values without
             // double-borrowing the map.
             let keys: Vec<String> = map.keys().cloned().collect();
             for k in keys {
-                if let Some(marker) = match_denylist(&k, sink) {
+                if let Some(marker) = match_denylist(&k, sink, extra_fields) {
                     if let Some(v) = map.get_mut(&k) {
                         *v = serde_json::Value::String(marker.to_string());
                     }
                 } else if let Some(v) = map.get_mut(&k) {
-                    redact_value(v, sink);
+                    redact_value(v, sink, extra_fields);
                 }
             }
         }
         serde_json::Value::Array(arr) => {
             for v in arr {
-                redact_value(v, sink);
+                redact_value(v, sink, extra_fields);
             }
         }
         _ => {}
@@ -562,8 +649,11 @@ fn redact_value(value: &mut serde_json::Value, sink: Sink) {
 
 /// Match a JSON field key against the denylist. Returns the
 /// typed marker that should replace the value, or `None` to leave it
-/// alone.
-fn match_denylist(key: &str, sink: Sink) -> Option<&'static str> {
+/// alone. The `extra_fields` slice is the per-scope (proxy / tenant /
+/// origin) field-key denylist resolved by the caller; it sits in
+/// front of the operator-extensible global `state.fields` slot so the
+/// most-specific scope's additions fire.
+fn match_denylist(key: &str, sink: Sink, extra_fields: &[String]) -> Option<&'static str> {
     let k = key.to_ascii_lowercase();
     // Authorization headers + cookies: every sink redacts these.
     if k == "authorization" || k == "proxy-authorization" {
@@ -633,16 +723,20 @@ fn match_denylist(key: &str, sink: Sink) -> Option<&'static str> {
     {
         return Some("[REDACTED:API_KEY]");
     }
-    // Operator-extensible field-key denylist installed via
-    // install_op_redact_config. The match runs case-insensitively
-    // against the lowercased key (`k`); the marker is constructed
-    // from the configured field name for traceability.
-    let state = op_redact_state();
-    if !state.fields.is_empty() && state.fields.iter().any(|f| f == &k) {
-        // Leak a stable marker shape: the configured field is the
-        // typed name; uppercase + underscore-normalised for the
-        // marker so downstream tooling sees a consistent format.
+    // Operator-extensible field-key denylist. `extra_fields` is the
+    // per-scope (proxy / tenant / origin) resolved set passed in by
+    // the caller; an empty slice falls back to the global state's
+    // proxy-scope `fields` (the legacy path for emit sites that have
+    // not threaded a scope through). The match runs case-insensitively
+    // against the lowercased key (`k`).
+    if !extra_fields.is_empty() && extra_fields.iter().any(|f| f == &k) {
         return Some("[REDACTED:OPERATOR_FIELD]");
+    }
+    if extra_fields.is_empty() {
+        let state = op_redact_state();
+        if !state.fields.is_empty() && state.fields.iter().any(|f| f == &k) {
+            return Some("[REDACTED:OPERATOR_FIELD]");
+        }
     }
     None
 }
@@ -868,6 +962,10 @@ mod tests {
             proxy_pii: None,
             tenant_pii: std::collections::HashMap::new(),
             origin_pii: std::collections::HashMap::new(),
+            tenant_fields: std::collections::HashMap::new(),
+            tenant_patterns: std::collections::HashMap::new(),
+            origin_fields: std::collections::HashMap::new(),
+            origin_patterns: std::collections::HashMap::new(),
         });
         let json = r#"{"authorization":"Bearer x","internal_account_id":"acct-123456"}"#;
         let out = apply_redaction(json, Sink::AccessLog);
@@ -904,6 +1002,10 @@ mod tests {
             proxy_pii: None,
             tenant_pii: std::collections::HashMap::new(),
             origin_pii: std::collections::HashMap::new(),
+            tenant_fields: std::collections::HashMap::new(),
+            tenant_patterns: std::collections::HashMap::new(),
+            origin_fields: std::collections::HashMap::new(),
+            origin_patterns: std::collections::HashMap::new(),
         });
         let json = r#"{"freeform":"cust_abc1234567 was here"}"#;
         let out = apply_redaction(json, Sink::AccessLog);
@@ -946,6 +1048,10 @@ mod tests {
             proxy_pii: Some(pii),
             tenant_pii: std::collections::HashMap::new(),
             origin_pii: std::collections::HashMap::new(),
+            tenant_fields: std::collections::HashMap::new(),
+            tenant_patterns: std::collections::HashMap::new(),
+            origin_fields: std::collections::HashMap::new(),
+            origin_patterns: std::collections::HashMap::new(),
         });
         let json = r#"{"freeform":"ping alice@example.com please"}"#;
         let out = apply_redaction(json, Sink::AccessLog);
@@ -1008,6 +1114,10 @@ mod tests {
             proxy_pii: None,
             tenant_pii,
             origin_pii: std::collections::HashMap::new(),
+            tenant_fields: std::collections::HashMap::new(),
+            tenant_patterns: std::collections::HashMap::new(),
+            origin_fields: std::collections::HashMap::new(),
+            origin_patterns: std::collections::HashMap::new(),
         });
 
         let json = r#"{"freeform":"ping alice@example.com please"}"#;
@@ -1045,6 +1155,10 @@ mod tests {
             proxy_pii: None,
             tenant_pii,
             origin_pii: std::collections::HashMap::new(),
+            tenant_fields: std::collections::HashMap::new(),
+            tenant_patterns: std::collections::HashMap::new(),
+            origin_fields: std::collections::HashMap::new(),
+            origin_patterns: std::collections::HashMap::new(),
         });
 
         let json = r#"{"freeform":"ping alice@example.com please"}"#;
@@ -1090,6 +1204,10 @@ mod tests {
             proxy_pii: None,
             tenant_pii,
             origin_pii,
+            tenant_fields: std::collections::HashMap::new(),
+            tenant_patterns: std::collections::HashMap::new(),
+            origin_fields: std::collections::HashMap::new(),
+            origin_patterns: std::collections::HashMap::new(),
         });
 
         let json = r#"{"freeform":"alice@example.com paid via 4111 1111 1111 1111 last week"}"#;
@@ -1142,6 +1260,10 @@ mod tests {
             proxy_pii: Some(proxy_pii),
             tenant_pii,
             origin_pii: std::collections::HashMap::new(),
+            tenant_fields: std::collections::HashMap::new(),
+            tenant_patterns: std::collections::HashMap::new(),
+            origin_fields: std::collections::HashMap::new(),
+            origin_patterns: std::collections::HashMap::new(),
         });
 
         let json = r#"{"freeform":"ping alice@example.com please"}"#;
@@ -1160,6 +1282,137 @@ mod tests {
             at_default.contains("[REDACTED:EMAIL]"),
             "proxy-scope default should still redact: {at_default}"
         );
+
+        let _ = install_op_redact_config(OpRedactState::empty());
+    }
+
+    /// WOR-1042: a tenant-scope `fields:` entry adds to (does not
+    /// replace) the proxy-scope denylist. Proxy adds `x-proxy-token`;
+    /// tenant `acme` adds `x-acme-license`. A record at tenant `acme`
+    /// redacts BOTH; a record at any other tenant only sees the
+    /// proxy-scope entry.
+    #[test]
+    fn tenant_fields_extend_proxy_fields_additively() {
+        let _guard = OP_REDACT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut tenant_fields: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        // Tenant entry MUST include the proxy-scope set verbatim plus
+        // its own additions; that is what the lifecycle composer does
+        // at install time. The resolver returns this set as-is. The
+        // field names below avoid the built-in `_token` / `_key`
+        // suffix matchers so the OPERATOR_FIELD marker fires (rather
+        // than the built-in API_KEY marker).
+        tenant_fields.insert(
+            "acme".to_string(),
+            vec!["x-internal-acct".to_string(), "x-acme-license".to_string()],
+        );
+
+        let _ = install_op_redact_config(OpRedactState {
+            fields: vec!["x-internal-acct".to_string()],
+            patterns: Vec::new(),
+            proxy_pii: None,
+            tenant_pii: std::collections::HashMap::new(),
+            origin_pii: std::collections::HashMap::new(),
+            tenant_fields,
+            tenant_patterns: std::collections::HashMap::new(),
+            origin_fields: std::collections::HashMap::new(),
+            origin_patterns: std::collections::HashMap::new(),
+        });
+
+        let json = r#"{"x-acme-license":"a-l-1","x-internal-acct":"i-a-1","keep":"me"}"#;
+        let at_acme = apply_redaction_for(json, Sink::AccessLog, Some("acme"), None);
+        assert!(
+            at_acme.contains("[REDACTED:OPERATOR_FIELD]"),
+            "tenant-scope acme fields not honoured: {at_acme}"
+        );
+        // Both denylisted keys carry the OPERATOR_FIELD marker.
+        assert_eq!(at_acme.matches("[REDACTED:OPERATOR_FIELD]").count(), 2);
+
+        let at_other = apply_redaction_for(json, Sink::AccessLog, Some("other"), None);
+        // Tenant `other` has no entry, falls through to proxy-scope.
+        // Only `x-internal-acct` denylisted; `x-acme-license` passes.
+        assert_eq!(at_other.matches("[REDACTED:OPERATOR_FIELD]").count(), 1);
+        assert!(
+            at_other.contains("\"x-acme-license\":\"a-l-1\""),
+            "tenant `other` should NOT redact acme fields: {at_other}"
+        );
+
+        let _ = install_op_redact_config(OpRedactState::empty());
+    }
+
+    /// WOR-1042: a tenant-scope `patterns:` entry composes on top of
+    /// the proxy patterns; tenant `disable:` opts out of a proxy
+    /// pattern by name. The composer lives in `lifecycle.rs`; this
+    /// test asserts the resolver returns the composed slice.
+    #[test]
+    fn tenant_patterns_compose_with_disable() {
+        let _guard = OP_REDACT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let proxy_patterns = vec![
+            (
+                regex::Regex::new(r"acct-[a-z0-9]+").expect("compiles"),
+                "[REDACTED:ACCOUNT]".to_string(),
+            ),
+            (
+                regex::Regex::new(r"cust-[a-z0-9]+").expect("compiles"),
+                "[REDACTED:CUSTOMER]".to_string(),
+            ),
+        ];
+        // Tenant `hipaa` opts out of CUSTOMER (e.g. compliance reason)
+        // and adds its own MRN pattern. The lifecycle composer would
+        // emit this; we hand-roll it here.
+        let mut tenant_patterns: std::collections::HashMap<String, Vec<(regex::Regex, String)>> =
+            std::collections::HashMap::new();
+        tenant_patterns.insert(
+            "hipaa".to_string(),
+            vec![
+                (
+                    regex::Regex::new(r"acct-[a-z0-9]+").expect("compiles"),
+                    "[REDACTED:ACCOUNT]".to_string(),
+                ),
+                (
+                    regex::Regex::new(r"mrn-[0-9]+").expect("compiles"),
+                    "[REDACTED:MRN]".to_string(),
+                ),
+            ],
+        );
+
+        let _ = install_op_redact_config(OpRedactState {
+            fields: Vec::new(),
+            patterns: proxy_patterns,
+            proxy_pii: None,
+            tenant_pii: std::collections::HashMap::new(),
+            origin_pii: std::collections::HashMap::new(),
+            tenant_fields: std::collections::HashMap::new(),
+            tenant_patterns,
+            origin_fields: std::collections::HashMap::new(),
+            origin_patterns: std::collections::HashMap::new(),
+        });
+
+        let json = r#"{"body":"saw acct-abc123 and cust-foo and mrn-987 today"}"#;
+        let at_hipaa = apply_redaction_for(json, Sink::AccessLog, Some("hipaa"), None);
+        assert!(
+            at_hipaa.contains("[REDACTED:ACCOUNT]"),
+            "tenant `hipaa` lost the inherited ACCOUNT pattern: {at_hipaa}"
+        );
+        assert!(
+            at_hipaa.contains("[REDACTED:MRN]"),
+            "tenant `hipaa` did not pick up its own MRN pattern: {at_hipaa}"
+        );
+        assert!(
+            at_hipaa.contains("cust-foo"),
+            "tenant `hipaa` disable: should have dropped CUSTOMER from the composed set: {at_hipaa}"
+        );
+
+        let at_other = apply_redaction_for(json, Sink::AccessLog, Some("other"), None);
+        // Tenant `other` falls back to proxy-scope: both ACCOUNT +
+        // CUSTOMER fire, MRN does not.
+        assert!(at_other.contains("[REDACTED:ACCOUNT]"));
+        assert!(at_other.contains("[REDACTED:CUSTOMER]"));
+        assert!(at_other.contains("mrn-987"));
 
         let _ = install_op_redact_config(OpRedactState::empty());
     }
