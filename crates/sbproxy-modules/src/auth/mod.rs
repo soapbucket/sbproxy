@@ -564,6 +564,32 @@ impl BearerAuth {
         })
     }
 
+    /// WOR-1074: sibling of [`Self::check_request_with_principal`]
+    /// that also exposes the matched [`BearerToken`] entry so a
+    /// downstream sender-constraint verifier (RFC 9449 DPoP, RFC
+    /// 8705 mTLS-bound) can read `attrs.metadata["dpop_jkt"]` to
+    /// learn which JWK thumbprint the proof must bind to.
+    ///
+    /// Returns the `Principal` along with a borrowed reference to
+    /// the matched entry. Existing callers that only need the
+    /// principal can keep using [`Self::check_request_with_principal`];
+    /// the verifier-driving call site uses this variant.
+    pub fn check_request_with_token(
+        &self,
+        headers: &http::HeaderMap,
+        tenant_id: TenantId,
+    ) -> Option<(Principal, &BearerToken)> {
+        let entry = self.match_token(headers)?;
+        let principal = Principal {
+            tenant_id,
+            sub: String::new(),
+            source: PrincipalSource::Bearer,
+            virtual_key: None,
+            attrs: entry.attrs.to_principal_attrs(),
+        };
+        Some((principal, entry))
+    }
+
     /// Constant-time scan that returns the matched entry so a caller
     /// can also pull its metadata. The loop runs over every entry so
     /// the total time depends on the configured token-set size, not
@@ -685,6 +711,20 @@ impl JwtAuth {
         headers: &http::HeaderMap,
         tenant_id: TenantId,
     ) -> Option<Principal> {
+        self.check_request_with_claims(headers, tenant_id)
+            .map(|(p, _)| p)
+    }
+
+    /// WOR-1074: sibling of [`Self::check_request_with_principal`]
+    /// that ALSO returns the decoded JWT claims so a sender-
+    /// constraint verifier (RFC 9449 DPoP, RFC 8705 mTLS-bound)
+    /// can read the `cnf` claim (`cnf.jkt` for DPoP, `cnf.x5t#S256`
+    /// for mTLS-bound).
+    pub fn check_request_with_claims(
+        &self,
+        headers: &http::HeaderMap,
+        tenant_id: TenantId,
+    ) -> Option<(Principal, serde_json::Value)> {
         let (sub, claims) = self.validate_request(headers)?;
         let mut attrs = self.attrs.to_principal_attrs();
         // First-name-wins resolution across `roles_claim`. The
@@ -703,16 +743,25 @@ impl JwtAuth {
                 }
             }
         }
+        // Return the claims to the WOR-1074 verifier path BEFORE
+        // moving them into `attrs`. The verifier reads `cnf.jkt`
+        // (DPoP) or `cnf.x5t#S256` (mTLS-bound) off the same
+        // structure; using a fresh clone avoids re-decoding the
+        // JWT just to inspect the binding.
+        let claims_for_verifier = claims.clone();
         if let serde_json::Value::Object(map) = claims {
             attrs.claims = Some(map);
         }
-        Some(Principal {
-            tenant_id,
-            sub,
-            source: PrincipalSource::Jwt,
-            virtual_key: None,
-            attrs,
-        })
+        Some((
+            Principal {
+                tenant_id,
+                sub,
+                source: PrincipalSource::Jwt,
+                virtual_key: None,
+                attrs,
+            },
+            claims_for_verifier,
+        ))
     }
 
     /// Internal validation that returns both the resolved `sub` and

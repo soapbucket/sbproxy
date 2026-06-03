@@ -1,0 +1,52 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+#
+# RFC 9449 DPoP-bound Bearer tokens.
+#
+# A stolen Bearer token is only useful if the attacker can also
+# replay it. RFC 9449 (DPoP, "Demonstrating Proof of Possession")
+# binds each token to a key the legitimate client signs with on
+# every request. The proxy reads the `DPoP:` header, verifies
+# the proof, and checks the proof's JWK thumbprint against the
+# operator-stamped `dpop_jkt` on the matched token entry.
+#
+# Curl:
+#   # Without a DPoP proof: rejected.
+#   curl -i http://127.0.0.1:8080/anything \
+#     -H 'Host: api.local' \
+#     -H 'Authorization: Bearer service-token-1'
+#   # HTTP/1.1 401
+#
+#   # With a valid DPoP proof signed by the key whose RFC 7638
+#   # thumbprint is NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs:
+#   curl -i http://127.0.0.1:8080/anything \
+#     -H 'Host: api.local' \
+#     -H 'Authorization: Bearer service-token-1' \
+#     -H "DPoP: $DPOP_PROOF"
+#   # HTTP/1.1 200
+#
+# Generating a DPoP proof is the client's job; libraries exist
+# for Python, Go, Java, JS (search for "dpop client library").
+# The proof's claims must include `htm` (request method), `htu`
+# (request URL), `jti` (unique id) + `iat`; the header carries
+# `typ = "dpop+jwt"` and the JWK of the signing key.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    authentication:
+      type: bearer
+      require_dpop: true
+      tokens:
+        - secret: service-token-1
+          # RFC 7638 SHA-256 thumbprint of the client's DPoP
+          # signing key, base64url-no-pad. Operators derive it
+          # once when minting the bearer secret + share the
+          # public JWK with the client.
+          metadata:
+            dpop_jkt: "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"

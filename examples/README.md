@@ -61,6 +61,7 @@ directory (with its `sb.yml` and README). Regenerated from `examples/` on 2026-0
 | [auth-api-key](auth-api-key/) | Enforces an API key check before any upstream call. The `api_key` authentication provider compares the value of the configured header (`X-Api-Key`) ag |
 | [auth-basic](auth-basic/) | Two-user HTTP Basic auth with a custom realm (`"sbproxy demo"`). Useful for quick admin panels and small internal tools. Requests without credentials  |
 | [auth-bearer](auth-bearer/) | Accepts a fixed allowlist of opaque service tokens in the `Authorization: Bearer <token>` header. Pick this when callers are services that already man |
+| [auth-bearer-dpop](auth-bearer-dpop/) | RFC 9449 DPoP-bound Bearer tokens. A stolen token alone is not enough: the request must come with a valid DPoP proof whose JWK thumbprint matches the operator-stamped `dpop_jkt` on the matched token entry. |
 | [auth-cap](auth-cap/) | Validates Crawler Authorization Protocol (CAP) tokens on every request. CAP tokens are EdDSA-signed JWTs bound to an agent identity (`sub`), a request |
 | [auth-forward](auth-forward/) | Delegates the authentication decision to an external HTTP service. For each inbound request, sbproxy issues a sub-request to the configured URL (`http |
 | [auth-jwt](auth-jwt/) | Validates HS256 JWTs against a static HMAC secret (`dev-secret-change-me`). The JWT must carry the configured issuer (`https://issuer.local`) and audi |
