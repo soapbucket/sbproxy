@@ -69,6 +69,7 @@ impl PolicyEnforcer for HttpFramingEnforcer {
                 Some(ctx.request_id.to_string()),
                 Some(req.method().as_str().to_string()),
             )
+            .with_tenant_id(ctx.tenant_id.to_string())
             .emit();
             let message = violation.message().to_string();
             ctx.deny_policy_type = Some("http_framing");

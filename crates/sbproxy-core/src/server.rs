@@ -2225,6 +2225,7 @@ fn emit_auth_audit(
         Some(ctx.request_id.to_string()),
         Some(session.req_header().method.as_str().to_string()),
     )
+    .with_tenant_id(ctx.tenant_id.to_string())
     .emit();
 }
 
