@@ -14,6 +14,8 @@ pub mod cap;
 /// WOR-1070: RFC 9449 inbound DPoP proof verification.
 pub mod dpop;
 pub mod jwks;
+/// WOR-1072: RFC 8705 mTLS-bound access token validation.
+pub mod mtls_bound;
 pub mod oidc;
 /// Outbound credential resolver (WOR-802): per-upstream RFC 8693 token
 /// exchange, OAuth client-credentials, and vault-resolved secrets.
