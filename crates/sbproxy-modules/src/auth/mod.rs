@@ -473,12 +473,19 @@ pub struct BearerToken {
 
 /// Bearer token authentication.
 /// Validates a token from the `Authorization: Bearer <token>` header.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct BearerAuth {
     /// Accepted bearer token entries. Stored in declaration order so
     /// the constant-time scan is deterministic; the matching helper is
     /// crate-private (see `match_token`).
     pub tokens: Vec<BearerToken>,
+    /// WOR-1052 wire-up: when `true`, every accepted bearer token
+    /// MUST be presented alongside a valid RFC 9449 DPoP proof. The
+    /// `cnf.jkt` claim is read from the matched token entry's
+    /// `attrs.metadata["dpop_jkt"]` (operators stamp it next to the
+    /// secret so different tokens can be bound to different keys).
+    /// Default `false` preserves the legacy bearer semantics.
+    pub require_dpop: bool,
 }
 
 impl<'de> Deserialize<'de> for BearerAuth {
@@ -490,9 +497,14 @@ impl<'de> Deserialize<'de> for BearerAuth {
         struct Raw {
             #[serde(deserialize_with = "deserialize_bearer_tokens")]
             tokens: Vec<BearerToken>,
+            #[serde(default)]
+            require_dpop: bool,
         }
         let raw = Raw::deserialize(d)?;
-        Ok(Self { tokens: raw.tokens })
+        Ok(Self {
+            tokens: raw.tokens,
+            require_dpop: raw.require_dpop,
+        })
     }
 }
 
@@ -581,7 +593,7 @@ impl BearerAuth {
 /// instantiated without either a shared `secret` or a `jwks_url`, all
 /// tokens are rejected: there is no configuration under which this
 /// provider accepts an unsigned or unverified token.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct JwtAuth {
     /// Shared HMAC secret for verifying tokens (used with HS-family algorithms).
     #[serde(default)]
@@ -620,6 +632,21 @@ pub struct JwtAuth {
     /// JWT payload; nested-claim resolution is out of scope for PR2.
     #[serde(default)]
     pub roles_claim: Vec<String>,
+    /// WOR-1052 wire-up: when `true`, every accepted JWT MUST carry
+    /// a `cnf.jkt` claim AND be presented alongside a valid RFC 9449
+    /// DPoP proof that thumbprints to the same value. Tokens without
+    /// `cnf.jkt` are rejected. Default `false` preserves the legacy
+    /// bearer-token semantics.
+    #[serde(default)]
+    pub require_dpop: bool,
+    /// WOR-1052 wire-up: when `true`, every accepted JWT MUST carry
+    /// a `cnf.x5t#S256` claim AND be presented over an mTLS
+    /// connection whose client cert thumbprints to the same value.
+    /// Tokens without `cnf.x5t#S256` are rejected. Default `false`.
+    /// `require_dpop` and `require_mtls_bound` can be set together;
+    /// each binding is validated independently and both must pass.
+    #[serde(default)]
+    pub require_mtls_bound: bool,
 }
 
 impl JwtAuth {
@@ -1217,6 +1244,7 @@ mod tests {
     fn bearer_auth_type() {
         let auth = Auth::Bearer(BearerAuth {
             tokens: bearer_entries(&["tok"]),
+            ..Default::default()
         });
         assert_eq!(auth.auth_type(), "bearer");
     }
@@ -1232,6 +1260,8 @@ mod tests {
             algorithms: Vec::new(),
             attrs: CredentialAttrs::default(),
             roles_claim: Vec::new(),
+            require_dpop: false,
+            require_mtls_bound: false,
         });
         assert_eq!(auth.auth_type(), "jwt");
     }
@@ -1287,6 +1317,7 @@ mod tests {
     fn auth_debug_bearer() {
         let auth = Auth::Bearer(BearerAuth {
             tokens: bearer_entries(&["tok"]),
+            ..Default::default()
         });
         let debug = format!("{:?}", auth);
         assert!(debug.contains("Bearer"));
@@ -1303,6 +1334,8 @@ mod tests {
             algorithms: Vec::new(),
             attrs: CredentialAttrs::default(),
             roles_claim: Vec::new(),
+            require_dpop: false,
+            require_mtls_bound: false,
         });
         let debug = format!("{:?}", auth);
         assert!(debug.contains("Jwt"));
@@ -1617,6 +1650,7 @@ mod tests {
     fn bearer_valid_token() {
         let auth = BearerAuth {
             tokens: bearer_entries(&["valid-token", "also-valid"]),
+            ..Default::default()
         };
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -1630,6 +1664,7 @@ mod tests {
     fn bearer_invalid_token() {
         let auth = BearerAuth {
             tokens: bearer_entries(&["valid-token"]),
+            ..Default::default()
         };
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -1643,6 +1678,7 @@ mod tests {
     fn bearer_missing_header() {
         let auth = BearerAuth {
             tokens: bearer_entries(&["tok"]),
+            ..Default::default()
         };
         let headers = http::HeaderMap::new();
         assert!(!auth.check_request(&headers));
@@ -1652,6 +1688,7 @@ mod tests {
     fn bearer_wrong_scheme() {
         let auth = BearerAuth {
             tokens: bearer_entries(&["tok"]),
+            ..Default::default()
         };
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -1707,13 +1744,7 @@ mod tests {
     fn jwt_auth(secret: Option<&str>) -> JwtAuth {
         JwtAuth {
             secret: secret.map(str::to_string),
-            jwks_url: None,
-            required_claims: HashMap::new(),
-            audience: None,
-            issuer: None,
-            algorithms: Vec::new(),
-            attrs: CredentialAttrs::default(),
-            roles_claim: Vec::new(),
+            ..Default::default()
         }
     }
 
