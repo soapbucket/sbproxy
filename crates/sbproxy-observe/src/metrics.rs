@@ -1956,6 +1956,46 @@ pub fn record_cert_expiry(host: &str, seconds_until_expiry: f64) {
         .set(seconds_until_expiry);
 }
 
+/// WOR-1024: record the age of the cached OCSP staple for `host` on
+/// `sbproxy_ocsp_staple_age_seconds{host}`. A stale staple (over
+/// 24 hours) signals an OCSP refresh failure that has not yet
+/// produced a hard handshake error.
+pub fn record_ocsp_staple_age(host: &str, age_seconds: f64) {
+    use prometheus::{register_gauge_vec, GaugeVec};
+    use std::sync::OnceLock;
+    static G: OnceLock<GaugeVec> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_gauge_vec!(
+            "sbproxy_ocsp_staple_age_seconds",
+            "Age of the cached OCSP staple for the host, in seconds",
+            &["host"],
+        )
+        .expect("ocsp staple age gauge registers")
+    });
+    let host = sanitize_label("host", host);
+    gauge.with_label_values(&[host.as_str()]).set(age_seconds);
+}
+
+/// WOR-1024: record an mTLS client-certificate verification outcome
+/// on `sbproxy_mtls_handshake_total{result}`. `result` is one of
+/// `ok`, `untrusted_issuer`, `expired`, `revoked`, `other`. An
+/// operator alerting on a non-trivial `untrusted_issuer` rate
+/// catches a CA misconfiguration before users see handshake errors.
+pub fn record_mtls_handshake(result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mtls_handshake_total",
+            "mTLS client-certificate verification outcomes",
+            &["result"],
+        )
+        .expect("mtls handshake counter registers")
+    });
+    counter.with_label_values(&[result]).inc();
+}
+
 // --- vault / secret-resolver metrics ------------------------------------
 //
 // The vault subsystem ran without any sbproxy_* metric until this PR.

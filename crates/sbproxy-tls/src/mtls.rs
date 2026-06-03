@@ -286,8 +286,16 @@ impl rustls::server::danger::ClientCertVerifier for CapturingClientCertVerifier 
             let digest = sha256(end_entity.as_ref());
             self.cache.insert(digest, info);
         }
-        self.inner
-            .verify_client_cert(end_entity, intermediates, now)
+        let outcome = self
+            .inner
+            .verify_client_cert(end_entity, intermediates, now);
+        // WOR-1024: bucket the verifier outcome onto
+        // `sbproxy_mtls_handshake_total{result}`. The closed-enum
+        // bucketing reads rustls' typed `Error::InvalidCertificate`
+        // discriminator; anything else collapses to `other`.
+        let label = classify_mtls_outcome(&outcome);
+        sbproxy_observe::metrics::record_mtls_handshake(label);
+        outcome
     }
 
     fn verify_tls12_signature(
@@ -324,6 +332,26 @@ impl rustls::server::danger::ClientCertVerifier for CapturingClientCertVerifier 
 fn sha256(data: &[u8]) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     Sha256::digest(data).to_vec()
+}
+
+/// WOR-1024: bucket a rustls `verify_client_cert` outcome onto the
+/// closed-enum label space of
+/// `sbproxy_mtls_handshake_total{result}`. The label set matches
+/// what an operator alerts on: a non-trivial `untrusted_issuer` rate
+/// signals a CA misconfiguration, `expired` signals client cert
+/// rotation problems, and `revoked` signals a real security event.
+fn classify_mtls_outcome(
+    outcome: &Result<rustls::server::danger::ClientCertVerified, rustls::Error>,
+) -> &'static str {
+    use rustls::CertificateError;
+    use rustls::Error::InvalidCertificate;
+    match outcome {
+        Ok(_) => "ok",
+        Err(InvalidCertificate(CertificateError::UnknownIssuer)) => "untrusted_issuer",
+        Err(InvalidCertificate(CertificateError::Expired)) => "expired",
+        Err(InvalidCertificate(CertificateError::Revoked)) => "revoked",
+        Err(_) => "other",
+    }
 }
 
 /// Parse an end-entity DER into `ClientCertInfo`. Returns `None` when

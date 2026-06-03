@@ -166,7 +166,7 @@ impl TlsState {
             return;
         };
         let resolver = self.resolver.clone();
-        stapler.start_refresh_task(cert_pem.clone(), move |bytes| {
+        stapler.start_refresh_task("_fallback".to_string(), cert_pem.clone(), move |bytes| {
             resolver.update_fallback_ocsp(bytes);
         });
         info!("OCSP refresh task started for manual fallback cert");
