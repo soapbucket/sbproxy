@@ -34,7 +34,7 @@ use crate::request_event::UserIdSource;
 /// Per-origin properties capture configuration. Defaults match the
 /// "capture on, no echo, no redaction" baseline; operators tune via
 /// `sb.yml`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct PropertiesConfig {
     /// Master switch. When `false`, [`capture_properties`] returns an
     /// empty map regardless of headers.
@@ -61,7 +61,7 @@ impl Default for PropertiesConfig {
 }
 
 /// Redaction rules for captured property values.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RedactConfig {
     /// Exact-match keys whose values are replaced with `"[redacted]"`.
     /// Match is case-insensitive on the lowercased captured key.
@@ -214,7 +214,9 @@ pub fn capture_properties(
 
 /// Auto-generation policy for session IDs when the caller does not
 /// supply one.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoGenerate {
     /// Never mint a session ID. Capture caller-supplied IDs only.
@@ -230,7 +232,7 @@ pub enum AutoGenerate {
 }
 
 /// Per-origin sessions configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SessionsConfig {
     /// Master capture switch. When `false`, callers see no session ID
     /// regardless of headers or auto-generation policy.
@@ -379,7 +381,7 @@ pub fn capture_parent_session_id(headers: &HeaderMap) -> (Option<Ulid>, SessionD
 // --- Users (T3.1) ---
 
 /// Per-origin user-ID configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct UserConfig {
     /// Master capture switch. When `false`, [`capture_user_id`] always
     /// returns `None`.
@@ -421,7 +423,7 @@ impl Default for UserConfig {
 /// (no 4xx); a dedicated metric tracks the drop for ops visibility.
 /// See `docs/A30.md` (decision log) for the rationale on why this
 /// path drops rather than rejects.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct BudgetConfig {
     /// Maximum admissions per window. Exceeding this floors further
     /// admissions in the same window to drop-with-metric.

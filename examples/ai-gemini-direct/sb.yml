@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # AI gateway: Google Gemini direct.
 #
 # Routes calls to generativelanguage.googleapis.com. Clients send

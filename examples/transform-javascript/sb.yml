@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # JavaScript body transform.
 #
 # Runs a JavaScript function against the raw body string. The entrypoint is

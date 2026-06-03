@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # 33 - quote-token-replay-jwks
 #
 # Demonstrates quote-token verification end-to-end:

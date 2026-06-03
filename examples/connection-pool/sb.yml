@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Per-origin connection pool tuning.
 #
 # The connection_pool block sizes the proxy's outbound HTTP client for this

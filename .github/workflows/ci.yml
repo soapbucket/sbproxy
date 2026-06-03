@@ -170,6 +170,10 @@ jobs:
           RUSTDOCFLAGS: -D warnings -D missing_docs
         run: cargo doc --workspace --no-deps --locked
 
+      - name: config schema is current (WOR-1081)
+        if: steps.filter.outputs.code == 'true'
+        run: bash scripts/check-config-schema.sh
+
   release-build:
     name: release build
     # Only run on pushes to main, not on pull_request events. Release

@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Forward auth: delegate the auth decision to an external service.
 #
 # Every incoming request triggers a subrequest to httpbin.org/status/200,

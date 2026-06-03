@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Shadow traffic with request mirroring.
 #
 # Every request matched by this origin is forwarded to the primary

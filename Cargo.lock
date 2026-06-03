@@ -3114,6 +3114,7 @@ checksum = "bd070e393353796e801d209ad339e89596eb4c8d430d18ede6a1cced8fafbd99"
 dependencies = [
  "autocfg",
  "hashbrown 0.12.3",
+ "serde",
 ]
 
 [[package]]
@@ -6384,6 +6385,7 @@ dependencies = [
  "sbproxy-observe",
  "sbproxy-platform",
  "sbproxy-plugin",
+ "schemars",
  "serde",
  "serde_json",
  "smallvec",
@@ -6686,6 +6688,7 @@ dependencies = [
  "reqwest",
  "sbproxy-plugin",
  "sbproxy-security",
+ "schemars",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -6892,6 +6895,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3fbf2ae1b8bc8e02df939598064d22402220cd5bbcca1c76f7d6a310974d5615"
 dependencies = [
  "dyn-clone",
+ "indexmap 1.9.3",
  "schemars_derive",
  "serde",
  "serde_json",

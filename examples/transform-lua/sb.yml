@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Lua JSON transform.
 #
 # Runs a Lua script against the parsed JSON body. The script entrypoint is

@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Circuit breaker for load balancer targets.
 #
 # A formal Closed -> Open -> HalfOpen -> Closed state machine, one

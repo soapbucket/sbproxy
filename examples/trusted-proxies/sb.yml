@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Trusted proxy CIDR list.
 #
 # When sbproxy itself sits behind another load balancer or CDN

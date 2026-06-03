@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # mTLS client certificate authentication.
 #
 # Verifies that incoming HTTPS clients present a certificate signed

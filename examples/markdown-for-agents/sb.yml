@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # 17 - Markdown for agents (Wave 4 / G4.2 + G4.3 + G4.5).
 #
 # Demonstrates the content-negotiate action and the Markdown projection.

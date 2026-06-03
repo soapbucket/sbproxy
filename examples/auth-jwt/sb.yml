@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # JWT authentication with a static HMAC secret.
 #
 # Validates HS256 tokens signed with `dev-secret-change-me`. Tokens must carry

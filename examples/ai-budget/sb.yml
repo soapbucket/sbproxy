@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # AI gateway: budget enforcement with per-scope downgrade.
 #
 # Two budget limits are stacked: a workspace-wide monthly cost cap and a

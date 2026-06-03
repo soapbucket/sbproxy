@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Bearer token authentication.
 #
 # Accepts a fixed list of opaque service tokens in the Authorization header.

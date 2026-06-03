@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Pattern-aware PII redaction at the AI request boundary.
 #
 # When `pii.enabled: true` is set on an AI proxy origin the gateway

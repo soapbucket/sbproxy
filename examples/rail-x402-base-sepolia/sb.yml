@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # 30 - rail-x402-base-sepolia
 #
 # x402 v2 paywall in front of an article origin. The bundled stack

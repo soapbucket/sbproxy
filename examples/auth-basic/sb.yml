@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # HTTP Basic authentication.
 #
 # Two users, plain passwords, custom realm. Useful for quick admin panels and

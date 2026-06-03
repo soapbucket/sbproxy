@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Active health checks for load balancer targets.
 #
 # Each target with a `health_check` block gets a background probe

@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Data Loss Prevention catalog.
 #
 # The dlp policy scans the request URI and headers for matches

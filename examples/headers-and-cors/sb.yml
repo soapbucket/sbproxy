@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Header injection and CORS.
 #
 # Demonstrates request_modifiers (rewrite outbound headers), response_modifiers

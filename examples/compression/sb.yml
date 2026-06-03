@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Response compression.
 #
 # Enables brotli, gzip, and zstd response compression for this origin. The

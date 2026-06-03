@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # API key authentication.
 #
 # Requires every request to present a valid key in `X-Api-Key`. Unauthorized

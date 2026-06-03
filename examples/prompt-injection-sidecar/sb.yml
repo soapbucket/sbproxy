@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # prompt_injection_v2 with the out-of-process sidecar detector.
 #
 # Instead of loading an ONNX model inside the proxy, this routes

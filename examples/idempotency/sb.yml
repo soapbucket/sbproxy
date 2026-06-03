@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # RFC 8594 idempotency middleware.
 #
 # Authoring `idempotency:` on an origin tells the proxy to short-circuit

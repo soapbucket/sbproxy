@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # OpenAPI 3.0 schema validation policy.
 #
 # Loads an inline OpenAPI document at startup and validates each

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 // --- Top-Level Config ---
 
 /// Top-level config file structure (sb.yml).
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ConfigFile {
     /// Optional source descriptor.
     ///
@@ -62,7 +62,7 @@ pub struct ConfigFile {
 ///   sources, merging each in order. A `db` form is reserved for a
 ///   later iteration but is intentionally not part of this primitive
 ///   yet.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConfigSource {
     /// The inline file is the config; nothing is fetched. This is the
@@ -104,7 +104,7 @@ pub enum ConfigSource {
 /// The block is fully optional: when absent the binary builds the
 /// resolver from `AgentClassCatalog::defaults()` plus the default
 /// resolver tuning. Most operators leave it untouched.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct AgentClassesConfig {
     /// Catalog source. `builtin` (default) loads the embedded YAML
     /// catalog. `hosted-feed` fetches from `hosted_feed.url`. `merged`
@@ -142,7 +142,7 @@ fn default_agent_classes_catalog() -> String {
 /// The fetch loop is not implemented in this crate; the field is
 /// reserved here so YAML written against the merged or hosted-feed
 /// shapes parses cleanly.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct HostedFeedConfig {
     /// Feed URL. Plain `http://` is allowed only against `127.0.0.1`
     /// and `localhost` for local development; the registry crate
@@ -161,7 +161,7 @@ pub struct HostedFeedConfig {
 /// keyid lookup on, 10 000-entry verdict cache. Operators set fields
 /// only when they need to disable a specific signal (typically rDNS
 /// in environments without a working PTR resolver).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct AgentClassResolverConfig {
     /// Run forward-confirmed reverse-DNS as resolver step 2. Default
     /// `true`. Disable when the runtime has no working DNS resolver.
@@ -212,7 +212,7 @@ fn default_resolver_cache_size() -> usize {
 /// resolution, and the optional shared-state backends (L2 cache +
 /// messenger). Out-of-tree top-level blocks live in
 /// [`Self::extensions`] and are ignored by the compiler.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ProxyServerConfig {
     /// HTTP listener port. Defaults to 8080.
     #[serde(default = "default_http_port")]
@@ -350,6 +350,10 @@ pub struct ProxyServerConfig {
     /// The compiler never parses these; extension consumers read
     /// their own keys.
     #[serde(default)]
+    // WOR-1081: schemars 0.8 does not know about `serde_yaml::Value`,
+    // so model the schema as an arbitrary JSON object (the wire form
+    // round-trips through serde_json equivalently for extension data).
+    #[schemars(with = "serde_json::Map<String, serde_json::Value>")]
     pub extensions: HashMap<String, serde_yaml::Value>,
     /// Tunable client-side timeouts for the proxy's outbound HTTP
     /// helpers (forward-auth, callbacks, mirrors, SWR refreshes, bot-
@@ -403,7 +407,7 @@ pub struct ProxyServerConfig {
 /// private seed signs outbound requests to upstreams that require Web
 /// Bot Auth. Treat `ed25519_seed_hex` as a secret (source it via an
 /// env interpolation rather than committing it).
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct WebBotAuthConfig {
     /// Key id advertised as the JWK `kid` and the RFC 9421 `keyid`.
     /// Must be non-empty.
@@ -465,7 +469,7 @@ impl Default for ProxyServerConfig {
 /// and the JavaScript engine. The CEL and WebAssembly
 /// engines manage their own budgets separately. Operators who omit
 /// the block get the documented defaults from each sub-block.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ScriptingConfig {
     /// Lua sandbox limits. Always populated, even when the operator
     /// omitted the block, so callers never have to special-case
@@ -485,7 +489,7 @@ pub struct ScriptingConfig {
 /// script. Adding fresh knobs here (module loader settings, host
 /// bindings, ...) should keep `sandbox:` as its own sub-block so
 /// existing configs keep parsing.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct JsScriptingConfig {
     /// Sandbox limits: CPU time budget, heap memory cap, and native
     /// stack cap. See [`JsSandboxConfig`].
@@ -509,7 +513,7 @@ pub struct JsScriptingConfig {
 /// respectively. They guard against runaway allocations and deeply
 /// recursive scripts in the same way the CPU budget guards against
 /// `while (true) {}`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct JsSandboxConfig {
     /// Wall-clock CPU budget per script execution. Defaults to 100
     /// ms, which is comfortably above any reasonable transform /
@@ -655,7 +659,7 @@ scripting:
 /// in the `/readyz` body and increments
 /// `sbproxy_synthetic_probe_failures_total{reason}` whenever the
 /// driver records a failure.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SyntheticProbeConfig {
     /// Master switch. Disabled by default so operators with strict
     /// request-cost budgets do not pay for a synthetic transaction
@@ -732,7 +736,7 @@ fn default_synthetic_timeout_ms() -> u64 {
 /// Lua scripting runtime configuration. Wraps the sandbox limits so
 /// future Lua-specific tunables (preloaded libraries, request-binding
 /// budgets, etc.) have a stable home.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct LuaScriptingConfig {
     /// Per-script execution limits.
     #[serde(default)]
@@ -758,7 +762,7 @@ pub struct LuaScriptingConfig {
 /// The on-the-wire field uses `max_memory_mb` (megabytes) because
 /// that is the unit operators reason about; the engine converts to
 /// bytes internally.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct LuaSandboxConfig {
     /// Wall-clock execution budget per Lua invocation, in
     /// milliseconds. Default: 100 ms.
@@ -822,7 +826,7 @@ fn default_lua_allow_patterns() -> bool {
 /// `SslDigest` does not expose the parsed Subject CN directly. When
 /// `require: true`, requests without a valid client cert are rejected
 /// during the TLS handshake and never reach `request_filter`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MtlsListenerConfig {
     /// Path to a PEM-encoded CA bundle used to verify client certs.
     pub client_ca_file: String,
@@ -854,7 +858,7 @@ fn default_mtls_require() -> bool {
 ///    the proxy used in its logs / webhooks.
 /// 4. The chosen value is echoed back to the client on the response,
 ///    unless `echo_response` is `false`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CorrelationIdConfig {
     /// Master switch. Default: `true`.
     #[serde(default = "default_correlation_id_enabled")]
@@ -945,7 +949,7 @@ mod correlation_id_tests {
 /// each request at `url` and discards the response. The primary
 /// upstream is never blocked by mirror delivery. Useful for safe
 /// rollouts of new backends and replay-driven testing.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MirrorConfig {
     /// Mirror upstream URL (http:// or https://). IPv6 hosts must be
     /// bracketed in the URL (e.g. `http://[2001:db8::1]:8080`) per RFC
@@ -996,7 +1000,7 @@ fn default_mirror_body_cap() -> usize {
 /// out of a key/value store (in-process by default, Redis when the top-level
 /// `l2_cache` block is set). See `CompiledPipeline` for where the backing store
 /// is selected.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ResponseCacheConfig {
     /// Global on/off switch for response caching on this origin.
     #[serde(default)]
@@ -1059,7 +1063,7 @@ pub struct ResponseCacheConfig {
 }
 
 /// Query-string normalization policy applied when computing the cache key.
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum QueryNormalize {
     /// Drop the query string from the cache key entirely.
@@ -1116,7 +1120,7 @@ impl Default for ResponseCacheConfig {
 /// cluster-wide shared state so multiple proxy replicas coordinate
 /// against the same counters and cache pool. YAML key:
 /// `l2_cache_settings`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct L2CacheConfig {
     /// Backend driver. Currently only `"redis"` is supported.
     pub driver: String,
@@ -1129,7 +1133,7 @@ pub struct L2CacheConfig {
 ///
 /// Kept separate from `L2CacheConfig` so future drivers can add fields
 /// (auth, pool size) without churning the parent struct.
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
 pub struct L2CacheParams {
     /// Connection DSN. For `redis` drivers this is a `redis://host:port[/db]`
     /// URL. Only the host:port portion is parsed today; the DB index is ignored.
@@ -1150,7 +1154,7 @@ pub struct L2CacheParams {
 /// Backend selection is open-ended via [`CacheReserveBackendConfig`]
 /// so the in-tree memory / filesystem / redis backends can be
 /// extended without touching this schema.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CacheReserveConfig {
     /// Master switch. When `false`, the reserve is not built and the
     /// hot cache behaves exactly as it does without this block.
@@ -1198,7 +1202,7 @@ impl Default for CacheReserveConfig {
 /// below; out-of-tree builds may register additional types via their
 /// own startup path (the in-tree pipeline ignores unknown types after
 /// logging a warning).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CacheReserveBackendConfig {
     /// In-process map. For tests and ephemeral single-replica setups.
@@ -1252,7 +1256,7 @@ fn default_reserve_max_size_bytes() -> u64 {
 ///
 /// Unknown drivers cause `build_messenger` to return an error; the caller
 /// decides whether to treat that as fatal or fall back to no-bus semantics.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MessengerSettings {
     /// Backend driver name.
     pub driver: String,
@@ -1264,7 +1268,7 @@ pub struct MessengerSettings {
 // --- Admin Config ---
 
 /// Configuration for the embedded read-only admin/stats API server.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct AdminConfig {
     /// Whether the admin server is enabled. Defaults to false.
     #[serde(default)]
@@ -1337,7 +1341,7 @@ fn default_http_port() -> u16 {
 ///     forward_auth_client_secs: 60
 ///     callback_client_secs: 15
 /// ```
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct HttpClientTimeoutsConfig {
     /// Outer client-level timeout for the shared forward-auth
     /// `reqwest::Client`. The per-request timeout from each
@@ -1403,7 +1407,7 @@ fn default_callback_client_secs() -> u64 {
 // --- ACME Config ---
 
 /// ACME (Automatic Certificate Management Environment) configuration for automatic TLS.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct AcmeConfig {
     /// Master switch for ACME-managed TLS certificates.
     #[serde(default)]
@@ -1451,7 +1455,7 @@ fn default_renew_before_days() -> u32 {
 // --- Metrics Config ---
 
 /// Metrics collection configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MetricsConfig {
     /// Max unique label values allowed per metric label before new values are
     /// collapsed to `__other__`. Defaults to 1 000.
@@ -1476,7 +1480,7 @@ fn default_max_cardinality() -> usize {
 }
 
 /// Per-label metrics cardinality overrides.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MetricsCardinalityConfig {
     /// Optional override for the `hostname` label cap.
     pub hostname_cap: Option<usize>,
@@ -1498,7 +1502,7 @@ pub struct MetricsCardinalityConfig {
 /// - `methods` empty matches every method; non-empty restricts to the
 ///   listed methods (case-insensitive on emit).
 /// - `sample_rate` is applied last and accepts a value in `[0.0, 1.0]`.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct AccessLogConfig {
     /// Master switch. When false (the default), no access-log lines are
     /// emitted regardless of the other fields.
@@ -1586,7 +1590,7 @@ fn default_access_log_sample_rate() -> f64 {
 }
 
 /// Access-log output sink.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct AccessLogOutputConfig {
     /// Sink type: `stderr` (default) or `file`.
     #[serde(default = "default_access_log_output_type", rename = "type")]
@@ -1646,7 +1650,7 @@ fn default_access_log_max_backups() -> usize {
 /// excluded from `*` and glob matches. To capture one of these, list
 /// it by exact name; the proxy logs a `WARN` at config load so the
 /// choice is visible.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CaptureHeadersConfig {
     /// Request-side allowlist. Empty (the default) captures nothing.
     #[serde(default)]
@@ -1781,7 +1785,7 @@ impl CompiledHeaderAllowlist {
 // --- Alerting Config ---
 
 /// Top-level alerting configuration block.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct AlertingConfig {
     /// List of notification channels to fire alerts to.
     #[serde(default)]
@@ -1792,7 +1796,7 @@ pub struct AlertingConfig {
 /// sub-blocks so an operator can configure both from YAML rather than
 /// CLI flags + env vars. Re-uses the existing `LoggingConfig` and
 /// `TelemetryConfig` shapes from `sbproxy-observe`.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ObservabilityConfig {
     /// `tracing-subscriber` configuration: level, format, per-level
     /// sampling. CLI / env still wins where applicable; this block is
@@ -1809,7 +1813,7 @@ pub struct ObservabilityConfig {
 /// config schema. Kept in `sbproxy-config` so the YAML round-trips
 /// through serde without dragging a serde dependency back into the
 /// observe crate.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ObservabilityLogConfig {
     /// Log level filter. `debug | info | warn | error`. Default `info`.
     #[serde(default)]
@@ -1844,7 +1848,7 @@ pub struct ObservabilityLogConfig {
 /// Operator-extensible redaction config. Sits under
 /// `proxy.observability.log.redact:` (today) and will surface at
 /// tenant and origin scopes once multi-tenant scaffolding lands.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ObservabilityRedactConfig {
     /// Additional JSON field keys whose values are replaced with
     /// `[REDACTED:<NAME>]`. Matched case-insensitively against the
@@ -1873,7 +1877,7 @@ pub struct ObservabilityRedactConfig {
 /// Operator-controlled PII redaction at the log layer. Mirrors the
 /// per-origin `PiiConfig` used by the AI handler but applies to every
 /// emitted log line, regardless of origin.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ObservabilityPiiConfig {
     /// Master switch. When `Some(false)`, the redactor is never built
     /// and the pipeline shorts the PII pass at this scope (and any
@@ -1900,7 +1904,7 @@ pub struct ObservabilityPiiConfig {
 
 /// One named regex mask. `name` is reported on cardinality / counter
 /// metrics; `replacement` defaults to `[REDACTED:<NAME>]` when empty.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ObservabilityRedactPattern {
     /// Operator-supplied label; appears in metrics + the marker.
     pub name: String,
@@ -1935,7 +1939,7 @@ pub struct ObservabilityRedactPattern {
 ///   raw query strings; `external` strips them. Tenant-scoped sinks
 ///   default to `external` because the operator usually does not
 ///   control the downstream backend.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ObservabilitySinkConfig {
     /// Unique name within the declaring scope (proxy / tenant / origin).
     /// Duplicates within a scope are rejected at config compile.
@@ -1965,7 +1969,7 @@ pub struct ObservabilitySinkConfig {
 ///
 /// Variants: `stdout`, `stderr`, `file`, `otlp`. `syslog` remains a
 /// planned follow-up. Unknown `type:` values fail compilation.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ObservabilitySinkOutput {
     /// Write to process stdout. The default for a freshly-installed
@@ -2019,7 +2023,7 @@ pub enum ObservabilitySinkOutput {
 }
 
 /// Per-level sample rates for the structured-log emitter.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ObservabilitySamplingConfig {
     /// Fraction of `info` lines to emit (default 1.0).
     #[serde(default)]
@@ -2033,7 +2037,7 @@ pub struct ObservabilitySamplingConfig {
 }
 
 /// Subset of `sbproxy-observe::TelemetryConfig` exposed in the YAML.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ObservabilityTelemetryConfig {
     /// Whether OTLP export is enabled.
     #[serde(default)]
@@ -2068,7 +2072,7 @@ pub struct ObservabilityTelemetryConfig {
 }
 
 /// Configuration for a single alert notification channel.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct AlertChannelConfig {
     /// Channel type: `"webhook"` or `"log"`.
     #[serde(rename = "type")]
@@ -2083,7 +2087,7 @@ pub struct AlertChannelConfig {
 // --- HTTP/3 Config ---
 
 /// HTTP/3 (QUIC) configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Http3Config {
     /// Whether to enable the HTTP/3 (QUIC) listener.
     #[serde(default)]
@@ -2113,7 +2117,7 @@ fn default_idle_timeout() -> u32 {
 /// Controls how many concurrent connections are maintained to an upstream,
 /// how long idle connections are kept alive, and the maximum lifetime of
 /// any individual connection.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ConnectionPoolConfig {
     /// Maximum number of concurrent connections to the upstream.
     ///
@@ -2167,7 +2171,7 @@ impl Default for ConnectionPoolConfig {
 /// every origin resolves to when `origin.tenant_id` is absent. The
 /// operator never declares `__default__` explicitly; doing so fails
 /// config compile.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ProxyTenantConfig {
     /// Operator-supplied stable identifier. Referenced from
     /// `origin.tenant_id` and stamped on every request the origin
@@ -2195,7 +2199,7 @@ pub struct ProxyTenantConfig {
 /// exist so the on-disk schema mirrors `proxy.observability.log.redact.pii`
 /// and we can extend the tree (e.g. tenant-scoped sinks) without a
 /// breaking shape change.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TenantObservabilityConfig {
     /// Tenant-scoped log block. See [`TenantObservabilityLogConfig`].
     #[serde(default)]
@@ -2215,7 +2219,7 @@ pub struct TenantObservabilityConfig {
 /// `__default__` tenant continues to use the proxy-wide
 /// `CardinalityLimiter` (in `sbproxy-observe`) so single-tenant
 /// deployments stay bit-for-bit identical to pre-WOR-1067 behaviour.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TenantCardinalityConfig {
     /// Maximum unique label values per metric, per label name, for
     /// requests resolving to this tenant. When omitted the
@@ -2241,7 +2245,7 @@ pub const TENANT_CARDINALITY_DEFAULT_MAX_SERIES: u32 = 10_000;
 /// every record whose resolved `Principal.tenant_id` matches this
 /// tenant into each declared sink; cross-tenant records never reach
 /// here.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TenantObservabilityLogConfig {
     /// Tenant-scope `redact:` sub-block. See
     /// [`TenantObservabilityRedactConfig`].
@@ -2260,7 +2264,7 @@ pub struct TenantObservabilityLogConfig {
 /// the field-key and pattern overrides remain proxy-scope only because
 /// they touch the rendered JSON, which is tenant-agnostic in the
 /// emitter.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TenantObservabilityRedactConfig {
     /// WOR-1042: tenant-scope additions to the field-key denylist.
     /// Additive only; a tenant CANNOT disable a proxy-level field
@@ -2304,7 +2308,7 @@ pub struct TenantObservabilityRedactConfig {
 /// * Allow / deny model lists that stack on top of the origin-level
 ///   allowlist (most-restrictive wins).
 /// * Per-credential sub-policies (rate limit, PII redaction, ...).
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CredentialBlock {
     /// Operator-supplied stable name. Unique within the declaring
     /// scope. Used to identify the credential in metrics and logs.
@@ -2345,7 +2349,7 @@ pub struct CredentialBlock {
 /// Selector matching an inbound principal to a credential. At least
 /// one field must be set; an entirely empty selector is rejected at
 /// compile.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct PrincipalSelector {
     /// Glob matching `Principal.virtual_key.name`. `*` matches any
     /// virtual key. `vk_frontend_*` matches every key with that
@@ -2371,7 +2375,7 @@ pub struct PrincipalSelector {
 }
 
 /// Attribution attributes copied onto matched principals.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CredentialAttrs {
     /// Project the credential's spend rolls up to.
     #[serde(default)]
@@ -2406,7 +2410,7 @@ pub struct CredentialAttrs {
 
 /// Per-credential budget. Reset windows use the LiteLLM-style
 /// `30s|30m|30h|30d` syntax.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CredentialBudget {
     /// Maximum tokens (input + output combined) per reset window.
     #[serde(default)]
@@ -2421,7 +2425,7 @@ pub struct CredentialBudget {
 
 /// Model allow / deny lists scoped to this credential. Stacks on top
 /// of the origin-level allowlist. Most-restrictive wins.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CredentialModels {
     /// Models this credential is allowed to use. Empty allows all
     /// origin-allowed models.
@@ -2437,7 +2441,7 @@ pub struct CredentialModels {
 /// Sub-policy attached to a credential. Closed enum; out-of-tree
 /// policies plug in through the existing plugin registry rather than
 /// widening this enum.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CredentialPolicy {
     /// Per-credential rate limit. Stacks on top of the origin-level
@@ -2461,7 +2465,7 @@ pub enum CredentialPolicy {
 
 /// A single origin config as it appears in YAML.
 /// Plugin-specific fields are kept as `serde_json::Value` for deferred parsing.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RawOriginConfig {
     /// Action describing what the origin does (proxy, redirect, static, etc.).
     pub action: serde_json::Value,
@@ -2615,6 +2619,10 @@ pub struct RawOriginConfig {
     /// name. Mirrors the server-level `proxy.extensions` pattern so
     /// the schema stays neutral.
     #[serde(default)]
+    // WOR-1081: schemars 0.8 does not know about `serde_yaml::Value`,
+    // so model the schema as an arbitrary JSON object (the wire form
+    // round-trips through serde_json equivalently for extension data).
+    #[schemars(with = "serde_json::Map<String, serde_json::Value>")]
     pub extensions: HashMap<String, serde_yaml::Value>,
     /// When true, the gateway exposes a per-host OpenAPI document at
     /// `/.well-known/openapi.json` (and `.yaml`) for this origin. Off by
@@ -2715,7 +2723,7 @@ pub struct RawOriginConfig {
 /// Origin-scope observability sub-tree. Currently only the
 /// `log.redact.pii` leaf is consumed at runtime; the nested layers
 /// exist so the on-disk schema mirrors the tenant + proxy shape.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct OriginObservabilityConfig {
     /// Origin-scope log block. See [`OriginObservabilityLogConfig`].
     #[serde(default)]
@@ -2726,7 +2734,7 @@ pub struct OriginObservabilityConfig {
 /// tenant-scope shape; exposes redaction plus origin-scoped sinks
 /// (WOR-1045 PR2). The dispatcher routes every record whose stamped
 /// `route` matches this origin's hostname into each declared sink.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct OriginObservabilityLogConfig {
     /// Origin-scope `redact:` sub-block. See
     /// [`OriginObservabilityRedactConfig`].
@@ -2744,7 +2752,7 @@ pub struct OriginObservabilityLogConfig {
 /// for the field-key denylist (WOR-1042 `fields:`, additive), the
 /// operator regex pass (WOR-1042 `patterns:` + `disable:`), and the
 /// rule-driven PII redactor (WOR-1043 `pii:`).
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct OriginObservabilityRedactConfig {
     /// WOR-1042: origin-scope additions to the field-key denylist.
     /// Additive only on top of the merged proxy + tenant set; an
@@ -2775,7 +2783,7 @@ pub struct OriginObservabilityRedactConfig {
 /// Per-origin agents.json manifest configuration (WOR-820). See the
 /// [`RawOriginConfig::agents_json`] field and the agents.json v0.1 spec
 /// at <https://github.com/wild-card-ai/agents-json>.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct AgentsJsonConfig {
     /// `info` block (title, version, description).
     pub info: AgentsJsonInfo,
@@ -2795,7 +2803,7 @@ pub struct AgentsJsonConfig {
 }
 
 /// The `info` block of an agents.json manifest.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct AgentsJsonInfo {
     /// Human-readable manifest title.
     pub title: String,
@@ -2823,7 +2831,7 @@ pub struct AgentsJsonInfo {
 /// a malicious origin cannot zip-bomb a downstream agent. All four
 /// have sensible defaults, and v1 configs that omit `agent_skills:`
 /// pay nothing for the new schema field.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct AgentSkillEntry {
     /// Stable identifier (used as the manifest `name` and as the
     /// audit-event subject). Must be unique within the origin's
@@ -2897,7 +2905,7 @@ fn default_agent_skill_visibility() -> String {
 /// Per-tenant and per-route token buckets, with an optional
 /// `route_overrides:` map that lets an operator pin a specific route
 /// to a tighter ceiling than the origin default.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct OriginRateLimitsConfig {
     /// Tenant-level burst. Effective ceiling that a single tenant
     /// may briefly exceed when arriving in bursts.
@@ -2950,7 +2958,7 @@ fn default_route_default() -> u32 {
 // --- Middleware Configs ---
 
 /// CORS configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CorsConfig {
     /// Origins permitted by `Access-Control-Allow-Origin`. Alias: `allow_origins`.
     #[serde(default, alias = "allow_origins")]
@@ -2978,7 +2986,7 @@ pub struct CorsConfig {
 }
 
 /// HSTS configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct HstsConfig {
     /// `max-age` directive of the `Strict-Transport-Security` header, in seconds.
     #[serde(default = "default_hsts_max_age")]
@@ -2996,7 +3004,7 @@ fn default_hsts_max_age() -> u64 {
 }
 
 /// Compression configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompressionConfig {
     /// Master switch for response compression. Alias: `enable`.
     #[serde(default = "default_true", alias = "enable")]
@@ -3017,7 +3025,7 @@ fn default_true() -> bool {
 }
 
 /// Session configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SessionConfig {
     /// Name of the session cookie.
     pub cookie_name: Option<String>,
@@ -3047,7 +3055,7 @@ pub struct SessionConfig {
 /// forward rule against the incoming request and uses the first matching
 /// entry's `origin`. Within a single entry the present matchers (path,
 /// header, query) are ANDed; across entries they are ORed.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RawForwardRule {
     /// Path matchers. The rule fires when any one of these matches the request path.
     #[serde(default)]
@@ -3069,7 +3077,7 @@ pub struct RawForwardRule {
 /// Field names and shapes mirror the OpenAPI spec exactly so emission is a
 /// direct passthrough. The `schema` field is kept as `serde_json::Value`
 /// because the OpenAPI Schema Object is large and we forward it verbatim.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Parameter {
     /// Parameter name. For path params this must match a `{name}` segment
     /// in one of the rule's `template` matchers.
@@ -3094,7 +3102,7 @@ pub struct Parameter {
 ///
 /// Matches the OpenAPI 3.0 enum exactly. `cookie` is intentionally not
 /// supported here yet because the gateway has no per-cookie capture story.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ParameterLocation {
     /// A captured `{name}` segment from a `template` matcher.
@@ -3112,7 +3120,7 @@ pub enum ParameterLocation {
 /// matcher must succeed for the entry to fire. Across entries in the
 /// same rule the semantics are OR: any matching entry triggers the rule.
 /// The shorthand `match: <prefix>` is equivalent to `path: { prefix: ... }`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ForwardRuleMatcher {
     /// Structured path matcher.
     #[serde(default)]
@@ -3133,7 +3141,7 @@ pub struct ForwardRuleMatcher {
 /// Exactly one of `value` or `prefix` should be set. When both are present
 /// `value` wins (exact comparison). Header name matching is case-insensitive
 /// per RFC 7230; value comparison is case-sensitive.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct HeaderMatcher {
     /// Header name (case-insensitive lookup).
     pub name: String,
@@ -3150,7 +3158,7 @@ pub struct HeaderMatcher {
 /// The query string is parsed as `application/x-www-form-urlencoded`. The
 /// matcher succeeds if any occurrence of `name` equals `value`. When `value`
 /// is omitted the matcher succeeds whenever the parameter is present at all.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct QueryMatcher {
     /// Query parameter name (case-sensitive).
     pub name: String,
@@ -3170,7 +3178,7 @@ pub struct QueryMatcher {
 /// catch-all (`/static/{*rest}`), and optional per-segment regex constraints
 /// (`/users/{id:[0-9]+}`). Constraint compilation happens at config-load time;
 /// the runtime only re-validates constrained params after the trie match.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct PathMatcher {
     /// Matches any path that starts with this prefix.
     #[serde(default)]
@@ -3191,7 +3199,7 @@ pub struct PathMatcher {
 
 /// Inline child origin used when a forward rule fires. Carries the action plus
 /// optional request modifiers and identifying metadata.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ForwardRuleOrigin {
     /// Optional identifier used in metrics and logs.
     #[serde(default)]
@@ -3220,7 +3228,7 @@ pub struct ForwardRuleOrigin {
 /// Each modifier entry can contain one or more of: `headers`, `url`, `query`,
 /// `method`, `body`, or `lua_script`. Multiple modifier entries in the list
 /// are applied in order.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RequestModifierConfig {
     /// Header set/add/remove operations.
     #[serde(default)]
@@ -3246,7 +3254,7 @@ pub struct RequestModifierConfig {
 }
 
 /// URL path rewrite configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct UrlModifier {
     /// Path rewrite rules.
     #[serde(default)]
@@ -3254,7 +3262,7 @@ pub struct UrlModifier {
 }
 
 /// Path rewrite: replace a substring in the path.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct PathRewrite {
     /// Replace a substring in the path.
     #[serde(default)]
@@ -3262,7 +3270,7 @@ pub struct PathRewrite {
 }
 
 /// A simple string-replace operation on the URL path.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct PathReplace {
     /// The substring to search for.
     pub old: String,
@@ -3271,7 +3279,7 @@ pub struct PathReplace {
 }
 
 /// Query parameter modification operations.
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
 pub struct QueryModifier {
     /// Set (overwrite) query parameters.
     #[serde(default)]
@@ -3285,7 +3293,7 @@ pub struct QueryModifier {
 }
 
 /// Body replacement configuration for request modifiers.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct BodyModifier {
     /// Replace the request body with this JSON value.
     #[serde(default)]
@@ -3299,7 +3307,7 @@ pub struct BodyModifier {
 ///
 /// Each modifier entry can contain one or more of: `headers`, `status`, `body`,
 /// or `lua_script`. Multiple modifier entries in the list are applied in order.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ResponseModifierConfig {
     /// Header set/add/remove operations.
     #[serde(default)]
@@ -3319,7 +3327,7 @@ pub struct ResponseModifierConfig {
 }
 
 /// Status code override for response modifiers.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct StatusOverride {
     /// The HTTP status code to set.
     pub code: u16,
@@ -3329,7 +3337,7 @@ pub struct StatusOverride {
 }
 
 /// Body replacement configuration for response modifiers.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ResponseBodyModifier {
     /// Replace the response body with this string.
     #[serde(default)]
@@ -3340,7 +3348,7 @@ pub struct ResponseBodyModifier {
 }
 
 /// Header modification operations (set, add, remove).
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
 pub struct HeaderModifiers {
     /// Headers to set, replacing any existing value.
     #[serde(default)]
@@ -3359,7 +3367,7 @@ pub struct HeaderModifiers {
 ///
 /// Controls which vault backend is used to resolve `secret:` references in
 /// config values and how secret rotation is handled.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SecretsConfig {
     /// Backend to use for resolving secrets.
     ///
@@ -3386,7 +3394,7 @@ pub struct SecretsConfig {
 }
 
 /// HashiCorp Vault connection settings.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct HashiCorpSecretsConfig {
     /// Vault server address (e.g. `"https://vault.example.com:8200"`).
     pub addr: String,
@@ -3399,7 +3407,7 @@ pub struct HashiCorpSecretsConfig {
 }
 
 /// Secret rotation configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RotationConfig {
     /// Seconds the previous secret value remains valid after rotation.
     /// Defaults to 300 (5 minutes).
@@ -3440,7 +3448,7 @@ fn default_re_resolve() -> u64 {
 /// header can diagnose forwarding errors without scraping the body.
 ///
 /// Spec: <https://www.rfc-editor.org/rfc/rfc9209.html>.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ProxyStatusConfig {
     /// Whether to stamp the `Proxy-Status` header on non-2xx responses.
     /// Defaults to `false`; opt in per origin so existing operator
@@ -3458,7 +3466,7 @@ pub struct ProxyStatusConfig {
 /// Status code spec for an [`ErrorPageEntry`]. Either a single integer
 /// (`status: 401`) or a list (`status: [401, 403]`). The list form is
 /// the historical authored shape; the single-int form is a sugar.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum StatusSpec {
     /// Single status code.
@@ -3488,7 +3496,7 @@ impl StatusSpec {
 /// One per-status custom error page entry. Multiple entries for the
 /// same status code are content-negotiated against the inbound request's
 /// `Accept` header.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ErrorPageEntry {
     /// Which HTTP status code(s) this entry covers.
     pub status: StatusSpec,
@@ -3512,7 +3520,7 @@ pub struct ErrorPageEntry {
 /// problem-details as a structured fallback for everything else.
 ///
 /// Spec: <https://www.rfc-editor.org/rfc/rfc9457.html>.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ProblemDetailsConfig {
     /// Whether to render unmatched proxy-generated errors as
     /// `application/problem+json`. Defaults to `false`; existing
@@ -3551,7 +3559,7 @@ fn default_include_detail() -> bool {
 /// `backend: redis`; the cache binds to the cluster L2 store at
 /// compile time. Single-instance deployments leave `backend: memory`
 /// (the default).
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct IdempotencyConfig {
     /// Whether to engage the idempotency middleware on this origin.
     /// Defaults to false; opt in per origin.
@@ -3614,7 +3622,9 @@ pub const DEFAULT_IDEMPOTENCY_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_IDEMPOTENCY_MAX_CONCURRENT_BUFFERS: usize = 256;
 
 /// Cache backend for [`IdempotencyConfig`].
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum IdempotencyBackend {
     /// In-process cache. Default. Suitable for single-instance
@@ -5052,7 +5062,7 @@ observability:
 /// `clock_skew_seconds` defaults to 30s.
 ///
 /// Spec: <https://www.rfc-editor.org/rfc/rfc9421.html>.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MessageSignaturesConfig {
     /// Whether to enforce signature verification on inbound requests.
     #[serde(default)]
@@ -5109,7 +5119,7 @@ fn default_signature_clock_skew_seconds() -> u64 {
 /// Operators who do not configure this block expose neither
 /// endpoint; requests to those paths fall through to the upstream
 /// proxy (or return 404 if no route matches).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct WebBotAuthPublishConfig {
     /// Whether the publish endpoints are enabled.
     #[serde(default)]
@@ -5149,7 +5159,9 @@ pub struct WebBotAuthPublishConfig {
 
 /// `/introspect` (RFC 7662) is deferred to a follow-up PR because
 /// it requires a revocation / nonce store.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq, schemars::JsonSchema,
+)]
 pub struct OlpConfig {
     /// Master toggle. When false the well-known endpoints 404.
     #[serde(default)]
@@ -5212,7 +5224,9 @@ pub struct OlpConfig {
 /// token is no longer trusted." Rate-limiting on `active: false`
 /// responses (RFC 7662 §2.1 scan-attack defence) and DPoP-bound
 /// confirmation checks ship in a follow-up PR.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq, Default, schemars::JsonSchema,
+)]
 pub struct OlpIntrospectConfig {
     /// Master toggle. When false the well-known endpoints 404 even if
     /// the rest of the block is configured. Lets an operator wire the
@@ -5288,7 +5302,9 @@ fn default_olp_introspect_mirror_cnf() -> bool {
 /// * `none` — no auth. ONLY appropriate for fully-private deployments
 ///   behind a service mesh that already authenticates the caller.
 ///   The proxy logs a `warn!` at startup when this is selected.
-#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq, schemars::JsonSchema,
+)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum OlpIntrospectAuth {
     /// Caller proves possession of the token they are introspecting.
@@ -5307,7 +5323,9 @@ pub enum OlpIntrospectAuth {
 }
 
 /// One `mode: basic` credential.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq, schemars::JsonSchema,
+)]
 pub struct OlpIntrospectBasicClient {
     /// Username sent over Basic auth.
     pub username: String,
@@ -5319,7 +5337,9 @@ pub struct OlpIntrospectBasicClient {
 }
 
 /// Revocation-store backend selector.
-#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq, schemars::JsonSchema,
+)]
 #[serde(tag = "backend", rename_all = "snake_case")]
 pub enum OlpRevocationStoreConfig {
     /// Process-local, lost on restart. Default; appropriate for dev

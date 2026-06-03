@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # AI shadow / side-by-side evaluation.
 #
 # Each request is forwarded to the primary provider as usual; a copy

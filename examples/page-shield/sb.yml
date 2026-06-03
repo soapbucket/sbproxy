@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Page Shield: client-side script monitoring via CSP report intake.
 #
 # Stamps a Content-Security-Policy-Report-Only header on every

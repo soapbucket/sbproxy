@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # semantic_constraint policy.
 #
 # Routes every request through the configured LLM-as-judge backend

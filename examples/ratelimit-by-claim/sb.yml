@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Per-tenant rate limiting keyed on a JWT claim.
 #
 # The rate limit policy accepts a `key:` CEL expression that runs

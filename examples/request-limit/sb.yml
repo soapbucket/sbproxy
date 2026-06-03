@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Request limit policy.
 #
 # Caps body size at 1 KiB, header count at 20, and URL length at 256 chars.
