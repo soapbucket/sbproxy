@@ -28,11 +28,17 @@ ureq = { version = "2", features = ["json"] }
 # AWS SDK: Secrets Manager backend uses the official SDK so the
 # default credential chain (env / instance-profile / SSO / SSO+role)
 # and STS-assumed roles are supported without re-implementing sigv4.
-# `rustls` feature pinned so we link against the same TLS stack the
-# rest of the workspace uses.
-aws-config = { version = "1", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
-aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
-aws-sdk-sts = { version = "1", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+#
+# Dependabot 14 / 13 / 12: the legacy `rustls` feature pulls
+# aws-smithy-http-client's `rustls 0.21` TLS stack which transitively
+# locks `rustls-webpki 0.101.7` (vulnerable to a DoS panic on
+# malformed CRL BIT STRING plus two low-sev name-constraint issues).
+# The `default-https-client` feature routes through smithy's hyper-rustls
+# 0.23 stack which uses `rustls-webpki 0.103.13+`. Same behaviour for
+# our use (TLS + SigV4); the feature switch alone is the fix.
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
 aws-credential-types = { version = "1" }
 aws-types = { version = "1" }
 
