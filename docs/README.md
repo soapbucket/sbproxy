@@ -13,6 +13,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [manual.md](manual.md) - install, CLI, runtime, TLS, deployment patterns.
 - [configuration.md](configuration.md) - every `sb.yml` field with examples.
 - [json-schema.md](json-schema.md) - JSON Schema for editor autocomplete + validation of `sb.yml`.
+- [mcp-schema-drift.md](mcp-schema-drift.md) - CI-friendly schema-drift detection for converted MCP servers (the `sbproxy-mcp-drift` CLI).
 - [features.md](features.md) - tour of every feature with copy-paste configs.
 - [troubleshooting.md](troubleshooting.md) - common failure modes and fixes.
 - [faq.md](faq.md) - quick answers to the questions operators hit most often.
