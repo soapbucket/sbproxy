@@ -7,6 +7,7 @@ pub mod ai_metrics;
 pub mod alerting;
 pub mod api_routes;
 pub mod assistants;
+pub mod attribution;
 pub mod audio;
 pub mod batch;
 pub mod budget;
