@@ -760,6 +760,164 @@ pub fn record_key_usage(
     }
 }
 
+// --- Waste-signal metrics (WOR-1085) ---
+//
+// The Token-to-Value Ledger lists "tokens spent with no outcome"
+// detectors that the gateway can flag deterministically without
+// any guess about what the caller intended:
+//
+// * `duplicate_request`: response_dedup.rs already detects an
+//   exact-context resend; tag the spend wasted.
+// * `abandoned_stream`: the client cancelled or the upstream
+//   stream closed with zero output tokens after the prompt was
+//   already sent.
+// * `validation_failed`: a guardrail or structured-output
+//   validator rejected AFTER the upstream call completed; the
+//   spend already happened.
+// * `context_bloat`: input tokens significantly above the
+//   route's rolling median (the gateway emits the counter; the
+//   classifier-cum-roller lives outside this module and reports
+//   in).
+//
+// These are observational counters + an estimated-wasted-USD
+// gauge. Enforcement (budget caps, denial gates) lives in
+// `budget.rs` / `hierarchical_budget.rs`, not here.
+
+/// Wasted-token counter, partitioned by waste class + bounded
+/// attribution labels. The same cardinality contract as
+/// [`AI_TOKENS_ATTRIBUTED`] applies: only bounded dimensions land
+/// on metric labels; `customer` / `trace_id` / `okr` stay on the
+/// span + access log.
+static AI_WASTED_TOKENS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_wasted_tokens_total",
+            "AI tokens classified as wasted, by waste class (WOR-1085)"
+        ),
+        &[
+            "kind", // "duplicate_request" | "abandoned_stream" | "validation_failed" | "context_bloat"
+            "provider",
+            "model",
+            "project",
+            "feature",
+            "team",
+            "agent_type",
+            "environment",
+        ]
+    )
+    .unwrap()
+});
+
+/// Wasted-USD counter, same labels as [`AI_WASTED_TOKENS`] minus
+/// the token-direction split.
+static AI_WASTED_COST: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_wasted_cost_dollars_total",
+            "Estimated USD cost of AI spend classified as wasted (WOR-1085)"
+        ),
+        &[
+            "kind",
+            "provider",
+            "model",
+            "project",
+            "feature",
+            "team",
+            "agent_type",
+            "environment",
+        ]
+    )
+    .unwrap()
+});
+
+/// Resolve an optional tag value to the label string Prometheus
+/// gets: empty stays empty (so `sum without (project)` works
+/// naturally), the string passes through otherwise.
+fn label_or_empty(value: Option<&str>) -> &str {
+    value.unwrap_or("")
+}
+
+/// Stable waste-class identifiers. The string slug lands on the
+/// `kind` label; using a closed enum keeps the label vocabulary
+/// auditable instead of letting a typo create a new time series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasteKind {
+    /// The request's full context matched a recent prior request
+    /// per `response_dedup.rs`; the gateway served the cached
+    /// reply but the upstream call still happened (or would have).
+    DuplicateRequest,
+    /// The client cancelled or the upstream stream closed with
+    /// zero output tokens after the prompt was sent.
+    AbandonedStream,
+    /// A guardrail / structured-output validator rejected after
+    /// the upstream call completed; the spend already happened.
+    ValidationFailed,
+    /// Input tokens significantly above the route's rolling
+    /// median. The threshold is policy; this module just records
+    /// when the rolling-window observer flags an event.
+    ContextBloat,
+}
+
+impl WasteKind {
+    /// Stable lower-snake string slug used as the `kind` label.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WasteKind::DuplicateRequest => "duplicate_request",
+            WasteKind::AbandonedStream => "abandoned_stream",
+            WasteKind::ValidationFailed => "validation_failed",
+            WasteKind::ContextBloat => "context_bloat",
+        }
+    }
+}
+
+/// Record an observed waste event: `tokens` is the upstream-side
+/// token count the gateway accounted for (input + output for a
+/// completed call, input + reasoning for an abandoned stream).
+/// `cost_usd` is the matching USD cost from the pricing catalog.
+#[allow(clippy::too_many_arguments)]
+pub fn record_waste(
+    kind: WasteKind,
+    provider: &str,
+    model: &str,
+    tags: &crate::attribution::AttributionTags,
+    tokens: u64,
+    cost_usd: f64,
+) {
+    let project = label_or_empty(tags.project.as_deref());
+    let feature = label_or_empty(tags.feature.as_deref());
+    let team = label_or_empty(tags.team.as_deref());
+    let agent_type = label_or_empty(tags.agent_type.as_deref());
+    let environment = label_or_empty(tags.environment.as_deref());
+    if tokens > 0 {
+        AI_WASTED_TOKENS
+            .with_label_values(&[
+                kind.as_str(),
+                provider,
+                model,
+                project,
+                feature,
+                team,
+                agent_type,
+                environment,
+            ])
+            .inc_by(tokens as f64);
+    }
+    if cost_usd > 0.0 {
+        AI_WASTED_COST
+            .with_label_values(&[
+                kind.as_str(),
+                provider,
+                model,
+                project,
+                feature,
+                team,
+                agent_type,
+                environment,
+            ])
+            .inc_by(cost_usd);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,5 +1165,80 @@ mod tests {
             .iter()
             .find(|f| f.name() == "sbproxy_ai_provider_errors_total");
         assert!(errs.is_some(), "provider errors counter must be registered");
+    }
+
+    /// WOR-1085: `record_waste` registers + increments both
+    /// counters, and the `kind` label carries the slug from the
+    /// closed enum.
+    #[test]
+    fn test_record_waste() {
+        use crate::attribution::AttributionTags;
+        let tags = AttributionTags {
+            project: Some("growth".to_string()),
+            team: Some("platform".to_string()),
+            ..Default::default()
+        };
+        record_waste(
+            WasteKind::DuplicateRequest,
+            "openai",
+            "gpt-4o",
+            &tags,
+            120,
+            0.0024,
+        );
+        record_waste(
+            WasteKind::AbandonedStream,
+            "anthropic",
+            "claude-sonnet",
+            &tags,
+            500,
+            0.003,
+        );
+        let families = prometheus::gather();
+        let tokens = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_wasted_tokens_total")
+            .expect("wasted_tokens counter registered");
+        let kinds: Vec<String> = tokens
+            .get_metric()
+            .iter()
+            .flat_map(|m| {
+                m.get_label()
+                    .iter()
+                    .filter(|l| l.name() == "kind")
+                    .map(|l| l.value().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(kinds.contains(&"duplicate_request".to_string()));
+        assert!(kinds.contains(&"abandoned_stream".to_string()));
+    }
+
+    /// `record_waste` with zero tokens skips the token counter
+    /// increment (matches the WOR-1086 behaviour and keeps empty
+    /// cells out of the metric).
+    #[test]
+    fn test_record_waste_zero_tokens_skipped() {
+        use crate::attribution::AttributionTags;
+        let tags = AttributionTags::default();
+        // Cost-only event (e.g. context_bloat detected against
+        // the rolling-median observer but no upstream token).
+        record_waste(WasteKind::ContextBloat, "openai", "gpt-4o", &tags, 0, 0.01);
+        let families = prometheus::gather();
+        let cost = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_wasted_cost_dollars_total");
+        assert!(cost.is_some(), "wasted_cost counter must be registered");
+    }
+
+    /// `WasteKind::as_str` is a closed-set vocabulary; the test
+    /// pins the exact wire form for each variant so a future
+    /// renaming surfaces here.
+    #[test]
+    fn waste_kind_slugs_pinned() {
+        assert_eq!(WasteKind::DuplicateRequest.as_str(), "duplicate_request");
+        assert_eq!(WasteKind::AbandonedStream.as_str(), "abandoned_stream");
+        assert_eq!(WasteKind::ValidationFailed.as_str(), "validation_failed");
+        assert_eq!(WasteKind::ContextBloat.as_str(), "context_bloat");
     }
 }
