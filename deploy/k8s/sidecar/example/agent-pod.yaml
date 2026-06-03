@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sbproxy-sidecar-demo
+---
+# Sample workload pod with the sbproxy sidecar injected. The
+# workload container here is `curlimages/curl` running an
+# infinite-sleep init plus periodic outbound calls so an operator
+# can observe the sidecar's policy stack and metrics without
+# wiring a real agent harness.
+#
+# Strategic-merge patching is applied via the base overlay; this
+# manifest defines the pod skeleton and the workload container.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: agent-pod
+  labels:
+    app.kubernetes.io/name: sbproxy
+    app.kubernetes.io/component: sidecar-demo
+  annotations:
+    # Operator-observable marker so an admission controller or
+    # operator can audit which pods are sidecar-enabled.
+    sbproxy.dev/sidecar-injected: "true"
+spec:
+  restartPolicy: Always
+  containers:
+    - name: workload
+      image: curlimages/curl:8.10.1
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          # Periodic outbound call so the sidecar's metrics
+          # surface a non-zero request rate. In a real workload
+          # this is whatever LLM client or MCP tool the agent
+          # drives.
+          while true; do
+            curl -sS -m 5 -o /dev/null -w "%{http_code}\n" \
+                http://test.sbproxy.dev/ || true
+            sleep 5
+          done
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 200m
+          memory: 64Mi
+    # The sbproxy + init containers come from base/sidecar-patch.yaml
+    # via the overlay's strategic merge.

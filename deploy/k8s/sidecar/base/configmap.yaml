@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sbproxy-sidecar-config
+  labels:
+    app.kubernetes.io/name: sbproxy
+    app.kubernetes.io/component: sidecar
+data:
+  sb.yml: |
+    # Sidecar-tuned sbproxy config. Keep in sync with
+    # examples/sidecar/sb.yml; this ConfigMap is the in-cluster
+    # delivery shape of the same content.
+
+    proxy:
+      http_bind_port: 15001
+
+    origins:
+      "*":
+        action:
+          type: proxy
+          url: https://test.sbproxy.dev
+
+        policies:
+          - type: rate_limiting
+            requests_per_minute: 3000
+            burst: 100
+            headers:
+              enabled: true
+              include_retry_after: true
+
+          - type: ip_filter
+            whitelist:
+              - 0.0.0.0/0

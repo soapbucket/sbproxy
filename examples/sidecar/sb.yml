@@ -1,0 +1,52 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Sidecar-tuned sbproxy config.
+#
+# Optimised for the per-pod fanout case: small RSS, fast cold
+# start, no required external dependencies. Run on the workload
+# pod's loopback interface; an init container redirects the
+# workload's outbound traffic onto this port. See
+# docs/sidecar-deployment.md for the full deployment shape.
+#
+# Run (locally, no k8s):
+#   make run CONFIG=examples/sidecar/sb.yml
+#
+# Test:
+#   curl -H 'Host: any.host' http://127.0.0.1:15001/
+#   # observe the rate_limiting and ip_filter policies in action
+#
+# In a pod the workload talks to 127.0.0.1:15001 directly (no
+# Host header rewriting needed), or an init container DNATs
+# outbound TCP onto :15001 transparently.
+
+proxy:
+  # The init container DNATs outbound TCP onto 15001. Bind here.
+  http_bind_port: 15001
+
+origins:
+  # Catch-all hostname. The sidecar instruments every outbound
+  # call the workload makes; layer policy on top without
+  # rewriting the destination.
+  "*":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    policies:
+      # Per-pod outbound rate limit. Sized to the workload's
+      # expected steady-state; bursts above this return 429 to
+      # the workload, which is the signal an agent loop should
+      # treat as a back-pressure hint.
+      - type: rate_limiting
+        requests_per_minute: 3000
+        burst: 100
+        headers:
+          enabled: true
+          include_retry_after: true
+
+      # IP allow-list keeps the workload from reaching arbitrary
+      # destinations. The default below admits everything; in
+      # production narrow this to the LLM provider CIDRs you
+      # have authorised.
+      - type: ip_filter
+        whitelist:
+          - 0.0.0.0/0

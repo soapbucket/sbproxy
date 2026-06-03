@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Base for the sbproxy sidecar deployment. Layer this into your
+# workload's kustomization tree as a component and patch the
+# target pod template to add the sidecar containers.
+#
+# See ../README.md for the full walkthrough and
+# ../../../../docs/sidecar-deployment.md for the operator guide.
+
+resources:
+  - configmap.yaml
+
+# Pod-template patch applied to whichever Deployment / StatefulSet
+# you want the sidecar on. Reference this from the consuming
+# kustomization with:
+#   patchesStrategicMerge:
+#     - ../base/sidecar-patch.yaml
