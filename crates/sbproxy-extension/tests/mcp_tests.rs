@@ -395,3 +395,51 @@ fn mcp_initialize_emits_path_only_url_without_authority() {
         .to_string();
     assert_eq!(url, "/.well-known/agent-skills/index.json");
 }
+
+// --- WOR-827: resources.listChanged capability for agent-skills ---
+
+#[test]
+fn mcp_initialize_advertises_resources_list_changed_when_agent_skills_configured() {
+    // When the origin surfaces the agent-skills manifest as an MCP
+    // resource, the server MUST advertise the `resources.listChanged`
+    // capability so a client with a persistent server-push transport
+    // knows to subscribe and refresh on regeneration. Clients without
+    // a persistent channel fall back to polling the manifest URL with
+    // `If-Modified-Since`.
+    let h = make_handler();
+    let req = rpc("initialize", None, Some(serde_json::json!(110)));
+    let ctx = InitializeContext {
+        has_agent_skills: true,
+        request_authority: Some("api.example.com".to_string()),
+        request_scheme: "https".to_string(),
+    };
+    let resp = h.handle_request_with_context(&req, &ctx).unwrap();
+    let caps = &resp.result.unwrap()["capabilities"];
+    let resources = caps
+        .get("resources")
+        .expect("resources capability must be present when agent_skills is configured");
+    assert_eq!(
+        resources["listChanged"],
+        serde_json::json!(true),
+        "listChanged must be true so clients subscribe to manifest regeneration; got {resources:?}"
+    );
+}
+
+#[test]
+fn mcp_initialize_omits_resources_capability_when_agent_skills_unconfigured() {
+    // No resources to surface means no `resources` capability. The
+    // capability descriptor must be absent (not `null` and not an
+    // empty object) so legacy MCP clients that key off field presence
+    // do not subscribe to a list-changed channel that has nothing to
+    // emit.
+    let h = make_handler();
+    let req = rpc("initialize", None, Some(serde_json::json!(111)));
+    let resp = h
+        .handle_request_with_context(&req, &InitializeContext::default())
+        .unwrap();
+    let caps = &resp.result.unwrap()["capabilities"];
+    assert!(
+        caps.get("resources").is_none(),
+        "resources capability must be omitted when no agent_skills; got {caps:?}"
+    );
+}
