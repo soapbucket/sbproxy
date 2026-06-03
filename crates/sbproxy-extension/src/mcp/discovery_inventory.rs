@@ -439,8 +439,8 @@ mod tests {
         assert!(parse_initialize_request(body).is_none());
     }
 
-    /// `parse_initialize_response` pulls server name + version
-    /// + protocol version + tool list out of a well-formed
+    /// `parse_initialize_response` pulls server name, version,
+    /// protocol version, and tool list out of a well-formed
     /// response body.
     #[test]
     fn parse_initialize_response_pulls_server_info() {
