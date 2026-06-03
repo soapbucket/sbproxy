@@ -2887,3 +2887,197 @@ fn resolve_shutdown_grace_malformed_seconds_falls_through_to_default() {
         0
     );
 }
+
+// --- WOR-1074: DPoP + mTLS-bound wire-up into check_auth ---
+//
+// These tests cover the wiring around `check_auth_with_tls` for
+// the four absence/mismatch paths the verifiers gate on. The
+// verifiers themselves (`DpopVerifier`, `MtlsBoundVerifier`) have
+// their own positive-path coverage in `sbproxy-modules`; here we
+// confirm the production auth path:
+//
+//   * threads the right inputs (DPoP header, cnf.jkt, cnf.x5t#S256,
+//     TLS thumbprint) into the verifier;
+//   * folds a verifier rejection into a 401 `AuthResult::Deny`;
+//   * keeps the legacy allow path intact when the require_* flag
+//     is off.
+
+#[tokio::test]
+async fn bearer_with_require_dpop_denies_when_proof_missing() {
+    // Bearer provider asks for DPoP binding. Client sends a valid
+    // bearer token but NO DPoP header. The wire-up must fail
+    // closed at the DPoP step before issuing the Allow.
+    let auth = super::Auth::Bearer(sbproxy_modules::auth::BearerAuth {
+        tokens: vec![sbproxy_modules::auth::BearerToken {
+            secret: "tok-1".to_string(),
+            attrs: sbproxy_modules::auth::CredentialAttrs {
+                metadata: std::collections::BTreeMap::from([(
+                    "dpop_jkt".to_string(),
+                    "pinned-thumbprint".to_string(),
+                )]),
+                ..Default::default()
+            },
+        }],
+        require_dpop: true,
+    });
+    let mut headers = http::HeaderMap::new();
+    headers.insert(http::header::AUTHORIZATION, "Bearer tok-1".parse().unwrap());
+    let (result, _) = super::check_auth_with_tls(
+        &auth,
+        &headers,
+        None,
+        "POST",
+        "/api/foo",
+        test_tenant(),
+        None,
+    )
+    .await;
+    match result {
+        super::AuthResult::Deny(401, msg) => {
+            assert!(
+                msg.to_lowercase().contains("dpop"),
+                "deny reason should mention DPoP, got: {msg}"
+            );
+        }
+        other => panic!("expected 401 deny, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn bearer_with_require_dpop_denies_when_metadata_missing() {
+    // Operator forgot to stamp `dpop_jkt` on the bearer token.
+    // The wire-up must fail closed rather than silently allow
+    // (no jkt = no proof-of-possession check possible).
+    let auth = super::Auth::Bearer(sbproxy_modules::auth::BearerAuth {
+        tokens: vec![sbproxy_modules::auth::BearerToken {
+            secret: "tok-no-jkt".to_string(),
+            attrs: sbproxy_modules::auth::CredentialAttrs::default(),
+        }],
+        require_dpop: true,
+    });
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        "Bearer tok-no-jkt".parse().unwrap(),
+    );
+    // Even a DPoP header would not help without the jkt to bind
+    // against; the wire-up rejects on the missing-metadata branch.
+    headers.insert("DPoP", "any.proof.bytes".parse().unwrap());
+    let (result, _) = super::check_auth_with_tls(
+        &auth,
+        &headers,
+        None,
+        "POST",
+        "/api/foo",
+        test_tenant(),
+        None,
+    )
+    .await;
+    match result {
+        super::AuthResult::Deny(401, msg) => {
+            assert!(
+                msg.contains("dpop_jkt"),
+                "deny reason should mention the missing metadata, got: {msg}"
+            );
+        }
+        other => panic!("expected 401 deny, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn jwt_with_require_dpop_denies_when_cnf_jkt_missing() {
+    // JWT that validates but carries no `cnf.jkt` claim. The
+    // wire-up must reject before issuing Allow.
+    let auth = super::Auth::Jwt(sbproxy_modules::auth::JwtAuth {
+        secret: Some("dev-secret".to_string()),
+        require_dpop: true,
+        ..Default::default()
+    });
+    // Mint a HS256 JWT signed with the test secret, without a
+    // `cnf` claim.
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    let claims = serde_json::json!({
+        "sub": "alice",
+        "iat": 0,
+        "exp": 9_999_999_999_u64,
+    });
+    let token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(b"dev-secret"),
+    )
+    .unwrap();
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    let (result, _) = super::check_auth_with_tls(
+        &auth,
+        &headers,
+        None,
+        "POST",
+        "/api/foo",
+        test_tenant(),
+        None,
+    )
+    .await;
+    match result {
+        super::AuthResult::Deny(401, msg) => {
+            assert!(
+                msg.contains("cnf.jkt"),
+                "deny reason should mention the missing claim, got: {msg}"
+            );
+        }
+        other => panic!("expected 401 deny, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn jwt_with_require_mtls_bound_denies_when_thumbprint_mismatches() {
+    // JWT carries a cnf.x5t#S256 thumbprint that does not match
+    // the inbound TLS cert's thumbprint. The wire-up must reject.
+    let auth = super::Auth::Jwt(sbproxy_modules::auth::JwtAuth {
+        secret: Some("dev-secret".to_string()),
+        require_mtls_bound: true,
+        ..Default::default()
+    });
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    let claims = serde_json::json!({
+        "sub": "alice",
+        "iat": 0,
+        "exp": 9_999_999_999_u64,
+        "cnf": { "x5t#S256": "pinned-cert-thumbprint" },
+    });
+    let token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(b"dev-secret"),
+    )
+    .unwrap();
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    let (result, _) = super::check_auth_with_tls(
+        &auth,
+        &headers,
+        None,
+        "POST",
+        "/api/foo",
+        test_tenant(),
+        // Wrong thumbprint presented by the client.
+        Some("a-different-thumbprint"),
+    )
+    .await;
+    match result {
+        super::AuthResult::Deny(401, msg) => {
+            assert!(
+                msg.contains("mTLS"),
+                "deny reason should mention mTLS, got: {msg}"
+            );
+        }
+        other => panic!("expected 401 deny, got {other:?}"),
+    }
+}

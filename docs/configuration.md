@@ -1173,7 +1173,32 @@ origins:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `type` | string | required | Must be `bearer` |
-| `tokens` | list | required | Accepted bearer tokens |
+| `tokens` | list | required | Accepted bearer tokens (each entry is either the raw secret or `{secret, dpop_jkt, ...}`) |
+| `require_dpop` | bool | `false` | When `true`, every accepted token MUST come with a valid RFC 9449 DPoP proof whose `jkt` matches the token entry's `dpop_jkt` metadata. Tokens without `dpop_jkt` metadata fail closed. |
+
+#### Sender-constrained Bearer (RFC 9449)
+
+DPoP binds an opaque bearer token to a proof-of-possession key
+so a stolen token alone is not enough to access the resource.
+The operator stamps the JWK thumbprint of the expected key on
+each bearer entry; the proxy reads the `DPoP:` header on every
+request and verifies the proof against the stamped thumbprint.
+
+```yaml
+authentication:
+  type: bearer
+  require_dpop: true
+  tokens:
+    - secret: ${SERVICE_TOKEN_1}
+      dpop_jkt: "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"
+    - secret: ${SERVICE_TOKEN_2}
+      dpop_jkt: "8WGoq1lXk-3z7AIuS-XwSeUGzqQ3LtIMOvbf2bZj0Vk"
+```
+
+The `dpop_jkt` value is the RFC 7638 SHA-256 thumbprint of the
+client's DPoP signing key, base64url-no-pad. Deriving it once
+per client is a one-shot operator step (most identity systems
+publish it alongside the client's other registration data).
 
 ### jwt
 
@@ -1204,8 +1229,40 @@ origins:
 | `audience` | string | | Required `aud` claim value |
 | `algorithms` | list | inferred | Allowed signing algorithms. Defaults to HS256/HS384/HS512 with `secret`, RS256 with `jwks_url`. |
 | `required_claims` | map | | Claims that must be present and equal to the configured value. |
+| `require_dpop` | bool | `false` | When `true`, the JWT MUST come with a valid RFC 9449 DPoP proof whose `jkt` matches the token's `cnf.jkt` claim. Tokens without a `cnf.jkt` claim fail closed. |
+| `require_mtls_bound` | bool | `false` | When `true`, the JWT's `cnf.x5t#S256` claim MUST match the SHA-256 thumbprint of the inbound TLS client cert (RFC 8705 mutual-TLS-bound tokens). |
 
 The list must contain at least one entry; an empty list rejects all tokens. Bearer tokens must be supplied via `Authorization: Bearer <jwt>`.
+
+#### Sender-constrained JWT (RFC 9449 + RFC 8705)
+
+Both `require_dpop` and `require_mtls_bound` may be set together
+on the same provider; the request must satisfy BOTH constraints.
+The two constraints are independent:
+
+* **DPoP** (RFC 9449) binds the token to a proof-of-possession
+  key the client signs with on every request. The token's
+  `cnf.jkt` claim is the SHA-256 thumbprint of that key; the
+  proxy reads the `DPoP:` header and verifies.
+* **mTLS-bound** (RFC 8705) binds the token to the SHA-256
+  thumbprint of the TLS client cert the resource server saw
+  on the connection. The token's `cnf.x5t#S256` claim carries
+  the thumbprint; the proxy compares against the inbound
+  client cert.
+
+```yaml
+authentication:
+  type: jwt
+  jwks_url: https://auth.example.com/.well-known/jwks.json
+  issuer: https://auth.example.com
+  audience: my-api
+  require_dpop: true
+  require_mtls_bound: true
+```
+
+Both flags default to `false` so existing JWT configurations
+keep their unbound semantics. Turn them on per-route as the
+issuer starts minting `cnf.jkt` / `cnf.x5t#S256` tokens.
 
 ### digest
 

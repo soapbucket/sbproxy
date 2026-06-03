@@ -1592,6 +1592,7 @@ async fn serve_fallback_action(
 // --- Auth checking ---
 
 /// Result of running an auth check.
+#[derive(Debug)]
 enum AuthResult {
     /// Auth passed. `sub` carries the resolved end-user subject when
     /// the provider could identify one (JWT `sub` claim, basic-auth
@@ -1764,6 +1765,55 @@ async fn check_auth(
     path: &str,
     tenant_id: sbproxy_plugin::TenantId,
 ) -> (AuthResult, Option<sbproxy_plugin::Principal>) {
+    // WOR-1074: Stage 2 calls `check_auth_with_tls` with the
+    // resolved TLS-cert thumbprint from `sbproxy_tls::mtls::ClientCertInfo`.
+    // Existing callers that have not yet been plumbed pass `None`
+    // here, which keeps the legacy behaviour: any auth provider
+    // configured with `require_mtls_bound = true` rejects when no
+    // thumbprint is available (the verifier treats `None` as
+    // "no TLS binding"). The DPoP wire-up does not need a
+    // thumbprint and works through the `None` path unchanged.
+    check_auth_with_tls(auth, headers, query, method, path, tenant_id, None).await
+}
+
+/// WOR-1074: build the `htu` claim value the DPoP verifier
+/// compares against. RFC 9449 §4.2 mandates the verifier match
+/// `htu` against the request's resource URI, ignoring query +
+/// fragment. The function reads the inbound `Host` header (Pingora
+/// surfaces it as a regular header) and prepends `https://`; that
+/// matches what a DPoP-aware client typically signs. Deployments
+/// terminating TLS upstream of the proxy can layer a follow-up
+/// helper that reads `X-Forwarded-Proto` if needed.
+fn format_htu(headers: &http::HeaderMap, path: &str) -> String {
+    let host = headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    format!("https://{host}{path}")
+}
+
+/// WOR-1074: extended `check_auth` that threads the inbound TLS
+/// client cert's SHA-256 thumbprint through to the
+/// [`MtlsBoundVerifier`] when a Bearer / JWT provider has
+/// `require_mtls_bound = true` set. Production callers eventually
+/// pass `tls_cert_thumbprint = Some(<base64url-no-pad SHA-256>)`;
+/// today the request-phase shim passes `None` so a misconfigured
+/// `require_mtls_bound = true` deployment fails closed (every
+/// request rejected) instead of silently allowing.
+#[allow(clippy::too_many_arguments)]
+async fn check_auth_with_tls(
+    auth: &Auth,
+    headers: &http::HeaderMap,
+    query: Option<&str>,
+    method: &str,
+    path: &str,
+    tenant_id: sbproxy_plugin::TenantId,
+    tls_cert_thumbprint: Option<&str>,
+) -> (AuthResult, Option<sbproxy_plugin::Principal>) {
+    use sbproxy_modules::auth::dpop::DpopVerifier;
+    use sbproxy_modules::auth::mtls_bound::MtlsBoundVerifier;
+    let dpop_verifier = DpopVerifier::default();
+    let mtls_verifier = MtlsBoundVerifier::default();
     match auth {
         Auth::ApiKey(a) => {
             match a.check_request_with_principal(headers, query, tenant_id.clone()) {
@@ -1784,12 +1834,101 @@ async fn check_auth(
             }
             None => (AuthResult::Deny(401, "unauthorized".to_string()), None),
         },
-        Auth::Bearer(a) => match a.check_request_with_principal(headers, tenant_id.clone()) {
-            Some(principal) => (AuthResult::allow_anonymous(), Some(principal)),
+        Auth::Bearer(a) => match a.check_request_with_token(headers, tenant_id.clone()) {
+            Some((principal, token)) => {
+                // WOR-1074 Stage 2: if the provider has
+                // `require_dpop = true`, the matched bearer token
+                // MUST come with a valid RFC 9449 DPoP proof whose
+                // jkt matches the operator-stamped
+                // `attrs.metadata["dpop_jkt"]`. Without the
+                // metadata, the provider is misconfigured and we
+                // fail closed.
+                if a.require_dpop {
+                    let dpop_header = headers
+                        .get("dpop")
+                        .or_else(|| headers.get("DPoP"))
+                        .and_then(|v| v.to_str().ok());
+                    let expected_jkt = token.attrs.metadata.get("dpop_jkt").map(|s| s.as_str());
+                    let Some(expected_jkt) = expected_jkt else {
+                        return (
+                            AuthResult::Deny(
+                                401,
+                                "bearer token requires DPoP binding but `attrs.metadata.dpop_jkt` is unset"
+                                    .to_string(),
+                            ),
+                            None,
+                        );
+                    };
+                    let htu = format_htu(headers, path);
+                    if let Err(err) = dpop_verifier.verify(
+                        dpop_header,
+                        method,
+                        &htu,
+                        expected_jkt,
+                        std::time::SystemTime::now(),
+                    ) {
+                        return (
+                            AuthResult::Deny(401, format!("DPoP verification failed: {err}")),
+                            None,
+                        );
+                    }
+                }
+                (AuthResult::allow_anonymous(), Some(principal))
+            }
             None => (AuthResult::Deny(401, "unauthorized".to_string()), None),
         },
-        Auth::Jwt(a) => match a.check_request_with_principal(headers, tenant_id.clone()) {
-            Some(principal) => {
+        Auth::Jwt(a) => match a.check_request_with_claims(headers, tenant_id.clone()) {
+            Some((principal, claims)) => {
+                // WOR-1074 Stage 2: DPoP first (the JWT's
+                // `cnf.jkt` claim binds the access token to a
+                // proof-of-possession key), then mTLS-bound
+                // (the `cnf.x5t#S256` claim binds the access
+                // token to a TLS client cert). The two checks
+                // can both be enabled; both must pass.
+                if a.require_dpop {
+                    let dpop_header = headers
+                        .get("dpop")
+                        .or_else(|| headers.get("DPoP"))
+                        .and_then(|v| v.to_str().ok());
+                    let expected_jkt = claims
+                        .get("cnf")
+                        .and_then(|c| c.get("jkt"))
+                        .and_then(|v| v.as_str());
+                    let Some(expected_jkt) = expected_jkt else {
+                        return (
+                            AuthResult::Deny(
+                                401,
+                                "JWT requires DPoP binding but `cnf.jkt` claim is missing"
+                                    .to_string(),
+                            ),
+                            None,
+                        );
+                    };
+                    let htu = format_htu(headers, path);
+                    if let Err(err) = dpop_verifier.verify(
+                        dpop_header,
+                        method,
+                        &htu,
+                        expected_jkt,
+                        std::time::SystemTime::now(),
+                    ) {
+                        return (
+                            AuthResult::Deny(401, format!("DPoP verification failed: {err}")),
+                            None,
+                        );
+                    }
+                }
+                if a.require_mtls_bound {
+                    if let Err(err) = mtls_verifier.verify(&claims, tls_cert_thumbprint) {
+                        return (
+                            AuthResult::Deny(
+                                401,
+                                format!("mTLS-bound token verification failed: {err}"),
+                            ),
+                            None,
+                        );
+                    }
+                }
                 let sub = principal.sub.clone();
                 let auth_result = if sub.is_empty() {
                     // Token validated but carried no `sub` claim:
