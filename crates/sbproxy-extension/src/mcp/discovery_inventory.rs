@@ -339,7 +339,10 @@ mod tests {
         let drift = inv
             .observe("ws-acme", "https://github-mcp.example", updated)
             .expect("expected drift on added tool");
-        assert_eq!(drift.added_tools, BTreeSet::from(["close_issue".to_string()]));
+        assert_eq!(
+            drift.added_tools,
+            BTreeSet::from(["close_issue".to_string()])
+        );
         assert!(drift.removed_tools.is_empty());
     }
 
@@ -367,16 +370,8 @@ mod tests {
     #[test]
     fn inventory_keys_by_workspace() {
         let inv = McpDiscoveryInventory::new();
-        inv.observe(
-            "ws-a",
-            "https://github-mcp.example",
-            sample_observation(),
-        );
-        inv.observe(
-            "ws-b",
-            "https://github-mcp.example",
-            sample_observation(),
-        );
+        inv.observe("ws-a", "https://github-mcp.example", sample_observation());
+        inv.observe("ws-b", "https://github-mcp.example", sample_observation());
         assert_eq!(inv.len(), 2);
     }
 
@@ -424,7 +419,10 @@ mod tests {
             "method": "initialize",
             "params": {}
         }"#;
-        assert_eq!(parse_initialize_request(body_no_client).as_deref(), Some(""));
+        assert_eq!(
+            parse_initialize_request(body_no_client).as_deref(),
+            Some("")
+        );
     }
 
     /// `parse_initialize_request` rejects non-initialize bodies
@@ -498,11 +496,7 @@ mod tests {
         );
         let snap = inv.snapshot();
         // Mutate after snapshot.
-        inv.observe(
-            "ws-acme",
-            "https://other.example",
-            sample_observation(),
-        );
+        inv.observe("ws-acme", "https://other.example", sample_observation());
         assert_eq!(snap.len(), 1);
         assert_eq!(inv.len(), 2);
     }
