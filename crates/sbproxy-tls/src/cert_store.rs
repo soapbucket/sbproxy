@@ -94,9 +94,34 @@ impl<S: KVStore> CertStore<S> {
     // --- Metadata ---
 
     /// Persist JSON-encoded [`CertMeta`] for a hostname.
+    ///
+    /// WOR-1024: side-effect — stamps
+    /// `sbproxy_cert_expiry_seconds{host}` with the seconds-until-expiry
+    /// derived from `meta.expires_at`. Negative values mean the cert
+    /// is already expired; an alert at `< 7 days` catches a stalled
+    /// ACME renewal before a handshake error surfaces. Parse failure
+    /// on the RFC 3339 timestamp is logged at warn and the metric is
+    /// skipped (the persistence path still succeeds so the cert
+    /// is not lost).
     pub fn put_meta(&self, hostname: &str, meta: &CertMeta) -> Result<()> {
         let json = serde_json::to_vec(meta)?;
-        self.store.put(meta_key(hostname).as_bytes(), &json)
+        self.store.put(meta_key(hostname).as_bytes(), &json)?;
+        match chrono::DateTime::parse_from_rfc3339(&meta.expires_at) {
+            Ok(exp) => {
+                let now = chrono::Utc::now();
+                let seconds = (exp.with_timezone(&chrono::Utc) - now).num_seconds() as f64;
+                sbproxy_observe::metrics::record_cert_expiry(hostname, seconds);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    hostname = %hostname,
+                    expires_at = %meta.expires_at,
+                    error = %e,
+                    "cert meta expires_at is not RFC 3339; skipping sbproxy_cert_expiry_seconds stamp"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Retrieve and deserialize [`CertMeta`] for a hostname, if present.

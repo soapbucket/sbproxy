@@ -20,6 +20,11 @@ use tracing::{error, info};
 pub struct OcspStapler {
     /// Cached OCSP response bytes (`None` until the first successful fetch).
     response: Arc<ArcSwap<Option<Vec<u8>>>>,
+    /// WOR-1024: `Instant` of the most recent successful fetch. Used
+    /// to drive the `sbproxy_ocsp_staple_age_seconds{host}` gauge so
+    /// an operator can spot a stale staple (12h-cadence refresh
+    /// loop silently failing) before the cert expires.
+    last_fetched_at: Arc<ArcSwap<Option<std::time::Instant>>>,
 }
 
 impl OcspStapler {
@@ -27,7 +32,17 @@ impl OcspStapler {
     pub fn new() -> Self {
         Self {
             response: Arc::new(ArcSwap::new(Arc::new(None))),
+            last_fetched_at: Arc::new(ArcSwap::new(Arc::new(None))),
         }
+    }
+
+    /// WOR-1024: age in seconds since the most recent successful fetch.
+    /// `None` when the stapler has never fetched a response.
+    pub fn staple_age_secs(&self) -> Option<f64> {
+        self.last_fetched_at
+            .load()
+            .as_ref()
+            .map(|t| t.elapsed().as_secs_f64())
     }
 
     /// Fetch the OCSP response for `cert_pem` from the CA's responder URL.
@@ -121,11 +136,17 @@ impl OcspStapler {
     /// responses are usually valid for 7 days but stapling them
     /// fresh shortens the window an attacker has to exploit a
     /// recently-compromised cert.
-    pub fn start_refresh_task<F>(&self, cert_pem: Vec<u8>, on_update: F)
+    ///
+    /// `host` is the metric label for the
+    /// `sbproxy_ocsp_staple_age_seconds{host}` gauge (WOR-1024). The
+    /// manual-fallback cert passes `"_fallback"`; per-host ACME
+    /// staples (when they land) pass the SAN they cover.
+    pub fn start_refresh_task<F>(&self, host: String, cert_pem: Vec<u8>, on_update: F)
     where
         F: Fn(Vec<u8>) + Send + 'static,
     {
         let response_slot = self.response.clone();
+        let last_fetched_slot = self.last_fetched_at.clone();
 
         tokio::spawn(async move {
             // --- Initial fetch ---
@@ -137,6 +158,8 @@ impl OcspStapler {
                 Ok(bytes) => {
                     info!(bytes = bytes.len(), "initial OCSP response fetched");
                     response_slot.store(Arc::new(Some(bytes.clone())));
+                    last_fetched_slot.store(Arc::new(Some(std::time::Instant::now())));
+                    sbproxy_observe::metrics::record_ocsp_staple_age(&host, 0.0);
                     on_update(bytes);
                 }
                 Err(e) => {
@@ -162,10 +185,22 @@ impl OcspStapler {
                     Ok(bytes) => {
                         info!(bytes = bytes.len(), "OCSP response refreshed");
                         response_slot.store(Arc::new(Some(bytes.clone())));
+                        last_fetched_slot.store(Arc::new(Some(std::time::Instant::now())));
+                        sbproxy_observe::metrics::record_ocsp_staple_age(&host, 0.0);
                         on_update(bytes);
                     }
                     Err(e) => {
                         error!("failed to refresh OCSP response: {e:#}");
+                        // WOR-1024: surface the staleness via the
+                        // gauge so an alert fires before the staple
+                        // outlives its useful life. The host label
+                        // matches the initial fetch.
+                        if let Some(t) = last_fetched_slot.load().as_ref() {
+                            sbproxy_observe::metrics::record_ocsp_staple_age(
+                                &host,
+                                t.elapsed().as_secs_f64(),
+                            );
+                        }
                     }
                 }
             }
