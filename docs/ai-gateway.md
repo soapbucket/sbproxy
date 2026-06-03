@@ -654,6 +654,19 @@ Provider capability is the source of truth for which surfaces a configured provi
 | `moderations` | POST | `/v1/moderations` | OpenAI |
 | `reranking` | POST | `/v1/rerank`, `/v1/reranking` | Cohere |
 
+### Response shape contract
+
+"Supported" in the table above means the gateway accepts the surface and routes it. It does NOT mean the gateway normalises the response. Per-surface translation behaviour:
+
+| Surface | Response shape |
+|---|---|
+| `chat_completions` | normalised to / from the OpenAI shape on Anthropic and Google (gemini) formats; passthrough on OpenAI-compatible upstreams |
+| `messages`, `responses` | native-format inbound shims that translate down to the same hub shape as chat completions |
+| `models` | **passthrough only**: the gateway forwards the upstream's native model-list body unchanged. Clients calling `/v1/models` through a non-OpenAI provider see the upstream's shape, not the OpenAI `{"object": "list", "data": [...]}` envelope |
+| everything else | passthrough on the providers listed in the table; clients see the upstream's native response shape |
+
+The Models passthrough decision is deliberate. OpenAI returns `{"object": "list", "data": [{"id": "...", "owned_by": "..."}]}`; Anthropic returns `{"data": [{"id": "...", "display_name": "..."}], "has_more": false}`; Google's `models.list` returns `{"models": [{"name": "models/...", "displayName": "..."}]}`. A lossy normalisation would conflate these and mislead clients about per-model metadata. Callers that need a unified shape across providers should consume the proxy's own model registry instead of the passthrough.
+
 ### Method coverage
 
 The gateway accepts any standard HTTP method for any supported surface. GET, POST, PUT, DELETE, PATCH, HEAD, and OPTIONS all dispatch through the same provider-selection and observability surface. Methods other than GET/POST forward via `AiClient::forward_with_method` and do not engage the chat-completions body-parse pipeline (no JSON parsing, no budget enforcement, no input guardrails). Method-aware dispatch is what makes `DELETE /v1/assistants/{id}`, `POST /v1/threads/{id}/runs/{id}/cancel`, and the other non-POST verbs work end-to-end.

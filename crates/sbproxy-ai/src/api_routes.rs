@@ -145,6 +145,25 @@ pub fn provider_supports_realtime(provider: &str) -> bool {
 /// `surface_matrix_matches_documented_contract` unit test enforces this
 /// table in the required CI job; the e2e `ai_surface_matrix` suite is the
 /// live-proxy complement.
+///
+/// ## Response shape contract
+///
+/// "Handled" does not imply "normalised". Per-surface translation state:
+///
+/// | surface | translation today |
+/// |---|---|
+/// | `chat_completions` | translated to / from the OpenAI shape on Anthropic and Google (gemini) formats; passthrough on OpenAI-compatible upstreams |
+/// | `messages` / `responses` | native-format inbound shims that translate down to the same hub shape as chat |
+/// | `models` | **passthrough only**: the response body is the upstream's native model-list shape, not normalised to the OpenAI `{"object": "list", "data": [...]}` envelope. Clients hitting a non-OpenAI provider via this surface MUST handle the upstream's shape directly. See `docs/ai-gateway.md` for the per-provider example. |
+/// | everything else | passthrough on the providers that support the OpenAI shape (openai, vertex, cohere where applicable); unsupported elsewhere |
+///
+/// Documenting Models as passthrough-only is the deliberate close of
+/// audit Finding C: response normalisation for the universal Models
+/// surface is not implemented because the OpenAI / Anthropic / Google
+/// model-list shapes diverge enough that a lossy normalisation would
+/// mislead callers. Operators that need a unified shape should use a
+/// dedicated discovery endpoint (the proxy's own model registry) rather
+/// than the passthrough.
 pub fn provider_supports_surface(provider: &str, surface: &crate::handler::AiSurface) -> bool {
     use crate::handler::AiSurface;
     match (provider, surface) {
@@ -286,6 +305,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- WOR-824 Finding C: Models passthrough-only contract ---
+
+    /// Pins the deliberate non-normalisation of the Models surface.
+    ///
+    /// The Models surface is universal (the matrix returns true for
+    /// every provider) but the gateway does NOT translate the response
+    /// body. This test exists so any future PR that adds a Models
+    /// translator must update this test in lockstep with the rustdoc
+    /// table and the operator doc. The check is documentary rather
+    /// than functional: it asserts both halves (matrix support AND
+    /// passthrough stance) sit together in one place, so the contract
+    /// cannot drift unnoticed.
+    #[test]
+    fn models_surface_is_universal_and_passthrough_only() {
+        use crate::handler::AiSurface;
+        // Half 1: every wire-format provider supports the Models
+        // surface (matrix says yes).
+        for provider in [
+            "openai",
+            "anthropic",
+            "gemini",
+            "vertex",
+            "bedrock",
+            "cohere",
+        ] {
+            assert!(
+                provider_supports_surface(provider, &AiSurface::Models),
+                "Models surface MUST be universal; provider={provider}"
+            );
+        }
+        // Half 2: the rustdoc on `provider_supports_surface` declares
+        // Models passthrough-only. If a Models response-shape
+        // translator ever lands, this assertion is the canary: the
+        // PR adding the translator must update the rustdoc, the
+        // operator doc, AND this test in lockstep so the contract
+        // stays internally consistent.
+        let rustdoc = include_str!("api_routes.rs");
+        assert!(
+            rustdoc.contains("`models` | **passthrough only**"),
+            "Models passthrough-only stance must remain documented in the \
+             `provider_supports_surface` rustdoc table; if the translator \
+             lands, update the rustdoc + docs/ai-gateway.md together"
+        );
     }
 
     // --- parse_endpoint tests ---
