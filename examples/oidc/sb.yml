@@ -1,0 +1,86 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# OpenID Connect Relying-Party login flow.
+#
+# Puts SSO in front of an upstream that has no auth of its own.
+# An unauthenticated browser is redirected to the IdP, completes
+# the auth-code + PKCE flow, and is served with a sealed session
+# cookie. Subsequent requests authenticate from the cookie.
+#
+# The four IdP endpoint URLs below are placeholders pointing at
+# a fictional IdP. To run against a real IdP (Keycloak, Auth0,
+# Google, Okta), copy the values from the IdP's published
+# `<issuer>/.well-known/openid-configuration` document.
+#
+# Run:
+#   make run CONFIG=examples/oidc/sb.yml
+#
+# Test (with a browser, since the auth-redirect dance is
+# interactive):
+#   open http://127.0.0.1:8080/         # 302 to IdP authorize
+#   ... complete login at IdP ...
+#   # IdP 302s back to /oidc/callback?code=...&state=...
+#   # the proxy mints a session cookie + 302s to "/"
+#
+# See docs/auth-oidc.md for the full operator guide.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "app.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    auth:
+      type: oidc
+
+      # IdP endpoints. In production these come from the IdP's
+      # `.well-known/openid-configuration` document; paste the
+      # values from there to avoid drift.
+      authorization_endpoint: https://idp.example.com/authorize
+      token_endpoint:         https://idp.example.com/oauth/token
+      jwks_uri:               https://idp.example.com/.well-known/jwks.json
+      issuer:                 https://idp.example.com/
+
+      # OAuth client registered with the IdP. The redirect URI
+      # the proxy advertises is `https://app.example.com/oidc/callback`;
+      # register that path with the IdP under `redirect_uris`.
+      client_id:     sbproxy-app-example-com
+      client_secret: dev-secret-replace-via-vault
+
+      # 32-byte HKDF IKM that derives the session + tx cookie
+      # keys. Rotate this to invalidate every outstanding session.
+      # `vault://oidc/cookie_secret` is the prod shape; the
+      # literal below works for `make run` against this example.
+      cookie_secret: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+      # Scopes. `openid` is the minimum (it produces an ID token);
+      # `email profile` is the common default for putting SSO in
+      # front of a web app.
+      scope: "openid email profile"
+
+      # Pull verified claims into trust headers the upstream can
+      # read. Optional; omit if you do not want a userinfo round
+      # trip on each login.
+      userinfo_endpoint: https://idp.example.com/userinfo
+
+      # Logout: when the user hits /oidc/logout the proxy deletes
+      # the cookie. If `end_session_endpoint` is set the browser
+      # is also 302'd to the OP so the IdP terminates its session.
+      end_session_endpoint: https://idp.example.com/oauth/logout
+
+      # Open-redirect gate for the `post_logout_redirect_uri`
+      # query parameter on /oidc/logout. Without this, the
+      # endpoint becomes an open redirect.
+      post_logout_redirect_allowlist:
+        - "https://app.example.com/"
+        - "https://app.example.com/goodbye"
+      post_logout_redirect_default: "https://app.example.com/"
+
+      # Session + transaction cookie TTLs. session_ttl_secs is
+      # the maximum time between IdP round-trips. tx_ttl_secs
+      # must comfortably exceed the wall-clock time between
+      # auth-redirect and callback (5 min is generous).
+      session_ttl_secs: 3600
+      tx_ttl_secs:      300
