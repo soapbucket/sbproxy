@@ -760,6 +760,155 @@ pub fn record_key_usage(
     }
 }
 
+// --- Per-attribution spend metrics (WOR-1086) ---
+//
+// Per-request attribution tags ride on every AI spend record (see
+// `crate::attribution`). The dashboard wants spend broken down by
+// the business dimensions those tags carry; this section exposes
+// the same totals as `AI_TOKENS` + `AI_COST` plus a bounded set of
+// attribution labels.
+//
+// ## Cardinality
+//
+// Only the dimensions with bounded vocabulary land on metric
+// labels: `project`, `feature`, `team`, `agent_type`,
+// `environment`. The high-cardinality dimensions (`customer`,
+// `trace_id`, `okr`) intentionally do NOT appear as metric labels;
+// they ride on the OTel span and the access log instead, where the
+// ledger consumes them via trace_id join. A `_other` bucket
+// stands in when a tag value would push past
+// `crate::attribution::MAX_DISTINCT_VALUES_PER_TAG`.
+//
+// ## Token-kind split (overlap with WOR-1084)
+//
+// The `direction` label takes one of: `input`, `output`,
+// `cache_read`, `cache_write`, `reasoning`. The non-input/output
+// variants are no-ops on providers that don't report them; the
+// caller passes 0 and this module skips the increment.
+
+/// Per-attribution token counter. Labels are kept to the bounded
+/// set documented above so the cardinality stays predictable
+/// (~10 providers × ~20 models × 5 directions × ~50 projects ×
+/// ~50 features × ~10 teams × 2 agent_types × 3 envs ≈ 30M cells
+/// at the worst-case full cross-product; in practice deployments
+/// see ~0.1% of cells populated).
+static AI_TOKENS_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_tokens_attributed_total",
+            "AI tokens consumed, partitioned by attribution tag (WOR-1086)"
+        ),
+        &[
+            "provider",
+            "model",
+            "direction",
+            "project",
+            "feature",
+            "team",
+            "agent_type",
+            "environment",
+        ]
+    )
+    .unwrap()
+});
+
+/// Per-attribution USD cost counter. Same label set as
+/// `AI_TOKENS_ATTRIBUTED` so a single PromQL `sum by (project)`
+/// answers "what did project X spend this week".
+static AI_COST_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_cost_dollars_attributed_total",
+            "AI cost in USD, partitioned by attribution tag (WOR-1086)"
+        ),
+        &[
+            "provider",
+            "model",
+            "project",
+            "feature",
+            "team",
+            "agent_type",
+            "environment",
+        ]
+    )
+    .unwrap()
+});
+
+/// Resolve an optional tag value to the label string Prometheus
+/// gets: empty stays empty (so `sum without (project)` works
+/// naturally), the string passes through otherwise. The
+/// cardinality cap is enforced elsewhere; this helper is a one-line
+/// adapter from `Option<&str>` to `&str`.
+fn label_or_empty(value: Option<&str>) -> &str {
+    value.unwrap_or("")
+}
+
+/// Record a per-attribution AI spend record.
+///
+/// Token-kind split: pass `input_tokens`, `output_tokens`, and the
+/// optional `cache_read` / `cache_write` / `reasoning` token
+/// counts. Any zero count is skipped so the empty cell does not
+/// land in the metric.
+///
+/// The OSS access log + OTel span pick up the high-cardinality
+/// dimensions (customer, trace_id, okr) elsewhere; the ledger's
+/// Allocate-layer join works off the span's trace_id.
+#[allow(clippy::too_many_arguments)]
+pub fn record_ai_request_attributed(
+    provider: &str,
+    model: &str,
+    tags: &crate::attribution::AttributionTags,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+    cost: f64,
+) {
+    let project = label_or_empty(tags.project.as_deref());
+    let feature = label_or_empty(tags.feature.as_deref());
+    let team = label_or_empty(tags.team.as_deref());
+    let agent_type = label_or_empty(tags.agent_type.as_deref());
+    let environment = label_or_empty(tags.environment.as_deref());
+
+    let record_token_kind = |direction: &'static str, n: u64| {
+        if n == 0 {
+            return;
+        }
+        AI_TOKENS_ATTRIBUTED
+            .with_label_values(&[
+                provider,
+                model,
+                direction,
+                project,
+                feature,
+                team,
+                agent_type,
+                environment,
+            ])
+            .inc_by(n as f64);
+    };
+    record_token_kind("input", input_tokens);
+    record_token_kind("output", output_tokens);
+    record_token_kind("cache_read", cache_read_tokens);
+    record_token_kind("cache_write", cache_write_tokens);
+    record_token_kind("reasoning", reasoning_tokens);
+
+    if cost > 0.0 {
+        AI_COST_ATTRIBUTED
+            .with_label_values(&[
+                provider,
+                model,
+                project,
+                feature,
+                team,
+                agent_type,
+                environment,
+            ])
+            .inc_by(cost);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,5 +1156,56 @@ mod tests {
             .iter()
             .find(|f| f.name() == "sbproxy_ai_provider_errors_total");
         assert!(errs.is_some(), "provider errors counter must be registered");
+    }
+
+    /// WOR-1086: per-attribution spend record registers both
+    /// counters and increments each populated token-kind cell.
+    #[test]
+    fn test_record_ai_request_attributed() {
+        use crate::attribution::AttributionTags;
+        let tags = AttributionTags {
+            project: Some("growth-q3".to_string()),
+            feature: Some("onboarding-summary".to_string()),
+            team: Some("platform".to_string()),
+            agent_type: Some("runtime".to_string()),
+            environment: Some("prod".to_string()),
+            ..Default::default()
+        };
+        record_ai_request_attributed("openai", "gpt-4o", &tags, 100, 50, 20, 5, 30, 0.01);
+        let families = prometheus::gather();
+        assert!(families
+            .iter()
+            .any(|f| f.name() == "sbproxy_ai_tokens_attributed_total"));
+        assert!(families
+            .iter()
+            .any(|f| f.name() == "sbproxy_ai_cost_dollars_attributed_total"));
+    }
+
+    /// Zero-token kinds are skipped: the empty cell does not land
+    /// in the metric, so a deployment whose provider does not
+    /// report cache / reasoning tokens does not pay cardinality
+    /// for unused directions.
+    #[test]
+    fn test_attributed_zero_kinds_skipped() {
+        use crate::attribution::AttributionTags;
+        let tags = AttributionTags::default();
+        // input + output only.
+        record_ai_request_attributed("anthropic", "claude-sonnet", &tags, 1000, 200, 0, 0, 0, 0.0);
+        let families = prometheus::gather();
+        let tokens = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_tokens_attributed_total")
+            .expect("tokens counter registered");
+        // Confirm no cell with direction = cache_read for these
+        // provider+model labels.
+        let has_cache = tokens.get_metric().iter().any(|m| {
+            m.get_label()
+                .iter()
+                .any(|l| l.name() == "direction" && l.value() == "cache_read")
+        });
+        assert!(
+            !has_cache,
+            "zero cache_read tokens should not land in the metric"
+        );
     }
 }
