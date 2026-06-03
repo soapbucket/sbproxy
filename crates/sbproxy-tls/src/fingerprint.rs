@@ -116,9 +116,24 @@ pub struct TlsFingerprint {
     /// ship alongside the listener-level capture (or an enterprise
     /// sidecar that observes the SYN) so callers can populate the
     /// field without re-walking the FoxIO format.
-    // TODO: wire JA4T capture once Pingora exposes the
-    // raw TCP socket options, or thread it through a SYN-observing
-    // sidecar header on the trusted-proxy path.
+    //
+    // WOR-1036 (readiness tracker):
+    //
+    // - Pingora 0.8 (the current pin) does not surface SYN-packet
+    //   TCP options to the request handler. JA4T stays `None`.
+    // - Pingora's roadmap discusses an `OnTcpAccept` hook on the
+    //   listener that would expose the raw socket options before the
+    //   TLS handshake. When that lands (track at
+    //   <https://github.com/cloudflare/pingora>), add a
+    //   `compute_ja4t(socket_options) -> String` helper in this
+    //   module and populate the field from the listener's accept
+    //   callback in `crates/sbproxy-core/src/server.rs`.
+    // - Trusted-proxy header alternative: a SYN-observing sidecar
+    //   (per-deployment, not OSS) can stamp a `X-Sbproxy-JA4T:` header
+    //   the proxy reads and assigns here. The sidecar's plaintext
+    //   header MUST only be honoured on the trusted-proxy CIDR
+    //   allowlist (see `TrustedProxyCIDRs` in `request_phase.rs`),
+    //   otherwise an external client could spoof the fingerprint.
     pub ja4t: Option<String>,
     /// JA4X X.509 cert-chain fingerprint computed from the client
     /// cert chain presented during mTLS. Format per FoxIO:
