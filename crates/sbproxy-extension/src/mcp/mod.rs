@@ -27,6 +27,11 @@ pub mod codemode_from_openapi;
 pub mod codemode_ts;
 pub mod context_opt;
 pub mod discovery;
+/// WOR-507: east-west MCP federation discovery via passive
+/// `initialize` observation. Builds an inventory of every MCP
+/// server an agent has reached and emits a drift event when a
+/// server's advertised tool list changes.
+pub mod discovery_inventory;
 pub mod federation;
 pub mod guardrails;
 pub mod handler;
