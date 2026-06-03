@@ -57,6 +57,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [upgrade.md](upgrade.md) - migration notes between releases.
 - [quickstart-operator.md](quickstart-operator.md) - first 24 hours running the Kubernetes operator.
 - [kubernetes.md](kubernetes.md) - the OSS Kubernetes operator and its CRDs.
+- [sidecar-deployment.md](sidecar-deployment.md) - running sbproxy as a per-pod sidecar: traffic capture (iptables / eBPF), service-mesh integration (Istio, Linkerd), and the kustomize overlay under `deploy/k8s/sidecar/`.
 
 ### Reference
 - [402-challenge.md](402-challenge.md) - wire-format contract for the `402 Payment Required` body, including the OSS-advertises / enterprise-settles split.

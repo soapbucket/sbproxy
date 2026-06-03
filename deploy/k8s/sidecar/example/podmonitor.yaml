@@ -1,0 +1,25 @@
+# PodMonitor for the sbproxy sidecar's per-pod metrics endpoint.
+# Requires the Prometheus Operator CRDs. For a Prometheus install
+# without the operator, replace with a static scrape config or
+# add the equivalent annotations to the pod directly:
+#
+#   prometheus.io/scrape: "true"
+#   prometheus.io/port:   "15002"
+#   prometheus.io/path:   "/metrics"
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: sbproxy-sidecar
+  labels:
+    app.kubernetes.io/name: sbproxy
+    app.kubernetes.io/component: sidecar
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sbproxy
+      app.kubernetes.io/component: sidecar-demo
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s

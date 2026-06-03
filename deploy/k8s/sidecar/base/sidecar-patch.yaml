@@ -1,0 +1,104 @@
+# Strategic-merge patch that adds the sbproxy sidecar to a pod
+# template. Reference from a consuming kustomization with:
+#
+#   patchesStrategicMerge:
+#     - ../base/sidecar-patch.yaml
+#
+# Adjust the ConfigMap volume name (sbproxy-sidecar-config) and
+# the redirect ports (REDIRECT_PORTS) to match the workload.
+#
+# The init container needs NET_ADMIN + NET_RAW to write iptables
+# rules in the pod's netns. The sbproxy container itself runs
+# unprivileged.
+
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: sbproxy-init
+          image: ghcr.io/soapbucket/sbproxy-redirect-init:1.0.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add:
+                - NET_ADMIN
+                - NET_RAW
+            runAsUser: 0
+          env:
+            - name: SBPROXY_PORT
+              value: "15001"
+            # Outbound TCP destinations to DNAT onto the sidecar.
+            # 443+80 covers most HTTP(S) outbound; widen the list
+            # if the workload talks to non-standard ports.
+            - name: REDIRECT_PORTS
+              value: "443,80"
+            # CIDRs the redirect should skip (cluster API, DNS,
+            # local). Tune for your cluster's service network.
+            - name: EXCLUDE_CIDRS
+              value: "10.96.0.0/12,169.254.0.0/16"
+
+      containers:
+        - name: sbproxy
+          image: ghcr.io/soapbucket/sbproxy:1.0.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--config"
+            - "/etc/sbproxy/sb.yml"
+          ports:
+            - name: sbproxy
+              containerPort: 15001
+              protocol: TCP
+            - name: metrics
+              containerPort: 15002
+              protocol: TCP
+          # Sized for the sidecar's published targets (cold start
+          # under 500ms, RSS under 80MB at idle). Tune the upper
+          # bounds based on the workload's actual throughput.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 1000m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 15002
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 15002
+            initialDelaySeconds: 1
+            periodSeconds: 5
+          volumeMounts:
+            - name: sbproxy-config
+              mountPath: /etc/sbproxy
+              readOnly: true
+            - name: sbproxy-audit
+              mountPath: /var/log/sbproxy
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: sbproxy-config
+          configMap:
+            name: sbproxy-sidecar-config
+        # Audit envelopes written to an emptyDir; a node-level
+        # log shipper (Fluent Bit, Vector, OTel Collector) reads
+        # them off-pod. Swap for a hostPath if the shipper runs
+        # outside the pod's mount namespace.
+        - name: sbproxy-audit
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
