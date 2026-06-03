@@ -96,6 +96,7 @@ impl SseUsageParser for OllamaUsageParser {
         Some(UsageTokens {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
+            ..Default::default()
         })
     }
 
@@ -119,6 +120,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 21,
                 completion_tokens: 34,
+                ..Default::default()
             })
         );
     }
@@ -134,6 +136,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 7,
                 completion_tokens: 11,
+                ..Default::default()
             })
         );
     }

@@ -102,6 +102,7 @@ impl SseUsageParser for VertexUsageParser {
         Some(UsageTokens {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
+            ..Default::default()
         })
     }
 
@@ -127,6 +128,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 11,
                 completion_tokens: 4,
+                ..Default::default()
             })
         );
     }
@@ -142,6 +144,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 7,
                 completion_tokens: 13,
+                ..Default::default()
             })
         );
     }
@@ -156,6 +159,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 3,
                 completion_tokens: 4,
+                ..Default::default()
             })
         );
     }

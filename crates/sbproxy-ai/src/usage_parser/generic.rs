@@ -159,6 +159,7 @@ impl SseUsageParser for GenericUsageParser {
         Some(UsageTokens {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
+            ..Default::default()
         })
     }
 
@@ -180,6 +181,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 10,
                 completion_tokens: 20,
+                ..Default::default()
             })
         );
     }
@@ -195,6 +197,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 5,
                 completion_tokens: 7,
+                ..Default::default()
             })
         );
     }
@@ -210,6 +213,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 3,
                 completion_tokens: 4,
+                ..Default::default()
             })
         );
     }
@@ -223,6 +227,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 2,
                 completion_tokens: 11,
+                ..Default::default()
             })
         );
     }
@@ -236,6 +241,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 4,
                 completion_tokens: 6,
+                ..Default::default()
             })
         );
     }
@@ -257,6 +263,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 5,
                 completion_tokens: 9,
+                ..Default::default()
             })
         );
     }

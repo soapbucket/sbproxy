@@ -109,6 +109,7 @@ impl SseUsageParser for CohereUsageParser {
         Some(UsageTokens {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
+            ..Default::default()
         })
     }
 
@@ -135,6 +136,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 15,
                 completion_tokens: 7,
+                ..Default::default()
             })
         );
     }
@@ -149,6 +151,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 3,
                 completion_tokens: 5,
+                ..Default::default()
             })
         );
     }
@@ -165,6 +168,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 4,
                 completion_tokens: 6,
+                ..Default::default()
             })
         );
     }
