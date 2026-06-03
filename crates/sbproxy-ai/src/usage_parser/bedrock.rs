@@ -129,6 +129,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 17,
                 completion_tokens: 99,
+                ..Default::default()
             })
         );
     }
@@ -145,6 +146,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 4,
                 completion_tokens: 12,
+                ..Default::default()
             })
         );
     }
@@ -178,6 +180,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 2,
                 completion_tokens: 3,
+                ..Default::default()
             })
         );
     }

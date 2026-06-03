@@ -132,6 +132,7 @@ impl SseUsageParser for OpenAiUsageParser {
         Some(UsageTokens {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
+            ..Default::default()
         })
     }
 
@@ -156,6 +157,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 12,
                 completion_tokens: 34,
+                ..Default::default()
             })
         );
     }
@@ -171,6 +173,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 5,
                 completion_tokens: 9,
+                ..Default::default()
             })
         );
     }
@@ -194,6 +197,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 3,
                 completion_tokens: 42,
+                ..Default::default()
             })
         );
     }
@@ -232,6 +236,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 120,
                 completion_tokens: 34,
+                ..Default::default()
             }),
             "the terminal thread.run.completed usage block should be captured"
         );
@@ -266,6 +271,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 7,
                 completion_tokens: 11,
+                ..Default::default()
             })
         );
     }

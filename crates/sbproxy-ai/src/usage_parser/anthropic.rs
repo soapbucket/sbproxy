@@ -122,6 +122,7 @@ impl SseUsageParser for AnthropicUsageParser {
         Some(UsageTokens {
             prompt_tokens: self.input_tokens,
             completion_tokens: self.output_tokens,
+            ..Default::default()
         })
     }
 
@@ -149,6 +150,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 7,
                 completion_tokens: 42,
+                ..Default::default()
             })
         );
     }
@@ -164,6 +166,7 @@ mod tests {
             Some(UsageTokens {
                 prompt_tokens: 3,
                 completion_tokens: 11,
+                ..Default::default()
             })
         );
     }

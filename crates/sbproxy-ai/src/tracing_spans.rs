@@ -94,6 +94,20 @@ pub fn ai_request_span(surface: &str, method: &str) -> Span {
         "gen_ai.response.id" = Empty,
         "gen_ai.usage.input_tokens" = Empty,
         "gen_ai.usage.output_tokens" = Empty,
+        // WOR-1084 capture completeness: per-dimension token
+        // counts that the Capture layer of the Token-to-Value
+        // Ledger expects. Zero on providers that do not report
+        // them; downstream callers record the populated split via
+        // `Span::record` from the usage parser's snapshot.
+        "gen_ai.usage.cache_read_tokens" = Empty,
+        "gen_ai.usage.cache_write_tokens" = Empty,
+        "gen_ai.usage.reasoning_tokens" = Empty,
+        // WOR-1084: pricing-catalog revision used to derive USD
+        // cost from the token counts. A re-price against a newer
+        // catalog reads this field to re-run the math against the
+        // original token snapshot; without it, the spend record
+        // is not reproducible past a pricing-table edit.
+        "sbproxy.ai.pricing_version" = Empty,
         "gen_ai.response.finish_reasons" = Empty,
         "llm.provider" = Empty,
         "llm.model_name" = Empty,
@@ -187,6 +201,50 @@ pub fn record_token_usage(span: &Span, input_tokens: u64, output_tokens: u64) {
         "llm.token_count.total",
         input_tokens.saturating_add(output_tokens),
     );
+}
+
+/// WOR-1084: stamp the full token-kind split onto an active AI
+/// span. Sibling of [`record_token_usage`] for callers that have
+/// the per-dimension counts from a [`crate::usage_parser::UsageTokens`]
+/// snapshot.
+///
+/// Sets the OTel GenAI cache + reasoning attributes plus the
+/// updated total (the `llm.token_count.total` field includes
+/// every dimension so a downstream dashboard sums tokens against
+/// a single field).
+pub fn record_token_usage_split(
+    span: &Span,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+) {
+    span.record("gen_ai.usage.input_tokens", input_tokens);
+    span.record("gen_ai.usage.output_tokens", output_tokens);
+    span.record("gen_ai.usage.cache_read_tokens", cache_read_tokens);
+    span.record("gen_ai.usage.cache_write_tokens", cache_write_tokens);
+    span.record("gen_ai.usage.reasoning_tokens", reasoning_tokens);
+    span.record("llm.token_count.prompt", input_tokens);
+    span.record("llm.token_count.completion", output_tokens);
+    let total = input_tokens
+        .saturating_add(output_tokens)
+        .saturating_add(cache_read_tokens)
+        .saturating_add(cache_write_tokens)
+        .saturating_add(reasoning_tokens);
+    span.record("llm.token_count.total", total);
+}
+
+/// WOR-1084: stamp the pricing-catalog revision the gateway used
+/// to derive USD cost from the token counts. Without this stamp,
+/// a re-price against a newer catalog cannot reproduce the
+/// historical cost from the original token snapshot.
+///
+/// `version` is the pricing-catalog identifier: today the
+/// catalog's file content hash; future revisions may switch to a
+/// monotonic version tag.
+pub fn record_pricing_version(span: &Span, version: &str) {
+    span.record("sbproxy.ai.pricing_version", version);
 }
 
 /// Stamp the response model and identifier onto an AI span.
@@ -460,6 +518,48 @@ mod tests {
         assert_field(span, "llm.token_count.prompt", "17");
         assert_field(span, "llm.token_count.completion", "42");
         assert_field(span, "llm.token_count.total", "59");
+    }
+
+    /// WOR-1084: the cache + reasoning split lands on
+    /// `gen_ai.usage.*` and the total includes every dimension.
+    #[test]
+    fn record_token_usage_split_stamps_all_dimensions() {
+        use tracing_subscriber::prelude::*;
+        let layer = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = ai_request_span("chat", "POST");
+            // input 100, output 50, cache_read 20, cache_write 5, reasoning 30
+            record_token_usage_split(&span, 100, 50, 20, 5, 30);
+            record_pricing_version(&span, "catalog-2026-06-01");
+        });
+
+        let spans = snapshot_spans(&layer);
+        let span = find_span(&spans, "ai.request");
+        assert_field(span, "gen_ai.usage.input_tokens", "100");
+        assert_field(span, "gen_ai.usage.output_tokens", "50");
+        assert_field(span, "gen_ai.usage.cache_read_tokens", "20");
+        assert_field(span, "gen_ai.usage.cache_write_tokens", "5");
+        assert_field(span, "gen_ai.usage.reasoning_tokens", "30");
+        // Total is the sum of every dimension.
+        assert_field(span, "llm.token_count.total", "205");
+        assert_field(span, "sbproxy.ai.pricing_version", "catalog-2026-06-01");
+    }
+
+    /// `UsageTokens::total()` (WOR-1084) sums every dimension,
+    /// not just prompt + completion. Pinned so a downstream
+    /// dashboard's "total tokens" math stays consistent.
+    #[test]
+    fn usage_tokens_total_includes_all_dimensions() {
+        use crate::usage_parser::UsageTokens;
+        let u = UsageTokens {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            cache_read_tokens: 20,
+            cache_write_tokens: 5,
+            reasoning_tokens: 30,
+        };
+        assert_eq!(u.total(), 205);
     }
 
     #[test]
