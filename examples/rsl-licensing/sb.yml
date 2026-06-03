@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # 18 - RSL licensing (Wave 4 / G4.5 + G4.7 + G4.8).
 #
 # Demonstrates the policy-graph projections that surface an origin's

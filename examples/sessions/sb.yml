@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Session cookies.
 #
 # The session block configures the encrypted cookie used to carry session data

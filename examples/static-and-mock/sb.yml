@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Static and mock responses.
 #
 # `static` returns a fixed body. `mock` returns a structured JSON response

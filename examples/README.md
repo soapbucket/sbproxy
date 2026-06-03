@@ -89,6 +89,7 @@ directory (with its `sb.yml` and README). Regenerated from `examples/` on 2026-0
 | [hsts](hsts/) | The `hsts` block on `secure.local` injects a `Strict-Transport-Security` header on every response. `max_age: 31536000` is one year, `include_subdomain |
 | [idempotency](idempotency/) | The origin on `api.local` opts in to RFC 8594-style idempotency for |
 | [ip-filter](ip-filter/) | Demonstrates the `ip_filter` policy. Only requests from the loopback range `127.0.0.0/8` and the private LAN range `10.0.0.0/8` are accepted; everythi |
+| [json-schema](json-schema/) | Demonstrates the `# yaml-language-server: $schema=...` opt-in for editor autocomplete + validation against the generated JSON Schema for `sb.yml`. See [`docs/json-schema.md`](../docs/json-schema.md) for the editor walkthrough. |
 | [k8s-gateway](k8s-gateway/) | Realistic config when SBproxy runs behind a Kubernetes Ingress (or any cluster-edge load balancer) and proxies to backend Pods that scale up and down  |
 | [listing-primitive](listing-primitive/) | A minimal example of the repo-native `Listing` primitive. |
 | [load-balancer](load-balancer/) | The `load_balancer` action dispatches each request across a pool of upstream targets using the `round_robin` algorithm. Two targets are configured wit |

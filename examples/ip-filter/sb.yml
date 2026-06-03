@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # IP whitelist policy.
 #
 # Only requests from loopback (127.0.0.0/8) and a private LAN range are

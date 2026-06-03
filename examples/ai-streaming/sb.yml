@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # AI gateway: SSE streaming.
 #
 # The proxy supports streaming responses end-to-end. Send a request with

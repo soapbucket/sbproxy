@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Hybrid local + cloud AI gateway.
 #
 # Routes cheap traffic to a locally-hosted model (Ollama, vLLM, LM

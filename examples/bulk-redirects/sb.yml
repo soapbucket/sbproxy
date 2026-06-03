@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Bulk redirects.
 #
 # Each origin owns its own redirect list. Three sources are supported:

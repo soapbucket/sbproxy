@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Production resilience stack on a load balancer.
 #
 # Combines four signals so a flaky backend gets isolated quickly and

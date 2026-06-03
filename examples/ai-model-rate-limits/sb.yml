@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # AI gateway: per-model rate limits.
 #
 # Different models have different cost and latency profiles, so they

@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # CSRF protection policy.
 #
 # State-changing methods (POST, PUT, DELETE, PATCH) must carry a valid

@@ -80,6 +80,33 @@ The config has two main sections: `proxy` (server-level settings) and `origins` 
 
 ---
 
+## JSON Schema (editor autocomplete + validation)
+
+SBproxy ships a JSON Schema at `schemas/sb-config.schema.json`. Editor tooling that understands the `yaml-language-server` directive (VS Code with the YAML extension, IntelliJ / JetBrains, Helix) reads this schema and validates `sb.yml` field names + types in real time. A typo in a key surfaces as an editor error rather than as a runtime parse failure.
+
+Opt in by adding a comment header at the top of your `sb.yml`:
+
+```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/soapbucket/sbproxy/main/schemas/sb-config.schema.json
+proxy:
+  http_bind_port: 8080
+origins:
+  "api.example.com":
+    action: { type: proxy, url: http://127.0.0.1:9000 }
+```
+
+Every `examples/*/sb.yml` in this repo carries the header pointing at the local `schemas/` path so the examples are self-validating against the same schema operators consume.
+
+The schema is **generated** from the Rust types in `crates/sbproxy-config/src/types.rs` so it cannot drift from the runtime. Regenerate locally with:
+
+```bash
+cargo run -p sbproxy-config --bin generate-schema > schemas/sb-config.schema.json
+```
+
+The CI gate `scripts/check-config-schema.sh` runs the generator and `diff`s against the committed file; a Rust type change that does not regenerate the schema is rejected at PR time. The generator is deterministic (the `preserve_order` feature on `schemars` keeps object property order stable), so the diff is byte-for-byte.
+
+---
+
 ## Top-level structure
 
 Complete YAML skeleton with every top-level key:

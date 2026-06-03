@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Response caching.
 #
 # Caches upstream responses for 60 seconds. The second request for the same

@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Basic reverse proxy.
 #
 # Forwards requests sent to `myapp.example.com` through the gateway to

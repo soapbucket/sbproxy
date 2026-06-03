@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # String replacement transform.
 #
 # Applies two find-and-replace rules to the upstream response body:

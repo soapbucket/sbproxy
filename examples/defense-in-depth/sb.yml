@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Defense in depth: layered authn / authz / inspection.
 #
 # Production API gateway in front of an internal service. Each layer

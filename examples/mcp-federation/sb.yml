@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # MCP (Model Context Protocol) gateway with federated upstreams.
 #
 # Aggregates two upstream MCP servers behind one virtual MCP endpoint

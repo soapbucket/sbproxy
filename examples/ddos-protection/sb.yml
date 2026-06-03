@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # DDoS protection: per-IP rate ceiling + temporary block.
 #
 # Tracks a sliding 1-second window per source IP. When the rate

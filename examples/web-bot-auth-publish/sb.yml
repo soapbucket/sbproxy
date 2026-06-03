@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Web Bot Auth publish: SBproxy serves its own JWKS directory +
 # Signature Agent Card so verifiers can discover the keys SBproxy
 # signs outbound requests with.

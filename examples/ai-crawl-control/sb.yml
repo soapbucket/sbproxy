@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # AI Crawl Control + Pay Per Crawl (HTTP 402).
 #
 # Returns 402 to known AI crawler User-Agents that arrive without

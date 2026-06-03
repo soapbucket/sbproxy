@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # AI gateway: fallback chain across three providers.
 #
 # Three providers are listed in priority order. The first entry is

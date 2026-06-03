@@ -127,6 +127,12 @@ tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 prometheus = "0.14"
 
+# WOR-1081: JSON Schema generation from the Rust config types.
+# `preserve_order` keeps the generated schema stable across runs
+# so the regenerator's CI gate diffs byte-for-byte (otherwise a
+# HashMap iteration reorder would surface as a no-op churn diff).
+schemars = { version = "0.8", features = ["preserve_order"] }
+
 # Error handling
 anyhow = "1"
 thiserror = "2"

@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # 31 - rail-mpp-stripe-test
 #
 # Stripe MPP (Merchant Payment Protocol, preview `2026-03-04`) paywall

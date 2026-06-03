@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # 32 - multi-rail-accept-payment
 #
 # Both x402 and MPP rails configured at once. The example demonstrates

@@ -22,6 +22,10 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tempfile = "3"
+# WOR-1081: JSON Schema generation from the Rust config types so
+# editor tooling (vscode-yaml, IntelliJ) validates `sb.yml`
+# against the runtime-truth types instead of a hand-rolled file.
+schemars = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

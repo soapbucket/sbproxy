@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # prompt_injection_v2: scoring detector + configurable action.
 #
 # Successor to the v1 `prompt_injection` heuristic guardrail. The v2

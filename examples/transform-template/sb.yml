@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Template transform (minijinja).
 #
 # A `static` action returns a JSON document. The `template` transform parses

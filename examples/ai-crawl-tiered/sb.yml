@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # AI Crawl Control with tiered pricing, ledger stub, and per-class
 # crawler matching. Three pricing tiers, each gated on a route pattern;
 # the policy returns 402 with the matched tier's price to a request

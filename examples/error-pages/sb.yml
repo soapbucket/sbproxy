@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Custom error pages.
 #
 # error_pages substitutes the body and content type when the proxy itself

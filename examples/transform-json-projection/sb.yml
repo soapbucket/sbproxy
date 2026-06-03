@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # JSON projection transform (whitelist mode).
 #
 # Whitelists `id` and `title` from the upstream JSON and drops everything

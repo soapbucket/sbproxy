@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Mixed AI and non-AI traffic on a single hostname.
 #
 # Pure AI gateway libraries assume the host is "the AI gateway" and

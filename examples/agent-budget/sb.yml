@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # agent_budget policy: per-agent semantic rate limit.
 #
 # A bucket per resolved agent_id. Cursor's 60/min coding loop and an

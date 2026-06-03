@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # AI gateway: input and output guardrails.
 #
 # Three guardrails inspect the inbound prompt before it reaches Claude:

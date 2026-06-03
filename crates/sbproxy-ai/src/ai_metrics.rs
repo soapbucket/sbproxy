@@ -1400,27 +1400,45 @@ mod tests {
     }
 
     /// Zero-token kinds are skipped: the empty cell does not land
-    /// in the metric, so a deployment whose provider does not
-    /// report cache / reasoning tokens does not pay cardinality
-    /// for unused directions.
+    /// in the metric for the recorded (provider, model) cell, so a
+    /// deployment whose provider does not report cache / reasoning
+    /// tokens does not pay cardinality for unused directions.
+    ///
+    /// Pinned to a UNIQUE (provider, model) combo so the cross-test
+    /// shared Prometheus registry does not produce false positives
+    /// from a sibling test that legitimately wrote a `cache_read`
+    /// cell against a different label set.
     #[test]
     fn test_attributed_zero_kinds_skipped() {
         use crate::attribution::AttributionTags;
         let tags = AttributionTags::default();
-        record_ai_request_attributed("anthropic", "claude-sonnet", &tags, 1000, 200, 0, 0, 0, 0.0);
+        // Unique provider+model labels not used by any other test
+        // in this module so the per-cell assertion is isolated from
+        // the global Prometheus registry's state.
+        let provider = "zero-kinds-test-provider";
+        let model = "zero-kinds-test-model";
+        record_ai_request_attributed(provider, model, &tags, 1000, 200, 0, 0, 0, 0.0);
         let families = prometheus::gather();
         let tokens = families
             .iter()
             .find(|f| f.name() == "sbproxy_ai_tokens_attributed_total")
             .expect("tokens counter registered");
-        let has_cache = tokens.get_metric().iter().any(|m| {
-            m.get_label()
+        let has_cache_for_our_labels = tokens.get_metric().iter().any(|m| {
+            let labels = m.get_label();
+            let has_provider = labels
                 .iter()
-                .any(|l| l.name() == "direction" && l.value() == "cache_read")
+                .any(|l| l.name() == "provider" && l.value() == provider);
+            let has_model = labels
+                .iter()
+                .any(|l| l.name() == "model" && l.value() == model);
+            let has_cache_dir = labels
+                .iter()
+                .any(|l| l.name() == "direction" && l.value() == "cache_read");
+            has_provider && has_model && has_cache_dir
         });
         assert!(
-            !has_cache,
-            "zero cache_read tokens should not land in the metric"
+            !has_cache_for_our_labels,
+            "zero cache_read tokens should not land in the metric for this test's labels"
         );
     }
 }

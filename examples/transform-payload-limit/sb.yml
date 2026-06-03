@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Payload limit transform.
 #
 # Caps the response body to 256 bytes. With `truncate: true`, oversize bodies

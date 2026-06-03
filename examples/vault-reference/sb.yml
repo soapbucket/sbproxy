@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Unified `vault://` reference URI with tenant-scoped backends.
 #
 # Every config field that holds a secret accepts a `vault://` URI in

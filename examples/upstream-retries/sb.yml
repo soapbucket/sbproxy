@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Upstream connect-error retries.
 #
 # When the proxy cannot establish a TCP/TLS connection to the upstream

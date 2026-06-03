@@ -1,0 +1,29 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+#
+# JSON Schema (editor autocomplete + validation) for sb.yml.
+#
+# The `# yaml-language-server: $schema=` directive on line 1 wires the
+# `schemas/sb-config.schema.json` generated from the Rust config
+# types into your editor. VS Code (with the YAML extension),
+# IntelliJ / JetBrains, and Helix all honour the directive and
+# validate `sb.yml` as you type:
+#
+#   * field-name autocomplete on tab
+#   * typed values (`http_bind_port: "hello"` underlines red)
+#   * closed-enum dropdowns (e.g. `session.kind: cookie | header`)
+#   * inline rustdoc-as-tooltips
+#
+# See `docs/json-schema.md` for the full editor-setup walkthrough.
+#
+# Try this in your editor: type `proxy.` on a fresh line under
+# `proxy:` and the autocomplete dropdown shows every field
+# `crates/sbproxy-config/src/types.rs::ProxyConfig` declares.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: http://127.0.0.1:9000
