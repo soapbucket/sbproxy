@@ -38,6 +38,12 @@ pub mod handler;
 pub mod openapi_convert;
 pub mod registry;
 pub mod rest_to_mcp;
+/// WOR-486: schema-drift detection for converted MCP servers.
+/// Diffs two OpenAPI snapshots and classifies the changes by
+/// severity so a CI gate can refuse to regenerate the MCP tool
+/// surface on a breaking change without explicit operator
+/// opt-in. Consumed by the `sbproxy-mcp-drift` CLI.
+pub mod schema_drift;
 pub mod spans;
 pub mod sse_client;
 pub mod streamable;
