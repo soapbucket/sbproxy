@@ -13,6 +13,8 @@ pub mod bot_auth_publish;
 pub mod cap;
 /// WOR-1070: RFC 9449 inbound DPoP proof verification.
 pub mod dpop;
+/// WOR-1071: RFC 9449 outbound DPoP proof minting (companion to `dpop`).
+pub mod dpop_outbound;
 pub mod jwks;
 /// WOR-1072: RFC 8705 mTLS-bound access token validation.
 pub mod mtls_bound;
