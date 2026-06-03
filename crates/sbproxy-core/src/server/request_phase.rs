@@ -2616,6 +2616,7 @@ pub(super) async fn request_filter(
                 Some(ctx.request_id.to_string()),
                 Some(session.req_header().method.as_str().to_string()),
             )
+            .with_tenant_id(ctx.tenant_id.to_string())
             .emit();
             if status == 429 && (policy_type == "rate_limit" || policy_type == "ddos") {
                 // Rate-limit + DDoS denial. Both emit 429 with a

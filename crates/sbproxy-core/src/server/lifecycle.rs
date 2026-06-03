@@ -55,6 +55,12 @@ pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<()> {
     // `observability.log.redact.pii:` overrides (WOR-1043 PR2 / PR3).
     install_op_redact_state(&compiled);
 
+    // WOR-1067 PR2: refresh per-tenant cardinality caps on reload so
+    // SIGHUP picks up changes to `tenants[].observability.cardinality.max_series`
+    // without restarting the process. Tenants without an entry stay
+    // on the proxy-wide cap.
+    install_tenant_cardinality_state(&compiled.server);
+
     // WOR-1045 PR1 + PR2: validate the declared sinks block and (PR2)
     // build a SinkDispatcher from proxy + tenant + origin scopes so
     // every declared sink receives the matching records. When no
@@ -485,6 +491,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // origin-scope `observability.log.redact.pii:` overrides
     // (WOR-1043 PR2 / PR3) are composed off the proxy-scope rule set.
     install_op_redact_state(&compiled);
+    install_tenant_cardinality_state(&server_config);
     validate_sinks_config(&server_config);
     install_sink_dispatcher_from_config(&compiled);
 
@@ -1237,6 +1244,36 @@ fn report_plugin_registrations() {
 /// clobbers the other's installed state mid-flight.
 #[cfg(test)]
 pub(crate) static OP_REDACT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// WOR-1067 PR2: walk `server.tenants` and install each tenant's
+/// `observability.cardinality.max_series` cap on the global
+/// [`sbproxy_observe::metrics::global_limiter`]. A tenant without an
+/// `observability.cardinality:` block stays on the proxy-wide cap
+/// (today's behaviour); a tenant that declares the block without a
+/// `max_series:` value gets the
+/// `TENANT_CARDINALITY_DEFAULT_MAX_SERIES` (10_000) fallback so an
+/// operator can opt in to per-tenant tracking without picking a
+/// number.
+///
+/// Called once at boot (from `run`) and on every config reload (from
+/// `reload_from_config_path`) so SIGHUP picks up new tenant caps.
+fn install_tenant_cardinality_state(server: &sbproxy_config::ProxyServerConfig) {
+    use sbproxy_config::TENANT_CARDINALITY_DEFAULT_MAX_SERIES;
+    let limiter = sbproxy_observe::metrics::global_limiter();
+    for tenant in &server.tenants {
+        if let Some(cardinality) = tenant
+            .observability
+            .as_ref()
+            .and_then(|o| o.cardinality.as_ref())
+        {
+            let max_series = cardinality
+                .max_series
+                .unwrap_or(TENANT_CARDINALITY_DEFAULT_MAX_SERIES)
+                as usize;
+            limiter.set_tenant_cap(tenant.id.clone(), max_series);
+        }
+    }
+}
 
 /// Read `proxy.observability.log.redact:` (proxy scope) and walk
 /// `compiled.server.tenants` + `compiled.origins` for tenant- and

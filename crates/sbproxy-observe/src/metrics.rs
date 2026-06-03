@@ -97,6 +97,36 @@ pub fn sanitize_label_budget(metric: &str, label_name: &str, value: &str) -> Str
     sanitised
 }
 
+/// WOR-1067 PR2: tenant-scoped equivalent of [`sanitize_label_budget`].
+/// Routes to the per-tenant accepted-value set so a noisy tenant cannot
+/// demote labels for every other tenant. Tenant-scoped overflows
+/// increment the separate
+/// `sbproxy_label_cardinality_overflow_per_tenant_total{metric, label, tenant_id}`
+/// counter so PromQL queries against the existing 2-label counter stay
+/// unchanged.
+///
+/// The synthetic `__default__` tenant falls through to the proxy-wide
+/// path (and the existing 2-label counter) so single-tenant deployments
+/// stay bit-for-bit identical to pre-WOR-1067 behaviour.
+pub fn sanitize_label_budget_tenant(
+    metric: &str,
+    label_name: &str,
+    value: &str,
+    tenant_id: &str,
+) -> String {
+    if value.is_empty() {
+        return value.to_string();
+    }
+    if tenant_id.is_empty() || tenant_id == "__default__" {
+        return sanitize_label_budget(metric, label_name, value);
+    }
+    let sanitised = global_limiter().sanitize_tenant(tenant_id, label_name, value);
+    if sanitised == crate::cardinality::OTHER_LABEL && value != crate::cardinality::OTHER_LABEL {
+        record_label_overflow_per_tenant(metric, label_name, tenant_id);
+    }
+    sanitised
+}
+
 // --- Cardinality overflow counter and rate-limiter ---
 
 /// Counter `sbproxy_label_cardinality_overflow_total{metric, label}`.
@@ -155,6 +185,58 @@ fn record_label_overflow(metric: &str, label: &str) {
             metric = metric,
             label = label,
             "metric label budget exceeded; demoting new values to __other__ (rate-limited 1/min)"
+        );
+    }
+}
+
+/// WOR-1067 PR2: per-tenant overflow counter.
+/// `sbproxy_label_cardinality_overflow_per_tenant_total{metric, label, tenant_id}`.
+/// Kept separate from the proxy-wide [`overflow_counter`] so existing
+/// PromQL queries against the 2-label counter are unchanged when an
+/// operator opts in to per-tenant budgets.
+static OVERFLOW_COUNTER_PER_TENANT: OnceLock<prometheus::IntCounterVec> = OnceLock::new();
+
+fn overflow_counter_per_tenant() -> &'static prometheus::IntCounterVec {
+    OVERFLOW_COUNTER_PER_TENANT.get_or_init(|| {
+        let counter = prometheus::IntCounterVec::new(
+            Opts::new(
+                "sbproxy_label_cardinality_overflow_per_tenant_total",
+                "Per-tenant overflow demotions (`sbproxy_label_cardinality_overflow_total` with the tenant_id label)",
+            ),
+            &["metric", "label", "tenant_id"],
+        )
+        .expect("per-tenant overflow counter constructs");
+        let _ = metrics().registry.register(Box::new(counter.clone()));
+        counter
+    })
+}
+
+/// Increment the per-tenant overflow counter. Rate-limited tracing
+/// shares the same map as the proxy-wide counter so a single noisy
+/// `(metric, label)` pair does not spam regardless of which tenant
+/// scope it appears under; the warning includes the tenant id so an
+/// operator can identify the source.
+fn record_label_overflow_per_tenant(metric: &str, label: &str, tenant_id: &str) {
+    overflow_counter_per_tenant()
+        .with_label_values(&[metric, label, tenant_id])
+        .inc();
+
+    let map = OVERFLOW_LAST_WARN.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().expect("overflow warn map poisoned");
+    let key = (format!("{metric}@{tenant_id}"), label.to_string());
+    let now = Instant::now();
+    let should_warn = match guard.get(&key) {
+        Some(prev) => now.duration_since(*prev).as_secs() >= OVERFLOW_WARN_INTERVAL_SECS,
+        None => true,
+    };
+    if should_warn {
+        guard.insert(key, now);
+        drop(guard);
+        tracing::warn!(
+            metric = metric,
+            label = label,
+            tenant_id = tenant_id,
+            "per-tenant metric label budget exceeded; demoting new values to __other__ (rate-limited 1/min)"
         );
     }
 }
