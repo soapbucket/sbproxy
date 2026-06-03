@@ -93,9 +93,18 @@ impl McpHandler {
         // the same regardless of caller identity; anonymous callers
         // simply receive a smaller manifest.
         //
-        // TODO: emit `notifications/resources/list_changed`
-        // when the manifest regenerates so connected clients refresh
-        // automatically. Out of scope for the first ship.
+        // When agent-skills are configured, advertise the
+        // `resources.listChanged` capability so clients with a
+        // persistent server-push transport (the streamable HTTP
+        // transport's GET-SSE channel) know to subscribe and refresh
+        // when the manifest regenerates. Clients without a persistent
+        // channel fall back to polling the manifest URL with
+        // `If-Modified-Since` (the spec's documented fallback). The
+        // server-side SSE push channel itself is not yet implemented
+        // in this crate; advertising the capability today lets a
+        // client speaking to a future-shipping transport subscribe
+        // without a re-handshake. See docs/agent-skills.md for the
+        // operator-facing summary of the contract.
         let experimental = if ctx.has_agent_skills {
             let scheme = if ctx.request_scheme.is_empty() {
                 "https"
@@ -114,11 +123,21 @@ impl McpHandler {
             None
         };
 
+        // Resources capability. When agent-skills are configured, the
+        // well-known manifest at `/.well-known/agent-skills/index.json`
+        // is the resource that can change; advertise `listChanged: true`
+        // so a client knows to subscribe. When no agent-skills are
+        // configured this handler has no resources to surface and the
+        // capability stays absent.
+        let resources = ctx
+            .has_agent_skills
+            .then(|| serde_json::json!({ "listChanged": true }));
+
         let result = InitializeResult {
             protocol_version: "2025-06-18".to_string(),
             capabilities: ServerCapabilities {
                 tools: Some(serde_json::json!({})),
-                resources: None,
+                resources,
                 prompts: None,
                 experimental,
                 // The embedded standalone handler has no federation

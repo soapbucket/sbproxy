@@ -1100,11 +1100,22 @@ pub(super) async fn handle_mcp_action(
                 warn!(error = %e, "MCP federation resource refresh failed");
             }
             let mcp_apps = mcp.federation.mcp_apps_capability();
-            let resources = if mcp.federation.list_resources().is_empty() {
-                None
-            } else {
-                Some(serde_json::json!({}))
-            };
+            // Resources capability: present whenever this origin
+            // surfaces resources to MCP clients, either via the
+            // agent-skills well-known projection or via a federated
+            // upstream that advertised resources. `listChanged: true`
+            // tells clients with a persistent server-push transport
+            // (the streamable HTTP transport's GET-SSE channel) to
+            // subscribe and refresh when the resource set changes.
+            // Clients without a persistent channel fall back to
+            // polling the manifest URL with `If-Modified-Since` (the
+            // spec's documented fallback). The server-side push
+            // channel itself is not yet implemented; advertising the
+            // capability lets clients on a future-shipping transport
+            // subscribe without re-handshaking.
+            let surfaces_resources =
+                has_agent_skills || !mcp.federation.list_resources().is_empty();
+            let resources = surfaces_resources.then(|| serde_json::json!({ "listChanged": true }));
             let result = InitializeResult {
                 protocol_version: "2025-06-18".to_string(),
                 capabilities: ServerCapabilities {
