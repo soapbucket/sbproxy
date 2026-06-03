@@ -11,6 +11,8 @@ pub mod bot_auth_directory;
 pub mod bot_auth_publish;
 /// Crawler Authorization Protocol (CAP) verifier.
 pub mod cap;
+/// WOR-1070: RFC 9449 inbound DPoP proof verification.
+pub mod dpop;
 pub mod jwks;
 pub mod oidc;
 /// Outbound credential resolver (WOR-802): per-upstream RFC 8693 token
