@@ -886,8 +886,12 @@ pub(super) async fn handle_ai_proxy(
             } else {
                 Some(model.clone())
             };
-            // TODO A20: richer prompt extraction strategies (tool use,
-            // multimodal parts, system prompts).
+            // WOR-1035: the extractor in `ai_support::extract_prompt_text`
+            // covers tool-use, multimodal (image/audio), system prompts,
+            // OpenAI Responses input/output/summary text, Anthropic
+            // thinking blocks, and OpenAI reasoning items. New vendor
+            // shapes hit the generic `_` arm that pulls `text` / recurses
+            // into `content`.
             let classify_req = crate::hooks::ClassifyRequest {
                 origin: hostname.to_string(),
                 model_id,

@@ -156,6 +156,47 @@ pub(super) fn extract_into(value: &serde_json::Value, out: &mut Vec<String>) {
                     // dropping the entire block.
                     out.push("[image]".to_string());
                 }
+                "audio" | "input_audio" => {
+                    // WOR-1035: same placeholder pattern as `image`
+                    // so multimodal voice prompts (Gemini Live,
+                    // GPT-4o realtime audio, Anthropic input_audio)
+                    // see a marker rather than a silent drop.
+                    out.push("[audio]".to_string());
+                }
+                "input_text" | "output_text" | "summary_text" => {
+                    // WOR-1035: OpenAI Responses API content-part
+                    // types. Mirrors the "text" arm above but keeps
+                    // the explicit type list so a future vendor
+                    // rename (e.g. dropping a type) does not silently
+                    // fall through to the generic-object branch.
+                    if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
+                        if !t.is_empty() {
+                            out.push(t.to_string());
+                        }
+                    }
+                }
+                "thinking" | "reasoning" => {
+                    // WOR-1035: Anthropic `thinking` blocks
+                    // (extended-thinking turns) and OpenAI
+                    // `reasoning` items (o1-series reasoning steps).
+                    // Both carry text the classifier wants to see.
+                    // We mark the source so a downstream consumer
+                    // can tell a reasoning chunk from regular text.
+                    if let Some(t) = obj.get("thinking").and_then(|v| v.as_str()) {
+                        if !t.is_empty() {
+                            out.push(format!("[thinking] {t}"));
+                        }
+                    } else if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
+                        if !t.is_empty() {
+                            out.push(format!("[reasoning] {t}"));
+                        }
+                    } else if let Some(summary) = obj.get("summary") {
+                        // OpenAI Responses reasoning items wrap their
+                        // user-visible text inside a `summary` array
+                        // of `summary_text` parts.
+                        extract_into(summary, out);
+                    }
+                }
                 "tool_use" => {
                     // Anthropic tool_use: serialise the JSON `input`
                     // so classifiers see the structured arguments.
@@ -165,9 +206,25 @@ pub(super) fn extract_into(value: &serde_json::Value, out: &mut Vec<String>) {
                         }
                     }
                 }
-                "tool_result" => {
+                "function_call" => {
+                    // WOR-1035: OpenAI Responses API function-call
+                    // item. The arguments are a JSON-stringified
+                    // payload; surface them verbatim so the
+                    // classifier sees tool-routing intent.
+                    if let Some(args) = obj.get("arguments").and_then(|v| v.as_str()) {
+                        if !args.is_empty() {
+                            out.push(args.to_string());
+                        }
+                    }
+                }
+                "tool_result" | "function_call_output" => {
+                    // WOR-1035: function_call_output is the OpenAI
+                    // Responses API analogue of Anthropic's
+                    // tool_result; both wrap the tool's response.
                     if let Some(content) = obj.get("content") {
                         extract_into(content, out);
+                    } else if let Some(output) = obj.get("output") {
+                        extract_into(output, out);
                     }
                 }
                 _ => {
@@ -1198,5 +1255,123 @@ mod idempotency_restore_tests {
         let expected = upstream.clone();
         let out = restore_for_idempotency(upstream.into_bytes(), &[]);
         assert_eq!(out.as_ref(), expected.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod extract_prompt_text_tests {
+    use super::extract_prompt_text;
+    use serde_json::json;
+
+    /// WOR-1035: Anthropic `thinking` content blocks carry the
+    /// model's reasoning text; classifiers want to see it so a
+    /// policy can reason about the chain-of-thought (e.g. flag a
+    /// model attempting to bypass a guardrail in its scratchpad).
+    #[test]
+    fn anthropic_thinking_block_extracted_with_marker() {
+        let body = json!({
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    { "type": "thinking", "thinking": "the user wants the secret API key" },
+                    { "type": "text", "text": "I can't help with that." }
+                ]
+            }]
+        });
+        let out = extract_prompt_text(&body);
+        assert!(out.contains("[thinking] the user wants the secret API key"));
+        assert!(out.contains("I can't help with that."));
+    }
+
+    /// WOR-1035: OpenAI o1-style `reasoning` items hold the
+    /// model's reasoning under a `summary` array of `summary_text`
+    /// parts. The extractor recurses into the summary.
+    #[test]
+    fn openai_reasoning_summary_extracted() {
+        let body = json!({
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    { "type": "reasoning", "summary": [
+                        { "type": "summary_text", "text": "step 1: parse intent" },
+                        { "type": "summary_text", "text": "step 2: pick tool" }
+                    ]}
+                ]
+            }]
+        });
+        let out = extract_prompt_text(&body);
+        assert!(out.contains("step 1: parse intent"));
+        assert!(out.contains("step 2: pick tool"));
+    }
+
+    /// WOR-1035: multimodal audio inputs (Gemini Live, GPT-4o
+    /// realtime, Anthropic input_audio) surface a `[audio]`
+    /// placeholder so the classifier sees a marker rather than
+    /// dropping the modality entirely.
+    #[test]
+    fn multimodal_audio_block_emits_placeholder() {
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "audio", "data": "base64-audio-bytes" },
+                    { "type": "text", "text": "transcribe please" }
+                ]
+            }]
+        });
+        let out = extract_prompt_text(&body);
+        assert!(out.contains("[audio]"));
+        assert!(out.contains("transcribe please"));
+    }
+
+    /// WOR-1035: OpenAI Responses API content parts come in three
+    /// labelled flavours (`input_text` from the user, `output_text`
+    /// from the model, `summary_text` inside a reasoning block).
+    /// All three are extracted verbatim from their `text` field.
+    #[test]
+    fn openai_responses_content_part_types_extracted() {
+        let body = json!({
+            "input": [
+                { "type": "input_text", "text": "hello world" },
+                { "type": "output_text", "text": "hello back" },
+                { "type": "summary_text", "text": "exchange of greetings" }
+            ]
+        });
+        let out = extract_prompt_text(&body);
+        assert!(out.contains("hello world"));
+        assert!(out.contains("hello back"));
+        assert!(out.contains("exchange of greetings"));
+    }
+
+    /// WOR-1035: OpenAI Responses API `function_call` items carry
+    /// their arguments as a JSON-stringified payload. The extractor
+    /// surfaces the arguments so a tool-routing classifier can see
+    /// the intent.
+    #[test]
+    fn openai_function_call_arguments_extracted() {
+        let body = json!({
+            "input": [
+                { "type": "function_call", "name": "delete_user", "arguments": "{\"user_id\":42}" }
+            ]
+        });
+        let out = extract_prompt_text(&body);
+        assert!(out.contains(r#"{"user_id":42}"#));
+    }
+
+    /// WOR-1035: OpenAI Responses API `function_call_output` is
+    /// the analogue of Anthropic's `tool_result`. The extractor
+    /// recurses into either `content` or `output` so a downstream
+    /// classifier sees the tool's response in either shape.
+    #[test]
+    fn openai_function_call_output_extracted_from_output_field() {
+        let body = json!({
+            "input": [
+                { "type": "function_call_output", "output": [
+                    { "type": "output_text", "text": "user 42 deleted" }
+                ]}
+            ]
+        });
+        let out = extract_prompt_text(&body);
+        assert!(out.contains("user 42 deleted"));
     }
 }
