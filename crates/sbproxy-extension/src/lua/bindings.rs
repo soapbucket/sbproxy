@@ -123,6 +123,79 @@ pub fn build_agent_class_table(
     serde_json::Value::Object(t)
 }
 
+/// WOR-730: splice the agent-detect verdict into an existing request
+/// table built by [`build_request_table`]. Adds a nested `agent`
+/// sub-table so Lua / JS / WASM scripts read `request.agent.score`
+/// / `.id` / `.provenance` / `.confidence` / `.signals_used` /
+/// `.headless_score` / `.headless_indicators` exactly like the CEL
+/// `request.agent.*` namespace built by
+/// [`crate::cel::context::populate_agent_detect_namespace`].
+///
+/// All fields are present on every call. Unset values render as the
+/// zero value (`0`, `""`, `[]`) so a script can branch on
+/// `request.agent.score >= 80` without first probing for `nil`.
+#[allow(clippy::too_many_arguments)]
+pub fn enrich_request_table_with_agent_detect(
+    request: &mut serde_json::Value,
+    score: u8,
+    agent_id: Option<&str>,
+    provenance: &str,
+    confidence: f32,
+    signals_used: &[String],
+    headless_score: u8,
+    headless_indicators: &[String],
+) {
+    if let Some(map) = request.as_object_mut() {
+        let mut agent = serde_json::Map::new();
+        agent.insert(
+            "score".to_string(),
+            serde_json::Value::Number(i64::from(score).into()),
+        );
+        agent.insert(
+            "id".to_string(),
+            serde_json::Value::String(agent_id.unwrap_or("").to_string()),
+        );
+        agent.insert(
+            "provenance".to_string(),
+            serde_json::Value::String(provenance.to_string()),
+        );
+        // `confidence` is f32 in the verdict; convert to f64 + wrap
+        // in `serde_json::Number`. JSON-RPC has no f32 distinction.
+        agent.insert(
+            "confidence".to_string(),
+            serde_json::Number::from_f64(f64::from(confidence))
+                .map(serde_json::Value::Number)
+                .unwrap_or_else(|| serde_json::Value::Number(0.into())),
+        );
+        agent.insert(
+            "signals_used".to_string(),
+            serde_json::Value::Array(
+                signals_used
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+        // WOR-817: headless / stealth-browser indicator surface,
+        // mirrored from the CEL bindings so a script sees the same
+        // shape regardless of which engine it runs under.
+        agent.insert(
+            "headless_score".to_string(),
+            serde_json::Value::Number(i64::from(headless_score).into()),
+        );
+        agent.insert(
+            "headless_indicators".to_string(),
+            serde_json::Value::Array(
+                headless_indicators
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+        map.insert("agent".to_string(), serde_json::Value::Object(agent));
+    }
+}
+
 /// Splice the TLS fingerprint into an existing request
 /// table built by [`build_request_table`]. Adds a nested `tls`
 /// sub-table with `ja3`, `ja4`, `ja4h`, and `trustworthy` keys so
@@ -583,5 +656,67 @@ mod tests {
         assert_eq!(req["agent_class"], "anthropic-claudebot");
         assert_eq!(req["agent_vendor"], "Anthropic");
         assert_eq!(req["agent_id_source"], "rdns");
+    }
+
+    /// WOR-730: a Lua / JS / WASM script reads
+    /// `request.agent.score` / `.id` / `.provenance` /
+    /// `.confidence` / `.signals_used` / `.headless_score` /
+    /// `.headless_indicators` after the enricher fires. Mirrors the
+    /// CEL `populate_agent_detect_namespace` surface.
+    #[test]
+    fn enrich_request_table_adds_agent_detect_subtable() {
+        let headers = HashMap::new();
+        let mut req = build_request_table("GET", "/", &headers, None, None);
+        let signals = vec!["ja4".to_string(), "header_order".to_string()];
+        let indicators = vec!["webdriver".to_string()];
+        enrich_request_table_with_agent_detect(
+            &mut req,
+            87,
+            Some("anthropic-claudebot"),
+            "unsigned-named",
+            0.92,
+            &signals,
+            45,
+            &indicators,
+        );
+        let agent = &req["agent"];
+        assert_eq!(agent["score"], 87);
+        assert_eq!(agent["id"], "anthropic-claudebot");
+        assert_eq!(agent["provenance"], "unsigned-named");
+        // confidence is f64 in JSON; assert via the parsed value to
+        // avoid floating-point string-repr drift across platforms.
+        assert!((agent["confidence"].as_f64().unwrap() - 0.92).abs() < 1e-6);
+        let used = agent["signals_used"].as_array().unwrap();
+        assert_eq!(used.len(), 2);
+        assert_eq!(used[0], "ja4");
+        assert_eq!(agent["headless_score"], 45);
+        let ind = agent["headless_indicators"].as_array().unwrap();
+        assert_eq!(ind.len(), 1);
+        assert_eq!(ind[0], "webdriver");
+    }
+
+    /// WOR-730: missing fields render as zero-equivalent values so a
+    /// script can branch on `request.agent.score >= 80` without
+    /// probing for `nil`.
+    #[test]
+    fn enrich_request_table_with_agent_detect_defaults_to_zero_values() {
+        let headers = HashMap::new();
+        let mut req = build_request_table("GET", "/", &headers, None, None);
+        enrich_request_table_with_agent_detect(
+            &mut req,
+            0,
+            None,
+            "unsigned-anonymous",
+            0.0,
+            &[],
+            0,
+            &[],
+        );
+        let agent = &req["agent"];
+        assert_eq!(agent["score"], 0);
+        assert_eq!(agent["id"], "");
+        assert_eq!(agent["provenance"], "unsigned-anonymous");
+        assert!(agent["signals_used"].as_array().unwrap().is_empty());
+        assert!(agent["headless_indicators"].as_array().unwrap().is_empty());
     }
 }
