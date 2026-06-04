@@ -474,7 +474,13 @@ impl WafPolicy {
                 }
                 Ok(false) => {} // No match, continue.
                 Err(e) => {
-                    return WafResult::Error(format!("WAF custom rule error: {}", e));
+                    // WOR-1152: a single malformed custom rule (e.g. an
+                    // invalid regex) must not abort evaluation of the
+                    // remaining rules or fail open by short-circuiting the
+                    // whole pass. Log and skip this rule so later rules
+                    // still enforce.
+                    tracing::warn!(error = %e, "WAF: custom rule engine error; skipping rule");
+                    continue;
                 }
             }
         }

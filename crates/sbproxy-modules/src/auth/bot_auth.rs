@@ -319,10 +319,19 @@ impl BotAuthProvider {
                 }
             }
             Err(_) => {
-                // Store-side failure (timeout, IO, ...). Fail-open: the
-                // store's own metrics surface the underlying incident
-                // and the timestamp-window check still bounds replay.
-                Ok(())
+                // WOR-1148: a store-side failure (timeout, IO, ...) must
+                // not silently disable replay protection. Under `Strict`
+                // the operator asked for single-use enforcement, so fail
+                // closed; `Permissive` still allows, bounded by the
+                // timestamp-window check.
+                tracing::warn!(
+                    policy = self.nonce_policy.metric_label(),
+                    "bot_auth nonce store error; failing closed under Strict"
+                );
+                match self.nonce_policy {
+                    NoncePolicy::Strict => Err("nonce_store_error"),
+                    NoncePolicy::Permissive => Ok(()),
+                }
             }
         }
     }
