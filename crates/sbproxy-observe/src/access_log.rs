@@ -134,6 +134,19 @@ pub struct AccessLogEntry {
     /// to. Same path as [`Self::project`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Team / cost-center the request's credential rolls up to. Lifted
+    /// off `principal.attrs.team` so log-based attribution can slice by
+    /// team without re-joining against the per-credential metric, which
+    /// is the only other place this dimension surfaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
+    /// Operator-supplied attribution tags copied off the matched
+    /// credential (`principal.attrs.tags`). Each tag is a free-form
+    /// label (for example `okr:q3-latency` or `cost_center:platform`);
+    /// log queries cross-tab `(project, tag)` the same way the
+    /// attribution metric does.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub tags: Vec<String>,
     /// WOR-894: arbitrary metadata copied off the matched virtual key.
     /// Serialized as a JSON object; empty when no key matched or no
     /// metadata was declared.
@@ -525,6 +538,8 @@ impl Default for AccessLogEntry {
             prompt_version: None,
             project: None,
             user: None,
+            team: None,
+            tags: Vec::new(),
             metadata: std::collections::HashMap::new(),
             tokens_in: None,
             tokens_out: None,
@@ -807,6 +822,8 @@ mod tests {
             prompt_version: None,
             project: None,
             user: None,
+            team: None,
+            tags: Vec::new(),
             metadata: std::collections::HashMap::new(),
             tokens_in: None,
             tokens_out: None,
@@ -926,6 +943,26 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let lat = v["latency_ms"].as_f64().unwrap();
         assert!((lat - 1.23456789).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_team_and_tags_serialize_for_attribution() {
+        // team + tags must reach the log line so attribution pipelines
+        // can slice by them, not just by project/user/metadata.
+        let mut entry = minimal_entry();
+        entry.team = Some("platform".to_string());
+        entry.tags = vec!["okr:q3-latency".to_string(), "tier:gold".to_string()];
+        let json = serde_json::to_string(&entry).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["team"].as_str(), Some("platform"));
+        assert_eq!(v["tags"][0].as_str(), Some("okr:q3-latency"));
+        assert_eq!(v["tags"][1].as_str(), Some("tier:gold"));
+
+        // Empty team/tags stay off the line entirely (no null/[] noise).
+        let bare = minimal_entry();
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("\"team\""));
+        assert!(!bare_json.contains("\"tags\""));
     }
 
     #[test]

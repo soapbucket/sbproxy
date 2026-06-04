@@ -534,6 +534,8 @@ pub(super) fn emit_access_log(
         prompt_version: ctx.ai_prompt_version.clone(),
         project: ctx.principal.attrs.project.clone(),
         user: ctx.principal.attrs.user.clone(),
+        team: ctx.principal.attrs.team.clone(),
+        tags: ctx.principal.attrs.tags.clone(),
         metadata: ctx
             .principal
             .attrs
@@ -687,6 +689,11 @@ pub(super) struct AccessLogContext {
     /// virtual key (per-key reporting dimensions).
     pub(super) project: Option<String>,
     pub(super) user: Option<String>,
+    /// Team + attribution tags copied off the matched credential, so
+    /// log-based attribution can slice by team / tag (previously these
+    /// only surfaced on the per-credential metric).
+    pub(super) team: Option<String>,
+    pub(super) tags: Vec<String>,
     pub(super) metadata: std::collections::HashMap<String, String>,
     /// Prompt / input tokens consumed (from the provider response).
     pub(super) tokens_in: Option<u64>,
@@ -764,6 +771,8 @@ impl AccessLogContext {
             prompt_version: None,
             project: None,
             user: None,
+            team: None,
+            tags: Vec::new(),
             metadata: std::collections::HashMap::new(),
             tokens_in: None,
             tokens_out: None,
@@ -873,6 +882,8 @@ pub(super) fn emit_access_log_entry(
         prompt_version: context.prompt_version,
         project: context.project,
         user: context.user,
+        team: context.team,
+        tags: context.tags,
         metadata: context.metadata,
         tokens_in: context.tokens_in,
         tokens_out: context.tokens_out,

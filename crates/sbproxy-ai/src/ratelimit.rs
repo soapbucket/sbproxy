@@ -437,8 +437,8 @@ impl ModelRateLimiter {
         self.admit_with_tenant(apikey, model, "", cfg, estimated_tokens)
     }
 
-    /// WOR-1096: tenant-attributed admission. Identical to [`admit`]
-    /// but stamps `tenant` onto the
+    /// WOR-1096: tenant-attributed admission. Identical to
+    /// [`Self::admit`] but stamps `tenant` onto the
     /// `sbproxy_ai_ratelimit_rejected_total` counter so a tenant that
     /// hits its TPM/RPM cap is distinguishable from global pressure.
     pub fn admit_with_tenant(
