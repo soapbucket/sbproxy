@@ -655,6 +655,63 @@ fn migrate_features_to_extensions(yaml: &str) -> Result<String> {
     serde_yaml::to_string(&root).context("failed to re-serialise YAML during migration")
 }
 
+/// Validate `observability.log.custom_fields:` at config-load time.
+///
+/// Each field must declare exactly one value source (`value`, or
+/// `source` + `engine`), have a non-empty unique name, and name a
+/// supported engine. WASM is rejected with a pointer to the reason:
+/// inline `source` is text, and a WASM log field would need a compiled
+/// module path instead.
+fn validate_custom_log_fields(fields: &[crate::CustomLogFieldConfig]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for field in fields {
+        if field.name.trim().is_empty() {
+            anyhow::bail!("observability.log.custom_fields: a field has an empty `name`");
+        }
+        if !seen.insert(field.name.as_str()) {
+            anyhow::bail!(
+                "observability.log.custom_fields: duplicate field name `{}`",
+                field.name
+            );
+        }
+        let has_value = field.value.is_some();
+        let has_source = field.source.is_some();
+        if has_value && has_source {
+            anyhow::bail!(
+                "observability.log.custom_fields: field `{}` sets both `value` and `source`; pick one",
+                field.name
+            );
+        }
+        if !has_value && !has_source {
+            anyhow::bail!(
+                "observability.log.custom_fields: field `{}` sets neither `value` nor `source`",
+                field.name
+            );
+        }
+        if has_source {
+            match field.engine.as_deref() {
+                Some("cel") | Some("lua") | Some("js") => {}
+                Some("wasm") => anyhow::bail!(
+                    "observability.log.custom_fields: field `{}` uses engine `wasm`, which is not \
+                     supported for log fields: WASM is a compiled module, not inline source. Use \
+                     `cel`, `lua`, or `js`.",
+                    field.name
+                ),
+                Some(other) => anyhow::bail!(
+                    "observability.log.custom_fields: field `{}` uses unknown engine `{other}` \
+                     (expected `cel`, `lua`, or `js`)",
+                    field.name
+                ),
+                None => anyhow::bail!(
+                    "observability.log.custom_fields: field `{}` sets `source` but no `engine`",
+                    field.name
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Compile a raw YAML config string into a `CompiledConfig`.
 ///
 /// # Errors
@@ -687,6 +744,15 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
 
     let mut config_file: ConfigFile =
         serde_yaml::from_str(&yaml).context("failed to parse config YAML")?;
+
+    if let Some(log) = config_file
+        .proxy
+        .observability
+        .as_ref()
+        .and_then(|o| o.log.as_ref())
+    {
+        validate_custom_log_fields(&log.custom_fields)?;
+    }
 
     // Lower `proxy.credentials` + `tenant.credentials` + per-origin
     // `credentials:` of type `ai_provider` into the existing
@@ -1209,6 +1275,58 @@ fn transform_type_is(value: &serde_json::Value, wanted: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn custom_field(
+        name: &str,
+        value: Option<&str>,
+        engine: Option<&str>,
+        source: Option<&str>,
+    ) -> crate::CustomLogFieldConfig {
+        crate::CustomLogFieldConfig {
+            name: name.to_string(),
+            value: value.map(str::to_string),
+            engine: engine.map(str::to_string),
+            source: source.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn custom_log_fields_accept_valid_shapes() {
+        let fields = vec![
+            custom_field("region", Some("${env.REGION}"), None, None),
+            custom_field("tier", None, Some("cel"), Some("\"gold\"")),
+            custom_field("rc", None, Some("lua"), Some("return 1")),
+            custom_field("um", None, Some("js"), Some("1")),
+        ];
+        assert!(validate_custom_log_fields(&fields).is_ok());
+    }
+
+    #[test]
+    fn custom_log_fields_reject_wasm_and_bad_shapes() {
+        // WASM is rejected with a clear message.
+        let wasm = vec![custom_field("x", None, Some("wasm"), Some("..."))];
+        let err = validate_custom_log_fields(&wasm).unwrap_err().to_string();
+        assert!(err.contains("wasm"), "got: {err}");
+
+        // Both value and source set.
+        let both = vec![custom_field("x", Some("a"), Some("cel"), Some("1"))];
+        assert!(validate_custom_log_fields(&both).is_err());
+
+        // Neither set.
+        let neither = vec![custom_field("x", None, None, None)];
+        assert!(validate_custom_log_fields(&neither).is_err());
+
+        // Unknown engine.
+        let unknown = vec![custom_field("x", None, Some("ruby"), Some("1"))];
+        assert!(validate_custom_log_fields(&unknown).is_err());
+
+        // Duplicate names.
+        let dup = vec![
+            custom_field("x", Some("a"), None, None),
+            custom_field("x", Some("b"), None, None),
+        ];
+        assert!(validate_custom_log_fields(&dup).is_err());
+    }
 
     // --- extract_type tests ---
 

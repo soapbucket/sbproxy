@@ -548,6 +548,26 @@ pub(super) fn emit_access_log(
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
+        // Operator-defined custom log fields
+        // (`observability.log.custom_fields:`), evaluated here where the
+        // session + request context are in hand. The result rides
+        // through every redaction pass like any other field. Proxy scope
+        // today; origin / tenant scopes compose the same way once their
+        // observability-log plumbing is consumed at runtime.
+        custom: pipeline
+            .config
+            .server
+            .observability
+            .as_ref()
+            .and_then(|o| o.log.as_ref())
+            .map(|l| l.custom_fields.as_slice())
+            .filter(|f| !f.is_empty())
+            .map(|fields| {
+                crate::server::custom_log::evaluate(
+                    fields, session, ctx, status, hostname, method, &path,
+                )
+            })
+            .unwrap_or_default(),
         tokens_in: ctx.ai_tokens_in,
         tokens_out: ctx.ai_tokens_out,
         ai_surface: ctx.ai_surface.clone(),
@@ -704,6 +724,9 @@ pub(super) struct AccessLogContext {
     /// `SB-Attr-*` headers), the same map fanned out to the spend
     /// metric. Keyed by stable schema name.
     pub(super) attribution: std::collections::BTreeMap<String, String>,
+    /// Operator-defined custom log fields, evaluated at the build site
+    /// where the session + request context are in hand.
+    pub(super) custom: std::collections::BTreeMap<String, String>,
     /// Prompt / input tokens consumed (from the provider response).
     pub(super) tokens_in: Option<u64>,
     /// Completion / output tokens generated.
@@ -784,6 +807,7 @@ impl AccessLogContext {
             tags: Vec::new(),
             metadata: std::collections::HashMap::new(),
             attribution: std::collections::BTreeMap::new(),
+            custom: std::collections::BTreeMap::new(),
             tokens_in: None,
             tokens_out: None,
             ai_surface: None,
@@ -896,6 +920,7 @@ pub(super) fn emit_access_log_entry(
         tags: context.tags,
         metadata: context.metadata,
         attribution: context.attribution,
+        custom: context.custom,
         tokens_in: context.tokens_in,
         tokens_out: context.tokens_out,
         ai_surface: context.ai_surface,

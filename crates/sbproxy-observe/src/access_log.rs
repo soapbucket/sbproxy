@@ -162,6 +162,14 @@ pub struct AccessLogEntry {
     /// identically. Empty for non-AI requests or when no tag resolved.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty", default)]
     pub attribution: std::collections::BTreeMap<String, String>,
+    /// Operator-defined custom fields from `observability.log.
+    /// custom_fields:`, each computed per request from a static value
+    /// (with `${...}` interpolation) or a CEL / Lua / JS script. Lets
+    /// operators pivot logs on dimensions the built-in schema does not
+    /// carry. Redacted by the same passes as every other field. Empty
+    /// when none are configured or none resolved.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty", default)]
+    pub custom: std::collections::BTreeMap<String, String>,
     /// Prompt / input tokens consumed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_in: Option<u64>,
@@ -552,6 +560,7 @@ impl Default for AccessLogEntry {
             tags: Vec::new(),
             metadata: std::collections::HashMap::new(),
             attribution: std::collections::BTreeMap::new(),
+            custom: std::collections::BTreeMap::new(),
             tokens_in: None,
             tokens_out: None,
             ai_surface: None,
@@ -837,6 +846,7 @@ mod tests {
             tags: Vec::new(),
             metadata: std::collections::HashMap::new(),
             attribution: std::collections::BTreeMap::new(),
+            custom: std::collections::BTreeMap::new(),
             tokens_in: None,
             tokens_out: None,
             ai_surface: None,
