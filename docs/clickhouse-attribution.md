@@ -49,6 +49,8 @@ CREATE TABLE access_log
     principal_kind            LowCardinality(Nullable(String)),
     project                   LowCardinality(Nullable(String)),
     user                      LowCardinality(Nullable(String)),
+    team                      LowCardinality(Nullable(String)),
+    tags                      Array(LowCardinality(String)),
     metadata                  Map(LowCardinality(String), String),
 
     -- AI gateway
@@ -161,35 +163,34 @@ WHERE ...
 
 ## Sample query 3: tag-level burndown vs budget
 
-The per-credential attribution metric `sbproxy_tokens_attributed_total{project, user, tag, direction}` rolls up at scrape time; the access-log query below mirrors it against per-credential budgets so dashboards can show "tag X has spent 7,200 of its 10,000 token allotment this week":
+The per-credential attribution metric `sbproxy_tokens_attributed_total{project, user, tag, direction}` rolls up at scrape time; the access-log query below mirrors it against per-credential budgets so dashboards can show "tag X has spent 7,200 of its 10,000 token allotment this week". Tags are a first-class `tags` array column on every line (copied from the credential's `attrs.tags:`), so the query reads them directly rather than parsing them out of the free-form `metadata` map:
 
 ```sql
 WITH (
     SELECT map(
-        'cost_center=eng-001', 10000,
-        'cost_center=ops-002', 5000,
-        'team=foundation',     50000
+        'cost_center:eng-001', 10000,
+        'cost_center:ops-002', 5000,
+        'okr:q3-latency',      50000
     )
 ) AS tag_budgets
 
 SELECT
-    arrayJoin(mapKeys(metadata))   AS tag,
-    metadata[tag]                   AS tag_value,
+    arrayJoin(tags)                                     AS tag,
     sumIf(tokens_in + tokens_out, provider IS NOT NULL) AS spent_tokens,
-    tag_budgets[concat(tag, '=', tag_value)]            AS budget_tokens,
+    tag_budgets[tag]                                    AS budget_tokens,
     if(budget_tokens > 0,
        round(100.0 * spent_tokens / budget_tokens, 1),
        NULL)                                            AS percent_used
 FROM access_log
 WHERE workspace_id = {workspace:String}
   AND timestamp >= toStartOfWeek(now())
-  AND notEmpty(metadata)
-GROUP BY tag, tag_value
+  AND notEmpty(tags)
+GROUP BY tag
 HAVING budget_tokens > 0
 ORDER BY percent_used DESC;
 ```
 
-The query reads tag values out of the `metadata` map column (populated from the AI virtual key's `metadata:` block; a follow-up wires the same map for the non-AI auth providers). Replace the inline `tag_budgets` map with a join against an operator-maintained budget table for production use.
+The query reads each line's `tags` array (populated from the credential's `attrs.tags:` list). To slice by team instead, group on the first-class `team` column the same way. Free-form `metadata` is still available for any key/value an operator declares on the credential. Replace the inline `tag_budgets` map with a join against an operator-maintained budget table for production use.
 
 ## Materialised view: per-day-per-project pre-aggregation
 
