@@ -753,6 +753,19 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     {
         validate_custom_log_fields(&log.custom_fields)?;
     }
+    // Tenant- and origin-scope custom_fields use the same validation.
+    for tenant in &config_file.proxy.tenants {
+        if let Some(obs) = tenant.observability.as_ref() {
+            validate_custom_log_fields(&obs.log.custom_fields)
+                .with_context(|| format!("tenant `{}` observability.log", tenant.id))?;
+        }
+    }
+    for (host, origin) in &config_file.origins {
+        if let Some(obs) = origin.observability.as_ref() {
+            validate_custom_log_fields(&obs.log.custom_fields)
+                .with_context(|| format!("origin `{host}` observability.log"))?;
+        }
+    }
 
     // Lower `proxy.credentials` + `tenant.credentials` + per-origin
     // `credentials:` of type `ai_provider` into the existing

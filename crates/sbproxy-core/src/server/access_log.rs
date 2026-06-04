@@ -551,23 +551,45 @@ pub(super) fn emit_access_log(
         // Operator-defined custom log fields
         // (`observability.log.custom_fields:`), evaluated here where the
         // session + request context are in hand. The result rides
-        // through every redaction pass like any other field. Proxy scope
-        // today; a tenant/origin-scope `custom_fields:` is a planned
-        // extension (those scopes already carry per-scope redact + sinks).
-        custom: pipeline
-            .config
-            .server
-            .observability
-            .as_ref()
-            .and_then(|o| o.log.as_ref())
-            .map(|l| l.custom_fields.as_slice())
-            .filter(|f| !f.is_empty())
-            .map(|fields| {
+        // through every redaction pass like any other field. Resolved
+        // across proxy, tenant (by `ctx.tenant_id`), and origin (by the
+        // matched `origin_idx`) scope; a more-specific scope's field
+        // overrides a less-specific field of the same name, the same way
+        // redaction composes proxy -> tenant -> origin.
+        custom: {
+            let proxy_fields = pipeline
+                .config
+                .server
+                .observability
+                .as_ref()
+                .and_then(|o| o.log.as_ref())
+                .map(|l| l.custom_fields.as_slice())
+                .unwrap_or(&[]);
+            let tenant_fields = pipeline
+                .config
+                .server
+                .tenants
+                .iter()
+                .find(|t| t.id == ctx.tenant_id)
+                .and_then(|t| t.observability.as_ref())
+                .map(|o| o.log.custom_fields.as_slice())
+                .unwrap_or(&[]);
+            let origin_fields = ctx
+                .origin_idx
+                .and_then(|i| pipeline.config.origins.get(i))
+                .and_then(|o| o.observability.as_ref())
+                .map(|o| o.log.custom_fields.as_slice())
+                .unwrap_or(&[]);
+            let merged =
+                crate::server::custom_log::merge_scoped(proxy_fields, tenant_fields, origin_fields);
+            if merged.is_empty() {
+                std::collections::BTreeMap::new()
+            } else {
                 crate::server::custom_log::evaluate(
-                    fields, session, ctx, status, hostname, method, &path,
+                    &merged, session, ctx, status, hostname, method, &path,
                 )
-            })
-            .unwrap_or_default(),
+            }
+        },
         tokens_in: ctx.ai_tokens_in,
         tokens_out: ctx.ai_tokens_out,
         ai_surface: ctx.ai_surface.clone(),

@@ -71,6 +71,29 @@ pub(super) fn evaluate(
     out
 }
 
+/// Merge custom-field definitions across scopes, most-specific wins by
+/// `name`: proxy is the base, a tenant field overrides the proxy field
+/// of the same name, and an origin field overrides both. Returns one
+/// definition per unique name (so the more-specific definition is the
+/// only one evaluated, regardless of what the broader one would resolve
+/// to). Returns an empty Vec when every scope is empty.
+pub(super) fn merge_scoped(
+    proxy: &[sbproxy_config::CustomLogFieldConfig],
+    tenant: &[sbproxy_config::CustomLogFieldConfig],
+    origin: &[sbproxy_config::CustomLogFieldConfig],
+) -> Vec<sbproxy_config::CustomLogFieldConfig> {
+    if proxy.is_empty() && tenant.is_empty() && origin.is_empty() {
+        return Vec::new();
+    }
+    // Insertion order proxy -> tenant -> origin; a later insert with the
+    // same key replaces the earlier one, so origin wins, then tenant.
+    let mut by_name: BTreeMap<&str, &sbproxy_config::CustomLogFieldConfig> = BTreeMap::new();
+    for field in proxy.iter().chain(tenant).chain(origin) {
+        by_name.insert(field.name.as_str(), field);
+    }
+    by_name.into_values().cloned().collect()
+}
+
 /// Build the request-context object shared by static interpolation and
 /// every engine. Scripts see it as a single `ctx` global (`ctx.request.
 /// method`, `ctx.attribution['feature']`, ...); CEL sees the same keys
@@ -280,6 +303,39 @@ fn json_scalar_to_string(value: Option<&serde_json::Value>) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn field(name: &str, value: &str) -> sbproxy_config::CustomLogFieldConfig {
+        sbproxy_config::CustomLogFieldConfig {
+            name: name.to_string(),
+            value: Some(value.to_string()),
+            engine: None,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn merge_scoped_precedence_origin_over_tenant_over_proxy() {
+        let proxy = vec![field("a", "proxy_a"), field("b", "proxy_b")];
+        let tenant = vec![field("b", "tenant_b"), field("c", "tenant_c")];
+        let origin = vec![field("c", "origin_c"), field("d", "origin_d")];
+        let merged = merge_scoped(&proxy, &tenant, &origin);
+        let got: std::collections::BTreeMap<_, _> = merged
+            .iter()
+            .map(|f| (f.name.as_str(), f.value.as_deref().unwrap()))
+            .collect();
+        // a: only proxy. b: tenant overrides proxy. c: origin overrides
+        // tenant. d: only origin. One entry per unique name.
+        assert_eq!(got["a"], "proxy_a");
+        assert_eq!(got["b"], "tenant_b");
+        assert_eq!(got["c"], "origin_c");
+        assert_eq!(got["d"], "origin_d");
+        assert_eq!(merged.len(), 4);
+    }
+
+    #[test]
+    fn merge_scoped_all_empty_is_empty() {
+        assert!(merge_scoped(&[], &[], &[]).is_empty());
+    }
 
     fn ctx() -> serde_json::Value {
         json!({
