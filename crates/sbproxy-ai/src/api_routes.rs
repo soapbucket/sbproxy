@@ -165,55 +165,144 @@ pub fn provider_supports_realtime(provider: &str) -> bool {
 /// dedicated discovery endpoint (the proxy's own model registry) rather
 /// than the passthrough.
 pub fn provider_supports_surface(provider: &str, surface: &crate::handler::AiSurface) -> bool {
+    // Per-provider narrowings: the wire-format default would admit
+    // more surfaces than the upstream actually exposes. Listed
+    // ahead of the format dispatch so the narrowing is the first
+    // signal a future maintainer sees. Each arm carries the reason
+    // the upstream's surface set is narrower than the format's
+    // default.
     use crate::handler::AiSurface;
     match (provider, surface) {
-        // Universal: chat + models. Messages and Responses are
-        // native-format inbound shims that translate down to
-        // the same hub shape as chat completions, so every
-        // chat-capable provider supports them.
-        (_, AiSurface::ChatCompletions) => true,
-        (_, AiSurface::Models) => true,
-        (_, AiSurface::Messages) => true,
-        (_, AiSurface::Responses) => true,
+        // Bedrock has no chat-completions-shaped embeddings,
+        // image, audio, reranking, or moderations endpoint.
+        // Titan embeddings exist but require the legacy
+        // InvokeModel shape, not the OpenAI /v1/embeddings shape.
+        ("bedrock", AiSurface::Embeddings)
+        | ("bedrock", AiSurface::ImageGeneration)
+        | ("bedrock", AiSurface::ImageEdits)
+        | ("bedrock", AiSurface::ImageVariations)
+        | ("bedrock", AiSurface::AudioTranscription)
+        | ("bedrock", AiSurface::AudioSpeech)
+        | ("bedrock", AiSurface::Moderations)
+        | ("bedrock", AiSurface::Reranking)
+        | ("bedrock", AiSurface::Assistants)
+        | ("bedrock", AiSurface::Threads)
+        | ("bedrock", AiSurface::Batches)
+        | ("bedrock", AiSurface::FineTuning)
+        | ("bedrock", AiSurface::Files)
+        | ("bedrock", AiSurface::Realtime) => false,
 
-        // OpenAI supports every shipped surface in this enum.
-        ("openai", _) => true,
+        // Cohere speaks the OpenAI wire shape but only exposes
+        // embeddings + reranking (plus the universal chat/models).
+        // Narrow the OpenAi-format default so an operator pointing
+        // a CohereClient at /v1/images/generations gets a clean
+        // 501 instead of a forwarded request the upstream 404s.
+        ("cohere", AiSurface::ImageGeneration)
+        | ("cohere", AiSurface::ImageEdits)
+        | ("cohere", AiSurface::ImageVariations)
+        | ("cohere", AiSurface::AudioTranscription)
+        | ("cohere", AiSurface::AudioSpeech)
+        | ("cohere", AiSurface::Moderations)
+        | ("cohere", AiSurface::Assistants)
+        | ("cohere", AiSurface::Threads)
+        | ("cohere", AiSurface::Batches)
+        | ("cohere", AiSurface::FineTuning)
+        | ("cohere", AiSurface::Files)
+        | ("cohere", AiSurface::Realtime)
+        | ("cohere", AiSurface::Unknown) => false,
 
-        // Anthropic: only chat + models (above). Everything else is false.
-        ("anthropic", _) => false,
+        // Vertex AI's OpenAI-compatible endpoint covers chat,
+        // embeddings, image, audio, and reranking; it does NOT
+        // expose the stateful surfaces (assistants, threads,
+        // batches, fine-tuning, files), moderations, realtime, or
+        // image edits/variations. Narrow the OpenAi-format default
+        // so /v1/threads against vertex 501s cleanly instead of
+        // 404ing at the upstream.
+        ("vertex", AiSurface::Assistants)
+        | ("vertex", AiSurface::Threads)
+        | ("vertex", AiSurface::Batches)
+        | ("vertex", AiSurface::FineTuning)
+        | ("vertex", AiSurface::Files)
+        | ("vertex", AiSurface::Realtime)
+        | ("vertex", AiSurface::ImageEdits)
+        | ("vertex", AiSurface::ImageVariations)
+        | ("vertex", AiSurface::Moderations)
+        | ("vertex", AiSurface::Unknown) => false,
 
-        // Vertex AI exposes an OpenAI-compatible endpoint (catalog
-        // `format: openai`), so these surfaces pass through unchanged
-        // like any OpenAI-compatible provider.
-        ("vertex", AiSurface::Embeddings) => true,
-        ("vertex", AiSurface::ImageGeneration) => true,
-        ("vertex", AiSurface::AudioTranscription) => true,
-        ("vertex", AiSurface::AudioSpeech) => true,
-        ("vertex", AiSurface::Reranking) => true,
-        ("vertex", _) => false,
+        _ => {
+            // Default path: dispatch on the provider's wire format.
+            // Unknown providers (not in the catalog) get the
+            // most-restrictive answer (chat + models only). The
+            // catalog lookup is cached so this stays cheap.
+            let format = crate::providers::get_provider_info(provider).map(|info| info.format);
+            match format {
+                Some(f) => provider_format_supports_surface(f, surface),
+                None => matches!(
+                    surface,
+                    AiSurface::ChatCompletions
+                        | AiSurface::Models
+                        | AiSurface::Messages
+                        | AiSurface::Responses
+                ),
+            }
+        }
+    }
+}
 
-        // Gemini (Google wire format) is translated, not passed through.
-        // Only chat completions has a Google translator today (the
-        // universal arm above also covers models/messages/responses).
-        // Embeddings, image generation, audio, and reranking have no
-        // Google translator, so claiming support here would forward the
-        // request verbatim to a path Gemini does not expose (WOR-752
-        // Finding A, the same class as #240). Return false so the
-        // gateway 501s instead of forwarding a doomed request; the
-        // non-chat Gemini translators are tracked separately.
-        ("gemini", _) => false,
+/// WOR-824 item 3: per-wire-format capability matrix.
+///
+/// Surface support keyed on [`crate::providers::ProviderFormat`]
+/// rather than the provider name string. Any catalog entry with `format: openai`
+/// (today's openai, vertex, cohere, mistral, groq, deepseek,
+/// ollama, vllm, together, fireworks, perplexity, xai, sagemaker,
+/// oracle, watsonx, ...) inherits the OpenAI-format default. The
+/// per-provider narrowing in [`provider_supports_surface`] is the
+/// only place upstream-specific exceptions live.
+///
+/// ## Matrix
+///
+/// | surface | OpenAi | Anthropic | Google | Bedrock | Custom |
+/// |---|---|---|---|---|---|
+/// | chat, models, messages, responses | yes | yes | yes | yes | yes |
+/// | embeddings | yes | no | no | no | no |
+/// | reranking | yes | no | no | no | no |
+/// | image generation / edits / variations | yes | no | no | no | no |
+/// | audio transcription / speech | yes | no | no | no | no |
+/// | moderations / assistants / threads / batches / fine-tuning / files / realtime | yes | no | no | no | no |
+///
+/// The `Google` row is currently `no` for everything beyond the
+/// universal arm because no Google-format translator exists for
+/// embeddings, image, audio, or reranking yet (WOR-824 item 2 will
+/// flip those cells as each translator lands). The `Custom` row is
+/// conservatively `no` so unknown shapes do not silently forward.
+pub fn provider_format_supports_surface(
+    format: crate::providers::ProviderFormat,
+    surface: &crate::handler::AiSurface,
+) -> bool {
+    use crate::handler::AiSurface;
+    use crate::providers::ProviderFormat;
 
-        // Bedrock: chat + models only (above). The other OpenAI
-        // surfaces don't map onto Bedrock's API family.
-        ("bedrock", _) => false,
+    // Universal across every format: chat / models / messages /
+    // responses. The matrix's `yes` row.
+    if matches!(
+        surface,
+        AiSurface::ChatCompletions | AiSurface::Models | AiSurface::Messages | AiSurface::Responses
+    ) {
+        return true;
+    }
 
-        // Cohere: embeddings and reranking (plus chat/models above).
-        ("cohere", AiSurface::Embeddings) => true,
-        ("cohere", AiSurface::Reranking) => true,
-        ("cohere", _) => false,
+    match format {
+        // OpenAI wire format: every shipped surface passes through.
+        // SageMaker / Oracle / Watsonx / any future catalog entry
+        // with format: openai inherits this row.
+        ProviderFormat::OpenAi => true,
 
-        // Unknown providers: chat + models only.
-        _ => false,
+        // Anthropic, Google, Bedrock, Custom: only universal
+        // (chat / models / messages / responses) above.
+        ProviderFormat::Anthropic
+        | ProviderFormat::Google
+        | ProviderFormat::Bedrock
+        | ProviderFormat::Custom => false,
     }
 }
 
@@ -302,6 +391,84 @@ mod tests {
                     provider_supports_surface(provider, surface),
                     expected(provider, surface),
                     "matrix mismatch: provider={provider} surface={surface:?}"
+                );
+            }
+        }
+    }
+
+    // --- WOR-824 item 3: per-wire-format matrix ---
+
+    /// Pins the per-wire-format default matrix
+    /// `provider_format_supports_surface` exposes. Every
+    /// catalog entry's format inherits this row by default;
+    /// per-provider narrowings in `provider_supports_surface`
+    /// are the only place upstream-specific exceptions live.
+    ///
+    /// Exhaustive (every format, every surface, no wildcard):
+    /// adding a `ProviderFormat` variant or an `AiSurface`
+    /// variant forces a triage decision here, preventing a
+    /// quiet drift between the format matrix and the provider
+    /// matrix.
+    #[test]
+    fn provider_format_matrix_matches_documented_contract() {
+        use crate::handler::AiSurface::{self, *};
+        use crate::providers::ProviderFormat;
+
+        fn expected(format: ProviderFormat, surface: &AiSurface) -> bool {
+            // Universal across every format: chat / models / messages / responses.
+            let universal = match surface {
+                ChatCompletions | Models | Messages | Responses => true,
+                Embeddings | Assistants | Threads | Batches | FineTuning | Files | Realtime
+                | ImageGeneration | ImageEdits | ImageVariations | AudioTranscription
+                | AudioSpeech | Moderations | Reranking | Unknown => false,
+            };
+            if universal {
+                return true;
+            }
+            match format {
+                ProviderFormat::OpenAi => true,
+                ProviderFormat::Anthropic => false,
+                ProviderFormat::Google => false,
+                ProviderFormat::Bedrock => false,
+                ProviderFormat::Custom => false,
+            }
+        }
+
+        const ALL_SURFACES: [AiSurface; 19] = [
+            ChatCompletions,
+            Models,
+            Embeddings,
+            Assistants,
+            Threads,
+            Batches,
+            FineTuning,
+            Files,
+            Realtime,
+            ImageGeneration,
+            ImageEdits,
+            ImageVariations,
+            AudioTranscription,
+            AudioSpeech,
+            Moderations,
+            Reranking,
+            Messages,
+            Responses,
+            Unknown,
+        ];
+        const ALL_FORMATS: [ProviderFormat; 5] = [
+            ProviderFormat::OpenAi,
+            ProviderFormat::Anthropic,
+            ProviderFormat::Google,
+            ProviderFormat::Bedrock,
+            ProviderFormat::Custom,
+        ];
+
+        for format in ALL_FORMATS {
+            for surface in &ALL_SURFACES {
+                assert_eq!(
+                    provider_format_supports_surface(format, surface),
+                    expected(format, surface),
+                    "format matrix mismatch: format={format:?} surface={surface:?}"
                 );
             }
         }
