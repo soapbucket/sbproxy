@@ -52,6 +52,7 @@ CREATE TABLE access_log
     team                      LowCardinality(Nullable(String)),
     tags                      Array(LowCardinality(String)),
     metadata                  Map(LowCardinality(String), String),
+    attribution               Map(LowCardinality(String), String),
 
     -- AI gateway
     provider                  LowCardinality(Nullable(String)),
@@ -94,6 +95,27 @@ SETTINGS index_granularity = 8192;
 ```
 
 The `TTL` is the recommended starting point for a SaaS deployment. Hot-data dashboards work off the last 30 days; the 90-day window covers month-end reconciliation. Compliance regimes that require longer retention (HIPAA, financial audit) should bump the TTL and budget the storage; ClickHouse compresses this schema to roughly 12-16 bytes per row in practice.
+
+### `metadata` vs `attribution`
+
+Two map columns carry per-request labels, from different sources:
+
+* `attribution` is the resolved business attribution tag set: the credential's `attrs:` defaults (project, team) merged with the inbound `SB-Attr-*` headers (project, feature, okr, team, customer, environment, agent_type, risk_tier, trace_id). Per-request headers override the credential default. This is the **same tag set the Prometheus per-attribution metrics are labeled by** (`sbproxy_ai_tokens_attributed_total`, `sbproxy_ai_cost_dollars_attributed_total`), so a log query and a metric query answer "spend by feature/customer" identically. Pivot on any key with `attribution['feature']`, `attribution['customer']`, and so on.
+* `metadata` is free-form key/values the operator pins on the credential's `attrs.metadata:`. Use it for dimensions outside the fixed attribution schema (cost_center is lifted in here for back-compat).
+
+To pivot spend by any attribution dimension, group on the map value:
+
+```sql
+SELECT
+    attribution['feature']                              AS feature,
+    sum(cost_usd_micros) / 1e6                          AS usd
+FROM access_log
+WHERE workspace_id = {workspace:String}
+  AND timestamp >= toStartOfWeek(now())
+  AND attribution['feature'] != ''
+GROUP BY feature
+ORDER BY usd DESC;
+```
 
 ## Truncation policy for text fields
 

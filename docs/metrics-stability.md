@@ -314,6 +314,26 @@ Buckets: `0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0`. Matches the bucket s
 
 ---
 
+#### `sbproxy_ai_tokens_attributed_total` / `sbproxy_ai_cost_dollars_attributed_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Per-attribution token and USD spend, so an operator can answer "what did project / feature / team X spend this week" from Prometheus. Fed from the single AI billing choke point, so unary, streaming, and non-chat surfaces all contribute. Cache hits contribute the cached token count under `direction=cache_read` at zero cost. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `provider`, `model` | Provider + model | `openai` / `gpt-4o` |
+| `direction` | Token kind (tokens metric only) | `input`, `output`, `cache_read` |
+| `project`, `feature`, `team`, `agent_type`, `environment` | Bounded business attribution dimensions, resolved from the credential `attrs:` + `SB-Attr-*` headers | `checkout`, `prod`, `runtime` |
+
+High-cardinality dimensions (customer, trace_id, okr, risk_tier) are deliberately kept **off** the metric labels and ride on the access log's `attribution` map / the trace span instead.
+
+---
+
 #### `sbproxy_ai_failovers_total`
 
 | Property | Value |

@@ -175,6 +175,7 @@ pub(super) async fn handle_ai_proxy(
             sbproxy_ai::budget::AiUsage::PerCall,
             0.0,
             Vec::new(),
+            &ctx.attribution_tags,
         );
         return relay_ai_response(
             session,
@@ -302,6 +303,7 @@ pub(super) async fn handle_ai_proxy(
             sbproxy_ai::budget::AiUsage::PerCall,
             0.0,
             Vec::new(),
+            &ctx.attribution_tags,
         );
         // WOR-1044 PR3: the GET-method-aware path runs before the
         // request body is read, so there is no reversible PII
@@ -530,6 +532,7 @@ pub(super) async fn handle_ai_proxy(
                 usage,
                 cost,
                 Vec::new(),
+                &ctx.attribution_tags,
             );
             let extra: Option<(&str, &str)> =
                 idem_skip_reason.map(|r| ("x-sbproxy-idempotency", r));
@@ -543,6 +546,7 @@ pub(super) async fn handle_ai_proxy(
             sbproxy_ai::budget::AiUsage::PerCall,
             0.0,
             Vec::new(),
+            &ctx.attribution_tags,
         );
         // Multipart never captures for idempotency (engagement
         // skipped with SKIPPED-MULTIPART). Pass the skip reason
@@ -723,6 +727,14 @@ pub(super) async fn handle_ai_proxy(
                     }),
                     attrs,
                 };
+                // Resolve business attribution tags once now that the
+                // credential principal is set: credential `attrs:`
+                // defaults merged with the inbound SB-Attr-* headers.
+                // Fanned out to the per-attribution spend metric and the
+                // access log so spend pivots on project / feature / team
+                // / customer / environment / agent_type / risk_tier.
+                ctx.attribution_tags =
+                    crate::server::ai_support::resolve_attribution_tags(session, &ctx.principal);
                 // WOR-893: per-key model routing. When the key pins a
                 // model, overwrite the request body's `model` field so
                 // the downstream allow/block, routing, budget, and
@@ -1110,6 +1122,7 @@ pub(super) async fn handle_ai_proxy(
                                         cache.provider(),
                                         cache.model(),
                                         &body,
+                                        &ctx.attribution_tags,
                                     );
                                     session
                                         .write_response_header(Box::new(header), false)
@@ -1480,6 +1493,7 @@ pub(super) async fn handle_ai_proxy(
                         sbproxy_ai::budget::AiUsage::PerCall,
                         0.0,
                         Vec::new(),
+                        &ctx.attribution_tags,
                     );
                     // Drop any idempotency capture: cascade does not
                     // engage the idempotency cache write in v1
@@ -1761,6 +1775,7 @@ pub(super) async fn handle_ai_proxy(
                 image_resolution: image_resolution_for_billing.clone(),
                 audio_speech_characters: audio_speech_characters_for_billing,
                 rerank_documents: rerank_documents_for_billing,
+                attribution_tags: ctx.attribution_tags.clone(),
             });
             let stream_router_sink = RouterTokenSink {
                 router: &router,
@@ -1834,6 +1849,7 @@ pub(super) async fn handle_ai_proxy(
                 image_resolution: image_resolution_for_billing.clone(),
                 audio_speech_characters: audio_speech_characters_for_billing,
                 rerank_documents: rerank_documents_for_billing,
+                attribution_tags: ctx.attribution_tags.clone(),
             });
             let cache_router_sink = RouterTokenSink {
                 router: &router,
@@ -2273,6 +2289,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 usage,
                 cost,
                 scope_keys,
+                &args.attribution_tags,
             );
         }
     } else if let Some(ctx) = ctx {
@@ -2643,6 +2660,11 @@ pub(super) struct BudgetRecorderArgs<'a> {
     /// so the relay function can emit a `RerankUnits { documents }`
     /// billing event scaled to the provider's per-document rate.
     rerank_documents: Option<u64>,
+    /// Business attribution tags resolved at the handler entry
+    /// (`ctx.attribution_tags`). Carried by value so the relay
+    /// functions can stamp the per-attribution spend metric without
+    /// borrowing `ctx`, which they hold only as an `Option<&mut>`.
+    attribution_tags: sbproxy_ai::attribution::AttributionTags,
 }
 
 /// WOR-798: the bundle a relay needs to feed
@@ -3173,6 +3195,7 @@ pub(super) async fn relay_ai_stream(
                     usage,
                     cost,
                     scope_keys,
+                    &args.attribution_tags,
                 );
 
                 // WOR-1093: a stream that closed before the upstream
@@ -3187,7 +3210,7 @@ pub(super) async fn relay_ai_stream(
                         sbproxy_ai::ai_metrics::WasteKind::AbandonedStream,
                         args.provider_name,
                         args.model,
-                        &sbproxy_ai::attribution::AttributionTags::default(),
+                        &args.attribution_tags,
                         prompt.saturating_add(completion),
                         cost,
                     );

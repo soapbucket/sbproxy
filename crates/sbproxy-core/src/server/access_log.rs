@@ -543,6 +543,11 @@ pub(super) fn emit_access_log(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
+        attribution: ctx
+            .attribution_tags
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
         tokens_in: ctx.ai_tokens_in,
         tokens_out: ctx.ai_tokens_out,
         ai_surface: ctx.ai_surface.clone(),
@@ -695,6 +700,10 @@ pub(super) struct AccessLogContext {
     pub(super) team: Option<String>,
     pub(super) tags: Vec<String>,
     pub(super) metadata: std::collections::HashMap<String, String>,
+    /// Resolved business attribution tag set (credential `attrs:` +
+    /// `SB-Attr-*` headers), the same map fanned out to the spend
+    /// metric. Keyed by stable schema name.
+    pub(super) attribution: std::collections::BTreeMap<String, String>,
     /// Prompt / input tokens consumed (from the provider response).
     pub(super) tokens_in: Option<u64>,
     /// Completion / output tokens generated.
@@ -774,6 +783,7 @@ impl AccessLogContext {
             team: None,
             tags: Vec::new(),
             metadata: std::collections::HashMap::new(),
+            attribution: std::collections::BTreeMap::new(),
             tokens_in: None,
             tokens_out: None,
             ai_surface: None,
@@ -885,6 +895,7 @@ pub(super) fn emit_access_log_entry(
         team: context.team,
         tags: context.tags,
         metadata: context.metadata,
+        attribution: context.attribution,
         tokens_in: context.tokens_in,
         tokens_out: context.tokens_out,
         ai_surface: context.ai_surface,

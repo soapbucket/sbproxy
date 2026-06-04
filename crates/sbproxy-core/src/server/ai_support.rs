@@ -693,6 +693,7 @@ pub(super) fn cached_message_signature_verifier(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_ai_billing_event(
     surface_label: &str,
     provider_name: &str,
@@ -700,6 +701,7 @@ pub(super) fn emit_ai_billing_event(
     usage: sbproxy_ai::budget::AiUsage,
     cost_usd: f64,
     scope_keys: Vec<String>,
+    tags: &sbproxy_ai::attribution::AttributionTags,
 ) {
     // Feed the per-attribution spend metrics from the single billing
     // choke point so every surface (unary, streaming, audio, image,
@@ -720,7 +722,7 @@ pub(super) fn emit_ai_billing_event(
     sbproxy_ai::ai_metrics::record_ai_request_attributed(
         provider_name,
         model_label,
-        &sbproxy_ai::attribution::AttributionTags::default(),
+        tags,
         input_tokens,
         output_tokens,
         0,
@@ -743,6 +745,43 @@ pub(super) fn emit_ai_billing_event(
     );
 }
 
+/// Resolve the business attribution tags for a request.
+///
+/// The credential's `attrs:` (project + team) provide the defaults; the
+/// inbound `SB-Attr-*` headers (project / feature / okr / team /
+/// customer / environment / agent_type / risk_tier / trace_id) fill in
+/// the rest and override the credential where both are present. A
+/// malformed attribution header degrades to the credential defaults
+/// rather than failing the request. The result is stamped on
+/// `ctx.attribution_tags` and fanned out to the per-attribution spend
+/// metric and the access log.
+pub(super) fn resolve_attribution_tags(
+    session: &Session,
+    principal: &sbproxy_plugin::Principal,
+) -> sbproxy_ai::attribution::AttributionTags {
+    use sbproxy_ai::attribution::AttributionTags;
+    let base = AttributionTags {
+        project: principal.attrs.project.clone(),
+        team: principal.attrs.team.clone(),
+        ..Default::default()
+    };
+    let headers = session
+        .req_header()
+        .headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_bytes()));
+    match sbproxy_ai::attribution::parse_from_headers(headers) {
+        Ok(parsed) => parsed.or_default_from(&base),
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "attribution: ignoring malformed SB-Attr-* header; using credential defaults"
+            );
+            base
+        }
+    }
+}
+
 /// Record a cache hit as a zero-marginal-cost ledger entry.
 ///
 /// A served cache hit avoids an upstream call, but the transaction
@@ -754,7 +793,12 @@ pub(super) fn emit_ai_billing_event(
 /// payload; its `usage` block (when present) gives the token counts,
 /// and its `model` field (falling back to `fallback_model`) gives the
 /// model label.
-pub(super) fn record_cache_hit_savings(provider: &str, fallback_model: &str, body: &[u8]) {
+pub(super) fn record_cache_hit_savings(
+    provider: &str,
+    fallback_model: &str,
+    body: &[u8],
+    tags: &sbproxy_ai::attribution::AttributionTags,
+) {
     let parsed = serde_json::from_slice::<serde_json::Value>(body).ok();
     let (prompt, completion) = parsed
         .as_ref()
@@ -779,7 +823,7 @@ pub(super) fn record_cache_hit_savings(provider: &str, fallback_model: &str, bod
     sbproxy_ai::ai_metrics::record_ai_request_attributed(
         provider,
         model,
-        &sbproxy_ai::attribution::AttributionTags::default(),
+        tags,
         0,
         0,
         prompt.saturating_add(completion),

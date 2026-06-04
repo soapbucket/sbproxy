@@ -152,6 +152,16 @@ pub struct AccessLogEntry {
     /// metadata was declared.
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub metadata: std::collections::HashMap<String, String>,
+    /// Resolved business attribution tags for the request, as a single
+    /// object: the credential's `attrs:` defaults merged with the
+    /// inbound `SB-Attr-*` headers. Keys are the stable schema names
+    /// (`project`, `feature`, `okr`, `team`, `customer`, `environment`,
+    /// `agent_type`, `risk_tier`, `trace_id`). This is the same tag set
+    /// the per-attribution spend metric is labeled by, so a log query
+    /// and a Prometheus query answer "spend by feature/customer/..."
+    /// identically. Empty for non-AI requests or when no tag resolved.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty", default)]
+    pub attribution: std::collections::BTreeMap<String, String>,
     /// Prompt / input tokens consumed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_in: Option<u64>,
@@ -541,6 +551,7 @@ impl Default for AccessLogEntry {
             team: None,
             tags: Vec::new(),
             metadata: std::collections::HashMap::new(),
+            attribution: std::collections::BTreeMap::new(),
             tokens_in: None,
             tokens_out: None,
             ai_surface: None,
@@ -825,6 +836,7 @@ mod tests {
             team: None,
             tags: Vec::new(),
             metadata: std::collections::HashMap::new(),
+            attribution: std::collections::BTreeMap::new(),
             tokens_in: None,
             tokens_out: None,
             ai_surface: None,
