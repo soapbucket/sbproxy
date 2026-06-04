@@ -151,6 +151,10 @@ struct EmbeddingEntry {
     embedding: Vec<f32>,
     response: CachedHttpResponse,
     cached_at: u64,
+    /// Per-caller scope (hashed tenant + credential). A lookup only
+    /// matches an entry with the same scope so one caller's cached
+    /// response is never replayed to another (WOR-1142).
+    scope: String,
 }
 
 /// Embedding-similarity response cache.
@@ -217,7 +221,7 @@ impl EmbeddingCache {
     /// similarity meets the threshold and is not expired. Returns the
     /// cached response and the matching score. Expired entries
     /// encountered during the scan are removed.
-    pub fn lookup(&self, query: &[f32]) -> Option<EmbeddingHit> {
+    pub fn lookup(&self, query: &[f32], scope: &str) -> Option<EmbeddingHit> {
         let q = normalize(query);
         if q.is_empty() {
             return None;
@@ -231,6 +235,11 @@ impl EmbeddingCache {
         for (key, entry) in cache.iter() {
             if now.saturating_sub(entry.cached_at) > self.ttl_secs {
                 expired.push(key.clone());
+                continue;
+            }
+            // WOR-1142: never match across callers. An entry stored by
+            // one tenant/credential is invisible to a different one.
+            if entry.scope != scope {
                 continue;
             }
             let score = dot(&q, &entry.embedding);
@@ -253,7 +262,13 @@ impl EmbeddingCache {
     /// Store a response under `key` with its prompt `embedding`. The
     /// vector is L2-normalized before storage. Evicts the LRU entry
     /// when at capacity.
-    pub fn store(&self, key: String, embedding: &[f32], response: CachedHttpResponse) {
+    pub fn store(
+        &self,
+        key: String,
+        embedding: &[f32],
+        response: CachedHttpResponse,
+        scope: String,
+    ) {
         let normalized = normalize(embedding);
         if normalized.is_empty() {
             return;
@@ -264,15 +279,35 @@ impl EmbeddingCache {
                 embedding: normalized,
                 response,
                 cached_at: Self::now_secs(),
+                scope,
             },
         );
     }
 
-    /// SHA-256 hex digest of a prompt string, used as the LRU key so an
-    /// exact repeat overwrites rather than accumulating duplicates.
-    pub fn prompt_key(prompt: &str) -> String {
+    /// SHA-256 hex digest of the prompt, namespaced by the caller scope,
+    /// used as the LRU key so an exact repeat from the SAME caller
+    /// overwrites rather than accumulating duplicates, while the same
+    /// prompt from different callers does not collide (WOR-1142).
+    pub fn prompt_key(scope: &str, prompt: &str) -> String {
         use sha2::{Digest, Sha256};
-        hex::encode(Sha256::digest(prompt.as_bytes()))
+        let mut h = Sha256::new();
+        h.update(scope.as_bytes());
+        h.update([0u8]);
+        h.update(prompt.as_bytes());
+        hex::encode(h.finalize())
+    }
+
+    /// Derive the per-caller cache scope from the resolved tenant and the
+    /// raw authorization header. Hashed so the stored key does not retain
+    /// the credential. Two requests share cache entries only when this
+    /// value matches (WOR-1142).
+    pub fn scope_key(tenant_id: &str, authorization: Option<&str>) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(tenant_id.as_bytes());
+        h.update([0u8]);
+        h.update(authorization.unwrap_or("").as_bytes());
+        hex::encode(h.finalize())
     }
 
     fn now_secs() -> u64 {
@@ -448,8 +483,15 @@ mod tests {
     #[test]
     fn exact_vector_is_a_hit() {
         let cache = embed_cache(0.85, 3600, 16);
-        cache.store("k1".to_string(), &[1.0, 0.0, 0.0], resp("cached"));
-        let hit = cache.lookup(&[2.0, 0.0, 0.0]).expect("same direction hits");
+        cache.store(
+            "k1".to_string(),
+            &[1.0, 0.0, 0.0],
+            resp("cached"),
+            "s".to_string(),
+        );
+        let hit = cache
+            .lookup(&[2.0, 0.0, 0.0], "s")
+            .expect("same direction hits");
         assert_eq!(hit.response.body, b"cached");
         assert!((hit.score - 1.0).abs() < 1e-5, "score {}", hit.score);
     }
@@ -458,41 +500,78 @@ mod tests {
     fn near_duplicate_hits_dissimilar_misses() {
         let cache = embed_cache(0.9, 3600, 16);
         // Stored vector.
-        cache.store("k1".to_string(), &[1.0, 1.0, 0.0], resp("photosynthesis"));
+        cache.store(
+            "k1".to_string(),
+            &[1.0, 1.0, 0.0],
+            resp("photosynthesis"),
+            "s".to_string(),
+        );
         // Near-duplicate (cosine ~0.97) -> hit.
-        assert!(cache.lookup(&[1.0, 0.9, 0.05]).is_some());
+        assert!(cache.lookup(&[1.0, 0.9, 0.05], "s").is_some());
         // Orthogonal (cosine 0) -> miss.
-        assert!(cache.lookup(&[0.0, 0.0, 1.0]).is_none());
+        assert!(cache.lookup(&[0.0, 0.0, 1.0], "s").is_none());
+    }
+
+    #[test]
+    fn cross_scope_entries_are_isolated() {
+        // WOR-1142: an entry stored by caller "a" must never be returned
+        // to caller "b", even for an identical vector.
+        let cache = embed_cache(0.85, 3600, 16);
+        cache.store(
+            "k".to_string(),
+            &[1.0, 0.0, 0.0],
+            resp("secret-a"),
+            "a".to_string(),
+        );
+        // Same scope -> hit.
+        assert!(cache.lookup(&[1.0, 0.0, 0.0], "a").is_some());
+        // Different scope, identical vector -> miss.
+        assert!(cache.lookup(&[1.0, 0.0, 0.0], "b").is_none());
     }
 
     #[test]
     fn threshold_is_enforced() {
         let strict = embed_cache(0.99, 3600, 16);
-        strict.store("k".to_string(), &[1.0, 0.0], resp("x"));
+        strict.store("k".to_string(), &[1.0, 0.0], resp("x"), "s".to_string());
         // cosine(45 deg) ~= 0.707 < 0.99 -> miss.
-        assert!(strict.lookup(&[1.0, 1.0]).is_none());
+        assert!(strict.lookup(&[1.0, 1.0], "s").is_none());
         let loose = embed_cache(0.5, 3600, 16);
-        loose.store("k".to_string(), &[1.0, 0.0], resp("x"));
-        assert!(loose.lookup(&[1.0, 1.0]).is_some());
+        loose.store("k".to_string(), &[1.0, 0.0], resp("x"), "s".to_string());
+        assert!(loose.lookup(&[1.0, 1.0], "s").is_some());
     }
 
     #[test]
     fn expired_entry_is_not_returned() {
         let cache = embed_cache(0.5, 0, 16); // ttl 0 -> immediately stale
-        cache.store("k".to_string(), &[1.0, 0.0], resp("x"));
+        cache.store("k".to_string(), &[1.0, 0.0], resp("x"), "s".to_string());
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        assert!(cache.lookup(&[1.0, 0.0]).is_none());
+        assert!(cache.lookup(&[1.0, 0.0], "s").is_none());
     }
 
     #[test]
     fn lru_evicts_when_full() {
         let cache = embed_cache(0.99, 3600, 2);
-        cache.store("a".to_string(), &[1.0, 0.0, 0.0], resp("a"));
-        cache.store("b".to_string(), &[0.0, 1.0, 0.0], resp("b"));
-        cache.store("c".to_string(), &[0.0, 0.0, 1.0], resp("c"));
+        cache.store(
+            "a".to_string(),
+            &[1.0, 0.0, 0.0],
+            resp("a"),
+            "s".to_string(),
+        );
+        cache.store(
+            "b".to_string(),
+            &[0.0, 1.0, 0.0],
+            resp("b"),
+            "s".to_string(),
+        );
+        cache.store(
+            "c".to_string(),
+            &[0.0, 0.0, 1.0],
+            resp("c"),
+            "s".to_string(),
+        );
         // "a" was LRU and evicted; its vector no longer matches.
-        assert!(cache.lookup(&[1.0, 0.0, 0.0]).is_none());
-        assert!(cache.lookup(&[0.0, 0.0, 1.0]).is_some());
+        assert!(cache.lookup(&[1.0, 0.0, 0.0], "s").is_none());
+        assert!(cache.lookup(&[0.0, 0.0, 1.0], "s").is_some());
     }
 
     #[test]
@@ -515,11 +594,13 @@ mod tests {
 
     #[test]
     fn prompt_key_is_deterministic_sha256() {
-        let a = EmbeddingCache::prompt_key("hello world");
-        let b = EmbeddingCache::prompt_key("hello world");
+        let a = EmbeddingCache::prompt_key("s", "hello world");
+        let b = EmbeddingCache::prompt_key("s", "hello world");
         assert_eq!(a, b);
         assert_eq!(a.len(), 64);
-        assert_ne!(a, EmbeddingCache::prompt_key("different"));
+        assert_ne!(a, EmbeddingCache::prompt_key("s", "different"));
+        // WOR-1142: same prompt under a different scope is a distinct key.
+        assert_ne!(a, EmbeddingCache::prompt_key("other", "hello world"));
     }
 
     #[test]
