@@ -49,4 +49,4 @@ origins:
   "localhost":
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev

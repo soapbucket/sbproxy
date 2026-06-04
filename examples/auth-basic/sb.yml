@@ -3,7 +3,7 @@
 #
 # Two users, plain passwords, custom realm. Useful for quick admin panels and
 # small internal tools. Missing or wrong credentials get a 401 with a
-# WWW-Authenticate challenge before httpbin.org is contacted.
+# WWW-Authenticate challenge before test.sbproxy.dev is contacted.
 #
 # Run:
 #   make run CONFIG=examples/auth-basic/sb.yml
@@ -22,7 +22,7 @@ origins:
   "basic.local":
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
 
     authentication:
       type: basic_auth

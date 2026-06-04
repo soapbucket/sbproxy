@@ -33,7 +33,7 @@ directory (with its `sb.yml` and README). Regenerated from `examples/` on 2026-0
 |---|---|
 | [a2a-protocol](a2a-protocol/) | The `a2a` policy enforces per-route safety on agent-to-agent traffic. Detection runs once per request and matches three signals: `Content-Type: applic |
 | [access-log](access-log/) | Structured JSON access log on stdout, ready for Fluent Bit / Vector / any stdout-tailing log shipper. Exercises every commonly-used knob on the top-level `access_log:` block: status and method filters, sampling, request and response header capture with the PII redactor, and the always-on secret redactor. |
-| [active-health-checks](active-health-checks/) | A round-robin load balancer with two targets: `httpbin.org` and `httpbingo.org`. Each target has a `health_check` block, so the proxy runs a backgroun |
+| [active-health-checks](active-health-checks/) | A round-robin load balancer with two targets: `test.sbproxy.dev` and `test.sbproxy.dev/status/503` (an always-503 alias on the same host so the example shows the proxy detecting and routing around the unhealthy upstream). Each target has a `health_check` block, so the proxy runs a backgroun |
 | [agent-budget](agent-budget/) | Demonstrates the `agent_budget` policy. Per-agent rate-limit primitive keyed on the resolved `agent_id` (from the agent-class resolver). One bucket pe |
 | [agent-skills](agent-skills/) | Demonstrates the Agent Skills v0.2.0 well-known projection. SBproxy |
 | [ai-agent-alignment](ai-agent-alignment/) | The `agent_alignment` guardrail audits the assistant's `tool_calls` array against an operator-declared ruleset (allow + deny lists, forbidden-substring matchers, argument validators). Catches an off-policy tool selection before it leaves the gateway. |
@@ -86,7 +86,7 @@ directory (with its `sb.yml` and README). Regenerated from `examples/` on 2026-0
 | [dlp-catalog](dlp-catalog/) | The `dlp` policy scans the request URI and headers for matches against the configured detector set, then either tags the upstream request with a `dlp- |
 | [error-pages](error-pages/) | The origin on `api.local` is protected by API key authentication (`X-Api-Key: secret-key`). Requests that miss the key get a 401 from the proxy, which |
 | [exposed-credentials](exposed-credentials/) | When a request carries `Authorization: Basic <base64>` whose password matches the configured exposure list, the proxy stamps the upstream request with |
-| [fallback-origin](fallback-origin/) | The primary action proxies to `httpbin.org/status/503`, which always returns 503. The `fallback_origin` block defines a backup origin served when the  |
+| [fallback-origin](fallback-origin/) | The primary action proxies to `test.sbproxy.dev/status/503`, which always returns 503. The `fallback_origin` block defines a backup origin served when the  |
 | [forward-rules](forward-rules/) | A single origin on `gateway.local` dispatches incoming requests to three different inline child origins based on path. Requests to `/api/*` proxy to ` |
 | [forwarding-headers](forwarding-headers/) | The proxy injects a standard set of forwarding headers on every upstream request: `X-Forwarded-Host`, `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Pro |
 | [grpc-h2c](grpc-h2c/) | Proxies plaintext gRPC traffic to an upstream gRPC server. gRPC requires HTTP/2 end-to-end, so the proxy's plain HTTP listener must speak HTTP/2 clear |
@@ -112,7 +112,7 @@ directory (with its `sb.yml` and README). Regenerated from `examples/` on 2026-0
 | [openapi-emission](openapi-emission/) | The gateway publishes an OpenAPI 3.0 document describing the routes it exposes, derived from the live config. Three things land together: rich path ma |
 | [openapi-validation](openapi-validation/) | The `openapi_validation` policy loads an inline OpenAPI document at startup and validates each request body against the matching operation's `requestB |
 | [outbound-peer-pricing](outbound-peer-pricing/) | Demonstrates the `peer_pricing_preflight` policy: when an internal |
-| [outlier-detection](outlier-detection/) | A round-robin load balancer with two targets: `httpbin.org` and `httpbingo.org`. The `outlier_detection` block tracks each target's success/failure ra |
+| [outlier-detection](outlier-detection/) | A round-robin load balancer with two targets: `test.sbproxy.dev` and `test.sbproxy.dev/status/503` (an always-503 alias on the same host so the example shows the proxy detecting and routing around the unhealthy upstream). The `outlier_detection` block tracks each target's success/failure ra |
 | [page-shield](page-shield/) | Client-side script monitoring via Content Security Policy report intake. The `page_shield` policy stamps a `Content-Security-Policy-Report-Only` (or e |
 | [pii-redaction](pii-redaction/) | When `pii.enabled: true` is set on an AI proxy origin, the gateway redacts well-known PII shapes from the parsed JSON request body before forwarding t |
 | [problem-details](problem-details/) | The origin on `api.local` is protected by API key authentication. The |
@@ -125,7 +125,7 @@ directory (with its `sb.yml` and README). Regenerated from `examples/` on 2026-0
 | [rate-limiting](rate-limiting/) | A token-bucket rate limit attached to a `proxy` action. The `rate_limiting` policy caps each client IP at 5 requests per second with a burst capacity  |
 | [ratelimit-by-claim](ratelimit-by-claim/) | Per-tenant rate limiting keyed on a JWT claim. The `rate_limiting` policy on `api.local` accepts a `key:` CEL expression that runs against the request |
 | [request-limit](request-limit/) | Demonstrates the `request_limit` policy. Caps the request body at `1024` bytes, the header count at `20`, and the URL length at `256` characters befor |
-| [request-mirror](request-mirror/) | Every request matched by `localhost` is forwarded to the primary upstream `httpbin.org` as normal AND a copy is fired at `https://httpbingo.org` (the  |
+| [request-mirror](request-mirror/) | Every request matched by `localhost` is forwarded to the primary upstream `test.sbproxy.dev` as normal AND a copy is fired at `https://test.sbproxy.dev/echo` (the  |
 | [request-modifiers](request-modifiers/) | Demonstrates the full typed shape of `request_modifiers`. On the way to the upstream, the proxy sets `X-Source: sbproxy` and `Content-Type: applicatio |
 | [request-validator](request-validator/) | The `request_validator` policy on `localhost` validates inbound JSON request bodies against a JSON Schema before they reach the upstream. The schema i |
 | [resilience-stack](resilience-stack/) | Composes four signals on a single load balancer so a flaky backend gets isolated quickly and recovers automatically without operator intervention. Act |
@@ -133,7 +133,7 @@ directory (with its `sb.yml` and README). Regenerated from `examples/` on 2026-0
 | [response-modifiers](response-modifiers/) | Demonstrates the full typed shape of `response_modifiers` across two origins on `127.0.0.1:8080`. `api.local` keeps the upstream `200`, sets `X-Served |
 | [robots-llms-txt](robots-llms-txt/) | Demonstrates the Wave 4 text-format policy-graph projections. |
 | [rsl-licensing](rsl-licensing/) | Demonstrates the Wave 4 policy-graph projections. A single |
-| [security-headers](security-headers/) | Demonstrates the `security_headers` policy. Every response from the `httpbin.org` upstream gains the standard browser hardening set: `Strict-Transport |
+| [security-headers](security-headers/) | Demonstrates the `security_headers` policy. Every response from the `test.sbproxy.dev` upstream gains the standard browser hardening set: `Strict-Transport |
 | [semantic-constraint](semantic-constraint/) | A natural-language policy enforced by an LLM-as-judge backend. The `semantic_constraint` policy renders a prompt template against the request envelope |
 | [service-discovery](service-discovery/) | Demonstrates `service_discovery` on a `proxy` action. Without service discovery, Pingora resolves the upstream hostname once when a connection is esta |
 | [sessions](sessions/) | The `session` block on `app.local` configures the encrypted cookie used to carry session state across requests. Cookie name is `sb_session`, max age i |
@@ -143,15 +143,15 @@ directory (with its `sb.yml` and README). Regenerated from `examples/` on 2026-0
 | [static-and-mock](static-and-mock/) | Three origins demonstrating the two upstream-free actions. `hello.local` uses the `static` action to return a fixed plain-text body. `api.local` uses  |
 | [storage-action](storage-action/) | The `storage` action serves files from object storage backends. It is backed by the `object_store` crate and supports S3, GCS, Azure Blob, and the loc |
 | [transform-encoding](transform-encoding/) | Demonstrates the `encoding` transform. A `static` action returns a small JSON document; the transform converts the bytes to standard base64 via `encod |
-| [transform-html](transform-html/) | Demonstrates the `html` transform on a real upstream. The proxy fetches `https://httpbin.org/html` (a public Moby-Dick excerpt page) and rewrites the  |
-| [transform-html-to-markdown](transform-html-to-markdown/) | Demonstrates the `html_to_markdown` transform. The proxy fetches `https://httpbin.org/html` (a public Moby-Dick excerpt page) and converts the HTML bo |
+| [transform-html](transform-html/) | Demonstrates the `html` transform on a real upstream. The proxy fetches `https://test.sbproxy.dev/html` (a public Moby-Dick excerpt page) and rewrites the  |
+| [transform-html-to-markdown](transform-html-to-markdown/) | Demonstrates the `html_to_markdown` transform. The proxy fetches `https://test.sbproxy.dev/html` (a public Moby-Dick excerpt page) and converts the HTML bo |
 | [transform-javascript](transform-javascript/) | Demonstrates the `javascript` transform via QuickJS. The entrypoint is `function transform(body)` where `body` is the raw upstream body as a string. T |
 | [transform-json](transform-json/) | Demonstrates the `json` transform. The upstream is a `static` action that returns a canned post document, so the example runs offline. The transform r |
 | [transform-json-projection](transform-json-projection/) | Demonstrates the `json_projection` transform in whitelist mode. Only the listed fields (`id`, `title`) survive in the response; everything else is dro |
 | [transform-json-schema](transform-json-schema/) | Demonstrates the `json_schema` transform. The upstream JSON response body is validated against a JSON Schema compiled once at config-load time (remote |
 | [transform-lua](transform-lua/) | Demonstrates the `lua_json` transform. The script entrypoint is `function modify_json(data, ctx)` where `data` is the decoded JSON value (a Lua table) |
 | [transform-markdown](transform-markdown/) | Demonstrates the `markdown` transform. A `static` action returns a Markdown release-notes document; the transform converts it to HTML using pulldown-c |
-| [transform-payload-limit](transform-payload-limit/) | Demonstrates the `payload_limit` transform. The proxy fetches `https://httpbin.org/bytes/4096`, which returns 4096 random bytes, and clips the respons |
+| [transform-payload-limit](transform-payload-limit/) | Demonstrates the `payload_limit` transform. The proxy fetches `https://test.sbproxy.dev/bytes/4096`, which returns 4096 random bytes, and clips the respons |
 | [transform-replace-strings](transform-replace-strings/) | Demonstrates the `replace_strings` transform. Two find-and-replace rules run against the upstream body: a literal substring swap that rewrites every o |
 | [transform-template](transform-template/) | Demonstrates the `template` transform. A `static` action emits a JSON document describing an order; the `template` transform parses that JSON as the i |
 | [trusted-proxies](trusted-proxies/) | When SBproxy sits behind another LB or CDN (Cloudflare, AWS ALB, Fly.io edge, internal LB), the immediate TCP peer is the LB, not the real client. The |

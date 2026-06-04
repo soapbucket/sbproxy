@@ -33,14 +33,14 @@ origins:
       type: load_balancer
       algorithm: round_robin
       targets:
-        - url: https://httpbin.org
+        - url: https://test.sbproxy.dev
           health_check:
             path: /status/200
             interval_secs: 10        # probe period in seconds
             timeout_ms: 2000
             unhealthy_threshold: 3
             healthy_threshold: 2
-        - url: https://httpbingo.org
+        - url: https://test.sbproxy.dev/status/503
           health_check:
             path: /status/200
             interval_secs: 10

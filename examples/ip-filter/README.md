@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-Demonstrates the `ip_filter` policy. Only requests from the loopback range `127.0.0.0/8` and the private LAN range `10.0.0.0/8` are accepted; everything else is rejected with `403` before the upstream `httpbin.org` is contacted. A blacklist entry of `10.0.0.99/32` carves a single IP back out of the allowed range to show how whitelist and blacklist combine. The proxy listens on `127.0.0.1:8080` and routes to the origin via the `ipfilter.local` Host header.
+Demonstrates the `ip_filter` policy. Only requests from the loopback range `127.0.0.0/8` and the private LAN range `10.0.0.0/8` are accepted; everything else is rejected with `403` before the upstream `test.sbproxy.dev` is contacted. A blacklist entry of `10.0.0.99/32` carves a single IP back out of the allowed range to show how whitelist and blacklist combine. The proxy listens on `127.0.0.1:8080` and routes to the origin via the `ipfilter.local` Host header.
 
 ## Run
 
@@ -23,11 +23,11 @@ content-type: application/json
 {
   "args": {},
   "headers": {
-    "Host": "httpbin.org",
+    "Host": "test.sbproxy.dev",
     ...
   },
   "origin": "...",
-  "url": "https://httpbin.org/get"
+  "url": "https://test.sbproxy.dev/get"
 }
 ```
 

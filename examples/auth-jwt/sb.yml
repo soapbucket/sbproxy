@@ -4,7 +4,7 @@
 # Validates HS256 tokens signed with `dev-secret-change-me`. Tokens must carry
 # the configured issuer and audience claims. Clients pass the JWT in the
 # Authorization header as `Bearer <token>`. Bad or missing tokens get a 401
-# before httpbin.org is contacted.
+# before test.sbproxy.dev is contacted.
 #
 # Run:
 #   make run CONFIG=examples/auth-jwt/sb.yml
@@ -27,7 +27,7 @@ origins:
   "jwt.local":
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
 
     authentication:
       type: jwt

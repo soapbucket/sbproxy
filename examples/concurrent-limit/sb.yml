@@ -37,7 +37,7 @@ origins:
   "localhost":
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
     policies:
       - type: concurrent_limit
         max: 3

@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-Validates HS256 JWTs against a static HMAC secret (`dev-secret-change-me`). The JWT must carry the configured issuer (`https://issuer.local`) and audience (`sbproxy-demo`); requests with a missing, malformed, or wrong-issuer token are rejected with 401 inside the proxy. Valid tokens flow through to `httpbin.org` unchanged. Rotate the secret out of YAML in production via `${ENV_VAR}` interpolation; the static value is here only so the example is reproducible.
+Validates HS256 JWTs against a static HMAC secret (`dev-secret-change-me`). The JWT must carry the configured issuer (`https://issuer.local`) and audience (`sbproxy-demo`); requests with a missing, malformed, or wrong-issuer token are rejected with 401 inside the proxy. Valid tokens flow through to `test.sbproxy.dev` unchanged. Rotate the secret out of YAML in production via `${ENV_VAR}` interpolation; the static value is here only so the example is reproducible.
 
 ## Run
 
@@ -34,7 +34,7 @@ $ curl -i -H 'Host: jwt.local' -H "Authorization: Bearer $TOKEN" \
 HTTP/1.1 200 OK
 content-type: application/json
 
-{"args":{},"headers":{"Authorization":"Bearer eyJ...","Host":"httpbin.org",...},"url":"https://httpbin.org/get"}
+{"args":{},"headers":{"Authorization":"Bearer eyJ...","Host":"test.sbproxy.dev",...},"url":"https://test.sbproxy.dev/get"}
 ```
 
 Token signed with the wrong secret, rejected:
@@ -52,7 +52,7 @@ HTTP/1.1 401 Unauthorized
 - `authentication.type: jwt` - HS256 validation with a static secret
 - `issuer` and `audience` claim checks - both must match
 - `algorithms: [HS256]` allowlist - only the listed algorithms are accepted
-- Pre-upstream rejection - 401s never reach `httpbin.org`
+- Pre-upstream rejection - 401s never reach `test.sbproxy.dev`
 
 ## See also
 

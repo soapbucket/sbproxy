@@ -2,7 +2,7 @@
 # Request limit policy.
 #
 # Caps body size at 1 KiB, header count at 20, and URL length at 256 chars.
-# Anything past those limits is rejected with a 4xx before httpbin.org is
+# Anything past those limits is rejected with a 4xx before test.sbproxy.dev is
 # contacted. Useful as a defensive default in front of any backend that
 # does not enforce its own limits.
 #
@@ -28,7 +28,7 @@ origins:
   "limit.local":
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
 
     policies:
       - type: request_limit

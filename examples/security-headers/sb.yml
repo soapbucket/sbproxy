@@ -5,7 +5,7 @@
 # and Permissions-Policy into every response. Adds a Content-Security-Policy
 # via the structured `content_security_policy` block so report-only mode and
 # nonce injection are available later if needed. Pairs naturally with any
-# upstream; this example uses httpbin.org.
+# upstream; this example uses test.sbproxy.dev.
 #
 # Run:
 #   make run CONFIG=examples/security-headers/sb.yml
@@ -21,7 +21,7 @@ origins:
   "sec.local":
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
 
     policies:
       - type: security_headers

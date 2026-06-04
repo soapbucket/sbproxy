@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-Every request matched by `localhost` is forwarded to the primary upstream `httpbin.org` as normal AND a copy is fired at `https://httpbingo.org` (the mirror). The mirror response is read and discarded; the client only sees the primary's response. Mirror traffic is fire-and-forget. Method, path/query, and headers are mirrored. Body teeing is opt-in via `mirror_body: true` (capped at `max_body_bytes`, default 1 MiB). `Host` and hop-by-hop headers are skipped on the mirror request so vhost-routing on the shadow destination still works. `sample_rate: 1.0` mirrors every request; lower values down to `0.0` sample. Mirror requests carry `X-Sbproxy-Mirror: 1`.
+Every request matched by `localhost` is forwarded to the primary upstream `test.sbproxy.dev` as normal AND a copy is fired at `https://test.sbproxy.dev/echo` (the mirror). The mirror response is read and discarded; the client only sees the primary's response. Mirror traffic is fire-and-forget. Method, path/query, and headers are mirrored. Body teeing is opt-in via `mirror_body: true` (capped at `max_body_bytes`, default 1 MiB). `Host` and hop-by-hop headers are skipped on the mirror request so vhost-routing on the shadow destination still works. `sample_rate: 1.0` mirrors every request; lower values down to `0.0` sample. Mirror requests carry `X-Sbproxy-Mirror: 1`.
 
 ## Run
 
@@ -13,10 +13,10 @@ sbproxy serve -f sb.yml
 ## Try it
 
 ```bash
-# Single request: client sees the httpbin.org body. The mirror at httpbingo.org
+# Single request: client sees the test.sbproxy.dev body. The mirror at test.sbproxy.dev/echo
 # also receives the request asynchronously.
 curl -s -H 'Host: localhost' http://127.0.0.1:8080/get | jq .url
-# "https://httpbin.org/get"
+# "https://test.sbproxy.dev/get"
 
 # Quick burst to show that the client never blocks on the mirror.
 for i in $(seq 1 5); do

@@ -18,7 +18,7 @@ sbproxy serve -f sb.yml
 curl -s -H 'Host: localhost' http://127.0.0.1:8080/headers | jq .headers
 # {
 #   "Forwarded": "for=127.0.0.1;host=localhost;proto=http",
-#   "Host": "httpbin.org",
+#   "Host": "test.sbproxy.dev",
 #   "X-Forwarded-For": "127.0.0.1",
 #   "X-Forwarded-Host": "localhost",
 #   "X-Forwarded-Proto": "http",

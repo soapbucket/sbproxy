@@ -29,7 +29,7 @@ origins:
   "blog.local":
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
 
     authentication:
       type: bot_auth

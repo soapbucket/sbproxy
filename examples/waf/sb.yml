@@ -3,7 +3,7 @@
 #
 # Enables the OWASP Core Rule Set patterns and blocks any request that
 # matches a known SQL injection, XSS, or path-traversal signature. The
-# upstream is httpbin.org. Switch `action_on_match` to `log` (or set
+# upstream is test.sbproxy.dev. Switch `action_on_match` to `log` (or set
 # `test_mode: true`) to record matches without blocking.
 #
 # Run:
@@ -24,7 +24,7 @@ origins:
   "waf.local":
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
 
     policies:
       - type: waf

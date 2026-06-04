@@ -52,7 +52,7 @@ origins:
   "api.local":
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
 
     # `enabled: true` is the only required field. Everything else is
     # tuning. The default header name is `Idempotency-Key`, the default

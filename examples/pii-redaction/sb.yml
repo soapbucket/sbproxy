@@ -36,7 +36,7 @@ origins:
       providers:
         - name: openai
           api_key: "${OPENAI_API_KEY:-stub-key}"
-          base_url: "https://httpbin.org/anything"
+          base_url: "https://test.sbproxy.dev/anything"
       routing:
         strategy: round_robin
 

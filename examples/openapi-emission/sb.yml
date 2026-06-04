@@ -45,7 +45,7 @@ origins:
 
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
 
     # Restricting `allowed_methods` narrows the set of operations emitted
     # per path. Empty = every standard verb.
@@ -82,7 +82,7 @@ origins:
           id: user-posts
           action:
             type: proxy
-            url: https://httpbin.org/anything
+            url: https://test.sbproxy.dev/anything
 
       # Catch-all matcher: useful for static asset passthrough or
       # arbitrary trailing paths.
@@ -93,7 +93,7 @@ origins:
           id: static-passthrough
           action:
             type: proxy
-            url: https://httpbin.org/anything
+            url: https://test.sbproxy.dev/anything
 
       # Whole-path regex for shapes the template DSL cannot express.
       # Named captures (?P<version>...) are exposed as path params and
@@ -106,7 +106,7 @@ origins:
           id: versioned-items
           action:
             type: proxy
-            url: https://httpbin.org/anything
+            url: https://test.sbproxy.dev/anything
 
       # Plain exact and prefix matchers continue to work unchanged. The
       # prefix matcher is annotated with x-sbproxy-prefix-match in the
@@ -130,4 +130,4 @@ origins:
           id: api-passthrough
           action:
             type: proxy
-            url: https://httpbin.org/anything
+            url: https://test.sbproxy.dev/anything

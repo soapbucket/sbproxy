@@ -31,7 +31,7 @@ tenant not allowed
 ```
 
 ```bash
-# Allowed tenant - 200, request reaches httpbin.org
+# Allowed tenant - 200, request reaches test.sbproxy.dev
 $ curl -i -H 'Host: cel.local' -H 'X-Tenant: acme' http://127.0.0.1:8080/get
 HTTP/1.1 200 OK
 content-type: application/json
@@ -39,11 +39,11 @@ content-type: application/json
 {
   "args": {},
   "headers": {
-    "Host": "httpbin.org",
+    "Host": "test.sbproxy.dev",
     "X-Tenant": "acme",
     ...
   },
-  "url": "https://httpbin.org/get"
+  "url": "https://test.sbproxy.dev/get"
 }
 ```
 

@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-The `variables` block declares static, per-origin key-value pairs that the template engine exposes as `{{ variables.<name> }}`. Environment variables surface as `{{ env.<NAME> }}`. This example wires both into request headers (`X-Api-Version`, `X-Region-Label`, `X-Region-Env`, `X-Beta-Api`) so `httpbin.org/headers` echoes them back, demonstrating that interpolation happens at request time. Nested variables (e.g. `feature_flags.beta_api`) are addressable with dot notation.
+The `variables` block declares static, per-origin key-value pairs that the template engine exposes as `{{ variables.<name> }}`. Environment variables surface as `{{ env.<NAME> }}`. This example wires both into request headers (`X-Api-Version`, `X-Region-Label`, `X-Region-Env`, `X-Beta-Api`) so `test.sbproxy.dev/headers` echoes them back, demonstrating that interpolation happens at request time. Nested variables (e.g. `feature_flags.beta_api`) are addressable with dot notation.
 
 ## Run
 
@@ -19,7 +19,7 @@ sbproxy serve -f sb.yml
 # the proxy injected.
 curl -s -H 'Host: api.local' http://127.0.0.1:8080/headers | jq .headers
 # {
-#   "Host": "httpbin.org",
+#   "Host": "test.sbproxy.dev",
 #   "X-Api-Version": "v2",
 #   "X-Region-Label": "edge",
 #   "X-Region-Env": "us-east-1",

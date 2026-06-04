@@ -4,7 +4,7 @@
 # The variables block declares static, per-origin key-value pairs that are
 # available to the template engine as `{{ variables.<name> }}`. Environment
 # variables surface as `{{ env.<NAME> }}`. This example wires both into request
-# headers so httpbin.org echoes them back, demonstrating that interpolation
+# headers so test.sbproxy.dev echoes them back, demonstrating that interpolation
 # happens at request time.
 #
 # Run:
@@ -32,7 +32,7 @@ origins:
 
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
 
     request_modifiers:
       - headers:

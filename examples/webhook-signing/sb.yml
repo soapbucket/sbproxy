@@ -54,7 +54,7 @@ origins:
   "localhost":
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
     on_request:
       - url: https://hooks.example.com/sbproxy
         method: POST

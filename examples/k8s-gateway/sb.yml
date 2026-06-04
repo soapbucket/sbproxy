@@ -70,7 +70,7 @@ origins:
       type: proxy
       # In production this is the K8s Service DNS name:
       # url: http://backend.namespace.svc.cluster.local:8080
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
       host_override: backend.namespace.svc.cluster.local
       service_discovery:
         enabled: true

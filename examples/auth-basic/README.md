@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-Two-user HTTP Basic auth with a custom realm (`"sbproxy demo"`). Useful for quick admin panels and small internal tools. Requests without credentials get a 401 carrying a `WWW-Authenticate: Basic realm="sbproxy demo"` challenge so browsers prompt the user. Credentials are matched against the static `users` list before `httpbin.org` is contacted. Passwords are stored in plain in this example so it stays reproducible; in production you would interpolate them from the environment or the vault.
+Two-user HTTP Basic auth with a custom realm (`"sbproxy demo"`). Useful for quick admin panels and small internal tools. Requests without credentials get a 401 carrying a `WWW-Authenticate: Basic realm="sbproxy demo"` challenge so browsers prompt the user. Credentials are matched against the static `users` list before `test.sbproxy.dev` is contacted. Passwords are stored in plain in this example so it stays reproducible; in production you would interpolate them from the environment or the vault.
 
 ## Run
 
@@ -32,7 +32,7 @@ $ curl -i -u admin:s3cret -H 'Host: basic.local' http://127.0.0.1:8080/get
 HTTP/1.1 200 OK
 content-type: application/json
 
-{"args":{},"headers":{"Authorization":"Basic YWRtaW46czNjcmV0","Host":"httpbin.org",...},"url":"https://httpbin.org/get"}
+{"args":{},"headers":{"Authorization":"Basic YWRtaW46czNjcmV0","Host":"test.sbproxy.dev",...},"url":"https://test.sbproxy.dev/get"}
 ```
 
 Second user also works:

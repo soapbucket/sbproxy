@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Fallback origin.
 #
-# The primary action proxies to httpbin.org/status/503, which always returns
+# The primary action proxies to test.sbproxy.dev/status/503, which always returns
 # 503 Service Unavailable. When the upstream URL has a path component, the
 # proxy joins it with the request path: a request to `/` here becomes
 # upstream `/status/503`. So drive the test with `/`.
@@ -33,7 +33,7 @@ origins:
   "api.local":
     action:
       type: proxy
-      url: https://httpbin.org/status/503
+      url: https://test.sbproxy.dev/status/503
 
     fallback_origin:
       on_error: true

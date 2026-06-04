@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-Demonstrates the `html` transform on a real upstream. The proxy fetches `https://httpbin.org/html` (a public Moby-Dick excerpt page) and rewrites the HTML in flight: it removes the upstream `<h1>`, injects a stylesheet `<link>` at the end of `<head>`, prepends a banner `<div>` at the start of `<body>`, and stamps `data-rewritten="true"` on every `<p>`. The origin is reached on `127.0.0.1:8080` via the `html.local` Host header.
+Demonstrates the `html` transform on a real upstream. The proxy fetches `https://test.sbproxy.dev/html` (a public Moby-Dick excerpt page) and rewrites the HTML in flight: it removes the upstream `<h1>`, injects a stylesheet `<link>` at the end of `<head>`, prepends a banner `<div>` at the start of `<body>`, and stamps `data-rewritten="true"` on every `<p>`. The origin is reached on `127.0.0.1:8080` via the `html.local` Host header.
 
 ## Run
 
@@ -14,7 +14,7 @@ sbproxy serve -f sb.yml
 
 ```bash
 # Original upstream response (no proxy)
-$ curl -s https://httpbin.org/html | head -10
+$ curl -s https://test.sbproxy.dev/html | head -10
 <!DOCTYPE html>
 <html>
   <head>

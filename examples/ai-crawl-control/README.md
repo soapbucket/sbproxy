@@ -44,7 +44,7 @@ curl -i -H 'Host: blog.local' \
 
 ```bash
 # Normal browser UA - passes through without paying. We hit /get
-# rather than /article because the upstream (httpbin.org) only
+# rather than /article because the upstream (test.sbproxy.dev) only
 # implements the former; this confirms the proxy is forwarding
 # correctly when no payment challenge fires.
 curl -s -o /dev/null -w "%{http_code}\n" \
