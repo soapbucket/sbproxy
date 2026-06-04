@@ -3011,6 +3011,7 @@ mod request_phase;
 // re-import keeps every existing call site in this file unchanged.
 mod access_log;
 use access_log::*;
+mod custom_log;
 
 mod lifecycle;
 pub use lifecycle::*;

@@ -1843,6 +1843,47 @@ pub struct ObservabilityLogConfig {
     /// errors at parse time.
     #[serde(default)]
     pub sinks: Vec<ObservabilitySinkConfig>,
+    /// Operator-defined custom access-log fields. Each entry adds a key
+    /// to the access line's `custom` object, computed per request from
+    /// either a static value with `${...}` variable interpolation or a
+    /// script (CEL / Lua / JS) evaluated against the request context.
+    /// Lets operators pivot logs on dimensions the built-in schema does
+    /// not carry (region, deployment, a derived risk score, a hashed
+    /// account id, ...) without forking the binary. Resolved at proxy
+    /// scope today; a tenant- and origin-scope `custom_fields:` is a
+    /// planned extension that will compose proxy then tenant then origin,
+    /// the same way per-scope `redact:` and `sinks:` already do.
+    #[serde(default)]
+    pub custom_fields: Vec<CustomLogFieldConfig>,
+}
+
+/// One operator-defined custom access-log field.
+///
+/// Exactly one value source must be set: either `value` (a static
+/// string with `${...}` variable interpolation) or `source` together
+/// with `engine` (a script). Supplying both, or neither, is a config
+/// error. `engine` must be one of `cel`, `lua`, `js`. (`wasm` is
+/// rejected: it is a compiled module, not inline source.)
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct CustomLogFieldConfig {
+    /// Key the computed value lands under in the access line's `custom`
+    /// object. Must be unique within the scope.
+    pub name: String,
+    /// Static value with `${...}` variable interpolation. Mutually
+    /// exclusive with `source` / `engine`. Supported variables include
+    /// `${env.NAME}`, `${tenant_id}`, `${method}`, `${path}`,
+    /// `${host}`, `${status}`, `${provider}`, `${model}`,
+    /// `${request.header.NAME}`, and `${attribution.KEY}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Scripting engine for `source`. One of `cel`, `lua`, `js`.
+    /// Required when `source` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    /// Script source evaluated against the request context; its result
+    /// is stringified into the field. Mutually exclusive with `value`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Operator-extensible redaction config. Sits under
@@ -2194,11 +2235,12 @@ pub struct ProxyTenantConfig {
     pub observability: Option<TenantObservabilityConfig>,
 }
 
-/// Tenant-scope observability sub-tree. Currently only the
-/// `log.redact.pii` leaf is consumed at runtime; the nested layers
-/// exist so the on-disk schema mirrors `proxy.observability.log.redact.pii`
-/// and we can extend the tree (e.g. tenant-scoped sinks) without a
-/// breaking shape change.
+/// Tenant-scope observability sub-tree. The `log.redact` block (PII
+/// rules, patterns, and field denylist), `log.sinks` (tenant-scoped
+/// fan-out, filtered by `Principal.tenant_id`), and `cardinality`
+/// (per-tenant metric label budget) are all consumed at runtime;
+/// `log.custom_fields` is proxy-scope only today and is the next leaf
+/// planned to extend here.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TenantObservabilityConfig {
     /// Tenant-scoped log block. See [`TenantObservabilityLogConfig`].
@@ -2732,9 +2774,10 @@ pub struct RawOriginConfig {
     pub observability: Option<OriginObservabilityConfig>,
 }
 
-/// Origin-scope observability sub-tree. Currently only the
-/// `log.redact.pii` leaf is consumed at runtime; the nested layers
-/// exist so the on-disk schema mirrors the tenant + proxy shape.
+/// Origin-scope observability sub-tree. The `log.redact` block and
+/// `log.sinks` (origin-scoped fan-out, filtered by the stamped `route`)
+/// are consumed at runtime; `log.custom_fields` is proxy-scope only
+/// today and is the next leaf planned to extend here.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct OriginObservabilityConfig {
     /// Origin-scope log block. See [`OriginObservabilityLogConfig`].

@@ -171,9 +171,64 @@ restricts the rule set; accepted names are `email`, `us_ssn`,
 | `upstream_host` | string? | Upstream host the proxy contacted; absent on short-circuited requests (auth deny, WAF block, cache hit). |
 | `request_headers` | object? | Captured request headers, lowercased keys. Absent when no allowlist or no matches. |
 | `response_headers` | object? | Captured response headers, same shape as `request_headers`. |
+| `attribution` | object? | Resolved business attribution tags (project, feature, okr, team, customer, environment, agent_type, risk_tier, trace_id) merged from the credential `attrs:` and `SB-Attr-*` headers. Same tag set the per-attribution spend metric is labeled by. Absent when none resolved. |
+| `custom` | object? | Operator-defined custom fields from `observability.log.custom_fields:`. See below. Absent when none configured or none resolved. |
 
 Optional fields are omitted from the JSON object when their value is
 `None`.
+
+## Custom fields
+
+`observability.log.custom_fields:` adds operator-defined keys to each
+line's `custom` object, so you can pivot logs on dimensions the built-in
+schema does not carry (region, deployment, a derived tier, a routing
+decision) without forking the binary. Each field's value is computed per
+request from either a static string with `${...}` variable interpolation
+or a script.
+
+```yaml
+proxy:
+  observability:
+    log:
+      custom_fields:
+        - name: region                       # static value + interpolation
+          value: "${env.REGION}"
+        - name: caller_tier                  # CEL expression
+          engine: cel
+          source: 'has(request.headers["x-tier"]) ? request.headers["x-tier"] : "standard"'
+        - name: route_class                  # Lua script (returns the value)
+          engine: lua
+          source: 'return string.find(ctx.request.method, "GET") and "read" or "write"'
+        - name: upper_method                 # JS script
+          engine: js
+          source: "ctx.request.method.toUpperCase()"
+```
+
+Rules:
+
+- Each field sets exactly one of `value` or (`source` + `engine`).
+  Both, or neither, is a config error.
+- `engine` is one of `cel`, `lua`, `js`. WASM is not supported for log
+  fields because it is a compiled module, not inline source.
+- Static `value` interpolation variables: `${env.NAME}`, `${tenant_id}`,
+  `${method}`, `${path}`, `${host}`, `${status}`, `${provider}`,
+  `${model}`, `${request.header.NAME}`, `${attribution.KEY}`. An
+  unresolved variable becomes the empty string.
+- CEL expressions see the context keys as top-level variables
+  (`request`, `response`, `tenant_id`, `provider`, `model`,
+  `attribution`). Lua and JS scripts see the whole context as a `ctx`
+  global and `return` (Lua) / evaluate to (JS) the value to log.
+- A field whose script errors, or that resolves to the empty string, is
+  omitted from the line rather than failing the request.
+- Custom values pass through the same redaction as every other field.
+- Resolved at proxy scope today. A tenant- and origin-scope
+  `custom_fields:` is a planned extension; tenant and origin
+  observability already carry their own `redact:` and `sinks:` (see the
+  sink-scope and tenant/origin redaction sections in the observability
+  guide), and custom fields will compose proxy then tenant then origin
+  the same way.
+
+A worked example is in `examples/custom-log-fields/`.
 
 ## Redaction
 
