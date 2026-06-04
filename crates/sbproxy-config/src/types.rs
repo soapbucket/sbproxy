@@ -1849,10 +1849,10 @@ pub struct ObservabilityLogConfig {
     /// script (CEL / Lua / JS) evaluated against the request context.
     /// Lets operators pivot logs on dimensions the built-in schema does
     /// not carry (region, deployment, a derived risk score, a hashed
-    /// account id, ...) without forking the binary. Resolved at proxy
-    /// scope today; a tenant- and origin-scope `custom_fields:` is a
-    /// planned extension that will compose proxy then tenant then origin,
-    /// the same way per-scope `redact:` and `sinks:` already do.
+    /// account id, ...) without forking the binary. Configurable at
+    /// proxy, tenant, and origin scope; the sets compose per request as
+    /// proxy then tenant then origin, with a more-specific scope's field
+    /// overriding a less-specific field of the same `name`.
     #[serde(default)]
     pub custom_fields: Vec<CustomLogFieldConfig>,
 }
@@ -2237,10 +2237,10 @@ pub struct ProxyTenantConfig {
 
 /// Tenant-scope observability sub-tree. The `log.redact` block (PII
 /// rules, patterns, and field denylist), `log.sinks` (tenant-scoped
-/// fan-out, filtered by `Principal.tenant_id`), and `cardinality`
-/// (per-tenant metric label budget) are all consumed at runtime;
-/// `log.custom_fields` is proxy-scope only today and is the next leaf
-/// planned to extend here.
+/// fan-out, filtered by `Principal.tenant_id`), `log.custom_fields`
+/// (tenant-scoped access-log fields that override proxy-scope fields of
+/// the same name), and `cardinality` (per-tenant metric label budget)
+/// are all consumed at runtime.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TenantObservabilityConfig {
     /// Tenant-scoped log block. See [`TenantObservabilityLogConfig`].
@@ -2300,6 +2300,12 @@ pub struct TenantObservabilityLogConfig {
     /// usually outside the operator's trust boundary.
     #[serde(default)]
     pub sinks: Vec<ObservabilitySinkConfig>,
+    /// Tenant-scoped custom access-log fields. Same shape as the
+    /// proxy-scope `custom_fields:`. A field defined here overrides a
+    /// proxy-scope field with the same `name` for requests resolved to
+    /// this tenant; an origin-scope field overrides both.
+    #[serde(default)]
+    pub custom_fields: Vec<CustomLogFieldConfig>,
 }
 
 /// Tenant-scope `redact:` sub-block. Today only `pii:` is honoured;
@@ -2774,10 +2780,11 @@ pub struct RawOriginConfig {
     pub observability: Option<OriginObservabilityConfig>,
 }
 
-/// Origin-scope observability sub-tree. The `log.redact` block and
-/// `log.sinks` (origin-scoped fan-out, filtered by the stamped `route`)
-/// are consumed at runtime; `log.custom_fields` is proxy-scope only
-/// today and is the next leaf planned to extend here.
+/// Origin-scope observability sub-tree. The `log.redact` block,
+/// `log.sinks` (origin-scoped fan-out, filtered by the stamped `route`),
+/// and `log.custom_fields` (the most-specific access-log fields, which
+/// override tenant- and proxy-scope fields of the same name) are all
+/// consumed at runtime.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct OriginObservabilityConfig {
     /// Origin-scope log block. See [`OriginObservabilityLogConfig`].
@@ -2801,6 +2808,12 @@ pub struct OriginObservabilityLogConfig {
     /// Sinks at this scope default to the `external` redaction profile.
     #[serde(default)]
     pub sinks: Vec<ObservabilitySinkConfig>,
+    /// Origin-scoped custom access-log fields. Same shape as the
+    /// proxy-scope `custom_fields:`. A field defined here is the most
+    /// specific: it overrides a tenant- or proxy-scope field with the
+    /// same `name` for requests routed to this origin.
+    #[serde(default)]
+    pub custom_fields: Vec<CustomLogFieldConfig>,
 }
 
 /// Origin-scope `redact:` sub-block. Carries the per-origin overrides

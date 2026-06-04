@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
-# Operator-defined custom access-log fields.
+# Operator-defined custom access-log fields, at proxy / tenant / origin scope.
 #
 # `observability.log.custom_fields:` adds keys to each access line's
 # `custom` object, computed per request. Each field is either a static
@@ -8,15 +8,20 @@
 # dimensions the built-in schema does not carry (region, deployment, a
 # derived tier, a routing decision) without forking the binary.
 #
+# Fields can be declared at three scopes. They compose per request as
+# proxy then tenant then origin: a more-specific scope's field overrides
+# a less-specific field of the same name. The `scope` field below is
+# defined at all three scopes to show the precedence.
+#
 # Run:
 #   REGION=us-east-1 make run CONFIG=examples/custom-log-fields/sb.yml
 #
 # Test (in another terminal):
 #   curl -s -H 'Host: api.local' -H 'X-Tier: gold' http://127.0.0.1:8080/anything | head -c 40
 #
-# Expected (the access line on the proxy's stdout carries a `custom`
-# object alongside the standard fields):
-#   {"timestamp":"...","origin":"api.local","method":"GET","path":"/anything","status":200,...,"custom":{"region":"us-east-1","caller_tier":"gold","route_class":"read","upper_method":"GET"}}
+# Expected (the access line's `custom` object; `scope` resolves to the
+# origin value because origin is the most specific scope that defines it):
+#   "custom":{"caller_tier":"gold","region":"us-east-1","scope":"origin:api.local","tenant_tag":"acme"}
 
 proxy:
   http_bind_port: 8080
@@ -24,34 +29,33 @@ proxy:
   observability:
     log:
       custom_fields:
-        # 1. Static value with variable interpolation. Variables include
-        #    ${env.NAME}, ${tenant_id}, ${method}, ${path}, ${host},
-        #    ${status}, ${provider}, ${model},
-        #    ${request.header.NAME}, and ${attribution.KEY}.
+        # Static value with variable interpolation. Variables include
+        # ${env.NAME}, ${tenant_id}, ${method}, ${path}, ${host},
+        # ${status}, ${provider}, ${model}, ${request.header.NAME}, and
+        # ${attribution.KEY}.
         - name: region
           value: "${env.REGION}"
 
-        # 2. CEL expression over the request context. Reads an inbound
-        #    header and falls back to a literal.
+        # CEL expression over the request context.
         - name: caller_tier
           engine: cel
           source: 'has(request.headers["x-tier"]) ? request.headers["x-tier"] : "standard"'
 
-        # 3. Lua script. The whole request context is the `ctx` global;
-        #    the script returns the value to log.
-        - name: route_class
-          engine: lua
-          source: |
-            if string.find(ctx.request.method, "GET") then
-              return "read"
-            else
-              return "write"
-            end
+        # Defined at all three scopes; the origin value wins on api.local.
+        - name: scope
+          value: "proxy"
 
-        # 4. JS script. Same `ctx` global; returns a string.
-        - name: upper_method
-          engine: js
-          source: "ctx.request.method.toUpperCase()"
+  # Tenant-scope fields override proxy fields of the same name for
+  # requests resolved to this tenant.
+  tenants:
+    - id: acme
+      observability:
+        log:
+          custom_fields:
+            - name: scope
+              value: "tenant:acme"
+            - name: tenant_tag
+              value: "acme"
 
 # A plain access log so the lines (with their `custom` object) print to
 # stdout.
@@ -60,6 +64,15 @@ access_log:
 
 origins:
   "api.local":
+    # Bind this origin to the `acme` tenant so tenant-scope fields apply.
+    tenant_id: acme
+    # Origin-scope fields are the most specific; they override tenant and
+    # proxy fields of the same name.
+    observability:
+      log:
+        custom_fields:
+          - name: scope
+            value: "origin:api.local"
     action:
       type: proxy
       url: https://test.sbproxy.dev

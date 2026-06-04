@@ -2053,6 +2053,7 @@ mod tests {
                 cardinality: None,
                 log: TenantObservabilityLogConfig {
                     sinks: Vec::new(),
+                    custom_fields: Vec::new(),
                     redact: TenantObservabilityRedactConfig {
                         fields: Vec::new(),
                         patterns: Vec::new(),
@@ -2123,6 +2124,7 @@ mod tests {
             observability: Some(OriginObservabilityConfig {
                 log: OriginObservabilityLogConfig {
                     sinks: Vec::new(),
+                    custom_fields: Vec::new(),
                     redact: OriginObservabilityRedactConfig {
                         fields: Vec::new(),
                         patterns: Vec::new(),
