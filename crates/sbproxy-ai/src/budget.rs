@@ -176,13 +176,33 @@ impl BudgetTracker {
         origin: Option<&str>,
         tag: Option<&str>,
     ) -> Option<String> {
+        // WOR-1143: ApiKey / User / Tag scopes fall back to an
+        // `__unattributed__` bucket when the request omits the
+        // corresponding header, instead of returning `None`. Returning
+        // `None` dropped the limit from the checked set, so a request
+        // missing `authorization` / `x-user-id` / `x-sbproxy-tag` escaped
+        // a configured cap entirely. Funnelling unattributed traffic into
+        // one shared, still-capped bucket closes that bypass.
+        const UNATTRIBUTED: &str = "__unattributed__";
         match scope {
             BudgetScope::Workspace => Some(format!("workspace:{}", workspace_id)),
-            BudgetScope::ApiKey => api_key.map(|k| format!("api_key:{}:{}", workspace_id, k)),
-            BudgetScope::User => user.map(|u| format!("user:{}:{}", workspace_id, u)),
+            BudgetScope::ApiKey => Some(format!(
+                "api_key:{}:{}",
+                workspace_id,
+                api_key.unwrap_or(UNATTRIBUTED)
+            )),
+            BudgetScope::User => Some(format!(
+                "user:{}:{}",
+                workspace_id,
+                user.unwrap_or(UNATTRIBUTED)
+            )),
             BudgetScope::Model => model.map(|m| format!("model:{}:{}", workspace_id, m)),
             BudgetScope::Origin => origin.map(|o| format!("origin:{}", o)),
-            BudgetScope::Tag => tag.map(|t| format!("tag:{}:{}", workspace_id, t)),
+            BudgetScope::Tag => Some(format!(
+                "tag:{}:{}",
+                workspace_id,
+                tag.unwrap_or(UNATTRIBUTED)
+            )),
         }
     }
 
@@ -694,6 +714,32 @@ mod tests {
         assert_eq!(usage.tokens, 0);
         assert_eq!(usage.cost_usd, 0.0);
         assert_eq!(usage.request_count, 0);
+    }
+
+    #[test]
+    fn scope_key_uses_sentinel_bucket_when_header_absent() {
+        use BudgetScope::*;
+        // WOR-1143: ApiKey / User / Tag scopes must NOT drop out (return
+        // None) when their header is missing, or a request omitting the
+        // header escapes the cap. They fall back to a shared, still-capped
+        // `__unattributed__` bucket.
+        assert_eq!(
+            BudgetTracker::scope_key(&ApiKey, "ws", None, None, None, None, None),
+            Some("api_key:ws:__unattributed__".to_string())
+        );
+        assert_eq!(
+            BudgetTracker::scope_key(&User, "ws", None, None, None, None, None),
+            Some("user:ws:__unattributed__".to_string())
+        );
+        assert_eq!(
+            BudgetTracker::scope_key(&Tag, "ws", None, None, None, None, None),
+            Some("tag:ws:__unattributed__".to_string())
+        );
+        // Present headers still produce their own bucket.
+        assert_eq!(
+            BudgetTracker::scope_key(&ApiKey, "ws", Some("k1"), None, None, None, None),
+            Some("api_key:ws:k1".to_string())
+        );
     }
 
     #[test]

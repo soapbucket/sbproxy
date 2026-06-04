@@ -1172,10 +1172,24 @@ pub(super) async fn handle_ai_proxy(
     if let Some(ref guardrails_config) = config.guardrails {
         if let Some(pipeline) = cached_guardrails_pipeline(guardrails_config) {
             if pipeline.has_input() {
-                // Parse messages from the body.
+                // Parse messages from the body. WOR-1145: deserialize
+                // each element independently rather than the whole array
+                // at once. A single malformed entry (e.g. a numeric
+                // `role`) must not make `from_value::<Vec<Message>>` fail
+                // and yield an EMPTY vec, which would silently skip the
+                // input guardrails on the remaining valid messages. The
+                // body-aware `check_input_body` below still scans the raw
+                // body, so content in an unparseable element is not lost.
                 let messages: Vec<sbproxy_ai::Message> = body
                     .get("messages")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| {
+                                serde_json::from_value::<sbproxy_ai::Message>(m.clone()).ok()
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default();
 
                 if let Some(block) = pipeline.check_input(&messages) {
@@ -3016,7 +3030,12 @@ pub(super) async fn relay_ai_stream(
     // a per-chunk `is_noop` short-circuit so byte-forward streaming
     // stays zero-overhead.
     let mut reversible_restore = StreamingReversibleRestore::new(reversible_pairs);
-    loop {
+    // WOR-1144: set when the stream-safety classifier rejects a chunk so
+    // the relay stops forwarding (fail closed) instead of delivering
+    // flagged content. Leaves `upstream_complete` false so the recorder
+    // guard emits `End { complete: false }`.
+    let mut safety_blocked = false;
+    'relay: loop {
         match stream.next().await {
             Some(Ok(chunk)) => {
                 let chunk_bytes = Bytes::copy_from_slice(&chunk);
@@ -3025,13 +3044,17 @@ pub(super) async fn relay_ai_stream(
                     first_token_at = Some(std::time::Instant::now());
                 }
 
-                // --- Per-chunk safety probe (fail-open) ---
+                // --- Per-chunk safety probe (fail closed) ---
                 //
                 // We push chunks into the classifier session channel and
-                // drain any pending verdicts. Both sides are non-blocking:
-                // if the sidecar is slow, we prefer delivering the user's
-                // tokens over stalling on the verdict loop. Verdicts with
-                // `allow=false` are logged but the chunk is still forwarded.
+                // drain any pending verdicts. Feeding the classifier is
+                // non-blocking (if the sidecar is slow we do not stall the
+                // relay), but a verdict with `allow=false` terminates the
+                // stream: we stop forwarding the current and all
+                // subsequent chunks rather than delivering flagged content
+                // (WOR-1144). Verdicts lag the chunk that produced them by
+                // the classifier's latency, so an already-written chunk
+                // cannot be recalled, but the leak does not continue.
                 if let Some(ch) = safety_channel.as_mut() {
                     if ch.tx.try_send(chunk_bytes.clone()).is_err() {
                         debug!("stream safety channel full; skipping verdict input");
@@ -3040,8 +3063,10 @@ pub(super) async fn relay_ai_stream(
                         if !v.allow {
                             warn!(
                                 reason = ?v.reason,
-                                "stream safety verdict rejected a chunk (fail-open: forwarded anyway)"
+                                "stream safety verdict rejected a chunk; terminating stream (fail closed)"
                             );
+                            safety_blocked = true;
+                            break 'relay;
                         }
                     }
                 }
@@ -3173,6 +3198,14 @@ pub(super) async fn relay_ai_stream(
     // as a partial recording: we let the guard drop emit
     // `End { complete: false }`.
     session.write_response_body(None, true).await?;
+
+    if safety_blocked {
+        // WOR-1144: the stream was cut short by an output-safety verdict.
+        // `upstream_complete` stayed false, so the recorder guard emits
+        // `End { complete: false }`. Budget is still recorded best-effort
+        // below for whatever the upstream produced before the cut.
+        debug!("AI proxy: streaming response terminated early by stream-safety enforcement");
+    }
 
     // --- Streaming budget recording ---
     //
