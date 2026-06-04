@@ -1811,9 +1811,15 @@ async fn check_auth_with_tls(
     tls_cert_thumbprint: Option<&str>,
 ) -> (AuthResult, Option<sbproxy_plugin::Principal>) {
     use sbproxy_modules::auth::dpop::DpopVerifier;
-    use sbproxy_modules::auth::mtls_bound::MtlsBoundVerifier;
-    let dpop_verifier = DpopVerifier::default();
-    let mtls_verifier = MtlsBoundVerifier::default();
+    use sbproxy_modules::auth::mtls_bound::{MtlsBoundVerifier, MtlsBoundVerifierConfig};
+    // WOR-1136: the DPoP verifier owns the (jkt, jti) replay cache that
+    // rejects a reused proof (RFC 9449). That cache MUST persist across
+    // requests, so the verifier lives in a process-wide `OnceLock`
+    // rather than being rebuilt per call. A fresh per-request verifier
+    // has an empty cache and never detects a replay. Mirrors the
+    // `jwks::REGISTRY` singleton pattern.
+    static DPOP_VERIFIER: std::sync::OnceLock<DpopVerifier> = std::sync::OnceLock::new();
+    let dpop_verifier = DPOP_VERIFIER.get_or_init(DpopVerifier::default);
     match auth {
         Auth::ApiKey(a) => {
             match a.check_request_with_principal(headers, query, tenant_id.clone()) {
@@ -1919,6 +1925,14 @@ async fn check_auth_with_tls(
                     }
                 }
                 if a.require_mtls_bound {
+                    // WOR-1137: when the operator requires mTLS binding,
+                    // a token with no `cnf` claim must be rejected, not
+                    // allowed. The default verifier has `require_cnf =
+                    // false`, which let a plain bearer JWT (no cnf) pass
+                    // through; build it with `require_cnf = true` so a
+                    // missing cnf is a `MissingCnfClaim` denial.
+                    let mtls_verifier =
+                        MtlsBoundVerifier::new(MtlsBoundVerifierConfig { require_cnf: true });
                     if let Err(err) = mtls_verifier.verify(&claims, tls_cert_thumbprint) {
                         return (
                             AuthResult::Deny(
