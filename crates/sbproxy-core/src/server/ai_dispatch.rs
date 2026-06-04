@@ -42,6 +42,11 @@ pub(super) async fn handle_ai_proxy(
     // must be `Send`. The surface field is carried by the explicit
     // `debug!` above and by the per-surface metrics below.
     let _ai_span = sbproxy_ai::tracing_spans::ai_request_span(surface_label, &method_str);
+    // WOR-1098: stamp the resolved tenant onto the request span so OTel
+    // exporters can filter traces by tenant. The origin match has
+    // already populated `ctx.tenant_id` (defaulting to `__default__`
+    // when no tenant is configured) by the time dispatch runs.
+    _ai_span.record("sbproxy.tenant_id", ctx.tenant_id.as_str());
 
     // Increment the per-surface request counter and start the latency
     // clock. The latency guard records elapsed time at function exit
@@ -1617,17 +1622,34 @@ pub(super) async fn handle_ai_proxy(
         };
 
         let attempt_start = std::time::Instant::now();
-        let result = if let Some((bypass_body, native_path)) = upstream_call {
-            AI_CLIENT
-                .load()
-                .forward_native_bypass(provider, &method_str, native_path, bypass_body)
-                .await
-        } else {
-            AI_CLIENT
-                .load()
-                .forward_request(provider, &path, &attempt_body)
-                .await
-        };
+        // WOR-1103: wrap each upstream attempt in its own span so a
+        // forced failover shows one child span per provider tried, with
+        // the attempt index and outcome visible in the trace (the
+        // matching per-provider attempt counter is recorded below). The
+        // call future is `.instrument`ed rather than entered with a
+        // guard because the dispatch task must stay `Send` across the
+        // await.
+        use tracing::Instrument as _;
+        let attempt_span = tracing::debug_span!(
+            "ai.provider.attempt",
+            provider = %provider.name,
+            attempt = attempt,
+        );
+        let result = async {
+            if let Some((bypass_body, native_path)) = upstream_call {
+                AI_CLIENT
+                    .load()
+                    .forward_native_bypass(provider, &method_str, native_path, bypass_body)
+                    .await
+            } else {
+                AI_CLIENT
+                    .load()
+                    .forward_request(provider, &path, &attempt_body)
+                    .await
+            }
+        }
+        .instrument(attempt_span)
+        .await;
 
         match result {
             Ok(resp) => {
