@@ -2102,9 +2102,21 @@ pub(super) async fn request_filter(
                 .get(http::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
-            if content_type.contains("application/json") {
-                let body_bytes = session.read_request_body().await?;
-                if let Some(ref body) = body_bytes {
+            let declared_json = content_type.contains("application/json");
+            let body_bytes = session.read_request_body().await?;
+            if let Some(ref body) = body_bytes {
+                // WOR-1150: scan when the Content-Type declares JSON OR the
+                // body is actually JSON-shaped, so a client cannot bypass
+                // the JSON-bomb / depth limits by mislabeling the
+                // Content-Type (e.g. sending a deep JSON body as
+                // text/plain). `check_json_body` enforces the size limit,
+                // so an oversized body trips immediately.
+                let looks_json = body
+                    .iter()
+                    .find(|b| !b.is_ascii_whitespace())
+                    .map(|b| *b == b'{' || *b == b'[')
+                    .unwrap_or(false);
+                if declared_json || looks_json {
                     if let Err(msg) = threat.check_json_body(body) {
                         debug!(detail = %msg, "threat protection blocked request");
                         send_error(session, 413, "request entity too large").await?;

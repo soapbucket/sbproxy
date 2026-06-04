@@ -40,8 +40,13 @@ struct Operation {
     method: String,
     /// Schema validators keyed by media type (e.g.
     /// `application/json`). When the request `Content-Type` does not
-    /// match any key, the request is passed through.
+    /// match any key, the request is passed through unless
+    /// `required_body` is set.
     schemas: HashMap<String, jsonschema::JSONSchema>,
+    /// `requestBody.required` from the spec. When true, a request with
+    /// no schema matching its `Content-Type` is a failure, not an
+    /// out-of-scope pass-through (WOR-1151).
+    required_body: bool,
 }
 
 /// Compiled OpenAPI validation policy.
@@ -170,7 +175,20 @@ impl OpenApiValidationPolicy {
             .map(|m| m.trim().to_ascii_lowercase());
         let schema = match media.as_deref().and_then(|m| op.schemas.get(m)) {
             Some(s) => s,
-            None => return ValidationResult::OutOfScope,
+            // WOR-1151: an operation with `requestBody.required: true` must
+            // not pass through when the request carries no matching schema
+            // for its Content-Type (absent, wrong, or unsupported CT).
+            // Treating that as out-of-scope let a client skip the body
+            // contract by sending an unexpected Content-Type.
+            None => {
+                if op.required_body {
+                    return ValidationResult::Failed(format!(
+                        "{} {} requires a request body with a supported content type",
+                        op.method, op.template
+                    ));
+                }
+                return ValidationResult::OutOfScope;
+            }
         };
         let instance: serde_json::Value = match serde_json::from_slice(body) {
             Ok(v) => v,
@@ -230,6 +248,11 @@ fn compile_operations(spec: &serde_json::Value) -> anyhow::Result<Vec<Operation>
                 None => continue,
             };
             let mut schemas = HashMap::new();
+            let required_body = op
+                .get("requestBody")
+                .and_then(|rb| rb.get("required"))
+                .and_then(|r| r.as_bool())
+                .unwrap_or(false);
             if let Some(content) = op
                 .get("requestBody")
                 .and_then(|rb| rb.get("content"))
@@ -258,6 +281,7 @@ fn compile_operations(spec: &serde_json::Value) -> anyhow::Result<Vec<Operation>
                 regex: regex.clone(),
                 method: method.to_ascii_uppercase(),
                 schemas,
+                required_body,
             });
         }
     }
@@ -343,6 +367,51 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(policy.operation_count(), 1);
+    }
+
+    #[test]
+    fn required_body_with_wrong_content_type_fails() {
+        // WOR-1151: an operation whose requestBody is required must fail,
+        // not pass through, when the request's Content-Type has no
+        // matching schema.
+        let spec = serde_json::json!({
+            "openapi": "3.0.3",
+            "info": {"title": "t", "version": "1"},
+            "paths": {
+                "/users/{id}": {
+                    "post": {
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["name"],
+                                        "properties": { "name": { "type": "string" } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let policy =
+            OpenApiValidationPolicy::from_config(serde_json::json!({ "spec": spec })).unwrap();
+        // Wrong Content-Type -> Failed (not OutOfScope).
+        let res = policy.validate("POST", "/users/42", Some("text/plain"), br#"{"name":"x"}"#);
+        assert!(matches!(res, ValidationResult::Failed(_)), "got {res:?}");
+        // Absent Content-Type -> Failed.
+        let res2 = policy.validate("POST", "/users/42", None, br#"{"name":"x"}"#);
+        assert!(matches!(res2, ValidationResult::Failed(_)), "got {res2:?}");
+        // Correct Content-Type + valid body still passes.
+        let res3 = policy.validate(
+            "POST",
+            "/users/42",
+            Some("application/json"),
+            br#"{"name":"x"}"#,
+        );
+        assert_eq!(res3, ValidationResult::Passed);
     }
 
     #[test]
