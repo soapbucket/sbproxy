@@ -376,17 +376,34 @@ contracts live with the feature.
 
 ---
 
-## User directory (`GET /api/users`, `POST /api/users`)
+## Chat playground (`POST /admin/api/playground/chat`)
 
-Lists and provisions admin users (separate from the
-`admin.username` / `admin.password` Basic credentials, which are
-the bootstrap operator). The OSS implementation stores users
-in-memory; the enterprise build swaps in a SQLite-backed store.
+A stub handler for the dashboard's interactive chat surface. The
+admin UI scaffold + cargo feature ship today; the wiring that
+routes the request through `proxy_router.oneshot` and streams a
+model's response back is deferred to a follow-up ticket so the
+front-end scaffold and the production integration can land
+independently.
 
-`GET /api/users` returns the list. `POST /api/users` creates a
-user (body: `{"username": "...", "password": "..."}`). Updates and
-deletes are issued via `PUT` / `DELETE` against the same path with
-the user id. All routes carry the standard error envelope.
+Today the route returns `501 Not Implemented` with a JSON envelope
+naming the follow-up:
+
+```json
+{
+  "error": "not implemented",
+  "ticket": "WOR-227 follow-up",
+  "detail": "chat playground stub; real handler will route through proxy_router.oneshot and stream the model response back to /admin/ui"
+}
+```
+
+Other verbs return `405 Method Not Allowed`. The route shares the
+admin port's basic-auth gate, so a curious operator pinging it
+without credentials still sees `401 Unauthorized` first.
+
+This route is OSS, ships in every build, and lives on the admin
+server (next to `/admin/reload`) rather than the production proxy
+listener. The path is stable; the follow-up that lights up the
+real handler does not move it.
 
 ---
 
