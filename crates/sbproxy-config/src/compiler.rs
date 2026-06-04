@@ -491,6 +491,18 @@ fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFil
                         }
                     }
                 }
+                // `route_to_model` and `inject_tools` mirror the
+                // identically-named fields on the underlying
+                // `VirtualKeyConfig`; pass them through so the AI
+                // dispatch's model-pin + tool-injection paths fire.
+                // Empty `inject_tools` is dropped to keep the JSON
+                // shape compact and match the lowering above.
+                if let Some(m) = &cred.route_to_model {
+                    vk["route_to_model"] = json!(m);
+                }
+                if !cred.inject_tools.is_empty() {
+                    vk["inject_tools"] = json!(cred.inject_tools.clone());
+                }
                 vk
             })
             .collect();
@@ -1471,6 +1483,60 @@ origins:
         assert_eq!(vks[0]["project"], "shared");
         assert_eq!(vks[0]["allowed_providers"][0], "openai");
         assert_eq!(vks[0]["tags"][0], "tier-shared");
+    }
+
+    /// `route_to_model` and `inject_tools` set on a credentials-block
+    /// entry must reach the lowered virtual_keys entry verbatim; the
+    /// AI dispatch consumes the same field names on the underlying
+    /// `VirtualKeyConfig`. The legacy `action.virtual_keys:` shape
+    /// accepted these, and the credentials block has to as well or
+    /// the migration silently drops behaviour.
+    #[test]
+    fn credential_route_to_model_and_inject_tools_pass_through() {
+        let yaml = r#"
+proxy:
+  credentials:
+    - name: pinned
+      type: ai_provider
+      provider: openai
+      key: vault://env/OPENAI_API_KEY
+      route_to_model: gpt-4o-mini
+      inject_tools:
+        - type: function
+          function:
+            name: search_docs
+            description: search the documentation
+            parameters:
+              type: object
+              properties:
+                query: { type: string }
+              required: [query]
+origins:
+  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+"#;
+        let compiled = compile_config(yaml).expect("should compile");
+        let origin = compiled.resolve_origin("ai.local").expect("origin exists");
+        let vks = origin
+            .action_config
+            .get("virtual_keys")
+            .and_then(|v| v.as_array())
+            .expect("virtual_keys array materialised");
+        assert_eq!(vks.len(), 1);
+        assert_eq!(
+            vks[0]["route_to_model"], "gpt-4o-mini",
+            "route_to_model must reach the lowered VK; got: {}",
+            vks[0]
+        );
+        let tools = vks[0]["inject_tools"]
+            .as_array()
+            .expect("inject_tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "search_docs");
     }
 
     /// An origin-scope credential with the same name as a

@@ -66,7 +66,7 @@ e2e runs occasionally and locally, not on every PR.
 | OpenAPI emission + validation (`openapi_*`) | 2 | `/.well-known/openapi.{json,yaml}` round-trip; openapi_validation policy gates request body |
 | Bulk redirects (`bulk_*`) | 2 | O(1) path-keyed lookup; row-list compilation at config load |
 | Prompt injection v2 (`prompt_*`) | 2 | Heuristic detector default; sidecar detector via UDS or TCP |
-| Virtual keys / credentials (`virtual_key_*`, `credentials_*`) | 4 | Per-team budget + allow-list; credentials block lowering. Two assertions in `virtual_key_*` carry `#[ignore]` pending WOR-1110 + WOR-1111. |
+| Virtual keys / credentials (`virtual_key_*`, `credentials_*`) | 4 | Per-team budget + allow-list; credentials block lowering, including `route_to_model` pin + `inject_tools` injection. |
 | Sessions (`session*`) | 1 | Encrypted cookie issue + verify + rotate |
 | Object authz (`object_authz_*`) | 1 | BOLA + BFLA enforcement + tenant isolation |
 | Listings (`listing_*`) | 1 | Listing primitive: schema + loader + three pinning modes |
@@ -83,10 +83,9 @@ e2e runs occasionally and locally, not on every PR.
 | Admin (`admin_*`) | 2 | Admin server bind + basic-auth + `/api/*` + `/admin/reload` |
 | Misc cross-cutting | rest | Plug-in registry, classifier sidecar lifecycle, sidecar transport, ledger + 402, vault backend, well-known projections |
 
-Total: 135 files × multiple test functions = ~580 assertions. 5
-tests carry `#[ignore]`: the three `virtual_key_*` runtime assertions
-pending WOR-1110 + WOR-1111, plus two pre-existing
-network-bound-flake quarantined tests in the classifier suite.
+Total: 135 files × multiple test functions = ~580 assertions. The
+two ignored tests are pre-existing network-bound-flake quarantines
+in the classifier suite.
 
 ## ProxyHarness API
 
