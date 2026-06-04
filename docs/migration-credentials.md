@@ -29,8 +29,8 @@ Walk each origin's `action.providers[*].virtual_keys` array. Rewrite each entry 
 | `project` | `attrs.project` |
 | `user` | `attrs.user` |
 | `metadata` | `attrs.metadata` |
-| `route_to_model` | (unchanged; still on the legacy VirtualKeyConfig surface until the AI route override moves to the credentials block in a follow-up) |
-| `inject_tools` | (unchanged; same caveat as above) |
+| `route_to_model` | top-level on the credential (`route_to_model: gpt-4o-mini`). Lowered to the runtime virtual-key entry at config-compile time. |
+| `inject_tools` | top-level on the credential. Same lowering. The shape is provider-native (`function` objects today). |
 
 The credential `type:` is `ai_provider` for every entry migrated from `virtual_keys:`. The `provider:` field names the upstream provider this credential authenticates against; the credential is rejected at routing time if its request resolves to a different provider.
 

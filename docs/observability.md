@@ -218,9 +218,6 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 | `sbproxy_ledger_redeem_duration_seconds_bucket` | 10 000 | Plus buckets. |
 | `sbproxy_outbound_request_total` | 30 000 | Labels: `target`, `result`, `tenant_id`. `target` is enum-bounded. |
 | `sbproxy_audit_emit_total` | 5 000 | Labels: `result`, `tenant_id`. |
-| `sbproxy_webhook_in_total` | 10 000 | Labels: `provider`, `result`, `tenant_id`. |
-| `sbproxy_webhook_out_total` | 10 000 | Labels: `subscription`, `result`, `tenant_id`. |
-| `sbproxy_session_count_distinct` | 1 | HLL gauge; cardinality independent of session count. |
 | `sbproxy_script_compile_total` | 12 | Labels: `engine` (cel\|lua\|js\|wasm), `result` (ok\|parse_error\|sandbox_reject). |
 | `sbproxy_script_invocations_total` | 20 | Same `engine`, plus `result` (ok\|runtime_error\|timeout\|memory_cap\|instruction_cap). |
 | `sbproxy_script_duration_seconds_bucket` | 52 | `engine` label only; histogram buckets 0.1ms..10s. |
@@ -255,7 +252,7 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 
 Hard rule: `agent_id`, `request_id`, `session_id`, and `user_id` are never label values on Prometheus metrics. They live as span attributes (under traces) and log fields (under logs).
 
-When a budget is exhausted the offending label demotes to `__other__` and `sbproxy_label_demotion_total` increments. The metric update still happens; a demoted bucket is preferable to a missing one because gaps look like real traffic dips.
+When a budget is exhausted the offending label demotes to `__other__` and `sbproxy_label_cardinality_overflow_total` increments. The metric update still happens; a demoted bucket is preferable to a missing one because gaps look like real traffic dips.
 
 ## Logs
 
