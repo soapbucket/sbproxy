@@ -1862,7 +1862,8 @@ pub struct ObservabilityLogConfig {
 /// Exactly one value source must be set: either `value` (a static
 /// string with `${...}` variable interpolation) or `source` together
 /// with `engine` (a script). Supplying both, or neither, is a config
-/// error. `engine` must be one of `cel`, `lua`, `js`, `wasm`.
+/// error. `engine` must be one of `cel`, `lua`, `js`. (`wasm` is
+/// rejected: it is a compiled module, not inline source.)
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CustomLogFieldConfig {
     /// Key the computed value lands under in the access line's `custom`
@@ -1875,8 +1876,8 @@ pub struct CustomLogFieldConfig {
     /// `${request.header.NAME}`, and `${attribution.KEY}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
-    /// Scripting engine for `source`. One of `cel`, `lua`, `js`,
-    /// `wasm`. Required when `source` is set.
+    /// Scripting engine for `source`. One of `cel`, `lua`, `js`.
+    /// Required when `source` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
     /// Script source evaluated against the request context; its result
