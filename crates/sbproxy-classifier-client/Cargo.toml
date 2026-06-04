@@ -9,7 +9,7 @@ description = "Resilient gRPC client for the classifier sidecar InferenceService
 [dependencies]
 sbproxy-classifier-proto = { path = "../sbproxy-classifier-proto" }
 tonic = { workspace = true }
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "process", "sync", "time", "macros", "rt"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 # WOR-705 UDS transport: `tower::service_fn` is the tonic-recommended

@@ -27,6 +27,15 @@ use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
 
+/// WOR-705 part 2: child supervisor that owns the lifecycle of a
+/// co-located sidecar binary. Pairs with `connect_uds_lazy`: the
+/// supervisor spawns the sidecar with `--listen-uds <path>` and
+/// the lazy client over the same path races the bind exactly
+/// once. The supervisor restarts the child on unexpected exit
+/// and supports a SIGTERM-then-SIGKILL graceful shutdown.
+pub mod supervisor;
+pub use supervisor::{Supervisor, SupervisorConfig, SupervisorError, SupervisorState};
+
 /// Error talking to the classifier sidecar.
 ///
 /// The caller maps these to its fail policy: fail-open classifiers treat any
