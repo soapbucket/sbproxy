@@ -75,19 +75,26 @@ pub const OP_AUDIO: &str = "audio";
 ///   tooling that prefers the original label.
 /// - `http.request.method` mirrors the OpenTelemetry HTTP semantic
 ///   convention for HTTP method.
-/// - Empty placeholders for `gen_ai.system`, `gen_ai.request.model`,
-///   `gen_ai.response.model`, `gen_ai.response.id`,
-///   `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, and
-///   `gen_ai.response.finish_reasons` so downstream code can fill
-///   them in once the routing and upstream call complete (a
-///   `tracing::field::Empty` field becomes a settable slot on the
-///   live span).
+/// - Empty placeholders for `sbproxy.tenant_id`, `gen_ai.system`,
+///   `gen_ai.request.model`, `gen_ai.response.model`,
+///   `gen_ai.response.id`, `gen_ai.usage.input_tokens`,
+///   `gen_ai.usage.output_tokens`, and `gen_ai.response.finish_reasons`
+///   so downstream code can fill them in once the routing and upstream
+///   call complete (a `tracing::field::Empty` field becomes a settable
+///   slot on the live span). The tenant slot is populated from
+///   `RequestContext.tenant_id` at dispatch entry (WOR-1098).
 pub fn ai_request_span(surface: &str, method: &str) -> Span {
     tracing::info_span!(
         "ai.request",
         "gen_ai.operation.name" = surface,
         "sbproxy.ai.surface" = surface,
         "http.request.method" = method,
+        // WOR-1098: tenant attribution. Left Empty here and filled in
+        // by the dispatch path from `RequestContext.tenant_id` once the
+        // origin match has resolved the tenant, so exported request
+        // spans can be filtered by tenant downstream without parsing
+        // the event payload.
+        "sbproxy.tenant_id" = Empty,
         "gen_ai.system" = Empty,
         "gen_ai.request.model" = Empty,
         "gen_ai.response.model" = Empty,
@@ -487,6 +494,25 @@ mod tests {
         assert_field(span, "gen_ai.operation.name", "chat_completions");
         assert_field(span, "sbproxy.ai.surface", "chat_completions");
         assert_field(span, "http.request.method", "POST");
+    }
+
+    #[test]
+    fn ai_request_span_records_tenant_id() {
+        // WOR-1098: the dispatch path stamps `sbproxy.tenant_id` from
+        // `RequestContext.tenant_id` so exported request spans can be
+        // filtered by tenant. The slot starts Empty and is filled via
+        // `Span::record`, mirroring what `handle_ai_proxy` does.
+        use tracing_subscriber::prelude::*;
+        let layer = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = ai_request_span("chat_completions", "POST");
+            span.record("sbproxy.tenant_id", "acme");
+        });
+
+        let spans = snapshot_spans(&layer);
+        let span = find_span(&spans, "ai.request");
+        assert_field(span, "sbproxy.tenant_id", "acme");
     }
 
     #[test]
