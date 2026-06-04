@@ -221,8 +221,12 @@ Rules:
 - A field whose script errors, or that resolves to the empty string, is
   omitted from the line rather than failing the request.
 - Custom values pass through the same redaction as every other field.
-- Resolved at proxy scope today. Origin and tenant scopes compose the
-  same way once their observability-log plumbing is consumed at runtime.
+- Resolved at proxy scope today. A tenant- and origin-scope
+  `custom_fields:` is a planned extension; tenant and origin
+  observability already carry their own `redact:` and `sinks:` (see the
+  sink-scope and tenant/origin redaction sections in the observability
+  guide), and custom fields will compose proxy then tenant then origin
+  the same way.
 
 A worked example is in `examples/custom-log-fields/`.
 

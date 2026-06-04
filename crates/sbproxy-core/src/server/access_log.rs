@@ -552,8 +552,8 @@ pub(super) fn emit_access_log(
         // (`observability.log.custom_fields:`), evaluated here where the
         // session + request context are in hand. The result rides
         // through every redaction pass like any other field. Proxy scope
-        // today; origin / tenant scopes compose the same way once their
-        // observability-log plumbing is consumed at runtime.
+        // today; a tenant/origin-scope `custom_fields:` is a planned
+        // extension (those scopes already carry per-scope redact + sinks).
         custom: pipeline
             .config
             .server

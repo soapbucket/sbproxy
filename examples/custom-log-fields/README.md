@@ -35,4 +35,4 @@ The access line on the proxy's stdout carries a `custom` object:
 - `engine` is one of `cel`, `lua`, `js`. WASM is not supported for log fields (it is a compiled module, not inline source).
 - Field names must be unique. A field whose script errors (or whose variable does not resolve) is omitted from the line rather than failing the request.
 - Custom values pass through the same redaction as every other field.
-- Resolved at proxy scope today; origin and tenant scopes compose the same way once their observability-log plumbing is consumed at runtime.
+- Resolved at proxy scope today. A tenant- and origin-scope `custom_fields:` is a planned extension; tenant and origin observability already carry per-scope `redact:` and `sinks:`, and custom fields will compose proxy then tenant then origin the same way.
