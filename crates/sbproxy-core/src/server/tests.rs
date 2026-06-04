@@ -3081,3 +3081,146 @@ async fn jwt_with_require_mtls_bound_denies_when_thumbprint_mismatches() {
         other => panic!("expected 401 deny, got {other:?}"),
     }
 }
+
+/// RFC 7638 thumbprint of the bundled DPoP fixture key
+/// (`crates/sbproxy-modules/src/auth/dpop_test_ec_p256.pem`).
+const DPOP_FIXTURE_JKT: &str = "IeJTwmoSPsFMO6w48KpbHar6spW4kZZ9UvgEXQ0hOwA";
+
+/// Mint a DPoP proof signed by the bundled P-256 fixture key, embedding
+/// the matching public JWK so the verifier derives the same jkt as
+/// [`DPOP_FIXTURE_JKT`]. Test-only.
+fn mint_dpop_proof(htm: &str, htu: &str, jti: &str) -> String {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    const PEM: &str = include_str!("../../../sbproxy-modules/src/auth/dpop_test_ec_p256.pem");
+    const JWK: &str = r#"{"kty":"EC","crv":"P-256","x":"DpZdjog3y9hgIyKgEPltBi5ptXKUeuRwVOAPSmoQAu4","y":"bfVVYV9slbMcg4dvtvYbeekYtpFXsYCWcIa9RCrBmTc"}"#;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut header = Header::new(Algorithm::ES256);
+    header.typ = Some("dpop+jwt".to_string());
+    header.jwk = Some(serde_json::from_str(JWK).unwrap());
+    let claims = serde_json::json!({ "jti": jti, "htm": htm, "htu": htu, "iat": now });
+    encode(
+        &header,
+        &claims,
+        &EncodingKey::from_ec_pem(PEM.as_bytes()).unwrap(),
+    )
+    .unwrap()
+}
+
+/// WOR-1136: the inbound DPoP verifier must keep its (jkt, jti) replay
+/// cache across requests. Mint one valid proof, accept it once, then
+/// replay the identical bytes on a second request and assert the second
+/// is denied. Guards against the verifier being reconstructed per
+/// request (which would void replay protection).
+#[tokio::test]
+async fn bearer_dpop_replayed_proof_denied_across_requests() {
+    let auth = super::Auth::Bearer(sbproxy_modules::auth::BearerAuth {
+        tokens: vec![sbproxy_modules::auth::BearerToken {
+            secret: "tok-replay".to_string(),
+            attrs: sbproxy_modules::auth::CredentialAttrs {
+                metadata: std::collections::BTreeMap::from([(
+                    "dpop_jkt".to_string(),
+                    DPOP_FIXTURE_JKT.to_string(),
+                )]),
+                ..Default::default()
+            },
+        }],
+        require_dpop: true,
+    });
+    let proof = mint_dpop_proof("POST", "https://api.local/api/foo", "replay-jti-1");
+    let mut headers = http::HeaderMap::new();
+    headers.insert(http::header::HOST, "api.local".parse().unwrap());
+    headers.insert(
+        http::header::AUTHORIZATION,
+        "Bearer tok-replay".parse().unwrap(),
+    );
+    headers.insert("DPoP", proof.parse().unwrap());
+
+    // First request: the proof is fresh, so the DPoP step passes.
+    let (first, _) = super::check_auth_with_tls(
+        &auth,
+        &headers,
+        None,
+        "POST",
+        "/api/foo",
+        test_tenant(),
+        None,
+    )
+    .await;
+    assert!(
+        !matches!(first, super::AuthResult::Deny(..)),
+        "first use of a fresh proof should not be denied, got {first:?}"
+    );
+
+    // Second request: identical proof bytes. The persistent replay
+    // cache must reject it.
+    let (second, _) = super::check_auth_with_tls(
+        &auth,
+        &headers,
+        None,
+        "POST",
+        "/api/foo",
+        test_tenant(),
+        None,
+    )
+    .await;
+    match second {
+        super::AuthResult::Deny(401, msg) => assert!(
+            msg.to_lowercase().contains("dpop"),
+            "replay deny should mention DPoP, got: {msg}"
+        ),
+        other => panic!("expected 401 replay deny on the second request, got {other:?}"),
+    }
+}
+
+/// WOR-1137: a JWT provider with `require_mtls_bound = true` must reject
+/// a token that carries no `cnf` claim. Before the fix the dispatcher
+/// built the verifier with `require_cnf = false`, so a plain bearer JWT
+/// bypassed the binding.
+#[tokio::test]
+async fn jwt_with_require_mtls_bound_denies_when_cnf_absent() {
+    let auth = super::Auth::Jwt(sbproxy_modules::auth::JwtAuth {
+        secret: Some("dev-secret".to_string()),
+        require_mtls_bound: true,
+        ..Default::default()
+    });
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    // No `cnf` claim at all.
+    let claims = serde_json::json!({
+        "sub": "alice",
+        "iat": 0,
+        "exp": 9_999_999_999_u64,
+    });
+    let token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(b"dev-secret"),
+    )
+    .unwrap();
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    // Production passes None today; a no-cnf token must be denied
+    // regardless of the presented thumbprint.
+    let (result, _) = super::check_auth_with_tls(
+        &auth,
+        &headers,
+        None,
+        "POST",
+        "/api/foo",
+        test_tenant(),
+        None,
+    )
+    .await;
+    match result {
+        super::AuthResult::Deny(401, msg) => assert!(
+            msg.contains("mTLS"),
+            "deny reason should mention mTLS, got: {msg}"
+        ),
+        other => panic!("expected 401 deny for a no-cnf token, got {other:?}"),
+    }
+}
