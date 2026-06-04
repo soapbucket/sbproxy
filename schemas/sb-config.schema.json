@@ -1801,6 +1801,20 @@
           "items": {
             "$ref": "#/definitions/CredentialPolicy"
           }
+        },
+        "route_to_model": {
+          "description": "Pin the upstream `model` field. When set, the AI dispatch rewrites the request's `model` before sending it to the provider; the client-supplied value is ignored. Mirrors the `route_to_model` field on the underlying `VirtualKeyConfig`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "inject_tools": {
+          "description": "Replace the request's `tools` array with these entries. The shape is provider-native (`function` objects today); the AI dispatch forwards the array verbatim. Empty == no injection. Mirrors `inject_tools` on the underlying `VirtualKeyConfig`.",
+          "default": [],
+          "type": "array",
+          "items": true
         }
       }
     },
