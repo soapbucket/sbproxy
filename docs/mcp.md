@@ -63,7 +63,7 @@ origins:
             - db.query
 ```
 
-Adapted from `examples/97-mcp-federation/sb.yml`. The wire-format
+Adapted from `examples/mcp-federation/sb.yml`. The wire-format
 struct is `McpActionConfig` in
 `crates/sbproxy-modules/src/action/mcp.rs`.
 
@@ -330,7 +330,7 @@ backend. Source:
 ## End-to-end example
 
 The full happy path lives at
-[`examples/97-mcp-federation/sb.yml`](../examples/97-mcp-federation/sb.yml).
+[`examples/mcp-federation/sb.yml`](../examples/mcp-federation/sb.yml).
 That fixture covers federated upstreams, prefix namespacing,
 `tool_allowlist`, and a curl recipe for `initialize`, `tools/list`,
 and `tools/call`.

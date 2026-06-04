@@ -89,6 +89,10 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [build.md](build.md) - building from source, supported platforms, optional features.
 - [CONTRIBUTING.md](../CONTRIBUTING.md) - how to set up a dev environment and submit changes.
 
+### AI-discoverable corpora
+- [llms.txt](llms.txt) - flat capability catalog (one line per shipped feature), per the [llmstxt.org](https://llmstxt.org/) convention. The small index AI tools fetch first.
+- [llms-full.txt](llms-full.txt) - the entire docs corpus (this directory + the top-level `README.md`, `MIGRATION.md`, `CHANGELOG.md`) flattened into one file so AI tools that want the full set get it in one HTTP request. Generated; do not hand-edit. Regenerate with `scripts/regen-llms-full.sh` after any docs change. Mirrored live at <https://sbproxy.dev/llms-full.txt>.
+
 ## Quick start
 
 ```bash

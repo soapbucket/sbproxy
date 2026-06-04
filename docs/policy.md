@@ -110,7 +110,7 @@ policies:
       additionalProperties: false
 ```
 
-Runnable example: `examples/81-request-validator/sb.yml`.
+Runnable example: `examples/request-validator/sb.yml`.
 
 ## concurrent_limit
 
@@ -131,7 +131,7 @@ policies:
     error_body: '{"error":"too many concurrent requests, retry shortly"}'
 ```
 
-Runnable example: `examples/82-concurrent-limit/sb.yml`.
+Runnable example: `examples/concurrent-limit/sb.yml`.
 
 ## http_framing
 
