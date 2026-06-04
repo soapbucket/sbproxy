@@ -67,18 +67,24 @@ impl PolicyEnforcer for ObjectAuthzEnforcer {
                 .filter(|s| !s.is_empty()),
         };
 
-        // Roles always come from the trusted role header (comma-separated).
-        let roles: Vec<String> = req
-            .headers()
-            .get(pcfg.role_header.as_str())
-            .and_then(|v| v.to_str().ok())
-            .map(|s| {
-                s.split(',')
-                    .map(|r| r.trim().to_string())
-                    .filter(|r| !r.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
+        // WOR-1139: roles come from `role_header` only when the operator
+        // has explicitly trusted it. By default the header is ignored so
+        // a direct client cannot send `x-roles: admin` and satisfy a BFLA
+        // role rule; the rule then fails closed (no roles -> no match).
+        let roles: Vec<String> = if pcfg.trust_role_header {
+            req.headers()
+                .get(pcfg.role_header.as_str())
+                .and_then(|v| v.to_str().ok())
+                .map(|s| {
+                    s.split(',')
+                        .map(|r| r.trim().to_string())
+                        .filter(|r| !r.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         let principal = Principal { owner, roles };
         let method = req.method().as_str().to_string();
