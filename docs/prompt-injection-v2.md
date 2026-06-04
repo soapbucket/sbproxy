@@ -247,6 +247,48 @@ spec:
 A runnable config is at
 [`examples/prompt-injection-sidecar/`](../examples/prompt-injection-sidecar/).
 
+### Unix domain socket transport (co-located only)
+
+When the sidecar is co-located with the proxy (in-pod or on the
+same host), the gateway can reach it over a Unix domain socket
+instead of loopback TCP. This skips the loopback round trip and
+stays bounded to the local filesystem namespace; the
+authentication boundary is filesystem permissions on the socket
+path rather than network reachability.
+
+Run the sidecar with `--listen-uds` (mutually exclusive with
+`--listen`):
+
+```bash
+cargo run -p sbproxy-classifier-sidecar -- \
+  --listen-uds /run/sbproxy/classifier.sock \
+  --default-model prompt-injection \
+  --model prompt-injection=/models/model.onnx:/models/tokenizer.json
+```
+
+The sidecar removes any stale socket file at the path on bind, so
+restarts after a crash do not hit `EADDRINUSE`. The parent
+directory must already exist; create it via a `tmpfiles.d` entry
+in systemd or a one-shot `mkdir` in an init container.
+
+Programmatic callers reach the UDS transport via the
+`ClassifierClient::connect_uds` and
+`ClassifierClient::connect_uds_lazy` constructors in
+`sbproxy-classifier-client`. The lazy form is the supervised-
+child pattern: build the client at proxy boot from sync code,
+let the supervisor (a separate follow-up) spawn the sidecar with
+`--listen-uds <path>`, and the first call races the sidecar's
+bind exactly once.
+
+Exposing the UDS path as a `detector_config.uds_path` YAML field
+on the `prompt_injection_v2` policy is a small follow-up; today
+the transport choice is wired at the `ClassifierClient`
+construction site rather than configured per-policy.
+
+TCP stays the default for the remote / external-sidecar case;
+the two transports do not coexist in the same sidecar process
+(`--listen` and `--listen-uds` are mutually exclusive).
+
 ## What the OSS scaffold scans
 
 The scaffold runs detection at request-filter time on the request URI

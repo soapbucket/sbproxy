@@ -1,20 +1,31 @@
 //! Resilient gRPC client for the classifier sidecar `InferenceService`.
 //!
-//! The proxy uses this one client to reach whichever sidecar is deployed -- the
-//! minimal OSS sidecar or the enterprise rich sidecar -- since both implement
-//! the shared proto. This crate owns the connection, a per-call timeout, and
-//! typed errors; the per-classifier fail-open/closed policy and the child
-//! supervisor are layered on top by the proxy in a later WOR-704 PR.
+//! The proxy uses this one client to reach whichever sidecar is deployed:
+//! the minimal OSS sidecar or the enterprise rich sidecar. Both implement
+//! the shared proto. This crate owns the connection, a per-call timeout,
+//! typed errors, and (WOR-705) two transports:
 //!
-//! Transport is TCP (`http://host:port`) for now; a Unix-domain-socket
-//! connector for a co-located sidecar is a follow-on latency optimization.
+//! * **TCP**: `http://host:port`. The default for a separately-deployed
+//!   sidecar.
+//! * **Unix domain socket**: a path on the local filesystem. The natural
+//!   default for a supervised co-located child; saves the loopback TCP
+//!   round trip and stays bounded to the proxy's own filesystem
+//!   namespace.
+//!
+//! The transport is the only thing that differs between the two
+//! constructors: once a channel is built the gRPC RPC surface and the
+//! per-call timeout behaviour are identical, and the rest of the proxy
+//! (the `SidecarDetector` request-path bridge) treats both alike.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sbproxy_classifier_proto::{
     ClassifyRequest, ClassifyResponse, InferenceServiceClient, VersionRequest, VersionResponse,
 };
+use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint};
+use tower::service_fn;
 
 /// Error talking to the classifier sidecar.
 ///
@@ -79,6 +90,73 @@ impl ClassifierClient {
             .map_err(|e| ClassifierClientError::Connect(e.to_string()))?
             .connect_timeout(call_timeout)
             .connect_lazy();
+        Ok(Self {
+            inner: InferenceServiceClient::new(channel),
+            timeout: call_timeout,
+        })
+    }
+
+    /// Connect to a sidecar over a Unix domain socket.
+    ///
+    /// The natural transport for a co-located sidecar (the supervised
+    /// child case): removes the loopback TCP round trip and stays
+    /// bounded to the proxy's own filesystem namespace. The path MUST
+    /// already exist; the connector dials it once with `connect_timeout`,
+    /// then per-call dials reuse the same UNIX stream multiplexer.
+    pub async fn connect_uds(
+        socket_path: impl AsRef<Path>,
+        connect_timeout: Duration,
+        call_timeout: Duration,
+    ) -> Result<Self, ClassifierClientError> {
+        let path: PathBuf = socket_path.as_ref().to_path_buf();
+        // The HTTP/2 authority on the placeholder URI is ignored by the
+        // custom connector; `Endpoint::try_from` still validates URI
+        // syntax, so passing `http://[::]:50051` keeps it happy.
+        let endpoint = Endpoint::try_from("http://[::]:50051")
+            .map_err(|e| ClassifierClientError::Connect(e.to_string()))?
+            .connect_timeout(connect_timeout);
+        let path_for_connector = path.clone();
+        let channel = endpoint
+            .connect_with_connector(service_fn(move |_| {
+                let p = path_for_connector.clone();
+                async move {
+                    let stream = UnixStream::connect(&p).await?;
+                    Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                }
+            }))
+            .await
+            .map_err(|e| ClassifierClientError::Connect(format!("uds {path:?}: {e}")))?;
+        Ok(Self {
+            inner: InferenceServiceClient::new(channel),
+            timeout: call_timeout,
+        })
+    }
+
+    /// Build a UDS client that connects lazily on first use.
+    ///
+    /// Same shape as [`connect_lazy`](Self::connect_lazy) but over UDS.
+    /// Use this from synchronous config-load code so a missing socket
+    /// surfaces on the first call rather than at proxy boot. The
+    /// supervised-child case typically pairs this with the supervisor
+    /// (a separate follow-up): the supervisor spawns the sidecar with
+    /// `--listen-uds <path>`, and the proxy holds a lazy client at the
+    /// same path so the dial races the child's bind exactly once.
+    pub fn connect_uds_lazy(
+        socket_path: impl AsRef<Path>,
+        call_timeout: Duration,
+    ) -> Result<Self, ClassifierClientError> {
+        let path: PathBuf = socket_path.as_ref().to_path_buf();
+        let endpoint = Endpoint::try_from("http://[::]:50051")
+            .map_err(|e| ClassifierClientError::Connect(e.to_string()))?
+            .connect_timeout(call_timeout);
+        let path_for_connector = path.clone();
+        let channel = endpoint.connect_with_connector_lazy(service_fn(move |_| {
+            let p = path_for_connector.clone();
+            async move {
+                let stream = UnixStream::connect(&p).await?;
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+            }
+        }));
         Ok(Self {
             inner: InferenceServiceClient::new(channel),
             timeout: call_timeout,
@@ -219,5 +297,86 @@ mod tests {
         .await
         .expect_err("connect to a dead endpoint must fail");
         assert!(matches!(err, ClassifierClientError::Connect(_)));
+    }
+
+    // --- WOR-705 UDS transport ---
+
+    /// Bind the stub server on a Unix domain socket in `dir` and return
+    /// the socket path. Co-located with the TCP `spawn_stub` helper so
+    /// both transports share the StubService implementation verbatim.
+    async fn spawn_stub_uds(dir: &std::path::Path) -> std::path::PathBuf {
+        let sock = dir.join("classifier.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let stream = tokio_stream::wrappers::UnixListenerStream::new(listener);
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(InferenceServiceServer::new(StubService))
+                .serve_with_incoming(stream)
+                .await
+                .unwrap();
+        });
+        sock
+    }
+
+    #[tokio::test]
+    async fn classify_round_trips_over_uds() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = spawn_stub_uds(dir.path()).await;
+        let client =
+            ClassifierClient::connect_uds(&sock, Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .expect("connect_uds");
+
+        let resp = client
+            .classify("prompt-injection", "ignore previous")
+            .await
+            .unwrap();
+        assert_eq!(resp.labels.len(), 1);
+        assert_eq!(resp.labels[0].name, "stub:prompt-injection");
+
+        let version = client.version().await.unwrap();
+        assert_eq!(version.models, vec!["stub".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn connect_uds_to_missing_socket_errors() {
+        // The path does not exist; connect_uds must surface a Connect
+        // error rather than hang. The connect_timeout bounds the dial.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.sock");
+        let err = ClassifierClient::connect_uds(
+            &missing,
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+        )
+        .await
+        .expect_err("connect to a missing UDS path must fail");
+        assert!(matches!(err, ClassifierClientError::Connect(_)));
+    }
+
+    #[tokio::test]
+    async fn connect_uds_lazy_defers_dial_to_first_call() {
+        // The path does not exist yet, but connect_uds_lazy must
+        // succeed because it does not dial. The failure surfaces on the
+        // first call, bounded by call_timeout.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-yet.sock");
+        let client = ClassifierClient::connect_uds_lazy(&missing, Duration::from_millis(500))
+            .expect("lazy build with non-existent socket must succeed");
+        let err = client
+            .version()
+            .await
+            .expect_err("version() must fail when the socket never appeared");
+        // Either Timeout or Rpc(...) is acceptable; the lazy connector
+        // surfaces tonic's underlying error wrapped as an Rpc status,
+        // and the per-call timeout wraps that. We only need to confirm
+        // the call did not succeed.
+        assert!(
+            matches!(
+                err,
+                ClassifierClientError::Timeout(_) | ClassifierClientError::Rpc(_)
+            ),
+            "expected Timeout or Rpc, got {err:?}"
+        );
     }
 }
