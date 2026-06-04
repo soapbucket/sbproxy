@@ -147,7 +147,6 @@ origins:
 }
 
 #[test]
-#[ignore = "credentials-block lowering drops route_to_model; see Linear ticket"]
 fn virtual_key_route_to_model_overrides_client_model() {
     let upstream = MockProvider::start();
     let proxy = ProxyHarness::start_with_yaml(&config_for(&upstream.base_url())).expect("start");

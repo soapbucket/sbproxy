@@ -2344,6 +2344,18 @@ pub struct CredentialBlock {
     /// Sub-policies that only fire when this credential matches.
     #[serde(default)]
     pub policies: Vec<CredentialPolicy>,
+    /// Pin the upstream `model` field. When set, the AI dispatch
+    /// rewrites the request's `model` before sending it to the
+    /// provider; the client-supplied value is ignored. Mirrors the
+    /// `route_to_model` field on the underlying `VirtualKeyConfig`.
+    #[serde(default)]
+    pub route_to_model: Option<String>,
+    /// Replace the request's `tools` array with these entries. The
+    /// shape is provider-native (`function` objects today); the AI
+    /// dispatch forwards the array verbatim. Empty == no injection.
+    /// Mirrors `inject_tools` on the underlying `VirtualKeyConfig`.
+    #[serde(default)]
+    pub inject_tools: Vec<serde_json::Value>,
 }
 
 /// Selector matching an inbound principal to a credential. At least

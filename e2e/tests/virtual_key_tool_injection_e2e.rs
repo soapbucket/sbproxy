@@ -115,11 +115,11 @@ fn parse_content_length(headers: &str) -> usize {
 fn config_for(upstream: &str) -> String {
     // Rewritten from the legacy `action.virtual_keys:` shape to the
     // unified `credentials:` block per docs/migration-credentials.md.
-    // The credentials-block lowering currently DROPS the
-    // `inject_tools` field, so the runtime injection still does not
-    // happen on a credential expressed this way. The
-    // inject-tools-specific tests below carry an `#[ignore]` with a
-    // Linear ticket reference until the lowering ships.
+    // `inject_tools` lands on the credential directly; the
+    // compile-time lowering materialises each ai_provider credential
+    // as the same virtual-key entry the AI handler used to consume,
+    // so the runtime tool-injection path is unchanged from the
+    // pre-credentials wire shape.
     format!(
         r#"
 proxy:
@@ -168,7 +168,6 @@ origins:
 }
 
 #[test]
-#[ignore = "credentials-block lowering drops inject_tools; see Linear ticket"]
 fn virtual_key_inject_tools_replaces_request_tools() {
     let upstream = MockProvider::start();
     let proxy = ProxyHarness::start_with_yaml(&config_for(&upstream.base_url())).expect("start");
@@ -253,7 +252,6 @@ fn plain_key_leaves_client_tools_intact() {
 }
 
 #[test]
-#[ignore = "credentials-block lowering drops inject_tools; see Linear ticket"]
 fn inject_tools_adds_when_client_sent_none() {
     let upstream = MockProvider::start();
     let proxy = ProxyHarness::start_with_yaml(&config_for(&upstream.base_url())).expect("start");
