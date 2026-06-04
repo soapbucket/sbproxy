@@ -281,7 +281,7 @@ Every redeem fires a metric and a structured-log line. The label set:
 | `payment_rail` | Closed enum: `none`, `x402`, `mpp_card`, `mpp_stablecoin`, `stripe_fiat`, `lightning`. | 6 |
 | `content_shape` | Closed enum: `html`, `markdown`, `json`, `pdf`, `other`. | 5 |
 
-Cardinality budgets are enforced by `sbproxy-observe::cardinality::CardinalityLimiter`; over-cap label values demote to `__other__` and increment `sbproxy_label_demotion_total`.
+Cardinality budgets are enforced by `sbproxy-observe::cardinality::CardinalityLimiter`; over-cap label values demote to `__other__` and increment `sbproxy_label_cardinality_overflow_total`.
 
 ### Metrics
 
