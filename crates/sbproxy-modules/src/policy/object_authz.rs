@@ -58,11 +58,19 @@ pub struct PrincipalConfig {
     /// Header carrying the owner when `owner_from = header`.
     #[serde(default = "default_owner_header")]
     pub owner_header: String,
-    /// Header carrying the caller's roles (comma-separated). Roles are
-    /// not part of the auth subject, so BFLA always reads them from a
-    /// trusted header set by the upstream auth layer.
+    /// Header carrying the caller's roles (comma-separated). Read only
+    /// when `trust_role_header` is true; a trusted upstream auth layer
+    /// must set it and the client must not be able to spoof it.
     #[serde(default = "default_role_header")]
     pub role_header: String,
+    /// Whether to trust `role_header` from the inbound request. Defaults
+    /// to `false`: roles are not read from a client-settable header
+    /// unless an operator explicitly opts in, because a direct client
+    /// could otherwise send `x-roles: admin` and satisfy any BFLA role
+    /// rule. Set to `true` only when a trusted upstream (an auth proxy,
+    /// a service mesh) populates the header and strips any client value.
+    #[serde(default)]
+    pub trust_role_header: bool,
 }
 
 impl Default for PrincipalConfig {
@@ -71,6 +79,7 @@ impl Default for PrincipalConfig {
             owner_from: OwnerSource::default(),
             owner_header: default_owner_header(),
             role_header: default_role_header(),
+            trust_role_header: false,
         }
     }
 }
@@ -552,6 +561,24 @@ mod tests {
             owner: owner.map(String::from),
             roles: roles.iter().map(|r| r.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn role_header_is_not_trusted_by_default() {
+        // WOR-1139: a config that omits trust_role_header must default to
+        // NOT trusting the client-settable role header, so a direct
+        // client cannot send `x-roles: admin` and satisfy a BFLA rule.
+        let cfg = PrincipalConfig::default();
+        assert!(
+            !cfg.trust_role_header,
+            "role header must not be trusted by default"
+        );
+        let from_empty: PrincipalConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!from_empty.trust_role_header);
+        // Explicit opt-in still works.
+        let opted: PrincipalConfig =
+            serde_json::from_value(serde_json::json!({ "trust_role_header": true })).unwrap();
+        assert!(opted.trust_role_header);
     }
 
     #[test]
