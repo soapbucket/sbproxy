@@ -1,0 +1,59 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Audit log: every state-mutating admin call emits a typed envelope.
+#
+# The OSS distribution writes audit envelopes to the structured-log
+# stream (same stream as the access log; one JSON object per event).
+# Pair with the log shipper you already run; durable persistence
+# (Postgres, S3, hash-chained verification) is the commercial
+# distribution's job and out of scope here.
+#
+# This config:
+#   1. Boots a small proxied origin so the proxy has something to
+#      reload (the canonical mutating admin call).
+#   2. Enables the admin server on :9090 with basic-auth so the
+#      mutation is reachable.
+#   3. Enables access-log too so you can compare the two streams
+#      side by side on stdout.
+#
+# Run:
+#   export ADMIN_PASSWORD=demo
+#   make run CONFIG=examples/audit-log/sb.yml
+#
+# Then trigger a state-mutating admin call (the canonical audited
+# verb is `reload`):
+#   curl -s -X POST -u admin:demo http://127.0.0.1:9090/admin/reload
+#
+# Watch stdout: one access-log line for the reload request itself,
+# plus one audit envelope (json, target_kind: admin) for the
+# mutation. Wire format + redaction rules are documented at
+# docs/audit-log.md.
+
+proxy:
+  http_bind_port: 8080
+
+  # Admin server: enabled, loopback-only, basic-auth-gated. Required
+  # for any of the audited mutations.
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: !env ADMIN_PASSWORD
+    # Bounded in-memory log buffer the admin /api/logs route reads
+    # from; not the audit sink itself.
+    max_log_entries: 1000
+
+# Access log on stdout. Pair this with the audit envelopes; both
+# stream through the same structured-log channel so a log shipper
+# picks both up without further wiring.
+access_log:
+  enabled: true
+  capture_headers:
+    request: [user-agent, x-request-id]
+
+origins:
+  # A regular proxied origin gives the admin reload something to act
+  # on (reloading is the mutation that emits the audit event).
+  "api.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
