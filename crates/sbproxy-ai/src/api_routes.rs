@@ -131,7 +131,7 @@ pub fn provider_supports_realtime(provider: &str) -> bool {
 /// | surface | openai | anthropic | gemini | vertex | bedrock | cohere | other |
 /// |---|---|---|---|---|---|---|---|
 /// | chat, models, messages, responses | yes | yes | yes | yes | yes | yes | yes |
-/// | embeddings | yes | no | no | yes | no | yes | no |
+/// | embeddings | yes | no | yes | yes | no | yes | no |
 /// | reranking | yes | no | no | yes | no | yes | no |
 /// | image generation | yes | no | no | yes | no | no | no |
 /// | audio transcription, audio speech | yes | no | no | yes | no | no | no |
@@ -297,8 +297,18 @@ pub fn provider_format_supports_surface(
         // with format: openai inherits this row.
         ProviderFormat::OpenAi => true,
 
-        // Anthropic, Google, Bedrock, Custom: only universal
-        // (chat / models / messages / responses) above.
+        // WOR-824 item 2: Google embeddings translated via the
+        // `gemini_embeddings` sub-translator
+        // (`embedContent` / `batchEmbedContents`). Other Google
+        // non-chat surfaces (image, audio, reranking) are
+        // out-of-scope here because they live in separate Google
+        // Cloud services (Imagen, Speech-to-Text, Text-to-Speech,
+        // Vertex Ranking) rather than the Gemini API surface.
+        ProviderFormat::Google if matches!(surface, AiSurface::Embeddings) => true,
+
+        // Anthropic, Google (everything else), Bedrock, Custom:
+        // only universal (chat / models / messages / responses)
+        // above.
         ProviderFormat::Anthropic
         | ProviderFormat::Google
         | ProviderFormat::Bedrock
@@ -349,7 +359,12 @@ mod tests {
                 ),
                 // Cohere: embeddings + reranking.
                 "cohere" => matches!(surface, Embeddings | Reranking),
-                // anthropic, gemini, bedrock, unknown: universal only.
+                // Gemini (Google wire format) gains Embeddings as of
+                // WOR-824 item 2: the embeddings sub-translator
+                // maps to the Gemini `embedContent` /
+                // `batchEmbedContents` API.
+                "gemini" => matches!(surface, Embeddings),
+                // anthropic, bedrock, unknown: universal only.
                 _ => false,
             }
         }
@@ -428,7 +443,12 @@ mod tests {
             match format {
                 ProviderFormat::OpenAi => true,
                 ProviderFormat::Anthropic => false,
-                ProviderFormat::Google => false,
+                // WOR-824 item 2: Google embeddings is translated;
+                // other non-chat Google surfaces (image, audio,
+                // reranking) live in separate Google Cloud
+                // services (Imagen, Speech, Vertex Ranking) and
+                // are filed as their own follow-up tickets.
+                ProviderFormat::Google => matches!(surface, Embeddings),
                 ProviderFormat::Bedrock => false,
                 ProviderFormat::Custom => false,
             }
@@ -882,25 +902,29 @@ mod tests {
     #[test]
     fn surface_matrix_gemini_supports_only_translated_chat_surfaces() {
         use crate::handler::AiSurface;
-        // Gemini is the Google wire format and only has a chat-completions
-        // translator; chat + the inbound shims (Messages/Responses, which
-        // translate down to chat) work, and models is universal.
+        // Gemini is the Google wire format. Chat + the inbound shims
+        // (Messages/Responses, which translate down to chat) work,
+        // and models is universal. WOR-824 item 2 added the
+        // embeddings translator, so Embeddings is also true now.
         for surface in &[
             AiSurface::ChatCompletions,
             AiSurface::Models,
             AiSurface::Messages,
             AiSurface::Responses,
+            AiSurface::Embeddings, // WOR-824 item 2
         ] {
             assert!(
                 provider_supports_surface("gemini", surface),
                 "gemini should support {surface:?}"
             );
         }
-        // WOR-752 Finding A: these have no Google translator, so the
-        // gateway must 501 rather than forward verbatim to a path Gemini
-        // does not expose.
+        // WOR-752 Finding A: these still have no Google translator,
+        // so the gateway must 501 rather than forward verbatim to a
+        // path Gemini does not expose. Image generation (Imagen),
+        // audio transcription / speech (Google Cloud Speech), and
+        // reranking (Vertex Ranking) live in separate Google Cloud
+        // services and are filed as their own follow-up tickets.
         for surface in &[
-            AiSurface::Embeddings,
             AiSurface::ImageGeneration,
             AiSurface::AudioTranscription,
             AiSurface::AudioSpeech,
@@ -948,10 +972,25 @@ mod tests {
                 "vertex should not advertise support for {surface:?}"
             );
         }
-        // The Finding A divergence: vertex (passthrough) advertises
-        // surfaces that gemini (translated, no translator) must not.
+        // Finding A divergence: vertex (passthrough) advertises
+        // image / audio / reranking that gemini (translated, no
+        // translator for those surfaces) must not. Embeddings was
+        // historically part of this divergence; WOR-824 item 2
+        // added the Gemini embeddings translator, so both vertex
+        // and gemini now advertise Embeddings (gemini via
+        // translator, vertex via the OpenAI-compatible passthrough).
         assert!(provider_supports_surface("vertex", &AiSurface::Embeddings));
-        assert!(!provider_supports_surface("gemini", &AiSurface::Embeddings));
+        assert!(provider_supports_surface("gemini", &AiSurface::Embeddings));
+        assert!(provider_supports_surface(
+            "vertex",
+            &AiSurface::ImageGeneration
+        ));
+        assert!(!provider_supports_surface(
+            "gemini",
+            &AiSurface::ImageGeneration
+        ));
+        assert!(provider_supports_surface("vertex", &AiSurface::Reranking));
+        assert!(!provider_supports_surface("gemini", &AiSurface::Reranking));
     }
 
     #[test]

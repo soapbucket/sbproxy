@@ -16,6 +16,12 @@
 pub mod anthropic;
 pub mod bedrock;
 pub mod gemini;
+/// WOR-824 item 2: Google Gemini embeddings sub-translator.
+/// Reachable through [`gemini::request_to_native`] /
+/// [`gemini::response_to_openai`] when the path is `/v1/embeddings`
+/// (request side) or the response carries an `embedding` /
+/// `embeddings` field with no `candidates` (response side).
+pub mod gemini_embeddings;
 
 use crate::providers::ProviderFormat;
 

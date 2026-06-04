@@ -39,6 +39,13 @@ use serde_json::{json, Map, Value};
 ///     `seed`, `user`) are dropped. Unknown extensions pass through
 ///     untouched at the top level.
 pub fn request_to_native(body: Value, path: &str) -> (Value, String) {
+    // WOR-824 item 2: surface dispatch. Embedding requests reach the
+    // gateway at /v1/embeddings; route them to the embeddings
+    // sub-translator instead of pretending they are chat.
+    if super::gemini_embeddings::is_embeddings_path(path) {
+        return super::gemini_embeddings::request_to_native(body, path);
+    }
+
     let mut obj: Map<String, Value> = match body {
         Value::Object(m) => m,
         other => return (other, path.to_string()),
@@ -269,6 +276,16 @@ fn message_to_content(m: &Value) -> Value {
 ///     `completion_tokens`.
 ///   * `modelVersion` (when present) -> OpenAI `model`.
 pub fn response_to_openai(body: Value) -> Value {
+    // WOR-824 item 2: shape-based dispatch. A Gemini embeddings
+    // response carries `embedding` or `embeddings` at the top
+    // level (no `candidates`); send it to the embeddings sub-
+    // translator. Detecting by shape rather than threading the
+    // path through the existing signature keeps the dispatcher
+    // API unchanged.
+    if super::gemini_embeddings::looks_like_embeddings_response(&body) {
+        return super::gemini_embeddings::response_to_openai(body);
+    }
+
     let m = match body {
         Value::Object(m) => m,
         other => return other,
