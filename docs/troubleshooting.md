@@ -1,7 +1,18 @@
 # Troubleshooting
-*Last modified: 2026-04-25*
+*Last modified: 2026-06-04*
 
 When something breaks, this is the first place to look. For *why* these things happen, see [architecture.md](architecture.md).
+
+## A config setting seems to be ignored
+
+You set a config key and nothing changes, with no error at boot.
+
+The most common cause is a misspelled key or one at the wrong nesting level. The config loader keeps an unrecognized key out of the compiled config and the field falls back to its default, which for a protection usually means off.
+
+Check:
+- Compare the key against `schemas/sb-config.schema.json`, which is the generated source of truth for every valid key and its nesting.
+- Run `sbproxy validate --config sb.yml` to parse the file offline before serving.
+- As a quick test, rename the suspect key to something obviously wrong and confirm the behavior is identical. If it is, the key was never taking effect.
 
 ## 404, origin not found
 
@@ -18,8 +29,8 @@ Usually one of: file watcher debounce, ConfigMap symlink swap, or a validation f
 
 Check:
 - A config with a validation error gets logged and rejected. The old config keeps running. Run `sbproxy validate --config sb.yml` to see the error.
-- Kubernetes ConfigMaps swap via atomic symlink. The watcher catches this, but detection can lag up to 2 seconds.
-- If your editor writes to a temp file and renames, make sure the watcher sees the final filename, not the temp.
+- The file watcher reacts to in-place writes. Saves that replace the file by atomic rename (many editors, `sed -i`, and Kubernetes ConfigMap symlink swaps) may not be detected. After a ConfigMap update, send `SIGHUP` or restart the pod to force the reload.
+- The `agent_classes`, `agent_detect`, and `tls_fingerprint` installers are applied at startup and are not currently re-applied on reload. Restart the process to pick up changes to those blocks.
 
 ## AI requests fail with provider error
 
@@ -63,6 +74,28 @@ Check:
 - Confirm UDP/443 is reachable: `nc -u -v -z <host> 443`.
 - The browser advertises HTTP/3 support via the `Alt-Svc` header. If the response does not include `Alt-Svc: h3=":443"`, the proxy is not advertising it.
 - HTTP/3 must be explicitly enabled in the `proxy.tls.http3` block. It is off by default.
+
+## An example docker compose stack will not start
+
+The compose-based examples build the `sbproxy` image from source in the container (`build: ../..`, `Dockerfile.cloudbuild`) and pull base images such as `wiremock/wiremock` from Docker Hub.
+
+Check:
+- Look for `pull access denied` or `auth.docker.io ... unexpected EOF` in the compose output. That is a registry-connectivity problem, not an example defect.
+- Confirm the daemon is up with `docker info`, and that the host can reach Docker Hub.
+- Pre-pull the base images (or build the `sbproxy` image once) so a later `docker compose up` works from cache.
+
+## Build and run quick reference
+
+```bash
+# Debug build
+make build                          # -> target/debug/sbproxy
+# Release build (required by the e2e harness)
+cargo build --release -p sbproxy    # -> target/release/sbproxy
+# Validate a config offline before serving
+sbproxy validate --config ./sb.yml
+# Run
+./target/release/sbproxy serve -f ./sb.yml
+```
 
 ## Structured log fields reference
 

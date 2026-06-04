@@ -11,6 +11,11 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 
 ### Getting started
 - [manual.md](manual.md) - install, CLI, runtime, TLS, deployment patterns.
+- [getting-started-api-estate.md](getting-started-api-estate.md) - put SBproxy in front of existing APIs with auth, rate limits, and header rewrites.
+- [getting-started-content-estate.md](getting-started-content-estate.md) - HTML-to-markdown and content transformation for agents.
+- [getting-started-ai-estate.md](getting-started-ai-estate.md) - run SBproxy as the LLM gateway in front of model providers.
+- [getting-started-agent-identity.md](getting-started-agent-identity.md) - issue and enforce agent identity at the edge.
+- [getting-started-sovereign-multicloud.md](getting-started-sovereign-multicloud.md) - Kubernetes, sidecar, and secret-backend deployment.
 - [configuration.md](configuration.md) - every `sb.yml` field with examples.
 - [json-schema.md](json-schema.md) - JSON Schema for editor autocomplete + validation of `sb.yml`.
 - [mcp-schema-drift.md](mcp-schema-drift.md) - CI-friendly schema-drift detection for converted MCP servers (the `sbproxy-mcp-drift` CLI).
