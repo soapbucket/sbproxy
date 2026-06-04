@@ -289,6 +289,55 @@ TCP stays the default for the remote / external-sidecar case;
 the two transports do not coexist in the same sidecar process
 (`--listen` and `--listen-uds` are mutually exclusive).
 
+### Child supervisor (auto-spawn)
+
+For the standalone / single-pod case, the proxy can spawn and
+supervise the sidecar binary itself rather than expect the
+operator to run it out of band. The `Supervisor` type in
+`sbproxy_classifier_client::supervisor` owns the child's
+lifecycle:
+
+* Spawns `sbproxy-classifier-sidecar --listen-uds <path>
+  --model <id=model:tokenizer> ...` per the configured
+  `SupervisorConfig`.
+* Restarts the child on unexpected exit with exponential
+  backoff (initial 200 ms, capped at 30 s; a child that
+  survives 30 s resets the backoff schedule on the next crash).
+* On graceful shutdown sends SIGTERM, waits up to
+  `shutdown_grace` (default 5 s), then SIGKILL.
+
+The pattern pairs naturally with `connect_uds_lazy`: the
+supervisor passes the UDS path to the child; the proxy holds a
+lazy client at the same path; the first `classify` call races
+the child's bind exactly once.
+
+```rust
+use std::path::PathBuf;
+use std::time::Duration;
+use sbproxy_classifier_client::{ClassifierClient, Supervisor, SupervisorConfig};
+
+let uds_path = PathBuf::from("/run/sbproxy/classifier.sock");
+
+let supervisor = Supervisor::spawn(SupervisorConfig {
+    binary: PathBuf::from("/opt/sbproxy/sbproxy-classifier-sidecar"),
+    uds_path: uds_path.clone(),
+    models: vec!["prompt-injection=/models/model.onnx:/models/tokenizer.json".into()],
+    default_model: Some("prompt-injection".into()),
+    ..SupervisorConfig::default()
+});
+
+let client = ClassifierClient::connect_uds_lazy(&uds_path, Duration::from_millis(250))?;
+
+// ... at shutdown ...
+supervisor.shutdown().await;
+```
+
+`Supervisor` is `Clone`; cheap clones share lifecycle state.
+The proxy's `prompt_injection_v2` policy does not surface this
+in YAML yet; the wire-up is in code (the proxy holds the
+supervisor next to the lazy client and drives both from the
+same config block).
+
 ## What the OSS scaffold scans
 
 The scaffold runs detection at request-filter time on the request URI
