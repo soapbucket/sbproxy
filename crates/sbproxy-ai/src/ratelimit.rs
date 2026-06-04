@@ -432,6 +432,23 @@ impl ModelRateLimiter {
         cfg: &ModelRateConfig,
         estimated_tokens: Option<u64>,
     ) -> Result<Admission, Rejection> {
+        // Tenant-blind entry point retained for existing callers and
+        // tests; rejections roll up to the empty-tenant bucket.
+        self.admit_with_tenant(apikey, model, "", cfg, estimated_tokens)
+    }
+
+    /// WOR-1096: tenant-attributed admission. Identical to
+    /// [`Self::admit`] but stamps `tenant` onto the
+    /// `sbproxy_ai_ratelimit_rejected_total` counter so a tenant that
+    /// hits its TPM/RPM cap is distinguishable from global pressure.
+    pub fn admit_with_tenant(
+        &self,
+        apikey: &str,
+        model: &str,
+        tenant: &str,
+        cfg: &ModelRateConfig,
+        estimated_tokens: Option<u64>,
+    ) -> Result<Admission, Rejection> {
         let est = estimated_tokens.unwrap_or(self.default_estimated_tokens);
         let bucket = self.entity(apikey, model, cfg);
         let now = Instant::now();
@@ -443,33 +460,39 @@ impl ModelRateLimiter {
         let permit = match Arc::clone(&bucket.concurrent).try_acquire_owned() {
             Ok(p) => Some(p),
             Err(_) => {
-                return Err(self.reject(apikey, model, RejectReason::Concurrent, 1));
+                return Err(self.reject(apikey, model, tenant, RejectReason::Concurrent, 1));
             }
         };
 
         // RPM
         if let Err(retry) = bucket.rpm.lock().try_acquire(1.0, now) {
-            return Err(self.reject(apikey, model, RejectReason::RequestsPerMinute, retry));
+            return Err(self.reject(
+                apikey,
+                model,
+                tenant,
+                RejectReason::RequestsPerMinute,
+                retry,
+            ));
         }
         // RPD
         if let Err(retry) = bucket.rpd.lock().try_acquire(1.0, now) {
             // Refund RPM so a daily reject does not eat a minute
             // slot we will never use.
             bucket.rpm.lock().refund(1.0);
-            return Err(self.reject(apikey, model, RejectReason::RequestsPerDay, retry));
+            return Err(self.reject(apikey, model, tenant, RejectReason::RequestsPerDay, retry));
         }
         // TPM
         if let Err(retry) = bucket.tpm.lock().try_acquire(est as f64, now) {
             bucket.rpm.lock().refund(1.0);
             bucket.rpd.lock().refund(1.0);
-            return Err(self.reject(apikey, model, RejectReason::TokensPerMinute, retry));
+            return Err(self.reject(apikey, model, tenant, RejectReason::TokensPerMinute, retry));
         }
         // TPD
         if let Err(retry) = bucket.tpd.lock().try_acquire(est as f64, now) {
             bucket.rpm.lock().refund(1.0);
             bucket.rpd.lock().refund(1.0);
             bucket.tpm.lock().refund(est as f64);
-            return Err(self.reject(apikey, model, RejectReason::TokensPerDay, retry));
+            return Err(self.reject(apikey, model, tenant, RejectReason::TokensPerDay, retry));
         }
 
         Ok(Admission {
@@ -485,8 +508,15 @@ impl ModelRateLimiter {
     /// `sbproxy_ai_ratelimit_rejected_total` counter and returns the
     /// rejection payload. Pulled out so every rejection path stays in
     /// lockstep with the metric.
-    fn reject(&self, apikey: &str, model: &str, reason: RejectReason, retry: u64) -> Rejection {
-        crate::ai_metrics::record_ratelimit_rejected(reason.axis_label(), apikey, model);
+    fn reject(
+        &self,
+        apikey: &str,
+        model: &str,
+        tenant: &str,
+        reason: RejectReason,
+        retry: u64,
+    ) -> Rejection {
+        crate::ai_metrics::record_ratelimit_rejected(reason.axis_label(), apikey, tenant, model);
         Rejection {
             reason,
             retry_after_secs: retry,
@@ -823,10 +853,10 @@ mod tests {
         // other test that touches the same global counter.
         let key = "metric-test-key-rpm";
         let model = "metric-test-model";
-        let before = ratelimit_rejected_value("rpm", key, model);
+        let before = ratelimit_rejected_value("rpm", key, "", model);
         let _a = limiter.admit(key, model, &c, Some(0)).unwrap();
         let _err = limiter.admit(key, model, &c, Some(0)).unwrap_err();
-        let after = ratelimit_rejected_value("rpm", key, model);
+        let after = ratelimit_rejected_value("rpm", key, "", model);
         assert!(
             after >= before + 1.0,
             "expected rpm counter to tick (before={before}, after={after})"

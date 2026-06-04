@@ -3678,6 +3678,7 @@ impl ProxyHttp for SbProxy {
                 usage,
                 0.0,
                 Vec::new(),
+                &ctx.attribution_tags,
             );
             info!(
                 ai.surface = rd.surface_label,

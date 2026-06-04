@@ -264,6 +264,23 @@ pub fn install_sink_dispatcher(dispatcher: SinkDispatcher) -> bool {
     false
 }
 
+/// WOR-1102: report whether the sink-dispatcher lock is usable.
+///
+/// Returns `false` only when the dispatcher slot has been initialised
+/// but its `RwLock` is poisoned (a sink panicked while holding the
+/// lock), which means the hot-emit path can no longer read the
+/// dispatcher and telemetry export is effectively down. An
+/// uninitialised slot (boot time, a config with no sinks) returns
+/// `true`: that is a valid state, not a failure. The readiness probe
+/// in [`crate::health`] consults this so a poisoned dispatcher drains
+/// the pod instead of silently black-holing telemetry.
+pub fn sink_dispatcher_healthy() -> bool {
+    match SINK_DISPATCHER.get() {
+        None => true,
+        Some(lock) => lock.read().is_ok(),
+    }
+}
+
 /// Read the current dispatcher. Returns `Some(arc)` when at least one
 /// sink is installed; returns `None` when the dispatcher slot is
 /// empty (boot time, tests, no sinks block). The [`crate::logging::emit`]
@@ -364,7 +381,17 @@ impl SinkOutput for FileSink {
         use std::io::Write;
         let _g = self.guard.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            // WOR-1100: a failed mkdir means the subsequent append also
+            // fails and the log line is silently lost. Count + log it
+            // so the blackhole is visible.
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                crate::metrics::record_telemetry_dropped("file_sink", "mkdir_failed");
+                tracing::warn!(
+                    path = %parent.display(),
+                    error = %e,
+                    "file sink: could not create parent directory; log line dropped"
+                );
+            }
         }
         // Rotate before the append when the active file has reached
         // the configured threshold.

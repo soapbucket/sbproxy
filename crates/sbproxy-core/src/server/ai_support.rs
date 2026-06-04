@@ -693,6 +693,7 @@ pub(super) fn cached_message_signature_verifier(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_ai_billing_event(
     surface_label: &str,
     provider_name: &str,
@@ -700,7 +701,36 @@ pub(super) fn emit_ai_billing_event(
     usage: sbproxy_ai::budget::AiUsage,
     cost_usd: f64,
     scope_keys: Vec<String>,
+    tags: &sbproxy_ai::attribution::AttributionTags,
 ) {
+    // Feed the per-attribution spend metrics from the single billing
+    // choke point so every surface (unary, streaming, audio, image,
+    // rerank, and cache-hit replays) lands in the FinOps dashboard,
+    // not just the unary chat path. Provider / model / token-kind /
+    // USD are always known here; the business attribution dimensions
+    // (project / feature / team) ride on the credential principal and
+    // are stamped at the dispatch site via `record_tokens_attributed`,
+    // so they roll up to the catch-all bucket here and the two views
+    // join on provider+model. The recorder skips zero counts, so an
+    // image / audio event records its USD cost without phantom token
+    // rows.
+    let (input_tokens, output_tokens) = match &usage {
+        sbproxy_ai::budget::AiUsage::Tokens { input, output } => (*input, *output),
+        _ => (0, 0),
+    };
+    let model_label = model.as_deref().unwrap_or("");
+    sbproxy_ai::ai_metrics::record_ai_request_attributed(
+        provider_name,
+        model_label,
+        tags,
+        input_tokens,
+        output_tokens,
+        0,
+        0,
+        0,
+        cost_usd,
+    );
+
     let event =
         sbproxy_ai::budget::AiBillingEvent::from_label(surface_label, provider_name, model, usage)
             .with_cost(cost_usd)
@@ -712,6 +742,94 @@ pub(super) fn emit_ai_billing_event(
         ai.cost_usd = event.cost_usd,
         ai.occurred_at_unix_secs = event.occurred_at_unix_secs,
         "AI billing event"
+    );
+}
+
+/// Resolve the business attribution tags for a request.
+///
+/// The credential's `attrs:` (project + team) provide the defaults; the
+/// inbound `SB-Attr-*` headers (project / feature / okr / team /
+/// customer / environment / agent_type / risk_tier / trace_id) fill in
+/// the rest and override the credential where both are present. A
+/// malformed attribution header degrades to the credential defaults
+/// rather than failing the request. The result is stamped on
+/// `ctx.attribution_tags` and fanned out to the per-attribution spend
+/// metric and the access log.
+pub(super) fn resolve_attribution_tags(
+    session: &Session,
+    principal: &sbproxy_plugin::Principal,
+) -> sbproxy_ai::attribution::AttributionTags {
+    use sbproxy_ai::attribution::AttributionTags;
+    let base = AttributionTags {
+        project: principal.attrs.project.clone(),
+        team: principal.attrs.team.clone(),
+        ..Default::default()
+    };
+    let headers = session
+        .req_header()
+        .headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_bytes()));
+    match sbproxy_ai::attribution::parse_from_headers(headers) {
+        Ok(parsed) => parsed.or_default_from(&base),
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "attribution: ignoring malformed SB-Attr-* header; using credential defaults"
+            );
+            base
+        }
+    }
+}
+
+/// Record a cache hit as a zero-marginal-cost ledger entry.
+///
+/// A served cache hit avoids an upstream call, but the transaction
+/// still happened from the ledger's point of view: the value was
+/// delivered. We record the cached prompt + completion tokens under
+/// the `cache_read` token-kind dimension with `cost_usd = 0.0` so the
+/// FinOps dashboard can show cache savings without the hit vanishing
+/// from the per-request spend record. `body` is the cached response
+/// payload; its `usage` block (when present) gives the token counts,
+/// and its `model` field (falling back to `fallback_model`) gives the
+/// model label.
+pub(super) fn record_cache_hit_savings(
+    provider: &str,
+    fallback_model: &str,
+    body: &[u8],
+    tags: &sbproxy_ai::attribution::AttributionTags,
+) {
+    let parsed = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let (prompt, completion) = parsed
+        .as_ref()
+        .and_then(|v| v.get("usage"))
+        .map(|u| {
+            let p = u
+                .get("prompt_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let c = u
+                .get("completion_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            (p, c)
+        })
+        .unwrap_or((0, 0));
+    let model = parsed
+        .as_ref()
+        .and_then(|v| v.get("model"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(fallback_model);
+    sbproxy_ai::ai_metrics::record_ai_request_attributed(
+        provider,
+        model,
+        tags,
+        0,
+        0,
+        prompt.saturating_add(completion),
+        0,
+        0,
+        0.0,
     );
 }
 

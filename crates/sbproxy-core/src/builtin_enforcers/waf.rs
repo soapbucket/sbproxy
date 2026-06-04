@@ -94,6 +94,11 @@ impl PolicyEnforcer for WafEnforcer {
         // still hold `ctx`), if persistent blocking is enabled. The
         // origin label for metrics/audit is the request hostname.
         let origin = ctx.hostname.to_string();
+        // WOR-1096: capture the tenant up front too, so the
+        // persistent-block metric is attributable per tenant from
+        // inside the `async move` closures below (which cannot borrow
+        // `ctx`). Each match arm moves its own clone.
+        let tenant = ctx.tenant_id.to_string();
         let block_state = policy.block_store().map(|store| {
             let kind = store.key_kind();
             let key = resolve_block_key(kind, store.cel_key(), req, ctx);
@@ -112,6 +117,7 @@ impl PolicyEnforcer for WafEnforcer {
                         if store.is_blocked(key).await {
                             sbproxy_observe::metrics::record_waf_persistent_block(
                                 &origin,
+                                &tenant,
                                 "blocked",
                                 kind.as_str(),
                             );
@@ -134,6 +140,7 @@ impl PolicyEnforcer for WafEnforcer {
                         if store.is_blocked(key).await {
                             sbproxy_observe::metrics::record_waf_persistent_block(
                                 &origin,
+                                &tenant,
                                 "blocked",
                                 kind.as_str(),
                             );
@@ -142,6 +149,7 @@ impl PolicyEnforcer for WafEnforcer {
                                 sbproxy_modules::policy::waf::StrikeOutcome::Escalated => {
                                     sbproxy_observe::metrics::record_waf_persistent_block(
                                         &origin,
+                                        &tenant,
                                         "escalated",
                                         kind.as_str(),
                                     );
@@ -159,6 +167,7 @@ impl PolicyEnforcer for WafEnforcer {
                                 sbproxy_modules::policy::waf::StrikeOutcome::Counted => {
                                     sbproxy_observe::metrics::record_waf_persistent_block(
                                         &origin,
+                                        &tenant,
                                         "strike",
                                         kind.as_str(),
                                     );

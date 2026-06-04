@@ -534,12 +534,19 @@ pub(super) fn emit_access_log(
         prompt_version: ctx.ai_prompt_version.clone(),
         project: ctx.principal.attrs.project.clone(),
         user: ctx.principal.attrs.user.clone(),
+        team: ctx.principal.attrs.team.clone(),
+        tags: ctx.principal.attrs.tags.clone(),
         metadata: ctx
             .principal
             .attrs
             .metadata
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        attribution: ctx
+            .attribution_tags
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
         tokens_in: ctx.ai_tokens_in,
         tokens_out: ctx.ai_tokens_out,
@@ -687,7 +694,16 @@ pub(super) struct AccessLogContext {
     /// virtual key (per-key reporting dimensions).
     pub(super) project: Option<String>,
     pub(super) user: Option<String>,
+    /// Team + attribution tags copied off the matched credential, so
+    /// log-based attribution can slice by team / tag (previously these
+    /// only surfaced on the per-credential metric).
+    pub(super) team: Option<String>,
+    pub(super) tags: Vec<String>,
     pub(super) metadata: std::collections::HashMap<String, String>,
+    /// Resolved business attribution tag set (credential `attrs:` +
+    /// `SB-Attr-*` headers), the same map fanned out to the spend
+    /// metric. Keyed by stable schema name.
+    pub(super) attribution: std::collections::BTreeMap<String, String>,
     /// Prompt / input tokens consumed (from the provider response).
     pub(super) tokens_in: Option<u64>,
     /// Completion / output tokens generated.
@@ -764,7 +780,10 @@ impl AccessLogContext {
             prompt_version: None,
             project: None,
             user: None,
+            team: None,
+            tags: Vec::new(),
             metadata: std::collections::HashMap::new(),
+            attribution: std::collections::BTreeMap::new(),
             tokens_in: None,
             tokens_out: None,
             ai_surface: None,
@@ -873,7 +892,10 @@ pub(super) fn emit_access_log_entry(
         prompt_version: context.prompt_version,
         project: context.project,
         user: context.user,
+        team: context.team,
+        tags: context.tags,
         metadata: context.metadata,
+        attribution: context.attribution,
         tokens_in: context.tokens_in,
         tokens_out: context.tokens_out,
         ai_surface: context.ai_surface,

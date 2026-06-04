@@ -55,7 +55,7 @@ impl PolicyEnforcer for HttpFramingEnforcer {
         let headers = req.headers();
         if let Err(violation) = policy.check_request(headers) {
             let reason = violation.metric_reason();
-            sbproxy_observe::metrics::record_http_framing_block(reason);
+            sbproxy_observe::metrics::record_http_framing_block(reason, ctx.tenant_id.as_ref());
             tracing::warn!(
                 target: "sbproxy::http_framing",
                 reason = %reason,

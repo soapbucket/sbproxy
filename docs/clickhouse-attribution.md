@@ -49,7 +49,10 @@ CREATE TABLE access_log
     principal_kind            LowCardinality(Nullable(String)),
     project                   LowCardinality(Nullable(String)),
     user                      LowCardinality(Nullable(String)),
+    team                      LowCardinality(Nullable(String)),
+    tags                      Array(LowCardinality(String)),
     metadata                  Map(LowCardinality(String), String),
+    attribution               Map(LowCardinality(String), String),
 
     -- AI gateway
     provider                  LowCardinality(Nullable(String)),
@@ -92,6 +95,27 @@ SETTINGS index_granularity = 8192;
 ```
 
 The `TTL` is the recommended starting point for a SaaS deployment. Hot-data dashboards work off the last 30 days; the 90-day window covers month-end reconciliation. Compliance regimes that require longer retention (HIPAA, financial audit) should bump the TTL and budget the storage; ClickHouse compresses this schema to roughly 12-16 bytes per row in practice.
+
+### `metadata` vs `attribution`
+
+Two map columns carry per-request labels, from different sources:
+
+* `attribution` is the resolved business attribution tag set: the credential's `attrs:` defaults (project, team) merged with the inbound `SB-Attr-*` headers (project, feature, okr, team, customer, environment, agent_type, risk_tier, trace_id). Per-request headers override the credential default. This is the **same tag set the Prometheus per-attribution metrics are labeled by** (`sbproxy_ai_tokens_attributed_total`, `sbproxy_ai_cost_dollars_attributed_total`), so a log query and a metric query answer "spend by feature/customer" identically. Pivot on any key with `attribution['feature']`, `attribution['customer']`, and so on.
+* `metadata` is free-form key/values the operator pins on the credential's `attrs.metadata:`. Use it for dimensions outside the fixed attribution schema (cost_center is lifted in here for back-compat).
+
+To pivot spend by any attribution dimension, group on the map value:
+
+```sql
+SELECT
+    attribution['feature']                              AS feature,
+    sum(cost_usd_micros) / 1e6                          AS usd
+FROM access_log
+WHERE workspace_id = {workspace:String}
+  AND timestamp >= toStartOfWeek(now())
+  AND attribution['feature'] != ''
+GROUP BY feature
+ORDER BY usd DESC;
+```
 
 ## Truncation policy for text fields
 
@@ -161,35 +185,34 @@ WHERE ...
 
 ## Sample query 3: tag-level burndown vs budget
 
-The per-credential attribution metric `sbproxy_tokens_attributed_total{project, user, tag, direction}` rolls up at scrape time; the access-log query below mirrors it against per-credential budgets so dashboards can show "tag X has spent 7,200 of its 10,000 token allotment this week":
+The per-credential attribution metric `sbproxy_tokens_attributed_total{project, user, tag, direction}` rolls up at scrape time; the access-log query below mirrors it against per-credential budgets so dashboards can show "tag X has spent 7,200 of its 10,000 token allotment this week". Tags are a first-class `tags` array column on every line (copied from the credential's `attrs.tags:`), so the query reads them directly rather than parsing them out of the free-form `metadata` map:
 
 ```sql
 WITH (
     SELECT map(
-        'cost_center=eng-001', 10000,
-        'cost_center=ops-002', 5000,
-        'team=foundation',     50000
+        'cost_center:eng-001', 10000,
+        'cost_center:ops-002', 5000,
+        'okr:q3-latency',      50000
     )
 ) AS tag_budgets
 
 SELECT
-    arrayJoin(mapKeys(metadata))   AS tag,
-    metadata[tag]                   AS tag_value,
+    arrayJoin(tags)                                     AS tag,
     sumIf(tokens_in + tokens_out, provider IS NOT NULL) AS spent_tokens,
-    tag_budgets[concat(tag, '=', tag_value)]            AS budget_tokens,
+    tag_budgets[tag]                                    AS budget_tokens,
     if(budget_tokens > 0,
        round(100.0 * spent_tokens / budget_tokens, 1),
        NULL)                                            AS percent_used
 FROM access_log
 WHERE workspace_id = {workspace:String}
   AND timestamp >= toStartOfWeek(now())
-  AND notEmpty(metadata)
-GROUP BY tag, tag_value
+  AND notEmpty(tags)
+GROUP BY tag
 HAVING budget_tokens > 0
 ORDER BY percent_used DESC;
 ```
 
-The query reads tag values out of the `metadata` map column (populated from the AI virtual key's `metadata:` block; a follow-up wires the same map for the non-AI auth providers). Replace the inline `tag_budgets` map with a join against an operator-maintained budget table for production use.
+The query reads each line's `tags` array (populated from the credential's `attrs.tags:` list). To slice by team instead, group on the first-class `team` column the same way. Free-form `metadata` is still available for any key/value an operator declares on the credential. Replace the inline `tag_budgets` map with a join against an operator-maintained budget table for production use.
 
 ## Materialised view: per-day-per-project pre-aggregation
 

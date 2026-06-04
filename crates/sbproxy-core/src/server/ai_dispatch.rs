@@ -175,6 +175,7 @@ pub(super) async fn handle_ai_proxy(
             sbproxy_ai::budget::AiUsage::PerCall,
             0.0,
             Vec::new(),
+            &ctx.attribution_tags,
         );
         return relay_ai_response(
             session,
@@ -302,6 +303,7 @@ pub(super) async fn handle_ai_proxy(
             sbproxy_ai::budget::AiUsage::PerCall,
             0.0,
             Vec::new(),
+            &ctx.attribution_tags,
         );
         // WOR-1044 PR3: the GET-method-aware path runs before the
         // request body is read, so there is no reversible PII
@@ -530,6 +532,7 @@ pub(super) async fn handle_ai_proxy(
                 usage,
                 cost,
                 Vec::new(),
+                &ctx.attribution_tags,
             );
             let extra: Option<(&str, &str)> =
                 idem_skip_reason.map(|r| ("x-sbproxy-idempotency", r));
@@ -543,6 +546,7 @@ pub(super) async fn handle_ai_proxy(
             sbproxy_ai::budget::AiUsage::PerCall,
             0.0,
             Vec::new(),
+            &ctx.attribution_tags,
         );
         // Multipart never captures for idempotency (engagement
         // skipped with SKIPPED-MULTIPART). Pass the skip reason
@@ -723,6 +727,14 @@ pub(super) async fn handle_ai_proxy(
                     }),
                     attrs,
                 };
+                // Resolve business attribution tags once now that the
+                // credential principal is set: credential `attrs:`
+                // defaults merged with the inbound SB-Attr-* headers.
+                // Fanned out to the per-attribution spend metric and the
+                // access log so spend pivots on project / feature / team
+                // / customer / environment / agent_type / risk_tier.
+                ctx.attribution_tags =
+                    crate::server::ai_support::resolve_attribution_tags(session, &ctx.principal);
                 // WOR-893: per-key model routing. When the key pins a
                 // model, overwrite the request body's `model` field so
                 // the downstream allow/block, routing, budget, and
@@ -838,7 +850,13 @@ pub(super) async fn handle_ai_proxy(
             })
             .unwrap_or_default();
         let estimated = sbproxy_ai::estimate_tokens(&model, &parsed_messages);
-        match AI_MODEL_RATE_LIMITER.admit(&apikey, &model, rate_cfg, Some(estimated)) {
+        match AI_MODEL_RATE_LIMITER.admit_with_tenant(
+            &apikey,
+            &model,
+            ctx.tenant_id.as_ref(),
+            rate_cfg,
+            Some(estimated),
+        ) {
             Ok(admission) => {
                 ctx.ai_admission = Some(admission);
             }
@@ -1095,6 +1113,17 @@ pub(super) async fn handle_ai_proxy(
                                     }
                                     let _ = header.insert_header("x-semcache", "HIT");
                                     let body = bytes::Bytes::from(hit.response.body);
+                                    // WOR-1094: a cache hit is a zero-cost
+                                    // ledger transaction, not an absent one.
+                                    // Record the served tokens under the
+                                    // cache_read dimension so the hit still
+                                    // shows up as savings.
+                                    crate::server::ai_support::record_cache_hit_savings(
+                                        cache.provider(),
+                                        cache.model(),
+                                        &body,
+                                        &ctx.attribution_tags,
+                                    );
                                     session
                                         .write_response_header(Box::new(header), false)
                                         .await?;
@@ -1464,6 +1493,7 @@ pub(super) async fn handle_ai_proxy(
                         sbproxy_ai::budget::AiUsage::PerCall,
                         0.0,
                         Vec::new(),
+                        &ctx.attribution_tags,
                     );
                     // Drop any idempotency capture: cascade does not
                     // engage the idempotency cache write in v1
@@ -1611,6 +1641,10 @@ pub(super) async fn handle_ai_proxy(
                     && retry_statuses.contains(&status)
                     && attempt + 1 < max_attempts
                 {
+                    // WOR-1103: record the failed attempt so per-provider
+                    // load distribution and failure rates are visible,
+                    // not just the fact that a failover happened.
+                    sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
                     warn!(
                         provider = %provider.name,
                         status = %status,
@@ -1621,15 +1655,31 @@ pub(super) async fn handle_ai_proxy(
                     let _ = resp.bytes().await;
                     continue;
                 }
+                // WOR-1103: this provider's response is the one we keep.
+                sbproxy_observe::metrics::record_provider_attempt(&provider.name, "success");
                 last_format = sbproxy_ai::client::provider_format(provider);
-                last_upstream_host = url::Url::parse(&provider.effective_base_url())
-                    .ok()
-                    .and_then(|u| u.host_str().map(|h| h.to_string()));
+                last_upstream_host = match url::Url::parse(&provider.effective_base_url()) {
+                    Ok(u) => u.host_str().map(|h| h.to_string()),
+                    Err(e) => {
+                        // WOR-1104: a malformed base URL silently degraded
+                        // the streaming usage parser to auto-detection.
+                        // Surface it at debug so the cause is traceable.
+                        debug!(
+                            provider = %provider.name,
+                            error = %e,
+                            "AI proxy: provider base URL did not parse; streaming usage parser will auto-detect"
+                        );
+                        None
+                    }
+                };
                 last_provider_name = provider.name.to_string();
                 last_resp = Some(resp);
                 break;
             }
             Err(e) => {
+                // WOR-1103: a transport-level failure is an attempt
+                // outcome too; count it per provider.
+                sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
                 warn!(
                     error = %e,
                     provider = %provider.name,
@@ -1725,6 +1775,7 @@ pub(super) async fn handle_ai_proxy(
                 image_resolution: image_resolution_for_billing.clone(),
                 audio_speech_characters: audio_speech_characters_for_billing,
                 rerank_documents: rerank_documents_for_billing,
+                attribution_tags: ctx.attribution_tags.clone(),
             });
             let stream_router_sink = RouterTokenSink {
                 router: &router,
@@ -1798,6 +1849,7 @@ pub(super) async fn handle_ai_proxy(
                 image_resolution: image_resolution_for_billing.clone(),
                 audio_speech_characters: audio_speech_characters_for_billing,
                 rerank_documents: rerank_documents_for_billing,
+                attribution_tags: ctx.attribution_tags.clone(),
             });
             let cache_router_sink = RouterTokenSink {
                 router: &router,
@@ -2237,6 +2289,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 usage,
                 cost,
                 scope_keys,
+                &args.attribution_tags,
             );
         }
     } else if let Some(ctx) = ctx {
@@ -2607,6 +2660,11 @@ pub(super) struct BudgetRecorderArgs<'a> {
     /// so the relay function can emit a `RerankUnits { documents }`
     /// billing event scaled to the provider's per-document rate.
     rerank_documents: Option<u64>,
+    /// Business attribution tags resolved at the handler entry
+    /// (`ctx.attribution_tags`). Carried by value so the relay
+    /// functions can stamp the per-attribution spend metric without
+    /// borrowing `ctx`, which they hold only as an `Option<&mut>`.
+    attribution_tags: sbproxy_ai::attribution::AttributionTags,
 }
 
 /// WOR-798: the bundle a relay needs to feed
@@ -3137,7 +3195,26 @@ pub(super) async fn relay_ai_stream(
                     usage,
                     cost,
                     scope_keys,
+                    &args.attribution_tags,
                 );
+
+                // WOR-1093: a stream that closed before the upstream
+                // signalled completion still consumed the prompt (and
+                // any reasoning) tokens; flag the spend as wasted so
+                // the ledger's abandoned-run detector can see it. The
+                // billing event above still records the real spend;
+                // this is an additional waste marker, not a double
+                // count of cost.
+                if !upstream_complete {
+                    sbproxy_ai::ai_metrics::record_waste(
+                        sbproxy_ai::ai_metrics::WasteKind::AbandonedStream,
+                        args.provider_name,
+                        args.model,
+                        &args.attribution_tags,
+                        prompt.saturating_add(completion),
+                        cost,
+                    );
+                }
 
                 // WOR-895: TTFT + output throughput. TTFT only when the
                 // upstream actually sent at least one chunk; throughput

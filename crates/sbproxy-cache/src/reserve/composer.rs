@@ -156,8 +156,16 @@ impl CacheStore for ReserveCacheStore {
                 self.stats.hits.fetch_add(1, Ordering::Relaxed);
                 if self.config.promote_on_hit {
                     // Best-effort: a failed promotion does not change
-                    // the answer the caller sees.
-                    let _ = self.primary.put(key, &entry);
+                    // the answer the caller sees, but a persistent
+                    // failure means the primary cache is unhealthy, so
+                    // surface it instead of dropping it silently
+                    // (WOR-1104). Debug level because it runs per hit.
+                    if let Err(e) = self.primary.put(key, &entry) {
+                        tracing::debug!(
+                            error = %e,
+                            "cache reserve: promotion to primary failed; serving reserve entry"
+                        );
+                    }
                 }
                 Ok(Some(entry))
             }

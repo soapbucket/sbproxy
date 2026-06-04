@@ -679,6 +679,14 @@ pub struct RequestContext {
     /// un-matched requests; access-log + metric paths short-circuit
     /// on `is_anonymous` to skip attribution work.
     pub principal: sbproxy_plugin::Principal,
+    /// Resolved business attribution tags for this request (project,
+    /// feature, team, customer, environment, agent_type, risk_tier,
+    /// trace_id, ...). Built once at the entry of `handle_ai_proxy`
+    /// from the credential's `attrs:` defaults merged with the inbound
+    /// `SB-Attr-*` headers, then fanned out to the per-attribution
+    /// spend metric and the access log so spend can be sliced by any
+    /// of these business dimensions. Empty for non-AI requests.
+    pub attribution_tags: sbproxy_ai::attribution::AttributionTags,
     /// AI model identifier the request routed to (e.g. `gpt-4o`,
     /// `claude-sonnet-4-6`). Captured before the upstream call so
     /// the access log records the resolved model even when the
@@ -1025,6 +1033,7 @@ impl RequestContext {
             ai_prompt_name: None,
             ai_prompt_version: None,
             principal: sbproxy_plugin::Principal::anonymous(),
+            attribution_tags: sbproxy_ai::attribution::AttributionTags::default(),
             ai_model: None,
             ai_tokens_in: None,
             ai_tokens_out: None,

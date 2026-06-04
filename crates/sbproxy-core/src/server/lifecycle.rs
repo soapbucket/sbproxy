@@ -35,6 +35,18 @@ use super::*;
 /// invocation. Safe to call from any thread; the global pipeline
 /// `ArcSwap` handles the publish.
 pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<()> {
+    // WOR-1101: stamp every reload outcome so operators can alert on
+    // failures and watch the reload cadence from metrics, not just
+    // logs. The inner function carries the original early-return body.
+    let result = reload_from_config_path_inner(config_path);
+    match &result {
+        Ok(()) => sbproxy_observe::metrics::record_config_reload("success"),
+        Err(_) => sbproxy_observe::metrics::record_config_reload("failure"),
+    }
+    result
+}
+
+fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<()> {
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config file '{config_path}': {e}"))?;
     let compiled = sbproxy_config::compile_config(&yaml)?;
@@ -1804,7 +1816,16 @@ fn install_sink_dispatcher_from_config(compiled: &sbproxy_config::CompiledConfig
     }
 
     let count = compiled_sinks.len();
-    install_sink_dispatcher(SinkDispatcher::new(compiled_sinks));
+    // WOR-1099: a failed install (poisoned dispatcher lock) leaves the
+    // proxy serving traffic with no log/event export. Surface it
+    // instead of discarding the result bool.
+    if !install_sink_dispatcher(SinkDispatcher::new(compiled_sinks)) {
+        sbproxy_observe::metrics::record_sink_install_failure();
+        tracing::error!(
+            count,
+            "failed to install sink dispatcher (dispatcher lock poisoned); telemetry export may be unavailable"
+        );
+    }
     if count > 0 {
         tracing::info!(
             count,
@@ -1913,6 +1934,10 @@ fn compile_one_sink(
             // runtime and pick the sink up. Operators who want OTLP
             // logs from the very first request can SIGHUP after boot.
             if tokio::runtime::Handle::try_current().is_err() {
+                // WOR-1100: count the skip so operators can see from
+                // metrics (not just a boot-time warn) that OTLP logs
+                // are not exporting until the first reload.
+                sbproxy_observe::metrics::record_telemetry_dropped("otlp_log", "no_runtime");
                 tracing::warn!(
                     sink = %raw.name,
                     "OTLP log sink declared but no tokio runtime is active; the sink will activate after the first SIGHUP / hot reload",

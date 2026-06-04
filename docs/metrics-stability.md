@@ -314,6 +314,26 @@ Buckets: `0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0`. Matches the bucket s
 
 ---
 
+#### `sbproxy_ai_tokens_attributed_total` / `sbproxy_ai_cost_dollars_attributed_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Per-attribution token and USD spend, so an operator can answer "what did project / feature / team X spend this week" from Prometheus. Fed from the single AI billing choke point, so unary, streaming, and non-chat surfaces all contribute. Cache hits contribute the cached token count under `direction=cache_read` at zero cost. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `provider`, `model` | Provider + model | `openai` / `gpt-4o` |
+| `direction` | Token kind (tokens metric only) | `input`, `output`, `cache_read` |
+| `project`, `feature`, `team`, `agent_type`, `environment` | Bounded business attribution dimensions, resolved from the credential `attrs:` + `SB-Attr-*` headers | `checkout`, `prod`, `runtime` |
+
+High-cardinality dimensions (customer, trace_id, okr, risk_tier) are deliberately kept **off** the metric labels and ride on the access log's `attribution` map / the trace span instead.
+
+---
+
 #### `sbproxy_ai_failovers_total`
 
 | Property | Value |
@@ -477,6 +497,116 @@ No labels.
 | `provider` | AI provider | `openai` |
 | `direction` | Frame direction | `inbound`, `outbound` |
 | `kind` | Frame payload kind | `text`, `audio` |
+
+---
+
+### Observability + reliability
+
+These surface the proxy's own telemetry pipeline and pre-routing
+rejections so an operator can alert on a telemetry blackhole or a flood
+of misrouted traffic.
+
+#### `sbproxy_unrouted_requests_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Requests rejected before origin resolution because no configured origin matched the inbound `Host`. These never reach the access log or any per-origin counter, so this is the only signal for misrouted / probing traffic. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `reason` | Why the request was unrouted | `unknown_host` |
+
+---
+
+#### `sbproxy_sink_install_failures_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Failed installs of the process-wide telemetry sink dispatcher (a poisoned dispatcher lock). Non-zero means the proxy may be serving traffic with no log / event export. The readiness probe `telemetry_sink` drains the pod in this state. |
+
+---
+
+#### `sbproxy_telemetry_dropped_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Telemetry records dropped or sinks that failed to set up, instead of failing silently. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `kind` | Which sink / path dropped | `webhook`, `file_sink`, `otlp_log` |
+| `reason` | Why it was dropped | `no_runtime`, `mkdir_failed` |
+
+---
+
+#### `sbproxy_config_reload_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Config (hot) reload attempts, by outcome. Alert on a non-zero `failure` rate or a stalled `success` cadence. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `result` | Reload outcome | `success`, `failure` |
+
+---
+
+#### `sbproxy_ai_provider_attempts_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | AI provider attempts on the failover/selection path, by provider and outcome. Gives the per-provider load distribution and failure rate that the bare `sbproxy_ai_failovers_total` "a failover happened" signal cannot. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `provider` | Provider attempted | `openai`, `anthropic` |
+| `outcome` | Attempt result | `success`, `error` |
+
+---
+
+#### `sbproxy_silent_degradations_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Best-effort operations that failed and were previously dropped silently (cache promotion, cache cleanup, ...), by op. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `op` | Operation that degraded | `cache_promote`, `cache_cleanup` |
+
+---
+
+#### Tenant label additions
+
+The following existing counters now carry a bounded `tenant` label so
+multi-tenant deployments can attribute rejections per tenant (the
+matching security-audit records already carried it):
+`sbproxy_http_framing_blocks_total`, `sbproxy_waf_persistent_blocks_total`,
+and `sbproxy_ai_ratelimit_rejected_total`. The label is the resolved
+tenant (`__default__` for single-tenant deployments) and is run through
+the cardinality limiter.
 
 ---
 
