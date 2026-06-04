@@ -14,11 +14,14 @@ path = "src/main.rs"
 sbproxy-classifier-proto = { path = "../sbproxy-classifier-proto" }
 sbproxy-classifiers = { path = "../sbproxy-classifiers" }
 tonic = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+# WOR-705 UDS listener: tonic's `serve_with_incoming` consumes a
+# stream of UnixListener accepts.
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

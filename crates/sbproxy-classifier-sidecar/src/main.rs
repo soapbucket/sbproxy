@@ -6,10 +6,21 @@
 //! malicious or oversized model OOMs the sidecar (which the proxy's
 //! supervisor restarts), never the proxy itself.
 //!
-//! This first cut serves over TCP and implements `Classify` for real;
-//! `Embed` is unimplemented (the OSS classifiers are label classifiers, not
-//! embedders). The Unix-domain-socket transport and the proxy-side
-//! supervisor land in WOR-704 PR 3.
+//! Transports:
+//!
+//! * `--listen 127.0.0.1:9440` (default) for the externally-deployed
+//!   case where the proxy reaches the sidecar over loopback or a
+//!   container network.
+//! * `--listen-uds /run/sbproxy/classifier.sock` (WOR-705) for the
+//!   co-located case where the sidecar is supervised next to the
+//!   proxy: skips the loopback TCP round trip and stays bounded to
+//!   the proxy's filesystem namespace. `--listen-uds` is mutually
+//!   exclusive with `--listen`.
+//!
+//! `Classify` is implemented for real; `Embed` is unimplemented (the
+//! OSS classifiers are label classifiers, not embedders). The
+//! proxy-side child supervisor lands in a follow-up; the sidecar's
+//! UDS option is the half of that story that ships here.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -122,9 +133,20 @@ impl InferenceService for SidecarService {
 #[derive(Parser)]
 #[command(about = "Minimal OSS classifier sidecar serving the InferenceService gRPC contract.")]
 struct Cli {
-    /// TCP address to listen on.
-    #[arg(long, default_value = "127.0.0.1:9440")]
+    /// TCP address to listen on. Mutually exclusive with
+    /// `--listen-uds`; the default is used only when neither flag is
+    /// set.
+    #[arg(long, default_value = "127.0.0.1:9440", conflicts_with = "listen_uds")]
     listen: String,
+    /// WOR-705: Unix domain socket path to listen on instead of TCP.
+    /// The natural transport for a supervised co-located sidecar:
+    /// removes the loopback TCP round trip and stays bounded to the
+    /// proxy's filesystem namespace. The path's parent directory MUST
+    /// exist; the sidecar creates the socket file on bind and removes
+    /// any stale file at the same path before binding (so a crashed
+    /// previous run does not block restart).
+    #[arg(long = "listen-uds", value_name = "PATH", conflicts_with = "listen")]
+    listen_uds: Option<std::path::PathBuf>,
     /// Model to load, as `id=<model.onnx>:<tokenizer.json>`. Repeatable.
     #[arg(long = "model", value_name = "ID=MODEL:TOKENIZER")]
     models: Vec<String>,
@@ -169,21 +191,43 @@ async fn main() -> Result<()> {
         }
     });
 
-    let addr: SocketAddr = cli
-        .listen
-        .parse()
-        .with_context(|| format!("invalid --listen address {:?}", cli.listen))?;
-
     let service = SidecarService {
         version: format!("sbproxy-classifier-sidecar {}", env!("CARGO_PKG_VERSION")),
         default_model,
         models,
     };
 
+    if let Some(uds_path) = cli.listen_uds.as_ref() {
+        // WOR-705 UDS branch. Remove a stale socket file from a prior
+        // crashed run so restart does not hit EADDRINUSE; the parent
+        // directory is the operator's responsibility (a tmpfiles.d
+        // entry or a Helm initContainer mkdir is typical).
+        let _ = std::fs::remove_file(uds_path);
+        let listener = tokio::net::UnixListener::bind(uds_path)
+            .with_context(|| format!("bind UDS {uds_path:?}"))?;
+        tracing::info!(
+            uds_path = %uds_path.display(),
+            models = service.models.len(),
+            "classifier sidecar listening on Unix domain socket",
+        );
+        let stream = tokio_stream::wrappers::UnixListenerStream::new(listener);
+        Server::builder()
+            .add_service(InferenceServiceServer::new(service))
+            .serve_with_incoming(stream)
+            .await
+            .context("classifier sidecar server failed")?;
+        return Ok(());
+    }
+
+    let addr: SocketAddr = cli
+        .listen
+        .parse()
+        .with_context(|| format!("invalid --listen address {:?}", cli.listen))?;
+
     tracing::info!(
         %addr,
         models = service.models.len(),
-        "classifier sidecar listening",
+        "classifier sidecar listening on TCP",
     );
 
     Server::builder()

@@ -6311,11 +6311,14 @@ dependencies = [
 name = "sbproxy-classifier-client"
 version = "0.1.0"
 dependencies = [
+ "hyper-util",
  "sbproxy-classifier-proto",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tonic",
+ "tower 0.5.3",
  "tracing",
 ]
 
@@ -6337,6 +6340,7 @@ dependencies = [
  "sbproxy-classifier-proto",
  "sbproxy-classifiers",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",

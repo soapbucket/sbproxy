@@ -9,10 +9,20 @@ description = "Resilient gRPC client for the classifier sidecar InferenceService
 [dependencies]
 sbproxy-classifier-proto = { path = "../sbproxy-classifier-proto" }
 tonic = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# WOR-705 UDS transport: `tower::service_fn` is the tonic-recommended
+# adapter for `Endpoint::connect_with_connector`. tonic 0.12 already
+# pulls `tower` in transitively but does not re-export `service_fn`,
+# so list it explicitly here. hyper-util's `TokioIo` wraps the
+# `tokio::net::UnixStream` so it satisfies tonic 0.12's connector
+# trait bounds.
+tower = "0.5"
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "macros"] }
 tokio-stream = { version = "0.1", features = ["net"] }
+# UDS test: bind in a tempdir so parallel test runs do not collide.
+tempfile = "3"
