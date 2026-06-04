@@ -32,7 +32,7 @@
 # Run:
 #   make run CONFIG=examples/resilience-stack/sb.yml
 #
-# Test (point httpbin.org / httpbingo.org at /status/<code> to
+# Test (point either upstream at /status/<code> to
 # simulate failure):
 #   curl -H 'Host: localhost' http://127.0.0.1:8080/status/200
 #   for i in $(seq 1 20); do
@@ -64,14 +64,14 @@ origins:
         min_requests: 5
         ejection_duration_secs: 30
       targets:
-        - url: https://httpbin.org
+        - url: https://test.sbproxy.dev
           health_check:
             path: /status/200
             interval_secs: 10
             timeout_ms: 2000
             unhealthy_threshold: 3
             healthy_threshold: 2
-        - url: https://httpbingo.org
+        - url: https://test.sbproxy.dev/status/503
           health_check:
             path: /status/200
             interval_secs: 10

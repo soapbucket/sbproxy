@@ -10,7 +10,7 @@ Combines three sibling blocks on one origin: `request_modifiers` injects `X-Forw
 make run CONFIG=examples/headers-and-cors/sb.yml
 ```
 
-No env vars required. Uses `httpbin.org` so you can see the modified request headers reflected back.
+No env vars required. Uses `test.sbproxy.dev` so you can see the modified request headers reflected back.
 
 ## Try it
 
@@ -21,7 +21,7 @@ $ curl -s -H 'Host: api.local' -H 'Cookie: should-be-stripped=1' \
        http://127.0.0.1:8080/headers
 {
   "headers": {
-    "Host": "httpbin.org",
+    "Host": "test.sbproxy.dev",
     "X-Forwarded-By": "sbproxy",
     "X-Trace-Id": "5b1e9b8a-2c4f-4d2a-9c4e-1f3a8e7d6c5b"
   }

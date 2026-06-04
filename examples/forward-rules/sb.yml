@@ -8,7 +8,7 @@
 #   /admin/*                            -> static action returning a JSON banner
 #   X-Beta-User: true (any path)        -> static beta banner
 #   ?env=staging (any path)             -> static staging banner
-#   anything else                       -> default action proxies to httpbin.org/anything
+#   anything else                       -> default action proxies to test.sbproxy.dev/anything
 #
 # Each forward rule embeds a full child origin via the `origin:` field, which
 # may carry its own action and request_modifiers. Rules are evaluated in order;
@@ -27,7 +27,7 @@
 #   curl -sv -H 'Host: gateway.local' http://127.0.0.1:8080/admin/dashboard 2>&1 \
 #     | grep -E '^< HTTP|admin'
 #
-#   # Default action: anything else proxies to httpbin.org/anything.
+#   # Default action: anything else proxies to test.sbproxy.dev/anything.
 #   curl -s -H 'Host: gateway.local' http://127.0.0.1:8080/health
 
 proxy:
@@ -37,7 +37,7 @@ origins:
   "gateway.local":
     action:
       type: proxy
-      url: https://httpbin.org/anything
+      url: https://test.sbproxy.dev/anything
 
     forward_rules:
       # /api/* -> jsonplaceholder, with the /api prefix stripped by a modifier.

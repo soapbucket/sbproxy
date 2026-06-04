@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-Enables response compression on `api.local` for brotli, gzip, and zstd. The first algorithm in `algorithms` that the client advertises in `Accept-Encoding` wins. `min_size: 512` keeps the proxy from compressing tiny payloads where the framing overhead exceeds the savings. The upstream is `httpbin.org`, which produces enough text to make the size delta visible.
+Enables response compression on `api.local` for brotli, gzip, and zstd. The first algorithm in `algorithms` that the client advertises in `Accept-Encoding` wins. `min_size: 512` keeps the proxy from compressing tiny payloads where the framing overhead exceeds the savings. The upstream is `test.sbproxy.dev`, which produces enough text to make the size delta visible.
 
 ## Run
 

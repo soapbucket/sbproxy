@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-Demonstrates the `security_headers` policy. Every response from the `httpbin.org` upstream gains the standard browser hardening set: `Strict-Transport-Security`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, and `Permissions-Policy`. A structured `content_security_policy` block adds `Content-Security-Policy` with `default-src 'self'; script-src 'self'`; `enable_nonce` and `report_only` are wired so the same policy block can flip into report-only or nonce-injecting modes later. The origin is reachable on `127.0.0.1:8080` via the `sec.local` Host header.
+Demonstrates the `security_headers` policy. Every response from the `test.sbproxy.dev` upstream gains the standard browser hardening set: `Strict-Transport-Security`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, and `Permissions-Policy`. A structured `content_security_policy` block adds `Content-Security-Policy` with `default-src 'self'; script-src 'self'`; `enable_nonce` and `report_only` are wired so the same policy block can flip into report-only or nonce-injecting modes later. The origin is reachable on `127.0.0.1:8080` via the `sec.local` Host header.
 
 ## Run
 
@@ -28,7 +28,7 @@ content-security-policy: default-src 'self'; script-src 'self'
   "args": {},
   "headers": { ... },
   "origin": "...",
-  "url": "https://httpbin.org/get"
+  "url": "https://test.sbproxy.dev/get"
 }
 ```
 

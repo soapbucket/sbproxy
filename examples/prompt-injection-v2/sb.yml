@@ -46,7 +46,7 @@ origins:
   "tag.local":
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
 
     policies:
       - type: prompt_injection_v2
@@ -65,7 +65,7 @@ origins:
   "block.local":
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
 
     policies:
       - type: prompt_injection_v2
@@ -81,7 +81,7 @@ origins:
   "log.local":
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
 
     policies:
       - type: prompt_injection_v2

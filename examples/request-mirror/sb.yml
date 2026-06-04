@@ -22,8 +22,8 @@
 #
 # Test:
 #   curl -H 'Host: localhost' http://127.0.0.1:8080/get
-#   # Both `httpbin.org/get` (primary) and `httpbingo.org/get`
-#   # (mirror) are hit. The client only sees the httpbin.org body.
+#   # Both `test.sbproxy.dev/get` (primary) and `test.sbproxy.dev/echo`
+#   # (mirror) are hit. The client only sees the test.sbproxy.dev body.
 
 proxy:
   http_bind_port: 8080
@@ -32,9 +32,9 @@ origins:
   "localhost":
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
     mirror:
-      url: https://httpbingo.org
+      url: https://test.sbproxy.dev/echo
       sample_rate: 1.0
       timeout_ms: 5000
       # Uncomment to shadow-replay POST/PUT/PATCH bodies as well:

@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-Demonstrates the per-origin `response_cache` block. Successful responses are stored in the in-memory cache for 60 seconds, keyed on the request method, host, path, and query string. The second request for the same URL is served from cache without contacting `httpbin.org`. With `cache_control: true`, SBproxy honours upstream `Cache-Control` directives such as `no-store` or `max-age` overrides when they are stricter than the configured TTL. The TTL difference is most visible against `/delay/N`, an httpbin endpoint that sleeps server-side.
+Demonstrates the per-origin `response_cache` block. Successful responses are stored in the in-memory cache for 60 seconds, keyed on the request method, host, path, and query string. The second request for the same URL is served from cache without contacting `test.sbproxy.dev`. With `cache_control: true`, SBproxy honours upstream `Cache-Control` directives such as `no-store` or `max-age` overrides when they are stricter than the configured TTL. The TTL difference is most visible against `/delay/N`, an httpbin endpoint that sleeps server-side.
 
 ## Run
 
@@ -10,7 +10,7 @@ Demonstrates the per-origin `response_cache` block. Successful responses are sto
 make run CONFIG=examples/response-caching/sb.yml
 ```
 
-No env vars required. Uses `httpbin.org` for the slow upstream call.
+No env vars required. Uses `test.sbproxy.dev` for the slow upstream call.
 
 ## Try it
 

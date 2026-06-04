@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-Demonstrates the `html_to_markdown` transform. The proxy fetches `https://httpbin.org/html` (a public Moby-Dick excerpt page) and converts the HTML body into Markdown using ATX-style headings (`#`, `##`, ...). A `response_modifier` rewrites the `Content-Type` header to `text/markdown; charset=utf-8` so the body is delivered with the right MIME. Useful for feeding HTML into LLM pipelines that prefer Markdown, or for archiving pages in a portable format. The origin is reached on `127.0.0.1:8080` via the `tomd.local` Host header.
+Demonstrates the `html_to_markdown` transform. The proxy fetches `https://test.sbproxy.dev/html` (a public Moby-Dick excerpt page) and converts the HTML body into Markdown using ATX-style headings (`#`, `##`, ...). A `response_modifier` rewrites the `Content-Type` header to `text/markdown; charset=utf-8` so the body is delivered with the right MIME. Useful for feeding HTML into LLM pipelines that prefer Markdown, or for archiving pages in a portable format. The origin is reached on `127.0.0.1:8080` via the `tomd.local` Host header.
 
 ## Run
 
@@ -14,7 +14,7 @@ sbproxy serve -f sb.yml
 
 ```bash
 # Original upstream is HTML
-$ curl -s https://httpbin.org/html | head -5
+$ curl -s https://test.sbproxy.dev/html | head -5
 <!DOCTYPE html>
 <html>
   <head>

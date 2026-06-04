@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Load balancing across two targets.
 #
-# Round-robin across two upstreams. Both targets here point at httpbin.org;
+# Round-robin across two upstreams. Both targets here point at test.sbproxy.dev;
 # in a real deployment you'd point each at a different replica address.
 # The example demonstrates the config shape and confirms the load balancer
 # successfully forwards requests; per-target traffic visibility requires
@@ -25,7 +25,7 @@ origins:
       type: load_balancer
       algorithm: round_robin
       targets:
-        - url: https://httpbin.org
+        - url: https://test.sbproxy.dev
           weight: 1
-        - url: https://httpbin.org
+        - url: https://test.sbproxy.dev
           weight: 1

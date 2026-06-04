@@ -50,5 +50,5 @@ origins:
         min_requests: 5
         ejection_duration_secs: 30
       targets:
-        - url: https://httpbin.org
-        - url: https://httpbingo.org
+        - url: https://test.sbproxy.dev
+        - url: https://test.sbproxy.dev/status/503

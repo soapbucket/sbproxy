@@ -11,7 +11,7 @@ export OPENAI_API_KEY=...
 sbproxy serve -f sb.yml
 ```
 
-The example points the OpenAI provider at `https://httpbin.org/anything` so you can see the exact body the upstream would have received, with PII already redacted.
+The example points the OpenAI provider at `https://test.sbproxy.dev/anything` so you can see the exact body the upstream would have received, with PII already redacted.
 
 ## Try it
 

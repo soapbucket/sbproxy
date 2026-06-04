@@ -2,7 +2,7 @@
 # IP whitelist policy.
 #
 # Only requests from loopback (127.0.0.0/8) and a private LAN range are
-# accepted. Everything else gets a 403 before httpbin.org is contacted.
+# accepted. Everything else gets a 403 before test.sbproxy.dev is contacted.
 # When the proxy is run locally, requests from your shell will match the
 # loopback CIDR. To see the deny path, swap the whitelist for a range that
 # does not include your client IP.
@@ -29,7 +29,7 @@ origins:
   "ipfilter.local":
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
 
     policies:
       - type: ip_filter

@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-Enforces an API key check before any upstream call. The `api_key` authentication provider compares the value of the configured header (`X-Api-Key`) against the static allowlist `["dev-key-1", "dev-key-2"]`. Requests with a missing or unrecognised key are rejected with 401 inside the proxy; matching requests are forwarded to `httpbin.org` unchanged. This is the simplest authentication mode in SBproxy and is well suited to internal APIs, demos, and key-per-tenant access patterns.
+Enforces an API key check before any upstream call. The `api_key` authentication provider compares the value of the configured header (`X-Api-Key`) against the static allowlist `["dev-key-1", "dev-key-2"]`. Requests with a missing or unrecognised key are rejected with 401 inside the proxy; matching requests are forwarded to `test.sbproxy.dev` unchanged. This is the simplest authentication mode in SBproxy and is well suited to internal APIs, demos, and key-per-tenant access patterns.
 
 ## Run
 
@@ -32,7 +32,7 @@ $ curl -i -H 'Host: api.local' -H 'X-Api-Key: dev-key-1' \
 HTTP/1.1 200 OK
 content-type: application/json
 
-{"args":{},"headers":{"Host":"httpbin.org","X-Api-Key":"dev-key-1",...},"url":"https://httpbin.org/get"}
+{"args":{},"headers":{"Host":"test.sbproxy.dev","X-Api-Key":"dev-key-1",...},"url":"https://test.sbproxy.dev/get"}
 ```
 
 Wrong key, also rejected:

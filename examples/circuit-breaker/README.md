@@ -10,7 +10,7 @@ Demonstrates the `circuit_breaker` block on a `load_balancer` action. The breake
 sbproxy serve -f sb.yml
 ```
 
-No setup required. Targets are `httpbin.org` and `httpbingo.org`; you can simulate failures by directing `/status/<code>` paths through one of them.
+No setup required. Targets are `test.sbproxy.dev` and `test.sbproxy.dev/status/503`; you can simulate failures by directing `/status/<code>` paths through one of them.
 
 ## Try it
 

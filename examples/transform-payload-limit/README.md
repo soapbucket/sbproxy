@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-Demonstrates the `payload_limit` transform. The proxy fetches `https://httpbin.org/bytes/4096`, which returns 4096 random bytes, and clips the response body to `max_size: 256`. With `truncate: true`, oversize bodies are silently clipped to the configured ceiling; with the default `truncate: false`, oversize bodies cause the transform to error and the response fails. Useful as a defensive cap on responses from untrusted or unstable upstreams. The origin is reached on `127.0.0.1:8080` via the `cap.local` Host header.
+Demonstrates the `payload_limit` transform. The proxy fetches `https://test.sbproxy.dev/bytes/4096`, which returns 4096 random bytes, and clips the response body to `max_size: 256`. With `truncate: true`, oversize bodies are silently clipped to the configured ceiling; with the default `truncate: false`, oversize bodies cause the transform to error and the response fails. Useful as a defensive cap on responses from untrusted or unstable upstreams. The origin is reached on `127.0.0.1:8080` via the `cap.local` Host header.
 
 ## Run
 
@@ -14,7 +14,7 @@ sbproxy serve -f sb.yml
 
 ```bash
 # Original upstream returns 4096 bytes
-$ curl -s -o /dev/null -w '%{size_download}\n' https://httpbin.org/bytes/4096
+$ curl -s -o /dev/null -w '%{size_download}\n' https://test.sbproxy.dev/bytes/4096
 4096
 ```
 

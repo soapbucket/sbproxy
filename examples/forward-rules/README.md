@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-A single origin on `gateway.local` dispatches incoming requests to three different inline child origins based on path. Requests to `/api/*` proxy to `dummyjson.com` with the `/api` prefix stripped, `/admin/*` returns a static JSON banner, and anything else falls through to the default action that proxies to `httpbin.org/anything`. Forward rules are evaluated in order; first match wins. Each rule embeds a full child origin via the `origin:` field so rules can carry their own action and request modifiers.
+A single origin on `gateway.local` dispatches incoming requests to three different inline child origins based on path. Requests to `/api/*` proxy to `dummyjson.com` with the `/api` prefix stripped, `/admin/*` returns a static JSON banner, and anything else falls through to the default action that proxies to `test.sbproxy.dev/anything`. Forward rules are evaluated in order; first match wins. Each rule embeds a full child origin via the `origin:` field so rules can carry their own action and request modifiers.
 
 ## Run
 
@@ -23,9 +23,9 @@ curl -s -H 'Host: gateway.local' http://127.0.0.1:8080/api/products/1
 curl -s -H 'Host: gateway.local' http://127.0.0.1:8080/admin/dashboard
 # {"section":"admin","message":"admin area placeholder","authenticated":false}
 
-# No rule matches -> default action proxies to httpbin.org/anything.
+# No rule matches -> default action proxies to test.sbproxy.dev/anything.
 curl -s -H 'Host: gateway.local' http://127.0.0.1:8080/health
-# {"args":{},"data":"","headers":{...},"method":"GET","url":"https://httpbin.org/anything/health"}
+# {"args":{},"data":"","headers":{...},"method":"GET","url":"https://test.sbproxy.dev/anything/health"}
 
 # Verify the X-Routed-By header set by the /api/* child origin.
 curl -s -H 'Host: gateway.local' http://127.0.0.1:8080/api/products/1 -o /dev/null -w '%{http_code}\n'

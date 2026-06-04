@@ -20,7 +20,7 @@ origins:
   "cached.local":
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
 
     response_cache:
       enabled: true

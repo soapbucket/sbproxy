@@ -3,7 +3,7 @@
 #
 # Demonstrates the full typed shape of request_modifiers: header set/add/remove,
 # URL path replace, query set/add/remove, method override, and JSON body
-# replacement. Upstream is httpbin.org, which echoes back the headers, path,
+# replacement. Upstream is test.sbproxy.dev, which echoes back the headers, path,
 # query, method, and JSON body it observed so you can verify each rewrite.
 #
 # Run:
@@ -28,7 +28,7 @@ origins:
   "api.local":
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
 
     request_modifiers:
       - headers:

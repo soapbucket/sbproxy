@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-Accepts a fixed allowlist of opaque service tokens in the `Authorization: Bearer <token>` header. Pick this when callers are services that already manage shared tokens and you do not need the JWT validation surface. The two configured tokens (`svc-token-alpha`, `svc-token-beta`) are matched verbatim. Unknown or missing tokens are rejected with 401 before `httpbin.org` is contacted.
+Accepts a fixed allowlist of opaque service tokens in the `Authorization: Bearer <token>` header. Pick this when callers are services that already manage shared tokens and you do not need the JWT validation surface. The two configured tokens (`svc-token-alpha`, `svc-token-beta`) are matched verbatim. Unknown or missing tokens are rejected with 401 before `test.sbproxy.dev` is contacted.
 
 ## Run
 
@@ -33,7 +33,7 @@ $ curl -i -H 'Host: bearer.local' \
 HTTP/1.1 200 OK
 content-type: application/json
 
-{"args":{},"headers":{"Authorization":"Bearer svc-token-alpha","Host":"httpbin.org",...},"url":"https://httpbin.org/get"}
+{"args":{},"headers":{"Authorization":"Bearer svc-token-alpha","Host":"test.sbproxy.dev",...},"url":"https://test.sbproxy.dev/get"}
 ```
 
 The second token works the same way:

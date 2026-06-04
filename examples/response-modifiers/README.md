@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-Demonstrates the full typed shape of `response_modifiers` across two origins on `127.0.0.1:8080`. `api.local` keeps the upstream `200`, sets `X-Served-By: sbproxy` and `Cache-Control: public, max-age=60`, adds `X-Trace-Id: trace-002`, removes `Content-Length` / `Server` / `X-Powered-By`, and replaces the body with `{"ok":true,"replaced_by":"sbproxy"}`. `text.local` overrides the status line to `418 I am a teapot`, switches `Content-Type` to `text/plain; charset=utf-8`, removes `Content-Length`, and replaces the body with the literal string `short and stout`. Both upstreams are `httpbin.org`.
+Demonstrates the full typed shape of `response_modifiers` across two origins on `127.0.0.1:8080`. `api.local` keeps the upstream `200`, sets `X-Served-By: sbproxy` and `Cache-Control: public, max-age=60`, adds `X-Trace-Id: trace-002`, removes `Content-Length` / `Server` / `X-Powered-By`, and replaces the body with `{"ok":true,"replaced_by":"sbproxy"}`. `text.local` overrides the status line to `418 I am a teapot`, switches `Content-Type` to `text/plain; charset=utf-8`, removes `Content-Length`, and replaces the body with the literal string `short and stout`. Both upstreams are `test.sbproxy.dev`.
 
 ## Run
 

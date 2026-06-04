@@ -29,6 +29,6 @@ origins:
   "localhost":
     action:
       type: proxy
-      url: https://httpbin.org
+      url: https://test.sbproxy.dev
       disable_via_header: true
       disable_forwarded_port_header: true
