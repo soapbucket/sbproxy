@@ -701,6 +701,34 @@ pub(super) fn emit_ai_billing_event(
     cost_usd: f64,
     scope_keys: Vec<String>,
 ) {
+    // Feed the per-attribution spend metrics from the single billing
+    // choke point so every surface (unary, streaming, audio, image,
+    // rerank, and cache-hit replays) lands in the FinOps dashboard,
+    // not just the unary chat path. Provider / model / token-kind /
+    // USD are always known here; the business attribution dimensions
+    // (project / feature / team) ride on the credential principal and
+    // are stamped at the dispatch site via `record_tokens_attributed`,
+    // so they roll up to the catch-all bucket here and the two views
+    // join on provider+model. The recorder skips zero counts, so an
+    // image / audio event records its USD cost without phantom token
+    // rows.
+    let (input_tokens, output_tokens) = match &usage {
+        sbproxy_ai::budget::AiUsage::Tokens { input, output } => (*input, *output),
+        _ => (0, 0),
+    };
+    let model_label = model.as_deref().unwrap_or("");
+    sbproxy_ai::ai_metrics::record_ai_request_attributed(
+        provider_name,
+        model_label,
+        &sbproxy_ai::attribution::AttributionTags::default(),
+        input_tokens,
+        output_tokens,
+        0,
+        0,
+        0,
+        cost_usd,
+    );
+
     let event =
         sbproxy_ai::budget::AiBillingEvent::from_label(surface_label, provider_name, model, usage)
             .with_cost(cost_usd)
@@ -712,6 +740,52 @@ pub(super) fn emit_ai_billing_event(
         ai.cost_usd = event.cost_usd,
         ai.occurred_at_unix_secs = event.occurred_at_unix_secs,
         "AI billing event"
+    );
+}
+
+/// Record a cache hit as a zero-marginal-cost ledger entry.
+///
+/// A served cache hit avoids an upstream call, but the transaction
+/// still happened from the ledger's point of view: the value was
+/// delivered. We record the cached prompt + completion tokens under
+/// the `cache_read` token-kind dimension with `cost_usd = 0.0` so the
+/// FinOps dashboard can show cache savings without the hit vanishing
+/// from the per-request spend record. `body` is the cached response
+/// payload; its `usage` block (when present) gives the token counts,
+/// and its `model` field (falling back to `fallback_model`) gives the
+/// model label.
+pub(super) fn record_cache_hit_savings(provider: &str, fallback_model: &str, body: &[u8]) {
+    let parsed = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let (prompt, completion) = parsed
+        .as_ref()
+        .and_then(|v| v.get("usage"))
+        .map(|u| {
+            let p = u
+                .get("prompt_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let c = u
+                .get("completion_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            (p, c)
+        })
+        .unwrap_or((0, 0));
+    let model = parsed
+        .as_ref()
+        .and_then(|v| v.get("model"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(fallback_model);
+    sbproxy_ai::ai_metrics::record_ai_request_attributed(
+        provider,
+        model,
+        &sbproxy_ai::attribution::AttributionTags::default(),
+        0,
+        0,
+        prompt.saturating_add(completion),
+        0,
+        0,
+        0.0,
     );
 }
 

@@ -458,6 +458,18 @@ impl Notifier {
             .store
             .list_subscriptions(&event.tenant_id, &event.event_type);
         let n = subs.len();
+        // WOR-1100: `tokio::spawn` panics without an ambient runtime, and
+        // even when it does not, a fire-and-forget dispatch can drop
+        // notifications with no trace. Guard the runtime so the drop is
+        // counted and logged rather than panicking or vanishing.
+        if n > 0 && tokio::runtime::Handle::try_current().is_err() {
+            crate::metrics::record_telemetry_dropped("webhook", "no_runtime");
+            tracing::warn!(
+                subscribers = n,
+                "webhook dispatch invoked with no tokio runtime; notifications dropped"
+            );
+            return 0;
+        }
         for sub in subs {
             let event = event.clone();
             let store = Arc::clone(&self.store);

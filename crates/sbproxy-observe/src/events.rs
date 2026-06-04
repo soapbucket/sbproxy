@@ -164,6 +164,13 @@ pub struct ProxyEvent {
     pub event_type: EventType,
     /// Hostname (origin) the event is associated with.
     pub hostname: String,
+    /// Tenant the event is attributed to, for per-tenant event
+    /// filtering on the bus without parsing `data` (WOR-1098). Empty
+    /// when the producing site has no resolved tenant. Defaults to
+    /// empty when absent in a serialized event so older payloads still
+    /// deserialize.
+    #[serde(default)]
+    pub tenant_id: String,
     /// Unix epoch timestamp in milliseconds when the event was produced.
     pub timestamp: u64, // Unix millis
     /// Free-form JSON payload carrying event-specific data.
@@ -255,6 +262,7 @@ mod tests {
         ProxyEvent {
             event_type,
             hostname: "example.com".to_string(),
+            tenant_id: "tenant-a".to_string(),
             timestamp: 1700000000000,
             data: serde_json::json!({"key": "value"}),
         }

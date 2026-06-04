@@ -353,6 +353,20 @@ pub fn default_registry_optional(
     registry.register(Arc::new(NotConfiguredProbe::new("agent_registry")));
     registry.register(Arc::new(NotConfiguredProbe::new("stripe")));
     registry.register(Arc::new(NotConfiguredProbe::new("facilitator_quorum")));
+    // WOR-1102: a poisoned sink dispatcher silently stops all telemetry
+    // export while the pod keeps serving. Gate readiness on it so the
+    // load balancer drains a telemetry-blind instance. A healthy or
+    // not-yet-installed dispatcher (no sinks configured) stays ready.
+    registry.register(Arc::new(SyntheticProbe::new("telemetry_sink", || {
+        if crate::sink_dispatcher::sink_dispatcher_healthy() {
+            (ComponentStatus::Healthy, None)
+        } else {
+            (
+                ComponentStatus::Unhealthy,
+                Some("sink dispatcher lock poisoned; telemetry export is down".to_string()),
+            )
+        }
+    })));
     registry
 }
 

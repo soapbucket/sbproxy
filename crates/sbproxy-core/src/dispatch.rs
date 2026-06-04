@@ -53,7 +53,15 @@ pub async fn dispatch_h3_request(
     let origin_idx = match pipeline.resolve_origin(&hostname) {
         Some(idx) => idx,
         None => {
-            debug!(hostname = %hostname, "H3: no origin found for hostname");
+            // WOR-1097: a request for an unrouted Host is rejected
+            // before origin resolution, so it never reaches the access
+            // log or any per-origin counter. Without this it is fully
+            // invisible (misconfiguration, scanning, wrong DNS). Tenant
+            // is unresolved here, so count it under a dedicated
+            // unrouted-request series and log at warn (not debug) so it
+            // surfaces in production.
+            sbproxy_observe::metrics::record_unrouted_request("unknown_host");
+            warn!(hostname = %hostname, status = 404, "H3: no origin found for hostname; request unrouted");
             return Ok(text_response(404, "Not Found"));
         }
     };

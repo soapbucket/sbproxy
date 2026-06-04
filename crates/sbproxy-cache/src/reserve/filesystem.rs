@@ -150,8 +150,17 @@ impl CacheReserveBackend for FsReserve {
                     };
                     if meta.expires_at < before {
                         let body_path = path.with_extension("bin");
-                        let _ = tokio::fs::remove_file(&body_path).await;
-                        let _ = tokio::fs::remove_file(&path).await;
+                        // WOR-1104: a failed unlink here means an
+                        // expired entry's bytes linger on disk; a slow
+                        // or read-only filesystem will accumulate them
+                        // unbounded. Log at debug so the condition is
+                        // observable rather than dropped outright.
+                        if let Err(e) = tokio::fs::remove_file(&body_path).await {
+                            tracing::debug!(path = %body_path.display(), error = %e, "cache reserve: failed to remove expired body file");
+                        }
+                        if let Err(e) = tokio::fs::remove_file(&path).await {
+                            tracing::debug!(path = %path.display(), error = %e, "cache reserve: failed to remove expired metadata file");
+                        }
                         removed += 1;
                     }
                 }

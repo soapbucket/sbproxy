@@ -838,7 +838,13 @@ pub(super) async fn handle_ai_proxy(
             })
             .unwrap_or_default();
         let estimated = sbproxy_ai::estimate_tokens(&model, &parsed_messages);
-        match AI_MODEL_RATE_LIMITER.admit(&apikey, &model, rate_cfg, Some(estimated)) {
+        match AI_MODEL_RATE_LIMITER.admit_with_tenant(
+            &apikey,
+            &model,
+            ctx.tenant_id.as_ref(),
+            rate_cfg,
+            Some(estimated),
+        ) {
             Ok(admission) => {
                 ctx.ai_admission = Some(admission);
             }
@@ -1095,6 +1101,16 @@ pub(super) async fn handle_ai_proxy(
                                     }
                                     let _ = header.insert_header("x-semcache", "HIT");
                                     let body = bytes::Bytes::from(hit.response.body);
+                                    // WOR-1094: a cache hit is a zero-cost
+                                    // ledger transaction, not an absent one.
+                                    // Record the served tokens under the
+                                    // cache_read dimension so the hit still
+                                    // shows up as savings.
+                                    crate::server::ai_support::record_cache_hit_savings(
+                                        cache.provider(),
+                                        cache.model(),
+                                        &body,
+                                    );
                                     session
                                         .write_response_header(Box::new(header), false)
                                         .await?;
@@ -1611,6 +1627,10 @@ pub(super) async fn handle_ai_proxy(
                     && retry_statuses.contains(&status)
                     && attempt + 1 < max_attempts
                 {
+                    // WOR-1103: record the failed attempt so per-provider
+                    // load distribution and failure rates are visible,
+                    // not just the fact that a failover happened.
+                    sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
                     warn!(
                         provider = %provider.name,
                         status = %status,
@@ -1621,15 +1641,31 @@ pub(super) async fn handle_ai_proxy(
                     let _ = resp.bytes().await;
                     continue;
                 }
+                // WOR-1103: this provider's response is the one we keep.
+                sbproxy_observe::metrics::record_provider_attempt(&provider.name, "success");
                 last_format = sbproxy_ai::client::provider_format(provider);
-                last_upstream_host = url::Url::parse(&provider.effective_base_url())
-                    .ok()
-                    .and_then(|u| u.host_str().map(|h| h.to_string()));
+                last_upstream_host = match url::Url::parse(&provider.effective_base_url()) {
+                    Ok(u) => u.host_str().map(|h| h.to_string()),
+                    Err(e) => {
+                        // WOR-1104: a malformed base URL silently degraded
+                        // the streaming usage parser to auto-detection.
+                        // Surface it at debug so the cause is traceable.
+                        debug!(
+                            provider = %provider.name,
+                            error = %e,
+                            "AI proxy: provider base URL did not parse; streaming usage parser will auto-detect"
+                        );
+                        None
+                    }
+                };
                 last_provider_name = provider.name.to_string();
                 last_resp = Some(resp);
                 break;
             }
             Err(e) => {
+                // WOR-1103: a transport-level failure is an attempt
+                // outcome too; count it per provider.
+                sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
                 warn!(
                     error = %e,
                     provider = %provider.name,
@@ -3138,6 +3174,24 @@ pub(super) async fn relay_ai_stream(
                     cost,
                     scope_keys,
                 );
+
+                // WOR-1093: a stream that closed before the upstream
+                // signalled completion still consumed the prompt (and
+                // any reasoning) tokens; flag the spend as wasted so
+                // the ledger's abandoned-run detector can see it. The
+                // billing event above still records the real spend;
+                // this is an additional waste marker, not a double
+                // count of cost.
+                if !upstream_complete {
+                    sbproxy_ai::ai_metrics::record_waste(
+                        sbproxy_ai::ai_metrics::WasteKind::AbandonedStream,
+                        args.provider_name,
+                        args.model,
+                        &sbproxy_ai::attribution::AttributionTags::default(),
+                        prompt.saturating_add(completion),
+                        cost,
+                    );
+                }
 
                 // WOR-895: TTFT + output throughput. TTFT only when the
                 // upstream actually sent at least one chunk; throughput

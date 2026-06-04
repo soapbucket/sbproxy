@@ -949,7 +949,12 @@ pub fn record_capture_budget_drop(workspace_id: &str, dimension: &'static str) {
 ///
 /// The origin label is run through the cardinality limiter; `event`
 /// and `key_kind` are closed sets and pass through unsanitised.
-pub fn record_waf_persistent_block(origin: &str, event: &'static str, key_kind: &'static str) {
+pub fn record_waf_persistent_block(
+    origin: &str,
+    tenant: &str,
+    event: &'static str,
+    key_kind: &'static str,
+) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;
     static C: OnceLock<IntCounterVec> = OnceLock::new();
@@ -957,13 +962,16 @@ pub fn record_waf_persistent_block(origin: &str, event: &'static str, key_kind: 
         register_int_counter_vec!(
             "sbproxy_waf_persistent_blocks_total",
             "WAF persistent (time-boxed) block actions, by lifecycle event and key kind",
-            &["origin", "event", "key_kind"],
+            &["origin", "tenant", "event", "key_kind"],
         )
         .expect("waf persistent block counter registers")
     });
+    // Both origin and tenant are operator-supplied and so pass through
+    // the cardinality limiter; event and key_kind are closed sets.
     let origin_san = sanitize_label("origin", origin);
+    let tenant_san = sanitize_label("tenant", tenant);
     counter
-        .with_label_values(&[origin_san.as_str(), event, key_kind])
+        .with_label_values(&[origin_san.as_str(), tenant_san.as_str(), event, key_kind])
         .inc();
 }
 
@@ -1171,7 +1179,7 @@ pub fn record_mcp_policy_hook_invocation(verdict: &str, mcp_server: &str, tool_n
 /// `FramingViolation::metric_reason` (`dual_cl_te`, `duplicate_cl`,
 /// `malformed_te`, `duplicate_te`, `control_chars`). Cardinality is
 /// bounded at five and locked by the policy.
-pub fn record_http_framing_block(reason: &str) {
+pub fn record_http_framing_block(reason: &str, tenant: &str) {
     use prometheus::{register_counter_vec, CounterVec};
     use std::sync::OnceLock;
     static C: OnceLock<CounterVec> = OnceLock::new();
@@ -1179,11 +1187,154 @@ pub fn record_http_framing_block(reason: &str) {
         register_counter_vec!(
             "sbproxy_http_framing_blocks_total",
             "Requests rejected by the http_framing policy (request smuggling defense)",
-            &["reason"],
+            &["reason", "tenant"],
         )
         .expect("counter vec registers")
     });
+    // `reason` is a closed five-value set; `tenant` is operator-supplied
+    // and so passes through the cardinality limiter.
+    let tenant_san = sanitize_label("tenant", tenant);
+    counter
+        .with_label_values(&[reason, tenant_san.as_str()])
+        .inc();
+}
+
+/// Count a request that was rejected before origin resolution because
+/// no configured origin matched the inbound Host. `reason` is a closed
+/// string (`unknown_host`). These requests never reach the access log
+/// or the per-origin counters, so without this counter misrouted /
+/// probing traffic is invisible (WOR-1097).
+pub fn record_unrouted_request(reason: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_unrouted_requests_total",
+            "Requests rejected before origin resolution, by reason",
+            &["reason"],
+        )
+        .expect("unrouted requests counter registers")
+    });
     counter.with_label_values(&[reason]).inc();
+}
+
+/// Count a failed install of the process-wide sink dispatcher. A
+/// non-zero value means the telemetry pipeline did not swap in and the
+/// proxy may be serving traffic with no log/event export (WOR-1099).
+pub fn record_sink_install_failure() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_sink_install_failures_total",
+            "Failed installs of the process-wide telemetry sink dispatcher",
+        )
+        .expect("sink install failure counter registers")
+    });
+    counter.inc();
+}
+
+/// Count telemetry that was dropped or failed to set up, by sink kind
+/// and reason. Makes otherwise-silent telemetry loss (a webhook task
+/// that never spawned, a file sink whose directory could not be
+/// created, an OTLP sink skipped at boot) observable (WOR-1100).
+/// `kind` and `reason` are closed operator-facing strings.
+pub fn record_telemetry_dropped(kind: &'static str, reason: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_telemetry_dropped_total",
+            "Telemetry records dropped or sinks that failed to set up, by kind and reason",
+            &["kind", "reason"],
+        )
+        .expect("telemetry dropped counter registers")
+    });
+    counter.with_label_values(&[kind, reason]).inc();
+}
+
+/// Count a config (hot) reload outcome on
+/// `sbproxy_config_reload_total{result}`. `result` is a closed string
+/// (`success` / `failure`). Operators alert on a non-zero `failure`
+/// rate or on a stalled `success` cadence (WOR-1101).
+pub fn record_config_reload(result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_config_reload_total",
+            "Config reload attempts, by result",
+            &["result"],
+        )
+        .expect("config reload counter registers")
+    });
+    counter.with_label_values(&[result]).inc();
+}
+
+/// Count a well-known projection render failure on
+/// `sbproxy_projection_render_failures_total{projection}`. A non-zero
+/// value means a robots.txt / llms.txt / similar projection could not
+/// be rendered on reload and may be served stale or empty (WOR-1101).
+pub fn record_projection_render_failure(projection: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_projection_render_failures_total",
+            "Well-known projection render failures, by projection",
+            &["projection"],
+        )
+        .expect("projection render failure counter registers")
+    });
+    let projection_san = sanitize_label("projection", projection);
+    counter.with_label_values(&[projection_san.as_str()]).inc();
+}
+
+/// Count an AI provider attempt during failover/selection on
+/// `sbproxy_ai_provider_attempts_total{provider, outcome}`. `outcome`
+/// is a closed string (`success` / `error`). Gives operators the
+/// per-provider load distribution and failure rate that a bare
+/// "failover happened" signal cannot (WOR-1103).
+pub fn record_provider_attempt(provider: &str, outcome: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_ai_provider_attempts_total",
+            "AI provider attempts during failover/selection, by provider and outcome",
+            &["provider", "outcome"],
+        )
+        .expect("provider attempts counter registers")
+    });
+    let provider_san = sanitize_label("provider", provider);
+    counter
+        .with_label_values(&[provider_san.as_str(), outcome])
+        .inc();
+}
+
+/// Count a silently-degraded best-effort operation on
+/// `sbproxy_silent_degradations_total{op}`. Surfaces error paths that
+/// were previously dropped with `let _ = ...` (cache promotion, cache
+/// cleanup, ...) so operators can see them accumulate (WOR-1104).
+pub fn record_silent_degradation(op: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_silent_degradations_total",
+            "Best-effort operations that failed and were previously dropped silently, by op",
+            &["op"],
+        )
+        .expect("silent degradation counter registers")
+    });
+    counter.with_label_values(&[op]).inc();
 }
 
 /// Record a replayed nonce observed by the Web Bot Auth verifier
