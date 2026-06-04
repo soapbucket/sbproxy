@@ -95,7 +95,17 @@ impl RequestValidatorPolicy {
     pub fn applies_to(&self, content_type: Option<&str>) -> bool {
         let ct = match content_type {
             Some(c) => c,
-            None => return false,
+            // WOR-1138: an absent Content-Type must not be a free pass. If
+            // this policy guards JSON (the default media type), validate
+            // the body anyway so a client cannot skip the schema gate by
+            // omitting the header. `validate` then fails closed on a
+            // non-JSON body (it errors on the JSON parse).
+            None => {
+                return self
+                    .content_types
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case("application/json"));
+            }
         };
         let media = ct.split(';').next().unwrap_or("").trim();
         self.content_types
@@ -119,5 +129,39 @@ impl RequestValidatorPolicy {
             return Err(format!("request body failed schema validation at {first}"));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn applies_to_absent_content_type_when_json_guarded() {
+        // WOR-1138: a JSON-guarded validator must apply to a request with
+        // no Content-Type so the schema gate cannot be skipped by omitting
+        // the header.
+        let v = RequestValidatorPolicy::from_config(serde_json::json!({
+            "schema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": { "name": { "type": "string" } }
+            }
+        }))
+        .unwrap();
+        assert!(
+            v.applies_to(None),
+            "absent Content-Type must be in scope for a JSON validator"
+        );
+        assert!(v.applies_to(Some("application/json")));
+
+        // A validator scoped only to a non-JSON media type does not claim
+        // an absent Content-Type.
+        let v2 = RequestValidatorPolicy::from_config(serde_json::json!({
+            "schema": { "type": "object" },
+            "content_types": ["application/cbor"]
+        }))
+        .unwrap();
+        assert!(!v2.applies_to(None));
     }
 }
