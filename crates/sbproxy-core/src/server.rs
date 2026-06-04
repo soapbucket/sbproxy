@@ -147,7 +147,15 @@ type PendingSemcacheMiss = (
 /// response under this key + vector after a successful (200) response.
 /// Mutually exclusive with [`PendingSemcacheMiss`]: the OSS cache only
 /// runs when the enterprise `SemanticLookupHook` is absent.
-type PendingEmbedMiss = (std::sync::Arc<sbproxy_ai::EmbeddingCache>, String, Vec<f32>);
+type PendingEmbedMiss = (
+    std::sync::Arc<sbproxy_ai::EmbeddingCache>,
+    String,
+    Vec<f32>,
+    // WOR-1142: per-caller cache scope (hashed tenant + credential) so
+    // the write-on-miss store records the same scope the lookup filtered
+    // on.
+    String,
+);
 
 /// The main proxy implementation.
 ///

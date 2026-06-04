@@ -1070,6 +1070,12 @@ pub(super) async fn handle_ai_proxy(
     let mut embed_miss: Option<PendingEmbedMiss> = None;
     if pipeline.hooks.semantic_lookup.is_none() {
         if let Some(cache) = config.embedding_cache() {
+            // WOR-1142: scope cache entries to the caller so one
+            // tenant/credential never receives another's cached response.
+            let cache_scope = sbproxy_ai::EmbeddingCache::scope_key(
+                ctx.tenant_id.as_str(),
+                req_header_value(session, "authorization").as_deref(),
+            );
             if !extracted_prompt.is_empty() {
                 match config.providers.iter().find(|p| p.name == cache.provider()) {
                     Some(provider) => {
@@ -1083,7 +1089,7 @@ pub(super) async fn handle_ai_proxy(
                         .await
                         {
                             Ok(query_vec) => {
-                                if let Some(hit) = cache.lookup(&query_vec) {
+                                if let Some(hit) = cache.lookup(&query_vec, &cache_scope) {
                                     sbproxy_ai::ai_metrics::record_cache_result(
                                         cache.provider(),
                                         "semantic",
@@ -1142,8 +1148,12 @@ pub(super) async fn handle_ai_proxy(
                                 );
                                 embed_miss = Some((
                                     std::sync::Arc::clone(cache),
-                                    sbproxy_ai::EmbeddingCache::prompt_key(&extracted_prompt),
+                                    sbproxy_ai::EmbeddingCache::prompt_key(
+                                        &cache_scope,
+                                        &extracted_prompt,
+                                    ),
                                     query_vec,
+                                    cache_scope,
                                 ));
                             }
                             Err(e) => {
@@ -2127,7 +2137,7 @@ pub(super) async fn relay_ai_response_with_cache(
     // cached. Mutually exclusive with the enterprise hook store below
     // (the lookup gates on the hook being absent). `captured_headers`
     // is cloned here so the enterprise branch can still move it.
-    if let Some((cache, key, embedding)) = embed_miss {
+    if let Some((cache, key, embedding, cache_scope)) = embed_miss {
         if status == 200 {
             let cached = sbproxy_ai::CachedHttpResponse {
                 status,
@@ -2137,7 +2147,7 @@ pub(super) async fn relay_ai_response_with_cache(
                     .collect(),
                 body: resp_body.to_vec(),
             };
-            cache.store(key, &embedding, cached);
+            cache.store(key, &embedding, cached, cache_scope);
             debug!(
                 origin = %hostname,
                 body_len = resp_body.len(),
