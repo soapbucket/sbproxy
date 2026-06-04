@@ -1,0 +1,76 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Structured JSON access log.
+#
+# The proxy writes one JSON object per response to stdout, suitable for
+# Fluent Bit, Vector, or any stdout-tailing log shipper. This config
+# turns on every commonly-used knob: status / method filters to keep
+# the volume bounded, sample rate, header capture with the PII
+# redactor on, and the secret redactor (always on, no opt-out).
+#
+# Run:
+#   make run CONFIG=examples/access-log/sb.yml
+#
+# Test (in another terminal):
+#   curl -s -H 'Host: api.local' http://127.0.0.1:8080/anything | head -c 80
+#   curl -s -H 'Host: api.local' -X POST http://127.0.0.1:8080/anything
+#   curl -s -H 'Host: api.local' http://127.0.0.1:8080/status/500
+#
+# Expected (one line per response, on the proxy's stdout):
+#   {"timestamp":"2026-06-04T01:23:45Z","request_id":"...","origin":"api.local","method":"GET","path":"/anything","status":200,"latency_ms":12.3,"upstream_ttfb_ms":11.0,"bytes_in":0,"bytes_out":456,"client_ip":"127.0.0.1","request_headers":{"user-agent":"curl/8.x"},"response_headers":{"content-length":"456"}}
+#
+# Note: GET /anything is matched by the status filter only when its
+# response is 5xx, so the first curl above appears only because the
+# status_codes list also admits 200 (added below). Drop 200 from
+# status_codes to get error-only logs.
+
+proxy:
+  http_bind_port: 8080
+
+# Top-level access_log block.
+access_log:
+  enabled: true
+
+  # Status filter: empty list matches every status. Listed for clarity;
+  # the default already admits everything.
+  status_codes: [200, 400, 401, 403, 404, 429, 500, 502, 503, 504]
+
+  # Method filter: empty list matches every method (case-insensitive
+  # comparison). Narrow when you want a method-specific tap (e.g.
+  # only write operations).
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE"]
+
+  # Sampling: 1.0 (default) logs every match. Drop to 0.05 to log 5%
+  # of matching requests; the secret-redactor still runs on every
+  # sampled line.
+  sample_rate: 1.0
+
+  # Header capture: per-request and per-response allowlists. Trailing
+  # `*` is a glob (one wildcard supported). The hardcoded denylist
+  # blocks `authorization`, `cookie`, `set-cookie`,
+  # `proxy-authorization`, and `x-api-key` from `*` and glob matches;
+  # list them by exact name to override (the proxy WARNs at config
+  # load so the choice is visible in the boot log).
+  capture_headers:
+    request:
+      - user-agent
+      - x-request-id
+      - x-ratelimit-*
+    response:
+      - x-sbproxy-cache
+      - content-length
+      - content-type
+    # Per-header value cap (default 1024 bytes); over-cap values get
+    # a trailing `...` that counts toward the cap.
+    max_value_bytes: 1024
+    # When true, the PII redactor runs over captured header values
+    # before they land on the line. The full PII rule set is off here
+    # to keep the example outputs predictable; flip to true in
+    # production where the request shape may carry email / SSN /
+    # credit-card / API-key shapes in a header.
+    redact_pii: false
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev

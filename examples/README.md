@@ -32,9 +32,11 @@ directory (with its `sb.yml` and README). Regenerated from `examples/` on 2026-0
 | Example | Description |
 |---|---|
 | [a2a-protocol](a2a-protocol/) | The `a2a` policy enforces per-route safety on agent-to-agent traffic. Detection runs once per request and matches three signals: `Content-Type: applic |
+| [access-log](access-log/) | Structured JSON access log on stdout, ready for Fluent Bit / Vector / any stdout-tailing log shipper. Exercises every commonly-used knob on the top-level `access_log:` block: status and method filters, sampling, request and response header capture with the PII redactor, and the always-on secret redactor. |
 | [active-health-checks](active-health-checks/) | A round-robin load balancer with two targets: `httpbin.org` and `httpbingo.org`. Each target has a `health_check` block, so the proxy runs a backgroun |
 | [agent-budget](agent-budget/) | Demonstrates the `agent_budget` policy. Per-agent rate-limit primitive keyed on the resolved `agent_id` (from the agent-class resolver). One bucket pe |
 | [agent-skills](agent-skills/) | Demonstrates the Agent Skills v0.2.0 well-known projection. SBproxy |
+| [ai-attribution-tags](ai-attribution-tags/) | Tokenomics: tag every AI request with the operator's project / feature / team / customer / env / agent_type / risk_tier / trace_id so the spend record lands on the right dashboard row and the downstream Token-to-Value Ledger can join token spend to business outcomes. Per-credential `attrs:` defaults compose with per-request `SB-Attr-<Key>` headers. |
 | [ai-bedrock-direct](ai-bedrock-direct/) | Direct integration with AWS Bedrock's model-agnostic Converse API. Clients send OpenAI-shaped chat completion requests; SBproxy translates them to the |
 | [ai-budget](ai-budget/) | Two stacked budget limits with `on_exceed: downgrade`. The workspace-wide cap allows up to USD 500 of spend per month and downgrades to `claude-3-5-ha |
 | [ai-cascade-routing](ai-cascade-routing/) | The `cascade` strategy walks an ordered list of `(provider, model)` tiers from cheapest to most expensive. Each tier's response is graded against a `q |
@@ -58,6 +60,8 @@ directory (with its `sb.yml` and README). Regenerated from `examples/` on 2026-0
 | [ai-shadow](ai-shadow/) | Each request is forwarded to the primary provider as usual; a copy is also sent to the shadow provider concurrently. The shadow response is drained an |
 | [ai-streaming](ai-streaming/) | Streaming is on by default in the AI gateway. The minimal Anthropic origin in this example handles `"stream": true` requests end-to-end: sbproxy opens |
 | [ai-virtual-keys](ai-virtual-keys/) | Two virtual keys, two teams, two budgets. The frontend team's key is allowlisted to `claude-3-5-haiku-latest` only, capped at 30 RPM and 60,000 TPM, w |
+| [ai-waste-signals](ai-waste-signals/) | Tokenomics: Prometheus counters for tokens spent with no outcome, partitioned by waste class (`duplicate_request`, `abandoned_stream`, `validation_failed`, `context_bloat`) and attribution (project, team). Observational only; pair with `ai-budget` for enforcement and `ai-attribution-tags` for the grouping labels. |
+| [audit-log](audit-log/) | Every state-mutating admin call emits a typed `AdminAuditEvent` envelope on the structured-log stream. Pairs with `access-log` to see both streams side by side. Bound on the admin server's loopback `:9090` with basic-auth; `/admin/reload` is the canonical mutation to trigger. |
 | [auth-api-key](auth-api-key/) | Enforces an API key check before any upstream call. The `api_key` authentication provider compares the value of the configured header (`X-Api-Key`) ag |
 | [auth-basic](auth-basic/) | Two-user HTTP Basic auth with a custom realm (`"sbproxy demo"`). Useful for quick admin panels and small internal tools. Requests without credentials  |
 | [auth-bearer](auth-bearer/) | Accepts a fixed allowlist of opaque service tokens in the `Authorization: Bearer <token>` header. Pick this when callers are services that already man |

@@ -1,0 +1,109 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI per-request attribution tag schema.
+#
+# Tokenomics layer: every AI request lands on the access log + the
+# Prometheus per-attribution metrics tagged with the operator's
+# project / feature / team / customer / env / agent_type / risk_tier /
+# trace_id. Two paths produce the tags:
+#
+#   1. Per-credential defaults under `credentials[].attrs:`. The
+#      operator pins which project / team / cost_center / tags a
+#      credential lands under; every request authenticated by that
+#      credential carries those tags.
+#
+#   2. Per-request `SB-Attr-<Key>` headers on the inbound HTTP
+#      request. These ride alongside the credential defaults; the
+#      AI handler parses the headers and (per
+#      `crates/sbproxy-ai/src/attribution.rs`) lifts them into the
+#      attribution tag set.
+#
+# The two stacks compose: missing per-request headers fall back to
+# the credential's `attrs:`; per-request headers fill in or override
+# fields the credential leaves blank. The downstream ledger joins
+# token spend to business outcomes on `trace_id`.
+#
+# Setup:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   export TEAM_FRONTEND_KEY=vk-frontend-...
+#
+# Run:
+#   make run CONFIG=examples/ai-attribution-tags/sb.yml
+#
+# Test (default tags from the credential):
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H "Authorization: Bearer ${TEAM_FRONTEND_KEY}" \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"claude-3-5-haiku-latest","messages":[{"role":"user","content":"hi"}]}'
+#
+# Test (override + augment with SB-Attr headers):
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H "Authorization: Bearer ${TEAM_FRONTEND_KEY}" \
+#     -H 'Content-Type: application/json' \
+#     -H 'SB-Attr-Project: chatbot-revamp' \
+#     -H 'SB-Attr-Feature: regen-button' \
+#     -H 'SB-Attr-Env: staging' \
+#     -H 'SB-Attr-Trace-Id: trc_01HABC...' \
+#     -H 'SB-Attr-Agent: development' \
+#     -H 'SB-Attr-Risk: internal-only' \
+#     -d '{"model":"claude-3-5-haiku-latest","messages":[{"role":"user","content":"regen"}]}'
+#
+# Expected:
+#   Access-log row + Prometheus per-attribution counters carry the
+#   final tag set: credential defaults overlaid by request headers.
+#   The `trace_id` lands on the spend record as the ledger's join
+#   key to a downstream outcome system (PR merged, ticket closed,
+#   etc.).
+
+proxy:
+  http_bind_port: 8080
+
+# Stream the access log so the operator can see the attribution
+# fields on each row in real time.
+access_log:
+  enabled: true
+  capture_headers:
+    request:
+      - sb-attr-*
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+      providers:
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          default_model: claude-3-5-haiku-latest
+          models: [claude-3-5-haiku-latest, claude-3-5-sonnet-latest]
+
+    # Per-credential attribution defaults. `attrs:` is the per-credential
+    # subtree the operator pins so every authenticated request inherits
+    # the project / team / cost-center / tags without the client having
+    # to send a header.
+    credentials:
+      - name: team-frontend
+        type: ai_provider
+        provider: anthropic
+        key: ${TEAM_FRONTEND_KEY}
+        attrs:
+          # Default project this credential's spend lands under. A
+          # per-request `SB-Attr-Project` header overrides per call;
+          # in its absence the default below is what the metrics
+          # carry.
+          project: frontend
+          # Team and cost center surface on the per-attribution
+          # metric so the FinOps dashboard can group by either.
+          team: frontend-eng
+          cost_center: cc-frontend-2026
+          # Operator tags become separate attribution rows. Use them
+          # for cross-cutting groupings the project / team taxonomy
+          # does not capture (campaign id, model-tier, etc.).
+          tags: [tier-haiku, lane-prod, region-us-east]
+          # Per-credential budget is part of `attrs:` because budget
+          # is an attribution-side concern. The budget enforcer
+          # reads the matched principal's attrs to apply caps.
+          budget:
+            max_tokens: 500000
+            max_cost_usd: 50

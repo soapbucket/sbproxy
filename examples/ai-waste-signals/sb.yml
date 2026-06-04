@@ -1,0 +1,99 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI waste-signal metrics.
+#
+# Tokenomics layer: surface tokens spent with no outcome. The
+# Token-to-Value Ledger calls these "waste detectors": tokens the
+# gateway counts as wasted because they did not produce a useful
+# result. The proxy emits two Prometheus counters partitioned by
+# waste class:
+#
+#   sbproxy_ai_wasted_tokens_total{kind, provider, model, project, team}
+#   sbproxy_ai_wasted_cost_dollars_total{kind, provider, model, project, team}
+#
+# Waste classes (the `kind` label):
+#
+#   duplicate_request  - exact-context resend; the response_dedup
+#                        layer caught it. Re-tagging the spend as
+#                        wasted is the canonical reuse signal.
+#   abandoned_stream   - the client cancelled or the upstream
+#                        completed but the client never read it.
+#                        Input + reasoning tokens still billed.
+#   validation_failed  - the request completed upstream but the
+#                        gateway's structured-output / guardrail
+#                        validation rejected the result; the spend
+#                        happened anyway.
+#   context_bloat      - input token count significantly above the
+#                        route's rolling median (free-form heuristic
+#                        signal an oversized prompt was sent).
+#
+# These are OBSERVATIONAL counters + a USD gauge. They do NOT
+# enforce; pair with the existing budget enforcer (`ai-budget`) for
+# enforcement. The point is to surface the spend an operator can act
+# on without staring at every request.
+#
+# Setup:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#
+# Run:
+#   make run CONFIG=examples/ai-waste-signals/sb.yml
+#
+# Drive a duplicate-request waste event (response_dedup recognises
+# the second call as a dup and the proxy serves the cached response;
+# the second's input tokens get tagged as wasted):
+#   PAYLOAD='{"model":"claude-3-5-haiku-latest","messages":[{"role":"user","content":"hello"}]}'
+#   curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local' \
+#     -H "Authorization: Bearer ${ANTHROPIC_API_KEY}" -d "$PAYLOAD" | head -c 80
+#   curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local' \
+#     -H "Authorization: Bearer ${ANTHROPIC_API_KEY}" -d "$PAYLOAD" | head -c 80
+#
+# Read the waste counters off the metrics endpoint:
+#   curl -s http://127.0.0.1:9090/metrics | grep -E "^sbproxy_ai_wasted"
+#
+# Expected:
+#   sbproxy_ai_wasted_tokens_total{kind="duplicate_request",...} > 0
+#   sbproxy_ai_wasted_cost_dollars_total{kind="duplicate_request",...} > 0
+
+proxy:
+  http_bind_port: 8080
+  metrics:
+    bind_port: 9090
+
+# Tag the wasted spend with the operator's attribution defaults so
+# the FinOps dashboard can group "what wasted tokens look like by
+# team / project / agent_type".
+access_log:
+  enabled: true
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+      providers:
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          default_model: claude-3-5-haiku-latest
+          models: [claude-3-5-haiku-latest]
+
+      # Response dedup catches exact-context resends; the second
+      # call hits the cached response. The waste-tagger registers
+      # the duplicate as wasted spend on the duplicate's wire shape
+      # so the operator can see "X% of our token spend went to
+      # exact-context resends" on the dashboard.
+      response_dedup:
+        enabled: true
+        ttl_seconds: 300
+
+    # Per-credential attribution so the waste counters carry the
+    # project / team labels and the FinOps dashboard can group by
+    # them. See `examples/ai-attribution-tags/` for the full tag
+    # set.
+    credentials:
+      - name: demo-credential
+        type: ai_provider
+        provider: anthropic
+        key: ${ANTHROPIC_API_KEY}
+        attrs:
+          project: demo
+          team: demo-team
+          tags: [waste-signals-demo]
