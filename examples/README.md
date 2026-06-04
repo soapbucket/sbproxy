@@ -36,6 +36,7 @@ directory (with its `sb.yml` and README). Regenerated from `examples/` on 2026-0
 | [active-health-checks](active-health-checks/) | A round-robin load balancer with two targets: `httpbin.org` and `httpbingo.org`. Each target has a `health_check` block, so the proxy runs a backgroun |
 | [agent-budget](agent-budget/) | Demonstrates the `agent_budget` policy. Per-agent rate-limit primitive keyed on the resolved `agent_id` (from the agent-class resolver). One bucket pe |
 | [agent-skills](agent-skills/) | Demonstrates the Agent Skills v0.2.0 well-known projection. SBproxy |
+| [ai-agent-alignment](ai-agent-alignment/) | The `agent_alignment` guardrail audits the assistant's `tool_calls` array against an operator-declared ruleset (allow + deny lists, forbidden-substring matchers, argument validators). Catches an off-policy tool selection before it leaves the gateway. |
 | [ai-attribution-tags](ai-attribution-tags/) | Tokenomics: tag every AI request with the operator's project / feature / team / customer / env / agent_type / risk_tier / trace_id so the spend record lands on the right dashboard row and the downstream Token-to-Value Ledger can join token spend to business outcomes. Per-credential `attrs:` defaults compose with per-request `SB-Attr-<Key>` headers. |
 | [ai-bedrock-direct](ai-bedrock-direct/) | Direct integration with AWS Bedrock's model-agnostic Converse API. Clients send OpenAI-shaped chat completion requests; SBproxy translates them to the |
 | [ai-budget](ai-budget/) | Two stacked budget limits with `on_exceed: downgrade`. The workspace-wide cap allows up to USD 500 of spend per month and downgrades to `claude-3-5-ha |
@@ -107,6 +108,7 @@ directory (with its `sb.yml` and README). Regenerated from `examples/` on 2026-0
 | [multi-rail-accept-payment](multi-rail-accept-payment/) | Both rails (x402 + MPP) configured at once. The example demonstrates |
 | [object-authz](object-authz/) | Demonstrates the `object_authz` policy. The gateway enforces a declarative ownership rule (`{owner}` path segment must equal the JWT `sub`) so a reque |
 | [observability-stack](observability-stack/) | A single `docker compose` command boots a complete metrics, logs, and traces stack pre-wired for SBproxy: Prometheus for metrics, Grafana for visualiz |
+| [oidc](oidc/) | OpenID Connect Relying-Party login flow. Puts SSO in front of an upstream that has no auth of its own: an unauthenticated browser is redirected to the IdP, completes the auth-code + PKCE flow, and is served with a sealed session cookie. See `docs/auth-oidc.md` for the full field reference. |
 | [openapi-emission](openapi-emission/) | The gateway publishes an OpenAPI 3.0 document describing the routes it exposes, derived from the live config. Three things land together: rich path ma |
 | [openapi-validation](openapi-validation/) | The `openapi_validation` policy loads an inline OpenAPI document at startup and validates each request body against the matching operation's `requestB |
 | [outbound-peer-pricing](outbound-peer-pricing/) | Demonstrates the `peer_pricing_preflight` policy: when an internal |
@@ -135,6 +137,7 @@ directory (with its `sb.yml` and README). Regenerated from `examples/` on 2026-0
 | [semantic-constraint](semantic-constraint/) | A natural-language policy enforced by an LLM-as-judge backend. The `semantic_constraint` policy renders a prompt template against the request envelope |
 | [service-discovery](service-discovery/) | Demonstrates `service_discovery` on a `proxy` action. Without service discovery, Pingora resolves the upstream hostname once when a connection is esta |
 | [sessions](sessions/) | The `session` block on `app.local` configures the encrypted cookie used to carry session state across requests. Cookie name is `sb_session`, max age i |
+| [sidecar](sidecar/) | Sidecar-tuned `sbproxy` config for the per-pod fanout case: small RSS, fast cold start, no required external dependencies. Runs on loopback in the pod's network namespace; an init container DNATs outbound TCP onto it. See `docs/sidecar-deployment.md` + `deploy/k8s/sidecar/` for the Kubernetes wire-up. |
 | [sni-resolve-override](sni-resolve-override/) | Two siblings of `action.url` change how the proxy reaches the upstream without touching the URL itself. `sni_override: cdn.provider.net` sends that na |
 | [sri](sri/) | Demonstrates the `sri` policy in observation mode. The proxy walks `text/html` responses, inspects every `<script src="https://...">` and `<link rel=" |
 | [static-and-mock](static-and-mock/) | Three origins demonstrating the two upstream-free actions. `hello.local` uses the `static` action to return a fixed plain-text body. `api.local` uses  |
@@ -154,6 +157,7 @@ directory (with its `sb.yml` and README). Regenerated from `examples/` on 2026-0
 | [trusted-proxies](trusted-proxies/) | When SBproxy sits behind another LB or CDN (Cloudflare, AWS ALB, Fly.io edge, internal LB), the immediate TCP peer is the LB, not the real client. The |
 | [upstream-retries](upstream-retries/) | When the proxy cannot establish a TCP/TLS connection to the upstream (DNS failure, refused, unreachable, TLS handshake fail), Pingora calls back into  |
 | [variables-template](variables-template/) | The `variables` block declares static, per-origin key-value pairs that the template engine exposes as `{{ variables.<name> }}`. Environment variables  |
+| [vault-reference](vault-reference/) | The `vault://` URI grammar for referencing secrets from the YAML. Demonstrates the canonical shape (`vault://backend/path?key=...`), `${...}` env-var interpolation, and the resolution order. Pair with the vault backend examples for end-to-end secret loading. |
 | [waf](waf/) | Demonstrates the `waf` policy with the OWASP Core Rule Set enabled. Each request is screened for common attack signatures (SQL injection, cross-site s |
 | [wasm](wasm/) | Reference modules for the SBproxy WASM transform. A WASM transform is a sandboxed module loaded by the `wasm` transform action; SBproxy invokes it onc |
 | [wasm-transform](wasm-transform/) | Demonstrates the `wasm` response-body transform. The upstream response body is piped through a sandboxed wasm32-wasi module: the body goes in on stdin |
@@ -161,4 +165,4 @@ directory (with its `sb.yml` and README). Regenerated from `examples/` on 2026-0
 | [web-bot-auth-publish](web-bot-auth-publish/) | Demonstrates the `web_bot_auth_publish` per-origin config. SBproxy serves its own JWKS-shaped signing-key directory at `/.well-known/http-message-sign |
 | [webhook-signing](webhook-signing/) | Every lifecycle webhook the proxy fires (`on_request`, `on_response`) carries a structured envelope and, when `secret` is set on the callback, an HMAC |
 
-_123 examples on disk._
+_133 examples on disk._

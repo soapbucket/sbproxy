@@ -28,7 +28,7 @@ For human-facing documentation, see `docs/architecture.md`, `docs/configuration.
 - slo_catalog: per-pillar availability, latency p95/p99, error rate, and ledger redeem-success SLOs with burn-rate alert windows and a stable alert-ID-to-runbook mapping.
 - dashboards.grafana: provisioned JSON dashboards for overview, per-agent, policy triggers, audit log, and traces overview under `deploy/dashboards/`.
 - alerts.prometheus: PromQL recording and alerting rules under `deploy/alerts/`.
-- observability_stack: reference Compose stack (Prometheus, Grafana, Tempo, Loki, OTel collector) at `examples/00-observability-stack/`, pre-provisioned with the dashboards and alerts.
+- observability_stack: reference Compose stack (Prometheus, Grafana, Tempo, Loki, OTel collector) at `examples/observability-stack/`, pre-provisioned with the dashboards and alerts.
 
 ## Audit
 

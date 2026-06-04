@@ -97,9 +97,9 @@ Behaviour is identical at runtime: the compile-time lowering materialises the cr
 
 The new block lives at three scopes:
 
-* `proxy.credentials:` — operator defaults shared across every tenant.
-* `tenants[].credentials:` — tenant-scoped credentials.
-* `origins[].credentials:` — origin-scoped credentials (the closest analog to today's `virtual_keys:`).
+* `proxy.credentials:` - operator defaults shared across every tenant.
+* `tenants[].credentials:` - tenant-scoped credentials.
+* `origins[].credentials:` - origin-scoped credentials (the closest analog to today's `virtual_keys:`).
 
 Resolution at request time walks origin → tenant → proxy. A credential at origin with the same `name:` as one at tenant or proxy scope shadows the broader scope. This lets an operator declare a shared `proxy.credentials[].openai-shared` default and then re-declare `openai-shared` at a tenant scope to override the key + budget for that tenant only.
 
