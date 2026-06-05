@@ -319,6 +319,15 @@ impl PiiRedactor {
         for rule in &config.rules {
             rules.push(compile_rule(rule)?);
         }
+        if config.enabled && rules.is_empty() {
+            // WOR-1158: an enabled redactor that compiles to zero rules
+            // (e.g. `defaults: false` with no custom rules) silently passes
+            // everything through. Warn loudly so an operator who believes
+            // PII/secret stripping is active is not misled.
+            tracing::warn!(
+                "pii redaction is enabled but no rules are active; nothing will be redacted"
+            );
+        }
         Ok(Self::from_compiled(rules))
     }
 
@@ -1230,6 +1239,22 @@ mod tests {
     /// reversible rule replaces with its static `replacement` and
     /// does not record on the capture. The reversible rule still
     /// captures.
+    #[test]
+    fn enabled_with_no_rules_compiles_to_empty_redactor() {
+        // WOR-1158: a redactor enabled with `defaults: false` and no
+        // custom rules compiles to zero rules (and logs a warning);
+        // is_empty() is true so the no-op is detectable.
+        let cfg = PiiConfig {
+            enabled: true,
+            defaults: false,
+            redact_request: true,
+            redact_response: false,
+            rules: vec![],
+        };
+        let r = PiiRedactor::from_config(&cfg).unwrap();
+        assert!(r.is_empty());
+    }
+
     #[test]
     fn reversible_only_captures_reversible_rules() {
         let cfg = PiiConfig {
