@@ -10,18 +10,21 @@
 //!   6. Fallthrough => `human`
 //!
 //! Implementation lives in `crates/sbproxy-modules/src/policy/agent_class.rs`
-//! per the ADR; the resolver lands on `wave1/G1.4-G1.5-agent-class`. Until
-//! that branch merges, the assertions in this file are gated behind
-//! `#[ignore]` markers because the proxy does not yet emit an
-//! `X-Sb-Agent-Class`-style header (or carry the resolver result onto an
-//! observable surface) for tests to read.
+//! (resolver) plus `crates/sbproxy-core/src/server/proxy_http.rs`
+//! (`forward_to_upstream` stamping). The resolver runs in `request_filter`
+//! from the built-in catalog, and an `agent_class` policy with
+//! `forward_to_upstream: true` stamps the verdict onto the upstream request
+//! as `X-Forwarded-Agent-Class` / `-Vendor` / `-Verified` (WOR-1132).
 //!
-//! Strategy for observing the verdict from a black-box e2e: the resolver
-//! is expected to surface its decision via either (a) a response header
-//! the proxy adds when an `enrich_response` flag is set, or (b) an
-//! origin-side `X-Forwarded-Agent-Class` request header so a captured
-//! upstream call can read it. We mirror (b) here because it does not
-//! require a config knob unique to this test.
+//! The UA-only and human-sentinel cases run; the reverse-DNS, rDNS-spoof,
+//! and bot-auth-keyid cases stay `#[ignore]`'d on real blockers (live /
+//! injectable DNS, an open product question on UA-claim demotion, and the
+//! not-yet-landed Web Bot Auth keyid feed) - see each test's reason.
+//!
+//! Strategy for observing the verdict from a black-box e2e: the captured
+//! upstream call reads the origin-side `X-Forwarded-Agent-Class` request
+//! header the policy stamps. This does not require a config knob unique to
+//! this test.
 
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use serde_json::json;
@@ -52,7 +55,10 @@ origins:
 // --- Test 1: UA-only path => vendor=openai ---
 
 #[test]
-#[ignore = "TODO(wave2): G1.4 resolver landed (`crates/sbproxy-modules/src/policy/agent_class.rs::AgentClassResolver`), but the binary does not yet construct a resolver from `sb.yml` (no `agent_classes:` block + `policies: - type: agent_class` not registered). See WATCH.md \"AgentClassResolver instantiation deferred to config wiring\"."]
+// WOR-1132: reactivated. The agent_class resolver runs in `request_filter`
+// from the built-in catalog and `forward_to_upstream: true` now stamps
+// the verdict onto the upstream request, so the UA-only catalog match is
+// observable end-to-end.
 fn ua_only_resolves_to_gptbot_vendor_openai() {
     let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
     let harness = ProxyHarness::start_with_yaml(&agent_class_config(&upstream.base_url()))
@@ -85,7 +91,7 @@ fn ua_only_resolves_to_gptbot_vendor_openai() {
 // --- Test 2: reverse-DNS verified path => vendor=google, verified ---
 
 #[test]
-#[ignore = "TODO(wave2): G1.5 reverse-DNS verifier landed but agent_class policy is not wired (see WATCH.md). Live PTR resolver (`SystemResolver::reverse`) returns typed error today."]
+#[ignore = "WOR-1132: agent_class policy + forward_to_upstream are wired (see the reactivated UA / human tests), but this test needs a forward-confirmed PTR for 66.249.66.1 -> *.googlebot.com. The binary uses the live `SystemResolver`, which is nondeterministic in CI; reactivation needs an injectable test resolver feeding the binary a static PTR/A fixture. Tracked under WOR-1133 (e2e harness gaps)."]
 fn reverse_dns_verified_resolves_to_googlebot() {
     let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
     let harness = ProxyHarness::start_with_yaml(&agent_class_config(&upstream.base_url()))
@@ -133,7 +139,7 @@ fn reverse_dns_verified_resolves_to_googlebot() {
 // --- Test 3: rDNS spoof => falls back to unknown ---
 
 #[test]
-#[ignore = "TODO(wave2): G1.5 forward-confirm step landed in `sbproxy-security::agent_verify::verify_reverse_dns`; agent_class policy not yet wired in config compiler (see WATCH.md)."]
+#[ignore = "WOR-1132: behavior mismatch, not wiring. The resolver accepts a UA-regex match (step 3) at face value when reverse-DNS does not confirm; it does NOT demote a GPTBot UA from a non-Google IP to `unknown`. So forwarding stamps `openai-gptbot`, not `unknown`. Reactivation needs a resolver policy decision on whether an unconfirmed UA claim should be demoted (product question), tracked separately."]
 fn rdns_spoof_falls_back_to_unknown() {
     let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
     let harness = ProxyHarness::start_with_yaml(&agent_class_config(&upstream.base_url()))
@@ -171,7 +177,7 @@ fn rdns_spoof_falls_back_to_unknown() {
 // --- Test 4: bot-auth keyid matches expected => verified ---
 
 #[test]
-#[ignore = "TODO(wave2): G1.4 resolver + bot_auth directory both landed; agent_class policy not yet wired in config compiler (see WATCH.md)."]
+#[ignore = "WOR-1132: the resolver + forward_to_upstream are wired, but `request_filter` still feeds the resolver `bot_auth_keyid = None` (the Web Bot Auth verifier slice has not landed), so the keyid path (step 1) never runs. Also needs a real RFC 9421 ed25519 signature over the keyid, not the `AAAA` placeholder. Reactivation blocks on the bot-auth verifier wiring."]
 fn bot_auth_keyid_in_directory_resolves_verified() {
     let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
     let harness = ProxyHarness::start_with_yaml(&agent_class_config(&upstream.base_url()))
@@ -207,7 +213,9 @@ fn bot_auth_keyid_in_directory_resolves_verified() {
 // --- Test 5: sentinel => no signal => human ---
 
 #[test]
-#[ignore = "TODO(wave2): G1.4 resolver emits `human` sentinel; agent_class policy not yet wired in config compiler (see WATCH.md)."]
+// WOR-1132: reactivated. A vanilla browser UA falls through every signal
+// to the `human` sentinel, and `forward_to_upstream` surfaces it on the
+// upstream request.
 fn no_signals_resolves_to_human_sentinel() {
     let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
     let harness = ProxyHarness::start_with_yaml(&agent_class_config(&upstream.base_url()))
