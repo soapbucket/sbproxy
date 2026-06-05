@@ -36,10 +36,14 @@ origins:
     )
 }
 
-// A translated-format provider must 501 a surface it has no translator
-// for, rather than forward the path verbatim. (WOR-752 Finding A.)
+// A translated-format provider must translate a supported surface to the
+// upstream's native endpoint, never forward the inbound path verbatim.
+// WOR-1127: the Gemini embeddings translator (WOR-824) now handles
+// `/v1/embeddings`, so the gateway returns 200 and forwards the translated
+// Gemini-native request. This previously asserted 501 (WOR-752 Finding A),
+// before the embeddings translator existed.
 #[test]
-fn gemini_embeddings_returns_501_not_verbatim_forward() {
+fn gemini_embeddings_translated_not_verbatim_forward() {
     let upstream = MockUpstream::start(json!({"unused": true})).expect("mock");
     let harness = ProxyHarness::start_with_yaml(&config_for(
         "gemini",
@@ -58,14 +62,25 @@ fn gemini_embeddings_returns_501_not_verbatim_forward() {
         .expect("post");
 
     assert_eq!(
-        resp.status, 501,
-        "gemini has no embeddings translator, so the gateway must 501; got {}",
+        resp.status, 200,
+        "gemini embeddings are translated now; gateway returns 200; got {}",
         resp.status
     );
-    // The gateway rejected before forwarding: the upstream saw nothing.
+    let captured = upstream.captured();
     assert!(
-        upstream.captured().is_empty(),
-        "a 501'd surface must not reach the upstream"
+        !captured.is_empty(),
+        "the translated embeddings request must reach the upstream"
+    );
+    let paths: Vec<String> = captured.iter().map(|c| c.path.clone()).collect();
+    // The gateway must NOT forward the OpenAI-shaped `/v1/embeddings` path
+    // verbatim; it translates to the Gemini native embeddings endpoint.
+    assert!(
+        paths.iter().all(|p| p != "/v1/embeddings"),
+        "upstream must not receive the verbatim /v1/embeddings path; got {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.contains("embedContent")),
+        "upstream should receive the translated Gemini native embeddings path; got {paths:?}"
     );
 }
 
