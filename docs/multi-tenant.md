@@ -102,7 +102,7 @@ What is NOT guaranteed:
 
 ## Per-tenant cardinality budgets
 
-Prometheus metric label cardinality is the single biggest operational risk in a multi-tenant deployment. SBproxy's cardinality limiter caps the unique label sets per metric family; a tenant that would push the proxy past the cap sees its newest label combinations demoted to a `__other__` catch-all. WOR-1067 split this budget per tenant so a single noisy tenant cannot demote labels for every other tenant.
+Prometheus metric label cardinality is the single biggest operational risk in a multi-tenant deployment. SBproxy's cardinality limiter caps the unique label sets per metric family; a tenant that would push the proxy past the cap sees its newest label combinations demoted to a `__other__` catch-all. The cardinality budget is split per tenant so a single noisy tenant cannot demote labels for every other tenant.
 
 Configure the per-tenant cap on the tenant's observability block:
 
@@ -119,7 +119,7 @@ proxy:
           max_series: 1000   # tighter cap for a tenant known to send wide cardinality
 ```
 
-Omitting the block leaves the tenant on the per-tenant default (10000 unique values per label). The synthetic `__default__` tenant continues to share the proxy-wide budget so single-tenant deployments stay bit-for-bit identical to pre-WOR-1067 behaviour.
+Omitting the block leaves the tenant on the per-tenant default (10000 unique values per label). The synthetic `__default__` tenant continues to share the proxy-wide budget so single-tenant deployments stay bit-for-bit identical to the earlier single-budget behaviour.
 
 Overflows fire the `sbproxy_label_cardinality_overflow_total{tenant_id, metric, label}` counter so dashboards can spot which tenant is approaching its cap.
 

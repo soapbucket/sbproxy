@@ -391,7 +391,6 @@ naming the follow-up:
 ```json
 {
   "error": "not implemented",
-  "ticket": "WOR-227 follow-up",
   "detail": "chat playground stub; real handler will route through proxy_router.oneshot and stream the model response back to /admin/ui"
 }
 ```

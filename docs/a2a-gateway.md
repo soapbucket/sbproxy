@@ -1,7 +1,7 @@
 # A2A gateway
 *Last modified: 2026-05-31*
 
-The `a2a` action proxies agent-to-agent requests to an upstream A2A endpoint and surfaces the agent's typed AgentCard for capability discovery and modality negotiation. Pairs with MCP federation (one gateway, two protocols) and the AP2 / ACP / RAR payment surfaces (WOR-182, WOR-491, WOR-522).
+The `a2a` action proxies agent-to-agent requests to an upstream A2A endpoint and surfaces the agent's typed AgentCard for capability discovery and modality negotiation. Pairs with MCP federation (one gateway, two protocols) and the AP2 / ACP / RAR payment surfaces.
 
 ## Wire shape
 
@@ -57,8 +57,7 @@ The negotiator is case-insensitive on the MIME `type/subtype` head and strips `;
 
 ## See also
 
-- WOR-812 (this ticket).
-- WOR-492 - the A2A x402 payment bridge.
-- WOR-496 - the agentgateway / Bifrost / SBproxy capability benchmark.
+- The A2A x402 payment bridge.
+- The agentgateway / Bifrost / SBproxy capability benchmark.
 - `crates/sbproxy-modules/src/action/a2a.rs` - the proxy action itself.
 - `crates/sbproxy-modules/src/action/a2a_card.rs` - typed AgentCard + negotiator.

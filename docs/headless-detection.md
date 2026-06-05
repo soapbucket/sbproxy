@@ -1,7 +1,7 @@
 # Headless detection
 *Last modified: 2026-05-31*
 
-Header-only heuristics that flag headless and stealth-browser clients even when their TLS / JA4 fingerprint matches a real browser. Pairs with the rule-based agent detection (`request.agent.score`) and the JA4 scorer (WOR-592).
+Header-only heuristics that flag headless and stealth-browser clients even when their TLS / JA4 fingerprint matches a real browser. Pairs with the rule-based agent detection (`request.agent.score`) and the JA4 scorer.
 
 ## What it catches
 
@@ -61,7 +61,7 @@ Pair with `request.agent.score` and the JA4 verdict for a layered defence: a ben
 
 ## Scope and limitations
 
-This module is the deterministic, request-side half of WOR-817. Two further layers compose on top in follow-ups:
+This module is the deterministic, request-side half of the headless-detection design. Two further layers compose on top in follow-ups:
 
 * **JS-execution challenge**: serve a script that posts a token back on first navigation; absence of the token on subsequent requests is a stronger signal than any header heuristic.
 * **Session-window consistency**: header-order hash drift across the same session is a strong stealth indicator; needs the session-tracking surface to land.
@@ -72,5 +72,4 @@ The proprietary ML score that Akamai Content Protector pairs with these heuristi
 
 - [scripting.md](scripting.md) - the full CEL / Lua / JavaScript / WASM expression surface.
 - `crates/sbproxy-agent-detect/src/headless_indicators.rs` - source.
-- WOR-592 - JA4 CatBoost scorer that this pairs with.
-- WOR-817 - this ticket.
+- The JA4 CatBoost scorer that this pairs with.
