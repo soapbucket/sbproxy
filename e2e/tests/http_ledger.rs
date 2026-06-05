@@ -6,14 +6,17 @@
 //! contract holds for retry, idempotency, circuit breaker, HMAC
 //! signing, and the error envelope mapping.
 //!
-//! The G1.3 `HttpLedger` client lands on `wave1/G1.2-G1.3-tiers-ledger`
-//! in parallel with this file. Until that branch merges, every test
-//! that drives the ledger through the proxy is `#[ignore]`d with a
-//! `TODO(wave1-G1.3)` marker.
-//!
-//! The mock-server scaffolding (knobs, request capture, HMAC verify)
-//! is fully present so the day G1.3 lands a maintainer drops the
-//! `#[ignore]` attributes without touching the test bodies.
+//! The `HttpLedger` client and its `ledger:` YAML wiring have both
+//! landed: `AiCrawlControlConfig::from_config` threads `config.ledger`
+//! through `build_http_ledger` into an `HttpLedger` when the
+//! `http-ledger` feature is on (default-on in the binary), covered by a
+//! unit test in `ai_crawl/tests.rs`. The tests here stay `#[ignore]`d on
+//! a different blocker: this mock serves plain `http://` (axum +
+//! `TcpListener`) while `HttpLedger` mandates `https://` with a trusted
+//! cert, so the config-built client rejects the endpoint at
+//! construction. Reactivation needs an HTTPS mock ledger (self-signed
+//! cert) plus a TLS-trust path for the config-built client. See each
+//! test's reason; tracked as an e2e harness gap with WOR-1133.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -241,7 +244,7 @@ fn rt() -> tokio::runtime::Runtime {
 }
 
 #[test]
-#[ignore = "TODO(wave3): G1.3 HttpLedger client landed and unit-tested but is not wired into AiCrawlControlConfig::from_config; the ai_crawl policy still hard-codes InMemoryLedger. YAML `ledger:` block is also unrecognised and would route through plain http:// in the test which the client rejects."]
+#[ignore = "WOR-1129: the `ledger:` block IS wired - AiCrawlControlConfig::from_config threads config.ledger through build_http_ledger into an HttpLedger when the http-ledger feature is on (default-on in the binary), unit-tested in ai_crawl/tests.rs. The real blocker is this mock: it serves plain http:// (axum + TcpListener) while HttpLedger mandates https:// with a trusted cert, so the config-built client rejects the endpoint at construction. Reactivation needs an HTTPS mock ledger (self-signed cert) plus a TLS-trust path for the config-built client (build_http_ledger uses a default reqwest client). Tracked as an e2e harness gap with WOR-1133."]
 fn test_happy_path_redeem_returns_200() {
     let runtime = rt();
     let (addr, state) = runtime.block_on(spawn_mock_ledger(LedgerKnobs {
@@ -298,7 +301,7 @@ origins:
 }
 
 #[test]
-#[ignore = "TODO(wave3): G1.3 HttpLedger retry policy implemented in code but not yet exposed via YAML `ledger:` block on ai_crawl_control. Test asserts retries against a mock; needs YAML wiring + HTTPS-equipped mock."]
+#[ignore = "WOR-1129: the `ledger:` block is wired (from_config -> build_http_ledger -> HttpLedger; unit-tested). Real blocker is the same as test_happy_path_redeem_returns_200: the mock serves plain http:// but HttpLedger mandates https:// with a trusted cert. Needs an HTTPS mock + TLS-trust path for the config-built client. Tracked with WOR-1133."]
 fn test_retry_with_idempotency_key() {
     let runtime = rt();
     let (addr, state) = runtime.block_on(spawn_mock_ledger(LedgerKnobs {
@@ -351,7 +354,7 @@ origins:
 }
 
 #[test]
-#[ignore = "TODO(wave3): G1.3 HttpLedger circuit breaker implemented in code but the policy compiler does not surface a `ledger:` YAML block. Wave 3 wiring task."]
+#[ignore = "WOR-1129: the `ledger:` block IS surfaced (config.ledger -> build_http_ledger -> HttpLedger, unit-tested). Real blocker is the plain-http mock vs HttpLedger`s https:// requirement; needs an HTTPS mock + TLS-trust path for the config-built client. Tracked with WOR-1133."]
 fn test_circuit_breaker_opens_after_consecutive_failures() {
     let runtime = rt();
     let (addr, state) = runtime.block_on(spawn_mock_ledger(LedgerKnobs {
@@ -402,7 +405,7 @@ origins:
 }
 
 #[test]
-#[ignore = "TODO(wave3): G1.3 HttpLedger HMAC body-binding implemented in code but the policy compiler does not surface a `ledger:` YAML block. Wave 3 wiring task."]
+#[ignore = "WOR-1129: the `ledger:` block IS surfaced (config.ledger -> build_http_ledger -> HttpLedger, unit-tested). Real blocker is the plain-http mock vs HttpLedger`s https:// requirement; needs an HTTPS mock + TLS-trust path for the config-built client. Tracked with WOR-1133."]
 fn test_hmac_signature_binds_to_body() {
     // The mock server captures the raw body and the signature header.
     // The test recomputes the canonical signing string per ADR and
@@ -466,7 +469,7 @@ origins:
 }
 
 #[test]
-#[ignore = "TODO(wave3): G1.3 HttpLedger error-envelope mapping implemented but YAML wiring missing on ai_crawl_control."]
+#[ignore = "WOR-1129: the `ledger:` YAML wiring is present (config.ledger -> build_http_ledger -> HttpLedger, unit-tested). Real blocker is the plain-http mock vs HttpLedger`s https:// requirement; needs an HTTPS mock + TLS-trust path for the config-built client. Tracked with WOR-1133."]
 fn test_error_envelope_retryable_false_maps_to_402() {
     // Per ADR: a non-retryable error envelope (e.g.
     // `ledger.signature_invalid`) maps to 402 at the proxy edge so
@@ -512,7 +515,7 @@ origins:
 }
 
 #[test]
-#[ignore = "TODO(wave3): G1.3 HttpLedger retryable-503 mapping implemented but YAML wiring missing on ai_crawl_control."]
+#[ignore = "WOR-1129: the `ledger:` YAML wiring is present (config.ledger -> build_http_ledger -> HttpLedger, unit-tested). Real blocker is the plain-http mock vs HttpLedger`s https:// requirement; needs an HTTPS mock + TLS-trust path for the config-built client. Tracked with WOR-1133."]
 fn test_error_envelope_retryable_true_maps_to_503() {
     let runtime = rt();
     let (addr, _state) = runtime.block_on(spawn_mock_ledger(LedgerKnobs {
