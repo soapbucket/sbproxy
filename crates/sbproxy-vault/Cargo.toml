@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+tracing.workspace = true
 sbproxy-observe.workspace = true
 serde_json.workspace = true
 # YAML parser for the file-format vault backend.

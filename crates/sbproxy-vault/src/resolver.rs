@@ -87,6 +87,17 @@ impl SecretResolver {
                 .with_context(|| format!("failed to read secret file: {}", path))
                 .map(|s| s.trim().to_string())
         } else {
+            // WOR-1165: only a whole-value `${VAR}` wrapper is expanded.
+            // If the value embeds a reference inside a larger string (e.g.
+            // `Bearer ${TOKEN}`), it is passed through literally; warn so
+            // an operator who expected interpolation is not silently
+            // surprised by a literal `${...}` reaching the upstream.
+            if value.contains("${") {
+                tracing::warn!(
+                    "config value embeds an env-style `${{VAR}}` reference, but only a whole-value \
+                     `${{VAR}}` wrapper is expanded; this value is passed through literally"
+                );
+            }
             Ok(value.to_string())
         }
     }
