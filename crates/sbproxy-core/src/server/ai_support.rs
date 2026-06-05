@@ -455,6 +455,47 @@ pub(super) fn extract_usage(body: &[u8]) -> (u64, u64) {
     (prompt, completion)
 }
 
+/// WOR-1146: estimate completion tokens from a chat-completions
+/// response body when the upstream omitted a parseable `usage` block.
+///
+/// Concatenates the assistant text across `choices[].message.content`
+/// (OpenAI chat shape), falling back to `choices[].text` (legacy
+/// completions), then runs the canonical token estimator
+/// ([`sbproxy_ai::estimate_tokens`], which uses the model's BPE when
+/// known and a `chars/4` heuristic otherwise). Returns 0 when the body
+/// yields no assistant text (so the caller can decide not to debit).
+///
+/// This is intentionally a coarse safety-net estimate: it only runs on
+/// the anomalous path where a 2xx response carried no usage at all, so
+/// the budget is debited approximately rather than not at all.
+pub(super) fn estimate_completion_tokens(model: &str, resp_body: &[u8]) -> u64 {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(resp_body) else {
+        return 0;
+    };
+    let mut text = String::new();
+    if let Some(choices) = value.get("choices").and_then(|c| c.as_array()) {
+        for choice in choices {
+            if let Some(s) = choice
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+            {
+                text.push_str(s);
+            } else if let Some(s) = choice.get("text").and_then(|t| t.as_str()) {
+                text.push_str(s);
+            }
+        }
+    }
+    if text.is_empty() {
+        return 0;
+    }
+    let message = sbproxy_ai::Message {
+        role: "assistant".to_string(),
+        content: serde_json::Value::String(text),
+    };
+    sbproxy_ai::estimate_tokens(model, std::slice::from_ref(&message))
+}
+
 /// Streaming-aware accumulator for SSE `usage` blocks.
 ///
 /// AI providers report token usage in the terminal SSE chunk rather
@@ -1491,5 +1532,50 @@ mod extract_prompt_text_tests {
         });
         let out = extract_prompt_text(&body);
         assert!(out.contains("user 42 deleted"));
+    }
+}
+
+#[cfg(test)]
+mod estimate_completion_tokens_tests {
+    use super::estimate_completion_tokens;
+    use serde_json::json;
+
+    #[test]
+    fn chat_message_content_is_estimated() {
+        // A usage-less chat completion: the estimator must pull the
+        // assistant content and return a non-zero token estimate.
+        let body = json!({
+            "id": "chatcmpl-x",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "The quick brown fox jumps over the lazy dog."},
+                "finish_reason": "stop"
+            }]
+        });
+        let est = estimate_completion_tokens("gpt-4o", body.to_string().as_bytes());
+        assert!(
+            est > 0,
+            "non-empty assistant content must estimate > 0 tokens"
+        );
+    }
+
+    #[test]
+    fn legacy_completions_text_is_estimated() {
+        let body = json!({
+            "choices": [{"index": 0, "text": "hello world from the legacy completions surface"}]
+        });
+        let est = estimate_completion_tokens("gpt-4o", body.to_string().as_bytes());
+        assert!(est > 0, "legacy choices[].text must estimate > 0 tokens");
+    }
+
+    #[test]
+    fn empty_or_unparseable_body_estimates_zero() {
+        assert_eq!(estimate_completion_tokens("gpt-4o", b""), 0);
+        assert_eq!(estimate_completion_tokens("gpt-4o", b"not json"), 0);
+        // Valid JSON but no choices / content -> nothing to estimate.
+        assert_eq!(
+            estimate_completion_tokens("gpt-4o", br#"{"object":"chat.completion","choices":[]}"#),
+            0
+        );
     }
 }
