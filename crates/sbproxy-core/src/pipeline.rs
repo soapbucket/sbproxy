@@ -618,10 +618,29 @@ impl TlsFingerprintConfig {
         match serde_yaml::from_value::<TlsFingerprintConfig>(block.clone()) {
             Ok(cfg) => cfg,
             Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "proxy.extensions.tls_fingerprint failed to parse; capture disabled",
-                );
+                // WOR-1161: a malformed block silently falls back to
+                // disabled, which is a fail-open if the operator meant to
+                // turn the feature on. When the raw block has
+                // `enabled: true`, surface the parse error at ERROR (not
+                // warn) so the misconfig cannot hide. (A hard compile
+                // failure needs `from_extensions` to return Result; tracked
+                // as a follow-up.)
+                let was_enabled = block
+                    .get("enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if was_enabled {
+                    tracing::error!(
+                        error = %e,
+                        "proxy.extensions.tls_fingerprint has `enabled: true` but failed to parse; \
+                         TLS-fingerprint capture is DISABLED until the block is fixed",
+                    );
+                } else {
+                    tracing::warn!(
+                        error = %e,
+                        "proxy.extensions.tls_fingerprint failed to parse; capture disabled",
+                    );
+                }
                 Self::default()
             }
         }

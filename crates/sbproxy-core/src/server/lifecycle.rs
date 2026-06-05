@@ -188,6 +188,21 @@ pub(super) fn start_config_watcher(config_path: String) {
     use notify::{RecursiveMode, Watcher};
 
     std::thread::spawn(move || {
+        // WOR-1162: watch the PARENT directory, not the file itself.
+        // inotify (and most backends) bind a file watch to the inode, so
+        // an atomic-rename save (vim with backupcopy=no, `sed -i`, most
+        // config-management tools) or a Kubernetes ConfigMap symlink swap
+        // replaces the inode and a file-level watch never fires again.
+        // Watching the directory catches the create/rename of the new
+        // file. Reload re-reads `config_path`, so reacting to any relevant
+        // event in the directory is correct and idempotent.
+        let cfg_path = std::path::PathBuf::from(&config_path);
+        let watch_dir = cfg_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
         let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher = match notify::recommended_watcher(move |res| {
             let _ = tx.send(res);
@@ -199,20 +214,21 @@ pub(super) fn start_config_watcher(config_path: String) {
             }
         };
 
-        if let Err(e) = watcher.watch(
-            std::path::Path::new(&config_path),
-            RecursiveMode::NonRecursive,
-        ) {
-            tracing::error!(error = %e, path = %config_path, "failed to watch config file");
+        if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::NonRecursive) {
+            tracing::error!(error = %e, dir = %watch_dir.display(), "failed to watch config directory");
             return;
         }
 
-        tracing::info!(path = %config_path, "config file watcher started");
+        tracing::info!(path = %config_path, dir = %watch_dir.display(), "config file watcher started");
 
         for event in rx {
             match event {
-                Ok(event) if event.kind.is_modify() => {
-                    tracing::info!("config file changed, reloading...");
+                Ok(event)
+                    if event.kind.is_modify()
+                        || event.kind.is_create()
+                        || event.kind.is_remove() =>
+                {
+                    tracing::info!("config directory changed, reloading...");
                     if let Err(e) = reload_from_config_path(&config_path) {
                         tracing::error!(error = %e, "reload failed; serving prior pipeline");
                     }
