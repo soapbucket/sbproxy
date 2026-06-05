@@ -187,6 +187,13 @@ pub struct AccessLogEntry {
     /// Cache result: "hit", "miss", "stale", or "bypass".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_result: Option<String>,
+    /// Bytes removed by the `boilerplate` transform on this request.
+    /// `None` (and omitted from the line) when no boilerplate transform
+    /// ran or it stripped nothing; `Some(n>0)` when content was removed.
+    /// Summed across requests this matches the
+    /// `sbproxy_boilerplate_stripped_bytes_total` counter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stripped_bytes: Option<u64>,
 
     // --- Wave 8 envelope linkage ---
     /// Capture envelope ULID. Distinct from `request_id` (UUIDv4); the
@@ -566,6 +573,7 @@ impl Default for AccessLogEntry {
             ai_surface: None,
             trace_id: None,
             cache_result: None,
+            stripped_bytes: None,
             envelope_request_id: None,
             user_id: None,
             user_id_source: None,
@@ -852,6 +860,7 @@ mod tests {
             ai_surface: None,
             trace_id: None,
             cache_result: None,
+            stripped_bytes: None,
             envelope_request_id: None,
             user_id: None,
             user_id_source: None,

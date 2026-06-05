@@ -610,6 +610,9 @@ pub(super) fn emit_access_log(
         tokens_out: ctx.ai_tokens_out,
         ai_surface: ctx.ai_surface.clone(),
         cache_result,
+        // WOR-1131: omitted unless the boilerplate transform stripped
+        // something on this request.
+        stripped_bytes: (ctx.metrics.stripped_bytes > 0).then_some(ctx.metrics.stripped_bytes),
         // Wave 6 / G6.2 access-log v1 fields. Most surface stamping
         // lands as the request flows through the pipeline (e.g.
         // `cap_token_id` from the CAP verifier in R6.1, `rail` /
@@ -776,6 +779,10 @@ pub(super) struct AccessLogContext {
     /// Cache result label (`hit`, `miss`, `stale`, `bypass`) when
     /// the response cache ran.
     pub(super) cache_result: Option<String>,
+    /// WOR-1131: bytes removed by the `boilerplate` transform on this
+    /// request. `None` when no boilerplate transform ran or it stripped
+    /// nothing.
+    pub(super) stripped_bytes: Option<u64>,
     // --- Wave 6 / G6.2 access-log v1 fields ---
     /// Pricing tier the request matched (`free`, `commercial`,
     /// operator-defined name).
@@ -850,6 +857,7 @@ impl AccessLogContext {
             tokens_out: None,
             ai_surface: None,
             cache_result: None,
+            stripped_bytes: None,
             tier: None,
             shape: None,
             price: None,
@@ -964,6 +972,9 @@ pub(super) fn emit_access_log_entry(
         ai_surface: context.ai_surface,
         trace_id,
         cache_result: context.cache_result,
+        // WOR-1131: surface the boilerplate strip count. Omitted when no
+        // boilerplate transform ran or it removed nothing.
+        stripped_bytes: context.stripped_bytes,
         envelope_request_id: context.envelope_request_id,
         user_id: context.user_id,
         user_id_source: context.user_id_source,
