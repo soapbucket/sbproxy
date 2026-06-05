@@ -266,3 +266,97 @@ fn unrelated_prompt_misses_and_forwards() {
     );
     assert_eq!(upstream.chat_calls(), 2, "both prompts must reach upstream");
 }
+
+/// WOR-1154: input guardrails must run BEFORE the semantic-cache
+/// lookup. A prompt a guardrail would block must be blocked even when a
+/// matching cache entry exists, otherwise a cache hit short-circuits the
+/// request and serves a response for a prompt that should have been
+/// rejected.
+fn config_with_input_guardrail(upstream: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: "stub-key"
+          base_url: "{upstream}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+      routing:
+        strategy: round_robin
+      guardrails:
+        input:
+          - type: regex
+            action: block
+            patterns:
+              - "FORBIDDEN"
+      semantic_cache:
+        enabled: true
+        threshold: 0.9
+        ttl_secs: 60
+        max_entries: 64
+        embedding:
+          provider: openai
+          model: text-embedding-3-small
+"#
+    )
+}
+
+#[test]
+fn input_guardrail_blocks_even_on_cache_hit() {
+    let upstream = MockProvider::start();
+    let proxy = ProxyHarness::start_with_yaml(&config_with_input_guardrail(&upstream.base_url()))
+        .expect("start proxy");
+
+    // 1. Clean France prompt: miss -> upstream -> cached under the
+    //    France embedding bucket.
+    let r1 = proxy
+        .post_json(
+            "/v1/chat/completions",
+            "ai.localhost",
+            &chat("What is the capital of France?"),
+            &[],
+        )
+        .expect("first call");
+    assert_eq!(r1.status, 200, "clean prompt passes");
+    assert_eq!(
+        upstream.chat_calls(),
+        1,
+        "clean prompt reaches upstream once"
+    );
+
+    // 2. A France prompt carrying the forbidden token shares the same
+    //    embedding bucket, so it WOULD be a semantic cache hit. The
+    //    input guardrail must block it (400) before the cache lookup,
+    //    rather than replaying the cached reply.
+    let r2 = proxy
+        .post_json(
+            "/v1/chat/completions",
+            "ai.localhost",
+            &chat("Tell me about France and include FORBIDDEN content"),
+            &[],
+        )
+        .expect("second call");
+    assert_eq!(
+        r2.status,
+        400,
+        "a guardrail-blocked prompt must be blocked even when a cache entry matches, got {}: {:?}",
+        r2.status,
+        String::from_utf8_lossy(&r2.body)
+    );
+    let b2 = String::from_utf8_lossy(&r2.body);
+    assert!(
+        b2.contains("guardrail_violation"),
+        "block body should name the violation: {b2}"
+    );
+    assert_ne!(
+        r2.headers.get("x-semcache").map(|s| s.as_str()),
+        Some("HIT"),
+        "the blocked request must not be served from cache"
+    );
+}
