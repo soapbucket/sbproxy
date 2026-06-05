@@ -257,6 +257,9 @@ impl MtlsCertCache {
 struct CapturingClientCertVerifier {
     inner: std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier>,
     cache: MtlsCertCacheHandle,
+    /// WOR-1155: compiled allowlist of patterns the client cert CN must
+    /// match. Empty accepts any CA-signed CN.
+    cn_patterns: Vec<regex::Regex>,
 }
 
 impl std::fmt::Debug for CapturingClientCertVerifier {
@@ -282,7 +285,12 @@ impl rustls::server::danger::ClientCertVerifier for CapturingClientCertVerifier 
         // Capture metadata before delegating, so even a "verified but
         // we couldn't parse" path stores something useful. The actual
         // trust decision is the inner verifier's.
-        if let Some(info) = parse_client_cert_info(end_entity.as_ref()) {
+        let parsed = parse_client_cert_info(end_entity.as_ref());
+        let cn = parsed
+            .as_ref()
+            .map(|i| i.common_name.clone())
+            .unwrap_or_default();
+        if let Some(info) = parsed {
             let digest = sha256(end_entity.as_ref());
             self.cache.insert(digest, info);
         }
@@ -295,6 +303,21 @@ impl rustls::server::danger::ClientCertVerifier for CapturingClientCertVerifier 
         // discriminator; anything else collapses to `other`.
         let label = classify_mtls_outcome(&outcome);
         sbproxy_observe::metrics::record_mtls_handshake(label);
+        // WOR-1155: even when CA-chain validation passes, enforce the CN
+        // allowlist. A cert signed by the configured CA whose CN matches
+        // none of the operator's patterns is rejected at the handshake.
+        if outcome.is_ok()
+            && !self.cn_patterns.is_empty()
+            && !self.cn_patterns.iter().any(|re| re.is_match(&cn))
+        {
+            tracing::warn!(
+                cn = %cn,
+                "mTLS client cert CN does not match allowed_cn_patterns; rejecting handshake"
+            );
+            return Err(rustls::Error::General(format!(
+                "client certificate CN '{cn}' does not match any allowed_cn_patterns"
+            )));
+        }
         outcome
     }
 
@@ -422,12 +445,23 @@ fn parse_client_cert_info(der: &[u8]) -> Option<ClientCertInfo> {
 pub fn build_client_cert_verifier(
     ca_path: &str,
     require: bool,
+    allowed_cn_patterns: &[String],
     cache: MtlsCertCacheHandle,
 ) -> anyhow::Result<std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier>> {
     use rustls::server::WebPkiClientVerifier;
     use rustls::RootCertStore;
 
     use rustls::pki_types::{pem::PemObject as _, CertificateDer};
+
+    // WOR-1155: compile the optional CN allowlist up front so a bad
+    // pattern fails config load rather than at handshake time.
+    let mut cn_patterns = Vec::with_capacity(allowed_cn_patterns.len());
+    for pattern in allowed_cn_patterns {
+        let re = regex::Regex::new(pattern).map_err(|e| {
+            anyhow::anyhow!("invalid mtls allowed_cn_patterns entry '{pattern}': {e}")
+        })?;
+        cn_patterns.push(re);
+    }
 
     let pem_bytes = std::fs::read(ca_path)
         .map_err(|e| anyhow::anyhow!("read client_ca_file '{}': {e}", ca_path))?;
@@ -453,6 +487,7 @@ pub fn build_client_cert_verifier(
     Ok(std::sync::Arc::new(CapturingClientCertVerifier {
         inner,
         cache,
+        cn_patterns,
     }))
 }
 
@@ -533,6 +568,25 @@ mod tests {
         let got = cache.get(&digest).expect("hit");
         assert_eq!(got.common_name, info.common_name);
         assert_eq!(got.subject_alt_names, info.subject_alt_names);
+    }
+
+    #[test]
+    fn build_verifier_rejects_invalid_cn_pattern() {
+        // WOR-1155: an invalid CN regex fails config load up front (before
+        // the CA file is even read), so a typo cannot ship as a silently
+        // unenforced allowlist.
+        let cache = MtlsCertCache::new(8);
+        let result = build_client_cert_verifier(
+            "/nonexistent/ca.pem",
+            true,
+            &["[unterminated".to_string()],
+            cache,
+        );
+        let err = result.expect_err("invalid CN pattern must fail config load");
+        assert!(
+            err.to_string().contains("allowed_cn_patterns"),
+            "error should mention allowed_cn_patterns; got: {err}"
+        );
     }
 
     #[test]
