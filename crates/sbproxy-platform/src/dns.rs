@@ -183,6 +183,20 @@ impl RefreshingResolver {
                 .collect(),
             Err(e) => {
                 tracing::warn!(hostname = %hostname, error = %e, "DNS resolution failed");
+                // WOR-1165: on a transient resolver error, serve the
+                // last-good cached address instead of failing outright. A
+                // DNS blip should not take down live traffic to a host we
+                // previously resolved.
+                let guard = self.state.read().await;
+                if let Some(cached) = guard.get(hostname) {
+                    if let Some(ip) = cached.ips.first().copied() {
+                        tracing::debug!(
+                            hostname = %hostname,
+                            "serving last-good cached DNS address after transient resolution error"
+                        );
+                        return Some(ip);
+                    }
+                }
                 return None;
             }
         };
