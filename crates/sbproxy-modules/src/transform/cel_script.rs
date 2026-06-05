@@ -56,6 +56,12 @@ use std::time::Duration;
 use bytes::{BufMut, BytesMut};
 use http::HeaderMap;
 use sbproxy_extension::cel::{CelEngine, CelValue};
+
+/// Re-exported so `sbproxy-core`'s header-mutating call site can build
+/// the per-request TLS view it threads into
+/// [`CelScriptTransform::evaluate_headers_lossy_with_tls`] (WOR-1128)
+/// without depending on `sbproxy-extension` directly.
+pub use sbproxy_extension::cel::context::TlsFingerprintView;
 use serde::Deserialize;
 
 /// Headers a CEL expression is not allowed to mutate. Case-insensitive
@@ -226,10 +232,27 @@ impl CelScriptTransform {
         status: u16,
         headers: &HeaderMap,
     ) -> Result<Vec<CelHeaderMutation>, crate::transform::TransformError> {
+        self.evaluate_headers_with_tls(body, status, headers, None)
+    }
+
+    /// Same as [`Self::evaluate_headers`] but threads a per-request TLS
+    /// fingerprint view into the CEL context so `request.tls.*`
+    /// (`ja3` / `ja4` / `ja4h` / `trustworthy`) resolves inside
+    /// `value_expr` (WOR-1128). The header-mutating call site in
+    /// `sbproxy-core` owns the live request context and passes the view;
+    /// callers without one pass `None` (the bindings then render the
+    /// zero value).
+    pub fn evaluate_headers_with_tls(
+        &self,
+        body: &[u8],
+        status: u16,
+        headers: &HeaderMap,
+        tls: Option<TlsFingerprintView<'_>>,
+    ) -> Result<Vec<CelHeaderMutation>, crate::transform::TransformError> {
         if self.headers.is_empty() {
             return Ok(Vec::new());
         }
-        let ctx = build_response_eval_context(body, status, headers);
+        let ctx = build_response_eval_context(body, status, headers, tls.as_ref());
         let engine = CelEngine::new();
         let mut out = Vec::with_capacity(self.headers.len());
         for rule in &self.headers {
@@ -332,7 +355,20 @@ impl CelScriptTransform {
         status: u16,
         headers: &HeaderMap,
     ) -> Vec<CelHeaderMutation> {
-        match self.evaluate_headers(body, status, headers) {
+        self.evaluate_headers_lossy_with_tls(body, status, headers, None)
+    }
+
+    /// Lossy variant of [`Self::evaluate_headers_with_tls`]. Threads the
+    /// per-request TLS view through and drops invariant errors after
+    /// logging (WOR-1128).
+    pub fn evaluate_headers_lossy_with_tls(
+        &self,
+        body: &[u8],
+        status: u16,
+        headers: &HeaderMap,
+        tls: Option<TlsFingerprintView<'_>>,
+    ) -> Vec<CelHeaderMutation> {
+        match self.evaluate_headers_with_tls(body, status, headers, tls) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -394,7 +430,7 @@ impl CelScriptTransform {
             return Ok(());
         };
 
-        let ctx = build_response_eval_context(body.as_ref(), status, headers);
+        let ctx = build_response_eval_context(body.as_ref(), status, headers, None);
 
         let engine = CelEngine::new();
         let result = match engine.eval_source(expression, &ctx) {
@@ -452,14 +488,17 @@ impl CelScriptTransform {
 /// (`headers[*].value_expr`).
 ///
 /// Stamps a `response` namespace with `body`, `status`, and `headers`
-/// onto the standard request-context. The request namespace is empty
-/// here because the body-buffer call site does not own a `Session`;
-/// real `request.tls.*` / `request.kya.*` bindings come from the
-/// upstream call site that owns the request context (server.rs).
+/// onto the standard request-context. When `tls` is supplied (the
+/// upstream header-mutating call site in `sbproxy-core` owns the live
+/// request context) the `request.tls.*` bindings are populated from it
+/// so expressions like `string(request.tls.trustworthy)` resolve
+/// (WOR-1128). The body-buffer call site passes `None` because it does
+/// not own a `Session`.
 fn build_response_eval_context(
     body: &[u8],
     status: u16,
     headers: &HeaderMap,
+    tls: Option<&TlsFingerprintView<'_>>,
 ) -> sbproxy_extension::cel::CelContext {
     let body_str = match std::str::from_utf8(body) {
         Ok(s) => s.to_string(),
@@ -476,6 +515,13 @@ fn build_response_eval_context(
         None,
         "",
     );
+    // WOR-1128: thread the per-request TLS fingerprint into
+    // `request.tls.*` when the caller has it. `populate_tls_namespace`
+    // merges into the existing `request` map, so it must run after
+    // `build_request_context`.
+    if let Some(view) = tls {
+        sbproxy_extension::cel::context::populate_tls_namespace(&mut ctx, view);
+    }
     let mut resp_map = std::collections::HashMap::with_capacity(3);
     resp_map.insert("body".to_string(), CelValue::String(body_str));
     resp_map.insert("status".to_string(), CelValue::Int(status as i64));
@@ -597,6 +643,63 @@ mod tests {
                 "x-status".to_string(),
                 "418".to_string(),
             )]
+        );
+    }
+
+    #[test]
+    fn evaluate_headers_with_tls_resolves_request_tls_bindings() {
+        // WOR-1128: a `value_expr` that reads `request.tls.*` must
+        // resolve against the threaded view, not the zero value.
+        let v = serde_json::json!({
+            "type": "cel",
+            "headers": [
+                {"op": "set", "name": "x-tls-trust", "value_expr": r#"request.tls.trustworthy ? "yes" : "no""#},
+                {"op": "set", "name": "x-tls-ja4", "value_expr": "request.tls.ja4"},
+            ],
+        });
+        let t = CelScriptTransform::from_config(v).unwrap();
+        let view = TlsFingerprintView {
+            ja3: None,
+            ja4: Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            ja4h: None,
+            trustworthy: true,
+        };
+        let mutations = t
+            .evaluate_headers_with_tls(b"", 200, &HeaderMap::new(), Some(view))
+            .unwrap();
+        assert_eq!(
+            mutations,
+            vec![
+                CelHeaderMutation::Set("x-tls-trust".to_string(), "yes".to_string()),
+                CelHeaderMutation::Set(
+                    "x-tls-ja4".to_string(),
+                    "t13d1516h2_8daaf6152771_b186095e22b6".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn evaluate_headers_without_tls_skips_request_tls_rule() {
+        // Without a threaded view the `request.tls` namespace is absent,
+        // so a rule that reads it evaluates to an error and is skipped
+        // (the chain continues) rather than emitting a bogus value.
+        let v = serde_json::json!({
+            "type": "cel",
+            "headers": [
+                {"op": "set", "name": "x-tls-trust", "value_expr": r#"request.tls.trustworthy ? "yes" : "no""#},
+                {"op": "set", "name": "x-keep", "value_expr": r#""kept""#},
+            ],
+        });
+        let t = CelScriptTransform::from_config(v).unwrap();
+        let mutations = t.evaluate_headers(b"", 200, &HeaderMap::new()).unwrap();
+        assert_eq!(
+            mutations,
+            vec![CelHeaderMutation::Set(
+                "x-keep".to_string(),
+                "kept".to_string(),
+            )],
+            "the request.tls rule is skipped but the rest of the chain runs",
         );
     }
 

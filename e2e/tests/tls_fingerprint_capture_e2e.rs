@@ -196,11 +196,16 @@ origins:
     );
 }
 
-// The trustworthy assertion still depends on `features.tls_fingerprint`
-// landing on CompiledPipeline (day-6 Item 3 - WATCH). The fixture and
-// shape below pin the contract for the follow-up.
+// WOR-1128: `features.tls_fingerprint:` is threaded onto
+// CompiledPipeline (TlsFingerprintConfig::from_extensions) and the
+// header-mutating CEL surface now sees `request.tls.*` (the per-request
+// view is passed into evaluate_headers_lossy_with_tls). These tests
+// drive the full path: a trusted loopback sidecar supplies
+// `x-sbproxy-tls-ja4` so capture fires, the per-origin CIDR config
+// decides `trustworthy`, and a `headers:` CEL rule stamps the verdict
+// onto the response for assertion. The harness marks loopback trusted
+// by default, so the sidecar header survives the trust-boundary strip.
 #[test]
-#[ignore = "TODO(wave5-day6+): the day-6 Item 1 header-mutating CEL surface lands here. The remaining gap is day-6 Item 3: wire `features.tls_fingerprint:` onto CompiledPipeline so request.tls.trustworthy actually populates from the per-origin CIDR config (today the YAML block parses via the pre-process migration but is not threaded to the pipeline)."]
 fn trustworthy_true_for_direct_client_cidr() {
     let yaml = r#"
 proxy:
@@ -222,13 +227,19 @@ origins:
         headers:
           - op: set
             name: x-tls-trust
-            value_expr: 'string(request.tls.trustworthy)'
+            value_expr: 'request.tls.trustworthy ? "yes" : "no"'
 "#;
     let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
-    let resp = harness.get("/", "tls-fp.localhost").expect("GET");
+    let resp = harness
+        .get_with_headers(
+            "/",
+            "tls-fp.localhost",
+            &[("x-sbproxy-tls-ja4", "t13d1516h2_8daaf6152771_b186095e22b6")],
+        )
+        .expect("GET");
     assert_eq!(
         resp.headers.get("x-tls-trust").map(String::as_str),
-        Some("true"),
+        Some("yes"),
         "127.0.0.1 must match trustworthy_client_cidrs and surface trustworthy=true"
     );
 }
@@ -236,7 +247,6 @@ origins:
 // --- Test 5: trustworthy = false when client IP is in a CDN range ---
 
 #[test]
-#[ignore = "TODO(wave5-day6+): day-5 landed the `type: cel` transform (Item 4). Reactivation blocks on the `features.tls_fingerprint:` config block being parsed and threaded onto CompiledPipeline (today the YAML field is silently ignored) plus the header-vs-body CEL surface mismatch."]
 fn trustworthy_false_behind_cdn_range() {
     let yaml = r#"
 proxy:
@@ -257,14 +267,22 @@ origins:
       body: "ok"
     transforms:
       - type: cel
-        on_response: |
-          resp.headers["x-tls-trust"] = string(request.tls.trustworthy)
+        headers:
+          - op: set
+            name: x-tls-trust
+            value_expr: 'request.tls.trustworthy ? "yes" : "no"'
 "#;
     let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
-    let resp = harness.get("/", "tls-fp.localhost").expect("GET");
+    let resp = harness
+        .get_with_headers(
+            "/",
+            "tls-fp.localhost",
+            &[("x-sbproxy-tls-ja4", "t13d1516h2_8daaf6152771_b186095e22b6")],
+        )
+        .expect("GET");
     assert_eq!(
         resp.headers.get("x-tls-trust").map(String::as_str),
-        Some("false"),
+        Some("no"),
         "loopback listed under untrusted_client_cidrs must surface trustworthy=false"
     );
 }
@@ -272,7 +290,6 @@ origins:
 // --- Test 6: trustworthy defaults to false when no CIDR matches ---
 
 #[test]
-#[ignore = "TODO(wave5-day6+): day-5 landed the `type: cel` transform (Item 4). Same blockers as the other CIDR tests: `features.tls_fingerprint:` config plumbing onto CompiledPipeline plus the header-vs-body CEL surface mismatch."]
 fn trustworthy_defaults_false_when_no_cidr_match() {
     let yaml = r#"
 proxy:
@@ -291,14 +308,22 @@ origins:
       body: "ok"
     transforms:
       - type: cel
-        on_response: |
-          resp.headers["x-tls-trust"] = string(request.tls.trustworthy)
+        headers:
+          - op: set
+            name: x-tls-trust
+            value_expr: 'request.tls.trustworthy ? "yes" : "no"'
 "#;
     let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
-    let resp = harness.get("/", "tls-fp.localhost").expect("GET");
+    let resp = harness
+        .get_with_headers(
+            "/",
+            "tls-fp.localhost",
+            &[("x-sbproxy-tls-ja4", "t13d1516h2_8daaf6152771_b186095e22b6")],
+        )
+        .expect("GET");
     assert_eq!(
         resp.headers.get("x-tls-trust").map(String::as_str),
-        Some("false"),
+        Some("no"),
         "no CIDR match must default to trustworthy=false (conservative default per A5.1)"
     );
 }

@@ -386,12 +386,32 @@ fn apply_transform_with_ctx(
             // status (200 from the static action under test) rather
             // than the zero placeholder.
             let status = ctx.response_status.unwrap_or(0);
+            // WOR-1128: thread the captured TLS fingerprint into the CEL
+            // context so a `value_expr` reading `request.tls.trustworthy`
+            // / `request.tls.ja4` resolves against the live per-origin
+            // CIDR verdict. This is the static-action / body-buffer path
+            // (the upstream-response path in `proxy_http.rs` does the
+            // same). Without a captured fingerprint the view is `None`
+            // and `request.tls` is absent, so such a rule is skipped.
+            let tls_view = ctx.tls_fingerprint.as_ref().map(|fp| {
+                sbproxy_modules::transform::TlsFingerprintView {
+                    ja3: fp.ja3.as_deref(),
+                    ja4: fp.ja4.as_deref(),
+                    ja4h: fp.ja4h.as_deref(),
+                    trustworthy: fp.trustworthy,
+                }
+            });
             // WOR-168: `evaluate_headers` now returns
             // `TransformError::InvariantViolated` instead of panicking
             // when the inner Remove arm is reached. Propagate as
             // `anyhow::Error` so the body-buffer pipeline's `fail_on_error`
             // path takes over and synthesises a 500 with attribution.
-            match t.evaluate_headers(body.as_ref(), status, &http::HeaderMap::new()) {
+            match t.evaluate_headers_with_tls(
+                body.as_ref(),
+                status,
+                &http::HeaderMap::new(),
+                tls_view,
+            ) {
                 Ok(mutations) => {
                     ctx.cel_response_header_mutations.extend(mutations);
                 }
