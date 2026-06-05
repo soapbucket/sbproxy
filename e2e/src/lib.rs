@@ -599,8 +599,55 @@ impl MockUpstream {
     /// for tests that need the upstream to return e.g. `X-Inject-*`
     /// directives so the proxy's callback enrichment path can be
     /// exercised end-to-end.
+    ///
+    /// A `Content-Type` entry in `extra_headers` (case-insensitive)
+    /// overrides the default `application/json` and is not emitted
+    /// twice (WOR-1133).
     pub fn start_with_response_headers(
         reply_json: serde_json::Value,
+        extra_headers: Vec<(String, String)>,
+    ) -> anyhow::Result<Self> {
+        let reply_bytes = serde_json::to_vec(&reply_json)?;
+        // Lift a caller-supplied Content-Type out of the header list so
+        // the handler emits exactly one Content-Type line.
+        let mut content_type: Option<String> = None;
+        let rest: Vec<(String, String)> = extra_headers
+            .into_iter()
+            .filter(|(k, v)| {
+                if k.eq_ignore_ascii_case("content-type") {
+                    content_type = Some(v.clone());
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        Self::start_full(200, content_type, reply_bytes, rest)
+    }
+
+    /// WOR-1133: start a mock upstream that replies with a fixed HTTP
+    /// status (and the supplied JSON body). Useful for failover tests
+    /// that need a primary returning 5xx and a secondary returning 200.
+    pub fn start_with_status(reply_json: serde_json::Value, status: u16) -> anyhow::Result<Self> {
+        let reply_bytes = serde_json::to_vec(&reply_json)?;
+        Self::start_full(status, None, reply_bytes, Vec::new())
+    }
+
+    /// WOR-1133: start a mock upstream that replies with a raw byte
+    /// body and an explicit `Content-Type` (200). Useful for testing
+    /// binary content-types (e.g. `image/png`) that the compression
+    /// middleware must skip, where a JSON body would be on the
+    /// compress list.
+    pub fn start_raw(body: Vec<u8>, content_type: &str) -> anyhow::Result<Self> {
+        Self::start_full(200, Some(content_type.to_string()), body, Vec::new())
+    }
+
+    /// Shared constructor for the fixed-response mocks. `content_type`
+    /// of `None` defaults to `application/json`.
+    fn start_full(
+        status: u16,
+        content_type: Option<String>,
+        reply_bytes: Vec<u8>,
         extra_headers: Vec<(String, String)>,
     ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -611,7 +658,7 @@ impl MockUpstream {
 
         let cap_clone = captured.clone();
         let shut_clone = shutdown.clone();
-        let reply_bytes = serde_json::to_vec(&reply_json)?;
+        let content_type = content_type.unwrap_or_else(|| "application/json".to_string());
         let extra = Arc::new(extra_headers);
 
         let join = std::thread::spawn(move || {
@@ -632,8 +679,9 @@ impl MockUpstream {
                 let cap = cap_clone.clone();
                 let body = reply_bytes.clone();
                 let hdrs = extra.clone();
+                let ct = content_type.clone();
                 std::thread::spawn(move || {
-                    let _ = handle_mock_conn(stream, cap, body, hdrs);
+                    let _ = handle_mock_conn(stream, cap, body, status, ct, hdrs);
                 });
             }
         });
@@ -768,10 +816,13 @@ impl Drop for MockUpstream {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_mock_conn(
     mut stream: TcpStream,
     captured: Arc<Mutex<Vec<CapturedRequest>>>,
     reply_body: Vec<u8>,
+    status: u16,
+    content_type: String,
     extra_headers: Arc<Vec<(String, String)>>,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -839,9 +890,18 @@ fn handle_mock_conn(
     });
 
     let mut resp = String::new();
-    resp.push_str("HTTP/1.1 200 OK\r\n");
-    resp.push_str("Content-Type: application/json\r\n");
+    resp.push_str(&format!(
+        "HTTP/1.1 {} {}\r\n",
+        status,
+        reason_phrase(status)
+    ));
+    resp.push_str(&format!("Content-Type: {}\r\n", content_type));
     for (k, v) in extra_headers.iter() {
+        // The resolved Content-Type is emitted above; skip any stray
+        // content-type in the extra list so it is never duplicated.
+        if k.eq_ignore_ascii_case("content-type") {
+            continue;
+        }
         resp.push_str(&format!("{}: {}\r\n", k, v));
     }
     resp.push_str(&format!("Content-Length: {}\r\n", reply_body.len()));
@@ -850,6 +910,29 @@ fn handle_mock_conn(
     stream.write_all(&reply_body)?;
     stream.flush()?;
     Ok(())
+}
+
+/// Minimal HTTP reason phrase for the status codes the mock emits.
+/// Anything not listed falls back to a generic phrase keyed on class;
+/// the proxy keys off the numeric status, not the phrase.
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        s if (200..300).contains(&s) => "OK",
+        s if (400..500).contains(&s) => "Client Error",
+        _ => "Server Error",
+    }
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {

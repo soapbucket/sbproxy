@@ -161,14 +161,44 @@ fn payload_under_min_size_is_not_compressed() {
 }
 
 #[test]
-#[ignore = "MockUpstream hardcodes Content-Type: application/json; binary content-type test \
-    needs a custom upstream that emits image/png. Track in the e2e harness backlog."]
 fn binary_content_type_is_not_compressed() {
-    // The harness's mock upstream always replies with
-    // `Content-Type: application/json`, which is on the compress list.
-    // A real test of the skip list needs an upstream that returns
-    // image/png, video/*, or application/zip. Until the harness grows
-    // a content-type override, the unit tests in
-    // `compression::tests::test_should_skip_compressed_content_types`
-    // cover the skip list logic.
+    // WOR-1133: an upstream that returns a large `image/png` body. The
+    // body is well over the min_size floor, so size is not the reason
+    // to skip; the compression middleware must skip it purely because
+    // `image/png` is an already-compressed binary content-type.
+    let mut png = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+    // Highly compressible filler so a bug that compressed it anyway
+    // would be obvious (the encoded body would be far smaller).
+    png.extend(std::iter::repeat_n(0u8, 200_000));
+    let original_len = png.len();
+
+    let upstream = MockUpstream::start_raw(png, "image/png").expect("upstream");
+    let proxy =
+        ProxyHarness::start_with_yaml(&config_yaml(&upstream.base_url(), "[gzip, br, zstd]", 512))
+            .expect("start proxy");
+
+    let resp = proxy
+        .get_with_headers(
+            "/image.png",
+            "comp.localhost",
+            &[("accept-encoding", "gzip, br, zstd")],
+        )
+        .expect("send");
+
+    assert_eq!(resp.status, 200);
+    assert!(
+        !resp.headers.contains_key("content-encoding"),
+        "binary image/png must skip the encoder regardless of size, got headers: {:?}",
+        resp.headers
+    );
+    assert_eq!(
+        resp.body.len(),
+        original_len,
+        "an un-compressed binary body must reach the client byte-for-byte"
+    );
+    assert_eq!(
+        resp.headers.get("content-type").map(String::as_str),
+        Some("image/png"),
+        "the upstream content-type must be preserved"
+    );
 }
