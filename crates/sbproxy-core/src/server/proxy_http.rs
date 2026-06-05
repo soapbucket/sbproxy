@@ -397,6 +397,59 @@ impl ProxyHttp for SbProxy {
                     wba_signature_agent = pipeline.web_bot_auth_signature_agent.clone();
                 }
 
+                // WOR-1132: forward the resolved agent-class verdict to the
+                // upstream when an `agent_class` policy on this origin has
+                // `forward_to_upstream: true`. The resolver already ran in
+                // `request_filter` and stamped `ctx.agent_id` / `agent_vendor`
+                // / `agent_id_source`; the policy's `enforce` is a no-op
+                // marker, so the actual header stamping happens here where the
+                // outgoing request is in hand. Without a captured verdict
+                // (resolver disabled, or no signal) nothing is stamped.
+                #[cfg(feature = "agent-class")]
+                if let Some(policies) = pipeline.policies.get(idx) {
+                    for policy in policies {
+                        let sbproxy_modules::Policy::AgentClass(ac) = policy else {
+                            continue;
+                        };
+                        if !ac.forward_to_upstream() {
+                            continue;
+                        }
+                        if let Some(agent_id) = ctx.agent_id.as_ref() {
+                            req_to_set.push((
+                                ac.header_name().to_string(),
+                                agent_id.as_str().to_string(),
+                            ));
+                        }
+                        let vendor_header = ac.vendor_header_name();
+                        if !vendor_header.is_empty() {
+                            if let Some(vendor) = ctx.agent_vendor.as_ref() {
+                                req_to_set.push((vendor_header.to_string(), vendor.clone()));
+                            }
+                        }
+                        let verified_header = ac.verified_header_name();
+                        if !verified_header.is_empty() {
+                            // A verdict is "verified" only when it came from a
+                            // cryptographic or forward-confirmed signal (Web
+                            // Bot Auth keyid or forward-confirmed reverse DNS),
+                            // not from a spoofable user-agent match.
+                            let verified = matches!(
+                                ctx.agent_id_source,
+                                Some(
+                                    sbproxy_classifiers::AgentIdSource::BotAuth
+                                        | sbproxy_classifiers::AgentIdSource::Rdns
+                                )
+                            );
+                            req_to_set.push((
+                                verified_header.to_string(),
+                                if verified { "true" } else { "false" }.to_string(),
+                            ));
+                        }
+                        // One agent_class policy per origin is the contract;
+                        // stop after the first that forwards.
+                        break;
+                    }
+                }
+
                 // Extract the URL path from the proxy action so we can prepend it
                 // to the upstream request path. This ensures that configs like
                 // `url: http://backend:8080/api` proxy to /api/... not just /...
