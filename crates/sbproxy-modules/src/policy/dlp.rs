@@ -135,6 +135,18 @@ impl DlpPolicy {
         if compiled.is_empty() {
             anyhow::bail!("dlp policy requires at least one detector");
         }
+        if matches!(
+            policy.direction,
+            DlpDirection::Response | DlpDirection::Both
+        ) {
+            // WOR-1153: response-side DLP scanning is not implemented; the
+            // policy only inspects the request. Warn loudly so an operator
+            // who selected `response`/`both` is not lulled into believing
+            // outbound responses are scanned for leaks.
+            tracing::warn!(
+                "dlp: direction `response`/`both` is not implemented; scanning request only"
+            );
+        }
         policy.compiled = compiled;
         Ok(policy)
     }
@@ -191,6 +203,18 @@ mod tests {
             value.parse().unwrap(),
         );
         h
+    }
+
+    #[test]
+    fn response_direction_builds_but_is_request_only() {
+        // WOR-1153: `response`/`both` is accepted for forward-compat (and
+        // logs a warning that it scans request-only); from_config succeeds.
+        let policy = DlpPolicy::from_config(serde_json::json!({
+            "detectors": ["aws_access"],
+            "direction": "both"
+        }))
+        .unwrap();
+        assert_eq!(policy.direction, DlpDirection::Both);
     }
 
     #[test]
