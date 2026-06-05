@@ -13,7 +13,7 @@ Stability guarantees for every field in `sb.yml`. Check a field's tier before re
 A `stable` field is part of the committed public API of SBproxy.
 
 - The field name, type, and default value will not change in a minor or patch release.
-- Removing or renaming a `stable` field requires a major version bump (e.g. config_version 1 -> 2) and a migration guide.
+- Removing or renaming a `stable` field requires a major version bump (e.g. v1 -> v2) and a migration guide.
 - Behavioral changes to a `stable` field require at least a minor version bump and a changelog entry.
 
 ### `beta`
@@ -48,7 +48,6 @@ An `alpha` field is experimental.
 
 | Field | Type | Stability | Notes |
 |---|---|---|---|
-| `config_version` | integer | **stable** | Must be 1. Required. |
 | `proxy` | object | **stable** | Server configuration block. |
 | `origins` | object (map) | **stable** | Map of hostname to origin config. |
 

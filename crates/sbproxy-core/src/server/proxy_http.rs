@@ -796,6 +796,15 @@ impl ProxyHttp for SbProxy {
                 let fp = hex::encode(&digest.cert_digest);
                 let _ = upstream_request
                     .insert_header("x-client-cert-fingerprint".to_string(), fp.as_str());
+            } else {
+                // WOR-1159: TLS connection but the peer presented no client
+                // certificate (e.g. optional mTLS with `require: false`).
+                // Emit an explicit `x-client-cert-verified: 0` so the
+                // upstream receives an unambiguous "no verified client cert"
+                // signal, rather than the header simply being absent (which
+                // an upstream cannot distinguish from a proxy that never
+                // sets it). The inbound copies were already stripped above.
+                let _ = upstream_request.insert_header("x-client-cert-verified".to_string(), "0");
             }
         }
 
