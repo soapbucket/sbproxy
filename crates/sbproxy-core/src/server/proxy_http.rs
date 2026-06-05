@@ -1596,10 +1596,33 @@ impl ProxyHttp for SbProxy {
                             // 500 with attribution because that is
                             // where the failure must be visible to the
                             // client.
-                            let mutations = t.evaluate_headers_lossy(
+                            // WOR-1128: thread the captured TLS
+                            // fingerprint into the CEL context so a
+                            // `value_expr` of e.g.
+                            // `string(request.tls.trustworthy)` resolves
+                            // against the live per-origin CIDR verdict
+                            // instead of the zero value. Without a
+                            // captured fingerprint the view is `None` and
+                            // the bindings render `""` / `false` as
+                            // before.
+                            #[cfg(feature = "tls-fingerprint")]
+                            let tls_view = ctx.tls_fingerprint.as_ref().map(|fp| {
+                                sbproxy_modules::transform::TlsFingerprintView {
+                                    ja3: fp.ja3.as_deref(),
+                                    ja4: fp.ja4.as_deref(),
+                                    ja4h: fp.ja4h.as_deref(),
+                                    trustworthy: fp.trustworthy,
+                                }
+                            });
+                            #[cfg(not(feature = "tls-fingerprint"))]
+                            let tls_view: Option<
+                                sbproxy_modules::transform::TlsFingerprintView<'_>,
+                            > = None;
+                            let mutations = t.evaluate_headers_lossy_with_tls(
                                 b"",
                                 upstream_response.status.as_u16(),
                                 &upstream_response.headers,
+                                tls_view,
                             );
                             for m in mutations {
                                 match m {
