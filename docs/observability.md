@@ -359,7 +359,7 @@ proxy:
 * `fields:` is additive on the built-in baseline. Matched lowercase. Cannot disable a built-in entry.
 * `patterns:` is a list of named regexes applied to the rendered JSON after the field-key pass. Compiled once at config load; an invalid regex is logged at `warn` and skipped (the rest of the block still installs). `replacement:` defaults to `[REDACTED:<NAME_UPPER>]` when omitted.
 
-#### Tenant-scope and origin-scope redact additions (WOR-1042)
+#### Tenant-scope and origin-scope redact additions
 
 The `fields:` and `patterns:` blocks above also accept tenant-scope and origin-scope additions. Each scope inherits the parent and adds its own entries; `patterns:` additionally honours a `disable:` opt-out by pattern name. `fields:` is additive-only at every scope; a tenant or origin cannot disable a proxy-level field denylist entry because the security baseline always applies.
 

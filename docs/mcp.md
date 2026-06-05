@@ -338,8 +338,8 @@ and `tools/call`.
 ## See also
 
 - [`migration-mcp-rbac.md`](migration-mcp-rbac.md): upgrade
-  walk-through for the WOR-1065 + WOR-1066 principal-aware ACL
-  and default-deny flip.
+  walk-through for the principal-aware ACL and default-deny
+  flip.
 - [`agent-skills.md`](agent-skills.md): Agent Skills manifest
   advertised via `experimental.agentSkillsUrl`.
 - [`features.md`](features.md): feature overview that covers the

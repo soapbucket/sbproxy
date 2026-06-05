@@ -65,7 +65,7 @@ cargo run -p sbproxy-config --bin generate-schema > schemas/sb-config.schema.jso
 
 The CI gate runs the same command and diffs the result against
 the committed file; a Rust type change that does not regenerate
-the schema fails the `config schema is current (WOR-1081)` step
+the schema fails the `config schema is current` step
 on the `build / test` job. The generator is deterministic (the
 `preserve_order` feature on `schemars` pins object property
 order across runs), so the diff is byte-for-byte.

@@ -46,7 +46,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [observability.md](observability.md) - metrics, logs, traces, and the bundled dashboards.
 - [clickhouse-attribution.md](clickhouse-attribution.md) - access-log schema, pre-aggregations, and sample attribution queries.
 - [migration-credentials.md](migration-credentials.md) - migrating the legacy `virtual_keys:` shape to the unified `credentials:` block.
-- [migration-mcp-rbac.md](migration-mcp-rbac.md) - upgrading MCP `ToolAccessPolicy` to the principal-aware ACL and the WOR-1066 default-deny flip.
+- [migration-mcp-rbac.md](migration-mcp-rbac.md) - upgrading MCP `ToolAccessPolicy` to the principal-aware ACL and the default-deny flip.
 - [secrets.md](secrets.md) - vault backend setup for HashiCorp Vault, AWS Secrets Manager, and Kubernetes Secrets.
 - [multi-tenant.md](multi-tenant.md) - when to use the multi-tenant shape, the three scopes, isolation guarantees, the synthetic `__default__` tenant.
 - [operator-runbook.md](operator-runbook.md) - dashboard triage and rollback actions.
@@ -85,12 +85,10 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [model-pinning.md](model-pinning.md) - how SHA-256 hashes get computed and pinned for the classifier known-model registry.
 - [adr-ai-hub-format.md](adr-ai-hub-format.md) - hub `ChatFormat` trait and the canonical `ChatRequest` / `ChatResponse` shape that backs `/v1/chat/completions`, `/v1/messages`, and `/v1/responses`.
 - [adr-outbound-credential-resolver.md](adr-outbound-credential-resolver.md) - the OSS vs enterprise line for the outbound credential resolver (RFC 8693 exchange, client-credentials, and vault resolution in OSS).
-- [adr-ebpf-l7-acceleration.md](adr-ebpf-l7-acceleration.md) - eBPF L7 acceleration spike + go/no-go (defer until an operator cohort needs the kernel wins enough to take the elevated-privilege footprint).
 - [comparison.md](comparison.md) - how SBproxy compares to other proxies and AI gateways.
 
 ### Contributing
 - [architecture.md](architecture.md) - internals: pipeline, hot reload, plugin system.
-- [codebase.md](codebase.md) - plain-English walkthrough of every crate.
 - [build.md](build.md) - building from source, supported platforms, optional features.
 - [CONTRIBUTING.md](../CONTRIBUTING.md) - how to set up a dev environment and submit changes.
 

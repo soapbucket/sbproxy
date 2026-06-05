@@ -13,7 +13,7 @@ of the new YAML fields below until the version that ships them.
 
 ### Breaking
 
-- **MCP default-deny** (WOR-1066): `ToolAccessPolicy` flipped from
+- **MCP default-deny**: `ToolAccessPolicy` flipped from
   open-by-default to closed-by-default. An unknown caller (no
   matching ACL rule) is denied every tool. An empty `allowed: []`
   list under an ACL rule means "deny all", not "allow all".
@@ -22,7 +22,7 @@ of the new YAML fields below until the version that ships them.
   shape is gone; rewrite to the principal-aware `tool_access[]`
   selector list. See `docs/migration-mcp-rbac.md`.
 
-- **MCP principal-aware ACL** (WOR-1065): `ToolAccessPolicy` now
+- **MCP principal-aware ACL**: `ToolAccessPolicy` now
   carries `tool_access[]` rules with `principals[]` selectors
   (`virtual_key`, `sub`, `team`, `project`, `user`, `role`,
   `tenant_id`) plus an `allowed[]` tool list. The legacy
@@ -95,7 +95,7 @@ of the new YAML fields below until the version that ships them.
   aggregate via Mimir / Datadog / Honeycomb and want to skip the
   Prometheus scrape.
 
-- **OIDC Relying-Party stack (WOR-892) shipped end to end.**
+- **OIDC Relying-Party stack shipped end to end.**
   `/oidc/callback` (auth-code + PKCE + sealed session cookie)
   plus the helpers + config wiring for
   `/.well-known/openid-configuration` discovery, refresh-token
@@ -104,7 +104,7 @@ of the new YAML fields below until the version that ships them.
   (in-memory + KV-backed redb/file/Redis) for targeted revocation.
   See `docs/configuration.md` § OIDC auth.
 
-- **OpenAI Apps SDK / MCP Apps (SEP-1865) compatibility (WOR-818).**
+- **OpenAI Apps SDK / MCP Apps (SEP-1865) compatibility.**
   Gateway-side `_meta.mcpApps` passthrough for tool definitions,
   `params.audit.cause` plumbing on `tools/call`, and a typed
   validator set (`apps.template_declared`, `apps.iframe_sandbox`,
@@ -112,8 +112,8 @@ of the new YAML fields below until the version that ships them.
   the enterprise extension, and any CI gate over the
   `sbproxy-plugin` surface.
 
-- **Web Bot Auth full conformance, publish + sign sides
-  (WOR-805).** SBproxy now publishes its own JWKS-shaped
+- **Web Bot Auth full conformance, publish + sign sides.**
+  SBproxy now publishes its own JWKS-shaped
   directory at `/.well-known/http-message-signatures-directory`
   and a Signature Agent Card at
   `/.well-known/web-bot-auth/agent-card` (opt in via
