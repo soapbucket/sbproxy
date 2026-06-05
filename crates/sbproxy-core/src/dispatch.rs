@@ -68,7 +68,7 @@ pub async fn dispatch_h3_request(
 
     // --- 4. Auth check ---
     if let Some(auth) = pipeline.auths.get(origin_idx).and_then(|a| a.as_ref()) {
-        let authorized = check_auth(auth, &headers, &uri);
+        let authorized = check_auth(auth, &headers, &uri, &method);
         if !authorized {
             debug!(hostname = %hostname, "H3: auth failed");
             let mut resp = text_response(401, "Unauthorized");
@@ -130,7 +130,12 @@ fn handle_acme_challenge(path: &str) -> Result<HttpResponse> {
 // --- Auth checking ---
 
 /// Returns true if the request passes the configured auth check, false otherwise.
-fn check_auth(auth: &Auth, headers: &http::HeaderMap, uri: &http::Uri) -> bool {
+fn check_auth(
+    auth: &Auth,
+    headers: &http::HeaderMap,
+    uri: &http::Uri,
+    method: &http::Method,
+) -> bool {
     let query = uri.query();
     match auth {
         Auth::ApiKey(api_key) => api_key.check_request(headers, query),
@@ -140,7 +145,10 @@ fn check_auth(auth: &Auth, headers: &http::HeaderMap, uri: &http::Uri) -> bool {
         Auth::Digest(digest) => {
             // For H3, we cannot do the challenge-response flow in a single request.
             // Check if Authorization header is present and valid; reject otherwise.
-            digest.check_request(headers, "GET")
+            // WOR-1163: validate against the request's real method. RFC 7616
+            // digest binds the method into the A2 hash, so checking against a
+            // hardcoded "GET" rejected every valid non-GET request.
+            digest.check_request(headers, method.as_str())
         }
         Auth::ForwardAuth(fa) => {
             // Forward auth requires an async subrequest. The H3 dispatch path is
@@ -357,6 +365,23 @@ fn h3_unsupported_message(action_type: &str) -> String {
 
 // --- Upstream proxy via reqwest ---
 
+/// Process-wide client for H3 upstream proxying, built once. Reusing it
+/// across requests preserves connection pooling, and the bounded request
+/// timeout stops a hung upstream from hanging the H3 request forever
+/// (WOR-1147 / WOR-1160). No-redirect mirrors the proxy's pass-through
+/// semantics. Per-upstream TLS/SSRF config threading is a follow-up; the
+/// upstream URL here is operator-configured, not client-controlled.
+fn h3_upstream_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("building shared H3 upstream client")
+    })
+}
+
 async fn proxy_upstream(
     action: &sbproxy_modules::ProxyAction,
     method: &http::Method,
@@ -375,11 +400,12 @@ async fn proxy_upstream(
 
     debug!(upstream = %upstream_url, method = %method, "H3: proxying to upstream");
 
-    // Build reqwest client (no-redirect to preserve semantics).
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("building reqwest client")?;
+    // WOR-1147 / WOR-1160: reuse one process-wide client across H3
+    // requests instead of building a fresh one per call. Building per
+    // request discarded connection pooling and, with no timeout, let a
+    // hung upstream hang the request forever. The shared client carries a
+    // bounded request timeout (no-redirect to preserve proxy semantics).
+    let client = h3_upstream_client();
 
     // Convert http::Method to reqwest::Method.
     let req_method =
@@ -720,7 +746,7 @@ mod tests {
         let headers = http::HeaderMap::new();
         let uri: http::Uri = "/protected".parse().unwrap();
 
-        let authorized = check_auth(&auth, &headers, &uri);
+        let authorized = check_auth(&auth, &headers, &uri, &http::Method::GET);
 
         assert!(
             !authorized,
