@@ -3890,6 +3890,16 @@ impl ProxyHttp for SbProxy {
         // will introduce enterprise sinks (S3, Kafka, Datadog).
         emit_access_log(session, ctx, status_u16, &method, &hostname, duration);
 
+        // WOR-1131: feed the boilerplate strip count into
+        // `sbproxy_boilerplate_stripped_bytes_total`. Done here (not in the
+        // transform apply) so the counter increments once per request and
+        // independent of whether access-log emission is enabled; the
+        // no-op-on-zero guard lives in the recorder.
+        sbproxy_observe::metrics::record_boilerplate_stripped_bytes(
+            &hostname,
+            ctx.metrics.stripped_bytes,
+        );
+
         // --- Wave 8 / T4.6 envelope dispatch ---
         //
         // Build the terminal RequestEvent and hand it to the

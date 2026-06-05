@@ -336,6 +336,14 @@ pub struct ProxyMetrics {
     /// (`auth_ms`, `upstream_ttfb_ms`, `response_filter_ms`); the
     /// histogram is the aggregate view.
     pub phase_duration: HistogramVec,
+
+    // --- Content transform metrics ---
+    /// Counter `sbproxy_boilerplate_stripped_bytes_total{hostname}` of
+    /// bytes removed by the `boilerplate` transform. Summed across
+    /// requests this matches the per-request `stripped_bytes` access-log
+    /// field; dashboards use it to size how much chrome the strip pass
+    /// removes per origin.
+    pub boilerplate_stripped_bytes: IntCounterVec,
 }
 
 impl ProxyMetrics {
@@ -523,6 +531,17 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        // --- Content transform counters ---
+
+        let boilerplate_stripped_bytes = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_boilerplate_stripped_bytes_total",
+                "Bytes removed by the boilerplate transform, by hostname",
+            ),
+            &["hostname"],
+        )
+        .unwrap();
+
         // --- Agent Skills counters ---
 
         let agent_skill_digest_mismatch = IntCounterVec::new(
@@ -614,6 +633,9 @@ impl ProxyMetrics {
             .register(Box::new(dedup_cache_size.clone()))
             .unwrap();
         registry.register(Box::new(phase_duration.clone())).unwrap();
+        registry
+            .register(Box::new(boilerplate_stripped_bytes.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -640,6 +662,7 @@ impl ProxyMetrics {
             agent_skill_digest_mismatch,
             dedup_cache_size,
             phase_duration,
+            boilerplate_stripped_bytes,
         }
     }
 
@@ -1423,6 +1446,22 @@ pub fn dec_active(origin: &str) {
 /// best-effort no-op with a counter so operators can spot drift.
 pub fn record_mirror_state_drift() {
     metrics().mirror_state_drift.inc();
+}
+
+/// Add `bytes` to `sbproxy_boilerplate_stripped_bytes_total{hostname}`.
+///
+/// Called once per request that ran a `boilerplate` transform, with the
+/// total bytes the strip pass removed. A no-op for `bytes == 0` so the
+/// series stays absent for origins that never strip anything.
+pub fn record_boilerplate_stripped_bytes(hostname: &str, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    let hostname = sanitize_label("hostname", hostname);
+    metrics()
+        .boilerplate_stripped_bytes
+        .with_label_values(&[&hostname])
+        .inc_by(bytes);
 }
 
 /// Increment `sbproxy_policy_audit_events_total{verdict, surface, policy_id}`.
@@ -2710,6 +2749,36 @@ mod tests {
         assert!(
             output.contains("sbproxy_mirror_state_drift_total"),
             "rendered output must include the new counter family",
+        );
+    }
+
+    /// WOR-1131: the boilerplate strip counter must register, render in
+    /// the Prometheus output, accumulate by the supplied byte count, and
+    /// no-op on zero.
+    #[test]
+    fn test_record_boilerplate_stripped_bytes() {
+        let m = metrics();
+        let hostname = "test-boilerplate.example.com";
+        let sanitized = sanitize_label("hostname", hostname);
+        let before = m
+            .boilerplate_stripped_bytes
+            .with_label_values(&[&sanitized])
+            .get();
+
+        record_boilerplate_stripped_bytes(hostname, 0); // no-op
+        record_boilerplate_stripped_bytes(hostname, 128);
+        record_boilerplate_stripped_bytes(hostname, 64);
+
+        let after = m
+            .boilerplate_stripped_bytes
+            .with_label_values(&[&sanitized])
+            .get();
+        assert_eq!(after, before + 192, "zero is a no-op; 128 + 64 accrue");
+
+        let output = m.render();
+        assert!(
+            output.contains("sbproxy_boilerplate_stripped_bytes_total"),
+            "rendered output must include the boilerplate counter family",
         );
     }
 

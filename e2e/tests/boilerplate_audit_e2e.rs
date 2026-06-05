@@ -38,7 +38,7 @@
 use std::time::Duration;
 
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 // --- Config builder ---
 
@@ -68,12 +68,11 @@ observability:
 origins:
   "stripped.localhost":
     transforms:
-      # G4.10 boilerplate stripper. The transform name is provisional;
-      # the YAML key matches the registered transform module's `kind`.
-      - type: boilerplate_strip
-        # Per A1.5 redaction policy: log only the byte count of
-        # dropped content, never the content itself.
-        emit_metrics: true
+      # G4.10 boilerplate stripper. Per A1.5 redaction policy the proxy
+      # logs only the byte count of dropped content, never the content
+      # itself (the `stripped_bytes` access-log field +
+      # `sbproxy_boilerplate_stripped_bytes_total` counter).
+      - type: boilerplate
     action:
       type: proxy
       url: "{origin_base}"
@@ -183,42 +182,21 @@ fn admin_recent_logs(port: u16) -> Vec<Value> {
         .collect()
 }
 
-/// Scrape the Prometheus exposition body and return the
-/// `sbproxy_boilerplate_stripped_bytes_total` counter, summed across
-/// every label set. Returns 0 if the metric is absent.
-fn scrape_stripped_bytes_total(port: u16) -> u64 {
-    let (_, body) = admin_get(port, "/metrics");
-    let mut total: u64 = 0;
-    for line in body.lines() {
-        if line.starts_with('#') {
-            continue;
-        }
-        if !line.contains("sbproxy_boilerplate_stripped_bytes_total") {
-            continue;
-        }
-        // Format: `sbproxy_boilerplate_stripped_bytes_total{labels} <value>`
-        if let Some(value) = line.rsplit_once(' ').map(|(_, v)| v) {
-            // Some Prometheus clients emit the value as an integer
-            // ("123"), others as a float ("123.0"). Parse both.
-            if let Ok(v) = value.parse::<u64>() {
-                total = total.saturating_add(v);
-            } else if let Ok(v) = value.parse::<f64>() {
-                total = total.saturating_add(v as u64);
-            }
-        }
-    }
-    total
-}
-
 // --- Tests ---
 
 /// Q4.14 (1)  -  every request through a boilerplate-stripping origin
 /// emits a structured log line with `stripped_bytes` populated.
 #[test]
-#[ignore = "TODO(wave4-G4.10): BoilerplateTransform (sbproxy_modules::transform::boilerplate) lands the strip logic in day-3 cleanup; still waiting on the per-origin pipeline wiring that runs the transform from response_filter and stamps ctx.metrics.stripped_bytes onto the access-log entry. R1.2 typed-redactor stripped_bytes field tracks the same wiring."]
+#[ignore = "WOR-1131: the `stripped_bytes` access-log FIELD is wired (set from ctx.metrics.stripped_bytes in emit_access_log), but this test reads it back via `/api/logs/recent`, an in-memory access-log tap that does not exist yet (the admin server exposes `/api/requests` with a minimal RequestLogEntry, not the full access-log JSON). Reactivation blocks on an access-log ring-buffer admin endpoint; tracked with WOR-1133 (e2e harness gaps). The counter half of this ticket is covered end-to-end by stripped_bytes_sums_match_request_metric."]
 fn stripped_bytes_counter_emitted_per_request() {
     let admin_port = pick_port();
-    let upstream = MockUpstream::start(json!({"ok": true})).expect("mock upstream");
+    // The upstream must return boilerplate-laden HTML so the strip pass
+    // has something to remove and `stripped_bytes` is non-zero.
+    let upstream = MockUpstream::start_with_response_headers(
+        Value::String(html_with_pii_in_nav()),
+        vec![("content-type".into(), "text/html".into())],
+    )
+    .expect("mock upstream");
     let origin_base = upstream.base_url();
     let yaml = boilerplate_audit_config(admin_port, &origin_base);
     let harness = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
@@ -253,7 +231,7 @@ fn stripped_bytes_counter_emitted_per_request() {
 /// region must not appear in any log line. The redaction pass must
 /// drop bodies before logs flush.
 #[test]
-#[ignore = "TODO(wave4-G4.10): BoilerplateTransform now lands the strip logic; still waiting on response_filter wiring + access-log stripped_bytes field (same as Q4.14 (1)). R1.2 redaction pipeline must run downstream of the strip step."]
+#[ignore = "WOR-1131: same blocker as stripped_bytes_counter_emitted_per_request - the PII-leak assertion reads back log lines via `/api/logs/recent`, an in-memory access-log tap that does not exist yet. Reactivation blocks on that admin endpoint (tracked with WOR-1133)."]
 fn stripped_content_does_not_appear_in_logs() {
     let admin_port = pick_port();
     let upstream = MockUpstream::start_with_response_headers(
@@ -288,11 +266,38 @@ fn stripped_content_does_not_appear_in_logs() {
     drop(upstream);
 }
 
-/// Q4.14 (3)  -  `stripped_bytes` summed across N requests must match
-/// the `sbproxy_boilerplate_stripped_bytes_total` Prometheus counter
-/// within +/- 5%.
+/// Scrape `sbproxy_boilerplate_stripped_bytes_total` from the proxy's
+/// own `/metrics` endpoint (served on the main data-plane port, not the
+/// admin port), summed across every label set. Returns 0 when absent.
+fn scrape_boilerplate_metric(harness: &ProxyHarness) -> u64 {
+    let resp = harness
+        .get("/metrics", "stripped.localhost")
+        .expect("GET /metrics");
+    let body = String::from_utf8_lossy(&resp.body);
+    let mut total: u64 = 0;
+    for line in body.lines() {
+        if line.starts_with('#') || !line.contains("sbproxy_boilerplate_stripped_bytes_total") {
+            continue;
+        }
+        if let Some(value) = line.rsplit_once(' ').map(|(_, v)| v) {
+            if let Ok(v) = value.parse::<u64>() {
+                total = total.saturating_add(v);
+            } else if let Ok(v) = value.parse::<f64>() {
+                total = total.saturating_add(v as u64);
+            }
+        }
+    }
+    total
+}
+
+/// Q4.14 (3)  -  the `sbproxy_boilerplate_stripped_bytes_total` counter
+/// accumulates linearly with request count. Each identical request
+/// strips the same byte count, so after N requests the counter is
+/// exactly N times the single-request value. This pins the counter
+/// registration + per-request increment end-to-end via the proxy's own
+/// `/metrics` endpoint (the access-log-side sum is covered separately
+/// once the in-memory access-log tap lands; see the two ignored tests).
 #[test]
-#[ignore = "TODO(wave4-G4.10): BoilerplateTransform now lands the strip logic; still waiting on the sbproxy_boilerplate_stripped_bytes_total Prometheus counter registration in sbproxy-observe and the response_filter wiring that increments it."]
 fn stripped_bytes_sums_match_request_metric() {
     let admin_port = pick_port();
     let upstream = MockUpstream::start_with_response_headers(
@@ -303,35 +308,30 @@ fn stripped_bytes_sums_match_request_metric() {
     let origin_base = upstream.base_url();
     let yaml = boilerplate_audit_config(admin_port, &origin_base);
     let harness = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
-    ProxyHarness::wait_for_port(admin_port, Duration::from_secs(5)).expect("admin port");
 
-    const N: usize = 25;
-    for _ in 0..N {
-        let _ = harness
+    // One request establishes the per-request strip amount.
+    harness
+        .get_with_headers("/article", "stripped.localhost", &[])
+        .expect("request");
+    let per_request = scrape_boilerplate_metric(&harness);
+    assert!(
+        per_request > 0,
+        "boilerplate strip on an HTML response must increment the counter"
+    );
+
+    // N-1 more identical requests; the counter must land at exactly
+    // N times the single-request value.
+    const N: u64 = 10;
+    for _ in 1..N {
+        harness
             .get_with_headers("/article", "stripped.localhost", &[])
             .expect("request");
     }
-
-    // Allow async aggregation to land.
-    std::thread::sleep(Duration::from_millis(500));
-
-    let lines = admin_recent_logs(admin_port);
-    let log_sum: u64 = lines
-        .iter()
-        .filter_map(|l| l.get("stripped_bytes").and_then(|v| v.as_u64()))
-        .sum();
-    assert!(
-        log_sum > 0,
-        "expected a non-zero log-side stripped_bytes sum across {N} requests"
-    );
-
-    let metric_total = scrape_stripped_bytes_total(admin_port);
-    let lower = (log_sum as f64) * 0.95;
-    let upper = (log_sum as f64) * 1.05;
-    let m = metric_total as f64;
-    assert!(
-        m >= lower && m <= upper,
-        "metric {metric_total} not within +/- 5% of log-sum {log_sum} (range {lower:.0}..{upper:.0})"
+    let total = scrape_boilerplate_metric(&harness);
+    assert_eq!(
+        total,
+        per_request * N,
+        "counter must accumulate linearly: {per_request} * {N} expected, got {total}"
     );
 
     drop(harness);
@@ -339,13 +339,11 @@ fn stripped_bytes_sums_match_request_metric() {
 }
 
 /// Compile-time shape lock. Builds the YAML against fixed inputs and
-/// asserts the keys we depend on are present. Keeps the suite honest
-/// while the three asserting tests are `#[ignore]`d.
+/// asserts the keys we depend on are present.
 #[test]
 fn boilerplate_audit_config_compiles() {
     let yaml = boilerplate_audit_config(9999, "http://127.0.0.1:1");
-    assert!(yaml.contains("type: boilerplate_strip"));
-    assert!(yaml.contains("emit_metrics: true"));
+    assert!(yaml.contains("type: boilerplate"));
     assert!(yaml.contains("profile: internal"));
     // PII sentinel must be present in the fixture so the leak test
     // has a clear canary to look for.
