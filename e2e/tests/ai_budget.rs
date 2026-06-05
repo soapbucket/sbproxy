@@ -331,3 +331,74 @@ fn budget_records_usage_from_streaming_response() {
         "blocked request must not reach the upstream"
     );
 }
+
+/// WOR-1146: a chat completion reply that omits the `usage` block
+/// entirely. The gateway must fall back to a token estimate so the
+/// budget is still debited (a usage-less 200 would otherwise run
+/// unlimited volume against the cap). `content` drives the completion
+/// estimate; make it long enough to exceed the configured cap.
+fn reply_without_usage(content: &str) -> serde_json::Value {
+    json!({
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 1_700_000_000,
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop"
+        }]
+        // no "usage" key
+    })
+}
+
+#[test]
+fn budget_debited_from_estimate_when_usage_block_missing() {
+    // A long assistant body with no usage block. The completion
+    // estimate alone is well over the 100-token cap, so the second
+    // request must be blocked even though the upstream never reported
+    // usage.
+    let long_reply = "The quick brown fox jumps over the lazy dog. ".repeat(40);
+    let upstream = MockUpstream::start(reply_without_usage(&long_reply)).unwrap();
+    let yaml = build_config(
+        &upstream.base_url(),
+        r#"      budget:
+        on_exceed: block
+        limits:
+          - scope: workspace
+            max_tokens: 100
+"#,
+    );
+    let harness = ProxyHarness::start_with_yaml(&yaml).unwrap();
+
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "summarize the document"}]
+    });
+
+    // First request passes (cap checked pre-dispatch on an empty
+    // tracker) but the estimated usage is recorded against the budget.
+    let resp = harness
+        .post_json("/v1/chat/completions", "ai.localhost", &body, &[])
+        .unwrap();
+    assert_eq!(
+        resp.status, 200,
+        "first request passes; tracker starts empty"
+    );
+
+    // Second request: the estimate from request one pushed the tracker
+    // over the 100-token cap, so this must short-circuit with 402 even
+    // though no upstream ever reported a usage block.
+    let resp = harness
+        .post_json("/v1/chat/completions", "ai.localhost", &body, &[])
+        .unwrap();
+    assert_eq!(
+        resp.status, 402,
+        "a usage-less 2xx must still debit the budget (estimated) and block once over cap"
+    );
+    let body_text = resp.text().unwrap();
+    assert!(
+        body_text.contains("budget_exceeded"),
+        "error body should name the failure type: {body_text}"
+    );
+}

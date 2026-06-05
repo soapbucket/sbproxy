@@ -1347,6 +1347,28 @@ pub(super) async fn handle_ai_proxy(
             None
         };
 
+    // WOR-1146: pre-compute an estimated prompt-token count for
+    // chat_completions, captured once from the request body before the
+    // failover loop. The response handler uses it to debit the budget
+    // from an estimate when a 2xx response carries no parseable `usage`
+    // block (a usage-less 200 would otherwise run unlimited token
+    // volume against the cap). Parsed per-element so one malformed
+    // message does not zero the estimate (mirrors the input-guardrail
+    // message parse).
+    let estimated_prompt_tokens_for_budget: Option<u64> =
+        if matches!(surface, sbproxy_ai::handler::AiSurface::ChatCompletions) {
+            body.get("messages").and_then(|v| v.as_array()).map(|arr| {
+                let msgs: Vec<sbproxy_ai::Message> = arr
+                    .iter()
+                    .filter_map(|m| serde_json::from_value::<sbproxy_ai::Message>(m.clone()).ok())
+                    .collect();
+                let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                sbproxy_ai::estimate_tokens(model, &msgs)
+            })
+        } else {
+            None
+        };
+
     // Parse retry config from the action config's routing.retry section.
     // This is done by inspecting the raw handler config.
     let max_attempts = if is_failover {
@@ -1847,6 +1869,7 @@ pub(super) async fn handle_ai_proxy(
                 audio_speech_characters: audio_speech_characters_for_billing,
                 rerank_documents: rerank_documents_for_billing,
                 attribution_tags: ctx.attribution_tags.clone(),
+                estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
             });
             let stream_router_sink = RouterTokenSink {
                 router: &router,
@@ -1921,6 +1944,7 @@ pub(super) async fn handle_ai_proxy(
                 audio_speech_characters: audio_speech_characters_for_billing,
                 rerank_documents: rerank_documents_for_billing,
                 attribution_tags: ctx.attribution_tags.clone(),
+                estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
             });
             let cache_router_sink = RouterTokenSink {
                 router: &router,
@@ -2244,6 +2268,36 @@ pub(super) async fn relay_ai_response_with_cache(
     if let Some(args) = budget_recorder.as_ref() {
         if (200..300).contains(&status) {
             let (prompt_tokens, completion_tokens) = extract_usage(&resp_body);
+            // WOR-1146: when a 2xx chat_completions response carries no
+            // parseable `usage`, debit the budget (and feed the router)
+            // from an estimate so a usage-less 200 cannot run unlimited
+            // token volume against the cap. The measured-usage surfaces
+            // below (reconcile, ctx.ai_tokens_*, attribution, the
+            // billing event) stay on the real (0,0); the dedicated
+            // `sbproxy_ai_usage_parse_miss_total` metric is the signal
+            // that an estimate was used, so spend reports never silently
+            // mix estimated and measured tokens. Limited to
+            // chat_completions for now (the clearest foot-gun and a
+            // simple response shape to estimate); embeddings / native
+            // `messages` + `responses` / streaming are follow-ups.
+            let (budget_prompt_tokens, budget_completion_tokens) = if prompt_tokens == 0
+                && completion_tokens == 0
+                && args.surface_label == "chat_completions"
+            {
+                let est_prompt = args.estimated_prompt_tokens.unwrap_or(0);
+                let est_completion = estimate_completion_tokens(args.model, &resp_body);
+                if est_prompt + est_completion > 0 {
+                    sbproxy_observe::metrics::record_ai_usage_parse_miss(
+                        args.provider_name,
+                        args.surface_label,
+                    );
+                    (est_prompt, est_completion)
+                } else {
+                    (prompt_tokens, completion_tokens)
+                }
+            } else {
+                (prompt_tokens, completion_tokens)
+            };
             // WOR-232 reconcile: hand the real `usage.prompt_tokens`
             // back to the rate-limit reservation so TPM math settles
             // against the truth. Reservations that never see a usage
@@ -2308,13 +2362,13 @@ pub(super) async fn relay_ai_response_with_cache(
             // the load this provider just absorbed. The minute
             // window resets via the existing `reset_tokens` ticker
             // (sbproxy-ai/src/routing.rs).
-            router_sink.record(prompt_tokens + completion_tokens);
+            router_sink.record(budget_prompt_tokens + budget_completion_tokens);
             record_budget_usage(
                 args.config,
                 args.keys,
                 args.model,
-                prompt_tokens,
-                completion_tokens,
+                budget_prompt_tokens,
+                budget_completion_tokens,
             );
             // Emit a surface-tagged AiBillingEvent alongside the
             // existing budget recording. Token-bearing responses
@@ -2736,6 +2790,12 @@ pub(super) struct BudgetRecorderArgs<'a> {
     /// functions can stamp the per-attribution spend metric without
     /// borrowing `ctx`, which they hold only as an `Option<&mut>`.
     attribution_tags: sbproxy_ai::attribution::AttributionTags,
+    /// WOR-1146: estimated prompt tokens for a chat_completions
+    /// request, captured from the request body at dispatch. Used only
+    /// as the prompt side of the fallback budget debit when a 2xx
+    /// response carries no parseable `usage` block. `None` for
+    /// non-chat surfaces.
+    estimated_prompt_tokens: Option<u64>,
 }
 
 /// WOR-798: the bundle a relay needs to feed

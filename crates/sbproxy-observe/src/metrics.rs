@@ -2546,6 +2546,33 @@ pub fn record_tokens_attributed(
         .inc_by(count);
 }
 
+/// Increment `sbproxy_ai_usage_parse_miss_total{provider, surface}` by
+/// one (WOR-1146).
+///
+/// Called when a 2xx AI response on a token-bearing surface carried no
+/// parseable `usage` block, so the gateway fell back to an estimated
+/// token debit against the budget. A sustained miss rate per provider
+/// is an operability signal (an upstream wrapper stripping usage, or a
+/// surface the estimator does not yet cover) and can be alerted on.
+pub fn record_ai_usage_parse_miss(provider: &str, surface: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_ai_usage_parse_miss_total",
+            "2xx AI responses on a token surface that carried no parseable usage block (budget debited from an estimate)",
+            &["provider", "surface"],
+        )
+        .expect("ai usage parse miss counter registers")
+    });
+    let provider = sanitize_label("provider", provider);
+    let surface = sanitize_label("surface", surface);
+    counter
+        .with_label_values(&[provider.as_str(), surface.as_str()])
+        .inc();
+}
+
 // --- WOR-1044: reversible PII redaction miss ---
 //
 // Incremented when a `<placeholder:...>` shape appears in the upstream
