@@ -595,6 +595,17 @@ of the new YAML fields below until the version that ships them.
 
 ### Fixed
 
+- **Virtual-key model allow/block lists are now enforced.** A virtual
+  key (or `ai_provider` credential) with `models.allow` / `models.block`
+  declared its scope but the AI dispatch path never checked it, so a key
+  confined to a subset of the gateway's models could still call any
+  model the gateway served. The matched key's allow/block lists are now
+  enforced against the effective model (after any `route_to_model`
+  rewrite): a request for a disallowed model is rejected with `403`
+  before any upstream call, the block-list taking precedence over the
+  allow-list. Keys with no `models.allow` are unaffected. See
+  `examples/ai-virtual-keys/`.
+
 - **Licensing-projection wire formats now match the canonical specs [BREAKING].** Two projection emitters were producing
   document shapes that didn't match their cited specifications.
   `/licenses.xml` previously declared the namespace

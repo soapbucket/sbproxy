@@ -769,6 +769,31 @@ pub(super) async fn handle_ai_proxy(
                         );
                     }
                 }
+                // Per-key model gate. Enforce the matched key's
+                // `allowed_models` / `blocked_models` against the
+                // effective model (after any `route_to_model` rewrite),
+                // mirroring the action-level gate above but scoped to
+                // this virtual key. A key allow-listed to a subset of
+                // the gateway's models is rejected with 403 when it asks
+                // for a model outside that subset; the block-list takes
+                // precedence over the allow-list.
+                let effective_model = body
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !effective_model.is_empty() {
+                    let blocked = vk.blocked_models.iter().any(|m| m == &effective_model);
+                    let allowed = vk.allowed_models.is_empty()
+                        || vk.allowed_models.iter().any(|m| m == &effective_model);
+                    if blocked || !allowed {
+                        let msg =
+                            format!("model '{}' is not allowed for this key", effective_model);
+                        warn!(model = %effective_model, "AI proxy: model blocked for virtual key");
+                        send_error(session, 403, &msg).await?;
+                        return Ok(());
+                    }
+                }
             }
         }
     }

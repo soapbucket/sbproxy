@@ -2,12 +2,13 @@
 # AI gateway: per-team virtual keys.
 #
 # Two virtual keys split traffic between teams. The frontend team is
-# capped to a Haiku-only allow-list, modest RPM, and a small budget.
-# The data team gets Sonnet plus Haiku, a higher RPM, and a larger
-# budget. Tags surface in the sbproxy_ai_key_* metrics so dashboards
-# can attribute spend per team. Clients send their virtual key in the
-# Authorization header; the proxy validates it locally before any
-# upstream call.
+# allow-listed to Haiku only; the data team also gets Sonnet. A key
+# that requests a model outside its allow-list is rejected with 403
+# before any upstream call. Each credential also declares a budget and
+# tags that surface in the sbproxy_ai_key_* metrics so dashboards can
+# attribute spend per team. Clients send their virtual key in the
+# Authorization header; the gateway matches it locally and swaps in the
+# real upstream key before the call.
 #
 # Setup:
 #   export ANTHROPIC_API_KEY=sk-ant-...
@@ -48,11 +49,13 @@
 #     }'
 #
 # Expected behaviour:
-#   The frontend key is rejected for Sonnet (not in allowed_models) and
-#   for any path through OpenRouter (not in allowed_providers). Frontend
-#   throughput is capped at 30 RPM and 60k TPM with a $10 budget. The data
-#   key gets Sonnet plus Haiku at 120 RPM and 400k TPM with a $250 budget.
-#   Requests are tagged in the sbproxy_ai_key_* counters by name and tags.
+#   The frontend key is rejected with 403 for Sonnet (not on its
+#   models.allow list); the data key gets both Haiku and Sonnet.
+#   Requests are tagged in the sbproxy_ai_key_* counters by name and
+#   tags for per-team attribution. The per-credential budget and
+#   rate_limit below are attribution metadata, not per-key enforced
+#   limits: configure enforced ceilings at the action level (an action
+#   `budget:` block and rate-limit policies). See docs/ai-gateway.md.
 
 proxy:
   http_bind_port: 8080
@@ -65,17 +68,23 @@ origins:
 
       providers:
         - name: anthropic
+          # Secrets use ${ENV_VAR} interpolation here to stay runnable.
+          # In production any secret (this key and the virtual keys
+          # below) can instead be a vault reference, e.g.
+          #   api_key: vault://hashi/secret/data/anthropic-prod?key=api_key
+          # backed by HashiCorp Vault, AWS Secrets Manager, or K8s
+          # Secrets. See docs/secrets.md.
           api_key: ${ANTHROPIC_API_KEY}
           default_model: claude-3-5-haiku-latest
           models:
             - claude-3-5-haiku-latest
             - claude-3-5-sonnet-latest
 
-    # Per-team credentials. Migrated from the legacy
-    # `action.virtual_keys:` shape to the unified credentials block.
-    # The compile-time lowering materialises each `ai_provider`
-    # credential as a virtual-key entry on the AI handler so the
-    # runtime dispatch keeps working unchanged.
+    # Per-team credentials. Each credential's `models.allow` is an
+    # enforced per-key gate: a request for a model outside the list
+    # gets a 403. The `attrs.budget` and `policies.rate_limit` blocks
+    # are attribution metadata on the matched key, not per-key enforced
+    # ceilings; set enforced limits at the action level.
     credentials:
       - name: team-frontend
         type: ai_provider
