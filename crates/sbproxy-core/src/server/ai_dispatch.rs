@@ -1927,6 +1927,13 @@ pub(super) async fn handle_ai_proxy(
                     inbound_format: stream_inbound_format,
                 },
                 stream_reversible_pairs,
+                // WOR-1141: streaming output guardrails (only when the
+                // origin declares output guardrails).
+                config
+                    .guardrails
+                    .as_ref()
+                    .and_then(cached_guardrails_pipeline)
+                    .filter(|p| p.has_output()),
             )
             .await
         } else {
@@ -1964,6 +1971,15 @@ pub(super) async fn handle_ai_proxy(
                 Some(ctx),
                 idem_skip_reason,
                 idem_capture,
+                // WOR-1141: enforce OUTPUT guardrails on the response.
+                // Only pass the pipeline when it actually declares
+                // output guardrails, so origins without them pay no
+                // per-response cost.
+                config
+                    .guardrails
+                    .as_ref()
+                    .and_then(cached_guardrails_pipeline)
+                    .filter(|p| p.has_output()),
             )
             .await
         }
@@ -2089,6 +2105,7 @@ pub(super) async fn relay_ai_response_with_cache(
     mut ctx: Option<&mut RequestContext>,
     idem_skip_reason: Option<&'static str>,
     idem_capture: Option<AiIdempotencyCapture>,
+    output_guardrails: Option<std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
 ) -> Result<()> {
     let status = resp.status().as_u16();
 
@@ -2178,6 +2195,40 @@ pub(super) async fn relay_ai_response_with_cache(
             _ => resp_body,
         }
     };
+
+    // --- WOR-1141: enforce OUTPUT guardrails ---
+    //
+    // Run the configured output guardrails against the materialized
+    // response body BEFORE it is cached (semantic / embedding / idem)
+    // or sent, so a violating response is neither stored nor delivered.
+    // The check runs on the full response text (shape-agnostic across
+    // provider formats); a PII / toxicity / jailbreak / regex match
+    // anywhere in the model's output blocks the response. Only 2xx
+    // bodies are checked (error envelopes are pass-through). On a block
+    // we return a 403 with a `guardrail_violation` envelope and skip
+    // every cache write below via the early return.
+    if let Some(ref guardrails) = output_guardrails {
+        if (200..300).contains(&status) {
+            if let Ok(text) = std::str::from_utf8(&resp_body) {
+                if let Some(block) = guardrails.check_output(text) {
+                    warn!(
+                        guardrail = %block.name,
+                        reason = %block.reason,
+                        "AI proxy: output guardrail blocked response"
+                    );
+                    let error_body = serde_json::json!({
+                        "error": {
+                            "message": block.reason,
+                            "type": "guardrail_violation",
+                            "code": block.name,
+                        }
+                    });
+                    let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+                    return send_response(session, 403, "application/json", &body_bytes).await;
+                }
+            }
+        }
+    }
 
     // --- WOR-796: OSS embedding cache write on miss ---
     //
@@ -2978,6 +3029,11 @@ pub(super) async fn relay_ai_stream(
     // streaming restorer short-circuits per-chunk via
     // `StreamingReversibleRestore::is_noop`.
     reversible_pairs: Vec<(String, String, String)>,
+    // WOR-1141: streaming-safe OUTPUT guardrails. `None` when the origin
+    // declares no output guardrails. Each outbound chunk is fed through
+    // `check_output_chunk` (streaming-safe guardrails only, per the
+    // WOR-235 ADR); a match terminates the stream.
+    output_guardrails: Option<std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
 ) -> Result<()> {
     let status = resp.status().as_u16();
 
@@ -3130,6 +3186,12 @@ pub(super) async fn relay_ai_stream(
     // flagged content. Leaves `upstream_complete` false so the recorder
     // guard emits `End { complete: false }`.
     let mut safety_blocked = false;
+    // WOR-1141: set when a streaming-safe output guardrail matches an
+    // outbound chunk so the relay stops forwarding (the violating chunk
+    // and everything after it). Headers are already sent, so an
+    // already-written chunk cannot be recalled, but the rest of the
+    // violating output does not reach the client.
+    let mut output_guard_blocked = false;
     'relay: loop {
         match stream.next().await {
             Some(Ok(chunk)) => {
@@ -3234,6 +3296,23 @@ pub(super) async fn relay_ai_stream(
                     // and wait for the next chunk to flush.
                     continue;
                 }
+                // WOR-1141: run streaming-safe output guardrails against
+                // the client-facing chunk before it is written. A match
+                // terminates the stream (fail closed) so the violating
+                // content and everything after it is withheld.
+                if let Some(ref guardrails) = output_guardrails {
+                    if let Ok(text) = std::str::from_utf8(&outbound_bytes) {
+                        if let Some(block) = guardrails.check_output_chunk(text) {
+                            warn!(
+                                guardrail = %block.name,
+                                reason = %block.reason,
+                                "AI proxy: output guardrail blocked streaming chunk; terminating stream"
+                            );
+                            output_guard_blocked = true;
+                            break 'relay;
+                        }
+                    }
+                }
                 session
                     .write_response_body(Some(outbound_bytes), false)
                     .await?;
@@ -3300,6 +3379,11 @@ pub(super) async fn relay_ai_stream(
         // `End { complete: false }`. Budget is still recorded best-effort
         // below for whatever the upstream produced before the cut.
         debug!("AI proxy: streaming response terminated early by stream-safety enforcement");
+    }
+    if output_guard_blocked {
+        // WOR-1141: the stream was cut short by an output guardrail.
+        // Same partial-recording semantics as the safety-verdict cut.
+        debug!("AI proxy: streaming response terminated early by an output guardrail");
     }
 
     // --- Streaming budget recording ---
