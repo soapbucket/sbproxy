@@ -213,7 +213,17 @@ static AGENT_CLASS_RESOLVER: OnceLock<
 pub fn set_agent_class_resolver(
     resolver: Arc<sbproxy_modules::policy::agent_class::AgentClassResolver>,
 ) {
-    let _ = AGENT_CLASS_RESOLVER.set(resolver);
+    // WOR-1164: the slot is a `OnceLock`, so a second install (e.g. a
+    // SIGHUP reload that rebuilt the resolver from a changed config) is a
+    // silent no-op. Log at warn so an operator can see that the running
+    // resolver is the one from boot, not the reloaded config. (Swapping it
+    // live requires moving this slot to `ArcSwap`; tracked separately.)
+    if AGENT_CLASS_RESOLVER.set(resolver).is_err() {
+        tracing::warn!(
+            "agent_class resolver already installed; reload did not replace it \
+             (the original boot-time resolver stays active)"
+        );
+    }
 }
 
 /// Borrow the global agent-class resolver, when one has been installed.
@@ -291,7 +301,16 @@ static AGENT_DETECT_LOADER: OnceLock<Arc<sbproxy_agent_detect::RulePackLoader>> 
 /// the rule-pack *path* keeps the original loader. The pack *contents*
 /// still hot-reload through the loader's own `ArcSwap` via `reload()`.
 pub fn set_agent_detect_loader(loader: sbproxy_agent_detect::RulePackLoader) {
-    let _ = AGENT_DETECT_LOADER.set(Arc::new(loader));
+    // WOR-1164: a reload that changes `agent_detect.rule_pack_path` to a
+    // different file no-ops here (OnceLock). Log so the swap-not-applied
+    // case is visible; pack *contents* still hot-reload via the loader's
+    // own ArcSwap.
+    if AGENT_DETECT_LOADER.set(Arc::new(loader)).is_err() {
+        tracing::warn!(
+            "agent_detect loader already installed; reload did not replace it \
+             (a changed rule_pack_path needs a restart; pack contents still hot-reload)"
+        );
+    }
 }
 
 /// Borrow the global agent-detect rule-pack loader, when one is installed.
