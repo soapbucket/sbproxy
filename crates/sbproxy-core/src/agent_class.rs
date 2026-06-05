@@ -164,6 +164,8 @@ mod tests {
             Arc::new(AgentClassCatalog::defaults()),
             Arc::new(StubResolver::new()),
             16,
+            true,
+            true,
         )
     }
 

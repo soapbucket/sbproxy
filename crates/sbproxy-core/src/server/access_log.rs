@@ -132,8 +132,24 @@ pub(super) fn install_agent_class_resolver(block: Option<&sbproxy_config::AgentC
         }
     };
 
+    // WOR-1164: honor `resolver.rdns_enabled` / `bot_auth_keyid_enabled`
+    // (previously parsed but never threaded into the resolver). Absent
+    // block -> the config defaults (both enabled).
+    let (rdns_enabled, bot_auth_keyid_enabled) = match block {
+        None => (true, true),
+        Some(cfg) => (
+            cfg.resolver.rdns_enabled,
+            cfg.resolver.bot_auth_keyid_enabled,
+        ),
+    };
     let dns_resolver = Arc::new(SystemResolver);
-    let resolver = AgentClassResolver::new(Arc::new(catalog), dns_resolver, cache_size);
+    let resolver = AgentClassResolver::new(
+        Arc::new(catalog),
+        dns_resolver,
+        cache_size,
+        rdns_enabled,
+        bot_auth_keyid_enabled,
+    );
     reload::set_agent_class_resolver(Arc::new(resolver));
     tracing::info!(
         cache_size = %cache_size,

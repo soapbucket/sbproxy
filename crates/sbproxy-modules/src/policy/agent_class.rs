@@ -131,21 +131,34 @@ pub struct AgentClassResolver {
     catalog: Arc<AgentClassCatalog>,
     dns_resolver: Arc<dyn Resolver>,
     rdns_cache: ReverseDnsCache,
+    /// WOR-1164: gates Step 2 (forward-confirmed reverse DNS). When
+    /// false, the rDNS lookup is skipped entirely (e.g. a runtime with
+    /// no working PTR resolver), honoring `resolver.rdns_enabled`.
+    rdns_enabled: bool,
+    /// WOR-1164: gates Step 1 (Web Bot Auth keyid match). When false the
+    /// keyid lookup is skipped, honoring `resolver.bot_auth_keyid_enabled`.
+    bot_auth_keyid_enabled: bool,
 }
 
 impl AgentClassResolver {
     /// Build a resolver around the supplied catalog and DNS resolver.
     /// `rdns_cache_capacity` caps the per-process verdict cache; pass
     /// 4096 for the OSS default (matches `ReverseDnsCache`'s docs).
+    /// `rdns_enabled` / `bot_auth_keyid_enabled` gate the rDNS and keyid
+    /// resolver steps respectively (WOR-1164).
     pub fn new(
         catalog: Arc<AgentClassCatalog>,
         dns_resolver: Arc<dyn Resolver>,
         rdns_cache_capacity: usize,
+        rdns_enabled: bool,
+        bot_auth_keyid_enabled: bool,
     ) -> Self {
         Self {
             catalog,
             dns_resolver,
             rdns_cache: ReverseDnsCache::new(rdns_cache_capacity),
+            rdns_enabled,
+            bot_auth_keyid_enabled,
         }
     }
 
@@ -166,17 +179,23 @@ impl AgentClassResolver {
     ///   in the default catalog; tractable).
     pub fn resolve(&self, inputs: &ResolveInputs<'_>) -> Resolved {
         // --- Step 1: bot-auth keyid match. Highest confidence. ---
-        if let Some(keyid) = inputs.bot_auth_keyid {
-            if let Some(entry) = self.catalog.lookup_by_keyid(keyid) {
-                return Resolved::from_match(entry, AgentIdSource::BotAuth, None);
+        // WOR-1164: skip when the operator disabled keyid resolution.
+        if self.bot_auth_keyid_enabled {
+            if let Some(keyid) = inputs.bot_auth_keyid {
+                if let Some(entry) = self.catalog.lookup_by_keyid(keyid) {
+                    return Resolved::from_match(entry, AgentIdSource::BotAuth, None);
+                }
             }
         }
 
         // --- Step 2: forward-confirmed reverse DNS. ---
-        if let Some(ip) = inputs.client_ip {
-            if let Some(ReverseDnsVerdict::Verified(host)) = self.cached_rdns(ip) {
-                if let Some(entry) = self.catalog.lookup_by_reverse_dns(&host) {
-                    return Resolved::from_match(entry, AgentIdSource::Rdns, Some(host));
+        // WOR-1164: skip the PTR lookup entirely when rdns is disabled.
+        if self.rdns_enabled {
+            if let Some(ip) = inputs.client_ip {
+                if let Some(ReverseDnsVerdict::Verified(host)) = self.cached_rdns(ip) {
+                    if let Some(entry) = self.catalog.lookup_by_reverse_dns(&host) {
+                        return Resolved::from_match(entry, AgentIdSource::Rdns, Some(host));
+                    }
                 }
             }
         }
@@ -367,7 +386,13 @@ mod tests {
     }
 
     fn build_resolver_with_dns(stub: StubResolver) -> AgentClassResolver {
-        AgentClassResolver::new(Arc::new(AgentClassCatalog::defaults()), Arc::new(stub), 64)
+        AgentClassResolver::new(
+            Arc::new(AgentClassCatalog::defaults()),
+            Arc::new(stub),
+            64,
+            true,
+            true,
+        )
     }
 
     #[test]
@@ -406,6 +431,38 @@ mod tests {
             r.rdns_hostname.as_deref(),
             Some("crawl-66-249-66-1.googlebot.com")
         );
+    }
+
+    #[test]
+    fn rdns_disabled_skips_reverse_dns_step() {
+        // WOR-1164: with `rdns_enabled = false`, the googlebot PTR entry is
+        // ignored and the UA decides the verdict instead, so the resolver
+        // must not classify this as googlebot via rDNS.
+        let ip = googlebot_ip();
+        let stub = StubResolver::new()
+            .with_ptr(ip, vec!["crawl-66-249-66-1.googlebot.com".to_string()])
+            .with_forward("crawl-66-249-66-1.googlebot.com", vec![ip]);
+        let resolver = AgentClassResolver::new(
+            Arc::new(AgentClassCatalog::defaults()),
+            Arc::new(stub),
+            64,
+            false, // rdns_enabled
+            true,  // bot_auth_keyid_enabled
+        );
+        let inputs = ResolveInputs {
+            client_ip: Some(ip),
+            user_agent: Some(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123.0 Safari/537.36",
+            ),
+            ..Default::default()
+        };
+        let r = resolver.resolve(&inputs);
+        assert_ne!(
+            r.source,
+            AgentIdSource::Rdns,
+            "rdns step must be skipped when rdns_enabled is false"
+        );
+        assert_ne!(r.agent_id.as_str(), "google-googlebot");
     }
 
     #[test]
