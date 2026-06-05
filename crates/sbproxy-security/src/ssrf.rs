@@ -212,7 +212,12 @@ pub fn validate_url_resolved(url: &str, allowlist: &[String]) -> Result<Resolved
         // Caller has explicitly allowlisted this hostname. Resolve best-
         // effort so they can still pin the dial to a SocketAddr; if
         // resolution fails we return an empty addrs vec rather than
-        // blocking, preserving the original allowlist semantics.
+        // blocking, preserving the original allowlist semantics. This is
+        // intentional (WOR-1156): an operator who allowlists an internal
+        // host (split-horizon DNS, names only resolvable at dial time)
+        // wants the request permitted; the dial-time re-validation
+        // contract documented at the module level is the mitigation for
+        // the re-resolution TOCTOU, not failing this resolve.
         let addr_str = format!("{host}:{port}");
         let addrs = resolve_with_timeout(&addr_str, DNS_RESOLUTION_TIMEOUT).unwrap_or_default();
         return Ok(ResolvedUrl {

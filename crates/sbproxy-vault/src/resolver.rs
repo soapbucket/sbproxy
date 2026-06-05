@@ -14,7 +14,11 @@ use crate::manager::VaultBackend;
 /// needs to be resolved.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolveFallback {
-    /// Return the last successfully resolved value from a caller-managed cache.
+    /// Reserved for a future caller-managed last-good cache. NOT yet
+    /// implemented: the resolver has no backend to populate a cache from
+    /// on this path, so selecting `Cache` currently behaves like
+    /// [`ResolveFallback::Reject`] (it fails with an error). Do not rely
+    /// on it returning a cached value (WOR-1157).
     Cache,
     /// Fail with an error - the safest default.
     Reject,
