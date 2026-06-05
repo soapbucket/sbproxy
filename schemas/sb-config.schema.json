@@ -1497,6 +1497,14 @@
           "description": "When `true` (default), the TLS handshake fails if the client does not present a certificate. When `false`, the handshake succeeds without a cert and `X-Client-Cert-Verified: 0` is set (so upstreams can choose whether to reject anonymous traffic).",
           "default": true,
           "type": "boolean"
+        },
+        "allowed_cn_patterns": {
+          "description": "Optional allowlist of regex patterns the client certificate's Common Name must match. When non-empty, a certificate that passes CA-chain validation is still rejected during the handshake if its CN matches none of these patterns. Empty (the default) accepts any CN signed by the configured CA (WOR-1155).",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       }
     },

@@ -836,6 +836,13 @@ pub struct MtlsListenerConfig {
     /// (so upstreams can choose whether to reject anonymous traffic).
     #[serde(default = "default_mtls_require")]
     pub require: bool,
+    /// Optional allowlist of regex patterns the client certificate's
+    /// Common Name must match. When non-empty, a certificate that passes
+    /// CA-chain validation is still rejected during the handshake if its
+    /// CN matches none of these patterns. Empty (the default) accepts any
+    /// CN signed by the configured CA (WOR-1155).
+    #[serde(default)]
+    pub allowed_cn_patterns: Vec<String>,
 }
 
 fn default_mtls_require() -> bool {

@@ -183,8 +183,12 @@ fn build_mtls_tls_settings(
 ) -> anyhow::Result<pingora_core::listeners::tls::TlsSettings> {
     let mut settings = pingora_core::listeners::tls::TlsSettings::intermediate(cert_path, key_path)
         .map_err(|e| anyhow::anyhow!("TlsSettings::intermediate: {e}"))?;
-    let verifier =
-        sbproxy_tls::mtls::build_client_cert_verifier(&mtls.client_ca_file, mtls.require, cache)?;
+    let verifier = sbproxy_tls::mtls::build_client_cert_verifier(
+        &mtls.client_ca_file,
+        mtls.require,
+        &mtls.allowed_cn_patterns,
+        cache,
+    )?;
     settings.set_client_cert_verifier(verifier);
     Ok(settings)
 }
