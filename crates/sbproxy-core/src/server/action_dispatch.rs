@@ -1451,6 +1451,31 @@ pub(super) async fn handle_mcp_action(
                                         None
                                     };
 
+                                // WOR-508: capture the inputs for the
+                                // prompt-linked audit envelope before
+                                // `arguments` is moved into the call. Gated
+                                // on a subscriber being interested in the
+                                // `mcp_audit` target (the enterprise audit
+                                // layer), so an OSS-only deployment pays no
+                                // clone.
+                                let mcp_audit_capture = if tracing::enabled!(
+                                    target: "mcp_audit",
+                                    tracing::Level::INFO
+                                ) {
+                                    Some(McpAuditCapture {
+                                        args_json: serde_json::to_string(&arguments)
+                                            .unwrap_or_default(),
+                                        prompt: audit_cause.clone().unwrap_or_default(),
+                                        server: federated
+                                            .as_ref()
+                                            .map(|t| t.server_name.clone())
+                                            .unwrap_or_else(|| "unknown".to_string()),
+                                        started: std::time::Instant::now(),
+                                    })
+                                } else {
+                                    None
+                                };
+
                                 let call = mcp.federation.call_tool(&name, arguments);
                                 let outcome = match timeout {
                                     Some(d) => match tokio::time::timeout(d, call).await {
@@ -1481,6 +1506,13 @@ pub(super) async fn handle_mcp_action(
                                 // outcome is consumed by the response.
                                 if let Some(cap) = ledger_capture {
                                     emit_tool_call_ledger(ctx, &name, cap, &outcome);
+                                }
+
+                                // WOR-508: bridge the prompt-linked audit
+                                // inputs to the enterprise audit layer over
+                                // the `mcp_audit` tracing target.
+                                if let Some(cap) = mcp_audit_capture {
+                                    emit_mcp_prompt_audit(ctx, &name, cap, &outcome);
                                 }
 
                                 match outcome {
@@ -1526,6 +1558,67 @@ struct LedgerCapture {
 /// WOR-1186: assemble and emit one session-ledger tool-call record from
 /// the captured inputs and the call outcome. Identity (session, agent)
 /// comes off `ctx`; payload redaction happens inside `emit_tool_call`.
+/// WOR-508: inputs captured before `arguments` is moved into the tool
+/// call, used by the enterprise audit layer to build the prompt-linked
+/// audit envelope. Only populated when a subscriber is listening on
+/// the `mcp_audit` tracing target, so an OSS-only deployment pays no
+/// clone.
+struct McpAuditCapture {
+    /// Canonical JSON of the tool arguments (the enterprise side
+    /// digests this; the raw value never leaves the process).
+    args_json: String,
+    /// The originating prompt / reason for the call, from the SEP-1865
+    /// `params.audit.cause` field. Empty on base-MCP calls.
+    prompt: String,
+    /// Upstream MCP server name.
+    server: String,
+    /// Call start, for the end-to-end duration.
+    started: std::time::Instant,
+}
+
+/// WOR-508: emit a structured event on the `mcp_audit` tracing target
+/// carrying the inputs the enterprise audit layer needs to build an
+/// `McpPromptLinkedAudit` envelope (the prompt that caused the call,
+/// linked to the call). The OSS proxy cannot depend on the enterprise
+/// audit crate, so the bridge is a tracing event; with no subscriber
+/// the event is dropped at near-zero cost. The enterprise layer
+/// digests the arguments and PII-redacts the prompt excerpt before it
+/// reaches the hash-chained audit log.
+fn emit_mcp_prompt_audit(
+    ctx: &RequestContext,
+    tool_name: &str,
+    cap: McpAuditCapture,
+    outcome: &anyhow::Result<serde_json::Value>,
+) {
+    // No clean upstream response on an error / timeout; report 0 per
+    // the envelope's `upstream_status` contract, 200 on a served call.
+    let upstream_status: u16 = if outcome.is_ok() { 200 } else { 0 };
+    // The detected agent id is only present when the agent-class
+    // feature is compiled in; fall back to an empty string otherwise.
+    #[cfg(feature = "agent-class")]
+    let agent_id = ctx
+        .agent_id
+        .as_ref()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    #[cfg(not(feature = "agent-class"))]
+    let agent_id = String::new();
+    tracing::info!(
+        target: "mcp_audit",
+        workspace_id = %ctx.tenant_id,
+        request_id = %ctx.request_id,
+        agent_id = %agent_id,
+        human_sponsor = %ctx.principal.sub,
+        mcp_server = %cap.server,
+        tool_name = %tool_name,
+        tool_arguments = %cap.args_json,
+        prompt = %cap.prompt,
+        upstream_status = upstream_status,
+        duration_ms = cap.started.elapsed().as_millis() as u64,
+        "mcp prompt-linked tool-call audit",
+    );
+}
+
 fn emit_tool_call_ledger(
     ctx: &RequestContext,
     tool_name: &str,
