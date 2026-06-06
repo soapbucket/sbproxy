@@ -1,6 +1,6 @@
 # Metrics stability
 
-*Last modified: 2026-05-09*
+*Last modified: 2026-06-05*
 
 Naming conventions, stability guarantees, and the full catalogue of metrics emitted by SBproxy.
 
@@ -320,17 +320,51 @@ Buckets: `0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0`. Matches the bucket s
 |---|---|
 | Type | Counter |
 | Stability | **beta** |
-| Description | Per-attribution token and USD spend, so an operator can answer "what did project / feature / team X spend this week" from Prometheus. Fed from the single AI billing choke point, so unary, streaming, and non-chat surfaces all contribute. Cache hits contribute the cached token count under `direction=cache_read` at zero cost. |
+| Description | Per-attribution token and USD spend, so an operator can answer "what did project / feature / team X spend this week" from Prometheus. Fed from the single AI billing choke point, so unary, streaming, and non-chat surfaces (embeddings, image, audio, reranking) plus closed realtime sessions all contribute. Cache hits contribute the cached token count under `direction=cache_read` at zero cost. |
 
 **Labels:**
 
 | Label | Description | Example values |
 |---|---|---|
 | `provider`, `model` | Provider + model | `openai` / `gpt-4o` |
+| `surface` | Classified AI surface the spend came from, so non-chat spend is distinguishable on the dashboard | `chat_completions`, `embeddings`, `image_generation`, `audio_speech`, `reranking`, `realtime` |
 | `direction` | Token kind (tokens metric only) | `input`, `output`, `cache_read` |
 | `project`, `feature`, `team`, `agent_type`, `environment` | Bounded business attribution dimensions, resolved from the credential `attrs:` + `SB-Attr-*` headers | `checkout`, `prod`, `runtime` |
 
 High-cardinality dimensions (customer, trace_id, okr, risk_tier) are deliberately kept **off** the metric labels and ride on the access log's `attribution` map / the trace span instead.
+
+---
+
+#### `sbproxy_ai_audio_seconds_attributed_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Audio seconds consumed by realtime and audio surfaces, partitioned by the same attribution set as the token/cost metrics. Realtime sessions consume seconds rather than tokens and have no catalogue price yet, so neither the token nor the cost attributed counter captures them; this sibling gives those surfaces an attributed-spend presence so a project / team dashboard can see realtime + audio usage. |
+
+**Labels:** `provider`, `model`, `surface` (`realtime`, `audio_transcription`, `audio_speech`), `project`, `feature`, `team`, `agent_type`, `environment`.
+
+---
+
+#### `sbproxy_ai_wasted_tokens_total` / `sbproxy_ai_wasted_cost_dollars_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Tokens (and estimated USD) spent upstream that bought no served outcome, classified by waste detector. Observational only: the gateway flags the spend, it does not block it. The matching billing event still records the real spend, so these counters are an overlay, not a substitute. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `kind` | Waste detector that fired | `duplicate_request`, `abandoned_stream`, `validation_failed`, `context_bloat`, `failover_loser` |
+| `provider`, `model` | Provider + model that absorbed the spend | `openai` / `gpt-4o` |
+| `surface` | Classified AI surface | `chat_completions`, `realtime` |
+| `project`, `feature`, `team`, `agent_type`, `environment` | Same bounded attribution set as the attributed-spend metrics | `checkout`, `prod`, `runtime` |
+
+Detector meanings: `abandoned_stream` fires when a stream closes before the upstream signalled completion (client cancel or truncation); `validation_failed` fires when an output guardrail or the stream-safety classifier rejects a response whose tokens were already consumed; `failover_loser` fires for a cascade tier that returned a body but lost (5xx, refusal, or below the quality threshold) to a later tier; `duplicate_request` and `context_bloat` are reserved for the dedup and rolling-median observers.
 
 ---
 

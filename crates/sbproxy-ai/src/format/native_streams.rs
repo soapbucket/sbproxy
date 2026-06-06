@@ -644,7 +644,7 @@ impl SseFramer {
 /// Chat SSE, which this parses into the hub vocabulary so the inbound
 /// format's `from_hub_stream` emitter can re-frame it in Anthropic or
 /// Responses shape. It is the inverse of
-/// [`super::openai_chat::hub_chunk_to_openai_sse`].
+/// `super::openai_chat::hub_chunk_to_openai_sse`.
 #[derive(Debug, Default)]
 pub(crate) struct OpenAiChatStreamState {
     /// Whether `MessageStart` has been emitted (id/model arrive on

@@ -782,6 +782,8 @@ impl AiClient {
         cascade: &crate::routing::CascadeConfig,
         path: &str,
         body: &serde_json::Value,
+        tags: &crate::attribution::AttributionTags,
+        surface: &str,
     ) -> Result<CascadeOutcome> {
         if cascade.tiers.is_empty() {
             return Err(anyhow::anyhow!("cascade has no tiers"));
@@ -921,6 +923,13 @@ impl AiClient {
                     "cascade: tier returned 5xx; trying next"
                 );
                 ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
+                record_cascade_loser_waste(
+                    &provider.name,
+                    &tier.model,
+                    surface,
+                    tags,
+                    translated.as_ref(),
+                );
                 last_outcome = Some(CascadeOutcome {
                     status: status.as_u16(),
                     headers: header_pairs,
@@ -948,6 +957,13 @@ impl AiClient {
                     "cascade: tier returned empty or refused response; trying next"
                 );
                 ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
+                record_cascade_loser_waste(
+                    &provider.name,
+                    &tier.model,
+                    surface,
+                    tags,
+                    translated.as_ref(),
+                );
                 last_outcome = Some(CascadeOutcome {
                     status: status.as_u16(),
                     headers: header_pairs,
@@ -970,6 +986,13 @@ impl AiClient {
                     "cascade: tier scored below threshold; trying next"
                 );
                 ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
+                record_cascade_loser_waste(
+                    &provider.name,
+                    &tier.model,
+                    surface,
+                    tags,
+                    translated.as_ref(),
+                );
                 last_outcome = Some(CascadeOutcome {
                     status: status.as_u16(),
                     headers: header_pairs,
@@ -1012,6 +1035,54 @@ impl AiClient {
 fn estimate_cost_micros(model: &str) -> u64 {
     let cost_dollars = crate::budget::estimate_cost(model, 512, 512);
     (cost_dollars * 1_000_000.0).round() as u64
+}
+
+/// Extract OpenAI-shaped `(prompt_tokens, completion_tokens)` from a
+/// translated response body, returning `(0, 0)` when no usage block
+/// is present. The cascade always translates upstream bodies back to
+/// OpenAI Chat before this runs, so the `usage` shape is uniform.
+fn extract_usage_tokens(body: &[u8]) -> (u64, u64) {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("usage").cloned())
+        .map(|u| {
+            let p = u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+            let c = u
+                .get("completion_tokens")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
+            (p, c)
+        })
+        .unwrap_or((0, 0))
+}
+
+/// WOR-1093: a cascade tier that returned a body but lost (5xx,
+/// refusal, or below the quality threshold) still consumed upstream
+/// tokens that bought no served outcome. Flag those tokens as
+/// `failover_loser` waste, reusing the usage already present in the
+/// translated body. A loser with no parseable usage records nothing.
+fn record_cascade_loser_waste(
+    provider: &str,
+    model: &str,
+    surface: &str,
+    tags: &crate::attribution::AttributionTags,
+    body: &[u8],
+) {
+    let (prompt, completion) = extract_usage_tokens(body);
+    let tokens = prompt.saturating_add(completion);
+    if tokens == 0 {
+        return;
+    }
+    let cost = crate::budget::estimate_cost(model, prompt, completion);
+    ai_metrics::record_waste(
+        ai_metrics::WasteKind::FailoverLoser,
+        provider,
+        model,
+        surface,
+        tags,
+        tokens,
+        cost,
+    );
 }
 
 /// Look for a top-level `confidence_score` JSON number in the

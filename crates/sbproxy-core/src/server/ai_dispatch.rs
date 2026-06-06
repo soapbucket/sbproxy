@@ -1255,6 +1255,7 @@ pub(super) async fn handle_ai_proxy(
                                     crate::server::ai_support::record_cache_hit_savings(
                                         cache.provider(),
                                         cache.model(),
+                                        surface_label,
                                         &body,
                                         &ctx.attribution_tags,
                                     );
@@ -1547,7 +1548,14 @@ pub(super) async fn handle_ai_proxy(
         if !is_stream {
             let outcome = AI_CLIENT
                 .load()
-                .forward_cascade(config, cascade_cfg, &path, &body)
+                .forward_cascade(
+                    config,
+                    cascade_cfg,
+                    &path,
+                    &body,
+                    &ctx.attribution_tags,
+                    surface_label,
+                )
                 .await;
             match outcome {
                 Ok(o) => {
@@ -2219,6 +2227,33 @@ pub(super) async fn relay_ai_response_with_cache(
                         reason = %block.reason,
                         "AI proxy: output guardrail blocked response"
                     );
+                    // WOR-1093: the upstream already produced (and
+                    // billed) this 2xx response; an output guardrail
+                    // then rejected it, so the spend bought no served
+                    // outcome. Flag the consumed tokens as
+                    // `validation_failed` waste, reusing the usage
+                    // already parsed for billing. Observational only.
+                    if let Some(args) = budget_recorder.as_ref() {
+                        let (prompt_tokens, completion_tokens) = extract_usage(&resp_body);
+                        let wasted = prompt_tokens.saturating_add(completion_tokens);
+                        if wasted > 0 {
+                            let usage = sbproxy_ai::budget::AiUsage::Tokens {
+                                input: prompt_tokens,
+                                output: completion_tokens,
+                            };
+                            let cost =
+                                sbproxy_ai::budget::estimate_cost_for_usage(args.model, &usage);
+                            sbproxy_ai::ai_metrics::record_waste(
+                                sbproxy_ai::ai_metrics::WasteKind::ValidationFailed,
+                                args.provider_name,
+                                args.model,
+                                args.surface_label,
+                                &args.attribution_tags,
+                                wasted,
+                                cost,
+                            );
+                        }
+                    }
                     let error_body = serde_json::json!({
                         "error": {
                             "message": block.reason,
@@ -3435,18 +3470,30 @@ pub(super) async fn relay_ai_stream(
                     &args.attribution_tags,
                 );
 
-                // WOR-1093: a stream that closed before the upstream
-                // signalled completion still consumed the prompt (and
+                // WOR-1093: a stream that did not run to a clean
+                // upstream completion still consumed the prompt (and
                 // any reasoning) tokens; flag the spend as wasted so
-                // the ledger's abandoned-run detector can see it. The
-                // billing event above still records the real spend;
-                // this is an additional waste marker, not a double
-                // count of cost.
-                if !upstream_complete {
+                // the ledger's waste detectors can see it. The billing
+                // event above still records the real spend; this is an
+                // additional waste marker, not a double count of cost.
+                // A stream cut short by an output guardrail or the
+                // stream-safety classifier is `validation_failed`
+                // (spend that produced a rejected outcome); any other
+                // incomplete close is an `abandoned_stream` (client
+                // cancel or upstream truncation).
+                let stream_waste_kind = if output_guard_blocked || safety_blocked {
+                    Some(sbproxy_ai::ai_metrics::WasteKind::ValidationFailed)
+                } else if !upstream_complete {
+                    Some(sbproxy_ai::ai_metrics::WasteKind::AbandonedStream)
+                } else {
+                    None
+                };
+                if let Some(kind) = stream_waste_kind {
                     sbproxy_ai::ai_metrics::record_waste(
-                        sbproxy_ai::ai_metrics::WasteKind::AbandonedStream,
+                        kind,
                         args.provider_name,
                         args.model,
+                        args.surface_label,
                         &args.attribution_tags,
                         prompt.saturating_add(completion),
                         cost,
