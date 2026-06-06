@@ -213,7 +213,7 @@ pub(super) async fn request_filter(
             // exercises.
             crate::agent_class::stamp_request_context(
                 ctx,
-                resolver,
+                &resolver,
                 None,
                 false,
                 ctx.client_ip,

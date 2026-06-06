@@ -46,6 +46,94 @@ pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<()> {
     result
 }
 
+/// WOR-1164: (re)install the detection-singleton globals from
+/// `compiled`. Runs at startup AND from the hot-reload path so a SIGHUP
+/// that changed `agent_classes:`, the resolver flags, or
+/// `agent_detect.rule_pack_path` actually takes effect; every slot it
+/// touches is ArcSwap-backed and degrades to a warn on failure rather
+/// than blocking the reload.
+fn install_detection_singletons(compiled: &sbproxy_config::CompiledConfig) {
+    // --- Wave 3 / G1.4: agent-class resolver ---
+    //
+    // Build the process-wide `AgentClassResolver` from the parsed
+    // top-level `agent_classes:` block (or from defaults when the block
+    // is absent), then install it in the global slot the request
+    // pipeline reads in `request_filter`. The catalog source toggles
+    // between the embedded `builtin` defaults, an external `hosted-feed`
+    // (placeholder until G2.2 lands the registry fetcher), or the two
+    // `merged` (currently equivalent to defaults; the registry overlay
+    // arrives in G2.2). All paths are infallible: a malformed
+    // `hosted_feed` block degrades gracefully to defaults so a
+    // misconfiguration does not block serving.
+    #[cfg(feature = "agent-class")]
+    {
+        install_agent_class_resolver(compiled.agent_classes.as_ref());
+    }
+
+    // --- Wave 5 / G5.4: TLS-fingerprint catalogue ---
+    //
+    // The catalogue lives behind an arc-swap so reloads can refresh it
+    // without dropping in-flight detector reads. The embedded JSON ships
+    // with the seed entries from A5.1; the builder task (B5.x) refreshes
+    // the file via a monthly PR. Failures degrade gracefully: an empty
+    // catalogue means the detector never matches, the safe default.
+    #[cfg(feature = "tls-fingerprint")]
+    {
+        use std::sync::Arc as TlsFingerprintArc;
+        match sbproxy_security::TlsFingerprintCatalog::default_embedded() {
+            Ok(catalog) => {
+                // Also install the CEL matcher adapter so
+                // `tls_fingerprint_matches(ja4, agent_class_id)`
+                // resolves against the same catalogue.
+                struct CatalogAdapter(sbproxy_security::TlsFingerprintCatalog);
+                impl sbproxy_extension::cel::TlsFingerprintMatcher for CatalogAdapter {
+                    fn matches(&self, ja4: &str, agent_class_id: &str) -> bool {
+                        self.0.matches(ja4, agent_class_id)
+                    }
+                }
+                let adapter: TlsFingerprintArc<dyn sbproxy_extension::cel::TlsFingerprintMatcher> =
+                    TlsFingerprintArc::new(CatalogAdapter(catalog.clone()));
+                sbproxy_extension::cel::set_tls_fingerprint_matcher(adapter);
+                reload::set_tls_fingerprint_catalog(catalog);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to load embedded TLS fingerprint catalogue; headless detection disabled"
+                );
+            }
+        }
+    }
+
+    // --- WOR-706: agent-detect rule-pack loader ---
+    //
+    // When `proxy.extensions.agent_detect.enabled` is set with a
+    // `rule_pack_path`, load the ADRF pack and install the loader so
+    // `request_filter` can run the scorer. A load failure (or a missing
+    // path) degrades to no detection (the request_filter block
+    // short-circuits when no loader is installed) rather than blocking
+    // serving, matching the TLS-catalogue block above.
+    {
+        let agent_detect_cfg =
+            crate::pipeline::AgentDetectConfig::from_extensions(&compiled.server.extensions);
+        if agent_detect_cfg.enabled {
+            match agent_detect_cfg.rule_pack_path.as_deref() {
+                Some(path) => match sbproxy_agent_detect::RulePackLoader::open(path) {
+                    Ok(loader) => reload::set_agent_detect_loader(loader),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        path = %path,
+                        "failed to load agent-detect rule pack; agent detection disabled",
+                    ),
+                },
+                None => tracing::warn!(
+                    "agent_detect.enabled is set but rule_pack_path is unset; agent detection disabled",
+                ),
+            }
+        }
+    }
+}
+
 fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<()> {
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config file '{config_path}': {e}"))?;
@@ -104,6 +192,14 @@ fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<()> {
             reload_ai_client();
         }
     }
+
+    // WOR-1164: refresh the detection singletons (agent-class resolver,
+    // TLS-fingerprint catalogue + CEL matcher, agent-detect rule-pack
+    // loader) so a reload that changed `agent_classes:`, the resolver
+    // flags, or `agent_detect.rule_pack_path` takes effect. The slots are
+    // ArcSwap-backed, so this is a lock-free swap from the reload thread.
+    // Runs before `compiled` is moved into the pipeline below.
+    install_detection_singletons(&compiled);
 
     let mut new_pipeline = CompiledPipeline::from_config(compiled)?;
 
@@ -559,91 +655,22 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         }
     }
 
-    // --- Wave 3 / G1.4 wire: agent-class resolver startup ---
-    //
-    // Build the process-wide `AgentClassResolver` from the parsed
-    // top-level `agent_classes:` block (or from defaults when the block
-    // is absent), then install it in the global slot the request
-    // pipeline reads in `request_filter`. The catalog source toggles
-    // between the embedded `builtin` defaults, an external `hosted-feed`
-    // (placeholder until G2.2 lands the registry fetcher), or the two
-    // `merged` (currently equivalent to defaults; the registry overlay
-    // arrives in G2.2). All paths are infallible: a malformed
-    // `hosted_feed` block degrades gracefully to defaults so a startup
-    // misconfiguration does not block serving.
-    #[cfg(feature = "agent-class")]
-    {
-        install_agent_class_resolver(compiled.agent_classes.as_ref());
-    }
-
     // --- WOR-1130: install the workspace rate-limit budget registry ---
+    //
+    // Startup-only: the budget keeps accumulated state across reloads
+    // (like `BUDGET_TRACKER`), so it is deliberately not refreshed from
+    // the hot-reload path.
     if let Some(rl) = compiled.rate_limits.as_ref() {
         crate::rate_limit_budget::install_registry(rl);
     }
 
-    // --- Wave 5 / G5.4: install TLS-fingerprint catalogue ---
-    //
-    // The catalogue lives behind an arc-swap so SIGHUP reloads can
-    // refresh it without dropping in-flight detector reads. The
-    // embedded JSON ships with the seed entries from A5.1; the
-    // builder task (B5.x) refreshes the file via a monthly PR.
-    // Failures degrade gracefully: an empty catalogue means the
-    // detector never matches, which is the safe default.
-    #[cfg(feature = "tls-fingerprint")]
-    {
-        use std::sync::Arc as TlsFingerprintArc;
-        match sbproxy_security::TlsFingerprintCatalog::default_embedded() {
-            Ok(catalog) => {
-                // Also install the CEL matcher adapter so
-                // `tls_fingerprint_matches(ja4, agent_class_id)`
-                // resolves against the same catalogue.
-                struct CatalogAdapter(sbproxy_security::TlsFingerprintCatalog);
-                impl sbproxy_extension::cel::TlsFingerprintMatcher for CatalogAdapter {
-                    fn matches(&self, ja4: &str, agent_class_id: &str) -> bool {
-                        self.0.matches(ja4, agent_class_id)
-                    }
-                }
-                let adapter: TlsFingerprintArc<dyn sbproxy_extension::cel::TlsFingerprintMatcher> =
-                    TlsFingerprintArc::new(CatalogAdapter(catalog.clone()));
-                sbproxy_extension::cel::set_tls_fingerprint_matcher(adapter);
-                reload::set_tls_fingerprint_catalog(catalog);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "failed to load embedded TLS fingerprint catalogue; headless detection disabled"
-                );
-            }
-        }
-    }
-
-    // --- WOR-706: install agent-detect rule-pack loader ---
-    //
-    // When `proxy.extensions.agent_detect.enabled` is set with a
-    // `rule_pack_path`, load the ADRF pack once and install the loader so
-    // `request_filter` can run the scorer. A load failure (or a missing
-    // path) degrades to no detection (the request_filter block
-    // short-circuits when no loader is installed) rather than blocking
-    // serving, matching the TLS-catalogue block above.
-    {
-        let agent_detect_cfg =
-            crate::pipeline::AgentDetectConfig::from_extensions(&compiled.server.extensions);
-        if agent_detect_cfg.enabled {
-            match agent_detect_cfg.rule_pack_path.as_deref() {
-                Some(path) => match sbproxy_agent_detect::RulePackLoader::open(path) {
-                    Ok(loader) => reload::set_agent_detect_loader(loader),
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        path = %path,
-                        "failed to load agent-detect rule pack; agent detection disabled",
-                    ),
-                },
-                None => tracing::warn!(
-                    "agent_detect.enabled is set but rule_pack_path is unset; agent detection disabled",
-                ),
-            }
-        }
-    }
+    // WOR-1164: install the detection singletons (agent-class resolver,
+    // TLS-fingerprint catalogue + CEL matcher, agent-detect rule-pack
+    // loader). The same helper runs from `reload_from_config_path_inner`
+    // so a SIGHUP that changed `agent_classes:`, the resolver flags, or
+    // `agent_detect.rule_pack_path` swaps the live value (the slots are
+    // ArcSwap-backed) instead of silently keeping the boot-time value.
+    install_detection_singletons(&compiled);
 
     // --- WOR-201 PR 1b: install policy verdict audit bus ---
     //
