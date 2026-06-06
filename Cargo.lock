@@ -6669,6 +6669,7 @@ dependencies = [
  "hex",
  "hmac",
  "http 1.4.0",
+ "jsonschema",
  "once_cell",
  "opentelemetry",
  "opentelemetry-otlp",

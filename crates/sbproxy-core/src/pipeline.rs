@@ -1832,6 +1832,7 @@ mod tests {
             agent_classes: None,
             rate_limits: None,
             audit: None,
+            session_ledger: None,
         }
     }
 
@@ -1984,6 +1985,7 @@ mod tests {
             agent_classes: None,
             rate_limits: None,
             audit: None,
+            session_ledger: None,
         }
     }
 

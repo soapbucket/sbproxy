@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mcptest.sh/schema/session-ledger-v1.json",
+  "title": "mcptest session ledger (v1)",
+  "description": "One record of the mcptest session ledger: a structured, append-only run record of MCP tool calls keyed to a session, so behavioral eval can assert what an agent did at the tool boundary (which tools, in what order, with what params, given what inputs) instead of parsing a transcript. A ledger file is newline-delimited JSON (NDJSON): exactly one `header` record, then one `tool_call` record per call in call order. This schema validates a single record. OSS (mcptest, SBproxy) emits this artifact; the enterprise tier consumes, aggregates, signs, and governs it.",
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/$defs/header" },
+    { "$ref": "#/$defs/tool_call" }
+  ],
+  "$defs": {
+    "header": {
+      "title": "Ledger header record",
+      "description": "The first line of a ledger file. Carries the session/run metadata every following record is grouped under.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "schema_version", "session_id"],
+      "properties": {
+        "type": { "const": "header" },
+        "schema_version": {
+          "type": "string",
+          "description": "Ledger schema version this file conforms to, e.g. \"v1\"."
+        },
+        "session_id": {
+          "type": "string",
+          "description": "Groups every record produced by one run or user task. Derived from the run id."
+        },
+        "run_id": {
+          "type": "string",
+          "description": "The mcptest run id (UUIDv7) the session was derived from, when available."
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "RFC 3339 timestamp the run started."
+        },
+        "mcptest_version": {
+          "type": "string",
+          "description": "Version of the emitting binary."
+        },
+        "suite": {
+          "type": "string",
+          "description": "Suite file path or name the run executed."
+        }
+      }
+    },
+    "tool_call": {
+      "title": "Ledger tool-call record",
+      "description": "One MCP tool call as it crossed the boundary. The fields are the structure behavioral eval queries; payloads are redacted before they are written.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "session_id", "hop_index", "tool_name", "server"],
+      "properties": {
+        "type": { "const": "tool_call" },
+        "session_id": {
+          "type": "string",
+          "description": "Session this call belongs to. Matches the header `session_id`."
+        },
+        "agent_id": {
+          "type": ["string", "null"],
+          "description": "Which agent made the call. Set in multi-agent (planner/worker) runs so a per-agent baseline does not conflate behaviors; null or absent for single-agent runs."
+        },
+        "hop_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Zero-based position of this call in the run. Lets a baseline assert a call happened at a specific step, after the agent saw the output of the prior step."
+        },
+        "tool_name": {
+          "type": "string",
+          "description": "Bare tool name (without any `<server>__` namespace prefix)."
+        },
+        "server": {
+          "type": "string",
+          "description": "MCP server the call routed to."
+        },
+        "params": {
+          "description": "Structured tool arguments, redacted. Any JSON value, so eval can assert specific argument fields, not just the tool identity."
+        },
+        "result": {
+          "description": "Tool result payload, redacted. Any JSON value."
+        },
+        "is_error": {
+          "type": "boolean",
+          "description": "Whether the server flagged the result as an error."
+        },
+        "inputs_digest": {
+          "type": "string",
+          "description": "Stable fingerprint of the context the agent had in front of it when it made the call, so a baseline can assert the inputs were identical across runs (a determinism check) without storing the full context."
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "RFC 3339 timestamp the call was dispatched."
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Round-trip latency of the call in milliseconds."
+        },
+        "caller": {
+          "type": "string",
+          "enum": ["direct", "code_execution"],
+          "description": "How the call was issued: a direct model tool call, or one emitted from a code-execution sandbox."
+        }
+      }
+    }
+  }
+}

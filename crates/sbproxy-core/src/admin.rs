@@ -2686,6 +2686,7 @@ origins:
             agent_classes: None,
             rate_limits: None,
             audit: None,
+            session_ledger: None,
         };
         let pipeline = CompiledPipeline::from_config(cfg).expect("pipeline compiles");
         crate::reload::load_pipeline(pipeline);

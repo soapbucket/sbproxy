@@ -250,6 +250,7 @@ mod tests {
             agent_classes: None,
             rate_limits: None,
             audit: None,
+            session_ledger: None,
         };
         let pipeline = crate::pipeline::CompiledPipeline::from_config(compiled)
             .expect("static origin pipeline compiles");

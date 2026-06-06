@@ -47,6 +47,10 @@ pub mod request_event;
 /// completed `RequestEvent` values. Default no-op; enterprise
 /// registers a NATS-backed implementation.
 pub mod request_sink;
+/// WOR-1186 session ledger: per-tool-call run records emitted from the
+/// live MCP traffic path, conforming to the canonical mcptest
+/// `session-ledger-v1` schema.
+pub mod session_ledger;
 /// WOR-1045 PR2 sink dispatcher. Replaces the single tracing
 /// subscriber with a multi-writer fan-out filtered by proxy / tenant /
 /// origin scope.
@@ -92,6 +96,11 @@ pub use otlp_logs::{OtlpLogSink, OtlpLogSinkOptions};
 pub use request_event::{RequestEvent, UserIdSource};
 pub use request_sink::{
     dispatch_request_event, set_request_event_sink, LoggingSink, NoopSink, RequestEventSink,
+};
+pub use session_ledger::{
+    emit_tool_call, is_enabled as session_ledger_enabled, set_session_ledger_sink, Caller,
+    FileLedgerSink, LedgerHeader, LedgerRecord, LedgerToolCall, LoggingLedgerSink,
+    SessionLedgerSink, ToolCallObservation,
 };
 pub use sink_dispatcher::{
     current_sink_dispatcher, install_sink_dispatcher, CompiledSink, Profile, SinkDispatcher,
