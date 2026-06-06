@@ -70,6 +70,26 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
+      # The binary pulls in sbproxy-classifier-proto / sbproxy-classifiers,
+      # whose build scripts run prost/tonic codegen and need `protoc` on
+      # PATH. rquickjs-sys's bindgen also needs libclang on Linux. ci.yml
+      # installs these for its build/test job; the release runners are
+      # separate machines, so they need the same install or the build
+      # fails with "Could not find `protoc`".
+      - name: install protoc and build deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${RUNNER_OS}" in
+            Linux)
+              sudo apt-get update
+              sudo apt-get install -y protobuf-compiler libclang-dev clang
+              ;;
+            macOS)
+              brew install protobuf
+              ;;
+          esac
+
       - name: build release binary
         run: cargo build --release --locked --target ${{ matrix.target }} --bin sbproxy
 
