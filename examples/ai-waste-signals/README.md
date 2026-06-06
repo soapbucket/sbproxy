@@ -27,6 +27,7 @@ grouping.
 | `abandoned_stream` | The client cancelled or the upstream completed but the client never read it. Input + reasoning tokens still billed. |
 | `validation_failed` | The request completed upstream but the gateway's structured-output / guardrail validation rejected the result; the spend happened anyway. |
 | `context_bloat` | Input token count significantly above the route's rolling median (free-form heuristic signal an oversized prompt was sent). |
+| `failover_loser` | A cascade tier returned a body but lost (5xx, refusal, or below its quality threshold) to a later tier; the losing tier's tokens bought no served outcome. |
 
 ## Run
 
@@ -68,8 +69,8 @@ curl -s http://127.0.0.1:9090/metrics | grep -E "^sbproxy_ai_wasted"
 Expected (counter samples; values depend on the actual prompt):
 
 ```
-sbproxy_ai_wasted_tokens_total{kind="duplicate_request",provider="anthropic",model="claude-3-5-haiku-latest",project="demo",team="demo-team"} 5
-sbproxy_ai_wasted_cost_dollars_total{kind="duplicate_request",provider="anthropic",model="claude-3-5-haiku-latest",project="demo",team="demo-team"} 0.000005
+sbproxy_ai_wasted_tokens_total{kind="duplicate_request",provider="anthropic",model="claude-3-5-haiku-latest",surface="chat_completions",project="demo",team="demo-team"} 5
+sbproxy_ai_wasted_cost_dollars_total{kind="duplicate_request",provider="anthropic",model="claude-3-5-haiku-latest",surface="chat_completions",project="demo",team="demo-team"} 0.000005
 ```
 
 ## Dashboarding pattern

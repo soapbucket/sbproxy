@@ -763,6 +763,7 @@ pub(super) fn emit_ai_billing_event(
     sbproxy_ai::ai_metrics::record_ai_request_attributed(
         provider_name,
         model_label,
+        surface_label,
         tags,
         input_tokens,
         output_tokens,
@@ -771,6 +772,20 @@ pub(super) fn emit_ai_billing_event(
         0,
         cost_usd,
     );
+
+    // WOR-1095: realtime + audio surfaces consume seconds, not tokens,
+    // and realtime has no catalogue price, so the token / cost
+    // attributed counters above miss them. Give those surfaces an
+    // attributed-spend presence under the same bounded label set.
+    if let sbproxy_ai::budget::AiUsage::AudioSeconds { seconds } = &usage {
+        sbproxy_ai::ai_metrics::record_audio_seconds_attributed(
+            provider_name,
+            model_label,
+            surface_label,
+            tags,
+            *seconds,
+        );
+    }
 
     let event =
         sbproxy_ai::budget::AiBillingEvent::from_label(surface_label, provider_name, model, usage)
@@ -837,6 +852,7 @@ pub(super) fn resolve_attribution_tags(
 pub(super) fn record_cache_hit_savings(
     provider: &str,
     fallback_model: &str,
+    surface: &str,
     body: &[u8],
     tags: &sbproxy_ai::attribution::AttributionTags,
 ) {
@@ -864,6 +880,7 @@ pub(super) fn record_cache_hit_savings(
     sbproxy_ai::ai_metrics::record_ai_request_attributed(
         provider,
         model,
+        surface,
         tags,
         0,
         0,

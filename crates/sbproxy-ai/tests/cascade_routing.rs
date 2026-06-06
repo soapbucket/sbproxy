@@ -134,7 +134,14 @@ async fn cascade_below_threshold_falls_through_to_next_tier() {
 
     let client = AiClient::new();
     let out = client
-        .forward_cascade(&cfg, &cascade, "/v1/chat/completions", &chat_body("hi"))
+        .forward_cascade(
+            &cfg,
+            &cascade,
+            "/v1/chat/completions",
+            &chat_body("hi"),
+            &sbproxy_ai::attribution::AttributionTags::default(),
+            "chat_completions",
+        )
         .await
         .expect("cascade dispatch");
 
@@ -186,7 +193,14 @@ async fn cascade_above_threshold_short_circuits() {
     let client = AiClient::new();
     let before = cascade_tier_outcome_value(0, "accepted");
     let out = client
-        .forward_cascade(&cfg, &cascade, "/v1/chat/completions", &chat_body("hi"))
+        .forward_cascade(
+            &cfg,
+            &cascade,
+            "/v1/chat/completions",
+            &chat_body("hi"),
+            &sbproxy_ai::attribution::AttributionTags::default(),
+            "chat_completions",
+        )
         .await
         .expect("cascade dispatch");
 
@@ -233,7 +247,14 @@ async fn cascade_cost_cap_stops_retry_mid_cascade() {
     let client = AiClient::new();
     let before_cost_cap = cascade_tier_outcome_value(1, "cost_cap");
     let out = client
-        .forward_cascade(&cfg, &cascade, "/v1/chat/completions", &chat_body("hi"))
+        .forward_cascade(
+            &cfg,
+            &cascade,
+            "/v1/chat/completions",
+            &chat_body("hi"),
+            &sbproxy_ai::attribution::AttributionTags::default(),
+            "chat_completions",
+        )
         .await
         .expect("cascade dispatch");
 
@@ -277,7 +298,14 @@ async fn cascade_empty_response_falls_through() {
 
     let client = AiClient::new();
     let out = client
-        .forward_cascade(&cfg, &cascade, "/v1/chat/completions", &chat_body("hi"))
+        .forward_cascade(
+            &cfg,
+            &cascade,
+            "/v1/chat/completions",
+            &chat_body("hi"),
+            &sbproxy_ai::attribution::AttributionTags::default(),
+            "chat_completions",
+        )
         .await
         .expect("cascade dispatch");
     assert!(out.accepted);
@@ -315,7 +343,14 @@ async fn cascade_metric_increments_per_tier_outcome() {
 
     let client = AiClient::new();
     let out = client
-        .forward_cascade(&cfg, &cascade, "/v1/chat/completions", &chat_body("hi"))
+        .forward_cascade(
+            &cfg,
+            &cascade,
+            "/v1/chat/completions",
+            &chat_body("hi"),
+            &sbproxy_ai::attribution::AttributionTags::default(),
+            "chat_completions",
+        )
         .await
         .expect("cascade dispatch");
     assert!(out.accepted);

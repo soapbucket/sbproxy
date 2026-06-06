@@ -796,9 +796,10 @@ static AI_WASTED_TOKENS: LazyLock<CounterVec> = LazyLock::new(|| {
             "AI tokens classified as wasted, by waste class (WOR-1085)"
         ),
         &[
-            "kind", // "duplicate_request" | "abandoned_stream" | "validation_failed" | "context_bloat"
+            "kind", // "duplicate_request" | "abandoned_stream" | "validation_failed" | "context_bloat" | "failover_loser"
             "provider",
             "model",
+            "surface", // classified AI surface, e.g. "chat_completions" | "embeddings" | "realtime"
             "project",
             "feature",
             "team",
@@ -821,6 +822,7 @@ static AI_WASTED_COST: LazyLock<CounterVec> = LazyLock::new(|| {
             "kind",
             "provider",
             "model",
+            "surface",
             "project",
             "feature",
             "team",
@@ -857,6 +859,11 @@ pub enum WasteKind {
     /// median. The threshold is policy; this module just records
     /// when the rolling-window observer flags an event.
     ContextBloat,
+    /// A cascade / failover tier consumed tokens but its response
+    /// was rejected (5xx, refusal, or below the quality threshold)
+    /// in favour of a later tier; the losing tier's spend produced
+    /// no served outcome.
+    FailoverLoser,
 }
 
 impl WasteKind {
@@ -867,6 +874,7 @@ impl WasteKind {
             WasteKind::AbandonedStream => "abandoned_stream",
             WasteKind::ValidationFailed => "validation_failed",
             WasteKind::ContextBloat => "context_bloat",
+            WasteKind::FailoverLoser => "failover_loser",
         }
     }
 }
@@ -880,6 +888,7 @@ pub fn record_waste(
     kind: WasteKind,
     provider: &str,
     model: &str,
+    surface: &str,
     tags: &crate::attribution::AttributionTags,
     tokens: u64,
     cost_usd: f64,
@@ -895,6 +904,7 @@ pub fn record_waste(
                 kind.as_str(),
                 provider,
                 model,
+                surface,
                 project,
                 feature,
                 team,
@@ -909,6 +919,7 @@ pub fn record_waste(
                 kind.as_str(),
                 provider,
                 model,
+                surface,
                 project,
                 feature,
                 team,
@@ -954,6 +965,7 @@ static AI_TOKENS_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
         &[
             "provider",
             "model",
+            "surface", // classified AI surface (WOR-1095): chat_completions, embeddings, image_generation, audio_speech, realtime, ...
             "direction",
             "project",
             "feature",
@@ -977,6 +989,7 @@ static AI_COST_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
         &[
             "provider",
             "model",
+            "surface", // classified AI surface (WOR-1095)
             "project",
             "feature",
             "team",
@@ -1001,6 +1014,7 @@ static AI_COST_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
 pub fn record_ai_request_attributed(
     provider: &str,
     model: &str,
+    surface: &str,
     tags: &crate::attribution::AttributionTags,
     input_tokens: u64,
     output_tokens: u64,
@@ -1023,6 +1037,7 @@ pub fn record_ai_request_attributed(
             .with_label_values(&[
                 provider,
                 model,
+                surface,
                 direction,
                 project,
                 feature,
@@ -1043,6 +1058,7 @@ pub fn record_ai_request_attributed(
             .with_label_values(&[
                 provider,
                 model,
+                surface,
                 project,
                 feature,
                 team,
@@ -1051,6 +1067,62 @@ pub fn record_ai_request_attributed(
             ])
             .inc_by(cost);
     }
+}
+
+/// Per-attribution audio-seconds counter (WOR-1095).
+///
+/// Realtime sessions and audio surfaces consume seconds, not tokens,
+/// and realtime has no catalogue price yet, so neither the token nor
+/// the cost attributed counter captures them. This sibling counter
+/// gives those surfaces an attributed-spend presence keyed on the
+/// same bounded label set, so a project / team dashboard can answer
+/// "how much realtime / audio did X consume" even at zero priced
+/// cost. Same cardinality contract as [`AI_TOKENS_ATTRIBUTED`].
+static AI_AUDIO_SECONDS_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_audio_seconds_attributed_total",
+            "AI audio seconds consumed (realtime + audio surfaces), partitioned by attribution tag (WOR-1095)"
+        ),
+        &[
+            "provider",
+            "model",
+            "surface",
+            "project",
+            "feature",
+            "team",
+            "agent_type",
+            "environment",
+        ]
+    )
+    .unwrap()
+});
+
+/// Record per-attribution audio seconds for a realtime or audio
+/// surface. A zero/negative duration is skipped so an empty cell does
+/// not land in the metric.
+pub fn record_audio_seconds_attributed(
+    provider: &str,
+    model: &str,
+    surface: &str,
+    tags: &crate::attribution::AttributionTags,
+    seconds: f64,
+) {
+    if seconds <= 0.0 {
+        return;
+    }
+    AI_AUDIO_SECONDS_ATTRIBUTED
+        .with_label_values(&[
+            provider,
+            model,
+            surface,
+            label_or_empty(tags.project.as_deref()),
+            label_or_empty(tags.feature.as_deref()),
+            label_or_empty(tags.team.as_deref()),
+            label_or_empty(tags.agent_type.as_deref()),
+            label_or_empty(tags.environment.as_deref()),
+        ])
+        .inc_by(seconds);
 }
 
 #[cfg(test)]
@@ -1317,6 +1389,7 @@ mod tests {
             WasteKind::DuplicateRequest,
             "openai",
             "gpt-4o",
+            "chat_completions",
             &tags,
             120,
             0.0024,
@@ -1325,6 +1398,7 @@ mod tests {
             WasteKind::AbandonedStream,
             "anthropic",
             "claude-sonnet",
+            "chat_completions",
             &tags,
             500,
             0.003,
@@ -1358,7 +1432,15 @@ mod tests {
         let tags = AttributionTags::default();
         // Cost-only event (e.g. context_bloat detected against
         // the rolling-median observer but no upstream token).
-        record_waste(WasteKind::ContextBloat, "openai", "gpt-4o", &tags, 0, 0.01);
+        record_waste(
+            WasteKind::ContextBloat,
+            "openai",
+            "gpt-4o",
+            "chat_completions",
+            &tags,
+            0,
+            0.01,
+        );
         let families = prometheus::gather();
         let cost = families
             .iter()
@@ -1375,6 +1457,7 @@ mod tests {
         assert_eq!(WasteKind::AbandonedStream.as_str(), "abandoned_stream");
         assert_eq!(WasteKind::ValidationFailed.as_str(), "validation_failed");
         assert_eq!(WasteKind::ContextBloat.as_str(), "context_bloat");
+        assert_eq!(WasteKind::FailoverLoser.as_str(), "failover_loser");
     }
 
     /// WOR-1086: per-attribution spend record registers both
@@ -1390,7 +1473,18 @@ mod tests {
             environment: Some("prod".to_string()),
             ..Default::default()
         };
-        record_ai_request_attributed("openai", "gpt-4o", &tags, 100, 50, 20, 5, 30, 0.01);
+        record_ai_request_attributed(
+            "openai",
+            "gpt-4o",
+            "chat_completions",
+            &tags,
+            100,
+            50,
+            20,
+            5,
+            30,
+            0.01,
+        );
         let families = prometheus::gather();
         assert!(families
             .iter()
@@ -1398,6 +1492,43 @@ mod tests {
         assert!(families
             .iter()
             .any(|f| f.name() == "sbproxy_ai_cost_dollars_attributed_total"));
+    }
+
+    /// WOR-1095: realtime / audio surfaces land in the attributed
+    /// audio-seconds counter (priced cost is absent for realtime, so
+    /// this is the only attributed-spend presence those surfaces get).
+    /// A zero duration is skipped.
+    #[test]
+    fn test_record_audio_seconds_attributed() {
+        use crate::attribution::AttributionTags;
+        let tags = AttributionTags {
+            project: Some("voice-q3".to_string()),
+            team: Some("realtime".to_string()),
+            ..Default::default()
+        };
+        record_audio_seconds_attributed(
+            "openai",
+            "gpt-4o-realtime-preview",
+            "realtime",
+            &tags,
+            12.5,
+        );
+        // Zero duration is a no-op.
+        record_audio_seconds_attributed("openai", "whisper-1", "audio_transcription", &tags, 0.0);
+        let families = prometheus::gather();
+        let f = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_audio_seconds_attributed_total")
+            .expect("audio-seconds attributed counter registered");
+        let has_realtime = f.get_metric().iter().any(|m| {
+            m.get_label()
+                .iter()
+                .any(|l| l.name() == "surface" && l.value() == "realtime")
+        });
+        assert!(
+            has_realtime,
+            "realtime session must land with surface label"
+        );
     }
 
     /// Zero-token kinds are skipped: the empty cell does not land
@@ -1418,7 +1549,18 @@ mod tests {
         // the global Prometheus registry's state.
         let provider = "zero-kinds-test-provider";
         let model = "zero-kinds-test-model";
-        record_ai_request_attributed(provider, model, &tags, 1000, 200, 0, 0, 0, 0.0);
+        record_ai_request_attributed(
+            provider,
+            model,
+            "chat_completions",
+            &tags,
+            1000,
+            200,
+            0,
+            0,
+            0,
+            0.0,
+        );
         let families = prometheus::gather();
         let tokens = families
             .iter()
