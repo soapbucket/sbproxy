@@ -198,43 +198,44 @@ pub fn alt_svc_value() -> arc_swap::Guard<Arc<String>> {
 // resolver; rebuilding the resolver across reloads is reserved for a
 // later wave (the catalog source is rarely live-tuned).
 
-/// Global agent-class resolver, populated once at startup. `None` when
-/// the binary is built without the `agent-class` feature; otherwise
-/// always `Some(_)` after `install_agent_class_resolver` runs.
+/// Global agent-class resolver, populated at startup and refreshed on
+/// every hot reload. `None` when the binary is built without the
+/// `agent-class` feature; otherwise `Some(_)` after the first
+/// `install_agent_class_resolver` runs. ArcSwap-backed so a reload that
+/// rebuilt the resolver from a changed `agent_classes:` block (or the
+/// resolver flags) swaps it live without dropping in-flight reads.
 #[cfg(feature = "agent-class")]
 static AGENT_CLASS_RESOLVER: OnceLock<
-    Arc<sbproxy_modules::policy::agent_class::AgentClassResolver>,
+    arc_swap::ArcSwap<sbproxy_modules::policy::agent_class::AgentClassResolver>,
 > = OnceLock::new();
 
-/// Install the process-wide agent-class resolver. Idempotent: a second
-/// call after the first wins is silently ignored (config hot-reload
-/// keeps the original resolver).
+/// Install (or replace) the process-wide agent-class resolver.
+/// Idempotent across reloads: every call atomically swaps the live
+/// resolver, so a SIGHUP / file reload that changed the `agent_classes:`
+/// block or the `resolver.rdns_enabled` / `bot_auth_keyid_enabled` flags
+/// takes effect without a process restart (WOR-1164).
 #[cfg(feature = "agent-class")]
 pub fn set_agent_class_resolver(
     resolver: Arc<sbproxy_modules::policy::agent_class::AgentClassResolver>,
 ) {
-    // WOR-1164: the slot is a `OnceLock`, so a second install (e.g. a
-    // SIGHUP reload that rebuilt the resolver from a changed config) is a
-    // silent no-op. Log at warn so an operator can see that the running
-    // resolver is the one from boot, not the reloaded config. (Swapping it
-    // live requires moving this slot to `ArcSwap`; tracked separately.)
-    if AGENT_CLASS_RESOLVER.set(resolver).is_err() {
-        tracing::warn!(
-            "agent_class resolver already installed; reload did not replace it \
-             (the original boot-time resolver stays active)"
-        );
+    match AGENT_CLASS_RESOLVER.get() {
+        Some(swap) => swap.store(resolver),
+        None => {
+            let _ = AGENT_CLASS_RESOLVER.set(arc_swap::ArcSwap::from(resolver));
+        }
     }
 }
 
-/// Borrow the global agent-class resolver, when one has been installed.
+/// Borrow the live agent-class resolver, when one has been installed.
 ///
 /// Returns `None` before `set_agent_class_resolver` runs (e.g. very
 /// early in startup, or in tests that bypass the binary entrypoint).
-/// Callers in `request_filter` short-circuit on `None`.
+/// Callers in `request_filter` short-circuit on `None`. The returned
+/// guard derefs to `AgentClassResolver`.
 #[cfg(feature = "agent-class")]
 pub fn agent_class_resolver(
-) -> Option<&'static Arc<sbproxy_modules::policy::agent_class::AgentClassResolver>> {
-    AGENT_CLASS_RESOLVER.get()
+) -> Option<arc_swap::Guard<Arc<sbproxy_modules::policy::agent_class::AgentClassResolver>>> {
+    AGENT_CLASS_RESOLVER.get().map(|swap| swap.load())
 }
 
 // --- Wave 5 / G5.4 wire: TLS fingerprint catalogue singleton ---
@@ -242,11 +243,11 @@ pub fn agent_class_resolver(
 // The binary loads the catalogue once from the embedded JSON (or from
 // an operator-supplied path) at startup. The headless detector and
 // the `tls_fingerprint_matches` CEL function read from this slot in
-// `request_filter` and during script evaluation respectively. A
-// config hot reload that flips `tls_fingerprint.catalog_path` rebuilds
-// the slot via `set_tls_fingerprint_catalog`; the singleton is
-// `RwLock`-wrapped (rather than `OnceLock`) so reloads see the new
-// data without a process restart.
+// `request_filter` and during script evaluation respectively. The
+// catalogue is sourced from the embedded JSON (`default_embedded`);
+// there is no operator `catalog_path` override today. A hot reload
+// re-installs it via `set_tls_fingerprint_catalog`, which atomically
+// swaps the `ArcSwap` so reads never tear and no restart is needed.
 
 /// Global TLS-fingerprint catalogue, populated at startup. `None`
 /// before `set_tls_fingerprint_catalog` runs or when the
@@ -284,40 +285,42 @@ pub fn tls_fingerprint_catalog(
 
 // --- Agent-detect rule-pack loader singleton ---
 //
-// The binary loads the ADRF rule pack once at startup from
+// The binary loads the ADRF rule pack at startup from
 // `proxy.extensions.agent_detect.rule_pack_path` and installs the loader
 // here. `request_filter` reads the compiled pack via the loader when
-// agent detection is enabled. The loader owns its own `ArcSwap`, so a
-// SIGHUP reload swaps the pack contents in place without replacing this
-// slot; that is why the slot is `OnceLock` rather than `RwLock`.
+// agent detection is enabled. The slot is ArcSwap-backed so a reload
+// that repoints `rule_pack_path` at a different file swaps the loader
+// live (WOR-1164); the loader also owns its own `ArcSwap`, so a
+// same-path content change hot-reloads through `reload()`.
 
 /// Global agent-detect rule-pack loader, populated at startup when
-/// `proxy.extensions.agent_detect.rule_pack_path` is set. `None`
-/// otherwise; `request_filter` short-circuits on `None`.
-static AGENT_DETECT_LOADER: OnceLock<Arc<sbproxy_agent_detect::RulePackLoader>> = OnceLock::new();
+/// `proxy.extensions.agent_detect.rule_pack_path` is set and refreshed
+/// on reload. `None` otherwise; `request_filter` short-circuits on
+/// `None`.
+static AGENT_DETECT_LOADER: OnceLock<arc_swap::ArcSwap<sbproxy_agent_detect::RulePackLoader>> =
+    OnceLock::new();
 
-/// Install the process-wide agent-detect rule-pack loader. Idempotent: a
-/// later call after the first wins is ignored, so a config hot-reload of
-/// the rule-pack *path* keeps the original loader. The pack *contents*
-/// still hot-reload through the loader's own `ArcSwap` via `reload()`.
+/// Install (or replace) the process-wide agent-detect rule-pack loader.
+/// Idempotent across reloads: every call atomically swaps the live
+/// loader, so a reload that repoints `agent_detect.rule_pack_path` at a
+/// different file takes effect without a restart (WOR-1164). A same-path
+/// content change also hot-reloads through the loader's own `ArcSwap`.
 pub fn set_agent_detect_loader(loader: sbproxy_agent_detect::RulePackLoader) {
-    // WOR-1164: a reload that changes `agent_detect.rule_pack_path` to a
-    // different file no-ops here (OnceLock). Log so the swap-not-applied
-    // case is visible; pack *contents* still hot-reload via the loader's
-    // own ArcSwap.
-    if AGENT_DETECT_LOADER.set(Arc::new(loader)).is_err() {
-        tracing::warn!(
-            "agent_detect loader already installed; reload did not replace it \
-             (a changed rule_pack_path needs a restart; pack contents still hot-reload)"
-        );
+    let arc = Arc::new(loader);
+    match AGENT_DETECT_LOADER.get() {
+        Some(swap) => swap.store(arc),
+        None => {
+            let _ = AGENT_DETECT_LOADER.set(arc_swap::ArcSwap::from(arc));
+        }
     }
 }
 
-/// Borrow the global agent-detect rule-pack loader, when one is installed.
+/// Borrow the live agent-detect rule-pack loader, when one is installed.
 /// Returns `None` before `set_agent_detect_loader` runs (e.g. when the
 /// rule-pack path is unset or in tests that bypass the binary entrypoint).
-pub fn agent_detect_loader() -> Option<&'static Arc<sbproxy_agent_detect::RulePackLoader>> {
-    AGENT_DETECT_LOADER.get()
+/// The returned guard derefs to `RulePackLoader`.
+pub fn agent_detect_loader() -> Option<arc_swap::Guard<Arc<sbproxy_agent_detect::RulePackLoader>>> {
+    AGENT_DETECT_LOADER.get().map(|swap| swap.load())
 }
 
 #[cfg(test)]
@@ -551,5 +554,35 @@ mod tests {
         assert_eq!(guard2.config.origins.len(), 1);
         assert!(guard2.resolve_origin("new.example.com").is_some());
         assert!(guard2.resolve_origin("old.example.com").is_none());
+    }
+
+    /// WOR-1164 regression: a second `set_agent_detect_loader` (e.g. a
+    /// hot reload that repointed `rule_pack_path`) must atomically swap
+    /// the live loader, not silently no-op the way the old `OnceLock`
+    /// slot did. We prove the swap by Arc-pointer identity: the first
+    /// guard pins the old allocation alive, so a real swap yields a
+    /// distinct pointer while a no-op would yield the same one.
+    #[test]
+    fn agent_detect_loader_swaps_on_reinstall() {
+        use sbproxy_agent_detect::rules::CompiledRulePack;
+        use sbproxy_agent_detect::RulePackLoader;
+
+        let pack_a =
+            CompiledRulePack::from_yaml_str("version: 0\nagents: []\n").expect("pack a parses");
+        let pack_b =
+            CompiledRulePack::from_yaml_str("version: 0\nagents: []\n").expect("pack b parses");
+
+        set_agent_detect_loader(RulePackLoader::from_pack(pack_a, "/nonexistent/a.yaml"));
+        let first = agent_detect_loader().expect("loader installed after first set");
+        let first_ptr = Arc::as_ptr(&first);
+
+        set_agent_detect_loader(RulePackLoader::from_pack(pack_b, "/nonexistent/b.yaml"));
+        let second = agent_detect_loader().expect("loader still installed after reload");
+        let second_ptr = Arc::as_ptr(&second);
+
+        assert!(
+            !std::ptr::eq(first_ptr, second_ptr),
+            "reload must swap the agent-detect loader, not no-op the second install"
+        );
     }
 }
