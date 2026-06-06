@@ -61,3 +61,6 @@ tracing-opentelemetry = "0.28"
 
 [dev-dependencies]
 tempfile = "3"
+# WOR-1186: validate emitted session-ledger records against the
+# canonical schema (vendored copy under tests/).
+jsonschema.workspace = true

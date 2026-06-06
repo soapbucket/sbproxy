@@ -1436,6 +1436,7 @@ spec:
             agent_classes: None,
             rate_limits: None,
             audit: None,
+            session_ledger: None,
         };
         let map = render_indices(&cfg, Path::new("."));
         assert!(map.contains_key(&CompactString::new("with.example.com")));

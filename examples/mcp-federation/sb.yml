@@ -43,6 +43,15 @@
 proxy:
   http_bind_port: 8080
 
+# Emit the canonical session ledger (one record per `tools/call`) so
+# behavioral eval can assert what the agent did at the tool boundary.
+# `logging` writes each record as a structured `session_ledger` tracing
+# line; switch to `sink: file` + `path:` for an NDJSON artifact. See
+# docs/mcp.md "Session ledger".
+session_ledger:
+  enabled: true
+  sink: logging
+
 origins:
   "mcp.example.com":
     action:

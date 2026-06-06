@@ -931,6 +931,8 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         // WOR-1130: top-level workspace rate-limit budget + audit sink.
         rate_limits: config_file.rate_limits,
         audit: config_file.audit,
+        // WOR-1186: session-ledger emission config.
+        session_ledger: config_file.session_ledger,
     })
 }
 

@@ -133,6 +133,18 @@
           "type": "null"
         }
       ]
+    },
+    "session_ledger": {
+      "description": "WOR-1186: emit the canonical session ledger (per-tool-call run records) from the live MCP `tools/call` path. Off unless this block is present and `enabled: true`.",
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SessionLedgerConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "definitions": {
@@ -4879,6 +4891,53 @@
           "type": "string",
           "enum": [
             "tracing"
+          ]
+        }
+      ]
+    },
+    "SessionLedgerConfig": {
+      "description": "WOR-1186: session-ledger emission configuration.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Turn ledger emission on. When false (the default), the `tools/call` path pays a single atomic load and emits nothing.",
+          "default": false,
+          "type": "boolean"
+        },
+        "sink": {
+          "description": "Where ledger records go.",
+          "default": "logging",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SessionLedgerSinkKind"
+            }
+          ]
+        },
+        "path": {
+          "description": "NDJSON output path for the `file` sink. Required when `sink: file`; ignored otherwise.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "SessionLedgerSinkKind": {
+      "description": "WOR-1186: session-ledger sink kinds.",
+      "oneOf": [
+        {
+          "description": "Emit each record as a structured `session_ledger` tracing line.",
+          "type": "string",
+          "enum": [
+            "logging"
+          ]
+        },
+        {
+          "description": "Append each record as one NDJSON line to `path`.",
+          "type": "string",
+          "enum": [
+            "file"
           ]
         }
       ]

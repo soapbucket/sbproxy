@@ -1430,6 +1430,27 @@ pub(super) async fn handle_mcp_action(
                                 let timeout = federated
                                     .as_ref()
                                     .and_then(|t| mcp.timeout_for_server(&t.server_name));
+
+                                // WOR-1186: capture the ledger inputs
+                                // before `arguments` is moved into the
+                                // call. Gated on `is_enabled()` so a
+                                // deployment without the ledger pays no
+                                // clone and no timestamp.
+                                let ledger_capture =
+                                    if sbproxy_observe::session_ledger::is_enabled() {
+                                        Some(LedgerCapture {
+                                            params: arguments.clone(),
+                                            server: federated
+                                                .as_ref()
+                                                .map(|t| t.server_name.clone())
+                                                .unwrap_or_else(|| "unknown".to_string()),
+                                            started_at: chrono::Utc::now().to_rfc3339(),
+                                            started: std::time::Instant::now(),
+                                        })
+                                    } else {
+                                        None
+                                    };
+
                                 let call = mcp.federation.call_tool(&name, arguments);
                                 let outcome = match timeout {
                                     Some(d) => match tokio::time::timeout(d, call).await {
@@ -1454,6 +1475,14 @@ pub(super) async fn handle_mcp_action(
                                     },
                                     None => call.await,
                                 };
+
+                                // WOR-1186: emit the per-call ledger
+                                // record (success or failure) before the
+                                // outcome is consumed by the response.
+                                if let Some(cap) = ledger_capture {
+                                    emit_tool_call_ledger(ctx, &name, cap, &outcome);
+                                }
+
                                 match outcome {
                                     Ok(value) => {
                                         sbproxy_observe::metrics::record_policy(
@@ -1483,6 +1512,70 @@ pub(super) async fn handle_mcp_action(
     };
 
     write_jsonrpc(session, &response).await
+}
+
+/// WOR-1186: ledger inputs captured before the federated call consumes
+/// `arguments`, so the per-call record can be assembled after the await.
+struct LedgerCapture {
+    params: serde_json::Value,
+    server: String,
+    started_at: String,
+    started: std::time::Instant,
+}
+
+/// WOR-1186: assemble and emit one session-ledger tool-call record from
+/// the captured inputs and the call outcome. Identity (session, agent)
+/// comes off `ctx`; payload redaction happens inside `emit_tool_call`.
+fn emit_tool_call_ledger(
+    ctx: &RequestContext,
+    tool_name: &str,
+    cap: LedgerCapture,
+    outcome: &anyhow::Result<serde_json::Value>,
+) {
+    use sbproxy_observe::session_ledger::{emit_tool_call, Caller, ToolCallObservation};
+
+    // Session id: the MCP session when present, else the request id so a
+    // sessionless call still forms a coherent one-call session.
+    let session_id = ctx
+        .session_id
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| ctx.request_id.to_string());
+
+    // Agent id from the resolved principal; an empty subject is `None`.
+    let agent_id = {
+        let sub = ctx.principal.sub.clone();
+        (!sub.is_empty()).then_some(sub)
+    };
+
+    // Bare tool name: strip the `<server>__` federation prefix if present.
+    let bare = tool_name
+        .strip_prefix(&format!("{}__", cap.server))
+        .unwrap_or(tool_name)
+        .to_string();
+
+    let (result, is_error) = match outcome {
+        Ok(value) => {
+            let is_error = value
+                .get("isError")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            (Some(value.clone()), is_error)
+        }
+        Err(_) => (None, true),
+    };
+
+    emit_tool_call(ToolCallObservation {
+        session_id,
+        agent_id,
+        tool_name: bare,
+        server: cap.server,
+        params: cap.params,
+        result,
+        is_error,
+        started_at: cap.started_at,
+        duration_ms: cap.started.elapsed().as_millis() as u64,
+        caller: Caller::Direct,
+    });
 }
 
 /// The two meta-tool definitions advertised by `tools/list` when

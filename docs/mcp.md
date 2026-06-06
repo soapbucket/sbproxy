@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-06-02*
+*Last modified: 2026-06-05*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -326,6 +326,49 @@ No YAML knob; emission is unconditional.
 up alongside regular proxy request spans in any OTLP / Jaeger
 backend. Source:
 `crates/sbproxy-extension/src/mcp/spans.rs:tool_call_span`.
+
+## Session ledger
+
+SBproxy sits on the `tools/call` path, so it can record what an agent
+did at the tool boundary, which tools, in what order, with what
+arguments, instead of leaving you to reconstruct it from a transcript.
+With the ledger enabled, each call appends one record to a session
+ledger: an append-only, newline-delimited JSON (NDJSON) artifact that
+behavioral evaluation can query directly. The record shape is the
+canonical `session-ledger-v1` schema shared with mcptest, so a
+production capture and an mcptest run speak the same format.
+
+A ledger is one `header` record per session followed by one `tool_call`
+record per call, in call order:
+
+```json
+{"type":"header","schema_version":"v1","session_id":"01J0...","started_at":"2026-06-05T12:00:00Z"}
+{"type":"tool_call","session_id":"01J0...","agent_id":"planner","hop_index":0,"tool_name":"get_weather","server":"weather","params":{"city":"sf"},"result":{"content":[...]},"is_error":false,"started_at":"2026-06-05T12:00:01Z","duration_ms":42,"caller":"direct"}
+```
+
+Each record carries the session id, the zero-based `hop_index` (the
+call's position in the session), the bare tool name and its server, the
+redacted arguments and result, an error flag, and the round-trip
+duration. `agent_id` comes from the resolved caller principal and is set
+on multi-agent runs. `params` and `result` are redacted with the same
+secret-stripping the access log uses, so keys and tokens never reach the
+artifact.
+
+Turn it on with a top-level `session_ledger:` block:
+
+```yaml
+session_ledger:
+  enabled: true
+  sink: file          # `logging` (default) or `file`
+  path: ./ledger.ndjson   # required for `sink: file`
+```
+
+`sink: logging` emits each record as a structured `session_ledger`
+tracing line, so an existing log pipeline captures the ledger with no
+extra wiring. `sink: file` appends NDJSON to `path`, giving a single
+developer the same `*.ndjson` artifact mcptest writes. When the block is
+absent or `enabled: false`, the `tools/call` path pays a single atomic
+load and emits nothing.
 
 ## End-to-end example
 

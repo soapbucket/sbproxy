@@ -52,6 +52,11 @@ pub struct ConfigFile {
     /// rows queryable via `/api/audit/recent` (used by tests + ops).
     #[serde(default)]
     pub audit: Option<AuditConfig>,
+    /// WOR-1186: emit the canonical session ledger (per-tool-call run
+    /// records) from the live MCP `tools/call` path. Off unless this
+    /// block is present and `enabled: true`.
+    #[serde(default)]
+    pub session_ledger: Option<SessionLedgerConfig>,
 }
 
 /// WOR-1130: top-level workspace rate-limit budget configuration.
@@ -184,6 +189,43 @@ pub enum AuditSinkKind {
     Memory,
     /// Emit to the structured `security_audit` tracing target only.
     Tracing,
+}
+
+/// WOR-1186: session-ledger emission configuration.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct SessionLedgerConfig {
+    /// Turn ledger emission on. When false (the default), the
+    /// `tools/call` path pays a single atomic load and emits nothing.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Where ledger records go.
+    #[serde(default)]
+    pub sink: SessionLedgerSinkKind,
+    /// NDJSON output path for the `file` sink. Required when
+    /// `sink: file`; ignored otherwise.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// WOR-1186: session-ledger sink kinds.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLedgerSinkKind {
+    /// Emit each record as a structured `session_ledger` tracing line.
+    #[default]
+    Logging,
+    /// Append each record as one NDJSON line to `path`.
+    File,
 }
 
 /// Where to load a `sb.yml` config text from.

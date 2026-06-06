@@ -39,6 +39,19 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **Session ledger from live MCP traffic.** A new top-level
+  `session_ledger:` block makes SBproxy emit the canonical
+  `session-ledger-v1` run record (shared with mcptest) from its
+  `tools/call` path: one `header` per session, then one `tool_call`
+  record per call carrying `session_id`, a zero-based `hop_index`, the
+  bare tool name and server, redacted `params` / `result`, an error
+  flag, and the round-trip `duration_ms`. `sink: logging` (default)
+  emits each record as a `session_ledger` tracing line; `sink: file`
+  with a `path:` appends NDJSON. Off unless `enabled: true`; when off
+  the tool-call path pays only a single atomic load. Payloads are
+  redacted with the same secret-stripping the access log uses. See
+  `docs/mcp.md` and `examples/mcp-federation/sb.yml`.
+
 - **Structured-log schema v2 (`SCHEMA_VERSION = "2"`).** Three changes
   land together so downstream tooling can read them in one swing:
   optional `session_id` and `user_id` top-level fields parallel the

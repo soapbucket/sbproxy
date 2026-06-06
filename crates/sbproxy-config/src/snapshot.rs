@@ -251,6 +251,10 @@ pub struct CompiledConfig {
     pub rate_limits: Option<crate::types::RateLimitsConfig>,
     /// WOR-1130: audit sink selection (`memory` / `tracing`).
     pub audit: Option<crate::types::AuditConfig>,
+    /// WOR-1186: session-ledger emission config. `None` (or
+    /// `enabled: false`) leaves the ledger off. The binary registers a
+    /// ledger sink from this at startup.
+    pub session_ledger: Option<crate::types::SessionLedgerConfig>,
 }
 
 impl CompiledConfig {

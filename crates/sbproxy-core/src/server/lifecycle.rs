@@ -46,6 +46,49 @@ pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<()> {
     result
 }
 
+/// WOR-1186: build the configured session-ledger sink and register it
+/// process-wide. The `file` sink needs a `path`; a missing or
+/// unopenable path falls back to the logging sink with a warning so a
+/// misconfiguration still captures the ledger rather than dropping it.
+fn install_session_ledger_sink(cfg: &sbproxy_config::types::SessionLedgerConfig) {
+    use std::sync::Arc;
+
+    use sbproxy_config::types::SessionLedgerSinkKind;
+    use sbproxy_observe::session_ledger::{
+        set_session_ledger_sink, FileLedgerSink, LoggingLedgerSink, SessionLedgerSink,
+    };
+
+    let sink: Arc<dyn SessionLedgerSink> = match cfg.sink {
+        SessionLedgerSinkKind::File => match cfg.path.as_deref() {
+            Some(path) => match FileLedgerSink::create(std::path::Path::new(path)) {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %path,
+                        "session ledger file sink could not be opened; using the logging sink",
+                    );
+                    Arc::new(LoggingLedgerSink)
+                }
+            },
+            None => {
+                tracing::warn!(
+                    "session_ledger.sink is `file` but no `path` is set; using the logging sink",
+                );
+                Arc::new(LoggingLedgerSink)
+            }
+        },
+        SessionLedgerSinkKind::Logging => Arc::new(LoggingLedgerSink),
+    };
+
+    match set_session_ledger_sink(sink) {
+        Ok(()) => tracing::info!("session ledger emission enabled"),
+        Err(_) => {
+            tracing::warn!("session ledger sink already registered; keeping the existing one")
+        }
+    }
+}
+
 /// WOR-1164: (re)install the detection-singleton globals from
 /// `compiled`. Runs at startup AND from the hot-reload path so a SIGHUP
 /// that changed `agent_classes:`, the resolver flags, or
@@ -662,6 +705,16 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // the hot-reload path.
     if let Some(rl) = compiled.rate_limits.as_ref() {
         crate::rate_limit_budget::install_registry(rl);
+    }
+
+    // --- WOR-1186: register the session-ledger sink when enabled ---
+    //
+    // Startup-only and set-once: the ledger sink is process-global like
+    // the request-event sink. A reload does not re-register it.
+    if let Some(cfg) = compiled.session_ledger.as_ref() {
+        if cfg.enabled {
+            install_session_ledger_sink(cfg);
+        }
     }
 
     // WOR-1164: install the detection singletons (agent-class resolver,
@@ -2198,6 +2251,7 @@ mod tests {
             agent_classes: None,
             rate_limits: None,
             audit: None,
+            session_ledger: None,
         };
 
         install_op_redact_state(&compiled);
