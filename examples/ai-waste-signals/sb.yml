@@ -55,8 +55,10 @@
 
 proxy:
   http_bind_port: 8080
-  metrics:
-    bind_port: 9090
+
+# Prometheus metrics are exposed on `/metrics` on the data-plane port
+# (no separate metrics port); enable the family under
+# `observability.metrics.enabled` when you want the sbproxy_* series.
 
 # Tag the wasted spend with the operator's attribution defaults so
 # the FinOps dashboard can group "what wasted tokens look like by

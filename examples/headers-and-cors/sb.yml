@@ -39,4 +39,4 @@ origins:
       allow_origins: ["https://example.com"]
       allow_methods: ["GET", "POST", "OPTIONS"]
       allow_headers: ["Content-Type", "Authorization"]
-      max_age_seconds: 600
+      max_age: 600

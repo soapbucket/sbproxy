@@ -742,8 +742,54 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         );
     }
 
-    let mut config_file: ConfigFile =
-        serde_yaml::from_str(&yaml).context("failed to parse config YAML")?;
+    // WOR-1140: parse through `serde_ignored` so a misspelled key is a
+    // hard boot error rather than a silent drop that takes the field's
+    // (often protection-disabling) default. `serde_ignored` only reports
+    // keys that a *typed* struct ignores; the schema's deliberate
+    // arbitrary-key blocks (`proxy.extensions` / origin `extensions` are
+    // `HashMap<String, Value>`, and `action` / `policies` / `transforms`
+    // / `authentication` / `variables` are opaque `serde_json::Value`
+    // handed to the module layer) accept any key, so they are not
+    // flagged. The `sbproxy serve` boot path runs `compile_config`, so
+    // this gate fires on boot and reload, not just the `validate`
+    // subcommand.
+    let mut unknown_keys: Vec<String> = Vec::new();
+    let mut config_file: ConfigFile = {
+        let de = serde_yaml::Deserializer::from_str(&yaml);
+        serde_ignored::deserialize(de, |path| {
+            unknown_keys.push(path.to_string());
+        })
+        .context("failed to parse config YAML")?
+    };
+    // Split unknown keys by nesting. The archived Go `v0.1.x` schema was
+    // a flat single-origin file (`config_version`, `id`, `hostname`,
+    // `action`, ...) whose keys all sit at the TOP level; the
+    // schema-v1 compatibility promise tolerates those, so a top-level
+    // unknown only warns. A NESTED unknown (`proxy.*`, `origins.*.*`) in
+    // the schema-v2 shape is a real typo in a server / security / origin
+    // block - e.g. `mtls`->`mtsl`, `trusted_proxies`->`trusted_proxy`,
+    // `force_ssl`->`forced_ssl` - which silently disables the intended
+    // protection, so that fails the compile (and thus boot / reload).
+    let (nested_unknowns, top_unknowns): (Vec<String>, Vec<String>) =
+        unknown_keys.into_iter().partition(|k| k.contains('.'));
+    if !top_unknowns.is_empty() {
+        tracing::warn!(
+            keys = %top_unknowns.join(", "),
+            "config: ignored unknown/misspelled top-level key(s); each is dropped and \
+             takes its default. Check for typos, or move an out-of-tree block under \
+             `proxy.extensions:`."
+        );
+    }
+    if !nested_unknowns.is_empty() {
+        anyhow::bail!(
+            "config compile: unknown or misspelled config key(s): {}. A typo in a nested \
+             server / security / origin key is silently dropped and the setting takes its \
+             default (often disabling the protection you intended), so boot is rejected. \
+             Fix the spelling, or nest an out-of-tree block under `proxy.extensions:` (or \
+             the origin's `extensions:`).",
+            nested_unknowns.join(", ")
+        );
+    }
 
     if let Some(log) = config_file
         .proxy
@@ -1301,6 +1347,98 @@ mod tests {
             engine: engine.map(str::to_string),
             source: source.map(str::to_string),
         }
+    }
+
+    // WOR-1140: unknown-config-key handling.
+    #[test]
+    fn nested_unknown_key_fails_compile() {
+        // A typo in a nested server/security key (here `proxy.mtsl`
+        // instead of the real block) must fail the compile rather than
+        // be silently dropped.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  mtsl:
+    require_client_cert: true
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("nested typo must fail compile");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("mtsl"),
+            "error must name the offending key: {msg}"
+        );
+    }
+
+    #[test]
+    fn nested_origin_unknown_key_fails_compile() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "api.example.com":
+    forced_ssl: true
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("origin typo must fail compile");
+        assert!(format!("{err:#}").contains("forced_ssl"));
+    }
+
+    #[test]
+    fn top_level_unknown_key_compiles_for_v1_compat() {
+        // The archived Go v0.1.x flat schema puts metadata at the top
+        // level; schema-v1 compat tolerates those (they only warn), so
+        // the config still compiles.
+        let yaml = r#"
+config_version: 2
+id: "legacy-1"
+hostname: "api.example.com"
+version: "1.0"
+proxy:
+  http_bind_port: 8080
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        assert!(
+            compile_config(yaml).is_ok(),
+            "top-level v1-compat metadata keys must still compile"
+        );
+    }
+
+    #[test]
+    fn extensions_block_accepts_arbitrary_keys() {
+        // `proxy.extensions` is an opaque arbitrary-key block; unknown
+        // keys there must NOT trip the unknown-key gate.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  extensions:
+    my_out_of_tree_block:
+      anything: 1
+      goes: here
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        assert!(
+            compile_config(yaml).is_ok(),
+            "arbitrary keys under proxy.extensions must compile"
+        );
     }
 
     #[test]
