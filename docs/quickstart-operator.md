@@ -13,7 +13,7 @@ helm install sbproxy ./deploy/helm/sbproxy \
   --namespace sbproxy-system \
   --create-namespace \
   --set image.repository=ghcr.io/soapbucket/sbproxy-k8s-operator \
-  --set image.tag=v1.0.1
+  --set image.tag=v1.1.0
 ```
 
 For a single-node smoke check without the operator, run the data plane directly:
@@ -21,7 +21,7 @@ For a single-node smoke check without the operator, run the data plane directly:
 ```bash
 docker run --rm -p 8080:8080 -p 9090:9090 \
   -v "$PWD/sb.yml:/etc/sbproxy/sb.yml:ro" \
-  ghcr.io/soapbucket/sbproxy:v1.0.1 \
+  ghcr.io/soapbucket/sbproxy:v1.1.0 \
   serve -f /etc/sbproxy/sb.yml
 ```
 

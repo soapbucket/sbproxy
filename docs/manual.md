@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-05-22*
+*Last modified: 2026-06-06*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -739,7 +739,7 @@ process uptime, and the same component checks used by readiness:
 ```json
 {
   "status": "ok",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "build_hash": "5e8cfa8",
   "timestamp": "2026-05-04T18:30:00Z",
   "uptime_seconds": 12345,

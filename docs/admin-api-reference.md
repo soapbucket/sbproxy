@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-05-12*
+*Last modified: 2026-06-06*
 
 The embedded admin server publishes a small set of HTTP routes for
 operator tooling: liveness probes, request log, per-target health,
@@ -87,7 +87,7 @@ and a per-component status table:
 ```json
 {
   "status": "ok",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "commit": "abc1234",
   "components": [
     {"name": "config", "status": "ok"},

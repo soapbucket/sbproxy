@@ -7,9 +7,16 @@ repository.
 
 ## [Unreleased]
 
-Work that has merged to `main` since the v1.0.1 tag and is queued for
+Work that has merged to `main` since the v1.1.0 tag and is queued for
 the next version cut. No promises about backward compatibility for any
 of the new YAML fields below until the version that ships them.
+
+## [1.1.0] - 2026-06-06
+
+First minor release on the Rust v1.x line. This release carries
+breaking changes to the MCP tool-access policy (now closed-by-default
+and principal-aware); read the Breaking section and
+`docs/migration-mcp-rbac.md` before upgrading.
 
 ### Breaking
 
