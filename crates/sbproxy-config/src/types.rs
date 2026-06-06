@@ -41,6 +41,149 @@ pub struct ConfigFile {
     /// bot-auth / cache settings.
     #[serde(default)]
     pub agent_classes: Option<AgentClassesConfig>,
+    /// WOR-1130: top-level workspace rate-limit budget + auto-suspend
+    /// escalation (the R2.3 / A2.5 contract). Distinct from the
+    /// per-origin `rate_limits` policy: this is a workspace-wide ceiling
+    /// with a soft / throttle / auto-suspend state machine.
+    #[serde(default)]
+    pub rate_limits: Option<RateLimitsConfig>,
+    /// WOR-1130: audit sink selection for admin-action audit rows
+    /// (e.g. the auto-suspend transition). `memory` keeps the last N
+    /// rows queryable via `/api/audit/recent` (used by tests + ops).
+    #[serde(default)]
+    pub audit: Option<AuditConfig>,
+}
+
+/// WOR-1130: top-level workspace rate-limit budget configuration.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct RateLimitsConfig {
+    /// Budget applied to the default workspace (the only workspace in
+    /// the OSS single-tenant build; enterprise multi-tenant resolves a
+    /// per-tenant budget).
+    #[serde(default)]
+    pub workspace_default: WorkspaceBudgetConfig,
+    /// Throttle -> auto-suspend escalation tuning.
+    #[serde(default)]
+    pub escalation: RateLimitEscalationConfig,
+    /// Clock source for the token-bucket refill + suspend cool-down.
+    /// `system` (default) uses wall time; `manual` advances only via
+    /// the `/api/rate_limits/clock/advance` admin endpoint (tests).
+    #[serde(default)]
+    pub clock: RateLimitClockMode,
+}
+
+/// WOR-1130: the per-workspace request budget.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct WorkspaceBudgetConfig {
+    /// Sustained inbound HTTP requests-per-second ceiling (the token
+    /// bucket refill rate).
+    #[serde(default = "default_http_rps_sustained")]
+    pub http_rps_sustained: u32,
+    /// Burst ceiling (the token bucket capacity). Requests above this
+    /// within one window are throttled.
+    #[serde(default = "default_http_rps_burst")]
+    pub http_rps_burst: u32,
+    /// Soft observation threshold. Traffic above this but below the
+    /// sustained ceiling emits `sbproxy_rate_limit_total{result="soft"}`
+    /// without throttling, so operators see the climb early.
+    #[serde(default)]
+    pub soft_threshold_rps: Option<u32>,
+}
+
+impl Default for WorkspaceBudgetConfig {
+    fn default() -> Self {
+        Self {
+            http_rps_sustained: default_http_rps_sustained(),
+            http_rps_burst: default_http_rps_burst(),
+            soft_threshold_rps: None,
+        }
+    }
+}
+
+fn default_http_rps_sustained() -> u32 {
+    1000
+}
+fn default_http_rps_burst() -> u32 {
+    2000
+}
+
+/// WOR-1130: throttle -> auto-suspend escalation tuning.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct RateLimitEscalationConfig {
+    /// Consecutive-throttle count that promotes a workspace from
+    /// `Throttle` to `AutoSuspend`. A2.5 default is 1000.
+    #[serde(default = "default_abuse_threshold")]
+    pub abuse_threshold_throttle_to_suspend: u32,
+    /// Cool-down (seconds) a workspace stays auto-suspended before it
+    /// drops back to `Throttle`. A2.5 default is 3600.
+    #[serde(default = "default_auto_suspend_cooldown_secs")]
+    pub auto_suspend_cooldown_secs: u32,
+}
+
+impl Default for RateLimitEscalationConfig {
+    fn default() -> Self {
+        Self {
+            abuse_threshold_throttle_to_suspend: default_abuse_threshold(),
+            auto_suspend_cooldown_secs: default_auto_suspend_cooldown_secs(),
+        }
+    }
+}
+
+fn default_abuse_threshold() -> u32 {
+    1000
+}
+fn default_auto_suspend_cooldown_secs() -> u32 {
+    3600
+}
+
+/// WOR-1130: clock source for the rate-limit budget.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitClockMode {
+    /// Wall-clock time (production default).
+    #[default]
+    System,
+    /// Test clock advanced only via the admin endpoint.
+    Manual,
+}
+
+/// WOR-1130: audit sink selection.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct AuditConfig {
+    /// Where admin-action audit rows are kept.
+    #[serde(default)]
+    pub sink: AuditSinkKind,
+}
+
+/// WOR-1130: audit sink kinds.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditSinkKind {
+    /// Keep the last N rows in memory, queryable via `/api/audit/recent`.
+    #[default]
+    Memory,
+    /// Emit to the structured `security_audit` tracing target only.
+    Tracing,
 }
 
 /// Where to load a `sb.yml` config text from.

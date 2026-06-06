@@ -659,6 +659,8 @@ mod tests {
             mesh: None,
             access_log: None,
             agent_classes: None,
+            rate_limits: None,
+            audit: None,
         })
     }
 

@@ -576,6 +576,11 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         install_agent_class_resolver(compiled.agent_classes.as_ref());
     }
 
+    // --- WOR-1130: install the workspace rate-limit budget registry ---
+    if let Some(rl) = compiled.rate_limits.as_ref() {
+        crate::rate_limit_budget::install_registry(rl);
+    }
+
     // --- Wave 5 / G5.4: install TLS-fingerprint catalogue ---
     //
     // The catalogue lives behind an arc-swap so SIGHUP reloads can
@@ -2164,6 +2169,8 @@ mod tests {
             mesh: None,
             access_log: None,
             agent_classes: None,
+            rate_limits: None,
+            audit: None,
         };
 
         install_op_redact_state(&compiled);

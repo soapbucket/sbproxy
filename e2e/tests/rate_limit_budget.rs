@@ -111,7 +111,6 @@ origins:
 ///
 /// `#[ignore]` because the full header set requires R2.3.
 #[test]
-#[ignore = "TODO(wave3): R2.3 rate-limit middleware exists per WATCH.md but `rate_limit_budget` policy + top-level `rate_limits:` block + manual-clock admin endpoint are not yet on main; pipeline-wiring task tracked in WATCH.md."]
 fn burst_returns_429_with_full_ratelimit_headers() {
     let admin_port = pick_port();
     let cfg = rate_limit_config(admin_port, 1_000, 60);
@@ -192,7 +191,6 @@ fn burst_returns_429_with_full_ratelimit_headers() {
 /// to `AutoSuspend`. Assert the audit row, the metric increment,
 /// and the workspace's effective rate dropping to 1 rps.
 #[test]
-#[ignore = "TODO(wave3): escalation tier + audit row depend on R2.3 pipeline wiring (see WATCH.md) and an audit emitter wired in the OSS proxy."]
 fn sustained_throttle_promotes_to_auto_suspend() {
     let admin_port = pick_port();
     // Lower the threshold to 50 consecutive throttles so the test
@@ -272,7 +270,6 @@ fn sustained_throttle_promotes_to_auto_suspend() {
 /// burst within 24h promotes to `ManualReview`; this test only
 /// verifies the first cool-down transition.
 #[test]
-#[ignore = "TODO(wave3): manual-clock admin endpoint depends on R2.3 pipeline wiring."]
 fn auto_suspend_cooldown_returns_to_normal() {
     let admin_port = pick_port();
     let cfg = rate_limit_config(admin_port, 50, 2);
@@ -329,7 +326,6 @@ fn auto_suspend_cooldown_returns_to_normal() {
 /// `sbproxy_rate_limit_total{result="soft"}` so operators can see
 /// the climb in dashboards before the throttle bites.
 #[test]
-#[ignore = "TODO(wave3): soft-tier emit-only metric requires R2.3 pipeline wiring."]
 fn soft_tier_emits_metric_without_429() {
     let admin_port = pick_port();
     let cfg = rate_limit_config(admin_port, 1_000, 60);

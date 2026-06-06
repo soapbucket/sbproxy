@@ -21,8 +21,9 @@ use super::{
     ContentDigestEnforcer, CsrfEnforcer, DdosEnforcer, DlpEnforcer, ExposedCredsEnforcer,
     ExpressionEnforcer, HttpFramingEnforcer, IpFilterEnforcer, ObjectAuthzEnforcer,
     OpenApiValidationEnforcer, PageShieldEnforcer, PeerPricingPreflightEnforcer,
-    PromptInjectionV2Enforcer, RateLimitEnforcer, RequestLimitEnforcer, RequestValidatorEnforcer,
-    SecHeadersEnforcer, SemanticConstraintEnforcer, SriEnforcer, WafEnforcer,
+    PromptInjectionV2Enforcer, RateLimitBudgetEnforcer, RateLimitEnforcer, RequestLimitEnforcer,
+    RequestValidatorEnforcer, SecHeadersEnforcer, SemanticConstraintEnforcer, SriEnforcer,
+    WafEnforcer,
 };
 
 /// One compiled policy ready for request-phase dispatch.
@@ -59,6 +60,7 @@ pub fn compile_builtin_enforcers(policies: Vec<Policy>) -> Vec<CompiledEnforcer>
 fn compile_one(policy: Policy) -> CompiledEnforcer {
     match policy {
         Policy::RateLimit(p) => builtin(RateLimitEnforcer(Arc::new(p))),
+        Policy::RateLimitBudget(p) => builtin(RateLimitBudgetEnforcer(Arc::new(p))),
         Policy::IpFilter(p) => builtin(IpFilterEnforcer(Arc::new(p))),
         Policy::SecHeaders(p) => builtin(SecHeadersEnforcer(Arc::new(p))),
         Policy::RequestLimit(p) => builtin(RequestLimitEnforcer(Arc::new(p))),

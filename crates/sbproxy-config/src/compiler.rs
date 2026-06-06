@@ -928,6 +928,9 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         // `sbproxy-core` (which depends on the classifier crate); this
         // crate stays ignorant of the typed resolver.
         agent_classes: config_file.agent_classes,
+        // WOR-1130: top-level workspace rate-limit budget + audit sink.
+        rate_limits: config_file.rate_limits,
+        audit: config_file.audit,
     })
 }
 

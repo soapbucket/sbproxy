@@ -2647,14 +2647,17 @@ pub(super) async fn request_filter(
             )
             .with_tenant_id(ctx.tenant_id.to_string())
             .emit();
-            if status == 429 && (policy_type == "rate_limit" || policy_type == "ddos") {
+            if status == 429
+                && (policy_type == "rate_limit"
+                    || policy_type == "ddos"
+                    || policy_type == "rate_limit_budget")
+            {
                 // Rate-limit + DDoS denial. Both emit 429 with a
                 // RateLimitInfo and want the same wrapped envelope
-                // and X-RateLimit-* + Retry-After headers. Other
-                // policies that emit 429 (e.g. a2a_chain_depth_exceeded)
-                // fall through to their own dedicated branches below
-                // so their spec-pinned bodies and headers survive
-                // intact.
+                // and rate-limit headers. Other policies that emit 429
+                // (e.g. a2a_chain_depth_exceeded) fall through to their
+                // own dedicated branches below so their spec-pinned
+                // bodies and headers survive intact.
                 let body = format!("{{\"error\":\"{msg}\"}}");
                 let mut header =
                     pingora_http::ResponseHeader::build(status, Some(7)).map_err(|e| {
@@ -2671,7 +2674,23 @@ pub(super) async fn request_filter(
                 // that never comes, and the request hangs.
                 let _ = header.insert_header("content-length", body.len().to_string());
                 if let Some(ref info) = rl_info {
-                    if info.headers_enabled {
+                    // WOR-1130: the workspace budget policy emits the RFC
+                    // 9239 / draft-ietf-httpapi-ratelimit-headers set
+                    // (`RateLimit-*` + `RateLimit-Policy`); the Wave 1
+                    // per-policy limiter keeps the legacy `X-RateLimit-*`
+                    // shape for backward compatibility.
+                    if policy_type == "rate_limit_budget" {
+                        if info.headers_enabled {
+                            let _ = header.insert_header("RateLimit-Limit", info.limit.to_string());
+                            let _ = header
+                                .insert_header("RateLimit-Remaining", info.remaining.to_string());
+                            let _ = header
+                                .insert_header("RateLimit-Reset", info.reset_secs.to_string());
+                            // Window is the per-second budget window.
+                            let _ = header
+                                .insert_header("RateLimit-Policy", format!("{};w=1", info.limit));
+                        }
+                    } else if info.headers_enabled {
                         let _ = header.insert_header("X-RateLimit-Limit", info.limit.to_string());
                         let _ = header
                             .insert_header("X-RateLimit-Remaining", info.remaining.to_string());

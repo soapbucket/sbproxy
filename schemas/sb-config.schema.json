@@ -109,6 +109,30 @@
           "type": "null"
         }
       ]
+    },
+    "rate_limits": {
+      "description": "WOR-1130: top-level workspace rate-limit budget + auto-suspend escalation (the R2.3 / A2.5 contract). Distinct from the per-origin `rate_limits` policy: this is a workspace-wide ceiling with a soft / throttle / auto-suspend state machine.",
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RateLimitsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "audit": {
+      "description": "WOR-1130: audit sink selection for admin-action audit rows (e.g. the auto-suspend transition). `memory` keeps the last N rows queryable via `/api/audit/recent` (used by tests + ops).",
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/AuditConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "definitions": {
@@ -4715,6 +4739,149 @@
           "minimum": 0.0
         }
       }
+    },
+    "RateLimitsConfig": {
+      "description": "WOR-1130: top-level workspace rate-limit budget configuration.",
+      "type": "object",
+      "properties": {
+        "workspace_default": {
+          "description": "Budget applied to the default workspace (the only workspace in the OSS single-tenant build; enterprise multi-tenant resolves a per-tenant budget).",
+          "default": {
+            "http_rps_burst": 2000,
+            "http_rps_sustained": 1000,
+            "soft_threshold_rps": null
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/WorkspaceBudgetConfig"
+            }
+          ]
+        },
+        "escalation": {
+          "description": "Throttle -> auto-suspend escalation tuning.",
+          "default": {
+            "abuse_threshold_throttle_to_suspend": 1000,
+            "auto_suspend_cooldown_secs": 3600
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/RateLimitEscalationConfig"
+            }
+          ]
+        },
+        "clock": {
+          "description": "Clock source for the token-bucket refill + suspend cool-down. `system` (default) uses wall time; `manual` advances only via the `/api/rate_limits/clock/advance` admin endpoint (tests).",
+          "default": "system",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RateLimitClockMode"
+            }
+          ]
+        }
+      }
+    },
+    "WorkspaceBudgetConfig": {
+      "description": "WOR-1130: the per-workspace request budget.",
+      "type": "object",
+      "properties": {
+        "http_rps_sustained": {
+          "description": "Sustained inbound HTTP requests-per-second ceiling (the token bucket refill rate).",
+          "default": 1000,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "http_rps_burst": {
+          "description": "Burst ceiling (the token bucket capacity). Requests above this within one window are throttled.",
+          "default": 2000,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "soft_threshold_rps": {
+          "description": "Soft observation threshold. Traffic above this but below the sustained ceiling emits `sbproxy_rate_limit_total{result=\"soft\"}` without throttling, so operators see the climb early.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "RateLimitEscalationConfig": {
+      "description": "WOR-1130: throttle -> auto-suspend escalation tuning.",
+      "type": "object",
+      "properties": {
+        "abuse_threshold_throttle_to_suspend": {
+          "description": "Consecutive-throttle count that promotes a workspace from `Throttle` to `AutoSuspend`. A2.5 default is 1000.",
+          "default": 1000,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "auto_suspend_cooldown_secs": {
+          "description": "Cool-down (seconds) a workspace stays auto-suspended before it drops back to `Throttle`. A2.5 default is 3600.",
+          "default": 3600,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "RateLimitClockMode": {
+      "description": "WOR-1130: clock source for the rate-limit budget.",
+      "oneOf": [
+        {
+          "description": "Wall-clock time (production default).",
+          "type": "string",
+          "enum": [
+            "system"
+          ]
+        },
+        {
+          "description": "Test clock advanced only via the admin endpoint.",
+          "type": "string",
+          "enum": [
+            "manual"
+          ]
+        }
+      ]
+    },
+    "AuditConfig": {
+      "description": "WOR-1130: audit sink selection.",
+      "type": "object",
+      "properties": {
+        "sink": {
+          "description": "Where admin-action audit rows are kept.",
+          "default": "memory",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AuditSinkKind"
+            }
+          ]
+        }
+      }
+    },
+    "AuditSinkKind": {
+      "description": "WOR-1130: audit sink kinds.",
+      "oneOf": [
+        {
+          "description": "Keep the last N rows in memory, queryable via `/api/audit/recent`.",
+          "type": "string",
+          "enum": [
+            "memory"
+          ]
+        },
+        {
+          "description": "Emit to the structured `security_audit` tracing target only.",
+          "type": "string",
+          "enum": [
+            "tracing"
+          ]
+        }
+      ]
     }
   }
 }

@@ -1494,6 +1494,45 @@ pub fn record_policy_audit_emitted(verdict: &str, surface: &str, policy_id: &str
         .inc();
 }
 
+/// WOR-1130: increment `sbproxy_rate_limit_total{workspace, result}`.
+/// `result` is `soft` (above the soft threshold, not throttled) or
+/// `throttle` (burst ceiling hit).
+pub fn record_rate_limit(workspace: &str, result: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_rate_limit_total",
+            "Workspace rate-limit budget outcomes by workspace and result (soft/throttle)",
+            &["workspace", "result"],
+        )
+        .expect("rate_limit_total counter registers")
+    });
+    let workspace = sanitize_label("workspace", workspace);
+    counter
+        .with_label_values(&[workspace.as_str(), result])
+        .inc();
+}
+
+/// WOR-1130: increment `sbproxy_rate_limit_suspend_total{workspace}` on
+/// each workspace auto-suspend transition.
+pub fn record_rate_limit_suspend(workspace: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_rate_limit_suspend_total",
+            "Workspace auto-suspend transitions",
+            &["workspace"],
+        )
+        .expect("rate_limit_suspend_total counter registers")
+    });
+    let workspace = sanitize_label("workspace", workspace);
+    counter.with_label_values(&[workspace.as_str()]).inc();
+}
+
 /// Increment `sbproxy_policy_audit_events_dropped_total{tenant}`.
 ///
 /// Called when the bounded mpsc audit bus is full and the
