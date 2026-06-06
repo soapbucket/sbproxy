@@ -117,6 +117,10 @@ pub enum CapError {
     AudienceMismatch,
     /// Token's `sub` did not match the request's resolved `agent_id`.
     SubMismatch,
+    /// WOR-1149: `cap.require_agent_binding` is set but no agent
+    /// identity was resolved for the request, so the token could not be
+    /// bound. Fails closed.
+    AgentBindingRequired,
     /// Request path did not match the token's `glob` allow-list.
     PathNotAuthorized,
     /// JWKS source could not be consulted (network failure, no keys
@@ -134,6 +138,7 @@ impl CapError {
             Self::BadSignature => "invalid_token",
             Self::AudienceMismatch => "invalid_audience",
             Self::SubMismatch => "agent_mismatch",
+            Self::AgentBindingRequired => "agent_binding_required",
             Self::PathNotAuthorized => "path_not_authorized",
             Self::DirectoryUnavailable => "directory_unavailable",
         }
@@ -149,7 +154,10 @@ impl CapError {
             | Self::Expired
             | Self::BadSignature
             | Self::DirectoryUnavailable => 401,
-            Self::AudienceMismatch | Self::SubMismatch | Self::PathNotAuthorized => 403,
+            Self::AudienceMismatch
+            | Self::SubMismatch
+            | Self::AgentBindingRequired
+            | Self::PathNotAuthorized => 403,
         }
     }
 }
@@ -185,6 +193,13 @@ pub struct CapConfig {
     /// `Host` header (the typical operator deployment shape).
     #[serde(default)]
     pub audience: Option<String>,
+    /// WOR-1149: require the token's `sub` to bind to a resolved agent
+    /// identity. When `true` and the resolver produced no agent id, the
+    /// verifier fails closed (`AgentBindingRequired`) rather than
+    /// accepting an unbound token. Default `false` preserves the prior
+    /// behavior (binding checked only when a resolved id is present).
+    #[serde(default)]
+    pub require_agent_binding: bool,
 }
 
 fn default_jwks_refresh_secs() -> u64 {
@@ -254,6 +269,9 @@ pub struct CapVerifier {
     cache: Option<Arc<JwksCache>>,
     static_set: Option<JwkSet>,
     audience: Option<String>,
+    /// WOR-1149: fail closed when binding is required but no agent id
+    /// was resolved.
+    require_agent_binding: bool,
 }
 
 impl std::fmt::Debug for CapVerifier {
@@ -262,6 +280,7 @@ impl std::fmt::Debug for CapVerifier {
             .field("has_jwks_cache", &self.cache.is_some())
             .field("has_static_jwks", &self.static_set.is_some())
             .field("audience", &self.audience)
+            .field("require_agent_binding", &self.require_agent_binding)
             .finish()
     }
 }
@@ -286,6 +305,7 @@ impl CapVerifier {
             cache,
             static_set: cfg.jwks_static,
             audience: cfg.audience,
+            require_agent_binding: cfg.require_agent_binding,
         })
     }
 
@@ -417,11 +437,23 @@ impl CapVerifier {
             return CapVerdict::Invalid(CapError::AudienceMismatch);
         }
 
-        // Agent-id binding. Skipped when no resolver ran; the operator
-        // configures upstream agent-class resolution separately.
-        if let Some(agent_id) = resolved_agent_id {
-            if claims.sub != agent_id {
-                return CapVerdict::Invalid(CapError::SubMismatch);
+        // Agent-id binding (WOR-1149). Three states:
+        //   - a resolved id is present: the token's `sub` MUST match it.
+        //   - no resolved id, `require_agent_binding` set: fail closed,
+        //     so an unbound token cannot pass when the operator asked
+        //     for binding.
+        //   - no resolved id, binding not required: skip (the operator
+        //     configures upstream agent-class resolution separately).
+        match resolved_agent_id {
+            Some(agent_id) => {
+                if claims.sub != agent_id {
+                    return CapVerdict::Invalid(CapError::SubMismatch);
+                }
+            }
+            None => {
+                if self.require_agent_binding {
+                    return CapVerdict::Invalid(CapError::AgentBindingRequired);
+                }
             }
         }
 
@@ -580,6 +612,13 @@ mod tests {
     /// verifier is configured with a static JWKS containing the kid
     /// so signing tests do not touch the network.
     fn build_verifier_with_keypair() -> (CapVerifier, String, EncodingKey) {
+        build_verifier_with_keypair_cfg(false)
+    }
+
+    // WOR-1149: variant that lets a test pin `require_agent_binding`.
+    fn build_verifier_with_keypair_cfg(
+        require_agent_binding: bool,
+    ) -> (CapVerifier, String, EncodingKey) {
         let rng = ring::rand::SystemRandom::new();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
         let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
@@ -605,6 +644,7 @@ mod tests {
             jwks_static: Some(jwks_set),
             jwks_refresh_secs: 3600,
             audience: None,
+            require_agent_binding,
         })
         .unwrap();
 
@@ -651,6 +691,7 @@ mod tests {
             jwks_static: None,
             jwks_refresh_secs: 3600,
             audience: None,
+            require_agent_binding: false,
         })
         .unwrap_err();
         assert!(err.to_string().contains("jwks_url"));
@@ -870,6 +911,37 @@ mod tests {
         let token = mint_token(&signing, &kid, |_| {});
         let verdict = verifier.verify_token(&token, "api.example.com", "/blog/x", None);
         assert!(matches!(verdict, CapVerdict::Verified(_)));
+    }
+
+    // WOR-1149: `require_agent_binding` semantics.
+    #[test]
+    fn binding_required_with_no_resolver_fails_closed() {
+        let (verifier, kid, signing) = build_verifier_with_keypair_cfg(true);
+        let token = mint_token(&signing, &kid, |_| {});
+        // No resolved agent id + binding required -> reject.
+        let verdict = verifier.verify_token(&token, "api.example.com", "/blog/x", None);
+        assert_eq!(verdict, CapVerdict::Invalid(CapError::AgentBindingRequired));
+    }
+
+    #[test]
+    fn binding_required_with_matching_id_passes() {
+        let (verifier, kid, signing) = build_verifier_with_keypair_cfg(true);
+        // Default `sub` minted by `mint_token` is `agent_acme_001`.
+        let token = mint_token(&signing, &kid, |_| {});
+        let verdict =
+            verifier.verify_token(&token, "api.example.com", "/blog/x", Some("agent_acme_001"));
+        assert!(matches!(verdict, CapVerdict::Verified(_)));
+    }
+
+    #[test]
+    fn binding_required_with_mismatched_id_rejects() {
+        let (verifier, kid, signing) = build_verifier_with_keypair_cfg(true);
+        let token = mint_token(&signing, &kid, |c| {
+            c["sub"] = json!("agent_other_999");
+        });
+        let verdict =
+            verifier.verify_token(&token, "api.example.com", "/blog/x", Some("agent_acme_001"));
+        assert_eq!(verdict, CapVerdict::Invalid(CapError::SubMismatch));
     }
 
     #[test]

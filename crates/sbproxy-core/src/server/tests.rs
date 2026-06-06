@@ -307,8 +307,16 @@ async fn bot_auth_accepts_signature_bound_to_real_request_path() {
     headers.insert("signature-input", sig_input.parse().unwrap());
     headers.insert("signature", sig_value.parse().unwrap());
 
-    let (result, _principal) =
-        check_auth(&auth, &headers, None, "GET", "/api/foo", test_tenant()).await;
+    let (result, _principal) = check_auth(
+        &auth,
+        &headers,
+        None,
+        "GET",
+        "/api/foo",
+        test_tenant(),
+        None,
+    )
+    .await;
     assert!(
         matches!(result, AuthResult::Allow { .. }),
         "expected Allow when path matches signed @target-uri"
@@ -330,8 +338,16 @@ async fn bot_auth_rejects_signature_bound_to_different_path() {
     headers.insert("signature-input", sig_input.parse().unwrap());
     headers.insert("signature", sig_value.parse().unwrap());
 
-    let (result, _principal) =
-        check_auth(&auth, &headers, None, "GET", "/api/foo", test_tenant()).await;
+    let (result, _principal) = check_auth(
+        &auth,
+        &headers,
+        None,
+        "GET",
+        "/api/foo",
+        test_tenant(),
+        None,
+    )
+    .await;
     assert!(
         matches!(result, AuthResult::Deny(401, _)),
         "expected Deny(401) when @target-uri does not match signed path; got {:?}",
@@ -366,6 +382,7 @@ async fn bot_auth_includes_query_string_in_target_uri() {
         "GET",
         "/api/foo",
         test_tenant(),
+        None,
     )
     .await;
     assert!(
@@ -392,8 +409,16 @@ async fn bot_auth_signature_agent_uses_async_directory_path() {
         );
     headers.insert("signature", "sig1=:AAAA:".parse().unwrap());
 
-    let (result, _principal) =
-        check_auth(&auth, &headers, None, "GET", "/api/foo", test_tenant()).await;
+    let (result, _principal) = check_auth(
+        &auth,
+        &headers,
+        None,
+        "GET",
+        "/api/foo",
+        test_tenant(),
+        None,
+    )
+    .await;
 
     assert!(
             matches!(result, AuthResult::Deny(401, ref msg) if msg == "bot_auth: directory unavailable"),
@@ -488,7 +513,8 @@ async fn plugin_allow_decision_maps_to_auth_result_allow() {
     let auth = sbproxy_modules::Auth::Plugin(Box::new(provider));
     let headers = http::HeaderMap::new();
 
-    let (result, _principal) = check_auth(&auth, &headers, None, "GET", "/", test_tenant()).await;
+    let (result, _principal) =
+        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
     assert!(
         matches!(result, AuthResult::Allow { .. }),
         "Allow decision must map to AuthResult::Allow; got {}",
@@ -516,7 +542,7 @@ async fn plugin_deny_decision_maps_to_auth_result_deny() {
     let headers = http::HeaderMap::new();
 
     let (result, _principal) =
-        check_auth(&auth, &headers, None, "POST", "/api/x", test_tenant()).await;
+        check_auth(&auth, &headers, None, "POST", "/api/x", test_tenant(), None).await;
     match result {
         AuthResult::Deny(status, msg) => {
             assert_eq!(status, 403);
@@ -547,7 +573,8 @@ async fn plugin_deny_with_headers_propagates_custom_response_headers() {
     let auth = sbproxy_modules::Auth::Plugin(Box::new(provider));
     let headers = http::HeaderMap::new();
 
-    let (result, _principal) = check_auth(&auth, &headers, None, "GET", "/", test_tenant()).await;
+    let (result, _principal) =
+        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
     match result {
         AuthResult::DenyWithHeaders(status, msg, hdrs) => {
             assert_eq!(status, 401);
@@ -571,7 +598,8 @@ async fn plugin_authenticate_error_denies_with_500() {
     let auth = sbproxy_modules::Auth::Plugin(Box::new(ErrorAuthProvider));
     let headers = http::HeaderMap::new();
 
-    let (result, _principal) = check_auth(&auth, &headers, None, "GET", "/", test_tenant()).await;
+    let (result, _principal) =
+        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
     match result {
         AuthResult::Deny(status, msg) => {
             assert_eq!(status, 500);
@@ -651,6 +679,7 @@ async fn plugin_receives_method_path_query_and_headers() {
         "POST",
         "/api/v1/x",
         test_tenant(),
+        None,
     )
     .await;
 
@@ -701,7 +730,8 @@ async fn registered_auth_plugin_is_discoverable_by_name() {
     // Wrap in Auth::Plugin and verify dispatch works end to end.
     let auth = sbproxy_modules::Auth::Plugin(built);
     let headers = http::HeaderMap::new();
-    let (result, _principal) = check_auth(&auth, &headers, None, "GET", "/", test_tenant()).await;
+    let (result, _principal) =
+        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
     assert!(
         matches!(result, AuthResult::Allow { .. }),
         "registered plugin must dispatch to Allow; got {}",
@@ -2930,6 +2960,7 @@ async fn bearer_with_require_dpop_denies_when_proof_missing() {
         "/api/foo",
         test_tenant(),
         None,
+        None,
     )
     .await;
     match result {
@@ -2970,6 +3001,7 @@ async fn bearer_with_require_dpop_denies_when_metadata_missing() {
         "POST",
         "/api/foo",
         test_tenant(),
+        None,
         None,
     )
     .await;
@@ -3020,6 +3052,7 @@ async fn jwt_with_require_dpop_denies_when_cnf_jkt_missing() {
         "/api/foo",
         test_tenant(),
         None,
+        None,
     )
     .await;
     match result {
@@ -3069,6 +3102,7 @@ async fn jwt_with_require_mtls_bound_denies_when_thumbprint_mismatches() {
         test_tenant(),
         // Wrong thumbprint presented by the client.
         Some("a-different-thumbprint"),
+        None,
     )
     .await;
     match result {
@@ -3147,6 +3181,7 @@ async fn bearer_dpop_replayed_proof_denied_across_requests() {
         "/api/foo",
         test_tenant(),
         None,
+        None,
     )
     .await;
     assert!(
@@ -3163,6 +3198,7 @@ async fn bearer_dpop_replayed_proof_denied_across_requests() {
         "POST",
         "/api/foo",
         test_tenant(),
+        None,
         None,
     )
     .await;
@@ -3213,6 +3249,7 @@ async fn jwt_with_require_mtls_bound_denies_when_cnf_absent() {
         "POST",
         "/api/foo",
         test_tenant(),
+        None,
         None,
     )
     .await;
