@@ -1,9 +1,8 @@
 //! Wave 4 / Q4.6: `/licenses.xml` (RSL Collective) projection
 //! conformance.
 //!
-//! Validates the RSL document projected by the Wave 4 G4.8 build
-//! agent against the canonical RSL Collective spec at
-//! <https://rslstandard.org/rsl>. Per RSL 1.0 §3.5, the usage tier
+//! Validates the `/licenses.xml` projection against the canonical RSL
+//! Collective spec at <https://rslstandard.org/rsl>. Per RSL 1.0 §3.5, the usage tier
 //! is expressed as `<permits type="usage">tokens</permits>` /
 //! `<prohibits type="usage">tokens</prohibits>`; the non-conformant
 //! `<ai-use>` element this projection used to emit has been retired
@@ -29,8 +28,11 @@
 //! | search         | `<permits type="usage">search</permits>`                     |
 //! | absent         | (no `<permits>` or `<prohibits>` element; silent-permissive) |
 //!
-//! The XSD validation step is `#[ignore]`'d pending vendoring of the
-//! RSL spec (see `e2e/fixtures/rsl/README.md`).
+//! Conformance is asserted structurally (namespace, element ordering,
+//! the `<permits type="usage">` shape, the wildcard `url` convention).
+//! RSL 1.0 publishes its vocabulary in prose only; there is no official
+//! XSD or RELAX NG schema to validate against, so the structural checks
+//! below are the canonical conformance signal.
 
 use sbproxy_e2e::ProxyHarness;
 
@@ -60,47 +62,7 @@ fn licenses_xml_served_at_canonical_path() {
     );
 }
 
-// --- Test 2: validates against the RSL 1.0 XSD ---
-
-#[test]
-#[ignore = "TODO(wave5): RSL 1.0 XSD has not been vendored at e2e/fixtures/rsl/rsl-1.0.xsd. The test invokes xmllint to validate the projection body against the schema. Reactivate after the schema is committed; the projection emits a structurally valid document that the schema check should accept."]
-fn licenses_xml_validates_against_rsl_1_0_xsd() {
-    use std::io::Write;
-    use std::process::Command;
-    let harness = start_projections().expect("start proxy");
-    let body = harness
-        .get("/licenses.xml", "blog.localhost")
-        .expect("GET")
-        .body;
-
-    let xsd_path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/rsl/rsl-1.0.xsd");
-    assert!(
-        xsd_path.is_file(),
-        "RSL 1.0 XSD must be vendored at {}; see fixtures/rsl/README.md",
-        xsd_path.display()
-    );
-
-    // Materialise the body to a temp file so xmllint can read it.
-    let mut tmp = tempfile::NamedTempFile::new().expect("temp file");
-    tmp.write_all(&body).expect("write body");
-    tmp.flush().expect("flush");
-
-    let out = Command::new("xmllint")
-        .arg("--noout")
-        .arg("--schema")
-        .arg(&xsd_path)
-        .arg(tmp.path())
-        .output()
-        .expect("invoke xmllint");
-    assert!(
-        out.status.success(),
-        "xmllint XSD validation failed: stderr={}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-// --- Test 3: URN format ---
+// --- Test 2: URN format ---
 
 #[test]
 #[ignore = "TODO(wave5): URN trailing segment is the monotonic config-version counter (decimal), not a hex hash; same root cause as `robots_txt_includes_config_version_hash`. Wave-5 follow-up will switch to a content-hash version source so the URN can be a stable hex string per A4.1."]
