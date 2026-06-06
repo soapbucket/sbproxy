@@ -1,8 +1,7 @@
 //! Wave 4 / Q4.7: `/.well-known/tdmrep.json` (W3C TDMRep) projection.
 //!
-//! Validates the W3C TDMRep document projected by the Wave 4 G4.9
-//! build agent against the canonical
-//! CG-FINAL-tdmrep-20240510 spec. The document is a bare JSON array
+//! Validates the `/.well-known/tdmrep.json` projection against the
+//! canonical W3C CG-FINAL-tdmrep-20240510 spec. The document is a bare JSON array
 //! at the root, where each entry has three fields:
 //!
 //! ```json
@@ -58,37 +57,7 @@ fn tdmrep_json_served_at_canonical_path() {
     let _ = resp.json().expect("body must be valid JSON");
 }
 
-// --- Test 2: validates against the W3C TDMRep schema ---
-
-#[test]
-#[ignore = "TODO(wave5): W3C TDMRep schema is not vendored at e2e/fixtures/tdmrep/tdmrep-1.0.schema.json. Reactivate after the schema is committed; the projection emits a structurally valid document that the schema check should accept."]
-fn tdmrep_json_validates_against_w3c_schema() {
-    let harness = start_projections().expect("start proxy");
-    let body = harness
-        .get("/.well-known/tdmrep.json", "blog.localhost")
-        .expect("GET")
-        .json()
-        .expect("body must be valid JSON");
-
-    let schema_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/tdmrep/tdmrep-1.0.schema.json");
-    assert!(
-        schema_path.is_file(),
-        "W3C TDMRep schema must be vendored at {}; see fixtures/tdmrep/README.md",
-        schema_path.display()
-    );
-
-    let schema_bytes = std::fs::read(&schema_path).expect("read schema");
-    let schema_value: Value = serde_json::from_slice(&schema_bytes).expect("schema is valid JSON");
-
-    // Surface a structural assertion until the e2e crate adds
-    // `jsonschema` to its dev-deps. Once present, this becomes:
-    //   let compiled = jsonschema::JSONSchema::compile(&schema_value)?;
-    //   compiled.validate(&body)?;
-    let _ = (schema_value, body);
-}
-
-// --- Test 3: one entry per priced route ---
+// --- Test 2: one entry per priced route ---
 
 #[test]
 fn tdmrep_json_emits_one_entry_per_priced_route() {

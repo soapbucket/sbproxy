@@ -625,9 +625,10 @@ of the new YAML fields below until the version that ships them.
   programmatically must update their parsers to the new shapes; the
   in-process JSON envelope and the response middleware that stamps
   `TDM-Reservation: 1` and the URN-bearing `license` field are
-  unaffected. The schema-validation e2e tests remain `#[ignore]`'d
-  per the upstream issue (no canonical XSD or JSON Schema has been vendored yet);
-  the structure-shape tests are now updated and active.
+  unaffected. Conformance is asserted by the active structure-shape
+  tests; the earlier schema-validation tests were removed because
+  neither standard publishes a machine-readable schema to validate
+  against (RSL 1.0 is prose-only; W3C TDMRep ships no JSON Schema).
   ([crates/sbproxy-modules/src/projections/licenses.rs],
   [crates/sbproxy-modules/src/projections/tdmrep.rs],
   [e2e/tests/rsl_licenses_projection_e2e.rs],
