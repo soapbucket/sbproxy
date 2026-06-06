@@ -55,6 +55,8 @@ pub mod policy_bus;
 /// in its own module so the helpers can be exercised by
 /// integration tests in `crates/sbproxy-core/tests/`.
 pub mod policy_dispatch;
+/// WOR-1130: workspace rate-limit budget + auto-suspend state machine.
+pub mod rate_limit_budget;
 pub mod reload;
 pub mod router;
 /// Phase 1: per-request feature-flag parsing.

@@ -1173,6 +1173,16 @@ fn escape_json(s: &str) -> String {
 
 // --- Request Handler ---
 
+/// WOR-1130: pull a single query-string value out of a request target
+/// (`/path?a=1&b=2`). Returns the first match for `key`, or `None`.
+fn rl_query_param<'a>(path: &'a str, key: &str) -> Option<&'a str> {
+    let q = path.split_once('?')?.1;
+    q.split('&').find_map(|kv| {
+        kv.split_once('=')
+            .and_then(|(k, v)| (k == key).then_some(v))
+    })
+}
+
 /// Handle an admin API request.
 ///
 /// Returns `(status, content_type, body)`. `method` is the HTTP
@@ -1312,8 +1322,92 @@ pub fn handle_admin_request(
         );
     }
 
+    // --- WOR-1130: rate-limit budget admin routes ---
+    //
+    // These carry query strings, so match on the path prefix (the
+    // exact-match arm below sees the full target including `?...`).
+    let path_only = path.split('?').next().unwrap_or(path);
+    if path_only == "/api/rate_limits/effective" {
+        let workspace = rl_query_param(path, "workspace").unwrap_or("default");
+        return match crate::rate_limit_budget::registry() {
+            Some(reg) => {
+                let (rps, tier) = reg.effective(workspace);
+                (
+                    200,
+                    "application/json",
+                    format!(
+                        r#"{{"workspace":"{}","effective_rps":{},"tier":"{}"}}"#,
+                        workspace,
+                        rps,
+                        tier.as_str()
+                    ),
+                )
+            }
+            None => (
+                404,
+                "application/json",
+                r#"{"error":"no rate_limits: block configured"}"#.to_string(),
+            ),
+        };
+    }
+    if path_only == "/api/rate_limits/clock/advance" {
+        if !method.eq_ignore_ascii_case("POST") {
+            return (
+                405,
+                "application/json",
+                r#"{"error":"method not allowed"}"#.to_string(),
+            );
+        }
+        let secs: u64 = rl_query_param(path, "secs")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        return match crate::rate_limit_budget::registry() {
+            Some(reg) if reg.advance_clock(std::time::Duration::from_secs(secs)) => (
+                200,
+                "application/json",
+                format!(r#"{{"advanced_secs":{secs}}}"#),
+            ),
+            Some(_) => (
+                400,
+                "application/json",
+                r#"{"error":"clock is not in manual mode"}"#.to_string(),
+            ),
+            None => (
+                404,
+                "application/json",
+                r#"{"error":"no rate_limits: block configured"}"#.to_string(),
+            ),
+        };
+    }
+    if path_only == "/api/audit/recent" {
+        let limit: usize = rl_query_param(path, "limit")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50);
+        let rows = crate::rate_limit_budget::registry()
+            .map(|reg| reg.recent_audit(limit))
+            .unwrap_or_default();
+        return match serde_json::to_string(&rows) {
+            Ok(body) => (200, "application/json", body),
+            Err(e) => (
+                500,
+                "application/json",
+                format!(r#"{{"error":"serialization failed: {e}"}}"#),
+            ),
+        };
+    }
+
     // --- Route ---
     match path {
+        // WOR-1130: Prometheus exposition on the admin port. The same
+        // `sbproxy_*` series is also served on the main data-plane port;
+        // mirroring it here lets ops scrape via the (already
+        // access-controlled) admin listener.
+        "/metrics" => (
+            200,
+            "text/plain; version=0.0.4; charset=utf-8",
+            sbproxy_observe::metrics::metrics().render(),
+        ),
+
         // Recent request log.
         "/api/requests" => {
             let entries = state.get_recent_requests(state.config.max_log_entries);
@@ -2590,6 +2684,8 @@ origins:
             mesh: None,
             access_log: None,
             agent_classes: None,
+            rate_limits: None,
+            audit: None,
         };
         let pipeline = CompiledPipeline::from_config(cfg).expect("pipeline compiles");
         crate::reload::load_pipeline(pipeline);

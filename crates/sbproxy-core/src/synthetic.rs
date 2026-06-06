@@ -248,6 +248,8 @@ mod tests {
             mesh: None,
             access_log: None,
             agent_classes: None,
+            rate_limits: None,
+            audit: None,
         };
         let pipeline = crate::pipeline::CompiledPipeline::from_config(compiled)
             .expect("static origin pipeline compiles");

@@ -45,6 +45,7 @@ pub mod peer_pricing_preflight;
 pub mod prompt_injection_v2;
 pub mod quote_token;
 pub mod rate_limit;
+pub mod rate_limit_budget;
 pub mod request_limit;
 pub mod request_validator;
 pub mod sec_headers;
@@ -145,6 +146,9 @@ use sbproxy_plugin::PolicyEnforcer;
 pub enum Policy {
     /// Rate limiting policy.
     RateLimit(RateLimitPolicy),
+    /// WOR-1130: workspace rate-limit budget marker (the budget
+    /// state machine lives binary-side).
+    RateLimitBudget(rate_limit_budget::RateLimitBudgetPolicy),
     /// IP allow/deny filter based on CIDR lists.
     IpFilter(IpFilterPolicy),
     /// Injects security headers into responses.
@@ -253,6 +257,7 @@ impl Policy {
     pub fn policy_type(&self) -> &str {
         match self {
             Self::RateLimit(_) => "rate_limiting",
+            Self::RateLimitBudget(_) => "rate_limit_budget",
             Self::IpFilter(_) => "ip_filter",
             Self::SecHeaders(_) => "security_headers",
             Self::RequestLimit(_) => "request_limit",
@@ -288,6 +293,7 @@ impl std::fmt::Debug for Policy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RateLimit(r) => f.debug_tuple("RateLimit").field(r).finish(),
+            Self::RateLimitBudget(r) => f.debug_tuple("RateLimitBudget").field(r).finish(),
             Self::IpFilter(r) => f.debug_tuple("IpFilter").field(r).finish(),
             Self::SecHeaders(r) => f.debug_tuple("SecHeaders").field(r).finish(),
             Self::RequestLimit(r) => f.debug_tuple("RequestLimit").field(r).finish(),

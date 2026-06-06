@@ -129,6 +129,9 @@ pub fn compile_auth(config: &serde_json::Value) -> Result<Auth> {
 pub fn compile_policy(config: &serde_json::Value) -> Result<Policy> {
     let type_name = extract_type(config)?;
     match type_name.as_str() {
+        "rate_limit_budget" => Ok(Policy::RateLimitBudget(
+            crate::policy::rate_limit_budget::RateLimitBudgetPolicy::from_config(config.clone())?,
+        )),
         "rate_limiting" => Ok(Policy::RateLimit(RateLimitPolicy::from_config(
             config.clone(),
         )?)),

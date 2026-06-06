@@ -244,6 +244,13 @@ pub struct CompiledConfig {
     /// tuning so the binary can build the correct `AgentClassResolver`
     /// at startup.
     pub agent_classes: Option<AgentClassesConfig>,
+    /// WOR-1130: parsed top-level `rate_limits:` workspace budget +
+    /// auto-suspend escalation. `None` means no workspace ceiling is
+    /// configured. The binary installs a process-wide budget registry
+    /// from this at startup.
+    pub rate_limits: Option<crate::types::RateLimitsConfig>,
+    /// WOR-1130: audit sink selection (`memory` / `tracing`).
+    pub audit: Option<crate::types::AuditConfig>,
 }
 
 impl CompiledConfig {

@@ -1840,7 +1840,7 @@ fn format_htu(headers: &http::HeaderMap, path: &str) -> String {
 
 /// WOR-1074: extended `check_auth` that threads the inbound TLS
 /// client cert's SHA-256 thumbprint through to the
-/// [`MtlsBoundVerifier`] when a Bearer / JWT provider has
+/// [`MtlsBoundVerifier`](sbproxy_modules::auth::mtls_bound::MtlsBoundVerifier) when a Bearer / JWT provider has
 /// `require_mtls_bound = true` set. Production callers eventually
 /// pass `tls_cert_thumbprint = Some(<base64url-no-pad SHA-256>)`;
 /// today the request-phase shim passes `None` so a misconfigured
