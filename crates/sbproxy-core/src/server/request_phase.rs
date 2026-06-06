@@ -2184,8 +2184,25 @@ pub(super) async fn request_filter(
             let method = session.req_header().method.as_str();
             let path = session.req_header().uri.path();
             let tenant_id = sbproxy_plugin::TenantId::from(ctx.tenant_id.to_string());
-            let (auth_result, principal_opt) =
-                check_auth(auth, req_headers, query, method, path, tenant_id).await;
+            // WOR-1149: thread the resolved agent identity (stamped by
+            // the agent-class resolver earlier in this filter) into the
+            // auth check so the CAP verifier can enforce `sub` binding.
+            // Owned so no `ctx` borrow is held across the await.
+            #[cfg(feature = "agent-class")]
+            let resolved_agent_id: Option<String> =
+                ctx.agent_id.as_ref().map(|a| a.as_str().to_string());
+            #[cfg(not(feature = "agent-class"))]
+            let resolved_agent_id: Option<String> = None;
+            let (auth_result, principal_opt) = check_auth(
+                auth,
+                req_headers,
+                query,
+                method,
+                path,
+                tenant_id,
+                resolved_agent_id.as_deref(),
+            )
+            .await;
             // WOR-1047 PR2: every built-in provider returns a
             // `Principal` on Allow. Stamp it on `ctx.principal` so
             // downstream policy / access-log paths read attribution

@@ -1796,6 +1796,10 @@ async fn check_auth(
     method: &str,
     path: &str,
     tenant_id: sbproxy_plugin::TenantId,
+    // WOR-1149: the request's resolved agent identity (from the
+    // agent-class resolver chain), threaded into CAP `sub` binding.
+    // `None` when no resolver ran.
+    resolved_agent_id: Option<&str>,
 ) -> (AuthResult, Option<sbproxy_plugin::Principal>) {
     // WOR-1074: Stage 2 calls `check_auth_with_tls` with the
     // resolved TLS-cert thumbprint from `sbproxy_tls::mtls::ClientCertInfo`.
@@ -1805,7 +1809,17 @@ async fn check_auth(
     // thumbprint is available (the verifier treats `None` as
     // "no TLS binding"). The DPoP wire-up does not need a
     // thumbprint and works through the `None` path unchanged.
-    check_auth_with_tls(auth, headers, query, method, path, tenant_id, None).await
+    check_auth_with_tls(
+        auth,
+        headers,
+        query,
+        method,
+        path,
+        tenant_id,
+        None,
+        resolved_agent_id,
+    )
+    .await
 }
 
 /// WOR-1074: build the `htu` claim value the DPoP verifier
@@ -1841,6 +1855,8 @@ async fn check_auth_with_tls(
     path: &str,
     tenant_id: sbproxy_plugin::TenantId,
     tls_cert_thumbprint: Option<&str>,
+    // WOR-1149: resolved agent id for CAP `sub` binding (see `check_auth`).
+    resolved_agent_id: Option<&str>,
 ) -> (AuthResult, Option<sbproxy_plugin::Principal>) {
     use sbproxy_modules::auth::dpop::DpopVerifier;
     use sbproxy_modules::auth::mtls_bound::{MtlsBoundVerifier, MtlsBoundVerifierConfig};
@@ -2149,10 +2165,10 @@ async fn check_auth_with_tls(
                 }
             };
             *req.headers_mut() = headers.clone();
-            // Resolved agent_id from the Wave 1 resolver chain is not
-            // plumbed into this synchronous dispatch site yet; pass
-            // None so the verifier skips the binding check. Stamping
-            // the resolved id is a follow-up tracked in WATCH.md.
+            // WOR-1149: the resolved agent id from the agent-class
+            // resolver chain is now threaded in, so the verifier
+            // enforces the CAP `sub` binding (and fails closed when
+            // `require_agent_binding` is set but no id resolved).
             // WOR-808: emit RSL 1.0 CAP `WWW-Authenticate: License`
             // challenge on 401/403 so a crawler discovers the auth
             // scheme + the specific error code. The challenge mirrors
@@ -2160,7 +2176,7 @@ async fn check_auth_with_tls(
             // token; `License error="<code>"` on an invalid one, with
             // the code coming from `CapError::www_auth_code()` (e.g.
             // `invalid_token`, `path_not_authorized`).
-            match verifier.verify(&req, &host, path, None) {
+            match verifier.verify(&req, &host, path, resolved_agent_id) {
                 CapVerdict::Verified(_view) => {
                     let principal = sbproxy_plugin::Principal {
                         tenant_id: tenant_id.clone(),
