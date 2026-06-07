@@ -1,5 +1,5 @@
 # Frequently asked questions
-*Last modified: 2026-05-31*
+*Last modified: 2026-06-06*
 
 Quick answers to the questions operators hit most often when standing up SBproxy, picking between OSS and enterprise, debugging a config that will not load, or wiring observability. For the full reference of any feature, follow the link to the matching doc.
 
@@ -49,7 +49,7 @@ See [troubleshooting.md](./troubleshooting.md) for the most common validation er
 Everything in this repo:
 
 * The full proxy: HTTP/1.1, HTTP/2, HTTP/3, websockets, gRPC, GraphQL, MCP.
-* The AI gateway: 43 native providers, routing strategies, guardrails, budgets, streaming, semantic cache, virtual keys.
+* The AI gateway: 66 native providers, routing strategies, guardrails, budgets, streaming, semantic cache, virtual keys.
 * Every auth provider (API key, Basic, Bearer, JWT, Digest, forward-auth, Web Bot Auth, CAP, OIDC).
 * Every policy (rate limit, WAF, IP filter, CORS, HSTS, CSRF, agent budget, content digest, BOLA / `object_authz`, ...).
 * Every transform (25 types, including `json`, `template`, `wasm`).

@@ -1,6 +1,6 @@
 # How SBproxy compares
 
-*Last modified: 2026-05-03*
+*Last modified: 2026-06-06*
 
 SBproxy is a reverse proxy that doubles as an AI gateway. Most tools do one or the other; this page is honest about where SBproxy fits and where you should pick something else.
 
@@ -40,11 +40,11 @@ SBproxy fits when you need a production reverse proxy *and* an AI gateway in the
 ### vs LiteLLM
 
 LiteLLM is the most popular open-source AI gateway. It supports 100+ LLM providers.
-SBproxy reaches 200+ models: 43 native providers, including a native Anthropic translator and the OpenRouter aggregator routing 200+ more, alongside a generic OpenAI-compatible adapter for self-hosted or proprietary endpoints.
+SBproxy reaches 200+ models through 66 native providers behind one OpenAI-compatible API, including a native Anthropic translator. You bring your own key per provider and the model name passes straight through, so any model a provider serves works without per-model config. Point any provider at a custom `base_url` for self-hosted or proprietary endpoints.
 
 | | SBproxy | LiteLLM |
 |---|---------|---------|
-| LLM providers | 200+ models (43 native providers + OpenRouter aggregator + generic adapter) | 100+ native |
+| LLM providers | 200+ models (66 native providers, bring your own keys) | 100+ native |
 | General HTTP proxy | Yes | No |
 | Implementation | Compiled native binary | Python |
 | Min resources | 1 CPU, 256 MB | 4 CPU, 8 GB |

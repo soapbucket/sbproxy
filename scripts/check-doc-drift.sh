@@ -5,10 +5,11 @@
 # Guard against regression of provider-count, routing-strategy, and
 # unimplemented-feature claims in user-facing docs. Code reality:
 #
-#   - crates/sbproxy-ai/data/ai_providers.yml has 43 entries.
-#   - crates/sbproxy-ai/src/routing.rs defines 10 routing strategies
+#   - crates/sbproxy-ai/data/ai_providers.yml has 66 entries.
+#   - crates/sbproxy-ai/src/routing.rs defines 15 routing strategies
 #     (RoundRobin, Weighted, FallbackChain, Random, LowestLatency,
-#     LeastConnections, CostOptimized, TokenRate, Sticky, Race).
+#     LeastConnections, CostOptimized, TokenRate, LeastTokenUsage,
+#     PrefixAffinity, PeakEwma, Sticky, Race, Cascade, CostQuality).
 #   - crates/sbproxy-modules/src/action/routing/ ships two built-in
 #     RoutingStrategy implementations: first-healthy and lora-aware.
 #   - crates/sbproxy-security/ exposes crypto, hostfilter, ip, pii, ssrf,
@@ -58,6 +59,10 @@ TARGETS=(
 STALE_STRINGS=(
   "20 native"
   "9 routing strategies"
+  "10 routing strategies"
+  "ten routing strategies"
+  "Ten routing strategies"
+  "43 native providers"
   "one trivial built-in strategy"
   "36 OpenAI-compatible"
   "certpin"

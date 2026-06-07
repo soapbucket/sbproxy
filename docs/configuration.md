@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-05-03*
+*Last modified: 2026-06-06*
 
 The complete configuration reference for SBproxy. Every option, every field, every action type is documented here with real-world examples you can copy-paste and run.
 
@@ -841,7 +841,7 @@ origins:
 
 ### ai_proxy
 
-Route requests across LLM providers with automatic failover, cost tracking, and content-based routing. Supports many native providers; route through OpenRouter for hundreds of models. For full details, see [ai-gateway.md](ai-gateway.md) and [providers.md](providers.md).
+Route requests across LLM providers with automatic failover, cost tracking, and content-based routing. Supports 66 native providers behind one OpenAI-compatible API; the model name passes straight through, so any model a provider serves is reachable. For full details, see [ai-gateway.md](ai-gateway.md) and [providers.md](providers.md).
 
 ```yaml
 origins:
@@ -878,7 +878,7 @@ origins:
 | `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. |
 | `shadow` | object | | Side-by-side eval: mirror each request to a second provider and log metrics. |
 
-Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `token_rate`, `sticky`, `race`.
+Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `token_rate`, `least_token_usage`, `prefix_affinity`, `peak_ewma`, `sticky`, `race`, `cascade`, `cost_quality`. See [ai-gateway.md](ai-gateway.md#routing-strategies) for each.
 
 `default_model` is a per-provider field, not an action-level field. Set it on each `providers[]` entry.
 

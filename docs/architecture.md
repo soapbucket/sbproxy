@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-05-20*
+*Last modified: 2026-06-06*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -67,7 +67,7 @@ sbproxy/
                                           encoding, format_convert, normalize,
                                           payload_limit, replace_strings,
                                           html_to_markdown, sse_chunking, noop
-    sbproxy-ai/           - AI gateway: 43 native providers, routing,
+    sbproxy-ai/           - AI gateway: 66 native providers, routing,
                               guardrails, budget enforcement, key vault,
                               memory store, MCP federation.
     sbproxy-extension/    - Scripting and extension runtimes:
@@ -385,8 +385,9 @@ implements `sbproxy_ai::providers::Provider`. The provider list is also driven b
 `providers.yaml`, which maps provider names to their base URLs and supported models. Rust
 implementations handle request serialization and response normalization.
 
-43 native providers ship in-tree alongside a native Anthropic
-translator and the OpenRouter aggregator (which routes 200+ more models).
+66 native providers ship in-tree alongside a native Anthropic
+translator. The `model` field passes straight through to the upstream,
+so the gateway reaches 200+ models without enumerating them.
 Direct adapters include OpenAI, Anthropic, Google Gemini, Azure
 OpenAI, AWS Bedrock, Cohere, Mistral, DeepSeek, xAI / Grok, Perplexity,
 Groq, Together AI, Fireworks AI, OpenRouter, Ollama, vLLM, AWS SageMaker,

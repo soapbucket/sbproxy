@@ -1,6 +1,6 @@
 # SBproxy features manual
 
-*Last modified: 2026-05-20*
+*Last modified: 2026-06-06*
 
 Reference for SBproxy features. Each section covers what a feature does, how to configure it, and a working example against `test.sbproxy.dev`.
 
@@ -12,7 +12,7 @@ SBproxy is a reverse proxy and AI gateway shipped as a single binary, built on C
 
 Core capabilities:
 - Reverse proxy with hot reload, path routing, and forward rules
-- AI gateway with 43 native provider integrations (route through OpenRouter for 200+ models), model routing, and budget enforcement
+- AI gateway with 66 native provider integrations reaching 200+ models behind one OpenAI-compatible API, model routing, and budget enforcement
 - Load balancer with multiple algorithms, health checks, and circuit breakers
 - 7 authentication methods, 10 security policies, 25 response transforms
 - CEL, Lua, JavaScript, and WASM scripting for custom logic
@@ -105,7 +105,7 @@ The `ai_proxy` action turns SBproxy into an OpenAI-compatible API gateway. It ac
 
 ### Providers
 
-SBproxy ships with 43 native providers, including a native Anthropic translator and the OpenRouter aggregator routing 200+ more. Adapters include openai, anthropic, gemini, azure, bedrock, cohere, mistral, groq, deepseek, ollama, vllm, together, fireworks, perplexity, xai, sagemaker, databricks, oracle, watsonx, openrouter, plus three local-runtime adapters (`tgi`, `lmstudio`, `llamacpp`). The `provider_type` field on a provider picks the adapter (when unset, SBproxy infers it from `name`). For models not covered by a native adapter, route through the openrouter provider (200+ models), or use a self-hosted OpenAI-compatible server via the `vllm`/`generic` adapter with a custom `base_url`.
+SBproxy ships with 66 native providers behind one OpenAI-compatible API, including a native Anthropic translator. You bring your own key per provider and the model name passes straight through, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them. Adapters include openai, anthropic, gemini, azure, bedrock, cohere, mistral, groq, deepseek, together, fireworks, cerebras, sambanova, nvidia, vertex, databricks, huggingface, openrouter, and local-runtime adapters (`tgi`, `lmstudio`, `llamacpp`). The `provider_type` field on a provider picks the adapter (when unset, SBproxy infers it from `name`). For an endpoint no adapter covers, point any provider at it with a custom `base_url`; `openrouter` is available as a single-key aggregator. The catalog is plain YAML and operator-extensible: see [providers.md](providers.md#extending-the-provider-catalog).
 
 ```yaml
 origins:
@@ -1968,7 +1968,7 @@ The proxy is split into focused crates:
 - `sbproxy-config`: YAML parsing, type definitions
 - `sbproxy-core`: CompiledOrigin, phase dispatch, plugin registry, hot reload
 - `sbproxy-modules`: actions, auth, policies, transforms
-- `sbproxy-ai`: AI gateway (43 providers, routing, guardrails, budgets, MCP)
+- `sbproxy-ai`: AI gateway (66 providers, routing, guardrails, budgets, MCP)
 - `sbproxy-middleware`: CORS, HSTS, compression, header modifiers
 - `sbproxy-extension`: WASM (wasmtime), Lua (mlua/Luau), CEL (cel-rust), JavaScript (QuickJS)
 - `sbproxy-cache`: response cache, pluggable backends

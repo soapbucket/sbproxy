@@ -437,3 +437,234 @@ providers:
     supports_streaming: false
     supports_embeddings: true
     supports_chat: false
+
+  # --- Tier 10: Aggregators and gateways (OpenAI-compatible) ---
+  - name: huggingface
+    display_name: Hugging Face Inference Providers
+    aliases: [hf, hf_router]
+    default_base_url: https://router.huggingface.co/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: github_models
+    display_name: GitHub Models
+    aliases: [github]
+    default_base_url: https://models.github.ai/inference
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: vercel
+    display_name: Vercel AI Gateway
+    aliases: [vercel_ai_gateway]
+    default_base_url: https://ai-gateway.vercel.sh/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  # --- Tier 11: Inference platforms (OpenAI-compatible) ---
+  - name: nebius
+    display_name: Nebius AI Studio
+    aliases: [nebius_token_factory]
+    default_base_url: https://api.studio.nebius.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: baseten
+    display_name: Baseten Model APIs
+    default_base_url: https://inference.baseten.co/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: lambda
+    display_name: Lambda Inference API
+    aliases: [lambda_labs, lambdalabs]
+    default_base_url: https://api.lambda.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: friendliai
+    display_name: FriendliAI Serverless
+    aliases: [friendli]
+    default_base_url: https://api.friendli.ai/serverless/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: scaleway
+    display_name: Scaleway Generative APIs
+    default_base_url: https://api.scaleway.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: nscale
+    display_name: Nscale Serverless Inference
+    default_base_url: https://inference.api.nscale.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: digitalocean
+    display_name: DigitalOcean Gradient Inference
+    aliases: [gradient]
+    default_base_url: https://inference.do-ai.run/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: ovhcloud
+    display_name: OVHcloud AI Endpoints
+    aliases: [ovh]
+    default_base_url: https://oai.endpoints.kepler.ai.cloud.ovh.net/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: inferencenet
+    display_name: Inference.net
+    aliases: [inference_net]
+    default_base_url: https://api.inference.net/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: kluster
+    display_name: kluster.ai
+    aliases: [klusterai]
+    default_base_url: https://api.kluster.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: openpipe
+    display_name: OpenPipe
+    default_base_url: https://api.openpipe.ai/api/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  # --- Tier 12: Model labs (OpenAI-compatible) ---
+  - name: writer
+    display_name: Writer (Palmyra)
+    aliases: [palmyra]
+    default_base_url: https://api.writer.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: upstage
+    display_name: Upstage (Solar)
+    aliases: [solar]
+    default_base_url: https://api.upstage.ai/v1/solar
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: alephalpha
+    display_name: Aleph Alpha
+    aliases: [aleph_alpha]
+    default_base_url: https://api.aleph-alpha.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: minimax
+    display_name: MiniMax
+    default_base_url: https://api.minimax.io/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  # --- Tier 13: Regional providers (OpenAI-compatible) ---
+  - name: volcengine
+    display_name: Volcengine Ark (Doubao)
+    aliases: [ark, doubao]
+    default_base_url: https://ark.cn-beijing.volces.com/api/v3
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: hunyuan
+    display_name: Tencent Hunyuan
+    aliases: [tencent]
+    default_base_url: https://api.hunyuan.cloud.tencent.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: qianfan
+    display_name: Baidu Qianfan (ERNIE)
+    aliases: [baidu, ernie]
+    default_base_url: https://qianfan.baidubce.com/v2
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: stepfun
+    display_name: StepFun
+    aliases: [step]
+    default_base_url: https://api.stepfun.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  # --- Tier 14: Embeddings and rerank ---
+  - name: mixedbread
+    display_name: Mixedbread
+    aliases: [mxbai]
+    default_base_url: https://api.mixedbread.com/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: false
+    supports_embeddings: true
+    supports_chat: false

@@ -1,8 +1,8 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-05-12*
+*Last modified: 2026-06-06*
 
-SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 43 native providers, including a native Anthropic translator, and the OpenRouter aggregator routes 200+ more.
+SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 66 native providers behind one OpenAI-compatible API, including a native Anthropic translator. You bring your own provider keys and the model name passes straight through, so you reach 200+ models without waiting on us to add them.
 
 ## Provider setup
 
@@ -29,9 +29,9 @@ API keys support environment variable interpolation with `${VAR_NAME}` syntax. N
 
 ### Native providers
 
-43 native providers ship in-tree alongside a native Anthropic translator and the OpenRouter aggregator (which routes 200+ more models). Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `ollama`, `vllm`, `together`, `fireworks`, `perplexity`, `xai`, `sagemaker`, `databricks`, `oracle`, `watsonx`, and `openrouter`.
+66 native providers ship in-tree alongside a native Anthropic translator. You bring your own key per provider and the `model` field passes straight through, so the gateway reaches 200+ models (and any model a provider ships next) without enumerating them. Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `together`, `fireworks`, `cerebras`, `sambanova`, `nvidia`, `vertex`, `databricks`, `huggingface`, `vllm`, and `openrouter`.
 
-For models that are not natively supported, route through `openrouter` (200+ models behind one key) or point a `vllm` or generic OpenAI-compatible provider at a self-hosted endpoint via `base_url`. See `providers.md` for the full per-provider model table.
+Any model a listed provider serves works without extra config. For a self-hosted or proprietary endpoint, point `vllm` or any provider at it with a custom `base_url`. `openrouter` is available as one of the providers when you want many vendors behind a single key. See `providers.md` for the full per-provider table.
 
 ## Routing strategies
 
@@ -128,6 +128,64 @@ routing:
 ```
 
 See [examples/ai-race](../examples/ai-race/sb.yml).
+
+### least_token_usage
+
+Routes to the provider with the lowest absolute observed token throughput in the current minute, regardless of any configured limit. Unlike `token_rate`, which scores remaining headroom against a declared per-provider TPM cap, this scores raw observed throughput, so it suits self-hosted vLLM or SGLang pools that do not pre-declare a token cap. Untried providers sort lowest and are explored first.
+
+```yaml
+routing:
+  strategy: least_token_usage
+```
+
+### prefix_affinity
+
+Hashes a stable prefix of the request body to an enabled provider so requests that share a prompt prefix land on the same upstream and reuse its KV cache (vLLM, SGLang). The hash is deterministic and stable across reloads as long as the provider list does not reorder. Falls back to round_robin when no prefix can be extracted.
+
+```yaml
+routing:
+  strategy: prefix_affinity
+```
+
+### peak_ewma
+
+Power-of-two-choices over observed latency: sample two eligible providers and route to the one with the lower recently observed latency. Cuts tail latency under skewed load versus always picking the single lowest-latency provider, which herds traffic. An untried provider is explored first.
+
+```yaml
+routing:
+  strategy: peak_ewma
+```
+
+### cascade
+
+Tries a sequence of `(provider, model)` tiers from cheapest to most expensive. Each tier's response is graded against its `quality_threshold`; a response that is below threshold, empty, or refused retries on the next tier. `max_total_cost` (micro-USD) is an optional cumulative budget cap. Streaming requests dispatch only to the first tier.
+
+```yaml
+routing:
+  strategy: cascade
+  max_total_cost: 100000
+  tiers:
+    - provider_id: openai
+      model: gpt-4o-mini
+      quality_threshold: 0.7
+    - provider_id: openai
+      model: gpt-4o
+      quality_threshold: 0.85
+```
+
+See [examples/ai-cascade-routing](../examples/ai-cascade-routing/sb.yml).
+
+### cost_quality
+
+Scores each prompt's difficulty and routes simple prompts to a cheap model and hard prompts to a frontier model, on a single `cost_threshold` dial (`0.0` sends almost everything to the frontier, `1.0` sends almost everything to the cheap model).
+
+```yaml
+routing:
+  strategy: cost_quality
+  cheap_provider: openai-mini
+  frontier_provider: openai
+  cost_threshold: 0.5
+```
 
 ## Resilience
 

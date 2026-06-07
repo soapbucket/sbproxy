@@ -1,7 +1,9 @@
 # Supported providers
-*Last modified: 2026-05-20*
+*Last modified: 2026-06-06*
 
-SBproxy ships native adapters for 43 LLM providers, reaching 200+ models behind one OpenAI-compatible API. Most adapters speak the OpenAI wire format and pass through unchanged; a few (Anthropic, Bedrock, Gemini, SageMaker, Oracle, Watsonx) translate to the provider's native shape.
+SBproxy ships native adapters for 66 LLM providers behind one OpenAI-compatible API. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them. Most adapters speak the OpenAI wire format and pass through unchanged; a few (Anthropic, Bedrock, Gemini, SageMaker, Oracle, Watsonx) translate to the provider's native shape.
+
+The catalog is plain YAML and you can extend it yourself: see [Extending the provider catalog](#extending-the-provider-catalog).
 
 ## Native providers
 
@@ -52,6 +54,29 @@ Each provider has a default base URL and auth format. Override `base_url` if you
 | `zhipu` | Zhipu AI (GLM) | OpenAI | `Authorization: Bearer` | `https://open.bigmodel.cn/api/paas/v4` |
 | `voyage` | Voyage AI (embeddings only)[^embed-only] | OpenAI | `Authorization: Bearer` | `https://api.voyageai.com/v1` |
 | `jina` | Jina AI (embeddings only)[^embed-only] | OpenAI | `Authorization: Bearer` | `https://api.jina.ai/v1` |
+| `huggingface` | Hugging Face Inference Providers | OpenAI | `Authorization: Bearer` | `https://router.huggingface.co/v1` |
+| `github_models` | GitHub Models | OpenAI | `Authorization: Bearer` | `https://models.github.ai/inference` |
+| `vercel` | Vercel AI Gateway | OpenAI | `Authorization: Bearer` | `https://ai-gateway.vercel.sh/v1` |
+| `nebius` | Nebius AI Studio | OpenAI | `Authorization: Bearer` | `https://api.studio.nebius.ai/v1` |
+| `baseten` | Baseten Model APIs | OpenAI | `Authorization: Bearer` | `https://inference.baseten.co/v1` |
+| `lambda` | Lambda Inference API | OpenAI | `Authorization: Bearer` | `https://api.lambda.ai/v1` |
+| `friendliai` | FriendliAI Serverless | OpenAI | `Authorization: Bearer` | `https://api.friendli.ai/serverless/v1` |
+| `scaleway` | Scaleway Generative APIs | OpenAI | `Authorization: Bearer` | `https://api.scaleway.ai/v1` |
+| `nscale` | Nscale Serverless Inference | OpenAI | `Authorization: Bearer` | `https://inference.api.nscale.com/v1` |
+| `digitalocean` | DigitalOcean Gradient Inference | OpenAI | `Authorization: Bearer` | `https://inference.do-ai.run/v1` |
+| `ovhcloud` | OVHcloud AI Endpoints | OpenAI | `Authorization: Bearer` | `https://oai.endpoints.kepler.ai.cloud.ovh.net/v1` |
+| `inferencenet` | Inference.net | OpenAI | `Authorization: Bearer` | `https://api.inference.net/v1` |
+| `kluster` | kluster.ai | OpenAI | `Authorization: Bearer` | `https://api.kluster.ai/v1` |
+| `openpipe` | OpenPipe | OpenAI | `Authorization: Bearer` | `https://api.openpipe.ai/api/v1` |
+| `writer` | Writer (Palmyra) | OpenAI | `Authorization: Bearer` | `https://api.writer.com/v1` |
+| `upstage` | Upstage (Solar) | OpenAI | `Authorization: Bearer` | `https://api.upstage.ai/v1/solar` |
+| `alephalpha` | Aleph Alpha | OpenAI | `Authorization: Bearer` | `https://api.aleph-alpha.com/v1` |
+| `minimax` | MiniMax | OpenAI | `Authorization: Bearer` | `https://api.minimax.io/v1` |
+| `volcengine` | Volcengine Ark (Doubao) | OpenAI | `Authorization: Bearer` | `https://ark.cn-beijing.volces.com/api/v3` |
+| `hunyuan` | Tencent Hunyuan | OpenAI | `Authorization: Bearer` | `https://api.hunyuan.cloud.tencent.com/v1` |
+| `qianfan` | Baidu Qianfan (ERNIE) | OpenAI | `Authorization: Bearer` | `https://qianfan.baidubce.com/v2` |
+| `stepfun` | StepFun | OpenAI | `Authorization: Bearer` | `https://api.stepfun.com/v1` |
+| `mixedbread` | Mixedbread (embeddings only)[^embed-only] | OpenAI | `Authorization: Bearer` | `https://api.mixedbread.com/v1` |
 
 The `cloudflare`, `vertex`, and `runpod` defaults contain path template parameters (`{account_id}`, `{location}`, `{project_id}`, `{endpoint_id}`). Fill them in by overriding `base_url` per-origin, typically with environment-or-config interpolation (for example `base_url: https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID}/openai/v1`). Paths left with literal placeholders will reach the upstream as-is and 404.
 
@@ -104,7 +129,11 @@ providers:
 
 ## Reaching providers not on this list
 
-Route through `openrouter`. One API key, 200+ models including Claude, Llama, GPT, Gemini, Mistral, DeepSeek, and Command:
+Three options, roughly in order of preference:
+
+1. **Point any provider at a custom `base_url`.** Most upstreams speak the OpenAI wire format, so a `provider_type: openai` entry with your own `base_url` reaches anything OpenAI-compatible: a self-hosted vLLM or SGLang pool, an internal gateway, or a proprietary endpoint.
+2. **Add the provider to the catalog yourself.** It is plain YAML and ships uncompiled. See [Extending the provider catalog](#extending-the-provider-catalog).
+3. **Use `openrouter` as a single-key aggregator** when you want many vendors without holding a direct account with each. It is one of the native providers, no different from the rest:
 
 ```yaml
 providers:
@@ -132,6 +161,63 @@ providers:
     base_url: http://127.0.0.1:11434/v1
     allow_private_base_url: true
 ```
+
+## Extending the provider catalog
+
+The provider list above is not hard-coded. It is a plain YAML registry that ships embedded in the binary; the source of truth is `crates/sbproxy-ai/data/ai_providers.yml`. Each entry maps a provider `name` to its base URL, auth header, and wire format. Models are never listed here: the `model` field on a request passes straight through to the upstream, so a provider's whole model lineup is reachable the moment the provider is in the catalog, and new models work the day the upstream ships them.
+
+There are three ways to reach a provider that is not already listed, from least to most permanent:
+
+### 1. Override `base_url` on a single provider (no catalog change)
+
+For a one-off OpenAI-compatible endpoint, reuse an existing OpenAI-format `provider_type` and point it wherever you like. Nothing to rebuild.
+
+```yaml
+providers:
+  - name: my-endpoint
+    provider_type: openai          # reuse the OpenAI wire format
+    base_url: https://llm.internal.example.com/v1
+    api_key: ${INTERNAL_LLM_KEY}
+    default_model: my-finetune
+```
+
+### 2. Replace the catalog at runtime with `proxy.ai_providers_file`
+
+Point the gateway at your own catalog on disk. The file fully replaces the embedded set, so include every provider you intend to use. This needs no rebuild and survives upgrades.
+
+```yaml
+proxy:
+  ai_providers_file: /etc/sbproxy/ai_providers.yml
+```
+
+Each entry uses these fields:
+
+```yaml
+providers:
+  - name: my_provider              # canonical id used in sb.yml (required)
+    display_name: My Provider      # human label (required)
+    aliases: [mine, myprov]        # optional alternative lookup names
+    default_base_url: https://api.my-provider.com/v1   # required
+    auth_header: Authorization     # header carrying the key (default Authorization)
+    auth_prefix: "Bearer "         # prefix prepended to the key ("" for raw keys)
+    format: openai                 # wire format: openai | anthropic | google | bedrock | custom
+    supports_streaming: true
+    supports_embeddings: false
+    supports_chat: true            # set false for embeddings/rerank-only providers
+```
+
+A malformed override file is rejected and the gateway falls back to the embedded catalog rather than booting with no providers.
+
+### 3. Add it to the in-tree registry
+
+To make a provider part of the default build, append an entry to `crates/sbproxy-ai/data/ai_providers.yml` using the same schema, then regenerate the embedded copy:
+
+```bash
+gzip -9 -n -c crates/sbproxy-ai/data/ai_providers.yml \
+  > crates/sbproxy-ai/data/ai_providers.yml.gz
+```
+
+The registry picks it up on the next build. `format: openai` covers any OpenAI-compatible upstream; reach for `anthropic`, `google`, `bedrock`, or `custom` only when the upstream speaks that native shape.
 
 ## See also
 
