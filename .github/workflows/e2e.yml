@@ -41,5 +41,11 @@ jobs:
       - name: build sbproxy binary
         run: cargo build -p sbproxy --locked
 
+      # Run single-threaded. Each e2e test spawns its own proxy process
+      # with a full multi-core tokio runtime, so the default test-thread
+      # count (= CPU count) massively oversubscribes the runner and makes
+      # timing-sensitive tests (cache stale-while-revalidate, rate-limit
+      # budget windows, ...) flake. The required single-threaded gate in
+      # release-checks.yml runs the same suite green; match it here.
       - name: e2e
-        run: cargo test -p sbproxy-e2e --locked
+        run: cargo test -p sbproxy-e2e --locked -- --test-threads=1
