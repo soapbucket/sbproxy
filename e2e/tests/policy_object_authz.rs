@@ -31,6 +31,10 @@ origins:
           owner_from: header
           owner_header: x-owner-id
           role_header: x-roles
+          # The suite models a trusted upstream auth layer that populates
+          # x-roles (see the module doc). WOR-1139 made role headers
+          # untrusted by default, so the role-based BFLA cases must opt in.
+          trust_role_header: true
         object_rules:
           - path: /tenants/{{owner}}/orders/{{id}}
             owner_param: owner
