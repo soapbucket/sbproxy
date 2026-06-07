@@ -615,6 +615,19 @@ and principal-aware); read the Breaking section and
 
 ### Fixed
 
+- **CAP `sub` binding only fires for a genuinely resolved agent.** The
+  CAP verifier binds a token's `sub` to the request's resolved agent id
+  (rejecting a mismatch with `403`). Because the agent-class resolver is
+  installed with the built-in catalog by default and always stamps
+  *some* id (falling through to the `human` sentinel when no signal
+  matches), the binding would have rejected every CAP token whose `sub`
+  was not literally `"human"`, even on origins that never configured
+  agent classes. The binding now skips the resolver's fallback / `human`
+  verdict and engages only when the resolver actually identified an
+  agent, so an unauthenticated caller falls through to the normal CAP
+  validation path. Set `cap.require_agent_binding: true` to fail closed
+  when no agent is resolved.
+
 - **Virtual-key model allow/block lists are now enforced.** A virtual
   key (or `ai_provider` credential) with `models.allow` / `models.block`
   declared its scope but the AI dispatch path never checked it, so a key

@@ -2187,10 +2187,14 @@ pub(super) async fn request_filter(
             // WOR-1149: thread the resolved agent identity (stamped by
             // the agent-class resolver earlier in this filter) into the
             // auth check so the CAP verifier can enforce `sub` binding.
+            // `cap_binding_agent_id` yields `None` for the resolver's
+            // fallback/`human` verdict so an unidentified caller does not
+            // trip the binding check (the resolver is installed with the
+            // built-in catalog by default and always stamps *some* id).
             // Owned so no `ctx` borrow is held across the await.
             #[cfg(feature = "agent-class")]
             let resolved_agent_id: Option<String> =
-                ctx.agent_id.as_ref().map(|a| a.as_str().to_string());
+                crate::agent_class::cap_binding_agent_id(ctx).map(|s| s.to_string());
             #[cfg(not(feature = "agent-class"))]
             let resolved_agent_id: Option<String> = None;
             let (auth_result, principal_opt) = check_auth(

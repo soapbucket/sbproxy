@@ -55,6 +55,33 @@ pub fn stamp_request_context(
     ctx.agent_rdns_hostname = resolved.rdns_hostname;
 }
 
+/// Compute the CAP `sub`-binding target for this request (WOR-1149
+/// follow-up).
+///
+/// The agent-class resolver always stamps *some* `agent_id`: when no
+/// signal matches it falls through to the `human` sentinel with
+/// [`sbproxy_classifiers::AgentIdSource::Fallback`]. Binding the CAP
+/// token's `sub` against `ctx.agent_id` unconditionally would therefore
+/// reject every CAP token whose `sub` is not literally `"human"`, even on
+/// origins that never configured agent classes, because the resolver is
+/// installed with the built-in catalog by default. The binding is only
+/// meaningful when the resolver *genuinely* identified an agent, so the
+/// fallback / `human` verdict yields `None` and the CAP verifier falls
+/// through to its "no resolved agent -> skip" branch.
+///
+/// Compiled out unless the `agent-class` feature is enabled.
+pub fn cap_binding_agent_id(ctx: &RequestContext) -> Option<&str> {
+    use sbproxy_classifiers::{AgentId, AgentIdSource};
+    if matches!(ctx.agent_id_source, Some(AgentIdSource::Fallback)) {
+        return None;
+    }
+    let id = ctx.agent_id.as_ref()?.as_str();
+    if id == AgentId::HUMAN {
+        return None;
+    }
+    Some(id)
+}
+
 /// Apply the headless-detection override § "Worked example:
 /// headless Puppeteer detection".
 ///
@@ -200,6 +227,53 @@ mod tests {
         assert_eq!(ctx.agent_id.as_ref().unwrap().as_str(), "openai-gptbot");
         assert_eq!(ctx.agent_vendor.as_deref(), Some("OpenAI"));
         assert_eq!(ctx.agent_id_source, Some(AgentIdSource::UserAgent));
+    }
+
+    // --- WOR-1149 follow-up: CAP `sub`-binding target gating ---
+
+    #[test]
+    fn cap_binding_skips_fallback_human() {
+        let mut ctx = RequestContext::new();
+        let resolver = build_resolver();
+        // Browser UA -> Fallback `human` verdict; not a resolved agent.
+        stamp_request_context(
+            &mut ctx,
+            &resolver,
+            None,
+            false,
+            None,
+            Some("Mozilla/5.0 Chrome/123.0"),
+        );
+        assert_eq!(ctx.agent_id_source, Some(AgentIdSource::Fallback));
+        assert_eq!(
+            cap_binding_agent_id(&ctx),
+            None,
+            "a fallback/human verdict must not bind the CAP `sub`"
+        );
+    }
+
+    #[test]
+    fn cap_binding_uses_genuinely_resolved_agent() {
+        let mut ctx = RequestContext::new();
+        let resolver = build_resolver();
+        // GPTBot UA -> UserAgent source with a real catalog id.
+        stamp_request_context(
+            &mut ctx,
+            &resolver,
+            None,
+            false,
+            None,
+            Some("Mozilla/5.0 (compatible; GPTBot/1.0)"),
+        );
+        assert_eq!(cap_binding_agent_id(&ctx), Some("openai-gptbot"));
+    }
+
+    #[test]
+    fn cap_binding_none_when_resolver_never_ran() {
+        // No resolver stamped the context (feature on but no request
+        // passed through the resolver yet).
+        let ctx = RequestContext::new();
+        assert_eq!(cap_binding_agent_id(&ctx), None);
     }
 
     // --- A5.1 headless-override tests ---
