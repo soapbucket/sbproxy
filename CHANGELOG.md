@@ -11,37 +11,13 @@ Work that has merged to `main` since the v1.1.0 tag and is queued for
 the next version cut. No promises about backward compatibility for any
 of the new YAML fields below until the version that ships them.
 
-### Added
-
-- **AI provider catalog expanded to 66 native providers.** The embedded
-  `ai_providers.yml` registry gained 23 OpenAI-compatible providers:
-  Hugging Face Inference, GitHub Models, Vercel AI Gateway, Nebius,
-  Baseten, Lambda, FriendliAI, Scaleway, Nscale, DigitalOcean Gradient,
-  OVHcloud, Inference.net, kluster.ai, OpenPipe, Writer, Upstage, Aleph
-  Alpha, MiniMax, Volcengine Ark (Doubao), Tencent Hunyuan, Baidu
-  Qianfan (ERNIE), StepFun, and Mixedbread. The catalog is plain YAML
-  and operator-extensible at runtime via `proxy.ai_providers_file`; the
-  `model` field passes through to the upstream, so any model a provider
-  serves is reachable without per-model config. See
-  `docs/providers.md#extending-the-provider-catalog`.
-
-### Changed
-
-- **Docs accuracy: native-first AI gateway framing.** Provider count
-  corrected to 66 and routing-strategy count corrected to 15 across the
-  docs and the marketing site; the "200+ models" claim is now attributed
-  to the native providers (bring your own keys) rather than the
-  OpenRouter aggregator, which is one provider among the 66. The five
-  previously-undocumented routing strategies (`least_token_usage`,
-  `prefix_affinity`, `peak_ewma`, `cascade`, `cost_quality`) are now
-  documented in `docs/ai-gateway.md` and `docs/configuration.md`.
-
 ## [1.1.0] - 2026-06-06
 
 First minor release on the Rust v1.x line. This release carries
 breaking changes to the MCP tool-access policy (now closed-by-default
 and principal-aware); read the Breaking section and
-`docs/migration-mcp-rbac.md` before upgrading.
+`docs/migration-mcp-rbac.md` before upgrading. It also ships 66 native
+AI providers behind one OpenAI-compatible API.
 
 ### Breaking
 
@@ -70,6 +46,20 @@ and principal-aware); read the Breaking section and
   `docs/migration-mcp-rbac.md`.
 
 ### Added
+
+- **66 native AI providers behind one OpenAI-compatible API.** The
+  embedded `ai_providers.yml` registry ships 66 providers (up from 43),
+  adding Hugging Face Inference, GitHub Models, Vercel AI Gateway,
+  Nebius, Baseten, Lambda, FriendliAI, Scaleway, Nscale, DigitalOcean
+  Gradient, OVHcloud, Inference.net, kluster.ai, OpenPipe, Writer,
+  Upstage, Aleph Alpha, MiniMax, Volcengine Ark (Doubao), Tencent
+  Hunyuan, Baidu Qianfan (ERNIE), StepFun, and Mixedbread. The catalog
+  is plain YAML and operator-extensible at runtime via
+  `proxy.ai_providers_file`; the `model` field passes through to the
+  upstream, so any model a provider serves is reachable without
+  per-model config. The "200+ models" reach is native (bring your own
+  keys); OpenRouter is one provider among the 66, not a dependency. See
+  `docs/providers.md#extending-the-provider-catalog`.
 
 - **Session ledger from live MCP traffic.** A new top-level
   `session_ledger:` block makes SBproxy emit the canonical
