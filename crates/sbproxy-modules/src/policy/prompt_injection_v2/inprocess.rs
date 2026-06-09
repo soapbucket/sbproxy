@@ -162,4 +162,44 @@ mod tests {
         };
         assert!(err.to_string().contains("inprocess detector"));
     }
+
+    #[test]
+    fn classify_score_maps_to_the_v2_vocabulary() {
+        // At or above threshold => injection.
+        assert_eq!(classify_score(0.9, 0.5), DetectionLabel::Injection);
+        assert_eq!(classify_score(0.5, 0.5), DetectionLabel::Injection);
+        // In [0.3, threshold) => suspicious.
+        assert_eq!(classify_score(0.49, 0.5), DetectionLabel::Suspicious);
+        assert_eq!(classify_score(0.3, 0.5), DetectionLabel::Suspicious);
+        // Below 0.3 => clean.
+        assert_eq!(classify_score(0.29, 0.5), DetectionLabel::Clean);
+        assert_eq!(classify_score(0.0, 0.5), DetectionLabel::Clean);
+    }
+
+    #[test]
+    fn classify_score_threshold_is_inclusive_and_configurable() {
+        // A higher threshold widens the suspicious band.
+        assert_eq!(classify_score(0.85, 0.9), DetectionLabel::Suspicious);
+        assert_eq!(classify_score(0.9, 0.9), DetectionLabel::Injection);
+        // A low threshold collapses suspicious: 0.3 still suspicious, 0.31 injects.
+        assert_eq!(classify_score(0.31, 0.31), DetectionLabel::Injection);
+    }
+
+    #[test]
+    fn default_injection_label_and_threshold_are_stable() {
+        assert_eq!(DEFAULT_INJECTION_LABEL, "INJECTION");
+        assert_eq!(default_injection_label(), "INJECTION");
+        assert_eq!(default_threshold(), 0.5);
+    }
+
+    #[test]
+    fn from_config_rejects_paths_only_partially_given() {
+        // model_path without tokenizer_path is a config error, not a panic.
+        let err = InprocessDetector::from_config(&serde_json::json!({
+            "model_path": "/some/model.onnx"
+        }))
+        .err()
+        .expect("partial paths must fail");
+        assert!(err.to_string().contains("inprocess detector config"));
+    }
 }

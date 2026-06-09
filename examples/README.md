@@ -134,6 +134,7 @@ directory (with its `sb.yml` and README). Regenerated from `examples/` on 2026-0
 | [robots-llms-txt](robots-llms-txt/) | Demonstrates the Wave 4 text-format policy-graph projections. |
 | [rsl-licensing](rsl-licensing/) | Demonstrates the Wave 4 policy-graph projections. A single |
 | [security-headers](security-headers/) | Demonstrates the `security_headers` policy. Every response from the `test.sbproxy.dev` upstream gains the standard browser hardening set: `Strict-Transport |
+| [semantic-cache-local](semantic-cache-local/) | The AI gateway's embedding semantic cache, vectorizing prompts on-box via the local classifier sidecar (`source: sidecar`) instead of a paid provider embedding API. No per-call cost, no prompt egress, low loopback latency. |
 | [semantic-constraint](semantic-constraint/) | A natural-language policy enforced by an LLM-as-judge backend. The `semantic_constraint` policy renders a prompt template against the request envelope |
 | [service-discovery](service-discovery/) | Demonstrates `service_discovery` on a `proxy` action. Without service discovery, Pingora resolves the upstream hostname once when a connection is esta |
 | [sessions](sessions/) | The `session` block on `app.local` configures the encrypted cookie used to carry session state across requests. Cookie name is `sb_session`, max age i |

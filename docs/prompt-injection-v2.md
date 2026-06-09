@@ -52,6 +52,31 @@ pre-loads state at startup, not in `detect` itself.
 |------|-------------|
 | `heuristic-v1` | Case-insensitive substring matching against the OWASP-LLM-01 vocabulary plus a small "suspicious" cue list. Default; works out of the box. |
 | `sidecar` | Runs inference in a separate process over gRPC instead of in the proxy. The proxy holds one client; the sidecar (minimal OSS or richer enterprise) implements the shared `InferenceService`. Isolates the model runtime so a bad model cannot exhaust the proxy. Fail-open by default. See [Running detection out of process](#running-detection-out-of-process-the-sidecar-detector). |
+| `inprocess` | Runs the ONNX classifier inside the proxy via the pure-Rust tract engine. No second process, but the model parse and inference share the proxy's address space, so it is gated behind an explicit opt-in plus a `max_model_bytes` size guard. Prefer `sidecar` for isolation; use `inprocess` for a single-binary deploy. See [In-process detection](#in-process-detection-the-inprocess-detector). |
+
+### In-process detection (the `inprocess` detector)
+
+For a single binary, run the ONNX classifier in the proxy. WOR-612 removed the original in-process detector because an unsandboxed model parse could exhaust the proxy; this brings it back only behind the explicit `detector: inprocess` choice plus a hard `max_model_bytes` cap, and the operator supplies the model and tokenizer paths (OSS ships no weights).
+
+```yaml
+policies:
+  - type: prompt_injection_v2
+    action: block
+    detector: inprocess
+    threshold: 0.8
+    detector_config:
+      # On-disk ONNX model + tokenizer the operator provides.
+      model_path: /var/lib/sbproxy/models/injection/model.onnx
+      tokenizer_path: /var/lib/sbproxy/models/injection/tokenizer.json
+      # Label the model emits for an injection verdict (case-insensitive).
+      injection_label: INJECTION
+      # Optional class labels indexed by output class; omit to report class_<n>.
+      # labels: ["SAFE", "INJECTION"]
+      # Hard upper bound on the model file size in bytes (default 200 MB).
+      max_model_bytes: 209715200
+```
+
+The detector loads the model at config-compile time (the slow path), so a missing or oversized model fails fast at startup rather than on the first request. `detect` then runs cheap tract inference per prompt and maps the top label and score onto the v2 vocabulary using the same cutoffs as the sidecar detector: at or above `threshold` is `injection`, `[0.3, threshold)` is `suspicious`, below `0.3` is `clean`. A non-injection top label is read as confidence the prompt is benign, so its score is inverted. Inference failures fail open (clean); operators who want fail-closed should use the sidecar detector. Because the model loads eagerly, this detector cannot appear in the `examples/` validation sweep; see `docs/local-inference.md` for the full deployment recipe.
 
 ## Registering a custom detector
 
