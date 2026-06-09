@@ -122,6 +122,13 @@ pub fn ai_request_span(surface: &str, method: &str) -> Span {
         // stamped so either backend vocabulary renders it.
         "gen_ai.usage.cost" = Empty,
         "llm.usage.total_cost" = Empty,
+        // WOR-1231: error semantics. `otel.status_code` is the field the
+        // tracing-opentelemetry bridge maps to the OTel span status, so a
+        // failed generation surfaces as an ERROR span in trace backends.
+        // `error.type` carries the failure class (gen_ai / OTel convention).
+        "otel.status_code" = Empty,
+        "otel.status_message" = Empty,
+        "error.type" = Empty,
         "gen_ai.response.finish_reasons" = Empty,
         "llm.provider" = Empty,
         "llm.model_name" = Empty,
@@ -271,6 +278,32 @@ pub fn record_pricing_version(span: &Span, version: &str) {
 pub fn record_cost_usd(span: &Span, cost_usd: f64) {
     span.record("gen_ai.usage.cost", cost_usd);
     span.record("llm.usage.total_cost", cost_usd);
+}
+
+/// Well-known failure classes for an AI generation, recorded as the OTel
+/// `error.type` attribute (WOR-1231). Kept as string constants so call
+/// sites and trace queries agree.
+pub mod error_type {
+    /// A guardrail (input or output) blocked the request.
+    pub const GUARDRAIL_BLOCKED: &str = "guardrail_blocked";
+    /// The provider returned HTTP 429 (rate limited).
+    pub const RATE_LIMITED: &str = "rate_limited";
+    /// The provider returned a 5xx server error.
+    pub const PROVIDER_ERROR: &str = "provider_error";
+    /// The provider's content filter rejected the request or response.
+    pub const CONTENT_FILTER: &str = "content_filter";
+}
+
+/// Mark an AI span as failed (WOR-1231).
+///
+/// Sets `otel.status_code = "ERROR"` (which the tracing-opentelemetry bridge
+/// maps to the OTel span status, so the span shows as an error in trace
+/// backends), records the failure class as `error.type`, and stores a short
+/// human-readable message. Use the [`error_type`] constants for `kind`.
+pub fn record_error(span: &Span, kind: &str, message: &str) {
+    span.record("otel.status_code", "ERROR");
+    span.record("error.type", kind);
+    span.record("otel.status_message", message);
 }
 
 /// Stamp the response model and identifier onto an AI span.
@@ -606,6 +639,27 @@ mod tests {
         let span = find_span(&spans, "ai.request");
         assert_field(span, "gen_ai.usage.cost", "0.001234");
         assert_field(span, "llm.usage.total_cost", "0.001234");
+    }
+
+    /// WOR-1231: a failed generation marks the span ERROR with an
+    /// `error.type` so trace backends surface it as a failure.
+    #[test]
+    fn record_error_marks_span_failed() {
+        use tracing_subscriber::prelude::*;
+        let layer = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = ai_request_span("chat", "POST");
+            record_error(
+                &span,
+                error_type::GUARDRAIL_BLOCKED,
+                "blocked by input guardrail",
+            );
+        });
+        let spans = snapshot_spans(&layer);
+        let span = find_span(&spans, "ai.request");
+        assert_field(span, "otel.status_code", "ERROR");
+        assert_field(span, "error.type", "guardrail_blocked");
     }
 
     /// `UsageTokens::total()` (WOR-1084) sums every dimension,

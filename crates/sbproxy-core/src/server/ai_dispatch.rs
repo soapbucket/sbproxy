@@ -68,6 +68,11 @@ pub(super) async fn handle_ai_proxy(
                 method = %method_str,
                 "AI proxy: per-surface rate limit hit; returning 429"
             );
+            sbproxy_ai::tracing_spans::record_error(
+                &tracing::Span::current(),
+                sbproxy_ai::tracing_spans::error_type::RATE_LIMITED,
+                "per-surface rate limit exceeded",
+            );
             send_error(session, 429, "per-surface rate limit exceeded").await?;
             return Ok(());
         }
@@ -901,6 +906,11 @@ pub(super) async fn handle_ai_proxy(
                 );
                 let retry = rej.retry_after_secs.to_string();
                 let extra: Option<(&str, &str)> = Some(("retry-after", &retry));
+                sbproxy_ai::tracing_spans::record_error(
+                    &tracing::Span::current(),
+                    sbproxy_ai::tracing_spans::error_type::RATE_LIMITED,
+                    "model rate limit exceeded",
+                );
                 send_response_with_extra(
                     session,
                     429,
@@ -1020,6 +1030,11 @@ pub(super) async fn handle_ai_proxy(
                         guardrail = %block.name,
                         reason = %block.reason,
                         "AI proxy: input guardrail blocked request"
+                    );
+                    sbproxy_ai::tracing_spans::record_error(
+                        &tracing::Span::current(),
+                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                        &block.reason,
                     );
                     let error_body = serde_json::json!({
                         "error": {
