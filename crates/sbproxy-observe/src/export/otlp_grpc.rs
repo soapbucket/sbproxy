@@ -58,6 +58,8 @@ pub fn init_grpc_pipeline(config: &OtlpGrpcConfig) -> anyhow::Result<()> {
         service_name: config.service_name.clone(),
         sample_rate: None,
         always_sample_errors: true,
+        keep_over_budget_usd: None,
+        keep_slower_than_secs: None,
         propagation: None,
         resource_attrs: std::collections::BTreeMap::new(),
         export_metrics: false,

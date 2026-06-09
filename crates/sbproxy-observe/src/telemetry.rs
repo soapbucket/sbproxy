@@ -71,10 +71,22 @@ pub struct TelemetryConfig {
     #[serde(default)]
     pub sample_rate: Option<f64>,
     /// When `true`, every 5xx / policy-block / ledger-denial root span
-    /// is sampled at 100% even if the head ratio would have dropped it.
+    /// is kept at 100% even if the head ratio would have dropped it.
     /// Default `true`.
     #[serde(default = "default_always_sample_errors")]
     pub always_sample_errors: bool,
+    /// WOR-1230: keep any trace whose derived USD cost is at or above this
+    /// threshold, regardless of the head ratio. `None` disables the
+    /// cost-based keep. Cost is known at request end, so this is consulted
+    /// by the tail-sampling policy (the reference collector), not the
+    /// head sampler.
+    #[serde(default)]
+    pub keep_over_budget_usd: Option<f64>,
+    /// WOR-1230: keep any trace whose wall-clock duration is at or above
+    /// this many seconds, regardless of the head ratio. `None` disables the
+    /// latency-based keep. Like cost, a tail-sampling concern.
+    #[serde(default)]
+    pub keep_slower_than_secs: Option<f64>,
     /// Propagation format: `"w3c"` (default), `"b3"`, or `"jaeger"`.
     /// Only ships W3C; the other variants land in a follow-up.
     #[serde(default)]
@@ -125,12 +137,39 @@ impl Default for TelemetryConfig {
             service_name: default_service_name(),
             sample_rate: None,
             always_sample_errors: true,
+            keep_over_budget_usd: None,
+            keep_slower_than_secs: None,
             propagation: None,
             resource_attrs: std::collections::BTreeMap::new(),
             export_metrics: false,
             metrics_interval_secs: None,
         }
     }
+}
+
+/// WOR-1230: cost-aware tail-sampling decision for an AI trace.
+///
+/// Head sampling (ParentBased + TraceIdRatio, configured via
+/// `sample_rate`) decides at span start, before the outcome is known.
+/// Whether a finished trace should be kept regardless of that ratio,
+/// because it errored, cost over a budget, or ran slow, is a tail
+/// decision: it is evaluated at request end and applied by the reference
+/// collector's tail-sampling policy. This pure helper is the single
+/// source of truth for that decision so the proxy and the collector
+/// policy agree.
+///
+/// Returns `true` when the trace should be force-kept.
+pub fn should_force_sample(
+    is_error: bool,
+    cost_usd: f64,
+    latency_secs: f64,
+    always_sample_errors: bool,
+    keep_over_budget_usd: Option<f64>,
+    keep_slower_than_secs: Option<f64>,
+) -> bool {
+    (always_sample_errors && is_error)
+        || keep_over_budget_usd.is_some_and(|budget| cost_usd >= budget)
+        || keep_slower_than_secs.is_some_and(|threshold| latency_secs >= threshold)
 }
 
 // --- OTLP exporter ---
@@ -660,6 +699,53 @@ mod tests {
         assert!(config.endpoint.is_none());
         assert!(config.sample_rate.is_none());
         assert!(config.propagation.is_none());
+        // WOR-1230: errors kept by default; cost/latency keeps off unless set.
+        assert!(config.always_sample_errors);
+        assert!(config.keep_over_budget_usd.is_none());
+        assert!(config.keep_slower_than_secs.is_none());
+    }
+
+    #[test]
+    fn force_sample_keeps_errors_when_enabled() {
+        assert!(should_force_sample(true, 0.0, 0.0, true, None, None));
+        // Disabled error keep: an error alone does not force a keep.
+        assert!(!should_force_sample(true, 0.0, 0.0, false, None, None));
+    }
+
+    #[test]
+    fn force_sample_keeps_over_budget_and_slow() {
+        // Over the cost budget.
+        assert!(should_force_sample(
+            false,
+            0.05,
+            0.0,
+            true,
+            Some(0.01),
+            None
+        ));
+        assert!(!should_force_sample(
+            false,
+            0.005,
+            0.0,
+            true,
+            Some(0.01),
+            None
+        ));
+        // Slower than the latency threshold.
+        assert!(should_force_sample(false, 0.0, 2.0, true, None, Some(1.0)));
+        assert!(!should_force_sample(false, 0.0, 0.5, true, None, Some(1.0)));
+    }
+
+    #[test]
+    fn force_sample_is_false_for_a_cheap_fast_success() {
+        assert!(!should_force_sample(
+            false,
+            0.001,
+            0.05,
+            true,
+            Some(1.0),
+            Some(5.0)
+        ));
     }
 
     #[test]
