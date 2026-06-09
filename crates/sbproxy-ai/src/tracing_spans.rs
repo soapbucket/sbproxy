@@ -129,6 +129,12 @@ pub fn ai_request_span(surface: &str, method: &str) -> Span {
         "otel.status_code" = Empty,
         "otel.status_message" = Empty,
         "error.type" = Empty,
+        // WOR-1228: OpenInference prompt / completion content. Empty unless
+        // the origin sets `trace_content: true`; the dispatch path redacts
+        // the text (secrets + PII) before recording it here, so backends can
+        // show the conversation, not just token counts.
+        "input.value" = Empty,
+        "output.value" = Empty,
         "gen_ai.response.finish_reasons" = Empty,
         "llm.provider" = Empty,
         "llm.model_name" = Empty,
@@ -304,6 +310,22 @@ pub fn record_error(span: &Span, kind: &str, message: &str) {
     span.record("otel.status_code", "ERROR");
     span.record("error.type", kind);
     span.record("otel.status_message", message);
+}
+
+/// Record the prompt text as the OpenInference `input.value` span attribute
+/// (WOR-1228). The caller MUST have already redacted the content and gated
+/// on the origin's `trace_content` flag: this helper only writes the field,
+/// it does not redact. Off-by-default content capture lives in the dispatch
+/// path, which routes the text through the secret + PII redactors first.
+pub fn record_input_content(span: &Span, redacted: &str) {
+    span.record("input.value", redacted);
+}
+
+/// Record the completion text as the OpenInference `output.value` span
+/// attribute (WOR-1228). Same contract as [`record_input_content`]: the
+/// caller redacts and gates; this only writes the field.
+pub fn record_output_content(span: &Span, redacted: &str) {
+    span.record("output.value", redacted);
 }
 
 /// Stamp the response model and identifier onto an AI span.
@@ -660,6 +682,25 @@ mod tests {
         let span = find_span(&spans, "ai.request");
         assert_field(span, "otel.status_code", "ERROR");
         assert_field(span, "error.type", "guardrail_blocked");
+    }
+
+    /// WOR-1228: prompt / completion content lands on the OpenInference
+    /// `input.value` / `output.value` span attributes (already redacted by
+    /// the caller).
+    #[test]
+    fn record_content_stamps_input_and_output_values() {
+        use tracing_subscriber::prelude::*;
+        let layer = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = ai_request_span("chat", "POST");
+            record_input_content(&span, "summarize this [redacted]");
+            record_output_content(&span, "here is the summary");
+        });
+        let spans = snapshot_spans(&layer);
+        let span = find_span(&spans, "ai.request");
+        assert_field(span, "input.value", "summarize this [redacted]");
+        assert_field(span, "output.value", "here is the summary");
     }
 
     /// WOR-1232: GenAI semantic-convention conformance. Pin the version and

@@ -71,6 +71,15 @@ pub struct AiHandlerConfig {
     /// See `sbproxy_security::pii::PiiConfig` for the rule schema.
     #[serde(default)]
     pub pii: Option<sbproxy_security::pii::PiiConfig>,
+    /// WOR-1228: when `true`, emit the prompt text as the OpenInference
+    /// `input.value` span attribute so trace backends (Phoenix, Langfuse)
+    /// show the actual conversation, not just token counts. Off by default
+    /// because prompt content is sensitive: when on, the text is routed
+    /// through the configured `pii` redactor (if any) and the always-on
+    /// secret redactor before it lands on the span. Enable only with `pii`
+    /// configured and a trace backend inside your trust boundary.
+    #[serde(default)]
+    pub trace_content: bool,
     /// Opaque semantic-cache configuration block. The OSS proxy
     /// stores this verbatim and surfaces it through the stream cache
     /// recorder hook so the enterprise implementation can read its
@@ -857,6 +866,7 @@ mod tests {
             resilience: None,
             shadow: None,
             pii: None,
+            trace_content: false,
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),
@@ -885,6 +895,7 @@ mod tests {
             resilience: None,
             shadow: None,
             pii: None,
+            trace_content: false,
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),
@@ -913,6 +924,7 @@ mod tests {
             resilience: None,
             shadow: None,
             pii: None,
+            trace_content: false,
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),
@@ -942,6 +954,7 @@ mod tests {
             resilience: None,
             shadow: None,
             pii: None,
+            trace_content: false,
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),

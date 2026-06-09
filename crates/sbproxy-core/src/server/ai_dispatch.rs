@@ -937,6 +937,20 @@ pub(super) async fn handle_ai_proxy(
     // and the intent detection hook so we do not re-parse the body twice.
     let extracted_prompt = extract_prompt_text(&body);
 
+    // WOR-1228: emit the prompt as the OpenInference `input.value` span
+    // attribute when the origin opts into content capture. Off by default;
+    // the text is routed through the always-on secret redactor and the
+    // origin's PII redactor (if any) before it lands on the span, so a
+    // trace backend never sees raw secrets or PII.
+    if config.trace_content && !extracted_prompt.is_empty() {
+        let secrets_redacted = sbproxy_observe::redact::redact_secrets(&extracted_prompt);
+        let redacted = match config.pii_redactor() {
+            Some(redactor) => redactor.redact(&secrets_redacted).into_owned(),
+            None => secrets_redacted,
+        };
+        sbproxy_ai::tracing_spans::record_input_content(&tracing::Span::current(), &redacted);
+    }
+
     if let Some(hook) = pipeline.hooks.prompt_classifier.as_ref().cloned() {
         if !extracted_prompt.is_empty() {
             let model_id = if model.is_empty() {
