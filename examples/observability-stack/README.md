@@ -16,6 +16,11 @@ Then open:
 - Prometheus at http://localhost:9090
 - Loki ready endpoint at http://localhost:3100/ready
 - Tempo (queried via Grafana, no first-class UI)
+- Arize Phoenix at http://localhost:6006 (LLM-native trace view: SBproxy AI spans render as full generations with tokens, USD cost, latency, and error status)
+
+The collector applies a cost-aware tail-sampling policy (`tail_sampling` in `otel-collector/config.yaml`): errors and slow traces are always kept, the rest at a configurable base rate. Mirror `keep_over_budget_usd` / `keep_slower_than_secs` from the proxy's telemetry config into that policy.
+
+Langfuse is a second LLM-native backend. Its v3 self-host needs its own multi-service stack (Postgres, ClickHouse, Redis, object store), so it is not embedded here: run it from its own compose and uncomment the `otlphttp/langfuse` exporter in the collector config, pointing it at the Langfuse OTLP endpoint (`/api/public/otel`).
 
 Verify everything is healthy:
 
