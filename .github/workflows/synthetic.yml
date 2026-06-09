@@ -54,7 +54,7 @@ jobs:
       # `bench-synthetic` is its own workspace, so it gets a dedicated
       # cache key. That keeps the proxy workspace cache from being
       # invalidated by churn on the synthetic harness.
-      - uses: Swatinem/rust-cache@v2.7.3
+      - uses: Swatinem/rust-cache@v2
         with:
           shared-key: synthetic
           workspaces: bench-synthetic
@@ -189,7 +189,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2.7.3
+      - uses: Swatinem/rust-cache@v2
         with:
           shared-key: chaos-hot-reload
 

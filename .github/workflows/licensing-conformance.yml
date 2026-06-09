@@ -176,7 +176,7 @@ jobs:
 
       - name: open PR with refreshed vendored copies
         if: steps.diff.outputs.changed == '1'
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           branch: chore/licensing-schemas-refresh
