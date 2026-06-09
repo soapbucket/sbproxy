@@ -1242,6 +1242,11 @@ pub(super) async fn handle_ai_proxy(
                          use source: sidecar"
                     )),
                 };
+                let source_label: &str = match cache.source() {
+                    sbproxy_ai::semantic_cache::EmbeddingSource::Provider => "provider",
+                    sbproxy_ai::semantic_cache::EmbeddingSource::Sidecar => "sidecar",
+                    sbproxy_ai::semantic_cache::EmbeddingSource::Inprocess => "inprocess",
+                };
                 match query_vec_result {
                     Ok(query_vec) => {
                         if let Some(hit) = cache.lookup(&query_vec, &cache_scope) {
@@ -1250,11 +1255,18 @@ pub(super) async fn handle_ai_proxy(
                                 "semantic",
                                 true,
                             );
+                            sbproxy_observe::metrics::record_semantic_cache(
+                                ctx.tenant_id.as_str(),
+                                hostname,
+                                source_label,
+                                "hit",
+                            );
                             sbproxy_ai::ai_metrics::record_semantic_similarity(
                                 cache.provider(),
                                 hit.score,
                             );
                             debug!(
+                                tenant = %ctx.tenant_id,
                                 origin = %hostname,
                                 score = hit.score,
                                 status = hit.response.status,
@@ -1285,6 +1297,8 @@ pub(super) async fn handle_ai_proxy(
                             // cache_read dimension so the hit still
                             // shows up as savings.
                             crate::server::ai_support::record_cache_hit_savings(
+                                ctx.tenant_id.as_str(),
+                                hostname,
                                 cache.provider(),
                                 cache.model(),
                                 surface_label,
@@ -1302,6 +1316,12 @@ pub(super) async fn handle_ai_proxy(
                             "semantic",
                             false,
                         );
+                        sbproxy_observe::metrics::record_semantic_cache(
+                            ctx.tenant_id.as_str(),
+                            hostname,
+                            source_label,
+                            "miss",
+                        );
                         embed_miss = Some((
                             std::sync::Arc::clone(cache),
                             sbproxy_ai::EmbeddingCache::prompt_key(&cache_scope, &extracted_prompt),
@@ -1310,7 +1330,14 @@ pub(super) async fn handle_ai_proxy(
                         ));
                     }
                     Err(e) => {
+                        sbproxy_observe::metrics::record_semantic_cache(
+                            ctx.tenant_id.as_str(),
+                            hostname,
+                            source_label,
+                            "error",
+                        );
                         warn!(
+                            tenant = %ctx.tenant_id,
                             origin = %hostname,
                             error = %e,
                             "AI proxy: embedding cache lookup failed (fail-open)"

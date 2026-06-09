@@ -265,6 +265,25 @@ pub struct ProxyMetrics {
     /// Counter `sbproxy_ai_tokens_total` of AI token usage labelled by hostname, provider, and direction.
     pub ai_tokens_total: IntCounterVec,
 
+    // --- Local inference + semantic cache (WOR-1225) ---
+    /// Counter `sbproxy_semantic_cache_results_total` of semantic-cache
+    /// outcomes labelled by tenant, origin, embedding source, and result.
+    pub semantic_cache_results: IntCounterVec,
+    /// Counter `sbproxy_inference_requests_total` of local inference calls
+    /// labelled by kind (embed|classify), backend (sidecar|inprocess),
+    /// model, and result (ok|error).
+    pub inference_requests: IntCounterVec,
+    /// Histogram `sbproxy_inference_duration_seconds` of local inference
+    /// latency labelled by kind, backend, and model.
+    pub inference_duration: HistogramVec,
+    /// Counter `sbproxy_ai_tokens_saved_total` of tokens a semantic-cache
+    /// hit avoided, labelled by tenant, origin, model, and kind
+    /// (prompt|completion).
+    pub ai_tokens_saved: IntCounterVec,
+    /// Counter `sbproxy_ai_cost_saved_micros_total` of micro-USD a
+    /// semantic-cache hit avoided, labelled by tenant, origin, and model.
+    pub ai_cost_saved_micros: IntCounterVec,
+
     // --- Per-origin metrics (Sprint 1A) ---
     /// Total HTTP requests with origin, method, and status labels.
     pub per_origin_requests_total: CounterVec,
@@ -398,6 +417,57 @@ impl ProxyMetrics {
         let ai_tokens_total = IntCounterVec::new(
             Opts::new("sbproxy_ai_tokens_total", "AI token usage"),
             &["hostname", "provider", "direction"], // "input" or "output"
+        )
+        .unwrap();
+
+        // --- Local inference + semantic cache (WOR-1225) ---
+
+        let semantic_cache_results = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_semantic_cache_results_total",
+                "Semantic-cache hit/miss/error counts",
+            ),
+            // tenant: multi-tenant attribution; source: provider|sidecar|inprocess; result: hit|miss|error
+            &["tenant", "origin", "source", "result"],
+        )
+        .unwrap();
+
+        let inference_requests = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_inference_requests_total",
+                "Local inference call counts",
+            ),
+            &["kind", "backend", "model", "result"], // kind: embed|classify; result: ok|error
+        )
+        .unwrap();
+
+        let inference_duration = HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "sbproxy_inference_duration_seconds",
+                "Local inference latency in seconds",
+            )
+            .buckets(vec![
+                0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
+            ]),
+            &["kind", "backend", "model"],
+        )
+        .unwrap();
+
+        let ai_tokens_saved = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_ai_tokens_saved_total",
+                "Tokens avoided by a semantic-cache hit",
+            ),
+            &["tenant", "origin", "model", "kind"], // kind: prompt|completion
+        )
+        .unwrap();
+
+        let ai_cost_saved_micros = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_ai_cost_saved_micros_total",
+                "Micro-USD avoided by a semantic-cache hit",
+            ),
+            &["tenant", "origin", "model"],
         )
         .unwrap();
 
@@ -591,6 +661,21 @@ impl ProxyMetrics {
             .register(Box::new(ai_tokens_total.clone()))
             .unwrap();
         registry
+            .register(Box::new(semantic_cache_results.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(inference_requests.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(inference_duration.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(ai_tokens_saved.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(ai_cost_saved_micros.clone()))
+            .unwrap();
+        registry
             .register(Box::new(per_origin_requests_total.clone()))
             .unwrap();
         registry
@@ -645,6 +730,11 @@ impl ProxyMetrics {
             active_connections,
             cache_hits,
             ai_tokens_total,
+            semantic_cache_results,
+            inference_requests,
+            inference_duration,
+            ai_tokens_saved,
+            ai_cost_saved_micros,
             per_origin_requests_total,
             per_origin_request_duration,
             per_origin_active_connections,
@@ -898,6 +988,72 @@ pub fn record_phase_duration(phase: &str, origin: &str, duration_secs: f64) {
             opentelemetry::KeyValue::new("origin", origin),
         ],
     );
+}
+
+/// Record a semantic-cache outcome (WOR-1225), attributed per tenant.
+/// `source` is provider|sidecar|inprocess; `result` is hit|miss|error.
+pub fn record_semantic_cache(tenant: &str, origin: &str, source: &str, result: &str) {
+    let tenant = sanitize_label("tenant", tenant);
+    let origin = sanitize_label("origin", origin);
+    metrics()
+        .semantic_cache_results
+        .with_label_values(&[tenant.as_str(), origin.as_str(), source, result])
+        .inc();
+}
+
+/// Record a local inference call and its latency (WOR-1225). `kind` is
+/// embed|classify; `backend` is sidecar|inprocess; `result` is ok|error.
+pub fn record_inference(kind: &str, backend: &str, model: &str, result: &str, duration_secs: f64) {
+    let model = sanitize_label("model", model);
+    metrics()
+        .inference_requests
+        .with_label_values(&[kind, backend, model.as_str(), result])
+        .inc();
+    if duration_secs > 0.0 {
+        metrics()
+            .inference_duration
+            .with_label_values(&[kind, backend, model.as_str()])
+            .observe(duration_secs);
+    }
+}
+
+/// Attribute the tokens and cost a semantic-cache hit avoided (WOR-1225):
+/// the upstream call that did not happen. This is the value-delivered side
+/// of usage tracking, so saved cost uses the same cost table as spent cost.
+pub fn record_cache_savings(
+    tenant: &str,
+    origin: &str,
+    model: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cost_micros: u64,
+) {
+    let tenant = sanitize_label("tenant", tenant);
+    let origin = sanitize_label("origin", origin);
+    let model = sanitize_label("model", model);
+    if prompt_tokens > 0 {
+        metrics()
+            .ai_tokens_saved
+            .with_label_values(&[tenant.as_str(), origin.as_str(), model.as_str(), "prompt"])
+            .inc_by(prompt_tokens);
+    }
+    if completion_tokens > 0 {
+        metrics()
+            .ai_tokens_saved
+            .with_label_values(&[
+                tenant.as_str(),
+                origin.as_str(),
+                model.as_str(),
+                "completion",
+            ])
+            .inc_by(completion_tokens);
+    }
+    if cost_micros > 0 {
+        metrics()
+            .ai_cost_saved_micros
+            .with_label_values(&[tenant.as_str(), origin.as_str(), model.as_str()])
+            .inc_by(cost_micros);
+    }
 }
 
 /// Record a policy trigger (allow or deny) for an origin.
@@ -2658,6 +2814,44 @@ mod tests {
     // Each test creates its own ProxyMetrics to avoid global state conflicts.
     // Helper functions that call metrics() use the global instance, so those
     // tests verify the global registry path.
+
+    #[test]
+    fn local_inference_and_savings_metrics_registered() {
+        let m = ProxyMetrics::new();
+        m.semantic_cache_results
+            .with_label_values(&["acme", "o", "sidecar", "hit"])
+            .inc();
+        m.inference_requests
+            .with_label_values(&["embed", "sidecar", "all-MiniLM-L6-v2", "ok"])
+            .inc();
+        m.inference_duration
+            .with_label_values(&["embed", "sidecar", "all-MiniLM-L6-v2"])
+            .observe(0.001);
+        m.ai_tokens_saved
+            .with_label_values(&["acme", "o", "gpt-4o", "prompt"])
+            .inc_by(120);
+        m.ai_cost_saved_micros
+            .with_label_values(&["acme", "o", "gpt-4o"])
+            .inc_by(900);
+        let names: Vec<String> = m
+            .registry
+            .gather()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
+        for expected in [
+            "sbproxy_semantic_cache_results_total",
+            "sbproxy_inference_requests_total",
+            "sbproxy_inference_duration_seconds",
+            "sbproxy_ai_tokens_saved_total",
+            "sbproxy_ai_cost_saved_micros_total",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing metric {expected}"
+            );
+        }
+    }
 
     #[test]
     fn test_increment_requests() {

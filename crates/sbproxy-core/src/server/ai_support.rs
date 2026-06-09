@@ -850,6 +850,8 @@ pub(super) fn resolve_attribution_tags(
 /// and its `model` field (falling back to `fallback_model`) gives the
 /// model label.
 pub(super) fn record_cache_hit_savings(
+    tenant: &str,
+    origin: &str,
     provider: &str,
     fallback_model: &str,
     surface: &str,
@@ -888,6 +890,19 @@ pub(super) fn record_cache_hit_savings(
         0,
         0,
         0.0,
+    );
+    // WOR-1225: SOTA usage tracking. Attribute the tokens and cost this hit
+    // avoided (the upstream call that did not happen), using the same cost
+    // table as spent cost so saved and spent reconcile.
+    let cost_micros =
+        (sbproxy_ai::estimate_cost(model, prompt, completion) * 1_000_000.0).max(0.0) as u64;
+    sbproxy_observe::metrics::record_cache_savings(
+        tenant,
+        origin,
+        model,
+        prompt,
+        completion,
+        cost_micros,
     );
 }
 
