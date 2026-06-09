@@ -93,13 +93,13 @@ jobs:
       # would let the second build trample the first's lockfile state
       # and skew the bench.
       - name: cache (candidate)
-        uses: Swatinem/rust-cache@v2.7.3
+        uses: Swatinem/rust-cache@v2
         with:
           shared-key: perf-regression-candidate
           workspaces: candidate-src
 
       - name: cache (baseline)
-        uses: Swatinem/rust-cache@v2.7.3
+        uses: Swatinem/rust-cache@v2
         with:
           shared-key: perf-regression-baseline
           workspaces: baseline-src

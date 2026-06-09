@@ -66,6 +66,9 @@ pub mod agent_classifier_types;
 pub mod judge_rpc;
 pub mod known_models;
 
+mod embedder;
+pub use embedder::{EmbeddingOutput, OnnxEmbedder};
+
 pub use agent_class::{
     AgentClass, AgentClassCatalog, AgentId, AgentIdSource, AgentPurpose, DEFAULT_CATALOG_YAML,
 };
@@ -106,7 +109,7 @@ pub const MAX_MODEL_BYTES_DEFAULT: u64 = 200 * 1024 * 1024;
 /// Type alias for the optimised, runnable tract graph held inside
 /// [`OnnxClassifier`]. The full path is unwieldy and trips
 /// `clippy::type_complexity`.
-type RunnableOnnxModel =
+pub(crate) type RunnableOnnxModel =
     SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
 
 /// A loaded ONNX classifier paired with its tokenizer.
@@ -208,11 +211,11 @@ impl LoadOptions {
         self
     }
 
-    fn effective_model_limit(&self) -> u64 {
+    pub(crate) fn effective_model_limit(&self) -> u64 {
         self.max_model_bytes.unwrap_or(MAX_MODEL_BYTES_DEFAULT)
     }
 
-    fn effective_tokenizer_limit(&self) -> u64 {
+    pub(crate) fn effective_tokenizer_limit(&self) -> u64 {
         self.max_tokenizer_bytes.unwrap_or(MAX_MODEL_BYTES_DEFAULT)
     }
 }
@@ -670,7 +673,7 @@ fn ensure_cached_file(
 /// Reject `path` if its on-disk size exceeds `max_bytes`. `max_bytes`
 /// of `0` is treated as "no limit" so callers that explicitly opt out
 /// of the budget still get the rest of the load-time pipeline.
-fn check_size_budget(path: &Path, kind: &str, max_bytes: u64) -> Result<()> {
+pub(crate) fn check_size_budget(path: &Path, kind: &str, max_bytes: u64) -> Result<()> {
     if max_bytes == 0 {
         return Ok(());
     }

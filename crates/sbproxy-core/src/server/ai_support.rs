@@ -772,6 +772,10 @@ pub(super) fn emit_ai_billing_event(
         0,
         cost_usd,
     );
+    // WOR-1229: stamp the derived USD cost onto the AI request span so trace
+    // backends show spend per generation. This is the same choke point the
+    // cost metric uses, so the span and the metric agree.
+    sbproxy_ai::tracing_spans::record_cost_usd(&tracing::Span::current(), cost_usd);
 
     // WOR-1095: realtime + audio surfaces consume seconds, not tokens,
     // and realtime has no catalogue price, so the token / cost
@@ -850,6 +854,8 @@ pub(super) fn resolve_attribution_tags(
 /// and its `model` field (falling back to `fallback_model`) gives the
 /// model label.
 pub(super) fn record_cache_hit_savings(
+    tenant: &str,
+    origin: &str,
     provider: &str,
     fallback_model: &str,
     surface: &str,
@@ -889,6 +895,93 @@ pub(super) fn record_cache_hit_savings(
         0,
         0.0,
     );
+    // WOR-1225: SOTA usage tracking. Attribute the tokens and cost this hit
+    // avoided (the upstream call that did not happen), using the same cost
+    // table as spent cost so saved and spent reconcile.
+    let cost_micros =
+        (sbproxy_ai::estimate_cost(model, prompt, completion) * 1_000_000.0).max(0.0) as u64;
+    sbproxy_observe::metrics::record_cache_savings(
+        tenant,
+        origin,
+        model,
+        prompt,
+        completion,
+        cost_micros,
+    );
+}
+
+/// WOR-1235: compute a prompt embedding with an in-process tract embedder
+/// for the semantic cache (`source: inprocess`). The embedder is loaded once
+/// from the config's `model_path` + `tokenizer_path` (with the
+/// `max_model_bytes` guard) and held for the process lifetime. Available only
+/// when built with the `inprocess-embed` feature; otherwise the
+/// `EmbeddingSource::Inprocess` arm returns a clear error and the cache treats
+/// the lookup as a miss.
+#[cfg(feature = "inprocess-embed")]
+pub(super) fn inprocess_embed(
+    cfg: &sbproxy_ai::semantic_cache::InprocessEmbeddingConfig,
+    text: &str,
+) -> anyhow::Result<Vec<f32>> {
+    use std::sync::{Arc, OnceLock};
+    static EMBEDDER: OnceLock<Option<Arc<sbproxy_classifiers::OnnxEmbedder>>> = OnceLock::new();
+    let started = std::time::Instant::now();
+    let embedder = EMBEDDER.get_or_init(|| {
+        let (Some(model_path), Some(tokenizer_path)) =
+            (cfg.model_path.as_ref(), cfg.tokenizer_path.as_ref())
+        else {
+            warn!(
+                "inprocess embedding source requires model_path and tokenizer_path; \
+                 the cache will treat lookups as misses"
+            );
+            return None;
+        };
+        let mut options = sbproxy_classifiers::LoadOptions::default();
+        if let Some(bytes) = cfg.max_model_bytes {
+            options = options.with_max_model_bytes(bytes);
+        }
+        match sbproxy_classifiers::OnnxEmbedder::load_with_options(
+            std::path::Path::new(model_path),
+            std::path::Path::new(tokenizer_path),
+            &options,
+        ) {
+            Ok(e) => Some(Arc::new(e)),
+            Err(e) => {
+                warn!(error = %e, "failed to load in-process embedder");
+                None
+            }
+        }
+    });
+    let model_label = if cfg.model.is_empty() {
+        "inprocess"
+    } else {
+        cfg.model.as_str()
+    };
+    match embedder {
+        Some(e) => {
+            let out = e.embed(text);
+            let result = if out.is_ok() { "ok" } else { "error" };
+            sbproxy_observe::metrics::record_inference(
+                "embed",
+                "inprocess",
+                model_label,
+                result,
+                started.elapsed().as_secs_f64(),
+            );
+            Ok(out?.values)
+        }
+        None => {
+            sbproxy_observe::metrics::record_inference(
+                "embed",
+                "inprocess",
+                model_label,
+                "error",
+                started.elapsed().as_secs_f64(),
+            );
+            Err(anyhow::anyhow!(
+                "in-process embedder not loaded; check model_path and tokenizer_path"
+            ))
+        }
+    }
 }
 
 pub(super) fn record_budget_usage(

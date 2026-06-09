@@ -21,7 +21,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sbproxy_classifier_proto::{
-    ClassifyRequest, ClassifyResponse, InferenceServiceClient, VersionRequest, VersionResponse,
+    ClassifyRequest, ClassifyResponse, EmbedRequest, InferenceServiceClient, VersionRequest,
+    VersionResponse,
 };
 use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint};
@@ -193,6 +194,33 @@ impl ClassifierClient {
         }
     }
 
+    /// Embed `inputs` with the named model (empty = the sidecar's default).
+    ///
+    /// Returns one L2-normalized vector per input, in request order. Used by
+    /// the AI gateway semantic cache to vectorize prompts locally instead of
+    /// via a paid embedding-provider API.
+    pub async fn embed(
+        &self,
+        model: &str,
+        inputs: &[String],
+    ) -> Result<Vec<Vec<f32>>, ClassifierClientError> {
+        let request = EmbedRequest {
+            model: model.to_string(),
+            texts: inputs.to_vec(),
+        };
+        let mut client = self.inner.clone();
+        match tokio::time::timeout(self.timeout, client.embed(request)).await {
+            Ok(Ok(resp)) => Ok(resp
+                .into_inner()
+                .embeddings
+                .into_iter()
+                .map(|e| e.values)
+                .collect()),
+            Ok(Err(status)) => Err(ClassifierClientError::Rpc(status.to_string())),
+            Err(_) => Err(ClassifierClientError::Timeout(self.timeout)),
+        }
+    }
+
     /// Probe the sidecar's version + served model ids (startup capability check).
     pub async fn version(&self) -> Result<VersionResponse, ClassifierClientError> {
         let mut client = self.inner.clone();
@@ -208,7 +236,7 @@ impl ClassifierClient {
 mod tests {
     use super::*;
     use sbproxy_classifier_proto::{
-        EmbedRequest, EmbedResponse, InferenceService, InferenceServiceServer, Label,
+        EmbedRequest, EmbedResponse, Embedding, InferenceService, InferenceServiceServer, Label,
         ModelInfoRequest, ModelInfoResponse,
     };
     use tonic::{Request, Response, Status};
@@ -234,9 +262,19 @@ mod tests {
         }
         async fn embed(
             &self,
-            _req: Request<EmbedRequest>,
+            req: Request<EmbedRequest>,
         ) -> Result<Response<EmbedResponse>, Status> {
-            Err(Status::unimplemented("stub"))
+            // Echo one fixed 2-dim vector per input so the client mapping is
+            // exercised without a real ONNX model.
+            let n = req.into_inner().texts.len();
+            Ok(Response::new(EmbedResponse {
+                embeddings: (0..n)
+                    .map(|_| Embedding {
+                        values: vec![1.0, 0.0],
+                    })
+                    .collect(),
+                latency_us: 1,
+            }))
         }
         async fn model_info(
             &self,
@@ -292,6 +330,24 @@ mod tests {
 
         let version = client.version().await.unwrap();
         assert_eq!(version.models, vec!["stub".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn embed_round_trips_against_a_stub() {
+        let endpoint = spawn_stub().await;
+        let client =
+            ClassifierClient::connect(&endpoint, Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .expect("connect");
+        let vecs = client
+            .embed(
+                "all-MiniLM-L6-v2",
+                &["hello".to_string(), "world".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(vecs.len(), 2);
+        assert_eq!(vecs[0], vec![1.0, 0.0]);
     }
 
     #[tokio::test]

@@ -11,6 +11,10 @@ sbproxy-config.workspace = true
 sbproxy-cache.workspace = true
 sbproxy-security.workspace = true
 sbproxy-platform.workspace = true
+# WOR-1223: local embedding source for the semantic cache. Only the
+# sidecar client is used here; the in-process embedder lives in sbproxy-core
+# because sbproxy-classifiers depends on sbproxy-ai (would be a cycle).
+sbproxy-classifier-client.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true

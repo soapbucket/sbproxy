@@ -49,6 +49,11 @@ tls-fingerprint = [
 # Real views land in follow-up tickets; this feature only wires
 # the scaffold mount.
 embed-admin-ui = ["dep:include_dir"]
+# WOR-1235: run the semantic-cache embedding model in-process (tract) for a
+# single-binary deploy. Pulls in the ONNX engine. The `sbproxy` binary turns
+# this on by default; library consumers leave it off (the `source: inprocess`
+# config then returns a clear error and the cache treats it as a miss).
+inprocess-embed = ["dep:sbproxy-classifiers"]
 
 [dependencies]
 sbproxy-plugin.workspace = true

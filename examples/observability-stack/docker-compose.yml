@@ -126,6 +126,29 @@ services:
     networks:
       - obsnet
 
+  # --- Arize Phoenix: LLM-native trace backend (WOR-1227) ---
+  #
+  # Renders SBproxy AI spans as full LLM trajectories: the proxy emits the
+  # OpenTelemetry GenAI (`gen_ai.*`) plus OpenInference (`llm.*`) vocabulary,
+  # which Phoenix reads natively (tokens, USD cost, latency, error status).
+  # The collector fans the traces pipeline here in addition to Tempo. UI on
+  # 6006; Phoenix exposes an OTLP receiver the collector pushes to.
+  phoenix:
+    image: arizephoenix/phoenix:7.0.0
+    container_name: sbproxy_obs_phoenix
+    ports:
+      - "6006:6006"   # Phoenix UI + OTLP HTTP ingress
+    networks:
+      - obsnet
+
+  # --- Langfuse (OTLP target, run separately) ---
+  #
+  # Langfuse v3 self-host needs its own multi-service stack (Postgres +
+  # ClickHouse + Redis + object store), so it is not embedded here. Run
+  # Langfuse from its own compose and point the collector's
+  # `otlphttp/langfuse` exporter at its OTLP endpoint
+  # (`/api/public/otel`). See the README.
+
 networks:
   obsnet:
     driver: bridge

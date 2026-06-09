@@ -16,6 +16,7 @@
 mod body_aware;
 mod detector;
 mod heuristic;
+mod inprocess;
 mod sidecar;
 
 pub use body_aware::{
@@ -27,6 +28,7 @@ pub use detector::{
     DetectorFactory,
 };
 pub use heuristic::{HeuristicDetector, HEURISTIC_DETECTOR_NAME};
+pub use inprocess::{InprocessDetector, INPROCESS_DETECTOR_NAME};
 pub use sidecar::{SidecarDetector, SIDECAR_DETECTOR_NAME};
 
 use std::sync::Arc;
@@ -220,6 +222,10 @@ impl PromptInjectionV2Policy {
             ));
         } else if raw.detector == sidecar::SIDECAR_DETECTOR_NAME {
             sidecar::SidecarDetector::from_config(&raw.detector_config)?
+        } else if raw.detector == inprocess::INPROCESS_DETECTOR_NAME {
+            // WOR-1224: opt-in in-process ONNX classify. Bounded by a
+            // max_model_bytes guard; prefer detector: "sidecar" for isolation.
+            inprocess::InprocessDetector::from_config(&raw.detector_config)?
         } else {
             lookup_detector(&raw.detector).ok_or_else(|| {
                 anyhow!(

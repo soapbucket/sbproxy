@@ -27,6 +27,26 @@ processors:
     limit_percentage: 80
     spike_limit_percentage: 25
 
+  # WOR-1230: cost-aware tail sampling. Head sampling at the proxy keeps a
+  # ratio of roots; this tail policy additionally always-keeps the traces
+  # operators never want to lose, evaluated once the trace is complete:
+  # errors (span status ERROR), slow requests, and a probabilistic base
+  # rate for the rest. Mirror keep_over_budget_usd / keep_slower_than_secs
+  # from the proxy's telemetry config here.
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 50000
+    policies:
+      - name: keep-errors
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      - name: keep-slow
+        type: latency
+        latency: { threshold_ms: 2000 }
+      - name: base-rate
+        type: probabilistic
+        probabilistic: { sampling_percentage: 100 }
+
 exporters:
   # Traces -> Tempo via OTLP gRPC inside the bridge network.
   otlp/tempo:
@@ -49,6 +69,20 @@ exporters:
     tls:
       insecure: true
 
+  # Traces -> Arize Phoenix (WOR-1227), the LLM-native backend that renders
+  # SBproxy AI spans as full generations. Phoenix accepts OTLP HTTP on 6006.
+  otlphttp/phoenix:
+    endpoint: http://phoenix:6006
+    tls:
+      insecure: true
+
+  # Traces -> Langfuse (run separately, see docker-compose.yml). Uncomment
+  # and set the endpoint + Basic auth header for your Langfuse instance.
+  # otlphttp/langfuse:
+  #   endpoint: http://langfuse:3000/api/public/otel
+  #   headers:
+  #     Authorization: "Basic ${LANGFUSE_OTEL_BASIC_AUTH}"
+
 # The collector publishes its own self-metrics on :8888 so Prometheus can
 # scrape it directly (see prometheus.yml).
 service:
@@ -58,8 +92,11 @@ service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
-      exporters: [otlp/tempo]
+      # tail_sampling must run before batch so the keep/drop decision sees
+      # the whole trace. Fans out to Tempo (general traces) and Phoenix
+      # (LLM-native rendering of the AI spans).
+      processors: [memory_limiter, tail_sampling, batch]
+      exporters: [otlp/tempo, otlphttp/phoenix]
     metrics:
       receivers: [otlp]
       processors: [memory_limiter, batch]

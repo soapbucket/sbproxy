@@ -68,6 +68,11 @@ pub(super) async fn handle_ai_proxy(
                 method = %method_str,
                 "AI proxy: per-surface rate limit hit; returning 429"
             );
+            sbproxy_ai::tracing_spans::record_error(
+                &tracing::Span::current(),
+                sbproxy_ai::tracing_spans::error_type::RATE_LIMITED,
+                "per-surface rate limit exceeded",
+            );
             send_error(session, 429, "per-surface rate limit exceeded").await?;
             return Ok(());
         }
@@ -901,6 +906,11 @@ pub(super) async fn handle_ai_proxy(
                 );
                 let retry = rej.retry_after_secs.to_string();
                 let extra: Option<(&str, &str)> = Some(("retry-after", &retry));
+                sbproxy_ai::tracing_spans::record_error(
+                    &tracing::Span::current(),
+                    sbproxy_ai::tracing_spans::error_type::RATE_LIMITED,
+                    "model rate limit exceeded",
+                );
                 send_response_with_extra(
                     session,
                     429,
@@ -926,6 +936,20 @@ pub(super) async fn handle_ai_proxy(
     // Keep a single extraction available to both the prompt classifier
     // and the intent detection hook so we do not re-parse the body twice.
     let extracted_prompt = extract_prompt_text(&body);
+
+    // WOR-1228: emit the prompt as the OpenInference `input.value` span
+    // attribute when the origin opts into content capture. Off by default;
+    // the text is routed through the always-on secret redactor and the
+    // origin's PII redactor (if any) before it lands on the span, so a
+    // trace backend never sees raw secrets or PII.
+    if config.trace_content && !extracted_prompt.is_empty() {
+        let secrets_redacted = sbproxy_observe::redact::redact_secrets(&extracted_prompt);
+        let redacted = match config.pii_redactor() {
+            Some(redactor) => redactor.redact(&secrets_redacted).into_owned(),
+            None => secrets_redacted,
+        };
+        sbproxy_ai::tracing_spans::record_input_content(&tracing::Span::current(), &redacted);
+    }
 
     if let Some(hook) = pipeline.hooks.prompt_classifier.as_ref().cloned() {
         if !extracted_prompt.is_empty() {
@@ -1020,6 +1044,11 @@ pub(super) async fn handle_ai_proxy(
                         guardrail = %block.name,
                         reason = %block.reason,
                         "AI proxy: input guardrail blocked request"
+                    );
+                    sbproxy_ai::tracing_spans::record_error(
+                        &tracing::Span::current(),
+                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                        &block.reason,
                     );
                     let error_body = serde_json::json!({
                         "error": {
@@ -1200,101 +1229,164 @@ pub(super) async fn handle_ai_proxy(
                 req_header_value(session, "authorization").as_deref(),
             );
             if !extracted_prompt.is_empty() {
-                match config.providers.iter().find(|p| p.name == cache.provider()) {
-                    Some(provider) => {
-                        let ai_client = AI_CLIENT.load_full();
-                        match sbproxy_ai::semantic_cache::compute_embedding(
-                            &ai_client,
-                            provider,
-                            cache.model(),
-                            &extracted_prompt,
-                        )
-                        .await
-                        {
-                            Ok(query_vec) => {
-                                if let Some(hit) = cache.lookup(&query_vec, &cache_scope) {
-                                    sbproxy_ai::ai_metrics::record_cache_result(
-                                        cache.provider(),
-                                        "semantic",
-                                        true,
-                                    );
-                                    sbproxy_ai::ai_metrics::record_semantic_similarity(
-                                        cache.provider(),
-                                        hit.score,
-                                    );
-                                    debug!(
-                                        origin = %hostname,
-                                        score = hit.score,
-                                        status = hit.response.status,
-                                        "AI proxy: embedding semantic cache HIT; replaying"
-                                    );
-                                    let mut header = pingora_http::ResponseHeader::build(
-                                        hit.response.status,
-                                        Some(hit.response.headers.len() + 1),
-                                    )
-                                    .map_err(|e| {
-                                        Error::because(
-                                            ErrorType::InternalError,
-                                            "embedding cache: failed to build response header",
-                                            e,
-                                        )
-                                    })?;
-                                    for (name, value) in &hit.response.headers {
-                                        if name == "transfer-encoding" || name == "connection" {
-                                            continue;
-                                        }
-                                        let _ = header.insert_header(name.clone(), value.clone());
-                                    }
-                                    let _ = header.insert_header("x-semcache", "HIT");
-                                    let body = bytes::Bytes::from(hit.response.body);
-                                    // WOR-1094: a cache hit is a zero-cost
-                                    // ledger transaction, not an absent one.
-                                    // Record the served tokens under the
-                                    // cache_read dimension so the hit still
-                                    // shows up as savings.
-                                    crate::server::ai_support::record_cache_hit_savings(
-                                        cache.provider(),
-                                        cache.model(),
-                                        surface_label,
-                                        &body,
-                                        &ctx.attribution_tags,
-                                    );
-                                    session
-                                        .write_response_header(Box::new(header), false)
-                                        .await?;
-                                    session.write_response_body(Some(body), true).await?;
-                                    return Ok(());
-                                }
-                                sbproxy_ai::ai_metrics::record_cache_result(
-                                    cache.provider(),
-                                    "semantic",
-                                    false,
-                                );
-                                embed_miss = Some((
-                                    std::sync::Arc::clone(cache),
-                                    sbproxy_ai::EmbeddingCache::prompt_key(
-                                        &cache_scope,
-                                        &extracted_prompt,
-                                    ),
-                                    query_vec,
-                                    cache_scope,
-                                ));
+                // WOR-1223: vectorize the prompt via the configured source.
+                // Provider hits the embedding API (costs money, egresses the
+                // prompt); sidecar uses the local classifier sidecar (free, no
+                // egress). Any error falls through to an uncached upstream call.
+                let query_vec_result: anyhow::Result<Vec<f32>> = match cache.source() {
+                    sbproxy_ai::semantic_cache::EmbeddingSource::Provider => {
+                        match config.providers.iter().find(|p| p.name == cache.provider()) {
+                            Some(provider) => {
+                                let ai_client = AI_CLIENT.load_full();
+                                sbproxy_ai::semantic_cache::compute_embedding(
+                                    &ai_client,
+                                    provider,
+                                    cache.model(),
+                                    &extracted_prompt,
+                                )
+                                .await
                             }
-                            Err(e) => {
-                                warn!(
-                                    origin = %hostname,
-                                    error = %e,
-                                    "AI proxy: embedding cache lookup failed (fail-open)"
-                                );
-                            }
+                            None => Err(anyhow::anyhow!(
+                                "semantic cache embedding provider {} not found in providers list",
+                                cache.provider()
+                            )),
                         }
                     }
-                    None => {
+                    sbproxy_ai::semantic_cache::EmbeddingSource::Sidecar => {
+                        match cache.sidecar_config() {
+                            Some(sc) => {
+                                sbproxy_ai::semantic_cache::compute_embedding_sidecar(
+                                    sc,
+                                    &extracted_prompt,
+                                )
+                                .await
+                            }
+                            None => Err(anyhow::anyhow!(
+                                "semantic cache sidecar source has no sidecar config"
+                            )),
+                        }
+                    }
+                    sbproxy_ai::semantic_cache::EmbeddingSource::Inprocess => {
+                        #[cfg(feature = "inprocess-embed")]
+                        {
+                            match cache.inprocess_config() {
+                                Some(cfg) => crate::server::ai_support::inprocess_embed(
+                                    cfg,
+                                    &extracted_prompt,
+                                ),
+                                None => Err(anyhow::anyhow!(
+                                    "inprocess embedding source has no inprocess config"
+                                )),
+                            }
+                        }
+                        #[cfg(not(feature = "inprocess-embed"))]
+                        {
+                            Err(anyhow::anyhow!(
+                                "in-process embedding not compiled in this build; rebuild with \
+                                 --features inprocess-embed or use source: sidecar"
+                            ))
+                        }
+                    }
+                };
+                let source_label: &str = match cache.source() {
+                    sbproxy_ai::semantic_cache::EmbeddingSource::Provider => "provider",
+                    sbproxy_ai::semantic_cache::EmbeddingSource::Sidecar => "sidecar",
+                    sbproxy_ai::semantic_cache::EmbeddingSource::Inprocess => "inprocess",
+                };
+                match query_vec_result {
+                    Ok(query_vec) => {
+                        if let Some(hit) = cache.lookup(&query_vec, &cache_scope) {
+                            sbproxy_ai::ai_metrics::record_cache_result(
+                                cache.provider(),
+                                "semantic",
+                                true,
+                            );
+                            sbproxy_observe::metrics::record_semantic_cache(
+                                ctx.tenant_id.as_str(),
+                                hostname,
+                                source_label,
+                                "hit",
+                            );
+                            sbproxy_ai::ai_metrics::record_semantic_similarity(
+                                cache.provider(),
+                                hit.score,
+                            );
+                            debug!(
+                                tenant = %ctx.tenant_id,
+                                origin = %hostname,
+                                score = hit.score,
+                                status = hit.response.status,
+                                "AI proxy: embedding semantic cache HIT; replaying"
+                            );
+                            let mut header = pingora_http::ResponseHeader::build(
+                                hit.response.status,
+                                Some(hit.response.headers.len() + 1),
+                            )
+                            .map_err(|e| {
+                                Error::because(
+                                    ErrorType::InternalError,
+                                    "embedding cache: failed to build response header",
+                                    e,
+                                )
+                            })?;
+                            for (name, value) in &hit.response.headers {
+                                if name == "transfer-encoding" || name == "connection" {
+                                    continue;
+                                }
+                                let _ = header.insert_header(name.clone(), value.clone());
+                            }
+                            let _ = header.insert_header("x-semcache", "HIT");
+                            let body = bytes::Bytes::from(hit.response.body);
+                            // WOR-1094: a cache hit is a zero-cost
+                            // ledger transaction, not an absent one.
+                            // Record the served tokens under the
+                            // cache_read dimension so the hit still
+                            // shows up as savings.
+                            crate::server::ai_support::record_cache_hit_savings(
+                                ctx.tenant_id.as_str(),
+                                hostname,
+                                cache.provider(),
+                                cache.model(),
+                                surface_label,
+                                &body,
+                                &ctx.attribution_tags,
+                            );
+                            session
+                                .write_response_header(Box::new(header), false)
+                                .await?;
+                            session.write_response_body(Some(body), true).await?;
+                            return Ok(());
+                        }
+                        sbproxy_ai::ai_metrics::record_cache_result(
+                            cache.provider(),
+                            "semantic",
+                            false,
+                        );
+                        sbproxy_observe::metrics::record_semantic_cache(
+                            ctx.tenant_id.as_str(),
+                            hostname,
+                            source_label,
+                            "miss",
+                        );
+                        embed_miss = Some((
+                            std::sync::Arc::clone(cache),
+                            sbproxy_ai::EmbeddingCache::prompt_key(&cache_scope, &extracted_prompt),
+                            query_vec,
+                            cache_scope,
+                        ));
+                    }
+                    Err(e) => {
+                        sbproxy_observe::metrics::record_semantic_cache(
+                            ctx.tenant_id.as_str(),
+                            hostname,
+                            source_label,
+                            "error",
+                        );
                         warn!(
+                            tenant = %ctx.tenant_id,
                             origin = %hostname,
-                            provider = %cache.provider(),
-                            "AI proxy: semantic cache embedding provider not found in \
-                             providers list; skipping cache"
+                            error = %e,
+                            "AI proxy: embedding cache lookup failed (fail-open)"
                         );
                     }
                 }

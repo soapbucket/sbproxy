@@ -140,9 +140,37 @@ pub const PROMPT_INJECTION_V2_MODEL: KnownModel = KnownModel {
     revision_pinned_at: "2026-04-27",
 };
 
+/// Default sentence-embedding model for the AI gateway semantic cache and
+/// the in-process / sidecar embedder.
+///
+/// `all-MiniLM-L6-v2` is a 6-layer, 384-dim sentence-transformer under
+/// Apache-2.0. It runs on the pure-Rust tract engine, is small enough to
+/// cache and ship to air-gapped sites, and its quality is well-suited to
+/// near-duplicate prompt detection (the semantic-cache use case).
+///
+/// SHA pins are empty for the same reason as `prompt-injection-v2`: the
+/// build sandbox cannot reach the upstream URL, so operators compute the
+/// hash on first download. The `no_known_model_has_unpinned_sha256` test
+/// stays `#[ignore]`'d until the pinning follow-up lands.
+pub const ALL_MINILM_L6_V2_MODEL: KnownModel = KnownModel {
+    name: "all-MiniLM-L6-v2",
+    model_url: concat!(
+        "https://huggingface.co/sentence-transformers/",
+        "all-MiniLM-L6-v2/resolve/main/onnx/model.onnx"
+    ),
+    model_sha256: "",
+    tokenizer_url: concat!(
+        "https://huggingface.co/sentence-transformers/",
+        "all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+    ),
+    tokenizer_sha256: "",
+    license: "Apache-2.0",
+    revision_pinned_at: "2026-06-08",
+};
+
 /// Every entry the registry knows about. Add new pins here; tests
 /// assert that the array stays unique by `name`.
-pub const KNOWN_MODELS: &[KnownModel] = &[PROMPT_INJECTION_V2_MODEL];
+pub const KNOWN_MODELS: &[KnownModel] = &[PROMPT_INJECTION_V2_MODEL, ALL_MINILM_L6_V2_MODEL];
 
 static INDEX: OnceLock<HashMap<&'static str, &'static KnownModel>> = OnceLock::new();
 

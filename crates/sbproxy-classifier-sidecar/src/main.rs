@@ -30,11 +30,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use sbproxy_classifier_proto::{
-    ClassifyRequest, ClassifyResponse, EmbedRequest, EmbedResponse, InferenceService,
+    ClassifyRequest, ClassifyResponse, EmbedRequest, EmbedResponse, Embedding, InferenceService,
     InferenceServiceServer, Label, ModelInfoRequest, ModelInfoResponse, VersionRequest,
     VersionResponse,
 };
-use sbproxy_classifiers::OnnxClassifier;
+use sbproxy_classifiers::{OnnxClassifier, OnnxEmbedder};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
@@ -42,8 +42,13 @@ use tonic::{Request, Response, Status};
 /// tract ONNX classifiers keyed by logical model id.
 struct SidecarService {
     models: HashMap<String, Arc<OnnxClassifier>>,
-    /// Model used when a request leaves `model` empty.
+    /// Embedding models keyed by logical id, paired with the embedding
+    /// dimension learned at load time (for `ModelInfo`).
+    embedders: HashMap<String, (Arc<OnnxEmbedder>, u32)>,
+    /// Classifier used when a `Classify` request leaves `model` empty.
     default_model: Option<String>,
+    /// Embedder used when an `Embed` request leaves `model` empty.
+    default_embed_model: Option<String>,
     /// Reported by the `Version` RPC.
     version: String,
 }
@@ -57,6 +62,17 @@ impl SidecarService {
             model.to_string()
         };
         self.models.get(&id).map(|m| (id, Arc::clone(m)))
+    }
+
+    /// Resolve a request's `model` field (or the default) to a loaded
+    /// embedder.
+    fn resolve_embedder(&self, model: &str) -> Option<(String, Arc<OnnxEmbedder>)> {
+        let id = if model.is_empty() {
+            self.default_embed_model.clone()?
+        } else {
+            model.to_string()
+        };
+        self.embedders.get(&id).map(|(e, _)| (id, Arc::clone(e)))
     }
 }
 
@@ -88,10 +104,34 @@ impl InferenceService for SidecarService {
         }))
     }
 
-    async fn embed(&self, _req: Request<EmbedRequest>) -> Result<Response<EmbedResponse>, Status> {
-        Err(Status::unimplemented(
-            "embeddings are not supported by the minimal OSS classifier sidecar",
-        ))
+    async fn embed(&self, req: Request<EmbedRequest>) -> Result<Response<EmbedResponse>, Status> {
+        let req = req.into_inner();
+        let (_id, embedder) = self.resolve_embedder(&req.model).ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "no embedding model loaded for {:?}; start the sidecar with --embed-model",
+                req.model
+            ))
+        })?;
+        let texts = req.texts;
+        let started = std::time::Instant::now();
+        // tract inference is synchronous and CPU-bound: run it on the blocking
+        // pool so it never stalls a gRPC async worker.
+        let vectors = tokio::task::spawn_blocking(move || {
+            texts
+                .iter()
+                .map(|t| embedder.embed(t))
+                .collect::<anyhow::Result<Vec<_>>>()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("embed task panicked: {e}")))?
+        .map_err(|e| Status::internal(format!("embed failed: {e}")))?;
+        Ok(Response::new(EmbedResponse {
+            embeddings: vectors
+                .into_iter()
+                .map(|v| Embedding { values: v.values })
+                .collect(),
+            latency_us: started.elapsed().as_micros() as u64,
+        }))
     }
 
     async fn model_info(
@@ -99,19 +139,34 @@ impl InferenceService for SidecarService {
         req: Request<ModelInfoRequest>,
     ) -> Result<Response<ModelInfoResponse>, Status> {
         let req = req.into_inner();
-        let resp = match self.resolve(&req.model) {
-            Some((id, _)) => ModelInfoResponse {
+        // Classifiers first, then embedders (which report their dimension).
+        let resp = if let Some((id, _)) = self.resolve(&req.model) {
+            ModelInfoResponse {
                 model: id,
                 loaded: true,
                 labels: Vec::new(),
                 embedding_dim: 0,
-            },
-            None => ModelInfoResponse {
-                model: req.model,
-                loaded: false,
-                labels: Vec::new(),
-                embedding_dim: 0,
-            },
+            }
+        } else {
+            let embed_id = if req.model.is_empty() {
+                self.default_embed_model.clone()
+            } else {
+                Some(req.model.clone())
+            };
+            match embed_id.and_then(|id| self.embedders.get(&id).map(|(_, dim)| (id, *dim))) {
+                Some((id, dim)) => ModelInfoResponse {
+                    model: id,
+                    loaded: true,
+                    labels: Vec::new(),
+                    embedding_dim: dim,
+                },
+                None => ModelInfoResponse {
+                    model: req.model,
+                    loaded: false,
+                    labels: Vec::new(),
+                    embedding_dim: 0,
+                },
+            }
         };
         Ok(Response::new(resp))
     }
@@ -154,6 +209,15 @@ struct Cli {
     /// single loaded model when exactly one is configured.
     #[arg(long)]
     default_model: Option<String>,
+    /// Embedding model to load, as `id=<model.onnx>:<tokenizer.json>`.
+    /// Repeatable. Enables the `Embed` RPC (used by the AI gateway semantic
+    /// cache); without one, `Embed` returns FAILED_PRECONDITION.
+    #[arg(long = "embed-model", value_name = "ID=MODEL:TOKENIZER")]
+    embed_models: Vec<String>,
+    /// Embedding model id used when an `Embed` request leaves `model` empty.
+    /// Defaults to the single loaded embedder when exactly one is configured.
+    #[arg(long)]
+    default_embed_model: Option<String>,
 }
 
 /// Parse one `id=<model>:<tokenizer>` spec and load the classifier.
@@ -167,6 +231,25 @@ fn load_model_spec(spec: &str) -> Result<(String, Arc<OnnxClassifier>)> {
     let classifier = OnnxClassifier::load(Path::new(model_path), Path::new(tokenizer_path))
         .with_context(|| format!("loading model {id:?}"))?;
     Ok((id.to_string(), Arc::new(classifier)))
+}
+
+/// Parse one `id=<model>:<tokenizer>` spec and load the embedder, learning
+/// its output dimension via a one-time warmup embed so `ModelInfo` can
+/// report it.
+fn load_embed_spec(spec: &str) -> Result<(String, Arc<OnnxEmbedder>, u32)> {
+    let (id, paths) = spec
+        .split_once('=')
+        .with_context(|| format!("--embed-model must be ID=MODEL:TOKENIZER, got {spec:?}"))?;
+    let (model_path, tokenizer_path) = paths
+        .split_once(':')
+        .with_context(|| format!("--embed-model paths must be MODEL:TOKENIZER, got {paths:?}"))?;
+    let embedder = OnnxEmbedder::load(Path::new(model_path), Path::new(tokenizer_path))
+        .with_context(|| format!("loading embed model {id:?}"))?;
+    let dim = embedder
+        .embed("dimension probe")
+        .map(|o| o.values.len() as u32)
+        .unwrap_or(0);
+    Ok((id.to_string(), Arc::new(embedder), dim))
 }
 
 #[tokio::main]
@@ -191,10 +274,26 @@ async fn main() -> Result<()> {
         }
     });
 
+    let mut embedders = HashMap::new();
+    for spec in &cli.embed_models {
+        let (id, embedder, dim) = load_embed_spec(spec)?;
+        embedders.insert(id, (embedder, dim));
+    }
+
+    let default_embed_model = cli.default_embed_model.or_else(|| {
+        if embedders.len() == 1 {
+            embedders.keys().next().cloned()
+        } else {
+            None
+        }
+    });
+
     let service = SidecarService {
         version: format!("sbproxy-classifier-sidecar {}", env!("CARGO_PKG_VERSION")),
         default_model,
+        default_embed_model,
         models,
+        embedders,
     };
 
     if let Some(uds_path) = cli.listen_uds.as_ref() {
@@ -246,7 +345,9 @@ mod tests {
     fn empty_service() -> SidecarService {
         SidecarService {
             models: HashMap::new(),
+            embedders: HashMap::new(),
             default_model: None,
+            default_embed_model: None,
             version: "sbproxy-classifier-sidecar test".to_string(),
         }
     }
@@ -266,16 +367,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn embed_is_unimplemented() {
+    async fn embed_without_model_is_failed_precondition() {
         let svc = empty_service();
         let err = svc
             .embed(Request::new(EmbedRequest {
                 model: String::new(),
-                texts: Vec::new(),
+                texts: vec!["hi".to_string()],
             }))
             .await
-            .expect_err("embed must be unimplemented");
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+            .expect_err("embed must fail when no embed model is loaded");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn embed_unknown_model_is_failed_precondition() {
+        let svc = empty_service();
+        let err = svc
+            .embed(Request::new(EmbedRequest {
+                model: "nope".to_string(),
+                texts: vec!["hi".to_string()],
+            }))
+            .await
+            .expect_err("unknown embed model must fail");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn load_embed_spec_rejects_malformed() {
+        assert!(load_embed_spec("no-equals").is_err());
+        assert!(load_embed_spec("id=only-one-path").is_err());
     }
 
     #[tokio::test]

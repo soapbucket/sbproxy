@@ -115,6 +115,26 @@ pub fn ai_request_span(surface: &str, method: &str) -> Span {
         // original token snapshot; without it, the spend record
         // is not reproducible past a pricing-table edit.
         "sbproxy.ai.pricing_version" = Empty,
+        // WOR-1229: derived USD cost for the request, so trace backends
+        // (Phoenix, Langfuse, Tempo) show spend per generation alongside
+        // tokens. Recorded at the billing choke point via
+        // `record_cost_usd`. Both the OpenInference and gen_ai keys are
+        // stamped so either backend vocabulary renders it.
+        "gen_ai.usage.cost" = Empty,
+        "llm.usage.total_cost" = Empty,
+        // WOR-1231: error semantics. `otel.status_code` is the field the
+        // tracing-opentelemetry bridge maps to the OTel span status, so a
+        // failed generation surfaces as an ERROR span in trace backends.
+        // `error.type` carries the failure class (gen_ai / OTel convention).
+        "otel.status_code" = Empty,
+        "otel.status_message" = Empty,
+        "error.type" = Empty,
+        // WOR-1228: OpenInference prompt / completion content. Empty unless
+        // the origin sets `trace_content: true`; the dispatch path redacts
+        // the text (secrets + PII) before recording it here, so backends can
+        // show the conversation, not just token counts.
+        "input.value" = Empty,
+        "output.value" = Empty,
         "gen_ai.response.finish_reasons" = Empty,
         "llm.provider" = Empty,
         "llm.model_name" = Empty,
@@ -252,6 +272,60 @@ pub fn record_token_usage_split(
 /// monotonic version tag.
 pub fn record_pricing_version(span: &Span, version: &str) {
     span.record("sbproxy.ai.pricing_version", version);
+}
+
+/// Stamp the derived USD cost of the request onto an AI span (WOR-1229).
+///
+/// Records `gen_ai.usage.cost` (gen_ai vocabulary) and
+/// `llm.usage.total_cost` (OpenInference vocabulary) so both trace-backend
+/// conventions render spend per generation. `cost_usd` is the same value
+/// the FinOps cost metric uses, derived from the token counts and the
+/// pricing catalog stamped via [`record_pricing_version`].
+pub fn record_cost_usd(span: &Span, cost_usd: f64) {
+    span.record("gen_ai.usage.cost", cost_usd);
+    span.record("llm.usage.total_cost", cost_usd);
+}
+
+/// Well-known failure classes for an AI generation, recorded as the OTel
+/// `error.type` attribute (WOR-1231). Kept as string constants so call
+/// sites and trace queries agree.
+pub mod error_type {
+    /// A guardrail (input or output) blocked the request.
+    pub const GUARDRAIL_BLOCKED: &str = "guardrail_blocked";
+    /// The provider returned HTTP 429 (rate limited).
+    pub const RATE_LIMITED: &str = "rate_limited";
+    /// The provider returned a 5xx server error.
+    pub const PROVIDER_ERROR: &str = "provider_error";
+    /// The provider's content filter rejected the request or response.
+    pub const CONTENT_FILTER: &str = "content_filter";
+}
+
+/// Mark an AI span as failed (WOR-1231).
+///
+/// Sets `otel.status_code = "ERROR"` (which the tracing-opentelemetry bridge
+/// maps to the OTel span status, so the span shows as an error in trace
+/// backends), records the failure class as `error.type`, and stores a short
+/// human-readable message. Use the [`error_type`] constants for `kind`.
+pub fn record_error(span: &Span, kind: &str, message: &str) {
+    span.record("otel.status_code", "ERROR");
+    span.record("error.type", kind);
+    span.record("otel.status_message", message);
+}
+
+/// Record the prompt text as the OpenInference `input.value` span attribute
+/// (WOR-1228). The caller MUST have already redacted the content and gated
+/// on the origin's `trace_content` flag: this helper only writes the field,
+/// it does not redact. Off-by-default content capture lives in the dispatch
+/// path, which routes the text through the secret + PII redactors first.
+pub fn record_input_content(span: &Span, redacted: &str) {
+    span.record("input.value", redacted);
+}
+
+/// Record the completion text as the OpenInference `output.value` span
+/// attribute (WOR-1228). Same contract as [`record_input_content`]: the
+/// caller redacts and gates; this only writes the field.
+pub fn record_output_content(span: &Span, redacted: &str) {
+    span.record("output.value", redacted);
 }
 
 /// Stamp the response model and identifier onto an AI span.
@@ -570,6 +644,102 @@ mod tests {
         // Total is the sum of every dimension.
         assert_field(span, "llm.token_count.total", "205");
         assert_field(span, "sbproxy.ai.pricing_version", "catalog-2026-06-01");
+    }
+
+    /// WOR-1229: derived USD cost lands on both the gen_ai and
+    /// OpenInference cost keys so either trace backend renders spend.
+    #[test]
+    fn record_cost_usd_stamps_both_vocabularies() {
+        use tracing_subscriber::prelude::*;
+        let layer = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = ai_request_span("chat", "POST");
+            record_cost_usd(&span, 0.001234);
+        });
+        let spans = snapshot_spans(&layer);
+        let span = find_span(&spans, "ai.request");
+        assert_field(span, "gen_ai.usage.cost", "0.001234");
+        assert_field(span, "llm.usage.total_cost", "0.001234");
+    }
+
+    /// WOR-1231: a failed generation marks the span ERROR with an
+    /// `error.type` so trace backends surface it as a failure.
+    #[test]
+    fn record_error_marks_span_failed() {
+        use tracing_subscriber::prelude::*;
+        let layer = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = ai_request_span("chat", "POST");
+            record_error(
+                &span,
+                error_type::GUARDRAIL_BLOCKED,
+                "blocked by input guardrail",
+            );
+        });
+        let spans = snapshot_spans(&layer);
+        let span = find_span(&spans, "ai.request");
+        assert_field(span, "otel.status_code", "ERROR");
+        assert_field(span, "error.type", "guardrail_blocked");
+    }
+
+    /// WOR-1228: prompt / completion content lands on the OpenInference
+    /// `input.value` / `output.value` span attributes (already redacted by
+    /// the caller).
+    #[test]
+    fn record_content_stamps_input_and_output_values() {
+        use tracing_subscriber::prelude::*;
+        let layer = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = ai_request_span("chat", "POST");
+            record_input_content(&span, "summarize this [redacted]");
+            record_output_content(&span, "here is the summary");
+        });
+        let spans = snapshot_spans(&layer);
+        let span = find_span(&spans, "ai.request");
+        assert_field(span, "input.value", "summarize this [redacted]");
+        assert_field(span, "output.value", "here is the summary");
+    }
+
+    /// WOR-1232: GenAI semantic-convention conformance. Pin the version and
+    /// the required `gen_ai.*` attribute set so a span never silently drifts
+    /// off-spec. Recording into a field that `ai_request_span` does not
+    /// declare is a no-op, so dropping a required attribute fails this test.
+    #[test]
+    fn ai_request_span_conforms_to_pinned_genai_semconv() {
+        // Bump deliberately when re-validating against a newer semconv.
+        const GEN_AI_SEMCONV_VERSION: &str = "1.36.0";
+        const REQUIRED_GEN_AI_FIELDS: &[&str] = &[
+            "gen_ai.system",
+            "gen_ai.request.model",
+            "gen_ai.response.model",
+            "gen_ai.response.id",
+            "gen_ai.usage.input_tokens",
+            "gen_ai.usage.output_tokens",
+            "gen_ai.usage.cost",
+            "gen_ai.response.finish_reasons",
+        ];
+        assert!(
+            !GEN_AI_SEMCONV_VERSION.is_empty(),
+            "semconv version must be pinned"
+        );
+
+        use tracing_subscriber::prelude::*;
+        let layer = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = ai_request_span("chat", "POST");
+            for field in REQUIRED_GEN_AI_FIELDS {
+                span.record(*field, "conformance-probe");
+            }
+        });
+        let spans = snapshot_spans(&layer);
+        let span = find_span(&spans, "ai.request");
+        for field in REQUIRED_GEN_AI_FIELDS {
+            assert_field(span, field, "conformance-probe");
+        }
     }
 
     /// `UsageTokens::total()` (WOR-1084) sums every dimension,

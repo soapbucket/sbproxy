@@ -1,6 +1,6 @@
 # Metrics stability
 
-*Last modified: 2026-06-05*
+*Last modified: 2026-06-08*
 
 Naming conventions, stability guarantees, and the full catalogue of metrics emitted by SBproxy.
 
@@ -641,6 +641,91 @@ matching security-audit records already carried it):
 and `sbproxy_ai_ratelimit_rejected_total`. The label is the resolved
 tenant (`__default__` for single-tenant deployments) and is run through
 the cardinality limiter.
+
+### Local inference and semantic cache
+
+#### `sbproxy_semantic_cache_results_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Embedding semantic-cache outcomes, attributed per tenant. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `tenant` | Tenant id the request was attributed to | `acme`, `__default__` |
+| `origin` | Virtual hostname | `api.example.com` |
+| `source` | Embedding source that vectorized the prompt | `provider`, `sidecar`, `inprocess` |
+| `result` | Lookup outcome | `hit`, `miss`, `error` |
+
+#### `sbproxy_inference_requests_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Local ONNX inference calls (embeddings and classify) and their outcome. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `kind` | Inference kind | `embed`, `classify` |
+| `backend` | Where inference ran | `sidecar`, `inprocess` |
+| `model` | Logical model id | `all-MiniLM-L6-v2`, `prompt-injection-v2` |
+| `result` | Call outcome | `ok`, `error` |
+
+#### `sbproxy_inference_duration_seconds`
+
+| Property | Value |
+|---|---|
+| Type | Histogram |
+| Stability | **beta** |
+| Description | Local ONNX inference latency in seconds. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `kind` | Inference kind | `embed`, `classify` |
+| `backend` | Where inference ran | `sidecar`, `inprocess` |
+| `model` | Logical model id | `all-MiniLM-L6-v2` |
+
+#### `sbproxy_ai_tokens_saved_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Tokens a semantic-cache hit avoided (the upstream call that did not happen). The value-delivered side of usage tracking, attributed per tenant. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `tenant` | Tenant id the savings are attributed to | `acme`, `__default__` |
+| `origin` | Virtual hostname | `api.example.com` |
+| `model` | Model id from the cached response | `gpt-4o`, `claude-sonnet-4-5` |
+| `kind` | Token kind | `prompt`, `completion` |
+
+#### `sbproxy_ai_cost_saved_micros_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Micro-USD a semantic-cache hit avoided. Saved cost uses the same cost table as spent cost, so saved and spent reconcile. Attributed per tenant. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `tenant` | Tenant id the savings are attributed to | `acme`, `__default__` |
+| `origin` | Virtual hostname | `api.example.com` |
+| `model` | Model id from the cached response | `gpt-4o` |
 
 ---
 

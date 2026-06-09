@@ -1,0 +1,45 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Local embedding semantic cache (no provider embedding API).
+#
+# The AI gateway's semantic cache serves near-duplicate prompts from
+# cache. By default it vectorizes prompts via a paid provider embedding
+# API; this example points it at the local classifier sidecar instead
+# (`source: sidecar`), so prompts are embedded on-box: no per-call cost,
+# no prompt egress, low loopback latency.
+#
+# Run the OSS sidecar with an embedding model (supply your own ONNX
+# model + tokenizer; OSS ships no weights):
+#   cargo run -p sbproxy-classifier-sidecar -- \
+#     --listen 127.0.0.1:9440 \
+#     --embed-model all-MiniLM-L6-v2=/models/minilm/model.onnx:/models/minilm/tokenizer.json
+#
+# Run the proxy:
+#   make run CONFIG=examples/semantic-cache-local/sb.yml
+#
+# See docs/local-inference.md for the full recipe and the metrics emitted.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+      routing: round_robin
+      # Embedding semantic cache, vectorized locally via the sidecar.
+      semantic_cache:
+        enabled: true
+        threshold: 0.85        # cosine similarity for a near-duplicate hit
+        ttl_secs: 3600
+        max_entries: 1024
+        source: sidecar
+        sidecar:
+          endpoint: http://127.0.0.1:9440
+          model: all-MiniLM-L6-v2
+          timeout_ms: 500

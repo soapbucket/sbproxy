@@ -110,9 +110,35 @@ pub struct EmbeddingCacheConfig {
     /// Maximum cached entries (LRU eviction). Defaults to 1024.
     #[serde(default = "default_max_entries")]
     pub max_entries: usize,
-    /// Embedding provider + model used to vectorize prompts.
+    /// Where prompt embeddings come from. Defaults to `provider` so
+    /// existing configs are unchanged.
+    #[serde(default)]
+    pub source: EmbeddingSource,
+    /// Embedding provider + model used to vectorize prompts (for
+    /// `source: provider`).
     #[serde(default)]
     pub embedding: Option<EmbeddingProviderConfig>,
+    /// Local classifier-sidecar embedding endpoint (for `source: sidecar`).
+    #[serde(default)]
+    pub sidecar: Option<SidecarEmbeddingConfig>,
+    /// In-process embedder (for `source: inprocess`).
+    #[serde(default)]
+    pub inprocess: Option<InprocessEmbeddingConfig>,
+}
+
+/// Where the semantic cache gets prompt embeddings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbeddingSource {
+    /// Call an AI embedding provider's `/v1/embeddings` API (default,
+    /// back-compat). Costs money and egresses the prompt.
+    #[default]
+    Provider,
+    /// Call the local classifier sidecar's `Embed` RPC. Free, no egress.
+    Sidecar,
+    /// Run an in-process tract embedder. Single-binary, but loads a model
+    /// into the proxy address space (opt-in).
+    Inprocess,
 }
 
 /// Which provider + model computes prompt embeddings.
@@ -122,6 +148,44 @@ pub struct EmbeddingProviderConfig {
     pub provider: String,
     /// Embedding model id, e.g. `text-embedding-3-small`.
     pub model: String,
+}
+
+/// Sidecar embedding endpoint config (for `source: sidecar`).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SidecarEmbeddingConfig {
+    /// gRPC endpoint, e.g. `http://127.0.0.1:9440`.
+    pub endpoint: String,
+    /// Embedding model id (empty selects the sidecar default).
+    #[serde(default)]
+    pub model: String,
+    /// Per-call timeout in milliseconds. Defaults to 500.
+    #[serde(default = "default_sidecar_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_sidecar_timeout_ms() -> u64 {
+    500
+}
+
+/// In-process embedder config (for `source: inprocess`).
+///
+/// Provide explicit `model_path` + `tokenizer_path`. Known-model
+/// auto-download for the in-process embedder is a follow-up; until then
+/// the operator points at on-disk ONNX + tokenizer files.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct InprocessEmbeddingConfig {
+    /// Logical model id (informational; e.g. `all-MiniLM-L6-v2`).
+    #[serde(default)]
+    pub model: String,
+    /// Path to the ONNX model file.
+    #[serde(default)]
+    pub model_path: Option<String>,
+    /// Path to the tokenizer.json file.
+    #[serde(default)]
+    pub tokenizer_path: Option<String>,
+    /// Max model size in bytes (guard). None uses the engine default.
+    #[serde(default)]
+    pub max_model_bytes: Option<u64>,
 }
 
 fn default_threshold() -> f32 {
@@ -170,8 +234,16 @@ struct EmbeddingEntry {
 pub struct EmbeddingCache {
     threshold: f32,
     ttl_secs: u64,
+    /// Where prompt embeddings come from.
+    source: EmbeddingSource,
+    /// Embedding provider name (for `source: provider`; empty otherwise).
     provider: String,
+    /// Embedding model id (for `source: provider`; empty otherwise).
     model: String,
+    /// Sidecar endpoint config (for `source: sidecar`).
+    sidecar: Option<SidecarEmbeddingConfig>,
+    /// In-process embedder config (for `source: inprocess`).
+    inprocess: Option<InprocessEmbeddingConfig>,
     entries: Mutex<LruCache<String, EmbeddingEntry>>,
 }
 
@@ -193,22 +265,57 @@ impl EmbeddingCache {
         if !cfg.enabled {
             return None;
         }
-        let embedding = cfg.embedding.as_ref()?;
+        // Each source needs its own config block to be usable. A missing
+        // block means there is nothing to vectorize with, so the cache
+        // stays inert (None) rather than half-built.
+        let (provider, model, sidecar, inprocess) = match cfg.source {
+            EmbeddingSource::Provider => {
+                let e = cfg.embedding.as_ref()?;
+                (e.provider.clone(), e.model.clone(), None, None)
+            }
+            EmbeddingSource::Sidecar => {
+                let s = cfg.sidecar.as_ref()?;
+                (String::new(), s.model.clone(), Some(s.clone()), None)
+            }
+            EmbeddingSource::Inprocess => {
+                // The embedder is built and held by sbproxy-core (which can
+                // depend on the tract engine without a dependency cycle). The
+                // cache carries the config so core can load it. Require the
+                // block so a typo'd config does not silently fall back.
+                let p = cfg.inprocess.as_ref()?;
+                (String::new(), p.model.clone(), None, Some(p.clone()))
+            }
+        };
         let cap = NonZeroUsize::new(cfg.max_entries.max(1)).expect("max_entries clamped to >= 1");
         Some(Self {
             threshold: cfg.threshold,
             ttl_secs: cfg.ttl_secs,
-            provider: embedding.provider.clone(),
-            model: embedding.model.clone(),
+            source: cfg.source,
+            provider,
+            model,
+            sidecar,
+            inprocess,
             entries: Mutex::new(LruCache::new(cap)),
         })
     }
 
-    /// Embedding provider name to vectorize prompts with.
+    /// Where this cache gets prompt embeddings.
+    pub fn source(&self) -> EmbeddingSource {
+        self.source
+    }
+    /// Sidecar endpoint config, when `source` is `sidecar`.
+    pub fn sidecar_config(&self) -> Option<&SidecarEmbeddingConfig> {
+        self.sidecar.as_ref()
+    }
+    /// In-process embedder config, when `source` is `inprocess`.
+    pub fn inprocess_config(&self) -> Option<&InprocessEmbeddingConfig> {
+        self.inprocess.as_ref()
+    }
+    /// Embedding provider name to vectorize prompts with (provider source).
     pub fn provider(&self) -> &str {
         &self.provider
     }
-    /// Embedding model id.
+    /// Embedding model id (provider source).
     pub fn model(&self) -> &str {
         &self.model
     }
@@ -316,6 +423,26 @@ impl EmbeddingCache {
             .unwrap_or_default()
             .as_secs()
     }
+}
+
+/// Compute an embedding via the local classifier sidecar's `Embed` RPC.
+///
+/// Used when `source: sidecar`. No provider API call, no prompt egress.
+pub async fn compute_embedding_sidecar(
+    cfg: &SidecarEmbeddingConfig,
+    text: &str,
+) -> anyhow::Result<Vec<f32>> {
+    let client = sbproxy_classifier_client::ClassifierClient::connect_lazy(
+        &cfg.endpoint,
+        std::time::Duration::from_millis(cfg.timeout_ms),
+    )
+    .map_err(|e| anyhow::anyhow!("sidecar connect: {e}"))?;
+    let mut out = client
+        .embed(&cfg.model, &[text.to_string()])
+        .await
+        .map_err(|e| anyhow::anyhow!("sidecar embed: {e}"))?;
+    out.pop()
+        .ok_or_else(|| anyhow::anyhow!("sidecar returned no embedding"))
 }
 
 /// Compute an embedding vector for `text` by POSTing `/v1/embeddings`
@@ -437,10 +564,13 @@ mod tests {
             threshold,
             ttl_secs: ttl,
             max_entries: max,
+            source: EmbeddingSource::Provider,
             embedding: Some(EmbeddingProviderConfig {
                 provider: "openai".to_string(),
                 model: "text-embedding-3-small".to_string(),
             }),
+            sidecar: None,
+            inprocess: None,
         })
         .expect("enabled config builds")
     }
@@ -460,10 +590,13 @@ mod tests {
             threshold: 0.85,
             ttl_secs: 60,
             max_entries: 8,
+            source: EmbeddingSource::Provider,
             embedding: Some(EmbeddingProviderConfig {
                 provider: "openai".to_string(),
                 model: "m".to_string(),
             }),
+            sidecar: None,
+            inprocess: None,
         };
         assert!(EmbeddingCache::from_config(&cfg).is_none());
     }
@@ -475,7 +608,10 @@ mod tests {
             threshold: 0.85,
             ttl_secs: 60,
             max_entries: 8,
+            source: EmbeddingSource::Provider,
             embedding: None,
+            sidecar: None,
+            inprocess: None,
         };
         assert!(EmbeddingCache::from_config(&cfg).is_none());
     }
@@ -590,6 +726,46 @@ mod tests {
         let cache = EmbeddingCache::from_config(&cfg).unwrap();
         assert_eq!(cache.provider(), "openai");
         assert_eq!(cache.model(), "text-embedding-3-small");
+        // Default source is provider so existing configs are unchanged.
+        assert_eq!(cache.source(), EmbeddingSource::Provider);
+    }
+
+    #[test]
+    fn source_defaults_to_provider() {
+        let cfg: EmbeddingCacheConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "embedding": { "provider": "openai", "model": "text-embedding-3-small" }
+        }))
+        .unwrap();
+        assert_eq!(cfg.source, EmbeddingSource::Provider);
+    }
+
+    #[test]
+    fn sidecar_source_parses_and_builds() {
+        let cfg: EmbeddingCacheConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "source": "sidecar",
+            "sidecar": { "endpoint": "http://127.0.0.1:9440", "model": "all-MiniLM-L6-v2", "timeout_ms": 750 }
+        }))
+        .unwrap();
+        assert_eq!(cfg.source, EmbeddingSource::Sidecar);
+        let cache =
+            EmbeddingCache::from_config(&cfg).expect("sidecar cache builds without a provider");
+        assert_eq!(cache.source(), EmbeddingSource::Sidecar);
+        let sc = cache.sidecar_config().expect("sidecar config present");
+        assert_eq!(sc.endpoint, "http://127.0.0.1:9440");
+        assert_eq!(sc.timeout_ms, 750);
+    }
+
+    #[test]
+    fn sidecar_source_without_block_is_inert() {
+        let cfg: EmbeddingCacheConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "source": "sidecar"
+        }))
+        .unwrap();
+        // No sidecar block: nothing to vectorize with, so the cache stays inert.
+        assert!(EmbeddingCache::from_config(&cfg).is_none());
     }
 
     #[test]

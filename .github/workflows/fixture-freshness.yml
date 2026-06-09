@@ -54,7 +54,7 @@ jobs:
 
       # Cache only the standalone tool's target dir; the parent
       # workspace's cache is owned by other workflows.
-      - uses: Swatinem/rust-cache@v2.7.3
+      - uses: Swatinem/rust-cache@v2
         with:
           shared-key: fixture-freshness
           workspaces: test/fixtures/refresh-tool
