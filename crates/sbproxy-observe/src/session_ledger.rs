@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Soap Bucket LLC
 
 //! WOR-1186: emit the canonical Session Ledger from live MCP traffic.

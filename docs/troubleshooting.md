@@ -1,5 +1,5 @@
 # Troubleshooting
-*Last modified: 2026-06-04*
+*Last modified: 2026-06-08*
 
 When something breaks, this is the first place to look. For *why* these things happen, see [architecture.md](architecture.md).
 
@@ -68,12 +68,11 @@ Check:
 
 ## HTTP/3 requests fall back to HTTP/2
 
-Cause: HTTP/3 (QUIC) is UDP-based. Most NATs and corporate firewalls block or rate-limit UDP/443.
+Cause: HTTP/3 is currently disabled until native QUIC support lands in Pingora. The proxy does not start a QUIC listener and does not advertise `Alt-Svc`, so HTTP/2 is the highest version served. Clients that try HTTP/3 fall back to HTTP/2, which is expected.
 
 Check:
-- Confirm UDP/443 is reachable: `nc -u -v -z <host> 443`.
-- The browser advertises HTTP/3 support via the `Alt-Svc` header. If the response does not include `Alt-Svc: h3=":443"`, the proxy is not advertising it.
-- HTTP/3 must be explicitly enabled in the `proxy.tls.http3` block. It is off by default.
+- The `proxy.http3` block still parses, but it is inert. Setting `enabled: true` only logs a warning and starts no listener, so the absence of an `Alt-Svc: h3` header on responses is expected.
+- If you need a UDP/QUIC path today, terminate HTTP/3 at an upstream edge or CDN and forward HTTP/2 to SBproxy.
 
 ## An example docker compose stack will not start
 

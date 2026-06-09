@@ -1,5 +1,5 @@
 # Frequently asked questions
-*Last modified: 2026-06-06*
+*Last modified: 2026-06-08*
 
 Quick answers to the questions operators hit most often when standing up SBproxy, picking between OSS and enterprise, debugging a config that will not load, or wiring observability. For the full reference of any feature, follow the link to the matching doc.
 
@@ -48,7 +48,7 @@ See [troubleshooting.md](./troubleshooting.md) for the most common validation er
 
 Everything in this repo:
 
-* The full proxy: HTTP/1.1, HTTP/2, HTTP/3, websockets, gRPC, GraphQL, MCP.
+* The full proxy: HTTP/1.1, HTTP/2, websockets, gRPC, GraphQL, MCP.
 * The AI gateway: 66 native providers, routing strategies, guardrails, budgets, streaming, semantic cache, virtual keys.
 * Every auth provider (API key, Basic, Bearer, JWT, Digest, forward-auth, Web Bot Auth, CAP, OIDC).
 * Every policy (rate limit, WAF, IP filter, CORS, HSTS, CSRF, agent budget, content digest, BOLA / `object_authz`, ...).
@@ -70,7 +70,7 @@ See [enterprise.md](./enterprise.md) for the buyer-facing overview.
 
 ### Can I run SBproxy in production?
 
-Yes. The Business Source License 1.1 allows production use for everyone except a competing hosted or managed SBproxy service. The Change License flips to Apache 2.0 on 2030-05-01.
+Yes. SBproxy is licensed under the Apache License 2.0, which permits any use, including production and commercial deployment, with no field-of-use restriction.
 
 ## Auth + sessions
 

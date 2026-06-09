@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-06-06*
+*Last modified: 2026-06-08*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -445,7 +445,7 @@ SBproxy initializes subsystems in a fixed order. Each step must succeed before t
 11. **Feature flags**: loads and caches workspace-level feature flags from the messenger.
 12. **Host filter**: builds the bloom filter from all known hostnames. Short-circuits requests for unknown hostnames before full origin lookup.
 13. **Build router**: assembles the HTTP router with all middleware, auth handlers, and proxy engine endpoints.
-14. **Start servers**: binds and listens on configured HTTP, HTTPS, and HTTP/3 (QUIC) ports.
+14. **Start servers**: binds and listens on configured HTTP and HTTPS ports. (The HTTP/3 (QUIC) listener is currently disabled pending native Pingora HTTP/3, so no QUIC port is bound even when `http3` is configured.)
 15. **Start subscribers**: starts background workers that subscribe to messenger topics for real-time config updates, cache invalidation, and feature flag changes.
 16. **Mark ready**: sets the health manager's ready flag to `true`. The `/ready` and `/readyz` endpoints begin returning `200`.
 17. **Hot reload watcher**: starts the file watcher on the config file.
@@ -956,7 +956,7 @@ Connection pool behavior and timeouts are configurable per origin. Place these s
 | `http11_only` | `false` | - | Force HTTP/1.1 (disable HTTP/2 and HTTP/3) |
 | `skip_tls_verify_host` | `false` | - | Skip TLS certificate verification for upstream (use only in dev) |
 | `min_tls_version` | (global) | - | Minimum TLS version for outbound: `"1.2"` or `"1.3"` |
-| `enable_http3` | `false` | - | Enable HTTP/3 (QUIC) for upstream connections |
+| `enable_http3` | `false` | - | Enable HTTP/3 (QUIC) for upstream connections. Currently inert; HTTP/3 is disabled pending native Pingora HTTP/3. |
 
 Example: aggressive tuning for a low-latency internal API:
 
@@ -1036,9 +1036,9 @@ proxy:
 
 ### HTTP/3 (QUIC)
 
-HTTP/3 is supported for both inbound connections and upstream forwarding.
+HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. The `http3` config and the `enable_http3` flags below still parse, but they are currently ignored: no QUIC listener is started, no `Alt-Svc` header is advertised, and setting `enable_http3: true` only logs a warning. HTTP/2 is the highest version served. The configuration and the UDP, port, and firewall mechanics below are documented for when HTTP/3 returns.
 
-Enable inbound HTTP/3 on the proxy server:
+Enable inbound HTTP/3 on the proxy server (currently has no effect):
 
 ```yaml
 proxy:
@@ -1057,7 +1057,7 @@ origins:
     enable_http3: true
 ```
 
-HTTP/3 requires the HTTPS port to also be bound: the `Alt-Svc` header is sent on the HTTPS response to signal QUIC availability to clients.
+When HTTP/3 returns, it will require the HTTPS port to also be bound: the `Alt-Svc` header is sent on the HTTPS response to signal QUIC availability to clients. Today no `Alt-Svc` header is emitted.
 
 ---
 
@@ -1211,7 +1211,7 @@ header / query parsing is wired today.
 
 ### Single container
 
-Mount a config directory and map ports. The container exposes `8080/tcp`, `8443/tcp`, and `8443/udp` (UDP is required for HTTP/3 QUIC).
+Mount a config directory and map ports. The container exposes `8080/tcp`, `8443/tcp`, and `8443/udp` (UDP will be required for HTTP/3 QUIC when HTTP/3 returns; HTTP/3 is currently disabled, so the UDP mapping is presently unused).
 
 ```bash
 docker run -d \
@@ -1426,6 +1426,8 @@ spec:
 
 ### UDP support for HTTP/3
 
+HTTP/3 is currently disabled pending native Pingora HTTP/3, so no QUIC/UDP listener is started today and the UDP wiring below is not needed yet. It is documented for when HTTP/3 returns.
+
 HTTP/3 uses QUIC over UDP. Kubernetes Services with `type: ClusterIP` do not support UDP and TCP on the same port number by default; you need separate Service objects, or `type: LoadBalancer` with a cloud provider that supports mixed protocols.
 
 For AWS Network Load Balancer with mixed protocol support:
@@ -1587,12 +1589,7 @@ docker run --rm \
 
 ### HTTP/3 limitations
 
-The HTTP/3 listener does not yet plumb every auth or action module through its dispatch path. Plan accordingly when binding origins to the QUIC listener.
-
-- `forward_auth` over HTTP/3 is **not supported** and requests are denied with `401 Unauthorized` (fail closed). Configure an HTTP/1.1 or HTTP/2 listener for origins that rely on `forward_auth`.
-- `bot_auth` and plugin auth over HTTP/3 are also denied with `401`.
-- The following action types return `501 Not Implemented` over HTTP/3: `load_balancer`, `ai_proxy`, `websocket`, `grpc`, `graphql`, `storage`, `a2a`, `plugin`. The 501 body names the action type and reminds the operator to configure an HTTP/1.1 or HTTP/2 listener.
-- `proxy`, `redirect`, `static`, `echo`, `mock`, `beacon`, and `noop` actions are fully supported over HTTP/3.
+HTTP/3 is currently disabled entirely until native QUIC support lands in Pingora. No QUIC listener is started, so there is no HTTP/3 dispatch path and the previous per-auth and per-action limitations over HTTP/3 do not currently apply. All traffic is served over HTTP/1.1 and HTTP/2, where every auth and action module is supported. These limitations will be revisited when HTTP/3 returns.
 
 ---
 

@@ -1,5 +1,5 @@
 # Web Bot Auth
-*Last modified: 2026-04-27*
+*Last modified: 2026-06-08*
 
 The `bot_auth` provider verifies cryptographically-signed AI agents per the IETF "Web Bot Auth" pattern. AI crawlers sign each request with an Ed25519 key under [RFC 9421 HTTP Message Signatures](https://www.rfc-editor.org/rfc/rfc9421.html) and advertise their `keyid` in the `Signature-Input` header; the gateway looks up the matching public key in its directory and verifies the signature. Agents that pass come through; everything else gets `401`.
 
@@ -142,7 +142,7 @@ The deferred check fires only when `Signature-Input` actually covers `content-di
 ## Limitations
 
 - The OSS directory is inline in YAML. Dynamic directory refresh from a hosted JWKS-shaped document is on the roadmap; the same `Directory` trait will back both shapes.
-- HTTP/3 / QUIC requests deny by default until the H3 dispatch path is plumbed with the full request shape needed for signature reconstruction.
+- HTTP/3 / QUIC is currently disabled entirely (no QUIC listener is started) pending native HTTP/3 support in Pingora, so there is no H3 path for `bot_auth` to handle today.
 
 ## See also
 

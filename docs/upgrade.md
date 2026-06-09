@@ -1,5 +1,5 @@
 # Upgrade Guide
-*Last modified: 2026-04-24*
+*Last modified: 2026-06-08*
 
 ## Upgrading between versions
 
@@ -15,7 +15,7 @@
 
 - JavaScript engine (QuickJS) for transforms and WAF rules via `js_script` fields in request/response modifiers.
 - ACME auto-cert (Let's Encrypt) via `proxy.acme` config block.
-- HTTP/3 (QUIC) support via `proxy.http3` config block.
+- HTTP/3 (QUIC) support via `proxy.http3` config block (temporarily disabled pending native Pingora HTTP/3 support).
 - Per-origin metrics with 21 metric families and configurable cardinality limiting.
 - W3C and B3 distributed tracing header propagation.
 - Webhook alerting with configurable channels via `proxy.alerting`.
@@ -29,7 +29,7 @@ The following top-level `proxy:` sub-keys are new in v1.0:
 | Key | Description |
 |-----|-------------|
 | `proxy.acme` | ACME auto-cert configuration (Let's Encrypt). |
-| `proxy.http3` | HTTP/3 QUIC configuration. |
+| `proxy.http3` | HTTP/3 QUIC configuration (temporarily disabled pending native Pingora HTTP/3 support). |
 | `proxy.metrics` | Metrics cardinality limits. |
 | `proxy.alerting` | Alert notification channels (webhook, log). |
 | `proxy.admin` | Embedded stats/logs SPA. |

@@ -168,10 +168,10 @@ allow = [
 exceptions = []
 
 # All workspace crates are publish = false (see CLAUDE.md). They are licensed
-# under BUSL-1.1 (the project license, see LICENSE). cargo-deny does not need
-# to police our own first-party license choices; the allowlist above governs
-# transitive dependencies. Without this, every workspace crate would fail the
-# license gate because BUSL-1.1 is not in the third-party allowlist.
+# under Apache-2.0 (the project license, see LICENSE). Apache-2.0 is already in
+# the third-party allowlist above, but keeping our own first-party crates out
+# of the license gate is still correct: cargo-deny does not need to police our
+# own license choices, and the allowlist governs transitive dependencies.
 [licenses.private]
 ignore = true
 

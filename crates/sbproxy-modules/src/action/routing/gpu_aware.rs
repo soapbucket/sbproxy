@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 //! GPU-utilisation-aware routing strategy.
 //!
 //! Picks the healthy upstream with the lowest reported GPU utilisation,

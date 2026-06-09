@@ -1,6 +1,6 @@
 # SBproxy features manual
 
-*Last modified: 2026-06-06*
+*Last modified: 2026-06-08*
 
 Reference for SBproxy features. Each section covers what a feature does, how to configure it, and a working example against `test.sbproxy.dev`.
 
@@ -1973,7 +1973,7 @@ The proxy is split into focused crates:
 - `sbproxy-extension`: WASM (wasmtime), Lua (mlua/Luau), CEL (cel-rust), JavaScript (QuickJS)
 - `sbproxy-cache`: response cache, pluggable backends
 - `sbproxy-security`: WAF, DDoS, CSRF, message signatures
-- `sbproxy-tls`: TLS, ACME auto-cert, HTTP/3
+- `sbproxy-tls`: TLS, ACME auto-cert, HTTP/3 (currently disabled pending native Pingora HTTP/3)
 - `sbproxy-transport`: retry, coalescing, hedged requests, circuit breaker
 - `sbproxy-vault`: secret management
 - `sbproxy-observe`: logging, metrics, event bus
@@ -2175,24 +2175,5 @@ This flag only affects the plain `http_bind_port` listener. TLS-fronted HTTP/2 o
 
 ### HTTP/3 limitations
 
-The HTTP/3 (QUIC) listener uses a separate dispatch path that does not yet route through every action and auth module. Until those are wired through, the H3 listener handles each case as follows.
-
-Auth modules over HTTP/3:
-
-- `forward_auth`: not supported. Requests are denied with `401 Unauthorized` (fail closed) so the configured auth is never silently bypassed. Configure an HTTP/1.1 or HTTP/2 listener for origins that depend on `forward_auth`.
-- `bot_auth` and plugin auth: not supported. Requests are denied with `401 Unauthorized`.
-- `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `noop`: supported.
-
-Action modules over HTTP/3 that return `501 Not Implemented`:
-
-- `load_balancer`
-- `ai_proxy`
-- `websocket`
-- `grpc`
-- `graphql`
-- `storage`
-- `a2a`
-- `plugin`
-
-The 501 response body identifies the action type and tells operators to configure an HTTP/1.1 or HTTP/2 listener for the origin. Other actions (`proxy`, `redirect`, `static`, `echo`, `mock`, `beacon`, `noop`) work over HTTP/3 today.
+HTTP/3 is currently disabled entirely until native QUIC support lands in Pingora. No QUIC listener is started; the `http3` config block still parses but is ignored, and setting `enabled: true` only logs a warning. Because there is no H3 dispatch path today, the per-action and per-auth limitations that previously applied over HTTP/3 do not apply: all traffic is served over HTTP/1.1 and HTTP/2, where every action and auth module is supported. These notes will be revisited when HTTP/3 returns.
 

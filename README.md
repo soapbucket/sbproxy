@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/soapbucket/sbproxy/releases"><img src="https://img.shields.io/github/v/release/soapbucket/sbproxy" alt="Release"></a>
-  <a href="https://mariadb.com/bsl11/"><img src="https://img.shields.io/badge/License-BUSL_1.1-orange.svg" alt="License"></a>
+  <a href="https://www.apache.org/licenses/LICENSE-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
   <a href="https://github.com/soapbucket/sbproxy/actions/workflows/ci.yml"><img src="https://github.com/soapbucket/sbproxy/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/soapbucket/sbproxy/stargazers"><img src="https://img.shields.io/github/stars/soapbucket/sbproxy" alt="Stars"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.82+-orange.svg" alt="Rust 1.82+"></a>
@@ -125,6 +125,6 @@ SBproxy v1.0 is a Rust rewrite. The Go implementation that previously occupied t
 
 ## License
 
-Licensed under [BSL 1.1](LICENSE). Source available on GitHub. Production use is permitted for everything except offering SBproxy as a competing hosted or managed service.
+Licensed under the [Apache License 2.0](LICENSE). Free for any use, including production and commercial, with no field-of-use restriction.
 
-For commercial licensing inquiries, contact `legal@soapbucket.com`. See also [NOTICE](NOTICE) and [TRADEMARKS](TRADEMARKS.md). A [Soap Bucket LLC](https://www.soapbucket.com) project.
+See also [NOTICE](NOTICE) and [TRADEMARKS](TRADEMARKS.md). A [Soap Bucket LLC](https://www.soapbucket.com) project.

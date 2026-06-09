@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 //! AI gateway rate limiting.
 //!
 //! The AI gateway enforces five independent caps per `(apikey, model)`

@@ -33,7 +33,7 @@ name = "tls-fingerprint-bench"
 version = "0.0.1"
 edition = "2021"
 publish = false
-license = "BUSL-1.1"
+license = "Apache-2.0"
 
 [[bin]]
 name = "tls-fingerprint-bench"

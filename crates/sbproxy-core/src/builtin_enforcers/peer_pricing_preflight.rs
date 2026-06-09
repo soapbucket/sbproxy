@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 //! Newtype wrapper enforcer for the
 //! [`Policy::PeerPricingPreflight`](sbproxy_modules::policy::Policy::PeerPricingPreflight)
 //! variant.

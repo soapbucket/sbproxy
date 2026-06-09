@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 //! Config-source loader.
 //!
 //! The compiler historically accepted a single string of YAML and went

@@ -1198,15 +1198,21 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     if let Some(ref tls) = tls_state {
         reload::set_challenge_store(std::sync::Arc::clone(&tls.challenge_store));
     }
-    if server_config.http3.as_ref().is_some_and(|h| h.enabled) {
-        if let Some(https_port) = server_config.https_bind_port {
-            reload::set_alt_svc(sbproxy_tls::alt_svc::h3_alt_svc_value(https_port));
-            tracing::info!(
-                "Alt-Svc header will advertise HTTP/3 on port {}",
-                https_port
-            );
-        }
-    }
+    // HTTP/3 (QUIC) is temporarily disabled, so we do not advertise it via
+    // Alt-Svc. The listener below is a standalone quinn/h3 stack that is not
+    // integrated with the Pingora request pipeline; advertising HTTP/3 would
+    // steer clients onto a transport that does not honor the full proxy
+    // feature set. Restore this block once Pingora ships native HTTP/3.
+    //
+    // if server_config.http3.as_ref().is_some_and(|h| h.enabled) {
+    //     if let Some(https_port) = server_config.https_bind_port {
+    //         reload::set_alt_svc(sbproxy_tls::alt_svc::h3_alt_svc_value(https_port));
+    //         tracing::info!(
+    //             "Alt-Svc header will advertise HTTP/3 on port {}",
+    //             https_port
+    //         );
+    //     }
+    // }
 
     // Start ACME renewal task if enabled.
     if let Some(ref tls) = tls_state {
@@ -1219,27 +1225,40 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         tls.start_ocsp_refresh_task();
     }
 
-    // Start HTTP/3 listener if enabled.
-    if let Some(ref tls) = tls_state {
-        if server_config.http3.as_ref().is_some_and(|h| h.enabled) {
-            // Wire the real pipeline dispatch into the H3 listener.
-            let dispatch_fn: sbproxy_tls::h3_listener::DispatchFn =
-                std::sync::Arc::new(|method, uri, headers, body, client_ip| {
-                    Box::pin(crate::dispatch::dispatch_h3_request(
-                        method, uri, headers, body, client_ip,
-                    ))
-                });
-            match tls.start_h3_listener(&server_config, dispatch_fn) {
-                Ok(Some(_handle)) => {
-                    tracing::info!("HTTP/3 listener started");
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to start HTTP/3 listener, continuing without it");
-                }
-            }
-        }
+    // HTTP/3 (QUIC) support is temporarily disabled until native HTTP/3 lands
+    // in Pingora. The listener is a standalone quinn/h3 stack wired outside
+    // the Pingora pipeline, so enabling it would expose a transport path that
+    // does not run the full request chain. The `http3` config field stays
+    // parseable but is ignored; operators who set it get a warning so the
+    // behavior is visible. The original wiring is preserved below for the
+    // eventual cutover.
+    if server_config.http3.as_ref().is_some_and(|h| h.enabled) {
+        tracing::warn!(
+            "HTTP/3 (QUIC) is configured but not available in this build; the \
+             setting is ignored. HTTP/3 will return once native support lands \
+             in the proxy engine."
+        );
     }
+    // if let Some(ref tls) = tls_state {
+    //     if server_config.http3.as_ref().is_some_and(|h| h.enabled) {
+    //         // Wire the real pipeline dispatch into the H3 listener.
+    //         let dispatch_fn: sbproxy_tls::h3_listener::DispatchFn =
+    //             std::sync::Arc::new(|method, uri, headers, body, client_ip| {
+    //                 Box::pin(crate::dispatch::dispatch_h3_request(
+    //                     method, uri, headers, body, client_ip,
+    //                 ))
+    //             });
+    //         match tls.start_h3_listener(&server_config, dispatch_fn) {
+    //             Ok(Some(_handle)) => {
+    //                 tracing::info!("HTTP/3 listener started");
+    //             }
+    //             Ok(None) => {}
+    //             Err(e) => {
+    //                 tracing::warn!(error = %e, "failed to start HTTP/3 listener, continuing without it");
+    //             }
+    //         }
+    //     }
+    // }
 
     server.bootstrap();
 

@@ -188,15 +188,13 @@ unchanged.
 
 ## License + attribution
 
-Business Source License 1.1 (`LICENSE`). Source-available; production
-use is allowed for everything except offering SBproxy as a competing
-hosted or managed service.
+Apache License 2.0 (`LICENSE`). Open source; free for any use,
+including production and commercial, with no field-of-use restriction.
 
 When adding or upgrading a dependency licensed **only** under Apache
 2.0 (not dual MIT/Apache-2.0), update the `NOTICE` file in the same
-commit; the BSL Change License is Apache 2.0, and Apache 2.0 §4 will
-require those entries once the license flips. Easier to keep the file
-correct as you go than to reconstruct it later.
+commit; Apache 2.0 §4 requires those attribution entries. Easier to
+keep the file correct as you go than to reconstruct it later.
 
 ### Verifying NOTICE coverage
 

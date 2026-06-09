@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-06-06*
+*Last modified: 2026-06-08*
 
 The complete configuration reference for SBproxy. Every option, every field, every action type is documented here with real-world examples you can copy-paste and run.
 
@@ -202,7 +202,7 @@ proxy:
 | `tls_cert_file` | string | | Path to PEM-encoded TLS certificate. Ignored when `acme` is configured. |
 | `tls_key_file` | string | | Path to PEM-encoded TLS private key. |
 | `acme` | object | | ACME (auto-TLS) block. Overrides manual cert/key when set. See [ACME / auto TLS](#acme--auto-tls). |
-| `http3` | object | | HTTP/3 (QUIC) listener config. |
+| `http3` | object | | HTTP/3 (QUIC) listener config. Currently inert; see [HTTP/3 fields](#http3-fields). |
 | `metrics` | object | | Metrics tuning, including label cardinality limits. |
 | `alerting` | object | | Alert notification channels. |
 | `admin` | object | | Embedded read-only admin / stats API server. |
@@ -242,11 +242,13 @@ proxy:
 
 ### HTTP/3 fields
 
+HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. The `http3` block still parses, but no QUIC listener starts and setting `enabled: true` only logs a warning. The fields below are documented for forward compatibility; they have no runtime effect today.
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | false | Enable the HTTP/3 (QUIC) listener |
-| `max_streams` | int | 100 | Maximum concurrent QUIC streams per connection |
-| `idle_timeout_secs` | int | 30 | Idle timeout for QUIC connections |
+| `enabled` | bool | false | Enable the HTTP/3 (QUIC) listener. Currently inert; no listener starts. |
+| `max_streams` | int | 100 | Maximum concurrent QUIC streams per connection. Currently inert. |
+| `idle_timeout_secs` | int | 30 | Idle timeout for QUIC connections. Currently inert. |
 
 ### Admin fields
 

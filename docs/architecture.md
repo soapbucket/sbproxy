@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-06-06*
+*Last modified: 2026-06-08*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -15,8 +15,9 @@ interpreter, no Node.js runtime, and no shared library requirement beyond libc (
 all when built with `musl` or `--target *-unknown-linux-musl`).
 
 The proxy is built on Cloudflare's [Pingora](https://github.com/cloudflare/pingora)
-framework. Pingora supplies the tokio runtime, listener management, HTTP/1.1, HTTP/2, HTTP/3
-(QUIC via `quinn`), TLS termination, and a phase-based callback model for the request
+framework. Pingora supplies the tokio runtime, listener management, HTTP/1.1, HTTP/2
+(HTTP/3 is currently disabled pending native Pingora HTTP/3), TLS termination, and a
+phase-based callback model for the request
 pipeline. SBproxy layers its host router, compiled origin pipeline, plugin registry, and
 hot-reload machinery on top of those primitives.
 
@@ -89,7 +90,8 @@ sbproxy/
                               policies live in sbproxy-modules/src/policy/.
     sbproxy-tls/          - TLS termination via rustls 0.23 with the `ring`
                               crypto provider, ACME auto-cert (Let's Encrypt),
-                              HTTP/3 listener wiring, OCSP stapling.
+                              HTTP/3 listener wiring (currently disabled
+                              pending native Pingora HTTP/3), OCSP stapling.
     sbproxy-transport/    - Outbound transport: retry with exponential backoff,
                               request coalescing, hedged requests,
                               circuit breaker, upstream rate limiting.

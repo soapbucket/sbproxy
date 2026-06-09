@@ -426,6 +426,11 @@ pub struct ProxyServerConfig {
     #[serde(default)]
     pub acme: Option<AcmeConfig>,
     /// Optional HTTP/3 (QUIC) listener configuration.
+    ///
+    /// Temporarily inert: HTTP/3 is disabled until native QUIC support lands
+    /// in the underlying proxy engine. The field still parses so existing
+    /// configs keep loading, but enabling it only logs a warning and does not
+    /// start a listener.
     #[serde(default)]
     pub http3: Option<Http3Config>,
     /// Metrics collection settings, including cardinality limiting.
@@ -2320,9 +2325,16 @@ pub struct AlertChannelConfig {
 // --- HTTP/3 Config ---
 
 /// HTTP/3 (QUIC) configuration.
+///
+/// Temporarily inert: HTTP/3 is disabled until native QUIC support lands in
+/// the underlying proxy engine. These fields still parse, but the listener is
+/// not started; enabling it logs a warning instead.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Http3Config {
     /// Whether to enable the HTTP/3 (QUIC) listener.
+    ///
+    /// Currently ignored: HTTP/3 is temporarily disabled (see the struct
+    /// docs). Setting this to `true` logs a warning and starts no listener.
     #[serde(default)]
     pub enabled: bool,
     /// Maximum number of concurrent QUIC streams per connection.

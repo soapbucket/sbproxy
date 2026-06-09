@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Soap Bucket LLC
 
 //! The `RequestEvent` envelope that the four capture streams populate.

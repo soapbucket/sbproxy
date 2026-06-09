@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 //! Operator-defined custom access-log fields.
 //!
 //! `proxy.observability.log.custom_fields:` lets an operator add keys to

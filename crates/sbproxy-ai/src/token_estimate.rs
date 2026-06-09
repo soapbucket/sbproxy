@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 //! Pre-request prompt token estimation for fail-fast TPM enforcement.
 //!
 //! The WOR-223 [`ModelRateLimiter`](crate::ratelimit::ModelRateLimiter) reconciles

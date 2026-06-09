@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 //! Epsilon-greedy multi-armed bandit routing strategy.
 //!
 //! Treats each target as an arm of a bandit and learns which one delivers

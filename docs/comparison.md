@@ -1,6 +1,6 @@
 # How SBproxy compares
 
-*Last modified: 2026-06-06*
+*Last modified: 2026-06-08*
 
 SBproxy is a reverse proxy that doubles as an AI gateway. Most tools do one or the other; this page is honest about where SBproxy fits and where you should pick something else.
 
@@ -49,7 +49,7 @@ SBproxy reaches 200+ models through 66 native providers behind one OpenAI-compat
 | Implementation | Compiled native binary | Python |
 | Min resources | 1 CPU, 256 MB | 4 CPU, 8 GB |
 | Database required | No | PostgreSQL |
-| HTTP/3 | Yes | No |
+| HTTP/3 | Planned | No |
 | WebSocket proxy | Yes | No |
 | gRPC proxy | Yes | No |
 | MCP federation | Yes | No |
@@ -115,7 +115,7 @@ capabilities via plugins in 2024.
 | Database | Not required | PostgreSQL (or DB-less mode) |
 | AI gateway | Native | Plugin-based |
 | Plugin system | CEL + Lua + WASM + JS + registry | Lua plugins |
-| HTTP/3 | Yes | No |
+| HTTP/3 | Planned | No |
 | Rate limiting | Built-in, distributed | Plugin |
 | Authentication | 7+ built-in types | Plugin-based |
 | MCP federation | Yes | No |
@@ -124,7 +124,7 @@ capabilities via plugins in 2024.
 Choose Kong if you want a mature API gateway ecosystem with hundreds of community
 plugins.
 
-Choose SBproxy if you want native AI gateway features without plugins, HTTP/3 support,
+Choose SBproxy if you want native AI gateway features without plugins
 or a lighter deployment footprint.
 
 ### vs Caddy
@@ -138,7 +138,7 @@ Caddy is a Go reverse proxy known for automatic HTTPS.
 | Config format | YAML | Caddyfile or JSON |
 | Rate limiting | Built-in, distributed | Community module |
 | Scripting | CEL + Lua + WASM + JS | Modules |
-| HTTP/3 | Yes | Yes |
+| HTTP/3 | Planned | Yes |
 | Compression | Gzip, Brotli, Zstd | Gzip, Brotli, Zstd |
 | Circuit breaker | Built-in (3-state) | Latency-based |
 | Health checks | Active + passive | Active + passive |
@@ -173,7 +173,7 @@ Traefik is a cloud-native reverse proxy with automatic service discovery.
 | Service discovery | Config-based + DNS | Docker, K8s, Consul |
 | AI gateway | Yes | No |
 | Middleware | CEL + Lua + WASM + JS + built-in | Declarative chain |
-| HTTP/3 | Yes | Experimental |
+| HTTP/3 | Planned | Experimental |
 | Rate limiting | Built-in, distributed | Traefik Hub only (paid) |
 | MCP federation | Yes | No |
 | Plugin system | CEL + Lua + WASM + JS | WASM/Yaegi |
@@ -194,7 +194,7 @@ Nginx is the most widely deployed reverse proxy.
 | gRPC proxy | Yes | Yes |
 | MCP federation | Yes | No |
 | Scripting | CEL + Lua + WASM + JS | Lua (OpenResty) / C modules |
-| HTTP/3 | Yes | Yes (newer builds) |
+| HTTP/3 | Planned | Yes (newer builds) |
 | Active health checks | Built-in | NGINX Plus only |
 | Dynamic config | Feature flags | NGINX Plus only |
 | Static file serving | Not supported (proxy focus) | Excellent |

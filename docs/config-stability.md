@@ -1,6 +1,6 @@
 # Config stability tiers
 
-*Last modified: 2026-04-24*
+*Last modified: 2026-06-08*
 
 Stability guarantees for every field in `sb.yml`. Check a field's tier before relying on it in production.
 
@@ -32,6 +32,14 @@ An `alpha` field is experimental.
 - Do not depend on `alpha` fields in critical production paths.
 - Feedback on alpha fields is welcome and influences their stabilization.
 
+### `disabled`
+
+A `disabled` field still parses but has no runtime effect today.
+
+- The field is accepted by the config loader so existing configs keep loading.
+- No code path acts on the value; setting it does nothing beyond an optional warning log.
+- Currently applies to the `http3` block: HTTP/3 is temporarily disabled until native QUIC support lands in Pingora.
+
 ---
 
 ## Stabilization rules
@@ -60,7 +68,7 @@ An `alpha` field is experimental.
 | `tls_cert_file` | string | - | **stable** | Path to PEM cert for manual TLS. |
 | `tls_key_file` | string | - | **stable** | Path to PEM key for manual TLS. |
 | `acme` | object | - | **beta** | Automatic TLS via ACME. |
-| `http3` | object | - | **alpha** | HTTP/3 (QUIC) listener. |
+| `http3` | object | - | **disabled** | HTTP/3 (QUIC) listener. Currently inert. |
 
 ### `proxy.acme` - AcmeConfig
 
@@ -76,11 +84,13 @@ An `alpha` field is experimental.
 
 ### `proxy.http3` - Http3Config
 
+HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. These fields still parse, but no QUIC listener starts and setting `enabled: true` only logs a warning.
+
 | Field | Type | Default | Stability | Notes |
 |---|---|---|---|---|
-| `enabled` | boolean | false | **alpha** | Enable QUIC listener. |
-| `max_streams` | integer | 100 | **alpha** | Max concurrent QUIC streams per connection. |
-| `idle_timeout_secs` | integer | 30 | **alpha** | QUIC idle timeout in seconds. |
+| `enabled` | boolean | false | **disabled** | Enable QUIC listener. Currently inert; no listener starts. |
+| `max_streams` | integer | 100 | **disabled** | Max concurrent QUIC streams per connection. Currently inert. |
+| `idle_timeout_secs` | integer | 30 | **disabled** | QUIC idle timeout in seconds. Currently inert. |
 
 ### Origin Config (each entry under `origins:`)
 

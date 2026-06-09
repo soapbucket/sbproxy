@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 //! LoRA-identifier routing strategy.
 //!
 //! Picks the healthy upstream that advertises the LoRA adapter named on

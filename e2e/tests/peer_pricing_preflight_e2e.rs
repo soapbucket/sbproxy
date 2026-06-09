@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 //! WOR-188: outbound peer-pricing pre-flight, end-to-end.
 //!
 //! Exercises the [`PeerPricingPreflightPolicy`] against a real local

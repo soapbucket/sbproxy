@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Soap Bucket LLC
 
 //! Typed parser for the unified credential-reference URI.

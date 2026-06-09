@@ -1,6 +1,6 @@
 # SBproxy
 
-> The AI gateway built like a real proxy. One binary, built on Pingora. Source available under BSL 1.1.
+> The AI gateway built like a real proxy. One binary, built on Pingora. Open source under Apache 2.0.
 
 Most teams run nginx or Traefik for HTTP traffic, then route AI requests through a separate LiteLLM or Portkey instance. SBproxy handles both in a single binary. One config file covers everything.
 
@@ -255,4 +255,4 @@ These aren't synthetic ceilings. Most p99s land under 1 ms because the design pr
 - Source: https://github.com/soapbucket/sbproxy
 - Website: https://sbproxy.dev
 - Docker: ghcr.io/soapbucket/sbproxy
-- License: BSL 1.1 (see LICENSE)
+- License: Apache 2.0 (see LICENSE)

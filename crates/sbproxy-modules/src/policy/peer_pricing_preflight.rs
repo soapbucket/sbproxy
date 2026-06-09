@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 //! Outbound peer-pricing pre-flight policy.
 //!
 //! When sbproxy issues an outbound request to a cooperating peer the
