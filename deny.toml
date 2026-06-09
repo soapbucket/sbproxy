@@ -118,6 +118,13 @@ ignore = [
   # transitive; revisit when tract-onnx and tokenizers update.
   "RUSTSEC-2024-0436",
 
+  # RUSTSEC-2026-0173: proc-macro-error2 (a maintained fork of the older
+  # proc-macro-error) is now itself unmaintained. Pulled in transitively as a
+  # build-time proc-macro by the tonic/prost gRPC stack; no runtime artifact
+  # and no maintained replacement reachable without an upstream bump. Predates
+  # this change. Transitive; revisit when tonic/prost drop it.
+  "RUSTSEC-2026-0173",
+
   # RUSTSEC-2025-0134: rustls-pemfile 2.2.0. Paths: rustls-pemfile ->
   # pingora-rustls -> pingora-core (direct dep), -> object_store (direct
   # dep), -> kube-client -> kube (direct dep), and -> axum-server (direct
