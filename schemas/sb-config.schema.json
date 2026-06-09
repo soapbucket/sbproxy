@@ -285,7 +285,7 @@
           ]
         },
         "http3": {
-          "description": "Optional HTTP/3 (QUIC) listener configuration.",
+          "description": "Optional HTTP/3 (QUIC) listener configuration.\n\nTemporarily inert: HTTP/3 is disabled until native QUIC support lands in the underlying proxy engine. The field still parses so existing configs keep loading, but enabling it only logs a warning and does not start a listener.",
           "default": null,
           "anyOf": [
             {
@@ -578,11 +578,11 @@
       }
     },
     "Http3Config": {
-      "description": "HTTP/3 (QUIC) configuration.",
+      "description": "HTTP/3 (QUIC) configuration.\n\nTemporarily inert: HTTP/3 is disabled until native QUIC support lands in the underlying proxy engine. These fields still parse, but the listener is not started; enabling it logs a warning instead.",
       "type": "object",
       "properties": {
         "enabled": {
-          "description": "Whether to enable the HTTP/3 (QUIC) listener.",
+          "description": "Whether to enable the HTTP/3 (QUIC) listener.\n\nCurrently ignored: HTTP/3 is temporarily disabled (see the struct docs). Setting this to `true` logs a warning and starts no listener.",
           "default": false,
           "type": "boolean"
         },
