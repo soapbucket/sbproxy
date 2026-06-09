@@ -239,6 +239,9 @@ mod tests {
         assert!((norm - 1.0).abs() < 1e-3, "vector must be L2-normalized");
         let b = emb.embed("the cat sat on the mat").unwrap();
         let cos: f32 = a.values.iter().zip(&b.values).map(|(x, y)| x * y).sum();
-        assert!(cos > 0.999, "identical text cosine should be ~1.0, got {cos}");
+        assert!(
+            cos > 0.999,
+            "identical text cosine should be ~1.0, got {cos}"
+        );
     }
 }
