@@ -662,6 +662,45 @@ mod tests {
         assert_field(span, "error.type", "guardrail_blocked");
     }
 
+    /// WOR-1232: GenAI semantic-convention conformance. Pin the version and
+    /// the required `gen_ai.*` attribute set so a span never silently drifts
+    /// off-spec. Recording into a field that `ai_request_span` does not
+    /// declare is a no-op, so dropping a required attribute fails this test.
+    #[test]
+    fn ai_request_span_conforms_to_pinned_genai_semconv() {
+        // Bump deliberately when re-validating against a newer semconv.
+        const GEN_AI_SEMCONV_VERSION: &str = "1.36.0";
+        const REQUIRED_GEN_AI_FIELDS: &[&str] = &[
+            "gen_ai.system",
+            "gen_ai.request.model",
+            "gen_ai.response.model",
+            "gen_ai.response.id",
+            "gen_ai.usage.input_tokens",
+            "gen_ai.usage.output_tokens",
+            "gen_ai.usage.cost",
+            "gen_ai.response.finish_reasons",
+        ];
+        assert!(
+            !GEN_AI_SEMCONV_VERSION.is_empty(),
+            "semconv version must be pinned"
+        );
+
+        use tracing_subscriber::prelude::*;
+        let layer = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = ai_request_span("chat", "POST");
+            for field in REQUIRED_GEN_AI_FIELDS {
+                span.record(*field, "conformance-probe");
+            }
+        });
+        let spans = snapshot_spans(&layer);
+        let span = find_span(&spans, "ai.request");
+        for field in REQUIRED_GEN_AI_FIELDS {
+            assert_field(span, field, "conformance-probe");
+        }
+    }
+
     /// `UsageTokens::total()` (WOR-1084) sums every dimension,
     /// not just prompt + completion. Pinned so a downstream
     /// dashboard's "total tokens" math stays consistent.
