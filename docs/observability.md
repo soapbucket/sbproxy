@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-06-01*
+*Last modified: 2026-06-08*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -611,6 +611,36 @@ Span names follow `sbproxy.<pillar>.<verb>`:
 Span attributes include the OTel semantic conventions (`http.request.method`, `http.response.status_code`, `server.address`) plus the SBproxy-specific set (`sbproxy.request_id`, `sbproxy.tenant_id`, `sbproxy.route`, `sbproxy.agent_id`, `sbproxy.agent_class`, `sbproxy.rail`, `sbproxy.shape`, `sbproxy.ledger.idempotency_key`).
 
 High-cardinality attributes (`request_id`, `agent_id`) are span attributes only, never Prometheus labels.
+
+### AI gateway spans (gen_ai / OpenInference)
+
+The AI request span (`ai.request`) follows the OpenTelemetry GenAI semantic conventions (`gen_ai.*`) and dual-emits the OpenInference (`llm.*`) vocabulary, so LLM-native trace backends render a full generation without remapping. Per request it carries:
+
+| Concept | gen_ai | OpenInference |
+|---|---|---|
+| Provider / model | `gen_ai.system`, `gen_ai.request.model`, `gen_ai.response.model` | `llm.provider`, `llm.model_name` |
+| Tokens (with cache + reasoning split) | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read_tokens`, `gen_ai.usage.cache_write_tokens`, `gen_ai.usage.reasoning_tokens` | `llm.token_count.prompt`, `llm.token_count.completion`, `llm.token_count.total` |
+| Derived USD cost | `gen_ai.usage.cost` | `llm.usage.total_cost` |
+| Pricing catalog revision | `sbproxy.ai.pricing_version` | n/a |
+| Failure | `otel.status_code = ERROR` plus `error.type` (`guardrail_blocked`, `rate_limited`, `provider_error`, `content_filter`) | n/a |
+| Tenant | `sbproxy.tenant_id` | n/a |
+
+Token counting happens at the proxy (not trusted from the upstream's self-report), cost is derived from the catalog stamped in `sbproxy.ai.pricing_version`, and the GenAI attribute set is pinned by a conformance test (semconv 1.36.0) so emitted spans cannot silently drift off-spec.
+
+#### Compatible backends
+
+OTLP is vendor-agnostic: point `telemetry.endpoint` at any OTLP-compatible backend. These render SBproxy AI spans as LLM trajectories with no custom mapping:
+
+| Backend | Path |
+|---|---|
+| Arize Phoenix | OTLP gRPC; reads `gen_ai.*` and OpenInference `llm.*` |
+| Langfuse | OTLP; reads `gen_ai.*` |
+| Jaeger | OTLP via the OTel Collector |
+| Grafana Tempo | OTLP via the Collector |
+| Datadog | OTLP via the Datadog Agent or Collector |
+| Honeycomb | OTLP direct |
+
+The reference Compose stack under `deploy/observability/` boots an OTel Collector that fans traces out to these backends.
 
 ### Sampling
 
