@@ -115,6 +115,13 @@ pub fn ai_request_span(surface: &str, method: &str) -> Span {
         // original token snapshot; without it, the spend record
         // is not reproducible past a pricing-table edit.
         "sbproxy.ai.pricing_version" = Empty,
+        // WOR-1229: derived USD cost for the request, so trace backends
+        // (Phoenix, Langfuse, Tempo) show spend per generation alongside
+        // tokens. Recorded at the billing choke point via
+        // `record_cost_usd`. Both the OpenInference and gen_ai keys are
+        // stamped so either backend vocabulary renders it.
+        "gen_ai.usage.cost" = Empty,
+        "llm.usage.total_cost" = Empty,
         "gen_ai.response.finish_reasons" = Empty,
         "llm.provider" = Empty,
         "llm.model_name" = Empty,
@@ -252,6 +259,18 @@ pub fn record_token_usage_split(
 /// monotonic version tag.
 pub fn record_pricing_version(span: &Span, version: &str) {
     span.record("sbproxy.ai.pricing_version", version);
+}
+
+/// Stamp the derived USD cost of the request onto an AI span (WOR-1229).
+///
+/// Records `gen_ai.usage.cost` (gen_ai vocabulary) and
+/// `llm.usage.total_cost` (OpenInference vocabulary) so both trace-backend
+/// conventions render spend per generation. `cost_usd` is the same value
+/// the FinOps cost metric uses, derived from the token counts and the
+/// pricing catalog stamped via [`record_pricing_version`].
+pub fn record_cost_usd(span: &Span, cost_usd: f64) {
+    span.record("gen_ai.usage.cost", cost_usd);
+    span.record("llm.usage.total_cost", cost_usd);
 }
 
 /// Stamp the response model and identifier onto an AI span.
@@ -570,6 +589,23 @@ mod tests {
         // Total is the sum of every dimension.
         assert_field(span, "llm.token_count.total", "205");
         assert_field(span, "sbproxy.ai.pricing_version", "catalog-2026-06-01");
+    }
+
+    /// WOR-1229: derived USD cost lands on both the gen_ai and
+    /// OpenInference cost keys so either trace backend renders spend.
+    #[test]
+    fn record_cost_usd_stamps_both_vocabularies() {
+        use tracing_subscriber::prelude::*;
+        let layer = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = ai_request_span("chat", "POST");
+            record_cost_usd(&span, 0.001234);
+        });
+        let spans = snapshot_spans(&layer);
+        let span = find_span(&spans, "ai.request");
+        assert_field(span, "gen_ai.usage.cost", "0.001234");
+        assert_field(span, "llm.usage.total_cost", "0.001234");
     }
 
     /// `UsageTokens::total()` (WOR-1084) sums every dimension,

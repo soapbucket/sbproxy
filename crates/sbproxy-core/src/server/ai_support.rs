@@ -772,6 +772,10 @@ pub(super) fn emit_ai_billing_event(
         0,
         cost_usd,
     );
+    // WOR-1229: stamp the derived USD cost onto the AI request span so trace
+    // backends show spend per generation. This is the same choke point the
+    // cost metric uses, so the span and the metric agree.
+    sbproxy_ai::tracing_spans::record_cost_usd(&tracing::Span::current(), cost_usd);
 
     // WOR-1095: realtime + audio surfaces consume seconds, not tokens,
     // and realtime has no catalogue price, so the token / cost
