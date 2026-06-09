@@ -79,6 +79,15 @@ futures-util = "0.3"
 tonic = "0.12"
 prost = "0.13"
 
+# WOR-1233: span-arrival e2e. A mock OTLP gRPC collector (built from the
+# OTLP proto's TraceServiceServer) receives the proxy's AI spans, and the
+# test asserts the gen_ai / OpenInference vocabulary arrives intact. The
+# proto + opentelemetry crates are pinned to the same majors already in the
+# lock via opentelemetry-otlp, so no duplicate compile.
+sbproxy-ai.workspace = true
+opentelemetry-proto = { version = "0.27", features = ["gen-tonic", "trace"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
 # Compression decoders for compression.rs e2e assertions. Pinned to the
 # same versions sbproxy-middleware ships so the test bytes round-trip
 # through the same encoder/decoder pair the proxy uses at runtime.
