@@ -1237,10 +1237,27 @@ pub(super) async fn handle_ai_proxy(
                             )),
                         }
                     }
-                    sbproxy_ai::semantic_cache::EmbeddingSource::Inprocess => Err(anyhow::anyhow!(
-                        "in-process embedding source is not yet available in this build; \
-                         use source: sidecar"
-                    )),
+                    sbproxy_ai::semantic_cache::EmbeddingSource::Inprocess => {
+                        #[cfg(feature = "inprocess-embed")]
+                        {
+                            match cache.inprocess_config() {
+                                Some(cfg) => crate::server::ai_support::inprocess_embed(
+                                    cfg,
+                                    &extracted_prompt,
+                                ),
+                                None => Err(anyhow::anyhow!(
+                                    "inprocess embedding source has no inprocess config"
+                                )),
+                            }
+                        }
+                        #[cfg(not(feature = "inprocess-embed"))]
+                        {
+                            Err(anyhow::anyhow!(
+                                "in-process embedding not compiled in this build; rebuild with \
+                                 --features inprocess-embed or use source: sidecar"
+                            ))
+                        }
+                    }
                 };
                 let source_label: &str = match cache.source() {
                     sbproxy_ai::semantic_cache::EmbeddingSource::Provider => "provider",

@@ -140,8 +140,25 @@ policies:
       max_model_bytes: 209715200   # 200 MB guard
 ```
 
-The in-process embedding source for the semantic cache (`source: inprocess`) is
-parsed but not yet wired into the default build; use `source: sidecar` for now.
+In-process semantic cache embeddings:
+
+```yaml
+ai:
+  semantic_cache:
+    enabled: true
+    threshold: 0.85
+    source: inprocess
+    inprocess:
+      model: all-MiniLM-L6-v2
+      model_path: /var/lib/sbproxy/models/minilm/model.onnx
+      tokenizer_path: /var/lib/sbproxy/models/minilm/tokenizer.json
+      max_model_bytes: 209715200   # 200 MB guard
+```
+
+The released `sbproxy` binary is built with the `inprocess-embed` feature, so
+`source: inprocess` works out of the box. If you build from source without the
+default features, add `--features inprocess-embed`; without it, `source:
+inprocess` returns a clear error and the cache treats lookups as misses.
 
 ## Metrics and usage tracking
 

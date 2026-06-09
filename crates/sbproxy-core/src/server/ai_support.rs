@@ -906,6 +906,80 @@ pub(super) fn record_cache_hit_savings(
     );
 }
 
+/// WOR-1235: compute a prompt embedding with an in-process tract embedder
+/// for the semantic cache (`source: inprocess`). The embedder is loaded once
+/// from the config's `model_path` + `tokenizer_path` (with the
+/// `max_model_bytes` guard) and held for the process lifetime. Available only
+/// when built with the `inprocess-embed` feature; otherwise the
+/// `EmbeddingSource::Inprocess` arm returns a clear error and the cache treats
+/// the lookup as a miss.
+#[cfg(feature = "inprocess-embed")]
+pub(super) fn inprocess_embed(
+    cfg: &sbproxy_ai::semantic_cache::InprocessEmbeddingConfig,
+    text: &str,
+) -> anyhow::Result<Vec<f32>> {
+    use std::sync::{Arc, OnceLock};
+    static EMBEDDER: OnceLock<Option<Arc<sbproxy_classifiers::OnnxEmbedder>>> = OnceLock::new();
+    let started = std::time::Instant::now();
+    let embedder = EMBEDDER.get_or_init(|| {
+        let (Some(model_path), Some(tokenizer_path)) =
+            (cfg.model_path.as_ref(), cfg.tokenizer_path.as_ref())
+        else {
+            warn!(
+                "inprocess embedding source requires model_path and tokenizer_path; \
+                 the cache will treat lookups as misses"
+            );
+            return None;
+        };
+        let mut options = sbproxy_classifiers::LoadOptions::default();
+        if let Some(bytes) = cfg.max_model_bytes {
+            options = options.with_max_model_bytes(bytes);
+        }
+        match sbproxy_classifiers::OnnxEmbedder::load_with_options(
+            std::path::Path::new(model_path),
+            std::path::Path::new(tokenizer_path),
+            &options,
+        ) {
+            Ok(e) => Some(Arc::new(e)),
+            Err(e) => {
+                warn!(error = %e, "failed to load in-process embedder");
+                None
+            }
+        }
+    });
+    let model_label = if cfg.model.is_empty() {
+        "inprocess"
+    } else {
+        cfg.model.as_str()
+    };
+    match embedder {
+        Some(e) => {
+            let out = e.embed(text);
+            let result = if out.is_ok() { "ok" } else { "error" };
+            sbproxy_observe::metrics::record_inference(
+                "embed",
+                "inprocess",
+                model_label,
+                result,
+                started.elapsed().as_secs_f64(),
+            );
+            Ok(out?.values)
+        }
+        None => {
+            sbproxy_observe::metrics::record_inference(
+                "embed",
+                "inprocess",
+                model_label,
+                "error",
+                started.elapsed().as_secs_f64(),
+            );
+            Err(anyhow::anyhow!(
+                "in-process embedder not loaded; check model_path and tokenizer_path"
+            ))
+        }
+    }
+}
+
 pub(super) fn record_budget_usage(
     cfg: &sbproxy_ai::BudgetConfig,
     keys: &[(usize, String)],

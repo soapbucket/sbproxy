@@ -242,6 +242,8 @@ pub struct EmbeddingCache {
     model: String,
     /// Sidecar endpoint config (for `source: sidecar`).
     sidecar: Option<SidecarEmbeddingConfig>,
+    /// In-process embedder config (for `source: inprocess`).
+    inprocess: Option<InprocessEmbeddingConfig>,
     entries: Mutex<LruCache<String, EmbeddingEntry>>,
 }
 
@@ -266,21 +268,22 @@ impl EmbeddingCache {
         // Each source needs its own config block to be usable. A missing
         // block means there is nothing to vectorize with, so the cache
         // stays inert (None) rather than half-built.
-        let (provider, model, sidecar) = match cfg.source {
+        let (provider, model, sidecar, inprocess) = match cfg.source {
             EmbeddingSource::Provider => {
                 let e = cfg.embedding.as_ref()?;
-                (e.provider.clone(), e.model.clone(), None)
+                (e.provider.clone(), e.model.clone(), None, None)
             }
             EmbeddingSource::Sidecar => {
                 let s = cfg.sidecar.as_ref()?;
-                (String::new(), s.model.clone(), Some(s.clone()))
+                (String::new(), s.model.clone(), Some(s.clone()), None)
             }
             EmbeddingSource::Inprocess => {
-                // The embedder itself lives on the handler; the cache only
-                // needs to know the source. Require the block so a typo'd
-                // config does not silently fall back.
-                cfg.inprocess.as_ref()?;
-                (String::new(), String::new(), None)
+                // The embedder is built and held by sbproxy-core (which can
+                // depend on the tract engine without a dependency cycle). The
+                // cache carries the config so core can load it. Require the
+                // block so a typo'd config does not silently fall back.
+                let p = cfg.inprocess.as_ref()?;
+                (String::new(), p.model.clone(), None, Some(p.clone()))
             }
         };
         let cap = NonZeroUsize::new(cfg.max_entries.max(1)).expect("max_entries clamped to >= 1");
@@ -291,6 +294,7 @@ impl EmbeddingCache {
             provider,
             model,
             sidecar,
+            inprocess,
             entries: Mutex::new(LruCache::new(cap)),
         })
     }
@@ -302,6 +306,10 @@ impl EmbeddingCache {
     /// Sidecar endpoint config, when `source` is `sidecar`.
     pub fn sidecar_config(&self) -> Option<&SidecarEmbeddingConfig> {
         self.sidecar.as_ref()
+    }
+    /// In-process embedder config, when `source` is `inprocess`.
+    pub fn inprocess_config(&self) -> Option<&InprocessEmbeddingConfig> {
+        self.inprocess.as_ref()
     }
     /// Embedding provider name to vectorize prompts with (provider source).
     pub fn provider(&self) -> &str {

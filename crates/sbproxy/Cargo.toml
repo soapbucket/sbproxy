@@ -38,8 +38,12 @@ default = [
   "licensing-tdmrep",
   "llms-txt",
   "tls-fingerprint",
+  "inprocess-embed",
 ]
 tiered-pricing = ["sbproxy-modules/tiered-pricing"]
+# WOR-1235: in-process semantic-cache embedder (single-binary). Forwards to
+# sbproxy-core/inprocess-embed.
+inprocess-embed = ["sbproxy-core/inprocess-embed"]
 agent-class = ["sbproxy-core/agent-class"]
 http-ledger = ["sbproxy-modules/http-ledger"]
 content-negotiate = ["sbproxy-modules/content-negotiate"]
