@@ -6255,6 +6255,7 @@ dependencies = [
  "regex",
  "reqwest",
  "sbproxy-cache",
+ "sbproxy-classifier-client",
  "sbproxy-config",
  "sbproxy-platform",
  "sbproxy-plugin",
