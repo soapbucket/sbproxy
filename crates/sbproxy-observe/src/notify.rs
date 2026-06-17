@@ -809,9 +809,9 @@ mod tests {
     }
 
     impl CaptureServer {
-        async fn start(responses: Vec<u16>) -> Self {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+        async fn start(responses: Vec<u16>) -> std::io::Result<Self> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let addr = listener.local_addr()?;
             let captured = Arc::new(Mutex::new(Vec::new()));
             let responses = Arc::new(Mutex::new(responses));
 
@@ -882,11 +882,11 @@ mod tests {
                 }
             });
 
-            Self {
+            Ok(Self {
                 addr,
                 captured,
                 responses,
-            }
+            })
         }
 
         fn url(&self) -> String {
@@ -917,7 +917,11 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_signs_with_ed25519() {
-        let server = CaptureServer::start(vec![200]).await;
+        let server = match CaptureServer::start(vec![200]).await {
+            Ok(server) => server,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("capture server starts: {err}"),
+        };
         let (signing, verifying) = ed25519_keypair();
 
         let store = Arc::new(InMemoryStore::new());
@@ -975,7 +979,11 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_signs_with_hmac() {
-        let server = CaptureServer::start(vec![200]).await;
+        let server = match CaptureServer::start(vec![200]).await {
+            Ok(server) => server,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("capture server starts: {err}"),
+        };
         let secret = hmac_secret();
 
         let store = Arc::new(InMemoryStore::new());
@@ -1028,7 +1036,11 @@ mod tests {
 
     #[tokio::test]
     async fn dual_key_window_emits_both_signatures() {
-        let server = CaptureServer::start(vec![200]).await;
+        let server = match CaptureServer::start(vec![200]).await {
+            Ok(server) => server,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("capture server starts: {err}"),
+        };
         let (primary_signing, primary_verifying) = ed25519_keypair();
         let (previous_signing, previous_verifying) = ed25519_keypair();
 
@@ -1090,7 +1102,11 @@ mod tests {
         // the loop runs 6 attempts (initial + 5 retries) before
         // deadlettering. Compress the schedule to ms and queue 6 x 500s
         // so every attempt fails and the event lands in the deadletter.
-        let server = CaptureServer::start(vec![500, 500, 500, 500, 500, 500]).await;
+        let server = match CaptureServer::start(vec![500, 500, 500, 500, 500, 500]).await {
+            Ok(server) => server,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("capture server starts: {err}"),
+        };
         let (signing, _verifying) = ed25519_keypair();
 
         let store = Arc::new(InMemoryStore::new());

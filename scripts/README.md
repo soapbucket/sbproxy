@@ -1,6 +1,6 @@
 # scripts/
 
-*Last modified: 2026-04-30*
+*Last modified: 2026-06-17*
 
 
 Helper scripts that wrap the day-to-day dev loop and the CI runners
@@ -11,6 +11,8 @@ script's header says otherwise.
 
 | Script | What it does | CI workflow |
 |---|---|---|
+| `check.sh` | Local CLAUDE.md gate; prefers cargo-nextest for CI-equivalent non-e2e tests, runs doctests, and cleans high-churn build artifacts on exit. | local |
+| `cleanup-build-artifacts.sh` | Prune generated docs, nextest output, incremental dirs, and transient logs without deleting dependency build outputs. | local + CI |
 | `run-e2e.sh` | Build the Rust proxy and drive the vendored Go conformance suite. | local + CI |
 | `run-all-e2e.sh` | Build the proxy and run every Rust e2e test. | local + CI |
 | `build-e2e.sh` | Just the proxy build step (release profile). | shared by other runners |
@@ -22,6 +24,16 @@ script's header says otherwise.
 
 Per-script usage and env knobs live in each script's leading comment
 header. Run `<script> --help` to dump the header.
+
+`check.sh` defaults to the same non-e2e test scope as the required PR
+lane to keep local disk growth bounded. Set `SBPROXY_RELEASE_TESTS=1`
+for release-profile test binaries and `SBPROXY_CHECK_E2E=1` when you
+need to include the full e2e package locally.
+
+`cleanup-build-artifacts.sh --aggressive` additionally removes
+`target/release` after local release-profile experiments. The default
+cleanup keeps release artifacts so deployment-oriented workflows do not
+pay an unexpected rebuild cost.
 
 ## Cross-cutting runners
 

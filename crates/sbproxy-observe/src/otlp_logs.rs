@@ -339,9 +339,17 @@ mod tests {
     /// which is unnecessary for the round-trip assertion.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn otlp_logs_exporter_round_trip_through_mock_collector() {
-        let collector = MockOtlpCollector::start()
-            .await
-            .expect("mock collector starts");
+        let collector = match MockOtlpCollector::start().await {
+            Ok(collector) => collector,
+            Err(err)
+                if err
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied) =>
+            {
+                return;
+            }
+            Err(err) => panic!("mock collector starts: {err}"),
+        };
 
         let endpoint = format!("http://{}/v1/logs", collector.addr);
         let options = OtlpLogSinkOptions {

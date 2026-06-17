@@ -232,6 +232,39 @@ impl AiHandlerConfig {
         }
         false
     }
+
+    /// Whether request-body PII redaction is active for all named
+    /// rules required by a matched credential. An empty requirement
+    /// only requires that some request redactor is active.
+    pub fn satisfies_pii_redaction_requirement(&self, required_rules: &[String]) -> bool {
+        let Some(cfg) = self
+            .pii
+            .as_ref()
+            .filter(|cfg| cfg.enabled && cfg.redact_request)
+        else {
+            return false;
+        };
+        let Some(redactor) = self.pii_redactor() else {
+            return false;
+        };
+        if redactor.is_empty() {
+            return false;
+        }
+        if required_rules.is_empty() {
+            return true;
+        }
+
+        let mut active = std::collections::BTreeSet::new();
+        if cfg.defaults {
+            active.extend(
+                sbproxy_security::pii::default_rules()
+                    .into_iter()
+                    .map(|r| r.name),
+            );
+        }
+        active.extend(cfg.rules.iter().map(|r| r.name.clone()));
+        required_rules.iter().all(|rule| active.contains(rule))
+    }
 }
 
 /// Per-provider resilience signals layered on top of the routing
@@ -1254,6 +1287,49 @@ mod tests {
         let redacted = config.apply_request_pii(&mut body);
         assert!(!redacted);
         assert_eq!(body["prompt"].as_str(), Some("alice@example.com"));
+    }
+
+    #[test]
+    fn pii_requirement_satisfied_by_active_default_rule() {
+        let cfg_json = serde_json::json!({
+            "providers": [{"name": "openai"}],
+            "pii": { "enabled": true }
+        });
+        let config = AiHandlerConfig::from_config(cfg_json).unwrap();
+
+        assert!(config.satisfies_pii_redaction_requirement(&["email".to_string()]));
+    }
+
+    #[test]
+    fn pii_requirement_rejects_missing_rule() {
+        let cfg_json = serde_json::json!({
+            "providers": [{"name": "openai"}],
+            "pii": {
+                "enabled": true,
+                "defaults": false,
+                "rules": [
+                    { "name": "ticket", "pattern": "TICKET-[0-9]+" }
+                ]
+            }
+        });
+        let config = AiHandlerConfig::from_config(cfg_json).unwrap();
+
+        assert!(!config.satisfies_pii_redaction_requirement(&["email".to_string()]));
+        assert!(config.satisfies_pii_redaction_requirement(&["ticket".to_string()]));
+    }
+
+    #[test]
+    fn pii_requirement_rejects_disabled_request_redaction() {
+        let cfg_json = serde_json::json!({
+            "providers": [{"name": "openai"}],
+            "pii": {
+                "enabled": true,
+                "redact_request": false
+            }
+        });
+        let config = AiHandlerConfig::from_config(cfg_json).unwrap();
+
+        assert!(!config.satisfies_pii_redaction_requirement(&["email".to_string()]));
     }
 
     #[test]

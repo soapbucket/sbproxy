@@ -1,6 +1,6 @@
 # Migration: credentials block
 
-*Last modified: 2026-06-02*
+*Last modified: 2026-06-17*
 
 The legacy `virtual_keys:` YAML array under `origins[].action.providers` is no longer supported. The canonical replacement is the unified `credentials:` block, configurable at proxy, tenant, or origin scope.
 
@@ -143,8 +143,21 @@ A list of selectors. A selector matches when at least one of its fields matches 
 | `role` | Any role on `Principal.attrs.roles`. |
 | `claim.<name>` | Exact key=value match on `Principal.attrs.claims`. |
 
+Empty `principals: []` matches every principal. When a presented credential key
+matches but none of its selector rows match the already-resolved inbound
+principal, SBproxy rejects the request with `403` before applying that
+credential's attribution, model route override, tool injection, or provider
+dispatch.
+
+### `require_pii_redaction`
+
+`policies: [{ type: require_pii_redaction, rules: [...] }]` requires the
+matching origin's AI handler to have request-body PII redaction enabled before
+the credential can dispatch upstream. Rule names are checked against the active
+default and custom PII rules. If a required rule is missing, or `pii.enabled` /
+`pii.redact_request` disables request redaction, SBproxy rejects the request
+before provider dispatch and emits a structured warning.
+
 ## What's deferred
 
-* Selector matching is parsed but not yet enforced; the lowering materialises every `ai_provider` credential into the legacy registry regardless of selector. Selector enforcement lands alongside the principal-aware policy work in a follow-up.
-* The `require_pii_redaction` policy variant parses but does not yet attach to a per-request enforcer; that lands when the PII pass picks up policy-driven configuration.
 * `outbound_token_exchange` and `outbound_client_credentials` types parse but defer to the existing outbound resolver until the resolver migrates to the unified `Credential` shape.

@@ -398,7 +398,14 @@ mod tests {
             body
         );
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping JWKS refresh network test: loopback bind denied: {err}");
+                return;
+            }
+            Err(err) => panic!("failed to bind JWKS refresh test listener: {err}"),
+        };
         let addr: SocketAddr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {
@@ -420,7 +427,14 @@ mod tests {
     async fn refresh_with_propagates_http_errors() {
         // A bound port we never accept on -> connection refused after
         // we drop the listener. Use a separate port to avoid races.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping JWKS HTTP-error network test: loopback bind denied: {err}");
+                return;
+            }
+            Err(err) => panic!("failed to bind JWKS HTTP-error test listener: {err}"),
+        };
         let addr = listener.local_addr().unwrap();
         drop(listener);
         let cache = JwksCache::new(&format!("http://{}/jwks", addr), 60);
@@ -447,7 +461,14 @@ mod tests {
             body
         );
 
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping JWKS unknown-kid network test: loopback bind denied: {err}");
+                return;
+            }
+            Err(err) => panic!("failed to bind JWKS unknown-kid test listener: {err}"),
+        };
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
             if let Ok((mut sock, _)) = listener.accept() {

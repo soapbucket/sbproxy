@@ -769,12 +769,25 @@ fn fetch_bulk_list_body(url: &str, timeout: std::time::Duration) -> anyhow::Resu
 mod tests {
     use super::*;
 
+    fn bind_loopback() -> Option<std::net::TcpListener> {
+        match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => Some(listener),
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping bulk-list network test: loopback bind denied: {err}");
+                None
+            }
+            Err(err) => panic!("failed to bind bulk-list test listener: {err}"),
+        }
+    }
+
     #[test]
     fn bulk_list_fetch_times_out_on_a_hung_server() {
         // WOR-602: a server that accepts the connection but never replies must
         // produce a bounded error rather than hang config compile. A short
         // timeout keeps the test fast.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let Some(listener) = bind_loopback() else {
+            return;
+        };
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             let mut held = Vec::new();

@@ -373,16 +373,28 @@ fn decision_from_str(raw: &str, body: &Json) -> Result<PolicyDecision, JudgeErro
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::ErrorKind;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{SocketAddr, TcpListener};
     use std::sync::Arc;
     use std::thread;
+
+    fn bind_loopback() -> Option<TcpListener> {
+        match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => Some(listener),
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                eprintln!("skipping judge-client network test: loopback bind denied: {err}");
+                None
+            }
+            Err(err) => panic!("failed to bind loopback test listener: {err}"),
+        }
+    }
 
     /// Start a single-shot HTTP/1.1 mock that accepts one connection
     /// and returns the given response. Returns the bound address so
     /// the test can plumb it into the JudgeConfig.
-    fn one_shot_mock(response: String) -> std::net::SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    fn one_shot_mock(response: String) -> Option<SocketAddr> {
+        let listener = bind_loopback()?;
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
             if let Ok((mut sock, _)) = listener.accept() {
@@ -395,7 +407,14 @@ mod tests {
                 let _ = sock.shutdown(std::net::Shutdown::Both);
             }
         });
-        addr
+        Some(addr)
+    }
+
+    fn closed_loopback_addr() -> Option<SocketAddr> {
+        let listener = bind_loopback()?;
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        Some(addr)
     }
 
     fn http_response(status_line: &str, body: &str) -> String {
@@ -424,7 +443,9 @@ mod tests {
         // rather than stall the caller. This exercises the real
         // constructor path; if the builder ever silently fell back to a
         // no-timeout client, this call would hang well past 2s.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let Some(listener) = bind_loopback() else {
+            return;
+        };
         let addr = listener.local_addr().unwrap();
         // Accept connections but never reply, holding the sockets open.
         std::thread::spawn(move || {
@@ -463,7 +484,9 @@ mod tests {
     #[tokio::test]
     async fn provider_returns_allow_json_yields_allow_decision() {
         let body = json!({"verdict": "allow"}).to_string();
-        let addr = one_shot_mock(http_response("200 OK", &body));
+        let Some(addr) = one_shot_mock(http_response("200 OK", &body)) else {
+            return;
+        };
         let endpoint = url::Url::parse(&format!("http://{}/judge", addr)).unwrap();
         let client = build_client(endpoint, 100);
 
@@ -480,9 +503,9 @@ mod tests {
         // a cache that we pre-load. To prove the second call does
         // not touch the network we point the endpoint at a closed
         // port; if the cache misses, the call would error out.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let Some(addr) = closed_loopback_addr() else {
+            return;
+        };
         let endpoint = url::Url::parse(&format!("http://{}/judge", addr)).unwrap();
         let client = build_client(endpoint, 100);
 
@@ -513,7 +536,9 @@ mod tests {
     #[tokio::test]
     async fn malformed_provider_response_yields_malformed_error() {
         let body = "this is not JSON";
-        let addr = one_shot_mock(http_response("200 OK", body));
+        let Some(addr) = one_shot_mock(http_response("200 OK", body)) else {
+            return;
+        };
         let endpoint = url::Url::parse(&format!("http://{}/judge", addr)).unwrap();
         let client = build_client(endpoint, 100);
 
@@ -530,7 +555,9 @@ mod tests {
     #[tokio::test]
     async fn provider_429_maps_to_budget_exhausted() {
         let body = json!({"error": "rate limited"}).to_string();
-        let addr = one_shot_mock(http_response("429 Too Many Requests", &body));
+        let Some(addr) = one_shot_mock(http_response("429 Too Many Requests", &body)) else {
+            return;
+        };
         let endpoint = url::Url::parse(&format!("http://{}/judge", addr)).unwrap();
         let client = build_client(endpoint, 100);
 
@@ -546,9 +573,9 @@ mod tests {
         // Budget of 0 forces the budget gate to fire before the
         // client even reaches reqwest. We point the endpoint at a
         // closed port to assert that no network call happens.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let Some(addr) = closed_loopback_addr() else {
+            return;
+        };
         let endpoint = url::Url::parse(&format!("http://{}/judge", addr)).unwrap();
         let cfg = JudgeConfig {
             endpoint,
@@ -577,7 +604,9 @@ mod tests {
             "usage": {"cost_usd": 0.005}
         })
         .to_string();
-        let addr = one_shot_mock(http_response("200 OK", &body));
+        let Some(addr) = one_shot_mock(http_response("200 OK", &body)) else {
+            return;
+        };
         let endpoint = url::Url::parse(&format!("http://{}/judge", addr)).unwrap();
         let client = build_client(endpoint, 100);
 
@@ -604,7 +633,9 @@ mod tests {
     #[tokio::test]
     async fn second_call_after_cache_warm_does_not_charge_budget() {
         let body = json!({"verdict": "allow"}).to_string();
-        let addr = one_shot_mock(http_response("200 OK", &body));
+        let Some(addr) = one_shot_mock(http_response("200 OK", &body)) else {
+            return;
+        };
         let endpoint = url::Url::parse(&format!("http://{}/judge", addr)).unwrap();
         let cfg = JudgeConfig {
             endpoint,

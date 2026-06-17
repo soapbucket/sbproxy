@@ -49,7 +49,7 @@ pub struct KubernetesSecretsBackend {
 }
 
 struct BackendInner {
-    client: Client,
+    client: Option<Client>,
     /// Namespace the backend is scoped to. Every read must stay
     /// inside this namespace; absent reads use this as the default.
     namespace: String,
@@ -126,7 +126,7 @@ impl KubernetesSecretsBackend {
 
         Ok(Self {
             inner: BackendInner {
-                client,
+                client: Some(client),
                 namespace: cfg.namespace.trim_matches('/').to_string(),
                 cache_ttl,
                 rt,
@@ -289,7 +289,9 @@ impl VaultBackend for KubernetesSecretsBackend {
             return Ok(Some(hit));
         }
         let (ns, name, field_key) = self.resolve_path(key)?;
-        let client = self.inner.client.clone();
+        let client = self.inner.client.clone().ok_or_else(|| {
+            anyhow!("Kubernetes Secrets: client is not initialised for this backend")
+        })?;
         let resolved_ns = ns.clone();
         let resolved_name = name.clone();
         let resolved_key = field_key.clone();
@@ -370,36 +372,13 @@ mod tests {
     /// config which fails outside a cluster; this test helper
     /// constructs the inner fields directly.
     fn test_backend(namespace: &str) -> KubernetesSecretsBackend {
-        // Install the process-global CryptoProvider once per test.
-        // Errors from `install_default` mean another test already
-        // installed one; the call is idempotent.
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        // `Client::try_from` builds a hyper client at construction
-        // time, which requires a tokio reactor. Drive it inside the
-        // runtime we just built. The Client only exercises HTTP on
-        // a real `get` / `set` call, so the unreachable cluster URL
-        // is fine for the URL / cache tests.
-        let cfg = Config {
-            cluster_url: "https://127.0.0.1:1".parse().unwrap(),
-            default_namespace: namespace.to_string(),
-            root_cert: None,
-            connect_timeout: None,
-            read_timeout: None,
-            write_timeout: None,
-            accept_invalid_certs: true,
-            auth_info: Default::default(),
-            proxy_url: None,
-            tls_server_name: None,
-            headers: Default::default(),
-        };
-        let client = rt.block_on(async { Client::try_from(cfg) }).unwrap();
         KubernetesSecretsBackend {
             inner: BackendInner {
-                client,
+                client: None,
                 namespace: namespace.to_string(),
                 cache_ttl: Duration::from_secs(60),
                 rt,

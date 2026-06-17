@@ -245,7 +245,11 @@ mod tests {
             .unwrap();
         let _guard = rt.enter();
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("hung shadow listener starts: {err}"),
+        };
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             let mut held = Vec::new();

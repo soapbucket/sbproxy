@@ -1,0 +1,28 @@
+# cargo-nextest configuration for SBproxy.
+#
+# `scripts/check.sh` and the required PR lane prefer `cargo nextest run` for
+# faster test scheduling. nextest does not run doc tests, so callers that need
+# doctest coverage must run `cargo test --doc` separately.
+
+[profile.default]
+# Local runs should surface flaky failures instead of hiding them.
+retries = 0
+
+[profile.ci]
+# CI should report the whole failure set in one run and retry transient flakes
+# once. The e2e package is excluded from the required PR lane, but the profile is
+# still useful for manual nextest runs.
+retries = 1
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"
+
+[test-groups.sbproxy-e2e]
+# Each e2e test starts its own proxy process and listener. Keep those serialized
+# when a developer runs the full workspace through nextest.
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(sbproxy-e2e)'
+test-group = 'sbproxy-e2e'

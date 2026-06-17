@@ -1,8 +1,9 @@
 //! Virtual API key management and per-key rate limiting.
 
 use parking_lot::Mutex;
+use sbproxy_plugin::Principal;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Virtual API key configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -21,6 +22,14 @@ pub struct VirtualKeyConfig {
     /// Providers this key is allowed to use (empty = all).
     #[serde(default)]
     pub allowed_providers: Vec<String>,
+    /// Inbound principal selectors allowed to use this key. Empty
+    /// means the key is available to every inbound principal.
+    #[serde(default)]
+    pub principal_selectors: Vec<PrincipalSelectorConfig>,
+    /// Named PII redaction rules that must be active on request
+    /// bodies before this key can dispatch upstream.
+    #[serde(default)]
+    pub require_pii_redaction: Vec<String>,
     /// Maximum tokens per minute for this key.
     #[serde(default)]
     pub max_tokens_per_minute: Option<u64>,
@@ -78,6 +87,123 @@ pub struct VirtualKeyConfig {
     /// otherwise self-flag.
     #[serde(default)]
     pub bypass_prompt_injection: bool,
+}
+
+impl VirtualKeyConfig {
+    /// Whether this key's principal selectors allow the inbound
+    /// principal. An empty selector list is intentionally allow-all.
+    pub fn matches_principal(&self, principal: &Principal) -> bool {
+        self.principal_selectors.is_empty()
+            || self
+                .principal_selectors
+                .iter()
+                .any(|selector| selector.matches(principal))
+    }
+}
+
+/// Principal selector lowered from the unified `credentials:`
+/// block. Fields OR together inside a selector; selector rows OR
+/// together on [`VirtualKeyConfig`].
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PrincipalSelectorConfig {
+    /// Glob against `Principal.virtual_key.name`.
+    #[serde(default)]
+    pub virtual_key: Option<String>,
+    /// Exact match against `Principal.attrs.team`.
+    #[serde(default)]
+    pub team: Option<String>,
+    /// Exact match against `Principal.attrs.project`.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Exact match against `Principal.attrs.user`.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Exact match against any role in `Principal.attrs.roles`.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Exact key/value match against `Principal.attrs.claims`.
+    #[serde(default)]
+    pub claim: BTreeMap<String, String>,
+}
+
+impl PrincipalSelectorConfig {
+    fn is_empty(&self) -> bool {
+        self.virtual_key.is_none()
+            && self.team.is_none()
+            && self.project.is_none()
+            && self.user.is_none()
+            && self.role.is_none()
+            && self.claim.is_empty()
+    }
+
+    fn matches(&self, principal: &Principal) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        if let Some(pattern) = self.virtual_key.as_deref() {
+            if principal
+                .virtual_key
+                .as_ref()
+                .is_some_and(|vk| glob_match(pattern, &vk.name))
+            {
+                return true;
+            }
+        }
+        if self
+            .team
+            .as_deref()
+            .is_some_and(|team| principal.attrs.team.as_deref() == Some(team))
+        {
+            return true;
+        }
+        if self
+            .project
+            .as_deref()
+            .is_some_and(|project| principal.attrs.project.as_deref() == Some(project))
+        {
+            return true;
+        }
+        if self
+            .user
+            .as_deref()
+            .is_some_and(|user| principal.attrs.user.as_deref() == Some(user))
+        {
+            return true;
+        }
+        if self
+            .role
+            .as_deref()
+            .is_some_and(|role| principal.attrs.roles.iter().any(|r| r == role))
+        {
+            return true;
+        }
+        if let Some(claims) = principal.attrs.claims.as_ref() {
+            if self.claim.iter().any(|(key, expected)| {
+                claims
+                    .get(key)
+                    .is_some_and(|actual| claim_value_matches(actual, expected))
+            }) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn glob_match(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    pattern
+        .strip_suffix('*')
+        .map_or_else(|| pattern == value, |prefix| value.starts_with(prefix))
+}
+
+fn claim_value_matches(actual: &serde_json::Value, expected: &str) -> bool {
+    if let Some(actual) = actual.as_str() {
+        return actual == expected;
+    }
+    serde_json::from_str::<serde_json::Value>(expected).is_ok_and(|expected| *actual == expected)
 }
 
 fn default_true() -> bool {
@@ -210,6 +336,8 @@ mod tests {
             allowed_models: vec![],
             blocked_models: vec![],
             allowed_providers: vec![],
+            principal_selectors: vec![],
+            require_pii_redaction: vec![],
             max_tokens_per_minute: None,
             max_requests_per_minute: None,
             budget: None,
@@ -231,6 +359,8 @@ mod tests {
             allowed_models: allowed.into_iter().map(String::from).collect(),
             blocked_models: blocked.into_iter().map(String::from).collect(),
             allowed_providers: vec![],
+            principal_selectors: vec![],
+            require_pii_redaction: vec![],
             max_tokens_per_minute: None,
             max_requests_per_minute: None,
             budget: None,
@@ -301,6 +431,118 @@ mod tests {
     fn key_count() {
         let store = KeyStore::new(vec![make_key("a", true), make_key("b", true)]);
         assert_eq!(store.key_count(), 2);
+    }
+
+    #[test]
+    fn virtual_key_with_empty_principal_selectors_matches_everyone() {
+        let key = make_key("sk-1", true);
+        let principal = Principal::anonymous();
+        assert!(key.matches_principal(&principal));
+    }
+
+    #[test]
+    fn virtual_key_principal_selector_fields_or_together() {
+        let key = VirtualKeyConfig {
+            principal_selectors: vec![PrincipalSelectorConfig {
+                team: Some("frontend".to_string()),
+                role: Some("admin".to_string()),
+                ..PrincipalSelectorConfig::default()
+            }],
+            ..make_key("sk-1", true)
+        };
+        let principal = Principal {
+            attrs: sbproxy_plugin::PrincipalAttrs {
+                team: Some("backend".to_string()),
+                roles: vec!["admin".to_string()],
+                ..sbproxy_plugin::PrincipalAttrs::default()
+            },
+            ..Principal::anonymous()
+        };
+
+        assert!(key.matches_principal(&principal));
+    }
+
+    #[test]
+    fn virtual_key_principal_selector_miss_blocks_match() {
+        let key = VirtualKeyConfig {
+            principal_selectors: vec![PrincipalSelectorConfig {
+                team: Some("frontend".to_string()),
+                ..PrincipalSelectorConfig::default()
+            }],
+            ..make_key("sk-1", true)
+        };
+        let principal = Principal {
+            attrs: sbproxy_plugin::PrincipalAttrs {
+                team: Some("backend".to_string()),
+                ..sbproxy_plugin::PrincipalAttrs::default()
+            },
+            ..Principal::anonymous()
+        };
+
+        assert!(!key.matches_principal(&principal));
+    }
+
+    #[test]
+    fn virtual_key_selector_matches_virtual_key_glob_and_claims() {
+        let key = VirtualKeyConfig {
+            principal_selectors: vec![PrincipalSelectorConfig {
+                virtual_key: Some("team-*".to_string()),
+                claim: [("org".to_string(), "acme".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..PrincipalSelectorConfig::default()
+            }],
+            ..make_key("sk-1", true)
+        };
+        let principal = Principal {
+            virtual_key: Some(sbproxy_plugin::VirtualKeyRef {
+                name: "team-alpha".to_string(),
+                allowed_providers: vec![],
+            }),
+            attrs: sbproxy_plugin::PrincipalAttrs {
+                claims: Some(
+                    [(
+                        "org".to_string(),
+                        serde_json::Value::String("wrong".to_string()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..sbproxy_plugin::PrincipalAttrs::default()
+            },
+            ..Principal::anonymous()
+        };
+
+        assert!(key.matches_principal(&principal));
+    }
+
+    #[test]
+    fn virtual_key_selector_matches_json_claim_values() {
+        let key = VirtualKeyConfig {
+            principal_selectors: vec![PrincipalSelectorConfig {
+                claim: [("quota".to_string(), "7".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..PrincipalSelectorConfig::default()
+            }],
+            ..make_key("sk-1", true)
+        };
+        let principal = Principal {
+            attrs: sbproxy_plugin::PrincipalAttrs {
+                claims: Some(
+                    [(
+                        "quota".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(7)),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..sbproxy_plugin::PrincipalAttrs::default()
+            },
+            ..Principal::anonymous()
+        };
+
+        assert!(key.matches_principal(&principal));
     }
 
     // --- KeyRateLimiter tests ---

@@ -522,7 +522,16 @@ mod tests {
     async fn token_exchange_mints_against_mock_endpoint() {
         // Mock token endpoint: returns an access token for a valid
         // exchange form.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "skipping outbound credential token-exchange test: loopback bind denied: {err}"
+                );
+                return;
+            }
+            Err(err) => panic!("failed to bind outbound credential test listener: {err}"),
+        };
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             use std::io::{Read, Write};

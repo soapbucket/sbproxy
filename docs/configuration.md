@@ -2196,9 +2196,13 @@ Convert Markdown to HTML using `pulldown-cmark`.
 |------|-------|---------|-------------|
 | `lua_json` | `script` | required | Lua source. The Go-format function name is `modify_json(data, ctx)`; legacy scripts may use a `body` global. Alias: `lua_script`. |
 | `javascript` | `script` | required | JavaScript source. |
-| `javascript` | `function_name` | `transform` | Entrypoint function name. Receives the body as a string. |
+| `javascript` | `function_name` | `transform` | Entrypoint function name. Receives the body as a string and `ctx` as the second argument. |
 | `js_json` | `script` | required | JavaScript source. Alias: `js_script`. |
-| `js_json` | `function_name` | `modify_json` | Entrypoint function name. Receives the parsed JSON body. |
+| `js_json` | `function_name` | `modify_json` | Entrypoint function name. Receives the parsed JSON body and `ctx` as the second argument. |
+
+Lua and JavaScript transform contexts include `ctx.request.aipref.train`,
+`ctx.request.aipref.search`, and `ctx.request.aipref.ai_input`. Missing or
+malformed `aipref` headers leave all three values at `true`.
 
 ---
 
