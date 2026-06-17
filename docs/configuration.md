@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-06-08*
+*Last modified: 2026-06-17*
 
 The complete configuration reference for SBproxy. Every option, every field, every action type is documented here with real-world examples you can copy-paste and run.
 
@@ -1074,7 +1074,7 @@ origins:
 
 ### storage
 
-Serve files from an object storage backend (S3, GCS, Azure Blob, or local filesystem). The OSS implementation currently returns a 501 placeholder; the action exists so configs validate and for future runtime support.
+Serve files from an object storage backend (S3, GCS, Azure Blob, or local filesystem). The OSS runtime builds an `object_store` backend at config-load time and serves `GET` and `HEAD` requests with content metadata, byte-range responses, and optional `index_file` fallback for directory paths. Unsupported methods return `405`, missing objects return `404`, and transient backend failures return `502`.
 
 ```yaml
 origins:
@@ -1094,6 +1094,8 @@ origins:
 | `prefix` | string | | Key prefix prepended to request paths. May not contain `..` segments or NUL bytes. |
 | `path` | string | | Local filesystem root. Required for `backend: local`. May not contain `..` segments or NUL bytes. |
 | `index_file` | string | | Index file served for directory requests (e.g. `index.html`). May not contain `..` segments or NUL bytes. |
+
+Cloud backends use the standard credential discovery for their provider (`AWS_*`, Google, or Azure environment), plus optional S3 `region` and `endpoint` overrides in the runtime config. The HTTP/3 action dispatcher is still disabled with the rest of HTTP/3 support; storage is served over HTTP/1.1 and HTTP/2 today.
 
 ### a2a
 
@@ -3088,7 +3090,7 @@ origins:
 | `mirror_body` | bool | `false` | Tee the inbound request body into the mirror request. Off by default, mirror sees only method, path, query, and headers (sufficient for read endpoints; safe for any case where shadow-replaying writes is unsafe). Set `true` to shadow-replay POST/PUT/PATCH endpoints during migrations. |
 | `max_body_bytes` | int | `1048576` | Body size cap (bytes). Bodies larger than this fire the mirror without a body so a single large upload can't blow up proxy memory. Defaults to 1 MiB. |
 
-Mirror requests carry `X-Sbproxy-Mirror: 1` and the original `X-Sbproxy-Request-Id` so the shadow upstream can distinguish them from real traffic. Method, path/query, and headers are mirrored; body teeing is not yet supported (sufficient for read endpoints; POST bodies are not replayed in this cut). Hop-by-hop headers and `Host` are not forwarded, `reqwest` rebuilds `Host` from the mirror URL.
+Mirror requests carry `X-Sbproxy-Mirror: 1` and the original `X-Sbproxy-Request-Id` so the shadow upstream can distinguish them from real traffic. Method, path/query, and headers are mirrored. Request bodies are mirrored only when `mirror_body: true`; bodies larger than `max_body_bytes` fire the mirror without a body so large uploads do not grow proxy memory unbounded. Hop-by-hop headers and `Host` are not forwarded, and `reqwest` rebuilds `Host` from the mirror URL.
 
 See [example 75](../examples/request-mirror/sb.yml).
 

@@ -1,7 +1,7 @@
 # Supported providers
-*Last modified: 2026-06-06*
+*Last modified: 2026-06-17*
 
-SBproxy ships native adapters for 66 LLM providers behind one OpenAI-compatible API. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them. Most adapters speak the OpenAI wire format and pass through unchanged; a few (Anthropic, Bedrock, Gemini, SageMaker, Oracle, Watsonx) translate to the provider's native shape.
+SBproxy ships native adapters for 66 LLM providers behind one OpenAI-compatible API. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them. Most adapters speak the OpenAI wire format and pass through unchanged. Anthropic, Bedrock, and Gemini use in-tree translators for OpenAI-shaped chat or embedding clients; SageMaker, Oracle, Watsonx, and other `Custom` formats pass through in their native shape.
 
 The catalog is plain YAML and you can extend it yourself: see [Extending the provider catalog](#extending-the-provider-catalog).
 
@@ -84,7 +84,7 @@ The `cloudflare`, `vertex`, and `runpod` defaults contain path template paramete
 
 [^embed-only]: Voyage and Jina expose embeddings (and rerank) endpoints only. Their catalog entries set `supports_chat: false` so chat-completion configs against these providers will fail closed at validation time once the runtime check is wired.
 
-`format` is the wire protocol the upstream expects. OpenAI-compatible upstreams pass through unchanged. Anthropic is translated bidirectionally for non-streaming requests: clients send OpenAI-shaped chat completions, sbproxy rewrites the body and path on the way out and rewrites the response back to OpenAI shape. Streaming SSE event translation for Anthropic is not yet implemented; `stream: true` requests pass through in Anthropic's native event shape. Google Gemini, AWS Bedrock, Oracle OCI, Watsonx, and SageMaker are not translated yet, so the client must send the provider's native body shape or route through OpenRouter.
+`format` is the wire protocol the upstream expects. OpenAI-compatible upstreams pass through unchanged. Anthropic, Google Gemini, and AWS Bedrock are translated bidirectionally for chat-completions requests: clients send OpenAI-shaped bodies, SBproxy rewrites the body and path on the way out, and SBproxy rewrites the response back to OpenAI shape. For streaming, the relay parses native Anthropic, Gemini, and Bedrock stream frames into the internal hub stream and re-emits OpenAI Chat, Anthropic Messages, or OpenAI Responses shape based on the inbound route. Gemini embeddings at `/v1/embeddings` translate to and from Gemini embedding calls. Oracle OCI, Watsonx, SageMaker, and other `Custom` formats remain native pass-through, so clients must send the provider's native body shape or route through OpenRouter/custom translation.
 
 Override `base_url` to use a region other than us-south for watsonx, or to point Bedrock and SageMaker at a non-default region.
 

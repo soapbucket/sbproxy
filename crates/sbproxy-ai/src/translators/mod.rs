@@ -8,10 +8,10 @@
 //! Bedrock), we translate request and response so the OpenAI client
 //! gets a uniform interface without an OpenRouter hop.
 //!
-//! This crate is shipped progressively. Anthropic lands first
-//! because it's the most-asked-for and the request/response shape is
-//! similar enough to OpenAI to translate cleanly. Gemini and Bedrock
-//! follow as separate translators registered the same way.
+//! Anthropic, Gemini, and Bedrock chat translators are registered on
+//! the same dispatch path. Gemini also has an embeddings translator
+//! for `/v1/embeddings`; native upstream streaming is normalized by
+//! `format::native_streams`.
 
 pub mod anthropic;
 pub mod bedrock;

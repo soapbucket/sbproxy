@@ -5,10 +5,10 @@
 //! system prompt, model, temperature, top_p, top_k, max_tokens,
 //! stop sequences, stream, and tool calls.
 //!
-//! Streaming SSE event translation is a follow-up; today the
-//! translator handles non-streaming bodies. Setting `stream: true`
-//! forwards as-is and the response stays in Anthropic's
-//! `event: content_block_delta` shape until SSE translation lands.
+//! This module owns non-streaming request/response JSON translation.
+//! Streaming responses are handled by the native stream translator in
+//! `format::native_streams`, which parses Anthropic SSE frames into
+//! the shared hub stream before the inbound route re-emits them.
 
 use serde_json::{json, Map, Value};
 

@@ -13,13 +13,14 @@
 //! shape so a single OpenAI client can fan out across Bedrock
 //! model families without per-model branching.
 //!
-//! Streaming SSE event translation is out of scope here; setting
-//! `stream: true` forwards as-is and the response stays in
-//! Bedrock's native EventStream shape until the sibling streaming
-//! ticket lands. SigV4 request signing is handled at the HTTP
-//! transport layer (the `Authorization` header set by operator
-//! config or a future signing middleware); it is not part of the
-//! JSON body translation contract this module owns.
+//! This module owns non-streaming request/response JSON translation.
+//! Streaming responses are handled by the native stream translator in
+//! `format::native_streams`, which parses Bedrock stream events into
+//! the shared hub stream before the inbound route re-emits them.
+//! SigV4 request signing is handled at the HTTP transport layer (the
+//! `Authorization` header set by operator config or a future signing
+//! middleware); it is not part of the JSON body translation contract
+//! this module owns.
 
 use serde_json::{json, Map, Value};
 
