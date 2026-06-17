@@ -30,6 +30,11 @@ lane to keep local disk growth bounded. Set `SBPROXY_RELEASE_TESTS=1`
 for release-profile test binaries and `SBPROXY_CHECK_E2E=1` when you
 need to include the full e2e package locally.
 
+`cleanup-build-artifacts.sh --aggressive` additionally removes
+`target/release` after local release-profile experiments. The default
+cleanup keeps release artifacts so deployment-oriented workflows do not
+pay an unexpected rebuild cost.
+
 ## Cross-cutting runners
 
 `docs-ci.sh` is wrapped by GitHub Actions. `examples-smoke.sh` is a
