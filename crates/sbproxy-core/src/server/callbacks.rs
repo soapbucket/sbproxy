@@ -32,14 +32,6 @@ pub(super) fn callback_client() -> &'static reqwest::Client {
     })
 }
 
-/// Fire a fire-and-forget shadow copy of an inbound request at a
-/// mirror URL. The response is read and discarded; errors are logged
-/// at debug level. Body data is NOT mirrored in this initial cut
-/// (the inbound body is consumed by Pingora to forward to the primary
-/// upstream); only method, path/query, and headers are sent. This is
-/// sufficient for safe rollouts of new backends and for replay-style
-/// shadowing of read endpoints. Body mirroring requires teeing the
-/// inbound body and is a follow-on.
 /// Fire a pending mirror with whatever body has been buffered. The
 /// `mirror_pending` slot is taken from `ctx` so the mirror only ever
 /// fires once. Bodies that exceed the configured cap are dropped (we

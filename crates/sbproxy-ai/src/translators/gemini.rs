@@ -7,10 +7,10 @@
 //! temperature, top_p, top_k, max_tokens, stop sequences, and tool
 //! calls.
 //!
-//! Streaming SSE event translation is out of scope here; setting
-//! `stream: true` forwards as-is and the response stays in Gemini's
-//! native SSE shape until the sibling streaming-translation ticket
-//! lands.
+//! This module owns non-streaming request/response JSON translation.
+//! Streaming responses are handled by the native stream translator in
+//! `format::native_streams`, which parses Gemini SSE frames into the
+//! shared hub stream before the inbound route re-emits them.
 
 use serde_json::{json, Map, Value};
 

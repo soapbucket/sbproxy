@@ -1,8 +1,8 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-06-06*
+*Last modified: 2026-06-17*
 
-SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 66 native providers behind one OpenAI-compatible API, including a native Anthropic translator. You bring your own provider keys and the model name passes straight through, so you reach 200+ models without waiting on us to add them.
+SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 66 native providers behind one OpenAI-compatible API, including native Anthropic, Gemini, and Bedrock translators. You bring your own provider keys and the model name passes straight through, so you reach 200+ models without waiting on us to add them.
 
 ## Provider setup
 
@@ -29,7 +29,7 @@ API keys support environment variable interpolation with `${VAR_NAME}` syntax. N
 
 ### Native providers
 
-66 native providers ship in-tree alongside a native Anthropic translator. You bring your own key per provider and the `model` field passes straight through, so the gateway reaches 200+ models (and any model a provider ships next) without enumerating them. Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `together`, `fireworks`, `cerebras`, `sambanova`, `nvidia`, `vertex`, `databricks`, `huggingface`, `vllm`, and `openrouter`.
+66 native providers ship in-tree alongside native translators for Anthropic, Gemini, and Bedrock. You bring your own key per provider and the `model` field passes straight through, so the gateway reaches 200+ models (and any model a provider ships next) without enumerating them. Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `together`, `fireworks`, `cerebras`, `sambanova`, `nvidia`, `vertex`, `databricks`, `huggingface`, `vllm`, and `openrouter`.
 
 Any model a listed provider serves works without extra config. For a self-hosted or proprietary endpoint, point `vllm` or any provider at it with a custom `base_url`. `openrouter` is available as one of the providers when you want many vendors behind a single key. See `providers.md` for the full per-provider table.
 
@@ -246,11 +246,20 @@ Clients always speak the OpenAI chat completions shape; sbproxy rewrites the bod
 |-----------------|-----------|--------|
 | OpenAI | pass-through | always |
 | Anthropic Messages API | bidirectional, non-streaming | shipped |
-| Anthropic SSE events | streaming | not yet translated, passes through native |
-| Google Gemini | bidirectional | not yet implemented |
-| AWS Bedrock | bidirectional | not yet implemented |
+| Anthropic SSE events | native stream to hub stream | shipped |
+| Google Gemini `generateContent` | bidirectional, non-streaming | shipped |
+| Google Gemini `streamGenerateContent` | native stream to hub stream | shipped |
+| Google Gemini embeddings | bidirectional `/v1/embeddings` | shipped |
+| AWS Bedrock Converse | bidirectional, non-streaming | shipped |
+| AWS Bedrock Converse stream | native stream to hub stream | shipped |
 
 For Anthropic, the request hoists `system` role messages to the top-level `system` field, defaults `max_tokens` when missing, strips OpenAI-only knobs (`logit_bias`, `n`, `presence_penalty`, `frequency_penalty`, `response_format`, `seed`, `user`), and rewrites the path from `/v1/chat/completions` to `/v1/messages`. The response converts text and tool_use blocks back into the OpenAI `choices[].message.content` and `tool_calls` shape, maps `stop_reason` to `finish_reason`, and renames `usage.input_tokens` / `output_tokens` to `prompt_tokens` / `completion_tokens`.
+
+For Gemini, chat completions are rewritten to `generateContent`: roles become Gemini `contents`, system messages become `systemInstruction`, sampling options move under `generationConfig`, and Gemini candidates plus `usageMetadata` are converted back into OpenAI choices and usage. Gemini embeddings translate OpenAI `/v1/embeddings` requests to Gemini embedding calls and normalize the response back to OpenAI embedding objects.
+
+For Bedrock, chat completions are rewritten to the model-agnostic Converse API. System messages become Bedrock `system` entries, user and assistant turns become `messages`, supported sampling and tool fields move into Bedrock's native request shape, and Converse responses are converted back to OpenAI choices and usage. Bedrock and SageMaker SigV4 signing is still operator-provided; SBproxy forwards the signed `Authorization` header rather than minting AWS signatures itself.
+
+For streaming responses, the relay parses native Anthropic, Gemini, and Bedrock frames into the internal hub stream, then re-emits the client-facing format selected by the inbound route. Oracle OCI, Watsonx, SageMaker, and other `Custom` formats are not translated in-tree; send their native body shape or route through a custom/OpenRouter adapter.
 
 See [examples/ai-claude](../examples/ai-claude/sb.yml) and [providers.md](providers.md).
 
