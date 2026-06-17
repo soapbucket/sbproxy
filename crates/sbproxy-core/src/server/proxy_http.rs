@@ -1510,16 +1510,22 @@ impl ProxyHttp for SbProxy {
             // 4. Response modifiers (static headers, status override, body replacement, Lua scripts)
             // Build template context for response modifier interpolation.
             let tmpl = build_request_template_context(session, ctx, origin);
+            let mut response_headers = response_headers_from_header_map(&upstream_response.headers);
             for modifier in &origin.response_modifiers {
                 if let Some(hm) = &modifier.headers {
                     for key in &hm.remove {
                         to_remove.push(key.clone());
+                        response_headers.remove(key);
                     }
                     for (key, value) in &hm.set {
-                        to_set.push((key.clone(), tmpl.resolve(value)));
+                        let resolved = tmpl.resolve(value);
+                        insert_json_header(&mut response_headers, key, &resolved);
+                        to_set.push((key.clone(), resolved));
                     }
                     for (key, value) in &hm.add {
-                        to_append.push((key.clone(), tmpl.resolve(value)));
+                        let resolved = tmpl.resolve(value);
+                        insert_json_header(&mut response_headers, key, &resolved);
+                        to_append.push((key.clone(), resolved));
                     }
                 }
                 // Status code override.
@@ -1536,14 +1542,29 @@ impl ProxyHttp for SbProxy {
                 }
                 if let Some(script) = &modifier.lua_script {
                     let status = upstream_response.status.as_u16();
-                    match lua_response_modifier(script, status) {
+                    match lua_response_modifier(script, status, &response_headers, ctx) {
                         Ok(headers) => {
                             for (key, value) in headers {
+                                insert_json_header(&mut response_headers, &key, &value);
                                 to_set.push((key, value));
                             }
                         }
                         Err(e) => {
                             warn!(error = %e, "Lua response modifier script error");
+                        }
+                    }
+                }
+                if let Some(script) = &modifier.js_script {
+                    let status = upstream_response.status.as_u16();
+                    match js_response_modifier(script, status, &response_headers, ctx) {
+                        Ok(headers) => {
+                            for (key, value) in headers {
+                                insert_json_header(&mut response_headers, &key, &value);
+                                to_set.push((key, value));
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "JavaScript response modifier script error");
                         }
                     }
                 }

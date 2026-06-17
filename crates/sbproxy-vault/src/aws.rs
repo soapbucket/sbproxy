@@ -55,7 +55,7 @@ pub struct AwsSecretsManagerBackend {
 }
 
 struct BackendInner {
-    client: smc::Client,
+    client: Option<smc::Client>,
     mount_prefix: String,
     cache_ttl: Duration,
     /// Dedicated runtime driving the SDK's async calls from the
@@ -165,7 +165,7 @@ impl AwsSecretsManagerBackend {
 
         Ok(Self {
             inner: BackendInner {
-                client,
+                client: Some(client),
                 mount_prefix,
                 cache_ttl,
                 rt,
@@ -240,7 +240,9 @@ impl VaultBackend for AwsSecretsManagerBackend {
             return Ok(Some(hit));
         }
         let name = self.resolve_name(key)?;
-        let client = self.inner.client.clone();
+        let client = self.inner.client.clone().ok_or_else(|| {
+            anyhow!("AWS Secrets Manager: client is not initialised for this backend")
+        })?;
         let name_for_call = name.clone();
         let secret = self
             .inner
@@ -271,7 +273,9 @@ impl VaultBackend for AwsSecretsManagerBackend {
 
     fn set(&self, key: &str, value: &str) -> Result<()> {
         let name = self.resolve_name(key)?;
-        let client = self.inner.client.clone();
+        let client = self.inner.client.clone().ok_or_else(|| {
+            anyhow!("AWS Secrets Manager: client is not initialised for this backend")
+        })?;
         let value = value.to_string();
         self.inner
             .rt
@@ -410,22 +414,22 @@ mod tests {
 
     /// Build a backend for URL / cache / prefix testing without
     /// performing any AWS calls. Bypasses the constructor so we
-    /// don't have to roll a real client.
+    /// don't initialise the platform TLS roots for a client that will
+    /// never send traffic.
     fn test_backend(mount: &str, ttl: Duration) -> AwsSecretsManagerBackend {
-        // The runtime + client construction touches the OS network
-        // resolver but does not perform any network IO until a call
-        // is made; building with static keys is purely local.
-        AwsSecretsManagerBackend::new(AwsSecretsManagerConfig {
-            region: "us-east-1".to_string(),
-            auth: AwsAuth::StaticKeys {
-                access_key_id: "AKIA".repeat(5),
-                secret_access_key: "x".repeat(40),
-                session_token: None,
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime builds");
+        AwsSecretsManagerBackend {
+            inner: BackendInner {
+                client: None,
+                mount_prefix: mount.trim_matches('/').to_string(),
+                cache_ttl: ttl,
+                rt,
             },
-            mount_prefix: mount.to_string(),
-            cache_ttl: Some(ttl),
-        })
-        .expect("static-keys construction is offline-safe")
+            cache: Mutex::new(HashMap::new()),
+        }
     }
 
     /// A relative path lands under the configured prefix.

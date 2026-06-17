@@ -288,10 +288,7 @@ mod tests {
         verdict: PolicyDecision,
         budget: u64,
     ) -> Arc<JudgeClient> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let endpoint = url::Url::parse(&format!("http://{}/judge", addr)).unwrap();
+        let endpoint = url::Url::parse("http://127.0.0.1:1/judge").unwrap();
         let cfg = JudgeConfig {
             endpoint,
             api_key_env: "SBPROXY_SC_TEST_KEY".to_string(),
@@ -402,10 +399,7 @@ mod tests {
         // happens first per JudgeClient::semantic, so an unprimed
         // cache + zero budget produces BudgetExhausted on the
         // budget gate. Confirmed via the judge backend tests.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let endpoint = url::Url::parse(&format!("http://{}/judge", addr)).unwrap();
+        let endpoint = url::Url::parse("http://127.0.0.1:1/judge").unwrap();
         let judge_cfg = JudgeConfig {
             endpoint,
             api_key_env: "SBPROXY_SC_TEST_KEY".to_string(),

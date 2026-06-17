@@ -1,6 +1,6 @@
 # SBproxy scripting reference: CEL, Lua, JavaScript, and WASM
 
-*Last modified: 2026-05-17*
+*Last modified: 2026-06-17*
 
 SBproxy includes four scripting engines for custom logic: CEL (Common Expression Language), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
@@ -602,7 +602,14 @@ ctx.id           -- request ID
 ctx.cache_status -- cache hit/miss status
 ctx.start_time   -- RFC 3339 start time
 ctx.data         -- mutable per-request data table
+
+ctx.request.aipref.train    -- boolean, default true
+ctx.request.aipref.search   -- boolean, default true
+ctx.request.aipref.ai_input -- boolean, default true
 ```
+
+Lua JSON transforms receive the same `ctx` table as the second argument to
+`modify_json(data, ctx)`.
 
 #### `response` table (response_modifiers only)
 
@@ -956,6 +963,12 @@ export default function (request, ctx) {
 ```
 
 Globals mirror the Lua context: `request`, `session`, `origin`, `server`, `vars`, `features`, `client`, `ctx`, and (for response modifiers) `response`. Helpers on the `sb` object include `sb.log`, `sb.json`, `sb.base64`, `sb.crypto`, `sb.uuid`, and `sb.time`.
+
+JavaScript transforms receive the request context as the second function
+argument. Raw body transforms use `transform(body, ctx)`, and JSON transforms
+use `modify_json(data, ctx)`. The `ctx.request.aipref` object exposes
+`train`, `search`, and `ai_input`, each defaulting to `true` when the request
+has no valid `aipref` header.
 
 JavaScript runtimes are pooled and reused. The per-execution timeout is 100ms with a memory cap; see `configuration.md` for tunables.
 

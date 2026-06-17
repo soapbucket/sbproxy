@@ -36,6 +36,65 @@ fn fire_pending_mirror_no_panic_when_slot_empty() {
     });
 }
 
+#[test]
+fn script_modifier_context_exposes_default_permissive_aipref() {
+    let ctx = RequestContext::new();
+    let script_ctx = script_modifier_context(&ctx);
+
+    assert_eq!(script_ctx["request"]["aipref"]["train"], true);
+    assert_eq!(script_ctx["request"]["aipref"]["search"], true);
+    assert_eq!(script_ctx["request"]["aipref"]["ai_input"], true);
+    assert_eq!(script_ctx["request"]["aipref"]["ai-input"], true);
+}
+
+#[test]
+fn lua_response_modifier_reads_aipref_context_from_ctx() {
+    let mut ctx = RequestContext::new();
+    ctx.aipref = Some(sbproxy_modules::AiprefSignal {
+        train: false,
+        ..Default::default()
+    });
+    let headers = serde_json::Map::new();
+    let script = r#"
+        function modify_response(resp, ctx)
+          resp.headers["x-aipref-train"] =
+            ctx.request.aipref.train == true and "true" or "false"
+          return resp
+        end
+    "#;
+
+    let out = lua_response_modifier(script, 200, &headers, &ctx).unwrap();
+
+    assert_eq!(
+        out,
+        vec![("x-aipref-train".to_string(), "false".to_string())]
+    );
+}
+
+#[test]
+fn js_response_modifier_reads_aipref_context_from_ctx() {
+    let mut ctx = RequestContext::new();
+    ctx.aipref = Some(sbproxy_modules::AiprefSignal {
+        train: false,
+        ..Default::default()
+    });
+    let headers = serde_json::Map::new();
+    let script = r#"
+        function modify_response(resp, ctx) {
+          resp.headers["x-aipref-train"] =
+            ctx.request.aipref.train === true ? "true" : "false";
+          return resp;
+        }
+    "#;
+
+    let out = js_response_modifier(script, 200, &headers, &ctx).unwrap();
+
+    assert_eq!(
+        out,
+        vec![("x-aipref-train".to_string(), "false".to_string())]
+    );
+}
+
 // --- resolve_override parsing ---
 
 #[test]

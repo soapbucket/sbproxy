@@ -153,11 +153,9 @@ origins:
 // --- Test 5: same surface from Lua and JavaScript transforms ---
 
 #[test]
-#[ignore = "TODO(wave5): Lua and JavaScript transform surfaces don't yet receive a `ctx.request` payload (the existing transforms see only the body). The CEL surface for aipref is wired (`request.aipref.{train,search,ai_input}` per `sbproxy_extension::cel::context::populate_aipref_namespace`); plumbing the same fields into the Lua and JS bindings is a small wave-5 follow-up that requires extending `LuaJsonTransform` / `JavaScriptTransform` to take an enriched ctx."]
 fn aipref_lua_and_js_surfaces() {
-    // Lua surface: a transform reads request.aipref.train and stamps a
-    // response header so the test can observe it. The transform path
-    // is per-response so the static-action body is enough.
+    // Lua surface: a JSON transform reads ctx.request.aipref.train
+    // and stamps the parsed body so the test can observe it.
     let lua_yaml = r#"
 proxy:
   http_bind_port: 0
@@ -166,19 +164,17 @@ origins:
     action:
       type: static
       status_code: 200
-      content_type: text/plain
-      body: "ok"
+      content_type: application/json
+      json_body:
+        ok: true
     transforms:
-      - type: lua
+      - type: lua_json
         script: |
-          function modify_response(resp, ctx)
-            local v = (ctx and ctx.request and ctx.request.aipref and ctx.request.aipref.train)
-            if v == true then
-              resp.headers["x-aipref-train"] = "true"
-            else
-              resp.headers["x-aipref-train"] = "false"
-            end
-            return resp
+          function modify_json(data, ctx)
+            data.aipref_train = ctx.request.aipref.train
+            data.aipref_search = ctx.request.aipref.search
+            data.aipref_ai_input = ctx.request.aipref.ai_input
+            return data
           end
 "#;
     let harness = ProxyHarness::start_with_yaml(lua_yaml).expect("start lua proxy");
@@ -189,13 +185,21 @@ origins:
             &[("aipref", "train=no, search=yes")],
         )
         .expect("GET lua");
+    let json = resp.json().expect("lua response must be JSON");
     assert_eq!(
-        resp.headers.get("x-aipref-train").map(String::as_str),
-        Some("false"),
+        json["aipref_train"], false,
         "Lua transform must observe request.aipref.train == false for train=no"
     );
+    assert_eq!(
+        json["aipref_search"], true,
+        "Lua transform must observe request.aipref.search == true for search=yes"
+    );
+    assert_eq!(
+        json["aipref_ai_input"], true,
+        "Lua transform must keep missing ai-input default-permissive"
+    );
 
-    // JS surface: same shape, JavaScript transform.
+    // JS surface: same context shape, JavaScript body transform.
     let js_yaml = r#"
 proxy:
   http_bind_port: 0
@@ -209,10 +213,9 @@ origins:
     transforms:
       - type: javascript
         script: |
-          function modify_response(resp, ctx) {
+          function transform(body, ctx) {
             const v = ctx?.request?.aipref?.train;
-            resp.headers["x-aipref-train"] = v === true ? "true" : "false";
-            return resp;
+            return v === true ? "true" : "false";
           }
 "#;
     let harness = ProxyHarness::start_with_yaml(js_yaml).expect("start js proxy");
@@ -224,8 +227,8 @@ origins:
         )
         .expect("GET js");
     assert_eq!(
-        resp.headers.get("x-aipref-train").map(String::as_str),
-        Some("false"),
+        resp.text().expect("js response text"),
+        "false",
         "JS transform must observe request.aipref.train == false for train=no"
     );
 }

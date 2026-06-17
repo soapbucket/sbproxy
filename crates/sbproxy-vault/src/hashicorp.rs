@@ -65,7 +65,7 @@ struct BackendInner {
     /// Operator-chosen mount prefix. Resolved paths must start with
     /// this prefix; reads outside it return `permission_denied`.
     /// For KV v2 mounts the prefix is the bare mount (`secret`); the
-    /// `data/` segment is interpolated by [`Self::build_url`].
+    /// `data/` segment is interpolated by [`HashiCorpVaultBackend::build_url`].
     mount_prefix: String,
     /// KV engine version. Selects the URL shape and the response
     /// payload extraction strategy.

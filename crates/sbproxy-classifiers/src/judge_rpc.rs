@@ -284,6 +284,7 @@ mod tests {
     use super::*;
     use proto::judge_client::JudgeClient as ProtoClient;
     use proto::judge_server::JudgeServer as ProtoServer;
+    use std::io::ErrorKind;
     use std::net::TcpListener as StdTcpListener;
     use std::time::Duration;
     use tokio::sync::Mutex;
@@ -326,11 +327,18 @@ mod tests {
     /// can rebind on the same address. Mirrors the trick used by the
     /// e2e crate's `pick_free_port`; safe in tests because we
     /// immediately call `serve` from the spawned task.
-    fn pick_free_port() -> std::net::SocketAddr {
-        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind");
+    fn pick_free_port() -> Option<std::net::SocketAddr> {
+        let listener = match StdTcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                eprintln!("skipping judge RPC network test: loopback bind denied: {err}");
+                return None;
+            }
+            Err(err) => panic!("failed to bind judge RPC test listener: {err}"),
+        };
         let addr = listener.local_addr().expect("local_addr");
         drop(listener);
-        addr
+        Some(addr)
     }
 
     /// Spawn an in-process tonic server backed by `stub` and return a
@@ -338,11 +346,11 @@ mod tests {
     /// runs until the shutdown receiver fires.
     async fn spawn_server(
         stub: Arc<StubJudge>,
-    ) -> (
+    ) -> Option<(
         ProtoClient<tonic::transport::Channel>,
         tokio::sync::oneshot::Sender<()>,
-    ) {
-        let addr = pick_free_port();
+    )> {
+        let addr = pick_free_port()?;
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let svc = JudgeRpcService::new(stub);
         tokio::spawn(async move {
@@ -368,13 +376,15 @@ mod tests {
             .timeout(Duration::from_secs(5));
         let channel = endpoint.connect().await.expect("grpc connect");
         let client = ProtoClient::new(channel);
-        (client, tx)
+        Some((client, tx))
     }
 
     #[tokio::test]
     async fn happy_path_allow_round_trips() {
         let stub = Arc::new(StubJudge::new(vec![Ok(PolicyDecision::Allow)]));
-        let (mut client, shutdown) = spawn_server(stub.clone()).await;
+        let Some((mut client, shutdown)) = spawn_server(stub.clone()).await else {
+            return;
+        };
 
         let resp = client
             .semantic(proto::JudgeRequest {
@@ -400,7 +410,9 @@ mod tests {
             status: 451,
             message: "blocked by judge".into(),
         })]));
-        let (mut client, shutdown) = spawn_server(stub).await;
+        let Some((mut client, shutdown)) = spawn_server(stub).await else {
+            return;
+        };
 
         let resp = client
             .semantic(proto::JudgeRequest {
@@ -426,7 +438,9 @@ mod tests {
     #[tokio::test]
     async fn budget_exhausted_maps_to_resource_exhausted() {
         let stub = Arc::new(StubJudge::new(vec![Err(JudgeError::BudgetExhausted)]));
-        let (mut client, shutdown) = spawn_server(stub).await;
+        let Some((mut client, shutdown)) = spawn_server(stub).await else {
+            return;
+        };
 
         let err = client
             .semantic(proto::JudgeRequest {
@@ -443,7 +457,9 @@ mod tests {
     #[tokio::test]
     async fn timeout_maps_to_deadline_exceeded() {
         let stub = Arc::new(StubJudge::new(vec![Err(JudgeError::Timeout)]));
-        let (mut client, shutdown) = spawn_server(stub).await;
+        let Some((mut client, shutdown)) = spawn_server(stub).await else {
+            return;
+        };
 
         let err = client
             .semantic(proto::JudgeRequest {
@@ -461,7 +477,9 @@ mod tests {
         let stub = Arc::new(StubJudge::new(vec![Err(JudgeError::MalformedResponse(
             "no verdict".into(),
         ))]));
-        let (mut client, shutdown) = spawn_server(stub).await;
+        let Some((mut client, shutdown)) = spawn_server(stub).await else {
+            return;
+        };
 
         let err = client
             .semantic(proto::JudgeRequest {
@@ -484,7 +502,9 @@ mod tests {
         let stub = Arc::new(StubJudge::new(vec![Err(JudgeError::ProviderError(
             "503 boom".into(),
         ))]));
-        let (mut client, shutdown) = spawn_server(stub).await;
+        let Some((mut client, shutdown)) = spawn_server(stub).await else {
+            return;
+        };
 
         let err = client
             .semantic(proto::JudgeRequest {
@@ -501,7 +521,9 @@ mod tests {
     #[tokio::test]
     async fn invalid_payload_json_maps_to_invalid_argument() {
         let stub = Arc::new(StubJudge::new(vec![Ok(PolicyDecision::Allow)]));
-        let (mut client, shutdown) = spawn_server(stub).await;
+        let Some((mut client, shutdown)) = spawn_server(stub).await else {
+            return;
+        };
 
         let err = client
             .semantic(proto::JudgeRequest {
@@ -517,7 +539,9 @@ mod tests {
     #[tokio::test]
     async fn empty_payload_json_is_treated_as_null() {
         let stub = Arc::new(StubJudge::new(vec![Ok(PolicyDecision::Allow)]));
-        let (mut client, shutdown) = spawn_server(stub.clone()).await;
+        let Some((mut client, shutdown)) = spawn_server(stub.clone()).await else {
+            return;
+        };
 
         let _ = client
             .semantic(proto::JudgeRequest {

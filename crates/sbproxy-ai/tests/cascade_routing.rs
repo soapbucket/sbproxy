@@ -13,7 +13,7 @@
 //! 4. An empty / refused response on a tier falls through.
 //! 5. The per-tier outcome metric ticks on every dispatch.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 
 use sbproxy_ai::ai_metrics::cascade_tier_outcome_value;
@@ -21,13 +21,24 @@ use sbproxy_ai::client::AiClient;
 use sbproxy_ai::handler::AiHandlerConfig;
 use sbproxy_ai::routing::{CascadeConfig, CascadeTier};
 
+fn bind_loopback() -> Option<TcpListener> {
+    match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => Some(listener),
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+            eprintln!("skipping cascade routing network test: loopback bind denied: {err}");
+            None
+        }
+        Err(err) => panic!("failed to bind loopback test listener: {err}"),
+    }
+}
+
 /// Spawn a one-shot mock that accepts a single connection and
 /// replies with `body` framed as an HTTP/1.1 response. The
 /// listener stays alive for the duration of the test via the
 /// returned `SocketAddr` (which captures the bind side) so each
 /// request reaches its own pre-staged mock.
-fn one_shot_json(body: &str) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+fn one_shot_json(body: &str) -> Option<SocketAddr> {
+    let listener = bind_loopback()?;
     let addr = listener.local_addr().expect("local_addr");
     let owned = body.to_string();
     std::thread::spawn(move || {
@@ -46,7 +57,14 @@ fn one_shot_json(body: &str) -> SocketAddr {
             let _ = stream.shutdown(std::net::Shutdown::Write);
         }
     });
-    addr
+    Some(addr)
+}
+
+fn closed_loopback_addr() -> Option<SocketAddr> {
+    let listener = bind_loopback()?;
+    let addr = listener.local_addr().expect("local_addr");
+    drop(listener);
+    Some(addr)
 }
 
 /// Build a minimal handler config JSON with one provider per
@@ -111,8 +129,12 @@ async fn cascade_below_threshold_falls_through_to_next_tier() {
     // Tier 1 emits a low-confidence response; tier 2 emits a high-
     // confidence one. The cascade must skip tier 1 and return tier
     // 2's body.
-    let addr1 = one_shot_json(&chat_response("rough answer", Some(0.4)));
-    let addr2 = one_shot_json(&chat_response("polished answer", Some(0.95)));
+    let Some(addr1) = one_shot_json(&chat_response("rough answer", Some(0.4))) else {
+        return;
+    };
+    let Some(addr2) = one_shot_json(&chat_response("polished answer", Some(0.95))) else {
+        return;
+    };
     let cfg = handler_config(&[("cheap", addr1), ("smart", addr2)]);
     let cascade = CascadeConfig {
         tiers: vec![
@@ -162,13 +184,12 @@ async fn cascade_above_threshold_short_circuits() {
     // contacted. Pointing tier 2 at a closed port asserts the
     // short-circuit: if the cascade dialled tier 2 the request
     // would error out.
-    let addr1 = one_shot_json(&chat_response("great answer", Some(0.99)));
+    let Some(addr1) = one_shot_json(&chat_response("great answer", Some(0.99))) else {
+        return;
+    };
     // Bind + immediately drop so the address is closed.
-    let closed = {
-        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let a = l.local_addr().expect("local_addr");
-        drop(l);
-        a
+    let Some(closed) = closed_loopback_addr() else {
+        return;
     };
 
     let cfg = handler_config(&[("cheap", addr1), ("smart", closed)]);
@@ -217,8 +238,12 @@ async fn cascade_cost_cap_stops_retry_mid_cascade() {
     // exceed `max_total_cost`. The cascade must record a cost_cap
     // outcome for tier 2 and return tier 1's (sub-threshold) body
     // as the best available answer.
-    let addr1 = one_shot_json(&chat_response("rough", Some(0.2)));
-    let addr2 = one_shot_json(&chat_response("never reached", Some(0.99)));
+    let Some(addr1) = one_shot_json(&chat_response("rough", Some(0.2))) else {
+        return;
+    };
+    let Some(addr2) = one_shot_json(&chat_response("never reached", Some(0.99))) else {
+        return;
+    };
     let cfg = handler_config(&[("cheap", addr1), ("expensive", addr2)]);
     // Cap chosen between the projected per-call costs of the two
     // tiers so tier 0 (gpt-4o-mini, roughly 384 micro-USD per
@@ -275,8 +300,12 @@ async fn cascade_empty_response_falls_through() {
     // response as a refusal and advance to tier 2 even though
     // tier 1 carried no `confidence_score` (which would otherwise
     // default to `1.0`).
-    let addr1 = one_shot_json(&chat_response("", None));
-    let addr2 = one_shot_json(&chat_response("real answer", Some(0.95)));
+    let Some(addr1) = one_shot_json(&chat_response("", None)) else {
+        return;
+    };
+    let Some(addr2) = one_shot_json(&chat_response("real answer", Some(0.95))) else {
+        return;
+    };
     let cfg = handler_config(&[("cheap", addr1), ("smart", addr2)]);
     let cascade = CascadeConfig {
         tiers: vec![
@@ -318,8 +347,12 @@ async fn cascade_metric_increments_per_tier_outcome() {
     // Mirrors the below-threshold test but asserts the metric
     // counters tick for both tiers: `retry` on tier 0, `accepted`
     // on tier 1.
-    let addr1 = one_shot_json(&chat_response("low", Some(0.3)));
-    let addr2 = one_shot_json(&chat_response("high", Some(0.9)));
+    let Some(addr1) = one_shot_json(&chat_response("low", Some(0.3))) else {
+        return;
+    };
+    let Some(addr2) = one_shot_json(&chat_response("high", Some(0.9))) else {
+        return;
+    };
     let cfg = handler_config(&[("cheap-m", addr1), ("smart-m", addr2)]);
     let cascade = CascadeConfig {
         tiers: vec![

@@ -427,6 +427,7 @@ pub(super) async fn handle_action(
             // Apply response modifiers to static actions (body replacement, headers, Lua, status).
             let mut status_override: Option<u16> = None;
             let mut extra_headers: Vec<(String, String)> = Vec::new();
+            let mut response_headers = response_headers_for_static_action(&ct, &s.headers);
             // Wave 5 day-6 Item 1: drain CEL header mutations the
             // transform pipeline accumulated while walking the body.
             // Set / Append both surface as `extra_headers` entries;
@@ -463,22 +464,40 @@ pub(super) async fn handle_action(
                     if let Some(hm) = &modifier.headers {
                         for (key, value) in &hm.set {
                             extra_headers.push((key.clone(), value.clone()));
+                            insert_json_header(&mut response_headers, key, value);
                         }
                         for (key, value) in &hm.add {
                             extra_headers.push((key.clone(), value.clone()));
+                            insert_json_header(&mut response_headers, key, value);
                         }
                     }
                     // Lua response modifier
                     if let Some(script) = &modifier.lua_script {
                         let lua_status = status_override.unwrap_or(s.status);
-                        match lua_response_modifier(script, lua_status) {
+                        match lua_response_modifier(script, lua_status, &response_headers, ctx) {
                             Ok(headers) => {
                                 for (key, value) in headers {
+                                    insert_json_header(&mut response_headers, &key, &value);
                                     extra_headers.push((key, value));
                                 }
                             }
                             Err(e) => {
                                 warn!(error = %e, "Lua response modifier on static action failed");
+                            }
+                        }
+                    }
+                    // JavaScript response modifier
+                    if let Some(script) = &modifier.js_script {
+                        let js_status = status_override.unwrap_or(s.status);
+                        match js_response_modifier(script, js_status, &response_headers, ctx) {
+                            Ok(headers) => {
+                                for (key, value) in headers {
+                                    insert_json_header(&mut response_headers, &key, &value);
+                                    extra_headers.push((key, value));
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "JavaScript response modifier on static action failed");
                             }
                         }
                     }

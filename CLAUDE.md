@@ -1,5 +1,5 @@
 # sbproxy (Rust workspace)
-*Last modified: 2026-05-17*
+*Last modified: 2026-06-17*
 
 The active implementation of sbproxy. Cargo workspace with ~20
 crates under `crates/`, an e2e suite under `e2e/`, examples under
@@ -7,20 +7,36 @@ crates under `crates/`, an e2e suite under `e2e/`, examples under
 
 ## Pre-commit checks
 
-Before committing any change, run all five. Each one corresponds to a
+Before committing any change, run all checks. Each one corresponds to a
 required CI gate; if any fails locally, CI will fail too.
 
 | Check | Command |
 |---|---|
 | Format | `cargo fmt --all -- --check` |
 | Build | `cargo build --workspace` |
-| Test | `cargo test --workspace --release --tests` |
+| Test | `cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci` |
+| Doctest | `cargo test --workspace --exclude sbproxy-e2e --locked --doc` |
 | Clippy | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Docs | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items` |
 
 Fix the issue before pushing. Do not paper over with `#[allow(...)]`
 unless you also write a one-line comment explaining the deliberate
 exception.
+
+The equivalent local runner is `scripts/check.sh`. It uses
+`cargo-nextest` when installed (`cargo install cargo-nextest --locked`)
+and falls back to plain `cargo test` otherwise. The default path mirrors
+the required PR lane: non-e2e workspace tests in the dev profile plus
+doctests. This keeps the local target directory materially smaller than
+full release/e2e runs. Set `SBPROXY_RELEASE_TESTS=1` to compile test
+binaries in release mode, and `SBPROXY_CHECK_E2E=1` to include the
+`sbproxy-e2e` package.
+
+By default, `scripts/check.sh` runs `scripts/cleanup-build-artifacts.sh`
+on exit to prune `target/doc`, nextest output, incremental directories,
+and other high-churn artifacts while keeping dependency build outputs
+available for reuse. Set `SBPROXY_CLEAN_AFTER_BUILD=0` only when you
+are deliberately preserving every artifact for local debugging.
 
 ## Faster inner-loop alternatives
 

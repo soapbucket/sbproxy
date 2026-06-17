@@ -487,17 +487,25 @@ impl LuaJsonTransform {
     ///
     /// Supports two script formats:
     /// 1. **Function format** (Go-compatible): script defines `modify_json(data, ctx)`.
-    ///    The function receives the parsed JSON body and an empty context table.
+    ///    The function receives the parsed JSON body and a context table.
     /// 2. **Global format** (legacy): script uses a `body` global variable directly.
     ///
     /// The function format is tried first. If `modify_json` is not defined, the
     /// engine falls back to the global format.
     pub fn apply(&self, body: &mut BytesMut) -> anyhow::Result<()> {
+        self.apply_with_context(body, serde_json::json!({}))
+    }
+
+    /// Apply the Lua script with a caller-supplied per-request context.
+    pub fn apply_with_context(
+        &self,
+        body: &mut BytesMut,
+        ctx: serde_json::Value,
+    ) -> anyhow::Result<()> {
         let json: serde_json::Value = serde_json::from_slice(body)?;
         let engine = sbproxy_extension::lua::LuaEngine::new()?;
 
         // Try function format first: modify_json(data, ctx)
-        let ctx = serde_json::json!({});
         let result =
             match engine.call_function(&self.script, "modify_json", vec![json.clone(), ctx]) {
                 Ok(r) => r,
@@ -555,12 +563,24 @@ impl JavaScriptTransform {
 
     /// Apply the JavaScript transform using JsEngine.
     pub fn apply(&self, body: &mut BytesMut) -> anyhow::Result<()> {
+        self.apply_with_context(body, serde_json::json!({}))
+    }
+
+    /// Apply the JavaScript transform with a caller-supplied per-request context.
+    pub fn apply_with_context(
+        &self,
+        body: &mut BytesMut,
+        ctx: serde_json::Value,
+    ) -> anyhow::Result<()> {
         let engine = sbproxy_extension::js::JsEngine::new()?;
         let input = String::from_utf8_lossy(body).to_string();
         let func = self.function_name.as_deref().unwrap_or("transform");
 
-        let result =
-            engine.call_function(&self.script, func, vec![serde_json::Value::String(input)])?;
+        let result = engine.call_function(
+            &self.script,
+            func,
+            vec![serde_json::Value::String(input), ctx],
+        )?;
 
         let output = match result {
             serde_json::Value::String(s) => s,
@@ -615,11 +635,20 @@ impl JsJsonTransform {
 
     /// Apply the JS JSON transform using JsEngine.
     pub fn apply(&self, body: &mut BytesMut) -> anyhow::Result<()> {
+        self.apply_with_context(body, serde_json::json!({}))
+    }
+
+    /// Apply the JS JSON transform with a caller-supplied per-request context.
+    pub fn apply_with_context(
+        &self,
+        body: &mut BytesMut,
+        ctx: serde_json::Value,
+    ) -> anyhow::Result<()> {
         let input: serde_json::Value = serde_json::from_slice(body)?;
         let engine = sbproxy_extension::js::JsEngine::new()?;
         let func = self.function_name.as_deref().unwrap_or("modify_json");
 
-        let result = engine.call_function(&self.script, func, vec![input])?;
+        let result = engine.call_function(&self.script, func, vec![input, ctx])?;
 
         let output = serde_json::to_vec(&result)?;
         body.clear();
@@ -884,6 +913,38 @@ mod tests {
     }
 
     #[test]
+    fn lua_json_apply_with_context_exposes_request_aipref() {
+        let t = LuaJsonTransform::from_config(serde_json::json!({
+            "script": r#"
+                function modify_json(data, ctx)
+                  data.train = ctx.request.aipref.train
+                  data.search = ctx.request.aipref.search
+                  data.ai_input = ctx.request.aipref.ai_input
+                  return data
+                end
+            "#
+        }))
+        .unwrap();
+        let ctx = serde_json::json!({
+            "request": {
+                "aipref": {
+                    "train": false,
+                    "search": true,
+                    "ai_input": false
+                }
+            }
+        });
+        let mut body = BytesMut::from(&b"{}"[..]);
+
+        t.apply_with_context(&mut body, ctx).unwrap();
+
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["train"], false);
+        assert_eq!(result["search"], true);
+        assert_eq!(result["ai_input"], false);
+    }
+
+    #[test]
     fn lua_json_apply_returns_new_value() {
         let t = LuaJsonTransform::from_config(serde_json::json!({
             "script": "return {status = \"ok\", count = 42}"
@@ -965,6 +1026,41 @@ mod tests {
     }
 
     #[test]
+    fn javascript_apply_with_context_exposes_request_aipref() {
+        let t = JavaScriptTransform::from_config(serde_json::json!({
+            "script": r#"
+                function transform(body, ctx) {
+                  return JSON.stringify({
+                    body,
+                    train: ctx.request.aipref.train,
+                    search: ctx.request.aipref.search,
+                    ai_input: ctx.request.aipref.ai_input
+                  });
+                }
+            "#
+        }))
+        .unwrap();
+        let ctx = serde_json::json!({
+            "request": {
+                "aipref": {
+                    "train": false,
+                    "search": true,
+                    "ai_input": false
+                }
+            }
+        });
+        let mut body = BytesMut::from(&b"hello"[..]);
+
+        t.apply_with_context(&mut body, ctx).unwrap();
+
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["body"], "hello");
+        assert_eq!(result["train"], false);
+        assert_eq!(result["search"], true);
+        assert_eq!(result["ai_input"], false);
+    }
+
+    #[test]
     fn javascript_apply_returns_string_result() {
         let t = JavaScriptTransform::from_config(serde_json::json!({
             "script": "function transform(body) { return body.replace('foo', 'bar'); }"
@@ -1034,6 +1130,38 @@ mod tests {
         let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(result["x"], 1);
         assert_eq!(result["added"], true);
+    }
+
+    #[test]
+    fn js_json_apply_with_context_exposes_request_aipref() {
+        let t = JsJsonTransform::from_config(serde_json::json!({
+            "script": r#"
+                function modify_json(data, ctx) {
+                  data.train = ctx.request.aipref.train;
+                  data.search = ctx.request.aipref.search;
+                  data.ai_input = ctx.request.aipref.ai_input;
+                  return data;
+                }
+            "#
+        }))
+        .unwrap();
+        let ctx = serde_json::json!({
+            "request": {
+                "aipref": {
+                    "train": false,
+                    "search": true,
+                    "ai_input": false
+                }
+            }
+        });
+        let mut body = BytesMut::from(&b"{}"[..]);
+
+        t.apply_with_context(&mut body, ctx).unwrap();
+
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["train"], false);
+        assert_eq!(result["search"], true);
+        assert_eq!(result["ai_input"], false);
     }
 
     #[test]

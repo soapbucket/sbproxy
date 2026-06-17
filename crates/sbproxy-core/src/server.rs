@@ -362,6 +362,9 @@ fn apply_transform_with_ctx(
             }
             Ok(())
         }
+        Transform::LuaJson(t) => t.apply_with_context(body, script_modifier_context(ctx)),
+        Transform::JavaScript(t) => t.apply_with_context(body, script_modifier_context(ctx)),
+        Transform::JsJson(t) => t.apply_with_context(body, script_modifier_context(ctx)),
         Transform::CelScript(t) => {
             // Wave 5 day-6 Item 1: typed dispatch for the CEL response
             // transform. The body-rewriting expression continues to use
@@ -656,6 +659,87 @@ fn build_request_template_context(
     }
 
     tmpl
+}
+
+fn script_modifier_context(ctx: &RequestContext) -> serde_json::Value {
+    let aipref = ctx.aipref.unwrap_or_default();
+    serde_json::json!({
+        "request": {
+            "aipref": {
+                "train": aipref.train,
+                "search": aipref.search,
+                "ai_input": aipref.ai_input,
+                "ai-input": aipref.ai_input,
+            }
+        }
+    })
+}
+
+fn insert_json_header(
+    headers: &mut serde_json::Map<String, serde_json::Value>,
+    key: impl AsRef<str>,
+    value: impl AsRef<str>,
+) {
+    headers.insert(
+        key.as_ref().to_string(),
+        serde_json::Value::String(value.as_ref().to_string()),
+    );
+}
+
+fn response_headers_from_header_map(
+    headers: &http::HeaderMap,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for (name, value) in headers.iter() {
+        if let Ok(v) = value.to_str() {
+            insert_json_header(&mut out, name.as_str(), v);
+        }
+    }
+    out
+}
+
+fn response_headers_for_static_action(
+    content_type: &str,
+    headers: &std::collections::HashMap<String, String>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    insert_json_header(&mut out, "content-type", content_type);
+    for (name, value) in headers {
+        insert_json_header(&mut out, name, value);
+    }
+    out
+}
+
+fn response_modifier_headers(
+    result: &serde_json::Value,
+    original_headers: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+
+    if let Some(set_headers) = result.get("set_headers").and_then(|h| h.as_object()) {
+        for (key, value) in set_headers {
+            if let Some(v) = value.as_str() {
+                headers.push((key.clone(), v.to_string()));
+            }
+        }
+    }
+
+    if let Some(returned_headers) = result.get("headers").and_then(|h| h.as_object()) {
+        for (key, value) in returned_headers {
+            let Some(v) = value.as_str() else {
+                continue;
+            };
+            let changed = original_headers
+                .get(key)
+                .and_then(|original| original.as_str())
+                != Some(v);
+            if changed {
+                headers.push((key.clone(), v.to_string()));
+            }
+        }
+    }
+
+    headers
 }
 
 // --- Response cache key construction ---
@@ -2947,15 +3031,21 @@ return __headers
 /// - Go: `match_response(resp, ctx)` with `resp:set_header()` method calls
 ///
 /// Returns a list of (header_name, header_value) pairs to set.
-fn lua_response_modifier(script: &str, status: u16) -> anyhow::Result<Vec<(String, String)>> {
+fn lua_response_modifier(
+    script: &str,
+    status: u16,
+    response_headers: &serde_json::Map<String, serde_json::Value>,
+    ctx: &RequestContext,
+) -> anyhow::Result<Vec<(String, String)>> {
     use sbproxy_extension::lua::LuaEngine;
 
     let engine = LuaEngine::new()?;
 
     let resp_table = serde_json::json!({
         "status_code": status,
+        "headers": response_headers,
     });
-    let ctx_table = serde_json::json!({});
+    let ctx_table = script_modifier_context(ctx);
 
     // Try the Rust format first (modify_response returning {set_headers: {...}}).
     let result = engine.call_function(
@@ -2967,13 +3057,7 @@ fn lua_response_modifier(script: &str, status: u16) -> anyhow::Result<Vec<(Strin
     let mut headers_to_set = Vec::new();
     match result {
         Ok(result) => {
-            if let Some(set_headers) = result.get("set_headers").and_then(|h| h.as_object()) {
-                for (key, value) in set_headers {
-                    if let Some(v) = value.as_str() {
-                        headers_to_set.push((key.clone(), v.to_string()));
-                    }
-                }
-            }
+            headers_to_set.extend(response_modifier_headers(&result, response_headers));
         }
         Err(_) => {
             // Try Go format: match_response(resp, ctx) with resp:set_header() calls.
@@ -3016,6 +3100,29 @@ return __headers
         }
     }
     Ok(headers_to_set)
+}
+
+/// Execute a JavaScript response modifier script.
+///
+/// The script defines `modify_response(resp, ctx)` and returns either
+/// `{set_headers: {...}}` or the mutated `resp` object with changed
+/// `resp.headers` entries.
+fn js_response_modifier(
+    script: &str,
+    status: u16,
+    response_headers: &serde_json::Map<String, serde_json::Value>,
+    ctx: &RequestContext,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let engine = sbproxy_extension::js::JsEngine::new()?;
+
+    let resp_table = serde_json::json!({
+        "status_code": status,
+        "headers": response_headers,
+    });
+    let ctx_table = script_modifier_context(ctx);
+
+    let result = engine.call_function(script, "modify_response", vec![resp_table, ctx_table])?;
+    Ok(response_modifier_headers(&result, response_headers))
 }
 
 // --- Session cookie builder ---

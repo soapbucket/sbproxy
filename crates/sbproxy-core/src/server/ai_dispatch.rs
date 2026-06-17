@@ -703,6 +703,35 @@ pub(super) async fn handle_ai_proxy(
                 .iter()
                 .find(|vk| vk.enabled && vk.key == key)
             {
+                if !vk.matches_principal(&ctx.principal) {
+                    let vk_name = vk.name.as_deref().unwrap_or("<unnamed>");
+                    warn!(
+                        credential = %vk_name,
+                        principal_source = %ctx.principal.source.as_str(),
+                        principal_sub = %ctx.principal.sub,
+                        "AI proxy: credential principal selector miss"
+                    );
+                    send_error(session, 403, "credential is not allowed for this principal")
+                        .await?;
+                    return Ok(());
+                }
+                if !vk.require_pii_redaction.is_empty()
+                    && !config.satisfies_pii_redaction_requirement(&vk.require_pii_redaction)
+                {
+                    let vk_name = vk.name.as_deref().unwrap_or("<unnamed>");
+                    warn!(
+                        credential = %vk_name,
+                        required_rules = ?vk.require_pii_redaction,
+                        "AI proxy: credential requires request PII redaction but origin redaction is inactive or missing required rules"
+                    );
+                    send_error(
+                        session,
+                        500,
+                        "credential requires active request PII redaction",
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 // Stamp the matched VK onto the unified Principal so
                 // the rest of the pipeline (access log, attribution
                 // metric, policy scripts, MCP RBAC) all read through

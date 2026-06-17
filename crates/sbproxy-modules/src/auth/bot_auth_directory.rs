@@ -858,7 +858,14 @@ mod tests {
         // Bind a port and immediately drop the listener: subsequent
         // connects fail with a connection-refused, which the fetcher
         // maps to `network`.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping bot-auth directory network test: loopback bind denied: {err}");
+                return;
+            }
+            Err(err) => panic!("failed to bind bot-auth directory test listener: {err}"),
+        };
         let addr = listener.local_addr().unwrap();
         drop(listener);
         // Use https:// to satisfy the URL check; the fetch itself

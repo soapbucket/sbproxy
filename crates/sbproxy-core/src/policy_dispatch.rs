@@ -289,9 +289,9 @@ mod tests {
     fn confirm_with_safe_webhook_stamps_header() {
         let mut headers = Vec::new();
         let mut state = ConfirmReducerState::default();
-        // example.com resolves to a public IP; the SSRF guard
-        // permits public targets.
-        let webhook = url::Url::parse("https://example.com/approve").expect("static url");
+        // Public IP literal keeps the test deterministic in local
+        // environments where DNS is unavailable.
+        let webhook = url::Url::parse("https://8.8.8.8/approve").expect("static url");
         let out = translate_plugin_decision(
             PolicyDecision::confirm("review", Some(webhook), None),
             &mut headers,

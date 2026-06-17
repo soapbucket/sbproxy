@@ -375,8 +375,22 @@ const MIGRATED_FEATURE_KEYS: &[(&str, &str)] = &[
 /// name so the per-credential attribution metric and access-log
 /// columns continue to populate from the unified principal write.
 fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFile) -> Result<()> {
-    use crate::types::CredentialBlock;
+    use crate::types::{CredentialBlock, CredentialPolicy};
     use serde_json::json;
+
+    validate_credential_principal_selectors("proxy", &file.proxy.credentials)?;
+    for tenant in &file.proxy.tenants {
+        validate_credential_principal_selectors(
+            &format!("tenant `{}`", tenant.id),
+            &tenant.credentials,
+        )?;
+    }
+    for (hostname, origin) in &file.origins {
+        validate_credential_principal_selectors(
+            &format!("origin `{hostname}`"),
+            &origin.credentials,
+        )?;
+    }
 
     // Walk the origins; for each origin's resolved tenant, build the
     // ordered scope list (origin -> tenant -> proxy) and merge the
@@ -456,6 +470,9 @@ fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFil
                 if let Some(provider) = &cred.provider {
                     vk["allowed_providers"] = json!([provider]);
                 }
+                if !cred.principals.is_empty() {
+                    vk["principal_selectors"] = json!(cred.principals.clone());
+                }
                 if let Some(models) = &cred.models {
                     if !models.allow.is_empty() {
                         vk["allowed_models"] = json!(models.allow.clone());
@@ -478,18 +495,27 @@ fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFil
                 }
                 // Per-credential rate_limit lowers onto the legacy
                 // `max_requests_per_minute` + `max_tokens_per_minute`
-                // fields. PII redaction policies attach via the
-                // separate scripting hook surface and are not
-                // mirrored on the VK shape today.
+                // fields. `require_pii_redaction` lowers onto the
+                // runtime key so dispatch can reject the request before
+                // provider selection when request redaction is inactive.
+                let mut required_pii_redaction = Vec::new();
                 for policy in &cred.policies {
-                    if let crate::types::CredentialPolicy::RateLimit { rpm, tpm } = policy {
-                        if let Some(r) = rpm {
-                            vk["max_requests_per_minute"] = json!(r);
+                    match policy {
+                        CredentialPolicy::RateLimit { rpm, tpm } => {
+                            if let Some(r) = rpm {
+                                vk["max_requests_per_minute"] = json!(r);
+                            }
+                            if let Some(t) = tpm {
+                                vk["max_tokens_per_minute"] = json!(t);
+                            }
                         }
-                        if let Some(t) = tpm {
-                            vk["max_tokens_per_minute"] = json!(t);
+                        CredentialPolicy::RequirePiiRedaction { rules } => {
+                            required_pii_redaction.extend(rules.iter().cloned());
                         }
                     }
+                }
+                if !required_pii_redaction.is_empty() {
+                    vk["require_pii_redaction"] = json!(required_pii_redaction);
                 }
                 // `route_to_model` and `inject_tools` mirror the
                 // identically-named fields on the underlying
@@ -520,6 +546,33 @@ fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFil
         }
     }
     Ok(())
+}
+
+fn validate_credential_principal_selectors(
+    scope: &str,
+    credentials: &[crate::types::CredentialBlock],
+) -> Result<()> {
+    for credential in credentials {
+        for (idx, selector) in credential.principals.iter().enumerate() {
+            if principal_selector_is_empty(selector) {
+                anyhow::bail!(
+                    "credential `{}` at {scope} has empty principals[{idx}] selector; \
+                     omit `principals` or use `principals: []` to match every principal",
+                    credential.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn principal_selector_is_empty(selector: &crate::types::PrincipalSelector) -> bool {
+    selector.virtual_key.is_none()
+        && selector.team.is_none()
+        && selector.project.is_none()
+        && selector.user.is_none()
+        && selector.role.is_none()
+        && selector.claim.is_empty()
 }
 
 fn yaml_uses_legacy_virtual_keys(yaml: &str) -> bool {
@@ -1811,6 +1864,73 @@ origins:
             .expect("inject_tools array");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "search_docs");
+    }
+
+    #[test]
+    fn credential_principals_and_pii_requirement_pass_through() {
+        let yaml = r#"
+proxy:
+  credentials:
+    - name: secure-openai
+      type: ai_provider
+      provider: openai
+      key: vault://env/OPENAI_API_KEY
+      principals:
+        - team: frontend
+          role: admin
+      policies:
+        - type: require_pii_redaction
+          rules: [email, credit_card]
+origins:
+  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+"#;
+        let compiled = compile_config(yaml).expect("should compile");
+        let origin = compiled.resolve_origin("ai.local").expect("origin exists");
+        let vks = origin
+            .action_config
+            .get("virtual_keys")
+            .and_then(|v| v.as_array())
+            .expect("virtual_keys array materialised");
+
+        assert_eq!(vks.len(), 1);
+        assert_eq!(vks[0]["principal_selectors"][0]["team"], "frontend");
+        assert_eq!(vks[0]["principal_selectors"][0]["role"], "admin");
+        assert_eq!(vks[0]["require_pii_redaction"][0], "email");
+        assert_eq!(vks[0]["require_pii_redaction"][1], "credit_card");
+    }
+
+    #[test]
+    fn credential_empty_principal_selector_is_rejected() {
+        let yaml = r#"
+proxy:
+  credentials:
+    - name: bad-openai
+      type: ai_provider
+      provider: openai
+      key: vault://env/OPENAI_API_KEY
+      principals:
+        - {}
+origins:
+  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("empty principal selector should fail compile");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bad-openai") && msg.contains("empty principals[0] selector"),
+            "unhelpful error: {msg}"
+        );
     }
 
     /// An origin-scope credential with the same name as a

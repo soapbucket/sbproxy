@@ -263,11 +263,7 @@ mod tests {
         compiler_version: &str,
         verdict: PolicyDecision,
     ) -> Arc<JudgeClient> {
-        // Allocate-and-drop a port to get an unused address.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let endpoint = url::Url::parse(&format!("http://{}/judge", addr)).unwrap();
+        let endpoint = url::Url::parse("http://127.0.0.1:1/judge").unwrap();
         let cfg = JudgeConfig {
             endpoint,
             api_key_env: "SBPROXY_NLC_TEST_KEY".to_string(),
@@ -299,10 +295,7 @@ mod tests {
     async fn linter_violation_blocks_compilation() {
         // The cache loader doesn't matter here; the linter fires
         // before any judge call. The bare predicate trips L009.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let endpoint = url::Url::parse(&format!("http://{}/judge", addr)).unwrap();
+        let endpoint = url::Url::parse("http://127.0.0.1:1/judge").unwrap();
         let cfg = JudgeConfig {
             endpoint,
             api_key_env: "SBPROXY_NLC_TEST_KEY".to_string(),
