@@ -923,6 +923,67 @@ pub(super) fn extract_usage(body: &[u8]) -> (u64, u64) {
     (prompt, completion)
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AiResponseSpanMetadata {
+    response_model: Option<String>,
+    response_id: Option<String>,
+    finish_reasons: Vec<String>,
+}
+
+fn extract_ai_response_span_metadata(body: &[u8]) -> AiResponseSpanMetadata {
+    let parsed: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return AiResponseSpanMetadata::default(),
+    };
+
+    let response_model = parsed
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let response_id = parsed
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mut finish_reasons = Vec::new();
+    if let Some(choices) = parsed.get("choices").and_then(serde_json::Value::as_array) {
+        for choice in choices {
+            let Some(reason) = choice
+                .get("finish_reason")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            if !finish_reasons.iter().any(|existing| existing == reason) {
+                finish_reasons.push(reason.to_string());
+            }
+        }
+    }
+
+    AiResponseSpanMetadata {
+        response_model,
+        response_id,
+        finish_reasons,
+    }
+}
+
+pub(super) fn record_ai_response_span_metadata(span: &tracing::Span, body: &[u8]) {
+    let metadata = extract_ai_response_span_metadata(body);
+    if metadata.response_model.is_some() || metadata.response_id.is_some() {
+        sbproxy_ai::tracing_spans::record_response_identity(
+            span,
+            metadata.response_model.as_deref().unwrap_or(""),
+            metadata.response_id.as_deref().unwrap_or(""),
+        );
+    }
+    if !metadata.finish_reasons.is_empty() {
+        let reasons: Vec<&str> = metadata.finish_reasons.iter().map(String::as_str).collect();
+        sbproxy_ai::tracing_spans::record_finish_reasons(span, &reasons);
+    }
+}
+
 /// WOR-1146: estimate completion tokens from a chat-completions
 /// response body when the upstream omitted a parseable `usage` block.
 ///
@@ -1231,6 +1292,15 @@ pub(super) fn emit_ai_billing_event(
         _ => (0, 0),
     };
     let model_label = model.as_deref().unwrap_or("");
+    ai_span.record("gen_ai.system", provider_name);
+    ai_span.record("llm.provider", provider_name);
+    if !model_label.is_empty() {
+        ai_span.record("gen_ai.request.model", model_label);
+        ai_span.record("llm.model_name", model_label);
+    }
+    if input_tokens != 0 || output_tokens != 0 {
+        sbproxy_ai::tracing_spans::record_token_usage(ai_span, input_tokens, output_tokens);
+    }
     sbproxy_ai::ai_metrics::record_ai_request_attributed(
         provider_name,
         model_label,
@@ -2149,6 +2219,44 @@ mod extract_prompt_text_tests {
         });
         let out = extract_prompt_text(&body);
         assert!(out.contains("user 42 deleted"));
+    }
+}
+
+#[cfg(test)]
+mod ai_response_span_metadata_tests {
+    use super::{extract_ai_response_span_metadata, AiResponseSpanMetadata};
+
+    #[test]
+    fn extracts_identity_and_finish_reasons() {
+        let body = br#"{
+            "id": "chatcmpl-wor1217",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o-2024-08-06",
+            "choices": [
+                {"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"},
+                {"index": 1, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "length"},
+                {"index": 2, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+            ],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+        }"#;
+
+        let metadata = extract_ai_response_span_metadata(body);
+
+        assert_eq!(
+            metadata,
+            AiResponseSpanMetadata {
+                response_model: Some("gpt-4o-2024-08-06".to_string()),
+                response_id: Some("chatcmpl-wor1217".to_string()),
+                finish_reasons: vec!["stop".to_string(), "length".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn ignores_malformed_bodies() {
+        let metadata = extract_ai_response_span_metadata(b"not json");
+        assert_eq!(metadata, AiResponseSpanMetadata::default());
     }
 }
 
