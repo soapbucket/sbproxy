@@ -27,11 +27,11 @@ processors:
     limit_percentage: 80
     spike_limit_percentage: 25
 
-  # WOR-1230: cost-aware tail sampling. Head sampling at the proxy keeps a
-  # ratio of roots; this tail policy additionally always-keeps the traces
-  # operators never want to lose, evaluated once the trace is complete:
-  # errors (span status ERROR), slow requests, and a probabilistic base
-  # rate for the rest. Mirror keep_over_budget_usd / keep_slower_than_secs
+  # Cost-aware tail sampling mirror. SBproxy applies source-side parent-based
+  # sampling and span-end keep overrides from proxy.observability.telemetry.
+  # This backend policy is a second line of defense once traces reach the
+  # collector: errors (span status ERROR), slow requests, and a probabilistic
+  # base rate for the rest. Mirror keep_over_budget_usd / keep_slower_than_secs
   # from the proxy's telemetry config here.
   tail_sampling:
     decision_wait: 10s

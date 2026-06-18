@@ -8,8 +8,9 @@
 //!    SDK so it costs nothing when telemetry is disabled.
 //! 2. **OTLP exporter** ([`init_otlp_pipeline`]): builds and installs
 //!    a tracing-subscriber layer that forwards spans to an OTLP
-//!    collector over HTTP/proto. Called once at startup when the
-//!    operator sets `telemetry.enabled: true` and an `endpoint`.
+//!    collector. Startup code that already owns the process subscriber
+//!    uses [`build_otlp_trace_pipeline`] and layers the returned tracer
+//!    into that subscriber.
 //! 3. **W3C TraceContext propagator** ([`init_propagator`]): registers
 //!    the OTel-default propagator as the global text-map propagator so
 //!    every outbound HTTP client that goes through
@@ -17,12 +18,23 @@
 //! 4. **Span-naming helper** ([`span`]): every pillar emits spans
 //!    named `sbproxy.<pillar>.<verb>` so dashboards group cleanly.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::sync::mpsc::TrySendError;
+use std::time::{Duration, SystemTime};
+
 use anyhow::Result;
-use opentelemetry::{global, KeyValue};
+use opentelemetry::trace::{
+    Link, SamplingDecision, SamplingResult, SpanKind, Status, TraceContextExt, TraceError, TraceId,
+    TraceResult,
+};
+use opentelemetry::{global, Context, KeyValue, Value};
 use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace as sdktrace;
-use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::trace::{ShouldSample, SpanProcessor};
+use opentelemetry_sdk::{trace::Span, Resource};
 use opentelemetry_semantic_conventions as semconv;
 use serde::Deserialize;
 use tracing_subscriber::layer::SubscriberExt;
@@ -46,9 +58,8 @@ pub enum OtlpTransport {
 
 /// Configuration for the OpenTelemetry pipeline.
 ///
-/// The substrate ships head-based sampling (parent-based +
-/// always-sample errors + ratio for unsampled roots); tail-based
-/// sampling is deferred.
+/// The substrate ships parent-based ratio sampling for normal traffic,
+/// plus span-end keep overrides for error, cost, and latency outcomes.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelemetryConfig {
     /// Whether tracing is enabled.
@@ -65,9 +76,8 @@ pub struct TelemetryConfig {
     /// Service name reported in spans.
     #[serde(default = "default_service_name")]
     pub service_name: String,
-    /// Head-based sampling probability for unsampled roots. Default is
-    /// 10%. Errors and parent-sampled requests are always
-    /// captured regardless of this value.
+    /// Head-based sampling probability for unsampled local roots.
+    /// Default is 10%. Parent-sampled requests are always captured.
     #[serde(default)]
     pub sample_rate: Option<f64>,
     /// When `true`, every 5xx / policy-block / ledger-denial root span
@@ -75,16 +85,15 @@ pub struct TelemetryConfig {
     /// Default `true`.
     #[serde(default = "default_always_sample_errors")]
     pub always_sample_errors: bool,
-    /// WOR-1230: keep any trace whose derived USD cost is at or above this
+    /// Keep any trace whose derived USD cost is at or above this
     /// threshold, regardless of the head ratio. `None` disables the
-    /// cost-based keep. Cost is known at request end, so this is consulted
-    /// by the tail-sampling policy (the reference collector), not the
-    /// head sampler.
+    /// cost-based keep. Cost is known at request end, so the source-side
+    /// span processor evaluates this once the span is complete.
     #[serde(default)]
     pub keep_over_budget_usd: Option<f64>,
-    /// WOR-1230: keep any trace whose wall-clock duration is at or above
+    /// Keep any trace whose wall-clock duration is at or above
     /// this many seconds, regardless of the head ratio. `None` disables the
-    /// latency-based keep. Like cost, a tail-sampling concern.
+    /// latency-based keep. Like cost, this is evaluated at span end.
     #[serde(default)]
     pub keep_slower_than_secs: Option<f64>,
     /// Propagation format: `"w3c"` (default), `"b3"`, or `"jaeger"`.
@@ -147,16 +156,14 @@ impl Default for TelemetryConfig {
     }
 }
 
-/// WOR-1230: cost-aware tail-sampling decision for an AI trace.
+/// Cost-aware keep decision for a completed AI trace.
 ///
 /// Head sampling (ParentBased + TraceIdRatio, configured via
 /// `sample_rate`) decides at span start, before the outcome is known.
 /// Whether a finished trace should be kept regardless of that ratio,
-/// because it errored, cost over a budget, or ran slow, is a tail
-/// decision: it is evaluated at request end and applied by the reference
-/// collector's tail-sampling policy. This pure helper is the single
-/// source of truth for that decision so the proxy and the collector
-/// policy agree.
+/// because it errored, cost over a budget, or ran slow, is evaluated at
+/// request end by the source-side span processor. The reference collector
+/// can mirror the same policy as a second line of defense.
 ///
 /// Returns `true` when the trace should be force-kept.
 pub fn should_force_sample(
@@ -172,7 +179,410 @@ pub fn should_force_sample(
         || keep_slower_than_secs.is_some_and(|threshold| latency_secs >= threshold)
 }
 
+const TRACE_EXPORT_QUEUE_SIZE: usize = 4096;
+const TRACE_EXPORT_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Effective source-side trace sampling policy.
+#[derive(Clone, Debug)]
+pub struct TraceSamplingPolicy {
+    /// ParentBased(TraceIdRatioBased(ratio)) ratio for local roots.
+    pub sample_rate: f64,
+    /// Keep completed error spans even when the head ratio did not sample them.
+    pub always_sample_errors: bool,
+    /// Keep completed spans whose cost meets or exceeds this USD threshold.
+    pub keep_over_budget_usd: Option<f64>,
+    /// Keep completed spans whose wall time meets or exceeds this threshold.
+    pub keep_slower_than_secs: Option<f64>,
+}
+
+impl TraceSamplingPolicy {
+    fn from_config(config: &TelemetryConfig) -> Self {
+        Self {
+            sample_rate: effective_sample_rate(config),
+            always_sample_errors: config.always_sample_errors,
+            keep_over_budget_usd: config.keep_over_budget_usd,
+            keep_slower_than_secs: config.keep_slower_than_secs,
+        }
+    }
+
+    fn head_sampler(&self) -> sdktrace::Sampler {
+        sdktrace::Sampler::ParentBased(Box::new(sdktrace::Sampler::TraceIdRatioBased(
+            self.sample_rate,
+        )))
+    }
+}
+
+fn effective_sample_rate(config: &TelemetryConfig) -> f64 {
+    config.sample_rate.unwrap_or(0.1).clamp(0.0, 1.0)
+}
+
+/// A parent-based ratio sampler that records locally dropped spans so
+/// the span-end processor can still evaluate error, cost, and latency
+/// overrides. Normal sampled/exported traffic follows the same export
+/// decision as `ParentBased(TraceIdRatioBased(ratio))`.
+#[derive(Clone, Debug)]
+struct OutcomeAwareSampler {
+    policy: TraceSamplingPolicy,
+}
+
+impl OutcomeAwareSampler {
+    fn new(policy: TraceSamplingPolicy) -> Self {
+        Self { policy }
+    }
+}
+
+impl ShouldSample for OutcomeAwareSampler {
+    #[allow(clippy::too_many_arguments)]
+    fn should_sample(
+        &self,
+        parent_context: Option<&Context>,
+        trace_id: TraceId,
+        name: &str,
+        span_kind: &SpanKind,
+        attributes: &[KeyValue],
+        links: &[Link],
+    ) -> SamplingResult {
+        let trace_state = parent_context
+            .map(|cx| cx.span().span_context().trace_state().clone())
+            .unwrap_or_default();
+
+        let decision = parent_context
+            .filter(|cx| cx.has_active_span())
+            .map_or_else(
+                || {
+                    let head = self.policy.head_sampler();
+                    match head
+                        .should_sample(None, trace_id, name, span_kind, attributes, links)
+                        .decision
+                    {
+                        SamplingDecision::RecordAndSample => SamplingDecision::RecordAndSample,
+                        SamplingDecision::RecordOnly | SamplingDecision::Drop => {
+                            SamplingDecision::RecordOnly
+                        }
+                    }
+                },
+                |cx| {
+                    if cx.span().span_context().is_sampled() {
+                        SamplingDecision::RecordAndSample
+                    } else {
+                        SamplingDecision::RecordOnly
+                    }
+                },
+            );
+
+        SamplingResult {
+            decision,
+            attributes: Vec::new(),
+            trace_state,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TraceExportMessage {
+    ExportSpan(Box<SpanData>),
+    ForceFlush(mpsc::Sender<ExportResult>),
+    SetResource(Resource),
+    Shutdown(mpsc::Sender<ExportResult>),
+}
+
+/// Span processor that exports the spans selected by the head sampler
+/// plus completed spans that satisfy the configured keep overrides.
+#[derive(Debug)]
+struct OutcomeSamplingSpanProcessor {
+    tx: mpsc::SyncSender<TraceExportMessage>,
+    policy: TraceSamplingPolicy,
+    dropped_spans: AtomicUsize,
+}
+
+impl OutcomeSamplingSpanProcessor {
+    fn new(exporter: Box<dyn SpanExporter>, policy: TraceSamplingPolicy) -> Self {
+        let (tx, rx) = mpsc::sync_channel(TRACE_EXPORT_QUEUE_SIZE);
+        spawn_trace_export_worker(exporter, rx);
+        Self {
+            tx,
+            policy,
+            dropped_spans: AtomicUsize::new(0),
+        }
+    }
+
+    fn should_export(&self, span: &SpanData) -> bool {
+        span.span_context.is_sampled() || should_force_export_span(span, &self.policy)
+    }
+
+    fn send_control(
+        &self,
+        build: impl FnOnce(mpsc::Sender<ExportResult>) -> TraceExportMessage,
+    ) -> TraceResult<()> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(build(reply_tx))
+            .map_err(|_| TraceError::Other("trace export worker is closed".into()))?;
+        reply_rx
+            .recv_timeout(TRACE_EXPORT_FLUSH_TIMEOUT)
+            .map_err(|_| TraceError::Other("trace export worker timed out".into()))?
+    }
+}
+
+impl SpanProcessor for OutcomeSamplingSpanProcessor {
+    fn on_start(&self, _span: &mut Span, _cx: &Context) {}
+
+    fn on_end(&self, span: SpanData) {
+        if !self.should_export(&span) {
+            return;
+        }
+
+        match self
+            .tx
+            .try_send(TraceExportMessage::ExportSpan(Box::new(span)))
+        {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                let dropped = self.dropped_spans.fetch_add(1, Ordering::Relaxed);
+                if dropped == 0 {
+                    tracing::warn!(
+                        queue_size = TRACE_EXPORT_QUEUE_SIZE,
+                        "telemetry: dropping trace spans because the OTLP export queue is full"
+                    );
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                tracing::debug!("telemetry: trace export worker is closed; dropping span");
+            }
+        }
+    }
+
+    fn force_flush(&self) -> TraceResult<()> {
+        self.send_control(TraceExportMessage::ForceFlush)
+    }
+
+    fn shutdown(&self) -> TraceResult<()> {
+        let dropped = self.dropped_spans.load(Ordering::Relaxed);
+        if dropped > 0 {
+            tracing::warn!(
+                dropped_spans = dropped,
+                queue_size = TRACE_EXPORT_QUEUE_SIZE,
+                "telemetry: OTLP trace spans were dropped before shutdown"
+            );
+        }
+        self.send_control(TraceExportMessage::Shutdown)
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        let _ = self
+            .tx
+            .try_send(TraceExportMessage::SetResource(resource.clone()));
+    }
+}
+
+fn spawn_trace_export_worker(
+    mut exporter: Box<dyn SpanExporter>,
+    rx: mpsc::Receiver<TraceExportMessage>,
+) {
+    if let Err(e) = std::thread::Builder::new()
+        .name("sbproxy-otel-trace-export".to_string())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "telemetry: failed to build OTLP trace export runtime"
+                    );
+                    return;
+                }
+            };
+
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    TraceExportMessage::ExportSpan(span) => {
+                        if let Err(e) = rt.block_on(exporter.export(vec![*span])) {
+                            tracing::debug!(error = ?e, "telemetry: OTLP span export failed");
+                        }
+                    }
+                    TraceExportMessage::ForceFlush(reply) => {
+                        let _ = reply.send(rt.block_on(exporter.force_flush()));
+                    }
+                    TraceExportMessage::SetResource(resource) => {
+                        exporter.set_resource(&resource);
+                    }
+                    TraceExportMessage::Shutdown(reply) => {
+                        let result = rt.block_on(exporter.force_flush());
+                        exporter.shutdown();
+                        let _ = reply.send(result);
+                        break;
+                    }
+                }
+            }
+        })
+    {
+        tracing::warn!(
+            error = %e,
+            "telemetry: failed to spawn OTLP trace export worker"
+        );
+    }
+}
+
+fn should_force_export_span(span: &SpanData, policy: &TraceSamplingPolicy) -> bool {
+    let is_error = span_is_error(span);
+    let cost_usd = span_cost_usd(&span.attributes).unwrap_or(0.0);
+    let latency_secs = span_latency_secs(span.start_time, span.end_time);
+    should_force_sample(
+        is_error,
+        cost_usd,
+        latency_secs,
+        policy.always_sample_errors,
+        policy.keep_over_budget_usd,
+        policy.keep_slower_than_secs,
+    )
+}
+
+fn span_is_error(span: &SpanData) -> bool {
+    matches!(span.status, Status::Error { .. })
+        || string_attr_eq(&span.attributes, "otel.status_code", "ERROR")
+        || string_attr_present(&span.attributes, "error.type")
+}
+
+fn span_cost_usd(attributes: &[KeyValue]) -> Option<f64> {
+    for key in [
+        "gen_ai.usage.cost",
+        "llm.usage.total_cost",
+        "sbproxy.ai.cost_usd",
+    ] {
+        if let Some(value) = numeric_attr(attributes, key) {
+            return Some(value);
+        }
+    }
+    numeric_attr(attributes, "sbproxy.ai.cost_usd_micros").map(|micros| micros / 1_000_000.0)
+}
+
+fn span_latency_secs(start: SystemTime, end: SystemTime) -> f64 {
+    end.duration_since(start)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn string_attr_eq(attributes: &[KeyValue], key: &str, expected: &str) -> bool {
+    attributes.iter().any(|kv| {
+        kv.key.as_str() == key
+            && match &kv.value {
+                Value::String(value) => value.to_string().eq_ignore_ascii_case(expected),
+                other => other.to_string().eq_ignore_ascii_case(expected),
+            }
+    })
+}
+
+fn string_attr_present(attributes: &[KeyValue], key: &str) -> bool {
+    attributes.iter().any(|kv| kv.key.as_str() == key)
+}
+
+fn numeric_attr(attributes: &[KeyValue], key: &str) -> Option<f64> {
+    attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == key)
+        .and_then(|kv| match &kv.value {
+            Value::I64(value) => Some(*value as f64),
+            Value::F64(value) => Some(*value),
+            Value::String(value) => value.to_string().parse::<f64>().ok(),
+            _ => None,
+        })
+}
+
 // --- OTLP exporter ---
+
+/// Built OTLP trace pipeline metadata.
+#[derive(Debug, Clone)]
+pub struct OtlpTracePipeline {
+    /// Tracer to attach to a `tracing-opentelemetry` layer.
+    pub tracer: sdktrace::Tracer,
+    /// Effective OTLP endpoint.
+    pub endpoint: String,
+    /// Effective service.name resource attribute.
+    pub service_name: String,
+    /// Effective head sample ratio for local roots.
+    pub sample_rate: f64,
+}
+
+/// Build and install the global OTLP tracer provider.
+///
+/// This does not install a `tracing-subscriber` layer. Callers that own
+/// the global subscriber should call this first, then attach
+/// `tracing_opentelemetry::layer().with_tracer(pipeline.tracer.clone())`
+/// to their subscriber stack.
+pub fn build_otlp_trace_pipeline(config: &TelemetryConfig) -> Result<Option<OtlpTracePipeline>> {
+    if !config.enabled {
+        // Even when OTLP export is off we still want propagation to
+        // work end-to-end so downstream services see traceparent
+        // headers we receive. Register the W3C propagator unconditionally.
+        init_propagator();
+        return Ok(None);
+    }
+
+    let endpoint = otlp_endpoint(config);
+    let policy = TraceSamplingPolicy::from_config(config);
+    let resource = otlp_resource(config);
+    let exporter = build_span_exporter(config, &endpoint)?;
+    let processor = OutcomeSamplingSpanProcessor::new(Box::new(exporter), policy.clone());
+
+    let provider = sdktrace::TracerProvider::builder()
+        .with_span_processor(processor)
+        .with_sampler(OutcomeAwareSampler::new(policy.clone()))
+        .with_resource(resource)
+        .build();
+    let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "sbproxy");
+    global::set_tracer_provider(provider);
+    init_propagator();
+
+    Ok(Some(OtlpTracePipeline {
+        tracer,
+        endpoint,
+        service_name: config.service_name.clone(),
+        sample_rate: policy.sample_rate,
+    }))
+}
+
+fn otlp_endpoint(config: &TelemetryConfig) -> String {
+    config
+        .endpoint
+        .clone()
+        .filter(|e| !e.is_empty())
+        .unwrap_or_else(|| DEFAULT_OTLP_ENDPOINT.to_string())
+}
+
+fn otlp_resource(config: &TelemetryConfig) -> Resource {
+    let mut resource_kv = vec![
+        KeyValue::new(semconv::resource::SERVICE_NAME, config.service_name.clone()),
+        KeyValue::new(
+            semconv::resource::SERVICE_VERSION,
+            env!("CARGO_PKG_VERSION"),
+        ),
+    ];
+    for (k, v) in &config.resource_attrs {
+        resource_kv.push(KeyValue::new(k.clone(), v.clone()));
+    }
+    Resource::new(resource_kv)
+}
+
+fn build_span_exporter(
+    config: &TelemetryConfig,
+    endpoint: &str,
+) -> Result<opentelemetry_otlp::SpanExporter> {
+    match config.transport {
+        OtlpTransport::Http => opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_endpoint(endpoint)
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to build OTLP/HTTP exporter: {}", e)),
+        OtlpTransport::Grpc => opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to build OTLP/gRPC exporter: {}", e)),
+    }
+}
 
 /// Initialise the OTLP tracing pipeline.
 ///
@@ -186,84 +596,9 @@ pub fn should_force_sample(
 /// endpoint URL); callers should log and continue rather than fail
 /// the whole startup.
 pub fn init_otlp_pipeline(config: &TelemetryConfig) -> Result<()> {
-    if !config.enabled {
-        // Even when OTLP export is off we still want propagation to
-        // work end-to-end so downstream services see traceparent
-        // headers we receive. Register the W3C propagator unconditionally.
-        init_propagator();
+    let Some(pipeline) = build_otlp_trace_pipeline(config)? else {
         return Ok(());
-    }
-    // Default endpoint matches the Day-1 reference Compose stack
-    // (`examples/observability-stack/`). Operators that point at a
-    // remote collector override this.
-    let endpoint_owned = config
-        .endpoint
-        .clone()
-        .filter(|e| !e.is_empty())
-        .unwrap_or_else(|| DEFAULT_OTLP_ENDPOINT.to_string());
-    let endpoint = endpoint_owned.as_str();
-
-    // --- Sampler ---
-    //
-    // Wave 1 ships parent-based sampling so an upstream tracer's
-    // sampling decision is honored. The unsampled root rate defaults
-    // to the value the operator provided (10% per A1.4 if absent).
-    // Errors get sampled at 100% by the per-request shim that lives
-    // alongside this config (see `should_sample_error`); the SDK
-    // sampler here only handles the no-context case.
-    let head_rate = config.sample_rate.unwrap_or(0.1).clamp(0.0, 1.0);
-    let sampler =
-        sdktrace::Sampler::ParentBased(Box::new(sdktrace::Sampler::TraceIdRatioBased(head_rate)));
-
-    // --- Resource: identifies this proxy instance to the collector ---
-    let mut resource_kv = vec![
-        KeyValue::new(semconv::resource::SERVICE_NAME, config.service_name.clone()),
-        KeyValue::new(
-            semconv::resource::SERVICE_VERSION,
-            env!("CARGO_PKG_VERSION"),
-        ),
-    ];
-    for (k, v) in &config.resource_attrs {
-        resource_kv.push(KeyValue::new(k.clone(), v.clone()));
-    }
-    let resource = Resource::new(resource_kv);
-
-    // --- Exporter ---
-    //
-    // Build the right transport variant. HTTP/proto goes through
-    // `reqwest`; gRPC goes through `tonic`. Both feed the same
-    // BatchSpanProcessor downstream so the rest of the pipeline
-    // does not care which one is in use.
-    let exporter = match config.transport {
-        OtlpTransport::Http => opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_endpoint(endpoint)
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to build OTLP/HTTP exporter: {}", e))?,
-        OtlpTransport::Grpc => opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .with_endpoint(endpoint)
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to build OTLP/gRPC exporter: {}", e))?,
     };
-
-    let provider = sdktrace::TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-        .with_sampler(sampler)
-        .with_resource(resource)
-        .build();
-    let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "sbproxy");
-    global::set_tracer_provider(provider);
-
-    // --- Propagator ---
-    //
-    // Register the W3C TraceContext propagator as the global
-    // text-map propagator so `extract_from_headers` /
-    // `inject_into_headers` correctly serialise the active span's
-    // trace into outbound HTTP headers. A1.4 pins W3C as the only
-    // shipped propagator for Wave 1; B3 / Jaeger remain on the
-    // table for a follow-up ADR.
-    init_propagator();
 
     // --- Tracing-subscriber bridge ---
     //
@@ -271,7 +606,7 @@ pub fn init_otlp_pipeline(config: &TelemetryConfig) -> Result<()> {
     // env var is unset. The OpenTelemetry layer forwards every
     // matching span to the global tracer provider we just installed.
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(pipeline.tracer);
 
     // We `try_init` because operators may have already wired a
     // tracing subscriber elsewhere; layering on top would panic.
@@ -287,8 +622,9 @@ pub fn init_otlp_pipeline(config: &TelemetryConfig) -> Result<()> {
     }
 
     tracing::info!(
-        endpoint = %endpoint,
-        service = %config.service_name,
+        endpoint = %pipeline.endpoint,
+        service = %pipeline.service_name,
+        sample_rate = %pipeline.sample_rate,
         "OTLP tracing pipeline initialised"
     );
     Ok(())
@@ -691,6 +1027,47 @@ impl Default for SpanContext {
 mod tests {
     use super::*;
 
+    fn test_trace_id(n: u8) -> opentelemetry::trace::TraceId {
+        let mut bytes = [0_u8; 16];
+        bytes[15] = n;
+        opentelemetry::trace::TraceId::from_bytes(bytes)
+    }
+
+    fn test_span_id(n: u8) -> opentelemetry::trace::SpanId {
+        let mut bytes = [0_u8; 8];
+        bytes[7] = n;
+        opentelemetry::trace::SpanId::from_bytes(bytes)
+    }
+
+    fn test_span_data(sampled: bool, attributes: Vec<KeyValue>, duration_secs: f64) -> SpanData {
+        let flags = if sampled {
+            opentelemetry::trace::TraceFlags::SAMPLED
+        } else {
+            opentelemetry::trace::TraceFlags::default()
+        };
+        let start_time = SystemTime::UNIX_EPOCH;
+        SpanData {
+            span_context: opentelemetry::trace::SpanContext::new(
+                test_trace_id(1),
+                test_span_id(2),
+                flags,
+                false,
+                opentelemetry::trace::TraceState::default(),
+            ),
+            parent_span_id: opentelemetry::trace::SpanId::INVALID,
+            span_kind: SpanKind::Internal,
+            name: std::borrow::Cow::Borrowed("ai.request"),
+            start_time,
+            end_time: start_time + Duration::from_secs_f64(duration_secs),
+            attributes,
+            dropped_attributes_count: 0,
+            events: opentelemetry_sdk::trace::SpanEvents::default(),
+            links: opentelemetry_sdk::trace::SpanLinks::default(),
+            status: Status::Unset,
+            instrumentation_scope: opentelemetry::InstrumentationScope::builder("test").build(),
+        }
+    }
+
     #[test]
     fn test_config_defaults() {
         let config = TelemetryConfig::default();
@@ -749,12 +1126,88 @@ mod tests {
     }
 
     #[test]
+    fn outcome_sampler_records_locally_dropped_roots() {
+        let sampler = OutcomeAwareSampler::new(TraceSamplingPolicy {
+            sample_rate: 0.0,
+            always_sample_errors: true,
+            keep_over_budget_usd: None,
+            keep_slower_than_secs: None,
+        });
+        let result = sampler.should_sample(
+            None,
+            test_trace_id(1),
+            "ai.request",
+            &opentelemetry::trace::SpanKind::Internal,
+            &[],
+            &[],
+        );
+        assert_eq!(result.decision, SamplingDecision::RecordOnly);
+    }
+
+    #[test]
+    fn outcome_sampler_samples_all_children_of_sampled_parent() {
+        let parent = opentelemetry::trace::SpanContext::new(
+            test_trace_id(1),
+            test_span_id(2),
+            opentelemetry::trace::TraceFlags::SAMPLED,
+            true,
+            opentelemetry::trace::TraceState::default(),
+        );
+        let cx = opentelemetry::Context::new().with_remote_span_context(parent);
+        let sampler = OutcomeAwareSampler::new(TraceSamplingPolicy {
+            sample_rate: 0.0,
+            always_sample_errors: true,
+            keep_over_budget_usd: None,
+            keep_slower_than_secs: None,
+        });
+
+        let result = sampler.should_sample(
+            Some(&cx),
+            test_trace_id(3),
+            "ai.request",
+            &opentelemetry::trace::SpanKind::Internal,
+            &[],
+            &[],
+        );
+        assert_eq!(result.decision, SamplingDecision::RecordAndSample);
+    }
+
+    #[test]
+    fn force_export_keeps_unsampled_error_cost_and_slow_spans() {
+        let policy = TraceSamplingPolicy {
+            sample_rate: 0.0,
+            always_sample_errors: true,
+            keep_over_budget_usd: Some(0.10),
+            keep_slower_than_secs: Some(2.0),
+        };
+
+        let error_span =
+            test_span_data(false, vec![KeyValue::new("otel.status_code", "ERROR")], 0.1);
+        assert!(should_force_export_span(&error_span, &policy));
+
+        let cost_span = test_span_data(
+            false,
+            vec![KeyValue::new("sbproxy.ai.cost_usd_micros", 250_000_i64)],
+            0.1,
+        );
+        assert!(should_force_export_span(&cost_span, &policy));
+
+        let slow_span = test_span_data(false, vec![], 2.5);
+        assert!(should_force_export_span(&slow_span, &policy));
+
+        let normal_span = test_span_data(false, vec![], 0.1);
+        assert!(!should_force_export_span(&normal_span, &policy));
+    }
+
+    #[test]
     fn test_config_deserialize() {
         let json = r#"{
             "enabled": true,
             "endpoint": "http://localhost:4317",
             "service_name": "my-proxy",
             "sample_rate": 0.5,
+            "keep_over_budget_usd": 1.25,
+            "keep_slower_than_secs": 4.5,
             "propagation": "w3c"
         }"#;
         let config: TelemetryConfig = serde_json::from_str(json).unwrap();
@@ -762,6 +1215,8 @@ mod tests {
         assert_eq!(config.endpoint.as_deref(), Some("http://localhost:4317"));
         assert_eq!(config.service_name, "my-proxy");
         assert_eq!(config.sample_rate, Some(0.5));
+        assert_eq!(config.keep_over_budget_usd, Some(1.25));
+        assert_eq!(config.keep_slower_than_secs, Some(4.5));
         assert_eq!(config.propagation.as_deref(), Some("w3c"));
     }
 

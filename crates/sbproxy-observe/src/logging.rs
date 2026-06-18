@@ -84,28 +84,83 @@ fn default_format() -> String {
 impl LoggingConfig {
     /// Initialize the global tracing subscriber.
     pub fn init(&self) {
-        let filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&self.level));
+        self.init_inner(None, true);
+    }
 
+    /// Initialize the global tracing subscriber with an optional OTLP
+    /// trace layer. `RUST_LOG` still overrides `self.level`, matching
+    /// [`Self::init`].
+    pub fn init_with_telemetry(&self, telemetry: Option<&crate::telemetry::TelemetryConfig>) {
+        self.init_inner(telemetry, true);
+    }
+
+    /// Initialize with an already-resolved filter string. The binary
+    /// uses this after applying CLI/env precedence itself so an ambient
+    /// `RUST_LOG` cannot override an explicit `--log-level`.
+    pub fn init_with_resolved_filter_and_telemetry(
+        &self,
+        telemetry: Option<&crate::telemetry::TelemetryConfig>,
+    ) {
+        self.init_inner(telemetry, false);
+    }
+
+    fn init_inner(
+        &self,
+        telemetry: Option<&crate::telemetry::TelemetryConfig>,
+        prefer_rust_log: bool,
+    ) {
+        let filter = if prefer_rust_log {
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&self.level))
+        } else {
+            EnvFilter::new(&self.level)
+        };
+
+        let otlp = telemetry.and_then(|config| {
+            match crate::telemetry::build_otlp_trace_pipeline(config) {
+                Ok(pipeline) => pipeline,
+                Err(err) => {
+                    eprintln!("telemetry: failed to initialize OTLP tracing: {err:#}");
+                    None
+                }
+            }
+        });
         match self.format.as_str() {
             "json" => {
                 tracing_subscriber::registry()
                     .with(filter)
                     .with(fmt::layer().json())
+                    .with(otlp.as_ref().map(|pipeline| {
+                        tracing_opentelemetry::layer().with_tracer(pipeline.tracer.clone())
+                    }))
                     .init();
             }
             "pretty" => {
                 tracing_subscriber::registry()
                     .with(filter)
                     .with(fmt::layer().pretty())
+                    .with(otlp.as_ref().map(|pipeline| {
+                        tracing_opentelemetry::layer().with_tracer(pipeline.tracer.clone())
+                    }))
                     .init();
             }
             _ => {
                 tracing_subscriber::registry()
                     .with(filter)
                     .with(fmt::layer().compact())
+                    .with(otlp.as_ref().map(|pipeline| {
+                        tracing_opentelemetry::layer().with_tracer(pipeline.tracer.clone())
+                    }))
                     .init();
             }
+        }
+
+        if let Some(pipeline) = otlp {
+            tracing::info!(
+                endpoint = %pipeline.endpoint,
+                service = %pipeline.service_name,
+                sample_rate = %pipeline.sample_rate,
+                "OTLP tracing pipeline initialised"
+            );
         }
     }
 }

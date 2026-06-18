@@ -65,6 +65,7 @@ embed-admin-ui = ["sbproxy-core/embed-admin-ui"]
 sbproxy-core.workspace = true
 sbproxy-config.workspace = true
 sbproxy-modules.workspace = true
+sbproxy-observe.workspace = true
 sbproxy-plugin.workspace = true
 sbproxy-vault.workspace = true
 tracing-subscriber.workspace = true

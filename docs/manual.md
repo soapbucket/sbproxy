@@ -658,26 +658,30 @@ scrape_configs:
 SBproxy exports distributed traces via OTLP. Configure in `sb.yaml`:
 
 ```yaml
-otel:
-  enabled: true
-  service_name: sbproxy
-  environment: production
-  otlp_endpoint: "otel-collector:4317"
-  otlp_protocol: grpc      # or "http"
-  otlp_insecure: false
-  sample_rate: 1.0          # 1.0 = 100%, 0.1 = 10%
-  headers:
-    - "Authorization=Bearer ${OTEL_TOKEN}"
+proxy:
+  observability:
+    telemetry:
+      enabled: true
+      endpoint: "http://otel-collector:4317"
+      transport: grpc        # grpc | http
+      service_name: sbproxy
+      sample_rate: 1.0       # 1.0 = 100%, 0.1 = 10%
+      always_sample_errors: true
+      keep_over_budget_usd: 1.00
+      keep_slower_than_secs: 2.0
+      resource_attrs:
+        deployment.environment: production
 ```
 
 For HTTP export:
 
 ```yaml
-otel:
-  enabled: true
-  otlp_endpoint: "https://otel-collector.example.com:4318"
-  otlp_protocol: http
-  otlp_insecure: false
+proxy:
+  observability:
+    telemetry:
+      enabled: true
+      endpoint: "https://otel-collector.example.com:4318/v1/traces"
+      transport: http
 ```
 
 ### Admin API

@@ -20,7 +20,7 @@ Then open:
 - Langfuse at http://localhost:3001 (login `admin@sbproxy.local` / `sbproxy-local-admin`, project `SBproxy LLM Traces`)
 - MinIO object storage for Langfuse at http://localhost:9092 (console at http://localhost:9093)
 
-The collector applies a cost-aware tail-sampling policy (`tail_sampling` in `otel-collector/config.yaml`): errors and slow traces are always kept, the rest at a configurable base rate. Mirror `keep_over_budget_usd` / `keep_slower_than_secs` from the proxy's telemetry config into that policy.
+SBproxy applies source-side parent-based sampling from `proxy.observability.telemetry.sample_rate` and keeps completed error, over-budget, and slow traces when the matching telemetry thresholds are set. The collector also carries a cost-aware tail-sampling policy (`tail_sampling` in `otel-collector/config.yaml`) as a backend-side mirror. Keep its latency and budget thresholds aligned with `keep_over_budget_usd` / `keep_slower_than_secs`.
 
 Phoenix and Langfuse are enabled by default in the trace pipeline. SBproxy AI spans are fanned out to both backends with no manual attribute remapping:
 

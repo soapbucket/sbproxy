@@ -1103,6 +1103,24 @@
             "null"
           ]
         },
+        "keep_over_budget_usd": {
+          "description": "Keep any completed trace at or above this derived USD cost.",
+          "default": null,
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "keep_slower_than_secs": {
+          "description": "Keep any completed trace at or above this wall-clock latency.",
+          "default": null,
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
         "propagation": {
           "description": "Propagation format: `w3c` (default), `b3`, `jaeger`.",
           "default": null,

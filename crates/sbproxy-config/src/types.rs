@@ -2302,6 +2302,12 @@ pub struct ObservabilityTelemetryConfig {
     /// Always-sample errors / policy blocks / ledger denials. Default true.
     #[serde(default)]
     pub always_sample_errors: Option<bool>,
+    /// Keep any completed trace at or above this derived USD cost.
+    #[serde(default)]
+    pub keep_over_budget_usd: Option<f64>,
+    /// Keep any completed trace at or above this wall-clock latency.
+    #[serde(default)]
+    pub keep_slower_than_secs: Option<f64>,
     /// Propagation format: `w3c` (default), `b3`, `jaeger`.
     #[serde(default)]
     pub propagation: Option<String>,
@@ -3942,6 +3948,8 @@ telemetry:
   service_name: sbproxy-dev
   sample_rate: 0.2
   always_sample_errors: true
+  keep_over_budget_usd: 0.25
+  keep_slower_than_secs: 2.5
   resource_attrs:
     deployment.environment: dev
 "#;
@@ -3956,6 +3964,10 @@ telemetry:
         assert!(telemetry.enabled);
         assert_eq!(telemetry.transport.as_deref(), Some("grpc"));
         assert_eq!(telemetry.service_name.as_deref(), Some("sbproxy-dev"));
+        assert_eq!(telemetry.sample_rate, Some(0.2));
+        assert_eq!(telemetry.always_sample_errors, Some(true));
+        assert_eq!(telemetry.keep_over_budget_usd, Some(0.25));
+        assert_eq!(telemetry.keep_slower_than_secs, Some(2.5));
         assert_eq!(
             telemetry.resource_attrs.get("deployment.environment"),
             Some(&"dev".to_string())
