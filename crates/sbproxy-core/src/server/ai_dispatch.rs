@@ -898,6 +898,13 @@ pub(super) async fn handle_ai_proxy(
         Vec::new()
     };
 
+    sbproxy_ai::tracing_spans::record_request_params(
+        &ai_span,
+        body.get("temperature").and_then(serde_json::Value::as_f64),
+        body.get("max_tokens").and_then(serde_json::Value::as_u64),
+        body.get("top_p").and_then(serde_json::Value::as_f64),
+    );
+
     // --- Pre-request token estimate + TPM reservation ---
     //
     // For chat completions only: we have the parsed `messages` array,
@@ -1763,6 +1770,12 @@ pub(super) async fn handle_ai_proxy(
         if !resolved_model.is_empty() {
             ctx.ai_model = Some(resolved_model.clone());
         }
+        ai_span.record("gen_ai.system", provider.name.as_str());
+        ai_span.record("llm.provider", provider.name.as_str());
+        if !resolved_model.is_empty() {
+            ai_span.record("gen_ai.request.model", resolved_model.as_str());
+            ai_span.record("llm.model_name", resolved_model.as_str());
+        }
 
         // WOR-229: native-format bypass. When the inbound client
         // format equals the upstream provider's wire format, send
@@ -2345,6 +2358,10 @@ pub(super) async fn relay_ai_response_with_cache(
             _ => resp_body,
         }
     };
+
+    if (200..300).contains(&status) {
+        record_ai_response_span_metadata(&ai_span, &resp_body);
+    }
 
     // --- WOR-1141: enforce OUTPUT guardrails ---
     //
