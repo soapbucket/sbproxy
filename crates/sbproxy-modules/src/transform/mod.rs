@@ -24,8 +24,9 @@ pub use a2a_agent_card_rewrite::{
 };
 pub use boilerplate::{BoilerplateConfig, BoilerplateTransform};
 pub use cel_script::{
-    CelHeaderMutation, CelHeaderOp, CelHeaderRule, CelScriptTransform, TlsFingerprintView,
-    HEADER_DENY_LIST, HEADER_EVAL_BUDGET,
+    AgentClassView, CelHeaderMutation, CelHeaderOp, CelHeaderRule, CelResponseRequestView,
+    CelScriptTransform, HeadlessSignalView, TlsFingerprintView, HEADER_DENY_LIST,
+    HEADER_EVAL_BUDGET,
 };
 pub use citation_block::{CitationBlockConfig, CitationBlockTransform};
 pub use control::{DiscardTransform, PayloadLimitTransform, SseChunkingTransform};

@@ -24,17 +24,16 @@
 //! `request.tls.ja4` / `request.tls.trustworthy` so the value is
 //! observable from the harness without reaching into proxy internals.
 //!
-//! All tests in this file are `#[ignore]`'d with a `TODO(wave5-G5.3)`
-//! marker until the capture lands. The fixture YAML is shaped against
-//! the schema from `` § "Configuration
-//! in sb.yml".
+//! The sidecar-backed tests run against the default harness. Native TLS
+//! ClientHello capture and disabled-feature coverage remain ignored with
+//! follow-up Linear issues because they need dedicated harness paths.
 
 use sbproxy_e2e::ProxyHarness;
 
 // --- Test 1: JA3 capture for a TLS 1.2 ClientHello ---
 
 #[test]
-#[ignore = "TODO(wave5-day6+): day-5 landed the `type: cel` transform (Item 4) and the harness loopback trust-CIDR default (Item 5). Reactivation now blocks on (1) the day-5 CEL transform writes to the response BODY, not response HEADERS as this test expects (`resp.headers[...] = ...`); the test needs to be rewritten to assert against the body, and (2) a curl-impersonate-driven harness path that drives a real TLS 1.2 ClientHello (or sidecar-header injection from the harness via `get_with_headers` plus the `features.tls_fingerprint:` config block being threaded onto CompiledPipeline)."]
+#[ignore = "WOR-1444: needs a real TLS 1.2 ClientHello e2e client path; trusted sidecar injection validates request.tls plumbing but cannot prove native JA3 capture."]
 fn ja3_captured_for_tls12_client() {
     let yaml = r#"
 proxy:
@@ -53,8 +52,10 @@ origins:
       body: "ok"
     transforms:
       - type: cel
-        on_response: |
-          resp.headers["x-ja3"] = request.tls.ja3 != null ? request.tls.ja3 : "absent"
+        headers:
+          - op: set
+            name: x-ja3
+            value_expr: 'size(request.tls.ja3) > 0 ? request.tls.ja3 : "absent"'
 "#;
     let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
     // The harness uses plaintext HTTP, so this assertion is a
@@ -72,7 +73,7 @@ origins:
 // --- Test 2: JA4 capture for a TLS 1.3 ClientHello ---
 
 #[test]
-#[ignore = "TODO(wave5-day6+): day-5 landed the `type: cel` transform (Item 4) and the harness loopback trust-CIDR default (Item 5). Same blockers as `ja3_captured_for_tls12_client`: header-vs-body CEL surface mismatch, plus a TLS 1.3 client path (or sidecar-header injection)."]
+#[ignore = "WOR-1444: needs a real TLS 1.3 ClientHello e2e client path; trusted sidecar injection validates request.tls plumbing but cannot prove native JA4 capture."]
 fn ja4_captured_for_tls13_client() {
     let yaml = r#"
 proxy:
@@ -91,8 +92,10 @@ origins:
       body: "ok"
     transforms:
       - type: cel
-        on_response: |
-          resp.headers["x-ja4"] = request.tls.ja4 != null ? request.tls.ja4 : "absent"
+        headers:
+          - op: set
+            name: x-ja4
+            value_expr: 'size(request.tls.ja4) > 0 ? request.tls.ja4 : "absent"'
 "#;
     let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
     let resp = harness.get("/", "tls-fp.localhost").expect("GET");
@@ -108,7 +111,6 @@ origins:
 // --- Test 3: JA4H populated mid-pipeline once headers land ---
 
 #[test]
-#[ignore = "TODO(wave5-day6+): day-5 landed the loopback trust-CIDR default (Item 5) so sidecar `x-sbproxy-tls-ja4` headers are now honoured from 127.0.0.1, AND landed the `type: cel` transform (Item 4). Reactivation blocks on (1) the test must inject `x-sbproxy-tls-ja4` via `get_with_headers` (the test already uses get_with_headers but does not include the sidecar header), and (2) the day-5 CEL transform writes to the response BODY, not headers; the test must rewrite the assertion against the body."]
 fn ja4h_captured_mid_pipeline() {
     let yaml = r#"
 proxy:
@@ -127,8 +129,10 @@ origins:
       body: "ok"
     transforms:
       - type: cel
-        on_response: |
-          resp.headers["x-ja4h"] = request.tls.ja4h != null ? request.tls.ja4h : "absent"
+        headers:
+          - op: set
+            name: x-ja4h
+            value_expr: 'size(request.tls.ja4h) > 0 ? request.tls.ja4h : "absent"'
 "#;
     let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
     let resp = harness
@@ -136,6 +140,7 @@ origins:
             "/",
             "tls-fp.localhost",
             &[
+                ("x-sbproxy-tls-ja4", "t13d1516h2_8daaf6152771_b1ff8ab2d16f"),
                 ("user-agent", "Mozilla/5.0 (test)"),
                 ("accept", "text/plain"),
                 ("accept-language", "en-US"),
@@ -331,7 +336,7 @@ origins:
 // --- Test 7: capture is a no-op when the cargo feature is off ---
 
 #[test]
-#[ignore = "TODO(wave5-day6+): day-5 landed the `type: cel` transform (Item 4). The harness binary is compiled with the `tls-fingerprint` feature on by default; reactivation blocks on a `--no-default-features` harness build path so this test can observe the noop branch. The header-vs-body CEL surface mismatch also applies."]
+#[ignore = "WOR-1445: needs a no-default-features e2e harness binary so the tls-fingerprint cargo feature is genuinely off."]
 fn capture_noop_when_feature_disabled() {
     let yaml = r#"
 proxy:
@@ -348,14 +353,22 @@ origins:
       body: "ok"
     transforms:
       - type: cel
-        on_response: |
-          resp.headers["x-ja4"] = request.tls.ja4 != null ? request.tls.ja4 : "absent"
+        headers:
+          - op: set
+            name: x-ja4
+            value_expr: 'request.tls.ja4'
 "#;
     let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
-    let resp = harness.get("/", "tls-fp.localhost").expect("GET");
+    let resp = harness
+        .get_with_headers(
+            "/",
+            "tls-fp.localhost",
+            &[("x-sbproxy-tls-ja4", "t13d1516h2_8daaf6152771_b1ff8ab2d16f")],
+        )
+        .expect("GET");
     assert_eq!(
         resp.headers.get("x-ja4").map(String::as_str),
-        Some("absent"),
-        "with the tls-fingerprint feature off, request.tls.ja4 must stay null"
+        None,
+        "with the tls-fingerprint feature off, request.tls.ja4 must not be exposed"
     );
 }

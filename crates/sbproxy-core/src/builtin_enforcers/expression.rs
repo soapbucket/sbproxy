@@ -5,10 +5,11 @@
 //! in `crate::server::check_policies` into a
 //! [`sbproxy_plugin::PolicyEnforcer`] impl. Builds the
 //! [`sbproxy_modules::ExpressionViews`] bundle from the live
-//! [`RequestContext`] (aipref signal, optional KYA verifier
-//! verdict under the `agent-class` feature, optional ML
-//! classifier verdict under the `agent-classifier` feature, and
-//! the `x-sb-flags` parsed feature flags) and dispatches into
+//! [`RequestContext`] (aipref signal, TLS fingerprint, agent-class
+//! resolver output, optional KYA verifier verdict under the
+//! `agent-class` feature, optional ML classifier verdict under the
+//! `agent-classifier` feature, and the `x-sb-flags` parsed feature
+//! flags) and dispatches into
 //! [`sbproxy_modules::policy::ExpressionPolicy::evaluate_with_views`].
 //!
 //! Per-deny-reason label: `"expression"`. The denial status and
@@ -90,6 +91,26 @@ impl PolicyEnforcer for ExpressionEnforcer {
         #[cfg(not(feature = "agent-class"))]
         let kya_view: Option<sbproxy_extension::cel::context::KyaVerdictView<'_>> = None;
 
+        let tls_view = ctx.tls_fingerprint.as_ref().map(|fp| {
+            sbproxy_extension::cel::context::TlsFingerprintView {
+                ja3: fp.ja3.as_deref(),
+                ja4: fp.ja4.as_deref(),
+                ja4h: fp.ja4h.as_deref(),
+                trustworthy: fp.trustworthy,
+            }
+        });
+
+        #[cfg(feature = "agent-class")]
+        let agent_class_view = Some(sbproxy_extension::cel::context::AgentClassView {
+            agent_id: ctx.agent_id.as_ref().map(|id| id.as_str()),
+            agent_vendor: ctx.agent_vendor.as_deref(),
+            agent_purpose: ctx.agent_purpose.map(|p| p.as_str()),
+            agent_id_source: ctx.agent_id_source.map(|s| s.as_str()),
+            agent_rdns_hostname: ctx.agent_rdns_hostname.as_deref(),
+        });
+        #[cfg(not(feature = "agent-class"))]
+        let agent_class_view: Option<sbproxy_extension::cel::context::AgentClassView<'_>> = None;
+
         #[cfg(feature = "agent-classifier")]
         let ml_view = ctx.ml_classification.as_ref().map(|m| {
             sbproxy_extension::cel::context::MlClassificationView {
@@ -129,6 +150,8 @@ impl PolicyEnforcer for ExpressionEnforcer {
         let views = sbproxy_modules::ExpressionViews {
             aipref: ctx.aipref.as_ref(),
             kya: kya_view,
+            tls: tls_view,
+            agent_class: agent_class_view,
             ml: ml_view,
             features: Some(features_view),
             agent_detect: agent_detect_view,
