@@ -398,6 +398,27 @@ impl ProxyHarness {
         }
         decode(req.send()?)
     }
+
+    /// PUT a raw body with an explicit `content-type`.
+    pub fn put_bytes(
+        &self,
+        path: &str,
+        host: &str,
+        content_type: &str,
+        body: Vec<u8>,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Response> {
+        let mut req = self
+            .http_client()
+            .put(format!("{}{}", self.base_url(), path))
+            .header("host", host)
+            .header("content-type", content_type)
+            .body(body);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        decode(req.send()?)
+    }
 }
 
 impl Drop for ProxyHarness {
