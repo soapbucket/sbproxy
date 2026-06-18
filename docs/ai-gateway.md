@@ -898,6 +898,7 @@ The proxy exposes aggregate AI usage as Prometheus metrics. When `telemetry.bind
 | `sbproxy_ai_surface_request_duration_seconds` | Histogram | `surface`, `method` | Per-surface request latency. Buckets match `sbproxy_ai_request_duration_seconds` for side-by-side dashboards |
 | `sbproxy_ai_tokens_total` | Counter | `provider`, `model`, `direction` | Tokens consumed (`direction` is `input` or `output`) |
 | `sbproxy_ai_cost_dollars_total` | Counter | `provider`, `model` | Estimated cost in USD |
+| `sbproxy_ai_cost_usd_micros_total` | Counter | `provider`, `model`, `tenant_id` | Derived request cost in micro-USD (`1e-6` USD); mirrored to OTLP as `sbproxy.ai.cost_usd_micros` when `telemetry.export_metrics` is enabled |
 | `sbproxy_ai_request_duration_seconds` | Histogram | `provider`, `model` | End-to-end AI request latency |
 | `sbproxy_ai_failovers_total` | Counter | `from_provider`, `to_provider`, `reason` | Provider failover events |
 | `sbproxy_ai_guardrail_blocks_total` | Counter | `category` | Guardrail block events (pii, injection, jailbreak, etc.) |

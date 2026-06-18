@@ -703,6 +703,9 @@ pub struct RequestContext {
     pub ai_tokens_in: Option<u64>,
     /// Completion / output tokens reported by the provider response.
     pub ai_tokens_out: Option<u64>,
+    /// Derived AI request cost in micro-USD (`1e-6` USD), computed
+    /// from the same pricing catalog used by AI billing metrics.
+    pub ai_cost_usd_micros: Option<u64>,
     /// Classified AI surface label from `classify_surface`. Stamped at
     /// the entry of `handle_ai_proxy` so every access log line for an
     /// AI request carries the surface (chat_completions, assistants,
@@ -1046,6 +1049,7 @@ impl RequestContext {
             ai_model: None,
             ai_tokens_in: None,
             ai_tokens_out: None,
+            ai_cost_usd_micros: None,
             ai_surface: None,
             ai_inbound_format: None,
             ai_native_bypass: false,

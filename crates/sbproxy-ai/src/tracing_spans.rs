@@ -30,6 +30,7 @@
 //! | Input tokens             | `gen_ai.usage.input_tokens`         | `llm.token_count.prompt`       |
 //! | Output tokens            | `gen_ai.usage.output_tokens`        | `llm.token_count.completion`   |
 //! | Total tokens             | n/a                                 | `llm.token_count.total`        |
+//! | Cost                     | `gen_ai.usage.cost`                 | `llm.usage.total_cost`         |
 //! | Finish reasons (joined)  | `gen_ai.response.finish_reasons`    | n/a                            |
 //! | Temperature              | `gen_ai.request.temperature`        | n/a                            |
 //! | Max tokens               | `gen_ai.request.max_tokens`         | n/a                            |
@@ -120,6 +121,7 @@ pub fn ai_request_span(surface: &str, method: &str) -> Span {
         // tokens. Recorded at the billing choke point via
         // `record_cost_usd`. Both the OpenInference and gen_ai keys are
         // stamped so either backend vocabulary renders it.
+        "sbproxy.ai.cost_usd_micros" = Empty,
         "gen_ai.usage.cost" = Empty,
         "llm.usage.total_cost" = Empty,
         // WOR-1231: error semantics. `otel.status_code` is the field the
@@ -284,6 +286,18 @@ pub fn record_pricing_version(span: &Span, version: &str) {
 pub fn record_cost_usd(span: &Span, cost_usd: f64) {
     span.record("gen_ai.usage.cost", cost_usd);
     span.record("llm.usage.total_cost", cost_usd);
+}
+
+/// Stamp the exact derived request cost onto an AI span in micro-USD.
+///
+/// `cost_usd_micros` is the canonical accounting value (`1e-6` USD
+/// units). The helper also records dollar-valued GenAI and
+/// OpenInference attributes for trace backends that expect human-scale
+/// cost fields.
+pub fn record_cost_usd_micros(span: &Span, cost_usd_micros: u64) {
+    let cost_usd = cost_usd_micros as f64 / 1_000_000.0;
+    span.record("sbproxy.ai.cost_usd_micros", cost_usd_micros);
+    record_cost_usd(span, cost_usd);
 }
 
 /// Well-known failure classes for an AI generation, recorded as the OTel
@@ -659,6 +673,24 @@ mod tests {
         });
         let spans = snapshot_spans(&layer);
         let span = find_span(&spans, "ai.request");
+        assert_field(span, "gen_ai.usage.cost", "0.001234");
+        assert_field(span, "llm.usage.total_cost", "0.001234");
+    }
+
+    /// WOR-1213: the canonical cost value is exact integer
+    /// micro-USD, with dollar fields retained for trace backends.
+    #[test]
+    fn record_cost_usd_micros_stamps_exact_and_backend_fields() {
+        use tracing_subscriber::prelude::*;
+        let layer = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = ai_request_span("chat", "POST");
+            record_cost_usd_micros(&span, 1_234);
+        });
+        let spans = snapshot_spans(&layer);
+        let span = find_span(&spans, "ai.request");
+        assert_field(span, "sbproxy.ai.cost_usd_micros", "1234");
         assert_field(span, "gen_ai.usage.cost", "0.001234");
         assert_field(span, "llm.usage.total_cost", "0.001234");
     }

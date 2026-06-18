@@ -264,6 +264,9 @@ pub struct ProxyMetrics {
     pub cache_hits: IntCounterVec,
     /// Counter `sbproxy_ai_tokens_total` of AI token usage labelled by hostname, provider, and direction.
     pub ai_tokens_total: IntCounterVec,
+    /// Counter `sbproxy_ai_cost_usd_micros_total` of AI request cost in
+    /// micro-USD, labelled by provider, model, and tenant.
+    pub ai_cost_usd_micros_total: IntCounterVec,
 
     // --- Local inference + semantic cache (WOR-1225) ---
     /// Counter `sbproxy_semantic_cache_results_total` of semantic-cache
@@ -417,6 +420,15 @@ impl ProxyMetrics {
         let ai_tokens_total = IntCounterVec::new(
             Opts::new("sbproxy_ai_tokens_total", "AI token usage"),
             &["hostname", "provider", "direction"], // "input" or "output"
+        )
+        .unwrap();
+
+        let ai_cost_usd_micros_total = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_ai_cost_usd_micros_total",
+                "Derived AI request cost in micro-USD",
+            ),
+            &["provider", "model", "tenant_id"],
         )
         .unwrap();
 
@@ -661,6 +673,9 @@ impl ProxyMetrics {
             .register(Box::new(ai_tokens_total.clone()))
             .unwrap();
         registry
+            .register(Box::new(ai_cost_usd_micros_total.clone()))
+            .unwrap();
+        registry
             .register(Box::new(semantic_cache_results.clone()))
             .unwrap();
         registry
@@ -730,6 +745,7 @@ impl ProxyMetrics {
             active_connections,
             cache_hits,
             ai_tokens_total,
+            ai_cost_usd_micros_total,
             semantic_cache_results,
             inference_requests,
             inference_duration,
@@ -2741,6 +2757,40 @@ pub fn record_tokens_attributed(
         .inc_by(count);
 }
 
+/// Increment `sbproxy_ai_cost_usd_micros_total{provider, model,
+/// tenant_id}` by `cost_usd_micros`.
+///
+/// The unit is micro-USD (`1e-6` USD), matching
+/// [`crate::request_event::RequestEvent::cost_usd_micros`]. The
+/// helper also mirrors the observation to the optional OTLP metrics
+/// pipeline as `sbproxy.ai.cost_usd_micros` with the same labels.
+pub fn record_ai_cost_usd_micros(
+    provider: &str,
+    model: &str,
+    tenant_id: &str,
+    cost_usd_micros: u64,
+) {
+    const METRIC: &str = "sbproxy_ai_cost_usd_micros_total";
+    if cost_usd_micros == 0 {
+        return;
+    }
+    let provider = sanitize_label_budget_tenant(METRIC, "provider", provider, tenant_id);
+    let model = sanitize_label_budget_tenant(METRIC, "model", model, tenant_id);
+    let tenant_id = sanitize_label_budget(METRIC, "tenant_id", tenant_id);
+    let m = metrics();
+    m.ai_cost_usd_micros_total
+        .with_label_values(&[provider.as_str(), model.as_str(), tenant_id.as_str()])
+        .inc_by(cost_usd_micros);
+    crate::otel::ai_cost_usd_micros_counter().add(
+        cost_usd_micros,
+        &[
+            opentelemetry::KeyValue::new("provider", provider),
+            opentelemetry::KeyValue::new("model", model),
+            opentelemetry::KeyValue::new("tenant_id", tenant_id),
+        ],
+    );
+}
+
 /// Increment `sbproxy_ai_usage_parse_miss_total{provider, surface}` by
 /// one (WOR-1146).
 ///
@@ -2947,6 +2997,9 @@ mod tests {
         m.ai_tokens_total
             .with_label_values(&["h", "p", "input"])
             .inc();
+        m.ai_cost_usd_micros_total
+            .with_label_values(&["p", "m", "tenant-a"])
+            .inc_by(42);
 
         // Touch each per-origin metric.
         m.per_origin_requests_total
@@ -2978,6 +3031,7 @@ mod tests {
         assert!(output.contains("sbproxy_active_connections"));
         assert!(output.contains("sbproxy_cache_hits_total"));
         assert!(output.contains("sbproxy_ai_tokens_total"));
+        assert!(output.contains("sbproxy_ai_cost_usd_micros_total"));
         assert!(output.contains("sbproxy_origin_requests_total"));
         assert!(output.contains("sbproxy_origin_request_duration_seconds"));
         assert!(output.contains("sbproxy_origin_active_connections"));
@@ -3990,5 +4044,30 @@ mod tests {
         // No row added; the assertion is that the call does not
         // panic and does not create a noise row for zero-count
         // observations.
+    }
+
+    #[test]
+    fn record_ai_cost_usd_micros_emits_counter_with_provider_model_tenant() {
+        record_ai_cost_usd_micros("openai", "gpt-4o", "acme", 1_234);
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_ai_cost_usd_micros_total"),
+            "AI cost micros counter missing"
+        );
+        for label_check in [
+            "provider=\"openai\"",
+            "model=\"gpt-4o\"",
+            "tenant_id=\"acme\"",
+        ] {
+            assert!(
+                out.contains(label_check),
+                "expected {label_check} in render"
+            );
+        }
+    }
+
+    #[test]
+    fn record_ai_cost_usd_micros_skips_zero_cost() {
+        record_ai_cost_usd_micros("openai", "gpt-4o", "acme", 0);
     }
 }

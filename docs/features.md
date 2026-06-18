@@ -1470,6 +1470,7 @@ A representative slice of the catalog appears below. The canonical, exhaustive r
 | `sbproxy_ai_requests_total` | counter | AI gateway requests by provider and model |
 | `sbproxy_ai_tokens_total` | counter | AI tokens by direction (input/output) |
 | `sbproxy_ai_cost_dollars_total` | counter | AI spend in USD |
+| `sbproxy_ai_cost_usd_micros_total` | counter | AI spend in micro-USD by provider, model, and tenant |
 | `sbproxy_ai_ttft_seconds` | histogram | Time to first AI token, by provider |
 
 ### Structured logging
@@ -2176,4 +2177,3 @@ This flag only affects the plain `http_bind_port` listener. TLS-fronted HTTP/2 o
 ### HTTP/3 limitations
 
 HTTP/3 is currently disabled entirely until native QUIC support lands in Pingora. No QUIC listener is started; the `http3` config block still parses but is ignored, and setting `enabled: true` only logs a warning. Because there is no H3 dispatch path today, the per-action and per-auth limitations that previously applied over HTTP/3 do not apply: all traffic is served over HTTP/1.1 and HTTP/2, where every action and auth module is supported. These notes will be revisited when HTTP/3 returns.
-

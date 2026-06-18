@@ -743,7 +743,10 @@ pub(super) fn emit_ai_billing_event(
     cost_usd: f64,
     scope_keys: Vec<String>,
     tags: &sbproxy_ai::attribution::AttributionTags,
-) {
+    tenant_id: &str,
+    ai_span: &tracing::Span,
+) -> u64 {
+    let cost_usd_micros = cost_usd_to_micros(cost_usd);
     // Feed the per-attribution spend metrics from the single billing
     // choke point so every surface (unary, streaming, audio, image,
     // rerank, and cache-hit replays) lands in the FinOps dashboard,
@@ -772,10 +775,16 @@ pub(super) fn emit_ai_billing_event(
         0,
         cost_usd,
     );
-    // WOR-1229: stamp the derived USD cost onto the AI request span so trace
-    // backends show spend per generation. This is the same choke point the
-    // cost metric uses, so the span and the metric agree.
-    sbproxy_ai::tracing_spans::record_cost_usd(&tracing::Span::current(), cost_usd);
+    // WOR-1213: stamp and count the same exact micro-USD value from
+    // the single billing choke point. Dollar-valued span attributes
+    // are derived from this integer for trace-backend compatibility.
+    sbproxy_ai::tracing_spans::record_cost_usd_micros(ai_span, cost_usd_micros);
+    sbproxy_observe::metrics::record_ai_cost_usd_micros(
+        provider_name,
+        model_label,
+        tenant_id,
+        cost_usd_micros,
+    );
 
     // WOR-1095: realtime + audio surfaces consume seconds, not tokens,
     // and realtime has no catalogue price, so the token / cost
@@ -803,6 +812,16 @@ pub(super) fn emit_ai_billing_event(
         ai.occurred_at_unix_secs = event.occurred_at_unix_secs,
         "AI billing event"
     );
+    cost_usd_micros
+}
+
+/// Convert a dollar-denominated AI cost estimate into the integer
+/// micro-USD unit used by metrics, spans, and request events.
+pub(super) fn cost_usd_to_micros(cost_usd: f64) -> u64 {
+    if !cost_usd.is_finite() || cost_usd <= 0.0 {
+        return 0;
+    }
+    (cost_usd * 1_000_000.0).round().clamp(0.0, u64::MAX as f64) as u64
 }
 
 /// Resolve the business attribution tags for a request.
@@ -1485,6 +1504,26 @@ pub(super) fn make_native_bypass_body(
     parsed["model"] = serde_json::Value::String(resolved_model.to_string());
     let remapped = serde_json::to_vec(&parsed)?;
     Ok(bytes::Bytes::from(remapped))
+}
+
+#[cfg(test)]
+mod cost_micros_tests {
+    use super::cost_usd_to_micros;
+
+    #[test]
+    fn cost_usd_to_micros_rounds_to_integer_unit() {
+        assert_eq!(cost_usd_to_micros(0.001234), 1_234);
+        assert_eq!(cost_usd_to_micros(0.0000004), 0);
+        assert_eq!(cost_usd_to_micros(0.0000005), 1);
+    }
+
+    #[test]
+    fn cost_usd_to_micros_rejects_non_positive_or_non_finite() {
+        assert_eq!(cost_usd_to_micros(0.0), 0);
+        assert_eq!(cost_usd_to_micros(-1.0), 0);
+        assert_eq!(cost_usd_to_micros(f64::NAN), 0);
+        assert_eq!(cost_usd_to_micros(f64::INFINITY), 0);
+    }
 }
 
 #[cfg(test)]
