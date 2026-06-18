@@ -5,6 +5,7 @@
 //! pack is a list of named agent rules plus a schema version. Each rule
 //! declares a [`MatchSpec`] over the signals plus the
 //! [`AgentProvenance`] and score to stamp when the rule matches.
+//! The format is versioned in the public [ADRF spec].
 //!
 //! ## File shape (v0)
 //!
@@ -38,6 +39,8 @@
 //! order hash, UA bucket, vendor-header set, JA4T / JA4X predicates,
 //! and payload signals. The shape is forward-compatible because new
 //! predicates are added as additional `Option` fields.
+//!
+//! [ADRF spec]: https://github.com/soapbucket/adrf-spec
 
 use std::sync::Arc;
 
