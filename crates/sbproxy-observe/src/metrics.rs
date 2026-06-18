@@ -4,8 +4,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use prometheus::{
-    CounterVec, Encoder, GaugeVec, HistogramVec, IntCounterVec, IntGauge, Opts, Registry,
-    TextEncoder,
+    CounterVec, Encoder, GaugeVec, Histogram, HistogramVec, IntCounterVec, IntGauge, Opts,
+    Registry, TextEncoder,
 };
 
 use crate::agent_labels::AgentLabels;
@@ -287,6 +287,16 @@ pub struct ProxyMetrics {
     /// semantic-cache hit avoided, labelled by tenant, origin, and model.
     pub ai_cost_saved_micros: IntCounterVec,
 
+    // --- Agent detection (WOR-592) ---
+    /// Counter `sbproxy_agent_detect_total` of agent-detect scorer
+    /// verdicts labelled by agent id and provenance.
+    pub agent_detect_total: IntCounterVec,
+    /// Histogram `sbproxy_agent_detect_score` of produced 0-100 scores.
+    pub agent_detect_score: Histogram,
+    /// Histogram `sbproxy_agent_detect_inference_seconds` of scorer
+    /// latency in seconds.
+    pub agent_detect_inference_seconds: Histogram,
+
     // --- Per-origin metrics (Sprint 1A) ---
     /// Total HTTP requests with origin, method, and status labels.
     pub per_origin_requests_total: CounterVec,
@@ -480,6 +490,39 @@ impl ProxyMetrics {
                 "Micro-USD avoided by a semantic-cache hit",
             ),
             &["tenant", "origin", "model"],
+        )
+        .unwrap();
+
+        // --- Agent detection (WOR-592) ---
+
+        let agent_detect_total = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_agent_detect_total",
+                "Agent-detect scorer verdicts by agent id and provenance",
+            ),
+            &["agent_id", "provenance"],
+        )
+        .unwrap();
+
+        let agent_detect_score = Histogram::with_opts(
+            prometheus::HistogramOpts::new(
+                "sbproxy_agent_detect_score",
+                "Agent-detect scorer output score, scaled 0-100",
+            )
+            .buckets(vec![
+                0.0, 5.0, 10.0, 20.0, 40.0, 60.0, 80.0, 90.0, 95.0, 100.0,
+            ]),
+        )
+        .unwrap();
+
+        let agent_detect_inference_seconds = Histogram::with_opts(
+            prometheus::HistogramOpts::new(
+                "sbproxy_agent_detect_inference_seconds",
+                "Agent-detect scorer inference latency in seconds",
+            )
+            .buckets(vec![
+                0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.005, 0.01,
+            ]),
         )
         .unwrap();
 
@@ -691,6 +734,15 @@ impl ProxyMetrics {
             .register(Box::new(ai_cost_saved_micros.clone()))
             .unwrap();
         registry
+            .register(Box::new(agent_detect_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(agent_detect_score.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(agent_detect_inference_seconds.clone()))
+            .unwrap();
+        registry
             .register(Box::new(per_origin_requests_total.clone()))
             .unwrap();
         registry
@@ -751,6 +803,9 @@ impl ProxyMetrics {
             inference_duration,
             ai_tokens_saved,
             ai_cost_saved_micros,
+            agent_detect_total,
+            agent_detect_score,
+            agent_detect_inference_seconds,
             per_origin_requests_total,
             per_origin_request_duration,
             per_origin_active_connections,
@@ -1030,6 +1085,37 @@ pub fn record_inference(kind: &str, backend: &str, model: &str, result: &str, du
             .inference_duration
             .with_label_values(&[kind, backend, model.as_str()])
             .observe(duration_secs);
+    }
+}
+
+/// Record one agent-detect scorer verdict (WOR-592).
+///
+/// `agent_id == None` is encoded as the empty-string sentinel, matching
+/// the existing per-agent request metrics. `provenance` is a closed enum
+/// label (`signed`, `unsigned-named`, `unsigned-anonymous`) and unknown
+/// values are collapsed to `unknown`.
+pub fn record_agent_detect(
+    agent_id: Option<&str>,
+    provenance: &str,
+    score: u8,
+    duration_secs: f64,
+) {
+    let agent_id = sanitize_label_budget(
+        "sbproxy_agent_detect_total",
+        "agent_id",
+        agent_id.unwrap_or_default(),
+    );
+    let provenance = match provenance {
+        "signed" | "unsigned-named" | "unsigned-anonymous" => provenance,
+        _ => "unknown",
+    };
+    let m = metrics();
+    m.agent_detect_total
+        .with_label_values(&[agent_id.as_str(), provenance])
+        .inc();
+    m.agent_detect_score.observe(score as f64);
+    if duration_secs > 0.0 {
+        m.agent_detect_inference_seconds.observe(duration_secs);
     }
 }
 
@@ -2883,6 +2969,11 @@ mod tests {
         m.ai_cost_saved_micros
             .with_label_values(&["acme", "o", "gpt-4o"])
             .inc_by(900);
+        m.agent_detect_total
+            .with_label_values(&["claude-code-cli", "unsigned-named"])
+            .inc();
+        m.agent_detect_score.observe(91.0);
+        m.agent_detect_inference_seconds.observe(0.0002);
         let names: Vec<String> = m
             .registry
             .gather()
@@ -2895,6 +2986,9 @@ mod tests {
             "sbproxy_inference_duration_seconds",
             "sbproxy_ai_tokens_saved_total",
             "sbproxy_ai_cost_saved_micros_total",
+            "sbproxy_agent_detect_total",
+            "sbproxy_agent_detect_score",
+            "sbproxy_agent_detect_inference_seconds",
         ] {
             assert!(
                 names.iter().any(|n| n == expected),
@@ -3334,6 +3428,24 @@ mod tests {
             .with_label_values(&[origin_san.as_str(), "POST", "201", "", "", "", "", ""])
             .get();
         assert_eq!(count, 1, "legacy record_request must use empty sentinel");
+    }
+
+    #[test]
+    fn record_agent_detect_stamps_labels_and_histograms() {
+        let m = metrics();
+        record_agent_detect(Some("claude-code-cli"), "unsigned-named", 88, 0.0003);
+
+        let agent_id =
+            sanitize_label_budget("sbproxy_agent_detect_total", "agent_id", "claude-code-cli");
+        let count = m
+            .agent_detect_total
+            .with_label_values(&[agent_id.as_str(), "unsigned-named"])
+            .get();
+        assert!(count >= 1, "agent-detect counter must increment");
+
+        let out = metrics().render();
+        assert!(out.contains("sbproxy_agent_detect_score_bucket"));
+        assert!(out.contains("sbproxy_agent_detect_inference_seconds_bucket"));
     }
 
     #[test]

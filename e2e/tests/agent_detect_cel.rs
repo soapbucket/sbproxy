@@ -12,6 +12,7 @@
 //! traffic passes.
 
 use std::io::Write;
+use std::path::PathBuf;
 
 use sbproxy_e2e::ProxyHarness;
 use tempfile::NamedTempFile;
@@ -52,6 +53,46 @@ origins:
     )
 }
 
+fn onnx_only_config_yaml(onnx_model_path: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+  extensions:
+    agent_detect:
+      enabled: true
+      onnx_model_path: "{onnx_model_path}"
+origins:
+  "detect.localhost":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+"#
+    )
+}
+
+fn fixture_model_path() -> String {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("e2e crate lives under workspace root")
+        .to_path_buf();
+    workspace_root
+        .join("crates/sbproxy-agent-detect/fixtures/ja4_catboost_fixture.onnx")
+        .to_str()
+        .expect("fixture path is utf8")
+        .to_string()
+}
+
+fn fetch_metrics(harness: &ProxyHarness) -> String {
+    let resp = harness
+        .get("/metrics", "detect.localhost")
+        .expect("metrics");
+    assert_eq!(resp.status, 200);
+    resp.text().unwrap_or_default()
+}
+
 #[test]
 fn high_score_agent_is_blocked_and_ordinary_traffic_passes() {
     // Materialise the rule pack at an absolute path the proxy reads at
@@ -87,4 +128,28 @@ fn high_score_agent_is_blocked_and_ordinary_traffic_passes() {
     );
 
     drop(rules);
+}
+
+#[test]
+fn onnx_agent_detect_populates_metrics_after_traffic() {
+    let model_path = fixture_model_path();
+    let harness =
+        ProxyHarness::start_with_yaml(&onnx_only_config_yaml(&model_path)).expect("start proxy");
+
+    let response = harness
+        .get_with_headers("/", "detect.localhost", &[("user-agent", "curl/8.0")])
+        .expect("send request");
+    assert_eq!(response.status, 200);
+
+    let metrics = fetch_metrics(&harness);
+    for series in [
+        "sbproxy_agent_detect_total",
+        "sbproxy_agent_detect_score_bucket",
+        "sbproxy_agent_detect_inference_seconds_bucket",
+    ] {
+        assert!(
+            metrics.contains(series),
+            "{series} must be populated after agent-detect traffic; metrics:\n{metrics}"
+        );
+    }
 }

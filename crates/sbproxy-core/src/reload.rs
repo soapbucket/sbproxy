@@ -12,7 +12,7 @@
 //! shutdown sequence.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use arc_swap::ArcSwap;
 
@@ -306,11 +306,16 @@ static AGENT_DETECT_LOADER: OnceLock<arc_swap::ArcSwap<sbproxy_agent_detect::Rul
 /// different file takes effect without a restart (WOR-1164). A same-path
 /// content change also hot-reloads through the loader's own `ArcSwap`.
 pub fn set_agent_detect_loader(loader: sbproxy_agent_detect::RulePackLoader) {
-    let arc = Arc::new(loader);
+    set_agent_detect_loader_arc(Arc::new(loader));
+}
+
+/// Install a shared rule-pack loader. Startup uses this when the same
+/// loader allocation also needs to back the trait-object scorer.
+pub fn set_agent_detect_loader_arc(loader: Arc<sbproxy_agent_detect::RulePackLoader>) {
     match AGENT_DETECT_LOADER.get() {
-        Some(swap) => swap.store(arc),
+        Some(swap) => swap.store(loader),
         None => {
-            let _ = AGENT_DETECT_LOADER.set(arc_swap::ArcSwap::from(arc));
+            let _ = AGENT_DETECT_LOADER.set(arc_swap::ArcSwap::from(loader));
         }
     }
 }
@@ -321,6 +326,44 @@ pub fn set_agent_detect_loader(loader: sbproxy_agent_detect::RulePackLoader) {
 /// The returned guard derefs to `RulePackLoader`.
 pub fn agent_detect_loader() -> Option<arc_swap::Guard<Arc<sbproxy_agent_detect::RulePackLoader>>> {
     AGENT_DETECT_LOADER.get().map(|swap| swap.load())
+}
+
+/// Global agent-detect scorer, populated at startup when
+/// `proxy.extensions.agent_detect` installs a rule pack, an ONNX model,
+/// or both. Stored behind an `RwLock<Option<Arc<_>>>` because scorer
+/// replacement happens only on startup/reload; the hot path clones the
+/// current `Arc` and then runs without holding the lock.
+type AgentDetectScorer = Arc<dyn sbproxy_agent_detect::AgentScorer>;
+type AgentDetectScorerSlot = RwLock<Option<AgentDetectScorer>>;
+
+static AGENT_DETECT_SCORER: OnceLock<AgentDetectScorerSlot> = OnceLock::new();
+
+fn agent_detect_scorer_slot() -> &'static AgentDetectScorerSlot {
+    AGENT_DETECT_SCORER.get_or_init(|| RwLock::new(None))
+}
+
+/// Install or replace the process-wide agent-detect scorer.
+pub fn set_agent_detect_scorer(scorer: AgentDetectScorer) {
+    let mut guard = agent_detect_scorer_slot()
+        .write()
+        .expect("agent-detect scorer lock poisoned");
+    *guard = Some(scorer);
+}
+
+/// Clear the process-wide agent-detect scorer.
+pub fn clear_agent_detect_scorer() {
+    let mut guard = agent_detect_scorer_slot()
+        .write()
+        .expect("agent-detect scorer lock poisoned");
+    *guard = None;
+}
+
+/// Clone the live agent-detect scorer, when configured.
+pub fn agent_detect_scorer() -> Option<AgentDetectScorer> {
+    agent_detect_scorer_slot()
+        .read()
+        .expect("agent-detect scorer lock poisoned")
+        .clone()
 }
 
 #[cfg(test)]
@@ -585,5 +628,17 @@ mod tests {
             !std::ptr::eq(first_ptr, second_ptr),
             "reload must swap the agent-detect loader, not no-op the second install"
         );
+    }
+
+    #[test]
+    fn agent_detect_scorer_installs_and_clears() {
+        clear_agent_detect_scorer();
+        assert!(agent_detect_scorer().is_none());
+
+        set_agent_detect_scorer(Arc::new(sbproxy_agent_detect::DefaultScorer));
+        assert!(agent_detect_scorer().is_some());
+
+        clear_agent_detect_scorer();
+        assert!(agent_detect_scorer().is_none());
     }
 }

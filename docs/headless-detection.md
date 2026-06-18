@@ -1,5 +1,5 @@
 # Headless detection
-*Last modified: 2026-05-31*
+*Last modified: 2026-06-18*
 
 Header-only heuristics that flag headless and stealth-browser clients even when their TLS / JA4 fingerprint matches a real browser. Pairs with the rule-based agent detection (`request.agent.score`) and the JA4 scorer.
 
@@ -44,6 +44,8 @@ proxy:
   extensions:
     agent_detect:
       enabled: true
+      rule_pack_path: /etc/sbproxy/agents.yml
+      onnx_model_path: /etc/sbproxy/ja4-catboost.onnx
 
 origins:
   "secure.example.com":
@@ -58,6 +60,10 @@ origins:
 ```
 
 Pair with `request.agent.score` and the JA4 verdict for a layered defence: a benign request scoring low on every dimension passes; a stealth headless that defeats one layer still trips the others.
+
+`onnx_model_path` loads an in-process CatBoost ONNX scorer at startup.
+When both `rule_pack_path` and `onnx_model_path` are set, exact
+rule-pack identity matches win and the ONNX scorer runs on rule misses.
 
 ## Scope and limitations
 

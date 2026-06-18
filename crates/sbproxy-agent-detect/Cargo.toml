@@ -31,6 +31,10 @@ arc-swap = { workspace = true }
 sbproxy-tls = { path = "../sbproxy-tls" }
 # Slice 4 (WOR-587) uses SHA-256 for the request header-order hash.
 sha2 = { workspace = true }
+# Slice 9 (WOR-592): pure-Rust ONNX runtime for the CatBoost JA4
+# scorer. Same engine/version as `sbproxy-classifiers`, avoiding the
+# system ONNX Runtime dependency in proxy binaries.
+tract-onnx = "0.21"
 
 [dev-dependencies]
 tempfile = "3"
