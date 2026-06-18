@@ -77,6 +77,7 @@ pub(super) fn agent_class_label(ctx: &RequestContext) -> &'static str {
 ///
 /// - `None` (no top-level block) or `catalog: builtin`: use
 ///   `AgentClassCatalog::defaults()`.
+/// - `catalog: inline`: validate and install `agent_classes.entries`.
 /// - `catalog: hosted-feed`: reserved for the registry fetcher landing
 ///   in the registry fetcher; for now we log a warning and fall back
 ///   to defaults so YAML written against the larger schema still boots.
@@ -109,6 +110,18 @@ pub(super) fn install_agent_class_resolver(block: Option<&sbproxy_config::AgentC
         Some(cfg) => {
             let catalog = match cfg.catalog.as_str() {
                 "builtin" => AgentClassCatalog::defaults(),
+                "inline" => match inline_agent_class_catalog(&cfg.entries) {
+                    Ok(catalog) => catalog,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "agent_classes.catalog inline is invalid; installing an empty \
+                             catalog",
+                        );
+                        AgentClassCatalog::from_entries(Vec::new())
+                            .expect("empty agent class catalog is valid")
+                    }
+                },
                 "hosted-feed" | "merged" => {
                     tracing::warn!(
                         catalog = %cfg.catalog,
@@ -155,6 +168,19 @@ pub(super) fn install_agent_class_resolver(block: Option<&sbproxy_config::AgentC
         cache_size = %cache_size,
         "agent_class resolver installed",
     );
+}
+
+#[cfg(feature = "agent-class")]
+fn inline_agent_class_catalog(
+    entries: &[serde_json::Value],
+) -> anyhow::Result<sbproxy_classifiers::AgentClassCatalog> {
+    let mut parsed = Vec::with_capacity(entries.len());
+    for (idx, value) in entries.iter().enumerate() {
+        let entry = serde_json::from_value::<sbproxy_classifiers::AgentClass>(value.clone())
+            .map_err(|err| anyhow::anyhow!("entry {idx}: {err}"))?;
+        parsed.push(entry);
+    }
+    sbproxy_classifiers::AgentClassCatalog::from_entries(parsed)
 }
 
 /// Cached default-rule PII redactor for access-log header capture.

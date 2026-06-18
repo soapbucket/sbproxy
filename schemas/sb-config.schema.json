@@ -4677,9 +4677,14 @@
       "type": "object",
       "properties": {
         "catalog": {
-          "description": "Catalog source. `builtin` (default) loads the embedded YAML catalog. `hosted-feed` fetches from `hosted_feed.url`. `merged` loads the hosted feed and overlays it on top of the embedded defaults so an operator's feed only needs to ship deltas.",
+          "description": "Catalog source. `builtin` (default) loads the embedded YAML catalog. `inline` loads the entries in `entries`. `hosted-feed` fetches from `hosted_feed.url`. `merged` loads the hosted feed and overlays it on top of the embedded defaults so an operator's feed only needs to ship deltas.",
           "default": "builtin",
           "type": "string"
+        },
+        "entries": {
+          "description": "Inline catalog entries. Used when `catalog: inline`; each entry is validated by the runtime against the same schema as the embedded catalog.",
+          "type": "array",
+          "items": true
         },
         "hosted_feed": {
           "description": "Hosted-feed configuration. Required when `catalog: hosted-feed` or `catalog: merged`.",

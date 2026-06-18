@@ -1,5 +1,5 @@
 # Web Bot Auth
-*Last modified: 2026-06-08*
+*Last modified: 2026-06-17*
 
 The `bot_auth` provider verifies cryptographically-signed AI agents per the IETF "Web Bot Auth" pattern. AI crawlers sign each request with an Ed25519 key under [RFC 9421 HTTP Message Signatures](https://www.rfc-editor.org/rfc/rfc9421.html) and advertise their `keyid` in the `Signature-Input` header; the gateway looks up the matching public key in its directory and verifies the signature. Agents that pass come through; everything else gets `401`.
 
@@ -56,6 +56,14 @@ The provider produces one of four verdicts; only the first allows the request:
 | `Failed` | `401` | Header parse failure, signature mismatch, expired, or required component missing. |
 
 The denial body is intentionally generic (`bot_auth: signature required` / `bot_auth: verification failed`); detailed reasons land in the structured log under the `sbproxy::auth` target so an operator can see exactly which check failed without leaking the same detail to a probing crawler.
+
+## Agent-class resolver relationship
+
+When `bot_auth` verifies a request, SBproxy carries the verified `keyid` on the unified principal as `attrs.metadata.bot_auth_keyid`. If the agent-class resolver is enabled and the active catalog has an entry whose `expected_keyids` contains that value, the request context is restamped with `agent_id_source = bot_auth` before upstream request headers and per-agent metrics are emitted.
+
+That key ID verdict is the resolver's highest-confidence signal. It outranks reverse DNS and User-Agent matches, so a request with a valid WBA signature for `openai-2026-01` but a spoofed `User-Agent: SpoofBot/1.0` resolves to the catalog entry that owns `openai-2026-01`. Set `agent_classes.resolver.bot_auth_keyid_enabled: false` to disable this step and fall back to rDNS / UA matching.
+
+On an origin protected by `authentication.type: bot_auth`, missing, unknown, malformed, or mismatched signatures return `401`; those requests do not reach anonymous agent-class classification. A signed request that covers `content-digest` can stamp the verified key ID during auth, but a later body digest mismatch still returns `401` before body bytes reach the upstream.
 
 ## Required components
 

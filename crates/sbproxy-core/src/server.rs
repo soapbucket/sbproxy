@@ -2174,14 +2174,19 @@ async fn check_auth_with_tls(
             };
 
             match verdict {
-                BotAuthVerdict::Verified { agent_name } => {
-                    tracing::info!(agent = %agent_name, "bot_auth verified");
+                BotAuthVerdict::Verified { agent_name, key_id } => {
+                    tracing::info!(agent = %agent_name, key_id = %key_id, "bot_auth verified");
+                    let mut metadata = std::collections::BTreeMap::new();
+                    metadata.insert("bot_auth_keyid".to_string(), key_id);
                     let principal = sbproxy_plugin::Principal {
                         tenant_id: tenant_id.clone(),
                         sub: agent_name,
                         source: sbproxy_plugin::PrincipalSource::BotAuth,
                         virtual_key: None,
-                        attrs: sbproxy_plugin::PrincipalAttrs::default(),
+                        attrs: sbproxy_plugin::PrincipalAttrs {
+                            metadata,
+                            ..sbproxy_plugin::PrincipalAttrs::default()
+                        },
                     };
                     (AuthResult::allow_anonymous(), Some(principal))
                 }

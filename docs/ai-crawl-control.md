@@ -1,5 +1,5 @@
 # AI Crawl Control + Pay Per Crawl
-*Last modified: 2026-05-08*
+*Last modified: 2026-06-17*
 
 The `ai_crawl_control` policy implements the "Pay Per Crawl" pattern: AI crawlers that arrive without a valid `Crawler-Payment` token receive `402 Payment Required` along with a JSON challenge body. A crawler that wants the content reads the challenge, posts a payment to your billing system, and retries with the issued token in the `Crawler-Payment` header. Each token redeems exactly once.
 
@@ -227,19 +227,23 @@ Operators see all three values in metrics and dashboards; alerting on a sustaine
 
 ```yaml
 agent_classes:
-  - id: openai-gptbot
-    vendor: OpenAI
-    purpose: training
-    expected_user_agent_pattern: "(?i)\\bGPTBot/\\d"
-    expected_reverse_dns_suffixes: [".gptbot.openai.com"]
-  - id: anthropic-claudebot
-    vendor: Anthropic
-    purpose: training
-    expected_user_agent_pattern: "(?i)\\bClaudeBot/\\d"
-  - id: commoncrawl-ccbot
-    vendor: Common Crawl
-    purpose: archival
-    expected_user_agent_pattern: "(?i)\\bCCBot/\\d"
+  catalog: inline
+  entries:
+    - id: openai-gptbot
+      vendor: OpenAI
+      purpose: training
+      expected_user_agent_pattern: "(?i)\\bGPTBot/\\d"
+      expected_reverse_dns_suffixes: [".gptbot.openai.com"]
+      expected_keyids: ["openai-2026-01"]
+    - id: anthropic-claudebot
+      vendor: Anthropic
+      purpose: training
+      expected_user_agent_pattern: "(?i)\\bClaudeBot/\\d"
+      expected_keyids: ["anthropic-2026-01"]
+    - id: commoncrawl-ccbot
+      vendor: Common Crawl
+      purpose: archival
+      expected_user_agent_pattern: "(?i)\\bCCBot/\\d"
 
 policies:
   - type: ai_crawl_control
@@ -265,9 +269,9 @@ policies:
         price: { amount_micros: 1500, currency: USD }
 ```
 
-`agent_id` on a tier matches against the resolver's verdict. The first tier whose route pattern AND agent id both match wins. A tier without `agent_id` matches every agent.
+`agent_id` on a tier matches against the resolver's verdict. The first tier whose route pattern AND agent id both match wins. A tier without `agent_id` matches every agent. `expected_keyids` lets a verified Web Bot Auth signature classify the request even when the User-Agent string is missing or spoofed.
 
-The eight default agent classes (`openai-gptbot`, `openai-chatgpt-user`, `anthropic-claudebot`, `perplexity-perplexitybot`, `google-googlebot`, `google-extended`, `microsoft-bingbot`, `duckduckgo-duckduckbot`, `apple-applebot`, `commoncrawl-ccbot`) ship embedded in the binary. Operators extend or override entries inline in `sb.yml`.
+The default agent classes ship embedded in the binary. Use `catalog: inline` when you want `sb.yml` to provide a complete catalog with your own `expected_keyids`; use `catalog: builtin` or omit the block to keep the embedded catalog.
 
 ## Observability
 

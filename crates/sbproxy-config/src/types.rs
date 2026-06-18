@@ -292,11 +292,17 @@ pub enum ConfigSource {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct AgentClassesConfig {
     /// Catalog source. `builtin` (default) loads the embedded YAML
-    /// catalog. `hosted-feed` fetches from `hosted_feed.url`. `merged`
-    /// loads the hosted feed and overlays it on top of the embedded
-    /// defaults so an operator's feed only needs to ship deltas.
+    /// catalog. `inline` loads the entries in `entries`. `hosted-feed`
+    /// fetches from `hosted_feed.url`. `merged` loads the hosted feed
+    /// and overlays it on top of the embedded defaults so an operator's
+    /// feed only needs to ship deltas.
     #[serde(default = "default_agent_classes_catalog")]
     pub catalog: String,
+    /// Inline catalog entries. Used when `catalog: inline`; each entry
+    /// is validated by the runtime against the same schema as the
+    /// embedded catalog.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<serde_json::Value>,
     /// Hosted-feed configuration. Required when `catalog: hosted-feed`
     /// or `catalog: merged`.
     #[serde(default)]
@@ -311,6 +317,7 @@ impl Default for AgentClassesConfig {
     fn default() -> Self {
         Self {
             catalog: default_agent_classes_catalog(),
+            entries: Vec::new(),
             hosted_feed: None,
             resolver: AgentClassResolverConfig::default(),
         }

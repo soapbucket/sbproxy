@@ -183,10 +183,10 @@ pub(super) async fn request_filter(
     // confidence) -> forward-confirmed reverse-DNS (strong) ->
     // User-Agent regex (advisory) -> anonymous bot-auth ->
     // generic-crawler heuristic -> human fallback. The OSS build
-    // wires the first signal into the bot-auth verifier (a
-    // separate slice); this seam reads the resolved keyid off the
-    // request context whenever that slice has run, otherwise
-    // passes `None` so the chain falls through to UA matching.
+    // restamps the first signal after the bot-auth verifier accepts
+    // a keyid. This early pass feeds `None` so CAP binding and
+    // request-time labels still get the best non-WBA verdict before
+    // auth runs.
     //
     // Skipped under three conditions:
     //   * `agent-class` feature is off (compile-time gate).
@@ -206,11 +206,9 @@ pub(super) async fn request_filter(
                 .headers
                 .get(http::header::USER_AGENT)
                 .and_then(|v| v.to_str().ok());
-            // `bot_auth_keyid` and `anonymous_bot_auth` will be wired
-            // through once the bot-auth verifier slice lands; until
-            // then the resolver is fed UA + client IP, which is
-            // sufficient for the catalog match path the e2e suite
-            // exercises.
+            // Auth runs below. If bot_auth verifies a keyid, the
+            // request is restamped with that stronger signal before
+            // upstream headers and metrics read the context.
             crate::agent_class::stamp_request_context(
                 ctx,
                 &resolver,
@@ -2207,6 +2205,14 @@ pub(super) async fn request_filter(
                 resolved_agent_id.as_deref(),
             )
             .await;
+            #[cfg(feature = "agent-class")]
+            let bot_auth_keyid = principal_opt
+                .as_ref()
+                .filter(|principal| {
+                    matches!(principal.source, sbproxy_plugin::PrincipalSource::BotAuth)
+                })
+                .and_then(|principal| principal.attrs.metadata.get("bot_auth_keyid"))
+                .cloned();
             // WOR-1047 PR2: every built-in provider returns a
             // `Principal` on Allow. Stamp it on `ctx.principal` so
             // downstream policy / access-log paths read attribution
@@ -2228,14 +2234,31 @@ pub(super) async fn request_filter(
             // `verify_content_digest` against the Content-Digest
             // header value the signature attests to.
             let auth_succeeded = matches!(auth_result, AuthResult::Allow { .. });
-            if auth_succeeded
-                && matches!(auth, Auth::BotAuth(_))
-                && sbproxy_middleware::signatures::signature_input_covers_content_digest(
+            if auth_succeeded && matches!(auth, Auth::BotAuth(_)) {
+                #[cfg(feature = "agent-class")]
+                if let Some(keyid) = bot_auth_keyid.as_deref() {
+                    if let Some(resolver) = reload::agent_class_resolver() {
+                        let user_agent = session
+                            .req_header()
+                            .headers
+                            .get(http::header::USER_AGENT)
+                            .and_then(|v| v.to_str().ok());
+                        crate::agent_class::stamp_request_context(
+                            ctx,
+                            &resolver,
+                            Some(keyid),
+                            false,
+                            ctx.client_ip,
+                            user_agent,
+                        );
+                    }
+                }
+                if sbproxy_middleware::signatures::signature_input_covers_content_digest(
                     req_headers,
-                )
-            {
-                ctx.bot_auth_digest_check_required = true;
-                ctx.validate_request_body = true;
+                ) {
+                    ctx.bot_auth_digest_check_required = true;
+                    ctx.validate_request_body = true;
+                }
             }
             match auth_result {
                 AuthResult::Allow { sub, source } => {

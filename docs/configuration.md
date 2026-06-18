@@ -140,6 +140,14 @@ proxy:
   # Opaque per-server extensions consumed by enterprise / third-party crates.
   extensions: { ... }
 
+# Agent classification catalog and resolver tuning
+agent_classes:
+  catalog: builtin
+  resolver:
+    rdns_enabled: true
+    bot_auth_keyid_enabled: true
+    cache_size: 10000
+
 # Per-hostname origin configurations
 origins:
   "api.example.com":
@@ -161,6 +169,34 @@ origins:
 ```
 
 `l2_cache_settings` and `messenger_settings` are nested under `proxy:` (the deserializer also accepts `l2_cache` as a canonical alias).
+
+### Agent classes
+
+The optional top-level `agent_classes` block configures the process-wide agent identity resolver. Omitting it uses the embedded catalog and default resolver tuning.
+
+```yaml
+agent_classes:
+  catalog: inline
+  entries:
+    - id: openai-gptbot
+      vendor: OpenAI
+      purpose: training
+      expected_user_agent_pattern: "(?i)\\bGPTBot/\\d"
+      expected_reverse_dns_suffixes: [".gptbot.openai.com"]
+      expected_keyids: ["openai-2026-01"]
+  resolver:
+    rdns_enabled: true
+    bot_auth_keyid_enabled: true
+    cache_size: 10000
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `catalog` | string | `builtin` | `builtin` loads the embedded catalog. `inline` loads `entries`. `hosted-feed` and `merged` are reserved for the registry fetcher and currently fall back to builtin. |
+| `entries` | list | `[]` | Complete inline catalog used when `catalog: inline`. Entries use `id`, `vendor`, `purpose`, `expected_user_agent_pattern`, optional `expected_reverse_dns_suffixes`, and optional `expected_keyids`. |
+| `resolver.rdns_enabled` | bool | `true` | Run forward-confirmed reverse DNS as resolver step 2. |
+| `resolver.bot_auth_keyid_enabled` | bool | `true` | Let a verified Web Bot Auth `keyid` match `expected_keyids` as resolver step 1. |
+| `resolver.cache_size` | int | `10000` | Per-process reverse-DNS verdict cache capacity. |
 
 ---
 
