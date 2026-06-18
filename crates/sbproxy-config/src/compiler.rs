@@ -1786,7 +1786,7 @@ proxy:
     - name: openai-shared
       type: ai_provider
       provider: openai
-      key: vault://env/OPENAI_API_KEY
+      key: ${OPENAI_API_KEY}
       attrs:
         project: shared
         tags: [tier-shared]
@@ -1826,7 +1826,7 @@ proxy:
     - name: pinned
       type: ai_provider
       provider: openai
-      key: vault://env/OPENAI_API_KEY
+      key: ${OPENAI_API_KEY}
       route_to_model: gpt-4o-mini
       inject_tools:
         - type: function
@@ -1874,7 +1874,7 @@ proxy:
     - name: secure-openai
       type: ai_provider
       provider: openai
-      key: vault://env/OPENAI_API_KEY
+      key: ${OPENAI_API_KEY}
       principals:
         - team: frontend
           role: admin
@@ -1912,7 +1912,7 @@ proxy:
     - name: bad-openai
       type: ai_provider
       provider: openai
-      key: vault://env/OPENAI_API_KEY
+      key: ${OPENAI_API_KEY}
       principals:
         - {}
 origins:
@@ -1944,7 +1944,7 @@ proxy:
     - name: openai
       type: ai_provider
       provider: openai
-      key: vault://env/OPENAI_PROXY
+      key: ${OPENAI_PROXY}
       attrs: { project: proxy-default }
 origins:
   ai.local:
@@ -1957,7 +1957,7 @@ origins:
       - name: openai
         type: ai_provider
         provider: openai
-        key: vault://env/OPENAI_LOCAL
+        key: ${OPENAI_LOCAL}
         attrs: { project: local-override }
 "#;
         let compiled = compile_config(yaml).expect("should compile");
@@ -1969,7 +1969,7 @@ origins:
             .expect("virtual_keys array materialised");
         assert_eq!(vks.len(), 1);
         assert_eq!(vks[0]["project"], "local-override");
-        assert_eq!(vks[0]["key"], "vault://env/OPENAI_LOCAL");
+        assert_eq!(vks[0]["key"], "${OPENAI_LOCAL}");
     }
 
     /// A tenant-scope credential applies only to origins that resolve

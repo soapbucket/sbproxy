@@ -279,9 +279,9 @@ impl Principal {
 // --- Credential model ---
 
 /// Where a credential's secret material lives. Mirrors today's
-/// `${ENV}` / `file:` / `secret:` / `vault://` patterns; future
-/// vault backends plug in by adding variants to the `Vault` arm
-/// rather than widening the enum.
+/// `${ENV}` / `file:` / `secret:` patterns and provider-specific
+/// secret-reference URIs; future vault backends plug in by adding
+/// variants to the `Vault` arm rather than widening the enum.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SecretRef {
@@ -307,11 +307,12 @@ pub enum SecretRef {
         /// Name of the static secret entry in `proxy.secrets`.
         name: String,
     },
-    /// `vault://<backend>/<path>` URI. The backend prefix selects the
-    /// vault backend (hashi, aws, kubernetes, file, sqlite, ...).
+    /// Provider-specific secret reference URI. The scheme selects the
+    /// provider type and the authority selects the configured backend
+    /// instance.
     Vault {
         /// Vault reference URI in the form
-        /// `vault://<backend>/<path>[?version=<n>][&key=<json-field>]`.
+        /// `<scheme>://<backend>/<path>[?version=<n>][&key=<json-field>]`.
         uri: String,
     },
 }
@@ -420,7 +421,7 @@ mod tests {
         assert_eq!(back, env);
 
         let vault = SecretRef::Vault {
-            uri: "vault://hashi/secret/data/openai-prod".to_string(),
+            uri: "vault://primary/secret/data/openai-prod".to_string(),
         };
         let json = serde_json::to_string(&vault).unwrap();
         assert!(json.contains(r#""type":"vault""#));

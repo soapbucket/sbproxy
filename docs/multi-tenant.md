@@ -33,7 +33,7 @@ proxy:
     - name: openai-shared
       type: ai_provider
       provider: openai
-      key: vault://env/OPENAI_PROXY_DEFAULT
+      key: ${OPENAI_PROXY_DEFAULT}
 
   tenants:
     - id: acme-corp
@@ -41,7 +41,7 @@ proxy:
         - name: openai-shared              # same NAME as proxy default, different key
           type: ai_provider
           provider: openai
-          key: vault://hashi/secret/data/acme/openai
+          key: vault://primary/secret/data/acme/openai?key=api_key
           attrs: { project: acme-prod }
 
     - id: beta-corp
@@ -49,7 +49,7 @@ proxy:
         - name: openai-experimental         # NEW credential, only for beta-corp
           type: ai_provider
           provider: openai
-          key: vault://aws/beta/openai-experimental?key=api_key
+          key: awssm://primary/beta/openai-experimental?key=api_key
           attrs: { project: beta-experimental }
 
 origins:
@@ -68,7 +68,7 @@ origins:
         - name: openai
 ```
 
-In this config, a request to `api.acme.example.com` resolves `openai-shared` to acme-corp's hashi-backed key; the same name on the proxy default is shadowed. A request to `api.beta.example.com` sees `openai-shared` from the proxy default plus `openai-experimental` from the tenant. The `__default__` tenant (any origin without `tenant_id`) sees only `openai-shared` from the proxy default.
+In this config, a request to `api.acme.example.com` resolves `openai-shared` to acme-corp's HashiCorp-backed key; the same name on the proxy default is shadowed. A request to `api.beta.example.com` sees `openai-shared` from the proxy default plus `openai-experimental` from the tenant. The `__default__` tenant (any origin without `tenant_id`) sees only `openai-shared` from the proxy default.
 
 ## The `__default__` tenant
 
@@ -150,7 +150,7 @@ The recommended sequence:
 The repository ships three worked examples covering the common shapes:
 
 * `examples/ai-virtual-keys/`: single-tenant credentials block with two team-scoped keys.
-* `examples/vault-reference/`: multi-tenant `vault://` references across HashiCorp / AWS / k8s / SQLite.
+* `examples/vault-reference/`: multi-tenant provider references across HashiCorp, AWS, GCP, Kubernetes, file, and static-map backends.
 * `examples/multi-tenant-saas/` (planned): full SaaS deployment with per-tenant vaults, credentials, observability sinks, and isolation tests.
 
 ## Related reading

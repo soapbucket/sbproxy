@@ -30,21 +30,23 @@ A virtual key can be any string. The `vk-frontend-...` / `vk-data-...` values ar
 
 This example reads every secret from an environment variable with `${...}` interpolation so it stays copy-paste runnable. The same fields accept a vault reference instead, so in production no secret has to sit in the shell environment or the config file.
 
-Any `${VAR}` above can be a `vault://<backend>/<path>` URI backed by HashiCorp Vault, AWS Secrets Manager, or Kubernetes Secrets. The upstream key and the virtual keys both resolve the same way:
+Any `${VAR}` above can be a provider-specific secret reference backed by HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager, Kubernetes Secrets, or a local secret file. The upstream key and the virtual keys both resolve the same way:
 
 ```yaml
 providers:
   - name: anthropic
     # env var (this example) ...
     api_key: ${ANTHROPIC_API_KEY}
-    # ... or a vault reference (production):
-    # api_key: vault://hashi/secret/data/anthropic-prod?key=api_key
+    # ... or a provider-specific reference (production):
+    # api_key: vault://primary/secret/data/anthropic-prod?key=api_key
+    # api_key: awssm://primary/anthropic-prod?key=api_key
 
 credentials:
   - name: team-frontend
     type: ai_provider
     provider: anthropic
-    # key: vault://hashi/secret/data/team-frontend?key=virtual_key
+    # key: vault://primary/secret/data/team-frontend?key=virtual_key
+    # key: k8ssecret://primary/sbproxy-secrets/team-frontend-key
     key: ${TEAM_FRONTEND_KEY}
 ```
 

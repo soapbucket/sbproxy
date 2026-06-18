@@ -51,8 +51,9 @@ origins:
 
       # 32-byte HKDF IKM that derives the session + tx cookie
       # keys. Rotate this to invalidate every outstanding session.
-      # `vault://oidc/cookie_secret` is the prod shape; the
-      # literal below works for `make run` against this example.
+      # `vault://primary/secret/data/oidc/cookie?key=cookie_secret`
+      # is a HashiCorp-backed production shape; the literal below
+      # works for `make run` against this example.
       cookie_secret: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 
       # Scopes. `openid` is the minimum (it produces an ID token);

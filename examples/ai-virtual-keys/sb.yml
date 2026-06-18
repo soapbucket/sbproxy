@@ -70,10 +70,12 @@ origins:
         - name: anthropic
           # Secrets use ${ENV_VAR} interpolation here to stay runnable.
           # In production any secret (this key and the virtual keys
-          # below) can instead be a vault reference, e.g.
-          #   api_key: vault://hashi/secret/data/anthropic-prod?key=api_key
-          # backed by HashiCorp Vault, AWS Secrets Manager, or K8s
-          # Secrets. See docs/secrets.md.
+          # below) can instead be a provider-specific secret reference,
+          # e.g.:
+          #   api_key: vault://primary/secret/data/anthropic-prod?key=api_key
+          #   api_key: awssm://primary/anthropic-prod?key=api_key
+          #   api_key: k8ssecret://primary/sbproxy-secrets/anthropic-key
+          # See docs/secrets.md.
           api_key: ${ANTHROPIC_API_KEY}
           default_model: claude-3-5-haiku-latest
           models:

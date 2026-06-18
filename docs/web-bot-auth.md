@@ -135,7 +135,7 @@ web_bot_auth_publish:
   public_key_hex: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
   agent_name: "SBproxy"
   directory_url: "https://agent.example.com/.well-known/http-message-signatures-directory"
-  # Optional. Hex-encoded 32-byte Ed25519 seed; `vault://` refs work.
+  # Optional. Hex-encoded 32-byte Ed25519 seed; secret references work.
   signing_key_hex: "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
 ```
 

@@ -143,7 +143,8 @@ pub struct HashiCorpConfig {
 #[derive(Debug, Clone)]
 pub enum HashiCorpAuth {
     /// Static token. The operator resolves it from the config's
-    /// secret reference (env var, file, vault://env/...).
+    /// secret reference such as `${ENV_VAR}`, `file:`, or a provider
+    /// URI.
     Token {
         /// Vault client token. Resolved by the operator from a
         /// secret reference at config-load.
@@ -799,7 +800,7 @@ mod tests {
     }
 
     /// A path that already names the mount is taken verbatim so
-    /// operators with `vault://hashi/secret/data/acme/openai-prod`
+    /// operators with `vault://primary/secret/data/acme/openai-prod`
     /// references get the same URL as the relative form.
     #[test]
     fn build_url_accepts_explicit_mount_prefix() {

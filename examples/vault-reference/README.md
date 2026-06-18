@@ -1,40 +1,43 @@
-# vault:// reference URI
+# Secret Reference Provider Schemes
 
-This example shows the unified `vault://` reference URI alongside the legacy `${ENV}` / `file:` / `secret:` shapes, and demonstrates how the same URI resolves to different physical vaults across tenants.
+This example shows the provider-specific secret reference schemes alongside the legacy `${ENV}` form, and demonstrates how the same URI can resolve to different physical vaults across tenants.
 
 ## Grammar
 
-```
-vault://<backend>/<path>[?version=<n>][&key=<json-field>]
+```text
+<scheme>://<backend>/<path>[?version=<n>][&key=<json-field>]
 ```
 
 | Segment | Meaning |
 |---|---|
-| `<backend>` | Operator-chosen name of a backend block configured per-scope. |
-| `<path>` | Backend-specific path inside the vault. The parser carries it verbatim. |
-| `version=<n>` | Optional version pin (HashiCorp KVv2, AWS Secrets Manager). |
+| `<scheme>` | Provider type: `vault`, `awssm`, `gcpsm`, `k8ssecret`, `secretfile`, or `secret`. |
+| `<backend>` | Operator-chosen name of a backend block configured per scope. |
+| `<path>` | Provider-specific path. The parser carries it verbatim. |
+| `version=<n>` | Optional version pin for versioned providers. |
 | `key=<json-field>` | Optional sub-field selector for JSON-shaped secrets. |
+
+Environment variables stay as `${VAR}`. The legacy environment alias under the old umbrella form is deprecated.
 
 ## Tenancy
 
-The URI itself is tenant-agnostic. The `<backend>` segment names a backend block; the block is configured at proxy scope, tenant scope, or origin scope. Resolution at request time walks the scopes from most specific to least specific: origin -> tenant -> proxy. The first scope that declares the named backend serves the reference. A tenant that does not redeclare a named backend transparently inherits the proxy default, so single-tenant configs need no changes.
+The URI itself is tenant-agnostic. The backend segment names a backend block, and the scheme requires the block to have the matching provider type. Resolution at request time walks the scopes from most specific to least specific: origin -> tenant -> proxy. The first scope that declares the matching backend serves the reference.
 
 Example: two tenants, one shared HashiCorp Vault for the proxy default, plus a tenant-specific Vault for acme-corp:
 
 ```yaml
 proxy:
   vault:
-    - name: hashi
+    - name: primary
       type: hashicorp
       addr: https://vault.shared.example/v1
-      token: vault://env/VAULT_TOKEN_SHARED
+      token: ${VAULT_TOKEN_SHARED}
   tenants:
     - id: acme-corp
       vault:
-        - name: hashi              # same NAME, different Vault instance
+        - name: primary              # same name, different Vault instance
           type: hashicorp
           addr: https://vault.acme.example/v1
-          token: vault://env/VAULT_TOKEN_ACME
+          token: ${VAULT_TOKEN_ACME}
 origins:
   api.acme.example.com:
     tenant_id: acme-corp
@@ -42,22 +45,27 @@ origins:
       type: ai_proxy
       providers:
         - name: openai
-          api_key: vault://hashi/secret/data/openai-prod?key=api_key
+          api_key: vault://primary/secret/data/openai-prod?key=api_key
 ```
 
-The `vault://hashi/secret/data/openai-prod` reference resolves against acme-corp's `hashi` block (Vault at `vault.acme.example`). The same reference used by a different origin scoped to `__default__` would resolve against the proxy default (Vault at `vault.shared.example`). The reference text is identical; the resolution context differs.
+The `vault://primary/secret/data/openai-prod` reference resolves against acme-corp's `primary` HashiCorp backend at `vault.acme.example`. The same reference used by an origin without a tenant-specific override resolves against the proxy default at `vault.shared.example`.
 
-## What you'll see in `sb.yml`
+## What You'll See In `sb.yml`
 
-* `action.providers[].api_key: vault://env/OPENAI_API_KEY` — env-backed reference, tenant-agnostic by construction.
-* `authentication.bearer.tokens` mixes `vault://env`, `vault://hashi`, `vault://aws`, `vault://k8s`, `vault://sqlite` references alongside the legacy `${ENV}` and `secret:` shapes.
-* The `proxy.vault` and `tenants[].vault` blocks are shown commented out: the config schema for those blocks lands alongside the credentials epic. The example illustrates the resolution model so the multi-tenant intent is clear from a single file.
+* `action.providers[].api_key: ${OPENAI_API_KEY}` keeps the example runnable.
+* Commented production alternatives show `vault://`, `awssm://`, `gcpsm://`, `k8ssecret://`, and `secretfile://` references.
+* `authentication.bearer.tokens` uses `${INTERNAL_BEARER_TOKEN}` for the runnable path and comments the provider-backed alternatives.
+* The `proxy.vault` and `tenants[].vault` blocks are shown commented out until the public config schema exposes backend blocks at every scope. The example still documents the resolution model from one file.
 
-## Status
+## Migration
 
-* The parser ships in `sbproxy-vault::vault_ref::VaultRef`.
-* The `env`, `file`, and `static-secret` backends keep working through the legacy resolver path.
-* The `hashi`, `aws`, `k8s`, `sqlite`, and `cdb` backend implementations land in follow-up tickets; the parser already understands their reference shape so this config compiles today, but resolving one of those references returns an unimplemented-backend error at request time.
+Legacy `vault://<alias>/...` forms are accepted with a warning during the compatibility window. Rewrite known aliases with:
+
+```bash
+sbproxy config migrate examples/vault-reference/sb.yml --out /tmp/sb.migrated.yml
+```
+
+See `docs/migration-credentials.md` for the old-to-new reference table and the deprecation window.
 
 ## Run
 

@@ -1,20 +1,20 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
-# Unified `vault://` reference URI with tenant-scoped backends.
+# Provider-specific secret references with tenant-scoped backends.
 #
-# Every config field that holds a secret accepts a `vault://` URI in
-# addition to the legacy `${ENV}`, `file:`, and `secret:` shapes. The
-# URI itself is tenant-agnostic; the named backend it references is
-# configured per-scope so the same URI resolves to different vaults
-# depending on which tenant's request is being served.
+# Secret-bearing fields accept provider-specific URI schemes:
 #
-# Grammar:
+#   vault://<backend>/<path>[?version=<n>][&key=<json-field>]      # HashiCorp Vault
+#   awssm://<backend>/<path>[?version=<n>][&key=<json-field>]      # AWS Secrets Manager
+#   gcpsm://<backend>/<path>[?version=<n>][&key=<json-field>]      # GCP Secret Manager
+#   k8ssecret://<backend>/<secret>[/<key>]                         # Kubernetes Secrets
+#   secretfile://<backend>/<path>[?key=<json-field>]               # local YAML / JSON file
+#   secret://<backend>/<name>                                      # local static map
 #
-#   vault://<backend>/<path>[?version=<n>][&key=<json-field>]
+# Environment variables keep the existing ${ENV_VAR} form.
 #
 # Resolution at request time: origin scope -> tenant scope -> proxy
-# scope. First scope that declares the named backend serves the
-# reference. A tenant that does not redeclare a named backend
-# transparently inherits the proxy default.
+# scope. First scope that declares a backend with the matching scheme
+# provider type and backend name serves the reference.
 #
 # Setup:
 #
@@ -23,8 +23,7 @@
 #   export VAULT_TOKEN_ACME=acme-token-...
 #   export INTERNAL_BEARER_TOKEN=test-bearer-1
 #
-# Test (the acme-scoped reference reads from acme-corp's hashi vault,
-# the shared reference reads from the proxy default):
+# Test:
 #
 #   curl http://127.0.0.1:8080/v1/chat/completions \
 #     -H 'Host: api.acme.example.com' \
@@ -38,33 +37,27 @@ proxy:
   # Proxy-scope vault backends are the fallback for any tenant that
   # does not redeclare the named backend below.
   #
-  # Status: the `vault:` block at proxy scope is shipped as the parser
-  # target; the actual backend implementations (hashi, aws, k8s,
-  # sqlite) land in follow-up tickets. The `env`/`file` backends are
-  # already served by the legacy resolver paths.
-  #
-  # NOTE: this block is illustrative; the proxy config schema does not
-  # parse `vault:` at proxy/tenant scope yet (the schema lands with
-  # the credentials block). It is shown here so the multi-tenant
-  # resolution model is clear from a single file.
+  # NOTE: this block is illustrative until the public config schema
+  # exposes vault backend blocks at every scope. It is shown here so
+  # the multi-tenant resolution model is clear from a single file.
   #
   # vault:
-  #   - name: hashi
+  #   - name: primary
   #     type: hashicorp
   #     addr: https://vault.shared.example/v1
-  #     token: vault://env/VAULT_TOKEN_SHARED
+  #     token: ${VAULT_TOKEN_SHARED}
 
-  # Tenant scope. Each declared tenant carries its own vault backends.
-  # The acme-corp `hashi` block redeclares the proxy default with a
-  # tenant-specific endpoint so references resolved in an acme-corp
+  # Tenant scope. Each tenant can carry its own vault backends. The
+  # acme-corp `primary` block redeclares the proxy default with a
+  # tenant-specific endpoint, so references resolved in an acme-corp
   # context hit acme's Vault, not the shared one.
   tenants:
     - id: acme-corp
       # vault:
-      #   - name: hashi   # same NAME as proxy default, different instance
+      #   - name: primary   # same name as proxy default, different instance
       #     type: hashicorp
       #     addr: https://vault.acme.example/v1
-      #     token: vault://env/VAULT_TOKEN_ACME
+      #     token: ${VAULT_TOKEN_ACME}
 
 origins:
   "api.acme.example.com":
@@ -73,12 +66,14 @@ origins:
       type: ai_proxy
       providers:
         - name: openai
-          # Two backend prefixes used here:
-          #
-          # `vault://env/...` is the universal env-var indirection
-          # served by the legacy resolver path. Tenant-agnostic by
-          # nature (env vars belong to the proxy process).
-          api_key: vault://env/OPENAI_API_KEY
+          # Runnable path:
+          api_key: ${OPENAI_API_KEY}
+          # Production alternatives:
+          #   api_key: vault://primary/secret/data/openai-prod?key=api_key
+          #   api_key: awssm://primary/prod/openai-prod?version=3&key=api_key
+          #   api_key: gcpsm://primary/openai-api-key?version=latest
+          #   api_key: k8ssecret://primary/sbproxy-secrets/openai-key
+          #   api_key: secretfile://local/openai-prod?key=api_key
           default_model: gpt-4o-mini
           models:
             - gpt-4o-mini
@@ -88,20 +83,12 @@ origins:
     authentication:
       type: bearer
       tokens:
-        # `vault://env/...` resolves to the proxy process env. Same
-        # across tenants by construction.
-        - vault://env/INTERNAL_BEARER_TOKEN
-        # `vault://hashi/...`: resolution looks at acme-corp's `hashi`
-        # block first (when declared), then the proxy default. PR1
-        # ships the parser; the dispatch into the named backend lands
-        # alongside the first backend implementation.
-        - vault://hashi/secret/data/inbound/admin-token?key=token
-        # `vault://aws/...`, `vault://k8s/...`, `vault://sqlite/...`:
-        # same lookup model. The named backend block selects the
-        # backend implementation type.
-        - vault://aws/prod/sbproxy-inbound-tokens?version=3&key=admin
-        - vault://k8s/default/sbproxy-secrets/inbound-token
-        - vault://sqlite/credentials/inbound-admin?key=current
-        # Legacy shapes keep working unchanged.
-        - ${INTERNAL_BEARER_TOKEN_LEGACY}
-        - secret:inbound-admin-token
+        # Runnable path:
+        - ${INTERNAL_BEARER_TOKEN}
+        # Production alternatives:
+        # - vault://primary/secret/data/inbound/admin-token?key=token
+        # - awssm://primary/prod/sbproxy-inbound-tokens?version=3&key=admin
+        # - gcpsm://primary/inbound-token?version=latest
+        # - k8ssecret://primary/sbproxy-secrets/inbound-token
+        # - secretfile://local/inbound-admin?key=current
+        # - secret://local/inbound-admin-token

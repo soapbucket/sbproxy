@@ -2,7 +2,7 @@
 
 *Last modified: 2026-06-18*
 
-Status: accepted for implementation in WOR-1460 through WOR-1463.
+Status: accepted and implemented.
 
 ## Context
 
@@ -52,7 +52,7 @@ Rationale:
 | `secretfile://` | Local file secret store | `secretfile://local/openai-prod?key=api_key` | Use a backend-configured root directory. Do not use reserved `file://`. |
 | `secret://` | Local static secret map | `secret://local/openai-prod` | Covers operator-provided static secret maps. Existing `secret:<name>` remains the legacy shorthand. |
 
-Do not add an `env://` or `vault://env/...` replacement. Environment variables keep the existing `${ENV_NAME}` form. That form is already unambiguous, does not need backend registration, and avoids treating process environment as a network-style URI authority.
+Do not add an `env://` replacement or another URI replacement for environment variables. Environment variables keep the existing `${ENV_NAME}` form. That form is already unambiguous, does not need backend registration, and avoids treating process environment as a network-style URI authority.
 
 SQLite-backed or other local stores are not part of the first migration table. If retained later, add a provider-specific scheme rather than placing them under `vault://`.
 
@@ -112,12 +112,12 @@ Operators can rewrite known aliases in-place or in CI with:
 sbproxy config migrate sb.yml --out sb.migrated.yml
 ```
 
-The migration helper rewrites `vault://aws/...` to `awssm://aws/...`,
-`vault://k8s/...` to `k8ssecret://k8s/...`, `vault://file/...` to
-`secretfile://file/...`, and `vault://env/NAME` to `${NAME}`.
-`vault://hashi/...` remains syntactically unchanged because HashiCorp
-Vault owns `vault://` after the migration, but the runtime still logs
-the deprecation warning during the window.
+The migration helper rewrites legacy AWS aliases to `awssm://...`,
+Kubernetes aliases to `k8ssecret://...`, file aliases to
+`secretfile://...`, and environment aliases to `${NAME}`. Legacy
+HashiCorp aliases remain syntactically valid because HashiCorp Vault
+owns `vault://` after the migration, but the runtime still logs the
+deprecation warning during the window.
 
 After the window, remove the shim and reject legacy umbrella references during config validation.
 
@@ -178,7 +178,7 @@ auth:
 
 ## Implementation Notes
 
-WOR-1460 should update `VaultRef` so it carries at least:
+`VaultRef` carries:
 
 * `scheme` or provider type.
 * `backend` from the URI authority.
@@ -187,4 +187,4 @@ WOR-1460 should update `VaultRef` so it carries at least:
 * extra query parameters.
 * a legacy marker for the compatibility shim.
 
-WOR-1462 should own the accept-with-warning shim for old `vault://<alias>` references. WOR-1463 should update `docs/secrets.md`, `docs/configuration.md`, examples, and generated reference text to use this table.
+The runtime accepts old `vault://<alias>` references with a warning during the deprecation window. Public docs, examples, and generated reference text use the provider-specific scheme table above.

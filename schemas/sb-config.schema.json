@@ -1812,7 +1812,7 @@
       }
     },
     "CredentialBlock": {
-      "description": "Canonical credentials block. Sits under `proxy.credentials`, `tenants[].credentials`, or `origins[].credentials`. A request resolves matching credentials by walking origin -> tenant -> proxy scopes; the first scope that produces a match for the request's principal serves the credential.\n\nThe credential carries:\n\n* Which provider produces it (`type`, `provider`). * Where the secret material lives (`key`, a `vault://` / `${ENV}` / `file:` / `secret:` reference). * Which inbound principals can use it (`principals` selectors). * Per-credential attribution metadata (`attrs`). * Allow / deny model lists that stack on top of the origin-level allowlist (most-restrictive wins). * Per-credential sub-policies (rate limit, PII redaction, ...).",
+      "description": "Canonical credentials block. Sits under `proxy.credentials`, `tenants[].credentials`, or `origins[].credentials`. A request resolves matching credentials by walking origin -> tenant -> proxy scopes; the first scope that produces a match for the request's principal serves the credential.\n\nThe credential carries:\n\n* Which provider produces it (`type`, `provider`). * Where the secret material lives (`key`, a provider-specific secret reference such as `vault://`, `awssm://`, `gcpsm://`, `k8ssecret://`, `secretfile://`, or `secret://`, or a legacy `${ENV}` / `file:` / `secret:` reference). * Which inbound principals can use it (`principals` selectors). * Per-credential attribution metadata (`attrs`). * Allow / deny model lists that stack on top of the origin-level allowlist (most-restrictive wins). * Per-credential sub-policies (rate limit, PII redaction, ...).",
       "type": "object",
       "required": [
         "name",
@@ -1836,7 +1836,7 @@
           ]
         },
         "key": {
-          "description": "Secret material reference (`vault://...`, `${ENV}`, `file:`, `secret:`). The resolver dispatches at runtime; the config parser carries it as a string.",
+          "description": "Secret material reference. Provider-specific schemes include `vault://`, `awssm://`, `gcpsm://`, `k8ssecret://`, `secretfile://`, and `secret://`; legacy `${ENV}`, `file:`, and `secret:` forms also remain valid. The resolver dispatches at runtime; the config parser carries it as a string.",
           "default": null,
           "type": [
             "string",
@@ -3803,7 +3803,7 @@
           "type": "boolean"
         },
         "signing_key": {
-          "description": "Ed25519 signing key, hex-encoded 32-byte seed. Operators generate one with `openssl rand -hex 32` or read it from a secret store (the `vault://` reference syntax is honoured by the secret-resolver pass at config-load time, mirroring how other key-material fields work).",
+          "description": "Ed25519 signing key, hex-encoded 32-byte seed. Operators generate one with `openssl rand -hex 32` or read it from a secret store. The secret-resolver pass honours provider-specific references at config-load time, mirroring how other key-material fields work.",
           "type": "string"
         },
         "key_id": {
@@ -3972,7 +3972,7 @@
           "type": "string"
         },
         "password_hash": {
-          "description": "Argon2id hash of the password (PHC string format, as produced by `argon2 -t 3 -m 65536 -p 4 -i`). The proxy verifies with the same parameters; supports `vault://` references via the secret-resolver pass.",
+          "description": "Argon2id hash of the password (PHC string format, as produced by `argon2 -t 3 -m 65536 -p 4 -i`). The proxy verifies with the same parameters; supports secret references via the secret-resolver pass.",
           "type": "string"
         }
       }
@@ -4085,7 +4085,7 @@
           ]
         },
         "signing_key_hex": {
-          "description": "Optional 32-byte Ed25519 private seed, hex-encoded (64 hex chars). When set, the directory and agent-card HTTP responses are self-signed per RFC 9421 over `(\"content-digest\")` with `tag=\"web-bot-auth\"` and `keyid=key_id`. Verifiers can then confirm the body they fetched was emitted by the holder of the key the directory advertises, closing the trust loop without relying solely on TLS. Absent leaves the responses unsigned; the Web Bot Auth IETF draft permits both shapes and verifiers MAY treat unsigned directories as lower-trust. The secret-resolver pass honours `vault://` references at config load so the raw seed never has to live in the YAML.",
+          "description": "Optional 32-byte Ed25519 private seed, hex-encoded (64 hex chars). When set, the directory and agent-card HTTP responses are self-signed per RFC 9421 over `(\"content-digest\")` with `tag=\"web-bot-auth\"` and `keyid=key_id`. Verifiers can then confirm the body they fetched was emitted by the holder of the key the directory advertises, closing the trust loop without relying solely on TLS. Absent leaves the responses unsigned; the Web Bot Auth IETF draft permits both shapes and verifiers MAY treat unsigned directories as lower-trust. The secret-resolver pass honours secret references at config load so the raw seed never has to live in the YAML.",
           "default": null,
           "type": [
             "string",

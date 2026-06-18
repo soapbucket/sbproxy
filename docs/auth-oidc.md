@@ -31,8 +31,8 @@ origins:
       jwks_uri:               https://idp.example.com/.well-known/jwks.json
       issuer:                 https://idp.example.com/
       client_id:              sbproxy-app-example-com
-      client_secret:          vault://idp/client_secret
-      cookie_secret:          vault://oidc/cookie_secret
+      client_secret:          vault://primary/secret/data/oidc/client?key=client_secret
+      cookie_secret:          vault://primary/secret/data/oidc/cookie?key=cookie_secret
       scope:                  "openid email profile"
 ```
 
@@ -77,8 +77,8 @@ against the session secret is closed.
 | `jwks_uri` | URL | (required) | IdP's JWKS endpoint. Fetched through the same `JwksCache` the `jwt` provider uses, so the keys are cached across origins. |
 | `issuer` | URL | (required) | Expected `iss` on the ID token. Pinned by config so a rogue token from a different IdP (even one signed by a key pulled from `jwks_uri`) is rejected. |
 | `client_id` | string | (required) | OAuth client ID. Sent on the auth redirect and matched against the ID token `aud`. |
-| `client_secret` | string | (required) | OAuth client secret. Sent over Basic on the token-endpoint POST. Supports `vault://` references. |
-| `cookie_secret` | string | (required) | 32+ byte secret used as the HKDF IKM for the session + transaction cookie keys. Supports `vault://`. Rotating this invalidates every outstanding session and tx cookie. |
+| `client_secret` | string | (required) | OAuth client secret. Sent over Basic on the token-endpoint POST. Supports secret references. |
+| `cookie_secret` | string | (required) | 32+ byte secret used as the HKDF IKM for the session + transaction cookie keys. Supports secret references. Rotating this invalidates every outstanding session and tx cookie. |
 | `redirect_path` | path | `/oidc/callback` | Path the IdP redirects back to. Must be one of the URIs you registered with the IdP under `redirect_uris`. |
 | `logout_path` | path | `/oidc/logout` | Path that triggers RP-initiated logout. |
 | `end_session_endpoint` | URL | unset | IdP's `end_session_endpoint`. When set, `/oidc/logout` deletes the session cookie and 302's to the OP so the IdP terminates its own session too. When unset, `/oidc/logout` only deletes the cookie and 302's to `post_logout_redirect_default`. |

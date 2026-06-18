@@ -19,7 +19,7 @@
 //!   URL composition.
 //! * Path shape: `<secret-name>/<data-key>` (relative) or
 //!   `<namespace>/<secret-name>/<data-key>` (when the operator's
-//!   `vault://k8s/...` reference encodes the namespace explicitly).
+//!   `k8ssecret://...` reference encodes the namespace explicitly).
 //! * Cache TTL: 5 minutes default, configurable per backend.
 //! * Honours the secret's `data` (base64-encoded) and `stringData`
 //!   (plaintext) shapes; `data` keys are decoded automatically.

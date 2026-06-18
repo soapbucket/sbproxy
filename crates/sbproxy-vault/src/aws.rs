@@ -89,7 +89,7 @@ pub struct AwsSecretsManagerConfig {
 #[derive(Debug, Clone)]
 pub enum AwsAuth {
     /// Static access keys. Operator resolves them from the config's
-    /// secret reference (env var, file, `vault://env/...`).
+    /// secret reference, such as `${ENV_VAR}` or `file:`.
     StaticKeys {
         /// AWS access key id.
         access_key_id: String,
