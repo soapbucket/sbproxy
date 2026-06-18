@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
-# Upstream connect-error retries.
+# Upstream retries.
 #
 # When the proxy cannot establish a TCP/TLS connection to the upstream
 # (DNS failure, refused, unreachable, TLS handshake fail), Pingora
@@ -9,10 +9,11 @@
 # reported to the outlier detector so the next attempt picks a
 # different target.
 #
-# Status-code retries (e.g. retry on 502/503) are not yet wired
-# because they require buffering the upstream response. Connect-error
-# / timeout retries cover the common case (rolling restarts, transient
-# DNS failures, and momentarily unreachable targets).
+# Status-code retries (e.g. retry on 502/503) are decided after
+# upstream response headers arrive and before downstream headers are
+# written. Only safe/idempotent requests with replayable bodies are
+# retried; other matches pass through with
+# x-sbproxy-retry-skip-reason.
 #
 # Backoff doubles with each attempt and is capped at 5s.
 #
@@ -37,4 +38,6 @@ origins:
         retry_on:
           - connect_error
           - timeout
+          - 502
+          - 503
         backoff_ms: 100

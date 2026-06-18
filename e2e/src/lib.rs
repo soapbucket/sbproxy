@@ -26,6 +26,7 @@ use std::io::{Read as IoRead, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -633,6 +634,20 @@ impl MockUpstream {
         Self::start_full(status, None, reply_bytes, Vec::new())
     }
 
+    /// Start a mock upstream that replies with the supplied status/body
+    /// sequence. Once the sequence is exhausted, the final response is
+    /// repeated for later requests.
+    pub fn start_sequence(responses: Vec<(u16, serde_json::Value)>) -> anyhow::Result<Self> {
+        if responses.is_empty() {
+            anyhow::bail!("mock upstream sequence must contain at least one response");
+        }
+        let mut encoded = Vec::with_capacity(responses.len());
+        for (status, body) in responses {
+            encoded.push((status, serde_json::to_vec(&body)?));
+        }
+        Self::start_sequence_full(encoded, "application/json".to_string())
+    }
+
     /// WOR-1133: start a mock upstream that replies with a raw byte
     /// body and an explicit `Content-Type` (200). Useful for testing
     /// binary content-types (e.g. `image/png`) that the compression
@@ -680,6 +695,58 @@ impl MockUpstream {
                 let body = reply_bytes.clone();
                 let hdrs = extra.clone();
                 let ct = content_type.clone();
+                std::thread::spawn(move || {
+                    let _ = handle_mock_conn(stream, cap, body, status, ct, hdrs);
+                });
+            }
+        });
+
+        Ok(Self {
+            port,
+            captured,
+            shutdown,
+            join: Some(join),
+        })
+    }
+
+    fn start_sequence_full(
+        responses: Vec<(u16, Vec<u8>)>,
+        content_type: String,
+    ) -> anyhow::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(false)?;
+        let port = listener.local_addr()?.port();
+        let captured: Arc<Mutex<Vec<CapturedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = Arc::new(Mutex::new(false));
+
+        let cap_clone = captured.clone();
+        let shut_clone = shutdown.clone();
+        let responses = Arc::new(responses);
+        let next = Arc::new(AtomicUsize::new(0));
+        let extra = Arc::new(Vec::new());
+
+        let join = std::thread::spawn(move || {
+            listener
+                .set_nonblocking(false)
+                .expect("listener nonblocking config");
+            for incoming in listener.incoming() {
+                if *shut_clone.lock().unwrap() {
+                    break;
+                }
+                let stream = match incoming {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let cap = cap_clone.clone();
+                let seq = responses.clone();
+                let idx = next.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = seq
+                    .get(idx)
+                    .or_else(|| seq.last())
+                    .expect("non-empty sequence")
+                    .clone();
+                let ct = content_type.clone();
+                let hdrs = extra.clone();
                 std::thread::spawn(move || {
                     let _ = handle_mock_conn(stream, cap, body, status, ct, hdrs);
                 });

@@ -78,7 +78,7 @@ origins:
         ipv6: true
       retry:
         max_attempts: 3
-        retry_on: [connect_error, timeout]
+        retry_on: [connect_error, timeout, 502, 503]
         backoff_ms: 100
 
     policies:

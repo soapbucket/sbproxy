@@ -1,6 +1,6 @@
 # Kubernetes gateway pattern
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-06-18*
 
 Realistic config when SBproxy runs behind a Kubernetes Ingress (or any cluster-edge load balancer) and proxies to backend Pods that scale up and down independently. `trusted_proxies` honours XFF only from cluster-internal source ranges and rejects spoofed XFF from anywhere else. `service_discovery` re-resolves the upstream hostname every `refresh_secs` so endpoint rotation is picked up automatically without restarting the proxy. `host_override` sends the Service hostname to the upstream when Pods route by Host header for multi-tenant or vhost dispatch. `correlation_id` threads `X-Request-Id` through the proxy, upstream, response, and webhooks so trace IDs survive the cluster boundary. `concurrent_limit` keyed by IP protects upstream Pods from a thundering herd. The Ingress, K8s Operator, and HTTPRoute fixtures from `docs/kubernetes.md` produce this exact shape on the dataplane.
 
@@ -46,7 +46,7 @@ curl -i -H 'Host: api.example.com' \
 - `proxy.correlation_id` - honour inbound `X-Request-Id`, generate when absent, echo on response
 - `service_discovery` on a Service hostname so endpoint rotation is picked up automatically
 - `host_override` so the upstream sees the Service hostname, not the public Host header
-- `retry` on `connect_error` / `timeout` with bounded attempts and backoff
+- `retry` on `connect_error`, `timeout`, and numeric status codes with bounded attempts and backoff
 - `concurrent_limit` keyed by IP so one client cannot exhaust upstream concurrency
 
 ## See also

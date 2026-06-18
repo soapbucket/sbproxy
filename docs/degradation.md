@@ -1,6 +1,6 @@
 # Dependency degradation matrix
 
-*Last modified: 2026-05-03*
+*Last modified: 2026-06-18*
 
 What happens when each dependency that SBproxy talks to is unavailable, and how the proxy degrades while it heals.
 
@@ -34,7 +34,7 @@ What happens when each dependency that SBproxy talks to is unavailable, and how 
 * **Active health checks** mark a target unhealthy after `unhealthy_threshold` consecutive probe failures and healthy again after `healthy_threshold` successes.
 * **Outlier detection** ejects targets whose error rate over `window_secs` crosses `threshold` (5xx + connect failures count).
 * **Circuit breaker** trips on `failure_threshold` consecutive failures and recovers via `success_threshold` HalfOpen probes.
-* **Retries** rerun `upstream_peer` on connect-error / timeout. For load balancers the failed target is reported to outlier and breaker so the next attempt picks a different healthy peer.
+* **Retries** rerun `upstream_peer` on connect-error, timeout, or configured response status codes such as `502` and `503`. For load balancers the failed target is reported to outlier and breaker so the next attempt picks a different healthy peer.
 
 When every target is ejected at once, the LB falls back to the unfiltered list rather than failing the client.
 
@@ -48,7 +48,7 @@ action:
   type: load_balancer
   retry:
     max_attempts: 3
-    retry_on: [connect_error, timeout]
+    retry_on: [connect_error, timeout, 502, 503]
     backoff_ms: 100
   circuit_breaker:
     failure_threshold: 5

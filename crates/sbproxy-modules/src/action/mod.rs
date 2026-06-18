@@ -37,7 +37,7 @@ pub use websocket::*;
 use std::collections::HashMap;
 
 use sbproxy_plugin::ActionHandler;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 /// Action handler - enum dispatch for built-in types.
 /// Each variant holds its compiled config inline (no Box indirection).
@@ -201,10 +201,9 @@ fn default_sd_ipv6() -> bool {
 /// Upstream retry policy attached to a proxy or load_balancer action.
 ///
 /// When `max_attempts > 0`, the proxy retries the request on a
-/// retryable failure (connect error, idempotent timeout) up to
-/// `max_attempts` total attempts. Retries on response status codes are
-/// out of scope for this initial cut because they require buffering
-/// the upstream response.
+/// retryable failure (connect error, idempotent timeout, or a
+/// configured upstream response status) up to `max_attempts` total
+/// attempts.
 #[derive(Debug, Deserialize, Clone)]
 pub struct RetryConfig {
     /// Maximum total request attempts (including the original). A
@@ -215,9 +214,12 @@ pub struct RetryConfig {
     ///   * `"connect_error"`: TCP connect failure
     ///   * `"timeout"`: connect or idle timeout
     ///
-    /// Status-code retries (e.g. `502`, `503`) are accepted but not
-    /// yet implemented in this cut.
-    #[serde(default = "default_retry_on")]
+    /// Numeric status codes may be written as YAML numbers
+    /// (`retry_on: [502]`) or strings (`retry_on: ["502"]`).
+    #[serde(
+        default = "default_retry_on",
+        deserialize_with = "deserialize_retry_on"
+    )]
     pub retry_on: Vec<String>,
     /// Base backoff in milliseconds before the next attempt. Doubled
     /// on each retry (capped at 5s) to avoid thundering herds against
@@ -248,6 +250,27 @@ fn default_retry_backoff_ms() -> u64 {
     100
 }
 
+fn deserialize_retry_on<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RetryOnValue {
+        String(String),
+        Number(u16),
+    }
+
+    let values = Vec::<RetryOnValue>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .map(|value| match value {
+            RetryOnValue::String(s) => s,
+            RetryOnValue::Number(n) => n.to_string(),
+        })
+        .collect())
+}
+
 impl RetryConfig {
     /// Returns true when retries are actually enabled (more than one
     /// attempt allowed).
@@ -261,11 +284,43 @@ impl RetryConfig {
         self.retry_on.iter().any(|s| s.eq_ignore_ascii_case(cond))
     }
 
+    /// Returns true when `retry_on` includes the given upstream
+    /// response status code.
+    pub fn allows_status(&self, status: u16) -> bool {
+        self.retry_on
+            .iter()
+            .filter_map(|s| s.trim().parse::<u16>().ok())
+            .any(|configured| configured == status)
+    }
+
     /// Backoff delay in milliseconds for the given attempt number
     /// (zero-based). Doubles with each attempt and caps at 5s.
     pub fn backoff_for_attempt(&self, attempt: u32) -> u64 {
         let scaled = self.backoff_ms.saturating_mul(1u64 << attempt.min(5));
         scaled.min(5_000)
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::RetryConfig;
+
+    #[test]
+    fn retry_on_accepts_numeric_status_codes() {
+        let cfg: RetryConfig = serde_yaml::from_str(
+            r#"
+max_attempts: 3
+retry_on: [connect_error, 502, "503"]
+backoff_ms: 10
+"#,
+        )
+        .expect("retry config");
+
+        assert!(cfg.allows("connect_error"));
+        assert!(cfg.allows_status(502));
+        assert!(cfg.allows_status(503));
+        assert!(!cfg.allows_status(504));
+        assert_eq!(cfg.retry_on, ["connect_error", "502", "503"]);
     }
 }
 

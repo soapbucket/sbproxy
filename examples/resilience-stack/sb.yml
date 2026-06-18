@@ -18,10 +18,11 @@
 #     for fast isolation, recovers via probe successes. Catches
 #     "the pod is hard down right now."
 #
-#   * Connect-error retries - on TCP connect failure / timeout, the
-#     proxy automatically tries the next target in the LB pool. The
-#     failed target feeds outlier and breaker so subsequent requests
-#     skip it without paying the connect-fail latency again.
+#   * Upstream retries - on TCP connect failure, timeout, or configured
+#     status codes, the proxy automatically tries the next target in
+#     the LB pool. The failed target feeds outlier and breaker so
+#     subsequent requests skip it without paying the same failure
+#     latency again.
 #
 # Each signal is independent. Either of outlier, breaker, or active
 # health check ejects a target from `select_target`. With every
@@ -53,6 +54,8 @@ origins:
         retry_on:
           - connect_error
           - timeout
+          - 502
+          - 503
         backoff_ms: 100
       circuit_breaker:
         failure_threshold: 5

@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-06-17*
+*Last modified: 2026-06-18*
 
 The complete configuration reference for SBproxy. Every option, every field, every action type is documented here with real-world examples you can copy-paste and run.
 
@@ -3138,7 +3138,7 @@ See [example 75](../examples/request-mirror/sb.yml).
 
 ## Upstream retries
 
-When an upstream connection fails (TCP refused, DNS failure, TLS handshake error, or connect timeout), the proxy can retry the request automatically.
+When an upstream connection fails (TCP refused, DNS failure, TLS handshake error, or connect timeout), or when an upstream response returns a configured status code, the proxy can retry the request automatically.
 
 ```yaml
 origins:
@@ -3151,16 +3151,20 @@ origins:
         retry_on:
           - connect_error
           - timeout
+          - 502
+          - 503
         backoff_ms: 100
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_attempts` | int | `1` | Total request attempts including the original. `1` disables retries. |
-| `retry_on` | array | `[connect_error, timeout]` | Retry conditions. Currently honoured: `connect_error`, `timeout`. Status-code retries (`502`, `503`, ...) are accepted but not yet wired in this cut because they require buffering the upstream response. |
+| `retry_on` | array | `[connect_error, timeout]` | Retry conditions. Recognized values include `connect_error`, `timeout`, and numeric upstream status codes such as `502` or `503`. Status codes may be written as YAML numbers or strings. |
 | `backoff_ms` | int | `100` | Base backoff before the next attempt. Doubles on each retry, capped at 5000ms. |
 
 `retry` is accepted on both `proxy` and `load_balancer` actions. For `load_balancer`, a failed target is reported to the outlier detector and circuit breaker so the next retry attempt selects a different healthy peer rather than retrying the same dead target.
+
+Status-code retries are decided after upstream response headers arrive and before any downstream response headers are written. The proxy only replays methods that are safe or idempotent by HTTP semantics: `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, and `DELETE`. A request with a body is replayed only after the downstream body has fully arrived and Pingora's retry buffer still contains the full body. Non-idempotent methods such as `POST` and `PATCH`, still-streaming bodies, and bodies larger than the retry buffer pass through unchanged. When a configured status retry is skipped, the response carries `x-sbproxy-retry-skip-reason` with one of `non_idempotent_method`, `streaming_body`, `body_too_large`, `body_unavailable`, or `max_attempts_exhausted`.
 
 See [example 76](../examples/upstream-retries/sb.yml).
 
@@ -3761,7 +3765,7 @@ action:
   url: https://upstream.example/api
   host_override: api.upstream.example       # rewrite the upstream Host
   disable_via_header: true                  # any of the disable_*_header flags
-  retry: { ... }                            # connect-error retry policy
+  retry: { ... }                            # upstream retry policy
 ```
 
 `load_balancer` actions accept an `outlier_detection` block at the action level and per-target `health_check`, `host_override`, and `disable_*_header` flags inside each target.
