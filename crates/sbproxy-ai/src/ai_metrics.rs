@@ -124,7 +124,10 @@ static AI_OUTPUT_THROUGHPUT: LazyLock<HistogramVec> = LazyLock::new(|| {
 // non-success outcome back to a named provider (transport error,
 // timeout, upstream 4xx/5xx, parse failure). The dashboard groups by
 // `provider`; `error_kind` is intended for ad-hoc drill-downs and
-// should stay low cardinality (handful of stable strings).
+// should stay low cardinality (handful of stable strings). The AI
+// gateway dispatch path uses the same stable categories it records on
+// span `error.type`, such as `rate_limited`, `content_filter`,
+// `upstream_5xx`, and `timeout`.
 static AI_PROVIDER_ERRORS: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new(
@@ -619,9 +622,9 @@ pub fn record_output_throughput(provider: &str, model: &str, tokens_per_second: 
 /// Record a per-provider error.
 ///
 /// `error_kind` is a short, low-cardinality label (e.g. `transport`,
-/// `timeout`, `http_4xx`, `http_5xx`, `parse`). Free-form upstream
-/// strings should be mapped to one of these stable buckets before
-/// being passed in.
+/// `timeout`, `rate_limited`, `content_filter`, `upstream_5xx`,
+/// `http_4xx`, `http_5xx`, `parse`). Free-form upstream strings should
+/// be mapped to one of these stable buckets before being passed in.
 pub fn record_provider_error(provider: &str, error_kind: &str) {
     AI_PROVIDER_ERRORS
         .with_label_values(&[provider, error_kind])

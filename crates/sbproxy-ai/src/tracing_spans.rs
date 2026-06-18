@@ -369,10 +369,16 @@ pub mod error_type {
     pub const GUARDRAIL_BLOCKED: &str = "guardrail_blocked";
     /// The provider returned HTTP 429 (rate limited).
     pub const RATE_LIMITED: &str = "rate_limited";
-    /// The provider returned a 5xx server error.
+    /// A generic provider or transport failure that does not fit a narrower class.
     pub const PROVIDER_ERROR: &str = "provider_error";
     /// The provider's content filter rejected the request or response.
     pub const CONTENT_FILTER: &str = "content_filter";
+    /// An AI spend or quota budget blocked the request before dispatch.
+    pub const BUDGET_EXCEEDED: &str = "budget_exceeded";
+    /// The provider returned a 5xx server error.
+    pub const UPSTREAM_5XX: &str = "upstream_5xx";
+    /// The upstream request or response stream timed out.
+    pub const TIMEOUT: &str = "timeout";
 }
 
 /// Mark an AI span as failed (WOR-1231).
@@ -775,6 +781,19 @@ mod tests {
         let span = find_span(&spans, "ai.request");
         assert_field(span, "otel.status_code", "ERROR");
         assert_field(span, "error.type", "guardrail_blocked");
+        assert_field(span, "otel.status_message", "blocked by input guardrail");
+    }
+
+    /// WOR-1215: the stable AI error taxonomy includes each failure
+    /// category the dispatch path records on `error.type`.
+    #[test]
+    fn error_type_constants_cover_ai_failure_taxonomy() {
+        assert_eq!(error_type::GUARDRAIL_BLOCKED, "guardrail_blocked");
+        assert_eq!(error_type::RATE_LIMITED, "rate_limited");
+        assert_eq!(error_type::CONTENT_FILTER, "content_filter");
+        assert_eq!(error_type::BUDGET_EXCEEDED, "budget_exceeded");
+        assert_eq!(error_type::UPSTREAM_5XX, "upstream_5xx");
+        assert_eq!(error_type::TIMEOUT, "timeout");
     }
 
     /// WOR-1228: prompt / completion content lands on the OpenInference
