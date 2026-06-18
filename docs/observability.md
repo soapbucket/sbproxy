@@ -622,10 +622,17 @@ The AI request span (`ai.request`) follows the OpenTelemetry GenAI semantic conv
 | Tokens (with cache + reasoning split) | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read_tokens`, `gen_ai.usage.cache_write_tokens`, `gen_ai.usage.reasoning_tokens` | `llm.token_count.prompt`, `llm.token_count.completion`, `llm.token_count.total` |
 | Derived USD cost | `sbproxy.ai.cost_usd_micros`, `gen_ai.usage.cost` | `llm.usage.total_cost` |
 | Pricing catalog revision | `sbproxy.ai.pricing_version` | n/a |
+| Content (opt-in) | role-aware `gen_ai.*.message` span events | `input.value`, `output.value`, `llm.input_messages.*`, `llm.output_messages.*` |
 | Failure | `otel.status_code = ERROR` plus `error.type` (`guardrail_blocked`, `rate_limited`, `provider_error`, `content_filter`) | n/a |
 | Tenant | `sbproxy.tenant_id` | n/a |
 
 Token counting happens at the proxy (not trusted from the upstream's self-report), cost is derived from the catalog stamped in `sbproxy.ai.pricing_version`, and the exact span value is `sbproxy.ai.cost_usd_micros` in micro-USD (`1e-6` USD). The GenAI attribute set is pinned by a conformance test (semconv 1.36.0) so emitted spans cannot silently drift off-spec.
+
+Prompt and completion content capture is disabled unless the AI origin sets
+`trace_content: true`. When enabled, content is redacted with the secret
+redactor and the origin PII redactor when configured, capped at 8 KiB per
+captured value, and truncated with `...[truncated]`; streaming completions are
+assembled from forwarded chunks before export.
 
 #### Compatible backends
 

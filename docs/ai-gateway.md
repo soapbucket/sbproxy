@@ -887,6 +887,15 @@ Already covered above under [Structured output](#structured-output). Shape and v
 
 The gateway records provider, model, token counts, and estimated cost for every AI request and exposes them through Prometheus metrics (see below). Direct response headers for these fields are not emitted today.
 
+Trace content capture is opt-in per AI origin with `trace_content: true`.
+When enabled, the request span records redacted prompt and completion text as
+OpenInference `input.value` / `output.value` attributes and emits role-aware
+message events for trace backends such as Phoenix and Langfuse. The capture is
+off by default; every captured value runs through the secret redactor, the
+origin's configured PII redactor when present, and an 8 KiB payload cap with a
+`...[truncated]` marker. Streaming responses are assembled from forwarded
+chunks before the completion is recorded.
+
 ## Token usage metrics
 
 The proxy exposes aggregate AI usage as Prometheus metrics. When `telemetry.bind_port` is configured, the following counters and gauges are available at `/metrics` under the `sbproxy_ai_*` namespace:
