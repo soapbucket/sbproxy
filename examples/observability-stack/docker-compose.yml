@@ -1,8 +1,8 @@
 # Reference observability stack for SBproxy.
 #
 # Operators, evaluators, and the local examples smoke runner consume this
-# exact compose file. Image tags are pinned to a specific
-# minor release so a `:latest` rebase upstream cannot change CI behavior.
+# exact compose file. Image tags are pinned where practical; vendor-supported
+# major/dev tags are used where upstream self-hosting recipes depend on them.
 #
 # Bring up:    docker compose up -d
 # Tear down:   docker compose down -v
@@ -116,6 +116,9 @@ services:
       - "4328:4318"   # OTLP HTTP (host -> collector)
     volumes:
       - ./otel-collector/config.yaml:/etc/otel-collector/config.yaml:ro
+    environment:
+      # Matches the LANGFUSE_INIT_PROJECT_* keys seeded below.
+      - LANGFUSE_OTEL_BASIC_AUTH=${LANGFUSE_OTEL_BASIC_AUTH:-bGZfcGtfc2Jwcm94eV9yZWZlcmVuY2U6bGZfc2tfc2Jwcm94eV9yZWZlcmVuY2U=}
     depends_on:
       prometheus:
         condition: service_healthy
@@ -123,6 +126,8 @@ services:
         condition: service_started
       loki:
         condition: service_healthy
+      langfuse-web:
+        condition: service_started
     networks:
       - obsnet
 
@@ -134,20 +139,188 @@ services:
   # The collector fans the traces pipeline here in addition to Tempo. UI on
   # 6006; Phoenix exposes an OTLP receiver the collector pushes to.
   phoenix:
-    image: arizephoenix/phoenix:7.0.0
+    image: arizephoenix/phoenix:17.8.1
     container_name: sbproxy_obs_phoenix
     ports:
       - "6006:6006"   # Phoenix UI + OTLP HTTP ingress
     networks:
       - obsnet
 
-  # --- Langfuse (OTLP target, run separately) ---
+  # --- Langfuse: LLM-native trace backend ---
   #
-  # Langfuse v3 self-host needs its own multi-service stack (Postgres +
-  # ClickHouse + Redis + object store), so it is not embedded here. Run
-  # Langfuse from its own compose and point the collector's
-  # `otlphttp/langfuse` exporter at its OTLP endpoint
-  # (`/api/public/otel`). See the README.
+  # Langfuse v3 self-host runs as web + worker containers backed by
+  # Postgres, ClickHouse, Redis, and S3-compatible object storage. The
+  # LANGFUSE_INIT_* values create a local demo org/project/user on first
+  # boot so the collector can ingest OTLP immediately without UI setup.
+  langfuse-web:
+    image: docker.io/langfuse/langfuse:3
+    container_name: sbproxy_obs_langfuse_web
+    restart: unless-stopped
+    depends_on: &langfuse-depends-on
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+    ports:
+      # Grafana owns host port 3000 in this stack.
+      - "3001:3000"
+    environment:
+      <<: &langfuse-env
+        NEXTAUTH_URL: ${LANGFUSE_NEXTAUTH_URL:-http://localhost:3001}
+        DATABASE_URL: postgresql://postgres:postgres@langfuse-postgres:5432/postgres
+        SALT: ${LANGFUSE_SALT:-sbproxy-local-demo-salt}
+        ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+        TELEMETRY_ENABLED: ${LANGFUSE_TELEMETRY_ENABLED:-false}
+        LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: ${LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES:-false}
+        CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+        CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+        CLICKHOUSE_USER: clickhouse
+        CLICKHOUSE_PASSWORD: clickhouse
+        CLICKHOUSE_CLUSTER_ENABLED: "false"
+        LANGFUSE_USE_AZURE_BLOB: "false"
+        LANGFUSE_USE_OCI_NATIVE_OBJECT_STORAGE: "false"
+        LANGFUSE_OCI_AUTH_TYPE: workload_identity
+        LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+        LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+        LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+        LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+        LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+        LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+        LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+        LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+        LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+        LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+        LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+        LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://localhost:9092
+        LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+        LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+        LANGFUSE_S3_BATCH_EXPORT_ENABLED: "false"
+        LANGFUSE_S3_BATCH_EXPORT_BUCKET: langfuse
+        LANGFUSE_S3_BATCH_EXPORT_PREFIX: exports/
+        LANGFUSE_S3_BATCH_EXPORT_REGION: auto
+        LANGFUSE_S3_BATCH_EXPORT_ENDPOINT: http://langfuse-minio:9000
+        LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT: http://localhost:9092
+        LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID: minio
+        LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY: miniosecret
+        LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: "true"
+        REDIS_HOST: langfuse-redis
+        REDIS_PORT: "6379"
+        REDIS_AUTH: myredissecret
+        LANGFUSE_BULLMQ_SKIP_REDIS_VERSION_CHECK: "false"
+        REDIS_TLS_ENABLED: "false"
+        REDIS_TLS_CA: /certs/ca.crt
+        REDIS_TLS_CERT: /certs/redis.crt
+        REDIS_TLS_KEY: /certs/redis.key
+        EMAIL_FROM_ADDRESS: ""
+        SMTP_CONNECTION_URL: ""
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-sbproxy-local-demo-nextauth-secret}
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-sbproxy-reference}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-SBproxy Reference}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-sbproxy-llm}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-SBproxy LLM Traces}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-lf_pk_sbproxy_reference}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-lf_sk_sbproxy_reference}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@sbproxy.local}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-SBproxy Admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-sbproxy-local-admin}
+    networks:
+      - obsnet
+
+  langfuse-worker:
+    image: docker.io/langfuse/langfuse-worker:3
+    container_name: sbproxy_obs_langfuse_worker
+    restart: unless-stopped
+    depends_on: *langfuse-depends-on
+    environment:
+      <<: *langfuse-env
+    networks:
+      - obsnet
+
+  langfuse-clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:25.3
+    container_name: sbproxy_obs_langfuse_clickhouse
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+    networks:
+      - obsnet
+
+  langfuse-minio:
+    image: cgr.dev/chainguard/minio:latest-dev
+    container_name: sbproxy_obs_langfuse_minio
+    restart: unless-stopped
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+    ports:
+      # Prometheus owns host port 9090 in this stack.
+      - "9092:9000"
+      - "127.0.0.1:9093:9001"
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 1s
+      timeout: 5s
+      retries: 5
+      start_period: 1s
+    networks:
+      - obsnet
+
+  langfuse-redis:
+    image: docker.io/redis:7
+    container_name: sbproxy_obs_langfuse_redis
+    restart: unless-stopped
+    command: >
+      --requirepass myredissecret
+      --maxmemory-policy noeviction
+    volumes:
+      - langfuse_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "myredissecret", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+    networks:
+      - obsnet
+
+  langfuse-postgres:
+    image: docker.io/postgres:17
+    container_name: sbproxy_obs_langfuse_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - obsnet
 
 networks:
   obsnet:
@@ -160,3 +333,8 @@ volumes:
   grafana_data:
   tempo_data:
   loki_data:
+  langfuse_postgres_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:
+  langfuse_redis_data:

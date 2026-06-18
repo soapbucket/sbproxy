@@ -71,17 +71,23 @@ exporters:
 
   # Traces -> Arize Phoenix (WOR-1227), the LLM-native backend that renders
   # SBproxy AI spans as full generations. Phoenix accepts OTLP HTTP on 6006.
+  # The x-project-name header pre-provisions/routes traces into a stable
+  # Phoenix project instead of the default bucket.
   otlphttp/phoenix:
     endpoint: http://phoenix:6006
+    headers:
+      x-project-name: "SBproxy LLM Traces"
     tls:
       insecure: true
 
-  # Traces -> Langfuse (run separately, see docker-compose.yml). Uncomment
-  # and set the endpoint + Basic auth header for your Langfuse instance.
-  # otlphttp/langfuse:
-  #   endpoint: http://langfuse:3000/api/public/otel
-  #   headers:
-  #     Authorization: "Basic ${LANGFUSE_OTEL_BASIC_AUTH}"
+  # Traces -> Langfuse, the second LLM-native backend in this stack.
+  # Langfuse accepts OTLP over HTTP only; Basic auth matches the seeded
+  # LANGFUSE_INIT_PROJECT_PUBLIC_KEY/SECRET_KEY from docker-compose.yml.
+  otlphttp/langfuse:
+    endpoint: http://langfuse-web:3000/api/public/otel
+    headers:
+      Authorization: "Basic ${env:LANGFUSE_OTEL_BASIC_AUTH}"
+      x-langfuse-ingestion-version: "4"
 
 # The collector publishes its own self-metrics on :8888 so Prometheus can
 # scrape it directly (see prometheus.yml).
@@ -93,10 +99,10 @@ service:
     traces:
       receivers: [otlp]
       # tail_sampling must run before batch so the keep/drop decision sees
-      # the whole trace. Fans out to Tempo (general traces) and Phoenix
-      # (LLM-native rendering of the AI spans).
+      # the whole trace. Fans out to Tempo (general traces), Phoenix, and
+      # Langfuse (LLM-native rendering of the AI spans).
       processors: [memory_limiter, tail_sampling, batch]
-      exporters: [otlp/tempo, otlphttp/phoenix]
+      exporters: [otlp/tempo, otlphttp/phoenix, otlphttp/langfuse]
     metrics:
       receivers: [otlp]
       processors: [memory_limiter, batch]

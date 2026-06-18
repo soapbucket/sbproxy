@@ -640,14 +640,14 @@ OTLP is vendor-agnostic: point `telemetry.endpoint` at any OTLP-compatible backe
 
 | Backend | Path |
 |---|---|
-| Arize Phoenix | OTLP gRPC; reads `gen_ai.*` and OpenInference `llm.*` |
-| Langfuse | OTLP; reads `gen_ai.*` |
+| Arize Phoenix | OTLP HTTP/gRPC; reads `gen_ai.*`, OpenInference `llm.*`, `input.value`, and `output.value` |
+| Langfuse | OTLP HTTP; reads `gen_ai.*`, OpenInference `input.value` / `output.value`, token usage, and cost fields |
 | Jaeger | OTLP via the OTel Collector |
 | Grafana Tempo | OTLP via the Collector |
 | Datadog | OTLP via the Datadog Agent or Collector |
 | Honeycomb | OTLP direct |
 
-The reference Compose stack under `deploy/observability/` boots an OTel Collector that fans traces out to these backends.
+The reference Compose stack under `examples/observability-stack/` boots an OTel Collector that fans traces out to Tempo, Phoenix, and Langfuse by default. The stack seeds a Phoenix project and a Langfuse project named `SBproxy LLM Traces`, so live AI traffic appears in both LLM-native UIs without manual attribute remapping.
 
 ### Sampling
 
@@ -722,7 +722,7 @@ curl http://localhost:9091/readyz
 
 ## Reference Compose stack
 
-`examples/observability-stack/` boots Prometheus, Grafana, Tempo, Loki, and an OTel Collector with one command:
+`examples/observability-stack/` boots Prometheus, Grafana, Tempo, Loki, Phoenix, Langfuse, and an OTel Collector with one command:
 
 ```bash
 cd examples/observability-stack
@@ -735,6 +735,8 @@ Then open:
 - Prometheus at http://localhost:9090
 - Loki ready endpoint at http://localhost:3100/ready
 - Tempo via Grafana (no first-class UI)
+- Phoenix at http://localhost:6006, project `SBproxy LLM Traces`
+- Langfuse at http://localhost:3001 (login `admin@sbproxy.local` / `sbproxy-local-admin`), project `SBproxy LLM Traces`
 
 Point SBproxy at the stack:
 
@@ -743,11 +745,13 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4327 \
   sbproxy serve --config sb.yml
 ```
 
-The proxy exposes Prometheus metrics on the address configured under the top-level `admin:` block (`admin.enabled: true`, `admin.port: 9090` by default). The reference Compose stack's example config sets `admin.port: 9091` so the Compose Prometheus job can scrape `host.docker.internal:9091`. Override the bind via YAML, not a CLI flag.
+The proxy exposes Prometheus metrics on the address configured in YAML. The reference Compose stack assumes SBproxy exposes `/metrics` on `127.0.0.1:9091`, so the Compose Prometheus job can scrape `host.docker.internal:9091`. Override the bind in YAML for your deployment.
 
-The OTLP endpoint targets the OTel Collector (host port 4327, mapped to the container's 4317). The dashboards from `deploy/dashboards/` are pre-provisioned, so you see metrics, logs, and traces flow as soon as the proxy starts handling requests.
+The OTLP endpoint targets the OTel Collector (host port 4327, mapped to the container's 4317). The collector fans traces to Tempo, Phoenix, and Langfuse, mirrors OTLP metrics to Prometheus, and sends OTLP logs to Loki. The dashboards from `deploy/dashboards/` are pre-provisioned in Grafana, so you see metrics, logs, and traces flow as soon as the proxy starts handling requests.
 
-`docker compose down -v` drops the four named volumes (`prometheus_data`, `grafana_data`, `tempo_data`, `loki_data`) for a fresh start.
+For a full LLM-native smoke test, enable `trace_content: true` on the AI origin and send a chat-completions request through SBproxy. Phoenix and Langfuse render the same generation with prompt, response, provider, model, token split, USD cost, TTFT, latency, and status fields from the emitted `gen_ai.*` and OpenInference attributes/events.
+
+`docker compose down -v` drops the named volumes for Prometheus, Grafana, Tempo, Loki, and Langfuse's Postgres, ClickHouse, MinIO, and Redis storage for a fresh start.
 
 ## See also
 

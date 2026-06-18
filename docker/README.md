@@ -1,5 +1,5 @@
 # Docker Compose Setup
-*Last modified: 2026-04-27*
+*Last modified: 2026-06-18*
 
 This directory contains a Docker Compose stack for running SBproxy locally with a full observability pipeline. The stack includes:
 
@@ -76,6 +76,15 @@ To inspect a trace:
 2. Select **sbproxy** from the Service dropdown
 3. Click **Find Traces**
 4. Click any trace to see the full span waterfall, including upstream latency, policy evaluation, and response handling
+
+## LLM-Native Trace Backends
+
+Jaeger is useful for generic trace debugging, but it does not render `gen_ai.*` and OpenInference `llm.*` spans as LLM generations. For Phoenix and Langfuse, use the reference stack:
+
+    cd ../examples/observability-stack
+    docker compose up -d
+
+That stack starts an OTel Collector, Tempo, Grafana, Phoenix, and Langfuse. Point SBproxy at `http://localhost:4327`; AI origins with `trace_content: true` render prompt, response, model, provider, tokens, USD cost, TTFT, and latency in both Phoenix (`http://localhost:6006`) and Langfuse (`http://localhost:3001`).
 
 ## Testing Auto-TLS Certificate Issuance
 
