@@ -126,7 +126,7 @@ The log carries phase timings (`auth_ms`, `upstream_ttfb_ms`, `response_filter_m
 
 ### Where do traces go?
 
-OTLP exporter, configured via `OTEL_EXPORTER_OTLP_ENDPOINT`. The reference Compose stack at `deploy/observability/` runs an OTel Collector + Tempo + Grafana you can point at for local development.
+OTLP exporter, configured via `OTEL_EXPORTER_OTLP_ENDPOINT`. The reference Compose stack at `examples/observability-stack/` runs an OTel Collector with Tempo, Grafana, Phoenix, and Langfuse for local development.
 
 ## Performance + capacity
 
