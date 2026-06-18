@@ -62,6 +62,28 @@ origins:
     )
 }
 
+/// Build an AI proxy config that routes a Bedrock upstream.
+fn build_bedrock_config(upstream_base: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      providers:
+        - name: bedrock
+          api_key: "stub-key"
+          base_url: "{upstream_base}"
+          allow_private_base_url: true
+          models: [anthropic.claude-3-5-sonnet-20240620-v1:0]
+      routing:
+        strategy: round_robin
+"#
+    )
+}
+
 #[test]
 fn anthropic_native_stream_emits_openai_chat_sse_to_client() {
     let frames = vec![
@@ -187,6 +209,77 @@ fn gemini_native_stream_emits_openai_chat_sse_to_client() {
         body.contains("data: [DONE]"),
         "missing [DONE] from gemini translation: {}",
         truncate(&body)
+    );
+}
+
+#[test]
+fn bedrock_native_stream_emits_openai_chat_sse_to_client() {
+    let frames = vec![
+        "event: messageStart\ndata: {\"role\":\"assistant\"}\n\n".to_string(),
+        "event: contentBlockDelta\ndata: {\"contentBlockIndex\":0,\"delta\":{\"text\":\"bedrock\"}}\n\n"
+            .to_string(),
+        "event: contentBlockDelta\ndata: {\"contentBlockIndex\":0,\"delta\":{\"text\":\" stream\"}}\n\n"
+            .to_string(),
+        "event: messageStop\ndata: {\"stopReason\":\"end_turn\"}\n\n".to_string(),
+        "event: metadata\ndata: {\"usage\":{\"inputTokens\":3,\"outputTokens\":2,\"totalTokens\":5}}\n\n"
+            .to_string(),
+    ];
+    let upstream =
+        MockUpstream::start_sse_raw(frames, "text/event-stream".to_string()).expect("mock");
+    let yaml = build_bedrock_config(&upstream.base_url());
+    let harness = ProxyHarness::start_with_yaml(&yaml).expect("proxy");
+
+    let body = json!({
+        "model": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true,
+    });
+    let resp = harness
+        .post_json("/v1/chat/completions", "ai.localhost", &body, &[])
+        .expect("post");
+    assert_eq!(resp.status, 200);
+    let body = String::from_utf8_lossy(&resp.body).into_owned();
+    assert!(
+        !body.contains("event: messageStart"),
+        "bedrock event markers leaked: {}",
+        truncate(&body)
+    );
+    assert!(
+        !body.contains("contentBlockDelta"),
+        "bedrock block markers leaked: {}",
+        truncate(&body)
+    );
+    assert!(
+        body.contains("\"object\":\"chat.completion.chunk\""),
+        "missing chat.completion.chunk in bedrock translation: {}",
+        truncate(&body)
+    );
+    assert!(
+        body.contains("\"content\":\"bedrock\""),
+        "missing bedrock delta: {}",
+        truncate(&body)
+    );
+    assert!(
+        body.contains("\"content\":\" stream\""),
+        "missing second bedrock delta: {}",
+        truncate(&body)
+    );
+    assert!(
+        body.contains("\"finish_reason\":\"stop\""),
+        "missing finish_reason stop: {}",
+        truncate(&body)
+    );
+    assert!(
+        body.contains("data: [DONE]"),
+        "missing [DONE] from bedrock translation: {}",
+        truncate(&body)
+    );
+
+    let captured = upstream.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0].path,
+        "/model/anthropic.claude-3-5-sonnet-20240620-v1:0/converse"
     );
 }
 
