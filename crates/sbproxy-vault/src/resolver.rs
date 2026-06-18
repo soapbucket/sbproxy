@@ -9,6 +9,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 
 use crate::manager::VaultBackend;
+use crate::vault_ref::{
+    legacy_vault_env_name, legacy_vault_reference_replacement, warn_legacy_vault_reference_once,
+};
 
 /// Behaviour when the vault backend is unavailable and a `secret:` reference
 /// needs to be resolved.
@@ -79,6 +82,11 @@ impl SecretResolver {
     pub fn resolve(&self, value: &str) -> Result<String> {
         if let Some(name) = value.strip_prefix("secret:") {
             self.resolve_secret(name)
+        } else if let Some(var) = legacy_vault_env_name(value) {
+            let replacement =
+                legacy_vault_reference_replacement(value).unwrap_or_else(|| format!("${{{var}}}"));
+            warn_legacy_vault_reference_once(value, &replacement);
+            std::env::var(var).with_context(|| format!("env var {} not set", var))
         } else if value.starts_with("${") && value.ends_with('}') {
             let var = &value[2..value.len() - 1];
             std::env::var(var).with_context(|| format!("env var {} not set", var))
@@ -253,6 +261,23 @@ mod tests {
             "from_environment"
         );
         unsafe { std::env::remove_var("TEST_RESOLVER_ENV") };
+    }
+
+    #[test]
+    fn resolve_legacy_vault_env_reference() {
+        // SAFETY (for both unsafe blocks below): ENV_LOCK serializes the
+        // env-mutating tests in this binary, so `set_var`/`remove_var` never
+        // race a concurrent environment access.
+        let _env = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("TEST_LEGACY_VAULT_ENV", "from_legacy_env") };
+        let resolver = resolver_no_backend();
+        assert_eq!(
+            resolver
+                .resolve("vault://env/TEST_LEGACY_VAULT_ENV")
+                .unwrap(),
+            "from_legacy_env"
+        );
+        unsafe { std::env::remove_var("TEST_LEGACY_VAULT_ENV") };
     }
 
     #[test]
