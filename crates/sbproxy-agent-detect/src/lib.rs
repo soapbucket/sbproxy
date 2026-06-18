@@ -43,8 +43,10 @@ use serde::{Deserialize, Serialize};
 pub mod headless_indicators;
 pub mod http_extractors;
 pub mod loader;
+pub mod onnx;
 pub mod payload_extractors;
 pub mod rules;
+pub mod scorer;
 
 pub use headless_indicators::{extract_headless_indicators, score_headless, HeadlessIndicators};
 pub use http_extractors::{
@@ -53,10 +55,12 @@ pub use http_extractors::{
 pub use loader::{
     ReloadMetrics, ReloadOutcome, RulePackLoader, RELOAD_METRIC_NAME, RELOAD_OUTCOME_LABELS,
 };
+pub use onnx::{OnnxCatBoostScorer, JA4_CATBOOST_FEATURE_COUNT, JA4_CATBOOST_FEATURE_NAMES};
 pub use payload_extractors::{
     count_unique_filesystem_paths, extract_payload_signals, is_stack_trace_shaped,
 };
 pub use rules::{AgentRule, MatchSpec, RulePack, RulePackError};
+pub use scorer::{FallbackAgentScorer, RulePackLoaderScorer};
 
 // --- Public detection shape -------------------------------------------------
 

@@ -727,6 +727,11 @@ pub struct AgentDetectConfig {
     /// operators normally point this at their pack.
     #[serde(default)]
     pub rule_pack_path: Option<String>,
+    /// Path to a CatBoost ONNX model exported with the raw probability
+    /// tensor output. When set, startup loads the model and installs it
+    /// as the fallback scorer behind exact rule-pack matches.
+    #[serde(default)]
+    pub onnx_model_path: Option<String>,
 }
 
 impl AgentDetectConfig {
@@ -2722,6 +2727,7 @@ origins: {}
         let cfg = AgentDetectConfig::default();
         assert!(!cfg.enabled);
         assert!(cfg.rule_pack_path.is_none());
+        assert!(cfg.onnx_model_path.is_none());
     }
 
     #[test]
@@ -2732,6 +2738,7 @@ origins: {}
         let ad = AgentDetectConfig::from_extensions(&cfg.server.extensions);
         assert!(!ad.enabled);
         assert!(ad.rule_pack_path.is_none());
+        assert!(ad.onnx_model_path.is_none());
     }
 
     #[test]
@@ -2743,6 +2750,7 @@ proxy:
     agent_detect:
       enabled: true
       rule_pack_path: /etc/sbproxy/agents.yml
+      onnx_model_path: /etc/sbproxy/ja4-catboost.onnx
 origins: {}
 "#;
         let cfg = sbproxy_config::compile_config(yaml).expect("compile");
@@ -2751,6 +2759,10 @@ origins: {}
         assert_eq!(
             ad.rule_pack_path.as_deref(),
             Some("/etc/sbproxy/agents.yml")
+        );
+        assert_eq!(
+            ad.onnx_model_path.as_deref(),
+            Some("/etc/sbproxy/ja4-catboost.onnx")
         );
     }
 

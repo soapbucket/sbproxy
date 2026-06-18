@@ -109,6 +109,53 @@ The same observations appear as `auth_ms` / `upstream_ttfb_ms` / `response_filte
 
 ---
 
+### Agent detection
+
+#### `sbproxy_agent_detect_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **stable** |
+| Description | Number of agent-detect scorer verdicts emitted by the request pipeline. |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `agent_id` | Matched agent id, or the empty-string sentinel when the scorer produced an anonymous verdict | `claude-code-cli`, `` |
+| `provenance` | Identity provenance tier | `signed`, `unsigned-named`, `unsigned-anonymous` |
+
+---
+
+#### `sbproxy_agent_detect_score`
+
+| Property | Value |
+|---|---|
+| Type | Histogram |
+| Stability | **stable** |
+| Description | Distribution of agent-detect scores, scaled 0-100. |
+
+**Labels:** none.
+
+**Bucket schedule:** `0, 5, 10, 20, 40, 60, 80, 90, 95, 100`.
+
+---
+
+#### `sbproxy_agent_detect_inference_seconds`
+
+| Property | Value |
+|---|---|
+| Type | Histogram |
+| Stability | **stable** |
+| Description | In-process agent-detect scorer latency in seconds. |
+
+**Labels:** none.
+
+**Bucket schedule:** `0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.005, 0.01`.
+
+---
+
 #### `sbproxy_active_connections`
 
 | Property | Value |

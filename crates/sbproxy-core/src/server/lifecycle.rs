@@ -92,9 +92,9 @@ fn install_session_ledger_sink(cfg: &sbproxy_config::types::SessionLedgerConfig)
 /// WOR-1164: (re)install the detection-singleton globals from
 /// `compiled`. Runs at startup AND from the hot-reload path so a SIGHUP
 /// that changed `agent_classes:`, the resolver flags, or
-/// `agent_detect.rule_pack_path` actually takes effect; every slot it
-/// touches is ArcSwap-backed and degrades to a warn on failure rather
-/// than blocking the reload.
+/// `agent_detect.rule_pack_path` / `agent_detect.onnx_model_path`
+/// actually takes effect; every slot it touches is swap-backed and
+/// degrades to a warn on failure rather than blocking the reload.
 fn install_detection_singletons(compiled: &sbproxy_config::CompiledConfig) {
     // --- Wave 3 / G1.4: agent-class resolver ---
     //
@@ -148,31 +148,69 @@ fn install_detection_singletons(compiled: &sbproxy_config::CompiledConfig) {
         }
     }
 
-    // --- WOR-706: agent-detect rule-pack loader ---
+    // --- WOR-706 / WOR-592: agent-detect scorers ---
     //
-    // When `proxy.extensions.agent_detect.enabled` is set with a
-    // `rule_pack_path`, load the ADRF pack and install the loader so
-    // `request_filter` can run the scorer. A load failure (or a missing
-    // path) degrades to no detection (the request_filter block
-    // short-circuits when no loader is installed) rather than blocking
-    // serving, matching the TLS-catalogue block above.
+    // When `proxy.extensions.agent_detect.enabled` is set, install one
+    // trait-object scorer backed by the ADRF rule pack, the CatBoost
+    // ONNX model, or both. A load failure degrades to whichever scorer
+    // did load rather than blocking serving, matching the TLS-catalogue
+    // block above.
     {
         let agent_detect_cfg =
             crate::pipeline::AgentDetectConfig::from_extensions(&compiled.server.extensions);
         if agent_detect_cfg.enabled {
-            match agent_detect_cfg.rule_pack_path.as_deref() {
-                Some(path) => match sbproxy_agent_detect::RulePackLoader::open(path) {
-                    Ok(loader) => reload::set_agent_detect_loader(loader),
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        path = %path,
-                        "failed to load agent-detect rule pack; agent detection disabled",
-                    ),
-                },
-                None => tracing::warn!(
-                    "agent_detect.enabled is set but rule_pack_path is unset; agent detection disabled",
-                ),
+            let rule_scorer: Option<std::sync::Arc<dyn sbproxy_agent_detect::AgentScorer>> =
+                match agent_detect_cfg.rule_pack_path.as_deref() {
+                    Some(path) => match sbproxy_agent_detect::RulePackLoader::open(path) {
+                        Ok(loader) => {
+                            let loader = std::sync::Arc::new(loader);
+                            reload::set_agent_detect_loader_arc(std::sync::Arc::clone(&loader));
+                            Some(std::sync::Arc::new(
+                                sbproxy_agent_detect::RulePackLoaderScorer::new(loader),
+                            ))
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                path = %path,
+                                "failed to load agent-detect rule pack; rule-pack scorer disabled",
+                            );
+                            None
+                        }
+                    },
+                    None => None,
+                };
+            let onnx_scorer: Option<std::sync::Arc<dyn sbproxy_agent_detect::AgentScorer>> =
+                match agent_detect_cfg.onnx_model_path.as_deref() {
+                    Some(path) => match sbproxy_agent_detect::OnnxCatBoostScorer::load(path) {
+                        Ok(scorer) => Some(std::sync::Arc::new(scorer)),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                path = %path,
+                                "failed to load agent-detect ONNX model; ONNX scorer disabled",
+                            );
+                            None
+                        }
+                    },
+                    None => None,
+                };
+
+            match (rule_scorer, onnx_scorer) {
+                (Some(rule), Some(onnx)) => reload::set_agent_detect_scorer(std::sync::Arc::new(
+                    sbproxy_agent_detect::FallbackAgentScorer::new(rule, onnx),
+                )),
+                (Some(rule), None) => reload::set_agent_detect_scorer(rule),
+                (None, Some(onnx)) => reload::set_agent_detect_scorer(onnx),
+                (None, None) => {
+                    reload::clear_agent_detect_scorer();
+                    tracing::warn!(
+                        "agent_detect.enabled is set but no scorer loaded; agent detection disabled",
+                    );
+                }
             }
+        } else {
+            reload::clear_agent_detect_scorer();
         }
     }
 }
@@ -237,10 +275,9 @@ fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<()> {
     }
 
     // WOR-1164: refresh the detection singletons (agent-class resolver,
-    // TLS-fingerprint catalogue + CEL matcher, agent-detect rule-pack
-    // loader) so a reload that changed `agent_classes:`, the resolver
-    // flags, or `agent_detect.rule_pack_path` takes effect. The slots are
-    // ArcSwap-backed, so this is a lock-free swap from the reload thread.
+    // TLS-fingerprint catalogue + CEL matcher, agent-detect scorer) so
+    // a reload that changed `agent_classes:`, the resolver flags, or
+    // `agent_detect.*` takes effect.
     // Runs before `compiled` is moved into the pipeline below.
     install_detection_singletons(&compiled);
 
@@ -718,11 +755,11 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     }
 
     // WOR-1164: install the detection singletons (agent-class resolver,
-    // TLS-fingerprint catalogue + CEL matcher, agent-detect rule-pack
-    // loader). The same helper runs from `reload_from_config_path_inner`
-    // so a SIGHUP that changed `agent_classes:`, the resolver flags, or
-    // `agent_detect.rule_pack_path` swaps the live value (the slots are
-    // ArcSwap-backed) instead of silently keeping the boot-time value.
+    // TLS-fingerprint catalogue + CEL matcher, agent-detect scorer).
+    // The same helper runs from `reload_from_config_path_inner` so a
+    // SIGHUP that changed `agent_classes:`, the resolver flags, or
+    // `agent_detect.*` swaps the live value instead of silently keeping
+    // the boot-time value.
     install_detection_singletons(&compiled);
 
     // --- WOR-201 PR 1b: install policy verdict audit bus ---

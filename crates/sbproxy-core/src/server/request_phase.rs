@@ -629,7 +629,7 @@ pub(super) async fn request_filter(
     // When `proxy.extensions.agent_detect.enabled` is set, build the
     // TLS + HTTP signal bag from the context the pipeline already has
     // (TLS fingerprint stamped above; headers read here) and run the
-    // rule-pack scorer. The verdict lands on `ctx.agent_detection` for
+    // configured scorer. The verdict lands on `ctx.agent_detection` for
     // the scripting bridges (`request.agent.*`, WOR-589) and the
     // `trust_tier` combiner to read. Payload signals need a buffered
     // body and are a follow-up; the TLS + HTTP extractors are cheap and
@@ -638,7 +638,7 @@ pub(super) async fn request_filter(
     {
         let pipeline = reload::current_pipeline();
         if pipeline.agent_detect_config.enabled {
-            if let Some(loader) = reload::agent_detect_loader() {
+            if let Some(scorer) = reload::agent_detect_scorer() {
                 let tls = ctx
                     .tls_fingerprint
                     .as_ref()
@@ -676,14 +676,17 @@ pub(super) async fn request_filter(
                     http: Some(http_signals),
                     payload: None,
                 };
-                // A rule miss is a clean unsigned-anonymous verdict
-                // (score 0), not the absence of a result.
-                let mut detection = loader
-                    .pack()
-                    .evaluate(&signals)
-                    .unwrap_or_else(sbproxy_agent_detect::AgentDetection::unscored);
+                let inference_started = std::time::Instant::now();
+                let mut detection = scorer.score(&signals);
+                let inference_secs = inference_started.elapsed().as_secs_f64();
                 detection.headless_score = headless_score;
                 detection.headless_indicators = headless_names;
+                sbproxy_observe::metrics::record_agent_detect(
+                    detection.agent_id.as_deref(),
+                    detection.provenance.as_str(),
+                    detection.score,
+                    inference_secs,
+                );
                 ctx.agent_detection = Some(detection);
             }
         }

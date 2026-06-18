@@ -258,6 +258,9 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 | `sbproxy_a2a_chain_depth_bucket` | 60 | `route`, `spec`; histogram buckets 1..32 chain hops. Tracks A2A call-graph depth before truncation. |
 | `sbproxy_a2a_denied_total` | 40 | Labels: `route`, `reason` (depth_cap\|policy_block\|loop_detected\|other). Per-request denial counter on the A2A surface. |
 | `sbproxy_agent_budget_decisions_total` | 400 | Labels: `agent_id` (sanitised, capped via the same demotion path as other agent_*) `outcome` (allow\|throttle\|deny). Drives the per-agent budget enforcement audit. |
+| `sbproxy_agent_detect_total` | 3 000 | Labels: `agent_id` (sanitised, empty when anonymous), `provenance` (signed\|unsigned-named\|unsigned-anonymous). Per-request agent-detect scorer verdicts. |
+| `sbproxy_agent_detect_score_bucket` | 11 | Histogram buckets over the 0-100 agent-detect score. No labels. |
+| `sbproxy_agent_detect_inference_seconds_bucket` | 9 | Histogram buckets 50us..10ms for in-process scorer latency. No labels. |
 | `sbproxy_object_authz_violations_total` | 200 | Labels: `origin`, `kind` (bola\|bfla\|tenant_mismatch). Counts BOLA / BFLA / cross-tenant violations the object-authz policy refused. |
 | `sbproxy_waf_persistent_blocks_total` | 600 | Labels: `origin`, `event` (rule_match\|ip_blocklisted\|anomaly_threshold), `key_kind` (ip\|jwt_sub\|api_key\|session). Counts the WAF blocks that landed on the persistent (cross-process) blocklist as opposed to the in-process rate-limit decision path. |
 | `sbproxy_bot_auth_nonce_replay_total` | 50 | Labels: `policy` (sanitised). Counts requests rejected because the Web-Bot-Auth nonce was already seen within the replay window. |

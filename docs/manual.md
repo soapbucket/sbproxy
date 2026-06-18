@@ -630,6 +630,14 @@ Label cardinality is capped by `metrics.max_cardinality_per_label` (default `100
 | `sbproxy_cache_hits_total` | Counter | `hostname`, `result` (`hit`, `miss`) |
 | `sbproxy_ai_tokens_total` | Counter | `hostname`, `provider`, `direction` (`input`, `output`) |
 
+#### Agent detection metrics
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| `sbproxy_agent_detect_total` | Counter | `agent_id`, `provenance` |
+| `sbproxy_agent_detect_score` | Histogram | (none) |
+| `sbproxy_agent_detect_inference_seconds` | Histogram | (none) |
+
 #### Per-origin metrics
 
 | Metric | Type | Labels |
