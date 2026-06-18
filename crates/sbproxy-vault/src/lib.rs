@@ -34,4 +34,7 @@ pub use resolver::{ResolveFallback, SecretResolver};
 pub use rotation::RotationManager;
 pub use scope::{auto_scope, parse_scope, validate_access, SecretScope};
 pub use secret_string::SecretString;
-pub use vault_ref::{looks_like_vault_uri, VaultRef, VaultRefError};
+pub use vault_ref::{
+    looks_like_secret_reference_uri, looks_like_vault_uri, VaultProviderType, VaultRef,
+    VaultRefError,
+};
