@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=../../../schemas/sb-config.schema.json
+#
+# WOR-1226: local semantic-cache sidecar e2e fixture.
+# The test replaces __UPSTREAM__ and __SIDECAR__ with ephemeral local
+# endpoints before starting the proxy.
+
+proxy:
+  http_bind_port: 0
+
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: "stub-key"
+          base_url: "__UPSTREAM__"
+          allow_private_base_url: true
+          models:
+            - gpt-4o
+      routing:
+        strategy: round_robin
+      semantic_cache:
+        enabled: true
+        threshold: 0.6
+        ttl_secs: 60
+        max_entries: 64
+        source: sidecar
+        sidecar:
+          endpoint: "__SIDECAR__"
+          model: all-MiniLM-L6-v2
+          timeout_ms: 2000
