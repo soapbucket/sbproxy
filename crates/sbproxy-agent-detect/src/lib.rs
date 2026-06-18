@@ -9,6 +9,9 @@
 //! scorer consulted. The rest of the proxy reads the struct off the
 //! request context.
 //!
+//! Rule-pack parsing follows the public [ADRF spec] published for
+//! interoperable agent fingerprint rules.
+//!
 //! This is the first slice: the crate skeleton + the public
 //! shapes + the [`AgentScorer`] trait + a default scorer that returns
 //! [`AgentProvenance::UnsignedAnonymous`] with a score of 0. The signal
@@ -32,6 +35,8 @@
 //! - **WOR-591**: payload-shaped signals (filesystem-path leakage,
 //!   stack-trace shape, embedding-burst heuristic).
 //! - **WOR-592**: ONNX CatBoost scorer + Prometheus metrics.
+//!
+//! [ADRF spec]: https://github.com/soapbucket/adrf-spec
 
 use serde::{Deserialize, Serialize};
 
