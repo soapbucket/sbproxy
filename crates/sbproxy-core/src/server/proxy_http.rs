@@ -8,6 +8,125 @@
 
 use super::*;
 
+fn active_action<'a>(pipeline: &'a CompiledPipeline, ctx: &RequestContext) -> Option<&'a Action> {
+    let origin_idx = ctx.origin_idx?;
+    if let Some(fwd_idx) = ctx.forward_rule_idx {
+        pipeline
+            .forward_rules
+            .get(origin_idx)
+            .and_then(|rules| rules.get(fwd_idx))
+            .map(|rule| &rule.action)
+    } else {
+        pipeline.actions.get(origin_idx)
+    }
+}
+
+fn retry_config_for_action(action: &Action) -> Option<&sbproxy_modules::action::RetryConfig> {
+    match action {
+        Action::Proxy(proxy) => proxy.retry.as_ref(),
+        Action::LoadBalancer(lb) => lb.retry.as_ref(),
+        _ => None,
+    }
+}
+
+fn is_status_retry_method(method: &str) -> bool {
+    matches!(
+        method,
+        "GET" | "HEAD" | "OPTIONS" | "TRACE" | "PUT" | "DELETE"
+    )
+}
+
+fn status_retry_skip_reason(session: &mut Session) -> Option<&'static str> {
+    let method = session.req_header().method.as_str();
+    if !is_status_retry_method(method) {
+        return Some("non_idempotent_method");
+    }
+
+    if session.as_mut().is_body_empty() {
+        return None;
+    }
+
+    if !session.as_mut().is_body_done() {
+        return Some("streaming_body");
+    }
+
+    if session.as_ref().retry_buffer_truncated() {
+        return Some("body_too_large");
+    }
+
+    if session.as_ref().get_retry_buffer().is_none() {
+        return Some("body_unavailable");
+    }
+
+    None
+}
+
+async fn maybe_retry_upstream_status(
+    session: &mut Session,
+    upstream_response: &ResponseHeader,
+    ctx: &mut RequestContext,
+) -> Result<()> {
+    let status = upstream_response.status.as_u16();
+    let pipeline = reload::current_pipeline();
+    let Some(action) = active_action(&pipeline, ctx) else {
+        return Ok(());
+    };
+    let Some(cfg) = retry_config_for_action(action) else {
+        return Ok(());
+    };
+    if !cfg.enabled() || !cfg.allows_status(status) {
+        return Ok(());
+    }
+
+    if ctx.retry_count + 1 >= cfg.max_attempts {
+        ctx.status_retry_skip_reason = Some("max_attempts_exhausted");
+        debug!(
+            hostname = %ctx.hostname,
+            upstream_status = %status,
+            attempts = %cfg.max_attempts,
+            "upstream status matched retry_on but max attempts were exhausted"
+        );
+        return Ok(());
+    }
+
+    if let Some(reason) = status_retry_skip_reason(session) {
+        ctx.status_retry_skip_reason = Some(reason);
+        debug!(
+            hostname = %ctx.hostname,
+            upstream_status = %status,
+            reason = %reason,
+            "upstream status matched retry_on but request is not replayable"
+        );
+        return Ok(());
+    }
+
+    let backoff_ms = cfg.backoff_for_attempt(ctx.retry_count);
+    if let (Action::LoadBalancer(lb), Some(target_idx)) = (action, ctx.lb_target_idx) {
+        lb.record_target_failure(target_idx);
+        lb.record_breaker_failure(target_idx);
+        ctx.lb_target_idx = None;
+    }
+
+    ctx.status_retry_skip_reason = None;
+    ctx.retry_count += 1;
+    ctx.retry_backoff_ms = Some(backoff_ms);
+    debug!(
+        hostname = %ctx.hostname,
+        upstream_status = %status,
+        attempt = %ctx.retry_count,
+        max = %cfg.max_attempts,
+        backoff_ms = %backoff_ms,
+        "upstream status matched retry_on, retrying"
+    );
+
+    let mut error = Error::explain(
+        ErrorType::HTTPStatus(status),
+        "upstream status matched retry_on",
+    );
+    error.set_retry(true);
+    Err(error)
+}
+
 #[async_trait]
 impl ProxyHttp for SbProxy {
     type CTX = RequestContext;
@@ -73,6 +192,17 @@ impl ProxyHttp for SbProxy {
             // tcp_rmem sysctl we set on the VMs.
             peer.options.tcp_recv_buf = Some(1024 * 1024);
             peer
+        }
+
+        if let Some(backoff_ms) = ctx.retry_backoff_ms.take() {
+            if backoff_ms > 0 {
+                debug!(
+                    attempt = %ctx.retry_count,
+                    backoff_ms = %backoff_ms,
+                    "sleeping before upstream retry"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
         }
 
         let pipeline = reload::current_pipeline();
@@ -1014,6 +1144,23 @@ impl ProxyHttp for SbProxy {
         Ok(())
     }
 
+    /// Inspect upstream response headers before cache/downstream handling.
+    ///
+    /// Status-code retries are decided here so a retryable upstream
+    /// response can be discarded before headers are written to the
+    /// downstream client.
+    async fn upstream_response_filter(
+        &self,
+        session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        maybe_retry_upstream_status(session, upstream_response, ctx).await
+    }
+
     /// Modify the response header before it is sent to the downstream client.
     ///
     /// This phase applies, in order:
@@ -1244,6 +1391,10 @@ impl ProxyHttp for SbProxy {
         // body and status come from the upstream untouched.
         if let Some(reason) = ctx.idempotency_skip_reason {
             let _ = upstream_response.insert_header("x-sbproxy-idempotency", reason);
+        }
+
+        if let Some(reason) = ctx.status_retry_skip_reason {
+            let _ = upstream_response.insert_header("x-sbproxy-retry-skip-reason", reason);
         }
 
         // --- Wave 5 / G5.6 wire: AnomalyDetectorHook dispatch ---
@@ -3549,14 +3700,7 @@ impl ProxyHttp for SbProxy {
         } else {
             pipeline.actions.get(origin_idx)
         };
-        let retry_cfg = match action {
-            Some(Action::Proxy(p)) => p.retry.as_ref(),
-            // LB targets share the LB-level retry policy. On retry the
-            // outlier ejection (recorded just below) plus per-target
-            // breaker steer select_target to a different peer.
-            Some(Action::LoadBalancer(lb)) => lb.retry.as_ref(),
-            _ => None,
-        };
+        let retry_cfg = action.and_then(retry_config_for_action);
         let Some(cfg) = retry_cfg else {
             return e;
         };
@@ -3568,19 +3712,21 @@ impl ProxyHttp for SbProxy {
         if ctx.retry_count + 1 >= cfg.max_attempts {
             return e;
         }
+        let backoff_ms = cfg.backoff_for_attempt(ctx.retry_count);
         // For LB, mark the failed target so the next select_target
         // skips it via outlier detection AND advances the breaker
         // state (a connect failure is a failure for both signals).
-        if let (Some(Action::LoadBalancer(lb)), Some(idx)) =
-            (pipeline.actions.get(origin_idx), ctx.lb_target_idx)
-        {
+        if let (Some(Action::LoadBalancer(lb)), Some(idx)) = (action, ctx.lb_target_idx) {
             lb.record_target_failure(idx);
             lb.record_breaker_failure(idx);
+            ctx.lb_target_idx = None;
         }
         ctx.retry_count += 1;
+        ctx.retry_backoff_ms = Some(backoff_ms);
         debug!(
             attempt = %ctx.retry_count,
             max = %cfg.max_attempts,
+            backoff_ms = %backoff_ms,
             "upstream connect error, retrying"
         );
         e.set_retry(true);

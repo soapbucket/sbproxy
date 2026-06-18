@@ -136,6 +136,13 @@ pub struct RequestContext {
     /// has occurred. Compared against the action's `RetryConfig.max_attempts`
     /// in `fail_to_connect` to decide whether to retry again.
     pub retry_count: u32,
+    /// Backoff delay scheduled by the last retry decision. Consumed by
+    /// `upstream_peer` before it selects the next upstream attempt.
+    pub retry_backoff_ms: Option<u64>,
+    /// Reason a configured status-code retry was skipped. Stamped on
+    /// the final upstream response so operators can see why the proxy
+    /// did not replay a matching failure status.
+    pub status_retry_skip_reason: Option<&'static str>,
 
     // --- Concurrent limit guards ---
     /// Permits issued by `ConcurrentLimitPolicy` for this request. The
@@ -923,6 +930,8 @@ impl RequestContext {
             origin_idx: None,
             lb_target_idx: None,
             retry_count: 0,
+            retry_backoff_ms: None,
+            status_retry_skip_reason: None,
             concurrent_limit_guards: Vec::new(),
             agent_budget_guards: Vec::new(),
             validate_request_body: false,
