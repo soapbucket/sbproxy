@@ -7,9 +7,10 @@
 //! itself is pure; this module is the seam between the resolver and
 //! [`crate::context::RequestContext`]. The binary owns the resolver
 //! instance (catalog + DNS resolver + verdict cache); the request
-//! pipeline calls `stamp_request_context` from `request_filter`
-//! immediately after the trust-boundary header strip and the bot-auth
-//! verifier (when configured).
+//! pipeline calls `stamp_request_context` from `request_filter`: first
+//! after the trust-boundary header strip for IP and User-Agent signals,
+//! then again after a configured bot-auth verifier accepts a signed
+//! keyid.
 //!
 //! Feature-gated: when `agent-class` is off, the helpers compile to
 //! no-ops and the context fields don't exist. The binary's default
@@ -182,13 +183,62 @@ pub fn apply_ml_override(ctx: &mut RequestContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sbproxy_classifiers::{AgentClassCatalog, AgentIdSource};
+    use sbproxy_classifiers::{AgentClass, AgentClassCatalog, AgentIdSource, AgentPurpose};
     use sbproxy_security::agent_verify::StubResolver;
     use std::sync::Arc;
 
     fn build_resolver() -> AgentClassResolver {
         AgentClassResolver::new(
             Arc::new(AgentClassCatalog::defaults()),
+            Arc::new(StubResolver::new()),
+            16,
+            true,
+            true,
+        )
+    }
+
+    fn agent_entry(
+        id: &str,
+        vendor: &str,
+        purpose: AgentPurpose,
+        ua: &str,
+        keyids: &[&str],
+    ) -> AgentClass {
+        AgentClass {
+            id: id.to_string(),
+            vendor: vendor.to_string(),
+            purpose,
+            contact_url: None,
+            expected_user_agent_pattern: ua.to_string(),
+            expected_reverse_dns_suffixes: Vec::new(),
+            expected_keyids: keyids.iter().map(|s| s.to_string()).collect(),
+            robots_compliance_score: None,
+            crawl_to_refer_ratio: None,
+            aliases: Vec::new(),
+            deprecated: false,
+        }
+    }
+
+    fn build_keyid_resolver() -> AgentClassResolver {
+        let catalog = AgentClassCatalog::from_entries(vec![
+            agent_entry(
+                "verified-bot",
+                "Verified",
+                AgentPurpose::Training,
+                "(?i)\\bVerifiedBot/\\d",
+                &["verified-key"],
+            ),
+            agent_entry(
+                "ua-bot",
+                "UA",
+                AgentPurpose::Search,
+                "(?i)\\bSpoofBot/\\d",
+                &[],
+            ),
+        ])
+        .expect("custom catalog");
+        AgentClassResolver::new(
+            Arc::new(catalog),
             Arc::new(StubResolver::new()),
             16,
             true,
@@ -227,6 +277,23 @@ mod tests {
         assert_eq!(ctx.agent_id.as_ref().unwrap().as_str(), "openai-gptbot");
         assert_eq!(ctx.agent_vendor.as_deref(), Some("OpenAI"));
         assert_eq!(ctx.agent_id_source, Some(AgentIdSource::UserAgent));
+    }
+
+    #[test]
+    fn verified_bot_auth_keyid_overrides_spoofed_ua() {
+        let mut ctx = RequestContext::new();
+        let resolver = build_keyid_resolver();
+        stamp_request_context(
+            &mut ctx,
+            &resolver,
+            Some("verified-key"),
+            false,
+            None,
+            Some("SpoofBot/1.0"),
+        );
+        assert_eq!(ctx.agent_id.as_ref().unwrap().as_str(), "verified-bot");
+        assert_eq!(ctx.agent_vendor.as_deref(), Some("Verified"));
+        assert_eq!(ctx.agent_id_source, Some(AgentIdSource::BotAuth));
     }
 
     // --- WOR-1149 follow-up: CAP `sub`-binding target gating ---

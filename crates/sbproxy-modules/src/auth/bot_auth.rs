@@ -121,6 +121,8 @@ pub enum BotAuthVerdict {
     Verified {
         /// The matched agent's display name.
         agent_name: String,
+        /// The verified keyid from `Signature-Input`.
+        key_id: String,
     },
     /// No `Signature-Input` header on the request. The auth provider
     /// returns `Deny(401)` so layered policies can interpret this as
@@ -459,6 +461,7 @@ impl BotAuthProvider {
                 }
                 BotAuthVerdict::Verified {
                     agent_name: matched.agent.clone().unwrap_or_else(|| matched.kid.clone()),
+                    key_id: matched.kid.clone(),
                 }
             }
             VerifyVerdict::Failed { reason } => BotAuthVerdict::Failed {
@@ -530,6 +533,7 @@ impl BotAuthProvider {
                 }
                 BotAuthVerdict::Verified {
                     agent_name: agent_name.clone(),
+                    key_id: kid.clone(),
                 }
             }
             VerifyVerdict::Failed { reason } => BotAuthVerdict::Failed {
@@ -742,8 +746,9 @@ mod tests {
             .unwrap();
 
         match provider.verify(&req) {
-            BotAuthVerdict::Verified { agent_name } => {
+            BotAuthVerdict::Verified { agent_name, key_id } => {
                 assert_eq!(agent_name, "openai-gptbot");
+                assert_eq!(key_id, "gptbot-key-2026");
             }
             other => panic!("expected Verified, got {:?}", other),
         }
@@ -768,8 +773,9 @@ mod tests {
             .with_nonce_store(Arc::new(InMemoryNonceStore::new()) as Arc<dyn NonceStore>);
         let req = signed_request_with_nonce(&pkcs8, key_id, "nonce-001");
         match provider.verify(&req) {
-            BotAuthVerdict::Verified { agent_name } => {
+            BotAuthVerdict::Verified { agent_name, key_id } => {
                 assert_eq!(agent_name, "openai-gptbot");
+                assert_eq!(key_id, "wor-502-strict-fresh");
             }
             other => panic!("expected Verified on first use, got {:?}", other),
         }
@@ -830,8 +836,9 @@ mod tests {
         // Permissive: second call still verifies but the metric must
         // bump by exactly one.
         match provider.verify(&req) {
-            BotAuthVerdict::Verified { agent_name } => {
+            BotAuthVerdict::Verified { agent_name, key_id } => {
                 assert_eq!(agent_name, "openai-gptbot");
+                assert_eq!(key_id, "wor-502-permissive-replay");
             }
             other => panic!("expected Verified under permissive replay, got {:?}", other),
         }

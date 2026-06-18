@@ -28,6 +28,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 /// Vector outcome the proxy is expected to produce for a given input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +62,37 @@ fn build_base_for_get_root(inner_list: &str, params: &str) -> String {
         out.push_str(params);
     }
     out
+}
+
+/// Build the canonical RFC 9421 signature base for `POST /` with
+/// `content-digest` in the covered component list.
+fn build_base_for_post_with_digest(inner_list: &str, params: &str, content_digest: &str) -> String {
+    let mut out = String::new();
+    out.push_str("\"@method\": POST\n");
+    out.push_str("\"@target-uri\": /\n");
+    out.push_str("\"content-digest\": ");
+    out.push_str(content_digest);
+    out.push('\n');
+    out.push_str("\"@signature-params\": (");
+    out.push_str(inner_list);
+    out.push(')');
+    if !params.is_empty() {
+        out.push(';');
+        out.push_str(params);
+    }
+    out
+}
+
+fn content_digest_header(body: &[u8]) -> String {
+    let raw = Sha256::digest(body);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+    format!("sha-256=:{}:", b64)
+}
+
+fn fresh_keypair() -> SigningKey {
+    let mut secret = [0u8; 32];
+    OsRng.fill_bytes(&mut secret);
+    SigningKey::from_bytes(&secret)
 }
 
 fn ed25519_config(upstream_url: &str, verifying_key_hex: &str) -> String {
@@ -200,32 +232,138 @@ fn conformance_unknown_keyid_yields_invalid() {
 }
 
 #[test]
-#[ignore = "TODO(wave3): G1.7 directory verifier supports Content-Digest covered-components but the test body is still a placeholder; needs vector 2 wiring (synthesize a request whose @target-uri reconstructs differently than the signer's)."]
 fn conformance_missing_component_yields_invalid() {
-    // Vector 2: `Signature-Input` declares `@target-uri` is covered,
-    // but the request is built so that the proxy reconstructs a
-    // different `@target-uri` than the signer did. The verifier's
-    // canonical-base reconstruction step must produce a different
-    // string and the signature check must fail.
-    //
-    // The "missing component" framing in the upstream draft refers to
-    // a covered component header that the request does not actually
-    // carry (e.g. `content-digest` listed in the inner-list but no
-    // `Content-Digest` header on the wire). Today's bot_auth verifier
-    // only covers `@method` + `@target-uri`; once G1.7 expands the
-    // covered-components set, drop the `#[ignore]`.
+    // Vector 2: `Signature-Input` declares `content-digest` is covered,
+    // but the request omits the header. The verifier must fail closed
+    // while reconstructing the canonical base.
+    let signing_key = fresh_keypair();
+    let verifying_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+
+    let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
+    let harness =
+        ProxyHarness::start_with_yaml(&ed25519_config(&upstream.base_url(), &verifying_key_hex))
+            .expect("start");
+
+    let body: Vec<u8> = br#"{"event":"missing-digest"}"#.to_vec();
+    let digest = content_digest_header(&body);
+    let inner_list = r#""@method" "@target-uri" "content-digest""#;
+    let params = r#"created=1700000000;keyid="conformance-key";alg="ed25519""#;
+    let base = build_base_for_post_with_digest(inner_list, params, &digest);
+    let sig = signing_key.sign(base.as_bytes());
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+    let signature_input = format!("sig1=({});{}", inner_list, params);
+    let signature_header = format!("sig1=:{}:", sig_b64);
+
+    let resp = harness
+        .post_bytes(
+            "/",
+            "blog.localhost",
+            "application/json",
+            body,
+            &[
+                ("signature-input", signature_input.as_str()),
+                ("signature", signature_header.as_str()),
+            ],
+        )
+        .expect("send");
+    assert_eq!(
+        resp.status, 401,
+        "missing covered digest => Invalid verdict"
+    );
+    assert!(
+        upstream.captured().is_empty(),
+        "missing covered digest must fail before upstream dispatch"
+    );
 }
 
 #[test]
-#[ignore = "TODO(wave3): G1.7 verifier supports Content-Digest but the test body remains a placeholder; needs vector 4 wiring (request body with mismatching Content-Digest)."]
 fn conformance_wrong_digest_yields_invalid() {
-    // Vector 4: the request body carries a `Content-Digest` whose
-    // value does not match SHA-256 of the body. When `content-digest`
-    // is in the covered set, the verifier's canonical-base step must
-    // include the (incorrect) header value; the signature is computed
-    // over the actual body so the bytes mismatch and verify fails.
-    //
-    // Reserved until G1.7 expands covered-component support.
+    // Vector 4: the signature covers a `Content-Digest` header, but
+    // the body that reaches the proxy hashes differently. Header auth
+    // succeeds, then the deferred body-binding check must return 401.
+    let signing_key = fresh_keypair();
+    let verifying_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+
+    let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
+    let harness =
+        ProxyHarness::start_with_yaml(&ed25519_config(&upstream.base_url(), &verifying_key_hex))
+            .expect("start");
+
+    let signed_body: Vec<u8> = br#"{"event":"signed"}"#.to_vec();
+    let tampered_body: Vec<u8> = br#"{"event":"tampered"}"#.to_vec();
+    let digest = content_digest_header(&signed_body);
+    let inner_list = r#""@method" "@target-uri" "content-digest""#;
+    let params = r#"created=1700000000;keyid="conformance-key";alg="ed25519""#;
+    let base = build_base_for_post_with_digest(inner_list, params, &digest);
+    let sig = signing_key.sign(base.as_bytes());
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+    let signature_input = format!("sig1=({});{}", inner_list, params);
+    let signature_header = format!("sig1=:{}:", sig_b64);
+
+    let resp = harness
+        .post_bytes(
+            "/",
+            "blog.localhost",
+            "application/json",
+            tampered_body,
+            &[
+                ("signature-input", signature_input.as_str()),
+                ("signature", signature_header.as_str()),
+                ("content-digest", digest.as_str()),
+            ],
+        )
+        .expect("send");
+    assert_eq!(resp.status, 401, "wrong covered digest => Invalid verdict");
+    for captured in upstream.captured() {
+        assert!(
+            captured.body.is_empty(),
+            "wrong covered digest bytes must not reach upstream"
+        );
+    }
+}
+
+#[test]
+fn conformance_valid_content_digest_yields_verified() {
+    // Valid digest-covered POST: signature verifies, the deferred body
+    // check verifies, and the upstream receives the signed bytes.
+    let signing_key = fresh_keypair();
+    let verifying_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+
+    let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
+    let harness =
+        ProxyHarness::start_with_yaml(&ed25519_config(&upstream.base_url(), &verifying_key_hex))
+            .expect("start");
+
+    let body: Vec<u8> = br#"{"event":"signed"}"#.to_vec();
+    let digest = content_digest_header(&body);
+    let inner_list = r#""@method" "@target-uri" "content-digest""#;
+    let params = r#"created=1700000000;keyid="conformance-key";alg="ed25519""#;
+    let base = build_base_for_post_with_digest(inner_list, params, &digest);
+    let sig = signing_key.sign(base.as_bytes());
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+    let signature_input = format!("sig1=({});{}", inner_list, params);
+    let signature_header = format!("sig1=:{}:", sig_b64);
+
+    let resp = harness
+        .post_bytes(
+            "/",
+            "blog.localhost",
+            "application/json",
+            body.clone(),
+            &[
+                ("signature-input", signature_input.as_str()),
+                ("signature", signature_header.as_str()),
+                ("content-digest", digest.as_str()),
+            ],
+        )
+        .expect("send");
+    assert_eq!(
+        resp.status, 200,
+        "matching covered digest => Verified verdict"
+    );
+    let captured = upstream.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].body, body);
 }
 
 // --- Vector pack manifest test ---
@@ -248,6 +386,10 @@ fn conformance_vector_pack_covers_required_outcomes() {
         Vector {
             name: "unknown_keyid",
             expected: ExpectedVerdict::Invalid,
+        },
+        Vector {
+            name: "valid_content_digest",
+            expected: ExpectedVerdict::Verified,
         },
         Vector {
             name: "missing_component",
@@ -274,6 +416,7 @@ fn conformance_vector_pack_covers_required_outcomes() {
     let names: Vec<_> = vectors.iter().map(|v| v.name).collect();
     for required in [
         "valid_signature",
+        "valid_content_digest",
         "wrong_key",
         "missing_component",
         "wrong_digest",

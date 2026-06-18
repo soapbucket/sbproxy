@@ -16,16 +16,20 @@
 //! `forward_to_upstream: true` stamps the verdict onto the upstream request
 //! as `X-Forwarded-Agent-Class` / `-Vendor` / `-Verified` (WOR-1132).
 //!
-//! The UA-only and human-sentinel cases run; the reverse-DNS, rDNS-spoof,
-//! and bot-auth-keyid cases stay `#[ignore]`'d on real blockers (live /
-//! injectable DNS, an open product question on UA-claim demotion, and the
-//! not-yet-landed Web Bot Auth keyid feed) - see each test's reason.
+//! The UA-only, bot-auth-keyid, and human-sentinel cases run; the
+//! reverse-DNS and rDNS-spoof cases stay `#[ignore]`'d on real blockers
+//! (live / injectable DNS and an open product question on UA-claim
+//! demotion) - see each test's reason.
 //!
 //! Strategy for observing the verdict from a black-box e2e: the captured
 //! upstream call reads the origin-side `X-Forwarded-Agent-Class` request
 //! header the policy stamps. This does not require a config knob unique to
 //! this test.
 
+use base64::Engine as _;
+use ed25519_dalek::{Signer, SigningKey};
+use rand::rngs::OsRng;
+use rand::RngCore;
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use serde_json::json;
 
@@ -50,6 +54,73 @@ origins:
         verify_reverse_dns: true
 "#
     )
+}
+
+fn agent_class_bot_auth_config(upstream_url: &str, verifying_key_hex: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+agent_classes:
+  catalog: inline
+  resolver:
+    rdns_enabled: false
+  entries:
+    - id: conformance-bot
+      vendor: Conformance
+      purpose: training
+      expected_user_agent_pattern: "(?i)\\bConformanceBot/\\d"
+      expected_reverse_dns_suffixes: []
+      expected_keyids:
+        - conformance-key
+    - id: ua-spoof-bot
+      vendor: Spoofed
+      purpose: search
+      expected_user_agent_pattern: "(?i)\\bSpoofBot/\\d"
+      expected_reverse_dns_suffixes: []
+      expected_keyids: []
+origins:
+  "blog.localhost":
+    action:
+      type: proxy
+      url: "{upstream_url}"
+    authentication:
+      type: bot_auth
+      clock_skew_seconds: 9999999999
+      agents:
+        - name: conformance-bot
+          key_id: conformance-key
+          algorithm: ed25519
+          public_key: "{verifying_key_hex}"
+          required_components:
+            - "@method"
+            - "@target-uri"
+    policies:
+      - type: agent_class
+        forward_to_upstream: true
+        verify_reverse_dns: false
+"#
+    )
+}
+
+fn build_base_for_get_root(inner_list: &str, params: &str) -> String {
+    let mut out = String::new();
+    out.push_str("\"@method\": GET\n");
+    out.push_str("\"@target-uri\": /\n");
+    out.push_str("\"@signature-params\": (");
+    out.push_str(inner_list);
+    out.push(')');
+    if !params.is_empty() {
+        out.push(';');
+        out.push_str(params);
+    }
+    out
+}
+
+fn fresh_keypair() -> SigningKey {
+    let mut secret = [0u8; 32];
+    OsRng.fill_bytes(&mut secret);
+    SigningKey::from_bytes(&secret)
 }
 
 // --- Test 1: UA-only path => vendor=openai ---
@@ -177,37 +248,61 @@ fn rdns_spoof_falls_back_to_unknown() {
 // --- Test 4: bot-auth keyid matches expected => verified ---
 
 #[test]
-#[ignore = "WOR-1132: the resolver + forward_to_upstream are wired, but `request_filter` still feeds the resolver `bot_auth_keyid = None` (the Web Bot Auth verifier slice has not landed), so the keyid path (step 1) never runs. Also needs a real RFC 9421 ed25519 signature over the keyid, not the `AAAA` placeholder. Reactivation blocks on the bot-auth verifier wiring."]
 fn bot_auth_keyid_in_directory_resolves_verified() {
-    let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
-    let harness = ProxyHarness::start_with_yaml(&agent_class_config(&upstream.base_url()))
-        .expect("start proxy");
+    let signing_key = fresh_keypair();
+    let verifying_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
 
-    // The fixture's static directory holds an OpenAI-owned keyid. The
-    // request signs RFC 9421 components with the matching key, the
-    // resolver picks the bot-auth path (highest precedence), and the
-    // verdict is verified with vendor=openai.
-    let signature_input = r#"sig1=("@method" "@target-uri");created=1700000000;keyid="openai-gptbot-key-1";alg="ed25519""#;
+    let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
+    let harness = ProxyHarness::start_with_yaml(&agent_class_bot_auth_config(
+        &upstream.base_url(),
+        &verifying_key_hex,
+    ))
+    .expect("start proxy");
+
+    let inner_list = r#""@method" "@target-uri""#;
+    let params = r#"created=1700000000;keyid="conformance-key";alg="ed25519""#;
+    let base = build_base_for_get_root(inner_list, params);
+    let sig = signing_key.sign(base.as_bytes());
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+    let signature_input = format!("sig1=({});{}", inner_list, params);
+    let signature_header = format!("sig1=:{}:", sig_b64);
+
+    // The UA would resolve to `ua-spoof-bot` if the verified keyid
+    // were not restamped after auth. BotAuth must outrank it.
     let resp = harness
         .get_with_headers(
             "/",
             "blog.localhost",
             &[
-                ("signature-input", signature_input),
-                // Real signature is produced by the regen binary; until
-                // it lands the test stays ignored.
-                ("signature", "sig1=:AAAA:"),
+                ("user-agent", "SpoofBot/1.0"),
+                ("signature-input", signature_input.as_str()),
+                ("signature", signature_header.as_str()),
             ],
         )
         .expect("send");
     assert_eq!(resp.status, 200);
     let captured = upstream.captured();
+    assert_eq!(captured.len(), 1);
     let agent_class = captured[0]
         .headers
         .get("x-forwarded-agent-class")
         .unwrap_or(&String::new())
         .clone();
-    assert!(agent_class.contains("openai"));
+    assert_eq!(agent_class, "conformance-bot");
+    assert_eq!(
+        captured[0]
+            .headers
+            .get("x-forwarded-agent-vendor")
+            .map(|s| s.as_str()),
+        Some("Conformance")
+    );
+    assert_eq!(
+        captured[0]
+            .headers
+            .get("x-forwarded-agent-verified")
+            .map(|s| s.as_str()),
+        Some("true")
+    );
 }
 
 // --- Test 5: sentinel => no signal => human ---

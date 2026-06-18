@@ -2998,6 +2998,36 @@ origins:
     }
 
     #[test]
+    fn compile_config_parses_inline_agent_class_entries() {
+        let yaml = r#"
+agent_classes:
+  catalog: inline
+  entries:
+    - id: conformance-bot
+      vendor: Conformance
+      purpose: training
+      expected_user_agent_pattern: "(?i)\\bConformanceBot/\\d"
+      expected_reverse_dns_suffixes: []
+      expected_keyids:
+        - conformance-key
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+"#;
+        let compiled = compile_config(yaml).expect("compile");
+        let ac = compiled
+            .agent_classes
+            .as_ref()
+            .expect("agent_classes parsed");
+        assert_eq!(ac.catalog, "inline");
+        assert_eq!(ac.entries.len(), 1);
+        assert_eq!(ac.entries[0]["id"], "conformance-bot");
+        assert_eq!(ac.entries[0]["expected_keyids"][0], "conformance-key");
+    }
+
+    #[test]
     fn compile_config_no_messenger_when_settings_absent() {
         // Absent messenger_settings: `CompiledConfig.messenger` stays None
         // so consumers (e.g. the purge subscriber) cleanly skip spawning.

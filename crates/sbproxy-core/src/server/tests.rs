@@ -366,7 +366,7 @@ async fn bot_auth_accepts_signature_bound_to_real_request_path() {
     headers.insert("signature-input", sig_input.parse().unwrap());
     headers.insert("signature", sig_value.parse().unwrap());
 
-    let (result, _principal) = check_auth(
+    let (result, principal) = check_auth(
         &auth,
         &headers,
         None,
@@ -379,6 +379,15 @@ async fn bot_auth_accepts_signature_bound_to_real_request_path() {
     assert!(
         matches!(result, AuthResult::Allow { .. }),
         "expected Allow when path matches signed @target-uri"
+    );
+    let principal = principal.expect("bot_auth allow returns principal");
+    assert_eq!(
+        principal
+            .attrs
+            .metadata
+            .get("bot_auth_keyid")
+            .map(String::as_str),
+        Some(key_id)
     );
 }
 

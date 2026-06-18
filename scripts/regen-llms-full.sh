@@ -98,7 +98,6 @@ fi
     # Read the file; demote H1 -> H2 so each doc sits one level under
     # the master file. Keep all other markdown intact.
     sed 's/^# /## /' "$f"
-    echo ""
   done
 } > "$TMP"
 
