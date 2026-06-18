@@ -18,10 +18,12 @@
 //! - [`context_opt`] - Optimize context window usage by prioritising frequently-used tools.
 //! - [`rest_to_mcp`] - Expose REST APIs as MCP servers.
 //! - [`verify_before_commit`] - VIGIL-pattern verify-before-commit checks for tool calls.
+//! - [`cassette_drift`] - Compare mcptest cassette contracts against live `tools/list`.
 
 pub mod access_control;
 pub mod apps_validators;
 pub mod audit;
+pub mod cassette_drift;
 pub mod code_mode;
 pub mod codemode_from_openapi;
 pub mod codemode_ts;
@@ -56,6 +58,11 @@ pub use access_control::{
     ToolQuotaStore,
 };
 pub use audit::{McpAuditBuilder, McpAuditEntry};
+pub use cassette_drift::{
+    cassette_contract_from_value, diff_cassette_against_tools, diff_cassette_values,
+    tools_from_value, CassetteContract, CassetteDriftChange, CassetteDriftEvent, CassetteDriftKind,
+    CassetteDriftReport, CassetteFieldContract, CassetteToolContract, CASSETTE_DRIFT_EVENT_TYPE,
+};
 pub use code_mode::{compress_tool_schema, estimate_token_reduction};
 pub use codemode_from_openapi::{emit_codemode_from_openapi, openapi_to_federated_tools};
 pub use context_opt::ToolUsageTracker;

@@ -1,5 +1,5 @@
 # MCP schema-drift detection
-*Last modified: 2026-06-03*
+*Last modified: 2026-06-18*
 
 Schema drift is the most-cited open problem in the API-to-MCP
 space: when the upstream OpenAPI changes, MCP tools fail silently
@@ -11,6 +11,11 @@ SBproxy ships `sbproxy-mcp-drift`, a CI-friendly CLI that diffs
 two OpenAPI snapshots and classifies the changes by severity so
 a pipeline can refuse to regenerate the MCP tool surface on a
 breaking change without explicit operator opt-in.
+
+The same CLI can also compare a consumer cassette against a live
+MCP `tools/list` snapshot. That mode catches producer drift against
+the contract a client actually relied on, rather than only against
+the previous producer snapshot.
 
 ## Severity model
 
@@ -34,10 +39,17 @@ classified change. The CLI maps it to an exit code:
 ```bash
 sbproxy-mcp-drift --previous prev.openapi.json --current cur.openapi.json
 sbproxy-mcp-drift --previous prev.openapi.yaml --current cur.openapi.yaml --format json
+sbproxy-mcp-drift --cassette session-ledger.ndjson --current-tools live-tools-list.json
 ```
 
-Both inputs accept JSON or YAML; the CLI sniffs the file with
-`serde_json` first, then falls back to `serde_yaml`.
+OpenAPI inputs accept JSON or YAML. Cassette mode accepts JSON, YAML,
+or NDJSON session-ledger records and looks for:
+
+* MCP `tools/list` result envelopes with a `tools` array.
+* JSON-RPC `tools/call` requests with `params.name` and
+  `params.arguments`.
+* `session-ledger-v1` `tool_call` records with `tool_name` and
+  `params`.
 
 ## CI gate
 
@@ -53,6 +65,16 @@ if ! sbproxy-mcp-drift \
         2) echo "BREAKING drift; refusing to regenerate MCP surface" >&2 ; exit 1 ;;
     esac
 fi
+```
+
+Cassette gate:
+
+```bash
+# Refuse deploy when a live MCP server no longer satisfies the
+# consumer contract captured in a cassette.
+sbproxy-mcp-drift \
+  --cassette cassettes/customer-onboarding.ndjson \
+  --current-tools snapshots/live-tools-list.json
 ```
 
 ## Change kinds
@@ -72,6 +94,21 @@ downstream tooling keys off (defined in
 | `required_param_type_changed` | breaking (required) / informational (optional) | type slug changed |
 | `enum_narrowed` | breaking | dropped enum value(s) |
 | `enum_widened` | informational | added enum value(s) |
+
+Cassette mode uses a cassette-specific event vocabulary in
+`sbproxy_extension::mcp::cassette_drift::CassetteDriftKind`:
+
+| Kind | Severity | Description |
+|---|---|---|
+| `tool_added` | informational | live `tools/list` contains a tool absent from the cassette |
+| `tool_removed` | breaking | a cassette tool is absent from live `tools/list` |
+| `description_changed` | informational | tool description changed |
+| `field_added` | informational or breaking | live schema added a field; breaking when the new field is required |
+| `field_removed` | breaking | cassette field is absent from the live schema |
+| `required_flipped` | informational or breaking | a field changed requiredness; optional to required is breaking |
+| `type_changed` | informational or breaking | a field type slug changed |
+| `enum_shrunk` | breaking | live enum dropped cassette values |
+| `enum_widened` | informational | live enum gained values |
 
 ## Sample output
 
@@ -108,11 +145,36 @@ changes (2):
 }
 ```
 
+### Cassette JSON
+
+```json
+{
+  "cassette": "cassettes/customer-onboarding.ndjson",
+  "severity": "breaking",
+  "changes": [
+    {
+      "tool": "search",
+      "field": "mode",
+      "severity": "breaking",
+      "kind": "enum_shrunk",
+      "summary": "field `mode` enum shrunk on tool `search`: removed [`deep`]"
+    }
+  ]
+}
+```
+
+Every cassette change can also be projected into an event payload via
+`CassetteDriftReport::events()`. The event type is
+`mcp.schema_drift.detected` and the payload includes `cassette`, `tool`,
+optional `field`, `kind`, `severity`, and `summary`.
+
 ## What the diff covers today
 
 * Operations: added / removed / description-only changes.
 * Parameters: added / removed / required-toggle / type slug.
 * Parameter enums: narrowed / widened.
+* Cassette contracts: top-level MCP tool fields extracted from
+  `inputSchema` plus observed `tools/call` argument keys.
 
 Out of scope today (follow-ups):
 
@@ -120,6 +182,7 @@ Out of scope today (follow-ups):
 * Request-body schema changes (this PR ships parameter-level
   diff only).
 * Response-body schema changes.
+* Nested MCP tool input diffs below the first object level.
 
 ## Library API
 
@@ -134,6 +197,21 @@ let cur: serde_json::Value = serde_json::from_str(cur_json)?;
 let report = diff_openapi(&prev, &cur);
 if report.severity == DriftSeverity::Breaking {
     // refuse to regenerate
+}
+```
+
+Cassette mode is also available as a library API:
+
+```rust
+use sbproxy_extension::mcp::cassette_drift::{
+    cassette_contract_from_value, diff_cassette_against_tools, tools_from_value,
+};
+
+let cassette_contract = cassette_contract_from_value("run.ndjson", &cassette_json);
+let live_tools = tools_from_value(&tools_list_json);
+let report = diff_cassette_against_tools(&cassette_contract, &live_tools);
+for event in report.events() {
+    // emit event to the audit/event sink
 }
 ```
 
