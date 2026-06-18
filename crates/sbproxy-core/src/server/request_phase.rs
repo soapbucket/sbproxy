@@ -525,16 +525,16 @@ pub(super) async fn request_filter(
 
     // --- Wave 5 / G5.3 wire: JA4H HTTP fingerprint ---
     //
-    // The TLS-handshake-time JA3 / JA4 are stamped on
-    // `ctx.tls_fingerprint` by the Pingora TLS lifecycle hook in
-    // `sbproxy_tls`. JA4H requires the request headers, which are
-    // not yet available at handshake time; compute it here, after
-    // the trust-boundary header strip and the aipref parse, so the
-    // hash reflects exactly the headers the upstream pipeline
-    // sees. Skips entirely when the `tls-fingerprint` feature is
-    // off, when no fingerprint was captured (plaintext HTTP), or
-    // when the fingerprint already has a `ja4h` value (a
-    // pre-stamped value from an enterprise hook).
+    // JA3 / JA4 are stamped on `ctx.tls_fingerprint` before this
+    // block by the trusted sidecar-header path today, or by a future
+    // native listener hook once Pingora exposes raw ClientHello bytes.
+    // JA4H requires the request headers, which are not available at
+    // handshake time; compute it here, after the trust-boundary header
+    // strip and the aipref parse, so the hash reflects exactly the
+    // headers the upstream pipeline sees. Skips entirely when the
+    // `tls-fingerprint` feature is off, when no fingerprint was
+    // captured (plaintext HTTP), or when the fingerprint already has a
+    // `ja4h` value (a pre-stamped value from an enterprise hook).
     #[cfg(feature = "tls-fingerprint")]
     {
         if let Some(fp) = ctx.tls_fingerprint.as_mut() {

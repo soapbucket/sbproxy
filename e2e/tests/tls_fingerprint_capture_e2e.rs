@@ -1,9 +1,6 @@
 //! Wave 5 / Q5.2: JA3 / JA4 / JA4H capture in `sbproxy-tls`.
 //!
-//! These tests pin the TLS-fingerprint capture contract from
-//!  (A5.1) and are activated
-//! when the G5.3 lane (`wave5/G5.3-tls-fingerprint-capture`) merges
-//! the capture point in `crates/sbproxy-tls/`.
+//! These tests pin the TLS-fingerprint capture contract from A5.1.
 //!
 //! Contract under test:
 //!
@@ -19,93 +16,115 @@
 //! - Capture is a no-op when the `tls-fingerprint` cargo feature is
 //!   disabled (the field stays `None`, no parse-and-hash work runs).
 //!
-//! Surface assertions: tests stamp the captured fingerprint into a
-//! response header via a CEL transform that reads
-//! `request.tls.ja4` / `request.tls.trustworthy` so the value is
+//! Surface assertions for the `ProxyHarness`-backed cases stamp the
+//! captured fingerprint into a response header via a CEL transform that
+//! reads `request.tls.ja4` / `request.tls.trustworthy` so the value is
 //! observable from the harness without reaching into proxy internals.
 //!
-//! The sidecar-backed tests run against the default harness. Native TLS
-//! ClientHello capture remains ignored until the real TLS client path
-//! lands; disabled-feature coverage uses the no-default-features harness.
+//! The JA3 / JA4 ClientHello tests generate real rustls TLS 1.2 / 1.3
+//! ClientHello records in-process and feed those bytes through the
+//! production parser. That is the deterministic in-repo alternative for
+//! the current OSS runtime: Pingora 0.8 with the rustls listener does not
+//! expose raw ClientHello bytes to `sbproxy-core`, so native listener
+//! capture cannot be asserted through `ProxyHarness` yet. The remaining
+//! sidecar-backed tests run against the default harness; disabled-feature
+//! coverage uses the no-default-features harness.
 
 use sbproxy_e2e::ProxyHarness;
+use sbproxy_tls::parse_client_hello;
+use std::sync::{Arc, Once};
+
+fn install_rustls_provider() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+fn rustls_client_hello(
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> anyhow::Result<Vec<u8>> {
+    install_rustls_provider();
+
+    let mut config = rustls::ClientConfig::builder_with_protocol_versions(versions)
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    let server_name = rustls::pki_types::ServerName::try_from("tls-fp.localhost")?.to_owned();
+    let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name)?;
+    let mut bytes = Vec::new();
+    let written = conn.write_tls(&mut bytes)?;
+    anyhow::ensure!(written > 0, "rustls did not emit a ClientHello");
+    anyhow::ensure!(
+        bytes.starts_with(&[0x16]),
+        "expected TLS handshake record, got first bytes {:?}",
+        bytes.get(..bytes.len().min(5))
+    );
+    Ok(bytes)
+}
+
+fn assert_hex(value: &str, len: usize, name: &str) {
+    assert_eq!(
+        value.len(),
+        len,
+        "expected {name} length {len}; got {value:?}"
+    );
+    assert!(
+        value.chars().all(|c| c.is_ascii_hexdigit()),
+        "expected {name} to be hex; got {value:?}"
+    );
+}
+
+fn assert_ja4_shape(ja4: &str, prefix: &str) {
+    assert_eq!(
+        ja4.len(),
+        23,
+        "expected JA4 with 10-char prefix + _ + 12-char hash; got {ja4:?}"
+    );
+    assert_eq!(
+        &ja4[..prefix.len()],
+        prefix,
+        "expected JA4 prefix {prefix:?}; got {ja4:?}"
+    );
+    assert_eq!(ja4.as_bytes()[10], b'_', "JA4 separator must be _");
+    assert_hex(&ja4[11..], 12, "JA4 hash");
+}
 
 // --- Test 1: JA3 capture for a TLS 1.2 ClientHello ---
 
 #[test]
-#[ignore = "WOR-1444: needs a real TLS 1.2 ClientHello e2e client path; trusted sidecar injection validates request.tls plumbing but cannot prove native JA3 capture."]
 fn ja3_captured_for_tls12_client() {
-    let yaml = r#"
-proxy:
-  http_bind_port: 0
-features:
-  tls_fingerprint:
-    enabled: true
-    trustworthy_client_cidrs:
-      - 127.0.0.1/32
-origins:
-  "tls-fp.localhost":
-    action:
-      type: static
-      status_code: 200
-      content_type: text/plain
-      body: "ok"
-    transforms:
-      - type: cel
-        headers:
-          - op: set
-            name: x-ja3
-            value_expr: 'size(request.tls.ja3) > 0 ? request.tls.ja3 : "absent"'
-"#;
-    let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
-    // The harness uses plaintext HTTP, so this assertion is a
-    // placeholder until a TLS 1.2 client path is wired in. Once
-    // G5.3 lands we expect a 32-char hex string here.
-    let resp = harness.get("/", "tls-fp.localhost").expect("GET");
-    let ja3 = resp.headers.get("x-ja3").map(String::as_str).unwrap_or("");
-    assert!(
-        ja3.len() == 32 && ja3.chars().all(|c| c.is_ascii_hexdigit()),
-        "expected 32-char hex JA3; got {:?}",
-        ja3
+    let hello = rustls_client_hello(&[&rustls::version::TLS12]).expect("TLS 1.2 ClientHello");
+    let fp = parse_client_hello(&hello);
+
+    let ja3 = fp.ja3.as_deref().expect("JA3 populated");
+    assert_hex(ja3, 32, "JA3");
+    assert_eq!(fp.sni.as_deref(), Some("tls-fp.localhost"));
+    assert_eq!(
+        fp.alpn,
+        vec!["h2".to_string(), "http/1.1".to_string()],
+        "ALPN must reflect the real ClientHello wire order"
     );
+    assert_ja4_shape(fp.ja4.as_deref().expect("JA4 populated"), "t12d");
 }
 
 // --- Test 2: JA4 capture for a TLS 1.3 ClientHello ---
 
 #[test]
-#[ignore = "WOR-1444: needs a real TLS 1.3 ClientHello e2e client path; trusted sidecar injection validates request.tls plumbing but cannot prove native JA4 capture."]
 fn ja4_captured_for_tls13_client() {
-    let yaml = r#"
-proxy:
-  http_bind_port: 0
-features:
-  tls_fingerprint:
-    enabled: true
-    trustworthy_client_cidrs:
-      - 127.0.0.1/32
-origins:
-  "tls-fp.localhost":
-    action:
-      type: static
-      status_code: 200
-      content_type: text/plain
-      body: "ok"
-    transforms:
-      - type: cel
-        headers:
-          - op: set
-            name: x-ja4
-            value_expr: 'size(request.tls.ja4) > 0 ? request.tls.ja4 : "absent"'
-"#;
-    let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
-    let resp = harness.get("/", "tls-fp.localhost").expect("GET");
-    let ja4 = resp.headers.get("x-ja4").map(String::as_str).unwrap_or("");
-    // FoxIO JA4 = 10-char prefix + `_` + 12-char hex hash.
-    assert!(
-        ja4.len() == 23 && ja4.as_bytes()[10] == b'_',
-        "expected JA4 with 10-char prefix + _ + 12-char hash; got {:?}",
-        ja4
+    let hello = rustls_client_hello(&[&rustls::version::TLS13]).expect("TLS 1.3 ClientHello");
+    let fp = parse_client_hello(&hello);
+
+    let ja3 = fp.ja3.as_deref().expect("JA3 populated");
+    assert_hex(ja3, 32, "JA3");
+    assert_eq!(fp.sni.as_deref(), Some("tls-fp.localhost"));
+    assert_eq!(
+        fp.alpn,
+        vec!["h2".to_string(), "http/1.1".to_string()],
+        "ALPN must reflect the real ClientHello wire order"
     );
+    assert_ja4_shape(fp.ja4.as_deref().expect("JA4 populated"), "t13d");
 }
 
 // --- Test 3: JA4H populated mid-pipeline once headers land ---
