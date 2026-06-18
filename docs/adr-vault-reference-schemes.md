@@ -97,12 +97,27 @@ Use one minor release of accept-with-warning for the legacy umbrella form:
 vault://<alias>/<path>
 ```
 
+The compatibility shim is scheduled for removal in SBproxy `1.2.0`.
+
 During the deprecation window:
 
 * Parse legacy references through a compatibility shim.
 * Resolve them against the existing alias behavior.
 * Emit one warning per unique legacy reference per process lifetime.
-* Include the migrated form in the warning when it can be inferred.
+* Include the migrated form and removal version in the warning when it can be inferred.
+
+Operators can rewrite known aliases in-place or in CI with:
+
+```bash
+sbproxy config migrate sb.yml --out sb.migrated.yml
+```
+
+The migration helper rewrites `vault://aws/...` to `awssm://aws/...`,
+`vault://k8s/...` to `k8ssecret://k8s/...`, `vault://file/...` to
+`secretfile://file/...`, and `vault://env/NAME` to `${NAME}`.
+`vault://hashi/...` remains syntactically unchanged because HashiCorp
+Vault owns `vault://` after the migration, but the runtime still logs
+the deprecation warning during the window.
 
 After the window, remove the shim and reject legacy umbrella references during config validation.
 

@@ -377,6 +377,22 @@ mod tests {
     }
 
     #[test]
+    fn legacy_aws_alias_dispatches_to_aws_backend() {
+        let mut mgr = VaultManager::new();
+        mgr.register_backend(
+            VaultProviderType::AwsSecretsManager,
+            "aws",
+            local_with("prod/openai", r#"{"api_key":"sk-legacy"}"#),
+        );
+
+        let reference = VaultRef::parse("vault://aws/prod/openai?key=api_key").unwrap();
+        assert_eq!(
+            mgr.get_from_ref(&reference).unwrap(),
+            Some("sk-legacy".to_string())
+        );
+    }
+
+    #[test]
     fn parsed_reference_extracts_json_key() {
         let mut mgr = VaultManager::new();
         mgr.register_backend(

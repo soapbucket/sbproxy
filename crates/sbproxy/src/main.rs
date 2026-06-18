@@ -146,6 +146,8 @@ enum Cmd {
     /// Validate and reload an sbproxy config in place. Same primitive
     /// the SIGHUP handler and file watcher use.
     Apply(ApplyArgs),
+    /// Config maintenance commands.
+    Config(ConfigCmd),
     /// Render projection documents (robots.txt, llms.txt, ...) for an
     /// origin without starting the proxy.
     Projections(ProjectionsCmd),
@@ -206,6 +208,27 @@ struct ApplyArgs {
     /// `baseline_revision` drifted. Mutually exclusive with `-f`.
     #[arg(short = 'p', long = "plan", conflicts_with = "config")]
     plan_file: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct ConfigCmd {
+    #[command(subcommand)]
+    sub: ConfigSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigSub {
+    /// Rewrite deprecated config syntax to the current canonical form.
+    Migrate(ConfigMigrateArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct ConfigMigrateArgs {
+    /// Path to the config file to migrate.
+    config_path: PathBuf,
+    /// Write migrated YAML to this path. Defaults to stdout.
+    #[arg(short = 'o', long = "out")]
+    out: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -366,6 +389,9 @@ fn main() {
         }
         Some(Cmd::Apply(args)) => {
             run_subcommand("apply", 1, handle_apply_subcommand(&args));
+        }
+        Some(Cmd::Config(cmd)) => {
+            run_subcommand("config", 2, handle_config_subcommand(&cmd));
         }
         Some(Cmd::Projections(cmd)) => {
             run_subcommand("error", 2, handle_projections_subcommand(&cmd).map(|()| 0));
@@ -603,6 +629,40 @@ fn handle_projections_render(args: &RenderArgs) -> anyhow::Result<()> {
     std::io::stdout().write_all(body.as_ref())?;
     std::io::stdout().flush()?;
     Ok(())
+}
+
+// --- `config` handler ---
+
+fn handle_config_subcommand(cmd: &ConfigCmd) -> anyhow::Result<i32> {
+    match &cmd.sub {
+        ConfigSub::Migrate(args) => handle_config_migrate(args),
+    }
+}
+
+fn handle_config_migrate(args: &ConfigMigrateArgs) -> anyhow::Result<i32> {
+    let path_str = args.config_path.to_string_lossy();
+    let yaml = std::fs::read_to_string(&args.config_path)
+        .map_err(|e| anyhow::anyhow!("failed to read config '{path_str}': {e}"))?;
+    let migration = sbproxy_vault::migrate_legacy_vault_references_in_text(&yaml);
+
+    match args.out.as_deref() {
+        Some(out_path) => {
+            let out_str = out_path.to_string_lossy();
+            std::fs::write(out_path, migration.output.as_bytes())
+                .map_err(|e| anyhow::anyhow!("failed to write migrated config '{out_str}': {e}"))?;
+            eprintln!(
+                "config migrate: wrote {out_str} (rewrote {} legacy vault reference(s))",
+                migration.replacements.len()
+            );
+        }
+        None => {
+            use std::io::Write as _;
+            std::io::stdout().write_all(migration.output.as_bytes())?;
+            std::io::stdout().flush()?;
+        }
+    }
+
+    Ok(0)
 }
 
 fn lookup_projection<'a>(
@@ -1189,6 +1249,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_config_migrate_subcommand() {
+        let cli = parse(&[
+            "sbproxy",
+            "config",
+            "migrate",
+            "sb.yml",
+            "--out",
+            "migrated.yml",
+        ]);
+        let cmd = match cli.cmd {
+            Some(Cmd::Config(cmd)) => cmd,
+            other => panic!("expected Config, got {other:?}"),
+        };
+        let ConfigSub::Migrate(args) = cmd.sub;
+        assert_eq!(args.config_path, std::path::PathBuf::from("sb.yml"));
+        assert_eq!(args.out, Some(std::path::PathBuf::from("migrated.yml")));
+    }
+
+    #[test]
     fn apply_rejects_dash_f_and_dash_p_together() {
         // `-f` and `-p` are declared mutually exclusive on `ApplyArgs`.
         let err = Cli::try_parse_from(["sbproxy", "apply", "-f", "x.yml", "-p", "plan.json"])
@@ -1409,6 +1488,26 @@ mod tests {
             format: OutputFormat::Json,
         };
         assert!(handle_validate_subcommand(&args).is_err());
+    }
+
+    // --- config migrate handler ---
+
+    #[test]
+    fn handle_config_migrate_writes_rewritten_yaml() {
+        let path = temp_config("key: vault://aws/prod/openai?version=3&key=api_key\n");
+        let out = path.with_extension("migrated.yml");
+        let args = ConfigMigrateArgs {
+            config_path: path.clone(),
+            out: Some(out.clone()),
+        };
+        assert_eq!(handle_config_migrate(&args).unwrap(), 0);
+        let migrated = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(
+            migrated,
+            "key: awssm://aws/prod/openai?version=3&key=api_key\n"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&out);
     }
 
     // --- plan handler regression coverage ---

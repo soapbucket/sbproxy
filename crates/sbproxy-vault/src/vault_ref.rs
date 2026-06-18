@@ -47,8 +47,39 @@
 //! scope; the first scope that declares a matching `(provider type,
 //! backend name)` pair serves the reference.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::sync::{Mutex, OnceLock};
+
+/// Version where the legacy `vault://<alias>/...` compatibility shim
+/// is scheduled to be removed.
+pub const LEGACY_VAULT_REFERENCE_REMOVAL_VERSION: &str = "1.2.0";
+
+/// One legacy vault reference rewrite produced by the migration helper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyVaultReferenceReplacement {
+    /// Original legacy reference text.
+    pub legacy: String,
+    /// Replacement reference text.
+    pub replacement: String,
+}
+
+/// Result of scanning a config-like text blob for legacy vault references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyVaultReferenceMigration {
+    /// Text after applying the known legacy-reference rewrites.
+    pub output: String,
+    /// Rewrites that changed the text. No-op aliases such as
+    /// `vault://hashi/...` warn at runtime but are not listed here.
+    pub replacements: Vec<LegacyVaultReferenceReplacement>,
+}
+
+impl LegacyVaultReferenceMigration {
+    /// Return true when at least one reference changed.
+    pub fn changed(&self) -> bool {
+        !self.replacements.is_empty()
+    }
+}
 
 /// Provider type selected by a secret-reference URI scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -170,77 +201,12 @@ impl VaultRef {
     /// regardless of whether the backend / path / key make semantic
     /// sense. Dispatch-time validation lives in each backend.
     pub fn parse(input: &str) -> Result<Self, VaultRefError> {
-        let (scheme, after_scheme) = input
-            .split_once("://")
-            .ok_or_else(|| VaultRefError::MissingPrefix(input.to_string()))?;
-
-        if !is_valid_reference_scheme(scheme) {
-            return Err(VaultRefError::InvalidScheme(
-                scheme.to_string(),
-                input.to_string(),
-            ));
-        }
-        if is_reserved_uri_scheme(scheme) {
-            return Err(VaultRefError::ReservedScheme(
-                scheme.to_string(),
-                input.to_string(),
-            ));
-        }
-        let provider_type = VaultProviderType::from_scheme(scheme)
-            .ok_or_else(|| VaultRefError::UnknownScheme(scheme.to_string(), input.to_string()))?;
-
-        // Split off the query string first; the rest is
-        // `<backend-name>/<provider-path>`.
-        let (path_part, query_part) = match after_scheme.split_once('?') {
-            Some((p, q)) => (p, Some(q)),
-            None => (after_scheme, None),
-        };
-
-        // Backend is the URI authority; path is everything after the
-        // first `/`.
-        let (backend, path) = match path_part.split_once('/') {
-            Some((b, p)) => (b, p),
-            None => (path_part, ""),
-        };
-
-        if backend.is_empty() {
-            return Err(VaultRefError::MissingBackend(input.to_string()));
-        }
-        if path.is_empty() {
-            return Err(VaultRefError::MissingPath(input.to_string()));
+        if let Some(replacement) = legacy_vault_reference_replacement(input) {
+            warn_legacy_vault_reference_once(input, &replacement);
+            return parse_provider_specific_vault_ref(&replacement);
         }
 
-        // Decode the query string into version / key / extra.
-        let mut version: Option<String> = None;
-        let mut key: Option<String> = None;
-        let mut extra: BTreeMap<String, String> = BTreeMap::new();
-
-        if let Some(query) = query_part {
-            for raw_pair in query.split('&') {
-                if raw_pair.is_empty() {
-                    continue;
-                }
-                let (k, v) = raw_pair.split_once('=').ok_or_else(|| {
-                    VaultRefError::MalformedQueryParam(raw_pair.to_string(), input.to_string())
-                })?;
-                match k {
-                    "version" => version = Some(v.to_string()),
-                    "key" => key = Some(v.to_string()),
-                    _ => {
-                        extra.insert(k.to_string(), v.to_string());
-                    }
-                }
-            }
-        }
-
-        Ok(Self {
-            provider_type,
-            backend: backend.to_string(),
-            path: path.to_string(),
-            version,
-            key,
-            extra,
-        })
+        parse_provider_specific_vault_ref(input)
     }
 
     /// Render the parsed reference back to its canonical URI form.
@@ -277,6 +243,145 @@ impl VaultRef {
     }
 }
 
+fn parse_provider_specific_vault_ref(input: &str) -> Result<VaultRef, VaultRefError> {
+    let (scheme, after_scheme) = input
+        .split_once("://")
+        .ok_or_else(|| VaultRefError::MissingPrefix(input.to_string()))?;
+
+    if !is_valid_reference_scheme(scheme) {
+        return Err(VaultRefError::InvalidScheme(
+            scheme.to_string(),
+            input.to_string(),
+        ));
+    }
+    if is_reserved_uri_scheme(scheme) {
+        return Err(VaultRefError::ReservedScheme(
+            scheme.to_string(),
+            input.to_string(),
+        ));
+    }
+    let provider_type = VaultProviderType::from_scheme(scheme)
+        .ok_or_else(|| VaultRefError::UnknownScheme(scheme.to_string(), input.to_string()))?;
+
+    // Split off the query string first; the rest is
+    // `<backend-name>/<provider-path>`.
+    let (path_part, query_part) = match after_scheme.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (after_scheme, None),
+    };
+
+    // Backend is the URI authority; path is everything after the
+    // first `/`.
+    let (backend, path) = match path_part.split_once('/') {
+        Some((b, p)) => (b, p),
+        None => (path_part, ""),
+    };
+
+    if backend.is_empty() {
+        return Err(VaultRefError::MissingBackend(input.to_string()));
+    }
+    if path.is_empty() {
+        return Err(VaultRefError::MissingPath(input.to_string()));
+    }
+
+    // Decode the query string into version / key / extra.
+    let mut version: Option<String> = None;
+    let mut key: Option<String> = None;
+    let mut extra: BTreeMap<String, String> = BTreeMap::new();
+
+    if let Some(query) = query_part {
+        for raw_pair in query.split('&') {
+            if raw_pair.is_empty() {
+                continue;
+            }
+            let (k, v) = raw_pair.split_once('=').ok_or_else(|| {
+                VaultRefError::MalformedQueryParam(raw_pair.to_string(), input.to_string())
+            })?;
+            match k {
+                "version" => version = Some(v.to_string()),
+                "key" => key = Some(v.to_string()),
+                _ => {
+                    extra.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(VaultRef {
+        provider_type,
+        backend: backend.to_string(),
+        path: path.to_string(),
+        version,
+        key,
+        extra,
+    })
+}
+
+/// Return the canonical replacement for a legacy `vault://<alias>/...`
+/// reference when the alias maps unambiguously to a provider scheme.
+pub fn legacy_vault_reference_replacement(input: &str) -> Option<String> {
+    let (alias, rest) = split_legacy_vault_alias(input)?;
+    match alias {
+        "aws" => Some(format!("awssm://aws/{rest}")),
+        "k8s" => Some(format!("k8ssecret://k8s/{rest}")),
+        "file" => Some(format!("secretfile://file/{rest}")),
+        "hashi" => Some(format!("vault://hashi/{rest}")),
+        "env" => legacy_vault_env_name(input).map(|name| format!("${{{name}}}")),
+        _ => None,
+    }
+}
+
+/// Return the environment variable named by a legacy
+/// `vault://env/<NAME>` reference.
+pub fn legacy_vault_env_name(input: &str) -> Option<&str> {
+    let (alias, rest) = split_legacy_vault_alias(input)?;
+    if alias != "env" || rest.contains('?') {
+        return None;
+    }
+    if is_env_var_name(rest) {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+/// Rewrite known legacy vault references in a config-like text blob.
+///
+/// The scanner is deliberately text-preserving: it only replaces URI
+/// tokens and leaves YAML formatting, comments, and ordering intact.
+pub fn migrate_legacy_vault_references_in_text(input: &str) -> LegacyVaultReferenceMigration {
+    let mut output = String::with_capacity(input.len());
+    let mut replacements = Vec::new();
+    let mut cursor = 0;
+
+    while let Some(rel_start) = input[cursor..].find("vault://") {
+        let start = cursor + rel_start;
+        output.push_str(&input[cursor..start]);
+
+        let tail = &input[start..];
+        let token_len = tail.find(is_reference_terminator).unwrap_or(tail.len());
+        let token = &tail[..token_len];
+        if let Some(replacement) = legacy_vault_reference_replacement(token) {
+            output.push_str(&replacement);
+            if replacement != token {
+                replacements.push(LegacyVaultReferenceReplacement {
+                    legacy: token.to_string(),
+                    replacement,
+                });
+            }
+        } else {
+            output.push_str(token);
+        }
+        cursor = start + token_len;
+    }
+
+    output.push_str(&input[cursor..]);
+    LegacyVaultReferenceMigration {
+        output,
+        replacements,
+    }
+}
+
 /// True when the string is shaped like a non-reserved secret-reference
 /// URI. Unknown non-reserved schemes return `true` so config
 /// validation can reject them as unsupported references instead of
@@ -293,6 +398,45 @@ pub fn looks_like_secret_reference_uri(s: &str) -> bool {
 /// detection, not `vault://`-only detection.
 pub fn looks_like_vault_uri(s: &str) -> bool {
     looks_like_secret_reference_uri(s)
+}
+
+pub(crate) fn warn_legacy_vault_reference_once(legacy: &str, replacement: &str) {
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let key = format!("{legacy}\0{replacement}");
+    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+    if !warned.lock().unwrap().insert(key) {
+        return;
+    }
+
+    tracing::warn!(
+        legacy_reference = legacy,
+        replacement = replacement,
+        removal_version = LEGACY_VAULT_REFERENCE_REMOVAL_VERSION,
+        "deprecated secret reference: legacy `vault://<alias>/...` forms are accepted during the \
+         deprecation window; migrate to the provider-specific replacement before the removal version"
+    );
+}
+
+fn split_legacy_vault_alias(input: &str) -> Option<(&str, &str)> {
+    let rest = input.strip_prefix("vault://")?;
+    let (alias, path) = rest.split_once('/')?;
+    if alias.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some((alias, path))
+}
+
+fn is_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_reference_terminator(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '"' | '\'' | ']' | '}' | ',' | '<' | '>')
 }
 
 fn is_valid_reference_scheme(scheme: &str) -> bool {
@@ -376,6 +520,70 @@ mod tests {
         assert_eq!(static_ref.provider_type, VaultProviderType::LocalSecret);
         assert_eq!(static_ref.backend, "local");
         assert_eq!(static_ref.path, "openai-prod");
+    }
+
+    /// Legacy umbrella aliases route to provider-specific schemes
+    /// during the deprecation window.
+    #[test]
+    fn parses_legacy_provider_aliases_through_deprecation_shim() {
+        let aws = VaultRef::parse("vault://aws/prod/openai-keys?version=3&key=api_key").unwrap();
+        assert_eq!(aws.provider_type, VaultProviderType::AwsSecretsManager);
+        assert_eq!(aws.backend, "aws");
+        assert_eq!(aws.path, "prod/openai-keys");
+        assert_eq!(aws.version.as_deref(), Some("3"));
+        assert_eq!(aws.key.as_deref(), Some("api_key"));
+
+        let k8s = VaultRef::parse("vault://k8s/default/sbproxy-secrets/openai-key").unwrap();
+        assert_eq!(k8s.provider_type, VaultProviderType::KubernetesSecret);
+        assert_eq!(k8s.backend, "k8s");
+        assert_eq!(k8s.path, "default/sbproxy-secrets/openai-key");
+
+        let file = VaultRef::parse("vault://file/etc/sbproxy/secrets/openai?key=api_key").unwrap();
+        assert_eq!(file.provider_type, VaultProviderType::SecretFile);
+        assert_eq!(file.backend, "file");
+        assert_eq!(file.path, "etc/sbproxy/secrets/openai");
+
+        let hashi = VaultRef::parse("vault://hashi/secret/data/openai?key=api_key").unwrap();
+        assert_eq!(hashi.provider_type, VaultProviderType::HashiCorp);
+        assert_eq!(hashi.backend, "hashi");
+        assert_eq!(hashi.path, "secret/data/openai");
+    }
+
+    #[test]
+    fn maps_legacy_env_alias_to_env_var_shape() {
+        assert_eq!(
+            legacy_vault_reference_replacement("vault://env/OPENAI_API_KEY").as_deref(),
+            Some("${OPENAI_API_KEY}")
+        );
+        assert_eq!(
+            legacy_vault_env_name("vault://env/OPENAI_API_KEY"),
+            Some("OPENAI_API_KEY")
+        );
+        assert!(legacy_vault_env_name("vault://env/OPENAI_API_KEY?key=value").is_none());
+    }
+
+    #[test]
+    fn migrates_legacy_vault_references_in_text() {
+        let input = r#"
+providers:
+  - api_key: vault://aws/prod/openai?version=3&key=api_key
+  - token: "vault://env/INTERNAL_BEARER_TOKEN"
+  - hashi: vault://hashi/secret/data/inbound?key=token
+  - primary: vault://primary/secret/data/openai
+"#;
+        let migrated = migrate_legacy_vault_references_in_text(input);
+        assert!(migrated.changed());
+        assert_eq!(migrated.replacements.len(), 2);
+        assert!(migrated
+            .output
+            .contains("awssm://aws/prod/openai?version=3&key=api_key"));
+        assert!(migrated.output.contains("\"${INTERNAL_BEARER_TOKEN}\""));
+        assert!(migrated
+            .output
+            .contains("vault://hashi/secret/data/inbound?key=token"));
+        assert!(migrated
+            .output
+            .contains("vault://primary/secret/data/openai"));
     }
 
     /// Round-trip: parse then re-serialise. The canonical form is
