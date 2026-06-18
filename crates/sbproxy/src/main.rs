@@ -279,6 +279,16 @@ enum LogFormat {
     Json,
 }
 
+impl LogFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            LogFormat::Compact => "compact",
+            LogFormat::Pretty => "pretty",
+            LogFormat::Json => "json",
+        }
+    }
+}
+
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
 enum ProjectionKind {
     Robots,
@@ -335,7 +345,9 @@ fn main() {
     //   2. `RUST_LOG` env var (rustc-style filter syntax)
     //   3. `info`
     let log_filter = resolve_log_filter(&cli.globals);
-    init_tracing(log_filter, cli.globals.log_format.unwrap_or_default());
+    let log_format = cli.globals.log_format.unwrap_or_default();
+    let runtime_telemetry = runtime_telemetry_config_for_cli(&cli);
+    init_tracing(log_filter, log_format, runtime_telemetry.as_ref());
 
     // Resolve the graceful-shutdown grace period from the CLI flags / env
     // the operator set (`--grace-time` / `SB_GRACE_TIME`, and
@@ -478,20 +490,62 @@ fn resolve_log_filter(g: &GlobalArgs) -> String {
     }
 }
 
-/// Install the global `tracing` subscriber with the resolved env
-/// filter and the operator-selected wire format. Each `LogFormat`
-/// arm picks a distinct `Subscriber` implementation, so the choice
-/// is fixed for the lifetime of the process (re-running with a
-/// different value requires a restart, which matches every other
-/// tracing-subscriber consumer).
-fn init_tracing(log_filter: String, format: LogFormat) {
-    let builder =
-        tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::new(log_filter));
-    match format {
-        LogFormat::Compact => builder.compact().init(),
-        LogFormat::Pretty => builder.pretty().init(),
-        LogFormat::Json => builder.json().init(),
+/// Read the run config just far enough to map `proxy.observability.telemetry`
+/// into the observe crate's runtime config. Errors return `None` so the
+/// normal run path can report the authoritative config failure after logging
+/// is installed.
+fn runtime_telemetry_config_for_cli(cli: &Cli) -> Option<sbproxy_observe::TelemetryConfig> {
+    if cli.check || !matches!(cli.cmd, None | Some(Cmd::Serve(_))) {
+        return None;
     }
+
+    let path = pick_run_path(cli)?;
+    let yaml = std::fs::read_to_string(&path).ok()?;
+    let compiled = sbproxy_config::compile_config(&yaml).ok()?;
+    compiled
+        .server
+        .observability
+        .as_ref()
+        .and_then(|observability| observability.telemetry.as_ref())
+        .map(runtime_telemetry_config)
+}
+
+fn runtime_telemetry_config(
+    raw: &sbproxy_config::ObservabilityTelemetryConfig,
+) -> sbproxy_observe::TelemetryConfig {
+    sbproxy_observe::TelemetryConfig {
+        enabled: raw.enabled,
+        endpoint: raw.endpoint.clone(),
+        transport: match raw.transport.as_deref() {
+            Some("http") => sbproxy_observe::OtlpTransport::Http,
+            _ => sbproxy_observe::OtlpTransport::Grpc,
+        },
+        service_name: raw
+            .service_name
+            .clone()
+            .unwrap_or_else(|| "sbproxy".to_string()),
+        sample_rate: raw.sample_rate,
+        always_sample_errors: raw.always_sample_errors.unwrap_or(true),
+        keep_over_budget_usd: raw.keep_over_budget_usd,
+        keep_slower_than_secs: raw.keep_slower_than_secs,
+        propagation: raw.propagation.clone(),
+        resource_attrs: raw.resource_attrs.clone(),
+        export_metrics: raw.export_metrics,
+        metrics_interval_secs: raw.metrics_interval_secs,
+    }
+}
+
+fn init_tracing(
+    log_filter: String,
+    format: LogFormat,
+    telemetry: Option<&sbproxy_observe::TelemetryConfig>,
+) {
+    let logging = sbproxy_observe::LoggingConfig {
+        level: log_filter,
+        format: format.as_str().to_string(),
+        sampling: sbproxy_observe::SamplingConfig::default(),
+    };
+    logging.init_with_resolved_filter_and_telemetry(telemetry);
 }
 
 /// Honour `SB_DISABLE_SB_FLAGS=1|true|yes|on` (case-insensitive).
@@ -1382,6 +1436,54 @@ mod tests {
         // The defaulting happens at init_tracing's call site; verify the
         // Default impl returns Compact so the call site can rely on it.
         assert_eq!(LogFormat::default(), LogFormat::Compact);
+    }
+
+    #[test]
+    fn log_format_as_str_matches_cli_values() {
+        assert_eq!(LogFormat::Compact.as_str(), "compact");
+        assert_eq!(LogFormat::Pretty.as_str(), "pretty");
+        assert_eq!(LogFormat::Json.as_str(), "json");
+    }
+
+    #[test]
+    fn runtime_telemetry_config_maps_yaml_surface() {
+        let raw = sbproxy_config::ObservabilityTelemetryConfig {
+            enabled: true,
+            endpoint: Some("http://otel-collector:4318/v1/traces".to_string()),
+            transport: Some("http".to_string()),
+            service_name: Some("sbproxy-dev".to_string()),
+            sample_rate: Some(0.25),
+            always_sample_errors: Some(false),
+            keep_over_budget_usd: Some(0.5),
+            keep_slower_than_secs: Some(3.0),
+            propagation: Some("w3c".to_string()),
+            resource_attrs: std::collections::BTreeMap::from([(
+                "deployment.environment".to_string(),
+                "dev".to_string(),
+            )]),
+            export_metrics: true,
+            metrics_interval_secs: Some(15),
+        };
+
+        let mapped = runtime_telemetry_config(&raw);
+        assert!(mapped.enabled);
+        assert_eq!(
+            mapped.endpoint.as_deref(),
+            Some("http://otel-collector:4318/v1/traces")
+        );
+        assert_eq!(mapped.transport, sbproxy_observe::OtlpTransport::Http);
+        assert_eq!(mapped.service_name, "sbproxy-dev");
+        assert_eq!(mapped.sample_rate, Some(0.25));
+        assert!(!mapped.always_sample_errors);
+        assert_eq!(mapped.keep_over_budget_usd, Some(0.5));
+        assert_eq!(mapped.keep_slower_than_secs, Some(3.0));
+        assert_eq!(mapped.propagation.as_deref(), Some("w3c"));
+        assert_eq!(
+            mapped.resource_attrs.get("deployment.environment"),
+            Some(&"dev".to_string())
+        );
+        assert!(mapped.export_metrics);
+        assert_eq!(mapped.metrics_interval_secs, Some(15));
     }
 
     /// The version line is load-bearing: the marketing site `Hero.vue`

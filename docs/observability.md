@@ -34,6 +34,8 @@ proxy:
       service_name: "sbproxy"
       sample_rate: 0.1             # head ratio for unsampled roots
       always_sample_errors: true   # 100% on 5xx / policy block paths
+      keep_over_budget_usd: 1.00   # keep completed traces at/above this cost
+      keep_slower_than_secs: 2.0   # keep completed traces at/above this latency
       propagation: w3c             # w3c | b3 | jaeger
       resource_attrs:
         deployment.environment: "prod"
@@ -41,6 +43,8 @@ proxy:
       export_metrics: false        # mirror metrics over OTLP
       metrics_interval_secs: 30
 ```
+
+`sample_rate` controls normal traffic with parent-based trace-id ratio sampling. Inbound sampled W3C parents are kept. Locally dropped spans are still recorded until completion so `always_sample_errors`, `keep_over_budget_usd`, and `keep_slower_than_secs` can export the traces operators usually need most.
 
 ### Sinks
 
@@ -571,7 +575,7 @@ The test injects fixture inputs covering every member of the typed `RedactedFiel
 
 ### Tracer setup
 
-OpenTelemetry SDK, pinned to the `0.27.x` family. The tracer is initialized once at boot in `sbproxy-observe::telemetry::init`; configuration lives under `observability.tracing` in `sb.yml` (see "Configuration" above).
+OpenTelemetry SDK, pinned to the `0.27.x` family. The tracer is initialized once at boot from `proxy.observability.telemetry` in `sb.yml` (see "Configuration" above).
 
 OTLP gRPC (port 4317) is the default exporter. HTTP/protobuf (port 4318) is supported for environments that block gRPC. The `stdout` exporter is for local debugging only.
 
@@ -667,6 +671,10 @@ proxy:
       endpoint: "http://otel-collector:4317"
       transport: grpc
       service_name: "sbproxy"
+      sample_rate: 0.1
+      always_sample_errors: true
+      keep_over_budget_usd: 1.00
+      keep_slower_than_secs: 2.0
       export_metrics: true
       metrics_interval_secs: 30
 ```

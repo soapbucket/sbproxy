@@ -6253,6 +6253,7 @@ dependencies = [
  "sbproxy-config",
  "sbproxy-core",
  "sbproxy-modules",
+ "sbproxy-observe",
  "sbproxy-plugin",
  "sbproxy-vault",
  "serde_json",
