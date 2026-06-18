@@ -149,6 +149,14 @@ impl ExpressionPolicy {
             sbproxy_extension::cel::context::populate_kya_namespace(&mut ctx, &kya);
         }
 
+        if let Some(tls) = views.tls {
+            sbproxy_extension::cel::context::populate_tls_namespace(&mut ctx, &tls);
+        }
+
+        if let Some(agent_class) = views.agent_class {
+            sbproxy_extension::cel::context::populate_agent_class_namespace(&mut ctx, &agent_class);
+        }
+
         // Wave 5 / A5.2: stamp the ML classifier verdict whenever
         // inference produced one.
         if let Some(ml) = views.ml {
@@ -203,6 +211,14 @@ pub struct ExpressionViews<'a> {
     pub aipref: Option<&'a AiprefSignal>,
     /// KYA verifier verdict view.
     pub kya: Option<sbproxy_extension::cel::context::KyaVerdictView<'a>>,
+    /// TLS fingerprint view. When `Some`, `populate_tls_namespace` runs
+    /// and policy expressions can branch on `request.tls.ja4` and
+    /// `request.tls.trustworthy`.
+    pub tls: Option<sbproxy_extension::cel::context::TlsFingerprintView<'a>>,
+    /// Rule-based agent-class resolver view. When `Some`,
+    /// `populate_agent_class_namespace` runs and policy expressions can
+    /// branch on `request.agent_class` / `request.agent_id_source`.
+    pub agent_class: Option<sbproxy_extension::cel::context::AgentClassView<'a>>,
     /// ML agent classifier verdict view.
     pub ml: Option<sbproxy_extension::cel::context::MlClassificationView<'a>>,
     /// Phase 2 per-request feature flags view. When `Some`,
@@ -369,6 +385,91 @@ mod tests {
         assert!(
             result,
             "absent aipref signal must default-permissive (train == true)"
+        );
+    }
+
+    #[test]
+    fn expression_policy_evaluate_with_tls_and_agent_class_views() {
+        let p = ExpressionPolicy {
+            expression: r#"request.agent_class == "openai-gptbot"
+                && request.agent_id_source == "user_agent"
+                && request.tls.trustworthy
+                && request.tls.ja4 == "t13d1715h2_5b57614c22b0_3d5424432f57""#
+                .to_string(),
+            deny_status: 403,
+            deny_message: "x".to_string(),
+        };
+        let tls = sbproxy_extension::cel::context::TlsFingerprintView {
+            ja3: None,
+            ja4: Some("t13d1715h2_5b57614c22b0_3d5424432f57"),
+            ja4h: None,
+            trustworthy: true,
+        };
+        let agent = sbproxy_extension::cel::context::AgentClassView {
+            agent_id: Some("openai-gptbot"),
+            agent_vendor: Some("OpenAI"),
+            agent_purpose: Some("training"),
+            agent_id_source: Some("user_agent"),
+            agent_rdns_hostname: None,
+        };
+        let result = p.evaluate_with_views(
+            "GET",
+            "/",
+            &http::HeaderMap::new(),
+            None,
+            None,
+            "h.com",
+            ExpressionViews {
+                tls: Some(tls),
+                agent_class: Some(agent),
+                ..Default::default()
+            },
+        );
+        assert!(
+            result,
+            "expression policy must read request.tls and request.agent_class from the view bundle"
+        );
+    }
+
+    #[test]
+    fn expression_policy_can_allow_untrustworthy_tls_branch() {
+        let p = ExpressionPolicy {
+            expression: r#"!(request.agent_class == "openai-gptbot"
+                && request.tls.trustworthy
+                && size(request.tls.ja4) > 0)"#
+                .to_string(),
+            deny_status: 403,
+            deny_message: "x".to_string(),
+        };
+        let tls = sbproxy_extension::cel::context::TlsFingerprintView {
+            ja3: None,
+            ja4: Some("t13d1516h2_8daaf6152771_b1ff8ab2d16f"),
+            ja4h: None,
+            trustworthy: false,
+        };
+        let agent = sbproxy_extension::cel::context::AgentClassView {
+            agent_id: Some("openai-gptbot"),
+            agent_vendor: Some("OpenAI"),
+            agent_purpose: Some("training"),
+            agent_id_source: Some("user_agent"),
+            agent_rdns_hostname: None,
+        };
+        let result = p.evaluate_with_views(
+            "GET",
+            "/",
+            &http::HeaderMap::new(),
+            None,
+            None,
+            "h.com",
+            ExpressionViews {
+                tls: Some(tls),
+                agent_class: Some(agent),
+                ..Default::default()
+            },
+        );
+        assert!(
+            result,
+            "untrustworthy TLS fingerprints must be available as false, not missing/fail-closed"
         );
     }
 }

@@ -90,6 +90,51 @@ pub fn budget_tracker() -> &'static sbproxy_ai::BudgetTracker {
     &BUDGET_TRACKER
 }
 
+fn cel_response_request_view(
+    ctx: &RequestContext,
+) -> sbproxy_modules::transform::CelResponseRequestView<'_> {
+    let tls =
+        ctx.tls_fingerprint
+            .as_ref()
+            .map(|fp| sbproxy_modules::transform::TlsFingerprintView {
+                ja3: fp.ja3.as_deref(),
+                ja4: fp.ja4.as_deref(),
+                ja4h: fp.ja4h.as_deref(),
+                trustworthy: fp.trustworthy,
+            });
+
+    #[cfg(feature = "agent-class")]
+    let agent = Some(sbproxy_modules::transform::AgentClassView {
+        agent_id: ctx.agent_id.as_ref().map(|id| id.0.as_str()),
+        agent_vendor: ctx.agent_vendor.as_deref(),
+        agent_purpose: ctx.agent_purpose.map(|p| p.as_str()),
+        agent_id_source: ctx.agent_id_source.map(|s| s.as_str()),
+        agent_rdns_hostname: ctx.agent_rdns_hostname.as_deref(),
+    });
+    #[cfg(not(feature = "agent-class"))]
+    let agent = None;
+
+    let headless = Some(match ctx.headless_signal.as_ref() {
+        Some(crate::context::HeadlessSignal::Detected {
+            library,
+            confidence,
+        }) => sbproxy_modules::transform::HeadlessSignalView {
+            detected: true,
+            library: Some(library.as_str()),
+            confidence: *confidence,
+        },
+        Some(crate::context::HeadlessSignal::NotDetected) | None => {
+            sbproxy_modules::transform::HeadlessSignalView::default()
+        }
+    });
+
+    sbproxy_modules::transform::CelResponseRequestView {
+        tls,
+        agent,
+        headless,
+    }
+}
+
 /// Tracks fire-and-forget webhook callback tasks so graceful shutdown
 /// can drain them. `tokio_util::task::TaskTracker` provides the
 /// `spawn` -> `close` -> `wait` pattern: every webhook task is spawned
@@ -389,31 +434,17 @@ fn apply_transform_with_ctx(
             // status (200 from the static action under test) rather
             // than the zero placeholder.
             let status = ctx.response_status.unwrap_or(0);
-            // WOR-1128: thread the captured TLS fingerprint into the CEL
-            // context so a `value_expr` reading `request.tls.trustworthy`
-            // / `request.tls.ja4` resolves against the live per-origin
-            // CIDR verdict. This is the static-action / body-buffer path
-            // (the upstream-response path in `proxy_http.rs` does the
-            // same). Without a captured fingerprint the view is `None`
-            // and `request.tls` is absent, so such a rule is skipped.
-            let tls_view = ctx.tls_fingerprint.as_ref().map(|fp| {
-                sbproxy_modules::transform::TlsFingerprintView {
-                    ja3: fp.ja3.as_deref(),
-                    ja4: fp.ja4.as_deref(),
-                    ja4h: fp.ja4h.as_deref(),
-                    trustworthy: fp.trustworthy,
-                }
-            });
+            let request_view = cel_response_request_view(ctx);
             // WOR-168: `evaluate_headers` now returns
             // `TransformError::InvariantViolated` instead of panicking
             // when the inner Remove arm is reached. Propagate as
             // `anyhow::Error` so the body-buffer pipeline's `fail_on_error`
             // path takes over and synthesises a 500 with attribution.
-            match t.evaluate_headers_with_tls(
+            match t.evaluate_headers_with_request(
                 body.as_ref(),
                 status,
                 &http::HeaderMap::new(),
-                tls_view,
+                request_view,
             ) {
                 Ok(mutations) => {
                     ctx.cel_response_header_mutations.extend(mutations);

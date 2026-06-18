@@ -6,23 +6,21 @@
 //! `request.tls_fingerprint.ja4` and consults the reference catalogue at
 //! `crates/sbproxy-classifiers/data/tls-fingerprints.json`. A match
 //! produces `HeadlessSignal::Detected { library, confidence }` and feeds
-//! the G1.4 resolver chain so `agent_class = "headless-browser"` lands on
-//! the request context.
+//! the G1.4 resolver chain so a headless agent class lands on the
+//! request context.
 //!
-//! Tests in this file rely on the G5.4 lane
-//! (`wave5/G5.4-headless-detect`) plus the G5.3 capture lane. Until both
-//! land we cannot drive a real Puppeteer JA4 through the pipeline, so
-//! every test is `#[ignore]`'d with the appropriate `TODO(wave5-G5.4)`
-//! marker. The fixture YAML is shaped against the ADR's worked example so
-//! the only remaining work at activation time is pointing the harness at
-//! a TLS-capable client path.
+//! The active tests use trusted sidecar JA4 injection because the e2e
+//! harness is plaintext. Native TLS ClientHello coverage is tracked by
+//! WOR-1444.
 
 use sbproxy_e2e::ProxyHarness;
+
+const PUPPETEER_JA4: &str = "t13d1516h2_8daaf6152771_b1ff8ab2d16f";
+const UNKNOWN_BROWSER_JA4: &str = "t13d0000h2_000000000000_000000000000";
 
 // --- Test 1: Puppeteer JA4 -> HeadlessSignal::Detected ---
 
 #[test]
-#[ignore = "TODO(wave5-day6+): day-5 landed the type: cel transform (Item 4) and the harness loopback trust-CIDR default (Item 5). Reactivation blocks on (1) the test must inject sidecar headers like x-sbproxy-tls-ja4 via get_with_headers so the JA4 actually populates request.tls.ja4, and (2) the day-5 CEL transform writes to the response BODY, not response HEADERS as these tests expect; the tests need to be rewritten to assert against the body."]
 fn puppeteer_ja4_detected_with_library_label() {
     let yaml = r#"
 proxy:
@@ -32,8 +30,6 @@ features:
     enabled: true
     trustworthy_client_cidrs:
       - 127.0.0.0/8
-  headless_detect:
-    enabled: true
 origins:
   "headless.localhost":
     action:
@@ -43,30 +39,49 @@ origins:
       body: "ok"
     transforms:
       - type: cel
-        on_response: |
-          resp.headers["x-headless-library"] = request.headless_signal != null
-            ? request.headless_signal.library
-            : "absent"
-          resp.headers["x-headless-confidence"] = request.headless_signal != null
-            ? string(request.headless_signal.confidence)
-            : "0"
+        headers:
+          - op: set
+            name: x-headless-library
+            value_expr: 'request.headless_signal.library'
+          - op: set
+            name: x-headless-confidence
+            value_expr: 'string(request.headless_signal.confidence)'
+          - op: set
+            name: x-headless-detected
+            value_expr: 'request.headless_signal.detected ? "yes" : "no"'
 "#;
     let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
-    // The harness has no path to drive a literal Puppeteer JA4 yet;
-    // when G5.4 lands the test runner will replay a known-Puppeteer
-    // ClientHello and assert the catalogue match below.
-    let resp = harness.get("/", "headless.localhost").expect("GET");
+    let resp = harness
+        .get_with_headers(
+            "/",
+            "headless.localhost",
+            &[("x-sbproxy-tls-ja4", PUPPETEER_JA4)],
+        )
+        .expect("GET");
     assert_eq!(
         resp.headers.get("x-headless-library").map(String::as_str),
         Some("puppeteer"),
         "Puppeteer JA4 must map to library = puppeteer in the reference catalogue"
+    );
+    assert_eq!(
+        resp.headers.get("x-headless-detected").map(String::as_str),
+        Some("yes"),
+        "Puppeteer JA4 must set the detected flag"
+    );
+    let confidence: f32 = resp
+        .headers
+        .get("x-headless-confidence")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    assert!(
+        (confidence - 0.95).abs() < 0.001,
+        "trustworthy Puppeteer JA4 must keep 0.95 confidence; got {confidence}"
     );
 }
 
 // --- Test 2: Generic browser JA4 -> NotDetected ---
 
 #[test]
-#[ignore = "TODO(wave5-day6+): day-5 landed the type: cel transform (Item 4) and the harness loopback trust-CIDR default (Item 5). Reactivation blocks on (1) the test must inject sidecar headers like x-sbproxy-tls-ja4 via get_with_headers so the JA4 actually populates request.tls.ja4, and (2) the day-5 CEL transform writes to the response BODY, not response HEADERS as these tests expect; the tests need to be rewritten to assert against the body."]
 fn generic_browser_ja4_not_detected() {
     let yaml = r#"
 proxy:
@@ -76,8 +91,6 @@ features:
     enabled: true
     trustworthy_client_cidrs:
       - 127.0.0.0/8
-  headless_detect:
-    enabled: true
 origins:
   "headless.localhost":
     action:
@@ -87,11 +100,19 @@ origins:
       body: "ok"
     transforms:
       - type: cel
-        on_response: |
-          resp.headers["x-headless"] = request.headless_signal != null ? "detected" : "none"
+        headers:
+          - op: set
+            name: x-headless
+            value_expr: 'request.headless_signal.detected ? "detected" : "none"'
 "#;
     let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
-    let resp = harness.get("/", "headless.localhost").expect("GET");
+    let resp = harness
+        .get_with_headers(
+            "/",
+            "headless.localhost",
+            &[("x-sbproxy-tls-ja4", UNKNOWN_BROWSER_JA4)],
+        )
+        .expect("GET");
     assert_eq!(
         resp.headers.get("x-headless").map(String::as_str),
         Some("none"),
@@ -102,7 +123,6 @@ origins:
 // --- Test 3: confidence halved when trustworthy = false ---
 
 #[test]
-#[ignore = "TODO(wave5-day6+): day-5 landed the type: cel transform (Item 4) and the harness loopback trust-CIDR default (Item 5). Reactivation blocks on (1) the test must inject sidecar headers like x-sbproxy-tls-ja4 via get_with_headers so the JA4 actually populates request.tls.ja4, and (2) the day-5 CEL transform writes to the response BODY, not response HEADERS as these tests expect; the tests need to be rewritten to assert against the body."]
 fn confidence_halved_when_not_trustworthy() {
     let yaml = r#"
 proxy:
@@ -112,8 +132,6 @@ features:
     enabled: true
     untrusted_client_cidrs:
       - 127.0.0.0/8
-  headless_detect:
-    enabled: true
 origins:
   "headless.localhost":
     action:
@@ -123,21 +141,27 @@ origins:
       body: "ok"
     transforms:
       - type: cel
-        on_response: |
-          resp.headers["x-headless-confidence"] = request.headless_signal != null
-            ? string(request.headless_signal.confidence)
-            : "0"
+        headers:
+          - op: set
+            name: x-headless-confidence
+            value_expr: 'string(request.headless_signal.confidence)'
 "#;
     let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
-    let resp = harness.get("/", "headless.localhost").expect("GET");
+    let resp = harness
+        .get_with_headers(
+            "/",
+            "headless.localhost",
+            &[("x-sbproxy-tls-ja4", PUPPETEER_JA4)],
+        )
+        .expect("GET");
     let conf: f32 = resp
         .headers
         .get("x-headless-confidence")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
     assert!(
-        (conf - 0.4).abs() < 0.05,
-        "confidence must be ~0.4 when trustworthy=false; got {}",
+        (conf - 0.475).abs() < 0.001,
+        "confidence must be 0.475 when trustworthy=false; got {}",
         conf
     );
 }
@@ -145,7 +169,6 @@ origins:
 // --- Test 4: headless verdict feeds the agent_class resolver ---
 
 #[test]
-#[ignore = "TODO(wave5-G5.4-harness): the resolver-chain hook (`apply_headless_override` in `sbproxy-core/src/agent_class.rs`) is wired and unit-tested; on a `Fallback` verdict it stamps `agent_id = \"headless-{library}\"` and `agent_id_source = TlsFingerprint`. The catalog already has `headless-browser` / `headless-puppeteer` / `headless-playwright` entries. Reactivation blocks on the same sidecar-header harness path + `type: cel` transform as the rest of the headless suite."]
 fn headless_verdict_resolves_to_headless_browser_class() {
     let yaml = r#"
 proxy:
@@ -155,8 +178,6 @@ features:
     enabled: true
     trustworthy_client_cidrs:
       - 127.0.0.0/8
-  headless_detect:
-    enabled: true
 origins:
   "headless.localhost":
     action:
@@ -166,16 +187,29 @@ origins:
       body: "ok"
     transforms:
       - type: cel
-        on_response: |
-          resp.headers["x-agent-class"] = request.agent_class
-          resp.headers["x-agent-source"] = request.agent_id_source
+        headers:
+          - op: set
+            name: x-agent-class
+            value_expr: 'request.agent_class'
+          - op: set
+            name: x-agent-source
+            value_expr: 'request.agent_id_source'
 "#;
     let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
-    let resp = harness.get("/", "headless.localhost").expect("GET");
+    let resp = harness
+        .get_with_headers(
+            "/",
+            "headless.localhost",
+            &[
+                ("x-sbproxy-tls-ja4", PUPPETEER_JA4),
+                ("user-agent", "Mozilla/5.0 Chrome/123.0"),
+            ],
+        )
+        .expect("GET");
     assert_eq!(
         resp.headers.get("x-agent-class").map(String::as_str),
-        Some("headless-browser"),
-        "Puppeteer JA4 with no higher-confidence resolver match must produce agent_class = headless-browser"
+        Some("headless-puppeteer"),
+        "Puppeteer JA4 with no higher-confidence resolver match must produce agent_class = headless-puppeteer"
     );
     assert_eq!(
         resp.headers.get("x-agent-source").map(String::as_str),
@@ -187,7 +221,7 @@ origins:
 // --- Test 5: detector is no-op when feature is disabled ---
 
 #[test]
-#[ignore = "TODO(wave5-G5.4-harness): the headless detector path is gated on the `tls-fingerprint` cargo feature (the wiring lives inside `#[cfg(feature = \"tls-fingerprint\")]` in `request_filter`). The harness binary ships with the feature on, so this test needs a `--no-default-features` harness build alongside the existing one. Same `type: cel` blocker."]
+#[ignore = "WOR-1445: needs a no-default-features e2e harness binary so the tls-fingerprint-gated headless detector path is genuinely off."]
 fn headless_detect_disabled_leaves_signal_null() {
     let yaml = r#"
 proxy:
@@ -206,11 +240,19 @@ origins:
       body: "ok"
     transforms:
       - type: cel
-        on_response: |
-          resp.headers["x-headless"] = request.headless_signal != null ? "detected" : "absent"
+        headers:
+          - op: set
+            name: x-headless
+            value_expr: 'request.headless_signal.detected ? "detected" : "absent"'
 "#;
     let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
-    let resp = harness.get("/", "headless.localhost").expect("GET");
+    let resp = harness
+        .get_with_headers(
+            "/",
+            "headless.localhost",
+            &[("x-sbproxy-tls-ja4", PUPPETEER_JA4)],
+        )
+        .expect("GET");
     assert_eq!(
         resp.headers.get("x-headless").map(String::as_str),
         Some("absent"),

@@ -190,6 +190,52 @@ pub fn populate_agent_class_namespace(ctx: &mut CelContext, view: &AgentClassVie
     ctx.set("agent", CelValue::Map(agent));
 }
 
+/// Headless-browser detector fields exposed to CEL.
+///
+/// Empty / absent detector output renders as zero values so response-time
+/// CEL can branch on `request.headless_signal.detected` without probing
+/// for map presence first.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HeadlessSignalView<'a> {
+    /// Whether the JA4 detector matched a known headless library.
+    pub detected: bool,
+    /// Library label (`puppeteer`, `playwright`, ...), when detected.
+    pub library: Option<&'a str>,
+    /// Detector confidence in `[0.0, 1.0]`.
+    pub confidence: f32,
+}
+
+/// Stamp [`HeadlessSignalView`] under `request.headless_signal.*`.
+///
+/// Exposed bindings:
+///
+/// - `request.headless_signal.detected` - boolean.
+/// - `request.headless_signal.library` - library label or `""`.
+/// - `request.headless_signal.confidence` - float confidence.
+pub fn populate_headless_signal_namespace(ctx: &mut CelContext, view: &HeadlessSignalView<'_>) {
+    let mut headless_map = HashMap::with_capacity(3);
+    headless_map.insert("detected".to_string(), CelValue::Bool(view.detected));
+    headless_map.insert(
+        "library".to_string(),
+        CelValue::String(view.library.unwrap_or("").to_string()),
+    );
+    headless_map.insert(
+        "confidence".to_string(),
+        CelValue::Float(f64::from(view.confidence)),
+    );
+
+    let request_var = ctx
+        .variables
+        .remove("request")
+        .unwrap_or_else(|| CelValue::Map(HashMap::new()));
+    let mut request_map = match request_var {
+        CelValue::Map(m) => m,
+        _ => HashMap::new(),
+    };
+    request_map.insert("headless_signal".to_string(), CelValue::Map(headless_map));
+    ctx.set("request", CelValue::Map(request_map));
+}
+
 /// Borrowed view over the three aipref axes the CEL context
 /// exposes. The caller (typically `sbproxy-modules` or
 /// `sbproxy-core`) owns the parsed signal and constructs this view to
@@ -1460,6 +1506,47 @@ mod tests {
             .eval_bool_source(
                 r#"request.agent_id == "" && agent.id == "" && agent.vendor == """#,
                 &ctx
+            )
+            .unwrap());
+    }
+
+    // --- HeadlessSignalView tests ---
+
+    #[test]
+    fn headless_signal_namespace_round_trips_detection_fields() {
+        let mut ctx = build_request_context("GET", "/", &HeaderMap::new(), None, None, "h.com");
+        let view = HeadlessSignalView {
+            detected: true,
+            library: Some("puppeteer"),
+            confidence: 0.95,
+        };
+        populate_headless_signal_namespace(&mut ctx, &view);
+
+        let engine = CelEngine::new();
+        assert!(engine
+            .eval_bool_source("request.headless_signal.detected == true", &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source(r#"request.headless_signal.library == "puppeteer""#, &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source("request.headless_signal.confidence > 0.9", &ctx)
+            .unwrap());
+    }
+
+    #[test]
+    fn headless_signal_namespace_defaults_to_zero_values() {
+        let mut ctx = build_request_context("GET", "/", &HeaderMap::new(), None, None, "h.com");
+        populate_headless_signal_namespace(&mut ctx, &HeadlessSignalView::default());
+
+        let engine = CelEngine::new();
+        assert!(engine
+            .eval_bool_source("request.headless_signal.detected == false", &ctx)
+            .unwrap());
+        assert!(engine
+            .eval_bool_source(
+                r#"request.headless_signal.library == "" && request.headless_signal.confidence == 0.0"#,
+                &ctx,
             )
             .unwrap());
     }
