@@ -10,6 +10,14 @@ use crate::vault_ref::{VaultProviderType, VaultRef};
 pub trait VaultBackend: Send + Sync {
     /// Retrieve a secret by key.
     fn get(&self, key: &str) -> Result<Option<String>>;
+    /// Retrieve a secret from a parsed provider reference.
+    ///
+    /// Backends with provider-specific URI query semantics can
+    /// override this. The default keeps existing backends on their
+    /// path-only lookup behaviour.
+    fn get_ref(&self, reference: &VaultRef) -> Result<Option<String>> {
+        self.get(&reference.path)
+    }
     /// Store a secret under the given key.
     fn set(&self, key: &str, value: &str) -> Result<()>;
 }
@@ -88,9 +96,21 @@ impl VaultManager {
         backend: &str,
         key: &str,
     ) -> Result<Option<String>> {
+        self.get_with_metrics(provider_type, backend, |vault| vault.get(key))
+    }
+
+    fn get_with_metrics<F>(
+        &self,
+        provider_type: VaultProviderType,
+        backend: &str,
+        get: F,
+    ) -> Result<Option<String>>
+    where
+        F: FnOnce(&dyn VaultBackend) -> Result<Option<String>>,
+    {
         let start = std::time::Instant::now();
         let outcome = match self.vaults.get(&BackendKey::new(provider_type, backend)) {
-            Some(vault) => vault.get(key),
+            Some(vault) => get(vault.as_ref()),
             None => Err(anyhow!(
                 "vault backend not found: {}://{}",
                 provider_type.scheme(),
@@ -115,9 +135,11 @@ impl VaultManager {
     /// manager. The backend path is read from [`VaultRef::path`], and a
     /// top-level JSON/map field is extracted when `?key=` is present.
     pub fn get_from_ref(&self, reference: &VaultRef) -> Result<Option<String>> {
-        self.get_typed(reference.provider_type, &reference.backend, &reference.path)?
-            .map(|secret| apply_key_selector(reference, secret))
-            .transpose()
+        self.get_with_metrics(reference.provider_type, &reference.backend, |vault| {
+            vault.get_ref(reference)
+        })?
+        .map(|secret| apply_key_selector(reference, secret))
+        .transpose()
     }
 
     /// Resolve a parsed reference by walking managers in caller-supplied

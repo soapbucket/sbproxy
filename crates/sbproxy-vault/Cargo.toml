@@ -10,6 +10,8 @@ anyhow.workspace = true
 tracing.workspace = true
 sbproxy-observe.workspace = true
 serde_json.workspace = true
+serde = { workspace = true }
+schemars.workspace = true
 # YAML parser for the file-format vault backend.
 serde_yaml = { workspace = true }
 base64.workspace = true
@@ -25,6 +27,10 @@ tokio = { workspace = true, features = ["rt"] }
 
 # Blocking HTTP client for HashiCorp Vault, AWS KMS, and GCP Cloud KMS backends
 ureq = { version = "2", features = ["json"] }
+
+# GCP auth. Pinned to the last 0.12.x release that preserves the
+# workspace MSRV (1.82); newer 0.12.x releases require Rust 1.83+.
+gcp_auth = "=0.12.4"
 
 # AWS SDK: Secrets Manager backend uses the official SDK so the
 # default credential chain (env / instance-profile / SSO / SSO+role)
