@@ -58,18 +58,103 @@ fn startup_timeout() -> Duration {
         .unwrap_or(DEFAULT_STARTUP_TIMEOUT)
 }
 
-/// Locate the `sbproxy` binary built by the workspace. Prefers the
-/// release build at `target/release/sbproxy`; falls back to
-/// `target/debug/sbproxy` so CI runs that only build the debug profile
-/// (the default `cargo test` flow) still find a usable binary.
-pub fn proxy_binary_path() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest.parent().unwrap();
-    let release = workspace_root.join("target/release/sbproxy");
-    if release.is_file() {
-        return release;
+const DEFAULT_BINARY_ENV: &str = "SBPROXY_E2E_BIN";
+const NO_DEFAULT_FEATURES_BINARY_ENV: &str = "SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN";
+
+#[derive(Debug, Clone, Copy)]
+enum ProxyBinaryFlavor {
+    Default,
+    NoDefaultFeatures,
+}
+
+impl ProxyBinaryFlavor {
+    fn env_var(self) -> &'static str {
+        match self {
+            Self::Default => DEFAULT_BINARY_ENV,
+            Self::NoDefaultFeatures => NO_DEFAULT_FEATURES_BINARY_ENV,
+        }
     }
-    workspace_root.join("target/debug/sbproxy")
+
+    fn search_paths(self) -> Vec<PathBuf> {
+        let root = workspace_root();
+        match self {
+            Self::Default => vec![
+                root.join("target/release/sbproxy"),
+                root.join("target/debug/sbproxy"),
+            ],
+            Self::NoDefaultFeatures => vec![
+                root.join("target/no-default-features/release/sbproxy"),
+                root.join("target/no-default-features/debug/sbproxy"),
+            ],
+        }
+    }
+
+    fn missing_hint(self) -> &'static str {
+        match self {
+            Self::Default => {
+                "run `cargo build --release -p sbproxy` or set SBPROXY_E2E_BIN"
+            }
+            Self::NoDefaultFeatures => {
+                "run `CARGO_TARGET_DIR=target/no-default-features cargo build -p sbproxy --no-default-features` or set SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN"
+            }
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Default => "sbproxy",
+            Self::NoDefaultFeatures => "no-default-features sbproxy",
+        }
+    }
+}
+
+fn workspace_root() -> PathBuf {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .parent()
+        .expect("e2e crate must live under workspace root")
+        .to_path_buf()
+}
+
+fn configured_binary_path(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var).and_then(|value| {
+        if value.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(value))
+        }
+    })
+}
+
+fn proxy_binary_path_for(flavor: ProxyBinaryFlavor) -> PathBuf {
+    if let Some(path) = configured_binary_path(flavor.env_var()) {
+        return path;
+    }
+    let paths = flavor.search_paths();
+    paths
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .unwrap_or_else(|| paths.last().expect("binary search paths").clone())
+}
+
+/// Locate the default-feature `sbproxy` binary built by the workspace.
+/// The `SBPROXY_E2E_BIN` environment variable wins when set. Otherwise
+/// this prefers `target/release/sbproxy` and falls back to
+/// `target/debug/sbproxy` so CI runs that only build the debug profile
+/// still find a usable binary.
+pub fn proxy_binary_path() -> PathBuf {
+    proxy_binary_path_for(ProxyBinaryFlavor::Default)
+}
+
+/// Locate a `sbproxy` binary compiled with `--no-default-features`.
+///
+/// The `SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN` environment variable wins
+/// when set. Otherwise this looks under `target/no-default-features/`,
+/// which lets disabled-feature e2e coverage run without overwriting the
+/// default-feature binary used by the normal suite.
+pub fn proxy_no_default_features_binary_path() -> PathBuf {
+    proxy_binary_path_for(ProxyBinaryFlavor::NoDefaultFeatures)
 }
 
 /// One-off response shape returned by the harness's HTTP helpers.
@@ -132,6 +217,22 @@ impl ProxyHarness {
         Self::start_with_resolved_yaml(&final_yaml, port)
     }
 
+    /// Start the proxy using a binary compiled with
+    /// `--no-default-features`.
+    ///
+    /// This keeps disabled-feature assertions separate from the default
+    /// e2e suite. Build the binary into `target/no-default-features/`
+    /// or set `SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN`.
+    pub fn start_no_default_features_with_yaml(yaml: &str) -> anyhow::Result<Self> {
+        let port = pick_free_port()?;
+        let final_yaml = inject_port(yaml, port)?;
+        Self::start_with_resolved_yaml_using_binary(
+            &final_yaml,
+            port,
+            ProxyBinaryFlavor::NoDefaultFeatures,
+        )
+    }
+
     /// Start the proxy with the YAML file at `path`, rewriting its
     /// `proxy.http_bind_port` to a fresh ephemeral port. The
     /// rewritten copy is held in a temp file; the original on
@@ -143,11 +244,21 @@ impl ProxyHarness {
     }
 
     fn start_with_resolved_yaml(yaml: &str, port: u16) -> anyhow::Result<Self> {
-        let bin = proxy_binary_path();
+        Self::start_with_resolved_yaml_using_binary(yaml, port, ProxyBinaryFlavor::Default)
+    }
+
+    fn start_with_resolved_yaml_using_binary(
+        yaml: &str,
+        port: u16,
+        binary: ProxyBinaryFlavor,
+    ) -> anyhow::Result<Self> {
+        let bin = proxy_binary_path_for(binary);
         if !bin.is_file() {
             anyhow::bail!(
-                "release binary missing at {}; run `cargo build --release -p sbproxy` first",
-                bin.display()
+                "{} binary missing at {}; {}",
+                binary.description(),
+                bin.display(),
+                binary.missing_hint()
             );
         }
         // The proxy reads its config from a path, not stdin, so
@@ -193,8 +304,10 @@ impl ProxyHarness {
         let bin = proxy_binary_path();
         if !bin.is_file() {
             anyhow::bail!(
-                "release binary missing at {}; run `cargo build --release -p sbproxy` first",
-                bin.display()
+                "{} binary missing at {}; {}",
+                ProxyBinaryFlavor::Default.description(),
+                bin.display(),
+                ProxyBinaryFlavor::Default.missing_hint()
             );
         }
         let tmp = tempfile::tempdir()?;

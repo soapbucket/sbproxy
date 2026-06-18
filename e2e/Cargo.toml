@@ -6,12 +6,17 @@ license.workspace = true
 publish = false
 
 # This crate ships a small `ProxyHarness` library plus a suite of
-# integration tests that spawn the release `sbproxy` binary against
+# integration tests that spawn a built `sbproxy` binary against
 # the example sb.yml files and exercise the documented HTTP
 # behaviour. Running it requires a release build of the binary:
 #
 #     cargo build --release -p sbproxy
 #     cargo test  --release -p sbproxy-e2e
+#
+# Disabled-feature coverage can target a separate no-default-features
+# build without overwriting the normal suite binary:
+#
+#     CARGO_TARGET_DIR=target/no-default-features cargo build -p sbproxy --no-default-features
 #
 # Each test owns its own ephemeral TCP port and writes a temp
 # config so the suite parallelises cleanly.
