@@ -69,7 +69,7 @@ pub(super) async fn handle_ai_proxy(
                 "AI proxy: per-surface rate limit hit; returning 429"
             );
             sbproxy_ai::tracing_spans::record_error(
-                &tracing::Span::current(),
+                &ai_span,
                 sbproxy_ai::tracing_spans::error_type::RATE_LIMITED,
                 "per-surface rate limit exceeded",
             );
@@ -170,9 +170,21 @@ pub(super) async fn handle_ai_proxy(
             .forward_get_request(provider, &path)
             .await
             .map_err(|e| {
+                record_ai_transport_failure(
+                    &ai_span,
+                    Some(provider.name.as_str()),
+                    &e,
+                    "AI upstream GET request failed",
+                );
                 warn!(error = %e, "AI proxy: upstream GET request failed");
                 Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
             })?;
+        record_ai_provider_response_failure(
+            &ai_span,
+            provider.name.as_str(),
+            resp.status().as_u16(),
+            None,
+        );
 
         // GET endpoints (e.g. /v1/models) aren't translated yet:
         // Anthropic's models listing has a different shape and most
@@ -298,6 +310,12 @@ pub(super) async fn handle_ai_proxy(
             .forward_with_method(provider, &method_str, &path, body_opt.as_ref())
             .await
             .map_err(|e| {
+                record_ai_transport_failure(
+                    &ai_span,
+                    Some(provider.name.as_str()),
+                    &e,
+                    "AI upstream method-aware request failed",
+                );
                 warn!(
                     error = %e,
                     method = %method_str,
@@ -306,6 +324,12 @@ pub(super) async fn handle_ai_proxy(
                 );
                 Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
             })?;
+        record_ai_provider_response_failure(
+            &ai_span,
+            provider.name.as_str(),
+            resp.status().as_u16(),
+            None,
+        );
 
         let format = sbproxy_ai::client::provider_format(provider);
         emit_ai_billing_event(
@@ -498,6 +522,12 @@ pub(super) async fn handle_ai_proxy(
             )
             .await
             .map_err(|e| {
+                record_ai_transport_failure(
+                    &ai_span,
+                    Some(provider.name.as_str()),
+                    &e,
+                    "AI upstream multipart request failed",
+                );
                 warn!(
                     error = %e,
                     method = %method_str,
@@ -526,6 +556,12 @@ pub(super) async fn handle_ai_proxy(
                 .unwrap_or("application/json")
                 .to_string();
             let resp_bytes = read_capped_response_body(resp, config.max_body_size).await?;
+            record_ai_provider_response_failure(
+                &ai_span,
+                provider.name.as_str(),
+                status,
+                Some(resp_bytes.as_ref()),
+            );
             // Whisper is the only OpenAI transcription model today;
             // the inbound body is multipart so the model is not in a
             // JSON field. Default to `whisper-1` for cost lookup; a
@@ -568,6 +604,12 @@ pub(super) async fn handle_ai_proxy(
             &ctx.attribution_tags,
             ctx.tenant_id.as_str(),
             &ai_span,
+        );
+        record_ai_provider_response_failure(
+            &ai_span,
+            provider.name.as_str(),
+            resp.status().as_u16(),
+            None,
         );
         // Multipart never captures for idempotency (engagement
         // skipped with SKIPPED-MULTIPART). Pass the skip reason
@@ -874,6 +916,11 @@ pub(super) async fn handle_ai_proxy(
         match budget_preflight(budget_cfg, &keys, &config.providers) {
             BudgetGate::Allow => keys,
             BudgetGate::Block { status, body: err } => {
+                sbproxy_ai::tracing_spans::record_error(
+                    &ai_span,
+                    sbproxy_ai::tracing_spans::error_type::BUDGET_EXCEEDED,
+                    "AI budget exceeded",
+                );
                 send_response(session, status, "application/json", &err).await?;
                 return Ok(());
             }
@@ -954,7 +1001,7 @@ pub(super) async fn handle_ai_proxy(
                 let retry = rej.retry_after_secs.to_string();
                 let extra: Option<(&str, &str)> = Some(("retry-after", &retry));
                 sbproxy_ai::tracing_spans::record_error(
-                    &tracing::Span::current(),
+                    &ai_span,
                     sbproxy_ai::tracing_spans::error_type::RATE_LIMITED,
                     "model rate limit exceeded",
                 );
@@ -1090,7 +1137,7 @@ pub(super) async fn handle_ai_proxy(
                         "AI proxy: input guardrail blocked request"
                     );
                     sbproxy_ai::tracing_spans::record_error(
-                        &tracing::Span::current(),
+                        &ai_span,
                         sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                         &block.reason,
                     );
@@ -1117,6 +1164,11 @@ pub(super) async fn handle_ai_proxy(
                         reason = %block.reason,
                         "AI proxy: body-aware input guardrail blocked request"
                     );
+                    sbproxy_ai::tracing_spans::record_error(
+                        &ai_span,
+                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                        &block.reason,
+                    );
                     let error_body = serde_json::json!({
                         "error": {
                             "message": block.reason,
@@ -1142,6 +1194,11 @@ pub(super) async fn handle_ai_proxy(
                             guardrail = %block.name,
                             reason = %block.reason,
                             "AI proxy: per-surface input guardrail blocked request"
+                        );
+                        sbproxy_ai::tracing_spans::record_error(
+                            &ai_span,
+                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                            &block.reason,
                         );
                         let error_body = serde_json::json!({
                             "error": {
@@ -1656,6 +1713,7 @@ pub(super) async fn handle_ai_proxy(
     let mut last_format: sbproxy_ai::providers::ProviderFormat =
         sbproxy_ai::providers::ProviderFormat::OpenAi;
     let mut last_error: Option<anyhow::Error> = None;
+    let mut last_error_type: &'static str = sbproxy_ai::tracing_spans::error_type::PROVIDER_ERROR;
     // Track the upstream URL host of the provider that produced
     // `last_resp`. Used by the streaming usage parser's `auto`
     // resolver so a Vertex / Bedrock / Cohere host picks the right
@@ -1904,7 +1962,14 @@ pub(super) async fn handle_ai_proxy(
                     continue;
                 }
                 // WOR-1103: this provider's response is the one we keep.
-                sbproxy_observe::metrics::record_provider_attempt(&provider.name, "success");
+                // HTTP error statuses still count as provider-attempt
+                // errors even when they are not retried, so metrics agree
+                // with the request span's final ERROR classification.
+                let provider_attempt_outcome = if status >= 400 { "error" } else { "success" };
+                sbproxy_observe::metrics::record_provider_attempt(
+                    &provider.name,
+                    provider_attempt_outcome,
+                );
                 last_format = sbproxy_ai::client::provider_format(provider);
                 last_upstream_host = match url::Url::parse(&provider.effective_base_url()) {
                     Ok(u) => u.host_str().map(|h| h.to_string()),
@@ -1933,6 +1998,11 @@ pub(super) async fn handle_ai_proxy(
                     provider = %provider.name,
                     attempt = %attempt,
                     "AI proxy: upstream request failed"
+                );
+                last_error_type = ai_transport_error_type(&e);
+                sbproxy_ai::ai_metrics::record_provider_error(
+                    &provider.name,
+                    ai_metric_error_kind_for_span_error_type(last_error_type),
                 );
                 last_error = Some(e);
                 if attempt + 1 >= max_attempts {
@@ -2145,6 +2215,11 @@ pub(super) async fn handle_ai_proxy(
             .await
         }
     } else if let Some(e) = last_error {
+        sbproxy_ai::tracing_spans::record_error(
+            &ai_span,
+            last_error_type,
+            "AI upstream request failed (all providers)",
+        );
         Err(Error::because(
             ErrorType::ConnectError,
             "AI upstream request failed (all providers)",
@@ -2152,8 +2227,142 @@ pub(super) async fn handle_ai_proxy(
         ))
     } else {
         warn!("AI proxy: no enabled providers");
+        sbproxy_ai::tracing_spans::record_error(
+            &ai_span,
+            sbproxy_ai::tracing_spans::error_type::PROVIDER_ERROR,
+            "no enabled AI providers",
+        );
         Err(Error::new(ErrorType::HTTPStatus(502)))
     }
+}
+
+fn record_ai_transport_failure(
+    span: &tracing::Span,
+    provider: Option<&str>,
+    error: &anyhow::Error,
+    message: &str,
+) {
+    let kind = ai_transport_error_type(error);
+    sbproxy_ai::tracing_spans::record_error(span, kind, message);
+    if let Some(provider) = provider.filter(|p| !p.is_empty()) {
+        sbproxy_ai::ai_metrics::record_provider_error(
+            provider,
+            ai_metric_error_kind_for_span_error_type(kind),
+        );
+    }
+}
+
+fn ai_transport_error_type(error: &anyhow::Error) -> &'static str {
+    if error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(reqwest::Error::is_timeout)
+    {
+        sbproxy_ai::tracing_spans::error_type::TIMEOUT
+    } else {
+        sbproxy_ai::tracing_spans::error_type::PROVIDER_ERROR
+    }
+}
+
+fn record_ai_provider_response_failure(
+    span: &tracing::Span,
+    provider: &str,
+    status: u16,
+    body: Option<&[u8]>,
+) {
+    let Some(kind) = ai_provider_response_error_type(status, body) else {
+        return;
+    };
+    let message = ai_provider_response_error_message(status, kind);
+    sbproxy_ai::tracing_spans::record_error(span, kind, message.as_str());
+    if !provider.is_empty() {
+        sbproxy_ai::ai_metrics::record_provider_error(
+            provider,
+            ai_metric_error_kind_for_span_error_type(kind),
+        );
+    }
+}
+
+fn ai_provider_response_error_type(status: u16, body: Option<&[u8]>) -> Option<&'static str> {
+    if status == 429 {
+        return Some(sbproxy_ai::tracing_spans::error_type::RATE_LIMITED);
+    }
+    if body.is_some_and(ai_response_body_indicates_content_filter) {
+        return Some(sbproxy_ai::tracing_spans::error_type::CONTENT_FILTER);
+    }
+    if (500..=599).contains(&status) {
+        return Some(sbproxy_ai::tracing_spans::error_type::UPSTREAM_5XX);
+    }
+    if !(200..300).contains(&status) {
+        return Some(sbproxy_ai::tracing_spans::error_type::PROVIDER_ERROR);
+    }
+    None
+}
+
+fn ai_provider_response_error_message(status: u16, kind: &str) -> String {
+    match kind {
+        k if k == sbproxy_ai::tracing_spans::error_type::RATE_LIMITED => {
+            format!("AI provider returned rate limit status {status}")
+        }
+        k if k == sbproxy_ai::tracing_spans::error_type::CONTENT_FILTER => {
+            "AI provider content filter rejected the generation".to_string()
+        }
+        k if k == sbproxy_ai::tracing_spans::error_type::UPSTREAM_5XX => {
+            format!("AI provider returned upstream 5xx status {status}")
+        }
+        _ => format!("AI provider returned HTTP status {status}"),
+    }
+}
+
+fn ai_metric_error_kind_for_span_error_type(kind: &str) -> &'static str {
+    match kind {
+        k if k == sbproxy_ai::tracing_spans::error_type::RATE_LIMITED => "rate_limited",
+        k if k == sbproxy_ai::tracing_spans::error_type::CONTENT_FILTER => "content_filter",
+        k if k == sbproxy_ai::tracing_spans::error_type::UPSTREAM_5XX => "upstream_5xx",
+        k if k == sbproxy_ai::tracing_spans::error_type::TIMEOUT => "timeout",
+        k if k == sbproxy_ai::tracing_spans::error_type::BUDGET_EXCEEDED => "budget_exceeded",
+        k if k == sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED => "guardrail_blocked",
+        _ => "transport",
+    }
+}
+
+fn ai_response_body_indicates_content_filter(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    ai_json_value_indicates_content_filter(&value)
+}
+
+fn ai_json_value_indicates_content_filter(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(_) => false,
+        serde_json::Value::Array(items) => items.iter().any(ai_json_value_indicates_content_filter),
+        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+            let key = key.as_str();
+            let nested = matches!(key, "error" | "innererror" | "inner_error" | "details");
+            let field = matches!(
+                key,
+                "code" | "type" | "reason" | "message" | "finish_reason" | "stop_reason"
+            );
+            match value {
+                serde_json::Value::String(s) if nested || field => {
+                    ai_string_indicates_content_filter(s)
+                }
+                serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                    ai_json_value_indicates_content_filter(value)
+                }
+                _ => false,
+            }
+        }),
+        _ => false,
+    }
+}
+
+fn ai_string_indicates_content_filter(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase().replace(['-', ' '], "_");
+    normalized.contains("content_filter")
+        || normalized.contains("content_filtered")
+        || normalized.contains("content_policy")
+        || normalized.contains("responsibleai")
 }
 
 /// Relay a non-streaming AI response back to the client. When the
@@ -2359,6 +2568,13 @@ pub(super) async fn relay_ai_response_with_cache(
         }
     };
 
+    record_ai_provider_response_failure(
+        &ai_span,
+        router_sink.provider_name,
+        status,
+        Some(resp_body.as_ref()),
+    );
+
     if (200..300).contains(&status) {
         record_ai_response_span_metadata(&ai_span, &resp_body);
     }
@@ -2382,6 +2598,11 @@ pub(super) async fn relay_ai_response_with_cache(
                         guardrail = %block.name,
                         reason = %block.reason,
                         "AI proxy: output guardrail blocked response"
+                    );
+                    sbproxy_ai::tracing_spans::record_error(
+                        &ai_span,
+                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                        &block.reason,
                     );
                     // WOR-1093: the upstream already produced (and
                     // billed) this 2xx response; an output guardrail
@@ -3273,6 +3494,7 @@ pub(super) async fn relay_ai_stream(
     output_guardrails: Option<std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
 ) -> Result<()> {
     let status = resp.status().as_u16();
+    record_ai_provider_response_failure(&ai_span, router_sink.provider_name, status, None);
 
     // --- Start safety session (fail-closed on None) ---
     //
@@ -3303,6 +3525,11 @@ pub(super) async fn relay_ai_stream(
                 warn!(
                     origin = %hostname,
                     "stream_safety session start failed; rejecting SSE per fail-closed policy"
+                );
+                sbproxy_ai::tracing_spans::record_error(
+                    &ai_span,
+                    sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                    "stream safety session failed closed",
                 );
                 return Err(Error::new(ErrorType::HTTPStatus(503)));
             }
@@ -3460,6 +3687,13 @@ pub(super) async fn relay_ai_stream(
                                 reason = ?v.reason,
                                 "stream safety verdict rejected a chunk; terminating stream (fail closed)"
                             );
+                            sbproxy_ai::tracing_spans::record_error(
+                                &ai_span,
+                                sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                                v.reason
+                                    .as_deref()
+                                    .unwrap_or("stream safety rejected response chunk"),
+                            );
                             safety_blocked = true;
                             break 'relay;
                         }
@@ -3546,6 +3780,11 @@ pub(super) async fn relay_ai_stream(
                                 reason = %block.reason,
                                 "AI proxy: output guardrail blocked streaming chunk; terminating stream"
                             );
+                            sbproxy_ai::tracing_spans::record_error(
+                                &ai_span,
+                                sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                                &block.reason,
+                            );
                             output_guard_blocked = true;
                             break 'relay;
                         }
@@ -3559,6 +3798,20 @@ pub(super) async fn relay_ai_stream(
                     .await?;
             }
             Some(Err(e)) => {
+                let kind = if e.is_timeout() {
+                    sbproxy_ai::tracing_spans::error_type::TIMEOUT
+                } else {
+                    sbproxy_ai::tracing_spans::error_type::PROVIDER_ERROR
+                };
+                sbproxy_ai::tracing_spans::record_error(
+                    &ai_span,
+                    kind,
+                    "AI upstream streaming response failed",
+                );
+                sbproxy_ai::ai_metrics::record_provider_error(
+                    router_sink.provider_name,
+                    ai_metric_error_kind_for_span_error_type(kind),
+                );
                 warn!(error = %e, "AI proxy: error reading SSE chunk from upstream");
                 break;
             }
@@ -3828,6 +4081,91 @@ fn prepend_system_message(body: &mut serde_json::Value, text: &str) {
         arr.insert(0, sys);
     } else if let Some(obj) = body.as_object_mut() {
         obj.insert("messages".to_string(), serde_json::json!([sys]));
+    }
+}
+
+#[cfg(test)]
+mod ai_error_classification_tests {
+    use super::{
+        ai_metric_error_kind_for_span_error_type, ai_provider_response_error_type,
+        ai_response_body_indicates_content_filter,
+    };
+
+    #[test]
+    fn provider_429_maps_to_rate_limited() {
+        assert_eq!(
+            ai_provider_response_error_type(429, None),
+            Some(sbproxy_ai::tracing_spans::error_type::RATE_LIMITED)
+        );
+    }
+
+    #[test]
+    fn provider_5xx_maps_to_upstream_5xx() {
+        assert_eq!(
+            ai_provider_response_error_type(503, None),
+            Some(sbproxy_ai::tracing_spans::error_type::UPSTREAM_5XX)
+        );
+    }
+
+    #[test]
+    fn content_filter_finish_reason_marks_success_response_failed() {
+        let body = br#"{
+            "choices": [
+                {"message": {"role": "assistant", "content": ""}, "finish_reason": "content_filter"}
+            ]
+        }"#;
+
+        assert_eq!(
+            ai_provider_response_error_type(200, Some(body)),
+            Some(sbproxy_ai::tracing_spans::error_type::CONTENT_FILTER)
+        );
+    }
+
+    #[test]
+    fn content_filter_error_envelope_is_detected() {
+        let body = br#"{
+            "error": {
+                "message": "The response was filtered due to the prompt triggering Azure OpenAI's content policy.",
+                "code": "content_filter",
+                "innererror": {"code": "ResponsibleAIPolicyViolation"}
+            }
+        }"#;
+
+        assert!(ai_response_body_indicates_content_filter(body));
+        assert_eq!(
+            ai_provider_response_error_type(400, Some(body)),
+            Some(sbproxy_ai::tracing_spans::error_type::CONTENT_FILTER)
+        );
+    }
+
+    #[test]
+    fn provider_4xx_without_known_filter_uses_generic_provider_error() {
+        assert_eq!(
+            ai_provider_response_error_type(400, Some(br#"{"error":{"code":"bad_request"}}"#)),
+            Some(sbproxy_ai::tracing_spans::error_type::PROVIDER_ERROR)
+        );
+    }
+
+    #[test]
+    fn trace_error_types_map_to_low_cardinality_metric_kinds() {
+        assert_eq!(
+            ai_metric_error_kind_for_span_error_type(
+                sbproxy_ai::tracing_spans::error_type::RATE_LIMITED
+            ),
+            "rate_limited"
+        );
+        assert_eq!(
+            ai_metric_error_kind_for_span_error_type(
+                sbproxy_ai::tracing_spans::error_type::UPSTREAM_5XX
+            ),
+            "upstream_5xx"
+        );
+        assert_eq!(
+            ai_metric_error_kind_for_span_error_type(
+                sbproxy_ai::tracing_spans::error_type::TIMEOUT
+            ),
+            "timeout"
+        );
     }
 }
 
