@@ -137,6 +137,29 @@ https://github.com/kube-rs/kube
 
 ===========================================================================
 
+gcp_auth
+Copyright 2020 Peter Hrvola
+Licensed under the MIT License
+https://github.com/hrvolapeter/gcp_auth
+
+Additional notices included in the gcp_auth license file:
+yup-oauth2
+Copyright 2015 The yup-oauth2 Developers
+Licensed under the MIT License
+
+JWT
+Copyright 2016 Google Inc. (lewinb@google.com)
+Licensed under the MIT License
+
+===========================================================================
+
+tracing-futures
+Copyright 2019 Tokio Contributors
+Licensed under the MIT License
+https://github.com/tokio-rs/tracing
+
+===========================================================================
+
 k8s-openapi
 Copyright 2018-2026 Arnav Singh
 Licensed under the Apache License, Version 2.0
