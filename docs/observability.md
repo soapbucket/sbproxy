@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-06-08*
+*Last modified: 2026-06-18*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -634,20 +634,160 @@ redactor and the origin PII redactor when configured, capped at 8 KiB per
 captured value, and truncated with `...[truncated]`; streaming completions are
 assembled from forwarded chunks before export.
 
-#### Compatible backends
+#### Verified backend matrix
 
-OTLP is vendor-agnostic: point `telemetry.endpoint` at any OTLP-compatible backend. These render SBproxy AI spans as LLM trajectories with no custom mapping:
+OTLP is vendor-agnostic. Use an OpenTelemetry Collector as the default ingress when you want fan-out, retries, memory limits, or backend-specific auth. Direct export is fine for a single trusted backend that accepts the same transport SBproxy is configured to emit and does not require custom OTLP headers. SBproxy's telemetry block exposes endpoint, transport, service name, resource attributes, sampling, and metric-export toggles; it does not expose per-exporter auth headers. Put Datadog Cloud, Honeycomb, Langfuse Cloud, and any other API-key backend behind the Collector.
 
-| Backend | Path |
-|---|---|
-| Arize Phoenix | OTLP HTTP/gRPC; reads `gen_ai.*`, OpenInference `llm.*`, `input.value`, and `output.value` |
-| Langfuse | OTLP HTTP; reads `gen_ai.*`, OpenInference `input.value` / `output.value`, token usage, and cost fields |
-| Jaeger | OTLP via the OTel Collector |
-| Grafana Tempo | OTLP via the Collector |
-| Datadog | OTLP via the Datadog Agent or Collector |
-| Honeycomb | OTLP direct |
+The reference Compose stack under `examples/observability-stack/` is the verified local path. SBproxy sends OTLP gRPC to the Collector on host port `4327`; the Collector receives on container port `4317` and fans traces to Tempo, Phoenix, and Langfuse. It mirrors OTLP metrics to Prometheus with remote write and sends OTLP logs to Loki.
 
-The reference Compose stack under `examples/observability-stack/` boots an OTel Collector that fans traces out to Tempo, Phoenix, and Langfuse by default. The stack seeds a Phoenix project and a Langfuse project named `SBproxy LLM Traces`, so live AI traffic appears in both LLM-native UIs without manual attribute remapping.
+| Backend | SBproxy endpoint | Collector exporter / backend endpoint | What renders |
+|---|---|---|---|
+| Arize Phoenix | `http://otel-collector:4317` via the reference Collector, or direct `http://localhost:6006` with `transport: http` when no Phoenix auth header is required | `otlphttp/phoenix` with `endpoint: http://phoenix:6006` and `x-project-name: SBproxy LLM Traces` | LLM trace tree, provider, model, prompt, completion, token split, cost, latency, and status from `gen_ai.*`, OpenInference `llm.*`, `input.value`, and `output.value`. |
+| Langfuse | `http://otel-collector:4317`; use the Collector for Cloud and authenticated self-hosted deployments | `otlphttp/langfuse` with `endpoint: http://langfuse-web:3000/api/public/otel`, Basic auth, and `x-langfuse-ingestion-version: 4` | LLM generation view with prompt, response, usage, cost, model, user/session metadata when supplied, and errors. Langfuse is HTTP OTLP only. |
+| Jaeger | `http://otel-collector:4317`, or a Jaeger collector with OTLP enabled on `4317` gRPC / `4318` HTTP `/v1/traces` | `otlp/jaeger` to `jaeger-collector:4317` | Generic distributed traces. AI fields appear as searchable span attributes, but Jaeger does not render a specialized LLM trajectory UI. |
+| Grafana Tempo | `http://otel-collector:4317` | `otlp/tempo` to `tempo:4317`; the reference stack wires this already | Generic traces in Grafana Explore and TraceQL. Use exemplars to jump from Prometheus outliers to traces. |
+| Grafana Mimir | `http://otel-collector:4317` when `export_metrics: true`, or Prometheus scrape plus remote write | `prometheusremotewrite` to `http://<mimir-endpoint>/api/v1/push` | Metrics panels for request rate, tokens, cost, cache, guardrail, and budget series. Mimir stores metrics, not traces; pair it with Tempo for the trace view. |
+| Datadog | Datadog Agent on `http://datadog-agent:4317` gRPC or `http://datadog-agent:4318` HTTP; use a Collector or Datadog Distribution of the OTel Collector for cloud-auth export | Datadog Agent OTLP receiver, Datadog Distribution of the OTel Collector, or direct OTLP intake from a Collector | APM traces with `gen_ai.*`, `llm.*`, `error.type`, token, and cost attributes. Use Datadog dashboards or notebooks for LLM-specific panels. |
+| Honeycomb | `http://otel-collector:4317`; use the Collector so it can attach the Honeycomb API-key header | `otlphttp/honeycomb` with `x-honeycomb-team: ${HONEYCOMB_API_KEY}` | High-cardinality trace exploration. `request_id`, `agent_id`, prompt capture, status, token, and cost attributes stay queryable without turning them into Prometheus labels. |
+| Generic OTLP collector | `http://otel-collector:4317` for gRPC or `http://otel-collector:4318` for HTTP/protobuf | Any OTLP-compatible exporter chain | Whatever the downstream exporter supports. This is the best path for vendor migration and dual shipping. |
+
+##### SBproxy to Collector
+
+Use this when the Collector is on the same Docker network as SBproxy:
+
+```yaml
+proxy:
+  observability:
+    telemetry:
+      enabled: true
+      endpoint: "http://otel-collector:4317"
+      transport: grpc
+      service_name: "sbproxy"
+      export_metrics: true
+      metrics_interval_secs: 30
+```
+
+Use this when SBproxy runs on the host and the reference Compose stack is running:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4327 \
+  sbproxy run --config sb.yml --metrics-listen 127.0.0.1:9091
+```
+
+The reference Collector fan-out is:
+
+```yaml
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls: { insecure: true }
+  otlphttp/phoenix:
+    endpoint: http://phoenix:6006
+    headers:
+      x-project-name: "SBproxy LLM Traces"
+  otlphttp/langfuse:
+    endpoint: http://langfuse-web:3000/api/public/otel
+    headers:
+      Authorization: "Basic ${env:LANGFUSE_OTEL_BASIC_AUTH}"
+      x-langfuse-ingestion-version: "4"
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, tail_sampling, batch]
+      exporters: [otlp/tempo, otlphttp/phoenix, otlphttp/langfuse]
+```
+
+##### Add a backend
+
+Append one of these exporters to the `traces` or `metrics` pipeline in your Collector.
+
+Jaeger:
+
+```yaml
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger-collector:4317
+    tls: { insecure: true }
+```
+
+Grafana Mimir for OTLP metrics:
+
+```yaml
+exporters:
+  prometheusremotewrite:
+    endpoint: http://mimir:9009/api/v1/push
+```
+
+Datadog Agent OTLP receiver:
+
+```yaml
+otlp_config:
+  receiver:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  logs:
+    enabled: false
+```
+
+Honeycomb:
+
+```yaml
+exporters:
+  otlphttp/honeycomb:
+    endpoint: https://api.honeycomb.io
+    headers:
+      x-honeycomb-team: ${env:HONEYCOMB_API_KEY}
+```
+
+For HTTP exporters, signal-specific paths are appended by the SDK or Collector when you configure the base OTLP endpoint. If you configure a traces-only endpoint directly, use the backend's `/v1/traces` path where required. Set `transport: grpc` for `4317` endpoints and `transport: http` for `4318` or HTTP/protobuf endpoints.
+
+##### LLM trajectory check
+
+Turn on content capture for the AI origin you are testing:
+
+```yaml
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      trace_content: true
+```
+
+Then send one chat request. A healthy LLM-native backend shows a trace shaped like this:
+
+```text
+trace: 9ff0a9a1c66e4c41ad3f2a8515d9d025
+span: ai.request
+attributes:
+  gen_ai.operation.name = chat_completions
+  gen_ai.system = openai
+  gen_ai.request.model = gpt-4o-mini
+  gen_ai.response.model = gpt-4o-mini-2024-07-18
+  gen_ai.usage.input_tokens = 19
+  gen_ai.usage.output_tokens = 23
+  gen_ai.usage.cost = 0.000014
+  llm.provider = openai
+  llm.model_name = gpt-4o-mini
+  llm.token_count.prompt = 19
+  llm.token_count.completion = 23
+  llm.token_count.total = 42
+  llm.usage.total_cost = 0.000014
+  sbproxy.ai.cost_usd_micros = 14
+  sbproxy.ai.pricing_version = 2026-06-01
+  sbproxy.tenant_id = default
+  input.value = "Say hello from SBproxy observability."
+  output.value = "Hello from SBproxy observability."
+events:
+  gen_ai.user.message
+  gen_ai.assistant.message
+```
+
+On a blocked or failed generation, `otel.status_code = ERROR` and `error.type` is one of `guardrail_blocked`, `rate_limited`, `provider_error`, `content_filter`, or `budget_exhausted`. Phoenix, Langfuse, Datadog, Honeycomb, Jaeger, and Tempo all preserve those attributes. The difference is presentation: Phoenix and Langfuse render a generation view, while the generic trace backends expose the same fields as searchable attributes.
 
 ### Sampling
 
