@@ -3902,6 +3902,7 @@ impl ProxyHttp for SbProxy {
             // Realtime audio pricing isn't in the catalog yet; cost
             // is reported as 0.0 so operators see the duration on the
             // event without a fabricated dollar figure.
+            let span = tracing::Span::current();
             emit_ai_billing_event(
                 rd.surface_label,
                 &rd.provider_name,
@@ -3910,6 +3911,8 @@ impl ProxyHttp for SbProxy {
                 0.0,
                 Vec::new(),
                 &ctx.attribution_tags,
+                ctx.tenant_id.as_str(),
+                &span,
             );
             info!(
                 ai.surface = rd.surface_label,

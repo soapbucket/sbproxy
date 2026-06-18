@@ -225,6 +225,11 @@ pub fn dispatch_terminal_event(
     ev.user_id = ctx.user_id.clone();
     ev.user_id_source = ctx.user_id_source;
     ev.properties = ctx.properties.clone();
+    ev.provider = ctx.ai_provider.clone();
+    ev.model = ctx.ai_model.clone();
+    ev.tokens_in = ctx.ai_tokens_in.and_then(|v| u32::try_from(v).ok());
+    ev.tokens_out = ctx.ai_tokens_out.and_then(|v| u32::try_from(v).ok());
+    ev.cost_usd_micros = ctx.ai_cost_usd_micros;
     ev.status_code = ctx.response_status;
     ev.error_class = error_class.map(str::to_string);
     ev.request_geo = ctx.request_geo.clone();
@@ -268,6 +273,11 @@ mod dispatch_tests {
         ctx.hostname = compact_str::CompactString::new("api.example.com");
         ctx.response_status = Some(200);
         ctx.user_id = Some("u".to_string());
+        ctx.ai_provider = Some("openai".to_string());
+        ctx.ai_model = Some("gpt-4o".to_string());
+        ctx.ai_tokens_in = Some(100);
+        ctx.ai_tokens_out = Some(25);
+        ctx.ai_cost_usd_micros = Some(375);
 
         CAPTURED.lock().expect("test sink lock").clear();
         dispatch_terminal_event(&ctx, DEFAULT_WORKSPACE_ID, Some(42), None);
@@ -280,6 +290,11 @@ mod dispatch_tests {
         assert_eq!(ev.latency_ms, Some(42));
         assert_eq!(ev.status_code, Some(200));
         assert_eq!(ev.user_id.as_deref(), Some("u"));
+        assert_eq!(ev.provider.as_deref(), Some("openai"));
+        assert_eq!(ev.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(ev.tokens_in, Some(100));
+        assert_eq!(ev.tokens_out, Some(25));
+        assert_eq!(ev.cost_usd_micros, Some(375));
         assert!(matches!(ev.event_type, EventType::RequestCompleted));
     }
 

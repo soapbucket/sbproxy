@@ -41,12 +41,12 @@ pub(super) async fn handle_ai_proxy(
     // guard is `!Send` and `request_filter` is an async function that
     // must be `Send`. The surface field is carried by the explicit
     // `debug!` above and by the per-surface metrics below.
-    let _ai_span = sbproxy_ai::tracing_spans::ai_request_span(surface_label, &method_str);
+    let ai_span = sbproxy_ai::tracing_spans::ai_request_span(surface_label, &method_str);
     // WOR-1098: stamp the resolved tenant onto the request span so OTel
     // exporters can filter traces by tenant. The origin match has
     // already populated `ctx.tenant_id` (defaulting to `__default__`
     // when no tenant is configured) by the time dispatch runs.
-    _ai_span.record("sbproxy.tenant_id", ctx.tenant_id.as_str());
+    ai_span.record("sbproxy.tenant_id", ctx.tenant_id.as_str());
 
     // Increment the per-surface request counter and start the latency
     // clock. The latency guard records elapsed time at function exit
@@ -186,6 +186,8 @@ pub(super) async fn handle_ai_proxy(
             0.0,
             Vec::new(),
             &ctx.attribution_tags,
+            ctx.tenant_id.as_str(),
+            &ai_span,
         );
         return relay_ai_response(
             session,
@@ -314,6 +316,8 @@ pub(super) async fn handle_ai_proxy(
             0.0,
             Vec::new(),
             &ctx.attribution_tags,
+            ctx.tenant_id.as_str(),
+            &ai_span,
         );
         // WOR-1044 PR3: the GET-method-aware path runs before the
         // request body is read, so there is no reversible PII
@@ -535,7 +539,7 @@ pub(super) async fn handle_ai_proxy(
                 None => sbproxy_ai::budget::AiUsage::PerCall,
             };
             let cost = sbproxy_ai::budget::estimate_cost_for_usage("whisper-1", &usage);
-            emit_ai_billing_event(
+            let cost_micros = emit_ai_billing_event(
                 surface_label,
                 &provider.name,
                 model,
@@ -543,7 +547,12 @@ pub(super) async fn handle_ai_proxy(
                 cost,
                 Vec::new(),
                 &ctx.attribution_tags,
+                ctx.tenant_id.as_str(),
+                &ai_span,
             );
+            if cost_micros > 0 {
+                ctx.ai_cost_usd_micros = Some(cost_micros);
+            }
             let extra: Option<(&str, &str)> =
                 idem_skip_reason.map(|r| ("x-sbproxy-idempotency", r));
             return send_response_with_extra(session, status, &resp_ct, &resp_bytes, extra).await;
@@ -557,6 +566,8 @@ pub(super) async fn handle_ai_proxy(
             0.0,
             Vec::new(),
             &ctx.attribution_tags,
+            ctx.tenant_id.as_str(),
+            &ai_span,
         );
         // Multipart never captures for idempotency (engagement
         // skipped with SKIPPED-MULTIPART). Pass the skip reason
@@ -1702,6 +1713,8 @@ pub(super) async fn handle_ai_proxy(
                         0.0,
                         Vec::new(),
                         &ctx.attribution_tags,
+                        ctx.tenant_id.as_str(),
+                        &ai_span,
                     );
                     // Drop any idempotency capture: cascade does not
                     // engage the idempotency cache write in v1
@@ -2001,6 +2014,7 @@ pub(super) async fn handle_ai_proxy(
                 audio_speech_characters: audio_speech_characters_for_billing,
                 rerank_documents: rerank_documents_for_billing,
                 attribution_tags: ctx.attribution_tags.clone(),
+                tenant_id: ctx.tenant_id.to_string(),
                 estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
             });
             let stream_router_sink = RouterTokenSink {
@@ -2058,6 +2072,7 @@ pub(super) async fn handle_ai_proxy(
                     upstream_format: last_format,
                     inbound_format: stream_inbound_format,
                 },
+                ai_span.clone(),
                 stream_reversible_pairs,
                 // WOR-1141: streaming output guardrails (only when the
                 // origin declares output guardrails).
@@ -2083,6 +2098,7 @@ pub(super) async fn handle_ai_proxy(
                 audio_speech_characters: audio_speech_characters_for_billing,
                 rerank_documents: rerank_documents_for_billing,
                 attribution_tags: ctx.attribution_tags.clone(),
+                tenant_id: ctx.tenant_id.to_string(),
                 estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
             });
             let cache_router_sink = RouterTokenSink {
@@ -2101,6 +2117,7 @@ pub(super) async fn handle_ai_proxy(
                 recorder,
                 cache_router_sink,
                 Some(ctx),
+                ai_span.clone(),
                 idem_skip_reason,
                 idem_capture,
                 // WOR-1141: enforce OUTPUT guardrails on the response.
@@ -2235,6 +2252,7 @@ pub(super) async fn relay_ai_response_with_cache(
     budget_recorder: Option<BudgetRecorderArgs<'_>>,
     router_sink: RouterTokenSink<'_>,
     mut ctx: Option<&mut RequestContext>,
+    ai_span: tracing::Span,
     idem_skip_reason: Option<&'static str>,
     idem_capture: Option<AiIdempotencyCapture>,
     output_guardrails: Option<std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
@@ -2617,7 +2635,7 @@ pub(super) async fn relay_ai_response_with_cache(
             };
             let cost = sbproxy_ai::budget::estimate_cost_for_usage(args.model, &usage);
             let scope_keys = args.keys.iter().map(|(_, k)| k.clone()).collect::<Vec<_>>();
-            emit_ai_billing_event(
+            let cost_micros = emit_ai_billing_event(
                 args.surface_label,
                 args.provider_name,
                 Some(args.model.to_string()),
@@ -2625,7 +2643,14 @@ pub(super) async fn relay_ai_response_with_cache(
                 cost,
                 scope_keys,
                 &args.attribution_tags,
+                args.tenant_id.as_str(),
+                &ai_span,
             );
+            if cost_micros > 0 {
+                if let Some(ctx_ref) = ctx.as_mut() {
+                    ctx_ref.ai_cost_usd_micros = Some(cost_micros);
+                }
+            }
         }
     } else if let Some(ctx) = ctx {
         // Even without a budget recorder we still want the access log
@@ -2641,6 +2666,32 @@ pub(super) async fn relay_ai_response_with_cache(
             if prompt_tokens != 0 || completion_tokens != 0 {
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);
+                let usage = sbproxy_ai::budget::AiUsage::Tokens {
+                    input: prompt_tokens,
+                    output: completion_tokens,
+                };
+                let model = ctx.ai_model.clone().unwrap_or_default();
+                let cost = sbproxy_ai::budget::estimate_cost_for_usage(&model, &usage);
+                let provider = ctx
+                    .ai_provider
+                    .clone()
+                    .unwrap_or_else(|| router_sink.provider_name.to_string());
+                let surface = ctx.ai_surface.clone().unwrap_or_default();
+                let model_for_event = (!model.is_empty()).then_some(model);
+                let cost_micros = emit_ai_billing_event(
+                    surface.as_str(),
+                    provider.as_str(),
+                    model_for_event,
+                    usage,
+                    cost,
+                    Vec::new(),
+                    &ctx.attribution_tags,
+                    ctx.tenant_id.as_str(),
+                    &ai_span,
+                );
+                if cost_micros > 0 {
+                    ctx.ai_cost_usd_micros = Some(cost_micros);
+                }
             }
             // WOR-798: feed the router's per-provider token counter
             // even on no-budget origins. The previous wire only
@@ -3000,6 +3051,10 @@ pub(super) struct BudgetRecorderArgs<'a> {
     /// functions can stamp the per-attribution spend metric without
     /// borrowing `ctx`, which they hold only as an `Option<&mut>`.
     attribution_tags: sbproxy_ai::attribution::AttributionTags,
+    /// Resolved tenant id for the request. Carried by value so the
+    /// relay can emit tenant-labelled cost metrics without borrowing
+    /// the request context.
+    tenant_id: String,
     /// WOR-1146: estimated prompt tokens for a chat_completions
     /// request, captured from the request body at dispatch. Used only
     /// as the prompt side of the fallback budget debit when a 2xx
@@ -3183,6 +3238,7 @@ pub(super) async fn relay_ai_stream(
     router_sink: RouterTokenSink<'_>,
     parser_args: StreamUsageParserArgs,
     format_args: StreamFormatArgs,
+    ai_span: tracing::Span,
     // WOR-1044 PR2: request-time reversible PII capture. Empty for
     // requests with no reversible rule matches; in that case the
     // streaming restorer short-circuits per-chunk via
@@ -3589,6 +3645,8 @@ pub(super) async fn relay_ai_stream(
                     cost,
                     scope_keys,
                     &args.attribution_tags,
+                    args.tenant_id.as_str(),
+                    &ai_span,
                 );
 
                 // WOR-1093: a stream that did not run to a clean

@@ -30,7 +30,7 @@
 use std::sync::OnceLock;
 
 use opentelemetry::global;
-use opentelemetry::metrics::Histogram;
+use opentelemetry::metrics::{Counter, Histogram};
 
 /// Convenience constructor for the `origin=<hostname>` label that
 /// every observation here shares. Re-exported so callers do not
@@ -75,6 +75,23 @@ pub fn request_duration_histogram() -> &'static Histogram<f64> {
     })
 }
 
+/// OTel counter mirroring `sbproxy_ai_cost_usd_micros_total`.
+///
+/// The unit is micro-USD (`1e-6` USD). Labels match the Prometheus
+/// surface: `provider`, `model`, and `tenant_id`.
+pub fn ai_cost_usd_micros_counter() -> &'static Counter<u64> {
+    static C: OnceLock<Counter<u64>> = OnceLock::new();
+    C.get_or_init(|| {
+        global::meter("sbproxy")
+            .u64_counter("sbproxy.ai.cost_usd_micros")
+            .with_description(
+                "Derived AI request cost in micro-USD, partitioned by provider, model, and tenant.",
+            )
+            .with_unit("micro_usd")
+            .build()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +111,13 @@ mod tests {
     }
 
     #[test]
+    fn ai_cost_handle_constructs_idempotently() {
+        let c1 = ai_cost_usd_micros_counter();
+        let c2 = ai_cost_usd_micros_counter();
+        assert!(std::ptr::eq(c1, c2));
+    }
+
+    #[test]
     fn record_without_provider_installed_is_silent() {
         // Pre-PR no MeterProvider is installed; the global meter is a
         // no-op meter and `record()` must not panic or block.
@@ -107,6 +131,14 @@ mod tests {
         request_duration_histogram().record(
             0.456,
             &[opentelemetry::KeyValue::new("origin", "api.example.com")],
+        );
+        ai_cost_usd_micros_counter().add(
+            123,
+            &[
+                opentelemetry::KeyValue::new("provider", "openai"),
+                opentelemetry::KeyValue::new("model", "gpt-4o"),
+                opentelemetry::KeyValue::new("tenant_id", "__default__"),
+            ],
         );
     }
 }

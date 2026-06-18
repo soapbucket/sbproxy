@@ -314,6 +314,24 @@ Buckets: `0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0`. Matches the bucket s
 
 ---
 
+#### `sbproxy_ai_cost_usd_micros_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | Cumulative derived AI request cost in micro-USD (`1e-6` USD), based on the provider pricing catalog. This is the exact integer-cost surface used for tenant spend dashboards and the optional OTLP metric mirror (`sbproxy.ai.cost_usd_micros`). |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `provider` | AI provider name | `openai`, `anthropic` |
+| `model` | Model identifier | `gpt-4o`, `claude-3-5-sonnet` |
+| `tenant_id` | Resolved tenant id for the matched origin | `acme`, `__default__` |
+
+---
+
 #### `sbproxy_ai_tokens_attributed_total` / `sbproxy_ai_cost_dollars_attributed_total`
 
 | Property | Value |

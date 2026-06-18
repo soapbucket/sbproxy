@@ -620,12 +620,12 @@ The AI request span (`ai.request`) follows the OpenTelemetry GenAI semantic conv
 |---|---|---|
 | Provider / model | `gen_ai.system`, `gen_ai.request.model`, `gen_ai.response.model` | `llm.provider`, `llm.model_name` |
 | Tokens (with cache + reasoning split) | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read_tokens`, `gen_ai.usage.cache_write_tokens`, `gen_ai.usage.reasoning_tokens` | `llm.token_count.prompt`, `llm.token_count.completion`, `llm.token_count.total` |
-| Derived USD cost | `gen_ai.usage.cost` | `llm.usage.total_cost` |
+| Derived USD cost | `sbproxy.ai.cost_usd_micros`, `gen_ai.usage.cost` | `llm.usage.total_cost` |
 | Pricing catalog revision | `sbproxy.ai.pricing_version` | n/a |
 | Failure | `otel.status_code = ERROR` plus `error.type` (`guardrail_blocked`, `rate_limited`, `provider_error`, `content_filter`) | n/a |
 | Tenant | `sbproxy.tenant_id` | n/a |
 
-Token counting happens at the proxy (not trusted from the upstream's self-report), cost is derived from the catalog stamped in `sbproxy.ai.pricing_version`, and the GenAI attribute set is pinned by a conformance test (semconv 1.36.0) so emitted spans cannot silently drift off-spec.
+Token counting happens at the proxy (not trusted from the upstream's self-report), cost is derived from the catalog stamped in `sbproxy.ai.pricing_version`, and the exact span value is `sbproxy.ai.cost_usd_micros` in micro-USD (`1e-6` USD). The GenAI attribute set is pinned by a conformance test (semconv 1.36.0) so emitted spans cannot silently drift off-spec.
 
 #### Compatible backends
 
