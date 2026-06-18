@@ -18,15 +18,19 @@
 //! ```bash
 //! sbproxy-mcp-drift --previous prev.json --current cur.json
 //! sbproxy-mcp-drift --previous prev.yaml --current cur.yaml --format json
+//! sbproxy-mcp-drift --cassette run.ndjson --current-tools tools-list.json
 //! ```
 //!
-//! YAML inputs are accepted; the tool parses with `serde_yaml`
-//! (re-exported by `sbproxy-config`'s dep set).
+//! OpenAPI inputs accept JSON or YAML. Cassette inputs also accept
+//! NDJSON session-ledger records.
 
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use sbproxy_extension::mcp::cassette_drift::{
+    diff_cassette_values, load_document, CassetteDriftReport,
+};
 use sbproxy_extension::mcp::schema_drift::{diff_openapi, DriftSeverity};
 
 fn print_usage() {
@@ -34,7 +38,8 @@ fn print_usage() {
         "sbproxy-mcp-drift: classify OpenAPI changes by severity (WOR-486)\n\
         \n\
         USAGE:\n    \
-            sbproxy-mcp-drift --previous <FILE> --current <FILE> [--format text|json]\n\
+            sbproxy-mcp-drift --previous <FILE> --current <FILE> [--format text|json]\n    \
+            sbproxy-mcp-drift --cassette <FILE> --current-tools <FILE> [--format text|json]\n\
         \n\
         EXIT CODES:\n    \
             0   no drift\n    \
@@ -47,7 +52,9 @@ fn print_usage() {
         \n\
         EXAMPLES:\n    \
             # CI gate: refuse to regenerate the MCP surface on a breaking change.\n    \
-            sbproxy-mcp-drift --previous last.openapi.json --current current.openapi.json || exit $?"
+            sbproxy-mcp-drift --previous last.openapi.json --current current.openapi.json || exit $?\n    \
+            # Gate a live MCP tools/list snapshot against a consumer cassette.\n    \
+            sbproxy-mcp-drift --cassette session-ledger.ndjson --current-tools live-tools-list.json"
     );
 }
 
@@ -55,6 +62,8 @@ fn print_usage() {
 struct Args {
     previous: Option<PathBuf>,
     current: Option<PathBuf>,
+    cassette: Option<PathBuf>,
+    current_tools: Option<PathBuf>,
     format: Format,
     help: bool,
 }
@@ -77,6 +86,14 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
             }
             "--current" => {
                 args.current = Some(PathBuf::from(iter.next().ok_or("--current needs a path")?));
+            }
+            "--cassette" => {
+                args.cassette = Some(PathBuf::from(iter.next().ok_or("--cassette needs a path")?));
+            }
+            "--current-tools" | "--live-tools" => {
+                args.current_tools = Some(PathBuf::from(
+                    iter.next().ok_or("--current-tools needs a path")?,
+                ));
             }
             "--format" => {
                 let fmt = iter.next().ok_or("--format needs a value")?;
@@ -108,18 +125,47 @@ fn run() -> Result<i32, String> {
         print_usage();
         return Ok(0);
     }
-    let previous = args.previous.ok_or("missing --previous")?;
-    let current = args.current.ok_or("missing --current")?;
 
-    let prev_spec = load_spec(&previous)?;
-    let cur_spec = load_spec(&current)?;
-    let report = diff_openapi(&prev_spec, &cur_spec);
+    match (
+        args.previous,
+        args.current,
+        args.cassette,
+        args.current_tools,
+    ) {
+        (Some(previous), Some(current), None, None) => {
+            let prev_spec = load_spec(&previous)?;
+            let cur_spec = load_spec(&current)?;
+            let report = diff_openapi(&prev_spec, &cur_spec);
+            print_openapi_report(&report, args.format)?;
+            Ok(report.severity.exit_code())
+        }
+        (None, None, Some(cassette), Some(current_tools)) => {
+            let cassette_value = load_document(&cassette)?;
+            let current_tools_value = load_document(&current_tools)?;
+            let report = diff_cassette_values(
+                cassette.display().to_string(),
+                &cassette_value,
+                &current_tools_value,
+            );
+            print_cassette_report(&report, args.format)?;
+            Ok(report.severity.exit_code())
+        }
+        _ => Err(
+            "choose either --previous/--current or --cassette/--current-tools; try --help"
+                .to_string(),
+        ),
+    }
+}
 
-    match args.format {
+fn print_openapi_report(
+    report: &sbproxy_extension::mcp::schema_drift::DriftReport,
+    format: Format,
+) -> Result<(), String> {
+    match format {
         Format::Json => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                serde_json::to_string_pretty(report).map_err(|e| e.to_string())?
             );
         }
         Format::Text => {
@@ -130,11 +176,7 @@ fn run() -> Result<i32, String> {
                 println!("changes ({}):", report.changes.len());
                 let mut by_sev = [Vec::new(), Vec::new(), Vec::new()];
                 for c in &report.changes {
-                    let bucket = match c.severity {
-                        DriftSeverity::None => 0,
-                        DriftSeverity::Informational => 1,
-                        DriftSeverity::Breaking => 2,
-                    };
+                    let bucket = severity_bucket(c.severity);
                     by_sev[bucket].push(c);
                 }
                 // Print Breaking first so a `head`d output shows
@@ -152,8 +194,55 @@ fn run() -> Result<i32, String> {
             }
         }
     }
+    Ok(())
+}
 
-    Ok(report.severity.exit_code())
+fn print_cassette_report(report: &CassetteDriftReport, format: Format) -> Result<(), String> {
+    match format {
+        Format::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(report).map_err(|e| e.to_string())?
+            );
+        }
+        Format::Text => {
+            println!("cassette: {}", report.cassette);
+            println!("overall severity: {}", report.severity.as_str());
+            if report.changes.is_empty() {
+                println!("(no changes)");
+            } else {
+                println!("changes ({}):", report.changes.len());
+                let mut by_sev = [Vec::new(), Vec::new(), Vec::new()];
+                for c in &report.changes {
+                    by_sev[severity_bucket(c.severity)].push(c);
+                }
+                for (label, idx) in [("breaking", 2), ("informational", 1)] {
+                    let bucket = &by_sev[idx];
+                    if bucket.is_empty() {
+                        continue;
+                    }
+                    println!("  [{}]", label);
+                    for c in bucket {
+                        match &c.field {
+                            Some(field) => {
+                                println!("    - {} (tool: {}, field: {})", c.summary, c.tool, field)
+                            }
+                            None => println!("    - {} (tool: {})", c.summary, c.tool),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn severity_bucket(severity: DriftSeverity) -> usize {
+    match severity {
+        DriftSeverity::None => 0,
+        DriftSeverity::Informational => 1,
+        DriftSeverity::Breaking => 2,
+    }
 }
 
 fn main() -> ExitCode {
