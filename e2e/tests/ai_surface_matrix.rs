@@ -44,7 +44,10 @@ origins:
 // before the embeddings translator existed.
 #[test]
 fn gemini_embeddings_translated_not_verbatim_forward() {
-    let upstream = MockUpstream::start(json!({"unused": true})).expect("mock");
+    let upstream = MockUpstream::start(json!({
+        "embedding": {"values": [0.25, -0.5, 0.75]}
+    }))
+    .expect("mock");
     let harness = ProxyHarness::start_with_yaml(&config_for(
         "gemini",
         "gemini.localhost",
@@ -56,7 +59,13 @@ fn gemini_embeddings_translated_not_verbatim_forward() {
         .post_json(
             "/v1/embeddings",
             "gemini.localhost",
-            &json!({"model": "text-embedding-004", "input": "hi"}),
+            &json!({
+                "model": "text-embedding-004",
+                "input": "hi",
+                "dimensions": 3,
+                "encoding_format": "float",
+                "user": "end-user-1"
+            }),
             &[],
         )
         .expect("post");
@@ -82,6 +91,31 @@ fn gemini_embeddings_translated_not_verbatim_forward() {
         paths.iter().any(|p| p.contains("embedContent")),
         "upstream should receive the translated Gemini native embeddings path; got {paths:?}"
     );
+    assert_eq!(
+        captured[0].path, "/v1beta/models/text-embedding-004:embedContent",
+        "single string embeddings input should use Gemini embedContent"
+    );
+    let forwarded: serde_json::Value =
+        serde_json::from_slice(&captured[0].body).expect("forwarded embeddings JSON");
+    assert_eq!(forwarded["model"], "models/text-embedding-004");
+    assert_eq!(forwarded["content"]["parts"][0]["text"], "hi");
+    assert_eq!(forwarded["outputDimensionality"], 3);
+    assert!(
+        forwarded.get("input").is_none(),
+        "OpenAI input must be translated away"
+    );
+    assert!(
+        forwarded.get("user").is_none(),
+        "OpenAI user tag has no Gemini embeddings equivalent"
+    );
+
+    let out = resp.json().expect("client embeddings JSON");
+    assert_eq!(out["object"], "list");
+    assert_eq!(out["data"][0]["object"], "embedding");
+    assert_eq!(out["data"][0]["index"], 0);
+    assert_eq!(out["data"][0]["embedding"][0], 0.25);
+    assert_eq!(out["data"][0]["embedding"][1], -0.5);
+    assert_eq!(out["data"][0]["embedding"][2], 0.75);
 }
 
 #[test]
