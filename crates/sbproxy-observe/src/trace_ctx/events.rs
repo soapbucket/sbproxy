@@ -40,6 +40,49 @@ pub fn guardrail_block_event(category: &str, reason: &str) {
     );
 }
 
+/// Emit a redacted AI input message event on the current span.
+///
+/// The event carries both OpenTelemetry GenAI-style message attributes
+/// and OpenInference message attributes. Callers must gate content capture
+/// and redact `content` before calling this helper.
+pub fn ai_input_message_event(index: usize, role: &str, content: &str) {
+    tracing::info!(
+        event = "ai_input_message",
+        "gen_ai.event.name" = gen_ai_message_event_name(role),
+        "gen_ai.message.role" = role,
+        "gen_ai.message.content" = content,
+        "llm.input_messages.index" = index,
+        "llm.input_messages.message.role" = role,
+        "llm.input_messages.message.content" = content,
+    );
+}
+
+/// Emit a redacted AI output message event on the current span.
+///
+/// The event carries both OpenTelemetry GenAI-style message attributes
+/// and OpenInference message attributes. Callers must gate content capture
+/// and redact `content` before calling this helper.
+pub fn ai_output_message_event(index: usize, role: &str, content: &str) {
+    tracing::info!(
+        event = "ai_output_message",
+        "gen_ai.event.name" = gen_ai_message_event_name(role),
+        "gen_ai.message.role" = role,
+        "gen_ai.message.content" = content,
+        "llm.output_messages.index" = index,
+        "llm.output_messages.message.role" = role,
+        "llm.output_messages.message.content" = content,
+    );
+}
+
+fn gen_ai_message_event_name(role: &str) -> &'static str {
+    match role {
+        "assistant" => "gen_ai.assistant.message",
+        "system" => "gen_ai.system.message",
+        "tool" | "function" => "gen_ai.tool.message",
+        _ => "gen_ai.user.message",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,6 +108,12 @@ mod tests {
     }
 
     #[test]
+    fn ai_message_events_do_not_panic() {
+        ai_input_message_event(0, "user", "summarize this [REDACTED:EMAIL]");
+        ai_output_message_event(0, "assistant", "summary text");
+    }
+
+    #[test]
     fn all_event_helpers_run_in_sequence() {
         // Run all helpers in a single test to confirm there is no shared
         // mutable state that would cause ordering issues.
@@ -72,5 +121,7 @@ mod tests {
         cache_miss_event("semantic");
         failover_event("svc-a", "svc-b", "circuit_open");
         guardrail_block_event("pii_detection", "email_address");
+        ai_input_message_event(0, "system", "policy");
+        ai_output_message_event(0, "assistant", "answer");
     }
 }

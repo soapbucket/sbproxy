@@ -976,19 +976,16 @@ pub(super) async fn handle_ai_proxy(
     // Keep a single extraction available to both the prompt classifier
     // and the intent detection hook so we do not re-parse the body twice.
     let extracted_prompt = extract_prompt_text(&body);
+    let trace_content = AiTraceContentArgs::from_config(config);
 
     // WOR-1228: emit the prompt as the OpenInference `input.value` span
     // attribute when the origin opts into content capture. Off by default;
     // the text is routed through the always-on secret redactor and the
     // origin's PII redactor (if any) before it lands on the span, so a
     // trace backend never sees raw secrets or PII.
-    if config.trace_content && !extracted_prompt.is_empty() {
-        let secrets_redacted = sbproxy_observe::redact::redact_secrets(&extracted_prompt);
-        let redacted = match config.pii_redactor() {
-            Some(redactor) => redactor.redact(&secrets_redacted).into_owned(),
-            None => secrets_redacted,
-        };
-        sbproxy_ai::tracing_spans::record_input_content(&tracing::Span::current(), &redacted);
+    if trace_content.enabled() && !extracted_prompt.is_empty() {
+        let trace_messages = extract_prompt_trace_messages(&body);
+        record_ai_input_trace(&ai_span, trace_content, &extracted_prompt, &trace_messages);
     }
 
     if let Some(hook) = pipeline.hooks.prompt_classifier.as_ref().cloned() {
@@ -2073,6 +2070,7 @@ pub(super) async fn handle_ai_proxy(
                     inbound_format: stream_inbound_format,
                 },
                 ai_span.clone(),
+                trace_content,
                 stream_reversible_pairs,
                 // WOR-1141: streaming output guardrails (only when the
                 // origin declares output guardrails).
@@ -2118,6 +2116,7 @@ pub(super) async fn handle_ai_proxy(
                 cache_router_sink,
                 Some(ctx),
                 ai_span.clone(),
+                trace_content,
                 idem_skip_reason,
                 idem_capture,
                 // WOR-1141: enforce OUTPUT guardrails on the response.
@@ -2253,6 +2252,7 @@ pub(super) async fn relay_ai_response_with_cache(
     router_sink: RouterTokenSink<'_>,
     mut ctx: Option<&mut RequestContext>,
     ai_span: tracing::Span,
+    trace_content: AiTraceContentArgs<'_>,
     idem_skip_reason: Option<&'static str>,
     idem_capture: Option<AiIdempotencyCapture>,
     output_guardrails: Option<std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
@@ -2736,6 +2736,10 @@ pub(super) async fn relay_ai_response_with_cache(
     // reaches the semantic cache even though it is written above
     // in the order-of-operations sense.
     let resp_body = restore_reversible_pii(&resp_body, &reversible_pairs);
+    if (200..300).contains(&status) && trace_content.enabled() {
+        let completion = extract_completion_text(&resp_body);
+        record_ai_output_trace(&ai_span, trace_content, &completion);
+    }
 
     // --- Idempotency record on miss ---
     //
@@ -3239,6 +3243,7 @@ pub(super) async fn relay_ai_stream(
     parser_args: StreamUsageParserArgs,
     format_args: StreamFormatArgs,
     ai_span: tracing::Span,
+    trace_content: AiTraceContentArgs<'_>,
     // WOR-1044 PR2: request-time reversible PII capture. Empty for
     // requests with no reversible rule matches; in that case the
     // streaming restorer short-circuits per-chunk via
@@ -3396,6 +3401,7 @@ pub(super) async fn relay_ai_stream(
     // a per-chunk `is_noop` short-circuit so byte-forward streaming
     // stays zero-overhead.
     let mut reversible_restore = StreamingReversibleRestore::new(reversible_pairs);
+    let mut trace_stream_content = trace_content.enabled().then(AiTraceStreamContent::default);
     // WOR-1144: set when the stream-safety classifier rejects a chunk so
     // the relay stops forwarding (fail closed) instead of delivering
     // flagged content. Leaves `upstream_complete` false so the recorder
@@ -3528,6 +3534,9 @@ pub(super) async fn relay_ai_stream(
                         }
                     }
                 }
+                if let Some(trace) = trace_stream_content.as_mut() {
+                    trace.feed(&outbound_bytes);
+                }
                 session
                     .write_response_body(Some(outbound_bytes), false)
                     .await?;
@@ -3561,6 +3570,9 @@ pub(super) async fn relay_ai_stream(
                                 reversible_restore.process_chunk(&bytes)
                             };
                             if !bytes.is_empty() {
+                                if let Some(trace) = trace_stream_content.as_mut() {
+                                    trace.feed(&bytes);
+                                }
                                 let _ = session.write_response_body(Some(bytes), false).await;
                             }
                         }
@@ -3576,6 +3588,9 @@ pub(super) async fn relay_ai_stream(
                 )
                 .finish();
                 if !tail.is_empty() {
+                    if let Some(trace) = trace_stream_content.as_mut() {
+                        trace.feed(&tail);
+                    }
                     let _ = session.write_response_body(Some(tail), false).await;
                 }
                 break;
@@ -3599,6 +3614,12 @@ pub(super) async fn relay_ai_stream(
         // WOR-1141: the stream was cut short by an output guardrail.
         // Same partial-recording semantics as the safety-verdict cut.
         debug!("AI proxy: streaming response terminated early by an output guardrail");
+    }
+    if (200..300).contains(&status) {
+        if let Some(trace) = trace_stream_content.take() {
+            let completion = trace.finish();
+            record_ai_output_trace(&ai_span, trace_content, &completion);
+        }
     }
 
     // --- Streaming budget recording ---

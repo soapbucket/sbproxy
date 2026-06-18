@@ -246,6 +246,474 @@ pub(super) fn extract_into(value: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
+const AI_TRACE_CONTENT_TRUNCATED_MARKER: &str = "...[truncated]";
+const AI_TRACE_STREAM_LINE_MAX_BYTES: usize =
+    sbproxy_observe::capture::MAX_PROPERTY_PAYLOAD_BYTES * 2;
+
+/// Maximum bytes retained for an AI prompt/completion trace content field.
+///
+/// Reuses the capture payload cap so `trace_content` cannot attach an
+/// unbounded prompt or completion to a span.
+pub(super) const AI_TRACE_CONTENT_MAX_BYTES: usize =
+    sbproxy_observe::capture::MAX_PROPERTY_PAYLOAD_BYTES;
+const AI_TRACE_CONTENT_MAX_MESSAGES: usize = sbproxy_observe::capture::MAX_PROPERTIES_PER_REQUEST;
+
+#[derive(Clone, Copy)]
+pub(super) struct AiTraceContentArgs<'a> {
+    enabled: bool,
+    pii_redactor: Option<&'a sbproxy_security::pii::PiiRedactor>,
+}
+
+impl<'a> AiTraceContentArgs<'a> {
+    pub(super) fn from_config(config: &'a AiHandlerConfig) -> Self {
+        Self {
+            enabled: config.trace_content,
+            pii_redactor: if config.trace_content {
+                config.pii_redactor()
+            } else {
+                None
+            },
+        }
+    }
+
+    pub(super) fn enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AiTraceMessage {
+    role: String,
+    content: String,
+}
+
+/// Extract role-aware input messages for trace events. The aggregate
+/// `input.value` still comes from [`extract_prompt_text`]; this helper keeps
+/// message roles available for OpenInference/GenAI span events.
+pub(super) fn extract_prompt_trace_messages(body: &serde_json::Value) -> Vec<AiTraceMessage> {
+    let mut messages = Vec::new();
+
+    if let Some(system) = body.get("system") {
+        push_trace_message(&mut messages, "system", system);
+    }
+
+    if let Some(arr) = body.get("messages").and_then(|v| v.as_array()) {
+        for msg in arr {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            let mut parts = Vec::new();
+            if let Some(content) = msg.get("content") {
+                extract_into(content, &mut parts);
+            }
+            if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                for call in tool_calls {
+                    if let Some(args) = call
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(|a| a.as_str())
+                    {
+                        parts.push(args.to_string());
+                    }
+                }
+            }
+            let content = parts.join("\n");
+            if !content.is_empty() {
+                messages.push(AiTraceMessage {
+                    role: role.to_string(),
+                    content,
+                });
+            }
+        }
+    }
+
+    if messages.is_empty() {
+        if let Some(input) = body.get("input") {
+            push_trace_message(&mut messages, "user", input);
+        }
+    }
+
+    if messages.is_empty() {
+        if let Some(prompt) = body.get("prompt") {
+            push_trace_message(&mut messages, "user", prompt);
+        }
+    }
+
+    messages
+}
+
+fn push_trace_message(messages: &mut Vec<AiTraceMessage>, role: &str, value: &serde_json::Value) {
+    let mut parts = Vec::new();
+    extract_into(value, &mut parts);
+    let content = parts.join("\n");
+    if !content.is_empty() {
+        messages.push(AiTraceMessage {
+            role: role.to_string(),
+            content,
+        });
+    }
+}
+
+/// Extract assistant-visible completion text from a non-streaming response.
+pub(super) fn extract_completion_text(body: &[u8]) -> String {
+    if body.is_empty() {
+        return String::new();
+    }
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(value) => extract_completion_text_from_value(&value),
+        Err(_) => std::str::from_utf8(body)
+            .ok()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_string(),
+    }
+}
+
+fn extract_completion_text_from_value(value: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(choices) = value.get("choices").and_then(|v| v.as_array()) {
+        for choice in choices {
+            if let Some(message) = choice.get("message") {
+                if let Some(content) = message.get("content") {
+                    extract_into(content, &mut parts);
+                }
+                if let Some(tool_calls) = message.get("tool_calls") {
+                    extract_into(tool_calls, &mut parts);
+                }
+            }
+            if let Some(delta) = choice.get("delta") {
+                extract_into(delta, &mut parts);
+            }
+            if let Some(text) = choice.get("text") {
+                extract_into(text, &mut parts);
+            }
+        }
+    }
+
+    for key in [
+        "output_text",
+        "output",
+        "message",
+        "content",
+        "text",
+        "response",
+    ] {
+        if let Some(v) = value.get(key) {
+            extract_into(v, &mut parts);
+        }
+    }
+
+    parts.join("\n")
+}
+
+/// Redact and cap content immediately before span export.
+pub(super) fn redact_ai_trace_content(
+    input: &str,
+    pii_redactor: Option<&sbproxy_security::pii::PiiRedactor>,
+) -> String {
+    let secrets_redacted = sbproxy_observe::redact::redact_secrets(input);
+    let redacted = match pii_redactor {
+        Some(redactor) => redactor.redact(&secrets_redacted).into_owned(),
+        None => secrets_redacted,
+    };
+    truncate_ai_trace_content(&redacted)
+}
+
+pub(super) fn record_ai_input_trace(
+    span: &tracing::Span,
+    args: AiTraceContentArgs<'_>,
+    aggregate: &str,
+    messages: &[AiTraceMessage],
+) {
+    if !args.enabled || aggregate.trim().is_empty() {
+        return;
+    }
+    let redacted = redact_ai_trace_content(aggregate, args.pii_redactor);
+    if redacted.trim().is_empty() {
+        return;
+    }
+    sbproxy_ai::tracing_spans::record_input_content(span, &redacted);
+    span.in_scope(|| {
+        if messages.is_empty() {
+            sbproxy_observe::trace_ctx::events::ai_input_message_event(0, "user", &redacted);
+            return;
+        }
+        for (index, message) in messages
+            .iter()
+            .take(AI_TRACE_CONTENT_MAX_MESSAGES)
+            .enumerate()
+        {
+            let redacted_message = redact_ai_trace_content(&message.content, args.pii_redactor);
+            if !redacted_message.trim().is_empty() {
+                sbproxy_observe::trace_ctx::events::ai_input_message_event(
+                    index,
+                    message.role.as_str(),
+                    &redacted_message,
+                );
+            }
+        }
+    });
+}
+
+pub(super) fn record_ai_output_trace(
+    span: &tracing::Span,
+    args: AiTraceContentArgs<'_>,
+    completion: &str,
+) {
+    if !args.enabled || completion.trim().is_empty() {
+        return;
+    }
+    let redacted = redact_ai_trace_content(completion, args.pii_redactor);
+    if redacted.trim().is_empty() {
+        return;
+    }
+    sbproxy_ai::tracing_spans::record_output_content(span, &redacted);
+    span.in_scope(|| {
+        sbproxy_observe::trace_ctx::events::ai_output_message_event(0, "assistant", &redacted);
+    });
+}
+
+fn truncate_ai_trace_content(input: &str) -> String {
+    truncate_utf8_with_marker(input, AI_TRACE_CONTENT_MAX_BYTES)
+}
+
+fn truncate_utf8_with_marker(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+    if max_bytes <= AI_TRACE_CONTENT_TRUNCATED_MARKER.len() {
+        let mut boundary = max_bytes;
+        while boundary > 0 && !AI_TRACE_CONTENT_TRUNCATED_MARKER.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        return AI_TRACE_CONTENT_TRUNCATED_MARKER[..boundary].to_string();
+    }
+    let mut boundary = max_bytes - AI_TRACE_CONTENT_TRUNCATED_MARKER.len();
+    while boundary > 0 && !input.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let mut out = String::with_capacity(boundary + AI_TRACE_CONTENT_TRUNCATED_MARKER.len());
+    out.push_str(&input[..boundary]);
+    out.push_str(AI_TRACE_CONTENT_TRUNCATED_MARKER);
+    out
+}
+
+#[derive(Default)]
+pub(super) struct AiTraceStreamContent {
+    carry: String,
+    content: BoundedTraceContent,
+}
+
+impl AiTraceStreamContent {
+    pub(super) fn feed(&mut self, bytes: &[u8]) {
+        if self.content.is_full() || bytes.is_empty() {
+            return;
+        }
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return;
+        };
+        self.carry.push_str(text);
+        while let Some(pos) = self.carry.find('\n') {
+            let line: String = self.carry.drain(..=pos).collect();
+            self.process_line(line.trim_end_matches(&['\r', '\n'][..]));
+            if self.content.is_full() {
+                self.carry.clear();
+                return;
+            }
+        }
+        if self.carry.len() > AI_TRACE_STREAM_LINE_MAX_BYTES {
+            let line = std::mem::take(&mut self.carry);
+            self.process_line(line.trim_end_matches(&['\r', '\n'][..]));
+        }
+    }
+
+    pub(super) fn finish(mut self) -> String {
+        if !self.carry.trim().is_empty() {
+            let line = std::mem::take(&mut self.carry);
+            self.process_line(line.trim_end_matches(&['\r', '\n'][..]));
+        }
+        self.content.finish()
+    }
+
+    fn process_line(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(':') || line.starts_with("event:") {
+            return;
+        }
+        let payload = line
+            .strip_prefix("data:")
+            .map(str::trim_start)
+            .unwrap_or(line);
+        if payload == "[DONE]" {
+            return;
+        }
+        let text = match serde_json::from_str::<serde_json::Value>(payload) {
+            Ok(value) => extract_stream_delta_text(&value),
+            Err(_) => payload.to_string(),
+        };
+        if !text.trim().is_empty() {
+            self.content.push_str(&text);
+        }
+    }
+}
+
+fn extract_stream_delta_text(value: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(choices) = value.get("choices").and_then(|v| v.as_array()) {
+        for choice in choices {
+            if let Some(delta) = choice.get("delta") {
+                extract_into(delta, &mut parts);
+            }
+            if let Some(message) = choice.get("message") {
+                if let Some(content) = message.get("content") {
+                    extract_into(content, &mut parts);
+                }
+            }
+            if let Some(text) = choice.get("text") {
+                extract_into(text, &mut parts);
+            }
+        }
+    }
+
+    if let Some(candidates) = value.get("candidates").and_then(|v| v.as_array()) {
+        for candidate in candidates {
+            if let Some(content) = candidate.get("content") {
+                extract_into(content, &mut parts);
+            }
+        }
+    }
+
+    for key in [
+        "delta",
+        "message",
+        "content",
+        "output",
+        "text",
+        "completion",
+        "response",
+    ] {
+        if let Some(v) = value.get(key) {
+            extract_into(v, &mut parts);
+        }
+    }
+
+    parts.join("")
+}
+
+#[derive(Default)]
+struct BoundedTraceContent {
+    value: String,
+    truncated: bool,
+}
+
+impl BoundedTraceContent {
+    fn is_full(&self) -> bool {
+        self.truncated
+    }
+
+    fn push_str(&mut self, text: &str) {
+        if self.truncated || text.is_empty() {
+            return;
+        }
+        if self.value.len().saturating_add(text.len()) <= AI_TRACE_CONTENT_MAX_BYTES {
+            self.value.push_str(text);
+            return;
+        }
+        let marker_len = AI_TRACE_CONTENT_TRUNCATED_MARKER.len();
+        let remaining = AI_TRACE_CONTENT_MAX_BYTES
+            .saturating_sub(marker_len)
+            .saturating_sub(self.value.len());
+        if remaining > 0 {
+            let mut boundary = remaining.min(text.len());
+            while boundary > 0 && !text.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            self.value.push_str(&text[..boundary]);
+        }
+        self.truncated = true;
+    }
+
+    fn finish(mut self) -> String {
+        if self.truncated {
+            self.value.push_str(AI_TRACE_CONTENT_TRUNCATED_MARKER);
+        }
+        self.value
+    }
+}
+
+#[cfg(test)]
+mod ai_trace_content_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_trace_messages_keep_roles() {
+        let body = serde_json::json!({
+            "system": "be terse",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+                {"role": "tool", "content": "tool output"}
+            ]
+        });
+        let messages = extract_prompt_trace_messages(&body);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[0].content, "be terse");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content, "hello");
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(messages[2].content, "hi");
+        assert_eq!(messages[3].role, "tool");
+        assert_eq!(messages[3].content, "tool output");
+    }
+
+    #[test]
+    fn completion_text_extracts_common_response_shapes() {
+        let chat = br#"{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#;
+        assert_eq!(extract_completion_text(chat), "hello");
+
+        let responses =
+            br#"{"output":[{"type":"message","content":[{"type":"output_text","text":"world"}]}]}"#;
+        assert_eq!(extract_completion_text(responses), "world");
+    }
+
+    #[test]
+    fn trace_content_redacts_and_truncates() {
+        let pii = sbproxy_security::pii::PiiRedactor::defaults();
+        let input = format!(
+            "email alice@example.com key sk-{} {}",
+            "a".repeat(48),
+            "x".repeat(AI_TRACE_CONTENT_MAX_BYTES)
+        );
+        let redacted = redact_ai_trace_content(&input, Some(&pii));
+        assert!(!redacted.contains("alice@example.com"));
+        assert!(!redacted.contains("sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(redacted.ends_with(AI_TRACE_CONTENT_TRUNCATED_MARKER));
+        assert!(redacted.len() <= AI_TRACE_CONTENT_MAX_BYTES);
+    }
+
+    #[test]
+    fn stream_content_accumulator_extracts_delta_text_without_framing() {
+        let mut acc = AiTraceStreamContent::default();
+        acc.feed(br#"data: {"choices":[{"delta":{"content":"Hel"}}]}"#);
+        acc.feed(b"\n\n");
+        acc.feed(br#"data: {"choices":[{"delta":{"content":"lo"}}]}"#);
+        acc.feed(b"\n\ndata: [DONE]\n\n");
+        let out = acc.finish();
+        assert_eq!(out, "Hello");
+        assert!(!out.contains("data:"));
+    }
+
+    #[test]
+    fn truncate_keeps_utf8_boundary() {
+        let input = format!("{}{}", "a".repeat(AI_TRACE_CONTENT_MAX_BYTES - 7), "🙂🙂");
+        let out = truncate_ai_trace_content(&input);
+        assert!(out.ends_with(AI_TRACE_CONTENT_TRUNCATED_MARKER));
+        assert!(out.len() <= AI_TRACE_CONTENT_MAX_BYTES);
+    }
+}
+
 // --- AI proxy handler ---
 
 /// Outcome of a pre-dispatch budget check. Tells the caller whether

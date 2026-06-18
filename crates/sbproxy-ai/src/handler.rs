@@ -71,13 +71,14 @@ pub struct AiHandlerConfig {
     /// See `sbproxy_security::pii::PiiConfig` for the rule schema.
     #[serde(default)]
     pub pii: Option<sbproxy_security::pii::PiiConfig>,
-    /// WOR-1228: when `true`, emit the prompt text as the OpenInference
-    /// `input.value` span attribute so trace backends (Phoenix, Langfuse)
-    /// show the actual conversation, not just token counts. Off by default
-    /// because prompt content is sensitive: when on, the text is routed
-    /// through the configured `pii` redactor (if any) and the always-on
-    /// secret redactor before it lands on the span. Enable only with `pii`
-    /// configured and a trace backend inside your trust boundary.
+    /// WOR-1228: when `true`, emit prompt and completion text as the
+    /// OpenInference `input.value` / `output.value` span attributes plus
+    /// role-aware message events so trace backends (Phoenix, Langfuse) show
+    /// the actual conversation, not just token counts. Off by default
+    /// because content is sensitive: when on, the text is routed through the
+    /// configured `pii` redactor (if any), the always-on secret redactor, and
+    /// a capture payload cap before it lands on the span. Enable only with
+    /// `pii` configured and a trace backend inside your trust boundary.
     #[serde(default)]
     pub trace_content: bool,
     /// Opaque semantic-cache configuration block. The OSS proxy
