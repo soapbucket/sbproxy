@@ -31,11 +31,13 @@
 //!
 //! # Capture point
 //!
-//! The pure parser in [`parse_client_hello`] is invoked from a
-//! Pingora TLS session lifecycle hook after the ClientHello is read.
-//! The Pingora glue is intentionally thin (just the hook adapter); all
-//! of the parsing logic lives here so it can be unit-tested without a
-//! real handshake.
+//! The parser in [`parse_client_hello`] is deliberately pure: callers
+//! hand it the raw ClientHello bytes from whatever listener or sidecar
+//! observed the handshake. The current OSS Pingora 0.8 + rustls listener
+//! path does not expose those bytes through the public request/session
+//! API, so `sbproxy-core` accepts trusted sidecar-stamped JA3 / JA4
+//! values at runtime today. Native listener capture should call this
+//! parser once the listener layer can surface the raw handshake bytes.
 //!
 //! # Feature gating
 //!
@@ -55,8 +57,10 @@ use std::net::IpAddr;
 /// Fields are independently optional because they are populated at
 /// different points in the pipeline:
 ///
-/// - [`Self::ja3`] / [`Self::ja4`] are populated by
-///   [`parse_client_hello`] at TLS handshake time.
+/// - [`Self::ja3`] / [`Self::ja4`] are values computed by
+///   [`parse_client_hello`] when raw ClientHello bytes are available, or
+///   supplied by the trusted sidecar capture path in the current OSS
+///   Pingora 0.8 + rustls runtime.
 /// - [`Self::ja4h`] is populated mid-pipeline by [`compute_ja4h`]
 ///   once the request headers are available.
 /// - [`Self::ja4s`] is populated on the outbound TLS session to the

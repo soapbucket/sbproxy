@@ -6521,6 +6521,7 @@ dependencies = [
  "sbproxy-middleware",
  "sbproxy-modules",
  "sbproxy-observe",
+ "sbproxy-tls",
  "serde",
  "serde_json",
  "sha2 0.11.0",

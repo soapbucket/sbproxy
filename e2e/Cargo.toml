@@ -45,6 +45,10 @@ base64.workspace = true
 # stub. Dev-only because no other harness path needs it.
 sbproxy-modules.workspace = true
 
+# WOR-1444: deterministic TLS ClientHello e2e coverage generates real
+# rustls ClientHello bytes and feeds them through the production parser.
+sbproxy-tls.workspace = true
+
 # WOR-805 publish-signed e2e (web_bot_auth_publish_signed_e2e.rs)
 # rehydrates the signed JWKS response as an http::Request and runs
 # the production verifier against the published JWK as the trust

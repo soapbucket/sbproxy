@@ -805,12 +805,14 @@ pub struct RequestContext {
 
     // --- Wave 5 / G5.3 TLS fingerprint ---
     //
-    // Captured at the Pingora TLS session lifecycle hook by
-    // [`sbproxy_tls::parse_client_hello`] when the `tls-fingerprint`
-    // cargo feature is on. `ja4h` is filled mid-pipeline by
-    // [`sbproxy_tls::compute_ja4h`] in `request_filter`, after
-    // headers are read. `None` for plaintext HTTP requests or when
-    // the feature is disabled.
+    // Current OSS runtime capture comes from trusted sidecar headers
+    // because Pingora 0.8 + rustls does not expose raw ClientHello
+    // bytes to the request/session API. A future native listener hook
+    // should populate this from [`sbproxy_tls::parse_client_hello`].
+    // `ja4h` is filled mid-pipeline by [`sbproxy_tls::compute_ja4h`]
+    // in `request_filter`, after headers are read. `None` for
+    // plaintext HTTP requests, when the feature is disabled, or when
+    // no trusted capture source supplied JA3 / JA4 values.
     /// JA3 / JA4 / JA4H / JA4S fingerprint bundle for this request.
     /// See [`sbproxy_tls::TlsFingerprint`].
     pub tls_fingerprint: Option<sbproxy_tls::TlsFingerprint>,
