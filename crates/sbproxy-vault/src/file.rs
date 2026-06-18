@@ -20,7 +20,7 @@
 //!   rest via the operator's existing GitOps secret-encryption
 //!   workflow).
 //! * Operator workflows that already maintain secrets in a checked-in
-//!   `secrets.yaml` and want a uniform `vault://` reference shape.
+//!   `secrets.yaml` and want a provider-specific secret reference.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

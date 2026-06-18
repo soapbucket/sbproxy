@@ -93,8 +93,8 @@ auth:
   type: oidc
   issuer: https://idp.example.com
   client_id: sbproxy
-  client_secret: vault://oidc/client_secret
-  cookie_secret: vault://oidc/cookie_secret
+  client_secret: vault://primary/secret/data/oidc/client?key=client_secret
+  cookie_secret: vault://primary/secret/data/oidc/cookie?key=cookie_secret
   authorization_endpoint: https://idp.example.com/authorize
   token_endpoint: https://idp.example.com/oauth/token
   jwks_uri: https://idp.example.com/.well-known/jwks.json

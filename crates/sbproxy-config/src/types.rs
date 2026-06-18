@@ -2560,7 +2560,9 @@ pub struct TenantObservabilityRedactConfig {
 /// The credential carries:
 ///
 /// * Which provider produces it (`type`, `provider`).
-/// * Where the secret material lives (`key`, a `vault://` /
+/// * Where the secret material lives (`key`, a provider-specific
+///   secret reference such as `vault://`, `awssm://`, `gcpsm://`,
+///   `k8ssecret://`, `secretfile://`, or `secret://`, or a legacy
 ///   `${ENV}` / `file:` / `secret:` reference).
 /// * Which inbound principals can use it (`principals` selectors).
 /// * Per-credential attribution metadata (`attrs`).
@@ -2582,9 +2584,11 @@ pub struct CredentialBlock {
     /// credential kinds.
     #[serde(default)]
     pub provider: Option<String>,
-    /// Secret material reference (`vault://...`, `${ENV}`, `file:`,
-    /// `secret:`). The resolver dispatches at runtime; the config
-    /// parser carries it as a string.
+    /// Secret material reference. Provider-specific schemes include
+    /// `vault://`, `awssm://`, `gcpsm://`, `k8ssecret://`,
+    /// `secretfile://`, and `secret://`; legacy `${ENV}`, `file:`,
+    /// and `secret:` forms also remain valid. The resolver dispatches
+    /// at runtime; the config parser carries it as a string.
     #[serde(default)]
     pub key: Option<String>,
     /// Principal selectors that match this credential to inbound
@@ -5430,8 +5434,8 @@ pub struct WebBotAuthPublishConfig {
     /// without relying solely on TLS. Absent leaves the responses
     /// unsigned; the Web Bot Auth IETF draft permits both shapes and
     /// verifiers MAY treat unsigned directories as lower-trust. The
-    /// secret-resolver pass honours `vault://` references at config
-    /// load so the raw seed never has to live in the YAML.
+    /// secret-resolver pass honours secret references at config load
+    /// so the raw seed never has to live in the YAML.
     #[serde(default)]
     pub signing_key_hex: Option<String>,
 }
@@ -5447,9 +5451,9 @@ pub struct OlpConfig {
     pub enabled: bool,
     /// Ed25519 signing key, hex-encoded 32-byte seed. Operators
     /// generate one with `openssl rand -hex 32` or read it from a
-    /// secret store (the `vault://` reference syntax is honoured by
-    /// the secret-resolver pass at config-load time, mirroring how
-    /// other key-material fields work).
+    /// secret store. The secret-resolver pass honours provider-specific
+    /// references at config-load time, mirroring how other key-material
+    /// fields work.
     pub signing_key: String,
     /// `kid` the JWS header advertises. Rotation appends a new key
     /// with a new kid and trusts both for the cutover window.
@@ -5610,7 +5614,7 @@ pub struct OlpIntrospectBasicClient {
     pub username: String,
     /// Argon2id hash of the password (PHC string format, as produced
     /// by `argon2 -t 3 -m 65536 -p 4 -i`). The proxy verifies with
-    /// the same parameters; supports `vault://` references via the
+    /// the same parameters; supports secret references via the
     /// secret-resolver pass.
     pub password_hash: String,
 }

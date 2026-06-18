@@ -110,7 +110,7 @@ Resolution at request time walks origin → tenant → proxy. A credential at or
 | `name` | string | Stable operator-supplied name. Unique within the declaring scope. |
 | `type` | enum | One of `ai_provider`, `bearer`, `api_key`, `jwt`, `basic`, `oidc_client`, `outbound_token_exchange`, `outbound_client_credentials`. |
 | `provider` | string | Provider name for `ai_provider` credentials. Matches an entry in the origin's `providers:` list. |
-| `key` | string | Secret reference. Accepts `vault://...`, `${ENV}`, `file:`, `secret:`. |
+| `key` | string | Secret reference. Accepts provider-specific schemes such as `vault://`, `awssm://`, `gcpsm://`, `k8ssecret://`, `secretfile://`, and `secret://`, plus `${ENV}`, `file:`, and `secret:`. |
 | `principals` | list | Principal selectors. Empty matches every principal. |
 | `attrs` | object | Attribution attributes copied onto matched principals. See below. |
 | `models.allow` / `models.deny` | lists | Stack on top of the origin-level allowlist. Most-restrictive wins. |
@@ -129,6 +129,38 @@ Resolution at request time walks origin → tenant → proxy. A credential at or
 | `budget.max_tokens` | int | Total input + output tokens per reset window. |
 | `budget.max_cost_usd` | float | USD spend cap per reset window. |
 | `budget.reset` | string | Reset window in LiteLLM-style `30s|30m|30h|30d`. |
+
+## Secret Reference Migration
+
+Credential keys use the same secret-reference grammar as other secret-bearing fields. The old umbrella form used the first `vault://` path segment as a backend alias:
+
+```text
+vault://aws/prod/openai?key=api_key
+vault://k8s/default/sbproxy-secrets/openai-key
+vault://file/etc/sbproxy/secrets/openai
+vault://env/OPENAI_API_KEY
+```
+
+New configs should use provider-specific schemes instead:
+
+```text
+awssm://aws/prod/openai?key=api_key
+k8ssecret://k8s/default/sbproxy-secrets/openai-key
+secretfile://file/etc/sbproxy/secrets/openai
+${OPENAI_API_KEY}
+```
+
+HashiCorp Vault owns `vault://` after the migration, so a HashiCorp reference should name the configured HashiCorp backend instance:
+
+```text
+vault://primary/secret/data/openai-prod?key=api_key
+```
+
+The legacy `vault://<alias>/...` forms are accepted with a warning during the compatibility window. The shim is scheduled for removal in SBproxy `1.2.0`. Rewrite known aliases with:
+
+```bash
+sbproxy config migrate sb.yml --out sb.migrated.yml
+```
 
 ### `principals:`
 

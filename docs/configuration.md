@@ -3462,19 +3462,28 @@ proxy:
 
 The `extensions` map at both the proxy and the origin level holds opaque blocks consumed by enterprise / third-party crates. OSS does not parse them.
 
-### `vault://` reference URI
+### Secret reference URI schemes
 
-In addition to `${ENV}`, `file:`, and `secret:`, secret-bearing fields accept a unified `vault://` reference URI that names a backend + path + optional sub-field. The parser ships in `sbproxy-vault`; the resolver will dispatch into the configured backend once the per-backend implementations land.
+In addition to `${ENV}`, `file:`, and `secret:`, secret-bearing fields accept provider-specific secret reference URIs. The scheme names the provider type, the authority names the configured backend instance, and the path is interpreted by that provider.
 
 #### Grammar
 
 ```
-vault://<backend>/<path>[?version=<n>][&key=<json-field>]
+<scheme>://<backend-name>/<provider-path>[?version=<n>][&key=<json-field>]
 ```
 
-* `<backend>` is the registered backend name (operator-chosen identifier under `proxy.vault:`, `tenants[].vault:`, or `origins[].vault:` once those scopes ship).
-* `<path>` is the backend-specific path inside the vault. The parser carries it verbatim; each backend validates its own shape at resolve time.
-* `version=<n>` pins a secret version where the backend supports versioning (HashiCorp KVv2, AWS Secrets Manager). Ignored by versionless backends.
+| Scheme | Provider type | Example |
+|---|---|---|
+| `vault://` | HashiCorp Vault KV | `vault://primary/secret/data/openai-prod?key=api_key` |
+| `awssm://` | AWS Secrets Manager | `awssm://primary/openai-keys?version=3&key=api_key` |
+| `gcpsm://` | GCP Secret Manager | `gcpsm://primary/openai-api-key?version=latest` |
+| `k8ssecret://` | Kubernetes Secret | `k8ssecret://primary/sbproxy-secrets/openai-key` |
+| `secretfile://` | Local YAML or JSON secret file | `secretfile://local/openai-prod?key=api_key` |
+| `secret://` | Local static secret map | `secret://local/openai-prod` |
+
+* `<backend-name>` is the operator-chosen backend instance name under `proxy.vault:`, `tenants[].vault:`, or `origins[].vault:`.
+* `<provider-path>` is the backend-specific path. The parser carries it verbatim; each backend validates its own shape at resolve time.
+* `version=<n>` pins a secret version where the backend supports versioning, such as HashiCorp KV v2, AWS Secrets Manager, or GCP Secret Manager. It is ignored by versionless backends.
 * `key=<json-field>` extracts a sub-field from a JSON secret payload. When omitted the entire payload is returned.
 * Additional query parameters carry through to the backend as opaque hints; the parser does not interpret them.
 
@@ -3484,42 +3493,49 @@ vault://<backend>/<path>[?version=<n>][&key=<json-field>]
 authentication:
   type: bearer
   tokens:
-    - vault://hashi/secret/data/openai-prod?key=api_key
-    - vault://aws/prod/openai-keys?version=3&key=api_key
-    - vault://k8s/default/sbproxy-secrets/openai-key
-    - vault://file/etc/sbproxy/secrets/openai
-    - vault://env/OPENAI_API_KEY
-    - vault://sqlite/credentials/openai?version=3&key=current
+    - vault://primary/secret/data/openai-prod?key=api_key
+    - awssm://primary/prod/openai-keys?version=3&key=api_key
+    - gcpsm://primary/openai-api-key?version=latest
+    - k8ssecret://primary/sbproxy-secrets/openai-key
+    - secretfile://local/openai-prod?key=api_key
+    - secret://local/openai-prod
+    - ${OPENAI_API_KEY}
 ```
 
 #### Backward compatibility
 
-Existing `${ENV}`, `file:/path/to/secret`, and `secret:<name>` shapes keep working unchanged. The resolver tries each parser in turn: a string that does not start with `vault://` falls through to the legacy resolvers exactly as before.
+Existing `${ENV}`, `file:/path/to/secret`, and `secret:<name>` shapes keep working unchanged. Legacy umbrella references shaped as `vault://<alias>/...` are accepted with a warning during the compatibility window and are scheduled for removal in SBproxy `1.2.0`.
+
+Rewrite known legacy aliases with:
+
+```bash
+sbproxy config migrate sb.yml --out sb.migrated.yml
+```
 
 #### Multi-tenant resolution
 
-The URI itself is tenant-agnostic. The `<backend>` segment names a backend block; the block is configured per-scope at `proxy.vault`, `tenants[].vault`, or `origins[].vault`. Resolution order at request time is origin scope, then tenant scope, then proxy scope; the first scope that declares the named backend serves the reference.
+The URI itself is tenant-agnostic. The `<backend-name>` segment names a backend block; the scheme requires that block to have the matching provider type. Resolution order at request time is origin scope, then tenant scope, then proxy scope; the first scope that declares the matching backend serves the reference.
 
 ```yaml
 proxy:
   vault:
-    - name: hashi
+    - name: primary
       type: hashicorp
       addr: https://vault.shared.example/v1
-      token: vault://env/VAULT_TOKEN_SHARED
+      token: ${VAULT_TOKEN_SHARED}
   tenants:
     - id: acme-corp
       vault:
-        - name: hashi              # same name, different Vault instance
+        - name: primary            # same name, different Vault instance
           type: hashicorp
           addr: https://vault.acme.example/v1
-          token: vault://env/VAULT_TOKEN_ACME
+          token: ${VAULT_TOKEN_ACME}
     - id: beta-corp
       vault:
-        - name: hashi
+        - name: primary
           type: hashicorp
           addr: https://vault.beta.example/v1
-          token: vault://env/VAULT_TOKEN_BETA
+          token: ${VAULT_TOKEN_BETA}
 origins:
   api.acme.example.com:
     tenant_id: acme-corp
@@ -3527,12 +3543,12 @@ origins:
       type: ai_proxy
       providers:
         - name: openai
-          api_key: vault://hashi/secret/data/openai-prod?key=api_key
+          api_key: vault://primary/secret/data/openai-prod?key=api_key
 ```
 
-The `vault://hashi/secret/data/openai-prod` reference in the origin above resolves against acme-corp's hashi block (Vault at `vault.acme.example`). A tenant that does not redeclare a named backend transparently inherits the proxy default, so single-tenant configs need no changes. The request's `tenant_id` (stamped by the routing layer) is the resolution context, not part of the URI.
+The `vault://primary/secret/data/openai-prod` reference in the origin above resolves against acme-corp's `primary` HashiCorp backend at `vault.acme.example`. A tenant that does not redeclare a matching backend inherits the proxy default, so single-tenant configs need no changes. The request's `tenant_id` is the resolution context, not part of the URI.
 
-Tenant and origin vault scopes land alongside the credentials epic; today's vault block is proxy-scope only.
+Tenant and origin vault scopes follow the same origin -> tenant -> proxy resolution order as credentials.
 
 ---
 

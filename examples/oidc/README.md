@@ -52,7 +52,7 @@ authenticate from it.
 |---|---|---|
 | `authorization_endpoint` / `token_endpoint` / `jwks_uri` / `issuer` | placeholder URLs | IdP's `.well-known/openid-configuration` |
 | `client_id` / `client_secret` | demo strings | OAuth client registered with the IdP |
-| `cookie_secret` | 32-byte literal (demo only) | `vault://oidc/cookie_secret` |
+| `cookie_secret` | 32-byte literal (demo only) | `vault://primary/secret/data/oidc/cookie?key=cookie_secret` |
 | `scope` | `openid email profile` | adjust to what your IdP exposes |
 | `userinfo_endpoint` | enabled | optional; enables the X-Auth-Subject / Email / Name / Groups trust-header projection |
 | `end_session_endpoint` | enabled | optional; lets `/oidc/logout` terminate the IdP session too |

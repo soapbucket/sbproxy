@@ -4,14 +4,14 @@
 
 ## What you will build
 
-You will run SBproxy as a cluster-edge gateway that serves more than one tenant, where each tenant's data and secrets stay in its own cloud. The gateway recovers the real client IP behind a Kubernetes Ingress, re-resolves backend Pod endpoints as they rotate, and resolves each tenant's upstream credentials from a backend named per tenant scope, so the same `vault://` reference reads from a different vault depending on which tenant the request belongs to. Every key in this guide comes from the runnable `examples/k8s-gateway` and `examples/vault-reference` configs.
+You will run SBproxy as a cluster-edge gateway that serves more than one tenant, where each tenant's data and secrets stay in its own cloud. The gateway recovers the real client IP behind a Kubernetes Ingress, re-resolves backend Pod endpoints as they rotate, and resolves each tenant's upstream credentials from a backend named per tenant scope, so the same provider reference can read from a different vault depending on which tenant the request belongs to. Every key in this guide comes from the runnable `examples/k8s-gateway` and `examples/vault-reference` configs.
 
 ## Prerequisites
 
 - Rust 1.82 or newer with `cargo` (the workspace `rust-version` is 1.82). Needed only if you build from source.
 - `curl` for the test requests.
 - A pre-built binary is fine too. You do not need the toolchain if you install with the release script, Homebrew, or Docker (see the next section).
-- Scenario-specific: nothing extra to start. The example uses `vault://env/...` references, which the shipping resolver serves straight from the proxy process environment, so you can run the sovereign shape locally without standing up HashiCorp Vault, AWS Secrets Manager, or a cluster secret store. Those named backends (`hashi`, `aws`, `k8s`, `sqlite`) parse today and resolve once their backend block is wired in; the `env` backend works now.
+- Scenario-specific: nothing extra to start. The runnable example uses `${ENV}` references, which the shipping resolver serves straight from the proxy process environment, so you can run the sovereign shape locally without standing up HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager, or a cluster secret store. The provider-specific vault references are shown in `examples/vault-reference` for production wiring.
 
 ## Install and build
 
@@ -58,7 +58,7 @@ Run the binary against a config file:
 
 ## Minimal config
 
-Save this as `sb.yml`. It is the `examples/k8s-gateway` dataplane shape (trusted-proxy XFF recovery, service discovery, host override, correlation id, per-IP concurrency) with the `examples/vault-reference` multi-tenant model layered on: a declared tenant whose origin reads its upstream key from a tenant-scoped `vault://` reference. `test.sbproxy.dev` stands in for the cluster Service so the config runs locally.
+Save this as `sb.yml`. It is the `examples/k8s-gateway` dataplane shape (trusted-proxy XFF recovery, service discovery, host override, correlation id, per-IP concurrency) with the `examples/vault-reference` multi-tenant model layered on: a declared tenant whose origin can read its upstream key from a tenant-scoped provider reference. `test.sbproxy.dev` stands in for the cluster Service so the config runs locally.
 
 ```yaml
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
@@ -107,14 +107,14 @@ origins:
         retry_on: [connect_error, timeout]
         backoff_ms: 100
 
-    # Inbound auth. The bearer token resolves through a vault://
-    # reference. vault://env reads the proxy process environment and
-    # is tenant-agnostic by construction; vault://hashi (and aws, k8s,
-    # sqlite) resolve against the named backend in the tenant scope.
+    # Inbound auth. The runnable token resolves from the proxy process
+    # environment. Production configs can use tenant-scoped provider
+    # references such as vault://primary, awssm://primary,
+    # gcpsm://primary, or k8ssecret://primary.
     authentication:
       type: bearer
       tokens:
-        - vault://env/INTERNAL_BEARER_TOKEN
+        - ${INTERNAL_BEARER_TOKEN}
 
     policies:
       # Protect upstream Pods from a thundering herd. Per-IP keying
@@ -197,6 +197,6 @@ curl -i -H 'Host: api.acme.example.com' http://127.0.0.1:8080/headers
 ## Next steps
 
 - [docs/multi-tenant.md](multi-tenant.md) - declared tenants, scope resolution, and per-tenant policy.
-- [docs/secrets.md](secrets.md) - the `vault://` grammar and wiring each tenant to its own cloud vault (HashiCorp, AWS, Kubernetes, SQLite).
+- [docs/secrets.md](secrets.md) - provider-specific secret references and wiring each tenant to its own cloud vault.
 - [docs/kubernetes.md](kubernetes.md) - generating this dataplane from a `Gateway` plus `HTTPRoute` pair.
 - [docs/operator-runbook.md](operator-runbook.md) - running, reloading, and observing the gateway in production.

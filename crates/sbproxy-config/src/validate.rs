@@ -8,12 +8,14 @@
 //! * [`orphan-ref`](validate#orphan-references): a `fallback_origin`
 //!   or forward-rule action target names a hostname that is not
 //!   present under `origins.*` in the same proposed config.
-//! * [`missing-secret`](validate#missing-secrets): a `secret:` /
-//!   `secret://` / `vault://` template reference whose logical name
+//! * [`missing-secret`](validate#missing-secrets): a legacy
+//!   `secret:` / `secret://` template reference whose logical name
 //!   does not appear under `proxy.secrets.map` in the proposed
-//!   config. Backends that resolve from the OS env (`backend: env`)
-//!   skip this check because the validator cannot inspect process
-//!   env safely at plan time.
+//!   config. Provider-specific references such as `vault://`,
+//!   `awssm://`, `gcpsm://`, `k8ssecret://`, `secretfile://`, and
+//!   `secret://<backend>/...` resolve through configured vault
+//!   backends rather than `proxy.secrets.map`, so this rule does not
+//!   treat them as map keys.
 //! * [`unknown-type`](validate#unknown-types): an `action`,
 //!   `authentication`, `policies[*]`, or `transforms[*]` `type:`
 //!   discriminator that names a module not registered in the OSS
@@ -377,9 +379,9 @@ fn is_hostname_like(host: &str) -> bool {
 
 // --- Missing-secret check ------------------------------------------
 
-/// Walk a JSON value tree and emit a finding for each `secret:` /
-/// `secret://` / `vault://` reference whose logical name is not in
-/// `secret_keys`. References embedded in arbitrary string fields
+/// Walk a JSON value tree and emit a finding for each legacy
+/// `secret:` / `secret://` map reference whose logical name is not
+/// in `secret_keys`. References embedded in arbitrary string fields
 /// (e.g. `auth.secret: "secret:my_jwt"`) are caught.
 ///
 /// When the proxy has no `secrets:` block at all
@@ -449,17 +451,21 @@ fn walk_secrets(
     }
 }
 
-/// Pull every `secret:`, `secret://`, or `vault://` reference out
-/// of a free-form string. Returns the bare logical name (the part
-/// after the prefix) for each match. Multiple references in one
-/// string (e.g. an interpolated template) are all returned.
+/// Pull every legacy `secret:` or `secret://` map reference out of a
+/// free-form string. Returns the bare logical name (the part after
+/// the prefix) for each match. Multiple references in one string
+/// (e.g. an interpolated template) are all returned.
 fn extract_secret_refs(input: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for prefix in ["secret://", "vault://", "secret:"] {
+    for prefix in ["secret://", "secret:"] {
         let mut start = 0;
         while let Some(idx) = input[start..].find(prefix) {
             let abs = start + idx;
             let after = &input[abs + prefix.len()..];
+            if prefix == "secret:" && after.starts_with("//") {
+                start = abs + prefix.len();
+                continue;
+            }
             // The reference ends at the first whitespace or quote /
             // closing brace, mirroring how the runtime resolver
             // tokenises template values.
@@ -468,6 +474,10 @@ fn extract_secret_refs(input: &str) -> Vec<String> {
                 .unwrap_or(after.len());
             let name = &after[..end];
             if !name.is_empty() {
+                if prefix == "secret://" && name.contains('/') {
+                    start = abs + prefix.len() + end;
+                    continue;
+                }
                 // Strip the canonical `system:` / `origin:host:` /
                 // `shared:` scope so the validation key matches the
                 // logical name in `proxy.secrets.map`.
@@ -774,7 +784,7 @@ origins:
     }
 
     #[test]
-    fn vault_url_style_reference_is_flagged() {
+    fn secret_uri_style_reference_is_flagged() {
         let yaml = r#"
 proxy:
   secrets:
@@ -787,7 +797,7 @@ origins:
       url: https://upstream.example.com
     authentication:
       type: jwt
-      secret: "vault://missing_key"
+      secret: "secret://missing_key"
 "#;
         let cfg = parse(yaml);
         let findings = validate(&cfg, &ValidationOptions::default());
@@ -797,6 +807,36 @@ origins:
             .collect();
         assert_eq!(missing.len(), 1, "got findings: {findings:?}");
         assert!(missing[0].message.contains("missing_key"));
+    }
+
+    #[test]
+    fn provider_secret_reference_uris_are_not_proxy_secret_map_keys() {
+        let yaml = r#"
+proxy:
+  secrets:
+    backend: env
+    map: {}
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: https://upstream.example.com
+    authentication:
+      type: bearer
+      tokens:
+        - "vault://primary/secret/data/inbound/admin-token?key=token"
+        - "awssm://primary/prod/sbproxy-inbound-tokens?version=3&key=admin"
+        - "gcpsm://primary/inbound-token?version=latest"
+        - "k8ssecret://primary/sbproxy-secrets/inbound-token"
+        - "secretfile://local/inbound-admin?key=current"
+        - "secret://local/inbound-admin-token"
+"#;
+        let cfg = parse(yaml);
+        let findings = validate(&cfg, &ValidationOptions::default());
+        assert!(
+            findings.iter().all(|f| f.rule_id != "missing-vault-key"),
+            "got findings: {findings:?}"
+        );
     }
 
     // -- unknown-type --
