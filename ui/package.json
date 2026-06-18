@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "SBproxy built-in admin dashboard + chat playground. Built to ui/dist/ and embedded into the sbproxy binary behind the embed-admin-ui cargo feature.",
+  "description": "SBproxy built-in admin dashboard scaffold. Built to ui/dist/ and embedded into the sbproxy binary behind the embed-admin-ui cargo feature.",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

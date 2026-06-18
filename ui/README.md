@@ -1,12 +1,11 @@
 # sbproxy admin UI
 
 Vite + React + TypeScript scaffold for the built-in admin dashboard
-and chat playground served by the `sbproxy` binary. Tracked under
-WOR-227.
+served by the `sbproxy` binary. Tracked under WOR-227.
 
 This is a foundation only. The real views (providers, models,
-routing-strategy preview, metrics tiles, chat playground) land in
-follow-up tickets.
+routing-strategy preview, metrics tiles, live chat) land in follow-up
+tickets.
 
 ## Build
 
@@ -56,16 +55,17 @@ What ships in this scaffold:
 
 - One placeholder page that calls `/admin/api/health` and renders
   the response.
+- A disabled chat-playground card that does not submit model traffic.
 - A `/admin/ui/*` mount on the admin server, behind the
   `embed-admin-ui` cargo feature.
-- A `POST /admin/api/playground/chat` stub that returns 501 with a
-  pointer to the follow-up ticket.
+- A reserved `POST /admin/api/playground/chat` admin route that
+  returns a JSON `feature disabled` envelope after admin auth.
 
 What is deferred:
 
 - The real React views (providers, models, routing-strategy
   preview, metrics).
-- The chat playground actually routing requests through the proxy
-  router (`proxy_router.oneshot`).
+- The chat playground routing requests through the production AI
+  dispatch path.
 - Live metrics tiles.
 - Bundling `ui/dist/` in CI.

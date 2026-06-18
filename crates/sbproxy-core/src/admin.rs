@@ -1251,14 +1251,16 @@ pub fn handle_admin_request(
         );
     }
 
-    // --- WOR-227 scaffold: built-in admin UI + playground stub. ---
+    // --- Built-in admin UI + gated playground route. ---
     //
     // Both modules return `Some(...)` for paths they own and `None`
     // otherwise, so we delegate first and only fall through to the
     // existing dispatcher when neither matches. The UI mount sits
     // behind the `embed-admin-ui` cargo feature; without the
     // feature, requests under `/admin/ui` return a one-line 404
-    // explaining how to enable the embedded build.
+    // explaining how to enable the embedded build. The playground
+    // chat path is reserved but explicitly disabled until the
+    // production AI dispatch wiring lands.
     if let Some(response) = crate::admin_ui::dispatch(method, path) {
         return response;
     }
@@ -1944,6 +1946,37 @@ mod tests {
         let (status, _, _) =
             handle_admin_request("GET", "/unknown/path", &state, Some(&auth), None);
         assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn playground_chat_requires_admin_auth() {
+        let state = make_state();
+        let (status, _, body) = handle_admin_request(
+            "POST",
+            crate::admin_playground::CHAT_PATH,
+            &state,
+            None,
+            Some("{}"),
+        );
+        assert_eq!(status, 401);
+        assert!(body.contains("Unauthorized"));
+    }
+
+    #[test]
+    fn playground_chat_is_feature_disabled_after_auth() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, ct, body) = handle_admin_request(
+            "POST",
+            crate::admin_playground::CHAT_PATH,
+            &state,
+            Some(&auth),
+            Some("{}"),
+        );
+        assert_eq!(status, 404);
+        assert_eq!(ct, "application/json");
+        assert!(body.contains("feature disabled"));
+        assert!(body.contains("admin_chat_playground"));
     }
 
     #[test]

@@ -3,8 +3,8 @@ import { useEffect, useState } from "react";
 // WOR-227 scaffold. This is intentionally a one-screen placeholder
 // so the embed wiring, the cargo feature, and the `/admin/ui` mount
 // can land independently of any real views. Follow-up tickets fill
-// in providers, models, routing-strategy preview, metrics, and the
-// chat playground.
+// in providers, models, routing-strategy preview, metrics, and live
+// chat.
 
 type HealthState =
   | { kind: "loading" }
@@ -66,6 +66,24 @@ export function App() {
           /admin/api/health
         </h2>
         <HealthBlock state={state} />
+      </section>
+      <section
+        aria-disabled="true"
+        style={{
+          marginTop: "1rem",
+          padding: "1rem 1.25rem",
+          border: "1px solid #d0d7de",
+          borderRadius: "6px",
+          background: "#ffffff",
+          opacity: 0.78,
+        }}
+      >
+        <h2 style={{ margin: 0, fontSize: "1rem", fontWeight: 600 }}>
+          Chat playground
+        </h2>
+        <p style={{ color: "#57606a", margin: "0.75rem 0 0" }}>
+          Disabled until the admin route is wired to the production AI dispatch path.
+        </p>
       </section>
     </main>
   );

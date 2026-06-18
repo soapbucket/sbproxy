@@ -378,20 +378,20 @@ contracts live with the feature.
 
 ## Chat playground (`POST /admin/api/playground/chat`)
 
-A stub handler for the dashboard's interactive chat surface. The
-admin UI scaffold + cargo feature ship today; the wiring that
-routes the request through `proxy_router.oneshot` and streams a
-model's response back is deferred to a follow-up ticket so the
-front-end scaffold and the production integration can land
-independently.
+A reserved endpoint for the dashboard's interactive chat surface.
+The admin UI scaffold + cargo feature ship today, but the chat
+playground is gated off until it can route through the production AI
+dispatch path with the same origin/provider constraints as normal
+proxy traffic.
 
-Today the route returns `501 Not Implemented` with a JSON envelope
-naming the follow-up:
+Today an authenticated `POST` returns `404 Not Found` with a JSON
+feature-disabled envelope:
 
 ```json
 {
-  "error": "not implemented",
-  "detail": "chat playground stub; real handler will route through proxy_router.oneshot and stream the model response back to /admin/ui"
+  "error": "feature disabled",
+  "feature": "admin_chat_playground",
+  "detail": "admin chat playground is not wired in this build; use configured AI proxy origins for live model traffic"
 }
 ```
 
@@ -399,10 +399,10 @@ Other verbs return `405 Method Not Allowed`. The route shares the
 admin port's basic-auth gate, so a curious operator pinging it
 without credentials still sees `401 Unauthorized` first.
 
-This route is OSS, ships in every build, and lives on the admin
-server (next to `/admin/reload`) rather than the production proxy
-listener. The path is stable; the follow-up that lights up the
-real handler does not move it.
+The path is reserved on the admin server (next to `/admin/reload`)
+rather than the production proxy listener. It is not a live chat API
+until a future implementation wires it to the production AI dispatch
+path.
 
 ---
 

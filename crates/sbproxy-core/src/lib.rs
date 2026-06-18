@@ -12,9 +12,9 @@
 #![warn(missing_docs)]
 
 pub mod admin;
-/// Stub chat-playground handler mounted on the
-/// admin server. Returns 501 today; the follow-up ticket wires it
-/// through `proxy_router.oneshot`.
+/// Gated chat-playground route mounted on the admin server. Returns
+/// a feature-disabled response until the route is wired through the
+/// production AI dispatch path.
 pub mod admin_playground;
 /// Static-asset surface for the built-in admin
 /// dashboard at `/admin/ui/*`. Embedded via `include_dir!` when the
