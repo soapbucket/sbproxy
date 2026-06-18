@@ -619,6 +619,8 @@ The AI request span (`ai.request`) follows the OpenTelemetry GenAI semantic conv
 | Concept | gen_ai | OpenInference |
 |---|---|---|
 | Provider / model | `gen_ai.system`, `gen_ai.request.model`, `gen_ai.response.model` | `llm.provider`, `llm.model_name` |
+| Request controls | `gen_ai.request.temperature`, `gen_ai.request.max_tokens`, `gen_ai.request.top_p` | n/a |
+| Response identity | `gen_ai.response.id`, `gen_ai.response.finish_reasons` | n/a |
 | Tokens (with cache + reasoning split) | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read_tokens`, `gen_ai.usage.cache_write_tokens`, `gen_ai.usage.reasoning_tokens` | `llm.token_count.prompt`, `llm.token_count.completion`, `llm.token_count.total` |
 | Derived USD cost | `sbproxy.ai.cost_usd_micros`, `gen_ai.usage.cost` | `llm.usage.total_cost` |
 | Pricing catalog revision | `sbproxy.ai.pricing_version` | n/a |
@@ -626,7 +628,9 @@ The AI request span (`ai.request`) follows the OpenTelemetry GenAI semantic conv
 | Failure | `otel.status_code = ERROR` plus `error.type` (`guardrail_blocked`, `rate_limited`, `provider_error`, `content_filter`) | n/a |
 | Tenant | `sbproxy.tenant_id` | n/a |
 
-Token counting happens at the proxy (not trusted from the upstream's self-report), cost is derived from the catalog stamped in `sbproxy.ai.pricing_version`, and the exact span value is `sbproxy.ai.cost_usd_micros` in micro-USD (`1e-6` USD). The GenAI attribute set is pinned by a conformance test (semconv 1.36.0) so emitted spans cannot silently drift off-spec.
+Token counting happens at the proxy (not trusted from the upstream's self-report), cost is derived from the catalog stamped in `sbproxy.ai.pricing_version`, and the exact span value is `sbproxy.ai.cost_usd_micros` in micro-USD (`1e-6` USD). The GenAI attribute set is pinned by a conformance test to OpenTelemetry GenAI semconv `1.36.0`, with OpenInference pinned to a source revision in `crates/sbproxy-ai/src/tracing_spans.rs`, so emitted spans cannot silently drift off-spec.
+
+To intentionally bump the AI span vocabulary, update the semconv constants and required field lists in `crates/sbproxy-ai/src/tracing_spans.rs`, update the span helpers for any renamed attributes, update this table, then run the span conformance test and the OTLP span-arrival e2e tests. Do not change these names just because the upstream experimental GenAI conventions moved; keep the existing emitted vocabulary until SBproxy explicitly ships an opt-in or migration.
 
 Prompt and completion content capture is disabled unless the AI origin sets
 `trace_content: true`. When enabled, content is redacted with the secret

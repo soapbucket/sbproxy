@@ -18,6 +18,18 @@
 //!
 //! - <https://github.com/Arize-ai/openinference/blob/main/spec/semantic_conventions.md>
 //!
+//! ## Version pin and bump procedure
+//!
+//! SBproxy currently targets OpenTelemetry GenAI semantic conventions
+//! v1.36.0. OpenTelemetry's GenAI transition plan says existing
+//! v1.36-or-earlier emitters should keep that vocabulary by default until
+//! they intentionally opt in to newer experimental conventions. The
+//! OpenInference vocabulary is pinned to the source revision listed below.
+//!
+//! To bump these conventions, update the constants and required field lists
+//! in this module, update the span helpers that emit changed fields, update
+//! `docs/observability.md`, then run the conformance and OTLP e2e tests.
+//!
 //! Stable field names used by this module:
 //!
 //! | Concept                  | OTel GenAI                          | OpenInference                  |
@@ -49,6 +61,52 @@
 //! parsed those raw field names must move to the conventions above.
 
 use tracing::{field::Empty, Span};
+
+/// OpenTelemetry GenAI semantic-convention version emitted by default.
+///
+/// The latest OpenTelemetry GenAI conventions may rename or deprecate
+/// attributes. Keep this value pinned until SBproxy deliberately implements
+/// an opt-in or migration to a newer GenAI vocabulary.
+pub const OTEL_GENAI_SEMCONV_VERSION: &str = "1.36.0";
+
+/// Versioned OpenTelemetry GenAI source used for the default emitted fields.
+pub const OTEL_GENAI_SEMCONV_SOURCE: &str =
+    "open-telemetry/semantic-conventions@v1.36.0/docs/gen-ai/README.md";
+
+/// OpenInference repository revision used to validate the `llm.*` field names.
+pub const OPENINFERENCE_SEMCONV_REVISION: &str = "ed49e2576afcb2219b6814d28f4e8c7b3a8aeb6a";
+
+/// OpenInference source file used for the pinned `llm.*` constants.
+pub const OPENINFERENCE_SEMCONV_SOURCE: &str =
+    "Arize-ai/openinference/python/openinference-semantic-conventions/src/openinference/semconv/trace/__init__.py";
+
+/// GenAI span fields SBproxy must keep emitting for the pinned vocabulary.
+pub const REQUIRED_OTEL_GENAI_SPAN_FIELDS: &[&str] = &[
+    "gen_ai.operation.name",
+    "gen_ai.system",
+    "gen_ai.request.model",
+    "gen_ai.response.model",
+    "gen_ai.response.id",
+    "gen_ai.usage.input_tokens",
+    "gen_ai.usage.output_tokens",
+    "gen_ai.usage.cost",
+    "gen_ai.response.finish_reasons",
+    "gen_ai.request.temperature",
+    "gen_ai.request.max_tokens",
+    "gen_ai.request.top_p",
+];
+
+/// OpenInference span fields SBproxy dual-emits for LLM-native backends.
+pub const REQUIRED_OPENINFERENCE_SPAN_FIELDS: &[&str] = &[
+    "llm.provider",
+    "llm.model_name",
+    "llm.token_count.prompt",
+    "llm.token_count.completion",
+    "llm.token_count.total",
+    "llm.usage.total_cost",
+    "input.value",
+    "output.value",
+];
 
 /// Operation name recorded on the top-level AI request span when no
 /// more specific operation has been classified yet. Mirrors the value
@@ -102,6 +160,9 @@ pub fn ai_request_span(surface: &str, method: &str) -> Span {
         "gen_ai.response.id" = Empty,
         "gen_ai.usage.input_tokens" = Empty,
         "gen_ai.usage.output_tokens" = Empty,
+        "gen_ai.request.temperature" = Empty,
+        "gen_ai.request.max_tokens" = Empty,
+        "gen_ai.request.top_p" = Empty,
         // WOR-1084 capture completeness: per-dimension token
         // counts that the Capture layer of the Token-to-Value
         // Ledger expects. Zero on providers that do not report
@@ -735,43 +796,81 @@ mod tests {
         assert_field(span, "output.value", "here is the summary");
     }
 
-    /// WOR-1232: GenAI semantic-convention conformance. Pin the version and
-    /// the required `gen_ai.*` attribute set so a span never silently drifts
-    /// off-spec. Recording into a field that `ai_request_span` does not
-    /// declare is a no-op, so dropping a required attribute fails this test.
+    /// GenAI/OpenInference semantic-convention conformance. Pin the source
+    /// versions and the required attribute sets so a span never silently
+    /// drifts off-spec. Recording into a field that `ai_request_span` does
+    /// not declare is a no-op, so dropping a required attribute fails this
+    /// test.
     #[test]
-    fn ai_request_span_conforms_to_pinned_genai_semconv() {
-        // Bump deliberately when re-validating against a newer semconv.
-        const GEN_AI_SEMCONV_VERSION: &str = "1.36.0";
-        const REQUIRED_GEN_AI_FIELDS: &[&str] = &[
-            "gen_ai.system",
-            "gen_ai.request.model",
-            "gen_ai.response.model",
-            "gen_ai.response.id",
-            "gen_ai.usage.input_tokens",
-            "gen_ai.usage.output_tokens",
-            "gen_ai.usage.cost",
-            "gen_ai.response.finish_reasons",
-        ];
+    fn ai_request_span_conforms_to_pinned_ai_semconv() {
+        assert_eq!(OTEL_GENAI_SEMCONV_VERSION, "1.36.0");
         assert!(
-            !GEN_AI_SEMCONV_VERSION.is_empty(),
-            "semconv version must be pinned"
+            !OTEL_GENAI_SEMCONV_SOURCE.is_empty(),
+            "OTel GenAI semconv source must be pinned"
+        );
+        assert!(
+            !OPENINFERENCE_SEMCONV_REVISION.is_empty(),
+            "OpenInference semconv revision must be pinned"
+        );
+        assert!(
+            !OPENINFERENCE_SEMCONV_SOURCE.is_empty(),
+            "OpenInference semconv source must be pinned"
         );
 
         use tracing_subscriber::prelude::*;
         let layer = CaptureLayer::default();
         let subscriber = tracing_subscriber::registry().with(layer.clone());
         tracing::subscriber::with_default(subscriber, || {
-            let span = ai_request_span("chat", "POST");
-            for field in REQUIRED_GEN_AI_FIELDS {
-                span.record(*field, "conformance-probe");
-            }
+            let span = ai_request_span("chat_completions", "POST");
+            span.record("gen_ai.system", "openai");
+            span.record("gen_ai.request.model", "gpt-4o");
+            span.record("llm.provider", "openai");
+            span.record("llm.model_name", "gpt-4o");
+            record_request_params(&span, Some(0.2), Some(64), Some(0.9));
+            record_response_identity(&span, "gpt-4o-2024-08-06", "chatcmpl-wor1216");
+            record_token_usage(&span, 7, 3);
+            record_cost_usd_micros(&span, 12);
+            record_finish_reasons(&span, &["stop"]);
+            record_input_content(&span, "hello from conformance");
+            record_output_content(&span, "collector received the span");
         });
         let spans = snapshot_spans(&layer);
         let span = find_span(&spans, "ai.request");
-        for field in REQUIRED_GEN_AI_FIELDS {
-            assert_field(span, field, "conformance-probe");
+        for field in REQUIRED_OTEL_GENAI_SPAN_FIELDS {
+            assert!(
+                span.fields.contains_key(*field),
+                "span {:?} missing pinned OTel GenAI field {field:?}",
+                span.name
+            );
         }
+        for field in REQUIRED_OPENINFERENCE_SPAN_FIELDS {
+            assert!(
+                span.fields.contains_key(*field),
+                "span {:?} missing pinned OpenInference field {field:?}",
+                span.name
+            );
+        }
+
+        assert_field(span, "gen_ai.operation.name", "chat_completions");
+        assert_field(span, "gen_ai.system", "openai");
+        assert_field(span, "gen_ai.request.model", "gpt-4o");
+        assert_field(span, "gen_ai.response.model", "gpt-4o-2024-08-06");
+        assert_field(span, "gen_ai.response.id", "chatcmpl-wor1216");
+        assert_field(span, "gen_ai.usage.input_tokens", "7");
+        assert_field(span, "gen_ai.usage.output_tokens", "3");
+        assert_field(span, "gen_ai.usage.cost", "0.000012");
+        assert_field(span, "gen_ai.response.finish_reasons", "stop");
+        assert_field(span, "gen_ai.request.temperature", "0.2");
+        assert_field(span, "gen_ai.request.max_tokens", "64");
+        assert_field(span, "gen_ai.request.top_p", "0.9");
+        assert_field(span, "llm.provider", "openai");
+        assert_field(span, "llm.model_name", "gpt-4o");
+        assert_field(span, "llm.token_count.prompt", "7");
+        assert_field(span, "llm.token_count.completion", "3");
+        assert_field(span, "llm.token_count.total", "10");
+        assert_field(span, "llm.usage.total_cost", "0.000012");
+        assert_field(span, "input.value", "hello from conformance");
+        assert_field(span, "output.value", "collector received the span");
     }
 
     /// `UsageTokens::total()` (WOR-1084) sums every dimension,
