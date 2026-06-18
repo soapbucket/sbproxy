@@ -221,7 +221,6 @@ origins:
 // --- Test 5: detector is no-op when feature is disabled ---
 
 #[test]
-#[ignore = "WOR-1445: needs a no-default-features e2e harness binary so the tls-fingerprint-gated headless detector path is genuinely off."]
 fn headless_detect_disabled_leaves_signal_null() {
     let yaml = r#"
 proxy:
@@ -245,7 +244,7 @@ origins:
             name: x-headless
             value_expr: 'request.headless_signal.detected ? "detected" : "absent"'
 "#;
-    let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
+    let harness = ProxyHarness::start_no_default_features_with_yaml(yaml).expect("start proxy");
     let resp = harness
         .get_with_headers(
             "/",

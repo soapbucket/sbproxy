@@ -25,8 +25,8 @@
 //! observable from the harness without reaching into proxy internals.
 //!
 //! The sidecar-backed tests run against the default harness. Native TLS
-//! ClientHello capture and disabled-feature coverage remain ignored with
-//! follow-up Linear issues because they need dedicated harness paths.
+//! ClientHello capture remains ignored until the real TLS client path
+//! lands; disabled-feature coverage uses the no-default-features harness.
 
 use sbproxy_e2e::ProxyHarness;
 
@@ -336,7 +336,6 @@ origins:
 // --- Test 7: capture is a no-op when the cargo feature is off ---
 
 #[test]
-#[ignore = "WOR-1445: needs a no-default-features e2e harness binary so the tls-fingerprint cargo feature is genuinely off."]
 fn capture_noop_when_feature_disabled() {
     let yaml = r#"
 proxy:
@@ -358,7 +357,7 @@ origins:
             name: x-ja4
             value_expr: 'request.tls.ja4'
 "#;
-    let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
+    let harness = ProxyHarness::start_no_default_features_with_yaml(yaml).expect("start proxy");
     let resp = harness
         .get_with_headers(
             "/",

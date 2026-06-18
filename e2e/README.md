@@ -1,5 +1,5 @@
 # sbproxy-e2e
-*Last modified: 2026-06-04*
+*Last modified: 2026-06-18*
 
 End-to-end integration tests for the OSS sbproxy binary. The crate
 ships a small `ProxyHarness` library plus per-feature integration
@@ -13,8 +13,21 @@ HTTP behaviour via reqwest, and tears the child down on Drop.
 cargo build --release -p sbproxy
 ```
 
-The e2e suite spawns `target/release/sbproxy` directly; rebuild
-after any code change or the suite silently runs stale code.
+The e2e suite spawns `target/release/sbproxy` directly, falling back
+to `target/debug/sbproxy` when only a debug build exists. Rebuild after
+any code change or the suite silently runs stale code. Set
+`SBPROXY_E2E_BIN=/path/to/sbproxy` to target a custom default-feature
+binary.
+
+Disabled-feature tests use a separate no-default-features binary so
+they do not overwrite the normal e2e build:
+
+```bash
+CARGO_TARGET_DIR=target/no-default-features cargo build -p sbproxy --no-default-features
+```
+
+The harness finds that binary under `target/no-default-features/` or
+uses `SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN=/path/to/sbproxy` when set.
 
 ## Run the suite
 
@@ -83,9 +96,10 @@ e2e runs occasionally and locally, not on every PR.
 | Admin (`admin_*`) | 2 | Admin server bind + basic-auth + `/api/*` + `/admin/reload` |
 | Misc cross-cutting | rest | Plug-in registry, classifier sidecar lifecycle, sidecar transport, ledger + 402, vault backend, well-known projections |
 
-Total: 135 files × multiple test functions = ~580 assertions. The
-two ignored tests are pre-existing network-bound-flake quarantines
-in the classifier suite.
+Total: 135 files × multiple test functions = ~580 assertions. Tests
+left under `#[ignore]` require an external service, a benchmark input,
+or a follow-up harness capability; run those explicitly with `--ignored`
+only when their prerequisites are available.
 
 ## ProxyHarness API
 
@@ -95,6 +109,10 @@ use sbproxy_e2e::{ProxyHarness, MockUpstream};
 // Spawn the binary against an inline YAML config; the harness picks
 // an ephemeral port and rewrites proxy.http_bind_port.
 let harness = ProxyHarness::start_with_yaml(yaml)?;
+
+// Spawn a binary compiled with `--no-default-features` for
+// disabled-feature assertions.
+let harness = ProxyHarness::start_no_default_features_with_yaml(yaml)?;
 
 // Issue requests with a Host header.
 let resp = harness.get("/path", "host.local")?;
