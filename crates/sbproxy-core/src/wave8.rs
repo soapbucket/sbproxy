@@ -233,6 +233,11 @@ pub fn dispatch_terminal_event(
     ev.properties = ctx.properties.clone();
     ev.provider = ctx.ai_provider.clone();
     ev.model = ctx.ai_model.clone();
+    // WOR-1499: request-path prompt accounting (estimate + salted
+    // fingerprint), populated even when the request was blocked / failed
+    // before producing an upstream usage block.
+    ev.prompt_tokens_est = ctx.ai_prompt_tokens_est.and_then(|v| u32::try_from(v).ok());
+    ev.prompt_fingerprint = ctx.ai_prompt_fingerprint.clone();
     ev.tokens_in = ctx.ai_tokens_in.and_then(|v| u32::try_from(v).ok());
     ev.tokens_out = ctx.ai_tokens_out.and_then(|v| u32::try_from(v).ok());
     ev.cost_usd_micros = ctx.ai_cost_usd_micros;

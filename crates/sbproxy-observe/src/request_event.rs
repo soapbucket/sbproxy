@@ -129,6 +129,19 @@ pub struct RequestEvent {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub model: Option<String>,
 
+    /// WOR-1499: request-path estimated prompt tokens, computed from the
+    /// inbound body before any upstream usage is known. Lets the portal
+    /// show prompt size (and reconcile estimate vs measured `tokens_in`)
+    /// even when a request is blocked or fails before producing usage.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub prompt_tokens_est: Option<u32>,
+
+    /// WOR-1499: salted, non-reversible prompt fingerprint (`pf_<hex>`)
+    /// for correlating identical prompts across requests without storing
+    /// prompt text. Never the prompt itself.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub prompt_fingerprint: Option<String>,
+
     /// Prompt tokens (AI requests only).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tokens_in: Option<u32>,
@@ -182,6 +195,8 @@ impl RequestEvent {
             properties: BTreeMap::new(),
             provider: None,
             model: None,
+            prompt_tokens_est: None,
+            prompt_fingerprint: None,
             tokens_in: None,
             tokens_out: None,
             tokens_cached: None,
@@ -225,6 +240,8 @@ mod tests {
             properties: props,
             provider: Some("openai".to_string()),
             model: Some("gpt-4o".to_string()),
+            prompt_tokens_est: Some(780),
+            prompt_fingerprint: Some("pf_0011223344".to_string()),
             tokens_in: Some(800),
             tokens_out: Some(150),
             tokens_cached: Some(200),

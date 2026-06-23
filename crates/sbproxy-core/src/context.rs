@@ -701,6 +701,18 @@ pub struct RequestContext {
     pub ai_model: Option<String>,
     /// Prompt / input tokens reported by the provider response.
     pub ai_tokens_in: Option<u64>,
+    /// WOR-1499: estimated prompt tokens computed on the request path
+    /// from the inbound body (before any upstream usage is known). Used
+    /// for request-path prompt accounting and as the fallback token
+    /// volume attributed to blocked / failed requests that never receive
+    /// an upstream `usage` block (WOR-1497). `None` for non-chat
+    /// surfaces.
+    pub ai_prompt_tokens_est: Option<u64>,
+    /// WOR-1499: salted, non-reversible fingerprint of the prompt, for
+    /// correlating identical prompts across requests (cache / value
+    /// analysis) without persisting prompt text. `None` for non-chat
+    /// surfaces.
+    pub ai_prompt_fingerprint: Option<String>,
     /// Completion / output tokens reported by the provider response.
     pub ai_tokens_out: Option<u64>,
     /// Derived AI request cost in micro-USD (`1e-6` USD), computed
@@ -1058,6 +1070,8 @@ impl RequestContext {
             attribution_tags: sbproxy_ai::attribution::AttributionTags::default(),
             ai_model: None,
             ai_tokens_in: None,
+            ai_prompt_tokens_est: None,
+            ai_prompt_fingerprint: None,
             ai_tokens_out: None,
             ai_cost_usd_micros: None,
             ai_surface: None,

@@ -1583,11 +1583,18 @@ pub(super) async fn handle_ai_proxy(
                     .filter_map(|m| serde_json::from_value::<sbproxy_ai::Message>(m.clone()).ok())
                     .collect();
                 let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                // WOR-1499: stamp the request-path prompt accounting on
+                // the context: the estimate (also reused as the
+                // failed/blocked-request token volume in WOR-1497) and a
+                // salted, non-reversible fingerprint that lets identical
+                // prompts be correlated without persisting prompt text.
+                ctx.ai_prompt_fingerprint = Some(sbproxy_ai::prompt_fingerprint(model, &msgs));
                 sbproxy_ai::estimate_tokens(model, &msgs)
             })
         } else {
             None
         };
+    ctx.ai_prompt_tokens_est = estimated_prompt_tokens_for_budget;
 
     // Parse retry config from the action config's routing.retry section.
     // This is done by inspecting the raw handler config.
