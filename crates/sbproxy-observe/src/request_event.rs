@@ -105,6 +105,16 @@ pub struct RequestEvent {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub user_id_source: Option<UserIdSource>,
 
+    /// WOR-1498: stable identifier of the credential (API key) that
+    /// authenticated this request and injected its policy. The
+    /// per-credential reporting join key, matching the `api_key_id`
+    /// label on the `sbproxy_ai_*_attributed_total` metrics and the
+    /// access log column. Operator-supplied stable id or the derived
+    /// `sk_<hex>` fingerprint; never the raw secret. Absent for
+    /// un-credentialed traffic.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub api_key_id: Option<String>,
+
     /// Custom properties. Lowercased keys, allowlist-checked,
     /// length-capped, redaction-applied. Empty map serializes as absent.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
@@ -168,6 +178,7 @@ impl RequestEvent {
             parent_session_id: None,
             user_id: None,
             user_id_source: None,
+            api_key_id: None,
             properties: BTreeMap::new(),
             provider: None,
             model: None,
@@ -210,6 +221,7 @@ mod tests {
             parent_session_id: None,
             user_id: Some("user_42".to_string()),
             user_id_source: Some(UserIdSource::Header),
+            api_key_id: Some("sk_deadbeef0001".to_string()),
             properties: props,
             provider: Some("openai".to_string()),
             model: Some("gpt-4o".to_string()),

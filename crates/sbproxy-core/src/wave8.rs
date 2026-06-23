@@ -224,6 +224,12 @@ pub fn dispatch_terminal_event(
     ev.parent_session_id = ctx.parent_session_id;
     ev.user_id = ctx.user_id.clone();
     ev.user_id_source = ctx.user_id_source;
+    // WOR-1498: the credential (API key) that injected the policy, so
+    // the request-event ledger join keys on it like the metrics do.
+    ev.api_key_id = match ctx.principal.api_key_id() {
+        "" => None,
+        id => Some(id.to_string()),
+    };
     ev.properties = ctx.properties.clone();
     ev.provider = ctx.ai_provider.clone();
     ev.model = ctx.ai_model.clone();

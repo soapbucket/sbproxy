@@ -447,6 +447,13 @@ pub(super) fn emit_access_log(
     } else {
         Some(auth_type.clone().unwrap_or_else(|| "none".to_string()))
     };
+    // WOR-1498: the credential (API key) that injected the policy, for
+    // the log-based per-credential reconciliation. Empty string means
+    // un-credentialed; record it as absent rather than a blank column.
+    let api_key_id = match ctx.principal.api_key_id() {
+        "" => None,
+        id => Some(id.to_string()),
+    };
     let workspace_id = ctx
         .origin_idx
         .and_then(|idx| pipeline.config.origins.get(idx))
@@ -548,6 +555,7 @@ pub(super) fn emit_access_log(
         tenant_id: ctx.tenant_id.to_string(),
         auth_type,
         principal_kind,
+        api_key_id,
         served_from_cache: Some(ctx.served_from_cache),
         fallback_triggered: Some(ctx.fallback_triggered),
         retry_count: Some(ctx.retry_count),
@@ -743,6 +751,9 @@ pub(super) struct AccessLogContext {
     /// downstream ClickHouse / Grafana queries to partition the log
     /// by principal source without joining on `auth_type IS NULL`.
     pub(super) principal_kind: Option<String>,
+    /// WOR-1498: stable credential id (API key) that injected the
+    /// policy. `None` for un-credentialed requests.
+    pub(super) api_key_id: Option<String>,
     pub(super) served_from_cache: Option<bool>,
     pub(super) fallback_triggered: Option<bool>,
     pub(super) retry_count: Option<u32>,
@@ -855,6 +866,7 @@ impl AccessLogContext {
             tenant_id: String::new(),
             auth_type: None,
             principal_kind: None,
+            api_key_id: None,
             served_from_cache: None,
             fallback_triggered: None,
             retry_count: None,
@@ -1011,6 +1023,7 @@ pub(super) fn emit_access_log_entry(
         tenant_id: context.tenant_id,
         auth_type: context.auth_type,
         principal_kind: context.principal_kind,
+        api_key_id: context.api_key_id,
         served_from_cache: context.served_from_cache,
         fallback_triggered: context.fallback_triggered,
         retry_count: context.retry_count,
