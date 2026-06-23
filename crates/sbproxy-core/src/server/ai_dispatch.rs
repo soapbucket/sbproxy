@@ -199,6 +199,7 @@ pub(super) async fn handle_ai_proxy(
             Vec::new(),
             &ctx.attribution_tags,
             ctx.tenant_id.as_str(),
+            ctx.principal.api_key_id(),
             &ai_span,
         );
         return relay_ai_response(
@@ -341,6 +342,7 @@ pub(super) async fn handle_ai_proxy(
             Vec::new(),
             &ctx.attribution_tags,
             ctx.tenant_id.as_str(),
+            ctx.principal.api_key_id(),
             &ai_span,
         );
         // WOR-1044 PR3: the GET-method-aware path runs before the
@@ -584,6 +586,7 @@ pub(super) async fn handle_ai_proxy(
                 Vec::new(),
                 &ctx.attribution_tags,
                 ctx.tenant_id.as_str(),
+                ctx.principal.api_key_id(),
                 &ai_span,
             );
             if cost_micros > 0 {
@@ -603,6 +606,7 @@ pub(super) async fn handle_ai_proxy(
             Vec::new(),
             &ctx.attribution_tags,
             ctx.tenant_id.as_str(),
+            ctx.principal.api_key_id(),
             &ai_span,
         );
         record_ai_provider_response_failure(
@@ -803,6 +807,13 @@ pub(super) async fn handle_ai_proxy(
                         .collect(),
                     roles: Vec::new(),
                     claims: None,
+                    // Per-credential reporting id for the virtual key.
+                    // The operator-supplied stable name only; never the
+                    // raw `vk.key` secret. `None` when the key is
+                    // unnamed so the metric falls back to the
+                    // un-credentialed bucket rather than leaking key
+                    // material.
+                    key_id: vk.name.clone(),
                 };
                 // Reflect the matched key name into `sub` so the
                 // access-log + principal_kind columns can show which
@@ -1445,6 +1456,7 @@ pub(super) async fn handle_ai_proxy(
                             // shows up as savings.
                             crate::server::ai_support::record_cache_hit_savings(
                                 ctx.tenant_id.as_str(),
+                                ctx.principal.api_key_id(),
                                 hostname,
                                 cache.provider(),
                                 cache.model(),
@@ -1776,6 +1788,7 @@ pub(super) async fn handle_ai_proxy(
                         Vec::new(),
                         &ctx.attribution_tags,
                         ctx.tenant_id.as_str(),
+                        ctx.principal.api_key_id(),
                         &ai_span,
                     );
                     // Drop any idempotency capture: cascade does not
@@ -2095,6 +2108,7 @@ pub(super) async fn handle_ai_proxy(
                 rerank_documents: rerank_documents_for_billing,
                 attribution_tags: ctx.attribution_tags.clone(),
                 tenant_id: ctx.tenant_id.to_string(),
+                api_key_id: ctx.principal.api_key_id().to_string(),
                 estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
             });
             let stream_router_sink = RouterTokenSink {
@@ -2180,6 +2194,7 @@ pub(super) async fn handle_ai_proxy(
                 rerank_documents: rerank_documents_for_billing,
                 attribution_tags: ctx.attribution_tags.clone(),
                 tenant_id: ctx.tenant_id.to_string(),
+                api_key_id: ctx.principal.api_key_id().to_string(),
                 estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
             });
             let cache_router_sink = RouterTokenSink {
@@ -2882,6 +2897,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 scope_keys,
                 &args.attribution_tags,
                 args.tenant_id.as_str(),
+                args.api_key_id.as_str(),
                 &ai_span,
             );
             if cost_micros > 0 {
@@ -2925,6 +2941,7 @@ pub(super) async fn relay_ai_response_with_cache(
                     Vec::new(),
                     &ctx.attribution_tags,
                     ctx.tenant_id.as_str(),
+                    ctx.principal.api_key_id(),
                     &ai_span,
                 );
                 if cost_micros > 0 {
@@ -3297,6 +3314,12 @@ pub(super) struct BudgetRecorderArgs<'a> {
     /// relay can emit tenant-labelled cost metrics without borrowing
     /// the request context.
     tenant_id: String,
+    /// Resolved per-credential reporting id (the API key that injected
+    /// the policy). Carried by value alongside `tenant_id` so the relay
+    /// can emit the authoritative identity dimensions on the spend
+    /// metric without borrowing the request context. Empty string when
+    /// the request was not credentialed.
+    api_key_id: String,
     /// WOR-1146: estimated prompt tokens for a chat_completions
     /// request, captured from the request body at dispatch. Used only
     /// as the prompt side of the fallback budget debit when a 2xx
@@ -3937,6 +3960,7 @@ pub(super) async fn relay_ai_stream(
                     scope_keys,
                     &args.attribution_tags,
                     args.tenant_id.as_str(),
+                    args.api_key_id.as_str(),
                     &ai_span,
                 );
 

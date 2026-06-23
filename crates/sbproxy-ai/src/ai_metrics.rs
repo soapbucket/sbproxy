@@ -975,6 +975,14 @@ static AI_TOKENS_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
             "team",
             "agent_type",
             "environment",
+            // Authoritative identity dimensions (WOR-1493/WOR-1494):
+            // the tenant the request resolved to and the credential
+            // (API key) that injected the policy. Both are sourced from
+            // the resolved Principal, never from a spoofable header, so
+            // multi-tenant + multi-model + per-credential spend is one
+            // PromQL: `sum by (tenant_id, model) (...)`.
+            "tenant_id",
+            "api_key_id",
         ]
     )
     .unwrap()
@@ -998,6 +1006,9 @@ static AI_COST_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
             "team",
             "agent_type",
             "environment",
+            // See AI_TOKENS_ATTRIBUTED (WOR-1493/WOR-1494).
+            "tenant_id",
+            "api_key_id",
         ]
     )
     .unwrap()
@@ -1018,6 +1029,8 @@ pub fn record_ai_request_attributed(
     provider: &str,
     model: &str,
     surface: &str,
+    tenant_id: &str,
+    api_key_id: &str,
     tags: &crate::attribution::AttributionTags,
     input_tokens: u64,
     output_tokens: u64,
@@ -1047,6 +1060,8 @@ pub fn record_ai_request_attributed(
                 team,
                 agent_type,
                 environment,
+                tenant_id,
+                api_key_id,
             ])
             .inc_by(n as f64);
     };
@@ -1067,6 +1082,8 @@ pub fn record_ai_request_attributed(
                 team,
                 agent_type,
                 environment,
+                tenant_id,
+                api_key_id,
             ])
             .inc_by(cost);
     }
@@ -1096,6 +1113,9 @@ static AI_AUDIO_SECONDS_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
             "team",
             "agent_type",
             "environment",
+            // See AI_TOKENS_ATTRIBUTED (WOR-1493/WOR-1494).
+            "tenant_id",
+            "api_key_id",
         ]
     )
     .unwrap()
@@ -1104,10 +1124,13 @@ static AI_AUDIO_SECONDS_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
 /// Record per-attribution audio seconds for a realtime or audio
 /// surface. A zero/negative duration is skipped so an empty cell does
 /// not land in the metric.
+#[allow(clippy::too_many_arguments)]
 pub fn record_audio_seconds_attributed(
     provider: &str,
     model: &str,
     surface: &str,
+    tenant_id: &str,
+    api_key_id: &str,
     tags: &crate::attribution::AttributionTags,
     seconds: f64,
 ) {
@@ -1124,6 +1147,8 @@ pub fn record_audio_seconds_attributed(
             label_or_empty(tags.team.as_deref()),
             label_or_empty(tags.agent_type.as_deref()),
             label_or_empty(tags.environment.as_deref()),
+            tenant_id,
+            api_key_id,
         ])
         .inc_by(seconds);
 }
@@ -1480,6 +1505,8 @@ mod tests {
             "openai",
             "gpt-4o",
             "chat_completions",
+            "acme-tenant",
+            "sk_deadbeef0001",
             &tags,
             100,
             50,
@@ -1489,9 +1516,25 @@ mod tests {
             0.01,
         );
         let families = prometheus::gather();
-        assert!(families
+        let tokens = families
             .iter()
-            .any(|f| f.name() == "sbproxy_ai_tokens_attributed_total"));
+            .find(|f| f.name() == "sbproxy_ai_tokens_attributed_total")
+            .expect("tokens counter registered");
+        // WOR-1494: the authoritative identity dimensions must land on
+        // the spend record so per-tenant / per-credential rollups work.
+        let has_identity = tokens.get_metric().iter().any(|m| {
+            let labels = m.get_label();
+            labels
+                .iter()
+                .any(|l| l.name() == "tenant_id" && l.value() == "acme-tenant")
+                && labels
+                    .iter()
+                    .any(|l| l.name() == "api_key_id" && l.value() == "sk_deadbeef0001")
+        });
+        assert!(
+            has_identity,
+            "tenant_id + api_key_id must be present on the attributed token metric"
+        );
         assert!(families
             .iter()
             .any(|f| f.name() == "sbproxy_ai_cost_dollars_attributed_total"));
@@ -1513,11 +1556,21 @@ mod tests {
             "openai",
             "gpt-4o-realtime-preview",
             "realtime",
+            "acme-tenant",
+            "sk_deadbeef0002",
             &tags,
             12.5,
         );
         // Zero duration is a no-op.
-        record_audio_seconds_attributed("openai", "whisper-1", "audio_transcription", &tags, 0.0);
+        record_audio_seconds_attributed(
+            "openai",
+            "whisper-1",
+            "audio_transcription",
+            "acme-tenant",
+            "sk_deadbeef0002",
+            &tags,
+            0.0,
+        );
         let families = prometheus::gather();
         let f = families
             .iter()
@@ -1556,6 +1609,8 @@ mod tests {
             provider,
             model,
             "chat_completions",
+            "",
+            "",
             &tags,
             1000,
             200,

@@ -203,6 +203,22 @@ pub struct PrincipalAttrs {
     /// for non-JWT principals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claims: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Stable identifier of the credential (API key, bearer token,
+    /// virtual key) that produced this principal. This is the
+    /// "API key that injected the policy" join key used by the
+    /// per-credential reporting surface: it lands on the spend
+    /// metrics, the OTel span, the access log, and the request-event
+    /// envelope so spend, tokens, and outcomes roll up to a single
+    /// credential.
+    ///
+    /// Never the raw secret. Auth providers either copy an
+    /// operator-supplied stable id off the matched credential or, when
+    /// the operator did not name the key, derive a non-reversible
+    /// fingerprint of the secret (see
+    /// `sbproxy_modules::auth` `derive_key_fingerprint`). `None` for
+    /// anonymous / un-credentialed principals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
 }
 
 /// Unified inbound identity carrier.
@@ -259,6 +275,16 @@ impl Principal {
             virtual_key: None,
             attrs: PrincipalAttrs::default(),
         }
+    }
+
+    /// Stable identifier of the credential (API key) that produced
+    /// this principal, for per-credential reporting. Returns the
+    /// effective `attrs.key_id` when set; otherwise an empty string so
+    /// the value can be used directly as a bounded metric label
+    /// (the empty string is the catch-all "un-credentialed" bucket).
+    /// Never returns the raw secret.
+    pub fn api_key_id(&self) -> &str {
+        self.attrs.key_id.as_deref().unwrap_or("")
     }
 
     /// True when the principal carries no subject and no attribution
@@ -387,6 +413,16 @@ mod tests {
         let p = Principal::anonymous();
         assert!(p.is_anonymous());
         assert!(p.tenant_id.is_default());
+    }
+
+    /// `api_key_id` returns the effective credential id and falls back
+    /// to the empty (un-credentialed) bucket when absent.
+    #[test]
+    fn api_key_id_reads_attrs_or_empty() {
+        let mut p = Principal::anonymous();
+        assert_eq!(p.api_key_id(), "");
+        p.attrs.key_id = Some("billing-prod-01".to_string());
+        assert_eq!(p.api_key_id(), "billing-prod-01");
     }
 
     /// Adding any attribute makes the principal non-anonymous.

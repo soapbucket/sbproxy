@@ -3912,6 +3912,7 @@ impl ProxyHttp for SbProxy {
                 Vec::new(),
                 &ctx.attribution_tags,
                 ctx.tenant_id.as_str(),
+                ctx.principal.api_key_id(),
                 &span,
             );
             info!(
