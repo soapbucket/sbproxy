@@ -1089,9 +1089,9 @@ static AI_OUTCOMES_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
 });
 
 /// Record one AI request against the per-attribution outcome counter.
-/// `outcome` must be one of the closed-set labels documented on
-/// [`AI_OUTCOMES_ATTRIBUTED`]; callers map their status / error into
-/// that set before calling so the label cardinality stays bounded.
+/// `outcome` must be one of the closed-set labels documented on the
+/// `AI_OUTCOMES_ATTRIBUTED` counter; callers map their status / error
+/// into that set before calling so the label cardinality stays bounded.
 #[allow(clippy::too_many_arguments)]
 pub fn record_ai_outcome_attributed(
     provider: &str,
