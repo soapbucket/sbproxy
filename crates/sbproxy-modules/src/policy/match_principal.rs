@@ -283,6 +283,7 @@ mod tests {
                 metadata,
                 roles: vec!["engineer".to_string()],
                 claims: Some(claims),
+                key_id: None,
             },
         }
     }

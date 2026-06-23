@@ -66,6 +66,14 @@ pub struct CredentialAttrs {
     /// Free-form metadata copied off the credential.
     #[serde(default)]
     pub metadata: std::collections::BTreeMap<String, String>,
+    /// Operator-supplied stable identifier for this credential, used as
+    /// the per-credential reporting join key (the "API key that
+    /// injected the policy"). When omitted on an API-key entry the
+    /// provider derives a non-reversible fingerprint of the secret so
+    /// every key is still attributable without the operator having to
+    /// name it. Never the raw secret.
+    #[serde(default)]
+    pub key_id: Option<String>,
 }
 
 impl CredentialAttrs {
@@ -81,8 +89,32 @@ impl CredentialAttrs {
             metadata: self.metadata.clone(),
             roles: Vec::new(),
             claims: None,
+            key_id: self.key_id.clone(),
         }
     }
+}
+
+/// Derive a stable, non-reversible per-credential reporting id from a
+/// secret.
+///
+/// Used when an operator did not assign a `key_id` to an API-key
+/// entry: every key still needs a stable identifier so spend, tokens,
+/// and outcomes can roll up per credential, but the raw secret must
+/// never land on a metric label, span, or log line. The id is the
+/// first 12 hex characters of the SHA-256 of the secret, prefixed
+/// `sk_` so it is visibly a derived fingerprint rather than an
+/// operator-chosen name. 48 bits of digest is ample to keep a typical
+/// operator key-set collision-free while staying short enough for a
+/// bounded metric label.
+pub fn derive_key_fingerprint(secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(secret.as_bytes());
+    let mut out = String::with_capacity(3 + 12);
+    out.push_str("sk_");
+    for byte in digest.iter().take(6) {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 /// Constant-time byte equality.
@@ -295,12 +327,20 @@ impl ApiKeyAuth {
         tenant_id: TenantId,
     ) -> Option<Principal> {
         let entry = self.match_key(headers, query)?;
+        let mut attrs = entry.attrs.to_principal_attrs();
+        // Per-credential reporting needs a stable id for every key.
+        // Honour an operator-supplied `key_id`; otherwise derive a
+        // non-reversible fingerprint of the secret so the key is
+        // attributable without exposing the secret on any metric / log.
+        if attrs.key_id.is_none() {
+            attrs.key_id = Some(derive_key_fingerprint(&entry.secret));
+        }
         Some(Principal {
             tenant_id,
             sub: String::new(),
             source: PrincipalSource::ApiKey,
             virtual_key: None,
-            attrs: entry.attrs.to_principal_attrs(),
+            attrs,
         })
     }
 
@@ -2339,6 +2379,47 @@ mod tests {
         assert_eq!(principal.source, PrincipalSource::ApiKey);
         assert_eq!(principal.sub, "");
         assert_eq!(principal.attrs.project.as_deref(), Some("foundation"));
+        // WOR-1493: an unnamed key still gets a stable, derived
+        // reporting id so spend can roll up per credential. It must be
+        // the derived-fingerprint shape, never the raw secret.
+        let key_id = principal.api_key_id();
+        assert_eq!(key_id, derive_key_fingerprint("abc"));
+        assert!(key_id.starts_with("sk_"));
+        assert!(!key_id.contains("abc"));
+    }
+
+    /// WOR-1493: an operator-supplied `key_id` wins over the derived
+    /// fingerprint so dashboards can use a human-readable credential id.
+    #[test]
+    fn api_key_explicit_key_id_wins() {
+        let json = serde_json::json!({
+            "type": "api_key",
+            "api_keys": [
+                {"secret": "abc", "key_id": "billing-prod-01", "team": "platform"}
+            ],
+        });
+        let auth = ApiKeyAuth::from_config(json).unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("X-Api-Key", "abc".parse().unwrap());
+        let principal = auth
+            .check_request_with_principal(&headers, None, TenantId::from("acme"))
+            .expect("matched key should yield a principal");
+        assert_eq!(principal.api_key_id(), "billing-prod-01");
+    }
+
+    /// WOR-1493: the derived fingerprint is stable across calls,
+    /// differs per secret, and never embeds the raw secret.
+    #[test]
+    fn derive_key_fingerprint_is_stable_and_opaque() {
+        let a1 = derive_key_fingerprint("super-secret-key");
+        let a2 = derive_key_fingerprint("super-secret-key");
+        let b = derive_key_fingerprint("a-different-key");
+        assert_eq!(a1, a2, "same secret must hash to the same id");
+        assert_ne!(a1, b, "different secrets must hash to different ids");
+        assert!(a1.starts_with("sk_"));
+        // `sk_` + 12 hex chars.
+        assert_eq!(a1.len(), 3 + 12);
+        assert!(!a1.contains("super-secret-key"));
     }
 
     /// `users:` list accepts the bare `{username, password}` shape

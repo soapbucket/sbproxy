@@ -84,6 +84,53 @@ static AI_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Per-attribution model latency histogram (WOR-1501). Mirrors
+/// `AI_LATENCY`'s bucket schedule but adds the surface and the
+/// authoritative identity dimensions (tenant + credential) so p50 / p95
+/// upstream latency can be sliced per tenant, per credential, and per
+/// model, not just globally per provider/model. Same bounded-cardinality
+/// contract as the attributed spend metrics.
+static AI_LATENCY_ATTRIBUTED: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        HistogramOpts::new(
+            "sbproxy_ai_request_duration_attributed_seconds",
+            "AI upstream request latency, partitioned by surface + tenant + credential (WOR-1501)"
+        )
+        .buckets(vec![0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
+        &["provider", "model", "surface", "tenant_id", "api_key_id"]
+    )
+    .unwrap()
+});
+
+/// Record upstream model latency on the live request path.
+///
+/// Observes BOTH the long-standing global histogram
+/// (`sbproxy_ai_request_duration_seconds{provider, model}`) and the
+/// attributed histogram (`sbproxy_ai_request_duration_attributed_seconds`,
+/// which adds surface + tenant + credential), so existing dashboards and
+/// the new per-credential / per-tenant latency view both work off a
+/// single call site. `secs` is the upstream round-trip latency to the
+/// accepted response. A non-finite or negative value is dropped.
+#[allow(clippy::too_many_arguments)]
+pub fn record_model_latency(
+    provider: &str,
+    model: &str,
+    surface: &str,
+    tenant_id: &str,
+    api_key_id: &str,
+    secs: f64,
+) {
+    if !secs.is_finite() || secs < 0.0 {
+        return;
+    }
+    AI_LATENCY
+        .with_label_values(&[provider, model])
+        .observe(secs);
+    AI_LATENCY_ATTRIBUTED
+        .with_label_values(&[provider, model, surface, tenant_id, api_key_id])
+        .observe(secs);
+}
+
 // Time to first token, in seconds. Recorded once per streaming
 // response when the first token arrives. The Prometheus client
 // auto-derives the `_bucket`, `_sum`, and `_count` series referenced
@@ -975,6 +1022,14 @@ static AI_TOKENS_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
             "team",
             "agent_type",
             "environment",
+            // Authoritative identity dimensions (WOR-1493/WOR-1494):
+            // the tenant the request resolved to and the credential
+            // (API key) that injected the policy. Both are sourced from
+            // the resolved Principal, never from a spoofable header, so
+            // multi-tenant + multi-model + per-credential spend is one
+            // PromQL: `sum by (tenant_id, model) (...)`.
+            "tenant_id",
+            "api_key_id",
         ]
     )
     .unwrap()
@@ -998,10 +1053,58 @@ static AI_COST_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
             "team",
             "agent_type",
             "environment",
+            // See AI_TOKENS_ATTRIBUTED (WOR-1493/WOR-1494).
+            "tenant_id",
+            "api_key_id",
         ]
     )
     .unwrap()
 });
+
+/// Per-attribution request-outcome counter (WOR-1496). One row per AI
+/// request, partitioned by the authoritative identity dimensions plus a
+/// closed `outcome` label so token / cost spend can be reconciled
+/// against value-vs-waste: `sum by (tenant_id, outcome)` answers "how
+/// much traffic for tenant X ended in a refusal / guardrail block /
+/// budget block / upstream error". The `outcome` label is a small
+/// closed set (`ok`, `guardrail_block`, `content_filter`,
+/// `budget_exceeded`, `rate_limited`, `timeout`, `upstream_5xx`,
+/// `auth_denied`, `client_error`, `other`) so cardinality stays bounded.
+static AI_OUTCOMES_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_requests_attributed_total",
+            "AI requests partitioned by attribution + outcome (WOR-1496)"
+        ),
+        &[
+            "provider",
+            "model",
+            "surface",
+            "tenant_id",
+            "api_key_id",
+            "outcome",
+        ]
+    )
+    .unwrap()
+});
+
+/// Record one AI request against the per-attribution outcome counter.
+/// `outcome` must be one of the closed-set labels documented on the
+/// `AI_OUTCOMES_ATTRIBUTED` counter; callers map their status / error
+/// into that set before calling so the label cardinality stays bounded.
+#[allow(clippy::too_many_arguments)]
+pub fn record_ai_outcome_attributed(
+    provider: &str,
+    model: &str,
+    surface: &str,
+    tenant_id: &str,
+    api_key_id: &str,
+    outcome: &str,
+) {
+    AI_OUTCOMES_ATTRIBUTED
+        .with_label_values(&[provider, model, surface, tenant_id, api_key_id, outcome])
+        .inc();
+}
 
 /// Record a per-attribution AI spend record.
 ///
@@ -1018,6 +1121,8 @@ pub fn record_ai_request_attributed(
     provider: &str,
     model: &str,
     surface: &str,
+    tenant_id: &str,
+    api_key_id: &str,
     tags: &crate::attribution::AttributionTags,
     input_tokens: u64,
     output_tokens: u64,
@@ -1047,6 +1152,8 @@ pub fn record_ai_request_attributed(
                 team,
                 agent_type,
                 environment,
+                tenant_id,
+                api_key_id,
             ])
             .inc_by(n as f64);
     };
@@ -1067,6 +1174,8 @@ pub fn record_ai_request_attributed(
                 team,
                 agent_type,
                 environment,
+                tenant_id,
+                api_key_id,
             ])
             .inc_by(cost);
     }
@@ -1096,6 +1205,9 @@ static AI_AUDIO_SECONDS_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
             "team",
             "agent_type",
             "environment",
+            // See AI_TOKENS_ATTRIBUTED (WOR-1493/WOR-1494).
+            "tenant_id",
+            "api_key_id",
         ]
     )
     .unwrap()
@@ -1104,10 +1216,13 @@ static AI_AUDIO_SECONDS_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
 /// Record per-attribution audio seconds for a realtime or audio
 /// surface. A zero/negative duration is skipped so an empty cell does
 /// not land in the metric.
+#[allow(clippy::too_many_arguments)]
 pub fn record_audio_seconds_attributed(
     provider: &str,
     model: &str,
     surface: &str,
+    tenant_id: &str,
+    api_key_id: &str,
     tags: &crate::attribution::AttributionTags,
     seconds: f64,
 ) {
@@ -1124,6 +1239,8 @@ pub fn record_audio_seconds_attributed(
             label_or_empty(tags.team.as_deref()),
             label_or_empty(tags.agent_type.as_deref()),
             label_or_empty(tags.environment.as_deref()),
+            tenant_id,
+            api_key_id,
         ])
         .inc_by(seconds);
 }
@@ -1167,6 +1284,89 @@ mod tests {
                 "expected label '{required}' on sbproxy_ai_surface_requests_total"
             );
         }
+    }
+
+    /// WOR-1501: model latency lands on BOTH the global histogram and
+    /// the attributed histogram, and the attributed series carries the
+    /// tenant + credential identity so latency is sliceable per
+    /// credential. A non-finite value is a no-op.
+    #[test]
+    fn test_record_model_latency() {
+        record_model_latency(
+            "openai",
+            "gpt-4o",
+            "chat_completions",
+            "acme-tenant",
+            "sk_latency0001",
+            0.875,
+        );
+        // Non-finite / negative durations are dropped.
+        record_model_latency(
+            "openai",
+            "gpt-4o",
+            "chat_completions",
+            "acme-tenant",
+            "x",
+            -1.0,
+        );
+        record_model_latency(
+            "openai",
+            "gpt-4o",
+            "chat_completions",
+            "acme-tenant",
+            "x",
+            f64::NAN,
+        );
+        let families = prometheus::gather();
+        assert!(families
+            .iter()
+            .any(|f| f.name() == "sbproxy_ai_request_duration_seconds"));
+        let attributed = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_request_duration_attributed_seconds")
+            .expect("attributed latency histogram registered");
+        let has_identity = attributed.get_metric().iter().any(|m| {
+            let labels = m.get_label();
+            labels
+                .iter()
+                .any(|l| l.name() == "tenant_id" && l.value() == "acme-tenant")
+                && labels
+                    .iter()
+                    .any(|l| l.name() == "api_key_id" && l.value() == "sk_latency0001")
+        });
+        assert!(
+            has_identity,
+            "attributed latency must carry tenant_id + api_key_id"
+        );
+    }
+
+    /// WOR-1496: the outcome counter records one row per request with
+    /// the closed outcome label plus the authoritative identity.
+    #[test]
+    fn test_record_ai_outcome_attributed() {
+        record_ai_outcome_attributed(
+            "openai",
+            "gpt-4o",
+            "chat_completions",
+            "acme-tenant",
+            "sk_outcome0001",
+            "guardrail_block",
+        );
+        let families = prometheus::gather();
+        let f = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_requests_attributed_total")
+            .expect("outcome counter registered");
+        let has_row = f.get_metric().iter().any(|m| {
+            let labels = m.get_label();
+            labels
+                .iter()
+                .any(|l| l.name() == "outcome" && l.value() == "guardrail_block")
+                && labels
+                    .iter()
+                    .any(|l| l.name() == "api_key_id" && l.value() == "sk_outcome0001")
+        });
+        assert!(has_row, "outcome row with identity must be recorded");
     }
 
     #[test]
@@ -1480,6 +1680,8 @@ mod tests {
             "openai",
             "gpt-4o",
             "chat_completions",
+            "acme-tenant",
+            "sk_deadbeef0001",
             &tags,
             100,
             50,
@@ -1489,9 +1691,25 @@ mod tests {
             0.01,
         );
         let families = prometheus::gather();
-        assert!(families
+        let tokens = families
             .iter()
-            .any(|f| f.name() == "sbproxy_ai_tokens_attributed_total"));
+            .find(|f| f.name() == "sbproxy_ai_tokens_attributed_total")
+            .expect("tokens counter registered");
+        // WOR-1494: the authoritative identity dimensions must land on
+        // the spend record so per-tenant / per-credential rollups work.
+        let has_identity = tokens.get_metric().iter().any(|m| {
+            let labels = m.get_label();
+            labels
+                .iter()
+                .any(|l| l.name() == "tenant_id" && l.value() == "acme-tenant")
+                && labels
+                    .iter()
+                    .any(|l| l.name() == "api_key_id" && l.value() == "sk_deadbeef0001")
+        });
+        assert!(
+            has_identity,
+            "tenant_id + api_key_id must be present on the attributed token metric"
+        );
         assert!(families
             .iter()
             .any(|f| f.name() == "sbproxy_ai_cost_dollars_attributed_total"));
@@ -1513,11 +1731,21 @@ mod tests {
             "openai",
             "gpt-4o-realtime-preview",
             "realtime",
+            "acme-tenant",
+            "sk_deadbeef0002",
             &tags,
             12.5,
         );
         // Zero duration is a no-op.
-        record_audio_seconds_attributed("openai", "whisper-1", "audio_transcription", &tags, 0.0);
+        record_audio_seconds_attributed(
+            "openai",
+            "whisper-1",
+            "audio_transcription",
+            "acme-tenant",
+            "sk_deadbeef0002",
+            &tags,
+            0.0,
+        );
         let families = prometheus::gather();
         let f = families
             .iter()
@@ -1556,6 +1784,8 @@ mod tests {
             provider,
             model,
             "chat_completions",
+            "",
+            "",
             &tags,
             1000,
             200,

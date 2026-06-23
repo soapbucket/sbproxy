@@ -1,6 +1,6 @@
 # Metrics stability
 
-*Last modified: 2026-06-08*
+*Last modified: 2026-06-23*
 
 Naming conventions, stability guarantees, and the full catalogue of metrics emitted by SBproxy.
 
@@ -395,6 +395,10 @@ Buckets: `0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0`. Matches the bucket s
 | `surface` | Classified AI surface the spend came from, so non-chat spend is distinguishable on the dashboard | `chat_completions`, `embeddings`, `image_generation`, `audio_speech`, `reranking`, `realtime` |
 | `direction` | Token kind (tokens metric only) | `input`, `output`, `cache_read` |
 | `project`, `feature`, `team`, `agent_type`, `environment` | Bounded business attribution dimensions, resolved from the credential `attrs:` + `SB-Attr-*` headers | `checkout`, `prod`, `runtime` |
+| `tenant_id` | Tenant the request resolved to. Sourced from the resolved principal, never from a request header, so it cannot be spoofed | `acme`, `__default__` |
+| `api_key_id` | Stable id of the credential (API key) that injected the policy: an operator-supplied id or a derived `sk_<hex>` fingerprint of the secret. Never the raw secret. Empty for un-credentialed traffic | `billing-prod-01`, `sk_9f2a1c4b77e0` |
+
+The `tenant_id` and `api_key_id` dimensions make per-tenant, multi-model, per-credential spend a single PromQL: `sum by (tenant_id, model) (rate(sbproxy_ai_tokens_attributed_total[5m]))` or `sum by (api_key_id) (sbproxy_ai_cost_dollars_attributed_total)`.
 
 High-cardinality dimensions (customer, trace_id, okr, risk_tier) are deliberately kept **off** the metric labels and ride on the access log's `attribution` map / the trace span instead.
 
@@ -408,7 +412,39 @@ High-cardinality dimensions (customer, trace_id, okr, risk_tier) are deliberatel
 | Stability | **beta** |
 | Description | Audio seconds consumed by realtime and audio surfaces, partitioned by the same attribution set as the token/cost metrics. Realtime sessions consume seconds rather than tokens and have no catalogue price yet, so neither the token nor the cost attributed counter captures them; this sibling gives those surfaces an attributed-spend presence so a project / team dashboard can see realtime + audio usage. |
 
-**Labels:** `provider`, `model`, `surface` (`realtime`, `audio_transcription`, `audio_speech`), `project`, `feature`, `team`, `agent_type`, `environment`.
+**Labels:** `provider`, `model`, `surface` (`realtime`, `audio_transcription`, `audio_speech`), `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id`.
+
+---
+
+#### `sbproxy_ai_requests_attributed_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **beta** |
+| Description | One row per AI request, partitioned by the authoritative identity dimensions plus a closed `outcome` label, so token / cost spend can be reconciled against value-vs-waste. Recorded once per request in the logging phase (independent of whether access-log emission is enabled), so blocked and failed requests are counted too. `sum by (tenant_id, outcome) (...)` answers "how much of tenant X's traffic ended in a refusal / guardrail block / budget block / error". |
+
+**Labels:**
+
+| Label | Description | Example values |
+|---|---|---|
+| `provider`, `model`, `surface` | Provider, model, classified surface | `openai` / `gpt-4o` / `chat_completions` |
+| `tenant_id`, `api_key_id` | Authoritative identity, as on the attributed token/cost metrics | `acme` / `billing-prod-01` |
+| `outcome` | Closed set: `ok`, `guardrail_block`, `content_filter`, `budget_exceeded`, `rate_limited`, `timeout`, `upstream_5xx`, `auth_denied`, `client_error`, `other`. Derived from the final HTTP status, with an AI-specific override at block sites so a guardrail block (wire status 400/403) is not mislabeled | `ok`, `guardrail_block`, `budget_exceeded` |
+
+---
+
+#### `sbproxy_ai_request_duration_attributed_seconds`
+
+| Property | Value |
+|---|---|
+| Type | Histogram |
+| Stability | **beta** |
+| Description | Upstream model latency, partitioned by surface plus the authoritative identity dimensions, so p50 / p95 latency is sliceable per tenant, per credential, and per model rather than only globally per provider/model. Recorded on the accepted upstream response for all surfaces. The sibling global histogram `sbproxy_ai_request_duration_seconds{provider, model}` is observed from the same call site. |
+
+**Labels:** `provider`, `model`, `surface`, `tenant_id`, `api_key_id`. Buckets match `sbproxy_ai_request_duration_seconds`: `0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0`.
+
+Example: `histogram_quantile(0.95, sum by (le, tenant_id, model) (rate(sbproxy_ai_request_duration_attributed_seconds_bucket[5m])))`.
 
 ---
 

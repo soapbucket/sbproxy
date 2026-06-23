@@ -13,3 +13,35 @@ groups:
 
       - record: sbproxy:ai_latency_p95_5m
         expr: histogram_quantile(0.95, sum(rate(sbproxy_ai_request_duration_seconds_bucket[5m])) by (le))
+
+      # --- WOR-1493..1501: per-credential, multi-tenant, multi-model
+      # value tracking. These roll the attributed spend / token / latency
+      # series up to the authoritative identity dimensions so dashboards
+      # and chargeback queries hit a precomputed series instead of a
+      # high-fan-out rate() at query time.
+      - record: sbproxy:ai_cost_by_tenant_5m
+        expr: sum by (tenant_id) (rate(sbproxy_ai_cost_dollars_attributed_total[5m]))
+
+      - record: sbproxy:ai_cost_by_credential_5m
+        expr: sum by (tenant_id, api_key_id) (rate(sbproxy_ai_cost_dollars_attributed_total[5m]))
+
+      - record: sbproxy:ai_tokens_by_tenant_model_5m
+        expr: sum by (tenant_id, model, direction) (rate(sbproxy_ai_tokens_attributed_total[5m]))
+
+      - record: sbproxy:ai_requests_by_outcome_5m
+        expr: sum by (tenant_id, outcome) (rate(sbproxy_ai_requests_attributed_total[5m]))
+
+      # Value-vs-waste: fraction of a tenant's AI requests that ended in a
+      # non-served outcome (guardrail / content filter / budget / error).
+      - record: sbproxy:ai_waste_ratio_by_tenant_5m
+        expr: |
+          sum by (tenant_id) (rate(sbproxy_ai_requests_attributed_total{outcome!="ok"}[5m]))
+            /
+          clamp_min(sum by (tenant_id) (rate(sbproxy_ai_requests_attributed_total[5m])), 1)
+
+      - record: sbproxy:ai_latency_p95_by_tenant_model_5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, tenant_id, model) (rate(sbproxy_ai_request_duration_attributed_seconds_bucket[5m]))
+          )

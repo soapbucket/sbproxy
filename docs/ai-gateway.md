@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-06-17*
+*Last modified: 2026-06-23*
 
 SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 66 native providers behind one OpenAI-compatible API, including native Anthropic, Gemini, and Bedrock translators. You bring your own provider keys and the model name passes straight through, so you reach 200+ models without waiting on us to add them.
 
@@ -887,6 +887,38 @@ Already covered above under [Structured output](#structured-output). Shape and v
 
 The gateway records provider, model, token counts, and estimated cost for every AI request and exposes them through Prometheus metrics (see below). Direct response headers for these fields are not emitted today.
 
+### Authoritative identity: tenant and credential
+
+Every AI spend, token, latency, and outcome metric is partitioned by two authoritative identity dimensions in addition to provider/model:
+
+- `tenant_id`: the tenant the request resolved to (`__default__` in single-tenant deployments), taken from the matched origin.
+- `api_key_id`: a stable id for the credential (API key) that authenticated the request and injected its policy. This is the join key that ties spend back to the agent routing traffic through the gateway.
+
+Both are sourced from the resolved principal, never from a request header, so a caller cannot misattribute its own spend. The business attribution tags (`project`, `feature`, `team`, ...) remain caller-overridable through `SB-Attr-*` headers over the credential defaults; the trust dimensions above do not.
+
+`api_key_id` resolution:
+
+- For an `api_key` auth credential, set a stable id explicitly with `key_id:` on the entry. When omitted, the gateway derives a non-reversible `sk_<hex>` fingerprint of the secret so the key is still attributable. The raw secret never reaches a metric label, span, or log line.
+- For a matched virtual key, the operator-supplied virtual-key `name` is used.
+
+```yaml
+auth:
+  type: api_key
+  api_keys:
+    - secret: ${TEAM_A_KEY}
+      key_id: team-a-prod      # stable reporting id; spend rolls up here
+      project: checkout
+      team: payments
+    - secret: ${TEAM_B_KEY}    # no key_id -> derived sk_<hex> fingerprint
+      team: growth
+```
+
+The same `api_key_id` and `tenant_id` are stamped on the access log and the request-event envelope, so a log-based ledger reconciles against the metric rollups.
+
+### Request-path prompt accounting
+
+For chat-completions requests the gateway computes, on the request path before any upstream call, an estimated prompt-token count and a salted, non-reversible prompt fingerprint (`pf_<hex>`). Both ride on the request-event envelope (`prompt_tokens_est`, `prompt_fingerprint`). The fingerprint lets identical prompts be correlated for cache/value analysis without persisting prompt text; the salt is per-process so fingerprints are not reversible or cross-deployment correlatable. When a request is blocked or fails before producing upstream usage, the estimated prompt tokens are still attributed (see the outcome metric below), so request-path value is never lost.
+
 Trace content capture is opt-in per AI origin with `trace_content: true`.
 When enabled, the request span records redacted prompt and completion text as
 OpenInference `input.value` / `output.value` attributes and emits role-aware
@@ -908,7 +940,11 @@ The proxy exposes aggregate AI usage as Prometheus metrics. When `telemetry.bind
 | `sbproxy_ai_tokens_total` | Counter | `provider`, `model`, `direction` | Tokens consumed (`direction` is `input` or `output`) |
 | `sbproxy_ai_cost_dollars_total` | Counter | `provider`, `model` | Estimated cost in USD |
 | `sbproxy_ai_cost_usd_micros_total` | Counter | `provider`, `model`, `tenant_id` | Derived request cost in micro-USD (`1e-6` USD); mirrored to OTLP as `sbproxy.ai.cost_usd_micros` when `telemetry.export_metrics` is enabled |
-| `sbproxy_ai_request_duration_seconds` | Histogram | `provider`, `model` | End-to-end AI request latency |
+| `sbproxy_ai_request_duration_seconds` | Histogram | `provider`, `model` | End-to-end AI request latency. Now recorded on the live path for every accepted upstream response |
+| `sbproxy_ai_tokens_attributed_total` | Counter | `provider`, `model`, `surface`, `direction`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id` | Per-attribution token spend. `sum by (tenant_id, model)` for multi-tenant multi-model token volume |
+| `sbproxy_ai_cost_dollars_attributed_total` | Counter | same as above minus `direction` | Per-attribution USD spend. `sum by (api_key_id)` for per-credential chargeback |
+| `sbproxy_ai_request_duration_attributed_seconds` | Histogram | `provider`, `model`, `surface`, `tenant_id`, `api_key_id` | Model latency sliceable per tenant / credential / model. `histogram_quantile(0.95, sum by (le, tenant_id, model) (rate(..._bucket[5m])))` |
+| `sbproxy_ai_requests_attributed_total` | Counter | `provider`, `model`, `surface`, `tenant_id`, `api_key_id`, `outcome` | One row per request with a closed `outcome` label (`ok`, `guardrail_block`, `content_filter`, `budget_exceeded`, `rate_limited`, `timeout`, `upstream_5xx`, `auth_denied`, `client_error`, `other`). `sum by (tenant_id, outcome)` answers value-vs-waste |
 | `sbproxy_ai_failovers_total` | Counter | `from_provider`, `to_provider`, `reason` | Provider failover events |
 | `sbproxy_ai_guardrail_blocks_total` | Counter | `category` | Guardrail block events (pii, injection, jailbreak, etc.) |
 | `sbproxy_ai_cache_results_total` | Counter | `provider`, `cache_type`, `result` | AI response cache results (`cache_type` is `exact` or `semantic`, `result` is `hit` or `miss`) |
@@ -925,7 +961,25 @@ Use these to build spending dashboards, set budget alerts, and track provider re
 
 ## Dashboards
 
-The metrics above can be wired into any Prometheus-compatible dashboard tool. A pre-built JSON for AI gateway health is on the roadmap; for now, point your existing Prometheus or Grafana setup at `/metrics` and chart the counters and histograms listed above.
+The metrics above can be wired into any Prometheus-compatible dashboard tool. Point your existing Prometheus or Grafana setup at `/metrics` and chart the counters and histograms listed above.
+
+The repo ships per-credential / per-tenant / per-model recording rules and alerts in `dashboards/prometheus/` (`recording-rules.yml`, `alerts.yml`), including per-tenant and per-credential spend alerts, an AI waste-ratio alert (share of requests ending in a non-served outcome), and a per-tenant/model latency alert. Sample queries:
+
+```promql
+# Spend by tenant and model, last 5m
+sum by (tenant_id, model) (rate(sbproxy_ai_cost_dollars_attributed_total[5m]))
+
+# Top credentials by cost
+topk(10, sum by (api_key_id) (rate(sbproxy_ai_cost_dollars_attributed_total[5m])))
+
+# Value vs waste: non-served share of a tenant's requests
+sum by (tenant_id) (rate(sbproxy_ai_requests_attributed_total{outcome!="ok"}[5m]))
+  / sum by (tenant_id) (rate(sbproxy_ai_requests_attributed_total[5m]))
+
+# p95 model latency per tenant + model
+histogram_quantile(0.95,
+  sum by (le, tenant_id, model) (rate(sbproxy_ai_request_duration_attributed_seconds_bucket[5m])))
+```
 
 ## Streaming
 
