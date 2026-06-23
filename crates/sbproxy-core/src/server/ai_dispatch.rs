@@ -1998,6 +1998,20 @@ pub(super) async fn handle_ai_proxy(
                         None
                     }
                 };
+                // WOR-1501: capture upstream model latency for the
+                // accepted response, keyed by the same authoritative
+                // identity dimensions as the spend metrics so p95
+                // latency is sliceable per tenant / credential / model
+                // (not just globally per provider/model). Measured once
+                // per request, on the attempt we keep.
+                sbproxy_ai::ai_metrics::record_model_latency(
+                    &provider.name,
+                    ctx.ai_model.as_deref().unwrap_or(""),
+                    surface_label,
+                    ctx.tenant_id.as_str(),
+                    ctx.principal.api_key_id(),
+                    attempt_start.elapsed().as_secs_f64(),
+                );
                 last_provider_name = provider.name.to_string();
                 last_resp = Some(resp);
                 break;

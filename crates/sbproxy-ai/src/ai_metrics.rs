@@ -84,6 +84,53 @@ static AI_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Per-attribution model latency histogram (WOR-1501). Mirrors
+/// `AI_LATENCY`'s bucket schedule but adds the surface and the
+/// authoritative identity dimensions (tenant + credential) so p50 / p95
+/// upstream latency can be sliced per tenant, per credential, and per
+/// model, not just globally per provider/model. Same bounded-cardinality
+/// contract as the attributed spend metrics.
+static AI_LATENCY_ATTRIBUTED: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        HistogramOpts::new(
+            "sbproxy_ai_request_duration_attributed_seconds",
+            "AI upstream request latency, partitioned by surface + tenant + credential (WOR-1501)"
+        )
+        .buckets(vec![0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
+        &["provider", "model", "surface", "tenant_id", "api_key_id"]
+    )
+    .unwrap()
+});
+
+/// Record upstream model latency on the live request path.
+///
+/// Observes BOTH the long-standing global histogram
+/// (`sbproxy_ai_request_duration_seconds{provider, model}`) and the
+/// attributed histogram (`sbproxy_ai_request_duration_attributed_seconds`,
+/// which adds surface + tenant + credential), so existing dashboards and
+/// the new per-credential / per-tenant latency view both work off a
+/// single call site. `secs` is the upstream round-trip latency to the
+/// accepted response. A non-finite or negative value is dropped.
+#[allow(clippy::too_many_arguments)]
+pub fn record_model_latency(
+    provider: &str,
+    model: &str,
+    surface: &str,
+    tenant_id: &str,
+    api_key_id: &str,
+    secs: f64,
+) {
+    if !secs.is_finite() || secs < 0.0 {
+        return;
+    }
+    AI_LATENCY
+        .with_label_values(&[provider, model])
+        .observe(secs);
+    AI_LATENCY_ATTRIBUTED
+        .with_label_values(&[provider, model, surface, tenant_id, api_key_id])
+        .observe(secs);
+}
+
 // Time to first token, in seconds. Recorded once per streaming
 // response when the first token arrives. The Prometheus client
 // auto-derives the `_bucket`, `_sum`, and `_count` series referenced
@@ -1192,6 +1239,60 @@ mod tests {
                 "expected label '{required}' on sbproxy_ai_surface_requests_total"
             );
         }
+    }
+
+    /// WOR-1501: model latency lands on BOTH the global histogram and
+    /// the attributed histogram, and the attributed series carries the
+    /// tenant + credential identity so latency is sliceable per
+    /// credential. A non-finite value is a no-op.
+    #[test]
+    fn test_record_model_latency() {
+        record_model_latency(
+            "openai",
+            "gpt-4o",
+            "chat_completions",
+            "acme-tenant",
+            "sk_latency0001",
+            0.875,
+        );
+        // Non-finite / negative durations are dropped.
+        record_model_latency(
+            "openai",
+            "gpt-4o",
+            "chat_completions",
+            "acme-tenant",
+            "x",
+            -1.0,
+        );
+        record_model_latency(
+            "openai",
+            "gpt-4o",
+            "chat_completions",
+            "acme-tenant",
+            "x",
+            f64::NAN,
+        );
+        let families = prometheus::gather();
+        assert!(families
+            .iter()
+            .any(|f| f.name() == "sbproxy_ai_request_duration_seconds"));
+        let attributed = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_request_duration_attributed_seconds")
+            .expect("attributed latency histogram registered");
+        let has_identity = attributed.get_metric().iter().any(|m| {
+            let labels = m.get_label();
+            labels
+                .iter()
+                .any(|l| l.name() == "tenant_id" && l.value() == "acme-tenant")
+                && labels
+                    .iter()
+                    .any(|l| l.name() == "api_key_id" && l.value() == "sk_latency0001")
+        });
+        assert!(
+            has_identity,
+            "attributed latency must carry tenant_id + api_key_id"
+        );
     }
 
     #[test]
