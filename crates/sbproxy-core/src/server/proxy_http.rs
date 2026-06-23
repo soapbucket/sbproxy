@@ -4040,6 +4040,25 @@ impl ProxyHttp for SbProxy {
         // will introduce enterprise sinks (S3, Kafka, Datadog).
         emit_access_log(session, ctx, status_u16, &method, &hostname, duration);
 
+        // WOR-1496: per-attribution AI request outcome. Recorded once
+        // per AI request in the logging phase so it is independent of
+        // whether access-log emission is enabled (same rationale as the
+        // boilerplate counter below), keyed by the authoritative
+        // identity dimensions plus a closed outcome label so spend can
+        // be sliced value-vs-waste. Non-AI traffic is skipped.
+        if ctx.ai_provider.is_some() || ctx.ai_surface.is_some() {
+            let outcome =
+                crate::server::access_log::ai_outcome_label(status_u16, ctx.ai_outcome.as_deref());
+            sbproxy_ai::ai_metrics::record_ai_outcome_attributed(
+                ctx.ai_provider.as_deref().unwrap_or(""),
+                ctx.ai_model.as_deref().unwrap_or(""),
+                ctx.ai_surface.as_deref().unwrap_or(""),
+                ctx.tenant_id.as_str(),
+                ctx.principal.api_key_id(),
+                outcome,
+            );
+        }
+
         // WOR-1131: feed the boilerplate strip count into
         // `sbproxy_boilerplate_stripped_bytes_total`. Done here (not in the
         // transform apply) so the counter increments once per request and

@@ -1152,6 +1152,10 @@ pub(super) async fn handle_ai_proxy(
                         sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                         &block.reason,
                     );
+                    // WOR-1496: a guardrail block surfaces as a generic
+                    // 400, so stamp the precise outcome for the
+                    // value-vs-waste metric.
+                    ctx.ai_outcome = Some("guardrail_block".to_string());
                     let error_body = serde_json::json!({
                         "error": {
                             "message": block.reason,
@@ -1180,6 +1184,10 @@ pub(super) async fn handle_ai_proxy(
                         sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                         &block.reason,
                     );
+                    // WOR-1496: a guardrail block surfaces as a generic
+                    // 400, so stamp the precise outcome for the
+                    // value-vs-waste metric.
+                    ctx.ai_outcome = Some("guardrail_block".to_string());
                     let error_body = serde_json::json!({
                         "error": {
                             "message": block.reason,
@@ -1211,6 +1219,9 @@ pub(super) async fn handle_ai_proxy(
                             sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                             &block.reason,
                         );
+                        // WOR-1496: stamp the precise outcome (the wire
+                        // status is a generic 400).
+                        ctx.ai_outcome = Some("guardrail_block".to_string());
                         let error_body = serde_json::json!({
                             "error": {
                                 "message": block.reason,
@@ -2633,6 +2644,13 @@ pub(super) async fn relay_ai_response_with_cache(
                         sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                         &block.reason,
                     );
+                    // WOR-1496: the block returns a 403, which the
+                    // status-derived outcome would mislabel as
+                    // `auth_denied`; stamp the precise outcome so the
+                    // value-vs-waste metric attributes it correctly.
+                    if let Some(c) = ctx.as_mut() {
+                        c.ai_outcome = Some("guardrail_block".to_string());
+                    }
                     // WOR-1093: the upstream already produced (and
                     // billed) this 2xx response; an output guardrail
                     // then rejected it, so the spend bought no served

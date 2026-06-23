@@ -1061,6 +1061,51 @@ static AI_COST_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Per-attribution request-outcome counter (WOR-1496). One row per AI
+/// request, partitioned by the authoritative identity dimensions plus a
+/// closed `outcome` label so token / cost spend can be reconciled
+/// against value-vs-waste: `sum by (tenant_id, outcome)` answers "how
+/// much traffic for tenant X ended in a refusal / guardrail block /
+/// budget block / upstream error". The `outcome` label is a small
+/// closed set (`ok`, `guardrail_block`, `content_filter`,
+/// `budget_exceeded`, `rate_limited`, `timeout`, `upstream_5xx`,
+/// `auth_denied`, `client_error`, `other`) so cardinality stays bounded.
+static AI_OUTCOMES_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_requests_attributed_total",
+            "AI requests partitioned by attribution + outcome (WOR-1496)"
+        ),
+        &[
+            "provider",
+            "model",
+            "surface",
+            "tenant_id",
+            "api_key_id",
+            "outcome",
+        ]
+    )
+    .unwrap()
+});
+
+/// Record one AI request against the per-attribution outcome counter.
+/// `outcome` must be one of the closed-set labels documented on
+/// [`AI_OUTCOMES_ATTRIBUTED`]; callers map their status / error into
+/// that set before calling so the label cardinality stays bounded.
+#[allow(clippy::too_many_arguments)]
+pub fn record_ai_outcome_attributed(
+    provider: &str,
+    model: &str,
+    surface: &str,
+    tenant_id: &str,
+    api_key_id: &str,
+    outcome: &str,
+) {
+    AI_OUTCOMES_ATTRIBUTED
+        .with_label_values(&[provider, model, surface, tenant_id, api_key_id, outcome])
+        .inc();
+}
+
 /// Record a per-attribution AI spend record.
 ///
 /// Token-kind split: pass `input_tokens`, `output_tokens`, and the
@@ -1293,6 +1338,35 @@ mod tests {
             has_identity,
             "attributed latency must carry tenant_id + api_key_id"
         );
+    }
+
+    /// WOR-1496: the outcome counter records one row per request with
+    /// the closed outcome label plus the authoritative identity.
+    #[test]
+    fn test_record_ai_outcome_attributed() {
+        record_ai_outcome_attributed(
+            "openai",
+            "gpt-4o",
+            "chat_completions",
+            "acme-tenant",
+            "sk_outcome0001",
+            "guardrail_block",
+        );
+        let families = prometheus::gather();
+        let f = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_requests_attributed_total")
+            .expect("outcome counter registered");
+        let has_row = f.get_metric().iter().any(|m| {
+            let labels = m.get_label();
+            labels
+                .iter()
+                .any(|l| l.name() == "outcome" && l.value() == "guardrail_block")
+                && labels
+                    .iter()
+                    .any(|l| l.name() == "api_key_id" && l.value() == "sk_outcome0001")
+        });
+        assert!(has_row, "outcome row with identity must be recorded");
     }
 
     #[test]

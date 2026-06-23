@@ -711,6 +711,14 @@ pub struct RequestContext {
     /// AI request carries the surface (chat_completions, assistants,
     /// image_generation, etc.) without re-parsing the path.
     pub ai_surface: Option<String>,
+    /// WOR-1496: AI-specific request outcome override for the
+    /// per-attribution outcome metric. Set at block sites whose HTTP
+    /// status alone is ambiguous (a guardrail block and a generic bad
+    /// request both surface as 400). When `None` the access-log
+    /// finalizer derives the outcome from the final HTTP status. Stable
+    /// closed-set strings only (`guardrail_block`, `content_filter`,
+    /// ...).
+    pub ai_outcome: Option<String>,
     /// Inbound `ChatFormat` id when the request entered on a native
     /// shim path (`anthropic` for `/v1/messages`, `responses` for
     /// `/v1/responses`). `None` (or `"openai"`) for the canonical
@@ -1053,6 +1061,7 @@ impl RequestContext {
             ai_tokens_out: None,
             ai_cost_usd_micros: None,
             ai_surface: None,
+            ai_outcome: None,
             ai_inbound_format: None,
             ai_native_bypass: false,
             ai_admission: None,
