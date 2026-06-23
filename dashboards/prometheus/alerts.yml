@@ -45,3 +45,41 @@ groups:
         annotations:
           summary: "Over 1M output tokens in the last hour"
           description: "Token output has exceeded 1 million in the past hour. Provider: {{ $labels.provider }}. Count: {{ $value }}."
+
+      # --- WOR-1493..1501: per-credential, multi-tenant value alerts ---
+
+      - alert: SBProxyTenantSpendSpike
+        expr: sum by (tenant_id) (increase(sbproxy_ai_cost_dollars_attributed_total[1h])) > 100
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tenant {{ $labels.tenant_id }} spent over $100 on AI in the last hour"
+          description: "Per-tenant AI spend crossed the chargeback alert threshold. Tenant: {{ $labels.tenant_id }}. Spend: ${{ $value | printf \"%.2f\" }}."
+
+      - alert: SBProxyCredentialSpendSpike
+        expr: sum by (tenant_id, api_key_id) (increase(sbproxy_ai_cost_dollars_attributed_total[1h])) > 50
+        for: 0m
+        labels:
+          severity: info
+        annotations:
+          summary: "Credential {{ $labels.api_key_id }} spent over $50 on AI in the last hour"
+          description: "A single API key crossed the per-credential spend alert threshold. Tenant: {{ $labels.tenant_id }}. Credential: {{ $labels.api_key_id }}. Spend: ${{ $value | printf \"%.2f\" }}."
+
+      - alert: SBProxyHighAIWasteRatio
+        expr: sbproxy:ai_waste_ratio_by_tenant_5m > 0.25
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Over 25% of tenant {{ $labels.tenant_id }} AI requests are non-served"
+          description: "More than a quarter of AI requests for tenant {{ $labels.tenant_id }} ended in a guardrail block, content filter, budget block, or error for 10 minutes. Spend on these buys no served outcome. Current ratio: {{ $value | humanizePercentage }}."
+
+      - alert: SBProxyModelLatencyP95High
+        expr: sbproxy:ai_latency_p95_by_tenant_model_5m > 30
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P95 model latency above 30s for tenant {{ $labels.tenant_id }} / {{ $labels.model }}"
+          description: "Upstream model latency p95 has exceeded 30 seconds for 10 minutes. Tenant: {{ $labels.tenant_id }}. Model: {{ $labels.model }}. Current: {{ $value | humanizeDuration }}."
