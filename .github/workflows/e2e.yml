@@ -41,6 +41,13 @@ jobs:
       - name: build sbproxy binary
         run: cargo build -p sbproxy --locked
 
+      # The no-default-features e2e harness (e.g. headless_detection_e2e's
+      # disabled-feature test) spawns a separate binary built without
+      # default features; build it into its own target dir so the harness
+      # finds it.
+      - name: build no-default-features sbproxy binary (e2e harness)
+        run: CARGO_TARGET_DIR=target/no-default-features cargo build -p sbproxy --no-default-features --locked
+
       # Run single-threaded. Each e2e test spawns its own proxy process
       # with a full multi-core tokio runtime, so the default test-thread
       # count (= CPU count) massively oversubscribes the runner and makes
