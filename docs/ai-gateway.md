@@ -19,7 +19,7 @@ origins:
           models: [gpt-4o, gpt-4o-mini, gpt-4-turbo]
         - name: anthropic
           api_key: ${ANTHROPIC_API_KEY}
-          models: [claude-sonnet-4-20250514, claude-3-5-haiku-20241022]
+          models: [claude-sonnet-4-20250514, claude-haiku-4-5]
       default_model: gpt-4o-mini
       routing:
         strategy: round_robin
@@ -33,9 +33,38 @@ API keys support environment variable interpolation with `${VAR_NAME}` syntax. N
 
 Any model a listed provider serves works without extra config. For a self-hosted or proprietary endpoint, point `vllm` or any provider at it with a custom `base_url`. `openrouter` is available as one of the providers when you want many vendors behind a single key. See `providers.md` for the full per-provider table.
 
+## Model-based provider selection
+
+Before the routing strategy runs, the proxy narrows the candidate providers to those that declare the requested model in their `models` list. With one model per provider you get a single OpenAI-compatible endpoint where the `model` field picks the vendor:
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      routing:
+        strategy: round_robin
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o-mini]
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          models: [claude-haiku-4-5]
+        - name: gemini
+          api_key: ${GEMINI_API_KEY}
+          models: [gemini-3.5-flash]
+```
+
+A request for `gpt-4o-mini` reaches OpenAI, one for `claude-haiku-4-5` reaches Anthropic, and so on, regardless of strategy. The rules:
+
+- A provider with an **empty** `models` list is a wildcard and stays eligible for every model (point one provider, such as `openrouter`, at many vendors this way).
+- If **no** provider declares the requested model, the model name passes straight through to the configured providers unchanged, so you still reach the 200+ models a provider serves without enumerating each one.
+- When more than one provider qualifies (an enumerated match plus a wildcard, say), the `routing.strategy` below picks among them.
+
 ## Routing strategies
 
-The `routing.strategy` field controls how the proxy picks a provider for each request.
+The `routing.strategy` field controls how the proxy picks a provider for each request, after model-based selection has narrowed the candidates.
 
 ### round_robin
 
@@ -534,7 +563,7 @@ action:
       name: team-a
       enabled: true
       allowed_providers: [openai, anthropic]
-      allowed_models: [gpt-4o-mini, claude-3-5-haiku-20241022]
+      allowed_models: [gpt-4o-mini, claude-haiku-4-5]
       blocked_models: [gpt-4-turbo]
       max_requests_per_minute: 60
       max_tokens_per_minute: 200000
@@ -709,7 +738,7 @@ model_aliases:
     model_id: claude-sonnet-4-20250514
   - alias: claude-old
     provider: anthropic
-    model_id: claude-3-opus-20240229
+    model_id: claude-sonnet-4-5
     deprecated: true
     replacement: smart
 ```
@@ -1150,7 +1179,7 @@ origins:
         - name: anthropic
           api_key: ${ANTHROPIC_API_KEY}
           priority: 2
-          models: [claude-sonnet-4-20250514, claude-3-5-haiku-20241022]
+          models: [claude-sonnet-4-20250514, claude-haiku-4-5]
       default_model: gpt-4o-mini
       routing:
         strategy: fallback_chain

@@ -44,7 +44,7 @@ registers the duplicate as wasted spend on the duplicate's wire
 shape.
 
 ```bash
-PAYLOAD='{"model":"claude-3-5-haiku-latest","messages":[{"role":"user","content":"hello"}]}'
+PAYLOAD='{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hello"}]}'
 
 # First call: cache miss, real upstream spend.
 curl -s http://127.0.0.1:8080/v1/chat/completions \
@@ -69,8 +69,8 @@ curl -s http://127.0.0.1:9090/metrics | grep -E "^sbproxy_ai_wasted"
 Expected (counter samples; values depend on the actual prompt):
 
 ```
-sbproxy_ai_wasted_tokens_total{kind="duplicate_request",provider="anthropic",model="claude-3-5-haiku-latest",surface="chat_completions",project="demo",team="demo-team"} 5
-sbproxy_ai_wasted_cost_dollars_total{kind="duplicate_request",provider="anthropic",model="claude-3-5-haiku-latest",surface="chat_completions",project="demo",team="demo-team"} 0.000005
+sbproxy_ai_wasted_tokens_total{kind="duplicate_request",provider="anthropic",model="claude-haiku-4-5",surface="chat_completions",project="demo",team="demo-team"} 5
+sbproxy_ai_wasted_cost_dollars_total{kind="duplicate_request",provider="anthropic",model="claude-haiku-4-5",surface="chat_completions",project="demo",team="demo-team"} 0.000005
 ```
 
 ## Dashboarding pattern

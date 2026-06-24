@@ -893,9 +893,9 @@ origins:
           default_model: gpt-4o-mini
         - name: anthropic
           api_key: ${ANTHROPIC_API_KEY}
-          models: [claude-sonnet-4-20250514, claude-3-5-haiku-20241022]
+          models: [claude-sonnet-4-20250514, claude-haiku-4-5]
       routing: fallback_chain
-      allowed_models: [gpt-4o, gpt-4o-mini, claude-3-5-haiku-20241022]
+      allowed_models: [gpt-4o, gpt-4o-mini, claude-haiku-4-5]
       blocked_models: []
       max_body_size: 4194304
 ```
@@ -948,7 +948,7 @@ Virtual API keys map a client-facing key to provider keys, model allow-lists, an
 virtual_keys:
   - key: vk-prod-abc123
     name: production-app
-    allowed_models: [gpt-4o-mini, claude-3-5-haiku-20241022]
+    allowed_models: [gpt-4o-mini, claude-haiku-4-5]
     blocked_models: []
     allowed_providers: [openai, anthropic]
     max_tokens_per_minute: 10000
@@ -1067,7 +1067,7 @@ Mirrors each request to a second provider concurrently. The primary's response i
 ```yaml
 shadow:
   provider: anthropic         # must also appear in `providers`
-  model: claude-3-5-haiku-latest   # optional override; defaults to client's model
+  model: claude-haiku-4-5   # optional override; defaults to client's model
   sample_rate: 0.1            # mirror 10% of traffic; 1.0 mirrors all
   timeout_ms: 30000
 ```

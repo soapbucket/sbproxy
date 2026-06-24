@@ -283,7 +283,7 @@ The same observations appear as `auth_ms` / `upstream_ttfb_ms` / `response_filte
 | Label | Description | Example values |
 |---|---|---|
 | `provider` | AI provider name | `openai`, `anthropic`, `google`, `cohere` |
-| `model` | Model identifier | `gpt-4o`, `claude-3-5-sonnet`, `gemini-1.5-pro` |
+| `model` | Model identifier | `gpt-4o`, `claude-3-5-sonnet`, `gemini-3.5-flash` |
 | `status` | Request outcome | `success`, `error`, `timeout`, `rate_limited` |
 
 ---

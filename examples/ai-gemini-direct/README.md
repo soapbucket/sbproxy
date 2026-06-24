@@ -20,7 +20,7 @@ $ curl -s http://127.0.0.1:8080/v1/chat/completions \
     -H 'Host: ai.local' \
     -H 'Content-Type: application/json' \
     -d '{
-      "model": "gemini-1.5-pro",
+      "model": "gemini-3.5-flash",
       "messages": [
         {"role": "system", "content": "You write terse haiku."},
         {"role": "user", "content": "Write a haiku about caching."}
@@ -29,7 +29,7 @@ $ curl -s http://127.0.0.1:8080/v1/chat/completions \
 {
   "id": "gen_01XyZ...",
   "object": "chat.completion",
-  "model": "gemini-1.5-pro",
+  "model": "gemini-3.5-flash",
   "choices": [
     {
       "index": 0,

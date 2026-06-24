@@ -2,7 +2,7 @@
 
 *Last modified: 2026-06-04*
 
-Two virtual keys, two teams. The frontend team's key is allow-listed to `claude-3-5-haiku-latest`; the data team's key also gets `claude-3-5-sonnet-latest`. A key that asks for a model outside its allow-list is rejected with `403` before any upstream call. Each credential also carries a declared budget and tags that flow to the `sbproxy_ai_key_*` metric series for per-team attribution. The gateway matches the virtual key locally from `Authorization: Bearer ...` and swaps in the real provider key, so clients never see the upstream Anthropic key.
+Two virtual keys, two teams. The frontend team's key is allow-listed to `claude-haiku-4-5`; the data team's key also gets `claude-sonnet-4-5`. A key that asks for a model outside its allow-list is rejected with `403` before any upstream call. Each credential also carries a declared budget and tags that flow to the `sbproxy_ai_key_*` metric series for per-team attribution. The gateway matches the virtual key locally from `Authorization: Bearer ...` and swaps in the real provider key, so clients never see the upstream Anthropic key.
 
 ## Run
 
@@ -62,7 +62,7 @@ $ curl -is http://127.0.0.1:8080/v1/chat/completions \
     -H "Authorization: Bearer ${TEAM_FRONTEND_KEY}" \
     -H 'Content-Type: application/json' \
     -d '{
-      "model": "claude-3-5-haiku-latest",
+      "model": "claude-haiku-4-5",
       "messages": [{"role": "user", "content": "Hello from frontend."}]
     }' | head -n 1
 HTTP/1.1 200 OK
@@ -75,12 +75,12 @@ $ curl -is http://127.0.0.1:8080/v1/chat/completions \
     -H 'Host: ai.local' \
     -H "Authorization: Bearer ${TEAM_FRONTEND_KEY}" \
     -H 'Content-Type: application/json' \
-    -d '{"model":"claude-3-5-sonnet-latest","messages":[{"role":"user","content":"Try Sonnet."}]}' \
+    -d '{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"Try Sonnet."}]}' \
     | head -n 5
 HTTP/1.1 403 Forbidden
 content-type: application/json
 
-{"error":"model 'claude-3-5-sonnet-latest' is not allowed for this key"}
+{"error":"model 'claude-sonnet-4-5' is not allowed for this key"}
 ```
 
 Data team, allowed Sonnet:
@@ -90,7 +90,7 @@ $ curl -is http://127.0.0.1:8080/v1/chat/completions \
     -H 'Host: ai.local' \
     -H "Authorization: Bearer ${TEAM_DATA_KEY}" \
     -H 'Content-Type: application/json' \
-    -d '{"model":"claude-3-5-sonnet-latest","messages":[{"role":"user","content":"Hello from data team."}]}' \
+    -d '{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"Hello from data team."}]}' \
     | head -n 1
 HTTP/1.1 200 OK
 ```

@@ -53,7 +53,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Host: ai.local' \
   -H "Authorization: Bearer ${TEAM_FRONTEND_KEY}" \
   -H 'Content-Type: application/json' \
-  -d '{"model":"claude-3-5-haiku-latest","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 The access-log row carries `project=frontend`, `team=frontend-eng`,
@@ -73,7 +73,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'SB-Attr-Trace-Id: trc_01HABC...' \
   -H 'SB-Attr-Agent: development' \
   -H 'SB-Attr-Risk: internal-only' \
-  -d '{"model":"claude-3-5-haiku-latest","messages":[{"role":"user","content":"regen"}]}'
+  -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"regen"}]}'
 ```
 
 This row's tag set:

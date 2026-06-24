@@ -22,7 +22,7 @@ $ curl -s http://127.0.0.1:8080/v1/chat/completions \
     -H 'Host: ai.local' \
     -H 'Content-Type: application/json' \
     -d '{
-      "model": "claude-3-5-sonnet-latest",
+      "model": "claude-sonnet-4-5",
       "messages": [
         {"role": "system", "content": "You write terse haiku."},
         {"role": "user", "content": "Write a haiku about caching."}
@@ -32,7 +32,7 @@ $ curl -s http://127.0.0.1:8080/v1/chat/completions \
   "id": "msg_01XyZ...",
   "object": "chat.completion",
   "created": 1714200000,
-  "model": "claude-3-5-sonnet-latest",
+  "model": "claude-sonnet-4-5",
   "choices": [
     {
       "index": 0,
