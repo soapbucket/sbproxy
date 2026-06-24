@@ -32,6 +32,7 @@ pub mod key_scoping;
 pub mod model_alias;
 pub mod multimodal;
 pub mod prompt_cache;
+pub mod prompt_fingerprint;
 pub mod prompts;
 pub mod provider;
 pub mod provider_ratelimit;
@@ -72,6 +73,7 @@ pub use multimodal::{
     detect_modality, filter_providers_by_modality, provider_supports_modality, Modality,
 };
 pub use prompt_cache::{check_cache, has_cache_control, prompt_cache_key};
+pub use prompt_fingerprint::prompt_fingerprint;
 pub use provider::ProviderConfig;
 pub use provider_ratelimit::{ProviderRateLimitTracker, ProviderRateState};
 pub use providers::{

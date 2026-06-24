@@ -3912,6 +3912,7 @@ impl ProxyHttp for SbProxy {
                 Vec::new(),
                 &ctx.attribution_tags,
                 ctx.tenant_id.as_str(),
+                ctx.principal.api_key_id(),
                 &span,
             );
             info!(
@@ -4038,6 +4039,57 @@ impl ProxyHttp for SbProxy {
         // build richer filter and sampling primitives on top of this; F2.12
         // will introduce enterprise sinks (S3, Kafka, Datadog).
         emit_access_log(session, ctx, status_u16, &method, &hostname, duration);
+
+        // WOR-1496: per-attribution AI request outcome. Recorded once
+        // per AI request in the logging phase so it is independent of
+        // whether access-log emission is enabled (same rationale as the
+        // boilerplate counter below), keyed by the authoritative
+        // identity dimensions plus a closed outcome label so spend can
+        // be sliced value-vs-waste. Non-AI traffic is skipped.
+        if ctx.ai_provider.is_some() || ctx.ai_surface.is_some() {
+            let outcome =
+                crate::server::access_log::ai_outcome_label(status_u16, ctx.ai_outcome.as_deref());
+            sbproxy_ai::ai_metrics::record_ai_outcome_attributed(
+                ctx.ai_provider.as_deref().unwrap_or(""),
+                ctx.ai_model.as_deref().unwrap_or(""),
+                ctx.ai_surface.as_deref().unwrap_or(""),
+                ctx.tenant_id.as_str(),
+                ctx.principal.api_key_id(),
+                outcome,
+            );
+
+            // WOR-1497: a request blocked before dispatch (budget cap,
+            // guardrail, rate limit) or one that failed without an
+            // upstream `usage` block emits no billing event, so its
+            // prompt-side token volume would vanish from per-credential
+            // reporting. When no measured usage was recorded
+            // (`ai_tokens_in` is None) but we computed a request-path
+            // estimate, attribute the estimated prompt tokens (cost 0,
+            // `cache_read` direction is not used; recorded as `input`).
+            // The `ai_tokens_in.is_none()` guard prevents double counting
+            // against the measured spend recorded by the billing choke
+            // point on the success path.
+            if ctx.ai_tokens_in.is_none() {
+                if let Some(est) = ctx.ai_prompt_tokens_est {
+                    if est > 0 {
+                        sbproxy_ai::ai_metrics::record_ai_request_attributed(
+                            ctx.ai_provider.as_deref().unwrap_or(""),
+                            ctx.ai_model.as_deref().unwrap_or(""),
+                            ctx.ai_surface.as_deref().unwrap_or(""),
+                            ctx.tenant_id.as_str(),
+                            ctx.principal.api_key_id(),
+                            &ctx.attribution_tags,
+                            est,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0.0,
+                        );
+                    }
+                }
+            }
+        }
 
         // WOR-1131: feed the boilerplate strip count into
         // `sbproxy_boilerplate_stripped_bytes_total`. Done here (not in the

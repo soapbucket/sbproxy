@@ -257,6 +257,16 @@ pub struct AccessLogEntry {
     /// on `auth_type IS NULL`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub principal_kind: Option<String>,
+    /// WOR-1498: stable identifier of the credential (API key) that
+    /// authenticated this request and injected its policy. This is the
+    /// per-credential reporting join key, mirroring the `api_key_id`
+    /// label on the `sbproxy_ai_*_attributed_total` metrics so a
+    /// log-based ledger can reconcile against the metric rollups.
+    /// Operator-supplied stable id when configured, otherwise the
+    /// derived `sk_<hex>` fingerprint; never the raw secret. Absent for
+    /// un-credentialed requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_id: Option<String>,
     /// True when this request was served from cache (hot or reserve)
     /// without contacting the upstream. Mirrors `cache_result == "hit"`
     /// but distinguishes hit-then-revalidated paths.
@@ -584,6 +594,7 @@ impl Default for AccessLogEntry {
             tenant_id: String::new(),
             auth_type: None,
             principal_kind: None,
+            api_key_id: None,
             served_from_cache: None,
             fallback_triggered: None,
             retry_count: None,
@@ -871,6 +882,7 @@ mod tests {
             tenant_id: String::new(),
             auth_type: None,
             principal_kind: None,
+            api_key_id: None,
             served_from_cache: None,
             fallback_triggered: None,
             retry_count: None,

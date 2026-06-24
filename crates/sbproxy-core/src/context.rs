@@ -701,6 +701,18 @@ pub struct RequestContext {
     pub ai_model: Option<String>,
     /// Prompt / input tokens reported by the provider response.
     pub ai_tokens_in: Option<u64>,
+    /// WOR-1499: estimated prompt tokens computed on the request path
+    /// from the inbound body (before any upstream usage is known). Used
+    /// for request-path prompt accounting and as the fallback token
+    /// volume attributed to blocked / failed requests that never receive
+    /// an upstream `usage` block (WOR-1497). `None` for non-chat
+    /// surfaces.
+    pub ai_prompt_tokens_est: Option<u64>,
+    /// WOR-1499: salted, non-reversible fingerprint of the prompt, for
+    /// correlating identical prompts across requests (cache / value
+    /// analysis) without persisting prompt text. `None` for non-chat
+    /// surfaces.
+    pub ai_prompt_fingerprint: Option<String>,
     /// Completion / output tokens reported by the provider response.
     pub ai_tokens_out: Option<u64>,
     /// Derived AI request cost in micro-USD (`1e-6` USD), computed
@@ -711,6 +723,14 @@ pub struct RequestContext {
     /// AI request carries the surface (chat_completions, assistants,
     /// image_generation, etc.) without re-parsing the path.
     pub ai_surface: Option<String>,
+    /// WOR-1496: AI-specific request outcome override for the
+    /// per-attribution outcome metric. Set at block sites whose HTTP
+    /// status alone is ambiguous (a guardrail block and a generic bad
+    /// request both surface as 400). When `None` the access-log
+    /// finalizer derives the outcome from the final HTTP status. Stable
+    /// closed-set strings only (`guardrail_block`, `content_filter`,
+    /// ...).
+    pub ai_outcome: Option<String>,
     /// Inbound `ChatFormat` id when the request entered on a native
     /// shim path (`anthropic` for `/v1/messages`, `responses` for
     /// `/v1/responses`). `None` (or `"openai"`) for the canonical
@@ -1050,9 +1070,12 @@ impl RequestContext {
             attribution_tags: sbproxy_ai::attribution::AttributionTags::default(),
             ai_model: None,
             ai_tokens_in: None,
+            ai_prompt_tokens_est: None,
+            ai_prompt_fingerprint: None,
             ai_tokens_out: None,
             ai_cost_usd_micros: None,
             ai_surface: None,
+            ai_outcome: None,
             ai_inbound_format: None,
             ai_native_bypass: false,
             ai_admission: None,

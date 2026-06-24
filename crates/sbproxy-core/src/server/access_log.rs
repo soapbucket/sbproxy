@@ -447,6 +447,13 @@ pub(super) fn emit_access_log(
     } else {
         Some(auth_type.clone().unwrap_or_else(|| "none".to_string()))
     };
+    // WOR-1498: the credential (API key) that injected the policy, for
+    // the log-based per-credential reconciliation. Empty string means
+    // un-credentialed; record it as absent rather than a blank column.
+    let api_key_id = match ctx.principal.api_key_id() {
+        "" => None,
+        id => Some(id.to_string()),
+    };
     let workspace_id = ctx
         .origin_idx
         .and_then(|idx| pipeline.config.origins.get(idx))
@@ -548,6 +555,7 @@ pub(super) fn emit_access_log(
         tenant_id: ctx.tenant_id.to_string(),
         auth_type,
         principal_kind,
+        api_key_id,
         served_from_cache: Some(ctx.served_from_cache),
         fallback_triggered: Some(ctx.fallback_triggered),
         retry_count: Some(ctx.retry_count),
@@ -743,6 +751,9 @@ pub(super) struct AccessLogContext {
     /// downstream ClickHouse / Grafana queries to partition the log
     /// by principal source without joining on `auth_type IS NULL`.
     pub(super) principal_kind: Option<String>,
+    /// WOR-1498: stable credential id (API key) that injected the
+    /// policy. `None` for un-credentialed requests.
+    pub(super) api_key_id: Option<String>,
     pub(super) served_from_cache: Option<bool>,
     pub(super) fallback_triggered: Option<bool>,
     pub(super) retry_count: Option<u32>,
@@ -855,6 +866,7 @@ impl AccessLogContext {
             tenant_id: String::new(),
             auth_type: None,
             principal_kind: None,
+            api_key_id: None,
             served_from_cache: None,
             fallback_triggered: None,
             retry_count: None,
@@ -931,6 +943,37 @@ pub(super) fn classify_error_class(status: u16) -> Option<String> {
         500..=599 => Some("upstream_5xx".to_string()),
         400..=499 => Some("client_error".to_string()),
         _ => Some("other".to_string()),
+    }
+}
+
+/// WOR-1496: map an AI request's final HTTP status (and any
+/// AI-specific outcome override stamped on the context) into the closed
+/// outcome set the per-attribution outcome metric partitions on.
+///
+/// The override wins when present because some block sites surface an
+/// ambiguous status: an input-guardrail block and a generic bad request
+/// both return 400, so the status alone cannot tell "we refused this on
+/// policy" from "the client sent garbage". Returns a `&'static str` so
+/// the value is a stable, bounded metric label.
+pub(super) fn ai_outcome_label(status: u16, override_outcome: Option<&str>) -> &'static str {
+    if let Some(o) = override_outcome {
+        return match o {
+            "guardrail_block" | "guardrail_blocked" => "guardrail_block",
+            "content_filter" => "content_filter",
+            "budget_exceeded" => "budget_exceeded",
+            "refusal" => "refusal",
+            _ => "other",
+        };
+    }
+    match status {
+        200..=299 => "ok",
+        402 => "budget_exceeded",
+        401 | 403 => "auth_denied",
+        429 => "rate_limited",
+        408 | 504 => "timeout",
+        500..=599 => "upstream_5xx",
+        400..=499 => "client_error",
+        _ => "other",
     }
 }
 
@@ -1011,6 +1054,7 @@ pub(super) fn emit_access_log_entry(
         tenant_id: context.tenant_id,
         auth_type: context.auth_type,
         principal_kind: context.principal_kind,
+        api_key_id: context.api_key_id,
         served_from_cache: context.served_from_cache,
         fallback_triggered: context.fallback_triggered,
         retry_count: context.retry_count,
@@ -1101,5 +1145,46 @@ pub(super) fn emit_access_log_entry(
             }
         }
         _ => entry.emit(),
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::ai_outcome_label;
+
+    /// WOR-1496: status-derived outcomes map into the closed set, with
+    /// 402 distinguished as a budget block (not a generic client error).
+    #[test]
+    fn outcome_label_from_status() {
+        assert_eq!(ai_outcome_label(200, None), "ok");
+        assert_eq!(ai_outcome_label(402, None), "budget_exceeded");
+        assert_eq!(ai_outcome_label(401, None), "auth_denied");
+        assert_eq!(ai_outcome_label(403, None), "auth_denied");
+        assert_eq!(ai_outcome_label(429, None), "rate_limited");
+        assert_eq!(ai_outcome_label(504, None), "timeout");
+        assert_eq!(ai_outcome_label(503, None), "upstream_5xx");
+        assert_eq!(ai_outcome_label(400, None), "client_error");
+    }
+
+    /// The AI-specific override wins over the status, so a guardrail
+    /// block (wire status 400 / 403) is not mislabeled as a client or
+    /// auth error.
+    #[test]
+    fn outcome_label_override_wins() {
+        assert_eq!(
+            ai_outcome_label(400, Some("guardrail_block")),
+            "guardrail_block"
+        );
+        assert_eq!(
+            ai_outcome_label(403, Some("guardrail_block")),
+            "guardrail_block"
+        );
+        assert_eq!(
+            ai_outcome_label(200, Some("content_filter")),
+            "content_filter"
+        );
+        // An unknown override degrades to `other` rather than leaking an
+        // unbounded label.
+        assert_eq!(ai_outcome_label(200, Some("bogus")), "other");
     }
 }

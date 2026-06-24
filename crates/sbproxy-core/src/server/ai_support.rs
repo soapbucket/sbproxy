@@ -1273,6 +1273,7 @@ pub(super) fn emit_ai_billing_event(
     scope_keys: Vec<String>,
     tags: &sbproxy_ai::attribution::AttributionTags,
     tenant_id: &str,
+    api_key_id: &str,
     ai_span: &tracing::Span,
 ) -> u64 {
     let cost_usd_micros = cost_usd_to_micros(cost_usd);
@@ -1305,6 +1306,8 @@ pub(super) fn emit_ai_billing_event(
         provider_name,
         model_label,
         surface_label,
+        tenant_id,
+        api_key_id,
         tags,
         input_tokens,
         output_tokens,
@@ -1333,6 +1336,8 @@ pub(super) fn emit_ai_billing_event(
             provider_name,
             model_label,
             surface_label,
+            tenant_id,
+            api_key_id,
             tags,
             *seconds,
         );
@@ -1372,6 +1377,16 @@ pub(super) fn cost_usd_to_micros(cost_usd: f64) -> u64 {
 /// rather than failing the request. The result is stamped on
 /// `ctx.attribution_tags` and fanned out to the per-attribution spend
 /// metric and the access log.
+///
+/// Trust boundary (WOR-1495): only the *business* tags
+/// (project / feature / okr / customer / environment / agent_type /
+/// risk_tier / trace_id) are caller-overridable here. The
+/// authoritative identity dimensions, `tenant_id` and `api_key_id`,
+/// are NOT part of `AttributionTags` and are never read from a request
+/// header. They are sourced from the resolved `Principal`
+/// (`ctx.tenant_id` and `principal.api_key_id()`) at the billing choke
+/// point, so a caller cannot spoof which tenant or credential its
+/// spend is charged to.
 pub(super) fn resolve_attribution_tags(
     session: &Session,
     principal: &sbproxy_plugin::Principal,
@@ -1410,8 +1425,15 @@ pub(super) fn resolve_attribution_tags(
 /// payload; its `usage` block (when present) gives the token counts,
 /// and its `model` field (falling back to `fallback_model`) gives the
 /// model label.
+// Deliberate: this is the cache-hit billing choke point; each arg is a
+// distinct attribution dimension (tenant, credential, origin, provider,
+// model, surface) that must reach the spend metric, and bundling them
+// into a struct here would just move the boilerplate without improving
+// clarity.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn record_cache_hit_savings(
     tenant: &str,
+    api_key_id: &str,
     origin: &str,
     provider: &str,
     fallback_model: &str,
@@ -1444,6 +1466,8 @@ pub(super) fn record_cache_hit_savings(
         provider,
         model,
         surface,
+        tenant,
+        api_key_id,
         tags,
         0,
         0,

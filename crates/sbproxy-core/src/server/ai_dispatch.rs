@@ -199,6 +199,7 @@ pub(super) async fn handle_ai_proxy(
             Vec::new(),
             &ctx.attribution_tags,
             ctx.tenant_id.as_str(),
+            ctx.principal.api_key_id(),
             &ai_span,
         );
         return relay_ai_response(
@@ -341,6 +342,7 @@ pub(super) async fn handle_ai_proxy(
             Vec::new(),
             &ctx.attribution_tags,
             ctx.tenant_id.as_str(),
+            ctx.principal.api_key_id(),
             &ai_span,
         );
         // WOR-1044 PR3: the GET-method-aware path runs before the
@@ -584,6 +586,7 @@ pub(super) async fn handle_ai_proxy(
                 Vec::new(),
                 &ctx.attribution_tags,
                 ctx.tenant_id.as_str(),
+                ctx.principal.api_key_id(),
                 &ai_span,
             );
             if cost_micros > 0 {
@@ -603,6 +606,7 @@ pub(super) async fn handle_ai_proxy(
             Vec::new(),
             &ctx.attribution_tags,
             ctx.tenant_id.as_str(),
+            ctx.principal.api_key_id(),
             &ai_span,
         );
         record_ai_provider_response_failure(
@@ -803,6 +807,13 @@ pub(super) async fn handle_ai_proxy(
                         .collect(),
                     roles: Vec::new(),
                     claims: None,
+                    // Per-credential reporting id for the virtual key.
+                    // The operator-supplied stable name only; never the
+                    // raw `vk.key` secret. `None` when the key is
+                    // unnamed so the metric falls back to the
+                    // un-credentialed bucket rather than leaking key
+                    // material.
+                    key_id: vk.name.clone(),
                 };
                 // Reflect the matched key name into `sub` so the
                 // access-log + principal_kind columns can show which
@@ -1141,6 +1152,10 @@ pub(super) async fn handle_ai_proxy(
                         sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                         &block.reason,
                     );
+                    // WOR-1496: a guardrail block surfaces as a generic
+                    // 400, so stamp the precise outcome for the
+                    // value-vs-waste metric.
+                    ctx.ai_outcome = Some("guardrail_block".to_string());
                     let error_body = serde_json::json!({
                         "error": {
                             "message": block.reason,
@@ -1169,6 +1184,10 @@ pub(super) async fn handle_ai_proxy(
                         sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                         &block.reason,
                     );
+                    // WOR-1496: a guardrail block surfaces as a generic
+                    // 400, so stamp the precise outcome for the
+                    // value-vs-waste metric.
+                    ctx.ai_outcome = Some("guardrail_block".to_string());
                     let error_body = serde_json::json!({
                         "error": {
                             "message": block.reason,
@@ -1200,6 +1219,9 @@ pub(super) async fn handle_ai_proxy(
                             sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                             &block.reason,
                         );
+                        // WOR-1496: stamp the precise outcome (the wire
+                        // status is a generic 400).
+                        ctx.ai_outcome = Some("guardrail_block".to_string());
                         let error_body = serde_json::json!({
                             "error": {
                                 "message": block.reason,
@@ -1445,6 +1467,7 @@ pub(super) async fn handle_ai_proxy(
                             // shows up as savings.
                             crate::server::ai_support::record_cache_hit_savings(
                                 ctx.tenant_id.as_str(),
+                                ctx.principal.api_key_id(),
                                 hostname,
                                 cache.provider(),
                                 cache.model(),
@@ -1560,11 +1583,18 @@ pub(super) async fn handle_ai_proxy(
                     .filter_map(|m| serde_json::from_value::<sbproxy_ai::Message>(m.clone()).ok())
                     .collect();
                 let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                // WOR-1499: stamp the request-path prompt accounting on
+                // the context: the estimate (also reused as the
+                // failed/blocked-request token volume in WOR-1497) and a
+                // salted, non-reversible fingerprint that lets identical
+                // prompts be correlated without persisting prompt text.
+                ctx.ai_prompt_fingerprint = Some(sbproxy_ai::prompt_fingerprint(model, &msgs));
                 sbproxy_ai::estimate_tokens(model, &msgs)
             })
         } else {
             None
         };
+    ctx.ai_prompt_tokens_est = estimated_prompt_tokens_for_budget;
 
     // Parse retry config from the action config's routing.retry section.
     // This is done by inspecting the raw handler config.
@@ -1776,6 +1806,7 @@ pub(super) async fn handle_ai_proxy(
                         Vec::new(),
                         &ctx.attribution_tags,
                         ctx.tenant_id.as_str(),
+                        ctx.principal.api_key_id(),
                         &ai_span,
                     );
                     // Drop any idempotency capture: cascade does not
@@ -1985,6 +2016,20 @@ pub(super) async fn handle_ai_proxy(
                         None
                     }
                 };
+                // WOR-1501: capture upstream model latency for the
+                // accepted response, keyed by the same authoritative
+                // identity dimensions as the spend metrics so p95
+                // latency is sliceable per tenant / credential / model
+                // (not just globally per provider/model). Measured once
+                // per request, on the attempt we keep.
+                sbproxy_ai::ai_metrics::record_model_latency(
+                    &provider.name,
+                    ctx.ai_model.as_deref().unwrap_or(""),
+                    surface_label,
+                    ctx.tenant_id.as_str(),
+                    ctx.principal.api_key_id(),
+                    attempt_start.elapsed().as_secs_f64(),
+                );
                 last_provider_name = provider.name.to_string();
                 last_resp = Some(resp);
                 break;
@@ -2095,6 +2140,7 @@ pub(super) async fn handle_ai_proxy(
                 rerank_documents: rerank_documents_for_billing,
                 attribution_tags: ctx.attribution_tags.clone(),
                 tenant_id: ctx.tenant_id.to_string(),
+                api_key_id: ctx.principal.api_key_id().to_string(),
                 estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
             });
             let stream_router_sink = RouterTokenSink {
@@ -2180,6 +2226,7 @@ pub(super) async fn handle_ai_proxy(
                 rerank_documents: rerank_documents_for_billing,
                 attribution_tags: ctx.attribution_tags.clone(),
                 tenant_id: ctx.tenant_id.to_string(),
+                api_key_id: ctx.principal.api_key_id().to_string(),
                 estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
             });
             let cache_router_sink = RouterTokenSink {
@@ -2604,6 +2651,13 @@ pub(super) async fn relay_ai_response_with_cache(
                         sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                         &block.reason,
                     );
+                    // WOR-1496: the block returns a 403, which the
+                    // status-derived outcome would mislabel as
+                    // `auth_denied`; stamp the precise outcome so the
+                    // value-vs-waste metric attributes it correctly.
+                    if let Some(c) = ctx.as_mut() {
+                        c.ai_outcome = Some("guardrail_block".to_string());
+                    }
                     // WOR-1093: the upstream already produced (and
                     // billed) this 2xx response; an output guardrail
                     // then rejected it, so the spend bought no served
@@ -2882,6 +2936,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 scope_keys,
                 &args.attribution_tags,
                 args.tenant_id.as_str(),
+                args.api_key_id.as_str(),
                 &ai_span,
             );
             if cost_micros > 0 {
@@ -2925,6 +2980,7 @@ pub(super) async fn relay_ai_response_with_cache(
                     Vec::new(),
                     &ctx.attribution_tags,
                     ctx.tenant_id.as_str(),
+                    ctx.principal.api_key_id(),
                     &ai_span,
                 );
                 if cost_micros > 0 {
@@ -3297,6 +3353,12 @@ pub(super) struct BudgetRecorderArgs<'a> {
     /// relay can emit tenant-labelled cost metrics without borrowing
     /// the request context.
     tenant_id: String,
+    /// Resolved per-credential reporting id (the API key that injected
+    /// the policy). Carried by value alongside `tenant_id` so the relay
+    /// can emit the authoritative identity dimensions on the spend
+    /// metric without borrowing the request context. Empty string when
+    /// the request was not credentialed.
+    api_key_id: String,
     /// WOR-1146: estimated prompt tokens for a chat_completions
     /// request, captured from the request body at dispatch. Used only
     /// as the prompt side of the fallback budget debit when a 2xx
@@ -3937,6 +3999,7 @@ pub(super) async fn relay_ai_stream(
                     scope_keys,
                     &args.attribution_tags,
                     args.tenant_id.as_str(),
+                    args.api_key_id.as_str(),
                     &ai_span,
                 );
 
