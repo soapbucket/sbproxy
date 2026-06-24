@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Load balancer (round-robin)](../../docs/assets/load-balancer.gif)
+
 The `load_balancer` action dispatches each request across a pool of upstream targets using the `round_robin` algorithm. Two targets are configured with equal weights. Both point at `test.sbproxy.dev` for demonstration, so per-target traffic distribution is not visible from the response body, but the example confirms the pool dispatches successfully and serves 200s on every iteration. In production you would point each target at a distinct replica address.
 
 ## Run

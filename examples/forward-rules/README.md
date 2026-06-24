@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Forward rules](../../docs/assets/forward-rules.gif)
+
 A single origin on `gateway.local` dispatches incoming requests to three different inline child origins based on path. Requests to `/api/*` proxy to `dummyjson.com` with the `/api` prefix stripped, `/admin/*` returns a static JSON banner, and anything else falls through to the default action that proxies to `test.sbproxy.dev/anything`. Forward rules are evaluated in order; first match wins. Each rule embeds a full child origin via the `origin:` field so rules can carry their own action and request modifiers.
 
 ## Run

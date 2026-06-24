@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Fallback origin](../../docs/assets/fallback-origin.gif)
+
 The primary action proxies to `test.sbproxy.dev/status/503`, which always returns 503. The `fallback_origin` block defines a backup origin served when the primary returns a status listed in `on_status` (502, 503, 504) or fails at the transport level (`on_error: true`). Clients see the fallback's static action: a 200 response carrying a friendly degraded JSON body. `add_debug_header: true` stamps an `X-Fallback` header so callers can tell when the fallback path was taken.
 
 ## Run

@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Connection pool](../../docs/assets/connection-pool.gif)
+
 The `connection_pool` block on `api.local` sizes the proxy's outbound HTTP client for this origin. `max_connections: 32` caps concurrent in-flight upstream connections, `idle_timeout_secs: 60` reaps idle keep-alive connections after a minute, and `max_lifetime_secs: 300` is the hard ceiling on any single connection's lifetime. Tune these when an upstream is sensitive to too many concurrent connections, or when an LB aggressively terminates long-lived TCP sessions.
 
 ## Run

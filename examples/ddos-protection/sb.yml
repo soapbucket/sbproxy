@@ -18,14 +18,10 @@
 #   make run CONFIG=examples/ddos-protection/sb.yml
 #
 # Test:
-#   # 200 under threshold
-#   curl -i -H 'Host: ddos.local' http://127.0.0.1:8080/echo
-#
-#   # Burst past the threshold; later requests return 429 with Retry-After
-#   for i in $(seq 1 15); do
-#     curl -s -o /dev/null -w "%{http_code} " -H 'Host: ddos.local' \
-#       http://127.0.0.1:8080/echo
-#   done; echo
+#   # Burst past the threshold concurrently; once tripped, the IP is
+#   # blocked and every request returns 429 with Retry-After.
+#   seq 1 30 | xargs -P 30 -I{} curl -s -o /dev/null -w '%{http_code}\n' \
+#     -H 'Host: ddos.local' http://127.0.0.1:8080/echo | sort | uniq -c
 #
 #   # The block clears automatically after block_duration. Watch it
 #   # recover with: sleep 11 && curl -i -H 'Host: ddos.local' \

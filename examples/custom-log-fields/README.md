@@ -1,5 +1,7 @@
 # custom-log-fields
 
+![custom-log-fields](../../docs/assets/custom-log-fields.gif)
+
 Operator-defined custom access-log fields. `observability.log.custom_fields:` adds keys to each access line's `custom` object, computed per request from either a static value with `${...}` variable interpolation or a script (CEL, Lua, or JS) evaluated against the request context. Use it to pivot logs on dimensions the built-in schema does not carry (region, deployment, a derived tier, a routing decision) without forking the binary.
 
 ## Run

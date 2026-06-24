@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![JSON projection transform](../../docs/assets/transform-json-projection.gif)
+
 Demonstrates the `json_projection` transform in whitelist mode. Only the listed fields (`id`, `title`) survive in the response; everything else is dropped. Same shape used by GraphQL field selection or sparse fieldsets. A self-contained `static` action seeds a four-field document so the example works offline. The origin is reached on `127.0.0.1:8080` via the `project.local` Host header.
 
 ## Run

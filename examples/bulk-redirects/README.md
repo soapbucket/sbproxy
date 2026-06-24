@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Bulk redirects](../../docs/assets/bulk-redirects.gif)
+
 Each origin owns its own redirect list, compiled at config-load into an O(1) lookup keyed on the request path. Three sources are supported: inline `rows:`, a local file via `path:`, or an HTTPS URL via `url:`. This example ships two origins. `marketing.local` reads `redirects.csv` next door (default 301 status, `preserve_query: true`). `shop.local` ships an inline list with per-row status overrides (308 for `/category/legacy`, default 302 for the others) and falls back to `https://shop.example.com/` for unmapped paths.
 
 ## Run

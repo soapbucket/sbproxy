@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![SNI and resolve overrides](../../docs/assets/sni-resolve-override.gif)
+
 Two siblings of `action.url` change how the proxy reaches the upstream without touching the URL itself. `sni_override: cdn.provider.net` sends that name in the TLS ClientHello SNI extension and validates the upstream cert against it; useful when the cert hostname differs from the URL host (typical SaaS-fronting pattern). `resolve_override: 203.0.113.7:443` pins the connect address, equivalent to `curl --connect-to`; the request line and `Host` header still use the URL host. The two are independent and compose with `host_override`.
 
 ## Run

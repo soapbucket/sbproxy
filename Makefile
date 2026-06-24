@@ -108,6 +108,14 @@ lint-all: ## Run clippy across the entire workspace
 
 check: fmt-check lint test ## Run the pre-commit check bundle (format, lint, test)
 
+# --- Cassettes ---------------------------------------------------------------
+
+tapes: build-release ## Record VHS cassettes (docs/tapes/*.tape -> docs/assets/*.gif)
+	scripts/record-tapes.sh $(TAPE)
+
+tapes-gen: ## Regenerate per-example tapes from their documented curls
+	python3 scripts/gen-example-tapes.py
+
 # --- Docker ------------------------------------------------------------------
 
 docker docker-build: ## Build the proxy container image

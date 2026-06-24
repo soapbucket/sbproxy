@@ -20,14 +20,14 @@
 #     -H 'Host: ai.local' \
 #     -H 'Content-Type: application/json' \
 #     -d '{
-#       "model": "claude-3-5-sonnet-latest",
+#       "model": "claude-haiku-4-5",
 #       "messages": [{"role": "user", "content": "Summarise the budget config."}]
 #     }'
 #
 # Expected behaviour:
-#   Under the limits, requests run on claude-3-5-sonnet-latest. Once
+#   Under the limits, requests run on claude-haiku-4-5. Once
 #   workspace monthly spend reaches $500, new requests are rewritten to
-#   claude-3-5-haiku-latest. Once an API key burns through 1M tokens in
+#   claude-haiku-4-5. Once an API key burns through 1M tokens in
 #   one day, that key is rewritten to anthropic/claude-3-haiku via
 #   OpenRouter. Each downgrade fires the sbproxy_ai_budget_utilization_ratio
 #   gauge.
@@ -44,10 +44,10 @@ origins:
       providers:
         - name: anthropic
           api_key: ${ANTHROPIC_API_KEY}
-          default_model: claude-3-5-sonnet-latest
+          default_model: claude-haiku-4-5
           models:
-            - claude-3-5-sonnet-latest
-            - claude-3-5-haiku-latest
+            - claude-haiku-4-5
+            - claude-haiku-4-5
         - name: openrouter
           api_key: ${OPENROUTER_API_KEY}
           default_model: anthropic/claude-3.5-sonnet
@@ -61,7 +61,7 @@ origins:
           - scope: workspace
             max_cost_usd: 500
             period: monthly
-            downgrade_to: claude-3-5-haiku-latest
+            downgrade_to: claude-haiku-4-5
           - scope: api_key
             max_tokens: 1000000
             period: daily

@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Template transform (minijinja)](../../docs/assets/transform-template.gif)
+
 Demonstrates the `template` transform. A `static` action emits a JSON document describing an order; the `template` transform parses that JSON as the input context and renders a minijinja template producing a human-readable plaintext receipt. A `response_modifier` rewrites `Content-Type` to `text/plain; charset=utf-8`. The origin is reached on `127.0.0.1:8080` via the `tmpl.local` Host header.
 
 ## Run

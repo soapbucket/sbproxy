@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Request limit](../../docs/assets/request-limit.gif)
+
 Demonstrates the `request_limit` policy. Caps the request body at `1024` bytes, the header count at `20`, and the URL length at `256` characters before the `test.sbproxy.dev` upstream is contacted. Anything past those limits is rejected at the edge so the upstream never sees an oversized payload. Listener is `127.0.0.1:8080` and the origin matches the `limit.local` Host header.
 
 ## Run

@@ -39,7 +39,7 @@ origins:
           default_model: gpt-4o-mini
         - name: anthropic
           api_key: ${ANTHROPIC_API_KEY}
-          default_model: claude-3-5-haiku-latest
+          default_model: claude-haiku-4-5
         - name: groq
           api_key: ${GROQ_API_KEY}
           default_model: llama-3.1-8b-instant

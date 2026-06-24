@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Basic reverse proxy](../../docs/assets/basic-proxy.gif)
+
 The simplest possible sbproxy configuration. A single origin keyed on `myapp.example.com` forwards every inbound request to `https://test.sbproxy.dev`, sbproxy's public HTTP echo service. The proxy listens on `127.0.0.1:8080`, matches the `Host` header to the configured origin, and rewrites the request line to point at the upstream. The echo service replies with the inbound request serialised as JSON, so you can confirm headers, method, and path made it through unchanged.
 
 ## Run

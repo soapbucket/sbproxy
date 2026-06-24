@@ -1,6 +1,8 @@
 # AI Crawl Control with tiered pricing
 *Last modified: 2026-04-30*
 
+![AI Crawl Control with tiered pricing](../../docs/assets/ai-crawl-tiered.gif)
+
 Demonstrates a three-tier paywall in front of an article-publishing
 origin. Known AI crawlers see a free preview window for short URLs, a
 charged Markdown feed for `/feed/articles/*`, and a charged HTML

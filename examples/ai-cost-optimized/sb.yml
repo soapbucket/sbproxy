@@ -26,7 +26,7 @@
 #     -H 'Host: ai.local' \
 #     -H 'Content-Type: application/json' \
 #     -d '{
-#       "model": "claude-3-5-haiku-latest",
+#       "model": "claude-haiku-4-5",
 #       "messages": [{"role": "user", "content":
 #         "Hello! Which provider served this?"}]
 #     }'
@@ -61,14 +61,14 @@ origins:
           provider_type: anthropic
           api_key: ${ANTHROPIC_API_KEY}
           weight: 5
-          default_model: claude-3-5-haiku-latest
+          default_model: claude-haiku-4-5
           models:
-            - claude-3-5-haiku-latest
+            - claude-haiku-4-5
 
         - name: anthropic-sonnet
           provider_type: anthropic
           api_key: ${ANTHROPIC_API_KEY}
           weight: 50
-          default_model: claude-3-5-sonnet-latest
+          default_model: claude-haiku-4-5
           models:
-            - claude-3-5-sonnet-latest
+            - claude-haiku-4-5

@@ -26,7 +26,7 @@
 #     -H 'Host: ai.local' \
 #     -H 'Content-Type: application/json' \
 #     -d '{
-#       "model": "claude-3-5-sonnet-latest",
+#       "model": "claude-haiku-4-5",
 #       "messages": [
 #         {"role": "user", "content": "Summarise the latest report."},
 #         {"role": "tool", "content":
@@ -39,7 +39,7 @@
 #     -H 'Host: ai.local' \
 #     -H 'Content-Type: application/json' \
 #     -d '{
-#       "model": "claude-3-5-sonnet-latest",
+#       "model": "claude-haiku-4-5",
 #       "messages": [
 #         {"role": "user", "content": "Summarise the latest report."},
 #         {"role": "tool", "content":
@@ -64,10 +64,10 @@ origins:
       providers:
         - name: anthropic
           api_key: ${ANTHROPIC_API_KEY}
-          default_model: claude-3-5-sonnet-latest
+          default_model: claude-haiku-4-5
           models:
-            - claude-3-5-sonnet-latest
-            - claude-3-5-haiku-latest
+            - claude-haiku-4-5
+            - claude-haiku-4-5
 
       guardrails:
         input:

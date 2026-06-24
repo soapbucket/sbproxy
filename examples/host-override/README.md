@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Host override](../../docs/assets/host-override.gif)
+
 By default the proxy sends the upstream URL's hostname in the upstream `Host` header (so vhost-routed services like Vercel, Cloudflare-fronted origins, S3 website endpoints, and AWS ALBs work out of the box). When the upstream expects a different `Host` than its DNS name (CDN-fronted services, multi-tenant SaaS), set `host_override`. Whenever the proxy rewrites `Host`, it also sets `X-Forwarded-Host` to the client's original `Host` so the upstream can still observe the public name.
 
 ## Run

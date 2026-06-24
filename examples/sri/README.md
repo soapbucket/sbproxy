@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Subresource Integrity (SRI) inspection](../../docs/assets/sri.gif)
+
 Demonstrates the `sri` policy in observation mode. The proxy walks `text/html` responses, inspects every `<script src="https://...">` and `<link rel="stylesheet" href="https://...">` pointing at an external origin, and checks for an `integrity="..."` attribute that uses one of the configured algorithms (`sha384` or `sha512` here). Missing or mismatched references are logged at warn level and counted in the `sbproxy_policy_triggers_total{policy_type="sri"}` metric. The proxy does not modify the body; SRI is a browser-side mechanism and the proxy's value is alerting an operator that a page is missing integrity coverage. Same-origin references and inline scripts are skipped per the SRI spec. The origin lives on `127.0.0.1:8080` behind the `sri.local` Host header and is served by a `static` action containing one violating `<link>` and one compliant `<script>`.
 
 ## Run

@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Web Bot Auth](../../docs/assets/web-bot-auth.gif)
+
 Cryptographic agent verification under RFC 9421 HTTP Message Signatures and the IETF Web Bot Auth draft. AI agents (crawlers, indexers, research bots) sign each request with an Ed25519 key and advertise the key id in the `Signature-Input` header. The gateway verifies the signature against a directory of agent public keys; only agents with valid signatures pass through. OSS ships the inline directory shape used here; a periodic-refresh JWKS-style directory wires onto the same `Directory` trait. `clock_skew_seconds` bounds replay; `required_components` defaults to `["@method", "@target-uri"]` so a signature that only covers a header cannot be replayed against a different verb or URL.
 
 ## Run

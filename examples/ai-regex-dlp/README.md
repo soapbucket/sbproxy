@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Custom regex DLP guardrail on AI traffic](../../docs/assets/ai-regex-dlp.gif)
+
 Built-in PII detection covers the obvious patterns (email, phone, SSN, credit card). Real organisations have their own confidential vocabulary: project codenames, internal doc IDs, source-control URLs, support ticket numbers. A regex guardrail extends the input pipeline with arbitrary patterns so confidential data never leaves the building, even if a developer accidentally pastes it into an AI request. Three layers run on every prompt: built-in PII detection (block on hit), a `regex` guardrail (`action: block`) with operator-supplied patterns blocking project codenames and internal references, and a second `regex` guardrail (`action: allow`) that acts as a positive filter requiring at least one approved engineering keyword. All three run before the upstream provider is contacted; a hit returns a 4xx with `sbproxy_ai_guardrail_blocks_total` incremented under the matching category.
 
 ## Run

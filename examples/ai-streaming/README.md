@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![AI gateway: SSE streaming](../../docs/assets/ai-streaming.gif)
+
 Streaming is on by default in the AI gateway. The minimal Anthropic origin in this example handles `"stream": true` requests end-to-end: sbproxy opens a server-sent-events connection to the upstream, forwards each chunk as it arrives, and harvests token usage from the final chunk into the `sbproxy_ai_tokens_total` counter. The streaming analytics module records time-to-first-token, tokens per second, and average inter-token latency for every streamed request. No special config is required; the behaviour is selected by the client request body.
 
 ## Run

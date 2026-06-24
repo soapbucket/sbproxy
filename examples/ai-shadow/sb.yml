@@ -46,9 +46,9 @@ origins:
           default_model: gpt-4o-mini
         - name: anthropic
           api_key: ${ANTHROPIC_API_KEY}
-          default_model: claude-3-5-haiku-latest
+          default_model: claude-haiku-4-5
       shadow:
         provider: anthropic
         sample_rate: 0.1
         timeout_ms: 30000
-        # model: claude-3-5-haiku-latest   # uncomment to override
+        # model: claude-haiku-4-5   # uncomment to override

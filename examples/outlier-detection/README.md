@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Outlier detection](../../docs/assets/outlier-detection.gif)
+
 A round-robin load balancer with two targets: `test.sbproxy.dev` and `test.sbproxy.dev/status/503`. The `outlier_detection` block tracks each target's success/failure rate over a 60-second sliding window. When the failure rate crosses `threshold: 0.5` and the target has seen at least `min_requests: 5` requests in the window, the target is ejected from selection for `ejection_duration_secs: 30` before being eligible again. Failures are recorded from upstream 5xx responses and from connect-error retries. Active health checks (example 77) feed this same store when both are configured.
 
 ## Run

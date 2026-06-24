@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![WAF (OWASP Core Rule Set)](../../docs/assets/waf.gif)
+
 Demonstrates the `waf` policy with the OWASP Core Rule Set enabled. Each request is screened for common attack signatures (SQL injection, cross-site scripting, path traversal) before it reaches the `test.sbproxy.dev` upstream. With `action_on_match: block`, `test_mode: false`, and `fail_open: false`, any rule hit returns `403` synchronously and never forwards. Toggle `test_mode: true` to log matches without blocking, or set `action_on_match: log` for an alert-only deployment. The origin is selected by the `waf.local` Host header on `127.0.0.1:8080`.
 
 ## Run

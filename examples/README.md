@@ -24,6 +24,19 @@ make run CONFIG=examples/transform-json/sb.yml LOG_LEVEL=debug
 
 Each `sb.yml` opens with a comment block listing the curl commands to drive it.
 
+## Cassettes
+
+Most examples include a short terminal recording (a GIF embedded in the example's README) showing the documented curl commands run against the live proxy. They are produced with [VHS](https://github.com/charmbracelet/vhs):
+
+```bash
+make build-release
+scripts/record-tapes.sh                 # record every cassette
+scripts/record-tapes.sh ai-gateway      # record a single one
+python3 scripts/gen-example-tapes.py    # regenerate per-example tapes
+```
+
+Tapes live in [`../docs/tapes/`](../docs/tapes) and GIFs in [`../docs/assets/`](../docs/assets). AI examples read provider keys from the environment while recording; the keys never appear on screen.
+
 ## Catalog
 
 Auto-generated index of every example. Each row links to the example's

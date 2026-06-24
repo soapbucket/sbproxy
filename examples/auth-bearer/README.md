@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Bearer token authentication](../../docs/assets/auth-bearer.gif)
+
 Accepts a fixed allowlist of opaque service tokens in the `Authorization: Bearer <token>` header. Pick this when callers are services that already manage shared tokens and you do not need the JWT validation surface. The two configured tokens (`svc-token-alpha`, `svc-token-beta`) are matched verbatim. Unknown or missing tokens are rejected with 401 before `test.sbproxy.dev` is contacted.
 
 ## Run

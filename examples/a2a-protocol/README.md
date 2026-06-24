@@ -2,6 +2,8 @@
 
 *Last modified: 2026-05-07*
 
+![A2A protocol envelope and policy](../../docs/assets/a2a-protocol.gif)
+
 The `a2a` policy enforces per-route safety on agent-to-agent traffic. Detection runs once per request and matches three signals: `Content-Type: application/a2a+json` (Google A2A), `MCP-Method: agents.invoke` (Anthropic A2A), and an optional operator route glob. When a request is detected as A2A, the policy applies a chain-depth cap, a cycle check, a callee allowlist, and a caller denylist before the request reaches the upstream. Off-list callers and callees get `403`, depth violations get `429`, and cycles get `409` with structured JSON error bodies.
 
 The runtime always builds an `A2AContext` once detection fires, even when the optional body parsers are off. That means the policy enforces route limits in the OSS default build with no extra cargo features set; the parser features add envelope-aware fields the policy can use, but the safety floor does not depend on them.

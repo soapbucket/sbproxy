@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![CSRF protection](../../docs/assets/csrf.gif)
+
 Demonstrates the `csrf` policy. Safe methods (`GET`, `HEAD`, `OPTIONS`) are exempt and serve as the channel through which the proxy issues the `csrf_token` cookie. State-changing methods (`POST`, `PUT`, `DELETE`, `PATCH`) must echo the token back in the `X-CSRF-Token` request header; mismatches and missing tokens are rejected with `403`. The action is `static` so the example is self-contained and shows the policy in isolation. Listener is `127.0.0.1:8080`, Host header is `csrf.local`.
 
 ## Run

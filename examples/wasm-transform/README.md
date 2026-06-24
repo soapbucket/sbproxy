@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![WASM transform](../../docs/assets/wasm-transform.gif)
+
 Demonstrates the `wasm` response-body transform. The upstream response body is piped through a sandboxed wasm32-wasi module: the body goes in on stdin, whatever the module writes to stdout becomes the new response body. Any wasm32-wasi binary works without custom glue. This example uses the pre-built `examples/wasm/echo-rust/echo.wasm` module which copies stdin to stdout, so the static `hello from sbproxy` body round-trips unchanged. Sandbox limits are conservative: `timeout_ms: 500` aborts modules that exceed wall-clock time via an epoch-interruption trap, and `max_memory_pages: 256` caps memory at 16 MiB (64 KiB per page). The origin is at `127.0.0.1:8080` behind the `wasm.local` Host header.
 
 ## Run

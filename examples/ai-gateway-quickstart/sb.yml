@@ -1,0 +1,74 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway quickstart: one OpenAI-compatible binary, every vendor.
+#
+# This is the "what is sbproxy" example. Point any OpenAI-shaped client at
+# the proxy and reach OpenAI, Anthropic, or Google without changing your
+# request or response handling. Each vendor is a separate origin here, so
+# you pick the upstream by host (openai.local / claude.local / gemini.local);
+# sbproxy translates the request and the response so every answer comes back
+# in OpenAI chat-completion shape.
+#
+# (Routing strategies like round_robin and fallback_chain pick among the
+# providers within a single origin and forward the model as-is; they do not
+# select a provider from the requested model. Use one provider per origin
+# when you want a specific vendor, as below, or an aggregator like OpenRouter
+# when you want many models behind one key.)
+#
+# Setup (bring your own keys):
+#   export OPENAI_API_KEY=sk-...
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   export GEMINI_API_KEY=...
+#   make run CONFIG=examples/ai-gateway-quickstart/sb.yml
+#
+# Same request shape, pick the vendor by host:
+#   # OpenAI
+#   curl -s http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: openai.local' -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"In one sentence, what is a reverse proxy?"}]}' \
+#     | jq -r '.model, .choices[0].message.content'
+#
+#   # Anthropic Claude
+#   curl -s http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: claude.local' -H 'Content-Type: application/json' \
+#     -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"In one sentence, what is a reverse proxy?"}]}' \
+#     | jq -r '.model, .choices[0].message.content'
+#
+#   # Google Gemini
+#   curl -s http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: gemini.local' -H 'Content-Type: application/json' \
+#     -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"In one sentence, what is a reverse proxy?"}]}' \
+#     | jq -r '.model, .choices[0].message.content'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "openai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+
+  "claude.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          default_model: claude-haiku-4-5
+          models:
+            - claude-haiku-4-5
+
+  "gemini.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: gemini
+          api_key: ${GEMINI_API_KEY}
+          default_model: gemini-3.5-flash
+          models:
+            - gemini-3.5-flash

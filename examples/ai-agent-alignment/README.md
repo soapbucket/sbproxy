@@ -1,5 +1,7 @@
 # ai-agent-alignment
 
+![ai-agent-alignment](../../docs/assets/ai-agent-alignment.gif)
+
 Demonstrates the `agent_alignment` input guardrail (WOR-801).
 
 The guardrail audits the assistant's `tool_calls` array against an

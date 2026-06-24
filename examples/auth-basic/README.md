@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![HTTP Basic authentication](../../docs/assets/auth-basic.gif)
+
 Two-user HTTP Basic auth with a custom realm (`"sbproxy demo"`). Useful for quick admin panels and small internal tools. Requests without credentials get a 401 carrying a `WWW-Authenticate: Basic realm="sbproxy demo"` challenge so browsers prompt the user. Credentials are matched against the static `users` list before `test.sbproxy.dev` is contacted. Passwords are stored in plain in this example so it stays reproducible; in production you would interpolate them from the environment or the vault.
 
 ## Run

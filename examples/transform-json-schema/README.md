@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![JSON Schema validation transform](../../docs/assets/transform-json-schema.gif)
+
 Demonstrates the `json_schema` transform. The upstream JSON response body is validated against a JSON Schema compiled once at config-load time (remote `$ref` resolution is disabled, so the schema must be self-contained). Two origins on `127.0.0.1:8080` make the difference visible: `schema-ok.local` returns a body that satisfies the schema, while `schema-bad.local` returns a body whose `id` and `title` fields have the wrong types. With `fail_on_error: true`, a schema violation rejects the response and the proxy returns a synthetic `502`.
 
 ## Run

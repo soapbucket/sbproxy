@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Request mirror](../../docs/assets/request-mirror.gif)
+
 Every request matched by `localhost` is forwarded to the primary upstream `test.sbproxy.dev` as normal AND a copy is fired at `https://test.sbproxy.dev/echo` (the mirror). The mirror response is read and discarded; the client only sees the primary's response. Mirror traffic is fire-and-forget. Method, path/query, and headers are mirrored. Body teeing is opt-in via `mirror_body: true` (capped at `max_body_bytes`, default 1 MiB). `Host` and hop-by-hop headers are skipped on the mirror request so vhost-routing on the shadow destination still works. `sample_rate: 1.0` mirrors every request; lower values down to `0.0` sample. Mirror requests carry `X-Sbproxy-Mirror: 1`.
 
 ## Run

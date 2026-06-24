@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Request modifiers](../../docs/assets/request-modifiers.gif)
+
 Demonstrates the full typed shape of `request_modifiers`. On the way to the upstream, the proxy sets `X-Source: sbproxy` and `Content-Type: application/json`, adds `X-Trace-Id: trace-001`, and removes `X-Internal-Token`. The URL path swap rewrites `/old/` to `/new/`, the query block sets `tenant=prod`, adds `extra=1`, and strips `debug`. The method is overridden to `POST` and the body is replaced with `{"injected":true,"source":"proxy"}`. The upstream is `test.sbproxy.dev`, which echoes back what it observed so each rewrite is verifiable. Origin is reached on `127.0.0.1:8080` via the `api.local` Host header.
 
 ## Run
