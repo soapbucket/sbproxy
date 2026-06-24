@@ -4,7 +4,7 @@
 
 <h1 align="center">SBproxy</h1>
 
-*Last modified: 2026-06-08*
+*Last modified: 2026-06-24*
 
 <h3 align="center">The AI gateway built like a real proxy.</h3>
 

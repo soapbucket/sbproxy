@@ -7,9 +7,73 @@ repository.
 
 ## [Unreleased]
 
-Work that has merged to `main` since the v1.1.0 tag and is queued for
+Work that has merged to `main` since the v1.2.0 tag and is queued for
 the next version cut. No promises about backward compatibility for any
 of the new YAML fields below until the version that ships them.
+
+## [1.2.0] - 2026-06-24
+
+Second minor release on the Rust v1.x line. Headline: local ONNX
+inference for the embedding semantic cache and the prompt-injection
+classifier, a standalone OpenAI-compatible embedding source, a
+best-of-class OpenTelemetry story for the AI gateway, and the move to
+Apache 2.0. No config-breaking changes; existing `sb.yml` files compile
+unchanged.
+
+### Added
+
+- **Local ONNX inference for the semantic cache.** The embedding
+  semantic cache can vectorize prompts on-box, with no per-call API cost
+  and no prompt egress. `source: sidecar` runs the embedder in the
+  supervised classifier sidecar; `source: inprocess` loads an ONNX model
+  (all-MiniLM-L6-v2 by default) into the proxy behind an explicit opt-in
+  and a `max_model_bytes` guard. Prompt-injection v2 gains first-class
+  ONNX detectors (`detector: sidecar`, `detector: inprocess`) next to the
+  zero-dependency heuristic default. See
+  [docs/local-inference.md](docs/local-inference.md).
+- **OpenAI-compatible embedding source** (`source: openai`). Vectorize
+  prompts through any standalone OpenAI-compatible `/v1/embeddings`
+  endpoint, decoupled from the origin's chat providers: point it at
+  another sbproxy that fronts an embedding model, at OpenRouter, or at a
+  hosted provider. Auth defaults to `Authorization: Bearer`; set
+  `auth_header` / `auth_prefix` for `api-key` / `x-api-key` endpoints, or
+  carry the credential in arbitrary extra `headers`.
+- **Best-of-class OpenTelemetry for the AI gateway.** AI spans now carry
+  derived USD cost (and a first-class cost metric), map failures
+  (guardrail, provider 429/5xx, content filter) to span status ERROR with
+  an `error.type`, and emit capture-gated, redacted prompt and completion
+  content as OpenInference / OTel gen_ai span events. A pinned GenAI
+  semantic-convention conformance test guards against attribute drift.
+  The reference stack adds Arize Phoenix and Langfuse with provisioned
+  dashboards, plus cost-aware (ParentBased + TraceIdRatio) trace
+  sampling. [docs/observability.md](docs/observability.md) gains a
+  verified backend matrix.
+- **Per-credential, multi-tenant, multi-model AI value tracking** in the
+  reporting surface.
+- **GCP Secret Manager vault backend** (`gcpsm://`), joining HashiCorp
+  Vault (`vault://`) and AWS Secrets Manager (`awssm://`).
+- Configurable retry on upstream response statuses.
+- Web Bot Auth key IDs now feed the agent identity proof.
+
+### Changed
+
+- **SBproxy OSS is now licensed Apache 2.0.** The previous Business
+  Source License field-of-use restriction is dropped; the project is free
+  for any use, including production and commercial, with no field-of-use
+  limit.
+- **Vault references moved to per-provider schemes.** The scheme now
+  selects the backend (`vault://` HashiCorp, `awssm://` AWS, `gcpsm://`
+  GCP) rather than a `vault://<alias>` umbrella form. The legacy form
+  still resolves during a deprecation window and logs a one-time warning.
+- **HTTP/3 (QUIC) is temporarily disabled** until native support lands in
+  the underlying proxy engine. Existing config still parses, but no
+  HTTP/3 listener starts.
+- The admin playground chat route is gated by default.
+
+### Fixed
+
+- Credential selectors are enforced consistently across request paths,
+  and the AI preference script context is exposed to request scripts.
 
 ## [1.1.0] - 2026-06-06
 
