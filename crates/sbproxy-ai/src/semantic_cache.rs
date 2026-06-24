@@ -124,6 +124,9 @@ pub struct EmbeddingCacheConfig {
     /// In-process embedder (for `source: inprocess`).
     #[serde(default)]
     pub inprocess: Option<InprocessEmbeddingConfig>,
+    /// Standalone OpenAI-compatible endpoint (for `source: openai`).
+    #[serde(default)]
+    pub openai: Option<OpenAiEmbeddingConfig>,
 }
 
 /// Where the semantic cache gets prompt embeddings.
@@ -139,6 +142,10 @@ pub enum EmbeddingSource {
     /// Run an in-process tract embedder. Single-binary, but loads a model
     /// into the proxy address space (opt-in).
     Inprocess,
+    /// Call a standalone OpenAI-compatible `/v1/embeddings` endpoint that is
+    /// not one of the origin's chat providers (another sbproxy, OpenRouter,
+    /// ...). Decoupled from `providers`; carries its own URL + auth.
+    Openai,
 }
 
 /// Which provider + model computes prompt embeddings.
@@ -186,6 +193,54 @@ pub struct InprocessEmbeddingConfig {
     /// Max model size in bytes (guard). None uses the engine default.
     #[serde(default)]
     pub max_model_bytes: Option<u64>,
+}
+
+/// Standalone OpenAI-compatible embedding endpoint config (for `source: openai`).
+///
+/// Unlike `source: provider`, this is not tied to the origin's chat
+/// `providers`: point `base_url` at any OpenAI-compatible `/v1/embeddings`
+/// route (another sbproxy, OpenRouter, ...). Auth defaults to
+/// `Authorization: Bearer <api_key>`; set `auth_header` / `auth_prefix` for
+/// `api-key` / `x-api-key` style endpoints, or omit `api_key` and carry the
+/// auth in `headers`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OpenAiEmbeddingConfig {
+    /// OpenAI-compatible base URL, e.g. `https://api.openai.com/v1`.
+    /// `/v1/embeddings` is appended (an overlapping trailing `/v1` is
+    /// collapsed, matching the chat-provider path join).
+    pub base_url: String,
+    /// Embedding model id, e.g. `text-embedding-3-small`.
+    #[serde(default)]
+    pub model: String,
+    /// Per-call timeout in milliseconds. Defaults to 2000.
+    #[serde(default = "default_openai_timeout_ms")]
+    pub timeout_ms: u64,
+    /// API key. Interpolated (`${VAR}` / vault) by the config layer. When
+    /// set, sent as `{auth_header}: {auth_prefix}{api_key}`.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Auth header name. Defaults to `Authorization`.
+    #[serde(default = "default_auth_header")]
+    pub auth_header: String,
+    /// Prefix prepended to the key in the auth header. Defaults to `Bearer `;
+    /// set to `""` for raw-key headers like `api-key` / `x-api-key`.
+    #[serde(default = "default_auth_prefix")]
+    pub auth_prefix: String,
+    /// Extra static headers, sent verbatim and applied after the auth header
+    /// (e.g. OpenRouter `HTTP-Referer` / `X-Title`, or a custom auth header
+    /// when `api_key` is omitted). Interpolated by the config layer.
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
+}
+
+fn default_openai_timeout_ms() -> u64 {
+    2000
+}
+fn default_auth_header() -> String {
+    "Authorization".to_string()
+}
+fn default_auth_prefix() -> String {
+    "Bearer ".to_string()
 }
 
 fn default_threshold() -> f32 {
@@ -244,6 +299,8 @@ pub struct EmbeddingCache {
     sidecar: Option<SidecarEmbeddingConfig>,
     /// In-process embedder config (for `source: inprocess`).
     inprocess: Option<InprocessEmbeddingConfig>,
+    /// Standalone OpenAI-compatible endpoint config (for `source: openai`).
+    openai: Option<OpenAiEmbeddingConfig>,
     entries: Mutex<LruCache<String, EmbeddingEntry>>,
 }
 
@@ -268,14 +325,14 @@ impl EmbeddingCache {
         // Each source needs its own config block to be usable. A missing
         // block means there is nothing to vectorize with, so the cache
         // stays inert (None) rather than half-built.
-        let (provider, model, sidecar, inprocess) = match cfg.source {
+        let (provider, model, sidecar, inprocess, openai) = match cfg.source {
             EmbeddingSource::Provider => {
                 let e = cfg.embedding.as_ref()?;
-                (e.provider.clone(), e.model.clone(), None, None)
+                (e.provider.clone(), e.model.clone(), None, None, None)
             }
             EmbeddingSource::Sidecar => {
                 let s = cfg.sidecar.as_ref()?;
-                (String::new(), s.model.clone(), Some(s.clone()), None)
+                (String::new(), s.model.clone(), Some(s.clone()), None, None)
             }
             EmbeddingSource::Inprocess => {
                 // The embedder is built and held by sbproxy-core (which can
@@ -283,7 +340,14 @@ impl EmbeddingCache {
                 // cache carries the config so core can load it. Require the
                 // block so a typo'd config does not silently fall back.
                 let p = cfg.inprocess.as_ref()?;
-                (String::new(), p.model.clone(), None, Some(p.clone()))
+                (String::new(), p.model.clone(), None, Some(p.clone()), None)
+            }
+            EmbeddingSource::Openai => {
+                // Standalone OpenAI-compatible endpoint, decoupled from the
+                // origin's chat providers. Require the block so a typo'd
+                // config stays inert rather than silently disabled.
+                let o = cfg.openai.as_ref()?;
+                (String::new(), o.model.clone(), None, None, Some(o.clone()))
             }
         };
         let cap = NonZeroUsize::new(cfg.max_entries.max(1)).expect("max_entries clamped to >= 1");
@@ -295,6 +359,7 @@ impl EmbeddingCache {
             model,
             sidecar,
             inprocess,
+            openai,
             entries: Mutex::new(LruCache::new(cap)),
         })
     }
@@ -310,6 +375,10 @@ impl EmbeddingCache {
     /// In-process embedder config, when `source` is `inprocess`.
     pub fn inprocess_config(&self) -> Option<&InprocessEmbeddingConfig> {
         self.inprocess.as_ref()
+    }
+    /// Standalone OpenAI-compatible endpoint config, when `source` is `openai`.
+    pub fn openai_config(&self) -> Option<&OpenAiEmbeddingConfig> {
+        self.openai.as_ref()
     }
     /// Embedding provider name to vectorize prompts with (provider source).
     pub fn provider(&self) -> &str {
@@ -479,6 +548,74 @@ pub async fn compute_embedding(
     Ok(first.embedding.into_iter().map(|x| x as f32).collect())
 }
 
+/// Build the request headers for a standalone OpenAI-compatible embedding
+/// call (WOR-1520): the auth header from `api_key` + `auth_header` +
+/// `auth_prefix` (when a key is set), then the extra `headers` on top.
+fn openai_request_headers(
+    cfg: &OpenAiEmbeddingConfig,
+) -> anyhow::Result<reqwest::header::HeaderMap> {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+    let mut headers = HeaderMap::new();
+    if let Some(key) = cfg.api_key.as_deref().filter(|k| !k.is_empty()) {
+        let name = HeaderName::from_bytes(cfg.auth_header.as_bytes())
+            .map_err(|e| anyhow::anyhow!("invalid auth_header {:?}: {e}", cfg.auth_header))?;
+        // The error from an invalid value does not echo the value, so a bad
+        // key never lands in logs; still mark it sensitive for good measure.
+        let mut value = HeaderValue::from_str(&format!("{}{}", cfg.auth_prefix, key))
+            .map_err(|_| anyhow::anyhow!("api_key produced an invalid auth header value"))?;
+        value.set_sensitive(true);
+        headers.insert(name, value);
+    }
+    // Extra headers apply after the auth header (insert replaces on a name
+    // collision), so a custom auth header can be carried here when api_key
+    // is omitted, or override the default.
+    for (raw_name, raw_value) in &cfg.headers {
+        let name = HeaderName::from_bytes(raw_name.as_bytes())
+            .map_err(|e| anyhow::anyhow!("invalid header name {raw_name:?}: {e}"))?;
+        let value = HeaderValue::from_str(raw_value)
+            .map_err(|e| anyhow::anyhow!("invalid value for header {raw_name:?}: {e}"))?;
+        headers.insert(name, value);
+    }
+    Ok(headers)
+}
+
+/// Compute an embedding via a standalone OpenAI-compatible `/v1/embeddings`
+/// endpoint (WOR-1520). Used when `source: openai`. Not tied to the origin's
+/// chat providers: carries its own base URL + auth.
+pub async fn compute_embedding_openai(
+    cfg: &OpenAiEmbeddingConfig,
+    text: &str,
+) -> anyhow::Result<Vec<f32>> {
+    let url = crate::client::build_url(cfg.base_url.trim_end_matches('/'), "/v1/embeddings");
+    let headers = openai_request_headers(cfg)?;
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(cfg.timeout_ms))
+        .build()
+        .map_err(|e| anyhow::anyhow!("openai embed client build: {e}"))?;
+    let body = serde_json::json!({ "model": cfg.model, "input": text });
+    let resp = http
+        .post(&url)
+        .headers(headers)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("openai embed request: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("openai embedding endpoint returned status {status}");
+    }
+    let parsed: crate::types::EmbeddingResponse = resp
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("openai embedding response parse failed: {e}"))?;
+    let first = parsed
+        .data
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("openai embedding response contained no vectors"))?;
+    Ok(first.embedding.into_iter().map(|x| x as f32).collect())
+}
+
 /// L2-normalize a vector. Returns an empty vec for a zero or empty
 /// vector (which then never matches).
 fn normalize(v: &[f32]) -> Vec<f32> {
@@ -571,6 +708,7 @@ mod tests {
             }),
             sidecar: None,
             inprocess: None,
+            openai: None,
         })
         .expect("enabled config builds")
     }
@@ -597,6 +735,7 @@ mod tests {
             }),
             sidecar: None,
             inprocess: None,
+            openai: None,
         };
         assert!(EmbeddingCache::from_config(&cfg).is_none());
     }
@@ -612,6 +751,7 @@ mod tests {
             embedding: None,
             sidecar: None,
             inprocess: None,
+            openai: None,
         };
         assert!(EmbeddingCache::from_config(&cfg).is_none());
     }
@@ -795,5 +935,154 @@ mod tests {
             }
         }
         assert_eq!(present, 8);
+    }
+
+    // --- WOR-1520: standalone OpenAI-compatible embedding endpoint source ---
+
+    #[test]
+    fn openai_source_parses_and_builds_with_defaults() {
+        let cfg: EmbeddingCacheConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "source": "openai",
+            "openai": {
+                "base_url": "https://openrouter.ai/api/v1",
+                "model": "text-embedding-3-small",
+                "api_key": "sk-test"
+            }
+        }))
+        .unwrap();
+        assert_eq!(cfg.source, EmbeddingSource::Openai);
+        let cache =
+            EmbeddingCache::from_config(&cfg).expect("openai cache builds without a provider");
+        assert_eq!(cache.source(), EmbeddingSource::Openai);
+        let oc = cache.openai_config().expect("openai config present");
+        assert_eq!(oc.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(oc.model, "text-embedding-3-small");
+        // Auth defaults: Authorization: Bearer <key>.
+        assert_eq!(oc.auth_header, "Authorization");
+        assert_eq!(oc.auth_prefix, "Bearer ");
+        assert_eq!(oc.timeout_ms, 2000);
+    }
+
+    #[test]
+    fn openai_source_without_block_is_inert() {
+        let cfg: EmbeddingCacheConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "source": "openai"
+        }))
+        .unwrap();
+        // No openai block: nothing to vectorize with, so the cache stays inert.
+        assert!(EmbeddingCache::from_config(&cfg).is_none());
+    }
+
+    #[test]
+    fn openai_headers_default_to_bearer_authorization() {
+        let cfg: OpenAiEmbeddingConfig = serde_json::from_value(serde_json::json!({
+            "base_url": "https://api.openai.com/v1",
+            "model": "text-embedding-3-small",
+            "api_key": "sk-secret"
+        }))
+        .unwrap();
+        let headers = openai_request_headers(&cfg).expect("headers build");
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer sk-secret");
+    }
+
+    #[test]
+    fn openai_headers_support_custom_header_without_prefix() {
+        let cfg: OpenAiEmbeddingConfig = serde_json::from_value(serde_json::json!({
+            "base_url": "https://host/openai",
+            "model": "m",
+            "api_key": "sk-secret",
+            "auth_header": "api-key",
+            "auth_prefix": ""
+        }))
+        .unwrap();
+        let headers = openai_request_headers(&cfg).expect("headers build");
+        assert_eq!(headers.get("api-key").unwrap(), "sk-secret");
+        assert!(headers.get("authorization").is_none());
+    }
+
+    #[test]
+    fn openai_headers_include_extra_static_headers() {
+        let cfg: OpenAiEmbeddingConfig = serde_json::from_value(serde_json::json!({
+            "base_url": "https://openrouter.ai/api/v1",
+            "model": "m",
+            "api_key": "sk",
+            "headers": [["HTTP-Referer", "https://sbproxy.dev"], ["X-Title", "sbproxy"]]
+        }))
+        .unwrap();
+        let headers = openai_request_headers(&cfg).expect("headers build");
+        assert_eq!(headers.get("http-referer").unwrap(), "https://sbproxy.dev");
+        assert_eq!(headers.get("x-title").unwrap(), "sbproxy");
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer sk");
+    }
+
+    #[test]
+    fn openai_headers_allow_header_only_auth_without_api_key() {
+        let cfg: OpenAiEmbeddingConfig = serde_json::from_value(serde_json::json!({
+            "base_url": "https://host/v1",
+            "model": "m",
+            "headers": [["X-API-Key", "raw-secret"]]
+        }))
+        .unwrap();
+        let headers = openai_request_headers(&cfg).expect("headers build");
+        assert_eq!(headers.get("x-api-key").unwrap(), "raw-secret");
+        assert!(headers.get("authorization").is_none());
+    }
+
+    #[tokio::test]
+    async fn compute_embedding_openai_returns_vector_and_sends_auth() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2,0.3]}],"model":"m","usage":{"prompt_tokens":1,"completion_tokens":0,"total_tokens":1}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            req
+        });
+        let cfg: OpenAiEmbeddingConfig = serde_json::from_value(serde_json::json!({
+            "base_url": format!("http://{addr}/v1"),
+            "model": "m",
+            "api_key": "sk-secret"
+        }))
+        .unwrap();
+        let vec = compute_embedding_openai(&cfg, "hello")
+            .await
+            .expect("embedding");
+        assert_eq!(vec.len(), 3);
+        let req = server.await.unwrap();
+        assert!(
+            req.starts_with("POST /v1/embeddings "),
+            "unexpected request line: {req}"
+        );
+        assert!(
+            req.to_lowercase()
+                .contains("authorization: bearer sk-secret"),
+            "auth header not sent: {req}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_embedding_openai_errors_when_endpoint_unreachable() {
+        // Nothing listening here: the call must error so the dispatcher
+        // fails open (treats the lookup as a miss).
+        let cfg: OpenAiEmbeddingConfig = serde_json::from_value(serde_json::json!({
+            "base_url": "http://127.0.0.1:1/v1",
+            "model": "m",
+            "api_key": "sk",
+            "timeout_ms": 200
+        }))
+        .unwrap();
+        assert!(compute_embedding_openai(&cfg, "hello").await.is_err());
     }
 }

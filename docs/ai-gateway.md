@@ -581,10 +581,11 @@ Stores responses keyed by the SHA-256 of the messages array with TTL and capacit
 | `threshold` | float | `0.85` | Minimum cosine similarity for a near-duplicate prompt to hit. |
 | `ttl_secs` | u64 | `3600` | Seconds before an entry is treated as a miss and removed. |
 | `max_entries` | usize | `1024` | Hard cap on cached responses. The oldest insert is evicted on overflow. |
-| `source` | string | `provider` | `provider`, `sidecar`, or `inprocess`. |
+| `source` | string | `provider` | `provider`, `sidecar`, `inprocess`, or `openai`. |
 | `embedding` | object | unset | Provider and model used when `source: provider`. |
 | `sidecar` | object | unset | gRPC endpoint, model, and timeout used when `source: sidecar`. |
 | `inprocess` | object | unset | ONNX model path, tokenizer path, and memory guard used when `source: inprocess`. |
+| `openai` | object | unset | Standalone OpenAI-compatible endpoint (base URL, model, auth) used when `source: openai`. |
 
 The semantic cache is configured on each AI origin under `action.semantic_cache`. The default `source: provider` calls the configured embedding provider's `/v1/embeddings` endpoint:
 
@@ -611,6 +612,22 @@ origins:
 ```
 
 For local embeddings with no provider egress, set `source: sidecar` and run the classifier sidecar with an embedding model. For single-process experiments, `source: inprocess` loads the ONNX model into the proxy process and should be paired with `max_model_bytes`. See [local-inference.md](local-inference.md) and [examples/semantic-cache-local](../examples/semantic-cache-local/sb.yml).
+
+To vectorize via an OpenAI-compatible endpoint that is not one of the origin's chat providers, set `source: openai`. This points the cache at any `/v1/embeddings` URL with its own key, so you can embed through another sbproxy that fronts an embedding model, through OpenRouter, or through a hosted provider, without adding it to `providers`:
+
+```yaml
+      semantic_cache:
+        enabled: true
+        threshold: 0.85
+        source: openai
+        openai:
+          base_url: https://openrouter.ai/api/v1   # or http://sbproxy.internal/v1
+          api_key: ${EMBEDDING_API_KEY}
+          model: text-embedding-3-small
+          timeout_ms: 2000
+```
+
+Auth defaults to `Authorization: Bearer ${api_key}`. For endpoints that expect a different header (Azure `api-key`, an `x-api-key` gateway), set `auth_header` and clear `auth_prefix`; endpoints that need extra headers (such as OpenRouter's `HTTP-Referer` / `X-Title`) take a `headers` list of name/value pairs, sent verbatim. For header-only auth, omit `api_key` and carry the credential in `headers`. The endpoint base URL joins `/v1/embeddings` the same way chat provider base URLs do (an overlapping trailing `/v1` is collapsed). On any embedding error the lookup degrades to an uncached upstream call. See [local-inference.md](local-inference.md) and [examples/semantic-cache-openai](../examples/semantic-cache-openai/sb.yml).
 
 ### Idempotency middleware (RFC 8594)
 

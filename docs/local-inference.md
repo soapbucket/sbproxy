@@ -108,6 +108,14 @@ proceeds to the upstream uncached. The cache never wedges a request.
 The default `source` is `provider`, which calls an AI provider's `/v1/embeddings`
 API. Existing configs are unchanged.
 
+If you would rather reuse a shared embedding model elsewhere than run one on this
+box, set `source: openai` to point the cache at any OpenAI-compatible
+`/v1/embeddings` endpoint (another sbproxy that fronts an embedding model,
+OpenRouter, or a hosted provider), decoupled from this origin's chat providers
+and with its own URL and auth. That source is documented with the AI gateway's
+[semantic cache configuration](./ai-gateway.md#semantic-cache); the rest of this
+guide covers the on-box options.
+
 ## Enable first-class ONNX prompt-injection
 
 Select the sidecar detector in the origin's `prompt_injection_v2` policy (the
