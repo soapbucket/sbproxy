@@ -1410,11 +1410,26 @@ pub(super) async fn handle_ai_proxy(
                             ))
                         }
                     }
+                    sbproxy_ai::semantic_cache::EmbeddingSource::Openai => {
+                        match cache.openai_config() {
+                            Some(oc) => {
+                                sbproxy_ai::semantic_cache::compute_embedding_openai(
+                                    oc,
+                                    &extracted_prompt,
+                                )
+                                .await
+                            }
+                            None => Err(anyhow::anyhow!(
+                                "semantic cache openai source has no openai config"
+                            )),
+                        }
+                    }
                 };
                 let source_label: &str = match cache.source() {
                     sbproxy_ai::semantic_cache::EmbeddingSource::Provider => "provider",
                     sbproxy_ai::semantic_cache::EmbeddingSource::Sidecar => "sidecar",
                     sbproxy_ai::semantic_cache::EmbeddingSource::Inprocess => "inprocess",
+                    sbproxy_ai::semantic_cache::EmbeddingSource::Openai => "openai",
                 };
                 match query_vec_result {
                     Ok(query_vec) => {

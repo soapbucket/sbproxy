@@ -1,0 +1,53 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# OpenAI-compatible embedding endpoint for the semantic cache.
+#
+# The AI gateway's semantic cache serves near-duplicate prompts from
+# cache. This example vectorizes prompts via any OpenAI-compatible
+# /v1/embeddings endpoint (`source: openai`), decoupled from this
+# origin's chat providers: point it at another sbproxy that fronts an
+# embedding model, at OpenRouter, or at any hosted provider.
+#
+# Run the proxy:
+#   make run CONFIG=examples/semantic-cache-openai/sb.yml
+#
+# See docs/local-inference.md for the auth/header knobs and the metrics
+# emitted. For an on-box embedder with no egress, see
+# examples/semantic-cache-local (source: sidecar / inprocess).
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+      routing: round_robin
+      # Embedding semantic cache, vectorized via a standalone
+      # OpenAI-compatible endpoint (not one of the providers above).
+      semantic_cache:
+        enabled: true
+        threshold: 0.85        # cosine similarity for a near-duplicate hit
+        ttl_secs: 3600
+        max_entries: 1024
+        source: openai
+        openai:
+          # Any OpenAI-compatible /v1/embeddings base URL. Point at
+          # another sbproxy (http://sbproxy.internal/v1) or OpenRouter.
+          base_url: https://openrouter.ai/api/v1
+          api_key: ${EMBEDDING_API_KEY}
+          model: text-embedding-3-small
+          timeout_ms: 2000
+          # Auth defaults to: Authorization: Bearer ${api_key}.
+          # For api-key / x-api-key style endpoints, set:
+          #   auth_header: api-key
+          #   auth_prefix: ""
+          # Extra headers are sent verbatim, e.g. OpenRouter ranking headers:
+          #   headers:
+          #     - ["HTTP-Referer", "https://sbproxy.dev"]
+          #     - ["X-Title", "sbproxy"]

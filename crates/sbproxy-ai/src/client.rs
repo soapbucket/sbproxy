@@ -1250,7 +1250,7 @@ pub fn provider_format(provider: &ProviderConfig) -> ProviderFormat {
 /// base="http://api.groq.com/openai/v1", path="/v1/chat/completions"
 ///   -> "http://api.groq.com/openai/v1/chat/completions"
 /// ```
-fn build_url(base_url: &str, path: &str) -> String {
+pub(crate) fn build_url(base_url: &str, path: &str) -> String {
     // Extract the last path segment from the base URL to check for overlap.
     // e.g. "http://host:8080/openai/v1" -> last segment is "/v1"
     if let Some(scheme_end) = base_url.find("://") {

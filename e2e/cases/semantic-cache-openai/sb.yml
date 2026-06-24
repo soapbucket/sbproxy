@@ -1,0 +1,33 @@
+# yaml-language-server: $schema=../../../schemas/sb-config.schema.json
+#
+# WOR-1520: OpenAI-compatible embedding-source semantic-cache e2e fixture.
+# The test replaces __UPSTREAM__ (chat) and __EMBED__ (embeddings) with
+# ephemeral local endpoints before starting the proxy.
+
+proxy:
+  http_bind_port: 0
+
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: "stub-key"
+          base_url: "__UPSTREAM__"
+          allow_private_base_url: true
+          models:
+            - gpt-4o
+      routing:
+        strategy: round_robin
+      semantic_cache:
+        enabled: true
+        threshold: 0.6
+        ttl_secs: 60
+        max_entries: 64
+        source: openai
+        openai:
+          base_url: "__EMBED__"
+          api_key: "embed-secret-key"
+          model: text-embedding-3-small
+          timeout_ms: 2000
