@@ -72,6 +72,12 @@ jobs:
       - name: build sbproxy binary (needed by e2e harness)
         run: cargo build -p sbproxy --locked
 
+      # Some e2e tests spawn a no-default-features build via the harness
+      # (target/no-default-features/); build it so they do not panic with
+      # "no-default-features sbproxy binary missing".
+      - name: build no-default-features sbproxy binary (needed by e2e harness)
+        run: CARGO_TARGET_DIR=target/no-default-features cargo build -p sbproxy --no-default-features --locked
+
       - name: test (single thread)
         run: cargo test --workspace --locked -- --test-threads=1
 

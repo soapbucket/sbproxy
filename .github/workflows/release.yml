@@ -257,6 +257,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Docker Hub (soapbucket org). Authenticates with an organization
+      # access token stored as the DOCKERHUB_TOKEN secret; the login user
+      # is the org namespace.
+      - name: log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: soapbucket
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: derive tag
         id: meta
         shell: bash
@@ -264,6 +274,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "image=${REGISTRY}/${IMAGE_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "dockerhub_image=docker.io/soapbucket/sbproxy" >> "${GITHUB_OUTPUT}"
 
       - name: build and push image
         id: push
@@ -275,30 +286,46 @@ jobs:
           tags: |
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
             ${{ steps.meta.outputs.image }}:latest
+            ${{ steps.meta.outputs.dockerhub_image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.dockerhub_image }}:latest
           provenance: true
           sbom: false
 
       - uses: sigstore/cosign-installer@v3
 
-      - name: sign image with cosign (keyless)
+      - name: sign images with cosign (keyless)
         env:
           COSIGN_EXPERIMENTAL: '1'
         run: |
-          cosign sign --yes \
-            "${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}"
+          for ref in \
+            "${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}" \
+            "${{ steps.meta.outputs.dockerhub_image }}@${{ steps.push.outputs.digest }}"; do
+            cosign sign --yes "$ref"
+          done
 
-      - name: attach sbom attestation to image
+      - name: attach sbom attestation to images
         env:
           COSIGN_EXPERIMENTAL: '1'
         run: |
-          cosign attest --yes \
-            --predicate docker-ctx/sbom.cyclonedx.json \
-            --type cyclonedx \
-            "${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}"
+          for ref in \
+            "${{ steps.meta.outputs.image }}@${{ steps.push.outputs.digest }}" \
+            "${{ steps.meta.outputs.dockerhub_image }}@${{ steps.push.outputs.digest }}"; do
+            cosign attest --yes \
+              --predicate docker-ctx/sbom.cyclonedx.json \
+              --type cyclonedx \
+              "$ref"
+          done
 
-      - name: attest build provenance for image
+      - name: attest build provenance for ghcr image
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ steps.meta.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: attest build provenance for Docker Hub image
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.meta.outputs.dockerhub_image }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true

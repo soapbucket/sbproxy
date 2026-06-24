@@ -30,7 +30,7 @@ Every git tag matching `v*.*.*` triggers the release workflow defined at `.githu
 |---|---|
 | Binaries (tarballs) | GitHub Releases on `soapbucket/sbproxy` |
 | Cosign signature bundles | Same GitHub Release, alongside each tarball |
-| Container images | `ghcr.io/soapbucket/sbproxy` |
+| Container images | `ghcr.io/soapbucket/sbproxy` and `docker.io/soapbucket/sbproxy` (same digest; cosign-signed on both) |
 | CycloneDX SBOM | GitHub Release asset (`sbom.cyclonedx.json`) and cosign attestation on the image |
 | SLSA build provenance | GitHub native attestation (visible via `gh attestation` and the API) |
 
