@@ -1106,7 +1106,7 @@ routing:
   model_selector: >
     request["headers"]["x-plan"] == "pro"
       ? "claude-sonnet-4-20250514"
-      : "claude-3-5-haiku-20241022"
+      : "claude-haiku-4-5"
 ```
 
 ### 8.3 CEL provider selectors

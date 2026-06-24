@@ -122,7 +122,7 @@ origins:
         - name: anthropic
           provider_type: anthropic
           api_key: ${ANTHROPIC_API_KEY}
-          models: [claude-3-5-sonnet-20241022, claude-3-5-haiku-20241022]
+          models: [claude-sonnet-4-5, claude-haiku-4-5]
 
         - name: local
           provider_type: ollama
@@ -172,7 +172,7 @@ action:
       weight: 3
     - name: fallback
       api_key: ${ANTHROPIC_API_KEY}
-      models: [claude-3-5-sonnet-20241022]
+      models: [claude-sonnet-4-5]
       weight: 1
   routing:
     strategy: fallback_chain
@@ -231,10 +231,10 @@ action:
       models: [gpt-4o, gpt-4o-mini]
     - name: anthropic
       api_key: ${ANTHROPIC_API_KEY}
-      models: [claude-3-5-sonnet-20241022]
+      models: [claude-sonnet-4-5]
 ```
 
-A request for `"model": "claude-3-5-sonnet-20241022"` routes to Anthropic; a request for `"model": "gpt-4o"` routes to OpenAI.
+A request for `"model": "claude-sonnet-4-5"` routes to Anthropic; a request for `"model": "gpt-4o"` routes to OpenAI.
 
 ### Cost headers
 

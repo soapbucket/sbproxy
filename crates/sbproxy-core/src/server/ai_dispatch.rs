@@ -1657,6 +1657,18 @@ pub(super) async fn handle_ai_proxy(
             return Ok(());
         }
     }
+    // WOR-1534: model-based provider routing. When the requested model is
+    // declared in one or more providers' `models` lists, restrict the routing
+    // set to those providers so the model name selects the vendor (a provider
+    // that enumerates no models acts as a wildcard and stays eligible). If no
+    // provider declares the model, the order is left unchanged so unenumerated
+    // models still pass straight through to the configured providers. This runs
+    // before the strategy below, so round_robin / fallback_chain / cost_quality
+    // all choose from the model-eligible set.
+    if let Some(eligible) = model_eligible_providers(&provider_order, &config.providers, &model) {
+        provider_order = eligible;
+    }
+
     // WOR-797: cost/quality routing. When configured, score the inbound
     // prompt's difficulty and pin the routing set to the cheap or
     // frontier provider. Composes after the disallow filter: if the
@@ -1997,6 +2009,17 @@ pub(super) async fn handle_ai_proxy(
                     // load distribution and failure rates are visible,
                     // not just the fact that a failover happened.
                     sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
+                    // WOR-1535: count the handover so sbproxy_ai_failovers_total
+                    // reflects real failovers (it was defined but never recorded).
+                    let to_provider = provider_order
+                        .get(attempt + 1)
+                        .map(|&i| config.providers[i].name.clone())
+                        .unwrap_or_default();
+                    sbproxy_ai::ai_metrics::record_failover(
+                        &provider.name,
+                        &to_provider,
+                        &format!("http_{status}"),
+                    );
                     warn!(
                         provider = %provider.name,
                         status = %status,
@@ -2068,6 +2091,12 @@ pub(super) async fn handle_ai_proxy(
                 if attempt + 1 >= max_attempts {
                     break;
                 }
+                // WOR-1535: count the transport-failure handover.
+                let to_provider = provider_order
+                    .get(attempt + 1)
+                    .map(|&i| config.providers[i].name.clone())
+                    .unwrap_or_default();
+                sbproxy_ai::ai_metrics::record_failover(&provider.name, &to_provider, "transport");
                 continue;
             }
         }
@@ -4159,6 +4188,98 @@ fn prepend_system_message(body: &mut serde_json::Value, text: &str) {
         arr.insert(0, sys);
     } else if let Some(obj) = body.as_object_mut() {
         obj.insert("messages".to_string(), serde_json::json!([sys]));
+    }
+}
+
+/// WOR-1534: restrict the routing set to providers that declare the requested
+/// model. A provider with an empty `models` list is a wildcard and stays
+/// eligible. Returns `None` (leave the order unchanged) when the model is
+/// empty, when no provider declares it (so unenumerated models still pass
+/// straight through), or when the filter would not exclude any provider.
+fn model_eligible_providers(
+    order: &[usize],
+    providers: &[sbproxy_ai::ProviderConfig],
+    model: &str,
+) -> Option<Vec<usize>> {
+    if model.is_empty() {
+        return None;
+    }
+    let eligible: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|&i| {
+            let models = &providers[i].models;
+            models.is_empty() || models.iter().any(|m| *m == model)
+        })
+        .collect();
+    (!eligible.is_empty() && eligible.len() < order.len()).then_some(eligible)
+}
+
+#[cfg(test)]
+mod model_routing_tests {
+    use super::model_eligible_providers;
+
+    fn prov(name: &str, models: &[&str]) -> sbproxy_ai::ProviderConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "api_key": "x",
+            "models": models,
+        }))
+        .expect("ProviderConfig fixture")
+    }
+
+    #[test]
+    fn requested_model_selects_declaring_provider() {
+        let providers = vec![
+            prov("openai", &["gpt-4o-mini"]),
+            prov("anthropic", &["claude-haiku-4-5"]),
+            prov("gemini", &["gemini-3.5-flash"]),
+        ];
+        let order = vec![0, 1, 2];
+        assert_eq!(
+            model_eligible_providers(&order, &providers, "gemini-3.5-flash"),
+            Some(vec![2])
+        );
+        assert_eq!(
+            model_eligible_providers(&order, &providers, "gpt-4o-mini"),
+            Some(vec![0])
+        );
+    }
+
+    #[test]
+    fn unenumerated_model_passes_through() {
+        let providers = vec![
+            prov("openai", &["gpt-4o-mini"]),
+            prov("anthropic", &["claude-haiku-4-5"]),
+        ];
+        // No provider declares this model: leave the order unchanged.
+        assert_eq!(model_eligible_providers(&[0, 1], &providers, "gpt-5"), None);
+    }
+
+    #[test]
+    fn empty_models_is_wildcard() {
+        let providers = vec![
+            prov("openai", &["gpt-4o-mini"]),
+            prov("anthropic", &["claude-haiku-4-5"]),
+            prov("openrouter", &[]),
+        ];
+        // The enumerated match plus the wildcard are eligible; the provider
+        // that enumerates a different model is excluded.
+        assert_eq!(
+            model_eligible_providers(&[0, 1, 2], &providers, "gpt-4o-mini"),
+            Some(vec![0, 2])
+        );
+        // For an unenumerated model only the wildcard qualifies.
+        assert_eq!(
+            model_eligible_providers(&[0, 1, 2], &providers, "mystery-model"),
+            Some(vec![2])
+        );
+    }
+
+    #[test]
+    fn empty_model_is_noop() {
+        let providers = vec![prov("openai", &["gpt-4o-mini"])];
+        assert_eq!(model_eligible_providers(&[0], &providers, ""), None);
     }
 }
 

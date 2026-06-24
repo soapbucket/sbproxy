@@ -2,7 +2,7 @@
 
 *Last modified: 2026-04-27*
 
-Different models cost and behave differently, so they each need their own rate cap. The `model_rate_limits` map keys by model name and applies sliding one-minute windows for both requests and tokens. The cap fires regardless of which provider serves the model, so an alias or fallback chain that lands on the same upstream model still counts against the same window. Three caps are configured: `claude-3-5-sonnet-latest` at 60 RPM / 200,000 TPM, `claude-3-5-haiku-latest` at 240 RPM / 600,000 TPM, and the OpenRouter passthrough `anthropic/claude-3.5-sonnet` at 30 RPM / 100,000 TPM.
+Different models cost and behave differently, so they each need their own rate cap. The `model_rate_limits` map keys by model name and applies sliding one-minute windows for both requests and tokens. The cap fires regardless of which provider serves the model, so an alias or fallback chain that lands on the same upstream model still counts against the same window. Three caps are configured: `claude-sonnet-4-5` at 60 RPM / 200,000 TPM, `claude-haiku-4-5` at 240 RPM / 600,000 TPM, and the OpenRouter passthrough `anthropic/claude-3.5-sonnet` at 30 RPM / 100,000 TPM.
 
 ## Run
 
@@ -23,7 +23,7 @@ $ curl -is http://127.0.0.1:8080/v1/chat/completions \
     -H 'Host: ai.local' \
     -H 'Content-Type: application/json' \
     -d '{
-      "model": "claude-3-5-sonnet-latest",
+      "model": "claude-sonnet-4-5",
       "messages": [{"role": "user", "content": "Quick check."}]
     }' | head -n 1
 HTTP/1.1 200 OK
@@ -36,7 +36,7 @@ $ for i in $(seq 1 80); do
     curl -s -o /dev/null -w '%{http_code}\n' \
       http://127.0.0.1:8080/v1/chat/completions \
       -H 'Host: ai.local' -H 'Content-Type: application/json' \
-      -d '{"model":"claude-3-5-sonnet-latest","messages":[{"role":"user","content":"ping"}]}'
+      -d '{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"ping"}]}'
   done | sort | uniq -c
      60 200
      20 429
@@ -47,7 +47,7 @@ A 429 response carries `Retry-After`:
 ```bash
 $ curl -is http://127.0.0.1:8080/v1/chat/completions \
     -H 'Host: ai.local' -H 'Content-Type: application/json' \
-    -d '{"model":"claude-3-5-sonnet-latest","messages":[{"role":"user","content":"ping"}]}' \
+    -d '{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"ping"}]}' \
     | head -n 4
 HTTP/1.1 429 Too Many Requests
 content-type: application/json
@@ -62,7 +62,7 @@ Other models are unaffected. While Sonnet is throttled, Haiku continues to serve
 $ curl -s -o /dev/null -w '%{http_code}\n' \
     http://127.0.0.1:8080/v1/chat/completions \
     -H 'Host: ai.local' -H 'Content-Type: application/json' \
-    -d '{"model":"claude-3-5-haiku-latest","messages":[{"role":"user","content":"ping"}]}'
+    -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"ping"}]}'
 200
 ```
 

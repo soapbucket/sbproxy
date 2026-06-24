@@ -24,20 +24,20 @@ $ curl --no-buffer -s http://127.0.0.1:8080/v1/chat/completions \
     -H 'Host: ai.local' \
     -H 'Content-Type: application/json' \
     -d '{
-      "model": "claude-3-5-sonnet-latest",
+      "model": "claude-sonnet-4-5",
       "stream": true,
       "messages": [{"role": "user", "content":
         "Stream a short story about a lighthouse keeper, six sentences."}]
     }'
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","model":"claude-3-5-sonnet-latest","choices":[{"index":0,"delta":{"role":"assistant","content":"The "},"finish_reason":null}]}
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","model":"claude-sonnet-4-5","choices":[{"index":0,"delta":{"role":"assistant","content":"The "},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","model":"claude-3-5-sonnet-latest","choices":[{"index":0,"delta":{"content":"lighthouse "},"finish_reason":null}]}
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","model":"claude-sonnet-4-5","choices":[{"index":0,"delta":{"content":"lighthouse "},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","model":"claude-3-5-sonnet-latest","choices":[{"index":0,"delta":{"content":"keeper "},"finish_reason":null}]}
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","model":"claude-sonnet-4-5","choices":[{"index":0,"delta":{"content":"keeper "},"finish_reason":null}]}
 
 ...
 
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","model":"claude-3-5-sonnet-latest","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":18,"completion_tokens":97,"total_tokens":115}}
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","model":"claude-sonnet-4-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":18,"completion_tokens":97,"total_tokens":115}}
 
 data: [DONE]
 ```
@@ -53,7 +53,7 @@ client = OpenAI(
     default_headers={"Host": "ai.local"},
 )
 stream = client.chat.completions.create(
-    model="claude-3-5-sonnet-latest",
+    model="claude-sonnet-4-5",
     messages=[{"role": "user", "content": "Count to ten."}],
     stream=True,
 )

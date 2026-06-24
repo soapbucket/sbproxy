@@ -36,7 +36,7 @@ curl -s http://127.0.0.1:8080/metrics 2>/dev/null \
 # streak (intermittent flapping).
 curl -s http://127.0.0.1:8080/v1/chat/completions \
   -H 'Host: ai.local' -H 'Content-Type: application/json' \
-  -d '{"model":"claude-3-5-haiku-latest","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ## What this exercises
