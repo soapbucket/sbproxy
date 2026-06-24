@@ -1,5 +1,5 @@
 # Local inference (embeddings and prompt-injection classify)
-*Last modified: 2026-06-08*
+*Last modified: 2026-06-23*
 
 SBproxy can run two AI-gateway features on local ONNX models instead of paid
 APIs:
@@ -74,20 +74,30 @@ deployment, use `--listen-uds /run/sbproxy/classifier.sock` instead of
 
 ## Enable the local semantic cache
 
-Point the `semantic_cache` block at the sidecar with `source: sidecar`:
+The semantic cache is configured on each AI origin under `action.semantic_cache`.
+Point it at the sidecar with `source: sidecar`:
 
 ```yaml
-ai:
-  semantic_cache:
-    enabled: true
-    threshold: 0.85        # cosine similarity for a near-duplicate hit
-    ttl_secs: 3600
-    max_entries: 1024
-    source: sidecar
-    sidecar:
-      endpoint: http://127.0.0.1:9440
-      model: all-MiniLM-L6-v2
-      timeout_ms: 500
+origins:
+  ai.example.com:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o]
+      routing:
+        strategy: round_robin
+      semantic_cache:
+        enabled: true
+        threshold: 0.85        # cosine similarity for a near-duplicate hit
+        ttl_secs: 3600
+        max_entries: 1024
+        source: sidecar
+        sidecar:
+          endpoint: http://127.0.0.1:9440
+          model: all-MiniLM-L6-v2
+          timeout_ms: 500
 ```
 
 On a miss the proxy vectorizes the prompt via the sidecar, scans the cache, and
@@ -100,20 +110,29 @@ API. Existing configs are unchanged.
 
 ## Enable first-class ONNX prompt-injection
 
-Select the sidecar detector in the `prompt_injection_v2` policy:
+Select the sidecar detector in the origin's `prompt_injection_v2` policy (the
+`policies` list sits alongside `action` on the origin):
 
 ```yaml
-policies:
-  - type: prompt_injection_v2
-    threshold: 0.8
-    action: block
-    detector: sidecar
-    detector_config:
-      endpoint: http://127.0.0.1:9440
-      model: prompt-injection
-      injection_label: INJECTION
-      timeout_ms: 250
-      fail_closed: false     # a sidecar outage degrades to "clean" (allow)
+origins:
+  ai.example.com:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o]
+    policies:
+      - type: prompt_injection_v2
+        threshold: 0.8
+        action: block
+        detector: sidecar
+        detector_config:
+          endpoint: http://127.0.0.1:9440
+          model: prompt-injection
+          injection_label: INJECTION
+          timeout_ms: 250
+          fail_closed: false     # a sidecar outage degrades to "clean" (allow)
 ```
 
 The default detector is `heuristic-v1` (a zero-dependency regex pass). Choosing
@@ -125,34 +144,53 @@ For a single binary, run either feature in-process. This loads a model into the
 proxy address space, so it is gated behind explicit config and a
 `max_model_bytes` guard. Prefer the sidecar for isolation.
 
+Each block sits in the same place as its sidecar form (the AI origin's
+`action.semantic_cache`, and the origin's `policies`); only `source` /
+`detector` and its sub-block change.
+
 Prompt-injection in-process:
 
 ```yaml
-policies:
-  - type: prompt_injection_v2
-    threshold: 0.8
-    action: block
-    detector: inprocess
-    detector_config:
-      model_path: /var/lib/sbproxy/models/injection/model.onnx
-      tokenizer_path: /var/lib/sbproxy/models/injection/tokenizer.json
-      injection_label: INJECTION
-      max_model_bytes: 209715200   # 200 MB guard
+origins:
+  ai.example.com:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o]
+    policies:
+      - type: prompt_injection_v2
+        threshold: 0.8
+        action: block
+        detector: inprocess
+        detector_config:
+          model_path: /var/lib/sbproxy/models/injection/model.onnx
+          tokenizer_path: /var/lib/sbproxy/models/injection/tokenizer.json
+          injection_label: INJECTION
+          max_model_bytes: 209715200   # 200 MB guard
 ```
 
 In-process semantic cache embeddings:
 
 ```yaml
-ai:
-  semantic_cache:
-    enabled: true
-    threshold: 0.85
-    source: inprocess
-    inprocess:
-      model: all-MiniLM-L6-v2
-      model_path: /var/lib/sbproxy/models/minilm/model.onnx
-      tokenizer_path: /var/lib/sbproxy/models/minilm/tokenizer.json
-      max_model_bytes: 209715200   # 200 MB guard
+origins:
+  ai.example.com:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o]
+      semantic_cache:
+        enabled: true
+        threshold: 0.85
+        source: inprocess
+        inprocess:
+          model: all-MiniLM-L6-v2
+          model_path: /var/lib/sbproxy/models/minilm/model.onnx
+          tokenizer_path: /var/lib/sbproxy/models/minilm/tokenizer.json
+          max_model_bytes: 209715200   # 200 MB guard
 ```
 
 The released `sbproxy` binary is built with the `inprocess-embed` feature, so
