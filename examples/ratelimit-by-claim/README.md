@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Rate limit by JWT claim](../../docs/assets/ratelimit-by-claim.gif)
+
 Per-tenant rate limiting keyed on a JWT claim. The `rate_limiting` policy on `api.local` accepts a `key:` CEL expression that runs against the request context. `jwt.claims.tenant_id` is auto-populated from `Authorization: Bearer <jwt>` without signature verification (`JwtAuth` handles that on a separate path). Two tenants with different `tenant_id` claims get independent 100-rpm token buckets with a burst of 20. When the expression returns empty, the policy falls back to client IP. Retry-After headers are emitted on rejection.
 
 ## Run

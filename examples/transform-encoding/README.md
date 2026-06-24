@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Encoding transform](../../docs/assets/transform-encoding.gif)
+
 Demonstrates the `encoding` transform. A `static` action returns a small JSON document; the transform converts the bytes to standard base64 via `encoding: base64_encode`. A `response_modifier` switches `Content-Type` to `text/plain; charset=utf-8` to match the new payload shape. Other valid `encoding` values are `base64_decode`, `url_encode`, and `url_decode`. The origin is reached on `127.0.0.1:8080` via the `enc.local` Host header.
 
 ## Run

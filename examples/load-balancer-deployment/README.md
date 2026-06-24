@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Load balancer deployment mode](../../docs/assets/load-balancer-deployment.gif)
+
 A blue-green deployment split across two LB targets. The targets carry `group: blue` and `group: green` tags. With `deployment_mode.mode: blue_green` and `active: green`, every request is routed to the green group regardless of the round-robin algorithm. To make the active group visible without local infrastructure, the two groups point at distinct public APIs that produce different response shapes. Flip `active: blue` and reload to send traffic to the other group without touching the targets list.
 
 ## Run

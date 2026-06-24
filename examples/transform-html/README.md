@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![HTML transform](../../docs/assets/transform-html.gif)
+
 Demonstrates the `html` transform on a real upstream. The proxy fetches `https://test.sbproxy.dev/html` (a public Moby-Dick excerpt page) and rewrites the HTML in flight: it removes the upstream `<h1>`, injects a stylesheet `<link>` at the end of `<head>`, prepends a banner `<div>` at the start of `<body>`, and stamps `data-rewritten="true"` on every `<p>`. The origin is reached on `127.0.0.1:8080` via the `html.local` Host header.
 
 ## Run

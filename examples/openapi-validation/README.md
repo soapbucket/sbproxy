@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![OpenAPI 3.0 schema validation](../../docs/assets/openapi-validation.gif)
+
 The `openapi_validation` policy loads an inline OpenAPI document at startup and validates each request body against the matching operation's `requestBody` schema. Requests whose path and method are not described in the spec, or whose `Content-Type` has no schema, are passed through unchanged. `mode: enforce` (default) returns the configured `status` on validation failure; `mode: log` writes a structured warn under the `sbproxy::openapi_validation` tracing target and forwards the request anyway. Useful for shifting body validation out of every backend service and into the edge.
 
 ## Run

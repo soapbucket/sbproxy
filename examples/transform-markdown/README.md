@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Markdown to HTML transform](../../docs/assets/transform-markdown.gif)
+
 Demonstrates the `markdown` transform. A `static` action returns a Markdown release-notes document; the transform converts it to HTML using pulldown-cmark with `smart_punctuation`, `tables`, and `strikethrough` enabled. A `response_modifier` rewrites the `Content-Type` to `text/html; charset=utf-8` so browsers and curl render the result correctly. The origin is reached on `127.0.0.1:8080` via the `md.local` Host header.
 
 ## Run

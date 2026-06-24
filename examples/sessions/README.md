@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Sessions](../../docs/assets/sessions.gif)
+
 The `session` block on `app.local` configures the encrypted cookie used to carry session state across requests. Cookie name is `sb_session`, max age is 3600 seconds, `http_only` is on, `same_site` is `Lax`, and `allow_non_ssl: true` lets the example run on plain HTTP for local testing. The action is a static JSON response so you can observe cookie issuance directly without a real backend.
 
 ## Run

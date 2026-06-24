@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![HSTS](../../docs/assets/hsts.gif)
+
 The `hsts` block on `secure.local` injects a `Strict-Transport-Security` header on every response. `max_age: 31536000` is one year, `include_subdomains: true` extends the policy to every subdomain, and `preload: true` opts the host into the browser preload list (production-grade only after submission to hstspreload.org). Browsers honour HSTS only over HTTPS, but the header is emitted regardless of scheme so you can verify it on plain HTTP locally.
 
 ## Run

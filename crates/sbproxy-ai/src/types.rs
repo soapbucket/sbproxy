@@ -70,7 +70,10 @@ pub struct Choice {
 pub struct Usage {
     /// Number of tokens in the prompt sent to the model.
     pub prompt_tokens: u32,
-    /// Number of tokens in the model's completion.
+    /// Number of tokens in the model's completion. The `/v1/embeddings`
+    /// response omits this field (embeddings have no completion), so it
+    /// defaults to zero rather than failing to deserialize.
+    #[serde(default)]
     pub completion_tokens: u32,
     /// Total tokens billed (prompt + completion).
     pub total_tokens: u32,
@@ -316,6 +319,24 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: EmbeddingResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.data.len(), 1);
+        assert_eq!(parsed.data[0].embedding.len(), 3);
+    }
+
+    #[test]
+    fn embedding_response_without_completion_tokens_deserializes() {
+        // OpenAI's /v1/embeddings response omits `completion_tokens` in its
+        // usage block. Regression guard for the semantic cache, which deserializes
+        // these into EmbeddingResponse; completion_tokens must default to 0
+        // rather than fail the whole response.
+        let json = r#"{
+            "object": "list",
+            "data": [{"object": "embedding", "embedding": [0.1, -0.2, 0.3], "index": 0}],
+            "model": "text-embedding-3-small",
+            "usage": {"prompt_tokens": 7, "total_tokens": 7}
+        }"#;
+        let parsed: EmbeddingResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.usage.completion_tokens, 0);
+        assert_eq!(parsed.usage.prompt_tokens, 7);
         assert_eq!(parsed.data[0].embedding.len(), 3);
     }
 

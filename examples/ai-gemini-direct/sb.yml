@@ -32,7 +32,7 @@
 #     -H 'Host: ai.local' \
 #     -H 'Content-Type: application/json' \
 #     -d '{
-#       "model": "gemini-1.5-pro",
+#       "model": "gemini-3.5-flash",
 #       "messages": [
 #         {"role": "system", "content": "You write terse haiku."},
 #         {"role": "user", "content": "Write a haiku about caching."}
@@ -52,9 +52,9 @@ origins:
       providers:
         - name: gemini
           api_key: ${GEMINI_API_KEY}
-          default_model: gemini-1.5-pro
+          default_model: gemini-3.5-flash
           models:
-            - gemini-1.5-pro
-            - gemini-1.5-flash
-            - gemini-2.0-flash
+            - gemini-3.5-flash
+            - gemini-3.5-flash
+            - gemini-3.5-flash
       routing: round_robin

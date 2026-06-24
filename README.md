@@ -23,6 +23,10 @@
   <a href="docs/README.md">Docs</a>
 </p>
 
+<p align="center">
+  <img src="docs/assets/ai-gateway.gif" alt="One OpenAI-compatible request routed to OpenAI, Anthropic, and Google through sbproxy" width="900">
+</p>
+
 ---
 
 ## Why SBproxy
@@ -101,6 +105,24 @@ curl -H "Host: myapp.example.com" http://127.0.0.1:8080/get
 `myapp.example.com` is the host your client sees; SoapBucket matches it against `origins:` and forwards to the upstream. Use any hostname you want here; `example.com` is reserved (RFC 2606), so it never collides with anything real.
 
 That's a reverse proxy. Add AI routing, auth, and rate limiting in the same file. See [`examples/`](examples/) for runnable end-to-end configurations covering each feature.
+
+---
+
+## See it in action
+
+Each clip is recorded against the release binary running a real example config. Regenerate them with [`scripts/record-tapes.sh`](scripts/record-tapes.sh).
+
+**Failover across providers** &mdash; the primary is down; the backup answers, transparently. ([config](examples/ai-routing-fallback/))
+
+![Multi-provider failover](docs/assets/ai-fallback.gif)
+
+**Semantic cache** &mdash; a reworded prompt is served from cache (`x-semcache: HIT`), skipping the billable completion. ([config](examples/semantic-cache-openai/))
+
+![Semantic cache hit](docs/assets/semantic-cache.gif)
+
+**Guardrails** &mdash; prompt-injection and PII are blocked before any provider is called. ([config](examples/ai-guardrails/))
+
+![Guardrails blocking injection and PII](docs/assets/ai-guardrails.gif)
 
 ---
 

@@ -2,6 +2,8 @@
 
 *Last modified: 2026-05-12*
 
+![AI gateway: context-poisoning detection](../../docs/assets/ai-context-poisoning.gif)
+
 A single Anthropic origin with the `context_poisoning` input guardrail enabled. The guardrail inspects the full input, including any retrieved content carried as `role: tool` or `role: function` messages, and flags untrusted content that tries to manipulate the model before a downstream tool call. This is the indirect prompt injection vector from Greshake et al. (2023): a RAG pipeline pulls a poisoned page into the model's context, and the model then issues a tool call influenced by that content.
 
 Every hit emits `sbproxy_ai_context_poisoning_findings_total{rule_id,action}`. When `action: deny`, the request is also counted in `sbproxy_ai_context_poisoning_blocked_total` and a 4xx response is returned before any upstream call.

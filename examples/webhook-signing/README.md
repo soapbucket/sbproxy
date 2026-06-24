@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Webhook signing](../../docs/assets/webhook-signing.gif)
+
 Every lifecycle webhook the proxy fires (`on_request`, `on_response`) carries a structured envelope and, when `secret` is set on the callback, an HMAC-SHA256 signature so the receiver can verify it wasn't forged. Headers on the webhook request include `X-Sbproxy-Event`, `X-Sbproxy-Instance`, `X-Sbproxy-Request-Id`, `X-Sbproxy-Config-Revision`, `X-Sbproxy-Timestamp`, and `X-Sbproxy-Signature: v1=<hex>`. The signature is `HMAC-SHA256(secret, "<timestamp>.<body>")`. Receivers should verify within a fixed time window (e.g. 5 minutes) to reject replays.
 
 ## Run

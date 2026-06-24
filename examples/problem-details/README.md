@@ -2,6 +2,8 @@
 
 *Last modified: 2026-05-11*
 
+![Problem-Details default renderer](../../docs/assets/problem-details.gif)
+
 The origin on `api.local` is protected by API key authentication. The
 operator authors a custom `error_pages` entry for 401 and opts in to the
 RFC 9457 `application/problem+json` default renderer for everything else

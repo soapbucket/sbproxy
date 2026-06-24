@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![AI gateway: Anthropic Claude direct](../../docs/assets/ai-claude.gif)
+
 Direct integration with the Anthropic Messages API. Clients send OpenAI-shaped chat completion requests; SBproxy translates them to Anthropic's `/v1/messages` shape on the way out and converts the response back to OpenAI shape on the way in. The translator hoists `system` role messages, defaults `max_tokens`, drops OpenAI-only fields (`logit_bias`, `n`, `presence_penalty`, `frequency_penalty`, `response_format`, `seed`, `user`), rewrites the path, then reassembles `choices[].message.content` from Anthropic's content blocks and renames usage fields. The result is that any OpenAI SDK works against `api.local` without modification, and Claude does the work.
 
 ## Run

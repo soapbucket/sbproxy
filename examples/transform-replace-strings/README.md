@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![String replacement transform](../../docs/assets/transform-replace-strings.gif)
+
 Demonstrates the `replace_strings` transform. Two find-and-replace rules run against the upstream body: a literal substring swap that rewrites every occurrence of `internal.example.com` to `public.example.com`, and a regex pattern that redacts any 16-digit run (e.g., a card number) with `[REDACTED]`. A `static` action seeds a JSON body containing both patterns so the example is self-contained. The origin is reached on `127.0.0.1:8080` via the `replace.local` Host header.
 
 ## Run

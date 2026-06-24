@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Header injection and CORS](../../docs/assets/headers-and-cors.gif)
+
 Combines three sibling blocks on one origin: `request_modifiers` injects `X-Forwarded-By: sbproxy` and a freshly generated `X-Trace-Id` (from the `uuid()` template helper) onto outbound requests while stripping the `Cookie` header; `response_modifiers` stamps `X-Served-By: sbproxy` and overrides `Cache-Control` on the way back; and `cors` handles preflight `OPTIONS` requests for browser clients on `https://example.com`. The CORS block allowlists three methods and two headers and caches preflight results for 600 seconds.
 
 ## Run

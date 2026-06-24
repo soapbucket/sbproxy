@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Response caching](../../docs/assets/response-caching.gif)
+
 Demonstrates the per-origin `response_cache` block. Successful responses are stored in the in-memory cache for 60 seconds, keyed on the request method, host, path, and query string. The second request for the same URL is served from cache without contacting `test.sbproxy.dev`. With `cache_control: true`, SBproxy honours upstream `Cache-Control` directives such as `no-store` or `max-age` overrides when they are stricter than the configured TTL. The TTL difference is most visible against `/delay/N`, an httpbin endpoint that sleeps server-side.
 
 ## Run

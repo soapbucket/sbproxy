@@ -1,6 +1,8 @@
 # Markdown for agents
 *Last modified: 2026-05-02*
 
+![Markdown for agents](../../docs/assets/markdown-for-agents.gif)
+
 Demonstrates the Wave 4 content negotiation surface end-to-end. A
 single origin serves an article. Browsers asking for HTML get the
 canned HTML body. AI crawlers asking for Markdown

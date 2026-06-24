@@ -1,5 +1,7 @@
 # Listing primitive
 
+![Listing primitive](../../docs/assets/listing-primitive.gif)
+
 A minimal example of the repo-native `Listing` primitive.
 
 The directory holds:

@@ -23,12 +23,9 @@
 #   make run CONFIG=examples/concurrent-limit/sb.yml
 #
 # Test:
-#   # Open 5 slow requests in parallel; the 4th and 5th get 503.
-#   for i in 1 2 3 4 5; do
-#     curl -s -o /dev/null -w "%{http_code}\n" \
-#       -H 'Host: localhost' http://127.0.0.1:8080/delay/3 &
-#   done
-#   wait
+#   # Open 5 slow requests at once; requests beyond the permit count get 503.
+#   seq 1 5 | xargs -P 5 -I{} curl -s -o /dev/null -w '%{http_code}\n' \
+#     -H 'Host: localhost' http://127.0.0.1:8080/delay/3 | sort | uniq -c
 
 proxy:
   http_bind_port: 8080

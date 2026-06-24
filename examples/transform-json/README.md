@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![JSON field transform](../../docs/assets/transform-json.gif)
+
 Demonstrates the `json` transform. The upstream is a `static` action that returns a canned post document, so the example runs offline. The transform reshapes the JSON before returning it to the client by renaming `userId` to `author_id`, removing the `body` field, and setting a new `source` field marking the response as proxied. The origin matches the `json.local` Host header on `127.0.0.1:8080`.
 
 ## Run

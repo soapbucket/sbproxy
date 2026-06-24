@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![DNS-based service discovery](../../docs/assets/service-discovery.gif)
+
 Demonstrates `service_discovery` on a `proxy` action. Without service discovery, Pingora resolves the upstream hostname once when a connection is established and the connection pool reuses that connection (and that IP) for the lifetime of the pool. With `service_discovery: { enabled: true }`, the proxy re-resolves the hostname every `refresh_secs` (default 30s) and rotates through the current A/AAAA set round-robin. The hostname stays as the SNI/Host header so TLS verification continues to match the certificate. In production, point this at a Kubernetes Service hostname (for example `backend.namespace.svc.cluster.local:8080`) and the proxy picks up new pods within `refresh_secs` of them entering the Endpoints list.
 
 ## Run

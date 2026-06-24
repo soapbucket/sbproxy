@@ -2,6 +2,8 @@
 
 *Last modified: 2026-05-08*
 
+![Content-shape negotiation](../../docs/assets/content-shape-negotiation.gif)
+
 Same URL, three response shapes. The proxy reads the agent's `Accept` header on the way in, resolves a single content shape per request, and the response pipeline rewrites `Content-Type` and stamps `x-markdown-tokens` on the way out. The four-transform default chain (`boilerplate`, `html_to_markdown`, `citation_block`, `json_envelope`) does the rewrite work in place; the resolver decides which transforms run for a given request and which stay quiet.
 
 This example uses `test.sbproxy.dev` as the upstream so the configuration is self-contained. Swap `action.url` for a real HTML upstream to drive the negotiation against a live page.

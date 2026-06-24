@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Forward auth](../../docs/assets/auth-forward.gif)
+
 Delegates the authentication decision to an external HTTP service. For each inbound request, sbproxy issues a sub-request to the configured URL (`https://test.sbproxy.dev/status/200`) using the configured method (`GET`) and a 5,000 ms timeout. If the sub-request returns 200 (`success_status`), the original request is forwarded to the upstream; otherwise it is rejected with the same status the auth service returned. The `headers_to_forward` list copies named headers (`Authorization`, `Cookie`) from the original request into the auth sub-request so the auth service has the context it needs. Swap the URL for `https://test.sbproxy.dev/status/401` to see the rejection path.
 
 ## Run

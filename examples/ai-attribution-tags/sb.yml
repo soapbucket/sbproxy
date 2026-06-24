@@ -34,7 +34,7 @@
 #     -H 'Host: ai.local' \
 #     -H "Authorization: Bearer ${TEAM_FRONTEND_KEY}" \
 #     -H 'Content-Type: application/json' \
-#     -d '{"model":"claude-3-5-haiku-latest","messages":[{"role":"user","content":"hi"}]}'
+#     -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}]}'
 #
 # Test (override + augment with SB-Attr headers):
 #   curl http://127.0.0.1:8080/v1/chat/completions \
@@ -47,7 +47,7 @@
 #     -H 'SB-Attr-Trace-Id: trc_01HABC...' \
 #     -H 'SB-Attr-Agent: development' \
 #     -H 'SB-Attr-Risk: internal-only' \
-#     -d '{"model":"claude-3-5-haiku-latest","messages":[{"role":"user","content":"regen"}]}'
+#     -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"regen"}]}'
 #
 # Expected:
 #   Access-log row + Prometheus per-attribution counters carry the
@@ -75,8 +75,8 @@ origins:
       providers:
         - name: anthropic
           api_key: ${ANTHROPIC_API_KEY}
-          default_model: claude-3-5-haiku-latest
-          models: [claude-3-5-haiku-latest, claude-3-5-sonnet-latest]
+          default_model: claude-haiku-4-5
+          models: [claude-haiku-4-5, claude-haiku-4-5]
 
     # Per-credential attribution defaults. `attrs:` is the per-credential
     # subtree the operator pins so every authenticated request inherits

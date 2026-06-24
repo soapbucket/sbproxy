@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Concurrent request limit](../../docs/assets/concurrent-limit.gif)
+
 Demonstrates the `concurrent_limit` policy. The limiter caps the number of in-flight requests per key, distinct from the requests-per-second `rate_limiting` policy. Each accepted request takes a permit; the permit is released when the request finishes (success, error, or client disconnect). Once `max` permits are issued for a given key, further requests are rejected with the configured `status` and `error_body`. Useful for protecting backends with low concurrency budgets such as legacy SOAP services, database-bound endpoints, or GPU inference workers with a fixed slot count.
 
 ## Run

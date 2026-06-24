@@ -2,6 +2,8 @@
 
 *Last modified: 2026-06-04*
 
+![access-log](../../docs/assets/access-log.gif)
+
 Structured JSON access log on stdout, ready for Fluent Bit / Vector /
 any stdout-tailing log shipper. Demonstrates every commonly-used knob
 on the top-level `access_log:` block: status and method filters,

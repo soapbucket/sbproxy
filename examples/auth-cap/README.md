@@ -2,6 +2,8 @@
 
 *Last modified: 2026-05-07*
 
+![CAP token authentication](../../docs/assets/auth-cap.gif)
+
 Validates Crawler Authorization Protocol (CAP) tokens on every request. CAP tokens are EdDSA-signed JWTs bound to an agent identity (`sub`), a request audience (`aud`), and a route allow-list (`glob`); they also carry a `rps` rate limit and a daily `bytes` budget that the proxy can enforce. The verifier in this example trusts a single Ed25519 public key supplied inline via `jwks_static`. Production deployments should swap that for `jwks_url` so the issuer can rotate keys without a config reload.
 
 The example is offline-friendly: a TEST Ed25519 keypair lives under `tokens/`, and `mint.py` signs sample tokens with the private half so you do not need an issuer running anywhere to try the flow.

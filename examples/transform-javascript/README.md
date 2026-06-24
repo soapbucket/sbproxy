@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![JavaScript body transform](../../docs/assets/transform-javascript.gif)
+
 Demonstrates the `javascript` transform via QuickJS. The entrypoint is `function transform(body)` where `body` is the raw upstream body as a string. The script parses it as JSON, mutates the document, and returns a new JSON string. A `static` action seeds the input so the example runs offline. The script computes `title_length`, adds a reversed copy of the title, trims `body` to 40 characters with an ellipsis, and stamps `transformed_by = "javascript"`. The origin is reached on `127.0.0.1:8080` via the `js.local` Host header.
 
 ## Run

@@ -1,41 +1,32 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
-# AI gateway: fallback chain across three providers.
+# AI gateway: fallback chain across providers.
 #
-# Three providers are listed in priority order. The first entry is
-# intentionally misconfigured with an invalid API key so it always
-# returns 401. The router treats the failure as a non-2xx upstream and
-# advances to the next provider. The second entry hits Anthropic
-# directly and serves the request. The third entry is OpenRouter as a
-# final fallback if Anthropic itself is unhealthy.
+# Providers are listed in priority order. With routing.strategy
+# fallback_chain, the proxy tries the highest-priority provider first and
+# advances to the next when an attempt fails at the transport level
+# (connection refused, DNS failure, timeout) or returns a retriable 5xx
+# (500, 502, 503). From the client's perspective the call simply succeeds.
 #
-# This is the classic "primary plus warm spares" pattern: keep the
-# cheapest or fastest provider as priority 1 and let the chain absorb
-# transient outages. Each handover increments
-# sbproxy_ai_failovers_total{from_provider, to_provider, reason}.
+# Here the primary points at a closed local port to simulate an outage, so
+# every request fails over to the live backup. Swap the primary's base_url
+# for a real upstream in production and keep the backup as a warm spare.
+#
+# Note: a 4xx such as 401 (bad key) is treated as a client error and is NOT
+# retried on another provider; only transport failures and 5xx advance the
+# chain.
 #
 # Setup:
 #   export ANTHROPIC_API_KEY=sk-ant-...
-#   export OPENROUTER_API_KEY=sk-or-...
-#
-# Run:
 #   make run CONFIG=examples/ai-routing-fallback/sb.yml
 #
 # Test:
-#   curl http://127.0.0.1:8080/v1/chat/completions \
-#     -H 'Host: ai.local' \
-#     -H 'Content-Type: application/json' \
-#     -d '{
-#       "model": "claude-3-5-sonnet-latest",
-#       "messages": [{"role": "user",
-#         "content": "Which provider answered this request?"}]
-#     }'
+#   curl -s http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' -H 'Content-Type: application/json' \
+#     -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"In one sentence, what is a reverse proxy?"}]}' \
+#     | jq -r '.model, .choices[0].message.content'
 #
-# Expected behaviour:
-#   Provider 1 (broken-anthropic) 401s, the proxy logs a failover, and
-#   the request reaches provider 2 (anthropic). If Anthropic itself is
-#   down, provider 3 (openrouter) takes over with the equivalent
-#   anthropic/claude-3.5-sonnet model. From the client's perspective
-#   the call simply succeeds.
+#   # The primary attempt is visible in the proxy log:
+#   #   AI proxy: upstream request failed ... provider=primary-unreachable
 
 proxy:
   http_bind_port: 8080
@@ -48,27 +39,23 @@ origins:
         strategy: fallback_chain
 
       providers:
-        - name: broken-anthropic
+        # Priority 1: simulated outage. The base_url points at a closed
+        # local port, so the connection is refused and the chain advances.
+        - name: primary-unreachable
           provider_type: anthropic
-          api_key: sk-ant-intentionally-invalid-key
+          api_key: ${ANTHROPIC_API_KEY}
+          base_url: http://127.0.0.1:9
+          allow_private_base_url: true
           priority: 1
-          default_model: claude-3-5-sonnet-latest
+          default_model: claude-haiku-4-5
           models:
-            - claude-3-5-sonnet-latest
-            - claude-3-5-haiku-latest
+            - claude-haiku-4-5
 
-        - name: anthropic
+        # Priority 2: live backup that serves the request.
+        - name: anthropic-backup
+          provider_type: anthropic
           api_key: ${ANTHROPIC_API_KEY}
           priority: 2
-          default_model: claude-3-5-sonnet-latest
+          default_model: claude-haiku-4-5
           models:
-            - claude-3-5-sonnet-latest
-            - claude-3-5-haiku-latest
-
-        - name: openrouter
-          api_key: ${OPENROUTER_API_KEY}
-          priority: 3
-          default_model: anthropic/claude-3.5-sonnet
-          models:
-            - anthropic/claude-3.5-sonnet
-            - anthropic/claude-3-haiku
+            - claude-haiku-4-5

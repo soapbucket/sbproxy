@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Correlation ID](../../docs/assets/correlation-id.gif)
+
 The proxy mints a per-request correlation ID early in the request lifecycle. With the default policy, an inbound `X-Request-Id` is adopted as-is so upstream callers can tie their traces to ours; otherwise the proxy generates a fresh 32-hex UUID v4. The chosen value is forwarded to the upstream under the same header name and echoed back on the response (`echo_response: true`). The same value flows through `ctx.request_id` so webhooks (`X-Sbproxy-Request-Id`), the `Forwarded` header, access logs, and AI gateway records share one identifier.
 
 ## Run

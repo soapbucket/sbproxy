@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![HTML to Markdown transform](../../docs/assets/transform-html-to-markdown.gif)
+
 Demonstrates the `html_to_markdown` transform. The proxy fetches `https://test.sbproxy.dev/html` (a public Moby-Dick excerpt page) and converts the HTML body into Markdown using ATX-style headings (`#`, `##`, ...). A `response_modifier` rewrites the `Content-Type` header to `text/markdown; charset=utf-8` so the body is delivered with the right MIME. Useful for feeding HTML into LLM pipelines that prefer Markdown, or for archiving pages in a portable format. The origin is reached on `127.0.0.1:8080` via the `tomd.local` Host header.
 
 ## Run

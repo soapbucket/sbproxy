@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![CEL tenant gate on AI traffic](../../docs/assets/ai-cel-tenant-gate.gif)
+
 A proxy-native pattern: a CEL expression runs at the network layer before any AI provider is contacted. Pure AI gateway libraries cannot reject a request based on the surrounding request context (auth claims, tenant headers, IP, geo) without taking on the proxy role themselves. Two CEL policies layer here: the first requires a non-empty `X-Tenant` header (anything without one gets a 403 before the AI handler reads the body, a hard tenant boundary); the second requires the tenant value to appear in an allow-list (unknown tenants are rejected with a different message so operators can spot misconfigured clients vs. unprovisioned ones). Both checks happen in the same place per-request rate limits and WAF rules run, so a single denial path covers AI, REST, and any other action behind the same hostname.
 
 ## Run

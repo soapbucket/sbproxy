@@ -2,6 +2,8 @@
 
 *Last modified: 2026-06-18*
 
+![Upstream retries](../../docs/assets/upstream-retries.gif)
+
 When the proxy cannot establish a TCP/TLS connection to the upstream (DNS failure, refused, unreachable, TLS handshake fail), Pingora calls back into the proxy and the request is retried. With `retry.max_attempts: 3` the proxy attempts the upstream up to three times. `retry_on: [connect_error, timeout, 502, 503]` selects which transport-level failures and upstream response statuses qualify. `backoff_ms: 100` is the base delay, doubled on each attempt and capped at 5s. For load_balancer actions the failed target is reported to the outlier detector so the next attempt picks a different target.
 
 Status-code retries are replayed only for safe/idempotent methods and replayable bodies. If a matching status cannot be safely replayed, the upstream response passes through with `x-sbproxy-retry-skip-reason`.

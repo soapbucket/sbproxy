@@ -8,11 +8,14 @@
 # Run:
 #   make run CONFIG=examples/rate-limiting/sb.yml
 #
-# Test (run a quick burst, expect 429s after the first ~10):
-#   for i in $(seq 1 20); do
-#     curl -s -o /dev/null -w '%{http_code}\n' \
-#       -H 'Host: api.local' http://127.0.0.1:8080/get
-#   done
+# Test (fire 30 requests at once; the burst of 10 passes, the rest get 429):
+#   seq 1 30 | xargs -P 30 -I{} curl -s -o /dev/null -w '%{http_code}\n' \
+#     -H 'Host: api.local' http://127.0.0.1:8080/get | sort | uniq -c
+#   # => roughly:  10 200
+#   #              20 429
+#
+#   # A sequential loop will not trip the limit: network latency keeps it
+#   # under 5 rps and the bucket refills between requests. Burst concurrently.
 
 proxy:
   http_bind_port: 8080

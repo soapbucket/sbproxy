@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Page Shield](../../docs/assets/page-shield.gif)
+
 Client-side script monitoring via Content Security Policy report intake. The `page_shield` policy stamps a `Content-Security-Policy-Report-Only` (or enforcing) header on every response with the configured directives plus a `report-uri` pointing at the proxy's intake endpoint. Browsers POST violation reports to that endpoint and the proxy logs each report under the `sbproxy::page_shield` tracing target so logpush sinks (or the enterprise connection-monitor) can analyse them. `report-only` mode is the recommended starting point: browsers report violations but do not block them. Watch the event stream until the policy reflects reality, then flip `mode` to `enforce`.
 
 ## Run

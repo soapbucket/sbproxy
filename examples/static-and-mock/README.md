@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Static and mock responses](../../docs/assets/static-and-mock.gif)
+
 Three origins demonstrating the two upstream-free actions. `hello.local` uses the `static` action to return a fixed plain-text body. `api.local` uses the `mock` action to return a structured JSON object after a 50 ms simulated delay with a custom `X-Mock` header. `health.local` uses `static` again, this time with `json_body` to emit a JSON health document. Both actions short-circuit the request before any network call, so they are useful for stubbing dependencies during local development or wiring up a placeholder service ahead of a real implementation.
 
 ## Run

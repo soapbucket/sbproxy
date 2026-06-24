@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Active health checks](../../docs/assets/active-health-checks.gif)
+
 A round-robin load balancer with two targets: `test.sbproxy.dev` and `test.sbproxy.dev/status/503`. Each target has a `health_check` block, so the proxy runs a background probe loop on each: every `interval_secs: 10` it `GET`s the probe path (`/status/200`). `unhealthy_threshold: 3` consecutive failures mark the target unhealthy; `healthy_threshold: 2` consecutive successes bring it back. Unhealthy targets are excluded from `select_target` until they recover. Probe results also feed the outlier detector when one is configured, so passive and active signals share state.
 
 ## Run

@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![CEL expression policy](../../docs/assets/cel-policy.gif)
+
 Demonstrates the `expression` policy, which evaluates a CEL expression per request and decides whether to allow it. This config admits requests only when the `X-Tenant` header equals `acme`. CEL header keys are normalised to lowercase with hyphens converted to underscores, so the access path is `request.headers["x-tenant"]`. Anything else returns `403` with the body `tenant not allowed`. Useful for custom access control beyond simple IP or API-key checks. The origin matches the `cel.local` Host header on `127.0.0.1:8080`.
 
 ## Run

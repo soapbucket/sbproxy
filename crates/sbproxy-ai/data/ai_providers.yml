@@ -44,8 +44,11 @@ providers:
     display_name: Google Gemini
     aliases: [google]
     default_base_url: https://generativelanguage.googleapis.com/v1beta
-    auth_header: Authorization
-    auth_prefix: "Bearer "
+    # The Gemini (AI Studio) REST API authenticates with an API key in the
+    # x-goog-api-key header, not an OAuth Bearer token. Vertex AI (below)
+    # uses Bearer because it takes a Google OAuth access token instead.
+    auth_header: x-goog-api-key
+    auth_prefix: ""
     format: google
     supports_streaming: true
     supports_embeddings: true

@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![Storage action](../../docs/assets/storage-action.gif)
+
 The `storage` action serves files from object storage backends. It is backed by the `object_store` crate and supports S3, GCS, Azure Blob, and the local filesystem. This example uses the `local` backend pointed at `/tmp/sbproxy-static` so it runs without any cloud setup; production configs swap `local` for `s3` / `gcs` / `azure` and add the corresponding credentials. Features include `GET` and `HEAD` with `content-type`, `content-length`, `etag`, and `last-modified`; range requests (`206 Partial Content` with `content-range`); `index_file` fallback for directory paths; `405` for unsupported methods; and `404` for missing objects.
 
 ## Run

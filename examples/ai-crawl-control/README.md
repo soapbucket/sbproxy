@@ -2,6 +2,8 @@
 
 *Last modified: 2026-04-27*
 
+![AI crawl control with Pay Per Crawl](../../docs/assets/ai-crawl-control.gif)
+
 The `ai_crawl_control` policy returns HTTP 402 Payment Required to known AI crawler User-Agents that arrive without a `Crawler-Payment` token. The 402 response body explains the price and the header to retry with; the response also stamps a `Crawler-Payment realm=...` challenge. The OSS ledger is in-memory: every token in `valid_tokens` redeems exactly once, after which the policy charges again. Enterprise builds swap in an HTTP-callable ledger that talks to a payments backend. Normal browser User-Agents pass through without paying.
 
 ## Run

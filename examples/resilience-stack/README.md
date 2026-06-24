@@ -2,6 +2,8 @@
 
 *Last modified: 2026-06-18*
 
+![Production resilience stack](../../docs/assets/resilience-stack.gif)
+
 Composes four signals on a single load balancer so a flaky backend gets isolated quickly and recovers automatically without operator intervention. Active health checks mark a target unhealthy after `unhealthy_threshold` consecutive failed background probes (catches "the pod is gone" without waiting for real traffic to fail). Outlier detection tracks each target's error rate in a sliding window and ejects when it crosses `threshold` (catches "the pod is up but answering 5xx under load"). The circuit breaker is a formal Closed/Open/HalfOpen state machine, one per target, that trips on consecutive failures (catches "the pod is hard down right now"). Retries automatically try the next target on TCP connect failure, timeout, or configured status codes such as `502` and `503`; the failed target feeds outlier and breaker so subsequent requests skip it without paying the same failure latency again. Each signal is independent. With every target ejected, the load balancer falls back to the unfiltered list rather than 502'ing the client.
 
 ## Run

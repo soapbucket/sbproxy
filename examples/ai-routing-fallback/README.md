@@ -1,57 +1,47 @@
-# AI gateway: fallback chain across three providers
+# AI gateway: fallback chain across providers
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-06-24*
 
-Three providers in priority order. Provider 1 (`broken-anthropic`) is intentionally configured with an invalid API key so it always returns 401. The router treats any non-2xx as an upstream failure and advances to provider 2 (`anthropic`), which serves the request with a real key. Provider 3 (`openrouter`) is the final fallback, picked up if Anthropic itself is unhealthy. From the client's perspective the call simply succeeds. Every handover increments `sbproxy_ai_failovers_total{from_provider, to_provider, reason}` so dashboards can show how often each spare is engaged.
+![sbproxy failing over from a down primary provider to a live backup](../../docs/assets/ai-fallback.gif)
+
+Providers are listed in priority order. With `routing.strategy: fallback_chain`, the proxy tries the highest-priority provider first and advances to the next when an attempt fails at the transport level (connection refused, DNS failure, timeout) or returns a retriable 5xx (500, 502, 503). From the client's perspective the call simply succeeds.
+
+In this example the primary provider points at a closed local port to simulate an outage, so every request fails over to the live backup. Swap the primary's `base_url` for a real upstream in production and keep the backup as a warm spare.
+
+A 4xx such as 401 (a bad key) is treated as a client error and is **not** retried on another provider; only transport failures and retriable 5xx advance the chain.
 
 ## Run
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-export OPENROUTER_API_KEY=sk-or-...
 make run CONFIG=examples/ai-routing-fallback/sb.yml
 ```
-
-Both env vars are required.
 
 ## Try it
 
 ```bash
 $ curl -s http://127.0.0.1:8080/v1/chat/completions \
-    -H 'Host: ai.local' \
-    -H 'Content-Type: application/json' \
-    -d '{
-      "model": "claude-3-5-sonnet-latest",
-      "messages": [{"role": "user", "content": "Which provider answered this request?"}]
-    }'
-{
-  "id": "msg_01...",
-  "object": "chat.completion",
-  "model": "claude-3-5-sonnet-latest",
-  "choices": [
-    {"index": 0, "message": {"role": "assistant", "content": "Anthropic served this request directly."}, "finish_reason": "stop"}
-  ],
-  "usage": {"prompt_tokens": 17, "completion_tokens": 8, "total_tokens": 25}
-}
+    -H 'Host: ai.local' -H 'Content-Type: application/json' \
+    -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"In one sentence, what is a reverse proxy?"}]}' \
+    | jq -r '.model, .choices[0].message.content'
+claude-haiku-4-5-20251001
+A reverse proxy is a server that sits between clients and backend servers, forwarding requests to the appropriate backend.
 ```
 
-Inspect the failover counter in `/metrics` (proxy admin endpoint, if exposed) to confirm the path:
+The client gets a clean answer. The primary attempt and the handover are visible in the proxy log:
 
 ```
-sbproxy_ai_failovers_total{from_provider="broken-anthropic",to_provider="anthropic",reason="401"} 1
+AI proxy: upstream request failed error=... provider=primary-unreachable attempt=0
 ```
-
-If you remove the broken provider from the chain, the same request returns the same response, but `sbproxy_ai_failovers_total` does not increment.
 
 ## What this exercises
 
-- `ai_proxy.routing.strategy: fallback_chain` - priority-ordered provider list
-- Provider `priority` - lower wins first; failover advances down the list on non-2xx or timeout
-- `provider_type` override - reuse the Anthropic translator with a custom provider name (`broken-anthropic`)
-- `sbproxy_ai_failovers_total` metric - one increment per handover, labelled with the reason
+- `routing.strategy: fallback_chain` with priority-ordered providers
+- Transport-level failure detection and automatic advancement to the next provider
+- A live backup serving the request transparently, with no client-side retry
 
 ## See also
 
-- [docs/ai-gateway.md](../../docs/ai-gateway.md) - AI gateway overview
-- [docs/routing-strategies.md](../../docs/routing-strategies.md) - fallback chain semantics
-- [docs/providers.md](../../docs/providers.md) - per-provider notes
+- [docs/ai-gateway.md](../../docs/ai-gateway.md) - AI gateway overview, routing strategies
+- [examples/ai-cost-optimized](../ai-cost-optimized) - cost-aware provider selection
+- [examples/ai-multi-provider](../ai-multi-provider) - multi-provider with guardrails
