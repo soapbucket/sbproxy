@@ -46,12 +46,12 @@ origins:
       providers:
         - name: anthropic
           api_key: ${ANTHROPIC_API_KEY}
-          default_model: claude-3-5-haiku-latest
+          default_model: claude-haiku-4-5
       virtual_keys:
         - key: ${TEAM_FRONTEND_KEY}
           name: team-frontend
           allowed_providers: [anthropic]
-          allowed_models: [claude-3-5-haiku-latest]
+          allowed_models: [claude-haiku-4-5]
           max_requests_per_minute: 30
           max_tokens_per_minute: 60000
           tags: [team-frontend, tier-haiku]
@@ -71,7 +71,7 @@ origins:
       providers:
         - name: anthropic
           api_key: ${ANTHROPIC_API_KEY}
-          default_model: claude-3-5-haiku-latest
+          default_model: claude-haiku-4-5
     credentials:
       - name: team-frontend
         type: ai_provider
@@ -84,7 +84,7 @@ origins:
             max_tokens: 500000
             max_cost_usd: 10
         models:
-          allow: [claude-3-5-haiku-latest]
+          allow: [claude-haiku-4-5]
         policies:
           - type: rate_limit
             rpm: 30

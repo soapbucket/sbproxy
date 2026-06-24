@@ -24,7 +24,7 @@
 #     -H "Authorization: Bearer ${TEAM_FRONTEND_KEY}" \
 #     -H 'Content-Type: application/json' \
 #     -d '{
-#       "model": "claude-3-5-haiku-latest",
+#       "model": "claude-haiku-4-5",
 #       "messages": [{"role": "user", "content": "Hello from frontend."}]
 #     }'
 #
@@ -34,7 +34,7 @@
 #     -H "Authorization: Bearer ${TEAM_FRONTEND_KEY}" \
 #     -H 'Content-Type: application/json' \
 #     -d '{
-#       "model": "claude-3-5-sonnet-latest",
+#       "model": "claude-sonnet-4-5",
 #       "messages": [{"role": "user", "content": "Try Sonnet."}]
 #     }'
 #
@@ -44,7 +44,7 @@
 #     -H "Authorization: Bearer ${TEAM_DATA_KEY}" \
 #     -H 'Content-Type: application/json' \
 #     -d '{
-#       "model": "claude-3-5-sonnet-latest",
+#       "model": "claude-sonnet-4-5",
 #       "messages": [{"role": "user", "content": "Hello from data team."}]
 #     }'
 #
@@ -77,10 +77,10 @@ origins:
           #   api_key: k8ssecret://primary/sbproxy-secrets/anthropic-key
           # See docs/secrets.md.
           api_key: ${ANTHROPIC_API_KEY}
-          default_model: claude-3-5-haiku-latest
+          default_model: claude-haiku-4-5
           models:
-            - claude-3-5-haiku-latest
-            - claude-3-5-sonnet-latest
+            - claude-haiku-4-5
+            - claude-sonnet-4-5
 
     # Per-team credentials. Each credential's `models.allow` is an
     # enforced per-key gate: a request for a model outside the list
@@ -99,7 +99,7 @@ origins:
             max_tokens: 500000
             max_cost_usd: 10
         models:
-          allow: [claude-3-5-haiku-latest]
+          allow: [claude-haiku-4-5]
         policies:
           - type: rate_limit
             rpm: 30
@@ -117,8 +117,8 @@ origins:
             max_cost_usd: 250
         models:
           allow:
-            - claude-3-5-haiku-latest
-            - claude-3-5-sonnet-latest
+            - claude-haiku-4-5
+            - claude-sonnet-4-5
         policies:
           - type: rate_limit
             rpm: 120

@@ -23,7 +23,7 @@ $ curl -s http://127.0.0.1:8080/v1/chat/completions \
     -H 'Host: ai.local' \
     -H 'Content-Type: application/json' \
     -d '{
-      "model": "claude-3-5-haiku-latest",
+      "model": "claude-haiku-4-5",
       "messages": [{"role": "user", "content": "Hello! Which provider served this?"}]
     }' | jq -r '.model'
 anthropic/claude-3-haiku
@@ -37,12 +37,12 @@ Run a sustained burst and watch the distribution skew toward the more expensive 
 $ for i in $(seq 1 100); do
     curl -s http://127.0.0.1:8080/v1/chat/completions \
       -H 'Host: ai.local' -H 'Content-Type: application/json' \
-      -d '{"model":"claude-3-5-haiku-latest","messages":[{"role":"user","content":"ping"}]}' \
+      -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"ping"}]}' \
       | jq -r '.model'
   done | sort | uniq -c
      78 anthropic/claude-3-haiku
-     19 claude-3-5-haiku-latest
-      3 claude-3-5-sonnet-latest
+     19 claude-haiku-4-5
+      3 claude-sonnet-4-5
 ```
 
 The proxy publishes `sbproxy_ai_requests_total{provider}` per provider so the per-route distribution is visible on a dashboard.

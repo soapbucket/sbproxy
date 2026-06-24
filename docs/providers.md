@@ -102,10 +102,10 @@ origins:
       providers:
         - name: anthropic
           api_key: ${ANTHROPIC_API_KEY}
-          default_model: claude-3-5-sonnet-latest
+          default_model: claude-sonnet-4-5
           models:
-            - claude-3-5-sonnet-latest
-            - claude-3-5-haiku-latest
+            - claude-sonnet-4-5
+            - claude-haiku-4-5
 ```
 
 Useful per-provider knobs:
