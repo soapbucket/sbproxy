@@ -4,7 +4,7 @@
 
 <h1 align="center">SBproxy</h1>
 
-*Last modified: 2026-05-16*
+*Last modified: 2026-06-08*
 
 <h3 align="center">The AI gateway built like a real proxy.</h3>
 
@@ -31,6 +31,8 @@ Most teams run one tool for HTTP traffic and another for LLM traffic. That's two
 
 - **One config file** replaces your reverse proxy, AI gateway, and the middleware glue between them.
 - **200+ LLM models** behind an OpenAI-compatible API, with fallback chains, guardrails, and budgets.
+- **Local semantic cache.** Near-duplicate prompts replay from cache. Vectorize them on-box with a local embedder, so there is no per-call cost and the prompt never leaves your network.
+- **Observable out of the box.** Metrics, logs, and traces from one process. AI spans follow the OpenTelemetry GenAI and OpenInference conventions and carry per-request token counts and USD cost, ready for Phoenix, Langfuse, Grafana, or Datadog.
 - **Secure by default.** Auth, rate limiting, WAF, DDoS, and CSRF are built in.
 - **Hot reload** with no dropped connections.
 - **Sub-millisecond p99 overhead.** Idle RSS in single-digit megabytes.
