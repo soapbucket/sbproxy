@@ -150,6 +150,12 @@ pub(super) async fn handle_ai_proxy(
 
     // Handle GET requests (e.g. /v1/models) by forwarding to first enabled provider.
     if method == http::Method::GET {
+        // LiteLLM-parity read-only endpoints served locally from config.
+        if let Some(body) = ai_management_response(&path, config) {
+            let bytes = serde_json::to_vec(&body).unwrap_or_default();
+            send_response(session, 200, "application/json", &bytes).await?;
+            return Ok(());
+        }
         let provider_idx = router
             .select_with_allowed(
                 &config.providers,
@@ -4215,6 +4221,62 @@ fn model_eligible_providers(
     (!eligible.is_empty() && eligible.len() < order.len()).then_some(eligible)
 }
 
+/// LiteLLM-parity read-only management endpoints served from the `ai_proxy`
+/// config without any upstream call: `/model/info`, `/model_group/info`, and
+/// the `/health[/readiness|/liveliness|/liveness]` aliases. Returns `None` for
+/// any other path so the caller falls through to normal handling.
+fn ai_management_response(
+    path: &str,
+    config: &sbproxy_ai::handler::AiHandlerConfig,
+) -> Option<serde_json::Value> {
+    match path.trim_end_matches('/') {
+        "/model/info" => {
+            let mut data = Vec::new();
+            for p in &config.providers {
+                let provider = p
+                    .provider_type
+                    .clone()
+                    .unwrap_or_else(|| p.name.to_string());
+                for m in &p.models {
+                    data.push(serde_json::json!({
+                        "model_name": m.as_str(),
+                        "litellm_provider": provider,
+                    }));
+                }
+            }
+            Some(serde_json::json!({ "data": data }))
+        }
+        "/model_group/info" => {
+            use std::collections::BTreeMap;
+            let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for p in &config.providers {
+                for m in &p.models {
+                    groups
+                        .entry(m.as_str().to_string())
+                        .or_default()
+                        .push(p.name.to_string());
+                }
+            }
+            let data: Vec<_> = groups
+                .into_iter()
+                .map(|(model_group, providers)| {
+                    serde_json::json!({
+                        "model_group": model_group,
+                        "num_deployments": providers.len(),
+                        "providers": providers,
+                    })
+                })
+                .collect();
+            Some(serde_json::json!({ "data": data }))
+        }
+        // LiteLLM spells one of these "liveliness"; accept both spellings.
+        "/health" | "/health/readiness" | "/health/liveliness" | "/health/liveness" => {
+            Some(serde_json::json!({ "status": "healthy" }))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod model_routing_tests {
     use super::model_eligible_providers;
@@ -4280,6 +4342,56 @@ mod model_routing_tests {
     fn empty_model_is_noop() {
         let providers = vec![prov("openai", &["gpt-4o-mini"])];
         assert_eq!(model_eligible_providers(&[0], &providers, ""), None);
+    }
+
+    fn handler_config_two_deployments() -> sbproxy_ai::handler::AiHandlerConfig {
+        serde_json::from_value(serde_json::json!({
+            "providers": [
+                {"name": "openai-a", "api_key": "k", "provider_type": "openai", "models": ["gpt-4o-mini"]},
+                {"name": "openai-b", "api_key": "k", "provider_type": "openai", "models": ["gpt-4o-mini"]},
+                {"name": "anthropic", "api_key": "k", "provider_type": "anthropic", "models": ["claude-haiku-4-5"]}
+            ]
+        }))
+        .expect("AiHandlerConfig fixture")
+    }
+
+    #[test]
+    fn model_group_info_groups_deployments_by_public_name() {
+        let cfg = handler_config_two_deployments();
+        let resp = super::ai_management_response("/model_group/info", &cfg).unwrap();
+        let groups = resp["data"].as_array().unwrap();
+        // Two public names: gpt-4o-mini (2 deployments) + claude-haiku-4-5 (1).
+        assert_eq!(groups.len(), 2);
+        let gpt = groups
+            .iter()
+            .find(|g| g["model_group"] == "gpt-4o-mini")
+            .unwrap();
+        assert_eq!(gpt["num_deployments"], 2);
+    }
+
+    #[test]
+    fn model_info_lists_every_deployment() {
+        let cfg = handler_config_two_deployments();
+        let resp = super::ai_management_response("/model/info", &cfg).unwrap();
+        assert_eq!(resp["data"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn health_aliases_report_healthy_and_unknown_paths_pass_through() {
+        let cfg = handler_config_two_deployments();
+        for p in [
+            "/health",
+            "/health/readiness",
+            "/health/liveliness",
+            "/health/liveness",
+        ] {
+            assert_eq!(
+                super::ai_management_response(p, &cfg).unwrap()["status"],
+                "healthy"
+            );
+        }
+        assert!(super::ai_management_response("/v1/models", &cfg).is_none());
+        assert!(super::ai_management_response("/v1/chat/completions", &cfg).is_none());
     }
 }
 

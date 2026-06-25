@@ -24,6 +24,23 @@ $ curl -s http://127.0.0.1:8080/v1/chat/completions \
     | jq -r '.model, .choices[0].message.content'
 ```
 
+## Group info and health (LiteLLM-parity endpoints)
+
+The gateway serves read-only metadata endpoints from this config, no upstream call:
+
+```bash
+# Deployments grouped by public model name.
+curl -s -H 'Host: ai.local' http://127.0.0.1:8080/model_group/info | jq
+# => {"data":[{"model_group":"gpt-4o-mini","num_deployments":2,"providers":["openai-deployment-a","openai-deployment-b"]}]}
+
+# Flat list of every deployment.
+curl -s -H 'Host: ai.local' http://127.0.0.1:8080/model/info | jq
+
+# Health (also /health/readiness and /health/liveliness).
+curl -s -H 'Host: ai.local' http://127.0.0.1:8080/health
+# => {"status":"healthy"}
+```
+
 ## What this exercises
 
 - Model-based provider routing: the `model` field selects the group of providers that declare it.
