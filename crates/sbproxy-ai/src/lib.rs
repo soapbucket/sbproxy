@@ -20,6 +20,7 @@ pub mod context_relay;
 pub mod cost_quality;
 pub mod degradation;
 pub mod external_guardrail;
+pub mod failure_cause;
 pub mod fill_first;
 pub mod finetune;
 pub mod format;

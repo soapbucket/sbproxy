@@ -1740,6 +1740,13 @@ pub(super) async fn handle_ai_proxy(
     let is_failover = matches!(config.routing, sbproxy_ai::RoutingStrategy::FallbackChain);
     // Default retry-on-status codes for failover.
     let retry_statuses: Vec<u16> = vec![500, 502, 503];
+    // WOR-1545 / WOR-1524: optional per-error-class retry policy. When set,
+    // the failover loop classifies each failure and consults it in addition
+    // to the status-code set above.
+    let retry_policy = config
+        .resilience
+        .as_ref()
+        .and_then(|r| r.retry_policy.as_ref());
 
     // Surface-specific request-body inspection captured once before
     // the failover loop so each attempt's BudgetRecorderArgs carries
@@ -2197,10 +2204,20 @@ pub(super) async fn handle_ai_proxy(
                 // `lowest_latency` reflect live data on the next request.
                 router.record_latency(provider_idx, attempt_start.elapsed().as_micros() as u64);
                 let status = resp.status().as_u16();
-                if is_failover
-                    && status >= 500
-                    && retry_statuses.contains(&status)
-                    && attempt + 1 < max_attempts
+                // WOR-1545 / WOR-1524: retry on the default status-code set,
+                // or on a per-error-class policy decision when configured.
+                // Classification from status alone is enough for the
+                // retryable classes (timeout / rate-limit / server error);
+                // the body-refined classes (context-window, content-policy)
+                // are not retried in place anyway.
+                let retry_by_status = status >= 500 && retry_statuses.contains(&status);
+                let retry_by_policy = retry_policy.is_some_and(|p| {
+                    p.should_retry(
+                        sbproxy_ai::failure_cause::FailureCause::classify(status, ""),
+                        attempt,
+                    )
+                });
+                if is_failover && (retry_by_status || retry_by_policy) && attempt + 1 < max_attempts
                 {
                     // WOR-1103: record the failed attempt so per-provider
                     // load distribution and failure rates are visible,

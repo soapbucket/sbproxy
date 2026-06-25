@@ -335,6 +335,13 @@ pub struct AiResilienceConfig {
     /// Active health probe of the provider's `/v1/models` endpoint.
     #[serde(default)]
     pub health_check: Option<AiHealthCheckConfig>,
+    /// WOR-1545 / WOR-1524: per-error-class retry counts. When set, the
+    /// failover loop classifies each upstream failure into a
+    /// [`crate::failure_cause::FailureCause`] and consults this policy,
+    /// so (for example) a `429` rate limit can be retried while a
+    /// malformed request is not. `None` keeps the status-code retry set.
+    #[serde(default)]
+    pub retry_policy: Option<crate::failure_cause::RetryPolicy>,
 }
 
 /// Circuit-breaker tuning shared with the load_balancer flavour.
