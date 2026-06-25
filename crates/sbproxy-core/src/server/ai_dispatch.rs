@@ -58,6 +58,26 @@ fn key_record_to_virtual_key(
     }
 }
 
+/// WOR-1555: map a verified OIDC/JWT identity to a stored virtual-key record's
+/// policy, so the bearer-token and OIDC front doors converge on one record.
+///
+/// The JWT/OIDC auth provider already proved the identity, so no secret is
+/// verified here: the configured claim's value names the record (key_id), and a
+/// usable record's policy/attribution is applied. Returns `None` when mapping is
+/// not configured, the claim is absent, or the record is missing or not active.
+async fn resolve_oidc_mapped_key(
+    plane: &crate::key_plane::KeyPlane,
+    principal: &sbproxy_plugin::Principal,
+) -> Option<sbproxy_ai::identity::VirtualKeyConfig> {
+    let claim_field = plane.oidc_claim_field()?;
+    let claims = principal.attrs.claims.as_ref()?;
+    let key_id = claims.get(claim_field)?.as_str()?;
+    match plane.cache().resolve_key(key_id).await {
+        Ok(Some(rec)) if rec.is_usable(chrono::Utc::now()) => Some(key_record_to_virtual_key(&rec)),
+        _ => None,
+    }
+}
+
 /// Resolve an inbound bearer token against the dynamic key plane: parse the
 /// `sk-<key_id>-<secret>` shape, look the id up through the cache then store,
 /// constant-time verify the secret, and gate on status/expiry. Fail-closed: a
@@ -878,7 +898,11 @@ pub(super) async fn handle_ai_proxy(
             if let Some(plane) = crate::key_plane::current_key_plane() {
                 match resolve_dynamic_virtual_key(&plane, raw_key.as_deref()).await {
                     DynamicKeyOutcome::Resolved(vk) => Some(*vk),
-                    DynamicKeyOutcome::NotApplicable => None,
+                    // No virtual-key bearer token: fall back to OIDC/JWT claim
+                    // mapping so a verified identity resolves the same record.
+                    DynamicKeyOutcome::NotApplicable => {
+                        resolve_oidc_mapped_key(&plane, &ctx.principal).await
+                    }
                     DynamicKeyOutcome::Deny(status, msg) => {
                         warn!(status, reason = %msg, "AI proxy: dynamic virtual key denied");
                         send_error(session, status, &msg).await?;
@@ -5306,5 +5330,66 @@ mod dynamic_key_resolution_tests {
             DynamicKeyOutcome::NotApplicable => "not-applicable",
             DynamicKeyOutcome::Deny(_, _) => "deny",
         }
+    }
+
+    fn principal_with_claim(field: &str, value: &str) -> sbproxy_plugin::Principal {
+        sbproxy_plugin::Principal {
+            attrs: sbproxy_plugin::PrincipalAttrs {
+                claims: Some(
+                    [(
+                        field.to_string(),
+                        serde_json::Value::String(value.to_string()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..Default::default()
+            },
+            ..sbproxy_plugin::Principal::anonymous()
+        }
+    }
+
+    #[tokio::test]
+    async fn oidc_claim_maps_to_virtual_key() {
+        let crypto = KeyCrypto::new(b"pep".to_vec(), b"mas".to_vec());
+        let now = chrono::Utc::now();
+        let store = Arc::new(MemoryKeyStore::new());
+        let mut active = KeyRecord::new("team-acme", "unused-hash", now);
+        active.name = Some("acme".into());
+        store.put_key(active).await.unwrap();
+        let mut revoked = KeyRecord::new("team-old", "unused-hash", now);
+        revoked.status = RecordStatus::Revoked;
+        store.put_key(revoked).await.unwrap();
+        let cache = Arc::new(TtlCache::new(
+            store as Arc<dyn KeyStore>,
+            TtlCacheConfig::default(),
+        ));
+
+        // Mapping configured on the claim `virtual_key`.
+        let plane = crate::key_plane::KeyPlane::from_parts(
+            crypto,
+            cache,
+            false,
+            false,
+            Some("virtual_key".to_string()),
+        );
+
+        // A verified identity whose claim names a usable record resolves it
+        // (no secret required, identity already proven by the JWT provider).
+        let p = principal_with_claim("virtual_key", "team-acme");
+        let vk = resolve_oidc_mapped_key(&plane, &p).await.expect("mapped");
+        assert_eq!(vk.key, "team-acme");
+
+        // A claim that names a revoked record does not resolve.
+        let p = principal_with_claim("virtual_key", "team-old");
+        assert!(resolve_oidc_mapped_key(&plane, &p).await.is_none());
+
+        // A claim that names no record does not resolve.
+        let p = principal_with_claim("virtual_key", "team-missing");
+        assert!(resolve_oidc_mapped_key(&plane, &p).await.is_none());
+
+        // A principal without the mapped claim does not resolve.
+        let p = principal_with_claim("other", "team-acme");
+        assert!(resolve_oidc_mapped_key(&plane, &p).await.is_none());
     }
 }
