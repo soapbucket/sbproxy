@@ -750,10 +750,9 @@ pub struct KeyStoreConfig {
     /// Secret-reference namespace prefix (backend `secrets_manager`).
     #[serde(default = "default_keystore_prefix")]
     pub prefix: String,
-    /// Vault backend alias used as the system of record (backend
-    /// `secrets_manager`).
+    /// External secrets-manager connection (backend `secrets_manager`).
     #[serde(default)]
-    pub vault: Option<String>,
+    pub secrets_manager: SecretsManagerStoreConfig,
 }
 
 impl Default for KeyStoreConfig {
@@ -764,7 +763,74 @@ impl Default for KeyStoreConfig {
             url: None,
             redis_source_of_truth: false,
             prefix: default_keystore_prefix(),
-            vault: None,
+            secrets_manager: SecretsManagerStoreConfig::default(),
+        }
+    }
+}
+
+fn default_kv_v2() -> bool {
+    true
+}
+
+fn default_vault_token_env() -> String {
+    "VAULT_TOKEN".to_string()
+}
+
+/// External secrets manager backing the `secrets_manager` store backend. Only
+/// writable managers are supported (HashiCorp Vault, AWS Secrets Manager, and an
+/// in-memory `local` store for dev/tests).
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretsManagerProvider {
+    /// In-memory, non-persistent. Dev and tests only.
+    #[default]
+    Local,
+    /// HashiCorp Vault KV (token auth, token read from `token_env`).
+    Hashicorp,
+    /// AWS Secrets Manager via the default credential chain.
+    Aws,
+}
+
+/// `key_management.store.secrets_manager:` connection block.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct SecretsManagerStoreConfig {
+    /// Which external manager.
+    #[serde(default)]
+    pub provider: SecretsManagerProvider,
+    /// HashiCorp Vault address (provider `hashicorp`), e.g.
+    /// `https://vault.example/v1`.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// KV mount path (provider `hashicorp`) or path prefix (provider `aws`).
+    #[serde(default)]
+    pub mount: Option<String>,
+    /// Use KV engine v2 (provider `hashicorp`). Default true.
+    #[serde(default = "default_kv_v2")]
+    pub kv_v2: bool,
+    /// Environment variable holding the Vault token (provider `hashicorp`).
+    /// Default `VAULT_TOKEN`.
+    #[serde(default = "default_vault_token_env")]
+    pub token_env: String,
+    /// Optional `X-Vault-Namespace` (provider `hashicorp`, Vault Enterprise).
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// AWS region (provider `aws`), e.g. `us-east-1`.
+    #[serde(default)]
+    pub region: Option<String>,
+}
+
+impl Default for SecretsManagerStoreConfig {
+    fn default() -> Self {
+        Self {
+            provider: SecretsManagerProvider::Local,
+            address: None,
+            mount: None,
+            kv_v2: default_kv_v2(),
+            token_env: default_vault_token_env(),
+            namespace: None,
+            region: None,
         }
     }
 }

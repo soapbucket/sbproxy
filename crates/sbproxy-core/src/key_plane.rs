@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use arc_swap::ArcSwapOption;
 use chrono::{DateTime, Utc};
 use sbproxy_config::types::{
@@ -173,9 +173,9 @@ fn build_crypto(cfg: &KeyManagementConfig) -> Result<KeyCrypto> {
     Ok(KeyCrypto::new(pepper, master))
 }
 
-/// Build the configured store backend. Embedded (redb) and Redis are wired at
-/// boot; the secrets-manager-direct backend exists but is not auto-wired from
-/// config yet (it needs a resolved vault backend handle).
+/// Build the configured store backend: embedded (redb), Redis, or
+/// secrets-manager-direct (HashiCorp / AWS / local, via the writable vault
+/// backends).
 fn build_store(cfg: &KeyManagementConfig) -> Result<Arc<dyn KeyStore>> {
     match cfg.store.backend {
         KeyStoreBackend::Embedded => {
@@ -197,11 +197,56 @@ fn build_store(cfg: &KeyManagementConfig) -> Result<Arc<dyn KeyStore>> {
                 url,
             )))
         }
-        KeyStoreBackend::SecretsManager => bail!(
-            "key_management.store.backend = secrets_manager is not yet wired from config; \
-             use the embedded or redis backend"
-        ),
+        KeyStoreBackend::SecretsManager => {
+            let spec = build_secrets_manager_spec(cfg)?;
+            Ok(Arc::new(
+                sbproxy_keystore::secrets_manager::SecretsManagerKeyStore::from_spec(spec)
+                    .context("build secrets-manager keystore")?,
+            ))
+        }
     }
+}
+
+/// Lower the `key_management.store.secrets_manager:` config into a keystore
+/// [`SecretsManagerSpec`](sbproxy_keystore::secrets_manager::SecretsManagerSpec),
+/// validating the per-provider required fields.
+fn build_secrets_manager_spec(
+    cfg: &KeyManagementConfig,
+) -> Result<sbproxy_keystore::secrets_manager::SecretsManagerSpec> {
+    use sbproxy_config::types::SecretsManagerProvider as CfgProvider;
+    use sbproxy_keystore::secrets_manager::{SecretsManagerProvider, SecretsManagerSpec};
+
+    let sm = &cfg.store.secrets_manager;
+    let provider = match sm.provider {
+        CfgProvider::Local => SecretsManagerProvider::Local,
+        CfgProvider::Hashicorp => {
+            let addr = sm.address.clone().context(
+                "key_management.store.secrets_manager.address is required for the hashicorp provider",
+            )?;
+            let mount = sm.mount.clone().unwrap_or_else(|| "secret".to_string());
+            SecretsManagerProvider::Hashicorp {
+                addr,
+                mount,
+                kv_v2: sm.kv_v2,
+                token_env: sm.token_env.clone(),
+                namespace: sm.namespace.clone(),
+            }
+        }
+        CfgProvider::Aws => {
+            let region = sm.region.clone().context(
+                "key_management.store.secrets_manager.region is required for the aws provider",
+            )?;
+            let mount_prefix = sm.mount.clone().unwrap_or_default();
+            SecretsManagerProvider::Aws {
+                region,
+                mount_prefix,
+            }
+        }
+    };
+    Ok(SecretsManagerSpec {
+        provider,
+        prefix: cfg.store.prefix.clone(),
+    })
 }
 
 /// Build the `TtlCache` wrapping `store`, attaching a Redis L2 tier when
@@ -487,7 +532,10 @@ pub(crate) fn test_plane_guard() -> TestPlaneGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sbproxy_config::types::{KeyCryptoConfig, KeySeedConfig, KeyStoreConfig};
+    use sbproxy_config::types::{
+        KeyCryptoConfig, KeySeedConfig, KeyStoreConfig, SecretsManagerProvider,
+        SecretsManagerStoreConfig,
+    };
 
     fn temp_db() -> String {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -594,5 +642,56 @@ mod tests {
         // A fresh slot would be None anyway; assert init is a no-op error-free.
         init_key_plane(&cfg).unwrap();
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn secrets_manager_local_backend_builds_and_seeds() {
+        // The secrets-manager store backend wires from config (local provider:
+        // an in-memory writable vault, exercising the full build_store path).
+        let _guard = test_plane_guard();
+        let mut cfg = KeyManagementConfig {
+            enabled: true,
+            store: KeyStoreConfig {
+                backend: KeyStoreBackend::SecretsManager,
+                secrets_manager: SecretsManagerStoreConfig {
+                    provider: SecretsManagerProvider::Local,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            crypto: KeyCryptoConfig {
+                pepper: Some("test-pepper".to_string()),
+                master_key: Some("test-master".to_string()),
+            },
+            ..Default::default()
+        };
+        cfg.seed = KeySeedConfig {
+            keys: vec![SeedKeyConfig {
+                key_id: "sm1".into(),
+                secret: Some("s".into()),
+                secret_hash: None,
+                name: Some("sm-seeded".into()),
+                max_requests_per_minute: None,
+                max_tokens_per_minute: None,
+                max_budget_tokens: None,
+                max_budget_usd: None,
+                allowed_models: vec![],
+                blocked_models: vec![],
+                allowed_providers: vec![],
+                project: None,
+                user: None,
+                tenant: None,
+                expires_at: None,
+            }],
+            credentials: vec![],
+        };
+
+        init_key_plane(&cfg).unwrap();
+        let plane = current_key_plane().expect("plane installed");
+        let rec = key_runtime()
+            .block_on(plane.cache().resolve_key("sm1"))
+            .unwrap()
+            .expect("seeded key present in secrets-manager store");
+        assert_eq!(rec.name.as_deref(), Some("sm-seeded"));
     }
 }

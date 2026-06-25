@@ -77,7 +77,7 @@ sbproxy-security.workspace = true
 # WOR-1546: the dynamic key plane (mutable store, policy cache, at-rest crypto).
 # Redis backend/tier + cross-replica invalidation enabled here so the assembly
 # in `key_plane.rs` can build either backend from config.
-sbproxy-keystore = { workspace = true, features = ["embedded", "redis-backend"] }
+sbproxy-keystore = { workspace = true, features = ["embedded", "redis-backend", "secrets-manager"] }
 # WOR-1562/1563: the mesh distributed-cache tier + CRDT spend/rate counters for
 # the key plane (consistent-hash ring, gossip replication, G-Counter, sliding
 # window). Pulls sbproxy-mesh transitively.

@@ -1362,8 +1362,16 @@
             "path": "/var/lib/sbproxy/keystore.redb",
             "prefix": "sbproxy/keystore",
             "redis_source_of_truth": false,
-            "url": null,
-            "vault": null
+            "secrets_manager": {
+              "address": null,
+              "kv_v2": true,
+              "mount": null,
+              "namespace": null,
+              "provider": "local",
+              "region": null,
+              "token_env": "VAULT_TOKEN"
+            },
+            "url": null
           },
           "allOf": [
             {
@@ -1471,12 +1479,21 @@
           "default": "sbproxy/keystore",
           "type": "string"
         },
-        "vault": {
-          "description": "Vault backend alias used as the system of record (backend `secrets_manager`).",
-          "default": null,
-          "type": [
-            "string",
-            "null"
+        "secrets_manager": {
+          "description": "External secrets-manager connection (backend `secrets_manager`).",
+          "default": {
+            "address": null,
+            "kv_v2": true,
+            "mount": null,
+            "namespace": null,
+            "provider": "local",
+            "region": null,
+            "token_env": "VAULT_TOKEN"
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/SecretsManagerStoreConfig"
+            }
           ]
         }
       }
@@ -1503,6 +1520,89 @@
           "type": "string",
           "enum": [
             "secrets_manager"
+          ]
+        }
+      ]
+    },
+    "SecretsManagerStoreConfig": {
+      "description": "`key_management.store.secrets_manager:` connection block.",
+      "type": "object",
+      "properties": {
+        "provider": {
+          "description": "Which external manager.",
+          "default": "local",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SecretsManagerProvider"
+            }
+          ]
+        },
+        "address": {
+          "description": "HashiCorp Vault address (provider `hashicorp`), e.g. `https://vault.example/v1`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mount": {
+          "description": "KV mount path (provider `hashicorp`) or path prefix (provider `aws`).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kv_v2": {
+          "description": "Use KV engine v2 (provider `hashicorp`). Default true.",
+          "default": true,
+          "type": "boolean"
+        },
+        "token_env": {
+          "description": "Environment variable holding the Vault token (provider `hashicorp`). Default `VAULT_TOKEN`.",
+          "default": "VAULT_TOKEN",
+          "type": "string"
+        },
+        "namespace": {
+          "description": "Optional `X-Vault-Namespace` (provider `hashicorp`, Vault Enterprise).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "region": {
+          "description": "AWS region (provider `aws`), e.g. `us-east-1`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "SecretsManagerProvider": {
+      "description": "External secrets manager backing the `secrets_manager` store backend. Only writable managers are supported (HashiCorp Vault, AWS Secrets Manager, and an in-memory `local` store for dev/tests).",
+      "oneOf": [
+        {
+          "description": "In-memory, non-persistent. Dev and tests only.",
+          "type": "string",
+          "enum": [
+            "local"
+          ]
+        },
+        {
+          "description": "HashiCorp Vault KV (token auth, token read from `token_env`).",
+          "type": "string",
+          "enum": [
+            "hashicorp"
+          ]
+        },
+        {
+          "description": "AWS Secrets Manager via the default credential chain.",
+          "type": "string",
+          "enum": [
+            "aws"
           ]
         }
       ]

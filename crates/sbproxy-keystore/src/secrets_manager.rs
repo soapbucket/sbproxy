@@ -30,6 +30,46 @@ pub struct SecretsManagerKeyStore {
     prefix: String,
 }
 
+/// Which writable external secrets manager backs the store. Only backends with
+/// a real `set` are usable as a mutable system of record (AWS Secrets Manager,
+/// HashiCorp Vault, and the in-memory local store for dev/tests); GCP, file, and
+/// Kubernetes backends are read-only and not offered here.
+#[derive(Debug, Clone)]
+pub enum SecretsManagerProvider {
+    /// In-memory, non-persistent. For dev and tests only.
+    Local,
+    /// HashiCorp Vault KV. Token auth; the token is read from the named env var.
+    Hashicorp {
+        /// Vault address, e.g. `https://vault.example/v1`.
+        addr: String,
+        /// KV mount path (e.g. `secret`).
+        mount: String,
+        /// Use KV engine v2 (the modern default) vs v1.
+        kv_v2: bool,
+        /// Environment variable holding the Vault token.
+        token_env: String,
+        /// Optional `X-Vault-Namespace` (Vault Enterprise).
+        namespace: Option<String>,
+    },
+    /// AWS Secrets Manager via the default credential chain (IAM role, env,
+    /// instance/task profile).
+    Aws {
+        /// AWS region, e.g. `us-east-1`.
+        region: String,
+        /// Path prefix every secret stays inside.
+        mount_prefix: String,
+    },
+}
+
+/// A build spec for a secrets-manager-direct store, lowered from config.
+#[derive(Debug, Clone)]
+pub struct SecretsManagerSpec {
+    /// The external manager.
+    pub provider: SecretsManagerProvider,
+    /// Namespace prefix for all keystore records.
+    pub prefix: String,
+}
+
 impl SecretsManagerKeyStore {
     /// Wrap a vault backend, namespacing all secrets under `prefix` (for
     /// example `sbproxy/keystore`).
@@ -38,6 +78,58 @@ impl SecretsManagerKeyStore {
             backend,
             prefix: prefix.into(),
         }
+    }
+
+    /// Build a store from a [`SecretsManagerSpec`], constructing the underlying
+    /// writable vault backend. HashiCorp reads its token from the configured
+    /// environment variable; AWS uses the default credential chain.
+    pub fn from_spec(spec: SecretsManagerSpec) -> anyhow::Result<Self> {
+        let backend: Arc<dyn VaultBackend> = match spec.provider {
+            SecretsManagerProvider::Local => Arc::new(sbproxy_vault::LocalVault::new()),
+            SecretsManagerProvider::Hashicorp {
+                addr,
+                mount,
+                kv_v2,
+                token_env,
+                namespace,
+            } => {
+                let token = std::env::var(&token_env).with_context(|| {
+                    format!("read HashiCorp token from env '{token_env}' for the secrets-manager keystore")
+                })?;
+                let cfg = sbproxy_vault::HashiCorpConfig {
+                    addr,
+                    auth: sbproxy_vault::HashiCorpAuth::Token { token },
+                    mount,
+                    engine: if kv_v2 {
+                        sbproxy_vault::KvEngine::V2
+                    } else {
+                        sbproxy_vault::KvEngine::V1
+                    },
+                    cache_ttl: None,
+                    namespace,
+                };
+                Arc::new(
+                    sbproxy_vault::HashiCorpVaultBackend::new(cfg).context(
+                        "build HashiCorp Vault backend for the secrets-manager keystore",
+                    )?,
+                )
+            }
+            SecretsManagerProvider::Aws {
+                region,
+                mount_prefix,
+            } => {
+                let cfg = sbproxy_vault::AwsSecretsManagerConfig {
+                    region,
+                    auth: sbproxy_vault::AwsAuth::DefaultChain,
+                    mount_prefix,
+                    cache_ttl: None,
+                };
+                Arc::new(sbproxy_vault::AwsSecretsManagerBackend::new(cfg).context(
+                    "build AWS Secrets Manager backend for the secrets-manager keystore",
+                )?)
+            }
+        };
+        Ok(Self::new(backend, spec.prefix))
     }
 
     fn key_path(&self, key_id: &str) -> String {
@@ -206,6 +298,18 @@ mod tests {
     fn store() -> SecretsManagerKeyStore {
         let backend: Arc<dyn VaultBackend> = Arc::new(LocalVault::new());
         SecretsManagerKeyStore::new(backend, "sbproxy/keystore")
+    }
+
+    #[tokio::test]
+    async fn from_spec_local_builds_a_working_store() {
+        let s = SecretsManagerKeyStore::from_spec(SecretsManagerSpec {
+            provider: SecretsManagerProvider::Local,
+            prefix: "sbproxy/keystore".into(),
+        })
+        .expect("build local secrets-manager store");
+        s.put_key(KeyRecord::new("k1", "h1", ts())).await.unwrap();
+        assert!(s.get_key("k1").await.unwrap().is_some());
+        assert_eq!(s.revision().await.unwrap(), 1);
     }
 
     #[tokio::test]

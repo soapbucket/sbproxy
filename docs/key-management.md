@@ -61,10 +61,12 @@ vault, which reads external secrets you do not own.
   or as a coherence tier behind the embedded store. Every mutation bumps a
   revision counter and publishes the changed id, so peers drop their cached copy
   and pick up the change. Set `store.url` to the Redis connection string.
-- `secrets_manager`: the configured vault backend (HashiCorp, AWS, or GCP) is
-  itself the system of record, for operators who want exactly one place secrets
-  live. The store is available programmatically; wiring it from config lands in a
-  follow-up.
+- `secrets_manager`: an external secrets manager is itself the system of record,
+  for operators who want exactly one place secrets live. Configured under
+  `store.secrets_manager` with a `provider` of `hashicorp` (token auth, token
+  from `token_env`), `aws` (default credential chain), or `local` (in-memory, for
+  dev and tests). Only writable managers are supported; read-only backends are
+  not offered here.
 
 ## The policy cache
 
