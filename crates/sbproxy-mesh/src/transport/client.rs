@@ -551,7 +551,7 @@ mod tests {
         let (server, _cache, port) = spawn_server_with_cipher(Some(server_cipher)).await;
         let client = PeerClient::with_cipher(format!("127.0.0.1:{port}"), None);
 
-        // The client sends plaintext bincode; the server fails AEAD
+        // The client sends plaintext postcard; the server fails AEAD
         // open and closes the connection. The client's read of the
         // response will then surface as a transport error.
         let err = client.get("k".to_string()).await.unwrap_err();
@@ -562,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn encrypted_client_against_plaintext_server_fails() {
         // Reverse asymmetry: client sends AEAD-wrapped frames to a
-        // server that isn't expecting them. The server's bincode
+        // server that isn't expecting them. The server's postcard
         // deserialize will fail on the random AEAD bytes, it closes
         // the connection, the client surfaces a read error.
         let client_cipher = Cipher::from_shared_key("cluster-secret");

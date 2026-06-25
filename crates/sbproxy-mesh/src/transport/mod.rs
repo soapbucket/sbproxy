@@ -60,7 +60,7 @@ pub struct StateDelta {
 ///
 /// JSON is used over the wire for human debuggability; the throughput
 /// profile of gossip membership traffic doesn't benefit meaningfully from
-/// a binary encoding. The J2 cache RPC transport uses `bincode` via
+/// a binary encoding. The J2 cache RPC transport uses `postcard` via
 /// [`frame`] instead.
 pub fn encode(msg: &MeshMessage) -> anyhow::Result<Vec<u8>> {
     let bytes = serde_json::to_vec(msg)?;

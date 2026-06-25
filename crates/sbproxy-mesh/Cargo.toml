@@ -24,7 +24,10 @@ base64 = { workspace = true }
 bytes = { workspace = true, features = ["serde"] }
 hostname = "0.4"
 prometheus = { workspace = true }
-bincode = { version = "2", features = ["serde"] }
+# Compact serde binary format for the internal mesh wire (RPC frames + gossip).
+# Maintained, unlike bincode (RUSTSEC-2025-0141). No on-disk persistence in this
+# format, so the encoding can change with a coordinated mesh-protocol bump.
+postcard = { version = "1", features = ["use-std"] }
 # Async Redis client for the backend/redis.rs persistence + federation paths.
 redis = { workspace = true }
 # Storage trait surface (PersistentKv + EphemeralKv + SetKv) + RedisStore.

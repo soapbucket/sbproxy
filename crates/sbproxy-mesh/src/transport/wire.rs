@@ -1,24 +1,23 @@
 //! Binary wire encoding for mesh RPC frames and gossip messages.
 //!
-//! Centralizes the `bincode` serde bridge so every call site shares one
-//! configuration. Uses bincode 2's `standard()` config (the maintained line;
-//! bincode 1.x is unmaintained). The format is internal to a cluster: all nodes
-//! agree on it, and there is no on-disk persistence in this format, so the
-//! encoding is free to change with a coordinated mesh-protocol version bump.
+//! Centralizes the serde serialization bridge so every call site shares one
+//! format. Uses `postcard`, a maintained, compact, serde-based binary format.
+//! The format is internal to a cluster: all nodes agree on it, and there is no
+//! on-disk persistence in this format, so the encoding is free to change with a
+//! coordinated mesh-protocol version bump.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-/// Encode `value` to bincode bytes.
+/// Encode `value` to wire bytes.
 pub(crate) fn encode<T: Serialize + ?Sized>(value: &T) -> anyhow::Result<Vec<u8>> {
-    bincode::serde::encode_to_vec(value, bincode::config::standard())
-        .map_err(|e| anyhow::anyhow!("bincode encode: {e}"))
+    postcard::to_allocvec(value).map_err(|e| anyhow::anyhow!("wire encode: {e}"))
 }
 
-/// Decode a `T` from bincode bytes (trailing bytes are ignored).
+/// Decode a `T` from wire bytes (trailing bytes are ignored).
 pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> anyhow::Result<T> {
-    let (value, _) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-        .map_err(|e| anyhow::anyhow!("bincode decode: {e}"))?;
+    let (value, _) =
+        postcard::take_from_bytes(bytes).map_err(|e| anyhow::anyhow!("wire decode: {e}"))?;
     Ok(value)
 }
 

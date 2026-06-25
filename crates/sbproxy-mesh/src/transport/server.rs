@@ -62,7 +62,7 @@ impl TransportServer {
     /// K3: bind a TCP listener with optional AES-256-GCM framing.
     ///
     /// When `cipher` is `Some`, every inbound frame is passed through
-    /// [`Cipher::open`] before bincode deserialization, and every outbound
+    /// [`Cipher::open`] before postcard deserialization, and every outbound
     /// response is passed through [`Cipher::seal`] before framing. AEAD
     /// failures tear down the connection immediately (unlike gossip's
     /// silent drop, because TCP is stateful and a cryptographic mismatch
@@ -149,7 +149,7 @@ impl Drop for TransportServer {
 /// # Encryption (K3)
 ///
 /// When `cipher` is `Some`, the wire payload inside each frame is an AEAD
-/// envelope (`[nonce][ciphertext][tag]`). We open it before bincode
+/// envelope (`[nonce][ciphertext][tag]`). We open it before postcard
 /// deserialization and seal every outgoing response body before framing.
 /// A failed open tears down the connection: an authenticated peer cannot
 /// "recover" by resyncing on the framing boundary after a crypto error, so

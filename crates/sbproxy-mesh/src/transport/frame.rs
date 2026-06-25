@@ -1,6 +1,6 @@
-//! Length-prefixed bincode framing for the cross-node cache RPC transport.
+//! Length-prefixed postcard framing for the cross-node cache RPC transport.
 //!
-//! Each wire frame is `[u32 big-endian length][bincode payload]`. The payload
+//! Each wire frame is `[u32 big-endian length][postcard payload]`. The payload
 //! is a [`Request`] on the wire from client to server, and a [`Response`] on
 //! the wire from server back to client. Requests carry a monotonic
 //! `request_id` so a single TCP connection could pipeline multiple in-flight
@@ -47,7 +47,7 @@ pub struct Request {
 /// key, and replies with `CacheResult::Purged(n)`. An empty `prefix` means
 /// "purge every entry" and is how the caller expresses a `PurgeScope::All`.
 ///
-/// bincode does **not** honor `#[serde(default)]` on enum variants, so
+/// postcard does **not** honor `#[serde(default)]` on enum variants, so
 /// every additive change to `CacheOp` is a wire-format break relative to
 /// older nodes. All nodes in a cluster must upgrade together. New variants
 /// are appended to the end so the discriminant ordering of older variants
@@ -177,7 +177,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_bincode_roundtrip_get() {
+    async fn request_wire_roundtrip_get() {
         let req = Request {
             request_id: 7,
             op: CacheOp::Get {
@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_bincode_roundtrip_put() {
+    async fn request_wire_roundtrip_put() {
         let req = Request {
             request_id: 99,
             op: CacheOp::Put {
@@ -221,7 +221,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_bincode_roundtrip_put_with_ttl() {
+    async fn request_wire_roundtrip_put_with_ttl() {
         let req = Request {
             request_id: 100,
             op: CacheOp::Put {
@@ -239,7 +239,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_bincode_roundtrip_value() {
+    async fn response_wire_roundtrip_value() {
         let resp = Response {
             request_id: 1,
             result: CacheResult::Value(Some(Bytes::from_static(b"hit"))),
@@ -254,7 +254,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_bincode_roundtrip_purge_prefix() {
+    async fn request_wire_roundtrip_purge_prefix() {
         // K2: PurgePrefix carries the scan prefix end-to-end. An empty
         // prefix is the "purge all" sentinel, which round-trips the same
         // way so we explicitly cover both cases.
@@ -286,7 +286,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_bincode_roundtrip_purged() {
+    async fn response_wire_roundtrip_purged() {
         let resp = Response {
             request_id: 7,
             result: CacheResult::Purged(17),
@@ -300,7 +300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_bincode_roundtrip_acked() {
+    async fn response_wire_roundtrip_acked() {
         let resp = Response {
             request_id: 1,
             result: CacheResult::Acked,

@@ -136,7 +136,7 @@ pub const MAX_UPDATES_PER_MSG: usize = 16;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum GossipMsg {
     /// Back-compat / legacy. Not emitted by K4; accepted on the receive
-    /// path so pre-K4 tests keep round-tripping through bincode.
+    /// path so pre-K4 tests keep round-tripping through the gossip codec.
     Heartbeat { node_id: String, ts_ms: u64 },
     /// Reserved for future dynamic-membership join.
     Join {
