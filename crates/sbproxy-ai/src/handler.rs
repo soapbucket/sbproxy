@@ -107,6 +107,11 @@ pub struct AiHandlerConfig {
     /// budget recording.
     #[serde(default = "default_usage_parser")]
     pub usage_parser: String,
+    /// Usage sinks: forward a record of every completed LLM call to external
+    /// systems (a JSONL file, an HTTP collector). The open-source seam that
+    /// LiteLLM's `success_callback` / `callbacks` map onto. Empty by default.
+    #[serde(default)]
+    pub usage_sinks: Vec<crate::usage_sink::UsageSinkConfig>,
     /// Lazy-built compiled redactor cached on the per-origin
     /// config. Built on first use so config-load does not pay the
     /// regex-compile cost for origins that never serve a request.
@@ -133,6 +138,10 @@ pub struct AiHandlerConfig {
     /// call and degrade them to round-robin.
     #[serde(skip)]
     pub(crate) router: OnceLock<std::sync::Arc<crate::routing::Router>>,
+    /// Lazy-built usage sinks, held in `Arc`s so a single instance per sink is
+    /// shared across requests for the lifetime of this per-origin config.
+    #[serde(skip)]
+    pub(crate) usage_sinks_built: OnceLock<Vec<std::sync::Arc<dyn crate::usage_sink::UsageSink>>>,
 }
 
 fn default_usage_parser() -> String {
@@ -191,6 +200,15 @@ impl AiHandlerConfig {
                 crate::semantic_cache::EmbeddingCache::from_config(&cfg).map(std::sync::Arc::new)
             })
             .as_ref()
+    }
+
+    /// Return the shared usage sinks for this handler, building them once.
+    /// Empty when none are configured. Sinks are best-effort and never fail a
+    /// request.
+    pub fn usage_sinks(&self) -> &[std::sync::Arc<dyn crate::usage_sink::UsageSink>] {
+        self.usage_sinks_built
+            .get_or_init(|| crate::usage_sink::build_sinks(&self.usage_sinks))
+            .as_slice()
     }
 
     /// Return the shared provider router for this handler, building it
@@ -856,6 +874,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn usage_sinks_parse_and_build_from_config() {
+        let cfg: AiHandlerConfig = serde_json::from_value(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "k", "models": ["gpt-4o-mini"]}],
+            "usage_sinks": [
+                {"type": "jsonl_file", "path": "/var/log/sb.jsonl"},
+                {"type": "webhook", "url": "https://collector.example/ingest"}
+            ]
+        }))
+        .expect("config with usage_sinks parses");
+        let sinks = cfg.usage_sinks();
+        assert_eq!(sinks.len(), 2);
+        assert_eq!(sinks[0].name(), "jsonl_file");
+        assert_eq!(sinks[1].name(), "webhook");
+        // The lazy accessor returns the same built instances on repeat calls.
+        assert_eq!(cfg.usage_sinks().len(), 2);
+    }
+
+    #[test]
     fn parse_ai_path_chat_completions() {
         assert_eq!(
             parse_ai_path("/v1/chat/completions"),
@@ -907,6 +943,8 @@ mod tests {
             pii_redactor: OnceLock::new(),
             embedding_cache: OnceLock::new(),
             router: OnceLock::new(),
+            usage_sinks: vec![],
+            usage_sinks_built: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("anything"));
@@ -936,6 +974,8 @@ mod tests {
             pii_redactor: OnceLock::new(),
             embedding_cache: OnceLock::new(),
             router: OnceLock::new(),
+            usage_sinks: vec![],
+            usage_sinks_built: OnceLock::new(),
         };
         assert!(!config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("gpt-3.5-turbo"));
@@ -965,6 +1005,8 @@ mod tests {
             pii_redactor: OnceLock::new(),
             embedding_cache: OnceLock::new(),
             router: OnceLock::new(),
+            usage_sinks: vec![],
+            usage_sinks_built: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("gpt-3.5-turbo"));
@@ -995,6 +1037,8 @@ mod tests {
             pii_redactor: OnceLock::new(),
             embedding_cache: OnceLock::new(),
             router: OnceLock::new(),
+            usage_sinks: vec![],
+            usage_sinks_built: OnceLock::new(),
         };
         // Block list wins
         assert!(!config.is_model_allowed("gpt-4"));

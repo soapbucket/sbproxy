@@ -46,7 +46,7 @@ pub struct LlmUsageEvent {
 ///
 /// Implementations must be non-blocking on the hot path and must never panic or
 /// propagate an error: failures are logged and swallowed.
-pub trait UsageSink: Send + Sync {
+pub trait UsageSink: Send + Sync + std::fmt::Debug {
     /// Record one completed-call event. Best effort.
     fn record(&self, event: &LlmUsageEvent);
     /// A short, stable label for logs and metrics.
@@ -54,6 +54,7 @@ pub trait UsageSink: Send + Sync {
 }
 
 /// A sink that appends one JSON object per line to a file.
+#[derive(Debug)]
 pub struct JsonlFileSink {
     path: std::path::PathBuf,
 }
@@ -97,6 +98,7 @@ impl UsageSink for JsonlFileSink {
 }
 
 /// A sink that POSTs each event as JSON to a webhook URL, fire-and-forget.
+#[derive(Debug)]
 pub struct WebhookSink {
     url: String,
     client: reqwest::Client,
@@ -161,17 +163,18 @@ pub enum UsageSinkConfig {
 }
 
 impl UsageSinkConfig {
-    /// Build the runtime sink for this config entry.
-    pub fn build(&self) -> Box<dyn UsageSink> {
+    /// Build the runtime sink for this config entry. Returned as an `Arc` so a
+    /// single instance is shared across every request for the origin.
+    pub fn build(&self) -> std::sync::Arc<dyn UsageSink> {
         match self {
-            UsageSinkConfig::JsonlFile { path } => Box::new(JsonlFileSink::new(path)),
-            UsageSinkConfig::Webhook { url } => Box::new(WebhookSink::new(url)),
+            UsageSinkConfig::JsonlFile { path } => std::sync::Arc::new(JsonlFileSink::new(path)),
+            UsageSinkConfig::Webhook { url } => std::sync::Arc::new(WebhookSink::new(url)),
         }
     }
 }
 
 /// Build the runtime sinks for a list of configs.
-pub fn build_sinks(configs: &[UsageSinkConfig]) -> Vec<Box<dyn UsageSink>> {
+pub fn build_sinks(configs: &[UsageSinkConfig]) -> Vec<std::sync::Arc<dyn UsageSink>> {
     configs.iter().map(UsageSinkConfig::build).collect()
 }
 
