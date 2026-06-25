@@ -1403,6 +1403,45 @@ pub(super) fn record_usage_sinks(ctx: &mut crate::context::RequestContext) {
     }
 }
 
+/// WOR-1541: fold this request's realized outcome into the global routing
+/// feedback store, so the `outcome_aware` strategy scores providers by
+/// realized cost-per-success. No-op unless the origin opted in (the
+/// strategy is `outcome_aware`) and the request actually reached a
+/// provider, so a pre-dispatch block records nothing.
+pub(super) fn record_routing_feedback(ctx: &crate::context::RequestContext) {
+    if !ctx.ai_record_routing_feedback {
+        return;
+    }
+    let Some(provider) = ctx.ai_provider.as_deref() else {
+        return;
+    };
+    let status = ctx.response_status.unwrap_or(0);
+    let success = (200..300).contains(&status);
+    // A provider-side refusal / content-filter, distinct from our own
+    // guardrail or policy blocks (those never set a provider).
+    let refused = matches!(
+        ctx.ai_outcome.as_deref(),
+        Some("content_filter") | Some("refusal")
+    );
+    let cost_usd = ctx
+        .ai_cost_usd_micros
+        .map(|m| m as f64 / 1_000_000.0)
+        .unwrap_or(0.0);
+    let latency_ms = ctx
+        .request_start
+        .map(|s| s.elapsed().as_millis() as u64)
+        .unwrap_or(0);
+    sbproxy_ai::routing_feedback::FeedbackStore::global().record(
+        &sbproxy_ai::routing_feedback::Outcome {
+            provider,
+            success,
+            refused,
+            cost_usd,
+            latency_ms,
+        },
+    );
+}
+
 /// Convert a dollar-denominated AI cost estimate into the integer
 /// micro-USD unit used by metrics, spans, and request events.
 pub(super) fn cost_usd_to_micros(cost_usd: f64) -> u64 {

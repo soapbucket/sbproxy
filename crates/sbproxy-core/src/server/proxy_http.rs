@@ -3935,6 +3935,10 @@ impl ProxyHttp for SbProxy {
         // origin with sinks configured.
         record_usage_sinks(ctx);
 
+        // WOR-1541: fold the realized outcome into the routing feedback
+        // store (no-op unless the origin uses outcome-aware routing).
+        record_routing_feedback(ctx);
+
         // --- Wave 3 / G1.6 wire: per-agent labels on the hot path ---
         //
         // Read the agent dimensions out of the request context that

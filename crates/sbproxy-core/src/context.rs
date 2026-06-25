@@ -749,6 +749,11 @@ pub struct RequestContext {
     /// `ai.guardrails.*` namespace so a policy rule can fuse the verdict
     /// set. Empty when the mesh is off or nothing flagged.
     pub ai_guardrail_labels: Vec<String>,
+    /// WOR-1541: when true, the end-of-request hook folds this request's
+    /// realized outcome (success / refusal / cost / latency) into the
+    /// global routing feedback store. Set by `handle_ai_proxy` only when
+    /// the origin uses the `outcome_aware` routing strategy.
+    pub ai_record_routing_feedback: bool,
     /// Inbound `ChatFormat` id when the request entered on a native
     /// shim path (`anthropic` for `/v1/messages`, `responses` for
     /// `/v1/responses`). `None` (or `"openai"`) for the canonical
@@ -1097,6 +1102,7 @@ impl RequestContext {
             ai_usage_sinks: None,
             ai_policy_sink_tag: None,
             ai_guardrail_labels: Vec::new(),
+            ai_record_routing_feedback: false,
             ai_inbound_format: None,
             ai_native_bypass: false,
             ai_admission: None,

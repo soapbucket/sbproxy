@@ -43,6 +43,7 @@ pub mod ratelimit;
 pub mod realtime;
 pub mod response_dedup;
 pub mod routing;
+pub mod routing_feedback;
 pub mod semantic_cache;
 pub mod session;
 pub mod streaming;

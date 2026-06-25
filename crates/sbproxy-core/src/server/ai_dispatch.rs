@@ -47,6 +47,13 @@ pub(super) async fn handle_ai_proxy(
         ctx.ai_usage_sinks = Some(usage_sinks.to_vec());
     }
 
+    // WOR-1541: arm realized-outcome recording when this origin routes
+    // with the outcome-aware strategy, so the end-of-request hook feeds
+    // the global feedback store.
+    if matches!(config.routing, sbproxy_ai::RoutingStrategy::OutcomeAware) {
+        ctx.ai_record_routing_feedback = true;
+    }
+
     // Create the top-level request span. The span is registered with
     // the subscriber (so OTel-style exporters see it as part of the
     // trace tree) but we do not `.enter()` it because the resulting
