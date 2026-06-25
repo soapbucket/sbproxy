@@ -620,9 +620,77 @@ pub fn record_billing_event(tracker: &BudgetTracker, event: &AiBillingEvent) {
     }
 }
 
+/// Parse a budget window period into its duration.
+///
+/// Accepts the canonical names `daily`, `weekly`, `monthly`, `total`, and
+/// `lifetime`, plus LiteLLM-style duration strings (`30s`, `30m`, `30h`,
+/// `30d`). `total` / `lifetime` / the empty string yield `None`, meaning the
+/// budget never rolls over. An unrecognized value is an error rather than a
+/// silent fallthrough, so a typo in a translated config is caught.
+pub fn parse_budget_period(period: &str) -> Result<Option<std::time::Duration>, String> {
+    use std::time::Duration;
+    let p = period.trim();
+    match p.to_ascii_lowercase().as_str() {
+        "" | "total" | "lifetime" => return Ok(None),
+        "daily" => return Ok(Some(Duration::from_secs(86_400))),
+        "weekly" => return Ok(Some(Duration::from_secs(7 * 86_400))),
+        "monthly" => return Ok(Some(Duration::from_secs(30 * 86_400))),
+        _ => {}
+    }
+    let split = p
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| format!("budget period '{period}' is missing a unit (s/m/h/d)"))?;
+    let (num, unit) = p.split_at(split);
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("budget period '{period}' has a non-numeric amount"))?;
+    let secs = match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3_600,
+        "d" => n * 86_400,
+        other => return Err(format!("budget period '{period}' has unknown unit '{other}'")),
+    };
+    Ok(Some(Duration::from_secs(secs)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn budget_period_named_and_duration_strings_parse() {
+        use std::time::Duration;
+        // Total / empty => no window.
+        assert_eq!(parse_budget_period("total").unwrap(), None);
+        assert_eq!(parse_budget_period("").unwrap(), None);
+        // Canonical names.
+        assert_eq!(
+            parse_budget_period("daily").unwrap(),
+            Some(Duration::from_secs(86_400))
+        );
+        assert_eq!(
+            parse_budget_period("monthly").unwrap(),
+            Some(Duration::from_secs(30 * 86_400))
+        );
+        // LiteLLM duration strings.
+        assert_eq!(
+            parse_budget_period("30d").unwrap(),
+            Some(Duration::from_secs(30 * 86_400))
+        );
+        assert_eq!(
+            parse_budget_period("30m").unwrap(),
+            Some(Duration::from_secs(1_800))
+        );
+        assert_eq!(
+            parse_budget_period("45s").unwrap(),
+            Some(Duration::from_secs(45))
+        );
+        // Unparseable values are errors, not silent fallthrough.
+        assert!(parse_budget_period("bogus").is_err());
+        assert!(parse_budget_period("10x").is_err());
+        assert!(parse_budget_period("30").is_err());
+    }
 
     fn make_config(
         max_tokens: Option<u64>,
