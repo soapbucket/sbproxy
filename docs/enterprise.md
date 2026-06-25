@@ -1,5 +1,5 @@
 # Enterprise
-*Last modified: 2026-05-08*
+*Last modified: 2026-06-25*
 
 What's in OSS, what the enterprise tier adds, and how to talk to us
 about it.
@@ -7,9 +7,15 @@ about it.
 ## OSS is the whole runtime
 
 The full SBproxy data plane is open source and self-hostable. Routing,
-AI gateway, MCP gateway, guardrails, security policies, and scripting
-(CEL, Lua, JavaScript, WebAssembly) all ship in this repository. There
-is no feature ceiling on the runtime itself.
+AI gateway, MCP gateway, guardrails, security policies, dynamic key
+management, and scripting (CEL, Lua, JavaScript, WebAssembly) all ship
+in this repository. There is no feature ceiling on the runtime itself.
+
+The clustering substrate is open source too: gossip mesh membership,
+consistent-hash routing, leader election, federation, service discovery,
+and a distributed cache with CRDT counters all live in the `sbproxy-mesh`
+crate (Apache 2.0). The dynamic key plane uses it for a clusterwide
+policy cache and per-key spend counters.
 
 The enterprise tier adds capabilities that only matter once you are
 running SBproxy at organizational scale or under regulator pressure.
@@ -17,13 +23,14 @@ None of them are required to use SBproxy in production.
 
 ## What enterprise adds
 
-### Cluster substrate
+### Cluster-distributed semantic cache
 
-Gossip mesh membership, consistent-hash routing across nodes, leader
-election, federation, five service-discovery providers, and a
-cluster-distributed semantic cache with LSH-bucketed embeddings,
-cluster-wide purge propagation, and per-origin and per-model TTL
-layering.
+The clustering substrate itself (gossip mesh, consistent-hash routing,
+leader election, federation, five service-discovery providers, and the
+distributed cache) is open source in `sbproxy-mesh`. The enterprise tier
+adds the semantic layer on top: a cluster-distributed semantic cache with
+LSH-bucketed embeddings, cluster-wide purge propagation, and per-origin
+and per-model TTL layering.
 
 ### Regulated-enterprise auth
 
