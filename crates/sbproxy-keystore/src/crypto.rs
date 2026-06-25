@@ -39,6 +39,16 @@ pub struct MintedKey {
     pub secret_hash: String,
 }
 
+/// A freshly minted secret for an existing key id (rotation): the one-time
+/// plaintext and the at-rest hash that replaces the record's current hash.
+#[derive(Debug, Clone)]
+pub struct MintedSecret {
+    /// The new plaintext secret half of the token. Shown once, never stored.
+    pub secret: String,
+    /// `HMAC-SHA256(secret, pepper)`, hex-encoded. Persisted as the new hash.
+    pub secret_hash: String,
+}
+
 /// Mint a brand-new virtual key, returning the public id, the one-time token,
 /// and the at-rest hash. `pepper` is the server-wide secret pepper.
 pub fn mint_key(pepper: &[u8]) -> MintedKey {
@@ -85,6 +95,12 @@ pub fn verify_secret(secret: &str, pepper: &[u8], expected_hex: &str) -> bool {
     let mut mac = HmacSha256::new_from_slice(pepper).expect("HMAC-SHA256 accepts any key length");
     mac.update(secret.as_bytes());
     mac.verify_slice(&expected).is_ok()
+}
+
+/// Generate a random, URL-safe record identifier (24 hex chars). Used for
+/// admin-created credential ids that the operator did not name.
+pub fn random_id() -> String {
+    random_hex(12)
 }
 
 /// Generate `n` random bytes hex-encoded (so the output is `2 * n` chars).
@@ -224,6 +240,17 @@ impl KeyCrypto {
     /// Mint a brand-new inbound key (id, one-time token, at-rest hash).
     pub fn mint_key(&self) -> MintedKey {
         mint_key(&self.pepper)
+    }
+
+    /// Mint a fresh secret + hash for an *existing* key id (rotation). The
+    /// caller forms the new token as `sk-<key_id>-<secret>`.
+    pub fn mint_secret(&self) -> MintedSecret {
+        let secret = random_hex(SECRET_BYTES);
+        let secret_hash = hash_secret(&secret, &self.pepper);
+        MintedSecret {
+            secret,
+            secret_hash,
+        }
     }
 
     /// Hash a secret for at-rest storage.

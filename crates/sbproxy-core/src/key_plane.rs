@@ -114,6 +114,24 @@ fn key_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// Run a future to completion on the dedicated key runtime, blocking the
+/// caller. Driven on a fresh thread so it is safe to call from anywhere,
+/// including the admin server's `spawn_blocking` pool and the reload path,
+/// without risking a nested-runtime panic. Use for the admin key/credential
+/// mutations, which are off the hot path.
+pub fn block_on_keystore<F>(fut: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| key_runtime().block_on(fut))
+            .join()
+            .expect("keystore op thread panicked")
+    })
+}
+
 /// Resolve a crypto secret reference into raw bytes. Supports `env:NAME`,
 /// `file:PATH`, and inline values. Vault scheme references are not resolved
 /// here; use `env:`/`file:` to point at a vault-injected value.
@@ -400,6 +418,33 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
     Ok(())
 }
 
+/// Serialize tests that install the process-global key plane so they do not
+/// clobber each other's installed instance when run in parallel.
+#[cfg(test)]
+fn test_serialize_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// RAII guard for global-key-plane tests: holds the serialize lock for the
+/// test's duration and uninstalls the plane on drop (even on panic) so a
+/// leftover plane cannot leak into another test.
+#[cfg(test)]
+pub(crate) struct TestPlaneGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+#[cfg(test)]
+impl Drop for TestPlaneGuard {
+    fn drop(&mut self) {
+        plane_slot().store(None);
+    }
+}
+
+/// Acquire the global-plane test guard.
+#[cfg(test)]
+pub(crate) fn test_plane_guard() -> TestPlaneGuard {
+    TestPlaneGuard(test_serialize_lock())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +485,7 @@ mod tests {
 
     #[test]
     fn init_seeds_keys_and_credentials_into_embedded_store() {
+        let _guard = test_plane_guard();
         let path = temp_db();
         let mut cfg = base_cfg(&path);
         cfg.seed = KeySeedConfig {
@@ -502,6 +548,7 @@ mod tests {
 
     #[test]
     fn disabled_block_installs_nothing() {
+        let _guard = test_plane_guard();
         let path = temp_db();
         let mut cfg = base_cfg(&path);
         cfg.enabled = false;

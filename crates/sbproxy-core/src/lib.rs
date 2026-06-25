@@ -12,6 +12,9 @@
 #![warn(missing_docs)]
 
 pub mod admin;
+/// WOR-1553/1554: key + credential lifecycle REST API mounted on the
+/// admin server (`/admin/keys`, `/admin/credentials`).
+pub mod admin_keys;
 /// Gated chat-playground route mounted on the admin server. Returns
 /// a feature-disabled response until the route is wired through the
 /// production AI dispatch path.

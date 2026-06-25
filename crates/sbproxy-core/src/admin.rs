@@ -1267,6 +1267,10 @@ pub fn handle_admin_request(
     if let Some(response) = crate::admin_playground::dispatch(method, path) {
         return response;
     }
+    // WOR-1553/1554: dynamic key + credential lifecycle API.
+    if let Some(response) = crate::admin_keys::dispatch(method, path, body) {
+        return response;
+    }
 
     // --- Method-aware routes first ---
     if path == "/admin/reload" {
