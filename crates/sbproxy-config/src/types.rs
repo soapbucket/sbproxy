@@ -462,6 +462,12 @@ pub struct ProxyServerConfig {
     /// Secrets management configuration.
     #[serde(default)]
     pub secrets: Option<SecretsConfig>,
+    /// Dynamic key-management configuration (WOR-1546): the mutable key store,
+    /// policy cache, at-rest crypto, OIDC claim mapping, and an optional
+    /// declarative seed. Distinct from the static `credentials:` block, which
+    /// keeps working and lowers into the same store as config-sourced records.
+    #[serde(default)]
+    pub key_management: Option<KeyManagementConfig>,
     /// Optional L2 cache / shared-state backend. When set with `driver: redis`,
     /// rate limit counters and response cache entries are stored in the
     /// external backend so multiple proxy replicas share state.
@@ -638,6 +644,7 @@ impl Default for ProxyServerConfig {
             alerting: None,
             admin: None,
             secrets: None,
+            key_management: None,
             l2_cache: None,
             cache_reserve: None,
             messenger_settings: None,
@@ -655,6 +662,392 @@ impl Default for ProxyServerConfig {
             credentials: Vec::new(),
         }
     }
+}
+
+// --- Dynamic key management (WOR-1546) ---
+
+fn default_keystore_path() -> String {
+    "/var/lib/sbproxy/keystore.redb".to_string()
+}
+fn default_keystore_prefix() -> String {
+    "sbproxy/keystore".to_string()
+}
+fn default_key_cache_ttl_secs() -> u64 {
+    60
+}
+fn default_key_cache_negative_ttl_secs() -> u64 {
+    5
+}
+fn default_key_cache_max_entries() -> usize {
+    10_000
+}
+
+/// Top-level `key_management:` block: the runtime key plane (mutable store,
+/// policy cache, at-rest crypto, OIDC claim map, declarative seed).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct KeyManagementConfig {
+    /// Turn the dynamic key plane on. When false (default), inbound auth keeps
+    /// using the compiled virtual-key registry and this block is inert.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Store backend (system of record).
+    #[serde(default)]
+    pub store: KeyStoreConfig,
+    /// In-memory policy cache in front of the store.
+    #[serde(default)]
+    pub cache: KeyCacheConfig,
+    /// At-rest crypto material.
+    #[serde(default)]
+    pub crypto: KeyCryptoConfig,
+    /// Allow the admin API to override config-seeded records on reload. When
+    /// false (default), config-seeded records are authoritative and re-asserted
+    /// on every reload.
+    #[serde(default)]
+    pub allow_api_override: bool,
+    /// When the store is unreachable, allow the request through in a degraded
+    /// mode. Default false: fail closed (deny).
+    #[serde(default)]
+    pub failure_mode_allow: bool,
+    /// Optional OIDC/JWT claim to virtual-key mapping.
+    #[serde(default)]
+    pub oidc_claim_map: Option<OidcClaimMapConfig>,
+    /// Optional declarative seed of keys and credentials.
+    #[serde(default)]
+    pub seed: KeySeedConfig,
+}
+
+/// Which store backend backs the key plane.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyStoreBackend {
+    /// redb embedded store (default).
+    #[default]
+    Embedded,
+    /// Redis store / coherence tier.
+    Redis,
+    /// Secrets-manager-direct: a configured vault backend is the system of record.
+    SecretsManager,
+}
+
+/// `key_management.store:` block.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct KeyStoreConfig {
+    /// Backend selector.
+    #[serde(default)]
+    pub backend: KeyStoreBackend,
+    /// Embedded redb file path (backend `embedded`).
+    #[serde(default = "default_keystore_path")]
+    pub path: String,
+    /// Redis connection URL (backend `redis`).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Treat Redis as the source of truth rather than a coherence tier
+    /// (backend `redis`).
+    #[serde(default)]
+    pub redis_source_of_truth: bool,
+    /// Secret-reference namespace prefix (backend `secrets_manager`).
+    #[serde(default = "default_keystore_prefix")]
+    pub prefix: String,
+    /// External secrets-manager connection (backend `secrets_manager`).
+    #[serde(default)]
+    pub secrets_manager: SecretsManagerStoreConfig,
+}
+
+impl Default for KeyStoreConfig {
+    fn default() -> Self {
+        Self {
+            backend: KeyStoreBackend::Embedded,
+            path: default_keystore_path(),
+            url: None,
+            redis_source_of_truth: false,
+            prefix: default_keystore_prefix(),
+            secrets_manager: SecretsManagerStoreConfig::default(),
+        }
+    }
+}
+
+fn default_kv_v2() -> bool {
+    true
+}
+
+fn default_vault_token_env() -> String {
+    "VAULT_TOKEN".to_string()
+}
+
+/// External secrets manager backing the `secrets_manager` store backend. Only
+/// writable managers are supported (HashiCorp Vault, AWS Secrets Manager, and an
+/// in-memory `local` store for dev/tests).
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretsManagerProvider {
+    /// In-memory, non-persistent. Dev and tests only.
+    #[default]
+    Local,
+    /// HashiCorp Vault KV (token auth, token read from `token_env`).
+    Hashicorp,
+    /// AWS Secrets Manager via the default credential chain.
+    Aws,
+}
+
+/// `key_management.store.secrets_manager:` connection block.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct SecretsManagerStoreConfig {
+    /// Which external manager.
+    #[serde(default)]
+    pub provider: SecretsManagerProvider,
+    /// HashiCorp Vault address (provider `hashicorp`), e.g.
+    /// `https://vault.example/v1`.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// KV mount path (provider `hashicorp`) or path prefix (provider `aws`).
+    #[serde(default)]
+    pub mount: Option<String>,
+    /// Use KV engine v2 (provider `hashicorp`). Default true.
+    #[serde(default = "default_kv_v2")]
+    pub kv_v2: bool,
+    /// Environment variable holding the Vault token (provider `hashicorp`).
+    /// Default `VAULT_TOKEN`.
+    #[serde(default = "default_vault_token_env")]
+    pub token_env: String,
+    /// Optional `X-Vault-Namespace` (provider `hashicorp`, Vault Enterprise).
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// AWS region (provider `aws`), e.g. `us-east-1`.
+    #[serde(default)]
+    pub region: Option<String>,
+}
+
+impl Default for SecretsManagerStoreConfig {
+    fn default() -> Self {
+        Self {
+            provider: SecretsManagerProvider::Local,
+            address: None,
+            mount: None,
+            kv_v2: default_kv_v2(),
+            token_env: default_vault_token_env(),
+            namespace: None,
+            region: None,
+        }
+    }
+}
+
+/// Which optional second cache tier sits behind the in-memory L1.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyCacheTier {
+    /// L1 only (default).
+    #[default]
+    None,
+    /// Redis L2 tier.
+    Redis,
+    /// Mesh distributed-cache tier.
+    Mesh,
+}
+
+/// `key_management.cache:` block.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct KeyCacheConfig {
+    /// Positive-entry TTL in seconds (default 60).
+    #[serde(default = "default_key_cache_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Negative (known-absent) entry TTL in seconds (default 5).
+    #[serde(default = "default_key_cache_negative_ttl_secs")]
+    pub negative_ttl_secs: u64,
+    /// Soft cap on cached entries per kind (default 10000).
+    #[serde(default = "default_key_cache_max_entries")]
+    pub max_entries: usize,
+    /// Optional second cache tier.
+    #[serde(default)]
+    pub tier: KeyCacheTier,
+    /// Redis URL for the redis cache tier (when `tier: redis`). Falls back to
+    /// the store URL when unset.
+    #[serde(default)]
+    pub redis_url: Option<String>,
+    /// Node id for the mesh cache tier (when `tier: mesh`). Defaults to the
+    /// machine hostname.
+    #[serde(default)]
+    pub mesh_node_id: Option<String>,
+    /// Mesh cluster bootstrap for the mesh cache tier. When set, the node joins
+    /// a gossip cluster and the cache routes by consistent hash, so a key cached
+    /// on one replica is reachable from the others. When absent, the mesh tier
+    /// runs single-node.
+    #[serde(default)]
+    pub mesh: Option<MeshClusterConfig>,
+}
+
+fn default_gossip_port() -> u16 {
+    7946
+}
+fn default_transport_port() -> u16 {
+    8946
+}
+
+/// `key_management.cache.mesh:` cluster bootstrap for the mesh cache tier.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MeshClusterConfig {
+    /// Static seed peers (`host:port`) to join. An empty list bootstraps a
+    /// single-node cluster.
+    #[serde(default)]
+    pub seeds: Vec<String>,
+    /// UDP port for the gossip protocol.
+    #[serde(default = "default_gossip_port")]
+    pub gossip_port: u16,
+    /// TCP port for the cross-node cache RPC transport. `0` requests an
+    /// OS-assigned ephemeral port.
+    #[serde(default = "default_transport_port")]
+    pub transport_port: u16,
+    /// Address this node advertises to peers (`host:port`). Defaults to the
+    /// gossip bind when unset.
+    #[serde(default)]
+    pub advertise_addr: Option<String>,
+    /// Optional cluster-wide shared secret (AES-256-GCM) for the gossip and
+    /// transport wire. Accepts an inline value or `env:NAME`. Plaintext when
+    /// unset.
+    #[serde(default)]
+    pub shared_key: Option<String>,
+}
+
+impl Default for MeshClusterConfig {
+    fn default() -> Self {
+        Self {
+            seeds: Vec::new(),
+            gossip_port: default_gossip_port(),
+            transport_port: default_transport_port(),
+            advertise_addr: None,
+            shared_key: None,
+        }
+    }
+}
+
+impl Default for KeyCacheConfig {
+    fn default() -> Self {
+        Self {
+            ttl_secs: default_key_cache_ttl_secs(),
+            negative_ttl_secs: default_key_cache_negative_ttl_secs(),
+            max_entries: default_key_cache_max_entries(),
+            tier: KeyCacheTier::None,
+            redis_url: None,
+            mesh_node_id: None,
+            mesh: None,
+        }
+    }
+}
+
+/// `key_management.crypto:` block. Both values accept a secret reference
+/// (`vault://`, `env:`, `file:`, ...) resolved at boot, or an inline value
+/// (discouraged outside tests).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct KeyCryptoConfig {
+    /// Server pepper for inbound virtual-key hashing. When unset, a
+    /// process-ephemeral pepper is generated, so stored hashes do not survive a
+    /// restart; set this in production.
+    #[serde(default)]
+    pub pepper: Option<String>,
+    /// Master key for upstream-credential envelope encryption. Required to store
+    /// encrypted upstream credentials; vault-ref credentials do not need it.
+    #[serde(default)]
+    pub master_key: Option<String>,
+}
+
+/// `key_management.oidc_claim_map:` block.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct OidcClaimMapConfig {
+    /// The verified JWT/OIDC claim whose value names the virtual-key record to
+    /// resolve, so the bearer-token and OIDC front doors converge on one record.
+    pub claim_field: String,
+}
+
+/// `key_management.seed:` block: declarative records applied at boot.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct KeySeedConfig {
+    /// Inbound virtual keys.
+    #[serde(default)]
+    pub keys: Vec<SeedKeyConfig>,
+    /// Upstream provider credentials.
+    #[serde(default)]
+    pub credentials: Vec<SeedCredentialConfig>,
+}
+
+/// A seeded inbound virtual key.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct SeedKeyConfig {
+    /// Stable public id and token prefix.
+    pub key_id: String,
+    /// Plaintext secret hashed at boot. Mutually exclusive with `secret_hash`.
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// Precomputed HMAC-SHA256 hash (hex) when the operator hashed offline.
+    #[serde(default)]
+    pub secret_hash: Option<String>,
+    /// Human-readable name, surfaced on access logs.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Max requests per minute.
+    #[serde(default)]
+    pub max_requests_per_minute: Option<u64>,
+    /// Max tokens per minute.
+    #[serde(default)]
+    pub max_tokens_per_minute: Option<u64>,
+    /// Max total tokens for this key's budget window.
+    #[serde(default)]
+    pub max_budget_tokens: Option<u64>,
+    /// Max total cost in USD for this key's budget window.
+    #[serde(default)]
+    pub max_budget_usd: Option<f64>,
+    /// Models this key may use (empty = all).
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
+    /// Models this key may not use.
+    #[serde(default)]
+    pub blocked_models: Vec<String>,
+    /// Providers this key may use (empty = all).
+    #[serde(default)]
+    pub allowed_providers: Vec<String>,
+    /// Project attribution.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// User attribution.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Owning tenant.
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// RFC 3339 expiry instant; past it the key is unusable.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+/// A seeded upstream credential.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct SeedCredentialConfig {
+    /// Stable id.
+    pub id: String,
+    /// Operator-facing name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Provider this credential authenticates to.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Credential kind (default `ai_provider`).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// A secret reference (`vault://`, `awssm://`, ...). Stored as vault-ref
+    /// material and resolved at use.
+    #[serde(default)]
+    pub vault_ref: Option<String>,
+    /// A plaintext secret to envelope-encrypt at boot (needs
+    /// `crypto.master_key`).
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// Owning tenant.
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 // --- Scripting engine sandbox config (WOR-594 + WOR-595) ---

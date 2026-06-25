@@ -31,15 +31,17 @@
 
 ## Why SBproxy
 
-Most teams run one tool for HTTP traffic and another for LLM traffic. That's two systems to configure, deploy, and monitor. SBproxy handles both in one binary.
+Most teams run one tool for HTTP traffic and another for LLM traffic, then bolt on a third for keys, a fourth for guardrails, and a dashboard they have to trust for spend. SBproxy is one binary that does all of it, built on Pingora so the proxy in front of your models is a real proxy.
 
-- **One config file** replaces your reverse proxy, AI gateway, and the middleware glue between them.
-- **200+ LLM models** behind an OpenAI-compatible API, with fallback chains, guardrails, and budgets.
-- **Local semantic cache.** Near-duplicate prompts replay from cache. Vectorize them on-box with a local embedder, so there is no per-call cost and the prompt never leaves your network.
-- **Observable out of the box.** Metrics, logs, and traces from one process. AI spans follow the OpenTelemetry GenAI and OpenInference conventions and carry per-request token counts and USD cost, ready for Phoenix, Langfuse, Grafana, or Datadog.
-- **Secure by default.** Auth, rate limiting, WAF, DDoS, and CSRF are built in.
-- **Hot reload** with no dropped connections.
-- **Sub-millisecond p99 overhead.** Idle RSS in single-digit megabytes.
+- **Route every model.** 200+ models behind one OpenAI-compatible API, with fallback chains, outcome-aware routing, predictive budgets, and per-error retry policies.
+- **Govern every key.** Inbound virtual keys are hashed at rest (HMAC-SHA256 plus a server pepper) and minted, rotated, and revoked at runtime through an admin API. A revoke takes effect on the next request, not the next reload. Upstream provider credentials are encrypted at rest. See [key management](docs/key-management.md).
+- **Secure in the same process.** Auth (JWT, OIDC, mTLS), WAF, DDoS, CSRF, SSRF guards, PII redaction, and prompt-injection detection on a local model. Guardrails run as a quorum mesh on a latency budget. The proxy that fronts your models is the security layer, not a thing you bolt on after it.
+- **Prove the spend.** Every request can emit a hash-chained, Ed25519-signed usage receipt with token counts and USD cost that you re-derive and verify offline.
+- **Run as a fleet.** Point every replica at a shared key store and a key minted on one works on all, with a revoke invalidated across the fleet. The clustering substrate for a distributed cache and per-key spend counters (gossip, CRDTs, a consistent-hash ring) is open source here, so you do not need a vendor's control plane.
+- **Keep cost and prompts on-box.** A local semantic cache replays near-duplicate prompts with no per-call cost, and the prompt never leaves your network. Metrics, logs, and OpenTelemetry GenAI traces with token and USD cost come from the same process, ready for Phoenix, Langfuse, Grafana, or Datadog.
+- **Stay fast.** Sub-millisecond p99 overhead, idle RSS in single-digit megabytes, hot reload with no dropped connections.
+
+New here and weighing the options? See [how SBproxy compares](docs/comparison.md).
 
 ---
 
@@ -112,17 +114,28 @@ That's a reverse proxy. Add AI routing, auth, and rate limiting in the same file
 
 Each clip is recorded against the release binary running a real example config. Regenerate them with [`scripts/record-tapes.sh`](scripts/record-tapes.sh).
 
-**Failover across providers** &mdash; the primary is down; the backup answers, transparently. ([config](examples/ai-routing-fallback/))
+**Failover across providers:** the primary is down, the backup answers, transparently. ([config](examples/ai-routing-fallback/))
 
 ![Multi-provider failover](docs/assets/ai-fallback.gif)
 
-**Semantic cache** &mdash; a reworded prompt is served from cache (`x-semcache: HIT`), skipping the billable completion. ([config](examples/semantic-cache-openai/))
+**Semantic cache:** a reworded prompt is served from cache (`x-semcache: HIT`), skipping the billable completion. ([config](examples/semantic-cache-openai/))
 
 ![Semantic cache hit](docs/assets/semantic-cache.gif)
 
-**Guardrails** &mdash; prompt-injection and PII are blocked before any provider is called. ([config](examples/ai-guardrails/))
+**Guardrails:** prompt-injection and PII are blocked before any provider is called. ([config](examples/ai-guardrails/))
 
 ![Guardrails blocking injection and PII](docs/assets/ai-guardrails.gif)
+
+**Governed keys:** mint a virtual key at runtime, then revoke it and watch the next request stop. No reload, no plaintext on disk. ([config](examples/ai-dynamic-keys/), [cluster](examples/ai-dynamic-keys-cluster/))
+
+```bash
+# Mint a key (the plaintext token is returned exactly once)
+curl -s -u admin:admin -X POST http://127.0.0.1:9090/admin/keys \
+  -d '{"name":"ci-runner","max_requests_per_minute":60}'
+
+# Revoke it; the next request carrying it is denied on every replica
+curl -s -u admin:admin -X POST http://127.0.0.1:9090/admin/keys/<key_id>/revoke
+```
 
 ---
 

@@ -1,0 +1,45 @@
+# yaml-language-server: $schema=../../../schemas/sb-config.schema.json
+# Recording config for docs/tapes/ai-dynamic-keys.tape. Self-contained: inline
+# demo crypto and a seeded key so the cassette boots with no environment setup
+# and the admin lifecycle (mint, list, rotate, revoke) records offline against
+# the embedded store. The runnable user-facing example is
+# examples/ai-dynamic-keys/, which sources crypto from the environment.
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: /tmp/sbproxy-tape-keys.redb
+    cache:
+      ttl_secs: 60
+    crypto:
+      pepper: demo-pepper-not-for-production
+      master_key: demo-master-not-for-production
+    failure_mode_allow: false
+    seed:
+      keys:
+        - key_id: seed0001
+          secret: demo-secret-please-rotate
+          name: seeded-demo-key
+          max_requests_per_minute: 60
+          allowed_models:
+            - gpt-4o-mini
+
+origins:
+  "openai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini

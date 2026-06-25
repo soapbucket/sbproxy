@@ -13,6 +13,10 @@ members = [
     "crates/sbproxy-cache",
     "crates/sbproxy-transport",
     "crates/sbproxy-vault",
+    "crates/sbproxy-keystore",
+    "crates/sbproxy-storage",
+    "crates/sbproxy-mesh",
+    "crates/sbproxy-storage-mesh",
     "crates/sbproxy-middleware",
     "crates/sbproxy-extension",
     "crates/sbproxy-ai",
@@ -44,6 +48,10 @@ default-members = [
     "crates/sbproxy-cache",
     "crates/sbproxy-transport",
     "crates/sbproxy-vault",
+    "crates/sbproxy-keystore",
+    "crates/sbproxy-storage",
+    "crates/sbproxy-mesh",
+    "crates/sbproxy-storage-mesh",
     "crates/sbproxy-middleware",
     "crates/sbproxy-extension",
     "crates/sbproxy-ai",
@@ -81,6 +89,10 @@ sbproxy-platform = { path = "crates/sbproxy-platform" }
 sbproxy-cache = { path = "crates/sbproxy-cache" }
 sbproxy-transport = { path = "crates/sbproxy-transport" }
 sbproxy-vault = { path = "crates/sbproxy-vault" }
+sbproxy-keystore = { path = "crates/sbproxy-keystore" }
+sbproxy-storage = { path = "crates/sbproxy-storage" }
+sbproxy-mesh = { path = "crates/sbproxy-mesh" }
+sbproxy-storage-mesh = { path = "crates/sbproxy-storage-mesh" }
 sbproxy-middleware = { path = "crates/sbproxy-middleware" }
 sbproxy-extension = { path = "crates/sbproxy-extension" }
 sbproxy-ai = { path = "crates/sbproxy-ai" }

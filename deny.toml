@@ -59,8 +59,8 @@ ignore = [
   "RUSTSEC-2024-0437",
 
   # --- AWS SDK: transitive rustls 0.21 -> rustls-webpki 0.101.7 ---
-  # The three advisories below all flag `rustls-webpki 0.101.7`, which the
-  # `aws-smithy-http-client 1.1.13` HTTP client pins through `rustls 0.21`.
+  # The three advisories below flag the unpatched `rustls-webpki 0.101.7`, which
+  # the `aws-smithy-http-client 1.1.13` HTTP client pins through `rustls 0.21`.
   # The upstream AWS SDK has not yet bumped the smithy http client to the
   # rustls 0.23 line. None of the three advisories applies to the
   # `aws-sdk-secretsmanager` / `aws-sdk-sts` use case: we connect to
@@ -69,6 +69,10 @@ ignore = [
   # Lists, and do not verify wildcard DNS-name SANs against permitted
   # subtree constraints. Resolves when the AWS SDK bumps smithy-http-client
   # to a rustls 0.23 base; CI re-gates automatically once Cargo.lock updates.
+  #
+  # sbproxy-mesh peer-mTLS (peer_auth.rs) also uses rustls-webpki, but pins the
+  # patched 0.103.13 (ISC-licensed), which is not vulnerable to any of these
+  # three advisories, so the mesh path is clean regardless of these ignores.
   #
   # RUSTSEC-2026-0098: URI name constraints ignored on CA verification.
   "RUSTSEC-2026-0098",

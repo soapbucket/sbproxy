@@ -262,6 +262,93 @@ impl ConfigAuditEntry {
     }
 }
 
+// --- Key-management audit channel (WOR-1557) ---
+
+/// A structured record of a single key or credential mutation.
+///
+/// Emitted on the `key_audit` target for every create / update / delete /
+/// revoke / block / unblock / rotate so an operator can route key-lifecycle
+/// changes to a dedicated sink and reconstruct who changed what. The record
+/// carries the public `id` and a before/after diff, never a plaintext secret,
+/// a hash, or an envelope. The diff is the seam the verifiable ledger
+/// (WOR-1539) hash-chains downstream.
+#[derive(Debug, Serialize)]
+pub struct KeyAuditEntry {
+    /// RFC 3339 timestamp of the mutation.
+    pub timestamp: String,
+    /// The operation: `create`, `update`, `delete`, `revoke`, `block`,
+    /// `unblock`, or `rotate`.
+    pub op: String,
+    /// The resource kind: `key` or `credential`.
+    pub resource: String,
+    /// The public record id (key_id or credential id). Never a secret.
+    pub id: String,
+    /// The principal that performed the mutation, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// Tenant the record belongs to, when scoped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    /// Redacted snapshot of the record before the mutation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<serde_json::Value>,
+    /// Redacted snapshot of the record after the mutation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<serde_json::Value>,
+}
+
+impl KeyAuditEntry {
+    /// Start an entry for `op` on a `resource` with public `id`, stamped now.
+    pub fn new(op: impl Into<String>, resource: impl Into<String>, id: impl Into<String>) -> Self {
+        Self {
+            timestamp: now_rfc3339(),
+            op: op.into(),
+            resource: resource.into(),
+            id: id.into(),
+            actor: None,
+            tenant_id: None,
+            before: None,
+            after: None,
+        }
+    }
+
+    /// Attach the acting principal.
+    pub fn with_actor(mut self, actor: impl Into<String>) -> Self {
+        self.actor = Some(actor.into());
+        self
+    }
+
+    /// Attach the owning tenant.
+    pub fn with_tenant_id(mut self, tenant_id: impl Into<String>) -> Self {
+        self.tenant_id = Some(tenant_id.into());
+        self
+    }
+
+    /// Attach the before/after redacted snapshots for the change diff.
+    pub fn with_diff(
+        mut self,
+        before: Option<serde_json::Value>,
+        after: Option<serde_json::Value>,
+    ) -> Self {
+        self.before = before;
+        self.after = after;
+        self
+    }
+
+    /// Serialize and emit on the `key_audit` tracing target at INFO level.
+    pub fn emit(&self) {
+        let started = std::time::Instant::now();
+        let outcome = match serde_json::to_string(self) {
+            Ok(json) => {
+                tracing::info!(target: "key_audit", "{}", json);
+                "ok"
+            }
+            Err(_) => "serialize_error",
+        };
+        crate::metrics::record_audit_emit_duration("key", outcome, started.elapsed().as_secs_f64());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

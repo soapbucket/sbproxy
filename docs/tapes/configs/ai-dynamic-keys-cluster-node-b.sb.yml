@@ -1,0 +1,43 @@
+# yaml-language-server: $schema=../../../schemas/sb-config.schema.json
+# Recording config for docs/tapes/ai-dynamic-keys-cluster.tape, node A.
+#
+# Resolution order: L1 in-memory cache -> mesh distributed cache -> Redis store.
+# The mesh tier (SWIM gossip + consistent-hash ring) sits in front and keeps the
+# policy cache coherent across replicas; Redis is the shared source of truth, so
+# a key minted on one node is usable on the others and a revoke propagates. Inline
+# demo crypto is shared by both nodes. Runnable example: examples/ai-dynamic-keys-cluster/.
+proxy:
+  http_bind_port: 8081
+  admin:
+    enabled: true
+    port: 9091
+    username: admin
+    password: admin
+  key_management:
+    enabled: true
+    store:
+      backend: redis
+      url: redis://127.0.0.1:6399
+      redis_source_of_truth: true
+    cache:
+      ttl_secs: 30
+      tier: mesh
+      mesh_node_id: node-b
+      mesh:
+        seeds: ["127.0.0.1:7946"]
+        gossip_port: 7947
+        transport_port: 8947
+        advertise_addr: "127.0.0.1:7947"
+    crypto:
+      pepper: demo-pepper-shared-by-all-replicas
+      master_key: demo-master-shared-by-all-replicas
+    failure_mode_allow: false
+origins:
+  "openai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models: [gpt-4o-mini]

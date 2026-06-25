@@ -1,6 +1,6 @@
 # How SBproxy compares
 
-*Last modified: 2026-06-08*
+*Last modified: 2026-06-25*
 
 SBproxy is a reverse proxy that doubles as an AI gateway. Most tools do one or the other; this page is honest about where SBproxy fits and where you should pick something else.
 
@@ -18,6 +18,39 @@ SBproxy is a reverse proxy that doubles as an AI gateway. Most tools do one or t
 | Nginx | Reverse proxy | No | Yes | Yes (C) | Lua (OpenResty) |
 | Pingora (raw) | Proxy framework | No (DIY) | Yes (DIY) | Library, not a binary | Rust code |
 | Envoy | Service mesh proxy | No | Yes | Yes (C++) | WASM |
+
+## Beyond an LLM router
+
+The provider-routing table above is table stakes. Where SBproxy pulls ahead of a
+typical gateway is governance, security, and clustering in the same self-hosted
+binary, with no vendor control plane.
+
+- **Keys as a governed resource.** Inbound virtual keys live in a mutable store,
+  hashed at rest with HMAC-SHA256 and a server pepper. Mint, rotate, and revoke
+  them at runtime through an admin API; a revoke takes effect on the next
+  request, not the next reload. Rotation keeps the prior secret valid for a grace
+  window. Upstream provider credentials are encrypted at rest with an AEAD
+  envelope or held as a vault reference. See [key-management.md](key-management.md).
+- **Security in the same process.** Auth (JWT, OIDC, basic, mTLS), a WAF, DDoS
+  and CSRF protection, SSRF guards, PII redaction, and prompt-injection detection
+  on a local ONNX model all ship in the runtime. Guardrails run as a mesh: every
+  verdict collected, fused on a quorum, redact-and-continue, on a latency budget.
+- **A verifiable spend ledger.** Requests can emit hash-chained, Ed25519-signed
+  usage receipts with token counts and USD cost that you re-derive and verify
+  offline. See [ai-usage-ledger.md](ai-usage-ledger.md).
+- **One policy over everything.** A single sandboxed CEL expression reads the
+  principal, model, guardrail verdicts, and budget state and returns a closed
+  action set (allow, deny, redact, route, downgrade). See [ai-policy-cel.md](ai-policy-cel.md).
+- **Runs as a fleet without a hosted control plane.** Point every replica at a
+  shared Redis key store and the key plane is coherent across the fleet: mint on
+  one replica, use on any, revoke on one and the others deny on their next
+  request. The clustering substrate (SWIM gossip, CRDTs, a consistent-hash
+  distributed cache) is open source in this repository, so cross-replica cache
+  and per-key spend counters do not need a vendor's control plane. See
+  [examples/ai-dynamic-keys-cluster/](../examples/ai-dynamic-keys-cluster/).
+- **Cost and latency stay on-box.** The semantic cache vectorizes prompts on a
+  local embedder, so a near-duplicate prompt replays with no per-call cost and
+  the prompt never leaves your network. See [local-inference.md](local-inference.md).
 
 ## When SBproxy is the right choice
 
@@ -54,6 +87,10 @@ SBproxy reaches 200+ models through 66 native providers behind one OpenAI-compat
 | gRPC proxy | Yes | No |
 | MCP federation | Yes | No |
 | Authentication | 7+ types (JWT, forward auth, digest, ...) | API key |
+| Virtual keys hashed at rest + runtime revoke | Yes (HMAC + pepper, admin API) | Varies |
+| Upstream creds encrypted at rest | Yes (AEAD envelope or vault ref) | Varies |
+| Verifiable, signed usage ledger | Yes | No |
+| OSS clustering substrate (gossip + CRDTs) | Yes | No |
 | Scripting | CEL + Lua + WASM + JS | No |
 | Rate limiting | Built-in, distributed | Built-in |
 | Response caching | Built-in (memory, file, memcached, redis) | 7 backends |

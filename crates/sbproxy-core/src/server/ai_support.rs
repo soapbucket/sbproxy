@@ -1316,6 +1316,14 @@ pub(super) fn emit_ai_billing_event(
         0,
         cost_usd,
     );
+    // WOR-1563: cross-replica per-key spend. Recorded from the single billing
+    // choke point so every surface contributes once; coherent across the fleet
+    // via the mesh CRDT when the mesh tier is on, local otherwise.
+    if !api_key_id.is_empty() {
+        if let Some(counters) = crate::mesh_counters::current_mesh_counters() {
+            counters.record_spend(api_key_id, input_tokens + output_tokens, cost_usd);
+        }
+    }
     // WOR-1213: stamp and count the same exact micro-USD value from
     // the single billing choke point. Dollar-valued span attributes
     // are derived from this integer for trace-backend compatibility.

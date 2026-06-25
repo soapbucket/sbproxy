@@ -1,0 +1,44 @@
+[package]
+name = "sbproxy-keystore"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Mutable system-of-record for sbproxy inbound virtual keys and upstream credentials: pluggable KeyStore backends, a fail-closed TtlCache, and at-rest hashing/encryption."
+
+[features]
+default = ["embedded"]
+# Embedded redb-backed store (the default system-of-record).
+embedded = ["dep:redb"]
+# Redis store + cross-replica pub/sub invalidation.
+redis-backend = ["dep:redis", "dep:futures"]
+# Secrets-manager-direct store wrapping sbproxy-vault backends.
+secrets-manager = ["dep:sbproxy-vault"]
+
+[dependencies]
+sbproxy-security.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rand.workspace = true
+
+# Optional backends.
+redb = { workspace = true, optional = true }
+redis = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+sbproxy-vault = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }

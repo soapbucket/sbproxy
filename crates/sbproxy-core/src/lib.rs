@@ -12,6 +12,9 @@
 #![warn(missing_docs)]
 
 pub mod admin;
+/// WOR-1553/1554: key + credential lifecycle REST API mounted on the
+/// admin server (`/admin/keys`, `/admin/credentials`).
+pub mod admin_keys;
 /// Gated chat-playground route mounted on the admin server. Returns
 /// a feature-disabled response until the route is wired through the
 /// production AI dispatch path.
@@ -39,6 +42,12 @@ pub mod dispatch;
 pub mod hook_registry;
 pub mod hooks;
 pub mod identity;
+/// WOR-1546: dynamic key plane assembly + process-global handle.
+pub mod key_plane;
+/// WOR-1562: mesh distributed-cache tier for the key plane.
+pub mod mesh_cache;
+/// WOR-1563: distributed per-key spend + rate counters via mesh CRDTs.
+pub mod mesh_counters;
 pub mod pipeline;
 /// Policy verdict audit event bus.
 ///

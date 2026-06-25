@@ -7,6 +7,126 @@
 
 use super::*;
 
+/// Outcome of resolving an inbound bearer token against the dynamic key plane
+/// (WOR-1551).
+enum DynamicKeyOutcome {
+    /// Not a virtual-key-shaped token (or no token); let other auth handle it.
+    NotApplicable,
+    /// Resolved to a usable key; proceed with this synthesized config.
+    Resolved(Box<sbproxy_ai::identity::VirtualKeyConfig>),
+    /// Deny the request with this status and message.
+    Deny(u16, String),
+}
+
+/// Map a stored [`KeyRecord`](sbproxy_keystore::record::KeyRecord) onto the
+/// gateway's `VirtualKeyConfig` so the existing per-key pipeline (principal
+/// stamp, attribution, model gate, budget scope) runs unchanged regardless of
+/// whether the key came from the dynamic store or the compiled config.
+fn key_record_to_virtual_key(
+    rec: &sbproxy_keystore::record::KeyRecord,
+) -> sbproxy_ai::identity::VirtualKeyConfig {
+    sbproxy_ai::identity::VirtualKeyConfig {
+        // The public id, never the secret: used only as a fallback display name.
+        key: rec.key_id.clone(),
+        name: rec.name.clone(),
+        allowed_models: rec.allowed_models.clone(),
+        blocked_models: rec.blocked_models.clone(),
+        allowed_providers: rec.allowed_providers.clone(),
+        principal_selectors: Vec::new(),
+        require_pii_redaction: Vec::new(),
+        max_tokens_per_minute: rec.max_tokens_per_minute,
+        max_requests_per_minute: rec.max_requests_per_minute,
+        budget: rec
+            .budget
+            .as_ref()
+            .map(|b| sbproxy_ai::identity::KeyBudget {
+                max_tokens: b.max_tokens,
+                max_cost_usd: b.max_cost_usd,
+            }),
+        tags: rec.tags.clone(),
+        project: rec.project.clone(),
+        user: rec.user.clone(),
+        metadata: rec
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        route_to_model: None,
+        inject_tools: Vec::new(),
+        enabled: true,
+        bypass_prompt_injection: false,
+    }
+}
+
+/// Process-global per-key rate limiter (WOR-1558). Accumulates request counts
+/// per virtual key across requests; the limit itself is read per-request from
+/// the resolved record, so a live PATCH changes enforcement without a reload.
+fn key_rate_limiter() -> &'static sbproxy_ai::identity::KeyRateLimiter {
+    static LIMITER: std::sync::OnceLock<sbproxy_ai::identity::KeyRateLimiter> =
+        std::sync::OnceLock::new();
+    LIMITER.get_or_init(sbproxy_ai::identity::KeyRateLimiter::new)
+}
+
+/// WOR-1555: map a verified OIDC/JWT identity to a stored virtual-key record's
+/// policy, so the bearer-token and OIDC front doors converge on one record.
+///
+/// The JWT/OIDC auth provider already proved the identity, so no secret is
+/// verified here: the configured claim's value names the record (key_id), and a
+/// usable record's policy/attribution is applied. Returns `None` when mapping is
+/// not configured, the claim is absent, or the record is missing or not active.
+async fn resolve_oidc_mapped_key(
+    plane: &crate::key_plane::KeyPlane,
+    principal: &sbproxy_plugin::Principal,
+) -> Option<sbproxy_ai::identity::VirtualKeyConfig> {
+    let claim_field = plane.oidc_claim_field()?;
+    let claims = principal.attrs.claims.as_ref()?;
+    let key_id = claims.get(claim_field)?.as_str()?;
+    match plane.cache().resolve_key(key_id).await {
+        Ok(Some(rec)) if rec.is_usable(chrono::Utc::now()) => Some(key_record_to_virtual_key(&rec)),
+        _ => None,
+    }
+}
+
+/// Resolve an inbound bearer token against the dynamic key plane: parse the
+/// `sk-<key_id>-<secret>` shape, look the id up through the cache then store,
+/// constant-time verify the secret, and gate on status/expiry. Fail-closed: a
+/// store outage denies unless `failure_mode_allow` is set.
+async fn resolve_dynamic_virtual_key(
+    plane: &crate::key_plane::KeyPlane,
+    raw_token: Option<&str>,
+) -> DynamicKeyOutcome {
+    let Some(token) = raw_token else {
+        return DynamicKeyOutcome::NotApplicable;
+    };
+    let Some((key_id, secret)) = sbproxy_keystore::crypto::parse_token(token) else {
+        // Not a virtual-key-shaped token; a different auth provider may own it.
+        return DynamicKeyOutcome::NotApplicable;
+    };
+    let now = chrono::Utc::now();
+    match plane.cache().resolve_key(key_id).await {
+        Err(e) => {
+            if plane.failure_mode_allow() {
+                tracing::warn!(error = %e, "key store unavailable; failure_mode_allow set, passing through");
+                DynamicKeyOutcome::NotApplicable
+            } else {
+                DynamicKeyOutcome::Deny(503, "key store unavailable".to_string())
+            }
+        }
+        // Unknown id and a wrong secret return the same status so neither is an
+        // existence oracle.
+        Ok(None) => DynamicKeyOutcome::Deny(401, "invalid key".to_string()),
+        Ok(Some(rec)) => {
+            if !plane.crypto().verify_record(&rec, secret, now) {
+                DynamicKeyOutcome::Deny(401, "invalid key".to_string())
+            } else if !rec.is_usable(now) {
+                DynamicKeyOutcome::Deny(403, "key is not active".to_string())
+            } else {
+                DynamicKeyOutcome::Resolved(Box::new(key_record_to_virtual_key(&rec)))
+            }
+        }
+    }
+}
+
 pub(super) async fn handle_ai_proxy(
     session: &mut Session,
     config: &AiHandlerConfig,
@@ -770,7 +890,7 @@ pub(super) async fn handle_ai_proxy(
     // can attribute spend / usage to them. Missing / unknown keys
     // silently no-op (auth itself is enforced by the configured auth
     // provider, not here). Skipped when no virtual_keys are declared.
-    if !config.virtual_keys.is_empty() {
+    {
         let auth_value = req_header_value(session, "authorization");
         let raw_key = auth_value.as_deref().map(|h| {
             h.strip_prefix("Bearer ")
@@ -779,11 +899,37 @@ pub(super) async fn handle_ai_proxy(
                 .trim()
                 .to_string()
         });
-        if let Some(key) = raw_key {
-            if let Some(vk) = config
-                .virtual_keys
-                .iter()
-                .find(|vk| vk.enabled && vk.key == key)
+        // Resolve the inbound virtual key. When the dynamic key plane is
+        // enabled it is the source of truth (hashed at rest, instant revoke,
+        // per-request cache->store); otherwise fall back to the compiled
+        // `virtual_keys:` list.
+        let resolved_vk: Option<sbproxy_ai::identity::VirtualKeyConfig> =
+            if let Some(plane) = crate::key_plane::current_key_plane() {
+                match resolve_dynamic_virtual_key(&plane, raw_key.as_deref()).await {
+                    DynamicKeyOutcome::Resolved(vk) => Some(*vk),
+                    // No virtual-key bearer token: fall back to OIDC/JWT claim
+                    // mapping so a verified identity resolves the same record.
+                    DynamicKeyOutcome::NotApplicable => {
+                        resolve_oidc_mapped_key(&plane, &ctx.principal).await
+                    }
+                    DynamicKeyOutcome::Deny(status, msg) => {
+                        warn!(status, reason = %msg, "AI proxy: dynamic virtual key denied");
+                        send_error(session, status, &msg).await?;
+                        return Ok(());
+                    }
+                }
+            } else if !config.virtual_keys.is_empty() {
+                raw_key.as_deref().and_then(|key| {
+                    config
+                        .virtual_keys
+                        .iter()
+                        .find(|vk| vk.enabled && vk.key == key)
+                        .cloned()
+                })
+            } else {
+                None
+            };
+        if let Some(vk) = resolved_vk {
             {
                 if !vk.matches_principal(&ctx.principal) {
                     let vk_name = vk.name.as_deref().unwrap_or("<unnamed>");
@@ -863,6 +1009,27 @@ pub(super) async fn handle_ai_proxy(
                 // / customer / environment / agent_type / risk_tier.
                 ctx.attribution_tags =
                     crate::server::ai_support::resolve_attribution_tags(session, &ctx.principal);
+                // WOR-1558: enforce the key's live requests-per-minute limit.
+                // The limit is read from the resolved record (via the cache),
+                // so a PATCH to a dynamic key's rate takes effect on the next
+                // request without a reload. The bucket is keyed by the stable
+                // key id, never the secret.
+                if vk.max_requests_per_minute.is_some()
+                    && !key_rate_limiter().check_rate(&vk.key, &vk)
+                {
+                    warn!(
+                        key = %vk.name.as_deref().unwrap_or(&vk.key),
+                        "AI proxy: per-key requests-per-minute limit exceeded"
+                    );
+                    send_error(session, 429, "rate limit exceeded for this key").await?;
+                    return Ok(());
+                }
+                // WOR-1563: record the request into the cross-replica rate
+                // counter (mesh CRDT) so a key's fleet-wide rate is visible to
+                // every replica. No-op unless the mesh tier is enabled.
+                if let Some(counters) = crate::mesh_counters::current_mesh_counters() {
+                    counters.record_request(&vk.key);
+                }
                 // WOR-893: per-key model routing. When the key pins a
                 // model, overwrite the request body's `model` field so
                 // the downstream allow/block, routing, budget, and
@@ -5121,5 +5288,157 @@ mod streaming_restore_tests {
         assert_eq!(out.as_ref(), b"data: {\"x\": 1}\n\n");
         let tail = restore.finish();
         assert!(tail.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod dynamic_key_resolution_tests {
+    use super::*;
+    use sbproxy_keystore::crypto::KeyCrypto;
+    use sbproxy_keystore::record::{KeyRecord, RecordStatus};
+    use sbproxy_keystore::{KeyStore, MemoryKeyStore, TtlCache, TtlCacheConfig};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn dynamic_key_resolution_outcomes() {
+        let crypto = KeyCrypto::new(b"pep".to_vec(), b"mas".to_vec());
+        let now = chrono::Utc::now();
+
+        let active = crypto.mint_key();
+        let active_rec = KeyRecord::new(active.key_id.clone(), active.secret_hash.clone(), now);
+
+        let revoked = crypto.mint_key();
+        let mut revoked_rec =
+            KeyRecord::new(revoked.key_id.clone(), revoked.secret_hash.clone(), now);
+        revoked_rec.status = RecordStatus::Revoked;
+
+        let store = Arc::new(MemoryKeyStore::new());
+        store.put_key(active_rec).await.unwrap();
+        store.put_key(revoked_rec).await.unwrap();
+        let cache = Arc::new(TtlCache::new(
+            store as Arc<dyn KeyStore>,
+            TtlCacheConfig::default(),
+        ));
+        let plane = crate::key_plane::KeyPlane::from_parts(crypto, cache, false, false, None);
+
+        // Valid token resolves; the synthesized key carries the public id.
+        match resolve_dynamic_virtual_key(&plane, Some(&active.token)).await {
+            DynamicKeyOutcome::Resolved(vk) => assert_eq!(vk.key, active.key_id),
+            other => panic!("expected resolved, got {:?}", outcome_label(&other)),
+        }
+        // Wrong secret for a known id is 401 (no existence oracle).
+        let wrong = format!("sk-{}-deadbeefdeadbeef", active.key_id);
+        assert!(matches!(
+            resolve_dynamic_virtual_key(&plane, Some(&wrong)).await,
+            DynamicKeyOutcome::Deny(401, _)
+        ));
+        // Unknown id is also 401.
+        assert!(matches!(
+            resolve_dynamic_virtual_key(&plane, Some("sk-nope-secretsecret")).await,
+            DynamicKeyOutcome::Deny(401, _)
+        ));
+        // Revoked key with the correct secret is 403 (known but not active).
+        assert!(matches!(
+            resolve_dynamic_virtual_key(&plane, Some(&revoked.token)).await,
+            DynamicKeyOutcome::Deny(403, _)
+        ));
+        // A non-virtual-key-shaped token defers to other auth providers.
+        assert!(matches!(
+            resolve_dynamic_virtual_key(&plane, Some("opaque-jwt")).await,
+            DynamicKeyOutcome::NotApplicable
+        ));
+        // No token at all is also not applicable.
+        assert!(matches!(
+            resolve_dynamic_virtual_key(&plane, None).await,
+            DynamicKeyOutcome::NotApplicable
+        ));
+    }
+
+    fn outcome_label(o: &DynamicKeyOutcome) -> &'static str {
+        match o {
+            DynamicKeyOutcome::Resolved(_) => "resolved",
+            DynamicKeyOutcome::NotApplicable => "not-applicable",
+            DynamicKeyOutcome::Deny(_, _) => "deny",
+        }
+    }
+
+    fn principal_with_claim(field: &str, value: &str) -> sbproxy_plugin::Principal {
+        sbproxy_plugin::Principal {
+            attrs: sbproxy_plugin::PrincipalAttrs {
+                claims: Some(
+                    [(
+                        field.to_string(),
+                        serde_json::Value::String(value.to_string()),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..Default::default()
+            },
+            ..sbproxy_plugin::Principal::anonymous()
+        }
+    }
+
+    #[tokio::test]
+    async fn oidc_claim_maps_to_virtual_key() {
+        let crypto = KeyCrypto::new(b"pep".to_vec(), b"mas".to_vec());
+        let now = chrono::Utc::now();
+        let store = Arc::new(MemoryKeyStore::new());
+        let mut active = KeyRecord::new("team-acme", "unused-hash", now);
+        active.name = Some("acme".into());
+        store.put_key(active).await.unwrap();
+        let mut revoked = KeyRecord::new("team-old", "unused-hash", now);
+        revoked.status = RecordStatus::Revoked;
+        store.put_key(revoked).await.unwrap();
+        let cache = Arc::new(TtlCache::new(
+            store as Arc<dyn KeyStore>,
+            TtlCacheConfig::default(),
+        ));
+
+        // Mapping configured on the claim `virtual_key`.
+        let plane = crate::key_plane::KeyPlane::from_parts(
+            crypto,
+            cache,
+            false,
+            false,
+            Some("virtual_key".to_string()),
+        );
+
+        // A verified identity whose claim names a usable record resolves it
+        // (no secret required, identity already proven by the JWT provider).
+        let p = principal_with_claim("virtual_key", "team-acme");
+        let vk = resolve_oidc_mapped_key(&plane, &p).await.expect("mapped");
+        assert_eq!(vk.key, "team-acme");
+
+        // A claim that names a revoked record does not resolve.
+        let p = principal_with_claim("virtual_key", "team-old");
+        assert!(resolve_oidc_mapped_key(&plane, &p).await.is_none());
+
+        // A claim that names no record does not resolve.
+        let p = principal_with_claim("virtual_key", "team-missing");
+        assert!(resolve_oidc_mapped_key(&plane, &p).await.is_none());
+
+        // A principal without the mapped claim does not resolve.
+        let p = principal_with_claim("other", "team-acme");
+        assert!(resolve_oidc_mapped_key(&plane, &p).await.is_none());
+    }
+
+    #[test]
+    fn per_key_rate_limiter_reads_live_rpm_from_record() {
+        // A record's max_requests_per_minute is carried onto the synthesized
+        // VirtualKeyConfig, so the same limiter the dispatch uses enforces the
+        // live value. A PATCH to the record changes this without a reload.
+        let mut rec = KeyRecord::new("rl-key", "h", chrono::Utc::now());
+        rec.max_requests_per_minute = Some(2);
+        let vk = key_record_to_virtual_key(&rec);
+        assert_eq!(vk.max_requests_per_minute, Some(2));
+
+        let limiter = sbproxy_ai::identity::KeyRateLimiter::new();
+        assert!(limiter.check_rate(&vk.key, &vk));
+        assert!(limiter.check_rate(&vk.key, &vk));
+        assert!(
+            !limiter.check_rate(&vk.key, &vk),
+            "the third request in the window exceeds the 2 rpm limit"
+        );
     }
 }

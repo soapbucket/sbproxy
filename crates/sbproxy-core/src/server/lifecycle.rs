@@ -281,6 +281,15 @@ fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<()> {
     // Runs before `compiled` is moved into the pipeline below.
     install_detection_singletons(&compiled);
 
+    // WOR-1546: reconcile the dynamic key plane so a reload that changed
+    // `key_management:` re-seeds config records and swaps the live plane.
+    // Config-seeded records are re-asserted unless `allow_api_override`.
+    if let Some(km) = compiled.server.key_management.as_ref() {
+        if let Err(e) = crate::key_plane::init_key_plane(km) {
+            tracing::error!(error = %e, "failed to reconcile dynamic key plane on reload");
+        }
+    }
+
     let mut new_pipeline = CompiledPipeline::from_config(compiled)?;
 
     // WOR-196: pick up `listings/*.yaml` from the same Repo (the
@@ -742,6 +751,18 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // the hot-reload path.
     if let Some(rl) = compiled.rate_limits.as_ref() {
         crate::rate_limit_budget::install_registry(rl);
+    }
+
+    // --- WOR-1546: assemble and install the dynamic key plane ---
+    //
+    // Lowered from `proxy.key_management:`. Builds the store, policy cache, and
+    // at-rest crypto, seeds config records, and (for the redis backend/tier)
+    // starts the cross-replica invalidation subscriber. Inert when the block is
+    // absent or `enabled: false`.
+    if let Some(km) = server_config.key_management.as_ref() {
+        if let Err(e) = crate::key_plane::init_key_plane(km) {
+            tracing::error!(error = %e, "failed to install dynamic key plane");
+        }
     }
 
     // --- WOR-1186: register the session-ledger sink when enabled ---

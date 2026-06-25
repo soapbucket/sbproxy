@@ -20,7 +20,10 @@ pub use agent_verify::{
 };
 #[allow(deprecated)]
 pub use crypto::hkdf_derive;
-pub use crypto::{hkdf_derive_purpose, HkdfPurpose};
+pub use crypto::{
+    aes256gcm_decrypt, aes256gcm_encrypt, hkdf_derive_purpose, random_aes256_key,
+    random_aes_gcm_nonce, HkdfPurpose, AES256_KEY_LEN, AES_GCM_NONCE_LEN,
+};
 #[cfg(feature = "tls-fingerprint")]
 pub use headless_detect::{
     detect as detect_headless, HeadlessSignal as HeadlessDetectSignal, TlsFingerprintCatalog,
