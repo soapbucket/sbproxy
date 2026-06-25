@@ -14,7 +14,7 @@ default = ["embedded"]
 # Embedded redb-backed store (the default system-of-record).
 embedded = ["dep:redb"]
 # Redis store + cross-replica pub/sub invalidation.
-redis-backend = ["dep:redis"]
+redis-backend = ["dep:redis", "dep:futures"]
 # Secrets-manager-direct store wrapping sbproxy-vault backends.
 secrets-manager = ["dep:sbproxy-vault"]
 
@@ -36,6 +36,7 @@ rand.workspace = true
 # Optional backends.
 redb = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 sbproxy-vault = { workspace = true, optional = true }
 
 [dev-dependencies]
