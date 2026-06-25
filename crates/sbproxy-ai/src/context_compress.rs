@@ -56,6 +56,28 @@ pub fn trim_to_budget(messages: &[serde_json::Value], max_tokens: u64) -> Vec<se
     result
 }
 
+/// Fit a message list to a model's context window (WOR-1545), reserving
+/// `completion_reserve_tokens` for the response.
+///
+/// Returns the trimmed messages when the prompt would overflow the window,
+/// so an over-long request can succeed on the same model instead of being
+/// rejected with a context-length error. Returns `None` when the model's
+/// window is unknown (so the request is left untouched) or the prompt
+/// already fits.
+pub fn fit_messages_to_model(
+    messages: &[serde_json::Value],
+    model: &str,
+    completion_reserve_tokens: u64,
+) -> Option<Vec<serde_json::Value>> {
+    let window = crate::context_overflow::model_context_window(model)?;
+    let budget = window.saturating_sub(completion_reserve_tokens).max(1);
+    let total: u64 = messages.iter().map(estimate_message_tokens).sum();
+    if total <= budget {
+        return None;
+    }
+    Some(trim_to_budget(messages, budget))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +185,42 @@ mod tests {
     fn estimate_message_tokens_proportional_to_content_length() {
         let msg = json!({"role": "user", "content": "abcdefgh"}); // 8 chars -> 2 + 1 = 3
         assert_eq!(estimate_message_tokens(&msg), 3);
+    }
+
+    #[test]
+    fn fit_to_model_trims_overflowing_prompt_keeping_system() {
+        // gpt-4 has an 8192-token window. Reserve 1024 -> 7168 budget.
+        // ~4 chars/token, so a 4000-char message is ~1000 tokens.
+        let big = "x".repeat(4000);
+        let mut messages = vec![sys()];
+        for _ in 0..10 {
+            messages.push(user(&big)); // ~10000 tokens total, over budget
+        }
+        let fitted =
+            fit_messages_to_model(&messages, "gpt-4", 1024).expect("overflowing prompt is trimmed");
+        assert!(fitted.len() < messages.len(), "messages were dropped");
+        assert_eq!(fitted[0]["role"], "system", "system message kept");
+        let total: u64 = fitted.iter().map(estimate_message_tokens).sum();
+        assert!(total <= 7168, "fitted prompt is within budget: {total}");
+    }
+
+    #[test]
+    fn fit_to_model_leaves_small_prompt_untouched() {
+        let messages = vec![sys(), user("hello"), assistant("hi")];
+        assert!(
+            fit_messages_to_model(&messages, "gpt-4", 1024).is_none(),
+            "a prompt that already fits is not trimmed"
+        );
+    }
+
+    #[test]
+    fn fit_to_model_unknown_model_is_noop() {
+        let big = "x".repeat(100_000);
+        let messages = vec![user(&big)];
+        assert!(
+            fit_messages_to_model(&messages, "some-unknown-model", 1024).is_none(),
+            "an unknown model window leaves the request untouched"
+        );
     }
 
     #[test]
