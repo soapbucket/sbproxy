@@ -29,6 +29,9 @@ pub mod embedded;
 #[cfg(feature = "redis-backend")]
 pub mod redis_store;
 
+#[cfg(feature = "secrets-manager")]
+pub mod secrets_manager;
+
 use anyhow::Result;
 use async_trait::async_trait;
 
