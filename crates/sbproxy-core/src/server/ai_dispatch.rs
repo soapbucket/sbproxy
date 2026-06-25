@@ -2094,7 +2094,118 @@ pub(super) async fn handle_ai_proxy(
         }
     }
 
+    // --- Hedged / raced dispatch (WOR-1545) ---
+    //
+    // When the configured strategy is `race`, fan the request out to every
+    // eligible provider concurrently and keep the first 2xx response,
+    // dropping (cancelling) the losers. This trades extra upstream calls
+    // for lower tail latency. Streaming and single-provider requests fall
+    // through to the sequential path below (mid-stream racing is out of
+    // scope); the operator opted into the extra calls, so a raced request
+    // does not also run the sequential failover loop afterward.
+    let race_mode = router.is_race() && !is_stream && provider_order.len() >= 2;
+    if race_mode {
+        use futures::stream::{FuturesUnordered, StreamExt as _};
+        let client = AI_CLIENT.load();
+        let race_start = std::time::Instant::now();
+        let mut futs = FuturesUnordered::new();
+        for &idx in &provider_order {
+            let provider = &config.providers[idx];
+            let mut attempt_body = body.clone();
+            if !model.is_empty() {
+                let mapped = provider.map_model(&model);
+                if mapped != model {
+                    attempt_body["model"] = serde_json::Value::String(mapped);
+                }
+            }
+            let path_ref = path.as_str();
+            let cl = &client;
+            futs.push(async move {
+                let r = cl.forward_request(provider, path_ref, &attempt_body).await;
+                (idx, r)
+            });
+        }
+
+        // Keep the first 2xx; hold the first non-2xx response as a
+        // fallback so the client still sees an upstream error rather than a
+        // synthetic one when every candidate fails.
+        let mut winner: Option<(usize, reqwest::Response)> = None;
+        let mut fallback: Option<(usize, reqwest::Response)> = None;
+        while let Some((idx, res)) = futs.next().await {
+            match res {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    router.record_latency(idx, race_start.elapsed().as_micros() as u64);
+                    let outcome = if (200..300).contains(&status) {
+                        "success"
+                    } else {
+                        "error"
+                    };
+                    sbproxy_observe::metrics::record_provider_attempt(
+                        &config.providers[idx].name,
+                        outcome,
+                    );
+                    if (200..300).contains(&status) {
+                        winner = Some((idx, resp));
+                        break;
+                    } else if fallback.is_none() {
+                        fallback = Some((idx, resp));
+                    }
+                }
+                Err(e) => {
+                    sbproxy_observe::metrics::record_provider_attempt(
+                        &config.providers[idx].name,
+                        "error",
+                    );
+                    last_error_type = ai_transport_error_type(&e);
+                    last_error = Some(e);
+                }
+            }
+        }
+        // Dropping the stream cancels any still-in-flight loser request.
+        drop(futs);
+        drop(client);
+
+        if let Some((idx, resp)) = winner.or(fallback) {
+            let provider = &config.providers[idx];
+            let resolved_model = if model.is_empty() {
+                String::new()
+            } else {
+                provider.map_model(&model)
+            };
+            ctx.ai_provider = Some(provider.name.to_string());
+            if !resolved_model.is_empty() {
+                ctx.ai_model = Some(resolved_model.clone());
+            }
+            ai_span.record("gen_ai.system", provider.name.as_str());
+            ai_span.record("llm.provider", provider.name.as_str());
+            if !resolved_model.is_empty() {
+                ai_span.record("gen_ai.request.model", resolved_model.as_str());
+                ai_span.record("llm.model_name", resolved_model.as_str());
+            }
+            sbproxy_ai::ai_metrics::record_model_latency(
+                &provider.name,
+                ctx.ai_model.as_deref().unwrap_or(""),
+                surface_label,
+                ctx.tenant_id.as_str(),
+                ctx.principal.api_key_id(),
+                race_start.elapsed().as_secs_f64(),
+            );
+            last_format = sbproxy_ai::client::provider_format(provider);
+            last_upstream_host = url::Url::parse(&provider.effective_base_url())
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.to_string()));
+            last_provider_name = provider.name.to_string();
+            last_resp = Some(resp);
+        }
+    }
+
     for (attempt, &provider_idx) in provider_order.iter().enumerate() {
+        // The raced dispatch above already produced `last_resp` (or an
+        // error); skip the sequential failover loop entirely.
+        if race_mode {
+            break;
+        }
         if attempt >= max_attempts {
             break;
         }
