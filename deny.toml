@@ -129,6 +129,13 @@ ignore = [
   # this change. Transitive; revisit when tonic/prost drop it.
   "RUSTSEC-2026-0173",
 
+  # RUSTSEC-2025-0141: bincode 1.3.3 is unmaintained (the maintained line is
+  # bincode 2.x, which is a breaking API change). It is a direct dep of
+  # sbproxy-mesh, used only to encode internal RPC frames on the gossip/transport
+  # wire between trusted cluster nodes (not for untrusted input). Unmaintained,
+  # not a known vulnerability. Revisit by migrating sbproxy-mesh to bincode 2.
+  "RUSTSEC-2025-0141",
+
   # RUSTSEC-2025-0134: rustls-pemfile 2.2.0. Paths: rustls-pemfile ->
   # pingora-rustls -> pingora-core (direct dep), -> object_store (direct
   # dep), -> kube-client -> kube (direct dep), and -> axum-server (direct
