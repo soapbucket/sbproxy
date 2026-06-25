@@ -1396,6 +1396,7 @@ pub(super) fn record_usage_sinks(ctx: &mut crate::context::RequestContext) {
         user: None,
         team: (!ctx.tenant_id.is_empty()).then(|| ctx.tenant_id.to_string()),
         request_id: (!ctx.request_id.is_empty()).then(|| ctx.request_id.to_string()),
+        tag: ctx.ai_policy_sink_tag.clone(),
     };
     for sink in &sinks {
         sink.record(&event);

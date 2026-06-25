@@ -4,6 +4,7 @@
 #![warn(missing_docs)]
 
 pub mod ai_metrics;
+pub mod ai_policy;
 pub mod alerting;
 pub mod api_routes;
 pub mod assistants;

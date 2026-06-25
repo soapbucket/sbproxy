@@ -476,6 +476,7 @@ mod tests {
             user: None,
             team: None,
             request_id: rid.map(|s| s.to_string()),
+            tag: None,
         }
     }
 

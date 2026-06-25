@@ -49,6 +49,11 @@ pub struct LlmUsageEvent {
     /// exactly-once on replay. `None` events are never deduplicated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// Optional tag set by a `set_sink_tag` action from the AI policy
+    /// plane (WOR-1542), so a policy decision is queryable in the spend
+    /// record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
 }
 
 /// A destination for completed-call usage events.
@@ -223,6 +228,7 @@ mod tests {
             user: None,
             team: None,
             request_id: None,
+            tag: None,
         }
     }
 

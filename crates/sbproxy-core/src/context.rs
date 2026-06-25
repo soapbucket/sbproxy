@@ -739,6 +739,11 @@ pub struct RequestContext {
     /// among them). `None` (the default) means no sinks are configured,
     /// so the request path does no extra work.
     pub ai_usage_sinks: Option<Vec<std::sync::Arc<dyn sbproxy_ai::usage_sink::UsageSink>>>,
+    /// WOR-1542: usage-record tag set by a `set_sink_tag:<tag>` action
+    /// from the AI policy plane. Stamped onto the `LlmUsageEvent` handed
+    /// to the usage sinks (including the verifiable ledger) so policy
+    /// decisions are queryable in the spend record. `None` by default.
+    pub ai_policy_sink_tag: Option<String>,
     /// Inbound `ChatFormat` id when the request entered on a native
     /// shim path (`anthropic` for `/v1/messages`, `responses` for
     /// `/v1/responses`). `None` (or `"openai"`) for the canonical
@@ -1085,6 +1090,7 @@ impl RequestContext {
             ai_surface: None,
             ai_outcome: None,
             ai_usage_sinks: None,
+            ai_policy_sink_tag: None,
             ai_inbound_format: None,
             ai_native_bypass: false,
             ai_admission: None,

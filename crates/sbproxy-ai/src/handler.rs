@@ -112,6 +112,14 @@ pub struct AiHandlerConfig {
     /// LiteLLM's `success_callback` / `callbacks` map onto. Empty by default.
     #[serde(default)]
     pub usage_sinks: Vec<crate::usage_sink::UsageSinkConfig>,
+    /// WOR-1542: optional unified CEL policy plane over the AI decision
+    /// pipeline. One sandboxed expression fuses guardrail verdicts, budget
+    /// state, routing candidate, and principal context into a closed set of
+    /// typed actions (block / redact / route_to / set_sink_tag / audit).
+    /// `None` (the default) leaves the pipeline's per-block decisions
+    /// unchanged.
+    #[serde(default)]
+    pub ai_policy: Option<crate::ai_policy::AiPolicyConfig>,
     /// Lazy-built compiled redactor cached on the per-origin
     /// config. Built on first use so config-load does not pay the
     /// regex-compile cost for origins that never serve a request.
@@ -142,6 +150,12 @@ pub struct AiHandlerConfig {
     /// shared across requests for the lifetime of this per-origin config.
     #[serde(skip)]
     pub(crate) usage_sinks_built: OnceLock<Vec<std::sync::Arc<dyn crate::usage_sink::UsageSink>>>,
+    /// Lazy-compiled AI policy plane (WOR-1542). `None` inside the OnceLock
+    /// means no policy is configured or it failed to compile; the request
+    /// path treats both as "no policy".
+    #[serde(skip)]
+    pub(crate) ai_policy_compiled:
+        OnceLock<Option<std::sync::Arc<crate::ai_policy::CompiledAiPolicy>>>,
 }
 
 fn default_usage_parser() -> String {
@@ -209,6 +223,26 @@ impl AiHandlerConfig {
         self.usage_sinks_built
             .get_or_init(|| crate::usage_sink::build_sinks(&self.usage_sinks))
             .as_slice()
+    }
+
+    /// Return the compiled AI policy plane for this handler, compiling it
+    /// once (WOR-1542). `None` when no policy is configured or it failed to
+    /// compile (logged once); the request path treats both as "no policy",
+    /// so a policy bug never takes the gateway down.
+    pub fn ai_policy(&self) -> Option<&std::sync::Arc<crate::ai_policy::CompiledAiPolicy>> {
+        self.ai_policy_compiled
+            .get_or_init(|| {
+                self.ai_policy.as_ref().and_then(|cfg| {
+                    match crate::ai_policy::CompiledAiPolicy::compile(cfg) {
+                        Ok(p) => Some(std::sync::Arc::new(p)),
+                        Err(e) => {
+                            tracing::error!(error = %e, "ai_policy: disabled (failed to compile)");
+                            None
+                        }
+                    }
+                })
+            })
+            .as_ref()
     }
 
     /// Return the shared provider router for this handler, building it
@@ -945,6 +979,8 @@ mod tests {
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
+            ai_policy: None,
+            ai_policy_compiled: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("anything"));
@@ -976,6 +1012,8 @@ mod tests {
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
+            ai_policy: None,
+            ai_policy_compiled: OnceLock::new(),
         };
         assert!(!config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("gpt-3.5-turbo"));
@@ -1007,6 +1045,8 @@ mod tests {
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
+            ai_policy: None,
+            ai_policy_compiled: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("gpt-3.5-turbo"));
@@ -1039,6 +1079,8 @@ mod tests {
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
+            ai_policy: None,
+            ai_policy_compiled: OnceLock::new(),
         };
         // Block list wins
         assert!(!config.is_model_allowed("gpt-4"));

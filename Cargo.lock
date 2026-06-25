@@ -6302,6 +6302,7 @@ dependencies = [
  "sbproxy-cache",
  "sbproxy-classifier-client",
  "sbproxy-config",
+ "sbproxy-extension",
  "sbproxy-platform",
  "sbproxy-plugin",
  "sbproxy-security",

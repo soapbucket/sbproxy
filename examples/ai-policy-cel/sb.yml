@@ -1,0 +1,60 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: unified CEL policy plane.
+#
+# One sandboxed CEL expression decides cross-cutting AI-gateway rules over
+# the signals the gateway already computes (guardrail verdicts, budget
+# state, routing candidate, principal context) and emits a small closed set
+# of typed actions, instead of those rules living in four separate config
+# blocks. The expression returns one action token or a list of them.
+#
+# Recognized actions: allow, block, redact, route_to:<model>,
+# set_sink_tag:<tag>, audit:<priority>.
+#
+# Here: route free-tier traffic that asks for the expensive model down to
+# the cheap one, and tag the spend record so it is queryable later.
+#
+# The `ai.*` namespace exposes:
+#   ai.surface, ai.model, ai.provider
+#   ai.principal.tenant, ai.principal.api_key_id, ai.principal.tier
+#   ai.guardrails.flagged, ai.guardrails.flagged_count, ai.guardrails.labels
+#   ai.budget.fraction, ai.budget.exceeded
+#   ai.tokens.input_est
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#   make run CONFIG=examples/ai-policy-cel/sb.yml
+#
+# Test (a free-tier request for gpt-4o is rerouted to gpt-4o-mini):
+#   curl -s http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' -H 'Content-Type: application/json' \
+#     -H 'SB-Attr-Risk-Tier: free' \
+#     -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}' \
+#     | jq -r '.model'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o
+            - gpt-4o-mini
+
+      ai_policy:
+        expression: |
+          ai.principal.tier == "free" && ai.model == "gpt-4o"
+            ? ["route_to:gpt-4o-mini", "set_sink_tag:downgraded-free-tier"]
+            : ["allow"]
+        # Applied when the expression errors or returns an unknown value.
+        # Defaults to allow (fail-open) so a policy bug cannot take the
+        # gateway down.
+        on_error: allow

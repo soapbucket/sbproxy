@@ -1256,6 +1256,80 @@ pub(super) async fn handle_ai_proxy(
         }
     }
 
+    // --- WOR-1542: unified AI policy plane ---
+    //
+    // After guardrail evaluation and before provider selection, evaluate
+    // one sandboxed CEL expression over the AI decision signals and apply
+    // its closed action set (block / redact / route_to / set_sink_tag /
+    // audit). Default off: the hook only runs when an `ai_policy` block is
+    // configured and compiled. A policy bug fails open (see `on_error`).
+    if let Some(policy) = config.ai_policy() {
+        let view = sbproxy_ai::ai_policy::AiDecisionView {
+            surface: surface_label.to_string(),
+            model: model.clone(),
+            provider: config
+                .providers
+                .first()
+                .map(|p| p.name.to_string())
+                .unwrap_or_default(),
+            tenant: ctx.tenant_id.to_string(),
+            api_key_id: ctx.principal.api_key_id().to_string(),
+            // The risk tier rides on the attribution tags resolved at the
+            // handler entry. Guardrail labels and the budget fraction are
+            // populated by the guardrail mesh and predictive budgets
+            // respectively; until those land they are empty/zero and the
+            // policy keys on principal / surface / model.
+            tier: ctx.attribution_tags.risk_tier.clone().unwrap_or_default(),
+            guardrail_labels: Vec::new(),
+            budget_fraction: 0.0,
+            budget_exceeded: false,
+            input_tokens_est: ctx.ai_prompt_tokens_est.unwrap_or(0) as i64,
+        };
+        let decision = policy.evaluate(&view);
+
+        if let Some(priority) = decision.audit_priority() {
+            info!(
+                ai.surface = surface_label,
+                ai.policy_priority = priority,
+                ai.policy_actions = ?decision.actions,
+                "AI policy: audit event"
+            );
+        }
+
+        if decision.is_block() {
+            warn!(ai.surface = surface_label, "AI policy: blocked request");
+            ctx.ai_outcome = Some("policy_block".to_string());
+            let error_body = serde_json::json!({
+                "error": {
+                    "message": "blocked by AI policy",
+                    "type": "ai_policy_block",
+                }
+            });
+            let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+            send_response(session, 403, "application/json", &body_bytes).await?;
+            return Ok(());
+        }
+
+        if decision.redact() {
+            if let Some(redactor) = config.pii_redactor() {
+                redactor.redact_json(&mut body);
+            }
+        }
+
+        if let Some(target) = decision.route_model() {
+            if !target.is_empty() && target != model {
+                info!(from = %model, to = %target, "AI policy: route_to override");
+                model = target.to_string();
+                body["model"] = serde_json::Value::String(target.to_string());
+                ctx.ai_model = Some(target.to_string());
+            }
+        }
+
+        if let Some(tag) = decision.sink_tag() {
+            ctx.ai_policy_sink_tag = Some(tag.to_string());
+        }
+    }
+
     // --- Semantic lookup hook (A21/F3+F4, fail-open) ---
     //
     // When the enterprise semantic cache is wired, ask the hook whether
