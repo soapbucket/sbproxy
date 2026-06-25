@@ -731,6 +731,34 @@ pub struct RequestContext {
     /// closed-set strings only (`guardrail_block`, `content_filter`,
     /// ...).
     pub ai_outcome: Option<String>,
+    /// WOR-1528 / WOR-1540: usage sinks for this origin, stashed by
+    /// `handle_ai_proxy` when the AI handler configures any. The
+    /// end-of-request `logging` hook reads them once the final status,
+    /// token counts, cost, and latency are known, builds one
+    /// `LlmUsageEvent`, and hands it to each sink (the verifiable ledger
+    /// among them). `None` (the default) means no sinks are configured,
+    /// so the request path does no extra work.
+    pub ai_usage_sinks: Option<Vec<std::sync::Arc<dyn sbproxy_ai::usage_sink::UsageSink>>>,
+    /// WOR-1542: usage-record tag set by a `set_sink_tag:<tag>` action
+    /// from the AI policy plane. Stamped onto the `LlmUsageEvent` handed
+    /// to the usage sinks (including the verifiable ledger) so policy
+    /// decisions are queryable in the spend record. `None` by default.
+    pub ai_policy_sink_tag: Option<String>,
+    /// WOR-1543: labels of the guardrails that flagged the request, set by
+    /// the guardrail mesh when configured. Fed into the AI policy plane's
+    /// `ai.guardrails.*` namespace so a policy rule can fuse the verdict
+    /// set. Empty when the mesh is off or nothing flagged.
+    pub ai_guardrail_labels: Vec<String>,
+    /// WOR-1541: when true, the end-of-request hook folds this request's
+    /// realized outcome (success / refusal / cost / latency) into the
+    /// global routing feedback store. Set by `handle_ai_proxy` only when
+    /// the origin uses the `outcome_aware` routing strategy.
+    pub ai_record_routing_feedback: bool,
+    /// WOR-1544: tightest active budget-window fraction consumed (0.0 to
+    /// just under 1.0), computed by the predictive soft-landing check.
+    /// Surfaced to the AI policy plane's `ai.budget.*` namespace. `0.0`
+    /// when no budget is configured.
+    pub ai_budget_fraction: f64,
     /// Inbound `ChatFormat` id when the request entered on a native
     /// shim path (`anthropic` for `/v1/messages`, `responses` for
     /// `/v1/responses`). `None` (or `"openai"`) for the canonical
@@ -1076,6 +1104,11 @@ impl RequestContext {
             ai_cost_usd_micros: None,
             ai_surface: None,
             ai_outcome: None,
+            ai_usage_sinks: None,
+            ai_policy_sink_tag: None,
+            ai_guardrail_labels: Vec::new(),
+            ai_record_routing_feedback: false,
+            ai_budget_fraction: 0.0,
             ai_inbound_format: None,
             ai_native_bypass: false,
             ai_admission: None,

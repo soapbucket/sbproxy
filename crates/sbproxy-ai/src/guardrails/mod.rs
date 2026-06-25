@@ -10,6 +10,7 @@ mod context_poisoning_rules;
 // constants without duplicating the lists.
 pub mod injection;
 mod jailbreak;
+pub mod mesh;
 mod pii;
 mod regex_guard;
 mod schema;
@@ -24,6 +25,7 @@ pub use context_poisoning::{
 pub use context_poisoning_rules::{ContextPoisoningRule, CONTEXT_POISONING_RULES};
 pub use injection::InjectionGuardrail;
 pub use jailbreak::JailbreakGuardrail;
+pub use mesh::{GuardrailMesh, GuardrailMeshConfig, MeshDecision};
 pub use pii::{PiiAction, PiiGuardrail};
 pub use regex_guard::{RegexAction, RegexGuardrail};
 pub use schema::SchemaGuardrail;
@@ -280,6 +282,13 @@ impl GuardrailPipeline {
     }
 }
 
+/// Public text view of a slice of messages, used by the guardrail mesh as
+/// its content-addressed cache key. Same extraction the serial pipeline's
+/// detectors see.
+pub fn message_text(messages: &[Message]) -> String {
+    extract_text_from_messages(messages)
+}
+
 /// Extract text content from a slice of messages.
 /// Handles both string content and multimodal arrays.
 fn extract_text_from_messages(messages: &[Message]) -> String {
@@ -403,6 +412,13 @@ pub struct GuardrailsConfig {
     /// Raw output-side guardrail configurations to compile.
     #[serde(default)]
     pub output: Vec<serde_json::Value>,
+    /// WOR-1543: optional guardrail mesh. When set, the input guardrails
+    /// run as a cascade whose full verdict set is fused under a
+    /// configurable rule (block on a quorum, redact-and-continue, verdict
+    /// cache), instead of the serial block-on-any chain. `None` keeps the
+    /// serial behavior.
+    #[serde(default)]
+    pub mesh: Option<GuardrailMeshConfig>,
 }
 
 #[cfg(test)]
@@ -651,6 +667,7 @@ mod tests {
                 serde_json::json!({"type": "pii", "patterns": ["email"]}),
             ],
             output: vec![serde_json::json!({"type": "pii", "patterns": ["ssn"]})],
+            mesh: None,
         };
         let pipeline = compile_pipeline(&config).unwrap();
         assert_eq!(pipeline.input.len(), 2);
@@ -729,6 +746,7 @@ mod tests {
                 serde_json::json!({"type": "jailbreak", "action": "block"}),
             ],
             output: vec![],
+            mesh: None,
         };
         let pipeline = compile_pipeline(&config).unwrap();
         assert_eq!(pipeline.input.len(), 4);

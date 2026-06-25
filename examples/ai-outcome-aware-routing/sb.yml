@@ -1,0 +1,46 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: closed-loop, outcome-aware routing.
+#
+# The latency- and cost-aware strategies decide from live signals or static
+# catalog price. `outcome_aware` instead scores each provider by the
+# *realized* cost-per-success fed back from completed requests: it folds in
+# whether each call succeeded, was refused, what it cost, and how long it
+# took, and routes to the provider with the best realized cost-per-success,
+# demoting one whose refusal or error rate is climbing.
+#
+# While providers are still warming up (fewer than a handful of samples
+# each) it round-robins, so a fresh deployment behaves exactly like
+# round-robin until it has data. Safe to turn on with no other change.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#   make run CONFIG=examples/ai-outcome-aware-routing/sb.yml
+#
+# Send a stream of requests; traffic converges on whichever deployment is
+# succeeding most cheaply. If one starts refusing, traffic shifts away from
+# it within a bounded window.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: outcome_aware
+
+      providers:
+        - name: openai-primary
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+
+        - name: openai-secondary
+          provider_type: openai
+          # In production a second deployment / region with its own key.
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini

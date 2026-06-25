@@ -13,7 +13,11 @@
 use serde::{Deserialize, Serialize};
 
 /// A record of one completed LLM call, handed to every configured sink.
-#[derive(Debug, Clone, Serialize)]
+///
+/// Deserializable as well as serializable so the verifiable ledger
+/// (see [`crate::usage_ledger`]) can replay a persisted chain and
+/// re-derive its hashes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmUsageEvent {
     /// Provider that served the request (e.g. `openai`).
     pub provider: String,
@@ -32,14 +36,24 @@ pub struct LlmUsageEvent {
     /// Final HTTP status returned to the client.
     pub status: u16,
     /// Authenticated key identifier, when known.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_id: Option<String>,
     /// End-user identifier, when supplied.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     /// Team / tenant identifier, when known.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<String>,
+    /// Stable per-request identifier. The verifiable ledger uses it as
+    /// the dedup key so an at-least-once delivery collapses to
+    /// exactly-once on replay. `None` events are never deduplicated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Optional tag set by a `set_sink_tag` action from the AI policy
+    /// plane (WOR-1542), so a policy decision is queryable in the spend
+    /// record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
 }
 
 /// A destination for completed-call usage events.
@@ -160,6 +174,20 @@ pub enum UsageSinkConfig {
         /// Collector URL.
         url: String,
     },
+    /// Append events to a tamper-evident, optionally signed ledger.
+    ///
+    /// See [`crate::usage_ledger`]. Each event is hash-chained to the
+    /// previous one; with `signing_seed_hex` set, each entry is also
+    /// Ed25519-signed so spend is provable, not just logged.
+    Ledger {
+        /// Filesystem path of the ledger (a JSONL write-ahead log).
+        path: String,
+        /// Optional 32-byte Ed25519 seed as hex. When present, every
+        /// entry is signed. Resolve from a secret via `${VAR}` or a
+        /// vault reference in the surrounding config.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signing_seed_hex: Option<String>,
+    },
 }
 
 impl UsageSinkConfig {
@@ -169,6 +197,10 @@ impl UsageSinkConfig {
         match self {
             UsageSinkConfig::JsonlFile { path } => std::sync::Arc::new(JsonlFileSink::new(path)),
             UsageSinkConfig::Webhook { url } => std::sync::Arc::new(WebhookSink::new(url)),
+            UsageSinkConfig::Ledger {
+                path,
+                signing_seed_hex,
+            } => crate::usage_ledger::LedgerSink::build(path, signing_seed_hex.as_deref()),
         }
     }
 }
@@ -195,6 +227,8 @@ mod tests {
             key_id: Some("k1".into()),
             user: None,
             team: None,
+            request_id: None,
+            tag: None,
         }
     }
 
@@ -230,5 +264,33 @@ mod tests {
         let sinks = build_sinks(&cfgs);
         assert_eq!(sinks[0].name(), "jsonl_file");
         assert_eq!(sinks[1].name(), "webhook");
+    }
+
+    #[test]
+    fn ledger_sink_config_parses_with_and_without_seed() {
+        let cfgs: Vec<UsageSinkConfig> = serde_json::from_str(
+            r#"[
+                {"type":"ledger","path":"/tmp/sb-x.jsonl"},
+                {"type":"ledger","path":"/tmp/sb-y.jsonl","signing_seed_hex":"abcd"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(cfgs.len(), 2);
+        match &cfgs[0] {
+            UsageSinkConfig::Ledger {
+                path,
+                signing_seed_hex,
+            } => {
+                assert_eq!(path, "/tmp/sb-x.jsonl");
+                assert!(signing_seed_hex.is_none(), "seed omitted parses as None");
+            }
+            other => panic!("expected ledger, got {other:?}"),
+        }
+        match &cfgs[1] {
+            UsageSinkConfig::Ledger {
+                signing_seed_hex, ..
+            } => assert_eq!(signing_seed_hex.as_deref(), Some("abcd")),
+            other => panic!("expected ledger, got {other:?}"),
+        }
     }
 }

@@ -85,6 +85,12 @@ pub enum RoutingStrategy {
     /// the prompt and applies [`crate::cost_quality`]; `select` returns
     /// the cheap provider as a deterministic fallback.
     CostQuality(crate::cost_quality::CostQualityConfig),
+    /// Closed-loop outcome-aware routing (WOR-1541): score candidates by
+    /// the realized cost-per-success fed back from completed requests
+    /// ([`crate::routing_feedback`]), demoting providers whose refusal or
+    /// error rate is climbing. Falls back to round-robin while providers
+    /// are still warming up.
+    OutcomeAware,
 }
 
 /// Configuration for the [`RoutingStrategy::Cascade`] variant.
@@ -466,7 +472,11 @@ impl Router {
                 sorted.sort_by_key(|(_, p)| p.priority.unwrap_or(u32::MAX));
                 Some(sorted[0].0)
             }
-            // For non-trivial strategies fall back to the unfiltered
+            // Outcome-aware routing works on the narrowed set directly:
+            // realized cost-per-success is provider-keyed, so the allowlist
+            // simply restricts the candidate pool.
+            RoutingStrategy::OutcomeAware => self.select_outcome_aware(&enabled),
+            // For other non-trivial strategies fall back to the unfiltered
             // dispatch on the narrowed set. The shape of the strategy
             // body matches `select_inner` so behaviour stays consistent.
             _ => {
@@ -725,6 +735,31 @@ impl Router {
                 }
                 Some(enabled[0].0)
             }
+            RoutingStrategy::OutcomeAware => self.select_outcome_aware(&enabled),
+        }
+    }
+
+    /// Pick the enabled provider with the best realized cost-per-success
+    /// from the global feedback store. Falls back to round-robin while
+    /// providers warm up (the store explores under-sampled candidates
+    /// first), so a fresh deployment behaves exactly like round-robin
+    /// until it has data.
+    fn select_outcome_aware(&self, enabled: &[(usize, &ProviderConfig)]) -> Option<usize> {
+        if enabled.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = enabled.iter().map(|(_, p)| p.name.as_str()).collect();
+        let store = crate::routing_feedback::FeedbackStore::global();
+        // While any candidate is still warming up, round-robin so every
+        // provider earns an estimate (and a fresh deployment behaves like
+        // round-robin until it has data).
+        if store.needs_exploration(&names) {
+            let idx = self.counter.fetch_add(1, Ordering::Relaxed);
+            return Some(enabled[idx as usize % enabled.len()].0);
+        }
+        match store.best_among(&names) {
+            Some(pos) => Some(enabled[pos].0),
+            None => Some(enabled[0].0),
         }
     }
 
@@ -830,6 +865,7 @@ impl Router {
             RoutingStrategy::PeakEwma => "peak_ewma",
             RoutingStrategy::Cascade(_) => "cascade",
             RoutingStrategy::CostQuality(_) => "cost_quality",
+            RoutingStrategy::OutcomeAware => "outcome_aware",
         }
     }
 
@@ -1398,6 +1434,72 @@ mod tests {
 
         let idx = router.select(&providers).unwrap();
         assert_eq!(idx, 1, "should skip disabled provider even if faster");
+    }
+
+    // --- OutcomeAware (WOR-1541) Tests ---
+
+    #[test]
+    fn outcome_aware_routes_to_healthy_provider() {
+        use crate::routing_feedback::{FeedbackStore, Outcome};
+        // Unique provider names so this test does not collide with the
+        // process-wide feedback store used by other tests.
+        let providers = vec![
+            make_provider("oa_flaky", 1, None, true),
+            make_provider("oa_good", 1, None, true),
+        ];
+        let store = FeedbackStore::global();
+        // Warm both well past the explore threshold; the flaky one refuses
+        // half its requests, the good one always succeeds.
+        for i in 0..20 {
+            let refused = i % 2 == 0;
+            store.record(&Outcome {
+                provider: "oa_flaky",
+                success: !refused,
+                refused,
+                cost_usd: 0.001,
+                latency_ms: 100,
+            });
+            store.record(&Outcome {
+                provider: "oa_good",
+                success: true,
+                refused: false,
+                cost_usd: 0.001,
+                latency_ms: 100,
+            });
+        }
+        let router = Router::new(RoutingStrategy::OutcomeAware, providers.len());
+        // Every selection routes to the healthy provider once both are
+        // warmed up.
+        for _ in 0..10 {
+            assert_eq!(router.select(&providers).unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn outcome_aware_round_robins_while_warming_up() {
+        let providers = vec![
+            make_provider("oa_cold_a", 1, None, true),
+            make_provider("oa_cold_b", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::OutcomeAware, providers.len());
+        // No feedback recorded for these names: the store explores, so
+        // selection distributes rather than pinning one provider.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10 {
+            seen.insert(router.select(&providers).unwrap());
+        }
+        assert!(seen.len() > 1, "explores both while warming up");
+    }
+
+    #[test]
+    fn outcome_aware_deserializes_from_snake_case() {
+        let s: RoutingStrategy =
+            serde_json::from_value(serde_json::json!("outcome_aware")).unwrap();
+        assert!(matches!(s, RoutingStrategy::OutcomeAware));
+        assert_eq!(
+            Router::new(RoutingStrategy::OutcomeAware, 1).strategy_name(),
+            "outcome_aware"
+        );
     }
 
     // --- PeakEwma (P2C latency) Tests ---

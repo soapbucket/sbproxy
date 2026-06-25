@@ -15,6 +15,78 @@ pub struct BudgetConfig {
     /// What to do when budget is exceeded.
     #[serde(default)]
     pub on_exceed: OnExceedAction,
+    /// WOR-1544: optional predictive soft-landing. When set, a scope
+    /// approaching its cap is degraded gracefully (warn, then downgrade)
+    /// before the hard block at 100%. `None` keeps the hard-block-only
+    /// behavior.
+    #[serde(default)]
+    pub soft_landing: Option<SoftLandingConfig>,
+}
+
+fn default_warn_at() -> f64 {
+    0.8
+}
+
+fn default_downgrade_at() -> f64 {
+    0.95
+}
+
+/// Predictive soft-landing thresholds (WOR-1544).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SoftLandingConfig {
+    /// Fraction of the tightest active window at which to warn (default
+    /// `0.8`).
+    #[serde(default = "default_warn_at")]
+    pub warn_at: f64,
+    /// Fraction at which to downgrade to a cheaper model before the hard
+    /// block (default `0.95`).
+    #[serde(default = "default_downgrade_at")]
+    pub downgrade_at: f64,
+    /// Model to downgrade to. When unset, the per-limit `downgrade_to` or
+    /// the cheapest model across the providers is used.
+    #[serde(default)]
+    pub downgrade_to: Option<String>,
+}
+
+/// The action a soft-landing evaluation recommends.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SoftLandingAction {
+    /// Below the warn threshold; proceed unchanged.
+    None,
+    /// Past the warn threshold but below downgrade; warn and proceed.
+    Warn,
+    /// Past the downgrade threshold (but below the hard cap); degrade to a
+    /// cheaper model.
+    Downgrade {
+        /// Configured target, when present; the caller resolves a fallback.
+        to: Option<String>,
+    },
+}
+
+/// The outcome of a soft-landing evaluation for a request.
+#[derive(Debug, Clone)]
+pub struct SoftLandingDecision {
+    /// Tightest current window fraction (0.0 to just under 1.0).
+    pub fraction: f64,
+    /// Recommended action.
+    pub action: SoftLandingAction,
+}
+
+/// Fraction of a single limit consumed, as the larger of the token and
+/// cost ratios. `0.0` when the limit caps neither.
+fn limit_fraction(tokens: u64, cost_usd: f64, limit: &BudgetLimit) -> f64 {
+    let mut frac = 0.0_f64;
+    if let Some(max) = limit.max_tokens {
+        if max > 0 {
+            frac = frac.max(tokens as f64 / max as f64);
+        }
+    }
+    if let Some(max) = limit.max_cost_usd {
+        if max > 0.0 {
+            frac = frac.max(cost_usd / max);
+        }
+    }
+    frac
 }
 
 /// A single budget limit rule.
@@ -159,6 +231,61 @@ impl BudgetTracker {
             }
         }
         None
+    }
+
+    /// Evaluate predictive soft-landing across the given scope keys.
+    ///
+    /// Returns the tightest current window fraction and the recommended
+    /// action. Soft-landing only fires below the hard cap: at or above a
+    /// fraction of 1.0 the [`Self::check_limits`] path already
+    /// blocks/downgrades, so this reports `None` there and lets the hard
+    /// path own the decision. `keys` is the `(limit_index, scope_key)`
+    /// list from [`Self::scope_key`].
+    pub fn soft_landing(
+        &self,
+        config: &BudgetConfig,
+        keys: &[(usize, String)],
+    ) -> SoftLandingDecision {
+        let sl = match &config.soft_landing {
+            Some(s) => s,
+            None => {
+                return SoftLandingDecision {
+                    fraction: 0.0,
+                    action: SoftLandingAction::None,
+                }
+            }
+        };
+        let mut max_frac = 0.0_f64;
+        let mut downgrade_to = sl.downgrade_to.clone();
+        for (limit_idx, key) in keys {
+            let limit = match config.limits.get(*limit_idx) {
+                Some(l) => l,
+                None => continue,
+            };
+            let usage = self.get_usage(key);
+            let frac = limit_fraction(usage.tokens, usage.cost_usd, limit);
+            if frac > max_frac {
+                max_frac = frac;
+                // Prefer a per-limit downgrade target, else the global one.
+                downgrade_to = limit
+                    .downgrade_to
+                    .clone()
+                    .or_else(|| sl.downgrade_to.clone());
+            }
+        }
+        let action = if max_frac >= 1.0 {
+            SoftLandingAction::None
+        } else if max_frac >= sl.downgrade_at {
+            SoftLandingAction::Downgrade { to: downgrade_to }
+        } else if max_frac >= sl.warn_at {
+            SoftLandingAction::Warn
+        } else {
+            SoftLandingAction::None
+        };
+        SoftLandingDecision {
+            fraction: max_frac,
+            action,
+        }
     }
 
     /// Compose a deterministic scope key for the given limit's scope.
@@ -711,7 +838,58 @@ mod tests {
                 downgrade_to,
             }],
             on_exceed,
+            soft_landing: None,
         }
+    }
+
+    #[test]
+    fn soft_landing_none_without_config() {
+        let tracker = BudgetTracker::new();
+        let config = make_config(Some(1000), None, OnExceedAction::Block, None);
+        let d = tracker.soft_landing(&config, &[(0, "ws:1".to_string())]);
+        assert_eq!(d.action, SoftLandingAction::None);
+    }
+
+    #[test]
+    fn soft_landing_warns_then_downgrades_then_yields_to_hard_cap() {
+        let mut config = make_config(Some(1000), None, OnExceedAction::Block, None);
+        config.soft_landing = Some(SoftLandingConfig {
+            warn_at: 0.8,
+            downgrade_at: 0.95,
+            downgrade_to: Some("gpt-4o-mini".to_string()),
+        });
+        let keys = [(0usize, "ws:1".to_string())];
+
+        let tracker = BudgetTracker::new();
+        // 50% consumed: below warn.
+        tracker.record_usage("ws:1", 500, 0.0);
+        assert_eq!(
+            tracker.soft_landing(&config, &keys).action,
+            SoftLandingAction::None
+        );
+
+        // 85% consumed: warn.
+        tracker.record_usage("ws:1", 350, 0.0);
+        let d = tracker.soft_landing(&config, &keys);
+        assert_eq!(d.action, SoftLandingAction::Warn);
+        assert!((d.fraction - 0.85).abs() < 1e-9);
+
+        // 96% consumed: downgrade.
+        tracker.record_usage("ws:1", 110, 0.0);
+        let d = tracker.soft_landing(&config, &keys);
+        assert_eq!(
+            d.action,
+            SoftLandingAction::Downgrade {
+                to: Some("gpt-4o-mini".to_string())
+            }
+        );
+
+        // At/over the cap: the hard path owns it, so soft-landing yields.
+        tracker.record_usage("ws:1", 100, 0.0);
+        assert_eq!(
+            tracker.soft_landing(&config, &keys).action,
+            SoftLandingAction::None
+        );
     }
 
     #[test]
@@ -831,6 +1009,7 @@ mod tests {
         let config = BudgetConfig {
             limits: vec![],
             on_exceed: OnExceedAction::Block,
+            soft_landing: None,
         };
         assert!(tracker.check_limits(&config, "ws:1").is_none());
     }

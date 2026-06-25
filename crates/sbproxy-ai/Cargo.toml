@@ -11,6 +11,10 @@ sbproxy-config.workspace = true
 sbproxy-cache.workspace = true
 sbproxy-security.workspace = true
 sbproxy-platform.workspace = true
+# WOR-1542: evaluate the AI decision policy plane on the sandboxed CEL
+# engine. sbproxy-extension does not depend on sbproxy-ai, so this is
+# acyclic.
+sbproxy-extension.workspace = true
 # WOR-1223: local embedding source for the semantic cache. Only the
 # sidecar client is used here; the in-process embedder lives in sbproxy-core
 # because sbproxy-classifiers depends on sbproxy-ai (would be a cycle).
@@ -34,6 +38,9 @@ tracing.workspace = true
 chrono.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# WOR-1540: Ed25519-signed entries for the verifiable usage ledger.
+# Same major as the RFC 9421 verifier in sbproxy-middleware.
+ed25519-dalek = "2"
 prometheus.workspace = true
 rand.workspace = true
 futures.workspace = true

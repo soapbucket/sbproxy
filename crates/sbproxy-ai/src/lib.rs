@@ -4,6 +4,7 @@
 #![warn(missing_docs)]
 
 pub mod ai_metrics;
+pub mod ai_policy;
 pub mod alerting;
 pub mod api_routes;
 pub mod assistants;
@@ -19,6 +20,7 @@ pub mod context_relay;
 pub mod cost_quality;
 pub mod degradation;
 pub mod external_guardrail;
+pub mod failure_cause;
 pub mod fill_first;
 pub mod finetune;
 pub mod format;
@@ -42,6 +44,7 @@ pub mod ratelimit;
 pub mod realtime;
 pub mod response_dedup;
 pub mod routing;
+pub mod routing_feedback;
 pub mod semantic_cache;
 pub mod session;
 pub mod streaming;
@@ -52,6 +55,7 @@ pub mod token_estimate;
 pub mod tracing_spans;
 pub mod translators;
 pub mod types;
+pub mod usage_ledger;
 pub mod usage_parser;
 pub mod usage_sink;
 

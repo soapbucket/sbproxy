@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: LLM-aware resilience (per-error retry policy).
+#
+# Status-code retries treat every 5xx the same and ignore the LLM-specific
+# failure modes a provider signals. With a `retry_policy`, the failover loop
+# classifies each upstream failure (timeout, rate-limit, context-window
+# overflow, content-policy refusal, auth, server error, bad request) and
+# applies a retry count per class: a rate limit is worth retrying, a
+# malformed or refused request is not (it would only fail again and should
+# route to a fallback model instead).
+#
+# Here failover runs across two deployments; a 429 retries up to 3 times, a
+# 5xx up to 2, and content-policy / bad-request never retry in place.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#   make run CONFIG=examples/ai-llm-aware-resilience/sb.yml
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: fallback_chain
+
+      resilience:
+        retry_policy:
+          rate_limit: 3
+          server_error: 2
+          content_policy: 0
+          bad_request: 0
+
+      providers:
+        - name: openai-primary
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          priority: 1
+          models:
+            - gpt-4o-mini
+
+        - name: openai-secondary
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          priority: 2
+          models:
+            - gpt-4o-mini

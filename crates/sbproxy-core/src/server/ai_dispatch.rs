@@ -35,6 +35,25 @@ pub(super) async fn handle_ai_proxy(
     // `ai_model`, and token-count fields.
     ctx.ai_surface = Some(surface_label.to_string());
 
+    // WOR-1528 / WOR-1540: stash the configured usage sinks on the
+    // context here, where the handler config is in scope. The
+    // end-of-request `logging` hook emits one `LlmUsageEvent` to them
+    // once the final status, tokens, cost, and latency are known. The
+    // clone is a handful of `Arc` pointer bumps and only happens when an
+    // operator has configured sinks (default: none), so the common path
+    // is untouched.
+    let usage_sinks = config.usage_sinks();
+    if !usage_sinks.is_empty() {
+        ctx.ai_usage_sinks = Some(usage_sinks.to_vec());
+    }
+
+    // WOR-1541: arm realized-outcome recording when this origin routes
+    // with the outcome-aware strategy, so the end-of-request hook feeds
+    // the global feedback store.
+    if matches!(config.routing, sbproxy_ai::RoutingStrategy::OutcomeAware) {
+        ctx.ai_record_routing_feedback = true;
+    }
+
     // Create the top-level request span. The span is registered with
     // the subscriber (so OTel-style exporters see it as part of the
     // trace tree) but we do not `.enter()` it because the resulting
@@ -931,7 +950,64 @@ pub(super) async fn handle_ai_proxy(
             tag_header.as_deref(),
         );
         match budget_preflight(budget_cfg, &keys, &config.providers) {
-            BudgetGate::Allow => keys,
+            BudgetGate::Allow => {
+                // WOR-1544: predictive soft-landing. Below the hard cap,
+                // warn and then downgrade as a scope approaches its
+                // window limit, instead of a cliff at 100%.
+                if budget_cfg.soft_landing.is_some() {
+                    let decision = BUDGET_TRACKER.soft_landing(budget_cfg, &keys);
+                    ctx.ai_budget_fraction = decision.fraction;
+                    match decision.action {
+                        sbproxy_ai::budget::SoftLandingAction::Warn => {
+                            tracing::warn!(
+                                fraction = decision.fraction,
+                                "AI budget: approaching limit (soft-landing warn)"
+                            );
+                            keys
+                        }
+                        sbproxy_ai::budget::SoftLandingAction::Downgrade { to } => {
+                            let target = to.or_else(|| {
+                                let mut candidates: Vec<String> = Vec::new();
+                                for p in &config.providers {
+                                    for m in &p.models {
+                                        candidates.push(m.as_str().to_string());
+                                    }
+                                }
+                                sbproxy_ai::cheapest_model(&candidates)
+                            });
+                            match target {
+                                Some(new_model) if new_model != model => {
+                                    tracing::warn!(
+                                        fraction = decision.fraction,
+                                        new_model = %new_model,
+                                        "AI budget: soft-landing downgrade before hard cap"
+                                    );
+                                    model = new_model.clone();
+                                    body["model"] = serde_json::Value::String(new_model);
+                                    // Record the soft-landing in the usage
+                                    // record / ledger via the policy tag,
+                                    // without clobbering an explicit tag.
+                                    ctx.ai_policy_sink_tag
+                                        .get_or_insert_with(|| "budget_soft_landing".to_string());
+                                    budget_scope_keys(
+                                        budget_cfg,
+                                        hostname,
+                                        auth_header.as_deref(),
+                                        user_header.as_deref(),
+                                        Some(model.as_str()),
+                                        Some(hostname),
+                                        tag_header.as_deref(),
+                                    )
+                                }
+                                _ => keys,
+                            }
+                        }
+                        sbproxy_ai::budget::SoftLandingAction::None => keys,
+                    }
+                } else {
+                    keys
+                }
+            }
             BudgetGate::Block { status, body: err } => {
                 sbproxy_ai::tracing_spans::record_error(
                     &ai_span,
@@ -1147,7 +1223,46 @@ pub(super) async fn handle_ai_proxy(
                     })
                     .unwrap_or_default();
 
-                if let Some(block) = pipeline.check_input(&messages) {
+                // WOR-1543: when a guardrail mesh is configured, run the
+                // messages-path detectors as a cascade, collect the full
+                // verdict set, and fuse it (block on a quorum, optional
+                // redact-and-continue). The label set is stashed on the
+                // context so the AI policy plane can reason over it.
+                // Otherwise fall back to the serial block-on-any check.
+                if let Some(mesh_cfg) = guardrails_config.mesh.clone() {
+                    let mesh = sbproxy_ai::guardrails::GuardrailMesh::new(mesh_cfg);
+                    let text = sbproxy_ai::guardrails::message_text(&messages);
+                    let decision = mesh.evaluate_input(&pipeline, &messages, &text);
+                    ctx.ai_guardrail_labels = decision.labels.clone();
+                    if decision.block {
+                        warn!(
+                            guardrails = ?decision.labels,
+                            "AI proxy: guardrail mesh blocked request"
+                        );
+                        let reason = decision.reasons.join("; ");
+                        sbproxy_ai::tracing_spans::record_error(
+                            &ai_span,
+                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                            &reason,
+                        );
+                        ctx.ai_outcome = Some("guardrail_block".to_string());
+                        let error_body = serde_json::json!({
+                            "error": {
+                                "message": reason,
+                                "type": "guardrail_violation",
+                                "code": decision.labels.join(","),
+                            }
+                        });
+                        let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+                        send_response(session, 400, "application/json", &body_bytes).await?;
+                        return Ok(());
+                    }
+                    if decision.redact {
+                        if let Some(redactor) = config.pii_redactor() {
+                            redactor.redact_json(&mut body);
+                        }
+                    }
+                } else if let Some(block) = pipeline.check_input(&messages) {
                     warn!(
                         guardrail = %block.name,
                         reason = %block.reason,
@@ -1241,6 +1356,82 @@ pub(super) async fn handle_ai_proxy(
                     }
                 }
             }
+        }
+    }
+
+    // --- WOR-1542: unified AI policy plane ---
+    //
+    // After guardrail evaluation and before provider selection, evaluate
+    // one sandboxed CEL expression over the AI decision signals and apply
+    // its closed action set (block / redact / route_to / set_sink_tag /
+    // audit). Default off: the hook only runs when an `ai_policy` block is
+    // configured and compiled. A policy bug fails open (see `on_error`).
+    if let Some(policy) = config.ai_policy() {
+        let view = sbproxy_ai::ai_policy::AiDecisionView {
+            surface: surface_label.to_string(),
+            model: model.clone(),
+            provider: config
+                .providers
+                .first()
+                .map(|p| p.name.to_string())
+                .unwrap_or_default(),
+            tenant: ctx.tenant_id.to_string(),
+            api_key_id: ctx.principal.api_key_id().to_string(),
+            // The risk tier rides on the attribution tags resolved at the
+            // handler entry. Guardrail labels and the budget fraction are
+            // populated by the guardrail mesh and predictive budgets
+            // respectively; until those land they are empty/zero and the
+            // policy keys on principal / surface / model.
+            tier: ctx.attribution_tags.risk_tier.clone().unwrap_or_default(),
+            // Populated by the guardrail mesh (WOR-1543) when configured.
+            guardrail_labels: ctx.ai_guardrail_labels.clone(),
+            // Populated by predictive soft-landing (WOR-1544).
+            budget_fraction: ctx.ai_budget_fraction,
+            budget_exceeded: ctx.ai_budget_fraction >= 1.0,
+            input_tokens_est: ctx.ai_prompt_tokens_est.unwrap_or(0) as i64,
+        };
+        let decision = policy.evaluate(&view);
+
+        if let Some(priority) = decision.audit_priority() {
+            info!(
+                ai.surface = surface_label,
+                ai.policy_priority = priority,
+                ai.policy_actions = ?decision.actions,
+                "AI policy: audit event"
+            );
+        }
+
+        if decision.is_block() {
+            warn!(ai.surface = surface_label, "AI policy: blocked request");
+            ctx.ai_outcome = Some("policy_block".to_string());
+            let error_body = serde_json::json!({
+                "error": {
+                    "message": "blocked by AI policy",
+                    "type": "ai_policy_block",
+                }
+            });
+            let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+            send_response(session, 403, "application/json", &body_bytes).await?;
+            return Ok(());
+        }
+
+        if decision.redact() {
+            if let Some(redactor) = config.pii_redactor() {
+                redactor.redact_json(&mut body);
+            }
+        }
+
+        if let Some(target) = decision.route_model() {
+            if !target.is_empty() && target != model {
+                info!(from = %model, to = %target, "AI policy: route_to override");
+                model = target.to_string();
+                body["model"] = serde_json::Value::String(target.to_string());
+                ctx.ai_model = Some(target.to_string());
+            }
+        }
+
+        if let Some(tag) = decision.sink_tag() {
+            ctx.ai_policy_sink_tag = Some(tag.to_string());
         }
     }
 
@@ -1549,6 +1740,13 @@ pub(super) async fn handle_ai_proxy(
     let is_failover = matches!(config.routing, sbproxy_ai::RoutingStrategy::FallbackChain);
     // Default retry-on-status codes for failover.
     let retry_statuses: Vec<u16> = vec![500, 502, 503];
+    // WOR-1545 / WOR-1524: optional per-error-class retry policy. When set,
+    // the failover loop classifies each failure and consults it in addition
+    // to the status-code set above.
+    let retry_policy = config
+        .resilience
+        .as_ref()
+        .and_then(|r| r.retry_policy.as_ref());
 
     // Surface-specific request-body inspection captured once before
     // the failover loop so each attempt's BudgetRecorderArgs carries
@@ -2006,10 +2204,20 @@ pub(super) async fn handle_ai_proxy(
                 // `lowest_latency` reflect live data on the next request.
                 router.record_latency(provider_idx, attempt_start.elapsed().as_micros() as u64);
                 let status = resp.status().as_u16();
-                if is_failover
-                    && status >= 500
-                    && retry_statuses.contains(&status)
-                    && attempt + 1 < max_attempts
+                // WOR-1545 / WOR-1524: retry on the default status-code set,
+                // or on a per-error-class policy decision when configured.
+                // Classification from status alone is enough for the
+                // retryable classes (timeout / rate-limit / server error);
+                // the body-refined classes (context-window, content-policy)
+                // are not retried in place anyway.
+                let retry_by_status = status >= 500 && retry_statuses.contains(&status);
+                let retry_by_policy = retry_policy.is_some_and(|p| {
+                    p.should_retry(
+                        sbproxy_ai::failure_cause::FailureCause::classify(status, ""),
+                        attempt,
+                    )
+                });
+                if is_failover && (retry_by_status || retry_by_policy) && attempt + 1 < max_attempts
                 {
                     // WOR-1103: record the failed attempt so per-provider
                     // load distribution and failure rates are visible,
