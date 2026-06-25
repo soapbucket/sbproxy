@@ -1,0 +1,72 @@
+# Distributed dynamic key management: two sbproxy replicas sharing one Redis
+# key store, so a key minted on one replica works on both and a revoke on one
+# is visible on the other.
+#
+# Bring up:    docker compose up --build
+# Tear down:   docker compose down -v
+# Validate:    docker compose config
+#
+# Set OPENAI_API_KEY in your shell (or a .env file) for live upstream calls.
+# The cross-replica key lifecycle works without it; only the upstream LLM call
+# needs a real provider key.
+
+x-sbproxy-env: &sbproxy-env
+  # Shared so hashes and envelopes are portable across replicas. Use real
+  # secrets in production (these are demo values).
+  SBPROXY_KEY_PEPPER: demo-cluster-pepper-change-me
+  SBPROXY_KEY_MASTER: demo-cluster-master-change-me
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-not-set}
+  SB_LOG_LEVEL: info
+
+services:
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - sbnet
+
+  sb1:
+    # Build the image once; sb2 reuses it. To pin a published image instead,
+    # swap `build:` for `image: ghcr.io/soapbucket/sbproxy:<tag>` on both.
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cloudbuild
+    image: sbproxy-dynamic-keys-cluster:local
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    environment: *sbproxy-env
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    ports:
+      - "8081:8080" # proxy
+      - "9091:9090" # admin
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - sbnet
+
+  sb2:
+    # Reuses the image sb1 builds.
+    image: sbproxy-dynamic-keys-cluster:local
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    environment: *sbproxy-env
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    ports:
+      - "8082:8080" # proxy
+      - "9092:9090" # admin
+    depends_on:
+      sb1:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    networks:
+      - sbnet
+
+networks:
+  sbnet:
+    driver: bridge

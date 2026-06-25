@@ -1,0 +1,51 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Distributed dynamic key management across a replica fleet.
+#
+# The same config runs on every replica. The key store is Redis as the source
+# of truth, and the policy cache uses a Redis L2 tier, so a key minted on one
+# replica is usable on all of them and a revoke on one replica is published to
+# the others and takes effect on their next request. This is the clustered
+# counterpart to examples/ai-dynamic-keys/ (single node).
+#
+# Run the two-replica cluster with examples/ai-dynamic-keys-cluster/docker-compose.yml;
+# see that example's README for the cross-replica test recipe.
+
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+  key_management:
+    enabled: true
+    store:
+      # Redis is the system of record so every replica reads the same keys.
+      backend: redis
+      url: redis://redis:6379
+      redis_source_of_truth: true
+    cache:
+      ttl_secs: 30
+      # The Redis cache tier publishes an invalidation on every mutation, so a
+      # revoke on one replica drops the cached entry on the others.
+      tier: redis
+      redis_url: redis://redis:6379
+    crypto:
+      # Every replica must share the same pepper and master key so hashes and
+      # envelopes are portable across the fleet.
+      pepper: env:SBPROXY_KEY_PEPPER
+      master_key: env:SBPROXY_KEY_MASTER
+    failure_mode_allow: false
+
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
