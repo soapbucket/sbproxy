@@ -71,6 +71,36 @@ Only the oldest non-system turns are dropped; the system message and the
 most recent turns are preserved. It is a no-op for unknown models (where the
 window is not known), non-chat surfaces, and prompts that already fit.
 
+## Hedged (raced) requests
+
+For latency-sensitive traffic, the `race` routing strategy fans a single
+request out to every eligible provider concurrently and keeps the first 2xx
+response, dropping (cancelling) the losers. It trades extra upstream calls
+for a lower tail latency: a slow or stuck provider no longer holds up the
+request, because a peer answers first.
+
+```yaml
+action:
+  type: ai_proxy
+  routing:
+    strategy: race
+  providers:
+    - name: openai-primary
+      provider_type: openai
+      api_key: ${OPENAI_API_KEY}
+      models: [gpt-4o-mini]
+    - name: openai-secondary
+      provider_type: openai
+      api_key: ${OPENAI_API_KEY}
+      models: [gpt-4o-mini]
+```
+
+Every racer is charged, so reserve `race` for traffic where tail latency
+matters more than the duplicate call. Streaming requests fall through to a
+single dispatch (mid-stream racing is out of scope); a single-provider
+origin dispatches normally. Because the operator opted into the extra calls,
+a raced request does not also run the sequential failover loop afterward.
+
 ## What is adaptive, and what fails over
 
 Adaptive cooldowns are already in effect when `circuit_breaker` or

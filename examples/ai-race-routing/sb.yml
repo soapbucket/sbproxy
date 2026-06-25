@@ -1,0 +1,47 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: hedged / raced requests.
+#
+# The `race` routing strategy fans a single request out to every eligible
+# provider concurrently and keeps the first 2xx response, cancelling the
+# losers. It trades extra upstream calls for lower tail latency: a slow or
+# stuck provider no longer holds up the request because a peer answers
+# first.
+#
+# Every racer is charged, so reserve `race` for traffic where tail latency
+# matters more than the duplicate call. Streaming falls through to a single
+# dispatch (mid-stream racing is out of scope).
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#   make run CONFIG=examples/ai-race-routing/sb.yml
+#
+# A single request fans out to both deployments; the first 2xx wins:
+#   curl -s http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hi"}]}'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing:
+        strategy: race
+
+      providers:
+        - name: openai-primary
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+
+        - name: openai-secondary
+          provider_type: openai
+          # In production a second deployment / region with its own key.
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
