@@ -7,6 +7,97 @@
 
 use super::*;
 
+/// Outcome of resolving an inbound bearer token against the dynamic key plane
+/// (WOR-1551).
+enum DynamicKeyOutcome {
+    /// Not a virtual-key-shaped token (or no token); let other auth handle it.
+    NotApplicable,
+    /// Resolved to a usable key; proceed with this synthesized config.
+    Resolved(Box<sbproxy_ai::identity::VirtualKeyConfig>),
+    /// Deny the request with this status and message.
+    Deny(u16, String),
+}
+
+/// Map a stored [`KeyRecord`](sbproxy_keystore::record::KeyRecord) onto the
+/// gateway's `VirtualKeyConfig` so the existing per-key pipeline (principal
+/// stamp, attribution, model gate, budget scope) runs unchanged regardless of
+/// whether the key came from the dynamic store or the compiled config.
+fn key_record_to_virtual_key(
+    rec: &sbproxy_keystore::record::KeyRecord,
+) -> sbproxy_ai::identity::VirtualKeyConfig {
+    sbproxy_ai::identity::VirtualKeyConfig {
+        // The public id, never the secret: used only as a fallback display name.
+        key: rec.key_id.clone(),
+        name: rec.name.clone(),
+        allowed_models: rec.allowed_models.clone(),
+        blocked_models: rec.blocked_models.clone(),
+        allowed_providers: rec.allowed_providers.clone(),
+        principal_selectors: Vec::new(),
+        require_pii_redaction: Vec::new(),
+        max_tokens_per_minute: rec.max_tokens_per_minute,
+        max_requests_per_minute: rec.max_requests_per_minute,
+        budget: rec
+            .budget
+            .as_ref()
+            .map(|b| sbproxy_ai::identity::KeyBudget {
+                max_tokens: b.max_tokens,
+                max_cost_usd: b.max_cost_usd,
+            }),
+        tags: rec.tags.clone(),
+        project: rec.project.clone(),
+        user: rec.user.clone(),
+        metadata: rec
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        route_to_model: None,
+        inject_tools: Vec::new(),
+        enabled: true,
+        bypass_prompt_injection: false,
+    }
+}
+
+/// Resolve an inbound bearer token against the dynamic key plane: parse the
+/// `sk-<key_id>-<secret>` shape, look the id up through the cache then store,
+/// constant-time verify the secret, and gate on status/expiry. Fail-closed: a
+/// store outage denies unless `failure_mode_allow` is set.
+async fn resolve_dynamic_virtual_key(
+    plane: &crate::key_plane::KeyPlane,
+    raw_token: Option<&str>,
+) -> DynamicKeyOutcome {
+    let Some(token) = raw_token else {
+        return DynamicKeyOutcome::NotApplicable;
+    };
+    let Some((key_id, secret)) = sbproxy_keystore::crypto::parse_token(token) else {
+        // Not a virtual-key-shaped token; a different auth provider may own it.
+        return DynamicKeyOutcome::NotApplicable;
+    };
+    let now = chrono::Utc::now();
+    match plane.cache().resolve_key(key_id).await {
+        Err(e) => {
+            if plane.failure_mode_allow() {
+                tracing::warn!(error = %e, "key store unavailable; failure_mode_allow set, passing through");
+                DynamicKeyOutcome::NotApplicable
+            } else {
+                DynamicKeyOutcome::Deny(503, "key store unavailable".to_string())
+            }
+        }
+        // Unknown id and a wrong secret return the same status so neither is an
+        // existence oracle.
+        Ok(None) => DynamicKeyOutcome::Deny(401, "invalid key".to_string()),
+        Ok(Some(rec)) => {
+            if !plane.crypto().verify_record(&rec, secret, now) {
+                DynamicKeyOutcome::Deny(401, "invalid key".to_string())
+            } else if !rec.is_usable(now) {
+                DynamicKeyOutcome::Deny(403, "key is not active".to_string())
+            } else {
+                DynamicKeyOutcome::Resolved(Box::new(key_record_to_virtual_key(&rec)))
+            }
+        }
+    }
+}
+
 pub(super) async fn handle_ai_proxy(
     session: &mut Session,
     config: &AiHandlerConfig,
@@ -770,7 +861,7 @@ pub(super) async fn handle_ai_proxy(
     // can attribute spend / usage to them. Missing / unknown keys
     // silently no-op (auth itself is enforced by the configured auth
     // provider, not here). Skipped when no virtual_keys are declared.
-    if !config.virtual_keys.is_empty() {
+    {
         let auth_value = req_header_value(session, "authorization");
         let raw_key = auth_value.as_deref().map(|h| {
             h.strip_prefix("Bearer ")
@@ -779,11 +870,33 @@ pub(super) async fn handle_ai_proxy(
                 .trim()
                 .to_string()
         });
-        if let Some(key) = raw_key {
-            if let Some(vk) = config
-                .virtual_keys
-                .iter()
-                .find(|vk| vk.enabled && vk.key == key)
+        // Resolve the inbound virtual key. When the dynamic key plane is
+        // enabled it is the source of truth (hashed at rest, instant revoke,
+        // per-request cache->store); otherwise fall back to the compiled
+        // `virtual_keys:` list.
+        let resolved_vk: Option<sbproxy_ai::identity::VirtualKeyConfig> =
+            if let Some(plane) = crate::key_plane::current_key_plane() {
+                match resolve_dynamic_virtual_key(&plane, raw_key.as_deref()).await {
+                    DynamicKeyOutcome::Resolved(vk) => Some(*vk),
+                    DynamicKeyOutcome::NotApplicable => None,
+                    DynamicKeyOutcome::Deny(status, msg) => {
+                        warn!(status, reason = %msg, "AI proxy: dynamic virtual key denied");
+                        send_error(session, status, &msg).await?;
+                        return Ok(());
+                    }
+                }
+            } else if !config.virtual_keys.is_empty() {
+                raw_key.as_deref().and_then(|key| {
+                    config
+                        .virtual_keys
+                        .iter()
+                        .find(|vk| vk.enabled && vk.key == key)
+                        .cloned()
+                })
+            } else {
+                None
+            };
+        if let Some(vk) = resolved_vk {
             {
                 if !vk.matches_principal(&ctx.principal) {
                     let vk_name = vk.name.as_deref().unwrap_or("<unnamed>");
@@ -5121,5 +5234,77 @@ mod streaming_restore_tests {
         assert_eq!(out.as_ref(), b"data: {\"x\": 1}\n\n");
         let tail = restore.finish();
         assert!(tail.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod dynamic_key_resolution_tests {
+    use super::*;
+    use sbproxy_keystore::crypto::KeyCrypto;
+    use sbproxy_keystore::record::{KeyRecord, RecordStatus};
+    use sbproxy_keystore::{KeyStore, MemoryKeyStore, TtlCache, TtlCacheConfig};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn dynamic_key_resolution_outcomes() {
+        let crypto = KeyCrypto::new(b"pep".to_vec(), b"mas".to_vec());
+        let now = chrono::Utc::now();
+
+        let active = crypto.mint_key();
+        let active_rec = KeyRecord::new(active.key_id.clone(), active.secret_hash.clone(), now);
+
+        let revoked = crypto.mint_key();
+        let mut revoked_rec =
+            KeyRecord::new(revoked.key_id.clone(), revoked.secret_hash.clone(), now);
+        revoked_rec.status = RecordStatus::Revoked;
+
+        let store = Arc::new(MemoryKeyStore::new());
+        store.put_key(active_rec).await.unwrap();
+        store.put_key(revoked_rec).await.unwrap();
+        let cache = Arc::new(TtlCache::new(
+            store as Arc<dyn KeyStore>,
+            TtlCacheConfig::default(),
+        ));
+        let plane = crate::key_plane::KeyPlane::from_parts(crypto, cache, false, false, None);
+
+        // Valid token resolves; the synthesized key carries the public id.
+        match resolve_dynamic_virtual_key(&plane, Some(&active.token)).await {
+            DynamicKeyOutcome::Resolved(vk) => assert_eq!(vk.key, active.key_id),
+            other => panic!("expected resolved, got {:?}", outcome_label(&other)),
+        }
+        // Wrong secret for a known id is 401 (no existence oracle).
+        let wrong = format!("sk-{}-deadbeefdeadbeef", active.key_id);
+        assert!(matches!(
+            resolve_dynamic_virtual_key(&plane, Some(&wrong)).await,
+            DynamicKeyOutcome::Deny(401, _)
+        ));
+        // Unknown id is also 401.
+        assert!(matches!(
+            resolve_dynamic_virtual_key(&plane, Some("sk-nope-secretsecret")).await,
+            DynamicKeyOutcome::Deny(401, _)
+        ));
+        // Revoked key with the correct secret is 403 (known but not active).
+        assert!(matches!(
+            resolve_dynamic_virtual_key(&plane, Some(&revoked.token)).await,
+            DynamicKeyOutcome::Deny(403, _)
+        ));
+        // A non-virtual-key-shaped token defers to other auth providers.
+        assert!(matches!(
+            resolve_dynamic_virtual_key(&plane, Some("opaque-jwt")).await,
+            DynamicKeyOutcome::NotApplicable
+        ));
+        // No token at all is also not applicable.
+        assert!(matches!(
+            resolve_dynamic_virtual_key(&plane, None).await,
+            DynamicKeyOutcome::NotApplicable
+        ));
+    }
+
+    fn outcome_label(o: &DynamicKeyOutcome) -> &'static str {
+        match o {
+            DynamicKeyOutcome::Resolved(_) => "resolved",
+            DynamicKeyOutcome::NotApplicable => "not-applicable",
+            DynamicKeyOutcome::Deny(_, _) => "deny",
+        }
     }
 }

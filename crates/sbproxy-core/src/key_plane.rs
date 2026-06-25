@@ -36,6 +36,24 @@ pub struct KeyPlane {
 }
 
 impl KeyPlane {
+    /// Assemble a plane from already-built parts. Used by the config-driven
+    /// [`init_key_plane`] and by tests that wire a store directly.
+    pub(crate) fn from_parts(
+        crypto: KeyCrypto,
+        cache: Arc<TtlCache>,
+        failure_mode_allow: bool,
+        allow_api_override: bool,
+        oidc_claim_field: Option<String>,
+    ) -> Self {
+        Self {
+            crypto,
+            cache,
+            failure_mode_allow,
+            allow_api_override,
+            oidc_claim_field,
+        }
+    }
+
     /// The shared crypto handle (pepper for inbound hashing, master for the
     /// upstream-credential envelope).
     pub fn crypto(&self) -> &KeyCrypto {
@@ -339,13 +357,13 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
     })
     .context("seed key_management records")?;
 
-    let plane = Arc::new(KeyPlane {
+    let plane = Arc::new(KeyPlane::from_parts(
         crypto,
-        cache: cache.clone(),
-        failure_mode_allow: cfg.failure_mode_allow,
-        allow_api_override: cfg.allow_api_override,
-        oidc_claim_field: cfg.oidc_claim_map.as_ref().map(|m| m.claim_field.clone()),
-    });
+        cache.clone(),
+        cfg.failure_mode_allow,
+        cfg.allow_api_override,
+        cfg.oidc_claim_map.as_ref().map(|m| m.claim_field.clone()),
+    ));
     install_key_plane(plane);
 
     // Cross-replica invalidation: subscribe to the Redis channel so a peer's

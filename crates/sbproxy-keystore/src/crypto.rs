@@ -236,6 +236,17 @@ impl KeyCrypto {
         verify_secret(secret, &self.pepper, expected_hex)
     }
 
+    /// Verify a presented secret against a [`KeyRecord`], honoring a rotation
+    /// grace window. Keeps the pepper private to this handle.
+    pub fn verify_record(
+        &self,
+        record: &crate::record::KeyRecord,
+        secret: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        record.verify_secret(secret, &self.pepper, now)
+    }
+
     /// Seal an upstream secret into an envelope bound to `record_id`.
     pub fn seal(&self, record_id: &str, plaintext: &[u8]) -> Result<Envelope> {
         seal_envelope(&self.master, record_id, plaintext)
