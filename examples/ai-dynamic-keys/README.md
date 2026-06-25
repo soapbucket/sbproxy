@@ -1,5 +1,7 @@
 # Dynamic key management
 
+![Dynamic key management: mint, list, rotate, and revoke virtual keys at runtime](../../docs/assets/ai-dynamic-keys.gif)
+
 Inbound virtual keys as a live, governed resource instead of lines of YAML.
 
 The `proxy.key_management:` block turns on a mutable key store (hashed at rest

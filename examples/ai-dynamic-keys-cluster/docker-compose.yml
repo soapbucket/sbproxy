@@ -1,6 +1,8 @@
-# Distributed dynamic key management: two sbproxy replicas sharing one Redis
-# key store, so a key minted on one replica works on both and a revoke on one
-# is visible on the other.
+# Distributed dynamic key management: two sbproxy replicas with the mesh
+# distributed cache in front of one shared Redis key store. A key minted on one
+# replica works on both and a revoke on one is visible on the other. The two
+# replicas gossip over the sbnet network (ports 7946/8946, internal only) and
+# seed each other by service name.
 #
 # Bring up:    docker compose up --build
 # Tear down:   docker compose down -v
@@ -17,6 +19,8 @@ x-sbproxy-env: &sbproxy-env
   SBPROXY_KEY_MASTER: demo-cluster-master-change-me
   OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-not-set}
   SB_LOG_LEVEL: info
+  # Per-replica mesh identity (SB_NODE_ID, SB_ADVERTISE, SB_SEED) is set on each
+  # service below; the shared sb.yml reads it from the environment.
 
 services:
   redis:
@@ -37,7 +41,11 @@ services:
       dockerfile: Dockerfile.cloudbuild
     image: sbproxy-dynamic-keys-cluster:local
     command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
-    environment: *sbproxy-env
+    environment:
+      <<: *sbproxy-env
+      SB_NODE_ID: node-1
+      SB_ADVERTISE: sb1:7946
+      SB_SEED: sb2:7946
     volumes:
       - ./sb.yml:/etc/sbproxy/sb.yml:ro
     ports:
@@ -53,7 +61,11 @@ services:
     # Reuses the image sb1 builds.
     image: sbproxy-dynamic-keys-cluster:local
     command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
-    environment: *sbproxy-env
+    environment:
+      <<: *sbproxy-env
+      SB_NODE_ID: node-2
+      SB_ADVERTISE: sb2:7946
+      SB_SEED: sb1:7946
     volumes:
       - ./sb.yml:/etc/sbproxy/sb.yml:ro
     ports:

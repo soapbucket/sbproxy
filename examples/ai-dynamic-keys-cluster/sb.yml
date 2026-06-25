@@ -1,11 +1,14 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Distributed dynamic key management across a replica fleet.
 #
-# The same config runs on every replica. The key store is Redis as the source
-# of truth, and the policy cache uses a Redis L2 tier, so a key minted on one
-# replica is usable on all of them and a revoke on one replica is published to
-# the others and takes effect on their next request. This is the clustered
-# counterpart to examples/ai-dynamic-keys/ (single node).
+# The same config runs on every replica. Resolution order is L1 in-memory cache,
+# then the mesh distributed cache, then Redis. The mesh tier (SWIM gossip plus a
+# consistent-hash ring) keeps the policy cache coherent across replicas; Redis is
+# the shared source of truth, so a key minted on one replica is usable on all of
+# them and a revoke takes effect fleet-wide. Each replica's mesh identity (node
+# id, advertised address, and seed peer) comes from the environment, so this one
+# file runs on every node. This is the clustered counterpart to
+# examples/ai-dynamic-keys/ (single node).
 #
 # Run the two-replica cluster with examples/ai-dynamic-keys-cluster/docker-compose.yml;
 # see that example's README for the cross-replica test recipe.
@@ -28,10 +31,22 @@ proxy:
       redis_source_of_truth: true
     cache:
       ttl_secs: 30
-      # The Redis cache tier publishes an invalidation on every mutation, so a
-      # revoke on one replica drops the cached entry on the others.
-      tier: redis
-      redis_url: redis://redis:6379
+      # The mesh distributed cache sits in front of the store. Reads and writes
+      # route by consistent hash across the gossip cluster, so a record cached on
+      # one replica is reachable from the others without a round trip to Redis.
+      tier: mesh
+      # Per-replica identity from the environment (set in docker-compose.yml), so
+      # the same file boots every node with a distinct mesh id and seed peer.
+      mesh_node_id: ${SB_NODE_ID}
+      mesh:
+        # Join the other replica's gossip endpoint. Membership feeds the ring and
+        # resolves a hash owner to a reachable transport address.
+        seeds: ["${SB_SEED}"]
+        gossip_port: 7946
+        transport_port: 8946
+        # What this node advertises to peers (its service name on the network).
+        advertise_addr: ${SB_ADVERTISE}
+        # Set a shared_key (inline or env:NAME) to encrypt gossip and transport.
     crypto:
       # Every replica must share the same pepper and master key so hashes and
       # envelopes are portable across the fleet.

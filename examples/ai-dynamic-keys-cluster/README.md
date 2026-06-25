@@ -1,25 +1,33 @@
 # Distributed dynamic key management (cluster)
 
-Two sbproxy replicas share one Redis key store, so a virtual key is governed
-fleet-wide: mint it on one replica and it works on the other, revoke it on one
-and the next request on either is denied.
+![Clustered key management: mint on node A, use and revoke from node B](../../docs/assets/ai-dynamic-keys-cluster.gif)
+
+Two sbproxy replicas govern one set of virtual keys fleet-wide: mint a key on
+one replica and it works on the other, revoke it on one and the next request on
+either is denied.
 
 This is the clustered counterpart to [`../ai-dynamic-keys/`](../ai-dynamic-keys/),
 which runs the same feature on a single local binary.
 
 ## How it clusters
 
-Two pieces make the key plane coherent across replicas, both in `sb.yml`:
+Resolution order is L1 in-memory cache, then the mesh distributed cache, then
+the store. Two pieces in `sb.yml` make the key plane coherent across replicas:
 
 - `store.backend: redis` with `redis_source_of_truth: true` - Redis is the
-  system of record, so every replica reads and writes the same keys.
-- `cache.tier: redis` - the policy cache uses a Redis L2 tier that publishes an
-  invalidation on every mutation, so a revoke or an update on one replica drops
-  the cached entry on the others. Each replica still keeps a fast in-memory L1
-  in front of it.
+  durable system of record, so every replica reads and writes the same keys. A
+  key minted on one replica is visible on the others as soon as it is written.
+- `cache.tier: mesh` - the policy cache is backed by the mesh distributed cache:
+  a SWIM gossip cluster with a consistent-hash ring. Reads and writes route to
+  the replica that owns a key, so a record cached on one node is reachable from
+  the others without a round trip to Redis, and an invalidation on revoke routes
+  to the owner. Each replica still keeps a fast in-memory L1 in front of it.
 
-The crypto pepper and master key are shared through the environment so hashes
-and envelopes are portable between replicas.
+Each replica's mesh identity (node id, advertised address, and seed peer) comes
+from the environment, so one `sb.yml` boots every node. The replicas gossip over
+ports 7946 (membership) and 8946 (cache transport), internal to the network. The
+crypto pepper and master key are shared through the environment so hashes and
+envelopes are portable between replicas.
 
 ## Run it locally (single node)
 
@@ -61,7 +69,8 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8082/v1/chat/completio
   -H 'Host: ai.localhost' -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
-# not 401/403 (the upstream call needs a real OPENAI_API_KEY to return 200)
+# not 403: the key passes the gate. A 200 needs a real OPENAI_API_KEY; without
+# one the upstream call itself fails (401), but the gate let the request through.
 ```
 
 Revoke it on `sb1`:
@@ -71,8 +80,9 @@ KEY_ID=$(curl -s -u admin:admin http://127.0.0.1:9091/admin/keys | jq -r '.keys[
 curl -s -u admin:admin -X POST http://127.0.0.1:9091/admin/keys/$KEY_ID/revoke
 ```
 
-The next request on `sb2` is denied. The revoke published an invalidation over
-Redis, so `sb2` dropped its cached copy and re-resolved the now-revoked record:
+The next request on `sb2` is denied. The revoke updated the record in Redis and
+routed a cache invalidation through the mesh, so `sb2` re-resolves the now-revoked
+record and the gate rejects it before it reaches any upstream:
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8082/v1/chat/completions \
@@ -84,12 +94,12 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8082/v1/chat/completio
 
 Tear down with `docker compose down -v`.
 
-## The mesh tier (Redis-free clustering)
+## Going fully Redis-free
 
-`cache.tier: mesh` is the gossip-based alternative to the Redis tier: it backs
-the policy cache with the mesh distributed cache (consistent-hash ring + gossip
-replication) and adds CRDT-based cross-replica per-key spend and rate counters,
-so a fleet can share key state without a Redis dependency. The cache tier and
-the counters are in place; wiring the gossip cluster bootstrap (seed discovery
-and transport) from config is the next step, so for a working multi-container
-demo today use the Redis path above. See `docs/key-management.md`.
+This example keeps Redis as the durable store and puts the mesh cache in front of
+it. To drop Redis entirely, point `store.backend` at a shared secrets manager
+(`secrets_manager`) and keep `cache.tier: mesh`; the gossip ring then carries the
+cache, and CRDT-based per-key spend and rate counters keep budgets coherent
+across replicas without a Redis dependency. The Redis-store setup above is the
+runnable multi-container demo; the secrets-manager store is the further step. See
+`docs/key-management.md`.

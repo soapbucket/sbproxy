@@ -84,6 +84,28 @@ drops the matching entry on every node, so a revoke is clusterwide.
 request -> L1 in-memory cache -> L2 tier (redis/mesh, optional) -> store
 ```
 
+The mesh tier makes the L2 a gossip cluster instead of Redis: a SWIM membership
+protocol feeds a consistent-hash ring, and reads and writes route to the replica
+that owns a key, so the resolution order is L1, then the mesh cache, then the
+store. A durable shared store still sits behind it as the source of truth (Redis,
+or a secrets manager for a Redis-free fleet); the mesh keeps the cache coherent
+and carries CRDT-based per-key spend and rate counters across replicas. Bootstrap
+it with a `cache.mesh:` block of seed peers plus gossip and transport ports:
+
+```yaml
+cache:
+  tier: mesh
+  mesh_node_id: node-a            # unique per replica
+  mesh:
+    seeds: ["node-b:7946"]        # another replica's gossip endpoint
+    gossip_port: 7946
+    transport_port: 8946
+    advertise_addr: node-a:7946   # what this node advertises to peers
+    # shared_key: env:SBPROXY_MESH_KEY  # encrypt gossip + transport (optional)
+```
+
+See the runnable `examples/ai-dynamic-keys-cluster/` for a two-replica setup.
+
 ## The security model
 
 Two kinds of secret, two different treatments.
