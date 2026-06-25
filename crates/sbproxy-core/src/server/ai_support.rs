@@ -1358,6 +1358,50 @@ pub(super) fn emit_ai_billing_event(
     cost_usd_micros
 }
 
+/// WOR-1528 / WOR-1540: emit one completed-call event to the usage sinks
+/// configured for this origin, if any.
+///
+/// Called once from the end-of-request `logging` hook, after the response
+/// is fully sent, so it is off the request latency path. A no-op unless
+/// [`super::ai_dispatch::handle_ai_proxy`] stashed sinks on the context
+/// and the request actually dispatched to an AI provider (so a guardrail
+/// block before dispatch records nothing). The sinks are non-blocking and
+/// swallow their own errors, so this never affects the request outcome.
+pub(super) fn record_usage_sinks(ctx: &mut crate::context::RequestContext) {
+    let Some(sinks) = ctx.ai_usage_sinks.take() else {
+        return;
+    };
+    let Some(provider) = ctx.ai_provider.clone() else {
+        return;
+    };
+    let prompt_tokens = ctx.ai_tokens_in.unwrap_or(0);
+    let completion_tokens = ctx.ai_tokens_out.unwrap_or(0);
+    let api_key_id = ctx.principal.api_key_id();
+    let event = sbproxy_ai::usage_sink::LlmUsageEvent {
+        provider,
+        model: ctx.ai_model.clone().unwrap_or_default(),
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        cost_usd: ctx
+            .ai_cost_usd_micros
+            .map(|m| m as f64 / 1_000_000.0)
+            .unwrap_or(0.0),
+        latency_ms: ctx
+            .request_start
+            .map(|s| s.elapsed().as_millis() as u64)
+            .unwrap_or(0),
+        status: ctx.response_status.unwrap_or(0),
+        key_id: (!api_key_id.is_empty()).then(|| api_key_id.to_string()),
+        user: None,
+        team: (!ctx.tenant_id.is_empty()).then(|| ctx.tenant_id.to_string()),
+        request_id: (!ctx.request_id.is_empty()).then(|| ctx.request_id.to_string()),
+    };
+    for sink in &sinks {
+        sink.record(&event);
+    }
+}
+
 /// Convert a dollar-denominated AI cost estimate into the integer
 /// micro-USD unit used by metrics, spans, and request events.
 pub(super) fn cost_usd_to_micros(cost_usd: f64) -> u64 {

@@ -64,6 +64,8 @@ embed-admin-ui = ["sbproxy-core/embed-admin-ui"]
 [dependencies]
 sbproxy-core.workspace = true
 sbproxy-config.workspace = true
+# WOR-1540: `ai ledger verify` reuses the verifiable-ledger crypto.
+sbproxy-ai.workspace = true
 sbproxy-modules.workspace = true
 sbproxy-observe.workspace = true
 sbproxy-plugin.workspace = true

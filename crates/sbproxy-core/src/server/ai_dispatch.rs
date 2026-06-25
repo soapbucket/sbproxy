@@ -35,6 +35,18 @@ pub(super) async fn handle_ai_proxy(
     // `ai_model`, and token-count fields.
     ctx.ai_surface = Some(surface_label.to_string());
 
+    // WOR-1528 / WOR-1540: stash the configured usage sinks on the
+    // context here, where the handler config is in scope. The
+    // end-of-request `logging` hook emits one `LlmUsageEvent` to them
+    // once the final status, tokens, cost, and latency are known. The
+    // clone is a handful of `Arc` pointer bumps and only happens when an
+    // operator has configured sinks (default: none), so the common path
+    // is untouched.
+    let usage_sinks = config.usage_sinks();
+    if !usage_sinks.is_empty() {
+        ctx.ai_usage_sinks = Some(usage_sinks.to_vec());
+    }
+
     // Create the top-level request span. The span is registered with
     // the subscriber (so OTel-style exporters see it as part of the
     // trace tree) but we do not `.enter()` it because the resulting

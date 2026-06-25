@@ -1,0 +1,56 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: verifiable usage ledger.
+#
+# A usage sink records every completed LLM call. The `ledger` sink goes
+# further than a log: it hash-chains each event to the previous one, so
+# editing any past record breaks every link after it, and (when a signing
+# seed is set) Ed25519-signs each entry so the spend is provable, not just
+# logged. The file is its own write-ahead log, so nothing is dropped under
+# load, and a `request_id` makes an at-least-once delivery exactly-once on
+# replay.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#   # Optional, to sign entries: any 32-byte value as 64 hex chars.
+#   export LEDGER_SIGNING_SEED_HEX=$(openssl rand -hex 32)
+#   make run CONFIG=examples/ai-usage-ledger/sb.yml
+#
+# Drive a request:
+#   curl -s http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hi"}]}' \
+#     | jq -r '.choices[0].message.content'
+#
+# Inspect + verify the ledger:
+#   cat /tmp/sb-usage-ledger.jsonl | jq .
+#   sbproxy ai ledger verify /tmp/sb-usage-ledger.jsonl \
+#     --signing-seed-hex "$LEDGER_SIGNING_SEED_HEX"
+#
+# Tamper test: edit a cost in the file, re-run verify, watch it fail at the
+# mutated sequence number.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+
+      # Every completed call is appended to the ledger. Drop the
+      # `signing_seed_hex` line for an unsigned (chain-only) ledger; keep
+      # it to also sign each entry. Resolve the seed from a secret manager
+      # in production rather than an env var.
+      usage_sinks:
+        - type: ledger
+          path: /tmp/sb-usage-ledger.jsonl
+          signing_seed_hex: ${LEDGER_SIGNING_SEED_HEX}

@@ -3929,6 +3929,12 @@ impl ProxyHttp for SbProxy {
         let hostname = ctx.hostname.to_string();
         let status_u16 = ctx.response_status.unwrap_or(0);
 
+        // WOR-1528 / WOR-1540: hand the completed AI call to the
+        // configured usage sinks (the verifiable ledger among them).
+        // No-op unless this request dispatched to an AI provider on an
+        // origin with sinks configured.
+        record_usage_sinks(ctx);
+
         // --- Wave 3 / G1.6 wire: per-agent labels on the hot path ---
         //
         // Read the agent dimensions out of the request context that

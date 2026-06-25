@@ -731,6 +731,14 @@ pub struct RequestContext {
     /// closed-set strings only (`guardrail_block`, `content_filter`,
     /// ...).
     pub ai_outcome: Option<String>,
+    /// WOR-1528 / WOR-1540: usage sinks for this origin, stashed by
+    /// `handle_ai_proxy` when the AI handler configures any. The
+    /// end-of-request `logging` hook reads them once the final status,
+    /// token counts, cost, and latency are known, builds one
+    /// `LlmUsageEvent`, and hands it to each sink (the verifiable ledger
+    /// among them). `None` (the default) means no sinks are configured,
+    /// so the request path does no extra work.
+    pub ai_usage_sinks: Option<Vec<std::sync::Arc<dyn sbproxy_ai::usage_sink::UsageSink>>>,
     /// Inbound `ChatFormat` id when the request entered on a native
     /// shim path (`anthropic` for `/v1/messages`, `responses` for
     /// `/v1/responses`). `None` (or `"openai"`) for the canonical
@@ -1076,6 +1084,7 @@ impl RequestContext {
             ai_cost_usd_micros: None,
             ai_surface: None,
             ai_outcome: None,
+            ai_usage_sinks: None,
             ai_inbound_format: None,
             ai_native_bypass: false,
             ai_admission: None,

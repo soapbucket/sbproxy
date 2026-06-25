@@ -151,6 +151,8 @@ enum Cmd {
     /// Render projection documents (robots.txt, llms.txt, ...) for an
     /// origin without starting the proxy.
     Projections(ProjectionsCmd),
+    /// AI gateway tools (usage ledger verification, ...).
+    Ai(AiCmd),
     /// Print a shell-completion script to stdout for the requested
     /// shell. Pipe into the shell's completion sink.
     Completions {
@@ -240,6 +242,46 @@ struct ImportLitellmArgs {
     /// Write the translated sb.yml to this path. Defaults to stdout.
     #[arg(short = 'o', long = "out")]
     out: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct AiCmd {
+    #[command(subcommand)]
+    sub: AiSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum AiSub {
+    /// Verifiable usage ledger commands.
+    Ledger(LedgerCmd),
+}
+
+#[derive(clap::Args, Debug)]
+struct LedgerCmd {
+    #[command(subcommand)]
+    sub: LedgerSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum LedgerSub {
+    /// Re-derive a ledger's hash chain (and signatures, when a seed is
+    /// given) and report the first broken link, if any. Exit 0 when the
+    /// ledger verifies, 1 when it does not.
+    Verify(LedgerVerifyArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct LedgerVerifyArgs {
+    /// Path to the ledger file (the JSONL write-ahead log).
+    path: PathBuf,
+    /// Optional 32-byte Ed25519 signing seed as hex. When provided, every
+    /// entry's signature is verified against the derived public key.
+    #[arg(long = "signing-seed-hex")]
+    signing_seed_hex: Option<String>,
+    /// Output format. `text` (default) prints a human line; `json` emits a
+    /// single structured object for CI consumption.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
 }
 
 #[derive(clap::Args, Debug)]
@@ -418,6 +460,9 @@ fn main() {
         }
         Some(Cmd::Projections(cmd)) => {
             run_subcommand("error", 2, handle_projections_subcommand(&cmd).map(|()| 0));
+        }
+        Some(Cmd::Ai(cmd)) => {
+            run_subcommand("ai", 2, handle_ai_subcommand(&cmd));
         }
         Some(Cmd::Completions { shell }) => {
             print_completions(shell);
@@ -703,6 +748,59 @@ fn handle_config_subcommand(cmd: &ConfigCmd) -> anyhow::Result<i32> {
         ConfigSub::Migrate(args) => handle_config_migrate(args),
         ConfigSub::ImportLitellm(args) => handle_config_import_litellm(args),
     }
+}
+
+fn handle_ai_subcommand(cmd: &AiCmd) -> anyhow::Result<i32> {
+    match &cmd.sub {
+        AiSub::Ledger(ledger) => match &ledger.sub {
+            LedgerSub::Verify(args) => handle_ledger_verify(args),
+        },
+    }
+}
+
+fn handle_ledger_verify(args: &LedgerVerifyArgs) -> anyhow::Result<i32> {
+    let verifying_key = match args.signing_seed_hex.as_deref() {
+        Some(seed) => Some(sbproxy_ai::usage_ledger::verifying_key_from_seed_hex(seed)?),
+        None => None,
+    };
+    let result = sbproxy_ai::usage_ledger::verify_ledger(&args.path, verifying_key.as_ref())?;
+    let path_str = args.path.to_string_lossy();
+
+    match args.format {
+        OutputFormat::Json => {
+            let obj = serde_json::json!({
+                "path": path_str,
+                "entries": result.entries,
+                "ok": result.ok,
+                "broken_seq": result.broken_seq,
+                "reason": result.reason,
+                "signature_checked": verifying_key.is_some(),
+            });
+            println!("{}", serde_json::to_string(&obj)?);
+        }
+        OutputFormat::Text => {
+            if result.ok {
+                println!(
+                    "ledger verify: OK ({} entr{}, {})",
+                    result.entries,
+                    if result.entries == 1 { "y" } else { "ies" },
+                    if verifying_key.is_some() {
+                        "chain + signatures"
+                    } else {
+                        "chain only"
+                    },
+                );
+            } else {
+                eprintln!(
+                    "ledger verify: FAILED at seq {}: {}",
+                    result.broken_seq.map(|s| s.to_string()).unwrap_or_default(),
+                    result.reason.as_deref().unwrap_or("unknown"),
+                );
+            }
+        }
+    }
+
+    Ok(if result.ok { 0 } else { 1 })
 }
 
 fn handle_config_import_litellm(args: &ImportLitellmArgs) -> anyhow::Result<i32> {

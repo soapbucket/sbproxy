@@ -34,6 +34,9 @@ tracing.workspace = true
 chrono.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# WOR-1540: Ed25519-signed entries for the verifiable usage ledger.
+# Same major as the RFC 9421 verifier in sbproxy-middleware.
+ed25519-dalek = "2"
 prometheus.workspace = true
 rand.workspace = true
 futures.workspace = true
