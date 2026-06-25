@@ -52,7 +52,7 @@
 //! When `GossipLoopConfig::cipher` is `Some`, every outbound message is
 //! passed through `Cipher::seal` before `UdpSocket::send_to`, and every
 //! inbound datagram is passed through `Cipher::open` before
-//! `bincode::deserialize`. Failures bump `MESH_CRYPTO_DECRYPT_FAILED` and
+//! `crate::transport::wire::decode`. Failures bump `MESH_CRYPTO_DECRYPT_FAILED` and
 //! drop the datagram. This mirrors K3 exactly; the only change is the
 //! set of enum variants that round-trip through it.
 //!
@@ -666,7 +666,7 @@ impl GossipLoop {
                             None => buf[..n].to_vec(),
                         };
 
-                        match bincode::deserialize::<GossipMsg>(&plaintext) {
+                        match crate::transport::wire::decode::<GossipMsg>(&plaintext) {
                             Ok(GossipMsg::Ping {
                                 seq,
                                 from: peer_id,
@@ -1361,8 +1361,8 @@ mod tests {
             from: "node-a".to_string(),
             updates: Vec::new(),
         };
-        let bytes = bincode::serialize(&m).unwrap();
-        let back: GossipMsg = bincode::deserialize(&bytes).unwrap();
+        let bytes = crate::transport::wire::encode(&m).unwrap();
+        let back: GossipMsg = crate::transport::wire::decode(&bytes).unwrap();
         assert_eq!(back, m);
 
         let m = GossipMsg::PingReq {
@@ -1371,8 +1371,8 @@ mod tests {
             target: "node-c".to_string(),
             target_addr: "10.0.0.3:7946".to_string(),
         };
-        let bytes = bincode::serialize(&m).unwrap();
-        let back: GossipMsg = bincode::deserialize(&bytes).unwrap();
+        let bytes = crate::transport::wire::encode(&m).unwrap();
+        let back: GossipMsg = crate::transport::wire::decode(&bytes).unwrap();
         assert_eq!(back, m);
 
         let m = GossipMsg::IndirectAck {
@@ -1381,8 +1381,8 @@ mod tests {
             target: "node-c".to_string(),
             alive: true,
         };
-        let bytes = bincode::serialize(&m).unwrap();
-        let back: GossipMsg = bincode::deserialize(&bytes).unwrap();
+        let bytes = crate::transport::wire::encode(&m).unwrap();
+        let back: GossipMsg = crate::transport::wire::decode(&bytes).unwrap();
         assert_eq!(back, m);
     }
 
@@ -1735,7 +1735,7 @@ mod tests {
                     Ok(r) => r,
                     Err(_) => break,
                 };
-                let msg: GossipMsg = match bincode::deserialize(&buf[..n]) {
+                let msg: GossipMsg = match crate::transport::wire::decode(&buf[..n]) {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
@@ -1749,7 +1749,7 @@ mod tests {
                             from: "node-b".to_string(),
                             updates: Vec::new(),
                         };
-                        let bytes = bincode::serialize(&ack).unwrap();
+                        let bytes = crate::transport::wire::encode(&ack).unwrap();
                         let _ = b_socket_clone.send_to(&bytes, from).await;
                     }
                 }
@@ -2245,7 +2245,7 @@ mod tests {
                 incarnation: 0,
             }],
         };
-        let bytes = bincode::serialize(&injected).unwrap();
+        let bytes = crate::transport::wire::encode(&injected).unwrap();
         let b_addr: SocketAddr = addr_b.parse().unwrap();
         let _ = injector.send_to(&bytes, b_addr).await;
 

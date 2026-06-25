@@ -24,7 +24,7 @@ pub(super) async fn send_msg(
     msg: &GossipMsg,
     addr: SocketAddr,
 ) {
-    let plaintext = match bincode::serialize(msg) {
+    let plaintext = match crate::transport::wire::encode(msg) {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "gossip: serialization failed");

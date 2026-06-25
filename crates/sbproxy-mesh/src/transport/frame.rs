@@ -184,8 +184,8 @@ mod tests {
                 key: "semcache:v1:k".to_string(),
             },
         };
-        let bytes = bincode::serialize(&req).expect("serialize");
-        let back: Request = bincode::deserialize(&bytes).expect("deserialize");
+        let bytes = crate::transport::wire::encode(&req).expect("serialize");
+        let back: Request = crate::transport::wire::decode(&bytes).expect("deserialize");
         assert_eq!(back.request_id, 7);
         match back.op {
             CacheOp::Get { key } => assert_eq!(key, "semcache:v1:k"),
@@ -203,8 +203,8 @@ mod tests {
                 ttl_secs: 0,
             },
         };
-        let bytes = bincode::serialize(&req).expect("serialize");
-        let back: Request = bincode::deserialize(&bytes).expect("deserialize");
+        let bytes = crate::transport::wire::encode(&req).expect("serialize");
+        let back: Request = crate::transport::wire::decode(&bytes).expect("deserialize");
         assert_eq!(back.request_id, 99);
         match back.op {
             CacheOp::Put {
@@ -230,8 +230,8 @@ mod tests {
                 ttl_secs: 60,
             },
         };
-        let bytes = bincode::serialize(&req).expect("serialize");
-        let back: Request = bincode::deserialize(&bytes).expect("deserialize");
+        let bytes = crate::transport::wire::encode(&req).expect("serialize");
+        let back: Request = crate::transport::wire::decode(&bytes).expect("deserialize");
         match back.op {
             CacheOp::Put { ttl_secs, .. } => assert_eq!(ttl_secs, 60),
             other => panic!("expected Put, got {:?}", other),
@@ -244,8 +244,8 @@ mod tests {
             request_id: 1,
             result: CacheResult::Value(Some(Bytes::from_static(b"hit"))),
         };
-        let bytes = bincode::serialize(&resp).expect("serialize");
-        let back: Response = bincode::deserialize(&bytes).expect("deserialize");
+        let bytes = crate::transport::wire::encode(&resp).expect("serialize");
+        let back: Response = crate::transport::wire::decode(&bytes).expect("deserialize");
         assert_eq!(back.request_id, 1);
         match back.result {
             CacheResult::Value(Some(b)) => assert_eq!(b, Bytes::from_static(b"hit")),
@@ -264,8 +264,8 @@ mod tests {
                 prefix: "semcache:v1:foo:".to_string(),
             },
         };
-        let bytes = bincode::serialize(&req).expect("serialize");
-        let back: Request = bincode::deserialize(&bytes).expect("deserialize");
+        let bytes = crate::transport::wire::encode(&req).expect("serialize");
+        let back: Request = crate::transport::wire::decode(&bytes).expect("deserialize");
         match back.op {
             CacheOp::PurgePrefix { prefix } => assert_eq!(prefix, "semcache:v1:foo:"),
             other => panic!("expected PurgePrefix, got {:?}", other),
@@ -277,8 +277,8 @@ mod tests {
                 prefix: String::new(),
             },
         };
-        let bytes = bincode::serialize(&req_all).expect("serialize");
-        let back: Request = bincode::deserialize(&bytes).expect("deserialize");
+        let bytes = crate::transport::wire::encode(&req_all).expect("serialize");
+        let back: Request = crate::transport::wire::decode(&bytes).expect("deserialize");
         match back.op {
             CacheOp::PurgePrefix { prefix } => assert!(prefix.is_empty()),
             other => panic!("expected PurgePrefix, got {:?}", other),
@@ -291,8 +291,8 @@ mod tests {
             request_id: 7,
             result: CacheResult::Purged(17),
         };
-        let bytes = bincode::serialize(&resp).expect("serialize");
-        let back: Response = bincode::deserialize(&bytes).expect("deserialize");
+        let bytes = crate::transport::wire::encode(&resp).expect("serialize");
+        let back: Response = crate::transport::wire::decode(&bytes).expect("deserialize");
         match back.result {
             CacheResult::Purged(n) => assert_eq!(n, 17),
             other => panic!("expected Purged, got {:?}", other),
@@ -305,8 +305,8 @@ mod tests {
             request_id: 1,
             result: CacheResult::Acked,
         };
-        let bytes = bincode::serialize(&resp).expect("serialize");
-        let back: Response = bincode::deserialize(&bytes).expect("deserialize");
+        let bytes = crate::transport::wire::encode(&resp).expect("serialize");
+        let back: Response = crate::transport::wire::decode(&bytes).expect("deserialize");
         match back.result {
             CacheResult::Acked => {}
             other => panic!("expected Acked, got {:?}", other),

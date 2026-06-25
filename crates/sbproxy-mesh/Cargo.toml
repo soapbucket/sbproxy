@@ -24,7 +24,7 @@ base64 = { workspace = true }
 bytes = { workspace = true, features = ["serde"] }
 hostname = "0.4"
 prometheus = { workspace = true }
-bincode = "1.3"
+bincode = { version = "2", features = ["serde"] }
 # Async Redis client for the backend/redis.rs persistence + federation paths.
 redis = { workspace = true }
 # Storage trait surface (PersistentKv + EphemeralKv + SetKv) + RedisStore.

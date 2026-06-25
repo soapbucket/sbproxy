@@ -191,7 +191,7 @@ async fn handle_connection(
             None => payload,
         };
 
-        let req: Request = match bincode::deserialize(&plaintext) {
+        let req: Request = match crate::transport::wire::decode(&plaintext) {
             Ok(req) => req,
             Err(e) => {
                 tracing::warn!(error = %e, "transport: bad request frame");
@@ -241,7 +241,7 @@ async fn handle_connection(
 
         // --- Write the response ---
         let resp = Response { request_id, result };
-        let bytes = match bincode::serialize(&resp) {
+        let bytes = match crate::transport::wire::encode(&resp) {
             Ok(b) => b,
             Err(e) => {
                 // Only fails on a type-level programming error; log and
@@ -316,10 +316,10 @@ mod tests {
                 ttl_secs: 0,
             },
         };
-        let bytes = bincode::serialize(&put_req).expect("ser");
+        let bytes = crate::transport::wire::encode(&put_req).expect("ser");
         write_frame(&mut w, &bytes).await.expect("write put");
         let resp_bytes = read_frame(&mut r).await.expect("read put resp");
-        let resp: Response = bincode::deserialize(&resp_bytes).expect("deser put");
+        let resp: Response = crate::transport::wire::decode(&resp_bytes).expect("deser put");
         assert_eq!(resp.request_id, 1);
         matches!(resp.result, CacheResult::Acked);
 
@@ -330,10 +330,10 @@ mod tests {
                 key: "k".to_string(),
             },
         };
-        let bytes = bincode::serialize(&get_req).expect("ser");
+        let bytes = crate::transport::wire::encode(&get_req).expect("ser");
         write_frame(&mut w, &bytes).await.expect("write get");
         let resp_bytes = read_frame(&mut r).await.expect("read get resp");
-        let resp: Response = bincode::deserialize(&resp_bytes).expect("deser get");
+        let resp: Response = crate::transport::wire::decode(&resp_bytes).expect("deser get");
         assert_eq!(resp.request_id, 2);
         match resp.result {
             CacheResult::Value(Some(b)) => assert_eq!(b, Bytes::from_static(b"v")),
@@ -364,10 +364,10 @@ mod tests {
                 key: "doomed".to_string(),
             },
         };
-        let bytes = bincode::serialize(&req).expect("ser");
+        let bytes = crate::transport::wire::encode(&req).expect("ser");
         write_frame(&mut w, &bytes).await.expect("write");
         let resp_bytes = read_frame(&mut r).await.expect("read");
-        let resp: Response = bincode::deserialize(&resp_bytes).expect("deser");
+        let resp: Response = crate::transport::wire::decode(&resp_bytes).expect("deser");
         matches!(resp.result, CacheResult::Acked);
         assert_eq!(cache.get_local("doomed"), None);
 
@@ -401,10 +401,10 @@ mod tests {
                 prefix: "foo:".to_string(),
             },
         };
-        let bytes = bincode::serialize(&req).expect("ser");
+        let bytes = crate::transport::wire::encode(&req).expect("ser");
         write_frame(&mut w, &bytes).await.expect("write");
         let resp_bytes = read_frame(&mut r).await.expect("read");
-        let resp: Response = bincode::deserialize(&resp_bytes).expect("deser");
+        let resp: Response = crate::transport::wire::decode(&resp_bytes).expect("deser");
         match resp.result {
             CacheResult::Purged(n) => assert_eq!(n, 2),
             other => panic!("expected Purged(2), got {:?}", other),
@@ -441,10 +441,10 @@ mod tests {
                 prefix: String::new(),
             },
         };
-        let bytes = bincode::serialize(&req).expect("ser");
+        let bytes = crate::transport::wire::encode(&req).expect("ser");
         write_frame(&mut w, &bytes).await.expect("write");
         let resp_bytes = read_frame(&mut r).await.expect("read");
-        let resp: Response = bincode::deserialize(&resp_bytes).expect("deser");
+        let resp: Response = crate::transport::wire::decode(&resp_bytes).expect("deser");
         match resp.result {
             CacheResult::Purged(n) => assert_eq!(n, 2),
             other => panic!("expected Purged(2), got {:?}", other),
@@ -473,10 +473,10 @@ mod tests {
                 key: "nope".to_string(),
             },
         };
-        let bytes = bincode::serialize(&req).expect("ser");
+        let bytes = crate::transport::wire::encode(&req).expect("ser");
         write_frame(&mut w, &bytes).await.expect("write");
         let resp_bytes = read_frame(&mut r).await.expect("read");
-        let resp: Response = bincode::deserialize(&resp_bytes).expect("deser");
+        let resp: Response = crate::transport::wire::decode(&resp_bytes).expect("deser");
         match resp.result {
             CacheResult::Value(None) => {}
             other => panic!("expected Value(None), got {:?}", other),

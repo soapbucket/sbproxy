@@ -188,7 +188,7 @@ impl PeerClient {
         let request_id = guard.next_id;
         guard.next_id = guard.next_id.wrapping_add(1);
         let req = Request { request_id, op };
-        let plaintext = bincode::serialize(&req)
+        let plaintext = crate::transport::wire::encode(&req)
             .map_err(|e| anyhow::anyhow!("request serialize failed: {}", e))?;
 
         // K3: seal the request body when encryption is configured. The
@@ -239,7 +239,7 @@ impl PeerClient {
             None => resp_bytes,
         };
 
-        let resp: Response = bincode::deserialize(&resp_plain)
+        let resp: Response = crate::transport::wire::decode(&resp_plain)
             .map_err(|e| anyhow::anyhow!("response deserialize failed: {}", e))?;
         if resp.request_id != request_id {
             // Pipelined implementations would fix this up via a pending

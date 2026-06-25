@@ -22,6 +22,7 @@ pub mod quic_transport;
 pub mod server;
 pub mod tcp;
 pub mod websocket;
+pub(crate) mod wire;
 
 // --- Re-exports for the cross-node cache RPC transport (J2) ---
 
