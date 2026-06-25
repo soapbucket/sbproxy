@@ -18,13 +18,17 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwapOption;
 use chrono::{DateTime, Utc};
 use sbproxy_config::types::{
-    KeyCacheTier, KeyManagementConfig, KeyStoreBackend, SeedCredentialConfig, SeedKeyConfig,
+    KeyCacheTier, KeyManagementConfig, KeyStoreBackend, MeshClusterConfig, SeedCredentialConfig,
+    SeedKeyConfig,
 };
 use sbproxy_keystore::crypto::KeyCrypto;
 use sbproxy_keystore::record::{
     CredentialMaterial, CredentialRecord, KeyRecord, RecordBudget, RecordSource, RecordStatus,
 };
 use sbproxy_keystore::{EmbeddedKeyStore, KeyStore, TtlCache, TtlCacheConfig};
+use sbproxy_mesh::bootstrap::{bootstrap, BootstrapConfig};
+use sbproxy_mesh::discovery::{seeds::SeedDiscovery, Discovery};
+use sbproxy_mesh::MeshNode;
 
 /// The live, installed key plane.
 pub struct KeyPlane {
@@ -279,20 +283,74 @@ fn build_cache(cfg: &KeyManagementConfig, store: Arc<dyn KeyStore>) -> Arc<TtlCa
             }
         }
         KeyCacheTier::Mesh => {
-            // Replicate cache state across the replica fleet via the mesh
-            // gossip + consistent-hash ring. Standalone until the node joins a
-            // mesh; node id defaults to the machine hostname.
+            // When a mesh cluster was bootstrapped (seeds configured), route
+            // through it so the cache is coherent across the fleet; otherwise a
+            // single-node standalone cache. Node id defaults to the hostname.
             let node_id = cfg
                 .cache
                 .mesh_node_id
                 .clone()
                 .unwrap_or_else(default_node_id);
-            cache = cache.with_tier(Arc::new(crate::mesh_cache::MeshCacheTier::standalone(
-                &node_id,
-            )));
+            let tier: Arc<dyn sbproxy_keystore::CacheTier> = if let Some(node) = current_mesh_node()
+            {
+                Arc::new(crate::mesh_cache::MeshCacheTier::clustered(node))
+            } else {
+                Arc::new(crate::mesh_cache::MeshCacheTier::standalone(&node_id))
+            };
+            cache = cache.with_tier(tier);
         }
     }
     Arc::new(cache)
+}
+
+/// Process-global handle to the bootstrapped mesh node (gossip + transport),
+/// kept alive for the process lifetime so its background tasks run. Set once; a
+/// reload does not re-bootstrap, since cluster membership is stable across
+/// config reloads.
+fn mesh_node_slot() -> &'static OnceLock<MeshNode> {
+    static SLOT: OnceLock<MeshNode> = OnceLock::new();
+    &SLOT
+}
+
+/// The bootstrapped mesh node, if the mesh cache tier is clustered.
+pub(crate) fn current_mesh_node() -> Option<&'static MeshNode> {
+    mesh_node_slot().get()
+}
+
+/// Bootstrap and install the mesh node for the cache tier, once. Joins the seed
+/// peers, binds gossip + transport, and runs the background tasks on the key
+/// runtime. A no-op if already bootstrapped.
+fn ensure_mesh_node(node_id: &str, mc: &MeshClusterConfig) -> Result<()> {
+    if mesh_node_slot().get().is_some() {
+        return Ok(());
+    }
+    let shared_key = match &mc.shared_key {
+        Some(r) => Some(
+            String::from_utf8(resolve_secret_material(r)?)
+                .context("mesh shared_key must be valid UTF-8")?,
+        ),
+        None => None,
+    };
+    let discoveries: Vec<Box<dyn Discovery>> = vec![Box::new(SeedDiscovery::new(mc.seeds.clone()))];
+    let boot = BootstrapConfig {
+        gossip_port: mc.gossip_port,
+        transport_port: mc.transport_port,
+        shared_key,
+        ..Default::default()
+    };
+    let node_id = node_id.to_string();
+    // Bootstrap on the dedicated key runtime via a fresh thread (block_on is
+    // safe off any runtime), so the gossip + transport tasks live on the key
+    // runtime for the process lifetime.
+    let node = std::thread::scope(|scope| {
+        scope
+            .spawn(|| key_runtime().block_on(bootstrap(&discoveries, &boot, node_id)))
+            .join()
+            .expect("mesh bootstrap thread panicked")
+    })
+    .context("bootstrap mesh cluster")?;
+    let _ = mesh_node_slot().set(node);
+    Ok(())
 }
 
 /// The default mesh node id: the `HOSTNAME` environment variable (set per pod
@@ -431,6 +489,20 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
     }
     let crypto = build_crypto(cfg)?;
     let store = build_store(cfg)?;
+    // Bootstrap the mesh cluster before building the cache so the mesh tier can
+    // route through it. A bootstrap failure logs and falls back to single-node.
+    if cfg.cache.tier == KeyCacheTier::Mesh {
+        if let Some(mc) = &cfg.cache.mesh {
+            let node_id = cfg
+                .cache
+                .mesh_node_id
+                .clone()
+                .unwrap_or_else(default_node_id);
+            if let Err(e) = ensure_mesh_node(&node_id, mc) {
+                tracing::error!(error = %e, "failed to bootstrap mesh cluster for the key cache tier; using single-node");
+            }
+        }
+    }
     let cache = build_cache(cfg, store.clone());
 
     let now = Utc::now();

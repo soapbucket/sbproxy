@@ -870,9 +870,59 @@ pub struct KeyCacheConfig {
     #[serde(default)]
     pub redis_url: Option<String>,
     /// Node id for the mesh cache tier (when `tier: mesh`). Defaults to the
-    /// machine hostname. Entries replicate across the mesh via gossip.
+    /// machine hostname.
     #[serde(default)]
     pub mesh_node_id: Option<String>,
+    /// Mesh cluster bootstrap for the mesh cache tier. When set, the node joins
+    /// a gossip cluster and the cache routes by consistent hash, so a key cached
+    /// on one replica is reachable from the others. When absent, the mesh tier
+    /// runs single-node.
+    #[serde(default)]
+    pub mesh: Option<MeshClusterConfig>,
+}
+
+fn default_gossip_port() -> u16 {
+    7946
+}
+fn default_transport_port() -> u16 {
+    8946
+}
+
+/// `key_management.cache.mesh:` cluster bootstrap for the mesh cache tier.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MeshClusterConfig {
+    /// Static seed peers (`host:port`) to join. An empty list bootstraps a
+    /// single-node cluster.
+    #[serde(default)]
+    pub seeds: Vec<String>,
+    /// UDP port for the gossip protocol.
+    #[serde(default = "default_gossip_port")]
+    pub gossip_port: u16,
+    /// TCP port for the cross-node cache RPC transport. `0` requests an
+    /// OS-assigned ephemeral port.
+    #[serde(default = "default_transport_port")]
+    pub transport_port: u16,
+    /// Address this node advertises to peers (`host:port`). Defaults to the
+    /// gossip bind when unset.
+    #[serde(default)]
+    pub advertise_addr: Option<String>,
+    /// Optional cluster-wide shared secret (AES-256-GCM) for the gossip and
+    /// transport wire. Accepts an inline value or `env:NAME`. Plaintext when
+    /// unset.
+    #[serde(default)]
+    pub shared_key: Option<String>,
+}
+
+impl Default for MeshClusterConfig {
+    fn default() -> Self {
+        Self {
+            seeds: Vec::new(),
+            gossip_port: default_gossip_port(),
+            transport_port: default_transport_port(),
+            advertise_addr: None,
+            shared_key: None,
+        }
+    }
 }
 
 impl Default for KeyCacheConfig {
@@ -884,6 +934,7 @@ impl Default for KeyCacheConfig {
             tier: KeyCacheTier::None,
             redis_url: None,
             mesh_node_id: None,
+            mesh: None,
         }
     }
 }

@@ -1383,6 +1383,7 @@
           "description": "In-memory policy cache in front of the store.",
           "default": {
             "max_entries": 10000,
+            "mesh": null,
             "mesh_node_id": null,
             "negative_ttl_secs": 5,
             "redis_url": null,
@@ -1650,11 +1651,23 @@
           ]
         },
         "mesh_node_id": {
-          "description": "Node id for the mesh cache tier (when `tier: mesh`). Defaults to the machine hostname. Entries replicate across the mesh via gossip.",
+          "description": "Node id for the mesh cache tier (when `tier: mesh`). Defaults to the machine hostname.",
           "default": null,
           "type": [
             "string",
             "null"
+          ]
+        },
+        "mesh": {
+          "description": "Mesh cluster bootstrap for the mesh cache tier. When set, the node joins a gossip cluster and the cache routes by consistent hash, so a key cached on one replica is reachable from the others. When absent, the mesh tier runs single-node.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MeshClusterConfig"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       }
@@ -1684,6 +1697,50 @@
           ]
         }
       ]
+    },
+    "MeshClusterConfig": {
+      "description": "`key_management.cache.mesh:` cluster bootstrap for the mesh cache tier.",
+      "type": "object",
+      "properties": {
+        "seeds": {
+          "description": "Static seed peers (`host:port`) to join. An empty list bootstraps a single-node cluster.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "gossip_port": {
+          "description": "UDP port for the gossip protocol.",
+          "default": 7946,
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "transport_port": {
+          "description": "TCP port for the cross-node cache RPC transport. `0` requests an OS-assigned ephemeral port.",
+          "default": 8946,
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "advertise_addr": {
+          "description": "Address this node advertises to peers (`host:port`). Defaults to the gossip bind when unset.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shared_key": {
+          "description": "Optional cluster-wide shared secret (AES-256-GCM) for the gossip and transport wire. Accepts an inline value or `env:NAME`. Plaintext when unset.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
     },
     "KeyCryptoConfig": {
       "description": "`key_management.crypto:` block. Both values accept a secret reference (`vault://`, `env:`, `file:`, ...) resolved at boot, or an inline value (discouraged outside tests).",
