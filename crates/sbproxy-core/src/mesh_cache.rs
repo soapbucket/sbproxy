@@ -7,7 +7,7 @@
 //!
 //! * **Standalone** (single node): local-shard get/put/delete with a background
 //!   sweeper. Useful without a cluster.
-//! * **Clustered**: backed by a bootstrapped [`MeshNode`], reads and writes go
+//! * **Clustered**: backed by a bootstrapped [`MeshNode`](sbproxy_mesh::MeshNode), reads and writes go
 //!   through the consistent-hash ring via routed RPCs (the node's transport pool
 //!   plus its peer-address lookup), so a record cached on one replica is
 //!   reachable from the others.
