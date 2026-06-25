@@ -1,0 +1,49 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: content-policy fallback.
+#
+# A provider may refuse a request on content-policy / safety grounds with a
+# 4xx instead of answering it. With resilience.content_policy_fallback, the
+# gateway routes that refusal to the next provider in order (a more
+# permissive model) instead of returning it. Plain 4xx client errors (a
+# malformed request, an auth failure) are not rerouted; only a body that
+# marks a content-policy / safety block triggers the fallover.
+#
+# Providers are tried in priority order (fallback_chain): the stricter model
+# first, the more permissive one as the content-policy fallback.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   make run CONFIG=examples/ai-content-policy-fallback/sb.yml
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing:
+        strategy: fallback_chain
+
+      resilience:
+        content_policy_fallback: true
+
+      providers:
+        - name: strict
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          priority: 1
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+
+        - name: permissive
+          provider_type: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          priority: 2
+          default_model: claude-haiku-4-5
+          model_map:
+            gpt-4o-mini: claude-haiku-4-5
+          models:
+            - gpt-4o-mini

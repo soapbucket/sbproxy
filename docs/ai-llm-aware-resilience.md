@@ -101,6 +101,32 @@ single dispatch (mid-stream racing is out of scope); a single-provider
 origin dispatches normally. Because the operator opted into the extra calls,
 a raced request does not also run the sequential failover loop afterward.
 
+## Content-policy fallback
+
+A provider may refuse a request on content-policy or safety grounds with a
+4xx rather than answer it. With `resilience.content_policy_fallback`, that
+refusal is routed to the next provider in order instead of being returned,
+so an operator can list a more permissive model after a stricter one:
+
+```yaml
+action:
+  type: ai_proxy
+  routing:
+    strategy: fallback_chain   # providers are tried in priority order
+  resilience:
+    content_policy_fallback: true
+  providers:
+    - { name: strict, provider_type: openai, api_key: ${OPENAI_API_KEY}, priority: 1, models: [gpt-4o] }
+    - { name: permissive, provider_type: anthropic, api_key: ${ANTHROPIC_API_KEY}, priority: 2, models: [claude-sonnet-4-5] }
+```
+
+The failover only fires when the response body marks a content-policy or
+safety block (a plain `400` bad request is not rerouted). Reading the body
+to classify consumes the response, so a 4xx that is not a content-policy
+refusal, or one with no more permissive provider left to try, is returned as
+a passthrough rather than re-wrapped through the relay. A refusal embedded in
+a 200 response is a valid completion and is not intercepted. Off by default.
+
 ## What is adaptive, and what fails over
 
 Adaptive cooldowns are already in effect when `circuit_breaker` or

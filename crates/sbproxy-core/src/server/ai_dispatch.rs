@@ -1846,9 +1846,18 @@ pub(super) async fn handle_ai_proxy(
         };
     ctx.ai_prompt_tokens_est = estimated_prompt_tokens_for_budget;
 
+    // WOR-1545: content-policy fallback re-routes a refusal to the next
+    // (more permissive) provider, so it needs the loop to iterate the
+    // provider order even when the strategy is not a fallback chain.
+    let content_policy_fallback = config
+        .resilience
+        .as_ref()
+        .map(|r| r.content_policy_fallback)
+        .unwrap_or(false);
+
     // Parse retry config from the action config's routing.retry section.
     // This is done by inspecting the raw handler config.
-    let max_attempts = if is_failover {
+    let max_attempts = if is_failover || content_policy_fallback {
         config.providers.len()
     } else {
         1
@@ -2385,6 +2394,51 @@ pub(super) async fn handle_ai_proxy(
                     // Consume the response body to avoid connection leak.
                     let _ = resp.bytes().await;
                     continue;
+                }
+                // WOR-1545: content-policy fallback. A 4xx may be a
+                // content-policy / safety refusal rather than a client
+                // error; route it to the next (more permissive) provider
+                // instead of returning the refusal. Classifying requires
+                // the body, which consumes the response, so a 4xx that is
+                // NOT a content-policy refusal (or that has no more
+                // permissive provider left) is returned here as a
+                // passthrough rather than re-wrapped through the relay.
+                if content_policy_fallback && (400..500).contains(&status) {
+                    let content_type = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("application/json")
+                        .to_string();
+                    let body_bytes = resp.bytes().await.unwrap_or_default();
+                    let cause = sbproxy_ai::failure_cause::FailureCause::classify(
+                        status,
+                        &String::from_utf8_lossy(&body_bytes),
+                    );
+                    if cause == sbproxy_ai::failure_cause::FailureCause::ContentPolicy
+                        && attempt + 1 < provider_order.len()
+                        && attempt + 1 < max_attempts
+                    {
+                        ctx.ai_outcome = Some("content_filter".to_string());
+                        let to_provider = provider_order
+                            .get(attempt + 1)
+                            .map(|&i| config.providers[i].name.clone())
+                            .unwrap_or_default();
+                        sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
+                        sbproxy_ai::ai_metrics::record_failover(
+                            &provider.name,
+                            &to_provider,
+                            "content_policy",
+                        );
+                        warn!(
+                            provider = %provider.name,
+                            to = %to_provider,
+                            "AI proxy: content-policy refusal, failing over to a more permissive provider"
+                        );
+                        continue;
+                    }
+                    sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
+                    return send_response(session, status, &content_type, &body_bytes).await;
                 }
                 // WOR-1103: this provider's response is the one we keep.
                 // HTTP error statuses still count as provider-attempt
