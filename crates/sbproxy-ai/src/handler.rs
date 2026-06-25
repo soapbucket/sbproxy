@@ -346,6 +346,12 @@ pub struct AiResilienceConfig {
     /// policy. `None` leaves the request path unchanged.
     #[serde(default)]
     pub llm_aware: Option<LlmAwareConfig>,
+    /// WOR-1545: when true, a content-policy refusal (a 4xx whose body marks
+    /// a content-policy / safety block) fails over to the next provider in
+    /// order instead of returning the refusal, so an operator can list a
+    /// more permissive model after a stricter one. Off by default.
+    #[serde(default)]
+    pub content_policy_fallback: bool,
 }
 
 /// LLM-aware failover actions (WOR-1545).
