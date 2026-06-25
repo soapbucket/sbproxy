@@ -28,6 +28,8 @@
 //! The single public re-export is [`MeshNode`], a lightweight handle
 //! returned from [`bootstrap::bootstrap`].
 
+#![deny(missing_docs)]
+
 pub mod backend;
 pub mod backoff;
 pub mod bootstrap;

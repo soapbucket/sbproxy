@@ -7,7 +7,9 @@ use super::MeshMessage;
 
 /// Configuration for the WebSocket transport listener.
 pub struct WebSocketTransportConfig {
+    /// Address the WebSocket listener binds.
     pub bind_addr: String,
+    /// TCP port the listener binds.
     pub port: u16,
 }
 

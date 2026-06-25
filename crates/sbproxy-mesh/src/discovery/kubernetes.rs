@@ -5,8 +5,11 @@ use super::Discovery;
 
 /// Discovers mesh peers by querying the Kubernetes API for matching pods.
 pub struct KubernetesDiscovery {
+    /// Namespace to search for peer pods.
     pub namespace: String,
+    /// Label selector matching the peer pods.
     pub label_selector: String,
+    /// Gossip port to contact discovered peers on.
     pub port: u16,
     /// Kubernetes API base URL. Defaults to `<https://kubernetes.default.svc>`.
     pub api_url: String,

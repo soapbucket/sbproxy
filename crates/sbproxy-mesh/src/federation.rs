@@ -30,10 +30,13 @@ use std::sync::Arc;
 /// drive the loop without a full `MeshConfig`.
 #[derive(Debug, Clone)]
 pub struct FederationRuntimeConfig {
+    /// Identifier for this cluster within the federation.
     pub cluster_id: String,
     /// If empty, peers are discovered via SMEMBERS(fed:clusters).
     pub peers: Vec<String>,
+    /// How often to sync state with peer clusters, in seconds.
     pub sync_interval_secs: u64,
+    /// When true, pull state from peers but do not publish our own.
     pub read_only: bool,
 }
 

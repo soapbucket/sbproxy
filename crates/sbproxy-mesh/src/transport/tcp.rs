@@ -7,7 +7,9 @@ use super::MeshMessage;
 
 /// Configuration for the TCP transport listener.
 pub struct TcpTransportConfig {
+    /// Address the TCP listener binds.
     pub bind_addr: String,
+    /// TCP port the listener binds.
     pub port: u16,
 }
 

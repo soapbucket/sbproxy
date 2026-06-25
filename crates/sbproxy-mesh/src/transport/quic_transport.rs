@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 
 /// Configuration for the QUIC transport layer.
 pub struct QuicTransportConfig {
+    /// Socket address the QUIC listener binds.
     pub bind_addr: SocketAddr,
     /// PEM-encoded certificate for this node (optional - mesh CA may be used).
     pub cert_pem: Option<Vec<u8>>,

@@ -323,15 +323,19 @@ impl Default for MeshFederationConfig {
 /// routine.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct DiscoveryConfig {
+    /// Kubernetes API-based peer discovery, when configured.
     #[serde(default)]
     pub kubernetes: Option<KubernetesDiscoveryConfig>,
 
+    /// DNS-based peer discovery, when configured.
     #[serde(default)]
     pub dns: Option<DnsDiscoveryConfig>,
 
+    /// Cloud-provider tag-based peer discovery, when configured.
     #[serde(default)]
     pub cloud: Option<CloudDiscoveryConfig>,
 
+    /// Consul service-catalog-based peer discovery, when configured.
     #[serde(default)]
     pub consul: Option<ConsulDiscoveryConfig>,
 }
@@ -340,8 +344,11 @@ pub struct DiscoveryConfig {
 /// [`crate::discovery::kubernetes::KubernetesDiscovery`].
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct KubernetesDiscoveryConfig {
+    /// Namespace to search for peer pods.
     pub namespace: String,
+    /// Label selector matching the peer pods.
     pub label_selector: String,
+    /// Gossip port to contact discovered peers on.
     #[serde(default = "default_gossip_port")]
     pub port: u16,
 }
@@ -350,7 +357,9 @@ pub struct KubernetesDiscoveryConfig {
 /// [`crate::discovery::dns::DnsDiscovery`].
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DnsDiscoveryConfig {
+    /// DNS name to resolve for peer addresses (e.g. a headless service).
     pub hostname: String,
+    /// Gossip port to contact resolved peers on.
     #[serde(default = "default_gossip_port")]
     pub port: u16,
 }
@@ -361,9 +370,13 @@ pub struct DnsDiscoveryConfig {
 pub struct CloudDiscoveryConfig {
     /// `"aws"`, `"gcp"`, or `"azure"`.
     pub provider: String,
+    /// Instance tag key to match when listing peers.
     pub tag_key: String,
+    /// Instance tag value to match when listing peers.
     pub tag_value: String,
+    /// Cloud region to query.
     pub region: String,
+    /// Gossip port to contact discovered peers on.
     #[serde(default = "default_gossip_port")]
     pub port: u16,
 }
@@ -372,10 +385,14 @@ pub struct CloudDiscoveryConfig {
 /// [`crate::discovery::consul::ConsulDiscovery`].
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ConsulDiscoveryConfig {
+    /// Consul HTTP API address.
     pub addr: String,
+    /// Service name to look up in the catalog.
     pub service: String,
+    /// Consul datacenter to query. Defaults to the agent's when unset.
     #[serde(default)]
     pub datacenter: Option<String>,
+    /// ACL token for the Consul API, if the cluster requires one.
     #[serde(default)]
     pub token: Option<String>,
 }

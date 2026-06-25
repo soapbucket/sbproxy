@@ -55,22 +55,34 @@ pub struct Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CacheOp {
     /// Fetch the value associated with `key`, if any.
-    Get { key: String },
+    Get {
+        /// Key to fetch.
+        key: String,
+    },
     /// Store `value` under `key`, overwriting any prior value. `ttl_secs`
     /// bounds the entry's lifetime on the owning node; `0` means no expiry.
     Put {
+        /// Key to store under.
         key: String,
+        /// Value bytes to store.
         value: Bytes,
+        /// Lifetime in seconds; `0` means no expiry.
         ttl_secs: u64,
     },
     /// Remove `key` from the cache; no-op if the key is absent.
-    Delete { key: String },
+    Delete {
+        /// Key to remove.
+        key: String,
+    },
     /// Delete every local entry whose key starts with `prefix`. An empty
     /// `prefix` means "purge every entry" (used to implement
     /// `PurgeScope::All`). The server replies with
     /// [`CacheResult::Purged`] carrying the number of entries removed on
     /// its local shard.
-    PurgePrefix { prefix: String },
+    PurgePrefix {
+        /// Key prefix to match; an empty prefix purges every entry.
+        prefix: String,
+    },
 }
 
 /// Server reply to a [`Request`]. Carries the original `request_id` so the

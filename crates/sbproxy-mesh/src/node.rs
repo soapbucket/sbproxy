@@ -39,11 +39,17 @@ impl std::fmt::Display for NodeId {
 /// Full information about a mesh node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
+    /// Stable identifier for this node.
     pub id: NodeId,
+    /// Address this node advertises to peers.
     pub advertise_addr: String,
+    /// UDP port for the SWIM gossip protocol.
     pub gossip_port: u16,
+    /// TCP port for the cache RPC transport.
     pub transport_port: u16,
+    /// When the node joined, as an ISO 8601 timestamp string.
     pub joined_at: String,
+    /// Free-form key/value labels attached to the node.
     pub metadata: HashMap<String, String>,
 }
 

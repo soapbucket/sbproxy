@@ -13,10 +13,15 @@ use serde::{Deserialize, Serialize};
 /// A complete snapshot of a node's CRDT state, ready to be persisted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedState {
+    /// Per-key rate-limit G-Counters.
     pub rate_counters: HashMap<String, crate::state::counter::GCounter>,
+    /// Blocked-IP OR-Set.
     pub blocked_ips: crate::state::set::ORSet,
+    /// Blocked-user OR-Set.
     pub blocked_users: crate::state::set::ORSet,
+    /// Per-session last-writer-wins registers.
     pub sessions: HashMap<String, crate::state::register::LWWRegister>,
+    /// Latest broadcast config version, if any.
     pub config_version: Option<crate::state::config_broadcast::ConfigVersion>,
     /// Unix timestamp (seconds) when this snapshot was saved.
     pub saved_at: u64,

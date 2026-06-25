@@ -137,15 +137,24 @@ pub const MAX_UPDATES_PER_MSG: usize = 16;
 pub enum GossipMsg {
     /// Back-compat / legacy. Not emitted by K4; accepted on the receive
     /// path so pre-K4 tests keep round-tripping through the gossip codec.
-    Heartbeat { node_id: String, ts_ms: u64 },
+    Heartbeat {
+        /// Originating node id.
+        node_id: String,
+        /// Send time in epoch milliseconds.
+        ts_ms: u64,
+    },
     /// Reserved for future dynamic-membership join.
     Join {
+        /// Id of the joining node.
         node_id: String,
+        /// Address the joining node advertises to peers.
         advertise_addr: String,
     },
     /// SWIM direct probe. Carries piggybacked state deltas (L1).
     Ping {
+        /// Per-probe sequence number, echoed in the matching `Ack`.
         seq: u64,
+        /// Node id of the sender.
         from: String,
         /// Piggybacked state deltas. Bounded by [`MAX_UPDATES_PER_MSG`].
         updates: Vec<PeerUpdate>,
@@ -153,7 +162,9 @@ pub enum GossipMsg {
     /// Response to either a direct `Ping` or a witness's proxied ping.
     /// Carries piggybacked state deltas (L1).
     Ack {
+        /// Sequence number echoed from the `Ping`.
         seq: u64,
+        /// Node id of the responder.
         from: String,
         /// Piggybacked state deltas. Bounded by [`MAX_UPDATES_PER_MSG`].
         updates: Vec<PeerUpdate>,
@@ -163,17 +174,25 @@ pub enum GossipMsg {
     /// (the originator carries this so the witness does not need an
     /// out-of-band address book).
     PingReq {
+        /// Per-probe sequence number.
         seq: u64,
+        /// Node id of the originator requesting the indirect probe.
         from: String,
+        /// Node id the witness should ping.
         target: String,
+        /// Socket address the witness should probe `target` at.
         target_addr: String,
     },
     /// Relayed result of a `PingReq`. `alive == true` means the witness
     /// got an ACK from `target` within its own direct-ping window.
     IndirectAck {
+        /// Sequence number echoed from the `PingReq`.
         seq: u64,
+        /// Node id of the witness relaying the result.
         from: String,
+        /// Node id that was probed.
         target: String,
+        /// Whether the witness got an ACK from `target`.
         alive: bool,
     },
 }

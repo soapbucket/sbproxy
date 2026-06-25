@@ -22,8 +22,11 @@ pub enum MemberState {
 /// A single member tracked by the membership list.
 #[derive(Debug, Clone)]
 pub struct Member {
+    /// Node identity and addressing for this member.
     pub info: NodeInfo,
+    /// Current membership state (alive, suspect, or dead).
     pub state: MemberState,
+    /// When this member was last heard from.
     pub last_seen: Instant,
 }
 

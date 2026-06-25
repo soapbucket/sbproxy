@@ -71,11 +71,17 @@ pub struct MeshBridge {
 /// A snapshot of one mesh group's state, exchanged between bridges.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeStateSnapshot {
+    /// Name of the mesh group this snapshot describes.
     pub group_name: String,
+    /// Number of nodes in the group at snapshot time.
     pub node_count: usize,
+    /// Per-key rate-limit counter totals.
     pub rate_limit_counters: HashMap<String, u64>,
+    /// IPs currently blocked across the group.
     pub blocked_ips: Vec<String>,
+    /// User identifiers currently blocked across the group.
     pub blocked_users: Vec<String>,
+    /// Send time in epoch milliseconds.
     pub timestamp: u64,
 }
 
