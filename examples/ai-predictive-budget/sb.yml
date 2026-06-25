@@ -1,0 +1,45 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: predictive budgets with soft-landing.
+#
+# A fixed-window budget blocks at 100% of the cap, a hard cliff. Soft-
+# landing degrades gracefully as a scope approaches its limit: warn past
+# `warn_at`, downgrade to a cheaper model past `downgrade_at`, and only then
+# hard-block at the cap. The downgrade is recorded on the usage record (and
+# the verifiable ledger) via a `budget_soft_landing` tag, and the live
+# fraction is exposed to the AI policy plane as `ai.budget.fraction`.
+#
+# Here the workspace has a $10/day cap. At 80% spent, requests warn; at 95%
+# they downgrade to gpt-4o-mini; at 100% they block.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#   make run CONFIG=examples/ai-predictive-budget/sb.yml
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o
+          models:
+            - gpt-4o
+            - gpt-4o-mini
+
+      budget:
+        limits:
+          - scope: workspace
+            max_cost_usd: 10.0
+            period: daily
+        on_exceed: block
+        soft_landing:
+          warn_at: 0.8
+          downgrade_at: 0.95
+          downgrade_to: gpt-4o-mini

@@ -754,6 +754,11 @@ pub struct RequestContext {
     /// global routing feedback store. Set by `handle_ai_proxy` only when
     /// the origin uses the `outcome_aware` routing strategy.
     pub ai_record_routing_feedback: bool,
+    /// WOR-1544: tightest active budget-window fraction consumed (0.0 to
+    /// just under 1.0), computed by the predictive soft-landing check.
+    /// Surfaced to the AI policy plane's `ai.budget.*` namespace. `0.0`
+    /// when no budget is configured.
+    pub ai_budget_fraction: f64,
     /// Inbound `ChatFormat` id when the request entered on a native
     /// shim path (`anthropic` for `/v1/messages`, `responses` for
     /// `/v1/responses`). `None` (or `"openai"`) for the canonical
@@ -1103,6 +1108,7 @@ impl RequestContext {
             ai_policy_sink_tag: None,
             ai_guardrail_labels: Vec::new(),
             ai_record_routing_feedback: false,
+            ai_budget_fraction: 0.0,
             ai_inbound_format: None,
             ai_native_bypass: false,
             ai_admission: None,

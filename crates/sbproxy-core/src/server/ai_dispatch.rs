@@ -950,7 +950,64 @@ pub(super) async fn handle_ai_proxy(
             tag_header.as_deref(),
         );
         match budget_preflight(budget_cfg, &keys, &config.providers) {
-            BudgetGate::Allow => keys,
+            BudgetGate::Allow => {
+                // WOR-1544: predictive soft-landing. Below the hard cap,
+                // warn and then downgrade as a scope approaches its
+                // window limit, instead of a cliff at 100%.
+                if budget_cfg.soft_landing.is_some() {
+                    let decision = BUDGET_TRACKER.soft_landing(budget_cfg, &keys);
+                    ctx.ai_budget_fraction = decision.fraction;
+                    match decision.action {
+                        sbproxy_ai::budget::SoftLandingAction::Warn => {
+                            tracing::warn!(
+                                fraction = decision.fraction,
+                                "AI budget: approaching limit (soft-landing warn)"
+                            );
+                            keys
+                        }
+                        sbproxy_ai::budget::SoftLandingAction::Downgrade { to } => {
+                            let target = to.or_else(|| {
+                                let mut candidates: Vec<String> = Vec::new();
+                                for p in &config.providers {
+                                    for m in &p.models {
+                                        candidates.push(m.as_str().to_string());
+                                    }
+                                }
+                                sbproxy_ai::cheapest_model(&candidates)
+                            });
+                            match target {
+                                Some(new_model) if new_model != model => {
+                                    tracing::warn!(
+                                        fraction = decision.fraction,
+                                        new_model = %new_model,
+                                        "AI budget: soft-landing downgrade before hard cap"
+                                    );
+                                    model = new_model.clone();
+                                    body["model"] = serde_json::Value::String(new_model);
+                                    // Record the soft-landing in the usage
+                                    // record / ledger via the policy tag,
+                                    // without clobbering an explicit tag.
+                                    ctx.ai_policy_sink_tag
+                                        .get_or_insert_with(|| "budget_soft_landing".to_string());
+                                    budget_scope_keys(
+                                        budget_cfg,
+                                        hostname,
+                                        auth_header.as_deref(),
+                                        user_header.as_deref(),
+                                        Some(model.as_str()),
+                                        Some(hostname),
+                                        tag_header.as_deref(),
+                                    )
+                                }
+                                _ => keys,
+                            }
+                        }
+                        sbproxy_ai::budget::SoftLandingAction::None => keys,
+                    }
+                } else {
+                    keys
+                }
+            }
             BudgetGate::Block { status, body: err } => {
                 sbproxy_ai::tracing_spans::record_error(
                     &ai_span,
@@ -1328,8 +1385,9 @@ pub(super) async fn handle_ai_proxy(
             tier: ctx.attribution_tags.risk_tier.clone().unwrap_or_default(),
             // Populated by the guardrail mesh (WOR-1543) when configured.
             guardrail_labels: ctx.ai_guardrail_labels.clone(),
-            budget_fraction: 0.0,
-            budget_exceeded: false,
+            // Populated by predictive soft-landing (WOR-1544).
+            budget_fraction: ctx.ai_budget_fraction,
+            budget_exceeded: ctx.ai_budget_fraction >= 1.0,
             input_tokens_est: ctx.ai_prompt_tokens_est.unwrap_or(0) as i64,
         };
         let decision = policy.evaluate(&view);
