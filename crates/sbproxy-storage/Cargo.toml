@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Soap Bucket LLC
+
+[package]
+name = "sbproxy-storage"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Storage abstraction (ephemeral KV, persistent KV, set, pub/sub) with a Redis backend, shared by the OSS mesh and the dynamic key plane."
+
+[features]
+default = ["redis"]
+# Redis backend (RedisStore) and its async deps.
+redis = ["dep:redis", "dep:futures"]
+# In-memory test doubles for trait-driven tests in downstream crates.
+mock = []
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+prometheus = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+redis = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

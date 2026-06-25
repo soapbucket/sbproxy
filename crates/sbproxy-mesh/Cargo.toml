@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Soap Bucket LLC
+
+[package]
+name = "sbproxy-mesh"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Distributed clustering layer for sbproxy: SWIM gossip, CRDTs, and a consistent-hash distributed cache. Backs the dynamic key plane's clusterwide cache tier and cross-replica counters."
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+arc-swap = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
+hostname = "0.4"
+prometheus = { workspace = true }
+bincode = "1.3"
+# Async Redis client for the backend/redis.rs persistence + federation paths.
+redis = { workspace = true }
+# Storage trait surface (PersistentKv + EphemeralKv + SetKv) + RedisStore.
+sbproxy-storage = { workspace = true, features = ["redis"] }
+# AES-256-GCM encryption for gossip + transport (opt-in via shared_key).
+aes-gcm = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+# X.509 chain verification for peer mTLS. rustls-webpki is ISC-licensed (a
+# permissive, Apache-2.0-compatible license), so it ships in the default build.
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "ring"] }
+rustls-pki-types = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"
+rcgen = { workspace = true }
+sbproxy-storage = { workspace = true, features = ["mock", "redis"] }
