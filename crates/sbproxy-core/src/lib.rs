@@ -46,6 +46,8 @@ pub mod identity;
 pub mod key_plane;
 /// WOR-1562: mesh distributed-cache tier for the key plane.
 pub mod mesh_cache;
+/// WOR-1563: distributed per-key spend + rate counters via mesh CRDTs.
+pub mod mesh_counters;
 pub mod pipeline;
 /// Policy verdict audit event bus.
 ///

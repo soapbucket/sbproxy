@@ -1024,6 +1024,12 @@ pub(super) async fn handle_ai_proxy(
                     send_error(session, 429, "rate limit exceeded for this key").await?;
                     return Ok(());
                 }
+                // WOR-1563: record the request into the cross-replica rate
+                // counter (mesh CRDT) so a key's fleet-wide rate is visible to
+                // every replica. No-op unless the mesh tier is enabled.
+                if let Some(counters) = crate::mesh_counters::current_mesh_counters() {
+                    counters.record_request(&vk.key);
+                }
                 // WOR-893: per-key model routing. When the key pins a
                 // model, overwrite the request body's `model` field so
                 // the downstream allow/block, routing, budget, and
