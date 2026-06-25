@@ -6609,6 +6609,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbproxy-keystore"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "hex",
+ "hmac",
+ "parking_lot",
+ "rand 0.8.6",
+ "redb",
+ "redis",
+ "sbproxy-vault",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sbproxy-middleware"
 version = "0.1.0"
 dependencies = [
