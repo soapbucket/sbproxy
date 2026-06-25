@@ -347,10 +347,20 @@ model_list:
         let out = translate_litellm(input).expect("translate ok");
         compile_config(&out.sb_yaml).expect("compiles");
         let action = action_of(&out.sb_yaml);
-        let mrl = action.get("model_rate_limits").unwrap().as_mapping().unwrap();
+        let mrl = action
+            .get("model_rate_limits")
+            .unwrap()
+            .as_mapping()
+            .unwrap();
         let limits = mrl.get(serde_yaml::Value::from("gpt-4")).unwrap();
-        assert_eq!(limits.get("requests_per_minute").unwrap().as_u64(), Some(100));
-        assert_eq!(limits.get("tokens_per_minute").unwrap().as_u64(), Some(200000));
+        assert_eq!(
+            limits.get("requests_per_minute").unwrap().as_u64(),
+            Some(100)
+        );
+        assert_eq!(
+            limits.get("tokens_per_minute").unwrap().as_u64(),
+            Some(200000)
+        );
     }
 
     #[test]
@@ -382,7 +392,9 @@ model_list:
         let out = translate_litellm(input).expect("translate ok");
         compile_config(&out.sb_yaml).expect("compiles");
         assert!(
-            out.warnings.iter().any(|w| w.contains("some_unknown_kwarg")),
+            out.warnings
+                .iter()
+                .any(|w| w.contains("some_unknown_kwarg")),
             "expected a warning naming the unmapped key, got {:?}",
             out.warnings
         );
@@ -423,7 +435,9 @@ guardrails:
         let out = translate_litellm(input).expect("translate ok");
         compile_config(&out.sb_yaml).expect("compiles");
         assert!(
-            out.warnings.iter().any(|w| w.to_lowercase().contains("guardrail")),
+            out.warnings
+                .iter()
+                .any(|w| w.to_lowercase().contains("guardrail")),
             "expected a guardrails warning, got {:?}",
             out.warnings
         );
@@ -442,8 +456,10 @@ litellm_settings:
         let out = translate_litellm(input).expect("translate ok");
         compile_config(&out.sb_yaml).expect("compiles");
         assert!(
-            out.warnings.iter().any(|w| w.to_lowercase().contains("callback")
-                && w.contains("my_module.MyCustomHandler")),
+            out.warnings
+                .iter()
+                .any(|w| w.to_lowercase().contains("callback")
+                    && w.contains("my_module.MyCustomHandler")),
             "expected a warning about the Python callback, got {:?}",
             out.warnings
         );
@@ -463,7 +479,10 @@ router_settings:
         compile_config(&out.sb_yaml).expect("compiles");
         let action = action_of(&out.sb_yaml);
         // LiteLLM latency-based-routing -> sbproxy lowest_latency.
-        assert_eq!(action.get("routing").unwrap().as_str(), Some("lowest_latency"));
+        assert_eq!(
+            action.get("routing").unwrap().as_str(),
+            Some("lowest_latency")
+        );
     }
 
     #[test]
@@ -501,7 +520,10 @@ router_settings:
             .iter()
             .map(|p| p.get("name").unwrap().as_str().unwrap().to_string())
             .collect();
-        assert_ne!(names[0], names[1], "deployments get distinct provider names");
+        assert_ne!(
+            names[0], names[1],
+            "deployments get distinct provider names"
+        );
     }
 
     #[test]

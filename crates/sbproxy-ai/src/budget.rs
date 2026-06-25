@@ -649,7 +649,11 @@ pub fn parse_budget_period(period: &str) -> Result<Option<std::time::Duration>, 
         "m" => n * 60,
         "h" => n * 3_600,
         "d" => n * 86_400,
-        other => return Err(format!("budget period '{period}' has unknown unit '{other}'")),
+        other => {
+            return Err(format!(
+                "budget period '{period}' has unknown unit '{other}'"
+            ))
+        }
     };
     Ok(Some(Duration::from_secs(secs)))
 }

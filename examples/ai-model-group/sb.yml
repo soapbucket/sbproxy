@@ -1,0 +1,49 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: model group (one public model name, several deployments).
+#
+# LiteLLM's core load-balancing abstraction is the "model group": several
+# deployments share one public model name and requests are spread across them.
+# sbproxy expresses this directly: list each deployment as a provider that
+# declares the same model in its `models` list. The requested model selects the
+# group (model-based routing), and the routing strategy load-balances across the
+# matching deployments. A failing deployment is ejected by outlier detection
+# without taking the group offline.
+#
+# Here two OpenAI deployments back the public name `gpt-4o-mini`. In production
+# they would be distinct deployments or regions with their own keys/base_urls
+# (e.g. OpenAI plus an Azure OpenAI deployment of the same model).
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#   make run CONFIG=examples/ai-model-group/sb.yml
+#
+# Test (every request addresses the one public name; the group load-balances):
+#   curl -s http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"In one sentence, what is load balancing?"}]}' \
+#     | jq -r '.model, .choices[0].message.content'
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+
+      providers:
+        - name: openai-deployment-a
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+
+        - name: openai-deployment-b
+          provider_type: openai
+          # In production this would be a second deployment's key / base_url.
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
