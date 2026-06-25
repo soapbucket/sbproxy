@@ -123,7 +123,10 @@ fn key_lifecycle_mint_use_revoke_rotate() {
     let token = v["token"].as_str().unwrap().to_string();
     let key_id = v["key"]["key_id"].as_str().unwrap().to_string();
     assert!(token.starts_with("sk-"));
-    assert!(!body.contains("secret_hash"), "response must not leak the hash");
+    assert!(
+        !body.contains("secret_hash"),
+        "response must not leak the hash"
+    );
 
     // A valid key passes the virtual-key gate (then fails at the dead upstream).
     assert!(

@@ -6475,6 +6475,7 @@ dependencies = [
  "sbproxy-extension",
  "sbproxy-httpkit",
  "sbproxy-keystore",
+ "sbproxy-mesh",
  "sbproxy-middleware",
  "sbproxy-modules",
  "sbproxy-observe",
