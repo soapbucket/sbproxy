@@ -214,24 +214,50 @@ fn build_cache(cfg: &KeyManagementConfig, store: Arc<dyn KeyStore>) -> Arc<TtlCa
         fail_closed: !cfg.failure_mode_allow,
     };
     let mut cache = TtlCache::new(store, cache_cfg);
-    if cfg.cache.tier == KeyCacheTier::Redis {
-        let url = cfg
-            .cache
-            .redis_url
-            .clone()
-            .or_else(|| cfg.store.url.clone());
-        if let Some(url) = url {
-            cache = cache.with_tier(Arc::new(
-                sbproxy_keystore::redis_store::RedisCacheTier::new(url),
-            ));
-        } else {
-            tracing::warn!(
-                "key_management.cache.tier = redis but no redis_url (or store url) is set; \
-                 running with the in-memory tier only"
-            );
+    match cfg.cache.tier {
+        KeyCacheTier::None => {}
+        KeyCacheTier::Redis => {
+            let url = cfg
+                .cache
+                .redis_url
+                .clone()
+                .or_else(|| cfg.store.url.clone());
+            if let Some(url) = url {
+                cache = cache.with_tier(Arc::new(
+                    sbproxy_keystore::redis_store::RedisCacheTier::new(url),
+                ));
+            } else {
+                tracing::warn!(
+                    "key_management.cache.tier = redis but no redis_url (or store url) is set; \
+                     running with the in-memory tier only"
+                );
+            }
+        }
+        KeyCacheTier::Mesh => {
+            // Replicate cache state across the replica fleet via the mesh
+            // gossip + consistent-hash ring. Standalone until the node joins a
+            // mesh; node id defaults to the machine hostname.
+            let node_id = cfg
+                .cache
+                .mesh_node_id
+                .clone()
+                .unwrap_or_else(default_node_id);
+            cache = cache.with_tier(Arc::new(crate::mesh_cache::MeshCacheTier::standalone(
+                &node_id,
+            )));
         }
     }
     Arc::new(cache)
+}
+
+/// The default mesh node id: the `HOSTNAME` environment variable (set per pod
+/// in most container schedulers), falling back to a fixed name. Operators set
+/// `key_management.cache.mesh_node_id` for an explicit, unique id.
+fn default_node_id() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "sbproxy-node".to_string())
 }
 
 fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {

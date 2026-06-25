@@ -78,6 +78,10 @@ sbproxy-security.workspace = true
 # Redis backend/tier + cross-replica invalidation enabled here so the assembly
 # in `key_plane.rs` can build either backend from config.
 sbproxy-keystore = { workspace = true, features = ["embedded", "redis-backend"] }
+# WOR-1562/1563: the mesh distributed-cache tier + CRDT spend/rate counters for
+# the key plane (consistent-hash ring, gossip replication, G-Counter, sliding
+# window). Pulls sbproxy-mesh transitively.
+sbproxy-mesh = { workspace = true }
 # Agent-detect engine (WOR-499). The pipeline runs the scorer per request
 # when enabled and stashes the AgentDetection on the request context for the
 # scripting bridges and the trust_tier combiner. Non-optional: behaviour is

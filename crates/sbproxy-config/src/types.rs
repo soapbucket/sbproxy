@@ -803,6 +803,10 @@ pub struct KeyCacheConfig {
     /// the store URL when unset.
     #[serde(default)]
     pub redis_url: Option<String>,
+    /// Node id for the mesh cache tier (when `tier: mesh`). Defaults to the
+    /// machine hostname. Entries replicate across the mesh via gossip.
+    #[serde(default)]
+    pub mesh_node_id: Option<String>,
 }
 
 impl Default for KeyCacheConfig {
@@ -813,6 +817,7 @@ impl Default for KeyCacheConfig {
             max_entries: default_key_cache_max_entries(),
             tier: KeyCacheTier::None,
             redis_url: None,
+            mesh_node_id: None,
         }
     }
 }

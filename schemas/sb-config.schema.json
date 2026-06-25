@@ -1375,6 +1375,7 @@
           "description": "In-memory policy cache in front of the store.",
           "default": {
             "max_entries": 10000,
+            "mesh_node_id": null,
             "negative_ttl_secs": 5,
             "redis_url": null,
             "tier": "none",
@@ -1542,6 +1543,14 @@
         },
         "redis_url": {
           "description": "Redis URL for the redis cache tier (when `tier: redis`). Falls back to the store URL when unset.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mesh_node_id": {
+          "description": "Node id for the mesh cache tier (when `tier: mesh`). Defaults to the machine hostname. Entries replicate across the mesh via gossip.",
           "default": null,
           "type": [
             "string",

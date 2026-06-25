@@ -44,6 +44,8 @@ pub mod hooks;
 pub mod identity;
 /// WOR-1546: dynamic key plane assembly + process-global handle.
 pub mod key_plane;
+/// WOR-1562: mesh distributed-cache tier for the key plane.
+pub mod mesh_cache;
 pub mod pipeline;
 /// Policy verdict audit event bus.
 ///
