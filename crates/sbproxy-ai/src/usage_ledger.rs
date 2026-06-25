@@ -44,7 +44,7 @@ pub struct LedgerEntry {
     /// RFC 3339 timestamp at which the entry was recorded. Part of the
     /// hashed material, so it is tamper-evident too.
     pub recorded_at: String,
-    /// Hex `entry_hash` of the preceding entry, or [`GENESIS_HASH`] for
+    /// Hex `entry_hash` of the preceding entry, or the genesis hash for
     /// the first one.
     pub prev_hash: String,
     /// Hex SHA-256 over `prev_hash || seq || recorded_at || event`.

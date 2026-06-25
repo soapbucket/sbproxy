@@ -133,7 +133,7 @@ impl FeedbackStore {
             .unwrap_or(0)
     }
 
-    /// True when any candidate still has fewer than [`MIN_SAMPLES`]
+    /// True when any candidate still has fewer than `MIN_SAMPLES`
     /// samples. The outcome-aware strategy keeps round-robining while this
     /// holds, so every provider earns an estimate before the store commits
     /// to the cheapest-per-success one.
@@ -144,7 +144,7 @@ impl FeedbackStore {
     /// Pick the best candidate by realized cost-per-success.
     ///
     /// Returns the index into `candidates`. A candidate that is still
-    /// warming up (fewer than [`MIN_SAMPLES`] samples) is explored first so
+    /// warming up (fewer than `MIN_SAMPLES` samples) is explored first so
     /// every provider earns an estimate before the store commits to the
     /// cheapest-per-success one. With all candidates warmed up, the lowest
     /// score wins. Returns `None` for an empty slice.

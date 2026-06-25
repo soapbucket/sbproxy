@@ -124,7 +124,7 @@ fn cache_key(pipeline: &GuardrailPipeline, content: &str) -> u64 {
     h.finish()
 }
 
-/// Process-wide verdict cache. Keyed by [`cache_key`], so it is correct
+/// Process-wide verdict cache. Keyed by `cache_key`, so it is correct
 /// across origins with different guardrail sets. Holds the flagged labels +
 /// reasons for a given prompt.
 type CacheEntry = (Vec<String>, Vec<String>);
