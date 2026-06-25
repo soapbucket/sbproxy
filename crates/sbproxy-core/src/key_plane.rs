@@ -1,8 +1,8 @@
 //! WOR-1546: assembly and process-global handle for the dynamic key plane.
 //!
-//! The `key_management:` config block is lowered here into a live [`KeyPlane`]:
-//! a [`KeyCrypto`] handle (pepper + master), a [`KeyStore`] backend, and a
-//! fail-closed [`TtlCache`] in front of it. The plane is held in a global
+//! The `key_management:` config block is lowered here into a live `KeyPlane`:
+//! a `KeyCrypto` handle (pepper + master), a `KeyStore` backend, and a
+//! fail-closed `TtlCache` in front of it. The plane is held in a global
 //! `ArcSwapOption` (like the rate-limit registry and the compiled pipeline) so
 //! the auth dispatch and the admin API resolve against one shared instance.
 //!
@@ -147,7 +147,7 @@ fn resolve_secret_material(reference: &str) -> Result<Vec<u8>> {
     Ok(reference.as_bytes().to_vec())
 }
 
-/// Build the [`KeyCrypto`] handle from config, generating ephemeral secrets
+/// Build the `KeyCrypto` handle from config, generating ephemeral secrets
 /// with a warning when the operator did not pin them.
 fn build_crypto(cfg: &KeyManagementConfig) -> Result<KeyCrypto> {
     let pepper = match &cfg.crypto.pepper {
@@ -204,7 +204,7 @@ fn build_store(cfg: &KeyManagementConfig) -> Result<Arc<dyn KeyStore>> {
     }
 }
 
-/// Build the [`TtlCache`] wrapping `store`, attaching a Redis L2 tier when
+/// Build the `TtlCache` wrapping `store`, attaching a Redis L2 tier when
 /// configured.
 fn build_cache(cfg: &KeyManagementConfig, store: Arc<dyn KeyStore>) -> Arc<TtlCache> {
     let cache_cfg = TtlCacheConfig {

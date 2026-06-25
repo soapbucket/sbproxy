@@ -1,14 +1,12 @@
-//! WOR-1562: mesh distributed-cache tier for the key plane's [`TtlCache`].
+//! WOR-1562: mesh distributed-cache tier for the key plane's `TtlCache`.
 //!
-//! Wraps a mesh [`DistributedCache<Bytes>`] as a key-plane
+//! Wraps a mesh `DistributedCache<Bytes>` as a key-plane
 //! [`CacheTier`](sbproxy_keystore::CacheTier). Records are serialized to JSON
 //! and stored on the local shard with a TTL; the mesh gossip loop replicates
 //! shard state across the cluster, and the consistent-hash ring makes a key's
 //! owner deterministic, so a record cached on one replica is visible to the
 //! others. When the cache is not attached to a running mesh node it degrades to
 //! a local-only second tier with a background sweeper.
-//!
-//! [`TtlCache`]: sbproxy_keystore::TtlCache
 
 use std::sync::Arc;
 use std::time::Duration;

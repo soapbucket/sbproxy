@@ -1,7 +1,7 @@
 //! WOR-1563: distributed per-key spend + rate-limit counters via mesh CRDTs.
 //!
-//! Per-key spend (tokens and cost) is a grow-only [`GCounter`] and per-key
-//! request rate is a [`SlidingWindow`], both keyed by virtual-key id. Each node
+//! Per-key spend (tokens and cost) is a grow-only `GCounter` and per-key
+//! request rate is a `SlidingWindow`, both keyed by virtual-key id. Each node
 //! increments its own slot locally; the mesh gossip loop disseminates the CRDT
 //! state, and merging is monotone, so a budget cap or a rate ceiling is coherent
 //! across the replica fleet (a key spending on replica A is visible to replica
