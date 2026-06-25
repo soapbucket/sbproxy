@@ -12,6 +12,7 @@
 pub mod compiler;
 pub mod duration;
 pub mod listing;
+pub mod litellm;
 pub mod plan;
 pub mod raw;
 pub mod snapshot;

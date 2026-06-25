@@ -220,6 +220,8 @@ struct ConfigCmd {
 enum ConfigSub {
     /// Rewrite deprecated config syntax to the current canonical form.
     Migrate(ConfigMigrateArgs),
+    /// Convert a LiteLLM config.yaml into an equivalent sbproxy sb.yml.
+    ImportLitellm(ImportLitellmArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -227,6 +229,15 @@ struct ConfigMigrateArgs {
     /// Path to the config file to migrate.
     config_path: PathBuf,
     /// Write migrated YAML to this path. Defaults to stdout.
+    #[arg(short = 'o', long = "out")]
+    out: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct ImportLitellmArgs {
+    /// Path to the LiteLLM config.yaml to convert.
+    config_path: PathBuf,
+    /// Write the translated sb.yml to this path. Defaults to stdout.
     #[arg(short = 'o', long = "out")]
     out: Option<PathBuf>,
 }
@@ -690,7 +701,43 @@ fn handle_projections_render(args: &RenderArgs) -> anyhow::Result<()> {
 fn handle_config_subcommand(cmd: &ConfigCmd) -> anyhow::Result<i32> {
     match &cmd.sub {
         ConfigSub::Migrate(args) => handle_config_migrate(args),
+        ConfigSub::ImportLitellm(args) => handle_config_import_litellm(args),
     }
+}
+
+fn handle_config_import_litellm(args: &ImportLitellmArgs) -> anyhow::Result<i32> {
+    let path_str = args.config_path.to_string_lossy();
+    let yaml = std::fs::read_to_string(&args.config_path)
+        .map_err(|e| anyhow::anyhow!("failed to read LiteLLM config '{path_str}': {e}"))?;
+    let translation = sbproxy_config::litellm::translate_litellm(&yaml)?;
+
+    match args.out.as_deref() {
+        Some(out_path) => {
+            let out_str = out_path.to_string_lossy();
+            std::fs::write(out_path, translation.sb_yaml.as_bytes())
+                .map_err(|e| anyhow::anyhow!("failed to write sb.yml '{out_str}': {e}"))?;
+            eprintln!("config import-litellm: wrote {out_str}");
+        }
+        None => {
+            use std::io::Write as _;
+            std::io::stdout().write_all(translation.sb_yaml.as_bytes())?;
+            std::io::stdout().flush()?;
+        }
+    }
+
+    // Warnings go to stderr so stdout stays a clean sb.yml; unmapped keys are
+    // not failures.
+    for w in &translation.warnings {
+        eprintln!("warning: {w}");
+    }
+    if !translation.warnings.is_empty() {
+        eprintln!(
+            "config import-litellm: {} key(s) need manual attention (see warnings above)",
+            translation.warnings.len()
+        );
+    }
+
+    Ok(0)
 }
 
 fn handle_config_migrate(args: &ConfigMigrateArgs) -> anyhow::Result<i32> {
@@ -1316,7 +1363,9 @@ mod tests {
             Some(Cmd::Config(cmd)) => cmd,
             other => panic!("expected Config, got {other:?}"),
         };
-        let ConfigSub::Migrate(args) = cmd.sub;
+        let ConfigSub::Migrate(args) = cmd.sub else {
+            panic!("expected Migrate subcommand");
+        };
         assert_eq!(args.config_path, std::path::PathBuf::from("sb.yml"));
         assert_eq!(args.out, Some(std::path::PathBuf::from("migrated.yml")));
     }

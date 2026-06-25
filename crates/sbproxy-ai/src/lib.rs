@@ -18,6 +18,7 @@ pub mod context_overflow;
 pub mod context_relay;
 pub mod cost_quality;
 pub mod degradation;
+pub mod external_guardrail;
 pub mod fill_first;
 pub mod finetune;
 pub mod format;
@@ -52,6 +53,7 @@ pub mod tracing_spans;
 pub mod translators;
 pub mod types;
 pub mod usage_parser;
+pub mod usage_sink;
 
 pub use batch::{BatchJob, BatchStatus, BatchStore, MemoryBatchStore};
 pub use budget::{cheapest_model, estimate_cost, BudgetConfig, BudgetTracker, OnExceedAction};
