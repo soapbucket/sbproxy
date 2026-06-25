@@ -18,6 +18,7 @@
 //! * [`crypto`] - inbound keys are hashed at rest (HMAC-SHA256 + pepper);
 //!   upstream credentials are sealed in an AEAD [`crypto::Envelope`].
 
+pub mod cache;
 pub mod crypto;
 pub mod memory;
 pub mod record;
@@ -28,6 +29,7 @@ pub mod embedded;
 use anyhow::Result;
 use async_trait::async_trait;
 
+pub use cache::{CacheTier, TtlCache, TtlCacheConfig};
 pub use memory::MemoryKeyStore;
 pub use record::{
     CredentialMaterial, CredentialRecord, KeyRecord, RecordBudget, RecordSource, RecordStatus,
