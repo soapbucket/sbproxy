@@ -263,8 +263,8 @@ impl KeyCrypto {
         verify_secret(secret, &self.pepper, expected_hex)
     }
 
-    /// Verify a presented secret against a [`KeyRecord`], honoring a rotation
-    /// grace window. Keeps the pepper private to this handle.
+    /// Verify a presented secret against a [`KeyRecord`](crate::record::KeyRecord),
+    /// honoring a rotation grace window. Keeps the pepper private to this handle.
     pub fn verify_record(
         &self,
         record: &crate::record::KeyRecord,
