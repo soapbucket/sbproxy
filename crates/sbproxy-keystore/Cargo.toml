@@ -19,6 +19,7 @@ redis-backend = ["dep:redis", "dep:futures"]
 secrets-manager = ["dep:sbproxy-vault"]
 
 [dependencies]
+sbproxy-security.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true

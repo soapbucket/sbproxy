@@ -1,9 +1,17 @@
 //! HKDF key derivation and cryptographic helpers.
 
+use aes_gcm::aead::{rand_core::RngCore, Aead, KeyInit as AeadKeyInit, OsRng, Payload};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
+use anyhow::{anyhow, Result};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// AES-256 key length in bytes.
+pub const AES256_KEY_LEN: usize = 32;
+/// AES-GCM nonce length in bytes (NIST SP 800-38D, 96-bit nonce).
+pub const AES_GCM_NONCE_LEN: usize = 12;
 
 /// HKDF key-derivation purpose.
 ///
@@ -36,6 +44,11 @@ pub enum HkdfPurpose {
     /// `state` + `nonce` + `pkce_verifier` + `return_to` between
     /// the auth-code redirect and the callback.
     OidcTxCookie,
+    /// WOR-1552: master-key derivation for the key-management envelope.
+    /// The per-record data key is wrapped under a key derived from the
+    /// operator master key with this purpose, keeping envelope wrapping
+    /// in a distinct keyspace from cookies and other derivations.
+    KeyEnvelope,
 }
 
 impl HkdfPurpose {
@@ -51,8 +64,72 @@ impl HkdfPurpose {
             HkdfPurpose::EmsContentKey => b"sbproxy.hkdf.ems-content-key.v1",
             HkdfPurpose::OidcSessionCookie => b"sbproxy.hkdf.oidc-session-cookie.v1",
             HkdfPurpose::OidcTxCookie => b"sbproxy.hkdf.oidc-tx-cookie.v1",
+            HkdfPurpose::KeyEnvelope => b"sbproxy.hkdf.key-envelope.v1",
         }
     }
+}
+
+/// Draw a fresh random AES-256 key from the OS CSPRNG.
+pub fn random_aes256_key() -> [u8; AES256_KEY_LEN] {
+    let mut k = [0u8; AES256_KEY_LEN];
+    OsRng.fill_bytes(&mut k);
+    k
+}
+
+/// Draw a fresh random 96-bit AES-GCM nonce from the OS CSPRNG.
+///
+/// NIST SP 800-38D requires the nonce to never repeat under one key. A
+/// 12-byte CSPRNG draw makes the collision probability negligible; rotate the
+/// key well before 2^32 seals under it.
+pub fn random_aes_gcm_nonce() -> [u8; AES_GCM_NONCE_LEN] {
+    let mut n = [0u8; AES_GCM_NONCE_LEN];
+    OsRng.fill_bytes(&mut n);
+    n
+}
+
+/// AES-256-GCM encryption with associated data (AAD).
+///
+/// The AAD is authenticated but not encrypted; binding a record id into it
+/// means a ciphertext cannot be lifted from one record and replayed under
+/// another. Returns the ciphertext with its GCM tag appended.
+pub fn aes256gcm_encrypt(
+    key: &[u8; AES256_KEY_LEN],
+    nonce: &[u8; AES_GCM_NONCE_LEN],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    cipher
+        .encrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|e| anyhow!("aes-256-gcm encrypt failed: {e}"))
+}
+
+/// AES-256-GCM decryption with associated data (AAD), the inverse of
+/// [`aes256gcm_encrypt`]. The AAD must match exactly or the tag fails to
+/// authenticate. The error is intentionally generic (tamper and wrong-key are
+/// indistinguishable to a caller).
+pub fn aes256gcm_decrypt(
+    key: &[u8; AES256_KEY_LEN],
+    nonce: &[u8; AES_GCM_NONCE_LEN],
+    ciphertext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|e| anyhow!("aes-256-gcm decrypt failed: {e}"))
 }
 
 /// Derive a key for a specific [`HkdfPurpose`] using HKDF-SHA256 (RFC 5869).
@@ -274,5 +351,49 @@ mod tests {
     fn hex_decode(s: &str) -> Vec<u8> {
         let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
         hex::decode(cleaned).expect("valid hex")
+    }
+}
+
+#[cfg(test)]
+mod aead_tests {
+    use super::*;
+
+    #[test]
+    fn aes_gcm_roundtrips_with_aad() {
+        let key = random_aes256_key();
+        let nonce = random_aes_gcm_nonce();
+        let ct = aes256gcm_encrypt(&key, &nonce, b"sk-secret-material", b"record-42").unwrap();
+        let pt = aes256gcm_decrypt(&key, &nonce, &ct, b"record-42").unwrap();
+        assert_eq!(pt, b"sk-secret-material");
+    }
+
+    #[test]
+    fn aes_gcm_rejects_wrong_aad() {
+        let key = random_aes256_key();
+        let nonce = random_aes_gcm_nonce();
+        let ct = aes256gcm_encrypt(&key, &nonce, b"secret", b"record-42").unwrap();
+        // A ciphertext bound to record-42 must not open under record-99.
+        assert!(aes256gcm_decrypt(&key, &nonce, &ct, b"record-99").is_err());
+    }
+
+    #[test]
+    fn aes_gcm_rejects_tamper_and_wrong_key() {
+        let key = random_aes256_key();
+        let nonce = random_aes_gcm_nonce();
+        let mut ct = aes256gcm_encrypt(&key, &nonce, b"secret", b"aad").unwrap();
+        let last = ct.len() - 1;
+        ct[last] ^= 0x01;
+        assert!(aes256gcm_decrypt(&key, &nonce, &ct, b"aad").is_err());
+
+        let other = random_aes256_key();
+        let good = aes256gcm_encrypt(&key, &nonce, b"secret", b"aad").unwrap();
+        assert!(aes256gcm_decrypt(&other, &nonce, &good, b"aad").is_err());
+    }
+
+    #[test]
+    fn key_envelope_purpose_has_distinct_keyspace() {
+        let env = hkdf_derive_purpose(b"master", b"", HkdfPurpose::KeyEnvelope, 32);
+        let cookie = hkdf_derive_purpose(b"master", b"", HkdfPurpose::OidcSessionCookie, 32);
+        assert_ne!(env, cookie);
     }
 }
