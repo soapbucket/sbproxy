@@ -74,6 +74,10 @@ sbproxy-cache.workspace = true
 sbproxy-platform.workspace = true
 sbproxy-openapi.workspace = true
 sbproxy-security.workspace = true
+# WOR-1546: the dynamic key plane (mutable store, policy cache, at-rest crypto).
+# Redis backend/tier + cross-replica invalidation enabled here so the assembly
+# in `key_plane.rs` can build either backend from config.
+sbproxy-keystore = { workspace = true, features = ["embedded", "redis-backend"] }
 # Agent-detect engine (WOR-499). The pipeline runs the scorer per request
 # when enabled and stashes the AgentDetection on the request context for the
 # scripting bridges and the trust_tier combiner. Non-optional: behaviour is

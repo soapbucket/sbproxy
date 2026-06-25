@@ -43,6 +43,7 @@
           "swr_client_secs": 30
         },
         "https_bind_port": null,
+        "key_management": null,
         "l2_cache_settings": null,
         "messenger_settings": null,
         "metrics": null,
@@ -350,6 +351,18 @@
           "anyOf": [
             {
               "$ref": "#/definitions/SecretsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "key_management": {
+          "description": "Dynamic key-management configuration (WOR-1546): the mutable key store, policy cache, at-rest crypto, OIDC claim mapping, and an optional declarative seed. Distinct from the static `credentials:` block, which keeps working and lowers into the same store as config-sourced records.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/KeyManagementConfig"
             },
             {
               "type": "null"
@@ -1330,6 +1343,486 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
+        }
+      }
+    },
+    "KeyManagementConfig": {
+      "description": "Top-level `key_management:` block: the runtime key plane (mutable store, policy cache, at-rest crypto, OIDC claim map, declarative seed).",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Turn the dynamic key plane on. When false (default), inbound auth keeps using the compiled virtual-key registry and this block is inert.",
+          "default": false,
+          "type": "boolean"
+        },
+        "store": {
+          "description": "Store backend (system of record).",
+          "default": {
+            "backend": "embedded",
+            "path": "/var/lib/sbproxy/keystore.redb",
+            "prefix": "sbproxy/keystore",
+            "redis_source_of_truth": false,
+            "url": null,
+            "vault": null
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeyStoreConfig"
+            }
+          ]
+        },
+        "cache": {
+          "description": "In-memory policy cache in front of the store.",
+          "default": {
+            "max_entries": 10000,
+            "negative_ttl_secs": 5,
+            "redis_url": null,
+            "tier": "none",
+            "ttl_secs": 60
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeyCacheConfig"
+            }
+          ]
+        },
+        "crypto": {
+          "description": "At-rest crypto material.",
+          "default": {
+            "master_key": null,
+            "pepper": null
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeyCryptoConfig"
+            }
+          ]
+        },
+        "allow_api_override": {
+          "description": "Allow the admin API to override config-seeded records on reload. When false (default), config-seeded records are authoritative and re-asserted on every reload.",
+          "default": false,
+          "type": "boolean"
+        },
+        "failure_mode_allow": {
+          "description": "When the store is unreachable, allow the request through in a degraded mode. Default false: fail closed (deny).",
+          "default": false,
+          "type": "boolean"
+        },
+        "oidc_claim_map": {
+          "description": "Optional OIDC/JWT claim to virtual-key mapping.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OidcClaimMapConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "seed": {
+          "description": "Optional declarative seed of keys and credentials.",
+          "default": {
+            "credentials": [],
+            "keys": []
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeySeedConfig"
+            }
+          ]
+        }
+      }
+    },
+    "KeyStoreConfig": {
+      "description": "`key_management.store:` block.",
+      "type": "object",
+      "properties": {
+        "backend": {
+          "description": "Backend selector.",
+          "default": "embedded",
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeyStoreBackend"
+            }
+          ]
+        },
+        "path": {
+          "description": "Embedded redb file path (backend `embedded`).",
+          "default": "/var/lib/sbproxy/keystore.redb",
+          "type": "string"
+        },
+        "url": {
+          "description": "Redis connection URL (backend `redis`).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "redis_source_of_truth": {
+          "description": "Treat Redis as the source of truth rather than a coherence tier (backend `redis`).",
+          "default": false,
+          "type": "boolean"
+        },
+        "prefix": {
+          "description": "Secret-reference namespace prefix (backend `secrets_manager`).",
+          "default": "sbproxy/keystore",
+          "type": "string"
+        },
+        "vault": {
+          "description": "Vault backend alias used as the system of record (backend `secrets_manager`).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "KeyStoreBackend": {
+      "description": "Which store backend backs the key plane.",
+      "oneOf": [
+        {
+          "description": "redb embedded store (default).",
+          "type": "string",
+          "enum": [
+            "embedded"
+          ]
+        },
+        {
+          "description": "Redis store / coherence tier.",
+          "type": "string",
+          "enum": [
+            "redis"
+          ]
+        },
+        {
+          "description": "Secrets-manager-direct: a configured vault backend is the system of record.",
+          "type": "string",
+          "enum": [
+            "secrets_manager"
+          ]
+        }
+      ]
+    },
+    "KeyCacheConfig": {
+      "description": "`key_management.cache:` block.",
+      "type": "object",
+      "properties": {
+        "ttl_secs": {
+          "description": "Positive-entry TTL in seconds (default 60).",
+          "default": 60,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "negative_ttl_secs": {
+          "description": "Negative (known-absent) entry TTL in seconds (default 5).",
+          "default": 5,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_entries": {
+          "description": "Soft cap on cached entries per kind (default 10000).",
+          "default": 10000,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "tier": {
+          "description": "Optional second cache tier.",
+          "default": "none",
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeyCacheTier"
+            }
+          ]
+        },
+        "redis_url": {
+          "description": "Redis URL for the redis cache tier (when `tier: redis`). Falls back to the store URL when unset.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "KeyCacheTier": {
+      "description": "Which optional second cache tier sits behind the in-memory L1.",
+      "oneOf": [
+        {
+          "description": "L1 only (default).",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        },
+        {
+          "description": "Redis L2 tier.",
+          "type": "string",
+          "enum": [
+            "redis"
+          ]
+        },
+        {
+          "description": "Mesh distributed-cache tier.",
+          "type": "string",
+          "enum": [
+            "mesh"
+          ]
+        }
+      ]
+    },
+    "KeyCryptoConfig": {
+      "description": "`key_management.crypto:` block. Both values accept a secret reference (`vault://`, `env:`, `file:`, ...) resolved at boot, or an inline value (discouraged outside tests).",
+      "type": "object",
+      "properties": {
+        "pepper": {
+          "description": "Server pepper for inbound virtual-key hashing. When unset, a process-ephemeral pepper is generated, so stored hashes do not survive a restart; set this in production.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "master_key": {
+          "description": "Master key for upstream-credential envelope encryption. Required to store encrypted upstream credentials; vault-ref credentials do not need it.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "OidcClaimMapConfig": {
+      "description": "`key_management.oidc_claim_map:` block.",
+      "type": "object",
+      "required": [
+        "claim_field"
+      ],
+      "properties": {
+        "claim_field": {
+          "description": "The verified JWT/OIDC claim whose value names the virtual-key record to resolve, so the bearer-token and OIDC front doors converge on one record.",
+          "type": "string"
+        }
+      }
+    },
+    "KeySeedConfig": {
+      "description": "`key_management.seed:` block: declarative records applied at boot.",
+      "type": "object",
+      "properties": {
+        "keys": {
+          "description": "Inbound virtual keys.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SeedKeyConfig"
+          }
+        },
+        "credentials": {
+          "description": "Upstream provider credentials.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SeedCredentialConfig"
+          }
+        }
+      }
+    },
+    "SeedKeyConfig": {
+      "description": "A seeded inbound virtual key.",
+      "type": "object",
+      "required": [
+        "key_id"
+      ],
+      "properties": {
+        "key_id": {
+          "description": "Stable public id and token prefix.",
+          "type": "string"
+        },
+        "secret": {
+          "description": "Plaintext secret hashed at boot. Mutually exclusive with `secret_hash`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secret_hash": {
+          "description": "Precomputed HMAC-SHA256 hash (hex) when the operator hashed offline.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Human-readable name, surfaced on access logs.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_requests_per_minute": {
+          "description": "Max requests per minute.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_tokens_per_minute": {
+          "description": "Max tokens per minute.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_budget_tokens": {
+          "description": "Max total tokens for this key's budget window.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_budget_usd": {
+          "description": "Max total cost in USD for this key's budget window.",
+          "default": null,
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "allowed_models": {
+          "description": "Models this key may use (empty = all).",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "blocked_models": {
+          "description": "Models this key may not use.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_providers": {
+          "description": "Providers this key may use (empty = all).",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "project": {
+          "description": "Project attribution.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "user": {
+          "description": "User attribution.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tenant": {
+          "description": "Owning tenant.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expires_at": {
+          "description": "RFC 3339 expiry instant; past it the key is unusable.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "SeedCredentialConfig": {
+      "description": "A seeded upstream credential.",
+      "type": "object",
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "description": "Stable id.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Operator-facing name.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "description": "Provider this credential authenticates to.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "Credential kind (default `ai_provider`).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "vault_ref": {
+          "description": "A secret reference (`vault://`, `awssm://`, ...). Stored as vault-ref material and resolved at use.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secret": {
+          "description": "A plaintext secret to envelope-encrypt at boot (needs `crypto.master_key`).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tenant": {
+          "description": "Owning tenant.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },

@@ -1,0 +1,74 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Dynamic key management: virtual keys as a live, governed resource.
+#
+# Inbound virtual keys live in a mutable store (hashed at rest), not in this
+# file. You mint, revoke, and rotate them at runtime through the admin API
+# instead of editing YAML and reloading. This example seeds one key at boot so
+# the config is self-contained; in production you would create keys via
+# POST /admin/keys and leave the seed empty.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#   export SBPROXY_KEY_PEPPER=a-long-random-server-pepper
+#   export SBPROXY_KEY_MASTER=a-long-random-master-key
+#   make run CONFIG=examples/ai-dynamic-keys/sb.yml
+#
+# Use the seeded key (its plaintext token is sk-seed0001-<secret>; here the
+# secret is "demo-secret-please-rotate", so the bearer token is
+# sk-seed0001-demo-secret-please-rotate):
+#   curl -s http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: openai.local' \
+#     -H 'Authorization: Bearer sk-seed0001-demo-secret-please-rotate' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+#
+# Mint a fresh key at runtime (returns the plaintext token once):
+#   curl -s -u admin:admin -X POST http://127.0.0.1:9090/admin/keys \
+#     -H 'Content-Type: application/json' \
+#     -d '{"name":"ci-runner","max_requests_per_minute":60}'
+#
+# Revoke it instantly (the next request with it is denied):
+#   curl -s -u admin:admin -X POST http://127.0.0.1:9090/admin/keys/<key_id>/revoke
+
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: /tmp/sbproxy-dynamic-keys.redb
+    cache:
+      ttl_secs: 60
+    crypto:
+      # Inbound keys are hashed with HMAC-SHA256 under this server pepper.
+      pepper: env:SBPROXY_KEY_PEPPER
+      # Upstream credentials, when stored encrypted, are sealed under this key.
+      master_key: env:SBPROXY_KEY_MASTER
+    # Fail closed: if the store is unreachable, deny rather than allow.
+    failure_mode_allow: false
+    seed:
+      keys:
+        - key_id: seed0001
+          secret: demo-secret-please-rotate
+          name: seeded-demo-key
+          max_requests_per_minute: 60
+          allowed_models:
+            - gpt-4o-mini
+
+origins:
+  "openai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini

@@ -39,6 +39,8 @@ pub mod dispatch;
 pub mod hook_registry;
 pub mod hooks;
 pub mod identity;
+/// WOR-1546: dynamic key plane assembly + process-global handle.
+pub mod key_plane;
 pub mod pipeline;
 /// Policy verdict audit event bus.
 ///
