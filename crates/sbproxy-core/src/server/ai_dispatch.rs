@@ -1736,6 +1736,37 @@ pub(super) async fn handle_ai_proxy(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // WOR-1545: LLM-aware context-window compression. When enabled, fit an
+    // over-long prompt to the resolved model's context window before
+    // dispatch, dropping the oldest non-system turns, so the request
+    // succeeds on the same model instead of being rejected with a
+    // context-length error. No-op for unknown models, non-chat surfaces, or
+    // prompts that already fit.
+    if let Some(llm) = config
+        .resilience
+        .as_ref()
+        .and_then(|r| r.llm_aware.as_ref())
+    {
+        if llm.context_compress && !model.is_empty() {
+            if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
+                let reserve = llm.completion_reserve_tokens.unwrap_or(1024);
+                if let Some(trimmed) =
+                    sbproxy_ai::context_compress::fit_messages_to_model(messages, &model, reserve)
+                {
+                    let removed = messages.len().saturating_sub(trimmed.len());
+                    if removed > 0 {
+                        warn!(
+                            model = %model,
+                            removed,
+                            "AI proxy: context-window compress, trimmed oldest messages to fit"
+                        );
+                        body["messages"] = serde_json::Value::Array(trimmed);
+                    }
+                }
+            }
+        }
+    }
+
     // Build a list of providers to try, in priority order for failover.
     let is_failover = matches!(config.routing, sbproxy_ai::RoutingStrategy::FallbackChain);
     // Default retry-on-status codes for failover.

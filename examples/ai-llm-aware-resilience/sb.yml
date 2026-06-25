@@ -31,6 +31,11 @@ origins:
           server_error: 2
           content_policy: 0
           bad_request: 0
+        # Fit an over-long prompt to the model's context window before
+        # dispatch, so it succeeds on the same model instead of erroring.
+        llm_aware:
+          context_compress: true
+          completion_reserve_tokens: 1024
 
       providers:
         - name: openai-primary

@@ -51,6 +51,36 @@ set (`500`/`502`/`503`) or when the classified cause clears the policy. A
 class with an explicit count caps its retries; a class with no entry uses
 its default retryability. The overall `max_attempts` still bounds the total.
 
+## Context-window compression
+
+A context-length overflow is not worth retrying as-is; the same prompt only
+fails again. With `llm_aware.context_compress`, the gateway fits an
+over-long prompt to the resolved model's context window before dispatch, so
+it succeeds on the same model instead of being rejected:
+
+```yaml
+action:
+  type: ai_proxy
+  resilience:
+    llm_aware:
+      context_compress: true
+      completion_reserve_tokens: 1024  # reserve room for the response
+```
+
+Only the oldest non-system turns are dropped; the system message and the
+most recent turns are preserved. It is a no-op for unknown models (where the
+window is not known), non-chat surfaces, and prompts that already fit.
+
+## What is adaptive, and what fails over
+
+Adaptive cooldowns are already in effect when `circuit_breaker` or
+`outlier_detection` is configured: every upstream outcome feeds the
+per-provider breaker and the sliding-window outlier detector, and a
+provider that crosses its failure threshold is ejected from selection until
+it recovers, alongside the PeakEWMA latency model. Failover itself routes to
+a different provider, so a retry never re-runs a side-effecting request
+against the same upstream.
+
 ## Try it
 
 The runnable example is in

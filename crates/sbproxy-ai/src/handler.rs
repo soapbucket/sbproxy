@@ -342,6 +342,26 @@ pub struct AiResilienceConfig {
     /// malformed request is not. `None` keeps the status-code retry set.
     #[serde(default)]
     pub retry_policy: Option<crate::failure_cause::RetryPolicy>,
+    /// WOR-1545: LLM-aware failover actions on top of the per-error retry
+    /// policy. `None` leaves the request path unchanged.
+    #[serde(default)]
+    pub llm_aware: Option<LlmAwareConfig>,
+}
+
+/// LLM-aware failover actions (WOR-1545).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct LlmAwareConfig {
+    /// Compress the prompt to fit the resolved model's context window
+    /// before dispatch, so an over-long request succeeds on the same model
+    /// instead of being rejected with a context-length error. Only the
+    /// oldest non-system messages are dropped; the system message and the
+    /// most recent turns are preserved.
+    #[serde(default)]
+    pub context_compress: bool,
+    /// Tokens to reserve for the completion when fitting the prompt to the
+    /// window. Defaults to 1024.
+    #[serde(default)]
+    pub completion_reserve_tokens: Option<u64>,
 }
 
 /// Circuit-breaker tuning shared with the load_balancer flavour.
