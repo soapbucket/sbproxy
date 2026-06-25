@@ -1159,7 +1159,46 @@ pub(super) async fn handle_ai_proxy(
                     })
                     .unwrap_or_default();
 
-                if let Some(block) = pipeline.check_input(&messages) {
+                // WOR-1543: when a guardrail mesh is configured, run the
+                // messages-path detectors as a cascade, collect the full
+                // verdict set, and fuse it (block on a quorum, optional
+                // redact-and-continue). The label set is stashed on the
+                // context so the AI policy plane can reason over it.
+                // Otherwise fall back to the serial block-on-any check.
+                if let Some(mesh_cfg) = guardrails_config.mesh.clone() {
+                    let mesh = sbproxy_ai::guardrails::GuardrailMesh::new(mesh_cfg);
+                    let text = sbproxy_ai::guardrails::message_text(&messages);
+                    let decision = mesh.evaluate_input(&pipeline, &messages, &text);
+                    ctx.ai_guardrail_labels = decision.labels.clone();
+                    if decision.block {
+                        warn!(
+                            guardrails = ?decision.labels,
+                            "AI proxy: guardrail mesh blocked request"
+                        );
+                        let reason = decision.reasons.join("; ");
+                        sbproxy_ai::tracing_spans::record_error(
+                            &ai_span,
+                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                            &reason,
+                        );
+                        ctx.ai_outcome = Some("guardrail_block".to_string());
+                        let error_body = serde_json::json!({
+                            "error": {
+                                "message": reason,
+                                "type": "guardrail_violation",
+                                "code": decision.labels.join(","),
+                            }
+                        });
+                        let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+                        send_response(session, 400, "application/json", &body_bytes).await?;
+                        return Ok(());
+                    }
+                    if decision.redact {
+                        if let Some(redactor) = config.pii_redactor() {
+                            redactor.redact_json(&mut body);
+                        }
+                    }
+                } else if let Some(block) = pipeline.check_input(&messages) {
                     warn!(
                         guardrail = %block.name,
                         reason = %block.reason,
@@ -1280,7 +1319,8 @@ pub(super) async fn handle_ai_proxy(
             // respectively; until those land they are empty/zero and the
             // policy keys on principal / surface / model.
             tier: ctx.attribution_tags.risk_tier.clone().unwrap_or_default(),
-            guardrail_labels: Vec::new(),
+            // Populated by the guardrail mesh (WOR-1543) when configured.
+            guardrail_labels: ctx.ai_guardrail_labels.clone(),
             budget_fraction: 0.0,
             budget_exceeded: false,
             input_tokens_est: ctx.ai_prompt_tokens_est.unwrap_or(0) as i64,

@@ -1,0 +1,57 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: guardrail mesh.
+#
+# The serial guardrail chain blocks on the first detector that flags. The
+# mesh instead runs the input detectors as a cascade, collects the full
+# verdict set, and fuses it under a configurable rule:
+#
+#   block_threshold: 2   -> block only when at least 2 detectors agree
+#   redact_on_flag: true -> a flagged-but-not-blocked prompt is masked
+#                           (via the PII redactor) and continues
+#   cache: true          -> a repeated prompt skips re-running detectors
+#   latency_budget_ms    -> stop launching expensive detectors past budget
+#
+# The full label set also feeds the AI policy plane's ai.guardrails.*
+# namespace (see examples/ai-policy-cel), so a CEL rule can reason over
+# `flagged_count`.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#   make run CONFIG=examples/ai-guardrail-mesh/sb.yml
+#
+# A prompt that trips a single detector is masked and forwarded; one that
+# trips two is blocked with a 400 listing the labels.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+
+      guardrails:
+        input:
+          - type: injection
+          - type: pii
+            patterns:
+              - email
+          - type: regex_guard
+            action: block
+            config:
+              deny:
+                - forbidden-term
+        mesh:
+          block_threshold: 2
+          redact_on_flag: true
+          cache: true
+          latency_budget_ms: 50

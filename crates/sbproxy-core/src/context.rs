@@ -744,6 +744,11 @@ pub struct RequestContext {
     /// to the usage sinks (including the verifiable ledger) so policy
     /// decisions are queryable in the spend record. `None` by default.
     pub ai_policy_sink_tag: Option<String>,
+    /// WOR-1543: labels of the guardrails that flagged the request, set by
+    /// the guardrail mesh when configured. Fed into the AI policy plane's
+    /// `ai.guardrails.*` namespace so a policy rule can fuse the verdict
+    /// set. Empty when the mesh is off or nothing flagged.
+    pub ai_guardrail_labels: Vec<String>,
     /// Inbound `ChatFormat` id when the request entered on a native
     /// shim path (`anthropic` for `/v1/messages`, `responses` for
     /// `/v1/responses`). `None` (or `"openai"`) for the canonical
@@ -1091,6 +1096,7 @@ impl RequestContext {
             ai_outcome: None,
             ai_usage_sinks: None,
             ai_policy_sink_tag: None,
+            ai_guardrail_labels: Vec::new(),
             ai_inbound_format: None,
             ai_native_bypass: false,
             ai_admission: None,
