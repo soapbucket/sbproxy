@@ -58,6 +58,15 @@ fn key_record_to_virtual_key(
     }
 }
 
+/// Process-global per-key rate limiter (WOR-1558). Accumulates request counts
+/// per virtual key across requests; the limit itself is read per-request from
+/// the resolved record, so a live PATCH changes enforcement without a reload.
+fn key_rate_limiter() -> &'static sbproxy_ai::identity::KeyRateLimiter {
+    static LIMITER: std::sync::OnceLock<sbproxy_ai::identity::KeyRateLimiter> =
+        std::sync::OnceLock::new();
+    LIMITER.get_or_init(sbproxy_ai::identity::KeyRateLimiter::new)
+}
+
 /// WOR-1555: map a verified OIDC/JWT identity to a stored virtual-key record's
 /// policy, so the bearer-token and OIDC front doors converge on one record.
 ///
@@ -1000,6 +1009,21 @@ pub(super) async fn handle_ai_proxy(
                 // / customer / environment / agent_type / risk_tier.
                 ctx.attribution_tags =
                     crate::server::ai_support::resolve_attribution_tags(session, &ctx.principal);
+                // WOR-1558: enforce the key's live requests-per-minute limit.
+                // The limit is read from the resolved record (via the cache),
+                // so a PATCH to a dynamic key's rate takes effect on the next
+                // request without a reload. The bucket is keyed by the stable
+                // key id, never the secret.
+                if vk.max_requests_per_minute.is_some()
+                    && !key_rate_limiter().check_rate(&vk.key, &vk)
+                {
+                    warn!(
+                        key = %vk.name.as_deref().unwrap_or(&vk.key),
+                        "AI proxy: per-key requests-per-minute limit exceeded"
+                    );
+                    send_error(session, 429, "rate limit exceeded for this key").await?;
+                    return Ok(());
+                }
                 // WOR-893: per-key model routing. When the key pins a
                 // model, overwrite the request body's `model` field so
                 // the downstream allow/block, routing, budget, and
@@ -5391,5 +5415,24 @@ mod dynamic_key_resolution_tests {
         // A principal without the mapped claim does not resolve.
         let p = principal_with_claim("other", "team-acme");
         assert!(resolve_oidc_mapped_key(&plane, &p).await.is_none());
+    }
+
+    #[test]
+    fn per_key_rate_limiter_reads_live_rpm_from_record() {
+        // A record's max_requests_per_minute is carried onto the synthesized
+        // VirtualKeyConfig, so the same limiter the dispatch uses enforces the
+        // live value. A PATCH to the record changes this without a reload.
+        let mut rec = KeyRecord::new("rl-key", "h", chrono::Utc::now());
+        rec.max_requests_per_minute = Some(2);
+        let vk = key_record_to_virtual_key(&rec);
+        assert_eq!(vk.max_requests_per_minute, Some(2));
+
+        let limiter = sbproxy_ai::identity::KeyRateLimiter::new();
+        assert!(limiter.check_rate(&vk.key, &vk));
+        assert!(limiter.check_rate(&vk.key, &vk));
+        assert!(
+            !limiter.check_rate(&vk.key, &vk),
+            "the third request in the window exceeds the 2 rpm limit"
+        );
     }
 }
