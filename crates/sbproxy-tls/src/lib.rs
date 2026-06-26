@@ -32,6 +32,29 @@ use ocsp::OcspStapler;
 use sbproxy_config::ProxyServerConfig;
 use sbproxy_platform::MemoryKVStore;
 
+/// A tokio runtime handle for the TLS maintenance tasks (OCSP refresh, ACME
+/// renewal). These are started from the synchronous proxy-setup path, before
+/// Pingora installs its own runtime, so there is usually no current runtime to
+/// `tokio::spawn` on, which would panic. Reuse the caller's runtime when one is
+/// present; otherwise fall back to a small process-lifetime runtime so the
+/// long-running refresh loops keep being driven for the life of the process.
+pub(crate) fn maintenance_handle() -> tokio::runtime::Handle {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return handle;
+    }
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("sbproxy-tls-maint")
+            .build()
+            .expect("build sbproxy-tls maintenance runtime")
+    })
+    .handle()
+    .clone()
+}
+
 // --- TlsState ---
 
 /// Central TLS state: certificate resolver, ACME challenge store, and lifecycle tasks.
@@ -187,7 +210,7 @@ impl TlsState {
         let challenge_store = self.challenge_store.clone();
         let hostnames = self.hostnames.clone();
 
-        tokio::spawn(async move {
+        maintenance_handle().spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(12 * 3600));
             // The first tick fires immediately; skip it so we don't flood logs at startup.
             interval.tick().await;
@@ -419,6 +442,34 @@ fn cert_needs_renewal(meta: &CertMeta, renew_before_days: u32) -> bool {
 mod tests {
     use super::*;
     use cert_store::CertMeta;
+
+    // Regression: the OCSP refresh task and the maintenance handle are started
+    // from the synchronous proxy-setup path, before Pingora installs a runtime.
+    // A bare `tokio::spawn` there panics with "there is no reactor running",
+    // which made every TLS config with a manual cert crash on startup. These
+    // tests run as plain `#[test]` (no `#[tokio::test]`), so there is no current
+    // runtime, reproducing that context.
+
+    #[test]
+    fn maintenance_handle_runs_a_task_without_a_current_runtime() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        maintenance_handle().spawn(async move {
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("task spawned on the maintenance handle ran to completion");
+    }
+
+    #[test]
+    fn ocsp_refresh_task_does_not_panic_outside_a_runtime() {
+        // Before the fix this panicked at the `tokio::spawn` inside
+        // `start_refresh_task`. The bogus cert makes the initial fetch fail,
+        // which the task handles gracefully; the point is that it spawns and
+        // runs without a current runtime instead of bringing the process down.
+        let stapler = ocsp::OcspStapler::new();
+        stapler.start_refresh_task("_test".to_string(), b"not-a-real-cert".to_vec(), |_| {});
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 
     fn meta(expires_at: &str) -> CertMeta {
         CertMeta {
