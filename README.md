@@ -4,9 +4,9 @@
 
 <h1 align="center">SBproxy</h1>
 
-*Last modified: 2026-06-24*
+*Last modified: 2026-06-25*
 
-<h3 align="center">The AI gateway built like a real proxy.</h3>
+<h3 align="center">Govern the AI you call and the AI that calls you.</h3>
 
 <p align="center">
   <a href="https://github.com/soapbucket/sbproxy/releases"><img src="https://img.shields.io/github/v/release/soapbucket/sbproxy" alt="Release"></a>
@@ -31,15 +31,15 @@
 
 ## Why SBproxy
 
-Most teams run one tool for HTTP traffic and another for LLM traffic, then bolt on a third for keys, a fourth for guardrails, and a dashboard they have to trust for spend. SBproxy is one binary that does all of it, built on Pingora so the proxy in front of your models is a real proxy.
+SBproxy governs AI traffic in both directions: the calls your apps and agents make out to models and MCP tools, and the calls AI agents and crawlers make in to your APIs and content. It is a real reverse proxy built on Pingora, so the same runtime also handles the rest of your API traffic, as one binary in your VPC. Most teams stitch this together from an LLM proxy, an API gateway, a key store, a guardrail service, and a dashboard they have to trust for spend. This is one process.
 
-- **Route every model.** 200+ models behind one OpenAI-compatible API, with fallback chains, outcome-aware routing, predictive budgets, and per-error retry policies.
-- **Govern every key.** Inbound virtual keys are hashed at rest (HMAC-SHA256 plus a server pepper) and minted, rotated, and revoked at runtime through an admin API. A revoke takes effect on the next request, not the next reload. Upstream provider credentials are encrypted at rest. See [key management](docs/key-management.md).
-- **Secure in the same process.** Auth (JWT, OIDC, mTLS), WAF, DDoS, CSRF, SSRF guards, PII redaction, and prompt-injection detection on a local model. Guardrails run as a quorum mesh on a latency budget. The proxy that fronts your models is the security layer, not a thing you bolt on after it.
-- **Prove the spend.** Every request can emit a hash-chained, Ed25519-signed usage receipt with token counts and USD cost that you re-derive and verify offline.
-- **Run as a fleet.** Point every replica at a shared key store and a key minted on one works on all, with a revoke invalidated across the fleet. The clustering substrate for a distributed cache and per-key spend counters (gossip, CRDTs, a consistent-hash ring) is open source here, so you do not need a vendor's control plane.
-- **Keep cost and prompts on-box.** A local semantic cache replays near-duplicate prompts with no per-call cost, and the prompt never leaves your network. Metrics, logs, and OpenTelemetry GenAI traces with token and USD cost come from the same process, ready for Phoenix, Langfuse, Grafana, or Datadog.
-- **Stay fast.** Sub-millisecond p99 overhead, idle RSS in single-digit megabytes, hot reload with no dropped connections.
+- **The AI you call.** 200+ models behind one OpenAI-compatible API, with fallback chains, outcome-aware routing, predictive budgets, and per-error retry policies. Guardrails screen the prompt and the model's response, blocking or redacting a streaming completion mid-flight. A local semantic cache replays near-duplicate prompts with no per-call cost, and the prompt never leaves your network.
+- **The AI that calls you.** Charge AI crawlers per request with Pay Per Crawl (x402 or Stripe), verify signed agents with Web Bot Auth (RFC 9421), and negotiate Markdown so agents stop paying for HTML they cannot use. Inbound AI is governed by the same gateway, not a separate product.
+- **Govern every key.** Inbound virtual keys are hashed at rest (HMAC-SHA256 plus a server pepper) and minted, rotated, and revoked at runtime through an admin API. A revoke takes effect on the next request, not the next reload. Per-key policy travels with the key: models, budgets, rate, required redaction, model pinning. Upstream credentials are encrypted at rest. See [key management](docs/key-management.md).
+- **A real proxy for the rest.** Auth (JWT, OIDC, mTLS), WAF, DDoS, CSRF, SSRF guards, PII redaction, and prompt-injection detection on a local model. Guardrails run as a quorum mesh on a latency budget. The proxy that fronts your models is the security layer, not a thing you bolt on after it.
+- **Run as a fleet without Redis.** Point every replica at a shared store and a key minted on one works on all, with a revoke seen across the fleet. The mesh that keeps the cache, budgets, and per-key spend counters coherent (gossip, CRDTs, a consistent-hash ring) is open source here, so the cluster coordinates itself without an external Redis or a vendor's control plane.
+- **Prove the spend.** Every request can emit a hash-chained, Ed25519-signed usage receipt with token counts and USD cost that you re-derive and verify offline. Metrics, logs, and OpenTelemetry GenAI traces come from the same process, ready for Phoenix, Langfuse, Grafana, or Datadog.
+- **Stay fast, stay yours.** Sub-millisecond p99 overhead, idle RSS in single-digit megabytes, hot reload with no dropped connections. One binary, Apache 2.0, in your VPC.
 
 New here and weighing the options? See [how SBproxy compares](docs/comparison.md).
 
