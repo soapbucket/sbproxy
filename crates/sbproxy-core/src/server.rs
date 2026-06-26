@@ -228,6 +228,9 @@ fn build_mtls_tls_settings(
 ) -> anyhow::Result<pingora_core::listeners::tls::TlsSettings> {
     let mut settings = pingora_core::listeners::tls::TlsSettings::intermediate(cert_path, key_path)
         .map_err(|e| anyhow::anyhow!("TlsSettings::intermediate: {e}"))?;
+    // Advertise h2 in ALPN so clients can negotiate HTTP/2 over the mTLS
+    // listener; without this the handshake only offers http/1.1.
+    settings.enable_h2();
     let verifier = sbproxy_tls::mtls::build_client_cert_verifier(
         &mtls.client_ca_file,
         mtls.require,
@@ -235,6 +238,22 @@ fn build_mtls_tls_settings(
         cache,
     )?;
     settings.set_client_cert_verifier(verifier);
+    Ok(settings)
+}
+
+/// Build Pingora `TlsSettings` for a manual or ACME-bootstrap cert with HTTP/2
+/// enabled. Pingora's convenience `add_tls(addr, cert, key)` only advertises
+/// `http/1.1` in ALPN, so a plain `tls_cert_file` listener never negotiates h2.
+/// Building the settings explicitly and calling `enable_h2()` adds `h2` to the
+/// ALPN list, so clients get HTTP/2 over TLS and fall back to HTTP/1.1 when they
+/// do not offer it.
+fn build_tls_settings(
+    cert_path: &str,
+    key_path: &str,
+) -> anyhow::Result<pingora_core::listeners::tls::TlsSettings> {
+    let mut settings = pingora_core::listeners::tls::TlsSettings::intermediate(cert_path, key_path)
+        .map_err(|e| anyhow::anyhow!("TlsSettings::intermediate: {e}"))?;
+    settings.enable_h2();
     Ok(settings)
 }
 
