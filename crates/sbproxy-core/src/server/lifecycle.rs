@@ -1069,10 +1069,16 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                         }
                     }
                 } else {
-                    proxy_service
-                        .add_tls(&format!("0.0.0.0:{https_port}"), cert_path, key_path)
-                        .map_err(|e| anyhow::anyhow!("failed to add TLS listener: {}", e))?;
-                    tracing::info!(port = %https_port, "HTTPS listener added (manual certs)");
+                    let settings = build_tls_settings(cert_path, key_path)?;
+                    proxy_service.add_tls_with_settings(
+                        &format!("0.0.0.0:{https_port}"),
+                        None,
+                        settings,
+                    );
+                    tracing::info!(
+                        port = %https_port,
+                        "HTTPS listener added (manual certs, HTTP/2 enabled)"
+                    );
                 }
             } else if server_config.acme.as_ref().is_some_and(|a| a.enabled) {
                 // ACME-only mode: generate a self-signed bootstrap cert so the
@@ -1117,14 +1123,15 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                                 }
                             }
                         } else {
-                            proxy_service
-                                .add_tls(&format!("0.0.0.0:{https_port}"), &cert_path, &key_path)
-                                .map_err(|e| {
-                                    anyhow::anyhow!("failed to add TLS listener: {}", e)
-                                })?;
+                            let settings = build_tls_settings(&cert_path, &key_path)?;
+                            proxy_service.add_tls_with_settings(
+                                &format!("0.0.0.0:{https_port}"),
+                                None,
+                                settings,
+                            );
                             tracing::info!(
                                 port = %https_port,
-                                "HTTPS listener added (self-signed bootstrap, ACME will replace)"
+                                "HTTPS listener added (self-signed bootstrap, HTTP/2 enabled, ACME will replace)"
                             );
                         }
                     }

@@ -148,7 +148,7 @@ impl OcspStapler {
         let response_slot = self.response.clone();
         let last_fetched_slot = self.last_fetched_at.clone();
 
-        tokio::spawn(async move {
+        crate::maintenance_handle().spawn(async move {
             // --- Initial fetch ---
             //
             // Before the 12h interval, fetch once so the first

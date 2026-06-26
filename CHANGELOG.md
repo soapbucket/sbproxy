@@ -11,6 +11,21 @@ Work that has merged to `main` since the latest tag and is queued for
 the next version cut. No promises about backward compatibility for any
 of the new YAML fields below until the version that ships them.
 
+## [1.3.1] - 2026-06-25
+
+Patch release. Fixes TLS, which was broken on startup in v1.2.0 and v1.3.0.
+
+### Fixed
+
+- **TLS no longer panics on startup.** The OCSP-staple and ACME-renewal
+  background tasks were spawned before the proxy runtime existed, so any HTTPS
+  listener with a manual cert (`tls_cert_file` / `tls_key_file`) or enabled ACME
+  crashed the process on boot ("there is no reactor running"). The tasks now
+  spawn on a runtime that is always available.
+- **HTTP/2 is now negotiated over TLS.** No TLS listener advertised `h2` in ALPN,
+  so every HTTPS connection fell back to HTTP/1.1. The manual-cert, ACME, and
+  mTLS listeners now enable h2; clients that do not offer it still get HTTP/1.1.
+
 ## [1.3.0] - 2026-06-25
 
 Third minor release on the Rust v1.x line. Two headlines: dynamic key
