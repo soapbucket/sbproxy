@@ -2,7 +2,7 @@
 
 *Last modified: 2026-06-25*
 
-SBproxy is a reverse proxy that doubles as an AI gateway. Most tools do one or the other; this page is honest about where SBproxy fits and where you should pick something else.
+SBproxy is an AI gateway that governs traffic in both directions. Most AI gateways only handle the calls your apps make out to models; SBproxy also governs the AI agents and crawlers coming in to your APIs and content, and because it is a real reverse proxy it handles the rest of your API traffic on the same runtime. This page is honest about where SBproxy fits and where you should pick something else.
 
 ## The short version
 
@@ -22,9 +22,20 @@ SBproxy is a reverse proxy that doubles as an AI gateway. Most tools do one or t
 ## Beyond an LLM router
 
 The provider-routing table above is table stakes. Where SBproxy pulls ahead of a
-typical gateway is governance, security, and clustering in the same self-hosted
-binary, with no vendor control plane.
+typical gateway is two-way governance, security, and clustering in the same
+self-hosted binary, with no vendor control plane.
 
+- **Both directions of AI traffic.** Most AI gateways only govern the calls your
+  apps make out to models. SBproxy also governs the AI coming in: Pay Per Crawl
+  and Web Bot Auth identity on the agents and crawlers hitting your APIs and
+  content, with content negotiated for them on demand. Same runtime, same config,
+  same audit log for both. See [content-for-agents.md](content-for-agents.md) and
+  [web-bot-auth.md](web-bot-auth.md).
+- **Guardrails on the response, not just the prompt.** Output guardrails screen
+  what the model returns, blocking or redacting the completion, and on a streaming
+  response they terminate the stream mid-token. PII masked on the way in is
+  restored on the way out. Most gateways filter the prompt and stop. See
+  [ai-gateway.md](ai-gateway.md).
 - **Keys as a governed resource.** Inbound virtual keys live in a mutable store,
   hashed at rest with HMAC-SHA256 and a server pepper. Mint, rotate, and revoke
   them at runtime through an admin API; a revoke takes effect on the next
@@ -41,13 +52,14 @@ binary, with no vendor control plane.
 - **One policy over everything.** A single sandboxed CEL expression reads the
   principal, model, guardrail verdicts, and budget state and returns a closed
   action set (allow, deny, redact, route, downgrade). See [ai-policy-cel.md](ai-policy-cel.md).
-- **Runs as a fleet without a hosted control plane.** Point every replica at a
-  shared Redis key store and the key plane is coherent across the fleet: mint on
-  one replica, use on any, revoke on one and the others deny on their next
-  request. The clustering substrate (SWIM gossip, CRDTs, a consistent-hash
-  distributed cache) is open source in this repository, so cross-replica cache
-  and per-key spend counters do not need a vendor's control plane. See
-  [examples/ai-dynamic-keys-cluster/](../examples/ai-dynamic-keys-cluster/).
+- **Clustered without an external Redis.** Run a fleet and the key plane, budgets,
+  and rate counters stay coherent: mint on one replica, use on any, revoke on one
+  and the others deny on their next request. A gossip mesh with CRDT counters and
+  a consistent-hash distributed cache does the coordination, all open source in
+  this repository, so the fleet needs no external Redis in the path and no vendor
+  control plane. A durable shared store still sits behind it, Redis or a secrets
+  manager. See the clustering section of [key-management.md](key-management.md)
+  and [examples/ai-dynamic-keys-cluster/](../examples/ai-dynamic-keys-cluster/).
 - **Cost and latency stay on-box.** The semantic cache vectorizes prompts on a
   local embedder, so a near-duplicate prompt replays with no per-call cost and
   the prompt never leaves your network. See [local-inference.md](local-inference.md).
