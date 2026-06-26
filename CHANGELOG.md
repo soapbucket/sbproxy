@@ -7,9 +7,56 @@ repository.
 
 ## [Unreleased]
 
-Work that has merged to `main` since the v1.2.0 tag and is queued for
+Work that has merged to `main` since the latest tag and is queued for
 the next version cut. No promises about backward compatibility for any
 of the new YAML fields below until the version that ships them.
+
+## [1.3.0] - 2026-06-25
+
+Third minor release on the Rust v1.x line. Two headlines: dynamic key
+management with an open-source mesh for clustering, and a wave of
+state-of-the-art AI-gateway capabilities. No config-breaking changes;
+existing `sb.yml` files compile unchanged, and every new field is
+default-off.
+
+### Added
+
+- **Dynamic key management.** Inbound virtual keys are a live, governed
+  resource: mint, list, rotate, and revoke them at runtime through an admin
+  API under `/admin/keys`, with no reload. Keys are hashed at rest with
+  HMAC-SHA256 and a server pepper, and a revoke takes effect on the next
+  request. Upstream provider credentials are encrypted at rest with an
+  AES-256-GCM envelope or held as a vault reference. Per-key policy travels
+  with the key: model and provider allow/deny, rate and token limits, token
+  and USD budgets, expiry, required PII redaction, principal selectors, a
+  pinned model, injected tools, and an injection-scan bypass. Pluggable
+  stores: embedded (redb), Redis, or a secrets manager. OIDC and JWT claims
+  can map to a key. New `key_management:` config block. (#542, #543)
+- **Open-source mesh clustering.** The mesh layer (SWIM gossip, CRDTs, a
+  consistent-hash distributed cache) is now Apache-2.0 in this repository.
+  Setting `cache.tier: mesh` keeps the key plane, budgets, and per-key spend
+  and rate counters coherent across a replica fleet, so the cluster
+  coordinates itself with no external Redis in the path. (#542)
+- **State-of-the-art AI-gateway differentiation.** A verifiable, hash-chained
+  and optionally Ed25519-signed usage ledger; a single sandboxed CEL policy
+  plane over guardrails, budgets, routing, and principal; a guardrail mesh
+  that fuses verdicts on a quorum with a verdict cache; outcome-aware routing
+  by realized cost-per-success; predictive budgets that warn, then downgrade,
+  then block; and LLM-aware resilience: per-error retry, context-window
+  compression, hedged and raced dispatch, and content-policy fallback to a
+  more permissive provider. (#538, #539, #540, #541)
+- **LiteLLM drop-in.** A `config import-litellm` translator, model groups, and
+  usage-sink plus budget foundations for moving a LiteLLM proxy over. (#537)
+- **Model-based routing** with a failover metric and a refreshed model-id
+  catalog. (#536)
+- VHS cassettes for the AI gateway and the example configs. (#534)
+
+### Changed
+
+- The mesh wire encoding moved off the unmaintained `bincode` crate to
+  `postcard`. Peer mTLS on the mesh transport is on by default.
+- The README and docs now lead with the two-way framing: SBproxy governs the
+  AI you call and the AI that calls you.
 
 ## [1.2.0] - 2026-06-24
 
