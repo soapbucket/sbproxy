@@ -742,6 +742,34 @@ pub(super) fn budget_scope_keys(
     origin: Option<&str>,
     tag: Option<&str>,
 ) -> Vec<(usize, String)> {
+    budget_scope_keys_at(
+        cfg,
+        workspace_id,
+        api_key,
+        user,
+        model,
+        origin,
+        tag,
+        budget_now_unix_secs(),
+    )
+}
+
+/// [`budget_scope_keys`] with an explicit clock so the rolling-window
+/// bucketing is deterministic under test. `now_unix_secs` is the UTC Unix
+/// time used to pick each limit's window bucket.
+// Mirrors the 7-arg public entry point plus an injected clock; the argument
+// count is inherent to the scope inputs, hence the deliberate allow.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn budget_scope_keys_at(
+    cfg: &sbproxy_ai::BudgetConfig,
+    workspace_id: &str,
+    api_key: Option<&str>,
+    user: Option<&str>,
+    model: Option<&str>,
+    origin: Option<&str>,
+    tag: Option<&str>,
+    now_unix_secs: u64,
+) -> Vec<(usize, String)> {
     let mut out = Vec::with_capacity(cfg.limits.len());
     for (idx, limit) in cfg.limits.iter().enumerate() {
         if let Some(key) = sbproxy_ai::budget::BudgetTracker::scope_key(
@@ -753,10 +781,23 @@ pub(super) fn budget_scope_keys(
             origin,
             tag,
         ) {
+            // WOR-1527: bucket the key by this limit's rolling window so a
+            // `daily`/`monthly` cap resets per period. Both the check and
+            // record paths derive their keys from this list, so windowing
+            // here keeps them consistent.
+            let key = sbproxy_ai::budget::windowed_key(&key, limit.window(), now_unix_secs);
             out.push((idx, key));
         }
     }
     out
+}
+
+/// Current UTC Unix time in seconds, used to bucket budget windows.
+fn budget_now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Compute a single limit's utilization ratio for the
@@ -796,14 +837,18 @@ pub(super) fn budget_preflight(
     providers: &[sbproxy_ai::ProviderConfig],
 ) -> BudgetGate {
     for (limit_idx, key) in keys {
-        let result = match BUDGET_TRACKER.check_limits(cfg, key) {
+        let limit = &cfg.limits[*limit_idx];
+        // WOR-1527: judge each windowed key against its OWN limit only. The
+        // keys are bucketed per-limit period, so checking one period's key
+        // against another period's cap (as the all-limits path would) is
+        // wrong.
+        let result = match BUDGET_TRACKER.check_limit(limit, key, &cfg.on_exceed) {
             Some(r) => r,
             None => continue,
         };
         if !result.exceeded {
             continue;
         }
-        let limit = &cfg.limits[*limit_idx];
         if let Some(ratio) =
             limit_utilization(result.current_tokens, result.current_cost_usd, limit)
         {
@@ -2418,5 +2463,50 @@ mod estimate_completion_tokens_tests {
             estimate_completion_tokens("gpt-4o", br#"{"object":"chat.completion","choices":[]}"#),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod budget_window_tests {
+    use super::budget_scope_keys_at;
+    use sbproxy_ai::budget::{BudgetConfig, BudgetLimit, BudgetScope, OnExceedAction};
+
+    fn workspace_limit(max_tokens: u64, period: Option<&str>) -> BudgetLimit {
+        BudgetLimit {
+            scope: BudgetScope::Workspace,
+            max_tokens: Some(max_tokens),
+            max_cost_usd: None,
+            period: period.map(|p| p.to_string()),
+            downgrade_to: None,
+        }
+    }
+
+    #[test]
+    fn budget_scope_keys_are_windowed_per_limit_period() {
+        // WOR-1527: a daily and a monthly cap on the same scope must resolve
+        // to distinct windowed keys so they accrue independently, and a
+        // cumulative (no-period) cap must keep the bare scope key.
+        let cfg = BudgetConfig {
+            limits: vec![
+                workspace_limit(1_000, Some("daily")),
+                workspace_limit(20_000, Some("monthly")),
+                workspace_limit(99_999, None),
+            ],
+            on_exceed: OnExceedAction::Block,
+            soft_landing: None,
+        };
+        let now = 100_000u64;
+        let keys = budget_scope_keys_at(&cfg, "host", None, None, None, None, None, now);
+        assert_eq!(keys.len(), 3);
+        assert_ne!(keys[0].1, keys[1].1);
+        assert_ne!(keys[0].1, keys[2].1);
+        assert_ne!(keys[1].1, keys[2].1);
+        // The cumulative limit keeps the bare scope key.
+        assert_eq!(keys[2].1, "workspace:host");
+        // The daily key rolls to a new bucket in the next window...
+        let later = budget_scope_keys_at(&cfg, "host", None, None, None, None, None, now + 86_400);
+        assert_ne!(keys[0].1, later[0].1);
+        // ...while the cumulative key never rolls.
+        assert_eq!(keys[2].1, later[2].1);
     }
 }
