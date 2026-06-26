@@ -1,7 +1,7 @@
 # SBproxy documentation
-*Last modified: 2026-06-18*
+*Last modified: 2026-06-25*
 
-The AI gateway built like a real proxy. One binary, built on Pingora.
+Govern the AI you call and the AI that calls you. One binary, built on Pingora, that routes your traffic across 200+ models with guardrails on the prompt and the response, governs the AI agents hitting your own APIs, and runs every API gateway feature in the same runtime.
 
 ## Where to start
 
