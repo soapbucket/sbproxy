@@ -66,7 +66,9 @@ pub use cassette_drift::{
 pub use code_mode::{compress_tool_schema, estimate_token_reduction};
 pub use codemode_from_openapi::{emit_codemode_from_openapi, openapi_to_federated_tools};
 pub use context_opt::ToolUsageTracker;
-pub use federation::{FederatedTool, McpCallOutcome, McpFederation, McpServerConfig};
+pub use federation::{
+    FederatedTool, McpCallOutcome, McpFederation, McpServerConfig, NamespaceMode,
+};
 pub use guardrails::{check_tool_invocation, McpGuardrailConfig};
 pub use handler::{InitializeContext, McpHandler};
 pub use openapi_convert::openapi_to_mcp_tools;

@@ -68,7 +68,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sbproxy_extension::mcp::{McpFederation, McpServerConfig, ToolAccessPolicy, ToolQuotaStore};
+use sbproxy_extension::mcp::{
+    McpFederation, McpServerConfig, NamespaceMode, ToolAccessPolicy, ToolQuotaStore,
+};
 use serde::Deserialize;
 
 // --- Wire format ---
@@ -142,11 +144,19 @@ pub struct McpFederatedServerConfig {
     /// (`https://example.com/mcp`) or a bare hostname; bare hostnames
     /// are normalised to `https://<host>/mcp`.
     pub origin: String,
-    /// Optional namespace prefix applied to every tool from this
-    /// upstream. When set, tools are exposed as `<prefix>.<tool>`
-    /// instead of `<tool>`.
+    /// Optional namespace label for this upstream. It sets the server name
+    /// used to disambiguate name collisions, and, when `namespace: always`
+    /// is set, the prefix every tool and resource is exposed under
+    /// (`<prefix>.<tool>` / `<prefix>/<uri>`). When unset, a name is derived
+    /// from the origin.
     #[serde(default)]
     pub prefix: Option<String>,
+    /// How this upstream's tool and resource names are namespaced in the
+    /// unified registry. `on_collision` (default) keeps bare names and only
+    /// prefixes on a clash; `always` prefixes every name with the server
+    /// label so the whole upstream is namespaced.
+    #[serde(default)]
+    pub namespace: NamespaceMode,
     /// Optional RBAC label for the upstream. References a key in the
     /// top-level `rbac_policies` map; the matching
     /// [`ToolAccessPolicy`] is consulted at request time using the
@@ -307,6 +317,7 @@ impl McpAction {
                 name: name.clone(),
                 url,
                 transport,
+                namespace: upstream.namespace,
             });
             prefixes.push(McpServerPrefix {
                 name,
@@ -755,6 +766,7 @@ mod tests {
             let entry = McpFederatedServerConfig {
                 origin: "a.example.com".to_string(),
                 prefix: None,
+                namespace: NamespaceMode::default(),
                 rbac: None,
                 timeout: Some(parse_duration_via_serde(raw)),
                 transport: None,
