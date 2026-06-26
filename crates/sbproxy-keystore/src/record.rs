@@ -94,6 +94,31 @@ pub struct KeyRecord {
     /// Providers this key may use (empty = all).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_providers: Vec<String>,
+    /// Named PII redaction rules that must be active on the request body before
+    /// this key can dispatch upstream (empty = none required).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub require_pii_redaction: Vec<String>,
+    /// Inbound principal selectors allowed to present this key (empty = any
+    /// principal). Each entry is a `PrincipalSelectorConfig`-shaped JSON object,
+    /// kept opaque here so this leaf crate stays free of the AI gateway types;
+    /// the auth path deserializes it at use.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub principal_selectors: Vec<serde_json::Value>,
+    /// Pin a model for requests on this key. When set, the gateway overwrites
+    /// the request body `model` before routing, so the caller cannot pick a
+    /// different one. `None` leaves the client's choice unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_to_model: Option<String>,
+    /// Provider tool definitions injected into the request when this key
+    /// authenticates, replacing any client-supplied tools. Opaque,
+    /// provider-shaped JSON. Empty leaves the request's tools untouched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inject_tools: Vec<serde_json::Value>,
+    /// Skip the body-aware prompt-injection scan for this key. Default false
+    /// (every key is scanned). Set true for trusted callers (eval, red-team)
+    /// that legitimately submit injection-shaped prompts.
+    #[serde(default)]
+    pub bypass_prompt_injection: bool,
     /// Project attribution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
@@ -143,6 +168,11 @@ impl KeyRecord {
             allowed_models: Vec::new(),
             blocked_models: Vec::new(),
             allowed_providers: Vec::new(),
+            require_pii_redaction: Vec::new(),
+            principal_selectors: Vec::new(),
+            route_to_model: None,
+            inject_tools: Vec::new(),
+            bypass_prompt_injection: false,
             project: None,
             user: None,
             tags: Vec::new(),

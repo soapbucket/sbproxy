@@ -1897,6 +1897,39 @@
             "type": "string"
           }
         },
+        "require_pii_redaction": {
+          "description": "Named PII redaction rules that must be active before this key can dispatch upstream (empty = none required).",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "principal_selectors": {
+          "description": "Inbound principal selectors allowed to present this key (empty = any). Each entry is a principal-selector object (virtual_key, team, project, user, role, claim).",
+          "default": [],
+          "type": "array",
+          "items": true
+        },
+        "route_to_model": {
+          "description": "Pin a model for requests on this key; the gateway overwrites the request body `model` before routing.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "inject_tools": {
+          "description": "Provider tool definitions injected into the request when this key authenticates, replacing any client-supplied tools.",
+          "default": [],
+          "type": "array",
+          "items": true
+        },
+        "bypass_prompt_injection": {
+          "description": "Skip the body-aware prompt-injection scan for this key. Default false.",
+          "default": false,
+          "type": "boolean"
+        },
         "project": {
           "description": "Project attribution.",
           "default": null,
