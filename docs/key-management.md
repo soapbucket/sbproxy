@@ -194,11 +194,45 @@ one-time minted token on create and rotate.
 
 ## Live policy
 
-A key's requests-per-minute limit is enforced from the resolved record. A `PATCH`
-to the limit takes effect on the next request without a reload. Per-key token and
-cost budgets ride on the record and reconcile with the multi-window budgets in the
-AI gateway. Across a replica fleet, per-key spend is kept coherent through the
-mesh counters.
+A key is not just an auth token; it carries its own policy. Everything below
+rides on the record, so a `PATCH` takes effect on the next request without a
+reload. Across a replica fleet, per-key spend and rate are kept coherent through
+the mesh counters.
+
+- **Model and provider access:** `allowed_models`, `blocked_models`,
+  `allowed_providers`. Empty allow-lists mean "all".
+- **Rate and budget:** `max_requests_per_minute`, `max_tokens_per_minute`, and a
+  `budget` with `max_tokens` and `max_cost_usd`. Budgets reconcile with the
+  multi-window budgets in the AI gateway.
+- **Lifecycle:** `status` (active, blocked, revoked) and `expires_at`.
+- **Guardrails:** `require_pii_redaction` lists redaction rules that must be
+  active before the key can dispatch; `bypass_prompt_injection` skips the
+  body-aware injection scan for a trusted caller (eval pipelines, red-team
+  tooling). Default off, so every key is scanned.
+- **Model pinning and tools:** `route_to_model` overwrites the request's `model`
+  before routing, so the caller cannot pick another; `inject_tools` replaces the
+  client's tool list with a set the key owns. Together these make a key a fixed
+  "model plus tools" surface.
+- **Principal gate:** `principal_selectors` restricts which inbound identities
+  may present the key, matched by `virtual_key`, `team`, `project`, `user`,
+  `role`, or `claim`. Empty means any principal.
+- **Attribution:** `project`, `user`, `tenant_id`, `tags`, and `metadata` flow
+  to the access log and cost reports.
+
+Set any of these at mint time, with `PATCH /admin/keys/{id}` at runtime, or in a
+seed key. For example:
+
+```bash
+curl -s -u admin:change-me -X PATCH http://127.0.0.1:9090/admin/keys/ab12cd34 \
+  -H 'Content-Type: application/json' \
+  -d '{"allowed_models":["gpt-4o-mini"],"max_requests_per_minute":60,
+       "budget":{"max_cost_usd":50},"route_to_model":"gpt-4o-mini",
+       "require_pii_redaction":["email"],"tags":["team:payments"]}'
+```
+
+Beyond the structured fields, the resolved key becomes the request principal, so
+the CEL policy plane can make decisions keyed on `project`, `user`, `tenant_id`,
+`tags`, or `key_id`.
 
 ## OIDC and JWT
 

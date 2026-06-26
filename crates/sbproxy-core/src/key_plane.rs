@@ -400,6 +400,11 @@ fn lower_seed_key(
     rec.allowed_models = seed.allowed_models.clone();
     rec.blocked_models = seed.blocked_models.clone();
     rec.allowed_providers = seed.allowed_providers.clone();
+    rec.require_pii_redaction = seed.require_pii_redaction.clone();
+    rec.principal_selectors = seed.principal_selectors.clone();
+    rec.route_to_model = seed.route_to_model.clone();
+    rec.inject_tools = seed.inject_tools.clone();
+    rec.bypass_prompt_injection = seed.bypass_prompt_injection;
     rec.project = seed.project.clone();
     rec.user = seed.user.clone();
     rec.tenant_id = seed.tenant.clone();
@@ -660,6 +665,11 @@ mod tests {
                 allowed_models: vec![],
                 blocked_models: vec![],
                 allowed_providers: vec![],
+                require_pii_redaction: vec![],
+                principal_selectors: vec![],
+                route_to_model: None,
+                inject_tools: vec![],
+                bypass_prompt_injection: false,
                 project: None,
                 user: None,
                 tenant: None,
@@ -750,6 +760,11 @@ mod tests {
                 allowed_models: vec![],
                 blocked_models: vec![],
                 allowed_providers: vec![],
+                require_pii_redaction: vec![],
+                principal_selectors: vec![],
+                route_to_model: None,
+                inject_tools: vec![],
+                bypass_prompt_injection: false,
                 project: None,
                 user: None,
                 tenant: None,

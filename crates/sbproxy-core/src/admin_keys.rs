@@ -139,6 +139,12 @@ struct KeyMutation {
     allowed_models: Option<Vec<String>>,
     blocked_models: Option<Vec<String>>,
     allowed_providers: Option<Vec<String>>,
+    require_pii_redaction: Option<Vec<String>>,
+    principal_selectors: Option<Vec<serde_json::Value>>,
+    /// Pin a model for this key. An empty string or "null" clears the pin.
+    route_to_model: Option<String>,
+    inject_tools: Option<Vec<serde_json::Value>>,
+    bypass_prompt_injection: Option<bool>,
     project: Option<String>,
     user: Option<String>,
     tags: Option<Vec<String>>,
@@ -177,6 +183,25 @@ fn apply_key_mutation(rec: &mut KeyRecord, m: &KeyMutation) {
     }
     if let Some(v) = &m.allowed_providers {
         rec.allowed_providers = v.clone();
+    }
+    if let Some(v) = &m.require_pii_redaction {
+        rec.require_pii_redaction = v.clone();
+    }
+    if let Some(v) = &m.principal_selectors {
+        rec.principal_selectors = v.clone();
+    }
+    if let Some(v) = &m.route_to_model {
+        rec.route_to_model = if v.is_empty() || v == "null" {
+            None
+        } else {
+            Some(v.clone())
+        };
+    }
+    if let Some(v) = &m.inject_tools {
+        rec.inject_tools = v.clone();
+    }
+    if let Some(v) = m.bypass_prompt_injection {
+        rec.bypass_prompt_injection = v;
     }
     if let Some(v) = &m.project {
         rec.project = Some(v.clone());
@@ -568,6 +593,15 @@ struct KeyView {
     allowed_models: Vec<String>,
     blocked_models: Vec<String>,
     allowed_providers: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    require_pii_redaction: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    principal_selectors: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route_to_model: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    inject_tools: Vec<serde_json::Value>,
+    bypass_prompt_injection: bool,
     project: Option<String>,
     user: Option<String>,
     tags: Vec<String>,
@@ -592,6 +626,11 @@ impl From<&KeyRecord> for KeyView {
             allowed_models: r.allowed_models.clone(),
             blocked_models: r.blocked_models.clone(),
             allowed_providers: r.allowed_providers.clone(),
+            require_pii_redaction: r.require_pii_redaction.clone(),
+            principal_selectors: r.principal_selectors.clone(),
+            route_to_model: r.route_to_model.clone(),
+            inject_tools: r.inject_tools.clone(),
+            bypass_prompt_injection: r.bypass_prompt_injection,
             project: r.project.clone(),
             user: r.user.clone(),
             tags: r.tags.clone(),

@@ -1009,6 +1009,26 @@ pub struct SeedKeyConfig {
     /// Providers this key may use (empty = all).
     #[serde(default)]
     pub allowed_providers: Vec<String>,
+    /// Named PII redaction rules that must be active before this key can
+    /// dispatch upstream (empty = none required).
+    #[serde(default)]
+    pub require_pii_redaction: Vec<String>,
+    /// Inbound principal selectors allowed to present this key (empty = any).
+    /// Each entry is a principal-selector object (virtual_key, team, project,
+    /// user, role, claim).
+    #[serde(default)]
+    pub principal_selectors: Vec<serde_json::Value>,
+    /// Pin a model for requests on this key; the gateway overwrites the request
+    /// body `model` before routing.
+    #[serde(default)]
+    pub route_to_model: Option<String>,
+    /// Provider tool definitions injected into the request when this key
+    /// authenticates, replacing any client-supplied tools.
+    #[serde(default)]
+    pub inject_tools: Vec<serde_json::Value>,
+    /// Skip the body-aware prompt-injection scan for this key. Default false.
+    #[serde(default)]
+    pub bypass_prompt_injection: bool,
     /// Project attribution.
     #[serde(default)]
     pub project: Option<String>,

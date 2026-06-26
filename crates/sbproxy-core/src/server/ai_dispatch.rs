@@ -32,8 +32,15 @@ fn key_record_to_virtual_key(
         allowed_models: rec.allowed_models.clone(),
         blocked_models: rec.blocked_models.clone(),
         allowed_providers: rec.allowed_providers.clone(),
-        principal_selectors: Vec::new(),
-        require_pii_redaction: Vec::new(),
+        // Stored opaque on the record (this crate is the seam between the
+        // keystore and the AI gateway); deserialize each selector here, dropping
+        // any malformed entry rather than failing the whole resolve.
+        principal_selectors: rec
+            .principal_selectors
+            .iter()
+            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+            .collect(),
+        require_pii_redaction: rec.require_pii_redaction.clone(),
         max_tokens_per_minute: rec.max_tokens_per_minute,
         max_requests_per_minute: rec.max_requests_per_minute,
         budget: rec
@@ -51,10 +58,10 @@ fn key_record_to_virtual_key(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
-        route_to_model: None,
-        inject_tools: Vec::new(),
+        route_to_model: rec.route_to_model.clone(),
+        inject_tools: rec.inject_tools.clone(),
         enabled: true,
-        bypass_prompt_injection: false,
+        bypass_prompt_injection: rec.bypass_prompt_injection,
     }
 }
 
@@ -5298,6 +5305,44 @@ mod dynamic_key_resolution_tests {
     use sbproxy_keystore::record::{KeyRecord, RecordStatus};
     use sbproxy_keystore::{KeyStore, MemoryKeyStore, TtlCache, TtlCacheConfig};
     use std::sync::Arc;
+
+    #[test]
+    fn key_record_carries_extended_per_key_policy() {
+        let mut rec = KeyRecord::new("k1", "h1", chrono::Utc::now());
+        rec.require_pii_redaction = vec!["email".into(), "ssn".into()];
+        rec.route_to_model = Some("gpt-4o-mini".into());
+        rec.inject_tools = vec![serde_json::json!({
+            "type": "function",
+            "function": { "name": "lookup" }
+        })];
+        rec.bypass_prompt_injection = true;
+        rec.principal_selectors = vec![serde_json::json!({ "team": "payments" })];
+
+        let vk = key_record_to_virtual_key(&rec);
+
+        assert_eq!(vk.require_pii_redaction, vec!["email", "ssn"]);
+        assert_eq!(vk.route_to_model.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(vk.inject_tools.len(), 1);
+        assert!(vk.bypass_prompt_injection);
+        assert_eq!(vk.principal_selectors.len(), 1);
+        assert_eq!(vk.principal_selectors[0].team.as_deref(), Some("payments"));
+    }
+
+    #[test]
+    fn malformed_principal_selector_is_dropped_not_fatal() {
+        let mut rec = KeyRecord::new("k2", "h2", chrono::Utc::now());
+        rec.principal_selectors = vec![
+            serde_json::json!({ "user": "alice" }), // valid
+            serde_json::json!(42),                  // not a selector object
+        ];
+        let vk = key_record_to_virtual_key(&rec);
+        assert_eq!(
+            vk.principal_selectors.len(),
+            1,
+            "the malformed entry is dropped, the resolve still succeeds"
+        );
+        assert_eq!(vk.principal_selectors[0].user.as_deref(), Some("alice"));
+    }
 
     #[tokio::test]
     async fn dynamic_key_resolution_outcomes() {
