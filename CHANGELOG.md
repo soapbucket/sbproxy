@@ -11,6 +11,19 @@ Work that has merged to `main` since the latest tag and is queued for
 the next version cut. No promises about backward compatibility for any
 of the new YAML fields below until the version that ships them.
 
+### Added
+
+- **External HTTP guardrail providers.** An AI origin's `guardrails.external`
+  list runs external guardrail services alongside the built-in checks.
+  Input-mode entries (`pre_call` / `during_call`) inspect the request before
+  dispatch and block on a not-allowed verdict; `logging_only` records only,
+  and a transport or parse error honors each entry's `fail_open` flag.
+  Provider presets shape the request and response for Presidio (`/analyze`
+  with a findings array) and a generic `{"input"}` shape that fits Lakera,
+  Aporia, and custom endpoints, with an optional API key on a configurable
+  auth header. Output-side and AWS Bedrock (SigV4) guardrails are not yet
+  wired.
+
 ## [1.3.1] - 2026-06-25
 
 Patch release. Fixes TLS, which was broken on startup in v1.2.0 and v1.3.0.
