@@ -69,7 +69,7 @@ default-off.
 ### Changed
 
 - The mesh wire encoding moved off the unmaintained `bincode` crate to
-  `postcard`. Peer mTLS on the mesh transport is on by default.
+  `postcard`.
 - The README and docs now lead with the two-way framing: SBproxy governs the
   AI you call and the AI that calls you.
 
