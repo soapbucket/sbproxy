@@ -36,7 +36,7 @@ SBproxy governs AI traffic in both directions: the calls your apps and agents ma
 - **The AI you call.** 200+ models behind one OpenAI-compatible API, with fallback chains, outcome-aware routing, predictive budgets, and per-error retry policies. Guardrails screen the prompt and the model's response, blocking or redacting a streaming completion mid-flight. A local semantic cache replays near-duplicate prompts with no per-call cost, and the prompt never leaves your network.
 - **The AI that calls you.** Charge AI crawlers per request with Pay Per Crawl (x402 or Stripe), verify signed agents with Web Bot Auth (RFC 9421), and negotiate Markdown so agents stop paying for HTML they cannot use. Inbound AI is governed by the same gateway, not a separate product.
 - **Govern every key.** Inbound virtual keys are hashed at rest (HMAC-SHA256 plus a server pepper) and minted, rotated, and revoked at runtime through an admin API. A revoke takes effect on the next request, not the next reload. Per-key policy travels with the key: models, budgets, rate, required redaction, model pinning. Upstream credentials are encrypted at rest. See [key management](docs/key-management.md).
-- **A real proxy for the rest.** Auth (JWT, OIDC, mTLS), WAF, DDoS, CSRF, SSRF guards, PII redaction, and prompt-injection detection on a local model. Guardrails run as a quorum mesh on a latency budget. The proxy that fronts your models is the security layer, not a thing you bolt on after it.
+- **A real proxy for the rest.** Auth (JWT, OIDC, mTLS), automatic TLS via ACME, WAF, DDoS, CSRF, SSRF guards, and PII redaction. Prompt-injection detection runs on an on-box ONNX model, so it adds no per-call cost and nothing leaves your network, even air-gapped. Guardrails run as a quorum mesh on a latency budget. The proxy that fronts your models is the security layer, not a thing you bolt on after it.
 - **Run as a fleet without Redis.** Point every replica at a shared store and a key minted on one works on all, with a revoke seen across the fleet. The mesh that keeps the cache, budgets, and per-key spend counters coherent (gossip, CRDTs, a consistent-hash ring) is open source here, so the cluster coordinates itself without an external Redis or a vendor's control plane.
 - **Prove the spend.** Every request can emit a hash-chained, Ed25519-signed usage receipt with token counts and USD cost that you re-derive and verify offline. Metrics, logs, and OpenTelemetry GenAI traces come from the same process, ready for Phoenix, Langfuse, Grafana, or Datadog.
 - **Stay fast, stay yours.** Sub-millisecond p99 overhead, idle RSS in single-digit megabytes, hot reload with no dropped connections. One binary, Apache 2.0, in your VPC.
@@ -151,12 +151,6 @@ For contributors: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 - [Issue Tracker](https://github.com/soapbucket/sbproxy/issues) for bug reports and feature requests.
 - Looking for a managed offering? [SBproxy Enterprise](https://sbproxy.dev/enterprise).
-
----
-
-## Upgrading from v0.1.x (Go)
-
-SBproxy v1.0 is a Rust rewrite. The Go implementation that previously occupied this repository is archived at [soapbucket/sbproxy-go](https://github.com/soapbucket/sbproxy-go) and tagged `v0.1.2-go-final`. New work happens here. See [MIGRATION.md](./MIGRATION.md) for the upgrade path; existing `sb.yml` files should compile unchanged.
 
 ---
 
