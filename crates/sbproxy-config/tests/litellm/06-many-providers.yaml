@@ -1,0 +1,15 @@
+# A broader provider spread with an org-scoped deployment, a simple-shuffle
+# strategy, and an unmapped litellm_param that must surface as a warning.
+model_list:
+  - model_name: mistral-large
+    litellm_params:
+      model: mistral/mistral-large-latest
+      api_key: os.environ/MISTRAL_API_KEY
+  - model_name: groq-llama
+    litellm_params:
+      model: groq/llama-3.1-70b-versatile
+      api_key: os.environ/GROQ_API_KEY
+      organization: org-acme
+      some_unknown_kwarg: 42
+router_settings:
+  routing_strategy: simple-shuffle
