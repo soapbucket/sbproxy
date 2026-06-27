@@ -21,6 +21,7 @@ pub mod frame;
 pub mod quic_transport;
 pub mod server;
 pub mod tcp;
+pub mod tls;
 pub mod websocket;
 pub(crate) mod wire;
 

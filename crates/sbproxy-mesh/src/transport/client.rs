@@ -27,6 +27,77 @@ use crate::crypto::Cipher;
 
 use super::frame::{read_frame, write_frame, CacheOp, CacheResult, Request, Response};
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use rustls::pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::TlsConnector;
+
+// --- Connection security ---
+
+/// The TLS client side for a [`PeerClient`]: a connector plus the logical
+/// `ServerName` every peer certificate is issued for. The mesh dials peers by
+/// address but verifies one fixed identity, so all peers share a name.
+#[derive(Clone)]
+pub struct MeshTlsClient {
+    /// rustls connector that presents this node's cert and verifies the peer's.
+    pub connector: TlsConnector,
+    /// Logical server name to verify the peer certificate against.
+    pub server_name: ServerName<'static>,
+}
+
+/// A live mesh connection: a plain TCP stream, or a mutually-authenticated
+/// TLS session over one. Implements `AsyncRead`/`AsyncWrite` by delegating to
+/// the active variant so the framing code is transport-agnostic.
+enum MeshConn {
+    /// Plaintext TCP (no peer mTLS configured).
+    Plain(TcpStream),
+    /// TLS-wrapped TCP. Boxed because `TlsStream` is comparatively large.
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for MeshConn {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MeshConn::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            MeshConn::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for MeshConn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            MeshConn::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            MeshConn::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MeshConn::Plain(s) => Pin::new(s).poll_flush(cx),
+            MeshConn::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MeshConn::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            MeshConn::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
 // --- PeerClient ---
 
 /// Per-peer RPC client. Holds exactly one TCP connection; reconnects lazily
@@ -39,6 +110,9 @@ pub struct PeerClient {
     /// sealed before framing and every inbound response is opened after
     /// unframing. `None` preserves K2 plaintext wire behavior.
     cipher: Option<Cipher>,
+    /// Optional client-side peer mTLS. When `Some`, the connection is wrapped
+    /// in a mutually-authenticated TLS session right after the TCP connect.
+    tls: Option<MeshTlsClient>,
     /// Shared inner state: current stream (if any) + monotonic request id
     /// counter. The `Mutex` also serialises send/recv so the MVP is always
     /// at most one request in flight per peer.
@@ -47,9 +121,9 @@ pub struct PeerClient {
 
 /// Internal state guarded by `PeerClient::inner`.
 struct InnerClient {
-    /// Live TCP connection. `None` before the first request or after any
-    /// transport failure; the next `send_request` call reconnects.
-    stream: Option<TcpStream>,
+    /// Live connection (plain TCP or TLS). `None` before the first request or
+    /// after any transport failure; the next `send_request` reconnects.
+    stream: Option<MeshConn>,
     /// Monotonic per-connection request id. Reset on reconnect.
     next_id: u64,
 }
@@ -72,9 +146,18 @@ impl PeerClient {
     /// decrypt failure invalidates the connection and is returned as an
     /// error to the caller; the next call transparently reconnects.
     pub fn with_cipher(addr: String, cipher: Option<Cipher>) -> Self {
+        Self::with_security(addr, cipher, None)
+    }
+
+    /// Construct a peer client with optional AEAD framing and optional peer
+    /// mTLS. When `tls` is `Some`, every connection to this peer is wrapped in
+    /// a mutually-authenticated TLS session after the TCP connect, so an
+    /// untrusted peer (or a man-in-the-middle) cannot serve mesh RPCs.
+    pub fn with_security(addr: String, cipher: Option<Cipher>, tls: Option<MeshTlsClient>) -> Self {
         Self {
             addr,
             cipher,
+            tls,
             inner: Arc::new(Mutex::new(InnerClient {
                 stream: None,
                 next_id: 1,
@@ -176,13 +259,24 @@ impl PeerClient {
 
         // --- Ensure we're connected ---
         if guard.stream.is_none() {
-            let stream = TcpStream::connect(&self.addr)
+            let tcp = TcpStream::connect(&self.addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("connect to {} failed: {}", self.addr, e))?;
             // Small perf win on the wire side: coalescing is almost never
             // beneficial for a request/response RPC.
-            let _ = stream.set_nodelay(true);
-            guard.stream = Some(stream);
+            let _ = tcp.set_nodelay(true);
+            let conn = match &self.tls {
+                Some(t) => MeshConn::Tls(Box::new(
+                    t.connector
+                        .connect(t.server_name.clone(), tcp)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("TLS handshake to {} failed: {}", self.addr, e)
+                        })?,
+                )),
+                None => MeshConn::Plain(tcp),
+            };
+            guard.stream = Some(conn);
         }
 
         let request_id = guard.next_id;
@@ -204,10 +298,11 @@ impl PeerClient {
         // block so they end before we touch `guard.stream = None`. Any I/O
         // error tears the connection down so the next call reconnects.
         let io_result: anyhow::Result<Vec<u8>> = {
-            let stream = guard.stream.as_mut().expect("connected above");
-            let (mut reader, mut writer) = stream.split();
-            match write_frame(&mut writer, &on_wire).await {
-                Ok(()) => match read_frame(&mut reader).await {
+            // `MeshConn` is `AsyncRead + AsyncWrite`; write then read run
+            // sequentially on the same connection, so no split is needed.
+            let conn = guard.stream.as_mut().expect("connected above");
+            match write_frame(conn, &on_wire).await {
+                Ok(()) => match read_frame(conn).await {
                     Ok(b) => Ok(b),
                     Err(e) => Err(anyhow::anyhow!("read from {} failed: {}", self.addr, e)),
                 },

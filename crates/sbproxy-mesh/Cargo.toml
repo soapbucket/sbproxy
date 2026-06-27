@@ -40,6 +40,10 @@ rand = { workspace = true }
 # permissive, Apache-2.0-compatible license), so it ships in the default build.
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "ring"] }
 rustls-pki-types = { workspace = true }
+# Peer mTLS for the mesh transport: build rustls server/client configs and
+# wrap accepted/dialed TCP streams in a mutually-authenticated TLS session.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
