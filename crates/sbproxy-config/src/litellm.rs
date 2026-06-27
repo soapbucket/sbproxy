@@ -583,4 +583,33 @@ litellm_settings:
             Some("gpt-4o")
         );
     }
+
+    /// Drop-in regression net: every representative LiteLLM config in
+    /// `tests/litellm/` must translate without error and produce an `sb.yml`
+    /// that compiles. A translator change that breaks a real-world config
+    /// shape fails here, and the corpus doubles as worked migration examples.
+    #[test]
+    fn litellm_corpus_translates_and_compiles() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/litellm");
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("read corpus dir {dir}: {e}"))
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "yaml"))
+            .collect();
+        paths.sort();
+        for path in &paths {
+            let yaml = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let out = translate_litellm(&yaml)
+                .unwrap_or_else(|e| panic!("translate {}: {e}", path.display()));
+            compile_config(&out.sb_yaml)
+                .unwrap_or_else(|e| panic!("compile translated {}: {e}", path.display()));
+        }
+        assert!(
+            paths.len() >= 5,
+            "expected >=5 corpus fixtures under {dir}, found {}",
+            paths.len()
+        );
+    }
 }

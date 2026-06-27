@@ -9,6 +9,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use sbproxy_plugin::mcp::{default_no_op_hook, mcp_policy_hooks, McpPolicyHook, McpToolCallCtx};
 use sbproxy_plugin::traits::PolicyDecision;
+use serde::Deserialize;
 use serde_json::json;
 use tracing::{debug, error, info, warn};
 
@@ -43,6 +44,21 @@ pub enum McpCallOutcome {
 
 // --- Config ---
 
+/// How a federated server's tool and resource names are namespaced when
+/// aggregated into the gateway's unified registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NamespaceMode {
+    /// Keep each name bare and only prefix it with the server name when it
+    /// collides with a name an earlier server already advertised (default).
+    #[default]
+    OnCollision,
+    /// Always prefix every tool and resource from this server with the
+    /// server name, so the whole upstream is namespaced even without a
+    /// collision.
+    Always,
+}
+
 /// Configuration for one upstream MCP server.
 #[derive(Debug, Clone)]
 pub struct McpServerConfig {
@@ -52,6 +68,42 @@ pub struct McpServerConfig {
     pub url: String,
     /// Transport type: `"streamable_http"` or `"sse"`.
     pub transport: String,
+    /// How this server's names are namespaced in the unified registry.
+    pub namespace: NamespaceMode,
+}
+
+/// Resolve the advertised (and registry-key) name for a tool or resource
+/// from `server_name`, given the names already taken in the registry.
+///
+/// In [`NamespaceMode::Always`] every name is prefixed with the server name
+/// up front. In [`NamespaceMode::OnCollision`] the bare name is kept unless
+/// it is already taken, in which case it is disambiguated with the
+/// server-qualified form. `sep` is `'.'` for tools and `'/'` for resources.
+/// The returned name is what the gateway advertises to clients *and* keys
+/// the registry by, so what a client sees is exactly what routes.
+fn federated_name(
+    server_name: &str,
+    namespace: NamespaceMode,
+    sep: char,
+    raw: &str,
+    taken: impl Fn(&str) -> bool,
+) -> String {
+    let base = match namespace {
+        NamespaceMode::Always => format!("{server_name}{sep}{raw}"),
+        NamespaceMode::OnCollision => raw.to_string(),
+    };
+    if !taken(&base) {
+        return base;
+    }
+    // Disambiguate against the server-qualified form. If that is also taken
+    // (a same-server duplicate, which `tools/list` should not produce), fall
+    // back to the base and let the caller overwrite.
+    let qualified = format!("{server_name}{sep}{raw}");
+    if qualified != base && !taken(&qualified) {
+        qualified
+    } else {
+        base
+    }
 }
 
 // --- Registry ---
@@ -157,19 +209,23 @@ impl McpFederation {
                         count = tools.len(),
                         "fetched tools from upstream MCP server"
                     );
-                    for tool in tools {
-                        let key = if registry.contains_key(&tool.name) {
-                            // Prefix with server name to avoid shadowing.
+                    for mut tool in tools {
+                        let advertised =
+                            federated_name(&server.name, server.namespace, '.', &tool.name, |n| {
+                                registry.contains_key(n)
+                            });
+                        if advertised != tool.name {
                             warn!(
                                 tool = %tool.name,
                                 server = %server.name,
-                                "tool name collision, using prefixed name"
+                                advertised = %advertised,
+                                "federated tool name namespaced (collision or always-namespace)"
                             );
-                            format!("{}.{}", server.name, tool.name)
-                        } else {
-                            tool.name.clone()
-                        };
-                        registry.insert(key, tool);
+                        }
+                        // Advertise the resolved name so the client sees and
+                        // calls the same name `resolve_tool` routes by.
+                        tool.name = advertised.clone();
+                        registry.insert(advertised, tool);
                     }
                 }
                 Err(e) => {
@@ -305,18 +361,27 @@ impl McpFederation {
                         count = resources.len(),
                         "fetched resources from upstream MCP server"
                     );
-                    for resource in resources {
-                        let key = if registry.contains_key(&resource.uri) {
+                    for mut resource in resources {
+                        let advertised = federated_name(
+                            &server.name,
+                            server.namespace,
+                            '/',
+                            &resource.uri,
+                            |n| registry.contains_key(n),
+                        );
+                        if advertised != resource.uri {
                             warn!(
                                 uri = %resource.uri,
                                 server = %server.name,
-                                "resource uri collision, using prefixed key"
+                                advertised = %advertised,
+                                "federated resource uri namespaced (collision or always-namespace)"
                             );
-                            format!("{}/{}", server.name, resource.uri)
-                        } else {
-                            resource.uri.clone()
-                        };
-                        registry.insert(key, resource);
+                        }
+                        // Advertise the resolved uri; `upstream_uri` keeps the
+                        // original so `resources/read` still forwards the URI
+                        // the upstream advertised.
+                        resource.uri = advertised.clone();
+                        registry.insert(advertised, resource);
                     }
                 }
                 Err(e) => {
@@ -812,7 +877,43 @@ mod tests {
             name: name.to_string(),
             url: url.to_string(),
             transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
         }
+    }
+
+    #[test]
+    fn federated_name_on_collision_prefixes_only_when_taken() {
+        use std::collections::HashSet;
+        let taken: HashSet<String> = ["search".to_string()].into_iter().collect();
+        // Default mode keeps the bare name when it is free...
+        assert_eq!(
+            federated_name("gh", NamespaceMode::OnCollision, '.', "create_issue", |n| {
+                taken.contains(n)
+            }),
+            "create_issue"
+        );
+        // ...and disambiguates with the server name when it collides, so the
+        // advertised name is the one that actually routes.
+        assert_eq!(
+            federated_name("gh", NamespaceMode::OnCollision, '.', "search", |n| taken
+                .contains(n)),
+            "gh.search"
+        );
+    }
+
+    #[test]
+    fn federated_name_always_prefixes_every_name() {
+        let none_taken = |_: &str| false;
+        // `Always` namespaces every name up front, even with no collision.
+        assert_eq!(
+            federated_name("gh", NamespaceMode::Always, '.', "search", none_taken),
+            "gh.search"
+        );
+        // Resources use a slash separator.
+        assert_eq!(
+            federated_name("docs", NamespaceMode::Always, '/', "file://x", none_taken),
+            "docs/file://x"
+        );
     }
 
     fn make_tool(name: &str, server: &str) -> FederatedTool {
@@ -1050,6 +1151,7 @@ mod tests {
             name: "legacy".to_string(),
             url: "https://legacy.example.com/sse".to_string(),
             transport: "sse".to_string(),
+            namespace: NamespaceMode::default(),
         };
         assert_eq!(config.transport, "sse");
     }
@@ -1101,25 +1203,42 @@ mod tests {
     // --- Collision handling (simulated) ---
 
     #[test]
-    fn test_tool_name_collision_uses_prefixed_name() {
-        // Simulate what federation does: if a tool name collides, it gets
-        // prefixed with the server name.
+    fn test_tool_name_collision_advertises_prefixed_name() {
+        // The collision fix: the later server's tool must be ADVERTISED under
+        // the prefixed name (its `tool.name`), not merely keyed by it, so a
+        // client both sees and can call the disambiguated name.
         let mut registry: HashMap<String, FederatedTool> = HashMap::new();
-        let tool_a = make_tool("search", "server_a");
-        registry.insert("search".to_string(), tool_a);
 
-        // Second server also has a "search" tool - should get prefixed.
-        let tool_b = make_tool("search", "server_b");
-        let key = if registry.contains_key(&tool_b.name) {
-            format!("{}.{}", tool_b.server_name, tool_b.name)
-        } else {
-            tool_b.name.clone()
-        };
-        registry.insert(key.clone(), tool_b);
+        let mut tool_a = make_tool("search", "server_a");
+        tool_a.name = federated_name(
+            "server_a",
+            NamespaceMode::OnCollision,
+            '.',
+            &tool_a.name,
+            |n| registry.contains_key(n),
+        );
+        registry.insert(tool_a.name.clone(), tool_a);
+
+        // Second server also has a "search" tool: it must be disambiguated.
+        let mut tool_b = make_tool("search", "server_b");
+        tool_b.name = federated_name(
+            "server_b",
+            NamespaceMode::OnCollision,
+            '.',
+            &tool_b.name,
+            |n| registry.contains_key(n),
+        );
+        registry.insert(tool_b.name.clone(), tool_b);
 
         assert!(registry.contains_key("search"));
         assert!(registry.contains_key("server_b.search"));
         assert_eq!(registry.len(), 2);
+        // Advertised name equals the routing key on both entries.
+        assert_eq!(registry.get("search").unwrap().name, "search");
+        assert_eq!(
+            registry.get("server_b.search").unwrap().name,
+            "server_b.search"
+        );
     }
 
     // --- Tool call routing ---

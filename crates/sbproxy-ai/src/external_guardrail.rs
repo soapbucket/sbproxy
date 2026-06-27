@@ -41,6 +41,24 @@ impl GuardrailMode {
     }
 }
 
+/// Which external guardrail provider an [`ExternalGuardrailConfig`] targets.
+/// Selects the request-body shape and the response parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardrailProvider {
+    /// A custom HTTP guardrail: POST `{"input": content}` and parse a common
+    /// `allowed` / `flagged` / `blocked` verdict (default).
+    #[default]
+    Generic,
+    /// Microsoft Presidio `/analyze`: POST `{"text", "language"}`; a
+    /// non-empty findings array means content was flagged.
+    Presidio,
+    /// Lakera Guard: POST `{"input"}` with a bearer key; common verdict.
+    Lakera,
+    /// Aporia: POST `{"input"}` with a key; common verdict.
+    Aporia,
+}
+
 /// Config for one external guardrail, parsed from the action's
 /// `external_guardrails` list.
 #[derive(Debug, Clone, Deserialize)]
@@ -61,10 +79,32 @@ pub struct ExternalGuardrailConfig {
     /// Per-call timeout in milliseconds.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// External provider preset selecting the request/response shape.
+    #[serde(default)]
+    pub provider: GuardrailProvider,
+    /// Optional API key sent on the auth header for hosted providers.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Header the API key is sent on. Defaults to `Authorization`.
+    #[serde(default = "default_auth_header")]
+    pub auth_header: Option<String>,
+    /// Prefix prepended to the API key value (a space separates it from the
+    /// key). Defaults to `Bearer`; set to an empty string to send the bare
+    /// key.
+    #[serde(default = "default_auth_prefix")]
+    pub auth_prefix: Option<String>,
 }
 
 fn default_timeout_ms() -> u64 {
     2_000
+}
+
+fn default_auth_header() -> Option<String> {
+    Some("Authorization".to_string())
+}
+
+fn default_auth_prefix() -> Option<String> {
+    Some("Bearer".to_string())
 }
 
 /// The verdict an external guardrail returns for a piece of content.
@@ -114,8 +154,10 @@ pub fn parse_verdict(body: &serde_json::Value) -> GuardrailVerdict {
 
 /// Call an external guardrail endpoint with `content` and return its verdict.
 ///
-/// POSTs `{"input": content}` as JSON. On any transport, status, or parse
-/// failure the result depends on [`ExternalGuardrailConfig::fail_open`]: a
+/// POSTs the provider-shaped request body (see [`provider_request_body`]),
+/// attaching the API key on the configured auth header when set. On any
+/// transport, status, or parse failure the result depends on
+/// [`ExternalGuardrailConfig::fail_open`]: a
 /// fail-open guardrail allows the content (with a reason), a fail-closed one
 /// blocks it. This never panics or propagates an error.
 pub async fn check_external_guardrail(
@@ -149,12 +191,18 @@ pub async fn check_external_guardrail(
         Ok(c) => c,
         Err(_) => return on_error("client build"),
     };
-    let resp = match client
+    let mut req = client
         .post(&cfg.url)
-        .json(&serde_json::json!({ "input": content }))
-        .send()
-        .await
-    {
+        .json(&provider_request_body(cfg.provider, content));
+    if let Some(key) = &cfg.api_key {
+        let header = cfg.auth_header.as_deref().unwrap_or("Authorization");
+        let value = match cfg.auth_prefix.as_deref() {
+            Some(p) if !p.is_empty() => format!("{p} {key}"),
+            _ => key.clone(),
+        };
+        req = req.header(header, value);
+    }
+    let resp = match req.send().await {
         Ok(r) => r,
         Err(_) => return on_error("request"),
     };
@@ -162,9 +210,87 @@ pub async fn check_external_guardrail(
         return on_error("non-2xx");
     }
     match resp.json::<serde_json::Value>().await {
-        Ok(body) => parse_verdict(&body),
+        Ok(body) => parse_provider_verdict(cfg.provider, &body),
         Err(_) => on_error("decode"),
     }
+}
+
+/// Build the request body for `content` in the shape `provider` expects.
+pub fn provider_request_body(provider: GuardrailProvider, content: &str) -> serde_json::Value {
+    match provider {
+        GuardrailProvider::Presidio => serde_json::json!({ "text": content, "language": "en" }),
+        GuardrailProvider::Generic | GuardrailProvider::Lakera | GuardrailProvider::Aporia => {
+            serde_json::json!({ "input": content })
+        }
+    }
+}
+
+/// Parse a verdict from `provider`'s response body.
+///
+/// Presidio returns an array of recognized entities, so a non-empty array is
+/// a flag. The other providers return a common object shape handled by
+/// [`parse_verdict`].
+pub fn parse_provider_verdict(
+    provider: GuardrailProvider,
+    body: &serde_json::Value,
+) -> GuardrailVerdict {
+    match provider {
+        GuardrailProvider::Presidio => {
+            let entities = body.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+            if entities.is_empty() {
+                return GuardrailVerdict::allow();
+            }
+            let kinds: Vec<String> = entities
+                .iter()
+                .filter_map(|e| e.get("entity_type").and_then(|v| v.as_str()))
+                .map(|s| s.to_string())
+                .collect();
+            let reason = if kinds.is_empty() {
+                format!("presidio flagged {} entities", entities.len())
+            } else {
+                format!("presidio flagged: {}", kinds.join(", "))
+            };
+            GuardrailVerdict {
+                allowed: false,
+                reason: Some(reason),
+            }
+        }
+        GuardrailProvider::Generic | GuardrailProvider::Lakera | GuardrailProvider::Aporia => {
+            parse_verdict(body)
+        }
+    }
+}
+
+/// Whether a guardrail's verdict should block the request: only when the
+/// mode actually blocks (not `logging_only`) and the content was disallowed.
+pub fn verdict_blocks(cfg: &ExternalGuardrailConfig, verdict: &GuardrailVerdict) -> bool {
+    cfg.mode.blocks() && !verdict.allowed
+}
+
+/// Run the input-side external guardrails over `content`, returning the
+/// `(name, reason)` of the first one that blocks.
+///
+/// Only guardrails that are `default_on` and run on input (`pre_call` /
+/// `during_call`) are evaluated here; `logging_only` records a verdict but
+/// never blocks. Transport or parse errors honor each guardrail's
+/// `fail_open` flag inside [`check_external_guardrail`].
+pub async fn run_input_external_guardrails(
+    cfgs: &[ExternalGuardrailConfig],
+    content: &str,
+) -> Option<(String, String)> {
+    for cfg in cfgs {
+        if !cfg.default_on || !cfg.mode.is_input() {
+            continue;
+        }
+        let verdict = check_external_guardrail(cfg, content).await;
+        if verdict_blocks(cfg, &verdict) {
+            let reason = verdict
+                .reason
+                .unwrap_or_else(|| format!("blocked by external guardrail '{}'", cfg.name));
+            return Some((cfg.name.clone(), reason));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -205,6 +331,86 @@ mod tests {
         assert!(!cfg.default_on);
         assert!(!cfg.fail_open);
         assert_eq!(cfg.timeout_ms, 2_000);
+    }
+
+    #[test]
+    fn presidio_uses_text_language_request_and_array_verdict() {
+        // Presidio's /analyze takes {text, language} and returns an array of
+        // findings; a non-empty array means PII was detected -> block.
+        let body = provider_request_body(GuardrailProvider::Presidio, "my ssn is 123");
+        assert_eq!(
+            body.get("text").and_then(|v| v.as_str()),
+            Some("my ssn is 123")
+        );
+        assert_eq!(body.get("language").and_then(|v| v.as_str()), Some("en"));
+        let found = parse_provider_verdict(
+            GuardrailProvider::Presidio,
+            &serde_json::json!([{"entity_type":"US_SSN"}]),
+        );
+        assert!(!found.allowed);
+        assert!(
+            parse_provider_verdict(GuardrailProvider::Presidio, &serde_json::json!([])).allowed
+        );
+    }
+
+    #[test]
+    fn generic_and_flagged_providers_use_input_request_and_common_verdict() {
+        // Generic / Lakera / Aporia POST {input} and return a common verdict
+        // shape (allowed / flagged / blocked).
+        let body = provider_request_body(GuardrailProvider::Generic, "hi");
+        assert_eq!(body.get("input").and_then(|v| v.as_str()), Some("hi"));
+        assert!(
+            !parse_provider_verdict(
+                GuardrailProvider::Lakera,
+                &serde_json::json!({"flagged": true})
+            )
+            .allowed
+        );
+        assert!(
+            parse_provider_verdict(
+                GuardrailProvider::Aporia,
+                &serde_json::json!({"allowed": true})
+            )
+            .allowed
+        );
+    }
+
+    #[test]
+    fn verdict_blocks_only_for_blocking_modes_and_disallowed() {
+        let pre = serde_json::from_str::<ExternalGuardrailConfig>(
+            r#"{"name":"g","url":"http://x","mode":"pre_call"}"#,
+        )
+        .unwrap();
+        let logging = serde_json::from_str::<ExternalGuardrailConfig>(
+            r#"{"name":"g","url":"http://x","mode":"logging_only"}"#,
+        )
+        .unwrap();
+        let blocked = GuardrailVerdict {
+            allowed: false,
+            reason: Some("pii".into()),
+        };
+        // pre_call + disallowed -> blocks; pre_call + allowed -> does not.
+        assert!(verdict_blocks(&pre, &blocked));
+        assert!(!verdict_blocks(&pre, &GuardrailVerdict::allow()));
+        // logging_only never blocks even on a disallowed verdict.
+        assert!(!verdict_blocks(&logging, &blocked));
+    }
+
+    #[test]
+    fn config_parses_provider_and_auth_defaults() {
+        let cfg: ExternalGuardrailConfig = serde_json::from_str(
+            r#"{"name":"lakera","url":"http://lakera/guard","mode":"pre_call","provider":"lakera","api_key":"sk-test"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.provider, GuardrailProvider::Lakera);
+        assert_eq!(cfg.api_key.as_deref(), Some("sk-test"));
+        // Auth header/prefix default to bearer.
+        assert_eq!(cfg.auth_header.as_deref(), Some("Authorization"));
+        assert_eq!(cfg.auth_prefix.as_deref(), Some("Bearer"));
+        // Provider defaults to generic when unset.
+        let bare: ExternalGuardrailConfig =
+            serde_json::from_str(r#"{"name":"g","url":"http://x","mode":"pre_call"}"#).unwrap();
+        assert_eq!(bare.provider, GuardrailProvider::Generic);
     }
 
     #[tokio::test]

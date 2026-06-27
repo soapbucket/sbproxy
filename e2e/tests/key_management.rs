@@ -185,6 +185,103 @@ fn key_lifecycle_mint_use_revoke_rotate() {
     let _ = std::fs::remove_file(&store_path);
 }
 
+/// Expiry, block/unblock, and per-key rate limiting all gate at auth time,
+/// before the dead upstream is reached.
+#[test]
+fn key_expiry_block_and_rate_limit() {
+    let admin_port = pick_port();
+    let dead_port = pick_port();
+    let store_path = format!(
+        "{}/sbproxy_e2e_keymgmt_gate_{}.redb",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&store_path);
+
+    let proxy = ProxyHarness::start_with_yaml(&config(admin_port, dead_port, &store_path))
+        .expect("start proxy");
+    ProxyHarness::wait_for_port(admin_port, Duration::from_secs(5)).expect("admin port to bind");
+    let auth = format!("Basic {}", base64_encode("admin:secret"));
+    let base = proxy.base_url();
+
+    // Expiry: a key whose expires_at is in the past is denied immediately.
+    let (status, body) = admin_post(
+        admin_port,
+        "/admin/keys",
+        &auth,
+        Some(r#"{"name":"expired","expires_at":"2020-01-01T00:00:00Z"}"#),
+    );
+    assert_eq!(status, 201, "mint expired key: {body}");
+    let exp_token = serde_json::from_str::<serde_json::Value>(&body).unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        denied(ai_request(&base, &exp_token)),
+        "a key past its expires_at must be denied"
+    );
+
+    // Block / unblock: a blocked key is denied; unblocking restores access.
+    let (status, body) = admin_post(admin_port, "/admin/keys", &auth, Some(r#"{"name":"blk"}"#));
+    assert_eq!(status, 201, "mint block key: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let blk_token = v["token"].as_str().unwrap().to_string();
+    let blk_id = v["key"]["key_id"].as_str().unwrap().to_string();
+    assert!(
+        !denied(ai_request(&base, &blk_token)),
+        "a fresh key must pass auth"
+    );
+    let (status, body) = admin_post(
+        admin_port,
+        &format!("/admin/keys/{blk_id}/block"),
+        &auth,
+        None,
+    );
+    assert_eq!(status, 200, "block: {body}");
+    assert_eq!(
+        ai_request(&base, &blk_token),
+        403,
+        "a blocked key must be 403"
+    );
+    let (status, body) = admin_post(
+        admin_port,
+        &format!("/admin/keys/{blk_id}/unblock"),
+        &auth,
+        None,
+    );
+    assert_eq!(status, 200, "unblock: {body}");
+    assert!(
+        !denied(ai_request(&base, &blk_token)),
+        "an unblocked key must pass auth again"
+    );
+
+    // Rate limit: a key capped at 1 request/minute returns 429 on the second
+    // call within the window (the gate runs before the upstream).
+    let (status, body) = admin_post(
+        admin_port,
+        "/admin/keys",
+        &auth,
+        Some(r#"{"name":"rl","max_requests_per_minute":1}"#),
+    );
+    assert_eq!(status, 201, "mint rate-limited key: {body}");
+    let rl_token = serde_json::from_str::<serde_json::Value>(&body).unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first = ai_request(&base, &rl_token);
+    assert!(
+        !denied(first) && first != 429,
+        "the first request must pass the gate (got {first})"
+    );
+    assert_eq!(
+        ai_request(&base, &rl_token),
+        429,
+        "the second request within the minute must be 429"
+    );
+
+    let _ = std::fs::remove_file(&store_path);
+}
+
 /// Minimal standard base64 (avoids a crate dep), matching admin_endpoints.rs.
 fn base64_encode(input: &str) -> String {
     const ALPH: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

@@ -419,6 +419,12 @@ pub struct GuardrailsConfig {
     /// serial behavior.
     #[serde(default)]
     pub mesh: Option<GuardrailMeshConfig>,
+    /// WOR-1529: external HTTP guardrail providers (Presidio, Lakera,
+    /// Aporia, or a custom endpoint) evaluated alongside the built-in
+    /// guardrails. Input-mode entries inspect the request before dispatch
+    /// and block on a not-allowed verdict; `logging_only` records only.
+    #[serde(default)]
+    pub external: Vec<crate::external_guardrail::ExternalGuardrailConfig>,
 }
 
 #[cfg(test)]
@@ -668,6 +674,7 @@ mod tests {
             ],
             output: vec![serde_json::json!({"type": "pii", "patterns": ["ssn"]})],
             mesh: None,
+            external: Vec::new(),
         };
         let pipeline = compile_pipeline(&config).unwrap();
         assert_eq!(pipeline.input.len(), 2);
@@ -747,6 +754,7 @@ mod tests {
             ],
             output: vec![],
             mesh: None,
+            external: Vec::new(),
         };
         let pipeline = compile_pipeline(&config).unwrap();
         assert_eq!(pipeline.input.len(), 4);

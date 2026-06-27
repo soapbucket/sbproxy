@@ -1375,6 +1375,62 @@ pub(super) async fn handle_ai_proxy(
     // served from a cache hit that short-circuits the request.
     // --- Input guardrails: check messages before forwarding ---
     if let Some(ref guardrails_config) = config.guardrails {
+        // WOR-1529: external HTTP guardrail providers (Presidio / Lakera /
+        // Aporia / custom) run before the built-in pipeline. Input-mode
+        // guardrails inspect the request content and block on a not-allowed
+        // verdict; `logging_only` records only, and errors honor each
+        // guardrail's `fail_open` flag.
+        if !guardrails_config.external.is_empty() {
+            let input_text = {
+                let messages: Vec<sbproxy_ai::Message> = body
+                    .get("messages")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| {
+                                serde_json::from_value::<sbproxy_ai::Message>(m.clone()).ok()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if messages.is_empty() {
+                    sbproxy_ai::handler::extract_input_text(&surface, &body).unwrap_or_default()
+                } else {
+                    sbproxy_ai::guardrails::message_text(&messages)
+                }
+            };
+            if !input_text.is_empty() {
+                if let Some((name, reason)) =
+                    sbproxy_ai::external_guardrail::run_input_external_guardrails(
+                        &guardrails_config.external,
+                        &input_text,
+                    )
+                    .await
+                {
+                    warn!(
+                        guardrail = %name,
+                        reason = %reason,
+                        "AI proxy: external input guardrail blocked request"
+                    );
+                    sbproxy_ai::tracing_spans::record_error(
+                        &ai_span,
+                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                        &reason,
+                    );
+                    ctx.ai_outcome = Some("guardrail_block".to_string());
+                    let error_body = serde_json::json!({
+                        "error": {
+                            "message": reason,
+                            "type": "guardrail_violation",
+                            "code": name,
+                        }
+                    });
+                    let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+                    send_response(session, 400, "application/json", &body_bytes).await?;
+                    return Ok(());
+                }
+            }
+        }
         if let Some(pipeline) = cached_guardrails_pipeline(guardrails_config) {
             if pipeline.has_input() {
                 // Parse messages from the body. WOR-1145: deserialize

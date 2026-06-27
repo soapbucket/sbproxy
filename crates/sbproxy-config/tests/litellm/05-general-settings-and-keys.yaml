@@ -1,0 +1,10 @@
+# A proxy with a master key and a database-backed key store. Both are flagged
+# as needing explicit sbproxy configuration, and the rest still compiles.
+model_list:
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL

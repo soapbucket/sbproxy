@@ -13,6 +13,23 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **Per-server namespace mode for MCP federation.** A federated upstream can
+  set `namespace: always` to expose every tool as `<prefix>.<tool>` and every
+  resource as `<prefix>/<uri>`, where the prefix is the server's `prefix` (or
+  a name derived from its origin). The default, `on_collision`, keeps bare
+  names and only qualifies one when it clashes with an earlier server.
+
+- **External HTTP guardrail providers.** An AI origin's `guardrails.external`
+  list runs external guardrail services alongside the built-in checks.
+  Input-mode entries (`pre_call` / `during_call`) inspect the request before
+  dispatch and block on a not-allowed verdict; `logging_only` records only,
+  and a transport or parse error honors each entry's `fail_open` flag.
+  Provider presets shape the request and response for Presidio (`/analyze`
+  with a findings array) and a generic `{"input"}` shape that fits Lakera,
+  Aporia, and custom endpoints, with an optional API key on a configurable
+  auth header. Output-side and AWS Bedrock (SigV4) guardrails are not yet
+  wired.
+
 - **Native Langfuse and Datadog usage sinks.** Alongside the JSONL-file,
   webhook, and ledger sinks, `usage_sinks` now accepts `type: langfuse`
   (`host` plus public/secret key; posts a generation observation to
@@ -20,6 +37,24 @@ of the new YAML fields below until the version that ships them.
   `site` / `service`; posts to the logs-intake API). Both are
   fire-and-forget and never fail the request they record. Object-store
   (S3/GCS) and OTel usage sinks are not yet included.
+
+### Fixed
+
+- **Budget windows now reset per period.** A budget `limit` with a `period`
+  (`daily`, `monthly`, or a duration like `30d`) was parsed but never enforced
+  as a rolling window, so spend accumulated forever and a daily cap behaved
+  like a lifetime cap. Each limit now accrues against its own per-period
+  bucket, so a daily cap clears at the next day and a daily and a monthly cap
+  on the same scope are tracked independently. Cumulative limits (no `period`,
+  or `total` / `lifetime`) are unchanged.
+
+- **MCP federation now advertises the disambiguated name on a collision.**
+  When two upstreams exported the same tool name, the gateway kept the
+  prefixed name only as an internal registry key while still advertising the
+  bare name, so the second tool was unreachable and `tools/list` showed a
+  duplicate. The disambiguated name (`<server>.<tool>`, or `<server>/<uri>`
+  for resources) is now the advertised, routable name; resource reads still
+  forward the original upstream URI.
 
 ## [1.3.1] - 2026-06-25
 
@@ -79,7 +114,7 @@ default-off.
 ### Changed
 
 - The mesh wire encoding moved off the unmaintained `bincode` crate to
-  `postcard`. Peer mTLS on the mesh transport is on by default.
+  `postcard`.
 - The README and docs now lead with the two-way framing: SBproxy governs the
   AI you call and the AI that calls you.
 

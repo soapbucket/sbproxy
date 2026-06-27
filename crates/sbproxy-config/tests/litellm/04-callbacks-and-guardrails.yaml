@@ -1,0 +1,16 @@
+# Observability callbacks plus an external guardrail. These translate with
+# warnings (the operator wires the equivalent sbproxy sink/guardrail) but the
+# emitted config must still compile.
+model_list:
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+litellm_settings:
+  success_callback: ["langfuse", "datadog"]
+  failure_callback: ["langfuse"]
+guardrails:
+  - guardrail_name: presidio-pii
+    litellm_params:
+      guardrail: presidio
+      mode: pre_call
