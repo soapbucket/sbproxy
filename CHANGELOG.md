@@ -11,6 +11,16 @@ Work that has merged to `main` since the latest tag and is queued for
 the next version cut. No promises about backward compatibility for any
 of the new YAML fields below until the version that ships them.
 
+### Added
+
+- **Native Langfuse and Datadog usage sinks.** Alongside the JSONL-file,
+  webhook, and ledger sinks, `usage_sinks` now accepts `type: langfuse`
+  (`host` plus public/secret key; posts a generation observation to
+  `/api/public/ingestion`) and `type: datadog` (`api_key` plus optional
+  `site` / `service`; posts to the logs-intake API). Both are
+  fire-and-forget and never fail the request they record. Object-store
+  (S3/GCS) and OTel usage sinks are not yet included.
+
 ## [1.3.1] - 2026-06-25
 
 Patch release. Fixes TLS, which was broken on startup in v1.2.0 and v1.3.0.
