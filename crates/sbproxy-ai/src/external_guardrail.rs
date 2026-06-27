@@ -267,19 +267,24 @@ pub fn verdict_blocks(cfg: &ExternalGuardrailConfig, verdict: &GuardrailVerdict)
     cfg.mode.blocks() && !verdict.allowed
 }
 
-/// Run the input-side external guardrails over `content`, returning the
-/// `(name, reason)` of the first one that blocks.
-///
-/// Only guardrails that are `default_on` and run on input (`pre_call` /
-/// `during_call`) are evaluated here; `logging_only` records a verdict but
-/// never blocks. Transport or parse errors honor each guardrail's
-/// `fail_open` flag inside [`check_external_guardrail`].
-pub async fn run_input_external_guardrails(
+/// Shared driver for the input/output external-guardrail runners. Evaluates
+/// the `default_on` guardrails whose mode matches the requested phase
+/// (`on_input`), returning the `(name, reason)` of the first that blocks.
+/// `logging_only` records a verdict but never blocks; transport or parse
+/// errors honor each guardrail's `fail_open` flag in
+/// [`check_external_guardrail`].
+async fn run_external_guardrails(
     cfgs: &[ExternalGuardrailConfig],
     content: &str,
+    on_input: bool,
 ) -> Option<(String, String)> {
     for cfg in cfgs {
-        if !cfg.default_on || !cfg.mode.is_input() {
+        let applies = if on_input {
+            cfg.mode.is_input()
+        } else {
+            cfg.mode.is_output()
+        };
+        if !cfg.default_on || !applies {
             continue;
         }
         let verdict = check_external_guardrail(cfg, content).await;
@@ -291,6 +296,24 @@ pub async fn run_input_external_guardrails(
         }
     }
     None
+}
+
+/// Run the input-side external guardrails (`pre_call` / `during_call`) over
+/// the request `content`, returning the first block.
+pub async fn run_input_external_guardrails(
+    cfgs: &[ExternalGuardrailConfig],
+    content: &str,
+) -> Option<(String, String)> {
+    run_external_guardrails(cfgs, content, true).await
+}
+
+/// Run the output-side external guardrails (`post_call` / `during_call`)
+/// over the response `content`, returning the first block.
+pub async fn run_output_external_guardrails(
+    cfgs: &[ExternalGuardrailConfig],
+    content: &str,
+) -> Option<(String, String)> {
+    run_external_guardrails(cfgs, content, false).await
 }
 
 #[cfg(test)]
@@ -428,6 +451,32 @@ mod tests {
         assert!(
             !check_external_guardrail(&cfg, "hello").await.allowed,
             "fail-closed blocks"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_output_skips_input_only_guardrails() {
+        // A pre_call (input-only) guardrail is never evaluated on the output
+        // path: it is skipped before any HTTP call, so the result is None even
+        // though the URL is unreachable and fail-closed.
+        let cfg: ExternalGuardrailConfig = serde_json::from_str(
+            r#"{"name":"in","url":"http://127.0.0.1:1/","mode":"pre_call","default_on":true,"timeout_ms":300}"#,
+        )
+        .unwrap();
+        assert!(run_output_external_guardrails(&[cfg], "x").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_output_evaluates_post_call_guardrails() {
+        // post_call applies to the output path; the unreachable URL plus
+        // fail-closed produces a block.
+        let cfg: ExternalGuardrailConfig = serde_json::from_str(
+            r#"{"name":"out","url":"http://127.0.0.1:1/","mode":"post_call","default_on":true,"timeout_ms":300}"#,
+        )
+        .unwrap();
+        assert!(
+            run_output_external_guardrails(&[cfg], "x").await.is_some(),
+            "a fail-closed post_call guardrail must block"
         );
     }
 }
