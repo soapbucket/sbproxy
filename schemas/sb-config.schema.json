@@ -1739,6 +1739,46 @@
             "string",
             "null"
           ]
+        },
+        "peer_tls": {
+          "description": "Optional peer mTLS (mutually-authenticated TLS) for the mesh transport. When set, inbound connections must present a CA-signed client certificate and outbound connections present this node's certificate, all verified against the configured CA. Plaintext when unset.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MeshPeerTlsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "MeshPeerTlsConfig": {
+      "description": "`key_management.cache.mesh.peer_tls:` mutual-TLS material (file paths) for the mesh peer transport.",
+      "type": "object",
+      "required": [
+        "ca_file",
+        "cert_file",
+        "key_file"
+      ],
+      "properties": {
+        "cert_file": {
+          "description": "Path to this node's PEM certificate chain (leaf first).",
+          "type": "string"
+        },
+        "key_file": {
+          "description": "Path to this node's PEM private key.",
+          "type": "string"
+        },
+        "ca_file": {
+          "description": "Path to the PEM CA certificate that signs every peer.",
+          "type": "string"
+        },
+        "server_name": {
+          "description": "Logical server name the peer certificates are issued for (their SAN); outbound connections verify peers against it. Defaults to `sbproxy-mesh`.",
+          "default": "sbproxy-mesh",
+          "type": "string"
         }
       }
     },

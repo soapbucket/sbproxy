@@ -85,6 +85,25 @@ pub struct BootstrapConfig {
     /// How long a peer stays in `Dead` before the L2 sweeper removes
     /// the entry from the peer table. Defaults to 300s (5 minutes).
     pub dead_peer_gc_secs: u64,
+
+    /// Optional peer mTLS for the transport. When `Some`, the transport
+    /// server requires and verifies a CA-signed client certificate on every
+    /// inbound connection, and the client pool presents this node's
+    /// certificate and verifies peers' on every outbound connection. `None`
+    /// keeps the plaintext transport (the pre-mTLS behavior).
+    pub peer_tls: Option<PeerTlsParams>,
+}
+
+/// Peer-mTLS material for the mesh transport, already resolved to PEM by the
+/// caller (for example by reading the configured cert/key/CA files).
+#[derive(Debug, Clone)]
+pub struct PeerTlsParams {
+    /// This node's certificate, private key, and the shared CA (PEM).
+    pub tls: crate::transport::tls::MeshTlsConfig,
+    /// Logical server name every peer certificate is issued for (its SAN).
+    /// Outbound connections verify the peer certificate against this name,
+    /// so the mesh can dial peers by address while pinning one identity.
+    pub server_name: String,
 }
 
 impl Default for BootstrapConfig {
@@ -97,6 +116,7 @@ impl Default for BootstrapConfig {
             failure_check_interval_secs: 2,
             failure_timeout_secs: 5,
             shared_key: None,
+            peer_tls: None,
             // K4 SWIM defaults mirror the paper's small-cluster profile.
             swim_protocol_period_ms: 1000,
             swim_ping_timeout_ms: 300,
@@ -295,12 +315,40 @@ pub async fn bootstrap(
     // K3: the pool gets the same cipher as the gossip loop so every
     // outbound `PeerClient` speaks the same AEAD-wrapped protocol as
     // the server on the other end.
-    let transport_pool = Arc::new(TransportClientPool::with_cipher(cipher.clone()));
+    // Peer mTLS: build the rustls acceptor (inbound) and connector (outbound)
+    // once, from the resolved cert/key/CA. A misconfigured cert fails the
+    // bootstrap rather than silently downgrading the cluster to plaintext.
+    let (tls_acceptor, tls_client) = match &config.peer_tls {
+        Some(p) => {
+            let acceptor = crate::transport::tls::build_acceptor(&p.tls)
+                .map_err(|e| anyhow::anyhow!("mesh peer-mTLS acceptor: {e}"))?;
+            let connector = crate::transport::tls::build_connector(&p.tls)
+                .map_err(|e| anyhow::anyhow!("mesh peer-mTLS connector: {e}"))?;
+            let server_name = rustls::pki_types::ServerName::try_from(p.server_name.clone())
+                .map_err(|e| {
+                    anyhow::anyhow!("mesh peer-mTLS server_name '{}': {e}", p.server_name)
+                })?;
+            (
+                Some(acceptor),
+                Some(crate::transport::client::MeshTlsClient {
+                    connector,
+                    server_name,
+                }),
+            )
+        }
+        None => (None, None),
+    };
 
-    let transport_server = match TransportServer::start_with_cipher(
+    let transport_pool = Arc::new(TransportClientPool::with_security(
+        cipher.clone(),
+        tls_client,
+    ));
+
+    let transport_server = match TransportServer::start_with_security(
         config.transport_port,
         node.distributed_cache(),
         cipher.clone(),
+        tls_acceptor,
     )
     .await
     {
@@ -367,6 +415,7 @@ mod tests {
             // bootstrap-suite tests exercise the GC path, which has
             // its own coverage in `gossip_loop::tests`.
             dead_peer_gc_secs: 60,
+            peer_tls: None,
         }
     }
 

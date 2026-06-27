@@ -370,26 +370,31 @@ pub struct TransportClientPool {
     /// `None` means plaintext; `Some` means every outbound RPC is sealed
     /// and every response is opened before deserialization.
     cipher: Option<Cipher>,
+    /// Optional client-side peer mTLS handed to every newly constructed
+    /// `PeerClient`. `None` means plaintext connects.
+    tls: Option<MeshTlsClient>,
 }
 
 impl TransportClientPool {
     /// Construct an empty pool with plaintext clients.
     pub fn new() -> Self {
-        Self {
-            clients: RwLock::new(HashMap::new()),
-            cipher: None,
-        }
+        Self::with_security(None, None)
     }
 
-    /// K3: construct an empty pool that builds encrypted peer clients.
-    ///
-    /// Every client created via [`Self::client_for`] will carry a clone
-    /// of this cipher, so all outbound RPCs go out AEAD-sealed and all
-    /// inbound responses are opened before handling.
+    /// K3: construct an empty pool that builds AEAD-encrypted peer clients.
     pub fn with_cipher(cipher: Option<Cipher>) -> Self {
+        Self::with_security(cipher, None)
+    }
+
+    /// Construct an empty pool whose clients use the given optional AEAD
+    /// cipher and/or peer mTLS. Every client created via [`Self::client_for`]
+    /// carries a clone of both, so all outbound RPCs share the same transport
+    /// security as the server on the other end.
+    pub fn with_security(cipher: Option<Cipher>, tls: Option<MeshTlsClient>) -> Self {
         Self {
             clients: RwLock::new(HashMap::new()),
             cipher,
+            tls,
         }
     }
 
@@ -409,9 +414,16 @@ impl TransportClientPool {
             Err(p) => p.into_inner(),
         };
         let cipher = self.cipher.clone();
+        let tls = self.tls.clone();
         guard
             .entry(peer_addr.to_string())
-            .or_insert_with(|| Arc::new(PeerClient::with_cipher(peer_addr.to_string(), cipher)))
+            .or_insert_with(|| {
+                Arc::new(PeerClient::with_security(
+                    peer_addr.to_string(),
+                    cipher,
+                    tls,
+                ))
+            })
             .clone()
     }
 

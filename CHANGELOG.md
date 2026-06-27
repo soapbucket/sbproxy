@@ -13,6 +13,14 @@ of the new YAML fields below until the version that ships them.
 
 ### Added
 
+- **Mesh peer mTLS.** The mesh peer transport can run over
+  mutually-authenticated TLS: set `key_management.cache.mesh.peer_tls` with
+  `cert_file`, `key_file`, and `ca_file` (plus an optional `server_name`,
+  default `sbproxy-mesh`). Every inbound connection must present a CA-signed
+  client certificate and every outbound connection presents this node's
+  certificate, both verified against the CA, so an untrusted peer cannot join
+  the cache fabric. Plaintext when unset.
+
 - **Per-server namespace mode for MCP federation.** A federated upstream can
   set `namespace: always` to expose every tool as `<prefix>.<tool>` and every
   resource as `<prefix>/<uri>`, where the prefix is the server's `prefix` (or

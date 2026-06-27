@@ -487,6 +487,10 @@ impl MeshConfig {
             // L2: forward the dead-peer GC knob so the gossip loop's
             // sweeper removes terminal entries after the timeout.
             dead_peer_gc_secs: self.dead_peer_gc_secs,
+            // Peer mTLS is supplied by the embedding host (the key plane reads
+            // the configured cert/key/CA); the standalone `MeshConfig` path
+            // stays plaintext unless a caller sets it after conversion.
+            peer_tls: None,
         }
     }
 }
