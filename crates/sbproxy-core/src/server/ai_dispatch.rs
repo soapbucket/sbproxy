@@ -2942,6 +2942,13 @@ pub(super) async fn handle_ai_proxy(
                     .as_ref()
                     .and_then(cached_guardrails_pipeline)
                     .filter(|p| p.has_output()),
+                // WOR-1529: external output guardrails (post_call) run on the
+                // response after the sync pipeline; empty when none configured.
+                config
+                    .guardrails
+                    .as_ref()
+                    .map(|g| g.external.clone())
+                    .unwrap_or_default(),
             )
             .await
         }
@@ -3209,6 +3216,7 @@ pub(super) async fn relay_ai_response_with_cache(
     idem_skip_reason: Option<&'static str>,
     idem_capture: Option<AiIdempotencyCapture>,
     output_guardrails: Option<std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
+    output_external: Vec<sbproxy_ai::external_guardrail::ExternalGuardrailConfig>,
 ) -> Result<()> {
     let status = resp.status().as_u16();
 
@@ -3321,66 +3329,89 @@ pub(super) async fn relay_ai_response_with_cache(
     // bodies are checked (error envelopes are pass-through). On a block
     // we return a 403 with a `guardrail_violation` envelope and skip
     // every cache write below via the early return.
-    if let Some(ref guardrails) = output_guardrails {
-        if (200..300).contains(&status) {
-            if let Ok(text) = std::str::from_utf8(&resp_body) {
-                if let Some(block) = guardrails.check_output(text) {
-                    warn!(
-                        guardrail = %block.name,
-                        reason = %block.reason,
-                        "AI proxy: output guardrail blocked response"
-                    );
-                    sbproxy_ai::tracing_spans::record_error(
-                        &ai_span,
-                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
-                        &block.reason,
-                    );
-                    // WOR-1496: the block returns a 403, which the
-                    // status-derived outcome would mislabel as
-                    // `auth_denied`; stamp the precise outcome so the
-                    // value-vs-waste metric attributes it correctly.
-                    if let Some(c) = ctx.as_mut() {
-                        c.ai_outcome = Some("guardrail_block".to_string());
-                    }
-                    // WOR-1093: the upstream already produced (and
-                    // billed) this 2xx response; an output guardrail
-                    // then rejected it, so the spend bought no served
-                    // outcome. Flag the consumed tokens as
-                    // `validation_failed` waste, reusing the usage
-                    // already parsed for billing. Observational only.
-                    if let Some(args) = budget_recorder.as_ref() {
-                        let (prompt_tokens, completion_tokens) = extract_usage(&resp_body);
-                        let wasted = prompt_tokens.saturating_add(completion_tokens);
-                        if wasted > 0 {
-                            let usage = sbproxy_ai::budget::AiUsage::Tokens {
-                                input: prompt_tokens,
-                                output: completion_tokens,
-                            };
-                            let cost =
-                                sbproxy_ai::budget::estimate_cost_for_usage(args.model, &usage);
-                            sbproxy_ai::ai_metrics::record_waste(
-                                sbproxy_ai::ai_metrics::WasteKind::ValidationFailed,
-                                args.provider_name,
-                                args.model,
-                                args.surface_label,
-                                &args.attribution_tags,
-                                wasted,
-                                cost,
-                            );
-                        }
-                    }
-                    let error_body = serde_json::json!({
-                        "error": {
-                            "message": block.reason,
-                            "type": "guardrail_violation",
-                            "code": block.name,
-                        }
-                    });
-                    let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
-                    return send_response(session, 403, "application/json", &body_bytes).await;
+    // WOR-1529: an output-guardrail block can come from the compiled sync
+    // pipeline or from an external provider (`post_call` / `during_call`).
+    // Only 2xx text is checked; external runs only when the sync pipeline
+    // did not already block, and works even when no sync pipeline is set.
+    let output_block: Option<sbproxy_ai::guardrails::GuardrailBlock> = if (200..300)
+        .contains(&status)
+    {
+        match std::str::from_utf8(&resp_body) {
+            Ok(text) => {
+                let sync_block = output_guardrails
+                    .as_ref()
+                    .and_then(|g| g.check_output(text));
+                if sync_block.is_some() {
+                    sync_block
+                } else if output_external.is_empty() {
+                    None
+                } else {
+                    sbproxy_ai::external_guardrail::run_output_external_guardrails(
+                        &output_external,
+                        text,
+                    )
+                    .await
+                    .map(|(name, reason)| sbproxy_ai::guardrails::GuardrailBlock { name, reason })
                 }
             }
+            Err(_) => None,
         }
+    } else {
+        None
+    };
+    if let Some(block) = output_block {
+        warn!(
+            guardrail = %block.name,
+            reason = %block.reason,
+            "AI proxy: output guardrail blocked response"
+        );
+        sbproxy_ai::tracing_spans::record_error(
+            &ai_span,
+            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+            &block.reason,
+        );
+        // WOR-1496: the block returns a 403, which the
+        // status-derived outcome would mislabel as
+        // `auth_denied`; stamp the precise outcome so the
+        // value-vs-waste metric attributes it correctly.
+        if let Some(c) = ctx.as_mut() {
+            c.ai_outcome = Some("guardrail_block".to_string());
+        }
+        // WOR-1093: the upstream already produced (and
+        // billed) this 2xx response; an output guardrail
+        // then rejected it, so the spend bought no served
+        // outcome. Flag the consumed tokens as
+        // `validation_failed` waste, reusing the usage
+        // already parsed for billing. Observational only.
+        if let Some(args) = budget_recorder.as_ref() {
+            let (prompt_tokens, completion_tokens) = extract_usage(&resp_body);
+            let wasted = prompt_tokens.saturating_add(completion_tokens);
+            if wasted > 0 {
+                let usage = sbproxy_ai::budget::AiUsage::Tokens {
+                    input: prompt_tokens,
+                    output: completion_tokens,
+                };
+                let cost = sbproxy_ai::budget::estimate_cost_for_usage(args.model, &usage);
+                sbproxy_ai::ai_metrics::record_waste(
+                    sbproxy_ai::ai_metrics::WasteKind::ValidationFailed,
+                    args.provider_name,
+                    args.model,
+                    args.surface_label,
+                    &args.attribution_tags,
+                    wasted,
+                    cost,
+                );
+            }
+        }
+        let error_body = serde_json::json!({
+            "error": {
+                "message": block.reason,
+                "type": "guardrail_violation",
+                "code": block.name,
+            }
+        });
+        let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+        return send_response(session, 403, "application/json", &body_bytes).await;
     }
 
     // --- WOR-796: OSS embedding cache write on miss ---

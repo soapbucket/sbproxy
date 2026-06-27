@@ -22,13 +22,14 @@ of the new YAML fields below until the version that ships them.
 - **External HTTP guardrail providers.** An AI origin's `guardrails.external`
   list runs external guardrail services alongside the built-in checks.
   Input-mode entries (`pre_call` / `during_call`) inspect the request before
-  dispatch and block on a not-allowed verdict; `logging_only` records only,
-  and a transport or parse error honors each entry's `fail_open` flag.
-  Provider presets shape the request and response for Presidio (`/analyze`
-  with a findings array) and a generic `{"input"}` shape that fits Lakera,
-  Aporia, and custom endpoints, with an optional API key on a configurable
-  auth header. Output-side and AWS Bedrock (SigV4) guardrails are not yet
-  wired.
+  dispatch; output-mode entries (`post_call` / `during_call`) inspect the
+  non-streaming response before it is cached or sent. Either blocks on a
+  not-allowed verdict (`logging_only` records only), and a transport or parse
+  error honors each entry's `fail_open` flag. Provider presets shape the
+  request and response for Presidio (`/analyze` with a findings array) and a
+  generic `{"input"}` shape that fits Lakera, Aporia, and custom endpoints,
+  with an optional API key on a configurable auth header. Streaming-response
+  and AWS Bedrock (SigV4) guardrails are not yet wired.
 
 - **Native Langfuse and Datadog usage sinks.** Alongside the JSONL-file,
   webhook, and ledger sinks, `usage_sinks` now accepts `type: langfuse`
