@@ -1,0 +1,21 @@
+# One public model name (gpt-4o) backed by two weighted deployments with
+# per-deployment rpm/tpm, load-balanced by a usage-based strategy.
+model_list:
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY_A
+      rpm: 1000
+      tpm: 200000
+      weight: 2
+  - model_name: gpt-4o
+    litellm_params:
+      model: azure/gpt-4o
+      api_base: https://my-azure.openai.azure.com
+      api_key: os.environ/AZURE_API_KEY
+      api_version: "2024-08-01-preview"
+      rpm: 500
+      tpm: 100000
+      weight: 1
+router_settings:
+  routing_strategy: usage-based-routing-v2

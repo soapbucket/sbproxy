@@ -21,6 +21,14 @@ of the new YAML fields below until the version that ships them.
 
 ### Fixed
 
+- **Budget windows now reset per period.** A budget `limit` with a `period`
+  (`daily`, `monthly`, or a duration like `30d`) was parsed but never enforced
+  as a rolling window, so spend accumulated forever and a daily cap behaved
+  like a lifetime cap. Each limit now accrues against its own per-period
+  bucket, so a daily cap clears at the next day and a daily and a monthly cap
+  on the same scope are tracked independently. Cumulative limits (no `period`,
+  or `total` / `lifetime`) are unchanged.
+
 - **MCP federation now advertises the disambiguated name on a collision.**
   When two upstreams exported the same tool name, the gateway kept the
   prefixed name only as an internal registry key while still advertising the
@@ -87,7 +95,7 @@ default-off.
 ### Changed
 
 - The mesh wire encoding moved off the unmaintained `bincode` crate to
-  `postcard`. Peer mTLS on the mesh transport is on by default.
+  `postcard`.
 - The README and docs now lead with the two-way framing: SBproxy governs the
   AI you call and the AI that calls you.
 
