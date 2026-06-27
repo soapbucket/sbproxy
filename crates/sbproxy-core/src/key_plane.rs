@@ -26,7 +26,7 @@ use sbproxy_keystore::record::{
     CredentialMaterial, CredentialRecord, KeyRecord, RecordBudget, RecordSource, RecordStatus,
 };
 use sbproxy_keystore::{EmbeddedKeyStore, KeyStore, TtlCache, TtlCacheConfig};
-use sbproxy_mesh::bootstrap::{bootstrap, BootstrapConfig};
+use sbproxy_mesh::bootstrap::{bootstrap, BootstrapConfig, PeerTlsParams};
 use sbproxy_mesh::discovery::{seeds::SeedDiscovery, Discovery};
 use sbproxy_mesh::MeshNode;
 
@@ -332,10 +332,27 @@ fn ensure_mesh_node(node_id: &str, mc: &MeshClusterConfig) -> Result<()> {
         None => None,
     };
     let discoveries: Vec<Box<dyn Discovery>> = vec![Box::new(SeedDiscovery::new(mc.seeds.clone()))];
+    // Peer mTLS: read the configured cert/key/CA into PEM (fail-closed on a
+    // read error) so the bootstrap can build the rustls acceptor/connector.
+    let peer_tls = match &mc.peer_tls {
+        Some(t) => Some(PeerTlsParams {
+            tls: sbproxy_mesh::transport::tls::MeshTlsConfig {
+                cert_pem: std::fs::read_to_string(&t.cert_file)
+                    .with_context(|| format!("read mesh peer_tls cert_file '{}'", t.cert_file))?,
+                key_pem: std::fs::read_to_string(&t.key_file)
+                    .with_context(|| format!("read mesh peer_tls key_file '{}'", t.key_file))?,
+                ca_pem: std::fs::read_to_string(&t.ca_file)
+                    .with_context(|| format!("read mesh peer_tls ca_file '{}'", t.ca_file))?,
+            },
+            server_name: t.server_name.clone(),
+        }),
+        None => None,
+    };
     let boot = BootstrapConfig {
         gossip_port: mc.gossip_port,
         transport_port: mc.transport_port,
         shared_key,
+        peer_tls,
         ..Default::default()
     };
     let node_id = node_id.to_string();

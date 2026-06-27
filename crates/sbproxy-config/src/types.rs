@@ -911,6 +911,33 @@ pub struct MeshClusterConfig {
     /// unset.
     #[serde(default)]
     pub shared_key: Option<String>,
+    /// Optional peer mTLS (mutually-authenticated TLS) for the mesh transport.
+    /// When set, inbound connections must present a CA-signed client
+    /// certificate and outbound connections present this node's certificate,
+    /// all verified against the configured CA. Plaintext when unset.
+    #[serde(default)]
+    pub peer_tls: Option<MeshPeerTlsConfig>,
+}
+
+/// `key_management.cache.mesh.peer_tls:` mutual-TLS material (file paths) for
+/// the mesh peer transport.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MeshPeerTlsConfig {
+    /// Path to this node's PEM certificate chain (leaf first).
+    pub cert_file: String,
+    /// Path to this node's PEM private key.
+    pub key_file: String,
+    /// Path to the PEM CA certificate that signs every peer.
+    pub ca_file: String,
+    /// Logical server name the peer certificates are issued for (their SAN);
+    /// outbound connections verify peers against it. Defaults to
+    /// `sbproxy-mesh`.
+    #[serde(default = "default_mesh_tls_server_name")]
+    pub server_name: String,
+}
+
+fn default_mesh_tls_server_name() -> String {
+    "sbproxy-mesh".to_string()
 }
 
 impl Default for MeshClusterConfig {
@@ -921,6 +948,7 @@ impl Default for MeshClusterConfig {
             transport_port: default_transport_port(),
             advertise_addr: None,
             shared_key: None,
+            peer_tls: None,
         }
     }
 }
