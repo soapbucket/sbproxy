@@ -11,6 +11,16 @@ Work that has merged to `main` since the latest tag and is queued for
 the next version cut. No promises about backward compatibility for any
 of the new YAML fields below until the version that ships them.
 
+### Fixed
+
+- **Budget windows now reset per period.** A budget `limit` with a `period`
+  (`daily`, `monthly`, or a duration like `30d`) was parsed but never enforced
+  as a rolling window, so spend accumulated forever and a daily cap behaved
+  like a lifetime cap. Each limit now accrues against its own per-period
+  bucket, so a daily cap clears at the next day and a daily and a monthly cap
+  on the same scope are tracked independently. Cumulative limits (no `period`,
+  or `total` / `lifetime`) are unchanged.
+
 ## [1.3.1] - 2026-06-25
 
 Patch release. Fixes TLS, which was broken on startup in v1.2.0 and v1.3.0.

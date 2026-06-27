@@ -106,6 +106,19 @@ pub struct BudgetLimit {
     pub downgrade_to: Option<String>,
 }
 
+impl BudgetLimit {
+    /// The rolling-window duration for this limit, if it declares a finite
+    /// period. `None` means the limit is cumulative (`total` / `lifetime` /
+    /// unset). An unparseable period is treated as cumulative; periods are
+    /// validated at config-load time, so a bad value never silently widens
+    /// enforcement here.
+    pub fn window(&self) -> Option<std::time::Duration> {
+        self.period
+            .as_deref()
+            .and_then(|p| parse_budget_period(p).ok().flatten())
+    }
+}
+
 /// Scope at which a budget limit is enforced.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -194,40 +207,65 @@ impl BudgetTracker {
             .unwrap_or_default()
     }
 
-    /// Check if any budget limit is exceeded. Returns `Some` with details if exceeded.
+    /// Check if any configured limit is exceeded for `scope_key`. Returns
+    /// `Some` with details for the first limit that fires.
+    ///
+    /// This compares the one key's usage against every limit, so callers
+    /// that pre-pair a windowed key with a specific limit should use
+    /// [`Self::check_limit`] instead to avoid a key bucketed for one period
+    /// being judged against another period's cap.
     pub fn check_limits(
         &self,
         config: &BudgetConfig,
         scope_key: &str,
     ) -> Option<BudgetCheckResult> {
-        let usage = self.get_usage(scope_key);
         for limit in &config.limits {
-            if let Some(max_tokens) = limit.max_tokens {
-                if usage.tokens >= max_tokens {
-                    return Some(BudgetCheckResult {
-                        exceeded: true,
-                        action: config.on_exceed.clone(),
-                        downgrade_to: limit.downgrade_to.clone(),
-                        reason: format!("token limit exceeded: {} >= {}", usage.tokens, max_tokens),
-                        current_tokens: usage.tokens,
-                        current_cost_usd: usage.cost_usd,
-                    });
-                }
+            if let Some(result) = self.check_limit(limit, scope_key, &config.on_exceed) {
+                return Some(result);
             }
-            if let Some(max_cost) = limit.max_cost_usd {
-                if usage.cost_usd >= max_cost {
-                    return Some(BudgetCheckResult {
-                        exceeded: true,
-                        action: config.on_exceed.clone(),
-                        downgrade_to: limit.downgrade_to.clone(),
-                        reason: format!(
-                            "cost limit exceeded: ${:.4} >= ${:.4}",
-                            usage.cost_usd, max_cost
-                        ),
-                        current_tokens: usage.tokens,
-                        current_cost_usd: usage.cost_usd,
-                    });
-                }
+        }
+        None
+    }
+
+    /// Check a single budget limit against an (already windowed) scope key.
+    ///
+    /// Unlike [`Self::check_limits`], the usage at `scope_key` is compared
+    /// against exactly `limit`. This is what the per-limit rolling-window
+    /// path needs: each limit owns a key bucketed for its own period
+    /// ([`windowed_key`]), so a monthly cap's key is never tripped by a
+    /// stricter daily cap that lives on a different key.
+    pub fn check_limit(
+        &self,
+        limit: &BudgetLimit,
+        scope_key: &str,
+        on_exceed: &OnExceedAction,
+    ) -> Option<BudgetCheckResult> {
+        let usage = self.get_usage(scope_key);
+        if let Some(max_tokens) = limit.max_tokens {
+            if usage.tokens >= max_tokens {
+                return Some(BudgetCheckResult {
+                    exceeded: true,
+                    action: on_exceed.clone(),
+                    downgrade_to: limit.downgrade_to.clone(),
+                    reason: format!("token limit exceeded: {} >= {}", usage.tokens, max_tokens),
+                    current_tokens: usage.tokens,
+                    current_cost_usd: usage.cost_usd,
+                });
+            }
+        }
+        if let Some(max_cost) = limit.max_cost_usd {
+            if usage.cost_usd >= max_cost {
+                return Some(BudgetCheckResult {
+                    exceeded: true,
+                    action: on_exceed.clone(),
+                    downgrade_to: limit.downgrade_to.clone(),
+                    reason: format!(
+                        "cost limit exceeded: ${:.4} >= ${:.4}",
+                        usage.cost_usd, max_cost
+                    ),
+                    current_tokens: usage.tokens,
+                    current_cost_usd: usage.cost_usd,
+                });
             }
         }
         None
@@ -785,6 +823,25 @@ pub fn parse_budget_period(period: &str) -> Result<Option<std::time::Duration>, 
     Ok(Some(Duration::from_secs(secs)))
 }
 
+/// Append a rolling-window bucket suffix to a base scope key for a limit
+/// with a finite period, so each period accrues against a fresh key and the
+/// budget effectively resets when the window rolls over. Cumulative limits
+/// (`window` is `None`) return the base key unchanged.
+///
+/// The suffix encodes the window length, so two limits with different
+/// periods on the same scope (for example a daily and a monthly cap) never
+/// share a bucket. Within one window every instant maps to the same bucket,
+/// so usage accrues together and is judged against that window's cap.
+pub fn windowed_key(base: &str, window: Option<std::time::Duration>, now_unix_secs: u64) -> String {
+    match window {
+        Some(d) if d.as_secs() > 0 => {
+            let secs = d.as_secs();
+            format!("{base}#w{secs}:{}", now_unix_secs / secs)
+        }
+        _ => base.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1285,5 +1342,99 @@ mod tests {
         assert_eq!(usage.tokens, 0, "image events do not contribute tokens");
         assert!((usage.cost_usd - 0.04).abs() < 1e-9);
         assert_eq!(usage.request_count, 1);
+    }
+
+    // --- WOR-1527: rolling-window (multi-window) budget enforcement ---
+
+    fn windowed_limit(max_tokens: Option<u64>, period: &str) -> BudgetLimit {
+        BudgetLimit {
+            scope: BudgetScope::Workspace,
+            max_tokens,
+            max_cost_usd: None,
+            period: Some(period.to_string()),
+            downgrade_to: None,
+        }
+    }
+
+    #[test]
+    fn windowed_key_is_unchanged_for_cumulative_limits() {
+        // A `total`/absent period must not bucket: the key is returned as-is
+        // so cumulative budgets keep accruing forever.
+        let base = "workspace:host";
+        assert_eq!(windowed_key(base, None, 123_456), base);
+        let total = windowed_limit(Some(1), "total");
+        assert_eq!(windowed_key(base, total.window(), 123_456), base);
+    }
+
+    #[test]
+    fn windowed_key_buckets_by_period() {
+        let base = "workspace:host";
+        let daily = windowed_limit(Some(1), "daily").window();
+        // Same calendar day => same bucket.
+        assert_eq!(
+            windowed_key(base, daily, 0),
+            windowed_key(base, daily, 86_399)
+        );
+        // Next day => a different bucket, so usage starts fresh.
+        assert_ne!(
+            windowed_key(base, daily, 0),
+            windowed_key(base, daily, 86_400)
+        );
+        // A different period length yields a distinct key even at the same
+        // instant, so a daily and a monthly cap on one scope don't collide.
+        let monthly = windowed_limit(Some(1), "monthly").window();
+        assert_ne!(windowed_key(base, daily, 0), windowed_key(base, monthly, 0));
+    }
+
+    #[test]
+    fn budget_limit_window_parses_period() {
+        use std::time::Duration;
+        assert_eq!(
+            windowed_limit(None, "daily").window(),
+            Some(Duration::from_secs(86_400))
+        );
+        assert_eq!(windowed_limit(None, "total").window(), None);
+        // An unparseable period degrades to cumulative rather than panicking.
+        assert_eq!(windowed_limit(None, "bogus").window(), None);
+    }
+
+    #[test]
+    fn check_limit_checks_only_the_given_limit() {
+        // check_limit must compare the key's usage against ONLY the passed
+        // limit, never the whole config, so a windowed key for a monthly cap
+        // is not tripped by a smaller daily cap that lives on another key.
+        let tracker = BudgetTracker::new();
+        tracker.record_usage("k", 1500, 0.0);
+        let daily = windowed_limit(Some(1000), "daily"); // smaller cap
+        let monthly = windowed_limit(Some(20_000), "monthly"); // larger cap
+        assert!(tracker
+            .check_limit(&daily, "k", &OnExceedAction::Block)
+            .is_some());
+        assert!(tracker
+            .check_limit(&monthly, "k", &OnExceedAction::Block)
+            .is_none());
+    }
+
+    #[test]
+    fn windowed_budget_resets_each_period() {
+        // A daily cap that is full in one window must be clear in the next:
+        // record into day 0's bucket to the cap, then a request in day 1
+        // (a fresh bucket) is under budget again.
+        let tracker = BudgetTracker::new();
+        let limit = windowed_limit(Some(1000), "daily");
+        let w = limit.window();
+        let day0 = windowed_key("workspace:host", w, 0);
+        let day1 = windowed_key("workspace:host", w, 86_400);
+        assert_ne!(day0, day1);
+
+        tracker.record_usage(&day0, 1000, 0.0);
+        // Day 0 is at the cap.
+        assert!(tracker
+            .check_limit(&limit, &day0, &OnExceedAction::Block)
+            .is_some());
+        // Day 1 is a fresh window, so the same cap is not exceeded.
+        assert!(tracker
+            .check_limit(&limit, &day1, &OnExceedAction::Block)
+            .is_none());
     }
 }
