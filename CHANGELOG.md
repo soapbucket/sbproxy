@@ -30,6 +30,14 @@ of the new YAML fields below until the version that ships them.
   auth header. Output-side and AWS Bedrock (SigV4) guardrails are not yet
   wired.
 
+- **Native Langfuse and Datadog usage sinks.** Alongside the JSONL-file,
+  webhook, and ledger sinks, `usage_sinks` now accepts `type: langfuse`
+  (`host` plus public/secret key; posts a generation observation to
+  `/api/public/ingestion`) and `type: datadog` (`api_key` plus optional
+  `site` / `service`; posts to the logs-intake API). Both are
+  fire-and-forget and never fail the request they record. Object-store
+  (S3/GCS) and OTel usage sinks are not yet included.
+
 ### Fixed
 
 - **Budget windows now reset per period.** A budget `limit` with a `period`

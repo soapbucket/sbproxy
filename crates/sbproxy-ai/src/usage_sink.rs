@@ -159,6 +159,192 @@ impl UsageSink for WebhookSink {
     }
 }
 
+/// Build the Langfuse `/api/public/ingestion` request body for one event.
+///
+/// `event_id` is the batch event and observation id; `timestamp` is an
+/// RFC-3339 string. Token counts go in `usage`; provider, cost, latency,
+/// status, and identifiers go in `metadata`. Kept pure (no clock, no IO) so
+/// the shape is unit-testable; the sink supplies the id and timestamp.
+pub fn langfuse_ingestion_body(
+    event: &LlmUsageEvent,
+    event_id: &str,
+    timestamp: &str,
+) -> serde_json::Value {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("provider".into(), serde_json::json!(event.provider));
+    metadata.insert("cost_usd".into(), serde_json::json!(event.cost_usd));
+    metadata.insert("latency_ms".into(), serde_json::json!(event.latency_ms));
+    metadata.insert("status".into(), serde_json::json!(event.status));
+    for (k, v) in [
+        ("key_id", &event.key_id),
+        ("user", &event.user),
+        ("team", &event.team),
+        ("tag", &event.tag),
+    ] {
+        if let Some(val) = v {
+            metadata.insert(k.into(), serde_json::json!(val));
+        }
+    }
+    serde_json::json!({
+        "batch": [{
+            "id": event_id,
+            "type": "generation-create",
+            "timestamp": timestamp,
+            "body": {
+                "id": event_id,
+                "name": "sbproxy",
+                "model": event.model,
+                "usage": {
+                    "input": event.prompt_tokens,
+                    "output": event.completion_tokens,
+                    "total": event.total_tokens,
+                    "unit": "TOKENS",
+                },
+                "metadata": serde_json::Value::Object(metadata),
+            },
+        }],
+    })
+}
+
+/// Build the Datadog logs-intake request body (an array of one log object)
+/// for `event`, tagged with `service`. Pure (no clock, no IO); Datadog
+/// stamps the ingestion time itself.
+pub fn datadog_log_body(event: &LlmUsageEvent, service: &str) -> serde_json::Value {
+    let mut log = serde_json::Map::new();
+    log.insert("ddsource".into(), serde_json::json!("sbproxy"));
+    log.insert("service".into(), serde_json::json!(service));
+    log.insert(
+        "message".into(),
+        serde_json::json!(format!("llm call {}/{}", event.provider, event.model)),
+    );
+    log.insert("provider".into(), serde_json::json!(event.provider));
+    log.insert("model".into(), serde_json::json!(event.model));
+    log.insert(
+        "prompt_tokens".into(),
+        serde_json::json!(event.prompt_tokens),
+    );
+    log.insert(
+        "completion_tokens".into(),
+        serde_json::json!(event.completion_tokens),
+    );
+    log.insert("total_tokens".into(), serde_json::json!(event.total_tokens));
+    log.insert("cost_usd".into(), serde_json::json!(event.cost_usd));
+    log.insert("latency_ms".into(), serde_json::json!(event.latency_ms));
+    log.insert("status".into(), serde_json::json!(event.status));
+    for (k, v) in [
+        ("key_id", &event.key_id),
+        ("user", &event.user),
+        ("team", &event.team),
+        ("tag", &event.tag),
+    ] {
+        if let Some(val) = v {
+            log.insert(k.into(), serde_json::json!(val));
+        }
+    }
+    serde_json::Value::Array(vec![serde_json::Value::Object(log)])
+}
+
+/// A sink that POSTs each event to Langfuse's ingestion API, fire-and-forget.
+#[derive(Debug)]
+pub struct LangfuseSink {
+    url: String,
+    public_key: String,
+    secret_key: String,
+    client: reqwest::Client,
+}
+
+impl LangfuseSink {
+    /// Create a Langfuse sink. `host` is the base URL (e.g.
+    /// `https://cloud.langfuse.com`); auth uses the public/secret key pair.
+    pub fn new(host: &str, public_key: impl Into<String>, secret_key: impl Into<String>) -> Self {
+        Self {
+            url: format!("{}/api/public/ingestion", host.trim_end_matches('/')),
+            public_key: public_key.into(),
+            secret_key: secret_key.into(),
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl UsageSink for LangfuseSink {
+    fn record(&self, event: &LlmUsageEvent) {
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let id = event
+            .request_id
+            .clone()
+            .unwrap_or_else(|| format!("sb-{}-{timestamp}", event.provider));
+        let body = langfuse_ingestion_body(event, &id, &timestamp);
+        let url = self.url.clone();
+        let (pk, sk) = (self.public_key.clone(), self.secret_key.clone());
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client
+                .post(&url)
+                .basic_auth(pk, Some(sk))
+                .json(&body)
+                .send()
+                .await
+            {
+                tracing::warn!(error = %e, "usage sink: langfuse POST failed");
+            }
+        });
+    }
+
+    fn name(&self) -> &str {
+        "langfuse"
+    }
+}
+
+/// A sink that POSTs each event to Datadog's logs-intake API, fire-and-forget.
+#[derive(Debug)]
+pub struct DatadogSink {
+    url: String,
+    api_key: String,
+    service: String,
+    client: reqwest::Client,
+}
+
+impl DatadogSink {
+    /// Create a Datadog logs sink. `site` is the DD site (e.g.
+    /// `datadoghq.com`, `datadoghq.eu`); `service` tags the log source.
+    pub fn new(site: &str, api_key: impl Into<String>, service: impl Into<String>) -> Self {
+        Self {
+            url: format!("https://http-intake.logs.{site}/api/v2/logs"),
+            api_key: api_key.into(),
+            service: service.into(),
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl UsageSink for DatadogSink {
+    fn record(&self, event: &LlmUsageEvent) {
+        let body = datadog_log_body(event, &self.service);
+        let url = self.url.clone();
+        let key = self.api_key.clone();
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client
+                .post(&url)
+                .header("DD-API-KEY", key)
+                .json(&body)
+                .send()
+                .await
+            {
+                tracing::warn!(error = %e, "usage sink: datadog POST failed");
+            }
+        });
+    }
+
+    fn name(&self) -> &str {
+        "datadog"
+    }
+}
+
+fn default_dd_site() -> String {
+    "datadoghq.com".to_string()
+}
+
 /// Declarative config for a usage sink, parsed from the action's
 /// `usage_sinks` list.
 #[derive(Debug, Clone, Deserialize)]
@@ -188,6 +374,30 @@ pub enum UsageSinkConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signing_seed_hex: Option<String>,
     },
+    /// POST events to Langfuse's ingestion API as generation observations.
+    Langfuse {
+        /// Base URL, e.g. `https://cloud.langfuse.com`.
+        host: String,
+        /// Langfuse public key.
+        public_key: String,
+        /// Langfuse secret key. Resolve from a secret via `${VAR}` or a
+        /// vault reference in the surrounding config.
+        secret_key: String,
+    },
+    /// POST events to Datadog's logs-intake API.
+    Datadog {
+        /// Datadog API key. Resolve from a secret via `${VAR}` or a vault
+        /// reference in the surrounding config.
+        api_key: String,
+        /// Datadog site. Defaults to `datadoghq.com`; set `datadoghq.eu`,
+        /// `us3.datadoghq.com`, etc. for other regions.
+        #[serde(default = "default_dd_site")]
+        site: String,
+        /// Optional `service` tag on the emitted logs. Defaults to
+        /// `sbproxy` at build time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service: Option<String>,
+    },
 }
 
 impl UsageSinkConfig {
@@ -201,6 +411,20 @@ impl UsageSinkConfig {
                 path,
                 signing_seed_hex,
             } => crate::usage_ledger::LedgerSink::build(path, signing_seed_hex.as_deref()),
+            UsageSinkConfig::Langfuse {
+                host,
+                public_key,
+                secret_key,
+            } => std::sync::Arc::new(LangfuseSink::new(host, public_key, secret_key)),
+            UsageSinkConfig::Datadog {
+                api_key,
+                site,
+                service,
+            } => std::sync::Arc::new(DatadogSink::new(
+                site,
+                api_key,
+                service.clone().unwrap_or_else(|| "sbproxy".to_string()),
+            )),
         }
     }
 }
@@ -291,6 +515,68 @@ mod tests {
                 signing_seed_hex, ..
             } => assert_eq!(signing_seed_hex.as_deref(), Some("abcd")),
             other => panic!("expected ledger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn langfuse_body_shapes_a_generation_event() {
+        let body = langfuse_ingestion_body(&sample_event(), "evt-1", "2026-06-26T00:00:00Z");
+        let batch = body.get("batch").unwrap().as_array().unwrap();
+        assert_eq!(batch.len(), 1);
+        let item = &batch[0];
+        assert_eq!(item["id"], "evt-1");
+        assert_eq!(item["type"], "generation-create");
+        assert_eq!(item["timestamp"], "2026-06-26T00:00:00Z");
+        let b = &item["body"];
+        assert_eq!(b["model"], "gpt-4o-mini");
+        assert_eq!(b["usage"]["input"], 10);
+        assert_eq!(b["usage"]["output"], 5);
+        assert_eq!(b["usage"]["total"], 15);
+        assert_eq!(b["usage"]["unit"], "TOKENS");
+        assert_eq!(b["metadata"]["provider"], "openai");
+        assert_eq!(b["metadata"]["key_id"], "k1");
+    }
+
+    #[test]
+    fn datadog_body_carries_usage_attributes() {
+        let body = datadog_log_body(&sample_event(), "sbproxy-ai");
+        let arr = body.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        let log = &arr[0];
+        assert_eq!(log["ddsource"], "sbproxy");
+        assert_eq!(log["service"], "sbproxy-ai");
+        assert_eq!(log["provider"], "openai");
+        assert_eq!(log["model"], "gpt-4o-mini");
+        assert_eq!(log["total_tokens"], 15);
+        assert_eq!(log["status"], 200);
+        assert_eq!(log["key_id"], "k1");
+    }
+
+    #[test]
+    fn config_parses_and_builds_langfuse_and_datadog() {
+        let cfgs: Vec<UsageSinkConfig> = serde_json::from_str(
+            r#"[
+                {"type":"langfuse","host":"https://cloud.langfuse.com","public_key":"pk","secret_key":"sk"},
+                {"type":"datadog","api_key":"dd","site":"datadoghq.eu","service":"my-svc"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(cfgs.len(), 2);
+        let sinks = build_sinks(&cfgs);
+        assert_eq!(sinks[0].name(), "langfuse");
+        assert_eq!(sinks[1].name(), "datadog");
+    }
+
+    #[test]
+    fn datadog_site_and_service_default() {
+        let cfgs: Vec<UsageSinkConfig> =
+            serde_json::from_str(r#"[{"type":"datadog","api_key":"dd"}]"#).unwrap();
+        match &cfgs[0] {
+            UsageSinkConfig::Datadog { site, service, .. } => {
+                assert_eq!(site, "datadoghq.com");
+                assert!(service.is_none());
+            }
+            other => panic!("expected datadog, got {other:?}"),
         }
     }
 }
