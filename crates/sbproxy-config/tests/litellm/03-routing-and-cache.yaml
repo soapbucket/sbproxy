@@ -1,0 +1,14 @@
+# Latency-based routing with the response cache enabled.
+model_list:
+  - model_name: chat
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: chat-backup
+    litellm_params:
+      model: anthropic/claude-3-5-haiku-20241022
+      api_key: os.environ/ANTHROPIC_API_KEY
+router_settings:
+  routing_strategy: latency-based-routing
+litellm_settings:
+  cache: true
