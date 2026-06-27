@@ -15,9 +15,10 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
 
 use crate::crypto::Cipher;
 use crate::metrics::{CRYPTO_KIND_TRANSPORT, MESH_CRYPTO_DECRYPT_FAILED};
@@ -72,6 +73,24 @@ impl TransportServer {
         cache: Arc<DistributedCache<Bytes>>,
         cipher: Option<Cipher>,
     ) -> anyhow::Result<Self> {
+        Self::start_with_security(port, cache, cipher, None).await
+    }
+
+    /// Bind a TCP listener with optional AEAD framing and optional peer mTLS.
+    ///
+    /// When `tls` is `Some`, each accepted connection is wrapped in a
+    /// mutually-authenticated TLS session before any frame is read, so a peer
+    /// that fails the handshake (no certificate, or one not signed by the mesh
+    /// CA) is dropped before it can issue an RPC. The handshake runs inside the
+    /// per-connection task, so a slow or hostile peer cannot stall the accept
+    /// loop. `cipher` still applies to the frames inside the TLS session; in
+    /// practice an operator picks one transport-security layer or the other.
+    pub async fn start_with_security(
+        port: u16,
+        cache: Arc<DistributedCache<Bytes>>,
+        cipher: Option<Cipher>,
+        tls: Option<TlsAcceptor>,
+    ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", port)).await?;
         let local_port = listener.local_addr()?.port();
 
@@ -91,7 +110,22 @@ impl TransportServer {
                                 tracing::debug!(peer = %addr, "transport: accepted connection");
                                 let cache = cache.clone();
                                 let cipher = cipher.clone();
-                                tokio::spawn(handle_connection(stream, cache, cipher));
+                                let tls = tls.clone();
+                                tokio::spawn(async move {
+                                    match tls {
+                                        Some(acceptor) => match acceptor.accept(stream).await {
+                                            Ok(tls_stream) => {
+                                                handle_connection(tls_stream, cache, cipher).await
+                                            }
+                                            Err(e) => tracing::warn!(
+                                                peer = %addr,
+                                                error = %e,
+                                                "transport: peer TLS handshake failed"
+                                            ),
+                                        },
+                                        None => handle_connection(stream, cache, cipher).await,
+                                    }
+                                });
                             }
                             Err(e) => {
                                 // Typically transient (fd exhaustion, peer
@@ -154,12 +188,14 @@ impl Drop for TransportServer {
 /// A failed open tears down the connection: an authenticated peer cannot
 /// "recover" by resyncing on the framing boundary after a crypto error, so
 /// there is no reason to keep the socket open.
-async fn handle_connection(
-    stream: TcpStream,
+async fn handle_connection<S>(
+    stream: S,
     cache: Arc<DistributedCache<Bytes>>,
     cipher: Option<Cipher>,
-) {
-    let (mut reader, mut writer) = stream.into_split();
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
     loop {
         // --- Read a framed request ---
         let payload = match read_frame(&mut reader).await {
@@ -270,6 +306,7 @@ async fn handle_connection(
 mod tests {
     use super::*;
     use std::time::Duration;
+    use tokio::net::TcpStream;
 
     #[tokio::test]
     async fn server_binds_and_reports_port() {
@@ -290,6 +327,68 @@ mod tests {
         server.shutdown();
         // Give the accept task a tick to notice the shutdown signal.
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn mtls_server_and_peer_client_roundtrip() {
+        use crate::transport::client::MeshTlsClient;
+        use crate::transport::tls::{build_acceptor, build_connector, MeshTlsConfig};
+        use crate::transport::PeerClient;
+        use rustls::pki_types::ServerName;
+
+        // Test PKI: a CA plus one peer cert valid as both TLS server and
+        // client (SAN `localhost`), used by both ends of the connection.
+        let tls_cfg = {
+            use rcgen::{
+                BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+            };
+            let ca_key = KeyPair::generate().unwrap();
+            let mut ca = CertificateParams::new(Vec::new()).unwrap();
+            ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let ca_cert = ca.self_signed(&ca_key).unwrap();
+            let peer_key = KeyPair::generate().unwrap();
+            let mut peer = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            peer.extended_key_usages = vec![
+                ExtendedKeyUsagePurpose::ServerAuth,
+                ExtendedKeyUsagePurpose::ClientAuth,
+            ];
+            let peer_cert = peer.signed_by(&peer_key, &ca_cert, &ca_key).unwrap();
+            MeshTlsConfig {
+                cert_pem: peer_cert.pem(),
+                key_pem: peer_key.serialize_pem(),
+                ca_pem: ca_cert.pem(),
+            }
+        };
+
+        // TLS-enabled server.
+        let cache: Arc<DistributedCache<Bytes>> = Arc::new(DistributedCache::new("mtls-node", 16));
+        let acceptor = build_acceptor(&tls_cfg).expect("acceptor");
+        let server = TransportServer::start_with_security(0, cache.clone(), None, Some(acceptor))
+            .await
+            .expect("start tls server");
+        let port = server.local_port();
+
+        // TLS peer client, connecting to the fixed logical name in the cert.
+        let connector = build_connector(&tls_cfg).expect("connector");
+        let client = PeerClient::with_security(
+            format!("127.0.0.1:{port}"),
+            None,
+            Some(MeshTlsClient {
+                connector,
+                server_name: ServerName::try_from("localhost").unwrap(),
+            }),
+        );
+
+        // A put then a get round-trip through the mutually-authenticated TLS
+        // session and the server's local cache.
+        client
+            .put("k".to_string(), Bytes::from_static(b"v"))
+            .await
+            .expect("put over mtls");
+        let got = client.get("k".to_string()).await.expect("get over mtls");
+        assert_eq!(got, Some(Bytes::from_static(b"v")));
+
+        server.shutdown();
     }
 
     #[tokio::test]

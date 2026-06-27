@@ -310,6 +310,9 @@ rcgen = "0.13"
 # crates/sbproxy/src/main.rs), so aws-lc is unused overhead and breaks
 # cross-compilation under qemu. Opt into only the features we need.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+# Async rustls adapter for tokio streams (mesh peer mTLS). Match rustls's
+# ring-only crypto provider; the default would pull aws-lc-rs.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 # PEM parsing is provided by rustls-pki-types directly via the PemObject
 # trait; replaces the unmaintained rustls-pemfile crate (RUSTSEC-2025-0134).
 rustls-pki-types = "1"
