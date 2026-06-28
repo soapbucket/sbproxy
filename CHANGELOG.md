@@ -11,6 +11,17 @@ Work that has merged to `main` since the latest tag and is queued for
 the next version cut. No promises about backward compatibility for any
 of the new YAML fields below until the version that ships them.
 
+## [1.4.0] - 2026-06-27
+
+Fourth minor release on the Rust v1.x line. Hardening and reach for the
+AI gateway and the clustering mesh: mutually-authenticated TLS on the
+peer transport, external HTTP guardrail providers on the request and the
+response, native Langfuse and Datadog usage sinks, and per-server
+namespace control for MCP federation. One correctness fix promotes
+budget windows from parsed-but-ignored to enforced. No config-breaking
+changes; existing `sb.yml` files compile unchanged, and every new field
+is default-off.
+
 ### Added
 
 - **Mesh peer mTLS.** The mesh peer transport can run over
