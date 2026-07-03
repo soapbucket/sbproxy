@@ -1352,8 +1352,12 @@ pub(super) async fn handle_mcp_action(
                 // so the catalogue never lists a tool the gate would
                 // refuse to call for this caller.
                 let snapshot = mcp.federation.serialized_tools();
-                let needs_filter =
-                    mcp.tool_allowlist.is_some() || mcp.has_principal_scoped_tools;
+                // WOR-1635: tools blocked by the version gate are
+                // filtered out of the catalogue entirely.
+                let version_blocked = mcp.federation.version_blocked();
+                let needs_filter = mcp.tool_allowlist.is_some()
+                    || mcp.has_principal_scoped_tools
+                    || !version_blocked.is_empty();
                 let tools_json: std::borrow::Cow<'_, str> = if !needs_filter {
                     std::borrow::Cow::Borrowed(snapshot.full_array.as_str())
                 } else {
@@ -1361,6 +1365,9 @@ pub(super) async fn handle_mcp_action(
                     out.push('[');
                     let mut first = true;
                     for entry in &snapshot.entries {
+                        if version_blocked.contains_key(&entry.name) {
+                            continue;
+                        }
                         if !mcp.is_tool_allowed(&entry.name) {
                             continue;
                         }
@@ -1513,7 +1520,16 @@ pub(super) async fn handle_mcp_action(
                         "tools/call requires a 'name' parameter",
                     ),
                     Some(name) => {
-                        if !mcp.is_tool_allowed(&name) {
+                        // WOR-1635: version-gate check first; a
+                        // blocked tool is invisible in tools/list and
+                        // must fail calls with the violation detail.
+                        if let Some(detail) = mcp.federation.version_blocked().get(&name) {
+                            JsonRpcResponse::error(
+                                request.id.clone(),
+                                INVALID_PARAMS,
+                                &format!("tool '{}' is blocked by the version gate: {}", name, detail),
+                            )
+                        } else if !mcp.is_tool_allowed(&name) {
                             JsonRpcResponse::error(
                                 request.id.clone(),
                                 INVALID_PARAMS,

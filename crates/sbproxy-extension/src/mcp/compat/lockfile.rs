@@ -16,6 +16,13 @@ pub struct ToolLock {
     pub semver: semver::Version,
     /// The `sha256:<hex>` contract digest captured for that version.
     pub contract_digest: String,
+    /// The full contract (the tool definition's contract projection)
+    /// captured at snapshot time. Optional for backward compatibility
+    /// with digest-only lockfiles; when present, a changed tool can
+    /// be graded structurally against this baseline instead of only
+    /// detected via the digest (WOR-1635).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<serde_json::Value>,
 }
 
 /// The committed baseline the oracle diffs live tools against.
@@ -52,6 +59,7 @@ mod tests {
             ToolLock {
                 semver: semver::Version::new(2, 1, 0),
                 contract_digest: "sha256:9e3a".to_string(),
+                contract: None,
             },
         );
         Lockfile {

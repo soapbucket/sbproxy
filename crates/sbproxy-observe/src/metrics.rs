@@ -2667,6 +2667,27 @@ pub fn record_mcp_tool_dispatch(tool: &str, result: &'static str, duration_secs:
         .observe(duration_secs);
 }
 
+/// Record a tool-versioning oracle verdict on
+/// `sbproxy_mcp_tool_compat_verdicts_total{grade, outcome}`
+/// (WOR-1635). `grade` is the computed semver grade (`none`, `patch`,
+/// `minor`, `major`); `outcome` is `ok`, `violation`, `removed_tool`,
+/// or `lockfile_error`.
+pub fn record_mcp_tool_compat_verdict(grade: &str, outcome: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_tool_compat_verdicts_total",
+            "Tool-versioning oracle verdicts, by computed grade and outcome",
+            &["grade", "outcome"],
+        )
+        .expect("mcp tool compat verdict counter registers")
+    });
+    let grade = sanitize_label("grade", grade);
+    counter.with_label_values(&[grade.as_str(), outcome]).inc();
+}
+
 /// Record an MCP upstream IO failure on
 /// `sbproxy_mcp_upstream_io_failures_total{kind}`. `kind` is one of
 /// `timeout`, `connect`, `response_cap`, `other`. Lets an operator

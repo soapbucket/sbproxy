@@ -73,12 +73,49 @@ jury returns needs-confirmation rather than a hard pass or fail. Without a
 configured judge, the dimension is skipped and the verdict is structural and
 behavioral only, so it never blocks on its own.
 
+## The live gate
+
+The `tool_versioning` block on the `mcp` action wires the oracle into the
+gateway. At every catalogue refresh that actually changed the contract set,
+the gateway diffs the live tools against the lockfile and lints each declared
+bump:
+
+```yaml
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      tool_versioning:
+        lockfile: "tool-versions.lock.yaml"
+        mode: warn            # or block
+        declared_versions:
+          search: "1.1.0"
+      federated_servers:
+        - origin: "tools.internal"
+```
+
+`mode: warn` logs a `mcp.tool_versioning.violation` audit event and counts it
+on `sbproxy_mcp_tool_compat_verdicts_total{grade, outcome}`. `mode: block`
+also removes the violating tool from `tools/list` and fails its `tools/call`
+with an error carrying the linter's detail. A changed tool with no entry in
+`declared_versions` is linted as "no bump declared" against its lockfile
+version.
+
+The lockfile is read at refresh time, never at config compile. An unreadable
+or invalid lockfile fails open: nothing is blocked, the gateway logs a loud
+error, and the metric records `outcome="lockfile_error"`. Tools present in the
+lockfile but missing from the live catalogue are reported as
+`outcome="removed_tool"` and never block anything else.
+
+See `examples/mcp-tool-versioning/` for a runnable configuration.
+
 ## Status
 
-The oracle engine ships in the runtime today: the digest, the three-dimension
-grade, and the version-bump linter. The `sb.yml` surface that wires it into the
-MCP gateway as a live gate, and the CLI that runs it against a lockfile in CI,
-are landing next.
+The oracle engine, the `sb.yml` gate above, and the runtime enforcement ship
+today. The CLI that generates and checks lockfiles in CI is landing next; a
+lockfile can be written by hand in the meantime (the embedded `contract`
+field is optional, and a digest-only baseline still detects changes, graded
+as at least a patch).
 
 ## Related
 

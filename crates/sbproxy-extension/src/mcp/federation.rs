@@ -189,6 +189,34 @@ impl Default for FederationIoSettings {
     }
 }
 
+/// Enforcement mode for the tool-versioning gate (WOR-1635).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersioningMode {
+    /// Violations are logged and counted; traffic is unaffected.
+    Warn,
+    /// Violating tools are filtered from `tools/list` and their
+    /// `tools/call` fails with a typed error.
+    Block,
+}
+
+/// Tool-versioning gate configuration (WOR-1635): the committed
+/// lockfile baseline plus the operator-declared current versions.
+/// The lockfile is (re)read at each catalogue change, not at compile
+/// time, so config compilation stays IO-free; an unreadable or
+/// invalid lockfile fails open (nothing blocked) with a loud error
+/// event and a `lockfile_error` verdict metric.
+pub struct ToolVersioningGate {
+    /// Path to the committed lockfile (YAML, see
+    /// [`super::compat::Lockfile`]).
+    pub lockfile_path: String,
+    /// Operator-declared current version per advertised tool name.
+    /// A changed tool absent from this map is linted against its
+    /// lockfile version, i.e. treated as "no bump declared".
+    pub declared_versions: HashMap<String, semver::Version>,
+    /// Warn or block.
+    pub mode: VersioningMode,
+}
+
 /// Aggregates tools from multiple upstream MCP servers into one registry.
 pub struct McpFederation {
     servers: Vec<McpServerConfig>,
@@ -233,6 +261,11 @@ pub struct McpFederation {
     /// Serialises the cold-start prime so N concurrent first
     /// requests trigger exactly one upstream fan-out.
     prime_lock: tokio::sync::Mutex<()>,
+    /// Tool-versioning gate (WOR-1635); `None` disables the oracle.
+    versioning: Option<ToolVersioningGate>,
+    /// Advertised names currently blocked by the version gate, with
+    /// the violation detail (only populated in Block mode).
+    version_blocked: ArcSwap<HashMap<String, String>>,
     /// WOR-1640: per-generation pre-serialized tool catalogue, so
     /// `tools/list` responses are string splices instead of
     /// per-request `FederatedTool` clones and re-serialization.
@@ -286,6 +319,16 @@ impl McpFederation {
 
     /// Create a new federation with explicit upstream IO limits.
     pub fn with_io(servers: Vec<McpServerConfig>, io: FederationIoSettings) -> Self {
+        Self::with_io_versioned(servers, io, None)
+    }
+
+    /// Create a new federation with explicit IO limits and an
+    /// optional tool-versioning gate (WOR-1635).
+    pub fn with_io_versioned(
+        servers: Vec<McpServerConfig>,
+        io: FederationIoSettings,
+        versioning: Option<ToolVersioningGate>,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .connect_timeout(io.connect_timeout)
             .timeout(io.request_timeout)
@@ -311,6 +354,8 @@ impl McpFederation {
             refresh_task_started: std::sync::atomic::AtomicBool::new(false),
             primed: std::sync::atomic::AtomicBool::new(false),
             prime_lock: tokio::sync::Mutex::new(()),
+            versioning,
+            version_blocked: ArcSwap::from_pointee(HashMap::new()),
             serialized_tools: ArcSwap::from_pointee(SerializedTools {
                 // u64::MAX never equals a live generation, so the
                 // first call rebuilds.
@@ -388,6 +433,9 @@ impl McpFederation {
             .swap(digest, std::sync::atomic::Ordering::AcqRel)
             != digest
         {
+            // WOR-1635: grade the changed catalogue against the
+            // lockfile baseline before publishing it.
+            self.evaluate_tool_versioning(&registry);
             self.tools.store(Arc::new(registry));
             self.generation
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -1072,6 +1120,139 @@ impl McpFederation {
         (module, etag)
     }
 
+    /// Advertised tool names currently blocked by the version gate,
+    /// mapped to the violation detail (WOR-1635). Empty when the gate
+    /// is off, in warn mode, or has nothing to block.
+    pub fn version_blocked(&self) -> Arc<HashMap<String, String>> {
+        self.version_blocked.load_full()
+    }
+
+    /// WOR-1635: diff a freshly fetched catalogue against the
+    /// lockfile baseline, lint declared bumps, and (in Block mode)
+    /// publish the violating tool set. Runs only when the catalogue
+    /// content changed. Fail-open: an unreadable lockfile clears the
+    /// blocked set and reports `lockfile_error`.
+    fn evaluate_tool_versioning(&self, registry: &HashMap<String, FederatedTool>) {
+        let Some(gate) = self.versioning.as_ref() else {
+            return;
+        };
+        let lockfile = match std::fs::read_to_string(&gate.lockfile_path)
+            .map_err(anyhow::Error::from)
+            .and_then(|y| super::compat::Lockfile::from_yaml(&y))
+        {
+            Ok(l) => l,
+            Err(e) => {
+                error!(
+                    lockfile = %gate.lockfile_path,
+                    error = %e,
+                    "tool-versioning lockfile unreadable; gate fails open"
+                );
+                sbproxy_observe::metrics::record_mcp_tool_compat_verdict(
+                    "none",
+                    "lockfile_error",
+                );
+                self.version_blocked.store(Arc::new(HashMap::new()));
+                return;
+            }
+        };
+
+        let mut blocked: HashMap<String, String> = HashMap::new();
+        for (name, tool) in registry {
+            let Some(lock) = lockfile.tools.get(name) else {
+                // New tool: nothing to diff against.
+                continue;
+            };
+            let live_contract = serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": tool.input_schema,
+            });
+            let live_digest = super::compat::contract_digest(&live_contract);
+            if live_digest == lock.contract_digest {
+                continue;
+            }
+            // Contract moved: grade it. With the full baseline
+            // contract in the lockfile the grade is structural;
+            // digest-only baselines can still prove "changed", which
+            // is at least a patch.
+            let verdict = match lock.contract.as_ref() {
+                Some(old_contract) => {
+                    super::compat::evaluate_compatibility(&super::compat::OracleInputs {
+                        tool: name,
+                        old_tool: old_contract,
+                        new_tool: &live_contract,
+                        old_response: None,
+                        new_response: None,
+                    })
+                }
+                None => super::compat::CompatibilityVerdict {
+                    tool: name.clone(),
+                    from_digest: lock.contract_digest.clone(),
+                    to_digest: live_digest,
+                    grade: super::compat::SemverGrade::Patch,
+                    findings: Vec::new(),
+                    behavioral_evaluated: false,
+                    needs_confirmation: false,
+                },
+            };
+            let declared = gate.declared_versions.get(name).unwrap_or(&lock.semver);
+            let grade_label = match verdict.grade {
+                super::compat::SemverGrade::None => "none",
+                super::compat::SemverGrade::Patch => "patch",
+                super::compat::SemverGrade::Minor => "minor",
+                super::compat::SemverGrade::Major => "major",
+            };
+            match super::compat::lint_bump(&lock.semver, declared, &verdict) {
+                super::compat::BumpVerdict::Ok => {
+                    sbproxy_observe::metrics::record_mcp_tool_compat_verdict(grade_label, "ok");
+                    info!(
+                        target: "sbproxy::audit",
+                        event = "mcp.tool_versioning.changed",
+                        tool = %name,
+                        grade = grade_label,
+                        prior = %lock.semver,
+                        declared = %declared,
+                        "tool contract changed with a matching version bump"
+                    );
+                }
+                super::compat::BumpVerdict::Violation { detail, .. } => {
+                    sbproxy_observe::metrics::record_mcp_tool_compat_verdict(
+                        grade_label,
+                        "violation",
+                    );
+                    warn!(
+                        target: "sbproxy::audit",
+                        event = "mcp.tool_versioning.violation",
+                        tool = %name,
+                        grade = grade_label,
+                        mode = ?gate.mode,
+                        detail = %detail,
+                        security = verdict.findings.iter().any(|f| f.security),
+                        "tool contract changed without a matching version bump"
+                    );
+                    if gate.mode == VersioningMode::Block {
+                        blocked.insert(name.clone(), detail);
+                    }
+                }
+            }
+        }
+        // Tools that vanished from the live catalogue but exist in
+        // the baseline: report, never block (there is nothing left
+        // to block).
+        for locked_name in lockfile.tools.keys() {
+            if !registry.contains_key(locked_name) {
+                sbproxy_observe::metrics::record_mcp_tool_compat_verdict("major", "removed_tool");
+                warn!(
+                    target: "sbproxy::audit",
+                    event = "mcp.tool_versioning.removed",
+                    tool = %locked_name,
+                    "locked tool no longer advertised by any upstream"
+                );
+            }
+        }
+        self.version_blocked.store(Arc::new(blocked));
+    }
+
     /// Make the federation servable: spawn the periodic refresh task
     /// on first use and run the cold-start prime (one tools fetch +
     /// one resources fetch) exactly once, single-flight. Requests
@@ -1497,6 +1678,136 @@ mod tests {
         // A different callback base misses the cache.
         let (m3, _) = fed.codemode_ts_cached("http://other.test");
         assert!(!std::sync::Arc::ptr_eq(&m1, &m3));
+    }
+
+    // --- Tool-versioning gate (WOR-1635) ---
+
+    fn write_lockfile(name: &str, lockfile: &crate::mcp::compat::Lockfile) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "sbproxy-fed-test-{}-{}.lock.yaml",
+            std::process::id(),
+            name
+        ));
+        std::fs::write(&path, lockfile.to_yaml().expect("yaml")).expect("write lockfile");
+        path.to_string_lossy().to_string()
+    }
+
+    fn gate_registry(description: &str) -> HashMap<String, FederatedTool> {
+        let mut tool = make_tool("search", "srv");
+        tool.description = description.to_string();
+        let mut map = HashMap::new();
+        map.insert("search".to_string(), tool);
+        map
+    }
+
+    fn locked_contract(description: &str) -> serde_json::Value {
+        let t = make_tool("search", "srv");
+        json!({
+            "name": t.name,
+            "description": description,
+            "inputSchema": t.input_schema,
+        })
+    }
+
+    fn gate_lockfile(description: &str) -> crate::mcp::compat::Lockfile {
+        let contract = locked_contract(description);
+        let mut tools = std::collections::BTreeMap::new();
+        tools.insert(
+            "search".to_string(),
+            crate::mcp::compat::ToolLock {
+                semver: semver::Version::new(1, 0, 0),
+                contract_digest: crate::mcp::compat::contract_digest(&contract),
+                contract: Some(contract),
+            },
+        );
+        crate::mcp::compat::Lockfile {
+            version: 1,
+            generated_for: "test".to_string(),
+            tools,
+        }
+    }
+
+    fn gated_federation(
+        lockfile_path: String,
+        mode: VersioningMode,
+        declared: Option<semver::Version>,
+    ) -> McpFederation {
+        let mut declared_versions = HashMap::new();
+        if let Some(v) = declared {
+            declared_versions.insert("search".to_string(), v);
+        }
+        McpFederation::with_io_versioned(
+            vec![],
+            FederationIoSettings::default(),
+            Some(ToolVersioningGate {
+                lockfile_path,
+                declared_versions,
+                mode,
+            }),
+        )
+    }
+
+    #[test]
+    fn version_gate_blocks_unbumped_change_in_block_mode() {
+        let path = write_lockfile("block", &gate_lockfile("original description"));
+        let fed = gated_federation(path.clone(), VersioningMode::Block, None);
+        fed.evaluate_tool_versioning(&gate_registry("completely different meaning"));
+        let blocked = fed.version_blocked();
+        assert!(
+            blocked.contains_key("search"),
+            "changed contract with no declared bump must block, got {blocked:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn version_gate_warn_mode_never_blocks() {
+        let path = write_lockfile("warn", &gate_lockfile("original description"));
+        let fed = gated_federation(path.clone(), VersioningMode::Warn, None);
+        fed.evaluate_tool_versioning(&gate_registry("completely different meaning"));
+        assert!(fed.version_blocked().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn version_gate_accepts_matching_bump() {
+        let path = write_lockfile("bumped", &gate_lockfile("original description"));
+        // Description-only rewording grades patch structurally; a
+        // declared patch bump satisfies the linter.
+        let fed = gated_federation(
+            path.clone(),
+            VersioningMode::Block,
+            Some(semver::Version::new(1, 0, 1)),
+        );
+        fed.evaluate_tool_versioning(&gate_registry("reworded description"));
+        assert!(
+            fed.version_blocked().is_empty(),
+            "a declared bump matching the grade must pass"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn version_gate_unchanged_contract_is_untouched() {
+        let path = write_lockfile("same", &gate_lockfile("original description"));
+        let fed = gated_federation(path.clone(), VersioningMode::Block, None);
+        fed.evaluate_tool_versioning(&gate_registry("original description"));
+        assert!(fed.version_blocked().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn version_gate_fails_open_on_missing_lockfile() {
+        let fed = gated_federation(
+            "/nonexistent/sbproxy-lockfile.yaml".to_string(),
+            VersioningMode::Block,
+            None,
+        );
+        fed.evaluate_tool_versioning(&gate_registry("anything"));
+        assert!(
+            fed.version_blocked().is_empty(),
+            "an unreadable lockfile must fail open"
+        );
     }
 
     #[tokio::test]
