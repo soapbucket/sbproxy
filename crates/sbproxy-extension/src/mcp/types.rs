@@ -15,6 +15,38 @@ pub const INVALID_PARAMS: i32 = -32602;
 /// JSON-RPC 2.0 internal error: server encountered an unexpected failure.
 pub const INTERNAL_ERROR: i32 = -32603;
 
+// --- Protocol version negotiation (WOR-1641) ---
+
+/// MCP protocol revisions this gateway can serve, newest first. One
+/// entry today: `2025-03-26` is deliberately absent because that
+/// revision requires servers to accept JSON-RPC batches, which the
+/// gateway does not, and advertising a version whose MUSTs we break
+/// is the exact capability lie this list exists to prevent.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18"];
+
+/// Newest protocol revision the gateway serves.
+pub const LATEST_PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
+
+/// True when the gateway can serve the given protocol revision.
+pub fn is_supported_protocol_version(version: &str) -> bool {
+    SUPPORTED_PROTOCOL_VERSIONS.contains(&version)
+}
+
+/// Spec-correct `initialize` negotiation: echo the client's requested
+/// revision when the gateway supports it, otherwise answer with the
+/// newest revision the gateway does support (the client then decides
+/// whether to continue). A missing request defaults to the newest.
+pub fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
+    match requested {
+        Some(v) => SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .find(|s| **s == v)
+            .copied()
+            .unwrap_or(LATEST_PROTOCOL_VERSION),
+        None => LATEST_PROTOCOL_VERSION,
+    }
+}
+
 // --- JSON-RPC 2.0 ---
 
 /// JSON-RPC 2.0 request envelope used by all MCP methods.
@@ -240,4 +272,49 @@ pub struct ServerInfo {
     pub name: String,
     /// Server software version string.
     pub version: String,
+}
+
+#[cfg(test)]
+mod protocol_version_tests {
+    use super::*;
+
+    #[test]
+    fn negotiation_echoes_supported_version() {
+        assert_eq!(
+            negotiate_protocol_version(Some(LATEST_PROTOCOL_VERSION)),
+            LATEST_PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn negotiation_falls_back_to_latest_for_unknown() {
+        assert_eq!(
+            negotiate_protocol_version(Some("2025-03-26")),
+            LATEST_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            negotiate_protocol_version(Some("1999-01-01")),
+            LATEST_PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn negotiation_defaults_to_latest_when_missing() {
+        assert_eq!(negotiate_protocol_version(None), LATEST_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn supported_check_matches_list() {
+        assert!(is_supported_protocol_version("2025-06-18"));
+        assert!(!is_supported_protocol_version("2025-03-26"));
+        assert!(!is_supported_protocol_version(""));
+    }
+
+    #[test]
+    fn latest_is_first_in_supported_list() {
+        assert_eq!(SUPPORTED_PROTOCOL_VERSIONS[0], LATEST_PROTOCOL_VERSION);
+        assert!(SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .all(|v| is_supported_protocol_version(v)));
+    }
 }

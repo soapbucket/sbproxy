@@ -745,8 +745,10 @@ pub(super) async fn handle_mcp_action(
     has_agent_skills: bool,
 ) -> Result<()> {
     use sbproxy_extension::mcp::types::{
-        InitializeResult, JsonRpcRequest, JsonRpcResponse, ServerCapabilities, ServerInfo,
-        INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
+        is_supported_protocol_version, negotiate_protocol_version, InitializeResult,
+        JsonRpcRequest, JsonRpcResponse, ServerCapabilities, ServerInfo, INTERNAL_ERROR,
+        INVALID_PARAMS, INVALID_REQUEST, LATEST_PROTOCOL_VERSION, METHOD_NOT_FOUND, PARSE_ERROR,
+        SUPPORTED_PROTOCOL_VERSIONS,
     };
 
     let method = session.req_header().method.clone();
@@ -976,7 +978,7 @@ pub(super) async fn handle_mcp_action(
         let manifest = sbproxy_extension::mcp::discovery::build_server_manifest(
             &mcp.server_name,
             &mcp.server_version,
-            "2025-06-18",
+            LATEST_PROTOCOL_VERSION,
             &endpoint,
             &tools,
             authorization,
@@ -1048,7 +1050,20 @@ pub(super) async fn handle_mcp_action(
     let request: JsonRpcRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
         Err(_) => {
-            let err = JsonRpcResponse::error(None, PARSE_ERROR, "invalid JSON-RPC body");
+            // WOR-1641: a JSON-RPC batch (top-level array) is valid
+            // JSON, so answer it with a specific message instead of
+            // a bare parse error. The 2025-06-18 revision removed
+            // batching and this gateway does not accept it.
+            let first_byte = body_bytes.iter().find(|b| !b.is_ascii_whitespace());
+            let (code, message) = if first_byte == Some(&b'[') {
+                (
+                    INVALID_REQUEST,
+                    "JSON-RPC batching is not supported (removed in MCP 2025-06-18); send one request per POST",
+                )
+            } else {
+                (PARSE_ERROR, "invalid JSON-RPC body")
+            };
+            let err = JsonRpcResponse::error(None, code, message);
             return write_jsonrpc(session, &err).await;
         }
     };
@@ -1060,6 +1075,34 @@ pub(super) async fn handle_mcp_action(
             "jsonrpc field must be \"2.0\"",
         );
         return write_jsonrpc(session, &err).await;
+    }
+
+    // WOR-1641: post-initialize requests SHOULD carry
+    // `MCP-Protocol-Version`; when present it must name a revision
+    // the gateway serves, else 400 per the spec's version-validation
+    // rule. A missing header is accepted (the request is served at
+    // the gateway's newest revision). `initialize` is exempt: that
+    // is where negotiation happens.
+    if request.method != "initialize" {
+        if let Some(header_version) = session
+            .req_header()
+            .headers
+            .get("mcp-protocol-version")
+            .and_then(|v| v.to_str().ok())
+        {
+            if !is_supported_protocol_version(header_version) {
+                send_error(
+                    session,
+                    400,
+                    &format!(
+                        "unsupported MCP-Protocol-Version '{header_version}' (supported: {})",
+                        SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
     }
 
     // Notifications (id absent) get an empty 204 per JSON-RPC 2.0.
@@ -1126,8 +1169,17 @@ pub(super) async fn handle_mcp_action(
             let surfaces_resources =
                 has_agent_skills || !mcp.federation.list_resources().is_empty();
             let resources = surfaces_resources.then(|| serde_json::json!({ "listChanged": true }));
+            // WOR-1641: spec-correct negotiation. Echo the client's
+            // requested revision when supported; otherwise answer
+            // with the newest revision the gateway serves and let
+            // the client decide.
+            let requested_version = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(|v| v.as_str());
             let result = InitializeResult {
-                protocol_version: "2025-06-18".to_string(),
+                protocol_version: negotiate_protocol_version(requested_version).to_string(),
                 capabilities: ServerCapabilities {
                     tools: Some(serde_json::json!({})),
                     resources,

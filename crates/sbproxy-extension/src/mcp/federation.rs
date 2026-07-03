@@ -575,7 +575,7 @@ impl McpFederation {
             jsonrpc: "2.0".to_string(),
             method: "initialize".to_string(),
             params: Some(json!({
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": super::types::LATEST_PROTOCOL_VERSION,
                 "clientInfo": { "name": "sbproxy", "version": env!("CARGO_PKG_VERSION") },
                 "capabilities": {},
             })),
