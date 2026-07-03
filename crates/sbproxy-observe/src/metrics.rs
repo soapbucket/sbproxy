@@ -2667,6 +2667,26 @@ pub fn record_mcp_tool_dispatch(tool: &str, result: &'static str, duration_secs:
         .observe(duration_secs);
 }
 
+/// Record an MCP upstream IO failure on
+/// `sbproxy_mcp_upstream_io_failures_total{kind}`. `kind` is one of
+/// `timeout`, `connect`, `response_cap`, `other`. Lets an operator
+/// see hung or oversized upstreams that the per-request deadlines
+/// and byte caps are absorbing.
+pub fn record_mcp_upstream_io_failure(kind: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_upstream_io_failures_total",
+            "MCP upstream IO failures absorbed by deadlines and byte caps, by kind",
+            &["kind"],
+        )
+        .expect("mcp upstream io failure counter registers")
+    });
+    counter.with_label_values(&[kind]).inc();
+}
+
 /// Record an MCP resource-fetch attempt on
 /// `sbproxy_mcp_resource_fetch_total{result}`. `result` is one of
 /// `ok`, `not_found`, `upstream_error`, `policy_denied`.

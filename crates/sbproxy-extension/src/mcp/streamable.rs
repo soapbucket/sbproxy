@@ -5,6 +5,56 @@
 
 use super::types::{JsonRpcRequest, JsonRpcResponse};
 
+/// Marker included in byte-cap errors so callers can classify the
+/// failure without a typed error enum crossing the module boundary.
+pub(crate) const RESPONSE_CAP_MARKER: &str = "response byte cap exceeded";
+
+/// Read a response body incrementally, bailing once it exceeds
+/// `max_bytes`. Never buffers more than the cap.
+pub(crate) async fn read_body_capped(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            anyhow::bail!("{RESPONSE_CAP_MARKER} ({max_bytes} bytes)");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Read an SSE response incrementally and return as soon as a
+/// complete JSON-RPC response event has arrived, instead of draining
+/// the stream into memory first. A stream that never carries a
+/// response is cut at `max_bytes` (or by the client's request
+/// timeout, whichever trips first).
+pub(crate) async fn read_sse_response_capped(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> anyhow::Result<JsonRpcResponse> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            anyhow::bail!("{RESPONSE_CAP_MARKER} ({max_bytes} bytes)");
+        }
+        let chunk_has_newline = chunk.contains(&b'\n');
+        buf.extend_from_slice(&chunk);
+        // A data line can only parse once its terminating newline
+        // arrived, so re-attempt only when this chunk carried one.
+        // A partial JSON payload fails the parse and we keep reading.
+        if chunk_has_newline {
+            let text = String::from_utf8_lossy(&buf);
+            if let Ok(response) = parse_sse_response(&text) {
+                return Ok(response);
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    parse_sse_response(&text)
+}
+
 // --- Streamable HTTP Send ---
 
 /// Send a JSON-RPC request to an MCP server via Streamable HTTP.
@@ -12,10 +62,12 @@ use super::types::{JsonRpcRequest, JsonRpcResponse};
 /// The server receives an HTTP POST with the serialized request body,
 /// and returns a JSON response (or SSE stream). This implementation
 /// reads the first complete JSON object from the response body.
+/// `max_bytes` bounds how much of the response is ever buffered.
 pub async fn send_request(
     client: &reqwest::Client,
     server_url: &str,
     request: &JsonRpcRequest,
+    max_bytes: usize,
 ) -> anyhow::Result<JsonRpcResponse> {
     let resp = client
         .post(server_url)
@@ -38,12 +90,13 @@ pub async fn send_request(
         .to_string();
 
     if content_type.contains("text/event-stream") {
-        // SSE response: parse events until we find a JSON-RPC response.
-        let body = resp.text().await?;
-        parse_sse_response(&body)
+        // SSE response: parse events until we find a JSON-RPC
+        // response; stop reading as soon as one arrives.
+        read_sse_response_capped(resp, max_bytes).await
     } else {
         // Plain JSON response.
-        let response: JsonRpcResponse = resp.json().await?;
+        let body = read_body_capped(resp, max_bytes).await?;
+        let response: JsonRpcResponse = serde_json::from_slice(&body)?;
         Ok(response)
     }
 }
@@ -51,11 +104,13 @@ pub async fn send_request(
 /// Send a batch of JSON-RPC requests.
 ///
 /// The MCP server must support JSON-RPC batching. Returns one response
-/// per request in the same order.
+/// per request in the same order. `max_bytes` bounds how much of the
+/// response is ever buffered.
 pub async fn send_batch(
     client: &reqwest::Client,
     server_url: &str,
     requests: &[JsonRpcRequest],
+    max_bytes: usize,
 ) -> anyhow::Result<Vec<JsonRpcResponse>> {
     if requests.is_empty() {
         return Ok(Vec::new());
@@ -81,11 +136,11 @@ pub async fn send_batch(
         .unwrap_or("")
         .to_string();
 
+    let body = read_body_capped(resp, max_bytes).await?;
     if content_type.contains("text/event-stream") {
-        let body = resp.text().await?;
-        parse_sse_batch_response(&body)
+        parse_sse_batch_response(&String::from_utf8_lossy(&body))
     } else {
-        let responses: Vec<JsonRpcResponse> = resp.json().await?;
+        let responses: Vec<JsonRpcResponse> = serde_json::from_slice(&body)?;
         Ok(responses)
     }
 }
@@ -254,6 +309,57 @@ mod tests {
     fn test_parse_sse_response_no_data_fails() {
         let result = parse_sse_response("event: open\n\n");
         assert!(result.is_err());
+    }
+
+    // --- Capped reads (WOR-1639) ---
+
+    #[tokio::test]
+    async fn read_body_capped_bails_over_cap() {
+        let resp = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .body("0123456789")
+                .unwrap(),
+        );
+        let err = read_body_capped(resp, 4).await.unwrap_err();
+        assert!(
+            err.to_string().contains(RESPONSE_CAP_MARKER),
+            "cap breach must carry the marker, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_passes_under_cap() {
+        let resp = reqwest::Response::from(
+            http::Response::builder().status(200).body("ok").unwrap(),
+        );
+        let body = read_body_capped(resp, 1024).await.unwrap();
+        assert_eq!(body, b"ok");
+    }
+
+    #[tokio::test]
+    async fn read_sse_response_capped_returns_response() {
+        let sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"result\":\"ok\",\"id\":1}\n\n";
+        let resp = reqwest::Response::from(
+            http::Response::builder().status(200).body(sse).unwrap(),
+        );
+        let parsed = read_sse_response_capped(resp, 1024).await.unwrap();
+        assert_eq!(parsed.id, Some(json!(1)));
+    }
+
+    #[tokio::test]
+    async fn read_sse_response_capped_bails_on_oversized_stream() {
+        // A stream that never carries a JSON-RPC response and exceeds
+        // the cap must fail with the cap marker, not buffer forever.
+        let noise = ": keep-alive\n".repeat(200);
+        let resp = reqwest::Response::from(
+            http::Response::builder().status(200).body(noise).unwrap(),
+        );
+        let err = read_sse_response_capped(resp, 64).await.unwrap_err();
+        assert!(
+            err.to_string().contains(RESPONSE_CAP_MARKER),
+            "oversized SSE stream must hit the cap, got: {err}"
+        );
     }
 
     #[test]

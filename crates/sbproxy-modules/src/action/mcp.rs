@@ -69,7 +69,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sbproxy_extension::mcp::{
-    McpFederation, McpServerConfig, NamespaceMode, ToolAccessPolicy, ToolQuotaStore,
+    FederationIoSettings, McpFederation, McpServerConfig, NamespaceMode, ToolAccessPolicy,
+    ToolQuotaStore,
 };
 use serde::Deserialize;
 
@@ -121,6 +122,22 @@ pub struct McpActionConfig {
     /// upstream fan-out.
     #[serde(default, with = "duration_str")]
     pub refresh_interval: Option<Duration>,
+    /// TCP connect deadline for every upstream exchange (WOR-1639).
+    /// Go duration syntax; defaults to 5s.
+    #[serde(default, with = "duration_str")]
+    pub upstream_connect_timeout: Option<Duration>,
+    /// Whole-request deadline for every upstream exchange
+    /// (WOR-1639): catalogue refreshes, tool calls, resource reads.
+    /// Per-server `timeout:` values can only shorten it for
+    /// `tools/call`. Go duration syntax; defaults to 30s.
+    #[serde(default, with = "duration_str")]
+    pub upstream_timeout: Option<Duration>,
+    /// Maximum upstream response bytes buffered per exchange
+    /// (WOR-1639). An upstream body over this cap fails the exchange
+    /// with a typed error instead of ballooning memory. Defaults to
+    /// 8 MiB.
+    #[serde(default)]
+    pub max_upstream_response_bytes: Option<usize>,
 }
 
 /// OAuth 2.0 Protected Resource Metadata (RFC 9728) for the MCP gateway.
@@ -339,7 +356,17 @@ impl McpAction {
             });
         }
 
-        let federation = Arc::new(McpFederation::new(server_configs));
+        let mut io = FederationIoSettings::default();
+        if let Some(t) = cfg.upstream_connect_timeout {
+            io.connect_timeout = t;
+        }
+        if let Some(t) = cfg.upstream_timeout {
+            io.request_timeout = t;
+        }
+        if let Some(cap) = cfg.max_upstream_response_bytes {
+            io.max_response_bytes = cap;
+        }
+        let federation = Arc::new(McpFederation::with_io(server_configs, io));
 
         // --- Collapse guardrails ---
         let tool_allowlist = collapse_allowlists(&cfg.guardrails);

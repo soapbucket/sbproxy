@@ -161,6 +161,34 @@ pub struct FederatedResource {
 
 // --- McpFederation ---
 
+/// Upstream IO limits for every HTTP exchange the federation makes
+/// (catalogue refreshes, tool calls, resource reads). WOR-1639: the
+/// client previously had no timeout at all, so one hung upstream
+/// stalled every registry-reading request indefinitely, and response
+/// bodies were buffered without bound.
+#[derive(Debug, Clone)]
+pub struct FederationIoSettings {
+    /// TCP connect deadline per upstream exchange.
+    pub connect_timeout: std::time::Duration,
+    /// Whole-request deadline per upstream exchange. Per-server
+    /// `timeout:` values wrap `tools/call` with a shorter deadline;
+    /// this is the ceiling everything else (refreshes, resource
+    /// reads) is bounded by.
+    pub request_timeout: std::time::Duration,
+    /// Maximum upstream response bytes ever buffered per exchange.
+    pub max_response_bytes: usize,
+}
+
+impl Default for FederationIoSettings {
+    fn default() -> Self {
+        Self {
+            connect_timeout: std::time::Duration::from_secs(5),
+            request_timeout: std::time::Duration::from_secs(30),
+            max_response_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
 /// Aggregates tools from multiple upstream MCP servers into one registry.
 pub struct McpFederation {
     servers: Vec<McpServerConfig>,
@@ -176,6 +204,9 @@ pub struct McpFederation {
     /// gateway re-advertises on its own `initialize`.
     mcp_apps_capability: ArcSwap<Option<serde_json::Value>>,
     client: reqwest::Client,
+    /// Maximum upstream response bytes buffered per exchange
+    /// (WOR-1639); passed to every transport send.
+    max_response_bytes: usize,
     /// Monotonic catalogue generation. Bumps once per refresh that
     /// actually changed the tool or resource registry (content
     /// digest short-circuit), so consumers can key caches on it and
@@ -199,14 +230,31 @@ pub struct McpFederation {
 }
 
 impl McpFederation {
-    /// Create a new federation from a list of upstream server configs.
+    /// Create a new federation from a list of upstream server
+    /// configs, with default IO limits.
     pub fn new(servers: Vec<McpServerConfig>) -> Self {
+        Self::with_io(servers, FederationIoSettings::default())
+    }
+
+    /// Create a new federation with explicit upstream IO limits.
+    pub fn with_io(servers: Vec<McpServerConfig>, io: FederationIoSettings) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(io.connect_timeout)
+            .timeout(io.request_timeout)
+            .pool_max_idle_per_host(8)
+            .build()
+            // Builder failure here means TLS backend initialisation
+            // failed; a clientless federation is useless, so fall
+            // back to the default client (same behaviour as before
+            // WOR-1639) rather than panicking in a constructor.
+            .unwrap_or_default();
         Self {
             servers,
             tools: ArcSwap::from_pointee(HashMap::new()),
             resources: ArcSwap::from_pointee(HashMap::new()),
             mcp_apps_capability: ArcSwap::from_pointee(None),
-            client: reqwest::Client::new(),
+            client,
+            max_response_bytes: io.max_response_bytes,
             generation: std::sync::atomic::AtomicU64::new(0),
             tools_digest: std::sync::atomic::AtomicU64::new(0),
             resources_digest: std::sync::atomic::AtomicU64::new(0),
@@ -853,11 +901,15 @@ impl McpFederation {
         server: &McpServerConfig,
         req: &JsonRpcRequest,
     ) -> anyhow::Result<JsonRpcResponse> {
-        match server.transport.as_str() {
-            "sse" => send_via_sse(&self.client, &server.url, req).await,
+        let result = match server.transport.as_str() {
+            "sse" => send_via_sse(&self.client, &server.url, req, self.max_response_bytes).await,
             // Default to streamable HTTP for "streamable_http" or unknown.
-            _ => send_request(&self.client, &server.url, req).await,
+            _ => send_request(&self.client, &server.url, req, self.max_response_bytes).await,
+        };
+        if let Err(e) = &result {
+            sbproxy_observe::metrics::record_mcp_upstream_io_failure(classify_io_failure(e));
         }
+        result
     }
 
     /// Current catalogue generation. Starts at zero and bumps once
@@ -930,6 +982,28 @@ impl McpFederation {
             }
         });
     }
+}
+
+/// Classify an upstream IO failure for the
+/// `sbproxy_mcp_upstream_io_failures_total{kind}` counter. Reqwest
+/// errors carry typed timeout/connect flags; the response byte cap is
+/// recognised by its marker string since it crosses the transport
+/// module boundary as `anyhow`.
+fn classify_io_failure(e: &anyhow::Error) -> &'static str {
+    if let Some(re) = e.downcast_ref::<reqwest::Error>() {
+        if re.is_timeout() {
+            return "timeout";
+        }
+        if re.is_connect() {
+            return "connect";
+        }
+    }
+    if e.to_string()
+        .contains(super::streamable::RESPONSE_CAP_MARKER)
+    {
+        return "response_cap";
+    }
+    "other"
 }
 
 /// Order-independent content digest of a tool registry. Two

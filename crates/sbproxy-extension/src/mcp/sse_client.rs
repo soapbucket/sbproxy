@@ -15,7 +15,7 @@
 //!    then POST the request to that endpoint and wait for the response
 //!    event on the SSE stream.
 
-use super::streamable::parse_sse_response;
+use super::streamable::{read_body_capped, read_sse_response_capped};
 use super::types::{JsonRpcRequest, JsonRpcResponse};
 
 // --- SSE Client ---
@@ -23,13 +23,16 @@ use super::types::{JsonRpcRequest, JsonRpcResponse};
 /// Connect to an SSE-based MCP server and send a JSON-RPC request.
 ///
 /// Attempts a POST to `sse_url` first. If the response is plain SSE,
-/// it parses events from the body. This covers the common case where
+/// it parses events from the body, returning as soon as a complete
+/// JSON-RPC response event arrives. This covers the common case where
 /// the SSE endpoint doubles as the POST endpoint and returns the
-/// response inline as SSE events.
+/// response inline as SSE events. `max_bytes` bounds how much of the
+/// response is ever buffered.
 pub async fn send_via_sse(
     client: &reqwest::Client,
     sse_url: &str,
     request: &JsonRpcRequest,
+    max_bytes: usize,
 ) -> anyhow::Result<JsonRpcResponse> {
     let resp = client
         .post(sse_url)
@@ -51,13 +54,12 @@ pub async fn send_via_sse(
         .unwrap_or("")
         .to_string();
 
-    let body = resp.text().await?;
-
     if content_type.contains("text/event-stream") {
-        parse_sse_response(&body)
+        read_sse_response_capped(resp, max_bytes).await
     } else {
         // Plain JSON response.
-        let response: JsonRpcResponse = serde_json::from_str(&body)?;
+        let body = read_body_capped(resp, max_bytes).await?;
+        let response: JsonRpcResponse = serde_json::from_slice(&body)?;
         Ok(response)
     }
 }
@@ -115,6 +117,7 @@ pub fn extract_endpoint_from_sse(raw: &str, base_url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::streamable::parse_sse_response;
     use serde_json::json;
 
     fn make_request(method: &str, id: i64) -> JsonRpcRequest {
