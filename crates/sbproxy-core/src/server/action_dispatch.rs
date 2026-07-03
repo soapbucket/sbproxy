@@ -1020,6 +1020,59 @@ pub(super) async fn handle_mcp_action(
         return Ok(());
     }
 
+    // WOR-1643: an OAuth-protected gateway must point credential-less
+    // callers at its protected-resource metadata; the MCP auth
+    // discovery flow starts from exactly this challenge (RFC 9728).
+    // Token validation stays in the generic auth layer; this covers
+    // only the no-Authorization-header case, so a request that passed
+    // header-based auth is never re-challenged. The well-known
+    // discovery routes above stay unauthenticated.
+    if mcp.oauth.is_some()
+        && session
+            .req_header()
+            .headers
+            .get("authorization")
+            .is_none()
+    {
+        let listener_is_tls = session
+            .digest()
+            .and_then(|d| d.ssl_digest.as_ref())
+            .is_some();
+        let scheme = if listener_is_tls { "https" } else { "http" };
+        let metadata_url = match session
+            .req_header()
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+        {
+            Some(authority) => format!(
+                "{scheme}://{authority}{}",
+                sbproxy_extension::mcp::discovery::OAUTH_PROTECTED_RESOURCE_PATH
+            ),
+            None => sbproxy_extension::mcp::discovery::OAUTH_PROTECTED_RESOURCE_PATH.to_string(),
+        };
+        let mut header = pingora_http::ResponseHeader::build(401, Some(2)).map_err(|e| {
+            Error::because(ErrorType::InternalError, "failed to build 401 header", e)
+        })?;
+        let _ = header.insert_header(
+            "www-authenticate",
+            format!("Bearer resource_metadata=\"{metadata_url}\""),
+        );
+        let _ = header.insert_header("content-length", "0");
+        session
+            .write_response_header(Box::new(header), true)
+            .await?;
+        tracing::info!(
+            target: "sbproxy::audit",
+            event = "mcp.oauth.challenge",
+            mcp_server = %mcp.server_name,
+            request_id = %ctx.request_id,
+            resource_metadata = %metadata_url,
+            "challenged credential-less MCP request with RFC 9728 pointer"
+        );
+        return Ok(());
+    }
+
     // Cap the inbound JSON-RPC body before reading it into memory.
     // MCP requests are a few KiB at most; an unbounded
     // `read_request_body()` would let a misconfigured (or hostile)
