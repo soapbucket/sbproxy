@@ -227,6 +227,48 @@ pub struct McpFederation {
     /// Serialises the cold-start prime so N concurrent first
     /// requests trigger exactly one upstream fan-out.
     prime_lock: tokio::sync::Mutex<()>,
+    /// WOR-1640: per-generation pre-serialized tool catalogue, so
+    /// `tools/list` responses are string splices instead of
+    /// per-request `FederatedTool` clones and re-serialization.
+    serialized_tools: ArcSwap<SerializedTools>,
+    /// WOR-1640: per-generation codemode.ts module + ETag, so the
+    /// well-known route re-emits and re-hashes only when the
+    /// catalogue (or callback base) changes.
+    codemode_cache: ArcSwap<CodemodeCache>,
+}
+
+/// Pre-serialized tool catalogue for one registry generation
+/// (WOR-1640). `entries` carry the routing fields needed for
+/// per-request filtering; `full_array` is the whole catalogue as a
+/// serialized JSON array for the unfiltered fast path.
+pub struct SerializedTools {
+    /// Registry generation this snapshot was built from.
+    pub generation: u64,
+    /// One entry per advertised tool, sorted by name.
+    pub entries: Vec<SerializedToolEntry>,
+    /// The full catalogue as a serialized JSON array.
+    pub full_array: String,
+}
+
+/// One pre-serialized tool entry (WOR-1640).
+pub struct SerializedToolEntry {
+    /// Advertised (possibly namespaced) tool name.
+    pub name: String,
+    /// Owning upstream server name, for per-server policy lookups.
+    pub server_name: String,
+    /// The serialized tool object (`{"name":...,"description":...,
+    /// "inputSchema":...}` plus `_meta` when present).
+    pub json: String,
+}
+
+/// Cached codemode.ts emission for one (generation, callback base)
+/// pair (WOR-1640).
+struct CodemodeCache {
+    generation: u64,
+    callback_base: String,
+    module: Arc<String>,
+    /// Strong ETag: quoted lowercase hex SHA-256 of the module bytes.
+    etag: String,
 }
 
 impl McpFederation {
@@ -261,6 +303,19 @@ impl McpFederation {
             refresh_task_started: std::sync::atomic::AtomicBool::new(false),
             primed: std::sync::atomic::AtomicBool::new(false),
             prime_lock: tokio::sync::Mutex::new(()),
+            serialized_tools: ArcSwap::from_pointee(SerializedTools {
+                // u64::MAX never equals a live generation, so the
+                // first call rebuilds.
+                generation: u64::MAX,
+                entries: Vec::new(),
+                full_array: "[]".to_string(),
+            }),
+            codemode_cache: ArcSwap::from_pointee(CodemodeCache {
+                generation: u64::MAX,
+                callback_base: String::new(),
+                module: Arc::new(String::new()),
+                etag: String::new(),
+            }),
         }
     }
 
@@ -921,6 +976,76 @@ impl McpFederation {
         self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Pre-serialized tool catalogue for the current generation
+    /// (WOR-1640). Rebuilt at most once per catalogue change; on a
+    /// warm snapshot this is a lock-free load with zero clones and
+    /// zero serialization. Concurrent rebuilds after a generation
+    /// bump are idempotent (last store wins).
+    pub fn serialized_tools(&self) -> Arc<SerializedTools> {
+        let generation = self.generation();
+        let current = self.serialized_tools.load_full();
+        if current.generation == generation {
+            return current;
+        }
+        let tools = self.tools.load();
+        let mut entries: Vec<SerializedToolEntry> = tools
+            .values()
+            .map(|t| {
+                let mut obj = serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "inputSchema": t.input_schema,
+                });
+                if let (Some(m), Some(map)) = (&t.meta, obj.as_object_mut()) {
+                    map.insert("_meta".to_string(), m.clone());
+                }
+                SerializedToolEntry {
+                    name: t.name.clone(),
+                    server_name: t.server_name.clone(),
+                    json: obj.to_string(),
+                }
+            })
+            .collect();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut full_array = String::with_capacity(entries.iter().map(|e| e.json.len() + 1).sum());
+        full_array.push('[');
+        for (i, e) in entries.iter().enumerate() {
+            if i > 0 {
+                full_array.push(',');
+            }
+            full_array.push_str(&e.json);
+        }
+        full_array.push(']');
+        let built = Arc::new(SerializedTools {
+            generation,
+            entries,
+            full_array,
+        });
+        self.serialized_tools.store(Arc::clone(&built));
+        built
+    }
+
+    /// Codemode.ts module + strong ETag for the current generation
+    /// and callback base (WOR-1640). Re-emits and re-hashes only when
+    /// either changes; a warm cache hit is a lock-free load.
+    pub fn codemode_ts_cached(&self, callback_base: &str) -> (Arc<String>, String) {
+        let generation = self.generation();
+        let current = self.codemode_cache.load_full();
+        if current.generation == generation && current.callback_base == callback_base {
+            return (Arc::clone(&current.module), current.etag.clone());
+        }
+        let module = Arc::new(self.codemode_ts(callback_base));
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(module.as_bytes());
+        let etag = format!("\"{}\"", hex::encode(digest));
+        self.codemode_cache.store(Arc::new(CodemodeCache {
+            generation,
+            callback_base: callback_base.to_string(),
+            module: Arc::clone(&module),
+            etag: etag.clone(),
+        }));
+        (module, etag)
+    }
+
     /// Make the federation servable: spawn the periodic refresh task
     /// on first use and run the cold-start prime (one tools fetch +
     /// one resources fetch) exactly once, single-flight. Requests
@@ -1296,6 +1421,56 @@ mod tests {
         // A later call is a no-op fast path.
         fed.ensure_ready(std::time::Duration::from_secs(3600)).await;
         assert_eq!(fed.generation(), 2);
+    }
+
+    #[tokio::test]
+    async fn serialized_tools_rebuilds_only_on_generation_change() {
+        let fed = std::sync::Arc::new(McpFederation::new(vec![]));
+        fed.refresh_tools().await.unwrap();
+        let first = fed.serialized_tools();
+        assert_eq!(first.generation, fed.generation());
+        assert_eq!(first.full_array, "[]");
+        // Warm path returns the same snapshot Arc.
+        let second = fed.serialized_tools();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+
+        // Manually store a catalogue and bump the generation the way
+        // a refresh would; the next call must rebuild.
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "b_tool".to_string(),
+            make_tool("b_tool", "srv"),
+        );
+        map.insert(
+            "a_tool".to_string(),
+            make_tool("a_tool", "srv"),
+        );
+        fed.tools.store(std::sync::Arc::new(map));
+        fed.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let rebuilt = fed.serialized_tools();
+        assert_eq!(rebuilt.entries.len(), 2);
+        // Sorted by name, spliced into one array.
+        assert_eq!(rebuilt.entries[0].name, "a_tool");
+        assert!(rebuilt.full_array.starts_with("[{"));
+        assert!(rebuilt.full_array.contains("\"a_tool\""));
+        assert!(rebuilt.full_array.contains("\"b_tool\""));
+        let parsed: serde_json::Value = serde_json::from_str(&rebuilt.full_array).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn codemode_cache_hits_on_same_generation_and_base() {
+        let fed = std::sync::Arc::new(McpFederation::new(vec![]));
+        fed.refresh_tools().await.unwrap();
+        let (m1, e1) = fed.codemode_ts_cached("http://gw.test");
+        let (m2, e2) = fed.codemode_ts_cached("http://gw.test");
+        assert!(std::sync::Arc::ptr_eq(&m1, &m2));
+        assert_eq!(e1, e2);
+        assert!(e1.starts_with('"') && e1.ends_with('"'));
+        // A different callback base misses the cache.
+        let (m3, _) = fed.codemode_ts_cached("http://other.test");
+        assert!(!std::sync::Arc::ptr_eq(&m1, &m3));
     }
 
     #[tokio::test]

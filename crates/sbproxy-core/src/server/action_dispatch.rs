@@ -767,8 +767,6 @@ pub(super) async fn handle_mcp_action(
     // any TypeScript agent or sandbox can `import` the module
     // directly without a separate codegen step.
     if method == http::Method::GET && req_path == "/.well-known/mcp/codemode.ts" {
-        use sha2::{Digest, Sha256};
-
         let listener_is_tls = session
             .digest()
             .and_then(|d| d.ssl_digest.as_ref())
@@ -790,21 +788,12 @@ pub(super) async fn handle_mcp_action(
             Some(authority) => format!("{scheme}://{authority}"),
             None => String::new(),
         };
-        let module = mcp.federation.codemode_ts(&callback_base);
-
         // Strong ETag is the lowercase hex SHA-256 of the emitted
-        // bytes wrapped in double quotes per RFC 9110 §8.8.3. The
-        // federation sorts tools lexicographically before emission,
-        // so the digest is stable across calls as long as the tool
-        // registry does not change; a CDN or browser can pin against
-        // it with `If-None-Match` and skip the body on the next pull.
-        let digest = Sha256::digest(module.as_bytes());
-        let mut etag_value = String::with_capacity(2 + digest.len() * 2);
-        etag_value.push('"');
-        for byte in digest.iter() {
-            etag_value.push_str(&format!("{:02x}", byte));
-        }
-        etag_value.push('"');
+        // bytes wrapped in double quotes per RFC 9110 §8.8.3.
+        // WOR-1640: module emission and hashing are cached by
+        // (registry generation, callback base), so a warm hit does
+        // neither; the ETag stays stable until the catalogue moves.
+        let (module, etag_value) = mcp.federation.codemode_ts_cached(&callback_base);
 
         let if_none_match = session
             .req_header()
@@ -850,7 +839,7 @@ pub(super) async fn handle_mcp_action(
 
         // 200 path: write content-type + content-length + etag +
         // cache-control inline so we can carry both custom headers.
-        let body = module.into_bytes();
+        let body = module.as_bytes().to_vec();
         let mut header = pingora_http::ResponseHeader::build(200, Some(4)).map_err(|e| {
             Error::because(
                 ErrorType::InternalError,
@@ -962,12 +951,7 @@ pub(super) async fn handle_mcp_action(
             .federation
             .list_tools()
             .into_iter()
-            .filter(|t| {
-                mcp.tool_allowlist
-                    .as_ref()
-                    .map(|allow| allow.iter().any(|a| a == &t.name))
-                    .unwrap_or(true)
-            })
+            .filter(|t| mcp.is_tool_allowed(&t.name))
             .filter(|t| match mcp.policy_for_server(&t.server_name) {
                 Some(policy) => matches!(
                     policy.check(&ctx.principal, &t.name),
@@ -1088,7 +1072,11 @@ pub(super) async fn handle_mcp_action(
         return Ok(());
     }
 
-    let response = match request.method.as_str() {
+    // WOR-1640: take the method out so match arms can move
+    // `request.params` instead of cloning the full inbound JSON.
+    let mut request = request;
+    let rpc_method = std::mem::take(&mut request.method);
+    let response = match rpc_method.as_str() {
         "initialize" => {
             // WOR-195: when the origin opts into Agent Skills, surface
             // `experimental.agentSkillsUrl` so MCP clients that have
@@ -1171,54 +1159,59 @@ pub(super) async fn handle_mcp_action(
             // (`search` / `execute`) instead of the full catalogue, so
             // a large federated tool set stays out of the model's
             // context window.
-            let tool_defs: Vec<serde_json::Value> = if mcp.progressive_discovery {
-                mcp_progressive_meta_tools()
+            if mcp.progressive_discovery {
+                JsonRpcResponse::success(
+                    request.id.clone(),
+                    serde_json::json!({ "tools": mcp_progressive_meta_tools() }),
+                )
             } else {
-                mcp.federation
-                    .list_tools()
-                    .into_iter()
-                    // WOR-1065: RBAC filter. The legacy schema returned
-                    // the full catalogue here even when the gate would
-                    // deny the matching `tools/call`, leaking tool
-                    // names to callers that could not invoke them. Now
-                    // each tool is filtered by its owning upstream's
-                    // policy against the inbound principal. A tool
-                    // whose owning upstream has no `rbac:` label keeps
-                    // the open-by-default behaviour for that upstream
-                    // (the action-level allowlist guardrail still
-                    // applies).
-                    .filter(|t| mcp.is_tool_allowed(&t.name))
-                    .filter(|t| match mcp.policy_for_server(&t.server_name) {
-                        Some(policy) => matches!(
-                            policy.check(&ctx.principal, &t.name),
-                            sbproxy_extension::mcp::ToolAccessDecision::Allow,
-                        ),
-                        None => true,
-                    })
-                    .map(|t| {
-                        // WOR-818: preserve the upstream `_meta`
-                        // block (SEP-1865 UI-template metadata, etc.)
-                        // by inserting it conditionally; absent
-                        // keeps the JSON shape unchanged for
-                        // base-MCP clients.
-                        let mut entry = serde_json::json!({
-                            "name": t.name,
-                            "description": t.description,
-                            "inputSchema": t.input_schema,
-                        });
-                        if let Some(m) = t.meta {
-                            if let Some(obj) = entry.as_object_mut() {
-                                obj.insert("_meta".to_string(), m);
+                // WOR-1640: the catalogue is pre-serialized once per
+                // registry generation. With no allowlist and no
+                // principal-scoped RBAC the cached array is spliced
+                // into the envelope untouched (zero clones, zero
+                // re-serialization); otherwise the response is a
+                // string concat of the pre-serialized entries that
+                // pass the filters.
+                // WOR-1065: the RBAC filter still runs per principal
+                // so the catalogue never lists a tool the gate would
+                // refuse to call for this caller.
+                let snapshot = mcp.federation.serialized_tools();
+                let needs_filter =
+                    mcp.tool_allowlist.is_some() || mcp.has_principal_scoped_tools;
+                let tools_json: std::borrow::Cow<'_, str> = if !needs_filter {
+                    std::borrow::Cow::Borrowed(snapshot.full_array.as_str())
+                } else {
+                    let mut out = String::with_capacity(snapshot.full_array.len());
+                    out.push('[');
+                    let mut first = true;
+                    for entry in &snapshot.entries {
+                        if !mcp.is_tool_allowed(&entry.name) {
+                            continue;
+                        }
+                        if let Some(policy) = mcp.policy_for_server(&entry.server_name) {
+                            if !matches!(
+                                policy.check(&ctx.principal, &entry.name),
+                                sbproxy_extension::mcp::ToolAccessDecision::Allow,
+                            ) {
+                                continue;
                             }
                         }
-                        entry
-                    })
-                    .collect()
-            };
-            JsonRpcResponse::success(
-                request.id.clone(),
-                serde_json::json!({ "tools": tool_defs }),
-            )
+                        if !first {
+                            out.push(',');
+                        }
+                        first = false;
+                        out.push_str(&entry.json);
+                    }
+                    out.push(']');
+                    std::borrow::Cow::Owned(out)
+                };
+                let id_json = serde_json::to_string(&request.id)
+                    .unwrap_or_else(|_| "null".to_string());
+                let body = format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{id_json},\"result\":{{\"tools\":{tools_json}}}}}"
+                );
+                return send_response(session, 200, "application/json", body.as_bytes()).await;
+            }
         }
         "resources/list" => {
             // WOR-818/WOR-1638: pass-through the federated resource
@@ -1252,7 +1245,7 @@ pub(super) async fn handle_mcp_action(
             // Pass-through only -- the gateway does not enforce
             // CSP / iframe-sandbox / cache-metadata at this layer;
             // those validators ship in the enterprise tier.
-            let params = request.params.clone().unwrap_or(serde_json::Value::Null);
+            let params = request.params.take().unwrap_or(serde_json::Value::Null);
             let uri = params.get("uri").and_then(|v| v.as_str()).unwrap_or("");
             if uri.is_empty() {
                 JsonRpcResponse::error(
@@ -1275,7 +1268,7 @@ pub(super) async fn handle_mcp_action(
             }
         }
         "tools/call" => {
-            let params = request.params.clone().unwrap_or(serde_json::Value::Null);
+            let params = request.params.take().unwrap_or(serde_json::Value::Null);
             // WOR-818 PR2: extract the OpenAI Apps SDK
             // `params.audit.cause` so it reaches the policy hook
             // and the audit chain. Absent on base-MCP calls.

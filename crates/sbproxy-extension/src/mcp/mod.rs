@@ -69,7 +69,7 @@ pub use codemode_from_openapi::{emit_codemode_from_openapi, openapi_to_federated
 pub use context_opt::ToolUsageTracker;
 pub use federation::{
     FederatedTool, FederationIoSettings, McpCallOutcome, McpFederation, McpServerConfig,
-    NamespaceMode,
+    NamespaceMode, SerializedToolEntry, SerializedTools,
 };
 pub use guardrails::{check_tool_invocation, McpGuardrailConfig};
 pub use handler::{InitializeContext, McpHandler};

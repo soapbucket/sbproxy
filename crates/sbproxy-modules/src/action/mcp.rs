@@ -64,7 +64,7 @@
 //! library; this module only translates YAML into library API calls
 //! and applies a small allowlist guardrail at request time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -229,16 +229,18 @@ pub struct McpAction {
     pub server_name: String,
     /// Server version reported in MCP `initialize` responses.
     pub server_version: String,
-    /// Per-server prefix table, keyed by upstream `name`.
-    pub prefixes: Vec<McpServerPrefix>,
+    /// Per-server prefix table, keyed by upstream `name` for O(1)
+    /// policy and timeout resolution on the request path (WOR-1640).
+    pub prefixes: HashMap<String, McpServerPrefix>,
     /// Named RBAC policies declared at the top level. Looked up by
     /// the per-server `rbac` label at `tools/call` time. WOR-186.
     pub rbac_policies: HashMap<String, ToolAccessPolicy>,
     /// Underlying federation handle from `sbproxy-extension`.
     pub federation: Arc<McpFederation>,
     /// Collapsed allowlist (union of every `tool_allowlist` guardrail).
-    /// `None` when no allowlist guardrail was configured (open access).
-    pub tool_allowlist: Option<Vec<String>>,
+    /// `None` when no allowlist guardrail was configured (open
+    /// access). A set so per-tool checks are O(1) (WOR-1640).
+    pub tool_allowlist: Option<HashSet<String>>,
     /// When `true`, `tools/list` advertises the `search` / `execute`
     /// meta-tools instead of the full catalogue (WOR-806).
     pub progressive_discovery: bool,
@@ -256,6 +258,10 @@ pub struct McpAction {
     /// lazily on the first request so compile time does no IO and
     /// needs no async runtime.
     pub refresh_interval: Duration,
+    /// True when any federated server carries an `rbac:` label, i.e.
+    /// `tools/list` responses depend on the inbound principal and the
+    /// unfiltered fast path must not be used (WOR-1640).
+    pub has_principal_scoped_tools: bool,
 }
 
 /// Per-upstream metadata captured at compile time. Kept outside
@@ -325,7 +331,8 @@ impl McpAction {
         // --- Build the federation server list + prefix table ---
         let mut server_configs: Vec<McpServerConfig> =
             Vec::with_capacity(cfg.federated_servers.len());
-        let mut prefixes: Vec<McpServerPrefix> = Vec::with_capacity(cfg.federated_servers.len());
+        let mut prefixes: HashMap<String, McpServerPrefix> =
+            HashMap::with_capacity(cfg.federated_servers.len());
 
         for upstream in cfg.federated_servers {
             let url = normalize_origin(&upstream.origin)?;
@@ -348,12 +355,15 @@ impl McpAction {
                 transport,
                 namespace: upstream.namespace,
             });
-            prefixes.push(McpServerPrefix {
-                name,
-                prefix: upstream.prefix,
-                rbac: upstream.rbac,
-                timeout: upstream.timeout,
-            });
+            prefixes.insert(
+                name.clone(),
+                McpServerPrefix {
+                    name,
+                    prefix: upstream.prefix,
+                    rbac: upstream.rbac,
+                    timeout: upstream.timeout,
+                },
+            );
         }
 
         let mut io = FederationIoSettings::default();
@@ -371,6 +381,8 @@ impl McpAction {
         // --- Collapse guardrails ---
         let tool_allowlist = collapse_allowlists(&cfg.guardrails);
 
+        let has_principal_scoped_tools = prefixes.values().any(|p| p.rbac.is_some());
+
         Ok(Self {
             mode: cfg.mode,
             server_name,
@@ -385,6 +397,7 @@ impl McpAction {
             refresh_interval: cfg
                 .refresh_interval
                 .unwrap_or(Duration::from_secs(60)),
+            has_principal_scoped_tools,
         })
     }
 
@@ -411,13 +424,13 @@ impl McpAction {
     pub fn is_tool_allowed(&self, tool_name: &str) -> bool {
         match &self.tool_allowlist {
             None => true,
-            Some(list) => list.iter().any(|t| t == tool_name),
+            Some(set) => set.contains(tool_name),
         }
     }
 
     /// Look up the per-server prefix entry by name.
     pub fn prefix_for(&self, server_name: &str) -> Option<&McpServerPrefix> {
-        self.prefixes.iter().find(|p| p.name == server_name)
+        self.prefixes.get(server_name)
     }
 }
 
@@ -465,18 +478,14 @@ fn derive_server_name(origin: &str) -> String {
         .replace([':', '.'], "_")
 }
 
-fn collapse_allowlists(guardrails: &[McpGuardrailEntry]) -> Option<Vec<String>> {
+fn collapse_allowlists(guardrails: &[McpGuardrailEntry]) -> Option<HashSet<String>> {
     let mut found = false;
-    let mut union: Vec<String> = Vec::new();
+    let mut union: HashSet<String> = HashSet::new();
     for entry in guardrails {
         match entry {
             McpGuardrailEntry::ToolAllowlist { allow } => {
                 found = true;
-                for name in allow {
-                    if !union.contains(name) {
-                        union.push(name.clone());
-                    }
-                }
+                union.extend(allow.iter().cloned());
             }
         }
     }
@@ -734,7 +743,7 @@ mod tests {
         assert_eq!(action.prefixes.len(), 1);
         // We do not expose the underlying server URL on the action, but
         // the prefix-derived name should still be deterministic.
-        assert!(!action.prefixes[0].name.is_empty());
+        assert!(action.prefixes.values().all(|p| !p.name.is_empty()));
     }
 
     #[test]
@@ -855,6 +864,6 @@ mod tests {
         });
         let action = McpAction::from_config(value).expect("compile");
         // No explicit prefix, so the derived name comes from the host.
-        assert_eq!(action.prefixes[0].name, "github_example_com");
+        assert!(action.prefixes.contains_key("github_example_com"));
     }
 }
