@@ -68,6 +68,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use sbproxy_extension::mcp::sessions::SessionStore;
 use sbproxy_extension::mcp::{
     FederationIoSettings, McpFederation, McpServerConfig, NamespaceMode, ToolAccessPolicy,
     ToolQuotaStore,
@@ -138,6 +139,27 @@ pub struct McpActionConfig {
     /// 8 MiB.
     #[serde(default)]
     pub max_upstream_response_bytes: Option<usize>,
+    /// Optional MCP session management (WOR-1642). When enabled the
+    /// gateway assigns an `Mcp-Session-Id` during `initialize`,
+    /// requires it on every later request, serves 404 for unknown or
+    /// expired ids (the client's cue to re-initialize), and ends a
+    /// session on `DELETE`. Off by default: the gateway stays
+    /// stateless and ignores session headers entirely.
+    #[serde(default)]
+    pub sessions: Option<McpSessionConfig>,
+}
+
+/// MCP session management config (WOR-1642).
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpSessionConfig {
+    /// Master switch. `false` keeps the stateless behaviour even if
+    /// the block is present.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Sliding idle TTL for a session. Go duration syntax; defaults
+    /// to 30 minutes.
+    #[serde(default, with = "duration_str")]
+    pub ttl: Option<Duration>,
 }
 
 /// OAuth 2.0 Protected Resource Metadata (RFC 9728) for the MCP gateway.
@@ -262,6 +284,12 @@ pub struct McpAction {
     /// `tools/list` responses depend on the inbound principal and the
     /// unfiltered fast path must not be used (WOR-1640).
     pub has_principal_scoped_tools: bool,
+    /// Session store when `sessions.enabled` (WOR-1642); `None`
+    /// keeps the gateway stateless. Like the quota store, sessions
+    /// live for the lifetime of the compiled origin chain and a hot
+    /// reload invalidates them (the spec's 404-then-reinitialize
+    /// flow covers exactly this).
+    pub sessions: Option<Arc<SessionStore>>,
 }
 
 /// Per-upstream metadata captured at compile time. Kept outside
@@ -398,6 +426,11 @@ impl McpAction {
                 .refresh_interval
                 .unwrap_or(Duration::from_secs(60)),
             has_principal_scoped_tools,
+            sessions: cfg.sessions.as_ref().filter(|s| s.enabled).map(|s| {
+                Arc::new(SessionStore::new(
+                    s.ttl.unwrap_or(Duration::from_secs(30 * 60)),
+                ))
+            }),
         })
     }
 

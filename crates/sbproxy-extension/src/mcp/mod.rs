@@ -47,6 +47,7 @@ pub mod rest_to_mcp;
 /// surface on a breaking change without explicit operator
 /// opt-in. Consumed by the `sbproxy-mcp-drift` CLI.
 pub mod schema_drift;
+pub mod sessions;
 pub mod spans;
 pub mod sse_client;
 pub mod streamable;

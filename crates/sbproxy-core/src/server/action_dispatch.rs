@@ -1015,6 +1015,30 @@ pub(super) async fn handle_mcp_action(
         return Ok(());
     }
 
+    // WOR-1642: a GET with `Accept: text/event-stream` opens the
+    // streamable HTTP server-to-client channel. The gateway pushes
+    // `notifications/tools/list_changed` and
+    // `notifications/resources/list_changed` when the corresponding
+    // registry generation moves, which is what the `listChanged`
+    // capabilities advertised in `initialize` promise.
+    if method == http::Method::GET {
+        let accepts_sse = session
+            .req_header()
+            .headers
+            .get("accept")
+            .and_then(|v| v.to_str().ok())
+            .map(|a| a.contains("text/event-stream"))
+            .unwrap_or(false);
+        if accepts_sse {
+            return handle_mcp_server_stream(session, mcp, ctx).await;
+        }
+    }
+
+    // WOR-1642: DELETE ends a session when session management is on.
+    if method == http::Method::DELETE {
+        return handle_mcp_session_delete(session, mcp, ctx).await;
+    }
+
     if method != http::Method::POST {
         send_error(session, 405, "MCP gateway accepts POST only").await?;
         return Ok(());
@@ -1158,10 +1182,44 @@ pub(super) async fn handle_mcp_action(
         }
     }
 
-    // Notifications (id absent) get an empty 204 per JSON-RPC 2.0.
+    // WOR-1642: with session management enabled, every
+    // post-initialize request (notifications included) must carry
+    // the Mcp-Session-Id the gateway issued. Missing means 400;
+    // unknown or expired means 404, the client's cue to
+    // re-initialize.
+    let mut mcp_session_id: Option<String> = None;
+    if let Some(store) = mcp.sessions.as_deref() {
+        if request.method != "initialize" {
+            match session
+                .req_header()
+                .headers
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+            {
+                None => {
+                    send_error(
+                        session,
+                        400,
+                        "missing Mcp-Session-Id header (session management is enabled)",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Some(id) if !store.validate(id) => {
+                    send_error(session, 404, "unknown or expired MCP session; re-initialize")
+                        .await?;
+                    return Ok(());
+                }
+                Some(id) => mcp_session_id = Some(id.to_string()),
+            }
+        }
+    }
+
+    // Notifications (id absent) get an empty 202 Accepted per the
+    // streamable HTTP transport (WOR-1642; previously 204).
     if request.id.is_none() {
-        let header = pingora_http::ResponseHeader::build(204, Some(0))
-            .map_err(|e| Error::because(ErrorType::InternalError, "failed to build mcp 204", e))?;
+        let header = pingora_http::ResponseHeader::build(202, Some(0))
+            .map_err(|e| Error::because(ErrorType::InternalError, "failed to build mcp 202", e))?;
         session
             .write_response_header(Box::new(header), true)
             .await?;
@@ -1172,6 +1230,10 @@ pub(super) async fn handle_mcp_action(
     // `request.params` instead of cloning the full inbound JSON.
     let mut request = request;
     let rpc_method = std::mem::take(&mut request.method);
+    // WOR-1642: set when this request is an `initialize` on a
+    // session-managed gateway; the response then carries the issued
+    // `Mcp-Session-Id` header.
+    let mut issued_session: Option<String> = None;
     let response = match rpc_method.as_str() {
         "initialize" => {
             // WOR-195: when the origin opts into Agent Skills, surface
@@ -1222,6 +1284,12 @@ pub(super) async fn handle_mcp_action(
             let surfaces_resources =
                 has_agent_skills || !mcp.federation.list_resources().is_empty();
             let resources = surfaces_resources.then(|| serde_json::json!({ "listChanged": true }));
+            // WOR-1642: issue a session when session management is
+            // enabled. The id rides back on the Mcp-Session-Id
+            // response header, per the streamable HTTP transport.
+            if let Some(store) = mcp.sessions.as_deref() {
+                issued_session = Some(store.create());
+            }
             // WOR-1641: spec-correct negotiation. Echo the client's
             // requested revision when supported; otherwise answer
             // with the newest revision the gateway serves and let
@@ -1234,7 +1302,10 @@ pub(super) async fn handle_mcp_action(
             let result = InitializeResult {
                 protocol_version: negotiate_protocol_version(requested_version).to_string(),
                 capabilities: ServerCapabilities {
-                    tools: Some(serde_json::json!({})),
+                    // WOR-1642: `listChanged: true` is truthful now
+                    // that the GET server-to-client stream delivers
+                    // the notifications.
+                    tools: Some(serde_json::json!({ "listChanged": true })),
                     resources,
                     prompts: None,
                     experimental,
@@ -1619,7 +1690,13 @@ pub(super) async fn handle_mcp_action(
                                 // record (success or failure) before the
                                 // outcome is consumed by the response.
                                 if let Some(cap) = ledger_capture {
-                                    emit_tool_call_ledger(ctx, &name, cap, &outcome);
+                                    emit_tool_call_ledger(
+                                        ctx,
+                                        &name,
+                                        cap,
+                                        &outcome,
+                                        mcp_session_id.as_deref(),
+                                    );
                                 }
 
                                 // WOR-508: bridge the prompt-linked audit
@@ -1657,7 +1734,10 @@ pub(super) async fn handle_mcp_action(
         ),
     };
 
-    write_jsonrpc(session, &response).await
+    match issued_session.as_deref() {
+        Some(session_id) => write_jsonrpc_with_session(session, &response, session_id).await,
+        None => write_jsonrpc(session, &response).await,
+    }
 }
 
 /// WOR-1186: ledger inputs captured before the federated call consumes
@@ -1738,14 +1818,17 @@ fn emit_tool_call_ledger(
     tool_name: &str,
     cap: LedgerCapture,
     outcome: &anyhow::Result<serde_json::Value>,
+    mcp_session_id: Option<&str>,
 ) {
     use sbproxy_observe::session_ledger::{emit_tool_call, Caller, ToolCallObservation};
 
-    // Session id: the MCP session when present, else the request id so a
-    // sessionless call still forms a coherent one-call session.
-    let session_id = ctx
-        .session_id
-        .map(|s| s.to_string())
+    // Session id preference (WOR-1642): the protocol-level MCP
+    // session when the gateway issued one, else the generic
+    // header-sourced session, else the request id so a sessionless
+    // call still forms a coherent one-call session.
+    let session_id = mcp_session_id
+        .map(str::to_string)
+        .or_else(|| ctx.session_id.map(|s| s.to_string()))
         .unwrap_or_else(|| ctx.request_id.to_string());
 
     // Agent id from the resolved principal; an empty subject is `None`.
@@ -1868,4 +1951,173 @@ pub(super) async fn write_jsonrpc(
         )
     })?;
     send_response(session, 200, "application/json", &body).await
+}
+
+/// Serialise a JSON-RPC response and write it with the issued
+/// `Mcp-Session-Id` header (WOR-1642; used by `initialize` on a
+/// session-managed gateway).
+async fn write_jsonrpc_with_session(
+    session: &mut Session,
+    response: &sbproxy_extension::mcp::types::JsonRpcResponse,
+    session_id: &str,
+) -> Result<()> {
+    let body = serde_json::to_vec(response).map_err(|e| {
+        Error::because(
+            ErrorType::InternalError,
+            "failed to serialise JSON-RPC response",
+            e,
+        )
+    })?;
+    let mut header = pingora_http::ResponseHeader::build(200, Some(3)).map_err(|e| {
+        Error::because(ErrorType::InternalError, "failed to build mcp header", e)
+    })?;
+    let _ = header.insert_header("content-type", "application/json");
+    let _ = header.insert_header("content-length", body.len().to_string());
+    let _ = header.insert_header("mcp-session-id", session_id);
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(bytes::Bytes::from(body)), true)
+        .await?;
+    Ok(())
+}
+
+/// WOR-1642: the streamable HTTP server-to-client channel. Opened by
+/// a GET with `Accept: text/event-stream`; pushes
+/// `notifications/tools/list_changed` and
+/// `notifications/resources/list_changed` when the corresponding
+/// federation registry generation moves, with periodic keep-alive
+/// comments in between. Runs until the client disconnects.
+async fn handle_mcp_server_stream(
+    session: &mut Session,
+    mcp: &sbproxy_modules::action::McpAction,
+    ctx: &RequestContext,
+) -> Result<()> {
+    // Session gating mirrors the POST path.
+    if let Some(store) = mcp.sessions.as_deref() {
+        match session
+            .req_header()
+            .headers
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            None => {
+                send_error(
+                    session,
+                    400,
+                    "missing Mcp-Session-Id header (session management is enabled)",
+                )
+                .await?;
+                return Ok(());
+            }
+            Some(id) if !store.validate(id) => {
+                send_error(session, 404, "unknown or expired MCP session; re-initialize").await?;
+                return Ok(());
+            }
+            Some(_) => {}
+        }
+    }
+
+    let mut header = pingora_http::ResponseHeader::build(200, Some(3)).map_err(|e| {
+        Error::because(ErrorType::InternalError, "failed to build sse header", e)
+    })?;
+    let _ = header.insert_header("content-type", "text/event-stream");
+    let _ = header.insert_header("cache-control", "no-cache");
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    tracing::info!(
+        target: "sbproxy::audit",
+        event = "mcp.stream.opened",
+        mcp_server = %mcp.server_name,
+        request_id = %ctx.request_id,
+        "opened MCP server-to-client stream"
+    );
+
+    let mut last_tools = mcp.federation.tools_generation();
+    let mut last_resources = mcp.federation.resources_generation();
+    let poll = std::time::Duration::from_millis(1000);
+    // Keep-alive cadence: one comment frame per 15 idle polls, so
+    // intermediaries do not reap the connection.
+    let mut idle_polls: u32 = 0;
+    loop {
+        tokio::time::sleep(poll).await;
+        let mut frames = String::new();
+        let tools_now = mcp.federation.tools_generation();
+        if tools_now != last_tools {
+            last_tools = tools_now;
+            frames.push_str(
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n",
+            );
+        }
+        let resources_now = mcp.federation.resources_generation();
+        if resources_now != last_resources {
+            last_resources = resources_now;
+            frames.push_str(
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\"}\n\n",
+            );
+        }
+        if frames.is_empty() {
+            idle_polls += 1;
+            if idle_polls < 15 {
+                continue;
+            }
+            frames.push_str(": keep-alive\n\n");
+        }
+        idle_polls = 0;
+        if session
+            .write_response_body(Some(bytes::Bytes::from(frames)), false)
+            .await
+            .is_err()
+        {
+            // Client went away; the stream is done.
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// WOR-1642: DELETE ends an MCP session on a session-managed
+/// gateway (405 otherwise, matching the POST-only contract).
+async fn handle_mcp_session_delete(
+    session: &mut Session,
+    mcp: &sbproxy_modules::action::McpAction,
+    ctx: &RequestContext,
+) -> Result<()> {
+    let Some(store) = mcp.sessions.as_deref() else {
+        send_error(session, 405, "MCP session management is not enabled").await?;
+        return Ok(());
+    };
+    match session
+        .req_header()
+        .headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+    {
+        None => {
+            send_error(session, 400, "missing Mcp-Session-Id header").await?;
+            Ok(())
+        }
+        Some(id) if store.end(id) => {
+            tracing::info!(
+                target: "sbproxy::audit",
+                event = "mcp.session.ended",
+                mcp_server = %mcp.server_name,
+                request_id = %ctx.request_id,
+                "ended MCP session on client DELETE"
+            );
+            let header = pingora_http::ResponseHeader::build(204, Some(0)).map_err(|e| {
+                Error::because(ErrorType::InternalError, "failed to build 204 header", e)
+            })?;
+            session
+                .write_response_header(Box::new(header), true)
+                .await?;
+            Ok(())
+        }
+        Some(_) => {
+            send_error(session, 404, "unknown or expired MCP session").await?;
+            Ok(())
+        }
+    }
 }

@@ -212,6 +212,12 @@ pub struct McpFederation {
     /// digest short-circuit), so consumers can key caches on it and
     /// emit `list_changed` notifications only on real change.
     generation: std::sync::atomic::AtomicU64,
+    /// Tool-registry-only generation, for `tools/list_changed`
+    /// notifications (WOR-1642).
+    tools_generation: std::sync::atomic::AtomicU64,
+    /// Resource-registry-only generation, for
+    /// `resources/list_changed` notifications (WOR-1642).
+    resources_generation: std::sync::atomic::AtomicU64,
     /// Content digest of the last stored tool registry. Zero until
     /// the first refresh.
     tools_digest: std::sync::atomic::AtomicU64,
@@ -298,6 +304,8 @@ impl McpFederation {
             client,
             max_response_bytes: io.max_response_bytes,
             generation: std::sync::atomic::AtomicU64::new(0),
+            tools_generation: std::sync::atomic::AtomicU64::new(0),
+            resources_generation: std::sync::atomic::AtomicU64::new(0),
             tools_digest: std::sync::atomic::AtomicU64::new(0),
             resources_digest: std::sync::atomic::AtomicU64::new(0),
             refresh_task_started: std::sync::atomic::AtomicBool::new(false),
@@ -382,6 +390,8 @@ impl McpFederation {
         {
             self.tools.store(Arc::new(registry));
             self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.tools_generation
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             debug!(total_tools = count, "MCP federation registry refreshed");
         } else {
@@ -550,6 +560,8 @@ impl McpFederation {
             self.resources.store(Arc::new(registry));
             self.mcp_apps_capability.store(Arc::new(apps_cap));
             self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.resources_generation
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             debug!(
                 total_resources = count,
@@ -974,6 +986,20 @@ impl McpFederation {
     /// codemode.ts module, `list_changed` notifications).
     pub fn generation(&self) -> u64 {
         self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Tool-registry generation (WOR-1642): bumps only when the tool
+    /// catalogue changes, driving `tools/list_changed` notifications.
+    pub fn tools_generation(&self) -> u64 {
+        self.tools_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Resource-registry generation (WOR-1642): bumps only when the
+    /// resource catalogue (or mirrored mcpApps capability) changes.
+    pub fn resources_generation(&self) -> u64 {
+        self.resources_generation
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Pre-serialized tool catalogue for the current generation
