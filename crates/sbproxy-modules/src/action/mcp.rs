@@ -114,6 +114,13 @@ pub struct McpActionConfig {
     /// advertises no OAuth auth-discovery surface.
     #[serde(default)]
     pub oauth: Option<McpOAuthConfig>,
+    /// How often the background task re-fetches upstream tool and
+    /// resource catalogues. Accepts Go duration syntax (`60s`, `5m`).
+    /// Defaults to 60 seconds. Inbound requests always serve the
+    /// cached snapshot; this interval is the only steady-state
+    /// upstream fan-out.
+    #[serde(default, with = "duration_str")]
+    pub refresh_interval: Option<Duration>,
 }
 
 /// OAuth 2.0 Protected Resource Metadata (RFC 9728) for the MCP gateway.
@@ -227,6 +234,11 @@ pub struct McpAction {
     /// the compiled origin chain; counters are wiped on hot reload
     /// since reload rebuilds the action.
     pub quota_store: Arc<ToolQuotaStore>,
+    /// Background catalogue refresh interval (default 60s). Passed to
+    /// `McpFederation::ensure_ready` on each request; the task spawns
+    /// lazily on the first request so compile time does no IO and
+    /// needs no async runtime.
+    pub refresh_interval: Duration,
 }
 
 /// Per-upstream metadata captured at compile time. Kept outside
@@ -343,6 +355,9 @@ impl McpAction {
             progressive_discovery: cfg.progressive_discovery,
             oauth: cfg.oauth,
             quota_store: Arc::new(ToolQuotaStore::new()),
+            refresh_interval: cfg
+                .refresh_interval
+                .unwrap_or(Duration::from_secs(60)),
         })
     }
 

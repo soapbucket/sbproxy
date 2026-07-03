@@ -176,6 +176,26 @@ pub struct McpFederation {
     /// gateway re-advertises on its own `initialize`.
     mcp_apps_capability: ArcSwap<Option<serde_json::Value>>,
     client: reqwest::Client,
+    /// Monotonic catalogue generation. Bumps once per refresh that
+    /// actually changed the tool or resource registry (content
+    /// digest short-circuit), so consumers can key caches on it and
+    /// emit `list_changed` notifications only on real change.
+    generation: std::sync::atomic::AtomicU64,
+    /// Content digest of the last stored tool registry. Zero until
+    /// the first refresh.
+    tools_digest: std::sync::atomic::AtomicU64,
+    /// Content digest of the last stored resource registry (plus the
+    /// mirrored mcpApps capability). Zero until the first refresh.
+    resources_digest: std::sync::atomic::AtomicU64,
+    /// Set once `ensure_ready` has spawned the periodic refresh task.
+    refresh_task_started: std::sync::atomic::AtomicBool,
+    /// Set once the cold-start prime (one tools + resources fetch)
+    /// has run. Requests after that serve the ArcSwap snapshot and
+    /// never fan out to upstreams inline.
+    primed: std::sync::atomic::AtomicBool,
+    /// Serialises the cold-start prime so N concurrent first
+    /// requests trigger exactly one upstream fan-out.
+    prime_lock: tokio::sync::Mutex<()>,
 }
 
 impl McpFederation {
@@ -187,6 +207,12 @@ impl McpFederation {
             resources: ArcSwap::from_pointee(HashMap::new()),
             mcp_apps_capability: ArcSwap::from_pointee(None),
             client: reqwest::Client::new(),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            tools_digest: std::sync::atomic::AtomicU64::new(0),
+            resources_digest: std::sync::atomic::AtomicU64::new(0),
+            refresh_task_started: std::sync::atomic::AtomicBool::new(false),
+            primed: std::sync::atomic::AtomicBool::new(false),
+            prime_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -242,8 +268,25 @@ impl McpFederation {
         sbproxy_observe::metrics::set_mcp_federation_peers_up(peers_up);
 
         let count = registry.len();
-        self.tools.store(Arc::new(registry));
-        debug!(total_tools = count, "MCP federation registry refreshed");
+        let digest = tools_registry_digest(&registry);
+        // Swap only on real change so steady-state refreshes do not
+        // churn the ArcSwap and the generation only moves when the
+        // catalogue does.
+        if self
+            .tools_digest
+            .swap(digest, std::sync::atomic::Ordering::AcqRel)
+            != digest
+        {
+            self.tools.store(Arc::new(registry));
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            debug!(total_tools = count, "MCP federation registry refreshed");
+        } else {
+            debug!(
+                total_tools = count,
+                "MCP federation registry unchanged; swap skipped"
+            );
+        }
         Ok(count)
     }
 
@@ -395,12 +438,26 @@ impl McpFederation {
         }
 
         let count = registry.len();
-        self.resources.store(Arc::new(registry));
-        self.mcp_apps_capability.store(Arc::new(apps_cap));
-        debug!(
-            total_resources = count,
-            "MCP federation resources refreshed"
-        );
+        let digest = resources_registry_digest(&registry, &apps_cap);
+        if self
+            .resources_digest
+            .swap(digest, std::sync::atomic::Ordering::AcqRel)
+            != digest
+        {
+            self.resources.store(Arc::new(registry));
+            self.mcp_apps_capability.store(Arc::new(apps_cap));
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            debug!(
+                total_resources = count,
+                "MCP federation resources refreshed"
+            );
+        } else {
+            debug!(
+                total_resources = count,
+                "MCP federation resources unchanged; swap skipped"
+            );
+        }
         Ok(count)
     }
 
@@ -803,21 +860,127 @@ impl McpFederation {
         }
     }
 
-    /// Start a background task to refresh tool lists periodically.
+    /// Current catalogue generation. Starts at zero and bumps once
+    /// per refresh that actually changed the tool or resource
+    /// registry, so it is a stable cache key for anything derived
+    /// from the catalogue (serialized `tools/list` bodies, the
+    /// codemode.ts module, `list_changed` notifications).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Make the federation servable: spawn the periodic refresh task
+    /// on first use and run the cold-start prime (one tools fetch +
+    /// one resources fetch) exactly once, single-flight. Requests
+    /// arriving after the prime serve the ArcSwap snapshot and never
+    /// fan out to upstreams inline; the background task is the only
+    /// steady-state refresher.
     ///
-    /// The task runs indefinitely; drop the returned handle to cancel.
-    pub fn start_refresh_task(self: &Arc<Self>, interval_secs: u64) {
-        let federation = Arc::clone(self);
+    /// A prime failure still marks the federation primed: serving an
+    /// empty catalogue until the next interval tick beats retrying
+    /// the fan-out on every inbound request (the failure mode this
+    /// replaces).
+    pub async fn ensure_ready(self: &Arc<Self>, interval: std::time::Duration) {
+        if !self
+            .refresh_task_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.start_refresh_task(interval);
+        }
+        if self.primed.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let _guard = self.prime_lock.lock().await;
+        if self.primed.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        if let Err(e) = self.refresh_tools().await {
+            error!(error = %e, "MCP federation initial tool refresh failed");
+        }
+        if let Err(e) = self.refresh_resources().await {
+            error!(error = %e, "MCP federation initial resource refresh failed");
+        }
+        self.primed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Start a background task to refresh the tool and resource
+    /// registries periodically.
+    ///
+    /// The task holds only a `Weak` reference: when a hot reload
+    /// rebuilds the action and drops the last `Arc`, the task exits
+    /// at its next tick instead of pinning the federation (and its
+    /// upstream fan-out) forever.
+    pub fn start_refresh_task(self: &Arc<Self>, interval: std::time::Duration) {
+        let weak = Arc::downgrade(self);
         tokio::spawn(async move {
-            let interval = std::time::Duration::from_secs(interval_secs.max(1));
+            let interval = interval.max(std::time::Duration::from_secs(1));
             loop {
                 tokio::time::sleep(interval).await;
+                let Some(federation) = weak.upgrade() else {
+                    debug!("MCP federation dropped; refresh task exiting");
+                    break;
+                };
                 if let Err(e) = federation.refresh_tools().await {
-                    error!(error = %e, "MCP federation refresh failed");
+                    error!(error = %e, "MCP federation tool refresh failed");
+                }
+                if let Err(e) = federation.refresh_resources().await {
+                    error!(error = %e, "MCP federation resource refresh failed");
                 }
             }
         });
     }
+}
+
+/// Order-independent content digest of a tool registry. Two
+/// registries with the same tools (same names, descriptions,
+/// schemas, owners, streaming flags, and `_meta` blocks) produce the
+/// same digest regardless of `HashMap` iteration order.
+fn tools_registry_digest(registry: &HashMap<String, FederatedTool>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut keys: Vec<&String> = registry.keys().collect();
+    keys.sort();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for k in keys {
+        let t = &registry[k];
+        t.name.hash(&mut h);
+        t.description.hash(&mut h);
+        t.server_name.hash(&mut h);
+        t.streaming.hash(&mut h);
+        t.input_schema.to_string().hash(&mut h);
+        match &t.meta {
+            Some(m) => m.to_string().hash(&mut h),
+            None => 0u8.hash(&mut h),
+        }
+    }
+    h.finish()
+}
+
+/// Order-independent content digest of a resource registry plus the
+/// mirrored mcpApps capability (both are stored by the same refresh,
+/// so one digest guards both swaps).
+fn resources_registry_digest(
+    registry: &HashMap<String, FederatedResource>,
+    apps_cap: &Option<serde_json::Value>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut keys: Vec<&String> = registry.keys().collect();
+    keys.sort();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for k in keys {
+        let r = &registry[k];
+        r.uri.hash(&mut h);
+        r.name.hash(&mut h);
+        r.description.hash(&mut h);
+        r.mime_type.hash(&mut h);
+        r.server_name.hash(&mut h);
+        r.upstream_uri.hash(&mut h);
+    }
+    match apps_cap {
+        Some(v) => v.to_string().hash(&mut h),
+        None => 0u8.hash(&mut h),
+    }
+    h.finish()
 }
 
 /// Detect whether an upstream MCP `tools/list` entry advertises a
@@ -1017,6 +1180,63 @@ mod tests {
     fn test_resolve_tool_empty_registry() {
         let fed = McpFederation::new(vec![]);
         assert!(fed.resolve_tool("any_tool").is_none());
+    }
+
+    // --- Generation counter + single-flight prime (WOR-1638) ---
+
+    #[tokio::test]
+    async fn refresh_bumps_generation_only_on_change() {
+        // Zero upstreams: every refresh observes the same (empty)
+        // catalogue. The first refresh establishes it (one bump);
+        // repeats must short-circuit on the digest and leave the
+        // generation alone.
+        let fed = std::sync::Arc::new(McpFederation::new(vec![]));
+        assert_eq!(fed.generation(), 0);
+        fed.refresh_tools().await.unwrap();
+        assert_eq!(fed.generation(), 1);
+        fed.refresh_tools().await.unwrap();
+        fed.refresh_tools().await.unwrap();
+        assert_eq!(fed.generation(), 1);
+        fed.refresh_resources().await.unwrap();
+        assert_eq!(fed.generation(), 2);
+        fed.refresh_resources().await.unwrap();
+        assert_eq!(fed.generation(), 2);
+    }
+
+    #[tokio::test]
+    async fn ensure_ready_primes_exactly_once() {
+        // Eight concurrent cold-start requests must share one prime
+        // pass: one tools bump + one resources bump, nothing more.
+        let fed = std::sync::Arc::new(McpFederation::new(vec![]));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let f = std::sync::Arc::clone(&fed);
+            handles.push(tokio::spawn(async move {
+                f.ensure_ready(std::time::Duration::from_secs(3600)).await;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(fed.generation(), 2);
+        // A later call is a no-op fast path.
+        fed.ensure_ready(std::time::Duration::from_secs(3600)).await;
+        assert_eq!(fed.generation(), 2);
+    }
+
+    #[tokio::test]
+    async fn refresh_task_exits_when_federation_dropped() {
+        // The background task holds only a Weak; dropping the last
+        // Arc must let the federation deallocate (the task exits at
+        // its next tick rather than pinning it forever).
+        let fed = std::sync::Arc::new(McpFederation::new(vec![]));
+        fed.start_refresh_task(std::time::Duration::from_secs(1));
+        let weak = std::sync::Arc::downgrade(&fed);
+        drop(fed);
+        assert!(
+            weak.upgrade().is_none(),
+            "refresh task must not keep the federation alive"
+        );
     }
 
     // --- Registry manipulation ---

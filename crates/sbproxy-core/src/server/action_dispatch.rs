@@ -752,6 +752,13 @@ pub(super) async fn handle_mcp_action(
     let method = session.req_header().method.clone();
     let req_path = session.req_header().uri.path();
 
+    // WOR-1638: make the federation servable before any branch reads
+    // the registry. First request spawns the periodic refresh task
+    // and runs the cold-start prime (single-flight); every request
+    // after that is a no-op fast path serving the cached snapshot.
+    // Inbound traffic never fans out to upstream catalogues inline.
+    mcp.federation.ensure_ready(mcp.refresh_interval).await;
+
     // WOR-483: serve the federated tool catalogue as a typed
     // Cloudflare-Code-Mode TypeScript module at
     // `/.well-known/mcp/codemode.ts`. WOR-410 added the
@@ -1110,14 +1117,10 @@ pub(super) async fn handle_mcp_action(
             } else {
                 None
             };
-            // WOR-818: lazy-prime the resource registry on the
-            // first initialize so the mcpApps capability mirrors
-            // from any upstream that advertised SEP-1865. A failure
-            // here logs and continues; the rest of the initialize
-            // response is still useful for base-MCP clients.
-            if let Err(e) = mcp.federation.refresh_resources().await {
-                warn!(error = %e, "MCP federation resource refresh failed");
-            }
+            // WOR-818/WOR-1638: the resource registry (and the
+            // mirrored mcpApps capability) is primed by ensure_ready
+            // above and kept fresh by the background task; initialize
+            // reads the snapshot.
             let mcp_apps = mcp.federation.mcp_apps_capability();
             // Resources capability: present whenever this origin
             // surfaces resources to MCP clients, either via the
@@ -1160,13 +1163,10 @@ pub(super) async fn handle_mcp_action(
         }
         "ping" => JsonRpcResponse::success(request.id.clone(), serde_json::json!("pong")),
         "tools/list" => {
-            // Lazy refresh: kick off a tools fetch on the first call so
-            // the registry is populated. Subsequent calls reuse the
-            // cached snapshot until the operator wires up a periodic
-            // refresh task. Failures fall through to an empty list.
-            if let Err(e) = mcp.federation.refresh_tools().await {
-                warn!(error = %e, "MCP federation tool refresh failed");
-            }
+            // WOR-1638: serves the ArcSwap snapshot primed by
+            // ensure_ready and refreshed by the background task.
+            // Upstream fan-outs are bounded by the refresh interval,
+            // not by inbound request volume.
             // WOR-806: progressive discovery advertises two meta-tools
             // (`search` / `execute`) instead of the full catalogue, so
             // a large federated tool set stays out of the model's
@@ -1221,12 +1221,9 @@ pub(super) async fn handle_mcp_action(
             )
         }
         "resources/list" => {
-            // WOR-818: pass-through the federated resource list. The
-            // refresh runs lazily on the first call (same pattern as
-            // `tools/list`). Failures fall through to an empty list.
-            if let Err(e) = mcp.federation.refresh_resources().await {
-                warn!(error = %e, "MCP federation resource refresh failed");
-            }
+            // WOR-818/WOR-1638: pass-through the federated resource
+            // list from the primed snapshot (same pattern as
+            // `tools/list`).
             let resources: Vec<serde_json::Value> = mcp
                 .federation
                 .list_resources()
