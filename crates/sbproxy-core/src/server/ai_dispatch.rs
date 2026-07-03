@@ -1524,7 +1524,13 @@ pub(super) async fn handle_ai_proxy(
                 // out of the raw body because the `Message` struct
                 // strips them). Runs after the text-shaped check so
                 // the cheap path short-circuits first.
-                if let Some(block) = pipeline.check_input_body(&body) {
+                // WOR-1645: pass the principal so the agent-alignment
+                // guardrail's shared MCP rbac_policy is evaluated
+                // against each model-emitted tool call, the same deny
+                // rule the mcp action enforces on tools/call.
+                if let Some(block) =
+                    pipeline.check_input_body_with_principal(&body, Some(&ctx.principal))
+                {
                     warn!(
                         guardrail = %block.name,
                         reason = %block.reason,
