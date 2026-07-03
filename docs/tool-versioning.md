@@ -109,13 +109,39 @@ lockfile but missing from the live catalogue are reported as
 
 See `examples/mcp-tool-versioning/` for a runnable configuration.
 
+## The CI gate
+
+`sbproxy-mcp-drift` generates and checks lockfiles, so the same oracle that
+guards the gateway can fail a pull request. Both flows take a `tools/list`
+dump: the full JSON-RPC response, the bare result object, or a plain tools
+array, from a file or stdin.
+
+```bash
+# Snapshot the live catalogue into a committed lockfile.
+curl -s https://mcp.example.com/ -H 'content-type: application/json' \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+     | sbproxy-mcp-drift --lock-tools - --lockfile tool-versions.lock.yaml
+
+# CI: fail the build on an under-bumped contract change.
+curl -s https://mcp.example.com/ -H 'content-type: application/json' \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+     | sbproxy-mcp-drift --check-tools - --lockfile tool-versions.lock.yaml
+```
+
+`--check-tools` exits 0 when every tool is unchanged or every change carries
+a covering bump, 1 when the only findings are new or removed tools, and 2 on
+a version-bump violation, printing the tool and the grade it required.
+Declared bumps come from `--declared versions.yaml` (a `tool: semver` map);
+without it, changes are linted against the lockfile versions, meaning "no
+bump declared". Regenerating a lockfile carries prior versions over for
+existing tools, so a snapshot refresh never invents a bump.
+
 ## Status
 
-The oracle engine, the `sb.yml` gate above, and the runtime enforcement ship
-today. The CLI that generates and checks lockfiles in CI is landing next; a
-lockfile can be written by hand in the meantime (the embedded `contract`
-field is optional, and a digest-only baseline still detects changes, graded
-as at least a patch).
+The oracle engine, the `sb.yml` gate, the runtime enforcement, and the
+lockfile CLI all ship today. The embedded `contract` field in the lockfile is
+optional: a digest-only baseline still detects changes, graded as at least a
+patch.
 
 ## Related
 
