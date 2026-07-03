@@ -27,6 +27,7 @@ pub mod cassette_drift;
 pub mod code_mode;
 pub mod codemode_from_openapi;
 pub mod codemode_ts;
+pub mod compat;
 pub mod context_opt;
 pub mod discovery;
 /// WOR-507: east-west MCP federation discovery via passive
