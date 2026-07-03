@@ -173,6 +173,34 @@ pub struct McpToolVersioningConfig {
     /// declared" against its lockfile version.
     #[serde(default)]
     pub declared_versions: HashMap<String, String>,
+    /// Description-semantics judges (WOR-1637). Empty (the default)
+    /// skips the model-judged dimension entirely; the verdict is
+    /// structural and digest-based only. More than one judge runs a
+    /// jury: agreement sets the confidence, and a split jury reports
+    /// needs-confirmation instead of blocking.
+    #[serde(default)]
+    pub judges: Vec<McpJudgeConfig>,
+}
+
+/// One description-semantics judge (WOR-1637): a BYOK
+/// OpenAI-compatible chat-completions endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpJudgeConfig {
+    /// Chat-completions endpoint URL to POST to.
+    pub endpoint: String,
+    /// Environment variable holding the bearer API key. The key
+    /// itself never lives in config.
+    pub api_key_env: String,
+    /// Optional `model` body field for endpoints that need one.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Per-call timeout. Go duration syntax; defaults to 5s.
+    #[serde(default, with = "duration_str")]
+    pub timeout: Option<Duration>,
+    /// Token-equivalent budget before judge calls hard-fail (and the
+    /// gate falls back to structural grading). Defaults to 100000.
+    #[serde(default)]
+    pub budget_tokens: Option<u64>,
 }
 
 /// Wire form of the versioning mode (WOR-1635).
@@ -449,6 +477,28 @@ impl McpAction {
                     })?;
                     declared_versions.insert(tool.clone(), parsed);
                 }
+                let mut judges: Vec<Arc<dyn sbproxy_extension::mcp::compat::Judge>> =
+                    Vec::with_capacity(tv.judges.len());
+                for judge in &tv.judges {
+                    let endpoint = judge.endpoint.parse::<url::Url>().map_err(|e| {
+                        anyhow::anyhow!(
+                            "mcp action: tool_versioning.judges endpoint '{}' is not a URL: {e}",
+                            judge.endpoint
+                        )
+                    })?;
+                    judges.push(Arc::new(sbproxy_ai::judge::CompatJudge::new(
+                        sbproxy_ai::judge::CompatJudgeConfig {
+                            endpoint,
+                            api_key_env: judge.api_key_env.clone(),
+                            model: judge.model.clone(),
+                            timeout_ms: judge
+                                .timeout
+                                .map(|d| d.as_millis().min(u128::from(u32::MAX)) as u32)
+                                .unwrap_or(5_000),
+                            budget_tokens: judge.budget_tokens.unwrap_or(100_000),
+                        },
+                    )));
+                }
                 Some(ToolVersioningGate {
                     lockfile_path: tv.lockfile.clone(),
                     declared_versions,
@@ -456,6 +506,7 @@ impl McpAction {
                         McpVersioningModeConfig::Warn => VersioningMode::Warn,
                         McpVersioningModeConfig::Block => VersioningMode::Block,
                     },
+                    judges,
                 })
             }
         };

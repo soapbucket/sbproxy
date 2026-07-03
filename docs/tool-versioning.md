@@ -73,6 +73,28 @@ jury returns needs-confirmation rather than a hard pass or fail. Without a
 configured judge, the dimension is skipped and the verdict is structural and
 behavioral only, so it never blocks on its own.
 
+Judges are declared under the same `tool_versioning` block. Each one is a BYOK
+OpenAI-compatible chat-completions endpoint; the bearer key comes from an
+environment variable, never from config:
+
+```yaml
+tool_versioning:
+  lockfile: "tool-versions.lock.yaml"
+  mode: block
+  judges:
+    - endpoint: "https://api.openai.com/v1/chat/completions"
+      api_key_env: OPENAI_API_KEY
+      model: gpt-5-mini
+      timeout: 5s
+      budget_tokens: 100000
+```
+
+Judge calls are counted on the `sbproxy_judge_calls_total` family next to the
+policy judge's spend, and each judge carries a token-equivalent budget so a
+churning catalogue cannot drain it. A judge failure falls back to the
+deterministic dimensions and records a `judge_error` verdict; a split jury
+records `needs_confirmation` and leaves traffic alone even in block mode.
+
 ## The live gate
 
 The `tool_versioning` block on the `mcp` action wires the oracle into the

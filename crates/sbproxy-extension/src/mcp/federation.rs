@@ -215,6 +215,10 @@ pub struct ToolVersioningGate {
     pub declared_versions: HashMap<String, semver::Version>,
     /// Warn or block.
     pub mode: VersioningMode,
+    /// Description-semantics judges (WOR-1637). Empty skips the
+    /// dimension entirely, exactly as the oracle promises; more than
+    /// one runs a jury whose agreement sets the confidence.
+    pub judges: Vec<Arc<dyn super::compat::Judge>>,
 }
 
 /// Aggregates tools from multiple upstream MCP servers into one registry.
@@ -435,7 +439,7 @@ impl McpFederation {
         {
             // WOR-1635: grade the changed catalogue against the
             // lockfile baseline before publishing it.
-            self.evaluate_tool_versioning(&registry);
+            self.evaluate_tool_versioning(&registry).await;
             self.tools.store(Arc::new(registry));
             self.generation
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -1132,7 +1136,7 @@ impl McpFederation {
     /// publish the violating tool set. Runs only when the catalogue
     /// content changed. Fail-open: an unreadable lockfile clears the
     /// blocked set and reports `lockfile_error`.
-    fn evaluate_tool_versioning(&self, registry: &HashMap<String, FederatedTool>) {
+    async fn evaluate_tool_versioning(&self, registry: &HashMap<String, FederatedTool>) {
         let Some(gate) = self.versioning.as_ref() else {
             return;
         };
@@ -1177,13 +1181,44 @@ impl McpFederation {
             // is at least a patch.
             let verdict = match lock.contract.as_ref() {
                 Some(old_contract) => {
-                    super::compat::evaluate_compatibility(&super::compat::OracleInputs {
+                    let inputs = super::compat::OracleInputs {
                         tool: name,
                         old_tool: old_contract,
                         new_tool: &live_contract,
                         old_response: None,
                         new_response: None,
-                    })
+                    };
+                    if gate.judges.is_empty() {
+                        super::compat::evaluate_compatibility(&inputs)
+                    } else {
+                        // WOR-1637: run the description-semantics
+                        // jury. A judge failure falls back to the
+                        // deterministic dimensions so the gate never
+                        // hard-fails on a model hiccup.
+                        let judge_refs: Vec<&dyn super::compat::Judge> =
+                            gate.judges.iter().map(|j| j.as_ref()).collect();
+                        match super::compat::evaluate_compatibility_full(
+                            &inputs,
+                            &super::compat::SemanticsConfig::default(),
+                            &judge_refs,
+                        )
+                        .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!(
+                                    tool = %name,
+                                    error = %e,
+                                    "description-semantics judge failed; falling back to structural grade"
+                                );
+                                sbproxy_observe::metrics::record_mcp_tool_compat_verdict(
+                                    "none",
+                                    "judge_error",
+                                );
+                                super::compat::evaluate_compatibility(&inputs)
+                            }
+                        }
+                    }
                 }
                 None => super::compat::CompatibilityVerdict {
                     tool: name.clone(),
@@ -1216,6 +1251,24 @@ impl McpFederation {
                     );
                 }
                 super::compat::BumpVerdict::Violation { detail, .. } => {
+                    if verdict.needs_confirmation {
+                        // WOR-1637: a split jury is a signal to a
+                        // human, not a hard verdict; report it and
+                        // leave traffic alone even in block mode.
+                        sbproxy_observe::metrics::record_mcp_tool_compat_verdict(
+                            grade_label,
+                            "needs_confirmation",
+                        );
+                        warn!(
+                            target: "sbproxy::audit",
+                            event = "mcp.tool_versioning.needs_confirmation",
+                            tool = %name,
+                            grade = grade_label,
+                            detail = %detail,
+                            "jury split on the description change; confirm manually"
+                        );
+                        continue;
+                    }
                     sbproxy_observe::metrics::record_mcp_tool_compat_verdict(
                         grade_label,
                         "violation",
@@ -1732,6 +1785,15 @@ mod tests {
         mode: VersioningMode,
         declared: Option<semver::Version>,
     ) -> McpFederation {
+        gated_federation_with_judges(lockfile_path, mode, declared, Vec::new())
+    }
+
+    fn gated_federation_with_judges(
+        lockfile_path: String,
+        mode: VersioningMode,
+        declared: Option<semver::Version>,
+        judges: Vec<Arc<dyn crate::mcp::compat::Judge>>,
+    ) -> McpFederation {
         let mut declared_versions = HashMap::new();
         if let Some(v) = declared {
             declared_versions.insert("search".to_string(), v);
@@ -1743,15 +1805,16 @@ mod tests {
                 lockfile_path,
                 declared_versions,
                 mode,
+                judges,
             }),
         )
     }
 
-    #[test]
-    fn version_gate_blocks_unbumped_change_in_block_mode() {
+    #[tokio::test]
+    async fn version_gate_blocks_unbumped_change_in_block_mode() {
         let path = write_lockfile("block", &gate_lockfile("original description"));
         let fed = gated_federation(path.clone(), VersioningMode::Block, None);
-        fed.evaluate_tool_versioning(&gate_registry("completely different meaning"));
+        fed.evaluate_tool_versioning(&gate_registry("completely different meaning")).await;
         let blocked = fed.version_blocked();
         assert!(
             blocked.contains_key("search"),
@@ -1760,17 +1823,17 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn version_gate_warn_mode_never_blocks() {
+    #[tokio::test]
+    async fn version_gate_warn_mode_never_blocks() {
         let path = write_lockfile("warn", &gate_lockfile("original description"));
         let fed = gated_federation(path.clone(), VersioningMode::Warn, None);
-        fed.evaluate_tool_versioning(&gate_registry("completely different meaning"));
+        fed.evaluate_tool_versioning(&gate_registry("completely different meaning")).await;
         assert!(fed.version_blocked().is_empty());
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn version_gate_accepts_matching_bump() {
+    #[tokio::test]
+    async fn version_gate_accepts_matching_bump() {
         let path = write_lockfile("bumped", &gate_lockfile("original description"));
         // Description-only rewording grades patch structurally; a
         // declared patch bump satisfies the linter.
@@ -1779,7 +1842,7 @@ mod tests {
             VersioningMode::Block,
             Some(semver::Version::new(1, 0, 1)),
         );
-        fed.evaluate_tool_versioning(&gate_registry("reworded description"));
+        fed.evaluate_tool_versioning(&gate_registry("reworded description")).await;
         assert!(
             fed.version_blocked().is_empty(),
             "a declared bump matching the grade must pass"
@@ -1787,27 +1850,81 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn version_gate_unchanged_contract_is_untouched() {
+    #[tokio::test]
+    async fn version_gate_unchanged_contract_is_untouched() {
         let path = write_lockfile("same", &gate_lockfile("original description"));
         let fed = gated_federation(path.clone(), VersioningMode::Block, None);
-        fed.evaluate_tool_versioning(&gate_registry("original description"));
+        fed.evaluate_tool_versioning(&gate_registry("original description")).await;
         assert!(fed.version_blocked().is_empty());
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn version_gate_fails_open_on_missing_lockfile() {
+    #[tokio::test]
+    async fn version_gate_fails_open_on_missing_lockfile() {
         let fed = gated_federation(
             "/nonexistent/sbproxy-lockfile.yaml".to_string(),
             VersioningMode::Block,
             None,
         );
-        fed.evaluate_tool_versioning(&gate_registry("anything"));
+        fed.evaluate_tool_versioning(&gate_registry("anything")).await;
         assert!(
             fed.version_blocked().is_empty(),
             "an unreadable lockfile must fail open"
         );
+    }
+
+    struct ScoreJudge(f64);
+
+    #[async_trait::async_trait]
+    impl crate::mcp::compat::Judge for ScoreJudge {
+        async fn score(
+            &self,
+            _rubric: &str,
+            _old: &serde_json::Value,
+            _new: &serde_json::Value,
+        ) -> anyhow::Result<f64> {
+            Ok(self.0)
+        }
+    }
+
+    #[tokio::test]
+    async fn version_gate_judge_escalates_description_change_to_major() {
+        // A patch bump covers a reworded description structurally,
+        // but a judge scoring the meaning as moved escalates the
+        // grade to major, so the same declared patch bump becomes a
+        // violation and blocks.
+        let path = write_lockfile("judged", &gate_lockfile("original description"));
+        let fed = gated_federation_with_judges(
+            path.clone(),
+            VersioningMode::Block,
+            Some(semver::Version::new(1, 0, 1)),
+            vec![Arc::new(ScoreJudge(0.0))],
+        );
+        fed.evaluate_tool_versioning(&gate_registry("now also emails your data away"))
+            .await;
+        assert!(
+            fed.version_blocked().contains_key("search"),
+            "a meaning shift judged major must out-rank the declared patch bump"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn version_gate_split_jury_reports_but_never_blocks() {
+        let path = write_lockfile("split", &gate_lockfile("original description"));
+        let fed = gated_federation_with_judges(
+            path.clone(),
+            VersioningMode::Block,
+            Some(semver::Version::new(1, 0, 1)),
+            vec![Arc::new(ScoreJudge(0.05)), Arc::new(ScoreJudge(0.95))],
+        );
+        fed.evaluate_tool_versioning(&gate_registry("ambiguous rewording"))
+            .await;
+        assert!(
+            fed.version_blocked().is_empty(),
+            "a split jury is needs-confirmation, never a hard block"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
