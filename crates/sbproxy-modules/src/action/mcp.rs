@@ -156,6 +156,20 @@ pub struct McpActionConfig {
     /// stateless and ignores session headers entirely.
     #[serde(default)]
     pub sessions: Option<McpSessionConfig>,
+    /// Per-tool-call cost attribution (WOR-1644). MCP has no usage
+    /// meter, so cost comes from this optional price map: a USD
+    /// figure per advertised (namespaced) tool name. Counts and
+    /// durations are always recorded; cost rows appear only for
+    /// priced tools.
+    #[serde(default)]
+    pub tool_pricing: HashMap<String, f64>,
+    /// Usage sinks for MCP tool calls (WOR-1644). Reuses the same
+    /// sink surface as the AI path (JSONL, webhook, ledger, Langfuse,
+    /// Datadog), so an operator meters tool spend in the same place
+    /// as model spend. Empty (the default) emits metrics and the
+    /// ledger only.
+    #[serde(default)]
+    pub usage_sinks: Vec<sbproxy_ai::usage_sink::UsageSinkConfig>,
 }
 
 /// Tool-versioning gate config (WOR-1635).
@@ -355,6 +369,11 @@ pub struct McpAction {
     /// reload invalidates them (the spec's 404-then-reinitialize
     /// flow covers exactly this).
     pub sessions: Option<Arc<SessionStore>>,
+    /// Per-tool USD price map for cost attribution (WOR-1644).
+    pub tool_pricing: HashMap<String, f64>,
+    /// Built usage sinks for MCP tool-call attribution (WOR-1644),
+    /// shared across requests. Empty when none are configured.
+    pub usage_sinks: Vec<Arc<dyn sbproxy_ai::usage_sink::UsageSink>>,
 }
 
 /// Per-upstream metadata captured at compile time. Kept outside
@@ -552,7 +571,15 @@ impl McpAction {
                     s.ttl.unwrap_or(Duration::from_secs(30 * 60)),
                 ))
             }),
+            tool_pricing: cfg.tool_pricing,
+            usage_sinks: sbproxy_ai::usage_sink::build_sinks(&cfg.usage_sinks),
         })
+    }
+
+    /// USD cost for one call of `tool`, from the price map (WOR-1644).
+    /// `None` when the tool is unpriced.
+    pub fn tool_cost(&self, tool: &str) -> Option<f64> {
+        self.tool_pricing.get(tool).copied()
     }
 
     /// Resolve the [`ToolAccessPolicy`] that governs a given upstream.

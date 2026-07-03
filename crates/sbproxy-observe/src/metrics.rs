@@ -2667,6 +2667,30 @@ pub fn record_mcp_tool_dispatch(tool: &str, result: &'static str, duration_secs:
         .observe(duration_secs);
 }
 
+/// Record MCP tool-call spend on
+/// `sbproxy_mcp_tool_cost_usd_total{tool, server}` (WOR-1644). Only
+/// emitted when a price map resolves a cost for the tool; the
+/// dispatch-count and duration already ride on
+/// `sbproxy_mcp_tool_dispatch_*`.
+pub fn record_mcp_tool_cost(tool: &str, server: &str, cost_usd: f64) {
+    use prometheus::{register_counter_vec, CounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<CounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_counter_vec!(
+            "sbproxy_mcp_tool_cost_usd_total",
+            "MCP tool-call cost in USD, by tool and owning server",
+            &["tool", "server"],
+        )
+        .expect("mcp tool cost counter registers")
+    });
+    let tool = sanitize_label("tool", tool);
+    let server = sanitize_label("server", server);
+    counter
+        .with_label_values(&[tool.as_str(), server.as_str()])
+        .inc_by(cost_usd);
+}
+
 /// Record a tool-versioning oracle verdict on
 /// `sbproxy_mcp_tool_compat_verdicts_total{grade, outcome}`
 /// (WOR-1635). `grade` is the computed semver grade (`none`, `patch`,

@@ -1182,6 +1182,18 @@ pub(super) async fn handle_mcp_action(
         }
     }
 
+    // WOR-1644: code-mode's emitted runtime stub sends
+    // `mcp-caller: code-execution`, so tool calls it makes are
+    // attributed to the code-execution sandbox rather than a direct
+    // model call in the session ledger.
+    let is_code_execution = session
+        .req_header()
+        .headers
+        .get("mcp-caller")
+        .and_then(|v| v.to_str().ok())
+        .map(|c| c.eq_ignore_ascii_case("code-execution"))
+        .unwrap_or(false);
+
     // WOR-1642: with session management enabled, every
     // post-initialize request (notifications included) must carry
     // the Mcp-Session-Id the gateway issued. Missing means 400;
@@ -1677,6 +1689,7 @@ pub(super) async fn handle_mcp_action(
                                     None
                                 };
 
+                                let call_started = std::time::Instant::now();
                                 let call = mcp.federation.call_tool(&name, arguments);
                                 let outcome = match timeout {
                                     Some(d) => match tokio::time::timeout(d, call).await {
@@ -1712,8 +1725,22 @@ pub(super) async fn handle_mcp_action(
                                         cap,
                                         &outcome,
                                         mcp_session_id.as_deref(),
+                                        is_code_execution,
                                     );
                                 }
+
+                                // WOR-1644: attribute the call into the
+                                // usage plane. Metrics always fire;
+                                // cost and the usage-sink row appear
+                                // when a price map resolves the tool.
+                                emit_mcp_tool_attribution(
+                                    ctx,
+                                    mcp,
+                                    &name,
+                                    federated.as_ref().map(|t| t.server_name.as_str()),
+                                    &outcome,
+                                    call_started.elapsed(),
+                                );
 
                                 // WOR-508: bridge the prompt-linked audit
                                 // inputs to the enterprise audit layer over
@@ -1835,6 +1862,7 @@ fn emit_tool_call_ledger(
     cap: LedgerCapture,
     outcome: &anyhow::Result<serde_json::Value>,
     mcp_session_id: Option<&str>,
+    is_code_execution: bool,
 ) {
     use sbproxy_observe::session_ledger::{emit_tool_call, Caller, ToolCallObservation};
 
@@ -1880,8 +1908,88 @@ fn emit_tool_call_ledger(
         is_error,
         started_at: cap.started_at,
         duration_ms: cap.started.elapsed().as_millis() as u64,
-        caller: Caller::Direct,
+        // WOR-1644: code-mode calls (from the emitted TS runtime,
+        // which sends `mcp-caller: code-execution`) are attributed to
+        // the sandbox; everything else is a direct call.
+        caller: if is_code_execution {
+            Caller::CodeExecution
+        } else {
+            Caller::Direct
+        },
     });
+}
+
+/// WOR-1644: attribute one MCP `tools/call` into the usage plane.
+/// Records the dispatch count and duration on
+/// `sbproxy_mcp_tool_dispatch_*`, the resolved cost on
+/// `sbproxy_mcp_tool_cost_usd_total`, and emits one `LlmUsageEvent`
+/// (keyed by tenant, principal, server, tool) to every configured
+/// usage sink, so tool spend lands in the same stream as model spend.
+fn emit_mcp_tool_attribution(
+    ctx: &RequestContext,
+    mcp: &sbproxy_modules::action::McpAction,
+    tool_name: &str,
+    server: Option<&str>,
+    outcome: &anyhow::Result<serde_json::Value>,
+    duration: std::time::Duration,
+) {
+    let (result_label, is_error): (&'static str, bool) = match outcome {
+        Ok(value) => {
+            let app_error = value
+                .get("isError")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if app_error {
+                ("tool_error", true)
+            } else {
+                ("ok", false)
+            }
+        }
+        Err(_) => ("tool_error", true),
+    };
+    sbproxy_observe::metrics::record_mcp_tool_dispatch(
+        tool_name,
+        result_label,
+        duration.as_secs_f64(),
+    );
+
+    let cost = mcp.tool_cost(tool_name);
+    let server = server.unwrap_or("unknown");
+    if let Some(cost_usd) = cost {
+        sbproxy_observe::metrics::record_mcp_tool_cost(tool_name, server, cost_usd);
+    }
+
+    // Usage-sink row: only build it when a sink is listening.
+    if mcp.usage_sinks.is_empty() {
+        return;
+    }
+    let event = sbproxy_ai::usage_sink::LlmUsageEvent {
+        // `mcp` provider + the owning server as the "model" so a tool
+        // call is filterable next to model completions without a
+        // separate schema.
+        provider: "mcp".to_string(),
+        model: server.to_string(),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+        cost_usd: cost.unwrap_or(0.0),
+        latency_ms: duration.as_millis() as u64,
+        status: if is_error { 500 } else { 200 },
+        key_id: {
+            let sub = ctx.principal.sub.clone();
+            (!sub.is_empty()).then_some(sub)
+        },
+        user: ctx.principal.attrs.user.clone(),
+        team: {
+            let tenant = ctx.principal.tenant_id.to_string();
+            (!tenant.is_empty()).then_some(tenant)
+        },
+        request_id: Some(ctx.request_id.to_string()),
+        tag: Some(format!("mcp_tool:{tool_name}")),
+    };
+    for sink in &mcp.usage_sinks {
+        sink.record(&event);
+    }
 }
 
 /// The two meta-tool definitions advertised by `tools/list` when
