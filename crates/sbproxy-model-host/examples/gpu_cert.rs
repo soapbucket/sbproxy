@@ -46,7 +46,8 @@ fn runtime_cert(repo: &str) {
     use sbproxy_model_host::launch::ProcessEngineLauncher;
     use sbproxy_model_host::weights::ensure_weight_file;
     use sbproxy_model_host::{
-        Catalog, ConfigDirMetadataProvider, ModelHostConfig, ModelHostRuntime, NvmlGpuProbe,
+        Catalog, ConfigDirMetadataProvider, GpuProbe, ModelHostConfig, ModelHostRuntime,
+        NvmlGpuProbe,
     };
     use std::sync::Arc;
     use std::time::Duration;
@@ -100,30 +101,50 @@ fn runtime_cert(repo: &str) {
         }
     };
 
-    // 2. A completion through the resolved port returns tokens.
-    if curl_tokens(port) {
+    // 2. A completion through the resolved port returns tokens. vLLM
+    //    serves under the repo id it was launched with.
+    if curl_tokens(port, repo) {
         println!("PASS: completion returned tokens through the runtime-spawned engine");
     } else {
         println!("FAIL: no tokens from the runtime-spawned engine");
     }
 
-    // 3. kill -9 the engine, then ensure_ready again -> health recheck
-    //    sees it dead and respawns.
-    println!("killing the vllm process tree ...");
-    let _ = std::process::Command::new("pkill")
-        .args(["-9", "-f", "vllm"])
-        .status();
-    std::thread::sleep(Duration::from_secs(5));
+    // 3. Evict through the runtime (kills the whole vLLM process group,
+    //    reaping the EngineCore workers that hold VRAM), confirm the
+    //    VRAM is actually released, then re-load: the load -> evict ->
+    //    reload cycle that multi-model residency depends on.
+    println!("evicting through the runtime (process-group kill) ...");
+    rt.block_on(runtime.unload("cert-model"));
+    wait_for_vram_free(
+        &NvmlGpuProbe::new(),
+        20 * 1024 * 1024 * 1024,
+        Duration::from_secs(60),
+    );
+    let free_after = NvmlGpuProbe::new()
+        .probe()
+        .first()
+        .map(|g| g.free_vram_bytes)
+        .unwrap_or(0);
+    if free_after >= 20 * 1024 * 1024 * 1024 {
+        println!(
+            "PASS: eviction reaped the engine tree and freed VRAM ({:.1} GiB free)",
+            free_after as f64 / 1e9
+        );
+    } else {
+        println!(
+            "FAIL: eviction leaked VRAM (only {:.1} GiB free)",
+            free_after as f64 / 1e9
+        );
+    }
     match rt.block_on(runtime.ensure_ready("cert-model")) {
         Ok(p2) => {
-            let recovered = curl_tokens(p2);
-            if recovered {
-                println!("PASS: recovered after kill -9 (respawned on port {p2}, serves tokens)");
+            if curl_tokens(p2, repo) {
+                println!("PASS: reloaded after eviction (port {p2}, serves tokens)");
             } else {
-                println!("FAIL: respawned on {p2} but no tokens");
+                println!("FAIL: reloaded on {p2} but no tokens");
             }
         }
-        Err(e) => println!("FAIL: no recovery after kill -9: {e}"),
+        Err(e) => println!("FAIL: reload after eviction: {e}"),
     }
 
     println!(
@@ -143,9 +164,40 @@ fn runtime_cert(_repo: &str) {
 /// POST a one-word completion to a local OpenAI-shaped engine and
 /// return whether it answered 200 with content. Uses curl to avoid an
 /// HTTP-client dep in the example.
+/// Wait until the GPU reports at least `need_bytes` free, or the
+/// timeout passes. vLLM holds most of the card, so after a kill the
+/// VRAM takes a few seconds to return before another engine can fit.
 #[cfg(all(feature = "gpu-nvidia", feature = "weights"))]
-fn curl_tokens(port: u16) -> bool {
-    let body = r#"{"model":"m","messages":[{"role":"user","content":"Say hi in one word."}],"max_tokens":8}"#;
+fn wait_for_vram_free(
+    probe: &sbproxy_model_host::NvmlGpuProbe,
+    need_bytes: u64,
+    timeout: std::time::Duration,
+) {
+    use sbproxy_model_host::GpuProbe;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let free = probe
+            .probe()
+            .first()
+            .map(|g| g.free_vram_bytes)
+            .unwrap_or(0);
+        if free >= need_bytes {
+            println!("VRAM recovered: {:.1} GiB free", free as f64 / 1e9);
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            println!("VRAM did not recover within {timeout:?} (still contended)");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    }
+}
+
+#[cfg(all(feature = "gpu-nvidia", feature = "weights"))]
+fn curl_tokens(port: u16, model: &str) -> bool {
+    let body = format!(
+        r#"{{"model":"{model}","messages":[{{"role":"user","content":"Say hi in one word."}}],"max_tokens":8}}"#
+    );
     let out = std::process::Command::new("curl")
         .args([
             "-sS",
@@ -155,7 +207,7 @@ fn curl_tokens(port: u16) -> bool {
             "-H",
             "Content-Type: application/json",
             "-d",
-            body,
+            body.as_str(),
         ])
         .output();
     match out {

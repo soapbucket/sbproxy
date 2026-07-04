@@ -396,6 +396,17 @@ impl EngineLauncher for ProcessEngineLauncher {
 
     async fn kill(&self) {
         if let Some(mut child) = self.child.lock().await.take() {
+            // vLLM forks worker processes (EngineCore) that hold the
+            // VRAM; killing only the parent PID leaks them. The child
+            // leads its own process group (`process_group(0)` at spawn),
+            // so kill the whole group by its negative PID. Falls back to
+            // the parent-only kill on non-Unix.
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &format!("-{pid}")])
+                    .status();
+            }
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
