@@ -520,7 +520,8 @@ mod tests {
     ) -> crate::config::ServeEntry {
         crate::config::ServeEntry {
             model: "qwen3-8b".into(),
-            engine: EngineKind::Vllm,
+            name: None,
+            engine: crate::config::EngineChoice::Vllm,
             keep_alive: None,
             max_context: None,
             extra_args: vec![],
