@@ -35,6 +35,7 @@ pub mod fit;
 pub mod hybrid;
 pub mod kv_tiering;
 pub mod launch;
+pub mod llama_release;
 pub mod lora;
 pub mod manifest;
 #[cfg(feature = "gpu-nvidia")]
@@ -67,6 +68,7 @@ pub use launch::{
     build_launch_spec, chunk_size_for_ttft, parse_duration, serving_flags, should_speculate,
     ProcessEngineLauncher,
 };
+pub use llama_release::{asset_url as llama_asset_url, resolve_on_path, Platform};
 pub use lora::{AdapterRoute, LoraCache};
 pub use manifest::{resolve_cache_dir, validate_serve_against_manifest, SourceScheme};
 #[cfg(feature = "gpu-nvidia")]
