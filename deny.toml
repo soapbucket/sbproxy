@@ -137,6 +137,26 @@ ignore = [
   # Unmaintained, no maintained replacement reachable; transitive; revisit
   # when pingora, object_store, kube, and axum-server update.
   "RUSTSEC-2025-0134",
+
+  # --- quick-xml 0.37.5 DoS advisories (transitive via object_store) -------
+  # These two are `vulnerability`-class (not merely unmaintained), so they
+  # are ignored with a tighter rationale. Path: quick-xml -> object_store
+  # 0.11.2 (direct dep of sbproxy-modules, the cloud blob-storage config
+  # backend) -> sbproxy-modules. quick-xml never parses proxy request bodies
+  # or MCP traffic; the only XML it decodes is the LIST/GET responses from
+  # the operator's own configured object store (S3/GCS/Azure), so the DoS
+  # surface is an operator-trusted endpoint, not attacker-controlled input.
+  # The fix is in quick-xml 0.38, which object_store 0.11's `^0.37` bound
+  # does not allow; there is no compatible patched release. Predates this
+  # change and is present on main. Transitive; revisit when object_store
+  # bumps its quick-xml floor to a 0.38 line.
+  #
+  # RUSTSEC-2026-0194: quadratic run time checking a start tag for duplicate
+  # attribute names.
+  "RUSTSEC-2026-0194",
+  # RUSTSEC-2026-0195: unbounded namespace-declaration allocation in
+  # `NsReader` (memory-exhaustion DoS).
+  "RUSTSEC-2026-0195",
 ]
 
 # --- Licenses -----------------------------------------------------------------
