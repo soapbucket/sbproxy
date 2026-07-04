@@ -95,7 +95,8 @@ pub struct AgentAlignmentConfig {
     #[serde(default)]
     pub max_tool_calls_per_turn: usize,
     /// WOR-1645: an optional MCP tool-access policy, the same
-    /// [`ToolAccessPolicy`] shape the `mcp` action enforces on
+    /// [`sbproxy_extension::mcp::ToolAccessPolicy`] shape the `mcp`
+    /// action enforces on
     /// `tools/call`. When set, every model-emitted tool call is
     /// checked against it with the request principal, so a deny rule
     /// written once (a YAML anchor referenced from both
