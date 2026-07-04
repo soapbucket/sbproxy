@@ -1,0 +1,36 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Single binary to self-host: the serve-only quickstart from
+# docs/self-hosting.md. One local model plus a cloud spill target in the
+# same fallback array. See docs/self-hosting.md for the full narrative.
+#
+# Run:
+#   make run CONFIG=examples/self-hosting/sb.yml
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "gateway.internal":
+    action:
+      type: ai_proxy
+      routing:
+        strategy: fallback_chain
+      providers:
+        # Provider zero: the model runs on this box. engine defaults to
+        # auto; the fit planner picks the quant the GPU can run.
+        - name: local
+          base_url: http://127.0.0.1:8000/v1
+          allow_private_base_url: true
+          default_model: qwen3-14b
+          models:
+            - qwen3-14b
+          serve:
+            models:
+              - model: qwen3-14b
+                keep_alive: 30m
+        # Spill target: overflow to the cloud when local is saturated,
+        # honoring per-request zdr / no_prompt_training.
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini

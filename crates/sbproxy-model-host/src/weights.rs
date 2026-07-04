@@ -68,6 +68,26 @@ pub fn verify_sha256(path: &Path, expected_hex: &str) -> Result<(), String> {
     }
 }
 
+/// Resolve a `file:` weight source (WOR-1681): weights already on disk,
+/// fetched over no network. Confirms the path exists and, when an
+/// `expected_sha256` is given, verifies it before the engine reads it.
+/// Returns the path unchanged (no copy: air-gapped weights stay where
+/// the operator put them). Needs no `weights` feature since it is only
+/// filesystem + sha256.
+pub fn resolve_local_source(path: &Path, expected_sha256: Option<&str>) -> Result<PathBuf, String> {
+    if !path.exists() {
+        return Err(format!("file: source does not exist: {}", path.display()));
+    }
+    if let Some(expected) = expected_sha256 {
+        // Verify a single file; a directory source is verified per-file
+        // by the caller against the manifest's sha256 map.
+        if path.is_file() {
+            verify_sha256(path, expected)?;
+        }
+    }
+    Ok(path.to_path_buf())
+}
+
 /// The Hugging Face hub base. Overridable with `HF_ENDPOINT` for
 /// mirrors / air-gapped proxies.
 #[cfg(feature = "weights")]
@@ -181,5 +201,21 @@ mod tests {
     #[test]
     fn verify_missing_file_is_error() {
         assert!(verify_sha256(Path::new("/no/such/file"), "abc").is_err());
+    }
+
+    #[test]
+    fn local_source_serves_without_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("model.gguf");
+        std::fs::write(&f, b"local weights").unwrap();
+        let hash = sha256_hex(&f).unwrap();
+        // Present + correct digest -> returns the path unchanged.
+        assert_eq!(resolve_local_source(&f, Some(&hash)).unwrap(), f);
+        // Present, no digest requested -> ok.
+        assert!(resolve_local_source(&f, None).is_ok());
+        // Wrong digest -> error.
+        assert!(resolve_local_source(&f, Some("deadbeef")).is_err());
+        // Missing path -> error.
+        assert!(resolve_local_source(Path::new("/no/such/model"), None).is_err());
     }
 }

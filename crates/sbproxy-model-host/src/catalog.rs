@@ -51,6 +51,50 @@ pub struct CatalogEntry {
     /// A pre-flight sanity bound only; the fit planner computes the
     /// real requirement from model metadata.
     pub min_vram_hint_gib: f64,
+
+    // --- Manifest fields (WOR-1681). All optional so the built-in
+    // certified catalog and any pre-manifest file still parse. When
+    // set on an operator manifest they carry everything needed to
+    // fetch and verify the weights. ---
+    /// Weight source scheme, e.g. `hf:Qwen/Qwen3-32B`, `file:/models/x`,
+    /// or `ms:...` (ModelScope, reserved). `None` derives `hf:{hf_repo}`.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Repo revision to pin (a branch, tag, or commit). `None` is
+    /// `main`. `weights` verifies it; this lets config express it.
+    #[serde(default)]
+    pub revision: Option<String>,
+    /// Per-file sha256 digests (filename -> lowercase hex). A curated
+    /// manifest with digests doubles as a supply-chain allowlist.
+    #[serde(default)]
+    pub sha256: BTreeMap<String, String>,
+    /// Hugging Face token for a gated repo, as an unresolved
+    /// `SecretResolver` reference (`${ENV}`, `secret:`, `vault://`,
+    /// ...). Resolved at the wiring layer, not here.
+    #[serde(default)]
+    pub hf_token: Option<String>,
+    /// Default engine for this model (overridable per serve entry).
+    #[serde(default)]
+    pub engine: crate::config::EngineChoice,
+    /// When to fetch the weights. Defaults to on-demand (first request).
+    #[serde(default)]
+    pub pull: PullPolicy,
+}
+
+/// When the weight manager fetches a model's weights (WOR-1681).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PullPolicy {
+    /// Fetch at server boot (warm before the first request).
+    OnBoot,
+    /// Fetch on the first request that needs the model (default).
+    #[default]
+    OnDemand,
+    /// Never fetch automatically; the operator warms the cache with
+    /// `sbproxy models pull`.
+    Manual,
 }
 
 /// The resolved target of a model reference: a concrete repo + a

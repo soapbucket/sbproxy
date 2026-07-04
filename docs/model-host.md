@@ -82,6 +82,21 @@ external fetch; an operator can supply their own catalog file, and can
 always skip the catalog with an `hf:` reference. The catalog is data
 only: it says what exists, and the fit planner decides what runs.
 
+## The model manifest
+
+Beyond a throwaway model, an operator keeps a manifest: one reviewable
+file that says which models exist and everything needed to fetch and
+verify them. Point `serve.catalog_file` at it. It is the fleet fact
+sheet; `sb.yml` is the box fact sheet (what this box serves, where its
+cache lives). Each entry carries a `source` (`hf:Org/Repo`, an
+air-gapped `file:` path, or `ms:` reserved for ModelScope), a pinned
+`revision`, per-file `sha256` digests (a curated manifest doubles as a
+supply-chain allowlist), a gated-repo `hf_token` as a secret reference,
+a default `engine`, and a `pull` policy (`on_boot`, `on_demand`,
+`manual`). The weight cache defaults to `/var/lib/sbproxy/models` for a
+service, honors `$HF_HOME` when set, and is overridable with
+`cache_dir`. See [`examples/model-manifest`](../examples/model-manifest).
+
 ## The fit planner
 
 The planner answers two questions the naive "does it fit VRAM" check

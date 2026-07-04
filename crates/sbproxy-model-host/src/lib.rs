@@ -33,8 +33,10 @@ pub mod catalog;
 pub mod config;
 pub mod fit;
 pub mod hybrid;
+pub mod kv_tiering;
 pub mod launch;
 pub mod lora;
+pub mod manifest;
 #[cfg(feature = "gpu-nvidia")]
 pub mod probe_nvidia;
 pub mod residency;
@@ -42,7 +44,7 @@ pub mod supervisor;
 pub mod supply_chain;
 pub mod weights;
 
-pub use catalog::{Catalog, CatalogEntry, ModelRef, ResolveError};
+pub use catalog::{Catalog, CatalogEntry, ModelRef, PullPolicy, ResolveError};
 pub use config::{
     ChunkedPrefill, EngineChoice, EngineDoctor, EngineEnv, EngineKind, EngineLaunchMethod,
     EngineProvisioning, EvictionPolicy, KvCacheQuant, LoraAdapter, ModelHostConfig, ServeEntry,
@@ -53,11 +55,13 @@ pub use fit::{
     ModelMetadata, Quant, StaticGpuProbe, ThroughputEstimate,
 };
 pub use hybrid::{savings_micros, AliasTable, CloudPrice, LaneSplit};
+pub use kv_tiering::{KvTier, KvTieringPolicy, TierDecision};
 pub use launch::{
     build_launch_spec, chunk_size_for_ttft, parse_duration, serving_flags, should_speculate,
     ProcessEngineLauncher,
 };
 pub use lora::{AdapterRoute, LoraCache};
+pub use manifest::{resolve_cache_dir, validate_serve_against_manifest, SourceScheme};
 #[cfg(feature = "gpu-nvidia")]
 pub use probe_nvidia::NvmlGpuProbe;
 pub use residency::{Admission, ResidencyManager, Resident};
