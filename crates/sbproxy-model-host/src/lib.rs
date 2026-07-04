@@ -44,8 +44,9 @@ pub mod weights;
 
 pub use catalog::{Catalog, CatalogEntry, ModelRef, ResolveError};
 pub use config::{
-    ChunkedPrefill, EngineKind, EvictionPolicy, KvCacheQuant, LoraAdapter, ModelHostConfig,
-    ServeEntry, SpecMethod, SpeculativeConfig,
+    ChunkedPrefill, EngineChoice, EngineDoctor, EngineEnv, EngineKind, EngineLaunchMethod,
+    EngineProvisioning, EvictionPolicy, KvCacheQuant, LoraAdapter, ModelHostConfig, ServeEntry,
+    SpecMethod, SpeculativeConfig,
 };
 pub use fit::{
     estimate_throughput, fp8_supported, FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor,

@@ -20,7 +20,17 @@ use serde::{Deserialize, Serialize};
 /// engine, so config chooses an engine and its knobs, never an
 /// arbitrary executable.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum EngineKind {
@@ -38,6 +48,112 @@ impl EngineKind {
         match self {
             EngineKind::Vllm => "vllm",
             EngineKind::LlamaCpp => "llama-server",
+        }
+    }
+}
+
+/// The engine an operator asks for on a model (WOR-1684). Unlike
+/// [`EngineKind`] (the resolved identity), this includes `Auto`, which
+/// the runtime resolves per model at boot from the weight format and
+/// what is installed. `Auto` is the default so a minimal `serve:`
+/// block does not have to name an engine.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineChoice {
+    /// Resolve the engine from the weights and the environment.
+    #[default]
+    Auto,
+    /// Force vLLM.
+    Vllm,
+    /// Force llama.cpp.
+    LlamaCpp,
+}
+
+impl EngineChoice {
+    /// Resolve to a concrete [`EngineKind`]. `Auto` picks llama.cpp for
+    /// GGUF weights or when no container runtime is available (the
+    /// zero-dependency path), and vLLM otherwise (safetensors / FP8 /
+    /// tensor parallelism, which is the datacenter default). A forced
+    /// choice is returned unchanged.
+    pub fn resolve(self, is_gguf: bool, container_runtime: bool) -> EngineKind {
+        match self {
+            EngineChoice::Vllm => EngineKind::Vllm,
+            EngineChoice::LlamaCpp => EngineKind::LlamaCpp,
+            EngineChoice::Auto => {
+                if is_gguf || !container_runtime {
+                    EngineKind::LlamaCpp
+                } else {
+                    EngineKind::Vllm
+                }
+            }
+        }
+    }
+
+    /// A short human-readable reason for the `Auto` resolution, for the
+    /// plan-time engine doctor.
+    pub fn resolve_reason(self, is_gguf: bool, container_runtime: bool) -> &'static str {
+        match self {
+            EngineChoice::Vllm => "engine: vllm (forced)",
+            EngineChoice::LlamaCpp => "engine: llama_cpp (forced)",
+            EngineChoice::Auto if is_gguf => "auto -> llama_cpp (GGUF weights)",
+            EngineChoice::Auto if !container_runtime => {
+                "auto -> llama_cpp (no container runtime for vLLM)"
+            }
+            EngineChoice::Auto => "auto -> vllm (safetensors, container runtime present)",
+        }
+    }
+}
+
+/// How an engine binary is acquired (WOR-1684). Engine *identity*
+/// stays the allowlisted [`EngineKind`]; only the acquisition method
+/// is configurable, so the config-spawn security posture (no arbitrary
+/// `cmd:`) is unchanged.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineLaunchMethod {
+    /// Resolve the engine binary from `PATH`.
+    #[default]
+    Binary,
+    /// Run the engine from a pinned container image.
+    Container,
+    /// Run the engine from a managed uv/venv (vLLM's Python path).
+    Venv,
+}
+
+/// Provisioning for one engine (how to acquire it), keyed by engine in
+/// [`ModelHostConfig::engines`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct EngineProvisioning {
+    /// How the binary is acquired.
+    #[serde(default)]
+    pub launch: EngineLaunchMethod,
+    /// Pinned container image (a tag or digest, never `:latest`) for
+    /// [`EngineLaunchMethod::Container`]. Rejected at plan time if it
+    /// ends in `:latest` or has no tag.
+    #[serde(default)]
+    pub image: Option<String>,
+}
+
+impl EngineProvisioning {
+    /// Whether `image` is acceptably pinned (has a tag or digest that
+    /// is not `latest`). Only meaningful for the container method.
+    pub fn image_is_pinned(&self) -> bool {
+        match &self.image {
+            None => true, // no image is fine for non-container methods
+            Some(img) => {
+                if let Some((_, tag)) = img.rsplit_once('@') {
+                    // digest form repo@sha256:...
+                    return tag.starts_with("sha256:") && tag.len() > "sha256:".len();
+                }
+                match img.rsplit_once(':') {
+                    Some((repo, tag)) => !repo.is_empty() && !tag.is_empty() && tag != "latest",
+                    None => false, // no tag at all
+                }
+            }
         }
     }
 }
@@ -168,9 +284,17 @@ pub struct ServeEntry {
     /// Catalog id (`qwen3-32b`) or an explicit `hf:Org/Repo:QUANT`
     /// reference. Resolved by [`crate::catalog`].
     pub model: String,
-    /// Engine to serve it with. Defaults to vLLM.
+    /// The model id every other plane sees (WOR-1683): routing,
+    /// `allowed_models`, rate limits, budgets, aliases. Defaults to the
+    /// catalog id in `model`; **required** when `model` is a raw `hf:`
+    /// reference (there is no catalog id to borrow). See
+    /// [`Self::effective_name`].
     #[serde(default)]
-    pub engine: EngineKind,
+    pub name: Option<String>,
+    /// Engine to serve it with. Defaults to `auto` (resolved per model
+    /// at boot from the weight format and what is installed).
+    #[serde(default)]
+    pub engine: EngineChoice,
     /// Idle time before the engine is unloaded to free VRAM. Go
     /// duration syntax (`10m`, `1h`); `None` means never auto-unload.
     #[serde(default)]
@@ -221,6 +345,10 @@ pub struct ModelHostConfig {
     /// What to do under VRAM pressure. Defaults to LRU eviction.
     #[serde(default)]
     pub eviction: EvictionPolicy,
+    /// Per-engine provisioning (how to acquire each engine binary).
+    /// Absent engines use the default (resolve from `PATH`).
+    #[serde(default)]
+    pub engines: std::collections::BTreeMap<EngineKind, EngineProvisioning>,
 }
 
 impl ServeEntry {
@@ -231,12 +359,123 @@ impl ServeEntry {
             .as_deref()
             .and_then(crate::launch::parse_duration)
     }
+
+    /// The model id this entry registers under (WOR-1683): the explicit
+    /// `name`, else the catalog id in `model`. Returns an error when
+    /// `model` is a raw `hf:` reference (or otherwise not a plain
+    /// catalog id) and no `name` was given, since a bare ref must not
+    /// leak into routing config as a model id.
+    pub fn effective_name(&self) -> Result<String, String> {
+        if let Some(n) = &self.name {
+            if n.trim().is_empty() {
+                return Err(format!(
+                    "serve entry for '{}' has an empty name",
+                    self.model
+                ));
+            }
+            return Ok(n.clone());
+        }
+        // A plain catalog id has no scheme prefix and no colon-quant.
+        if self.model.starts_with("hf:") || self.model.contains(':') || self.model.contains('/') {
+            return Err(format!(
+                "serve entry '{}' is a raw reference; give it a `name:` to use as the model id",
+                self.model
+            ));
+        }
+        Ok(self.model.clone())
+    }
 }
 
 impl ModelHostConfig {
     /// True when no models are configured (the block is inert).
     pub fn is_empty(&self) -> bool {
         self.models.is_empty()
+    }
+
+    /// The registered model names, in order (WOR-1683). The provider's
+    /// `models:` list is derived from this when `serve:` is present.
+    /// Errors on a nameless raw reference or a duplicate name.
+    pub fn model_names(&self) -> Result<Vec<String>, String> {
+        let mut names = Vec::with_capacity(self.models.len());
+        let mut seen = std::collections::HashSet::new();
+        for entry in &self.models {
+            let name = entry.effective_name()?;
+            if !seen.insert(name.clone()) {
+                return Err(format!("duplicate serve model name '{name}'"));
+            }
+            names.push(name);
+        }
+        Ok(names)
+    }
+}
+
+/// What the environment offers, for the plan-time engine doctor
+/// (WOR-1684). The runtime fills this from `PATH` lookups + GPU probe;
+/// the report logic ([`EngineDoctor::for_entry`]) is pure so it is
+/// testable against a synthetic environment with no real box.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineEnv {
+    /// The `vllm` binary is on `PATH`.
+    pub vllm_on_path: bool,
+    /// The `llama-server` binary is on `PATH`.
+    pub llama_server_on_path: bool,
+    /// A container runtime (docker/podman) is available.
+    pub container_runtime: bool,
+    /// At least one GPU was discovered.
+    pub gpu_present: bool,
+}
+
+/// One serve entry's engine resolution + whether the box can run it,
+/// reported by `sbproxy plan` before anything spawns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineDoctor {
+    /// The registered model name (or the raw `model` when unnamed).
+    pub model: String,
+    /// The engine `auto`/forced resolved to.
+    pub resolved: EngineKind,
+    /// The one-line reason for the resolution.
+    pub reason: String,
+    /// Whether the resolved engine's binary is available on the box.
+    pub runnable: bool,
+    /// A note when not runnable (what is missing).
+    pub blocker: Option<String>,
+}
+
+impl EngineDoctor {
+    /// Diagnose one serve entry against the environment. `is_gguf` is
+    /// whether the resolved weights are GGUF (from the fit planner /
+    /// catalog); the caller knows it, the doctor does not fetch.
+    pub fn for_entry(entry: &ServeEntry, is_gguf: bool, env: &EngineEnv) -> Self {
+        let resolved = entry.engine.resolve(is_gguf, env.container_runtime);
+        let reason = entry
+            .engine
+            .resolve_reason(is_gguf, env.container_runtime)
+            .to_string();
+        let (runnable, blocker) = match resolved {
+            EngineKind::LlamaCpp => (
+                env.llama_server_on_path,
+                (!env.llama_server_on_path).then(|| "llama-server not found on PATH".to_string()),
+            ),
+            EngineKind::Vllm => {
+                // vLLM runs from PATH or a container; either satisfies.
+                let ok = env.vllm_on_path || env.container_runtime;
+                (
+                    ok,
+                    (!ok).then(|| {
+                        "vLLM needs the `vllm` binary on PATH or a container runtime".to_string()
+                    }),
+                )
+            }
+        };
+        Self {
+            model: entry
+                .effective_name()
+                .unwrap_or_else(|_| entry.model.clone()),
+            resolved,
+            reason,
+            runnable,
+            blocker,
+        }
     }
 }
 
@@ -255,9 +494,11 @@ models:
         .expect("parse");
         assert_eq!(cfg.models.len(), 1);
         assert_eq!(cfg.models[0].model, "qwen3-32b");
-        // Defaults.
-        assert_eq!(cfg.models[0].engine, EngineKind::Vllm);
+        // Defaults: engine resolves at boot, so config default is Auto.
+        assert_eq!(cfg.models[0].engine, EngineChoice::Auto);
         assert_eq!(cfg.eviction, EvictionPolicy::Lru);
+        // A plain catalog id is its own model name.
+        assert_eq!(cfg.models[0].effective_name().unwrap(), "qwen3-32b");
     }
 
     #[test]
@@ -278,7 +519,7 @@ models:
         .expect("parse");
         assert_eq!(cfg.eviction, EvictionPolicy::Never);
         let e = &cfg.models[0];
-        assert_eq!(e.engine, EngineKind::LlamaCpp);
+        assert_eq!(e.engine, EngineChoice::LlamaCpp);
         assert_eq!(e.keep_alive.as_deref(), Some("30m"));
         assert_eq!(e.max_context, Some(8192));
         assert_eq!(e.extra_args, vec!["--flash-attn"]);
@@ -352,7 +593,8 @@ models:
         // carries only the known keys.
         let e = ServeEntry {
             model: "qwen3-8b".into(),
-            engine: EngineKind::Vllm,
+            name: None,
+            engine: EngineChoice::Vllm,
             keep_alive: None,
             max_context: None,
             extra_args: vec![],
@@ -403,5 +645,147 @@ models:
         ] {
             assert_eq!(kind.binary_name(), expect);
         }
+    }
+
+    // --- WOR-1683: named serve entries ---
+
+    #[test]
+    fn name_defaults_to_catalog_id_and_hf_ref_requires_name() {
+        let cfg: ModelHostConfig = serde_yaml::from_str(
+            "\
+models:
+  - model: qwen3-14b
+  - model: hf:Qwen/Qwen3-8B-GGUF:Q4_K_M
+    name: local-coder
+",
+        )
+        .expect("parse");
+        assert_eq!(cfg.models[0].effective_name().unwrap(), "qwen3-14b");
+        assert_eq!(cfg.models[1].effective_name().unwrap(), "local-coder");
+        assert_eq!(
+            cfg.model_names().unwrap(),
+            vec!["qwen3-14b".to_string(), "local-coder".to_string()]
+        );
+    }
+
+    #[test]
+    fn nameless_hf_ref_is_a_plan_error() {
+        let cfg: ModelHostConfig =
+            serde_yaml::from_str("models:\n  - model: hf:Qwen/Qwen3-8B:Q4_K_M\n").expect("parse");
+        assert!(cfg.models[0].effective_name().is_err());
+        assert!(cfg.model_names().is_err());
+    }
+
+    #[test]
+    fn duplicate_names_rejected() {
+        let cfg: ModelHostConfig = serde_yaml::from_str(
+            "\
+models:
+  - model: qwen3-14b
+  - model: hf:Org/Other:Q4
+    name: qwen3-14b
+",
+        )
+        .expect("parse");
+        let err = cfg.model_names().unwrap_err();
+        assert!(err.contains("duplicate"), "got: {err}");
+    }
+
+    #[test]
+    fn same_weights_two_names_two_contexts() {
+        // The same catalog model served twice under different names /
+        // context lengths (WOR-1683 acceptance).
+        let cfg: ModelHostConfig = serde_yaml::from_str(
+            "\
+models:
+  - model: qwen3-14b
+    name: qwen-short
+    max_context: 8192
+  - model: qwen3-14b
+    name: qwen-long
+    max_context: 131072
+",
+        )
+        .expect("parse");
+        assert_eq!(
+            cfg.model_names().unwrap(),
+            vec!["qwen-short".to_string(), "qwen-long".to_string()]
+        );
+    }
+
+    // --- WOR-1684: engine auto-resolution + provisioning + doctor ---
+
+    #[test]
+    fn engine_auto_resolves_by_format_and_runtime() {
+        // GGUF -> llama.cpp regardless of runtime.
+        assert_eq!(EngineChoice::Auto.resolve(true, true), EngineKind::LlamaCpp);
+        // safetensors + container runtime -> vLLM.
+        assert_eq!(EngineChoice::Auto.resolve(false, true), EngineKind::Vllm);
+        // safetensors but no container runtime -> llama.cpp (zero-dep).
+        assert_eq!(
+            EngineChoice::Auto.resolve(false, false),
+            EngineKind::LlamaCpp
+        );
+        // A forced choice ignores the environment.
+        assert_eq!(EngineChoice::Vllm.resolve(true, false), EngineKind::Vllm);
+    }
+
+    #[test]
+    fn engines_block_parses_and_pins_images() {
+        let cfg: ModelHostConfig = serde_yaml::from_str(
+            "\
+engines:
+  vllm:
+    launch: container
+    image: vllm/vllm-openai:v0.24.0
+models:
+  - model: qwen3-14b
+",
+        )
+        .expect("parse");
+        let vllm = cfg.engines.get(&EngineKind::Vllm).unwrap();
+        assert_eq!(vllm.launch, EngineLaunchMethod::Container);
+        assert!(vllm.image_is_pinned());
+        // :latest and untagged are not pinned.
+        let bad = EngineProvisioning {
+            launch: EngineLaunchMethod::Container,
+            image: Some("vllm/vllm-openai:latest".into()),
+        };
+        assert!(!bad.image_is_pinned());
+        let untagged = EngineProvisioning {
+            launch: EngineLaunchMethod::Container,
+            image: Some("vllm/vllm-openai".into()),
+        };
+        assert!(!untagged.image_is_pinned());
+        // A digest is pinned.
+        let digest = EngineProvisioning {
+            launch: EngineLaunchMethod::Container,
+            image: Some("vllm/vllm-openai@sha256:abc123".into()),
+        };
+        assert!(digest.image_is_pinned());
+    }
+
+    #[test]
+    fn engine_doctor_reports_resolution_and_blockers() {
+        let entry: ServeEntry = serde_yaml::from_str("model: qwen3-14b\nname: q\n").expect("entry");
+        // Box with only llama-server, no container runtime: auto +
+        // GGUF resolves to llama.cpp and is runnable.
+        let env = EngineEnv {
+            vllm_on_path: false,
+            llama_server_on_path: true,
+            container_runtime: false,
+            gpu_present: true,
+        };
+        let d = EngineDoctor::for_entry(&entry, true, &env);
+        assert_eq!(d.resolved, EngineKind::LlamaCpp);
+        assert!(d.runnable);
+        assert!(d.reason.contains("llama_cpp"));
+
+        // Box with nothing: safetensors + no runtime -> llama.cpp, and
+        // llama-server is absent, so it is not runnable with a blocker.
+        let bare = EngineEnv::default();
+        let d2 = EngineDoctor::for_entry(&entry, false, &bare);
+        assert!(!d2.runnable);
+        assert!(d2.blocker.is_some());
     }
 }

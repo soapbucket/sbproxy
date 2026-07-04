@@ -30,20 +30,29 @@ origins:
           base_url: http://127.0.0.1:8000/v1
           allow_private_base_url: true
           default_model: qwen3-14b
+          # The names below are the serve-entry names (WOR-1683): the
+          # model id every plane sees. Once the serve -> provider
+          # derivation is wired into the compiler this list becomes
+          # optional, derived from serve.models[].name.
           models:
             - qwen3-14b
+            - local-coder
           serve:
             eviction: lru
             cache_budget_gib: 200
             models:
-              # A catalog id (see the built-in model catalog). The fit
-              # planner picks the quant the GPU can run: an L4 accepts
-              # FP8, a T4 falls back to the Q4 GGUF.
+              # A catalog id (see the built-in model catalog). engine
+              # defaults to `auto`: GGUF or no container runtime picks
+              # llama.cpp, safetensors/FP8 picks vLLM. The fit planner
+              # picks the quant the GPU can run (L4 accepts FP8, T4
+              # falls back to the Q4 GGUF). The catalog id is the name.
               - model: qwen3-14b
-                engine: vllm
                 keep_alive: 30m
               # An explicit hf:Org/Repo:QUANT reference bypasses the
-              # catalog; llama.cpp is the low-VRAM / GGUF path.
+              # catalog, so it needs an explicit `name:` (the raw ref
+              # must not leak into routing config). llama.cpp is the
+              # low-VRAM / GGUF path.
               - model: hf:Qwen/Qwen3-8B-GGUF:Q4_K_M
+                name: local-coder
                 engine: llama_cpp
                 keep_alive: 15m
