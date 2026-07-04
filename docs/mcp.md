@@ -33,9 +33,10 @@ the aggregated tool catalogue across every federated upstream.
 `tools/call` routes by tool name to the owning upstream. `ping`
 returns `"pong"`. Notifications (requests with no `id`) get no
 response. Unknown methods return JSON-RPC error `-32601`
-(`method_not_found`). See
-`crates/sbproxy-extension/src/mcp/handler.rs:McpHandler` and
-`crates/sbproxy-extension/src/mcp/types.rs` for the wire enums.
+(`method_not_found`). The gateway serves this from
+`crates/sbproxy-core/src/server/action_dispatch.rs`
+(`handle_mcp_action`); the wire enums are in
+`crates/sbproxy-extension/src/mcp/types.rs`.
 
 ## Minimal config
 
@@ -113,28 +114,24 @@ The gateway is built on `crates/sbproxy-extension/src/mcp/`. The
 that library. Each submodule below is operator-visible either
 through a YAML knob or a runtime behaviour worth knowing about.
 
-### `handler`: JSON-RPC dispatcher
+### JSON-RPC dispatcher
 
-Dispatches `initialize`, `tools/list`, `tools/call`, and `ping`.
-Notifications return nothing. `initialize` answers with the configured
-`server_info` plus a `capabilities` block. When the host origin has
-`agent_skills:` configured, `capabilities.experimental.agentSkillsUrl`
-is set to the absolute URL of
-`/.well-known/agent-skills/index.json`; see
-[`agent-skills.md`](agent-skills.md). Source:
-`crates/sbproxy-extension/src/mcp/handler.rs:McpHandler`.
+Dispatches `initialize`, `tools/list`, `tools/call`, `ping`,
+`resources/list`, and `resources/read`. Notifications (no `id`) get a
+`202 Accepted`. `initialize` answers with the configured `server_info`
+plus a `capabilities` block; it negotiates the protocol version and,
+when the host origin has `agent_skills:` configured, sets
+`capabilities.experimental.agentSkillsUrl` to the absolute URL of
+`/.well-known/agent-skills/index.json` (see
+[`agent-skills.md`](agent-skills.md)). The dispatcher lives in the
+runtime, not the extension library:
+`crates/sbproxy-core/src/server/action_dispatch.rs`
+(`handle_mcp_action`). The `federation` submodule below holds the tool
+aggregation, transports, and the injectable-source registry it calls
+into.
 
 No direct YAML knobs. The `server_info` block on the action shapes
 the response.
-
-### `registry`: embedded tool catalogue
-
-Backs the embedded handler with a static map of tool definitions and
-their fulfilment strategy (`Static(value)` returns a fixed JSON
-payload, `Proxy { origin }` forwards to another origin). Used when
-SBproxy serves its own tools rather than federating; in the OSS build,
-federation is the documented path. Source:
-`crates/sbproxy-extension/src/mcp/registry.rs:ToolRegistry`.
 
 ### `types`: protocol envelopes
 

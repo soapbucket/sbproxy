@@ -37,9 +37,7 @@ pub mod discovery;
 pub mod discovery_inventory;
 pub mod federation;
 pub mod guardrails;
-pub mod handler;
 pub mod openapi_convert;
-pub mod registry;
 pub mod rest_to_mcp;
 /// WOR-486: schema-drift detection for converted MCP servers.
 /// Diffs two OpenAPI snapshots and classifies the changes by
@@ -74,9 +72,7 @@ pub use federation::{
     VersioningMode,
 };
 pub use guardrails::{check_tool_invocation, McpGuardrailConfig};
-pub use handler::{InitializeContext, McpHandler};
 pub use openapi_convert::{openapi_to_mcp_tools, openapi_to_routes, OpenApiRoute};
-pub use registry::{ToolHandlerType, ToolRegistry};
 pub use rest_to_mcp::{create_mcp_handler, execute_tool_as_rest, RestToMcpConfig};
 pub use types::*;
 pub use verify_before_commit::{
