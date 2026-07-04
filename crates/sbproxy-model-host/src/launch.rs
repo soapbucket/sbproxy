@@ -397,20 +397,56 @@ impl EngineLauncher for ProcessEngineLauncher {
     async fn kill(&self) {
         if let Some(mut child) = self.child.lock().await.take() {
             // vLLM forks worker processes (EngineCore) that hold the
-            // VRAM; killing only the parent PID leaks them. The child
-            // leads its own process group (`process_group(0)` at spawn),
-            // so kill the whole group by its negative PID. Falls back to
-            // the parent-only kill on non-Unix.
+            // VRAM, and it double-forks, so neither a parent SIGKILL nor
+            // a child-group kill reliably reaps them. The reliable path
+            // is graceful: SIGTERM the engine and let it tear down its
+            // own workers (SIGKILL cannot be caught, so it would orphan
+            // them). We SIGKILL only as a backstop if it does not exit,
+            // and even then only its own process group, never ours (that
+            // would take down the gateway).
             #[cfg(unix)]
             if let Some(pid) = child.id() {
                 let _ = std::process::Command::new("kill")
-                    .args(["-KILL", &format!("-{pid}")])
+                    .args(["-TERM", &pid.to_string()])
                     .status();
             }
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            // Give it a moment to shut its workers down cleanly.
+            if tokio::time::timeout(Duration::from_secs(10), child.wait())
+                .await
+                .is_err()
+            {
+                #[cfg(unix)]
+                if let Some(pid) = child.id() {
+                    // Backstop: group-kill, but only a distinct group the
+                    // child truly leads (pgid == pid), never our own.
+                    match (pgid_of(pid), pgid_of(std::process::id())) {
+                        (Some(child_pgid), Some(our_pgid))
+                            if child_pgid == pid && child_pgid != our_pgid =>
+                        {
+                            let _ = std::process::Command::new("kill")
+                                .args(["-KILL", &format!("-{child_pgid}")])
+                                .status();
+                        }
+                        _ => {}
+                    }
+                }
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
         }
     }
+}
+
+/// The process-group id of `pid` via `ps`, or `None` if it cannot be
+/// read. Used to guard the backstop group kill so it never targets our
+/// own group (which would SIGKILL the gateway).
+#[cfg(unix)]
+fn pgid_of(pid: u32) -> Option<u32> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 #[cfg(test)]

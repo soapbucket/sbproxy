@@ -113,7 +113,7 @@ fn runtime_cert(repo: &str) {
     //    reaping the EngineCore workers that hold VRAM), confirm the
     //    VRAM is actually released, then re-load: the load -> evict ->
     //    reload cycle that multi-model residency depends on.
-    println!("evicting through the runtime (process-group kill) ...");
+    println!("evicting through the runtime (graceful engine shutdown) ...");
     rt.block_on(runtime.unload("cert-model"));
     wait_for_vram_free(
         &NvmlGpuProbe::new(),
