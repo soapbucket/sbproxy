@@ -35,6 +35,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [local-inference.md](local-inference.md) - run embeddings (semantic cache) and prompt-injection classify on local ONNX models via the sidecar or in-process.
 - [self-hosting.md](self-hosting.md) - single binary to self-host: install, the serve-only quickstart, the model manifest, aliases, spill-to-cloud, and the OpenRouter parity map.
 - [model-host.md](model-host.md) - the gateway hosts the LLM itself: catalog, the `serve:` block, the GPU fit planner, and the engine supervisor (single-node local serving).
+- [gpu-fit-planning.md](gpu-fit-planning.md) - how the fit planner picks a quant for your GPU: capability tiers, the weights + KV math, throughput, and why it refuses an impossible config.
 - [model-host-certification.md](model-host-certification.md) - provisioning a cloud L4 GPU and running the model-host Definition-of-Done certification (the `gpu-nvidia` / `weights` features).
 - [security-model-host.md](security-model-host.md) - the config-spawn attack surface: engine allowlist (no cmd:), sha256 weights, PATH/pinned binaries, and what the spawn phase must enforce.
 - [ai-lb-benchmark.md](ai-lb-benchmark.md) - P50/P95/P99/P99.9 latency comparison across AI router strategies under skewed load.
