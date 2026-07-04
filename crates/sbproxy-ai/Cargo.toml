@@ -25,6 +25,10 @@ sbproxy-classifier-client.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
+# WOR-1686: JsonSchema on ProviderConfig so a committed schema covers
+# the serve: block (editor autocomplete). ModelHostConfig already
+# derives it; this pulls the provider surface in.
+schemars.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 # WOR-800: prompt-store template rendering.

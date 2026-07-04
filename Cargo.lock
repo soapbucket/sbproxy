@@ -6361,6 +6361,7 @@ dependencies = [
  "sbproxy-platform",
  "sbproxy-plugin",
  "sbproxy-security",
+ "schemars",
  "serde",
  "serde_json",
  "sha2 0.11.0",
