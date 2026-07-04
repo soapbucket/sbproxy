@@ -74,7 +74,9 @@ pub use probe_nvidia::NvmlGpuProbe;
 pub use pull::{pull_plan, PullItem, PullMode};
 pub use report::{ModelValue, ValueReport};
 pub use residency::{Admission, ResidencyManager, Resident};
-pub use runtime::{ModelHostRuntime, ModelMetadataProvider, RuntimeError};
+pub use runtime::{
+    parse_params, ConfigDirMetadataProvider, ModelHostRuntime, ModelMetadataProvider, RuntimeError,
+};
 pub use scheduling::{admit, next_to_admit, PriorityClass, SchedulingDecision};
 pub use sleep_wake::{is_sleeping, sleep, wake_up, SleepLevel};
 pub use supervisor::{EngineLauncher, EngineState, LaunchSpec, SupervisorError};
