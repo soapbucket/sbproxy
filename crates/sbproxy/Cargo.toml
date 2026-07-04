@@ -60,6 +60,13 @@ tls-fingerprint = ["sbproxy-core/tls-fingerprint"]
 # build does not require a prior `pnpm build` of the React scaffold.
 # See `ui/README.md` for the build flow.
 embed-admin-ui = ["sbproxy-core/embed-admin-ui"]
+# WOR-1680/1652: local model serving on a GPU host. `gpu-nvidia` gives
+# the model host a real NVML probe; `model-weights` enables the Hugging
+# Face weight pull. Off by default (a GPU-free build serves no local
+# models, so a serve: provider rejects admission cleanly); enable both
+# on a GPU host that hosts models locally.
+gpu-nvidia = ["sbproxy-core/gpu-nvidia"]
+model-weights = ["sbproxy-core/model-weights"]
 
 [dependencies]
 sbproxy-core.workspace = true

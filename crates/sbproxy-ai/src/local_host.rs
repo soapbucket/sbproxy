@@ -232,4 +232,86 @@ mod tests {
         assert_eq!(url.as_deref(), Some("http://127.0.0.1:41999/v1"));
         assert_eq!(host.last.lock().unwrap().as_deref(), Some("coder"));
     }
+
+    /// A host whose `ensure_ready` actually binds a minimal OpenAI-shaped
+    /// engine on a loopback port, so a real HTTP round trip can be made
+    /// against the resolved URL, no GPU or real engine involved.
+    struct FakeEngineHost {
+        port: AtomicU16,
+    }
+
+    impl FakeEngineHost {
+        async fn spawn() -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut s, _)) = listener.accept().await else {
+                        return;
+                    };
+                    // Read the request (ignore contents) then answer a
+                    // canned OpenAI chat completion.
+                    let mut buf = [0u8; 2048];
+                    let _ = s.read(&mut buf).await;
+                    let body = r#"{"id":"cmpl-fake","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                }
+            });
+            Self {
+                port: AtomicU16::new(port),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LocalModelHost for FakeEngineHost {
+        async fn ensure_ready(&self, _name: &str) -> Result<u16, RuntimeError> {
+            Ok(self.port.load(Ordering::SeqCst))
+        }
+        async fn resolved_base_url(&self, _name: &str) -> Option<String> {
+            Some(format!(
+                "http://127.0.0.1:{}/v1",
+                self.port.load(Ordering::SeqCst)
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_only_provider_completes_a_chat_round_trip_on_cpu() {
+        // WOR-1680 acceptance: a provider whose body is just serve:
+        // (no address anywhere) resolves to a live engine and a chat
+        // completion round-trips, on a CPU with a fake engine.
+        let host = FakeEngineHost::spawn().await;
+        let provider = provider_with_serve("models:\n  - model: qwen3-14b\n", None);
+        assert!(provider.base_url.is_none(), "no address in config");
+
+        let base = resolve_served_base_url(&provider, Some("qwen3-14b"), &host)
+            .await
+            .unwrap()
+            .expect("served provider resolves to a URL");
+
+        // Real HTTP POST to the resolved engine URL.
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/chat/completions"))
+            .json(&serde_json::json!({
+                "model": "qwen3-14b",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .expect("request reaches the resolved engine");
+        assert!(resp.status().is_success());
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            v["choices"][0]["message"]["content"], "hi",
+            "engine returned a completion"
+        );
+    }
 }

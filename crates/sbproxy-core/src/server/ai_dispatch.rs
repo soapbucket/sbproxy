@@ -2515,7 +2515,36 @@ pub(super) async fn handle_ai_proxy(
         if attempt >= max_attempts {
             break;
         }
-        let provider = &config.providers[provider_idx];
+        // WOR-1680: a provider with a serve: block hosts its model on
+        // this box. Resolve its live loopback engine port and route
+        // there instead of a base_url (which a served provider does not
+        // carry). Bring the engine to ready on demand. If it cannot be
+        // brought up, treat this like a failed attempt and fail over to
+        // the next provider (a lone served provider that fails then
+        // yields the "no provider succeeded" 502 after the loop).
+        let mut resolved_provider = config.providers[provider_idx].clone();
+        if resolved_provider.serve.is_some() {
+            let requested = (!model.is_empty()).then_some(model.as_str());
+            match crate::server::model_host::served_upstream(config, &resolved_provider, requested)
+                .await
+            {
+                Ok(Some(url)) => resolved_provider.base_url = Some(url),
+                Ok(None) => {}
+                Err(e) => {
+                    sbproxy_observe::metrics::record_provider_attempt(
+                        &resolved_provider.name,
+                        "error",
+                    );
+                    warn!(
+                        provider = %resolved_provider.name,
+                        attempt = %attempt,
+                        "AI proxy: local engine unavailable, failing over: {e}"
+                    );
+                    continue;
+                }
+            }
+        }
+        let provider = &resolved_provider;
 
         // Map model name for this provider.
         let mut attempt_body = body.clone();

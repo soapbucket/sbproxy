@@ -1,0 +1,182 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Soap Bucket LLC
+
+//! Process-global local model host (WOR-1680).
+//!
+//! When any `ai_proxy` provider carries a `serve:` block, the gateway
+//! itself hosts those models: it spawns and supervises an inference
+//! engine and routes requests to its loopback port. The
+//! [`ModelHostRuntime`] that does this owns child processes and VRAM
+//! residency, so it must be built once and survive hot config reloads
+//! (rebuilding it would kill and respawn a resident model on every
+//! config touch). It lives here as a lazily-initialized global,
+//! mirroring the `AI_CLIENT` global.
+//!
+//! [`served_upstream`] is the request-path entry point: given the AI
+//! config, the selected provider, and the requested model, it resolves
+//! a served provider to its live loopback base URL (bringing the engine
+//! to ready on demand), or returns `Ok(None)` for a normal proxied
+//! provider so the caller keeps its `base_url`.
+//!
+//! The GPU probe is feature-selected: with `gpu-nvidia` it is the real
+//! NVML probe; without it a zero-GPU probe, so on a CPU-only build a
+//! `serve:` provider fails admission with a clear residency error
+//! rather than pretending to serve.
+
+use std::sync::{Arc, OnceLock};
+
+use sbproxy_ai::local_host::{resolve_served_base_url, LocalModelHost};
+use sbproxy_ai::AiHandlerConfig;
+use sbproxy_model_host::{
+    Catalog, ConfigDirMetadataProvider, GpuProbe, ModelHostConfig, ModelHostRuntime,
+    ProcessEngineLauncher, StaticGpuProbe,
+};
+
+/// Built once from the first config that declares any `serve:` block;
+/// `None` when no provider serves locally. Survives hot reload so a
+/// resident engine is not killed on an unrelated config change.
+static MODEL_HOST: OnceLock<Option<Arc<ModelHostRuntime<ProcessEngineLauncher>>>> = OnceLock::new();
+
+/// The GPU probe for the runtime, selected at compile time.
+fn make_probe() -> Arc<dyn GpuProbe> {
+    #[cfg(feature = "gpu-nvidia")]
+    {
+        Arc::new(sbproxy_model_host::NvmlGpuProbe::new())
+    }
+    #[cfg(not(feature = "gpu-nvidia"))]
+    {
+        // No GPUs reported -> residency budget 0 -> admission rejects,
+        // so a serve: provider on a CPU-only build fails with a clear
+        // "residency" error instead of launching an engine that cannot
+        // fit. Building with --features gpu-nvidia enables real serving.
+        Arc::new(StaticGpuProbe::new(Vec::new()))
+    }
+}
+
+/// Merge every provider's `serve:` block into one host config. A single
+/// node has one GPU and one residency budget, so all served models
+/// share one runtime; a provider's models are concatenated and the
+/// engine-provisioning maps unioned. The first serve block's host
+/// policy (eviction, cache dir/budget) wins.
+fn merged_serve_config(config: &AiHandlerConfig) -> Option<ModelHostConfig> {
+    let mut merged: Option<ModelHostConfig> = None;
+    for provider in &config.providers {
+        let Some(serve) = &provider.serve else {
+            continue;
+        };
+        match &mut merged {
+            None => merged = Some(serve.clone()),
+            Some(m) => {
+                m.models.extend(serve.models.iter().cloned());
+                for (k, v) in &serve.engines {
+                    m.engines.entry(*k).or_insert_with(|| v.clone());
+                }
+            }
+        }
+    }
+    merged
+}
+
+/// Build the runtime from the merged serve config, or `None` when no
+/// provider serves locally or the merged config is invalid.
+fn build_runtime(config: &AiHandlerConfig) -> Option<Arc<ModelHostRuntime<ProcessEngineLauncher>>> {
+    let merged = merged_serve_config(config)?;
+    // Reject a cross-provider duplicate/nameless model here; per-provider
+    // validation ran at config load, this catches collisions across
+    // several serve blocks.
+    if let Err(e) = merged.validate() {
+        tracing::error!("model host: merged serve config is invalid: {e}");
+        return None;
+    }
+    let cache_root = sbproxy_model_host::resolve_cache_dir(merged.cache_dir.as_deref(), None);
+    let metadata = Arc::new(ConfigDirMetadataProvider {
+        cache_root,
+        revision: "main".to_string(),
+        catalog: Catalog::builtin(),
+    });
+    let runtime = ModelHostRuntime::new(
+        merged,
+        Catalog::builtin(),
+        make_probe(),
+        metadata,
+        Box::new(ProcessEngineLauncher::default),
+        // Container-runtime detection is a later refinement; the binary
+        // path is the default and llama.cpp/vLLM resolve from PATH.
+        false,
+    )
+    .with_health_recheck(true);
+    Some(Arc::new(runtime))
+}
+
+/// The process-global model host, built lazily from `config` on first
+/// use and cached for the process lifetime.
+fn model_host(config: &AiHandlerConfig) -> Option<Arc<ModelHostRuntime<ProcessEngineLauncher>>> {
+    MODEL_HOST.get_or_init(|| build_runtime(config)).clone()
+}
+
+/// Resolve a served provider's upstream to its live loopback base URL,
+/// bringing the engine to ready on demand.
+///
+/// Returns `Ok(None)` for a provider with no `serve:` block (the caller
+/// keeps the provider's normal `base_url`). For a served provider it
+/// returns `Ok(Some(url))`, or an error string when no served models are
+/// configured or the engine could not be brought to ready.
+pub async fn served_upstream(
+    config: &AiHandlerConfig,
+    provider: &sbproxy_ai::provider::ProviderConfig,
+    requested_model: Option<&str>,
+) -> Result<Option<String>, String> {
+    if provider.serve.is_none() {
+        return Ok(None);
+    }
+    let runtime = model_host(config)
+        .ok_or_else(|| "no local model host configured for this served provider".to_string())?;
+    resolve_served_base_url(
+        provider,
+        requested_model,
+        runtime.as_ref() as &dyn LocalModelHost,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_serve(serve_yaml: Option<&str>) -> AiHandlerConfig {
+        let providers = match serve_yaml {
+            Some(y) => serde_json::json!([{
+                "name": "local",
+                "serve": serde_yaml::from_str::<serde_json::Value>(y).unwrap()
+            }]),
+            None => serde_json::json!([{"name": "openai", "api_key": "sk-x"}]),
+        };
+        AiHandlerConfig::from_config(serde_json::json!({ "providers": providers })).unwrap()
+    }
+
+    #[test]
+    fn merged_serve_config_none_without_serve() {
+        let cfg = config_with_serve(None);
+        assert!(merged_serve_config(&cfg).is_none());
+    }
+
+    #[test]
+    fn merged_serve_config_collects_models() {
+        let cfg = config_with_serve(Some("models:\n  - model: qwen3-14b\n"));
+        let merged = merged_serve_config(&cfg).expect("one serve block");
+        assert_eq!(merged.models.len(), 1);
+        assert!(merged.validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn served_upstream_is_none_for_a_proxied_provider() {
+        let cfg = config_with_serve(None);
+        let provider = &cfg.providers[0];
+        assert_eq!(
+            served_upstream(&cfg, provider, Some("gpt-4o"))
+                .await
+                .unwrap(),
+            None
+        );
+    }
+}

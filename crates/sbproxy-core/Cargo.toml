@@ -16,6 +16,14 @@ publish = false
 # keyid; the resolved value is exposed to CEL, Lua, JS, and WASM.
 [features]
 default = []
+# WOR-1680/1652: real NVIDIA GPU discovery for the local model host.
+# Off by default (the lean binary needs no GPU libraries); on a GPU
+# host the `sbproxy` binary forwards this in. Without it the model-host
+# runtime uses a zero-GPU probe, so serve: providers reject admission
+# cleanly rather than pretending to serve on a CPU box.
+gpu-nvidia = ["sbproxy-model-host/gpu-nvidia"]
+# Hugging Face weight download for the model host. Same gating.
+model-weights = ["sbproxy-model-host/weights"]
 # Pulls the resolver in `sbproxy-modules::policy::agent_class` and the
 # reverse-DNS verifier in `sbproxy-security::agent_verify` into the
 # request pipeline. Off by default for library consumers; the
@@ -70,6 +78,9 @@ sbproxy-httpkit.workspace = true
 sbproxy-observe.workspace = true
 sbproxy-extension.workspace = true
 sbproxy-ai.workspace = true
+# WOR-1680: own the local model-host runtime (spawn/supervise engines
+# for serve: providers) as a process-global built at dispatch time.
+sbproxy-model-host.workspace = true
 sbproxy-cache.workspace = true
 sbproxy-platform.workspace = true
 sbproxy-openapi.workspace = true

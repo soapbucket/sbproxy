@@ -3219,6 +3219,9 @@ use ai_support::*;
 mod ai_dispatch;
 use ai_dispatch::*;
 
+// WOR-1680: process-global local model host for serve: providers.
+pub(crate) mod model_host;
+
 // --- Non-proxy action handlers ---
 
 mod action_dispatch;
