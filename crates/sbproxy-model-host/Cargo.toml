@@ -6,6 +6,16 @@ license.workspace = true
 publish = false
 description = "Local model-serving subsystem for sbproxy: model catalog, GPU fit planner, and engine supervisor (WOR-1652). Single-node, engine-agnostic, hardware-independent core."
 
+[features]
+default = []
+# Real NVIDIA GPU discovery via NVML (runtime dlopen, no CUDA toolkit at
+# build time). Off by default so the lean binary needs no GPU libraries;
+# enabled on a GPU host for the certification track.
+gpu-nvidia = ["dep:nvml-wrapper"]
+# Hugging Face weight download. Off by default; enabled on the host that
+# actually pulls and serves weights.
+weights = ["dep:hf-hub", "dep:reqwest"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -16,6 +26,11 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+nvml-wrapper = { version = "0.10", optional = true }
+# `tokio` gives the async ApiBuilder; hf-hub's default `online` feature
+# is what gates the `api` module itself, so keep defaults on.
+hf-hub = { version = "0.3", optional = true, features = ["tokio"] }
+reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

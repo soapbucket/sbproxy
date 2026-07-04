@@ -28,6 +28,13 @@ against a fake process; what it cannot prove without hardware is that a
 real engine boots and serves tokens. On a host with no GPU or no engine
 binary, a `serve:` block parses and validates but starts no engine.
 
+The real GPU bindings exist too, behind off-by-default cargo features:
+`gpu-nvidia` (an NVML `GpuProbe` with an `nvidia-smi` fallback) and
+`weights` (Hugging Face weight download). They compile in CI but are
+exercised on a GPU host; see
+[model-host-certification.md](model-host-certification.md) for the
+provisioning and Definition-of-Done run on a cloud L4.
+
 ## The `serve:` block
 
 `serve:` hangs off an `ai_proxy` provider:
