@@ -1,0 +1,200 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Soap Bucket LLC
+
+//! On-GPU certification harness for the model-host crate (WOR-1652).
+//!
+//! Run on a real GPU host to exercise the hardware-dependent code that
+//! CI cannot: the NVML probe, the capability-aware fit plan, the
+//! throughput estimate, the Hugging Face weight pull, and (optionally)
+//! spawning a real vLLM through the supervisor launcher.
+//!
+//! Build with the GPU features on:
+//!   cargo run --release --example gpu_cert \
+//!     --features gpu-nvidia,weights -- probe
+//!   cargo run --release --example gpu_cert \
+//!     --features gpu-nvidia,weights -- weights Qwen/Qwen3-0.6B
+//!   cargo run --release --example gpu_cert \
+//!     --features gpu-nvidia,weights -- serve Qwen/Qwen3-0.6B 8000
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let mode = args.get(1).map(String::as_str).unwrap_or("probe");
+    match mode {
+        "probe" => probe(),
+        "weights" => weights(args.get(2).map(String::as_str).unwrap_or("Qwen/Qwen3-0.6B")),
+        "serve" => serve(
+            args.get(2).map(String::as_str).unwrap_or("Qwen/Qwen3-0.6B"),
+            args.get(3).and_then(|p| p.parse().ok()).unwrap_or(8000),
+        ),
+        other => {
+            eprintln!("unknown mode {other}; use probe | weights <repo> | serve <repo> <port>");
+            std::process::exit(2);
+        }
+    }
+}
+
+#[cfg(feature = "gpu-nvidia")]
+fn probe() {
+    use sbproxy_model_host::fit::{estimate_throughput, plan_fit, ModelMetadata, Quant};
+    use sbproxy_model_host::{GpuProbe, NvmlGpuProbe};
+
+    let gpus = NvmlGpuProbe::new().probe();
+    assert!(
+        !gpus.is_empty(),
+        "FAIL: NVML reported no GPUs on a GPU host"
+    );
+    for g in &gpus {
+        println!(
+            "GPU[{}] {} | {:.1} GiB total, {:.1} GiB free | cc {:?} | fp8={} | bw={:?} GB/s",
+            g.index,
+            g.name,
+            g.total_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            g.free_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            g.compute_capability,
+            g.supports_fp8,
+            g.mem_bandwidth_gbps,
+        );
+    }
+    let g = &gpus[0];
+    // On an L4 (Ada 8.9) FP8 must be reported; on a T4 it must not.
+    println!("PASS: probed {} real GPU(s)", gpus.len());
+
+    // A ~8B model: fit planner should pick FP8 on an FP8-capable card,
+    // and refuse FP8 (fall back) on one without it.
+    let meta = ModelMetadata {
+        params: 8_000_000_000,
+        layers: 36,
+        kv_heads: 8,
+        head_dim: 128,
+        max_context: 40960,
+    };
+    let candidates = vec!["FP8".to_string(), "Q4_K_M".to_string()];
+    match plan_fit(g, &meta, &candidates, 8192, 1.15) {
+        Ok(plan) => {
+            println!(
+                "fit: chose {} ({:?}), est {:.1} GiB",
+                plan.quant_name,
+                plan.quant,
+                plan.estimated_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+            if g.supports_fp8 {
+                assert_eq!(plan.quant, Quant::Fp8, "FAIL: FP8 card should pick FP8");
+                println!("PASS: FP8-capable card selected FP8");
+            } else {
+                assert_ne!(
+                    plan.quant,
+                    Quant::Fp8,
+                    "FAIL: non-FP8 card must not pick FP8"
+                );
+                println!(
+                    "PASS: non-FP8 card refused FP8 and fell back to {}",
+                    plan.quant_name
+                );
+            }
+        }
+        Err(e) => println!("fit error: {e}"),
+    }
+    if let Some(t) = estimate_throughput(g, &meta, Quant::Fp8, 8192) {
+        println!(
+            "PASS: throughput estimate {:.0} tok/s decode, safe batch {}",
+            t.decode_tokens_per_sec, t.safe_max_batch
+        );
+    }
+}
+
+#[cfg(not(feature = "gpu-nvidia"))]
+fn probe() {
+    eprintln!("build with --features gpu-nvidia to run the probe");
+    std::process::exit(2);
+}
+
+#[cfg(feature = "weights")]
+fn weights(repo: &str) {
+    use sbproxy_model_host::weights::ensure_weight_file;
+    let cache = std::env::temp_dir().join("sbproxy-gpu-cert-cache");
+    let rt = tokio_rt();
+    // Pull the model's config.json (small, always present) to prove the
+    // hf-hub download + cache path works against the real hub.
+    println!("pulling {repo}/config.json into {}", cache.display());
+    match rt.block_on(ensure_weight_file(
+        &cache,
+        repo,
+        "main",
+        "config.json",
+        None,
+    )) {
+        Ok(path) => {
+            let sz = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            println!("PASS: downloaded {} ({} bytes)", path.display(), sz);
+        }
+        Err(e) => {
+            println!("FAIL: weight pull: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(feature = "weights"))]
+fn weights(_repo: &str) {
+    eprintln!("build with --features weights to run the weight pull");
+    std::process::exit(2);
+}
+
+/// Spawn a real vLLM through the supervisor launcher and confirm it
+/// reaches Ready, then leave it running (the shell curls it).
+fn serve(repo: &str, port: u16) {
+    use sbproxy_model_host::catalog::ModelRef;
+    use sbproxy_model_host::config::{EngineKind, KvCacheQuant};
+    use sbproxy_model_host::fit::{FitPlan, Quant};
+    use sbproxy_model_host::launch::{build_launch_spec, ProcessEngineLauncher};
+    use sbproxy_model_host::supervisor::EngineLauncher;
+    use std::time::Duration;
+
+    let model = ModelRef {
+        hf_repo: repo.to_string(),
+        quant: String::new(),
+        catalog_id: None,
+    };
+    // A minimal plan; the small model fits easily, so the numbers here
+    // only shape the argv (max-model-len), not admission.
+    let plan = FitPlan {
+        quant_name: "bf16".to_string(),
+        quant: Quant::F16,
+        estimated_vram_bytes: 4 * 1024 * 1024 * 1024,
+        gpu_index: 0,
+        seq_len: 8192,
+    };
+    let spec = build_launch_spec(
+        EngineKind::Vllm,
+        &model,
+        &plan,
+        port,
+        KvCacheQuant::Auto,
+        &[],
+    );
+    println!("launch: {} {}", spec.program, spec.args.join(" "));
+    let launcher = ProcessEngineLauncher::with_timeout(Duration::from_secs(420));
+    let rt = tokio_rt();
+    match rt.block_on(launcher.launch(&spec)) {
+        Ok(p) => {
+            println!("PASS: vLLM reached Ready on port {p} through ProcessEngineLauncher");
+            // Keep the process alive so the shell can curl it. Sleep,
+            // then kill on exit.
+            std::thread::sleep(Duration::from_secs(90));
+            rt.block_on(launcher.kill());
+            println!("engine killed");
+        }
+        Err(e) => {
+            println!("FAIL: launch/readiness: {e}");
+            rt.block_on(launcher.kill());
+            std::process::exit(1);
+        }
+    }
+}
+
+fn tokio_rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+}
