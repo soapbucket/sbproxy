@@ -88,6 +88,16 @@ impl GpuDescriptor {
 /// One GiB in bytes.
 pub const GIB: u64 = 1024 * 1024 * 1024;
 
+/// Whether a CUDA compute capability has usable FP8 tensor-core
+/// kernels. FP8 arrived with Ada Lovelace (8.9) and Hopper (9.0);
+/// Ampere (8.0 A100, 8.6) and Turing (7.5 T4) do not have it. A pure
+/// helper so the capability gate is identical whether the descriptor
+/// comes from a synthetic probe or a real NVML read.
+pub fn fp8_supported(cc: (u32, u32)) -> bool {
+    let (major, minor) = cc;
+    major > 8 || (major == 8 && minor >= 9)
+}
+
 /// A source of GPU descriptors. The real implementations (NVML,
 /// Metal, ROCm) live in a GPU-feature-gated phase; this trait keeps
 /// the planner testable with synthetic hardware.
@@ -583,6 +593,16 @@ mod tests {
             head_dim: 128,
             max_context: 40960,
         }
+    }
+
+    #[test]
+    fn fp8_capability_gate() {
+        assert!(!fp8_supported((7, 5)), "Turing T4 has no FP8");
+        assert!(!fp8_supported((8, 0)), "Ampere A100 has no FP8");
+        assert!(!fp8_supported((8, 6)), "Ampere 8.6 has no FP8");
+        assert!(fp8_supported((8, 9)), "Ada L4 has FP8");
+        assert!(fp8_supported((9, 0)), "Hopper H100 has FP8");
+        assert!(fp8_supported((10, 0)), "Blackwell has FP8");
     }
 
     #[test]
