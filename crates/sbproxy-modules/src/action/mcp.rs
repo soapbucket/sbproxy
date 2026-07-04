@@ -297,6 +297,20 @@ pub struct McpFederatedServerConfig {
     /// Transport name. Defaults to `streamable_http`; alternative is `sse`.
     #[serde(default)]
     pub transport: Option<String>,
+    /// Upstream kind (WOR-1648). `mcp` (default) speaks MCP to the
+    /// origin; `openapi` derives tools from an OpenAPI spec and
+    /// dispatches `tools/call` as REST requests against the origin.
+    #[serde(rename = "type", default)]
+    pub server_type: Option<String>,
+    /// Inline OpenAPI 3.x spec (JSON/YAML-decoded value) for an
+    /// `openapi` server. Mutually exclusive with `spec_path`.
+    #[serde(default)]
+    pub spec: Option<serde_json::Value>,
+    /// Filesystem path to an OpenAPI spec (JSON or YAML) for an
+    /// `openapi` server, read at config-load time so a bad spec fails
+    /// startup, not the hot path.
+    #[serde(default)]
+    pub spec_path: Option<String>,
 }
 
 /// One entry in the gateway-level guardrails list.
@@ -447,7 +461,6 @@ impl McpAction {
             HashMap::with_capacity(cfg.federated_servers.len());
 
         for upstream in cfg.federated_servers {
-            let url = normalize_origin(&upstream.origin)?;
             // The upstream `name` doubles as the implicit collision-prefix
             // inside the federation library. Use the user-supplied prefix
             // when present so library-level collision handling matches the
@@ -461,11 +474,42 @@ impl McpAction {
                 .clone()
                 .unwrap_or_else(|| "streamable_http".to_string());
 
+            // WOR-1648: an `openapi` server derives its tools from a
+            // spec and dispatches REST; the origin is the REST base
+            // URL, not an MCP endpoint.
+            let is_openapi = upstream.server_type.as_deref() == Some("openapi");
+            let (url, openapi) = if is_openapi {
+                let base_url = normalize_rest_origin(&upstream.origin);
+                let spec = load_openapi_spec(&upstream)?;
+                let tools = sbproxy_extension::mcp::openapi_to_mcp_tools(&spec);
+                if tools.is_empty() {
+                    anyhow::bail!(
+                        "mcp action: openapi server '{}' produced no tools from its spec",
+                        upstream.origin
+                    );
+                }
+                let routes = sbproxy_extension::mcp::openapi_to_routes(&spec)
+                    .into_iter()
+                    .map(|r| (r.name, (r.method, r.path)))
+                    .collect();
+                (
+                    base_url.clone(),
+                    Some(sbproxy_extension::mcp::OpenApiBacking {
+                        base_url,
+                        tools,
+                        routes,
+                    }),
+                )
+            } else {
+                (normalize_origin(&upstream.origin)?, None)
+            };
+
             server_configs.push(McpServerConfig {
                 name: name.clone(),
                 url,
                 transport,
                 namespace: upstream.namespace,
+                openapi,
             });
             prefixes.insert(
                 name.clone(),
@@ -654,6 +698,48 @@ fn normalize_origin(origin: &str) -> anyhow::Result<String> {
         Ok(trimmed.to_string())
     } else {
         Ok(format!("https://{}/mcp", trimmed))
+    }
+}
+
+/// Normalise a REST base URL for an OpenAPI-backed server (WOR-1648).
+/// A bare hostname becomes `https://<host>`; a scheme is preserved.
+/// Unlike [`normalize_origin`], no `/mcp` suffix is appended: the
+/// path template from each route is what determines the request path.
+fn normalize_rest_origin(origin: &str) -> String {
+    let trimmed = origin.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    }
+}
+
+/// Load an OpenAPI spec for an `openapi` federated server (WOR-1648),
+/// from the inline `spec:` value or the `spec_path:` file. Reading and
+/// parsing happen at config-load time so a bad spec fails startup.
+fn load_openapi_spec(
+    upstream: &McpFederatedServerConfig,
+) -> anyhow::Result<serde_json::Value> {
+    match (&upstream.spec, &upstream.spec_path) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "mcp action: openapi server '{}' sets both spec and spec_path; pick one",
+            upstream.origin
+        ),
+        (Some(spec), None) => Ok(spec.clone()),
+        (None, Some(path)) => {
+            let raw = std::fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!("mcp action: reading openapi spec_path '{path}': {e}")
+            })?;
+            // Accept JSON or YAML; serde_yaml parses JSON too, but try
+            // JSON first for a crisper error on a malformed JSON spec.
+            serde_json::from_str(&raw)
+                .or_else(|_| serde_yaml::from_str(&raw))
+                .map_err(|e| anyhow::anyhow!("mcp action: parsing openapi spec '{path}': {e}"))
+        }
+        (None, None) => anyhow::bail!(
+            "mcp action: openapi server '{}' needs spec or spec_path",
+            upstream.origin
+        ),
     }
 }
 
@@ -863,6 +949,39 @@ mod tests {
     use serde_json::json;
 
     // --- WOR-1646: federation-sourced injection ---
+
+    #[test]
+    fn openapi_server_compiles_with_inline_spec() {
+        let value = json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{
+                "type": "openapi",
+                "origin": "api.example.com",
+                "spec": {
+                    "openapi": "3.0.0",
+                    "info": {"title": "t", "version": "1"},
+                    "paths": {"/pets/{id}": {"get": {"operationId": "getPet"}}}
+                }
+            }]
+        });
+        let action = McpAction::from_config(value).expect("compile");
+        assert_eq!(action.prefixes.len(), 1);
+    }
+
+    #[test]
+    fn openapi_server_rejects_missing_spec() {
+        let value = json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{"type": "openapi", "origin": "api.example.com"}]
+        });
+        let err = McpAction::from_config(value).expect_err("must reject");
+        assert!(
+            err.to_string().contains("spec"),
+            "error must mention the missing spec, got: {err}"
+        );
+    }
 
     #[test]
     fn to_provider_tool_openai_and_anthropic_shapes() {
@@ -1213,6 +1332,9 @@ mod tests {
                 rbac: None,
                 timeout: Some(parse_duration_via_serde(raw)),
                 transport: None,
+                server_type: None,
+                spec: None,
+                spec_path: None,
             };
             assert_eq!(entry.timeout, Some(expected), "parsed {raw}");
         }

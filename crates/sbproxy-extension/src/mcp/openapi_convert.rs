@@ -214,6 +214,70 @@ pub fn openapi_to_mcp_tools(spec: &serde_json::Value) -> Vec<serde_json::Value> 
     tools
 }
 
+/// One REST route derived from an OpenAPI operation (WOR-1648): the
+/// MCP tool name paired with the HTTP method and path template it
+/// dispatches to. Path parameters stay in `{brace}` form; the caller
+/// substitutes them from the tool-call arguments at dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenApiRoute {
+    /// MCP tool name (same derivation as `openapi_to_mcp_tools`).
+    pub name: String,
+    /// Uppercase HTTP method.
+    pub method: String,
+    /// Path template, e.g. `/pets/{id}`.
+    pub path: String,
+}
+
+/// Derive the REST routing table from an OpenAPI spec, one entry per
+/// operation, using the same tool-name derivation and the same
+/// enabled/tag filtering as [`openapi_to_mcp_tools`], so the routes
+/// and the emitted tools stay in lockstep (WOR-1648).
+pub fn openapi_to_routes(spec: &serde_json::Value) -> Vec<OpenApiRoute> {
+    let mut routes = Vec::new();
+    let tag_filter = TagFilter::from_spec(spec);
+    let paths = match spec.get("paths").and_then(|p| p.as_object()) {
+        Some(p) => p,
+        None => return routes,
+    };
+    for (path, methods) in paths {
+        let Some(methods_obj) = methods.as_object() else {
+            continue;
+        };
+        for (method, operation) in methods_obj {
+            let Some(op) = operation.as_object() else {
+                continue;
+            };
+            let ext = op
+                .get("x-mcp")
+                .map(McpOpExtension::from_value)
+                .unwrap_or_default()
+                .merge_over(
+                    op.get("x-sbproxy-mcp")
+                        .map(McpOpExtension::from_value)
+                        .unwrap_or_default(),
+                );
+            if ext.enabled == Some(false) || !tag_filter.admits(op) {
+                continue;
+            }
+            let derived_name;
+            let name: &str = if let Some(n) = ext.name.as_deref() {
+                n
+            } else if let Some(n) = op.get("operationId").and_then(|v| v.as_str()) {
+                n
+            } else {
+                derived_name = format!("{}_{}", method, path.replace('/', "_"));
+                &derived_name
+            };
+            routes.push(OpenApiRoute {
+                name: name.to_string(),
+                method: method.to_ascii_uppercase(),
+                path: path.clone(),
+            });
+        }
+    }
+    routes
+}
+
 /// Build an MCP `inputSchema` from OpenAPI operation parameters.
 fn build_input_schema(operation: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
     let mut properties = serde_json::Map::new();
@@ -251,6 +315,41 @@ fn build_input_schema(operation: &serde_json::Map<String, serde_json::Value>) ->
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn routes_track_the_emitted_tools() {
+        let spec = json!({
+            "openapi": "3.0.0",
+            "info": {"title": "t", "version": "1"},
+            "paths": {
+                "/pets": {"get": {"operationId": "listPets"}},
+                "/pets/{id}": {"get": {"operationId": "getPet"}}
+            }
+        });
+        let tools = openapi_to_mcp_tools(&spec);
+        let routes = openapi_to_routes(&spec);
+        // One route per emitted tool, names in lockstep.
+        assert_eq!(tools.len(), routes.len());
+        let get_pet = routes.iter().find(|r| r.name == "getPet").expect("getPet route");
+        assert_eq!(get_pet.method, "GET");
+        assert_eq!(get_pet.path, "/pets/{id}");
+    }
+
+    #[test]
+    fn routes_respect_disabled_operations() {
+        let spec = json!({
+            "openapi": "3.0.0",
+            "info": {"title": "t", "version": "1"},
+            "paths": {
+                "/a": {"get": {"operationId": "a"}},
+                "/b": {"get": {"operationId": "b", "x-mcp": {"enabled": false}}}
+            }
+        });
+        let routes = openapi_to_routes(&spec);
+        let names: Vec<&str> = routes.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"a"));
+        assert!(!names.contains(&"b"), "disabled op must not route");
+    }
 
     fn simple_spec() -> serde_json::Value {
         json!({

@@ -59,6 +59,20 @@ pub enum NamespaceMode {
     Always,
 }
 
+/// An OpenAPI-backed upstream (WOR-1648): the gateway derives tools
+/// from a spec and dispatches `tools/call` as REST requests, instead
+/// of speaking MCP to the upstream. Turns an existing REST API into
+/// governed MCP tools with no code.
+#[derive(Debug, Clone)]
+pub struct OpenApiBacking {
+    /// Base URL the REST calls target (e.g. `https://api.example.com`).
+    pub base_url: String,
+    /// Tools derived from the spec (`name`/`description`/`inputSchema`).
+    pub tools: Vec<serde_json::Value>,
+    /// tool name -> (HTTP method, path template).
+    pub routes: HashMap<String, (String, String)>,
+}
+
 /// Configuration for one upstream MCP server.
 #[derive(Debug, Clone)]
 pub struct McpServerConfig {
@@ -70,6 +84,10 @@ pub struct McpServerConfig {
     pub transport: String,
     /// How this server's names are namespaced in the unified registry.
     pub namespace: NamespaceMode,
+    /// WOR-1648: when set, this upstream is served from an OpenAPI
+    /// spec (tools derived locally, `tools/call` dispatched as REST)
+    /// rather than by speaking MCP to `url`.
+    pub openapi: Option<OpenApiBacking>,
 }
 
 /// Resolve the advertised (and registry-key) name for a tool or resource
@@ -460,6 +478,36 @@ impl McpFederation {
         &self,
         server: &McpServerConfig,
     ) -> anyhow::Result<Vec<FederatedTool>> {
+        // WOR-1648: an OpenAPI-backed server serves tools from its
+        // spec, no MCP round-trip.
+        if let Some(backing) = &server.openapi {
+            let federated = backing
+                .tools
+                .iter()
+                .filter_map(|t| {
+                    let name = t.get("name")?.as_str()?.to_string();
+                    let description = t
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let input_schema = t
+                        .get("inputSchema")
+                        .cloned()
+                        .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+                    Some(FederatedTool {
+                        name,
+                        description,
+                        input_schema,
+                        server_name: server.name.clone(),
+                        streaming: false,
+                        meta: None,
+                    })
+                })
+                .collect();
+            return Ok(federated);
+        }
+
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "tools/list".to_string(),
@@ -981,6 +1029,14 @@ impl McpFederation {
             }
         }
 
+        // WOR-1648: an OpenAPI-backed tool dispatches as a REST call
+        // instead of an MCP tools/call.
+        if let Some(backing) = &server.openapi {
+            return self
+                .call_openapi_tool(server, backing, &federated.name, &arguments)
+                .await;
+        }
+
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "tools/call".to_string(),
@@ -1012,6 +1068,94 @@ impl McpFederation {
         Ok(McpCallOutcome::Allowed(
             resp.result.unwrap_or(serde_json::Value::Null),
         ))
+    }
+
+    /// WOR-1648: dispatch an OpenAPI-backed tool as a REST request.
+    /// Path parameters are substituted from the arguments; for a GET
+    /// the remaining arguments become the query string, otherwise
+    /// they form the JSON body. The response is wrapped in the MCP
+    /// tool-result content shape so a base-MCP client sees a normal
+    /// result. `federated_name` is the resolved (possibly namespaced)
+    /// name; the route table is keyed by the tool's original name, so
+    /// we strip any `<server>.` prefix first.
+    async fn call_openapi_tool(
+        &self,
+        server: &McpServerConfig,
+        backing: &OpenApiBacking,
+        federated_name: &str,
+        arguments: &serde_json::Value,
+    ) -> anyhow::Result<McpCallOutcome> {
+        let bare = federated_name
+            .strip_prefix(&format!("{}.", server.name))
+            .unwrap_or(federated_name);
+        let (method, path_template) = backing
+            .routes
+            .get(bare)
+            .or_else(|| backing.routes.get(federated_name))
+            .ok_or_else(|| anyhow::anyhow!("no OpenAPI route for tool {federated_name}"))?;
+
+        // Substitute {param} path segments from the arguments, and
+        // collect the leftovers for query/body.
+        let args_obj = arguments.as_object().cloned().unwrap_or_default();
+        let mut consumed = std::collections::HashSet::new();
+        let mut path = path_template.clone();
+        for (k, v) in &args_obj {
+            let placeholder = format!("{{{k}}}");
+            if path.contains(&placeholder) {
+                let rendered = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                path = path.replace(&placeholder, &urlencoding_encode(&rendered));
+                consumed.insert(k.clone());
+            }
+        }
+        let base = backing.base_url.trim_end_matches('/');
+        let url = format!("{base}{path}");
+
+        let leftovers: serde_json::Map<String, serde_json::Value> = args_obj
+            .into_iter()
+            .filter(|(k, _)| !consumed.contains(k))
+            .collect();
+
+        let is_get = method.eq_ignore_ascii_case("GET");
+        let http_method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|e| anyhow::anyhow!("invalid HTTP method {method}: {e}"))?;
+        let mut builder = self.client.request(http_method, &url);
+        if is_get {
+            let query: Vec<(String, String)> = leftovers
+                .iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    (k.clone(), val)
+                })
+                .collect();
+            if !query.is_empty() {
+                builder = builder.query(&query);
+            }
+        } else if !leftovers.is_empty() {
+            builder = builder.json(&serde_json::Value::Object(leftovers));
+        }
+
+        let resp = builder.send().await.map_err(|e| {
+            sbproxy_observe::metrics::record_mcp_upstream_io_failure(classify_io_failure(
+                &anyhow::anyhow!(e.to_string()),
+            ));
+            anyhow::anyhow!("openapi REST call to {url} failed: {e}")
+        })?;
+        let status = resp.status();
+        let body = super::streamable::read_body_capped(resp, self.max_response_bytes).await?;
+        let text = String::from_utf8_lossy(&body).to_string();
+        // Present the REST response as MCP tool-result content. A
+        // non-2xx status maps to isError so the caller sees a tool
+        // error, not a transport success.
+        Ok(McpCallOutcome::Allowed(json!({
+            "content": [{"type": "text", "text": text}],
+            "isError": !status.is_success(),
+        })))
     }
 
     /// Dispatch a request to an upstream server using the configured transport.
@@ -1382,6 +1526,22 @@ impl McpFederation {
     }
 }
 
+/// Percent-encode a path-parameter value (WOR-1648). Encodes
+/// everything outside the RFC 3986 unreserved set so a value with a
+/// slash or space cannot break out of its path segment.
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Classify an upstream IO failure for the
 /// `sbproxy_mcp_upstream_io_failures_total{kind}` counter. Reqwest
 /// errors carry typed timeout/connect flags; the response byte cap is
@@ -1513,6 +1673,7 @@ mod tests {
             url: url.to_string(),
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
+            openapi: None,
         }
     }
 
@@ -2088,6 +2249,7 @@ mod tests {
             url: "https://legacy.example.com/sse".to_string(),
             transport: "sse".to_string(),
             namespace: NamespaceMode::default(),
+            openapi: None,
         };
         assert_eq!(config.transport, "sse");
     }

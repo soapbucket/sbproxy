@@ -70,11 +70,12 @@ pub use codemode_from_openapi::{emit_codemode_from_openapi, openapi_to_federated
 pub use context_opt::ToolUsageTracker;
 pub use federation::{
     FederatedTool, FederationIoSettings, McpCallOutcome, McpFederation, McpServerConfig,
-    NamespaceMode, SerializedToolEntry, SerializedTools, ToolVersioningGate, VersioningMode,
+    NamespaceMode, OpenApiBacking, SerializedToolEntry, SerializedTools, ToolVersioningGate,
+    VersioningMode,
 };
 pub use guardrails::{check_tool_invocation, McpGuardrailConfig};
 pub use handler::{InitializeContext, McpHandler};
-pub use openapi_convert::openapi_to_mcp_tools;
+pub use openapi_convert::{openapi_to_mcp_tools, openapi_to_routes, OpenApiRoute};
 pub use registry::{ToolHandlerType, ToolRegistry};
 pub use rest_to_mcp::{create_mcp_handler, execute_tool_as_rest, RestToMcpConfig};
 pub use types::*;
