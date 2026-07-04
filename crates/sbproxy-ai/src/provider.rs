@@ -76,6 +76,15 @@ pub struct ProviderConfig {
     /// routed only to providers marked here. Defaults to `false`.
     #[serde(default)]
     pub no_prompt_training: bool,
+    /// WOR-1652: optional local model-serving block. When set, the
+    /// gateway itself hosts the models (pull weights, fit an engine to
+    /// the GPU, supervise it) and registers them as local providers
+    /// ahead of any cloud fallback, instead of proxying `base_url` to
+    /// an already-running server. `None` keeps the proxy-only behavior.
+    /// The lifecycle half (spawn/evict) ships in phases of the model-host
+    /// epic; this field is the config surface it reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve: Option<sbproxy_model_host::ModelHostConfig>,
 }
 
 fn default_weight() -> u32 {
@@ -192,6 +201,7 @@ mod tests {
             disable_forwarded_host_header: false,
             allow_private_base_url: false,
             no_prompt_training: false,
+            serve: None,
         }
     }
 

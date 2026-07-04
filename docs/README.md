@@ -33,6 +33,7 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [ai-predictive-budget.md](ai-predictive-budget.md) - predictive budgets with soft-landing: warn, then downgrade, then block as a scope approaches its cap.
 - [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md) - classify upstream failures (timeout, rate-limit, context-window, content-policy) and set per-error retry counts.
 - [local-inference.md](local-inference.md) - run embeddings (semantic cache) and prompt-injection classify on local ONNX models via the sidecar or in-process.
+- [model-host.md](model-host.md) - the gateway hosts the LLM itself: catalog, the `serve:` block, the GPU fit planner, and the engine supervisor (single-node local serving).
 - [ai-lb-benchmark.md](ai-lb-benchmark.md) - P50/P95/P99/P99.9 latency comparison across AI router strategies under skewed load.
 - [providers.md](providers.md) - the catalog of supported LLM providers.
 - [scripting.md](scripting.md) - CEL, Lua, JavaScript, and WASM scripting reference.

@@ -828,6 +828,79 @@ the cardinality limiter.
 | `origin` | Virtual hostname | `api.example.com` |
 | `model` | Model id from the cached response | `gpt-4o` |
 
+### Model host
+
+The local model host (`serve:`) publishes these. All **alpha** while the
+engine-runtime phases land; names may change before they graduate.
+
+#### `sbproxy_model_host_time_to_ready_seconds`
+
+| Property | Value |
+|---|---|
+| Type | Histogram |
+| Stability | **alpha** |
+| Description | Time from engine launch to the readiness probe passing (cold weight load + warm-up). Observed only on a successful launch. |
+
+**Labels:** `engine` (`vllm`, `llama_cpp`), `model` (catalog id / advertised name).
+
+#### `sbproxy_model_host_launches_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **alpha** |
+| Description | Engine launch attempts, by outcome. |
+
+**Labels:** `engine`, `model`, `outcome` (`ready`, `failed`).
+
+#### `sbproxy_model_host_evictions_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **alpha** |
+| Description | Model evictions from VRAM. |
+
+**Labels:** `reason` (`lru`, `keep_alive`, `manual`).
+
+#### `sbproxy_model_host_resident_models`
+
+| Property | Value |
+|---|---|
+| Type | Gauge |
+| Stability | **alpha** |
+| Description | Local models currently loaded and Ready. |
+
+#### `sbproxy_model_host_load_queue_depth`
+
+| Property | Value |
+|---|---|
+| Type | Gauge |
+| Stability | **alpha** |
+| Description | Requests parked waiting for a cold model to become Ready. |
+
+**Labels:** `model`.
+
+#### `sbproxy_model_host_gpu_vram_bytes`
+
+| Property | Value |
+|---|---|
+| Type | Gauge |
+| Stability | **alpha** |
+| Description | GPU memory in bytes, per device. |
+
+**Labels:** `device`, `kind` (`total`, `free`).
+
+#### `sbproxy_model_host_gpu_utilization`
+
+| Property | Value |
+|---|---|
+| Type | Gauge |
+| Stability | **alpha** |
+| Description | GPU utilization fraction (0.0-1.0), per device. This is the signal the `gpu-aware` routing strategy reads. |
+
+**Labels:** `device`.
+
 ---
 
 ## Deprecation process

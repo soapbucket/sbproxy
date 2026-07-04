@@ -1,5 +1,5 @@
 # Local inference (embeddings and prompt-injection classify)
-*Last modified: 2026-06-23*
+*Last modified: 2026-07-04*
 
 SBproxy can run two AI-gateway features on local ONNX models instead of paid
 APIs:
@@ -7,6 +7,11 @@ APIs:
 - The **embedding semantic cache** vectorizes prompts to serve near-duplicate
   requests from cache.
 - **Prompt-injection v2** classifies prompts for injection attempts.
+
+For running a full **LLM** locally (the gateway pulls weights, fits an engine
+to the GPU, and supervises it), see [model-host.md](model-host.md). This page
+covers the two ONNX auxiliary features; the model host covers chat/completion
+serving.
 
 Running these locally means no per-call API cost, no prompt egress (the prompt
 never leaves your network), low loopback latency, and air-gap support. Models

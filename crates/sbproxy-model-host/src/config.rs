@@ -1,0 +1,173 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Soap Bucket LLC
+
+//! The `serve:` configuration block (WOR-1653 core).
+//!
+//! An operator adds a `serve:` block to an `ai_proxy` provider to
+//! turn the gateway into the host for one or more local models. The
+//! config is deliberately not a free-form command line: engines are
+//! an allowlisted enum with argument templates, so config cannot ask
+//! the gateway (which also holds provider keys) to spawn an arbitrary
+//! binary. See the security review child of the epic.
+//!
+//! These types derive `JsonSchema` so the `serve:` surface appears in
+//! `sb-config.schema.json`.
+
+use serde::{Deserialize, Serialize};
+
+/// Which inference engine serves a model. An allowlisted enum, not a
+/// `cmd:` string: the runtime owns the argument template for each
+/// engine, so config chooses an engine and its knobs, never an
+/// arbitrary executable.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineKind {
+    /// vLLM, the datacenter default, driven as a supervised
+    /// subprocess over its OpenAI-compatible HTTP surface.
+    #[default]
+    Vllm,
+    /// llama.cpp `llama-server`, the low-VRAM / GGUF / edge path.
+    LlamaCpp,
+}
+
+impl EngineKind {
+    /// The binary name looked up on `PATH` for this engine.
+    pub fn binary_name(self) -> &'static str {
+        match self {
+            EngineKind::Vllm => "vllm",
+            EngineKind::LlamaCpp => "llama-server",
+        }
+    }
+}
+
+/// What to do when VRAM is needed and an idle model is resident.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EvictionPolicy {
+    /// Evict the least-recently-used idle model to make room (default).
+    #[default]
+    Lru,
+    /// Never evict; reject a new model when VRAM is full. Predictable
+    /// residency for a pinned single model.
+    Never,
+}
+
+/// One model an operator wants the gateway to serve locally.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ServeEntry {
+    /// Catalog id (`qwen3-32b`) or an explicit `hf:Org/Repo:QUANT`
+    /// reference. Resolved by [`crate::catalog`].
+    pub model: String,
+    /// Engine to serve it with. Defaults to vLLM.
+    #[serde(default)]
+    pub engine: EngineKind,
+    /// Idle time before the engine is unloaded to free VRAM. Go
+    /// duration syntax (`10m`, `1h`); `None` means never auto-unload.
+    #[serde(default)]
+    pub keep_alive: Option<String>,
+    /// Context length to plan VRAM for and pass to the engine.
+    /// `None` uses the model's declared max (clamped by the fit
+    /// planner to what actually fits).
+    #[serde(default)]
+    pub max_context: Option<u64>,
+    /// Extra engine flags appended to the templated args. Values only,
+    /// no shell: each entry is passed as one argv element.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+}
+
+/// The `serve:` block: the local models plus host-wide policy.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ModelHostConfig {
+    /// Models to serve locally. Registered as local providers ahead
+    /// of any cloud fallback.
+    #[serde(default)]
+    pub models: Vec<ServeEntry>,
+    /// Optional path to an operator catalog file, replacing the
+    /// built-in certified catalog for id resolution.
+    #[serde(default)]
+    pub catalog_file: Option<String>,
+    /// Directory for the content-addressed weight cache. `None` uses
+    /// the platform default (`$HF_HOME` / `~/.cache/sbproxy/models`).
+    #[serde(default)]
+    pub cache_dir: Option<String>,
+    /// Disk budget in GiB for the weight cache before GC. `None`
+    /// means unbounded (operator manages the disk).
+    #[serde(default)]
+    pub cache_budget_gib: Option<f64>,
+    /// What to do under VRAM pressure. Defaults to LRU eviction.
+    #[serde(default)]
+    pub eviction: EvictionPolicy,
+}
+
+impl ModelHostConfig {
+    /// True when no models are configured (the block is inert).
+    pub fn is_empty(&self) -> bool {
+        self.models.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minimal_serve_block_parses() {
+        let cfg: ModelHostConfig = serde_yaml::from_str(
+            "\
+models:
+  - model: qwen3-32b
+",
+        )
+        .expect("parse");
+        assert_eq!(cfg.models.len(), 1);
+        assert_eq!(cfg.models[0].model, "qwen3-32b");
+        // Defaults.
+        assert_eq!(cfg.models[0].engine, EngineKind::Vllm);
+        assert_eq!(cfg.eviction, EvictionPolicy::Lru);
+    }
+
+    #[test]
+    fn full_serve_block_parses() {
+        let cfg: ModelHostConfig = serde_yaml::from_str(
+            "\
+cache_dir: /var/lib/sbproxy/models
+cache_budget_gib: 500
+eviction: never
+models:
+  - model: hf:Org/Repo:Q4_K_M
+    engine: llama_cpp
+    keep_alive: 30m
+    max_context: 8192
+    extra_args: [\"--flash-attn\"]
+",
+        )
+        .expect("parse");
+        assert_eq!(cfg.eviction, EvictionPolicy::Never);
+        let e = &cfg.models[0];
+        assert_eq!(e.engine, EngineKind::LlamaCpp);
+        assert_eq!(e.keep_alive.as_deref(), Some("30m"));
+        assert_eq!(e.max_context, Some(8192));
+        assert_eq!(e.extra_args, vec!["--flash-attn"]);
+    }
+
+    #[test]
+    fn engine_binary_names() {
+        assert_eq!(EngineKind::Vllm.binary_name(), "vllm");
+        assert_eq!(EngineKind::LlamaCpp.binary_name(), "llama-server");
+    }
+
+    #[test]
+    fn unknown_engine_is_rejected() {
+        let r: Result<ModelHostConfig, _> =
+            serde_yaml::from_str("models:\n  - model: x\n    engine: sglang\n");
+        assert!(
+            r.is_err(),
+            "engine is an allowlisted enum; sglang must reject"
+        );
+    }
+}

@@ -6334,6 +6334,7 @@ dependencies = [
  "sbproxy-classifier-client",
  "sbproxy-config",
  "sbproxy-extension",
+ "sbproxy-model-host",
  "sbproxy-platform",
  "sbproxy-plugin",
  "sbproxy-security",
@@ -6730,6 +6731,22 @@ dependencies = [
  "ureq",
  "yaml_serde",
  "zstd",
+]
+
+[[package]]
+name = "sbproxy-model-host"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "yaml_serde",
 ]
 
 [[package]]
