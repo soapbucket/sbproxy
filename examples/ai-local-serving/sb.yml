@@ -1,0 +1,49 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway that HOSTS the model locally (WOR-1652 model host).
+#
+# Instead of proxying base_url to an already-running server, the
+# provider's `serve:` block declares models the gateway itself runs:
+# it resolves the catalog id to weights, fits an engine to the local
+# GPU, spawns and supervises it, and registers it as a local provider
+# ahead of any cloud fallback.
+#
+# NOTE ON STATUS: this config exercises the model-host CONFIG surface
+# and catalog. The engine-spawn + GPU-fit lifecycle ships in later
+# phases of the epic and needs a GPU to run; on a CPU-only or
+# engine-less host the serve block parses and validates but starts no
+# engine. See docs/model-host.md.
+#
+# Run:
+#   make run CONFIG=examples/ai-local-serving/sb.yml
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: local
+          # base_url points at where the supervised engine will bind
+          # (loopback); allow_private_base_url opts into the loopback
+          # SSRF exception for a local engine.
+          base_url: http://127.0.0.1:8000/v1
+          allow_private_base_url: true
+          default_model: qwen3-14b
+          models:
+            - qwen3-14b
+          serve:
+            eviction: lru
+            cache_budget_gib: 200
+            models:
+              # A catalog id (see the built-in model catalog). The fit
+              # planner picks the quant the GPU can run: an L4 accepts
+              # FP8, a T4 falls back to the Q4 GGUF.
+              - model: qwen3-14b
+                engine: vllm
+                keep_alive: 30m
+              # An explicit hf:Org/Repo:QUANT reference bypasses the
+              # catalog; llama.cpp is the low-VRAM / GGUF path.
+              - model: hf:Qwen/Qwen3-8B-GGUF:Q4_K_M
+                engine: llama_cpp
+                keep_alive: 15m
