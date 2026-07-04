@@ -14,7 +14,7 @@ default = []
 gpu-nvidia = ["dep:nvml-wrapper"]
 # Hugging Face weight download. Off by default; enabled on the host that
 # actually pulls and serves weights.
-weights = ["dep:hf-hub", "dep:reqwest"]
+weights = ["dep:reqwest"]
 
 [dependencies]
 serde = { workspace = true }
@@ -27,9 +27,10 @@ hex = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 nvml-wrapper = { version = "0.10", optional = true }
-# `tokio` gives the async ApiBuilder; hf-hub's default `online` feature
-# is what gates the `api` module itself, so keep defaults on.
-hf-hub = { version = "0.3", optional = true, features = ["tokio"] }
+# Weight download is a plain HTTP GET that follows HF's redirect to the
+# resolve-cache/Xet backend; reqwest's default redirect policy resolves
+# the relative Location the hub returns, which the old hf-hub 0.3 client
+# could not. No hf-hub dependency.
 reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
