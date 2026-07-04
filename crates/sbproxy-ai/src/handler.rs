@@ -636,6 +636,15 @@ impl AiHandlerConfig {
             provider
                 .validate_base_url()
                 .map_err(|e| anyhow::anyhow!("ai provider {:?} base_url: {e}", provider.name))?;
+            // WOR-1683/1684/1681: validate a serve: block (unique model
+            // names, no nameless raw refs, parseable keep_alive, pinned
+            // container images) at config load so a bad local-serving
+            // config fails at `plan` rather than at the first request.
+            if let Some(serve) = &provider.serve {
+                serve
+                    .validate()
+                    .map_err(|e| anyhow::anyhow!("ai provider {:?} serve: {e}", provider.name))?;
+            }
         }
         // WOR-625: validate provider names and the model allow-list here
         // so a typo (`openAI` for `openai`) or an unknown model is caught

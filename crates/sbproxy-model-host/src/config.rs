@@ -407,6 +407,47 @@ impl ModelHostConfig {
         }
         Ok(names)
     }
+
+    /// Validate the whole `serve:` block at config-load / `plan` time
+    /// so a bad block is rejected before boot rather than failing at a
+    /// request. Checks (WOR-1683 / WOR-1684 / WOR-1681):
+    /// - model names are unique and no raw `hf:`/`file:` ref leaks in
+    ///   without an explicit `name` (via [`Self::model_names`]);
+    /// - every `keep_alive` parses as a duration;
+    /// - each `engines` entry is coherent: a container launch needs a
+    ///   pinned image (no `:latest`, no untagged).
+    pub fn validate(&self) -> Result<(), String> {
+        // Names: unique, no nameless raw refs.
+        self.model_names()?;
+        // keep_alive durations parse.
+        for e in &self.models {
+            if let Some(ka) = &e.keep_alive {
+                if crate::launch::parse_duration(ka).is_none() {
+                    return Err(format!(
+                        "serve model '{}' has an invalid keep_alive '{ka}'",
+                        e.model
+                    ));
+                }
+            }
+        }
+        // Engine provisioning coherence.
+        for (kind, prov) in &self.engines {
+            if prov.launch == EngineLaunchMethod::Container {
+                if prov.image.is_none() {
+                    return Err(format!(
+                        "engine {kind:?} uses container launch but names no image"
+                    ));
+                }
+                if !prov.image_is_pinned() {
+                    return Err(format!(
+                        "engine {kind:?} image is not pinned (avoid :latest / untagged): {:?}",
+                        prov.image
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What the environment offers, for the plan-time engine doctor
@@ -763,6 +804,57 @@ models:
             image: Some("vllm/vllm-openai@sha256:abc123".into()),
         };
         assert!(digest.image_is_pinned());
+    }
+
+    #[test]
+    fn validate_accepts_a_good_block_and_rejects_bad_ones() {
+        // Good: unique names, valid keep_alive, pinned container image.
+        let good: ModelHostConfig = serde_yaml::from_str(
+            "\
+engines:
+  vllm:
+    launch: container
+    image: vllm/vllm-openai:v0.24.0
+models:
+  - model: qwen3-14b
+    keep_alive: 30m
+  - model: hf:Org/Coder:Q4
+    name: coder
+",
+        )
+        .expect("parse");
+        assert!(good.validate().is_ok());
+
+        // Duplicate names.
+        let dup: ModelHostConfig = serde_yaml::from_str(
+            "models:\n  - model: qwen3-14b\n  - model: hf:O/R:Q4\n    name: qwen3-14b\n",
+        )
+        .unwrap();
+        assert!(dup.validate().unwrap_err().contains("duplicate"));
+
+        // Nameless raw ref.
+        let nameless: ModelHostConfig =
+            serde_yaml::from_str("models:\n  - model: hf:Org/Repo:Q4\n").unwrap();
+        assert!(nameless.validate().is_err());
+
+        // Bad keep_alive.
+        let bad_ka: ModelHostConfig =
+            serde_yaml::from_str("models:\n  - model: qwen3-14b\n    keep_alive: soon\n").unwrap();
+        assert!(bad_ka.validate().unwrap_err().contains("keep_alive"));
+
+        // Container engine with an unpinned image.
+        let latest: ModelHostConfig = serde_yaml::from_str(
+            "engines:\n  vllm:\n    launch: container\n    image: vllm/vllm-openai:latest\nmodels:\n  - model: qwen3-14b\n",
+        )
+        .unwrap();
+        assert!(latest.validate().unwrap_err().contains("pinned"));
+
+        // Container engine with no image.
+        let noimg: ModelHostConfig = serde_yaml::from_str(
+            "engines:\n  vllm:\n    launch: container\nmodels:\n  - model: qwen3-14b\n",
+        )
+        .unwrap();
+        assert!(noimg.validate().unwrap_err().contains("no image"));
     }
 
     #[test]
