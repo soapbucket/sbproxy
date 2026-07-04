@@ -83,3 +83,39 @@ groups:
         annotations:
           summary: "P95 model latency above 30s for tenant {{ $labels.tenant_id }} / {{ $labels.model }}"
           description: "Upstream model latency p95 has exceeded 30 seconds for 10 minutes. Tenant: {{ $labels.tenant_id }}. Model: {{ $labels.model }}. Current: {{ $value | humanizeDuration }}."
+
+      - alert: SBProxyModelHostEngineLaunchFailing
+        expr: rate(sbproxy_model_host_launches_total{outcome="failed"}[10m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Model-host engine failing to launch ({{ $labels.engine }}/{{ $labels.model }})"
+          description: "A local inference engine has been failing to reach Ready for 5 minutes. Check GPU VRAM, the engine binary on PATH, and weight integrity. Runbook: docs/model-host.md."
+
+      - alert: SBProxyModelHostGpuVramNearFull
+        expr: min(sbproxy_model_host_gpu_vram_bytes{kind="free"}) / 1024 / 1024 / 1024 < 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU free VRAM below 1 GiB"
+          description: "The least-free GPU has under 1 GiB free for 5 minutes; the next model load may OOM or force an eviction. Consider a smaller quant or eviction: lru."
+
+      - alert: SBProxyModelHostEvictionChurn
+        expr: rate(sbproxy_model_host_evictions_total[5m]) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Model-host eviction churn"
+          description: "Models are being evicted faster than one per ten seconds for 10 minutes, which means VRAM thrash between models. Pin residency (eviction: never) or add VRAM headroom."
+
+      - alert: SBProxyModelHostLoadQueueBackedUp
+        expr: max(sbproxy_model_host_load_queue_depth) > 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Model-host load queue backed up"
+          description: "More than 20 requests have been queued waiting for a cold model to load for 5 minutes. Cold starts are not keeping up; consider keep_alive to hold the model resident."

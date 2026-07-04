@@ -170,4 +170,66 @@ models:
             "engine is an allowlisted enum; sglang must reject"
         );
     }
+
+    // --- WOR-1663: config-spawn surface guards ---
+
+    #[test]
+    fn no_arbitrary_command_field() {
+        // The config type has no `cmd`/`command`/`program`/`binary`
+        // field, so config cannot name an executable. A YAML that
+        // tries to smuggle one is a deserialize error (unknown field
+        // is not silently accepted into ServeEntry), or at minimum
+        // does not become a runnable command. We assert the type
+        // simply has no such surface: a serialized default ServeEntry
+        // carries only the known keys.
+        let e = ServeEntry {
+            model: "qwen3-8b".into(),
+            engine: EngineKind::Vllm,
+            keep_alive: None,
+            max_context: None,
+            extra_args: vec![],
+        };
+        let json = serde_json::to_value(&e).expect("serialize");
+        let obj = json.as_object().expect("object");
+        for forbidden in ["cmd", "command", "program", "binary", "exec", "shell"] {
+            assert!(
+                !obj.contains_key(forbidden),
+                "ServeEntry must not expose a `{forbidden}` field"
+            );
+        }
+        // The only executable-selecting key is the allowlisted enum.
+        assert!(obj.contains_key("engine"));
+    }
+
+    #[test]
+    fn extra_args_are_opaque_argv_not_shell() {
+        // extra_args must be preserved verbatim as individual argv
+        // elements. Shell metacharacters are data, never interpreted:
+        // the runtime passes each element as one arg, so there is no
+        // shell to expand `$(...)`, `;`, `&&`, or a redirect.
+        let cfg: ModelHostConfig = serde_yaml::from_str(
+            "models:\n  - model: x\n    extra_args:\n      - \"--flag=$(rm -rf /)\"\n      - \"; curl evil\"\n      - \"&& reboot\"\n",
+        )
+        .expect("parse");
+        let args = &cfg.models[0].extra_args;
+        assert_eq!(args.len(), 3);
+        // Stored verbatim, one element each, not split on the shell
+        // metacharacters, proving they are argv values not a command line.
+        assert_eq!(args[0], "--flag=$(rm -rf /)");
+        assert_eq!(args[1], "; curl evil");
+        assert_eq!(args[2], "&& reboot");
+    }
+
+    #[test]
+    fn engine_kind_maps_to_a_fixed_binary_only() {
+        // The engine-to-binary mapping is closed: every EngineKind
+        // resolves to one hard-coded binary name, so config chooses
+        // among a fixed set and can never inject an executable path.
+        for (kind, expect) in [
+            (EngineKind::Vllm, "vllm"),
+            (EngineKind::LlamaCpp, "llama-server"),
+        ] {
+            assert_eq!(kind.binary_name(), expect);
+        }
+    }
 }

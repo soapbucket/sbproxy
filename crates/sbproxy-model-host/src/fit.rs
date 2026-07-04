@@ -230,6 +230,70 @@ impl ModelMetadata {
         })
     }
 
+    /// Parse the shape from a GGUF file header (WOR-1654).
+    ///
+    /// GGUF stores the model shape as architecture-prefixed metadata
+    /// (`<arch>.block_count`, `<arch>.attention.head_count[_kv]`,
+    /// `<arch>.embedding_length`, `<arch>.context_length`). We match
+    /// on the key suffix so it works across architectures without
+    /// knowing the arch string. Only the header is needed, so a caller
+    /// can pass just the first N KiB of a large GGUF (a ranged read).
+    /// Returns `None` on a bad magic, an unsupported version, a
+    /// truncated header, or a missing required field. `params_fallback`
+    /// is used when the file has no `general.parameter_count`.
+    pub fn from_gguf(bytes: &[u8], params_fallback: u64) -> Option<Self> {
+        let mut r = GgufReader::new(bytes);
+        if r.take(4)? != b"GGUF" {
+            return None;
+        }
+        let version = r.u32()?;
+        if !(2..=3).contains(&version) {
+            return None; // only GGUF v2/v3 layouts are handled
+        }
+        let _tensor_count = r.u64()?;
+        let kv_count = r.u64()?;
+
+        let mut layers = None;
+        let mut head_count = None;
+        let mut head_count_kv = None;
+        let mut embedding_length = None;
+        let mut context_length = None;
+        let mut key_length = None;
+        let mut param_count = None;
+
+        for _ in 0..kv_count {
+            let key = r.gguf_string()?;
+            let vtype = r.u32()?;
+            // Advance past the value. The outer `?` aborts on a
+            // truncated/malformed value (cursor cannot advance); the
+            // inner Option is `Some(int)` only for an unsigned scalar
+            // and `None` for a string/array/float we skip over.
+            let scalar = r.read_value(vtype)?;
+            match () {
+                _ if key.ends_with(".block_count") => layers = scalar,
+                _ if key.ends_with(".attention.head_count_kv") => head_count_kv = scalar,
+                _ if key.ends_with(".attention.head_count") => head_count = scalar,
+                _ if key.ends_with(".embedding_length") => embedding_length = scalar,
+                _ if key.ends_with(".context_length") => context_length = scalar,
+                _ if key.ends_with(".attention.key_length") => key_length = scalar,
+                _ if key == "general.parameter_count" => param_count = scalar,
+                _ => {}
+            }
+        }
+
+        let layers = layers?;
+        let heads = head_count?;
+        let kv_heads = head_count_kv.unwrap_or(heads);
+        let head_dim = key_length.or_else(|| embedding_length.map(|e| e / heads.max(1)))?;
+        Some(Self {
+            params: param_count.unwrap_or(params_fallback),
+            layers,
+            kv_heads,
+            head_dim,
+            max_context: context_length.unwrap_or(8192),
+        })
+    }
+
     /// Weight bytes for a given quant.
     pub fn weight_bytes(&self, quant: Quant) -> f64 {
         self.params as f64 * quant.bytes_per_weight()
@@ -251,6 +315,110 @@ impl ModelMetadata {
     /// 1.15 for a 15% headroom.
     pub fn vram_estimate_bytes(&self, quant: Quant, seq_len: u64, overhead: f64) -> f64 {
         (self.weight_bytes(quant) + self.kv_bytes(quant, seq_len)) * overhead
+    }
+}
+
+/// A little-endian, bounds-checked cursor over a GGUF header. Every
+/// read returns `None` past the end, so a truncated or malformed file
+/// (including a ranged read that stopped mid-value) fails cleanly
+/// instead of panicking.
+struct GgufReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> GgufReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(slice)
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        let b = self.take(4)?;
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        let b = self.take(8)?;
+        Some(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
+    /// A GGUF string: u64 length prefix then that many bytes.
+    fn gguf_string(&mut self) -> Option<String> {
+        let len = self.u64()? as usize;
+        let bytes = self.take(len)?;
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    /// Byte width of a fixed-size GGUF scalar value type, or `None`
+    /// for the variable-length types (string=8, array=9) handled
+    /// separately.
+    fn scalar_width(vtype: u32) -> Option<usize> {
+        match vtype {
+            0 | 1 | 7 => Some(1), // u8, i8, bool
+            2 | 3 => Some(2),     // u16, i16
+            4..=6 => Some(4),     // u32, i32, f32
+            10..=12 => Some(8),   // u64, i64, f64
+            _ => None,
+        }
+    }
+
+    /// Advance the cursor past a value of `vtype`. Returns
+    /// `Some(Some(n))` for an unsigned scalar (the shape value),
+    /// `Some(None)` for a value skipped but well-formed (string,
+    /// array, signed, float), and `None` when the buffer is too short
+    /// to hold the value (truncation, which the caller treats as a
+    /// hard parse failure).
+    fn read_value(&mut self, vtype: u32) -> Option<Option<u64>> {
+        match vtype {
+            8 => {
+                // string
+                self.gguf_string()?;
+                Some(None)
+            }
+            9 => {
+                // array: elem type (u32) + count (u64) + elements
+                let elem_type = self.u32()?;
+                let count = self.u64()? as usize;
+                for _ in 0..count {
+                    if elem_type == 8 {
+                        self.gguf_string()?;
+                    } else if elem_type == 9 {
+                        // Nested arrays do not occur in model-shape
+                        // metadata; refuse rather than recurse blindly.
+                        return None;
+                    } else {
+                        let w = Self::scalar_width(elem_type)?;
+                        self.take(w)?;
+                    }
+                }
+                Some(None)
+            }
+            _ => {
+                let w = Self::scalar_width(vtype)?;
+                let bytes = self.take(w)?;
+                // Only unsigned integer types carry a shape value.
+                let v = match vtype {
+                    0 => Some(bytes[0] as u64),
+                    2 => Some(u16::from_le_bytes([bytes[0], bytes[1]]) as u64),
+                    4 => Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64),
+                    10 => Some(u64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ])),
+                    _ => None, // signed / float / bool: not a shape field
+                };
+                Some(v)
+            }
+        }
     }
 }
 
@@ -565,6 +733,105 @@ mod tests {
         assert_eq!(m.kv_heads, 8);
         assert_eq!(m.head_dim, 128); // 5120 / 40
         assert_eq!(m.max_context, 40960);
+    }
+
+    // --- GGUF header parsing (WOR-1654) ---
+
+    /// Build a minimal but valid GGUF v3 header with the given
+    /// architecture-prefixed shape fields, plus one string KV and one
+    /// array KV interleaved to prove the skip logic keeps the cursor
+    /// aligned. All shape values are encoded as u32 (GGUF type 4).
+    fn synth_gguf(
+        arch: &str,
+        layers: u32,
+        heads: u32,
+        kv_heads: u32,
+        hidden: u32,
+        ctx: u32,
+    ) -> Vec<u8> {
+        fn push_str(out: &mut Vec<u8>, s: &str) {
+            out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        fn push_u32_kv(out: &mut Vec<u8>, key: &str, v: u32) {
+            push_str(out, key);
+            out.extend_from_slice(&4u32.to_le_bytes()); // type u32
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes()); // version
+        out.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+                                                    // KV count: 5 shape ints + arch string + a decoy string + a decoy array = 8.
+        out.extend_from_slice(&8u64.to_le_bytes());
+        // A string KV (general.architecture).
+        push_str(&mut out, "general.architecture");
+        out.extend_from_slice(&8u32.to_le_bytes()); // type string
+        push_str(&mut out, arch);
+        // Shape ints, arch-prefixed.
+        push_u32_kv(&mut out, &format!("{arch}.block_count"), layers);
+        push_u32_kv(&mut out, &format!("{arch}.attention.head_count"), heads);
+        push_u32_kv(
+            &mut out,
+            &format!("{arch}.attention.head_count_kv"),
+            kv_heads,
+        );
+        push_u32_kv(&mut out, &format!("{arch}.embedding_length"), hidden);
+        push_u32_kv(&mut out, &format!("{arch}.context_length"), ctx);
+        // A decoy string KV.
+        push_str(&mut out, "general.name");
+        out.extend_from_slice(&8u32.to_le_bytes());
+        push_str(&mut out, "Test Model");
+        // A decoy array KV (u32 array of 3) the parser must skip past.
+        push_str(&mut out, "some.array");
+        out.extend_from_slice(&9u32.to_le_bytes()); // type array
+        out.extend_from_slice(&4u32.to_le_bytes()); // elem type u32
+        out.extend_from_slice(&3u64.to_le_bytes()); // count
+        for v in [1u32, 2, 3] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn gguf_header_parses_shape() {
+        // arch qwen3, 40 layers, 40 heads, 8 kv heads, hidden 5120, ctx 40960.
+        let bytes = synth_gguf("qwen3", 40, 40, 8, 5120, 40960);
+        let m = ModelMetadata::from_gguf(&bytes, 14_000_000_000).expect("parse gguf");
+        assert_eq!(m.layers, 40);
+        assert_eq!(m.kv_heads, 8);
+        assert_eq!(m.head_dim, 128); // 5120 / 40
+        assert_eq!(m.max_context, 40960);
+        assert_eq!(m.params, 14_000_000_000); // fallback (no parameter_count KV)
+    }
+
+    #[test]
+    fn gguf_bad_magic_is_none() {
+        let mut bytes = synth_gguf("llama", 32, 32, 8, 4096, 8192);
+        bytes[0] = b'X';
+        assert!(ModelMetadata::from_gguf(&bytes, 1).is_none());
+    }
+
+    #[test]
+    fn gguf_truncated_header_is_none_not_panic() {
+        let bytes = synth_gguf("llama", 32, 32, 8, 4096, 8192);
+        // Cut the file mid-metadata: must return None, never panic.
+        for cut in [4, 12, 24, bytes.len() / 2] {
+            assert!(
+                ModelMetadata::from_gguf(&bytes[..cut], 1).is_none(),
+                "truncated at {cut} should be None"
+            );
+        }
+    }
+
+    #[test]
+    fn gguf_missing_gqa_defaults_kv_to_heads() {
+        // A header without head_count_kv: kv_heads should default to heads.
+        // Rebuild with kv==heads and confirm.
+        let bytes = synth_gguf("mistral", 32, 32, 32, 4096, 32768);
+        let m = ModelMetadata::from_gguf(&bytes, 7_000_000_000).unwrap();
+        assert_eq!(m.kv_heads, 32);
+        assert_eq!(m.head_dim, 128);
     }
 
     #[test]
