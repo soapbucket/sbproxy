@@ -32,6 +32,7 @@ pub mod ids;
 pub mod image;
 pub mod judge;
 pub mod key_scoping;
+pub mod local_host;
 pub mod model_alias;
 pub mod multimodal;
 pub mod prompt_cache;
