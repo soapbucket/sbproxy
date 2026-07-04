@@ -104,6 +104,16 @@ pub struct ModelHostConfig {
     pub eviction: EvictionPolicy,
 }
 
+impl ServeEntry {
+    /// The parsed keep-alive idle timeout, or `None` when unset or
+    /// unparseable. Uses the compact duration form (`30m`, `1h30m`).
+    pub fn keep_alive_duration(&self) -> Option<std::time::Duration> {
+        self.keep_alive
+            .as_deref()
+            .and_then(crate::launch::parse_duration)
+    }
+}
+
 impl ModelHostConfig {
     /// True when no models are configured (the block is inert).
     pub fn is_empty(&self) -> bool {

@@ -32,6 +32,9 @@
 pub mod catalog;
 pub mod config;
 pub mod fit;
+pub mod hybrid;
+pub mod launch;
+pub mod residency;
 pub mod supervisor;
 
 pub use catalog::{Catalog, CatalogEntry, ModelRef, ResolveError};
@@ -39,4 +42,7 @@ pub use config::{EngineKind, EvictionPolicy, ModelHostConfig, ServeEntry};
 pub use fit::{
     FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor, ModelMetadata, Quant, StaticGpuProbe,
 };
+pub use hybrid::{savings_micros, AliasTable, CloudPrice, LaneSplit};
+pub use launch::{build_launch_spec, parse_duration, ProcessEngineLauncher};
+pub use residency::{Admission, ResidencyManager, Resident};
 pub use supervisor::{EngineLauncher, EngineState, LaunchSpec, SupervisorError};
