@@ -26,6 +26,15 @@ pub struct Resident {
     pub vram_bytes: u64,
     /// Logical last-used tick; higher is more recent.
     pub last_used: u64,
+    /// Relative cost of reloading this model if evicted (e.g. measured
+    /// cold-start milliseconds). A 2026 multi-model-scheduler study
+    /// found preemption cost is dominated by weight reload, so the
+    /// eviction planner minimizes the reload cost it gives up. `0` for
+    /// the plain-LRU path.
+    pub reload_cost_ms: u64,
+    /// Pinned models are never evicted (the operator wants them always
+    /// resident). A pinned co-resident pair is therefore never split.
+    pub pinned: bool,
 }
 
 /// The outcome of asking to admit a model.
@@ -105,48 +114,139 @@ impl ResidencyManager {
                 reason: "VRAM full and eviction policy is `never`".to_string(),
             };
         }
-        // Evict least-recently-used until it fits.
-        let mut by_lru: Vec<&Resident> = self.resident.iter().collect();
-        by_lru.sort_by_key(|r| r.last_used);
-        let mut reclaimed = self.free_bytes();
-        let mut evict = Vec::new();
-        for r in by_lru {
-            if vram_bytes <= reclaimed {
-                break;
-            }
-            evict.push(r.model.clone());
-            reclaimed += r.vram_bytes;
-        }
-        if vram_bytes <= reclaimed {
-            Admission::Admit { evict }
-        } else {
-            Admission::Rejected {
-                reason: "cannot free enough VRAM even after evicting all idle models".to_string(),
-            }
+        match self.choose_victims(vram_bytes, model) {
+            Some(evict) => Admission::Admit { evict },
+            None => Admission::Rejected {
+                reason: "cannot free enough VRAM even after evicting all idle (non-pinned) models"
+                    .to_string(),
+            },
         }
     }
 
-    /// Apply an admit decision: remove evicted models, add the new
-    /// one. Convenience for the common path.
+    /// Choose the set of resident models to evict to free `needed`
+    /// bytes for `incoming`, minimizing the reload cost given up while
+    /// protecting pinned models and recently-used ones.
+    ///
+    /// Cost of evicting a model = its `reload_cost_ms` plus a recency
+    /// term weighted to dominate any reload-cost difference, so a
+    /// more-recently-used model is always more expensive to evict than
+    /// an idle one (LRU behavior), and reload cost only breaks ties
+    /// among equally-idle candidates. Pinned models are never
+    /// candidates. Returns `None` when no non-pinned subset can free
+    /// enough (the caller rejects). With all `reload_cost_ms == 0` this
+    /// reduces exactly to least-recently-used eviction.
+    fn choose_victims(&self, needed: u64, incoming: &str) -> Option<Vec<String>> {
+        let free = self.free_bytes();
+        if needed <= free {
+            return Some(Vec::new());
+        }
+        let cands: Vec<&Resident> = self
+            .resident
+            .iter()
+            .filter(|r| r.model != incoming && !r.pinned)
+            .collect();
+        let reclaimable: u64 = cands.iter().map(|r| r.vram_bytes).sum();
+        if free + reclaimable < needed {
+            return None; // even evicting every non-pinned model is not enough
+        }
+        // Recency weight dominates reload-cost differences, so recency
+        // is the primary key and reload cost the tiebreaker.
+        let recency_w = cands.iter().map(|r| r.reload_cost_ms).max().unwrap_or(0) as u128 + 1;
+        let cost = |r: &Resident| r.reload_cost_ms as u128 + recency_w * r.last_used as u128;
+
+        let n = cands.len();
+        if n <= 16 {
+            // Exhaustive min-cost subset that frees enough.
+            let mut best: Option<(u128, usize, Vec<String>)> = None;
+            for mask in 1u32..(1u32 << n) {
+                let mut freed = free;
+                let mut total: u128 = 0;
+                let mut count = 0usize;
+                let mut set = Vec::new();
+                for (idx, r) in cands.iter().enumerate() {
+                    if mask & (1 << idx) != 0 {
+                        freed += r.vram_bytes;
+                        total += cost(r);
+                        count += 1;
+                        set.push(r.model.clone());
+                    }
+                }
+                if freed >= needed {
+                    let key = (total, count);
+                    if best.as_ref().is_none_or(|(bc, bn, _)| key < (*bc, *bn)) {
+                        best = Some((total, count, set));
+                    }
+                }
+            }
+            best.map(|(_, _, set)| set)
+        } else {
+            // Greedy fallback for large resident sets: evict lowest-cost
+            // (most idle, cheapest to reload) first until it fits.
+            let mut sorted = cands.clone();
+            sorted.sort_by_key(|r| cost(r));
+            let mut freed = free;
+            let mut set = Vec::new();
+            for r in sorted {
+                if freed >= needed {
+                    break;
+                }
+                freed += r.vram_bytes;
+                set.push(r.model.clone());
+            }
+            (freed >= needed).then_some(set)
+        }
+    }
+
+    /// Apply an admit decision: remove evicted models, add the new one
+    /// (unpinned, zero reload cost). Convenience for the common path.
     pub fn commit_admit(&mut self, model: &str, vram_bytes: u64, now: u64, evict: &[String]) {
+        self.insert(model, vram_bytes, now, 0, false, evict);
+    }
+
+    /// Insert a resident, removing any evicted models first.
+    fn insert(
+        &mut self,
+        model: &str,
+        vram_bytes: u64,
+        now: u64,
+        reload_cost_ms: u64,
+        pinned: bool,
+        evict: &[String],
+    ) {
         self.resident.retain(|r| !evict.contains(&r.model));
         self.resident.push(Resident {
             model: model.to_string(),
             vram_bytes,
             last_used: now,
+            reload_cost_ms,
+            pinned,
         });
     }
 
     /// Plan and apply in one step. Returns the models that were
-    /// evicted, or an error string when rejected.
+    /// evicted, or an error string when rejected. Plain LRU (zero
+    /// reload cost, unpinned).
     pub fn load(&mut self, model: &str, vram_bytes: u64, now: u64) -> Result<Vec<String>, String> {
+        self.load_managed(model, vram_bytes, now, 0, false)
+    }
+
+    /// Plan and apply with a reload cost and a pin flag. Eviction
+    /// minimizes reload cost given up and never evicts a pinned model.
+    pub fn load_managed(
+        &mut self,
+        model: &str,
+        vram_bytes: u64,
+        now: u64,
+        reload_cost_ms: u64,
+        pinned: bool,
+    ) -> Result<Vec<String>, String> {
         match self.plan_admit(model, vram_bytes, now) {
             Admission::AlreadyResident => {
                 self.touch(model, now);
                 Ok(Vec::new())
             }
             Admission::Admit { evict } => {
-                self.commit_admit(model, vram_bytes, now, &evict);
+                self.insert(model, vram_bytes, now, reload_cost_ms, pinned, &evict);
                 Ok(evict)
             }
             Admission::Rejected { reason } => Err(reason),
@@ -245,5 +345,63 @@ mod tests {
         m.unload("a");
         assert_eq!(m.used_bytes(), 0);
         assert!(m.resident_models().is_empty());
+    }
+
+    // --- WOR-1672: reload-cost-aware, pin-protecting eviction ---
+
+    #[test]
+    fn reload_cost_breaks_ties_among_equally_idle() {
+        // Two idle models with the SAME last_used but different reload
+        // cost; freeing room evicts the one cheaper to reload.
+        let mut m = ResidencyManager::new(24 * GIB, EvictionPolicy::Lru);
+        m.load_managed("cheap", 10 * GIB, 1, 5, false).unwrap();
+        m.load_managed("expensive", 10 * GIB, 1, 500, false)
+            .unwrap();
+        // free = 4 GiB; a 10 GiB model needs one eviction. Same recency,
+        // so the cheaper-to-reload model goes.
+        let evicted = m.load_managed("new", 10 * GIB, 2, 0, false).unwrap();
+        assert_eq!(evicted, vec!["cheap".to_string()]);
+    }
+
+    #[test]
+    fn evicts_large_idle_not_small_hot() {
+        // The design-doc exit case: a small, recently-used model and a
+        // large idle one; admitting a third evicts the large idle model.
+        let mut m = ResidencyManager::new(24 * GIB, EvictionPolicy::Lru);
+        m.load_managed("big-idle", 14 * GIB, 1, 800, false).unwrap();
+        m.load_managed("small-hot", 6 * GIB, 2, 50, false).unwrap();
+        m.touch("small-hot", 10); // keep it hot
+                                  // free = 4 GiB; a 12 GiB model needs room. big-idle is older, so
+                                  // recency makes it the cheaper eviction, and it alone frees enough.
+        let evicted = m.load_managed("new", 12 * GIB, 11, 0, false).unwrap();
+        assert_eq!(evicted, vec!["big-idle".to_string()]);
+        assert!(m.resident_models().contains(&"small-hot".to_string()));
+    }
+
+    #[test]
+    fn pinned_model_is_never_evicted() {
+        let mut m = ResidencyManager::new(24 * GIB, EvictionPolicy::Lru);
+        // Pin a small model that is also the oldest (would be LRU victim).
+        m.load_managed("pinned", 6 * GIB, 1, 10, true).unwrap();
+        m.load_managed("idle", 14 * GIB, 2, 800, false).unwrap();
+        // free = 4 GiB; a 12 GiB model needs room. Only "idle" may be
+        // evicted; "pinned" stays despite being older.
+        let evicted = m.load_managed("new", 12 * GIB, 3, 0, false).unwrap();
+        assert_eq!(evicted, vec!["idle".to_string()]);
+        assert!(m.resident_models().contains(&"pinned".to_string()));
+    }
+
+    #[test]
+    fn pinned_pair_is_never_split_and_blocks_when_it_must() {
+        let mut m = ResidencyManager::new(24 * GIB, EvictionPolicy::Lru);
+        m.load_managed("keep-a", 10 * GIB, 1, 10, true).unwrap();
+        m.load_managed("keep-b", 10 * GIB, 2, 10, true).unwrap();
+        // free = 4 GiB; a 12 GiB model cannot be admitted because both
+        // resident models are pinned. Neither is evicted (pair intact).
+        let err = m.load_managed("new", 12 * GIB, 3, 0, false).unwrap_err();
+        assert!(err.contains("non-pinned"), "got: {err}");
+        let mut names = m.resident_models();
+        names.sort();
+        assert_eq!(names, vec!["keep-a".to_string(), "keep-b".to_string()]);
     }
 }

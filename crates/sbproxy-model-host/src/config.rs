@@ -56,6 +56,49 @@ pub enum EvictionPolicy {
     Never,
 }
 
+/// KV-cache quantization for a served model (WOR-1676). Quantizing
+/// the KV cache multiplies effective KV capacity, so a model can fit a
+/// longer context or a larger batch on the same VRAM at some quality
+/// cost. `Auto` keeps the cache at the weight quant's default (f16 for
+/// most, fp8 when serving FP8).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum KvCacheQuant {
+    /// Follow the weight quant's default KV dtype.
+    #[default]
+    Auto,
+    /// 16-bit KV (the safe, full-quality default).
+    F16,
+    /// 8-bit float KV. Needs FP8-capable kernels.
+    Fp8,
+    /// 8-bit integer KV.
+    Int8,
+    /// 4-bit KV (maximum capacity, largest quality hit).
+    Int4,
+}
+
+impl KvCacheQuant {
+    /// Bytes per KV element for this mode, or `None` for `Auto` (the
+    /// caller uses the weight quant's default instead).
+    pub fn bytes_per_element(self) -> Option<f64> {
+        match self {
+            KvCacheQuant::Auto => None,
+            KvCacheQuant::F16 => Some(2.0),
+            KvCacheQuant::Fp8 => Some(1.0),
+            KvCacheQuant::Int8 => Some(1.0),
+            KvCacheQuant::Int4 => Some(0.5),
+        }
+    }
+
+    /// Whether this KV mode needs FP8 kernels (so the fit planner can
+    /// gate it on GPU capability, like FP8 weights).
+    pub fn needs_fp8(self) -> bool {
+        matches!(self, KvCacheQuant::Fp8)
+    }
+}
+
 /// One model an operator wants the gateway to serve locally.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServeEntry {
@@ -78,6 +121,10 @@ pub struct ServeEntry {
     /// no shell: each entry is passed as one argv element.
     #[serde(default)]
     pub extra_args: Vec<String>,
+    /// KV-cache quantization. Defaults to `Auto` (the weight quant's
+    /// default KV dtype).
+    #[serde(default)]
+    pub kv_quant: KvCacheQuant,
 }
 
 /// The `serve:` block: the local models plus host-wide policy.
@@ -198,6 +245,7 @@ models:
             keep_alive: None,
             max_context: None,
             extra_args: vec![],
+            kv_quant: KvCacheQuant::Auto,
         };
         let json = serde_json::to_value(&e).expect("serialize");
         let obj = json.as_object().expect("object");

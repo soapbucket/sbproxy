@@ -38,13 +38,14 @@ pub mod launch;
 pub mod probe_nvidia;
 pub mod residency;
 pub mod supervisor;
+pub mod supply_chain;
 pub mod weights;
 
 pub use catalog::{Catalog, CatalogEntry, ModelRef, ResolveError};
-pub use config::{EngineKind, EvictionPolicy, ModelHostConfig, ServeEntry};
+pub use config::{EngineKind, EvictionPolicy, KvCacheQuant, ModelHostConfig, ServeEntry};
 pub use fit::{
-    fp8_supported, FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor, ModelMetadata, Quant,
-    StaticGpuProbe,
+    estimate_throughput, fp8_supported, FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor,
+    ModelMetadata, Quant, StaticGpuProbe, ThroughputEstimate,
 };
 pub use hybrid::{savings_micros, AliasTable, CloudPrice, LaneSplit};
 pub use launch::{build_launch_spec, parse_duration, ProcessEngineLauncher};
@@ -52,3 +53,4 @@ pub use launch::{build_launch_spec, parse_duration, ProcessEngineLauncher};
 pub use probe_nvidia::NvmlGpuProbe;
 pub use residency::{Admission, ResidencyManager, Resident};
 pub use supervisor::{EngineLauncher, EngineState, LaunchSpec, SupervisorError};
+pub use supply_chain::{scan_pickle, select_weight_file, SupplyChainError, WeightFormat};

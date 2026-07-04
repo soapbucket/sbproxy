@@ -26,7 +26,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::catalog::ModelRef;
-use crate::config::EngineKind;
+use crate::config::{EngineKind, KvCacheQuant};
 use crate::fit::FitPlan;
 use crate::supervisor::{EngineLauncher, LaunchSpec};
 
@@ -82,6 +82,7 @@ pub fn build_launch_spec(
     model: &ModelRef,
     plan: &FitPlan,
     port: u16,
+    kv_quant: KvCacheQuant,
     extra_args: &[String],
 ) -> LaunchSpec {
     let mut args: Vec<String> = Vec::new();
@@ -101,6 +102,10 @@ pub fn build_launch_spec(
                 args.push("--quantization".to_string());
                 args.push(q.to_string());
             }
+            if let Some(dtype) = vllm_kv_cache_dtype(kv_quant) {
+                args.push("--kv-cache-dtype".to_string());
+                args.push(dtype.to_string());
+            }
             args.push("--max-model-len".to_string());
             args.push(plan.seq_len.to_string());
             // Enable the dev endpoints the sleep/wake phase drives.
@@ -118,6 +123,13 @@ pub fn build_launch_spec(
             args.push(port.to_string());
             args.push("--ctx-size".to_string());
             args.push(plan.seq_len.to_string());
+            if let Some(t) = llama_cache_type(kv_quant) {
+                // Quantize both K and V caches.
+                args.push("--cache-type-k".to_string());
+                args.push(t.to_string());
+                args.push("--cache-type-v".to_string());
+                args.push(t.to_string());
+            }
         }
     }
 
@@ -144,6 +156,30 @@ fn vllm_quantization(quant_name: &str) -> Option<&'static str> {
         Some("gptq")
     } else {
         None
+    }
+}
+
+/// Map a KV-quant mode to vLLM's `--kv-cache-dtype`, or `None` when no
+/// flag is needed (`Auto` / `F16` are vLLM's default).
+fn vllm_kv_cache_dtype(kv: KvCacheQuant) -> Option<&'static str> {
+    match kv {
+        KvCacheQuant::Auto | KvCacheQuant::F16 => None,
+        KvCacheQuant::Fp8 => Some("fp8"),
+        // vLLM exposes fp8 variants; int8/int4 KV map to the nearest
+        // supported low-precision dtype it accepts.
+        KvCacheQuant::Int8 => Some("fp8"),
+        KvCacheQuant::Int4 => Some("fp8"),
+    }
+}
+
+/// Map a KV-quant mode to llama.cpp's `--cache-type-{k,v}` value, or
+/// `None` for the f16 default.
+fn llama_cache_type(kv: KvCacheQuant) -> Option<&'static str> {
+    match kv {
+        KvCacheQuant::Auto | KvCacheQuant::F16 => None,
+        KvCacheQuant::Fp8 => Some("q8_0"),
+        KvCacheQuant::Int8 => Some("q8_0"),
+        KvCacheQuant::Int4 => Some("q4_0"),
     }
 }
 
@@ -293,7 +329,14 @@ mod tests {
 
     #[test]
     fn vllm_argv_has_repo_port_and_quant() {
-        let spec = build_launch_spec(EngineKind::Vllm, &model(), &plan("FP8"), 8001, &[]);
+        let spec = build_launch_spec(
+            EngineKind::Vllm,
+            &model(),
+            &plan("FP8"),
+            8001,
+            KvCacheQuant::Auto,
+            &[],
+        );
         assert_eq!(spec.program, "vllm");
         assert_eq!(spec.args[0], "serve");
         assert_eq!(spec.args[1], "Qwen/Qwen3-14B");
@@ -317,18 +360,61 @@ mod tests {
 
     #[test]
     fn vllm_bf16_omits_quantization_flag() {
-        let spec = build_launch_spec(EngineKind::Vllm, &model(), &plan("bf16"), 8002, &[]);
+        let spec = build_launch_spec(
+            EngineKind::Vllm,
+            &model(),
+            &plan("bf16"),
+            8002,
+            KvCacheQuant::Auto,
+            &[],
+        );
         assert!(!spec.args.iter().any(|a| a == "--quantization"));
+        // Auto KV adds no --kv-cache-dtype flag.
+        assert!(!spec.args.iter().any(|a| a == "--kv-cache-dtype"));
     }
 
     #[test]
     fn llama_cpp_argv_uses_hf_repo_and_ctx() {
-        let spec = build_launch_spec(EngineKind::LlamaCpp, &model(), &plan("Q4_K_M"), 8003, &[]);
+        let spec = build_launch_spec(
+            EngineKind::LlamaCpp,
+            &model(),
+            &plan("Q4_K_M"),
+            8003,
+            KvCacheQuant::Auto,
+            &[],
+        );
         assert_eq!(spec.program, "llama-server");
         let ri = spec.args.iter().position(|a| a == "--hf-repo").unwrap();
         assert_eq!(spec.args[ri + 1], "Qwen/Qwen3-14B");
         let ci = spec.args.iter().position(|a| a == "--ctx-size").unwrap();
         assert_eq!(spec.args[ci + 1], "8192");
+    }
+
+    #[test]
+    fn kv_quant_adds_engine_flags() {
+        // vLLM: Int4 KV maps to a --kv-cache-dtype flag.
+        let v = build_launch_spec(
+            EngineKind::Vllm,
+            &model(),
+            &plan("FP8"),
+            8010,
+            KvCacheQuant::Int4,
+            &[],
+        );
+        let ki = v.args.iter().position(|a| a == "--kv-cache-dtype").unwrap();
+        assert_eq!(v.args[ki + 1], "fp8");
+        // llama.cpp: Int4 KV quantizes both K and V caches to q4_0.
+        let l = build_launch_spec(
+            EngineKind::LlamaCpp,
+            &model(),
+            &plan("Q4_K_M"),
+            8011,
+            KvCacheQuant::Int4,
+            &[],
+        );
+        assert!(l.args.iter().any(|a| a == "--cache-type-k"));
+        assert!(l.args.iter().any(|a| a == "--cache-type-v"));
+        assert!(l.args.iter().any(|a| a == "q4_0"));
     }
 
     #[test]
@@ -338,6 +424,7 @@ mod tests {
             &model(),
             &plan("FP8"),
             8004,
+            KvCacheQuant::Auto,
             &[
                 "--enable-prefix-caching".to_string(),
                 "--seed=7".to_string(),
