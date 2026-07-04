@@ -40,8 +40,10 @@ pub mod manifest;
 #[cfg(feature = "gpu-nvidia")]
 pub mod probe_nvidia;
 pub mod pull;
+pub mod report;
 pub mod residency;
 pub mod scheduling;
+pub mod sleep_wake;
 pub mod supervisor;
 pub mod supply_chain;
 #[cfg(feature = "tokenizer")]
@@ -69,8 +71,10 @@ pub use manifest::{resolve_cache_dir, validate_serve_against_manifest, SourceSch
 #[cfg(feature = "gpu-nvidia")]
 pub use probe_nvidia::NvmlGpuProbe;
 pub use pull::{pull_plan, PullItem, PullMode};
+pub use report::{ModelValue, ValueReport};
 pub use residency::{Admission, ResidencyManager, Resident};
 pub use scheduling::{admit, next_to_admit, PriorityClass, SchedulingDecision};
+pub use sleep_wake::{is_sleeping, sleep, wake_up, SleepLevel};
 pub use supervisor::{EngineLauncher, EngineState, LaunchSpec, SupervisorError};
 pub use supply_chain::{scan_pickle, select_weight_file, SupplyChainError, WeightFormat};
 #[cfg(feature = "tokenizer")]
