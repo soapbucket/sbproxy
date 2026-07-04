@@ -1,0 +1,68 @@
+# Certified model catalog for the sbproxy model host (WOR-1662).
+#
+# Maps a short, stable catalog_id to the Hugging Face repo, the
+# official quant variants (most-preferred first), the parameter shape,
+# license, family, and a coarse min-VRAM hint. The fit planner
+# (crate::fit) does the precise capability-aware selection; this file
+# is data only.
+#
+# Seeded with the certified-first models from the design doc. Add a
+# model by appending an entry; catalog_id is the key an operator names
+# in `serve:`. An operator can always bypass this file with an
+# explicit hf:Org/Repo:QUANT reference.
+models:
+  qwen3-32b:
+    hf_repo: Qwen/Qwen3-32B
+    quants: [FP8, AWQ, Q4_K_M]
+    params: 32B
+    license: apache-2.0
+    family: qwen
+    min_vram_hint_gib: 20.0
+
+  qwen3-30b-a3b:
+    hf_repo: Qwen/Qwen3-30B-A3B
+    quants: [FP8, Q4_K_M]
+    params: 30B-A3B
+    license: apache-2.0
+    family: qwen
+    min_vram_hint_gib: 18.0
+
+  qwen3-14b:
+    hf_repo: Qwen/Qwen3-14B
+    quants: [FP8, Q4_K_M]
+    params: 14B
+    license: apache-2.0
+    family: qwen
+    min_vram_hint_gib: 10.0
+
+  qwen3-8b:
+    hf_repo: Qwen/Qwen3-8B
+    quants: [FP8, Q4_K_M]
+    params: 8B
+    license: apache-2.0
+    family: qwen
+    min_vram_hint_gib: 6.0
+
+  glm-4-flash:
+    hf_repo: THUDM/GLM-4-Flash
+    quants: [bf16, Q4_K_M]
+    params: 9B
+    license: apache-2.0
+    family: glm
+    min_vram_hint_gib: 7.0
+
+  gpt-oss-20b:
+    hf_repo: openai/gpt-oss-20b
+    quants: [Q4_K_M, Q5_K_M]
+    params: 20B
+    license: apache-2.0
+    family: gpt-oss
+    min_vram_hint_gib: 13.0
+
+  llama-3.1-8b-instruct:
+    hf_repo: meta-llama/Llama-3.1-8B-Instruct
+    quants: [FP8, Q4_K_M]
+    params: 8B
+    license: llama3.1
+    family: llama
+    min_vram_hint_gib: 6.0

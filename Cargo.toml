@@ -28,6 +28,7 @@ members = [
     "crates/sbproxy-classifier-sidecar",
     "crates/sbproxy-classifier-client",
     "crates/sbproxy-agent-detect",
+    "crates/sbproxy-model-host",
     "e2e",
 ]
 # The k8s operator pulls kube + k8s-openapi, which adds ~30-60s to a cold
@@ -95,6 +96,7 @@ sbproxy-mesh = { path = "crates/sbproxy-mesh" }
 sbproxy-storage-mesh = { path = "crates/sbproxy-storage-mesh" }
 sbproxy-middleware = { path = "crates/sbproxy-middleware" }
 sbproxy-extension = { path = "crates/sbproxy-extension" }
+sbproxy-model-host = { path = "crates/sbproxy-model-host" }
 sbproxy-ai = { path = "crates/sbproxy-ai" }
 sbproxy-tls = { path = "crates/sbproxy-tls" }
 sbproxy-openapi = { path = "crates/sbproxy-openapi" }
