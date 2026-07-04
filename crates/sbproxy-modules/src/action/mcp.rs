@@ -1307,9 +1307,9 @@ mod tests {
         let action = McpAction::from_config(value).expect("compile");
         let allow = action.tool_allowlist.unwrap();
         assert_eq!(allow.len(), 3, "union should dedupe overlapping entries");
-        assert!(allow.contains(&"a".to_string()));
-        assert!(allow.contains(&"b".to_string()));
-        assert!(allow.contains(&"c".to_string()));
+        assert!(allow.contains("a"));
+        assert!(allow.contains("b"));
+        assert!(allow.contains("c"));
     }
 
     #[test]
