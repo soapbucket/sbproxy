@@ -349,9 +349,7 @@ origins:
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
     stream
-        .write_all(
-            b"GET / HTTP/1.1\r\nHost: mcp.localhost\r\nAccept: text/event-stream\r\n\r\n",
-        )
+        .write_all(b"GET / HTTP/1.1\r\nHost: mcp.localhost\r\nAccept: text/event-stream\r\n\r\n")
         .expect("send GET");
 
     upstream.grow();

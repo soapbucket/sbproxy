@@ -71,7 +71,10 @@ impl Drop for MockProvider {
     }
 }
 
-fn handle_provider(stream: &mut std::net::TcpStream, last_body: Arc<Mutex<String>>) -> std::io::Result<()> {
+fn handle_provider(
+    stream: &mut std::net::TcpStream,
+    last_body: Arc<Mutex<String>>,
+) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     loop {
@@ -180,7 +183,9 @@ fn handle_mcp(stream: &mut std::net::TcpStream, grown: &AtomicBool) -> std::io::
             "protocolVersion":"2025-06-18","capabilities":{"tools":{}},
             "serverInfo":{"name":"up","version":"1.0.0"}}}),
         "tools/list" => {
-            let mut tools = vec![json!({"name":"search","description":"search","inputSchema":{"type":"object","properties":{"q":{"type":"string"}}}})];
+            let mut tools = vec![
+                json!({"name":"search","description":"search","inputSchema":{"type":"object","properties":{"q":{"type":"string"}}}}),
+            ];
             if grown.load(Ordering::SeqCst) {
                 tools.push(json!({"name":"summarize","description":"late","inputSchema":{"type":"object"}}));
             }

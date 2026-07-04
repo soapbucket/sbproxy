@@ -252,17 +252,14 @@ fn wait_for<F: Fn() -> bool>(cond: F, deadline: Duration) -> bool {
 fn block_mode_filters_and_fails_unbumped_change() {
     let upstream = MutatingUpstream::start();
     let lockfile = write_baseline_lockfile("block");
-    let harness = match ProxyHarness::start_with_yaml(&config_yaml(
-        &upstream.url(),
-        &lockfile,
-        "block",
-    )) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("skipping block_mode_filters_and_fails_unbumped_change: {e}");
-            return;
-        }
-    };
+    let harness =
+        match ProxyHarness::start_with_yaml(&config_yaml(&upstream.url(), &lockfile, "block")) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("skipping block_mode_filters_and_fails_unbumped_change: {e}");
+                return;
+            }
+        };
 
     // Baseline: contract matches the lockfile, so the tool serves.
     assert!(
@@ -311,17 +308,14 @@ fn block_mode_filters_and_fails_unbumped_change() {
 fn warn_mode_keeps_serving_the_changed_tool() {
     let upstream = MutatingUpstream::start();
     let lockfile = write_baseline_lockfile("warn");
-    let harness = match ProxyHarness::start_with_yaml(&config_yaml(
-        &upstream.url(),
-        &lockfile,
-        "warn",
-    )) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("skipping warn_mode_keeps_serving_the_changed_tool: {e}");
-            return;
-        }
-    };
+    let harness =
+        match ProxyHarness::start_with_yaml(&config_yaml(&upstream.url(), &lockfile, "warn")) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("skipping warn_mode_keeps_serving_the_changed_tool: {e}");
+                return;
+            }
+        };
 
     assert!(tools_names(&harness).contains(&"search".to_string()));
     upstream.mutate();

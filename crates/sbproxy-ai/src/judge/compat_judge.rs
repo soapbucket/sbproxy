@@ -56,11 +56,7 @@ impl CompatJudge {
             )))
             .build()
             .unwrap_or_default();
-        let provider_label = config
-            .endpoint
-            .host_str()
-            .unwrap_or("unknown")
-            .to_string();
+        let provider_label = config.endpoint.host_str().unwrap_or("unknown").to_string();
         let budget = Arc::new(BudgetTracker::new(config.budget_tokens));
         Self {
             config,

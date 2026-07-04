@@ -1051,13 +1051,7 @@ pub(super) async fn handle_mcp_action(
     // only the no-Authorization-header case, so a request that passed
     // header-based auth is never re-challenged. The well-known
     // discovery routes above stay unauthenticated.
-    if mcp.oauth.is_some()
-        && session
-            .req_header()
-            .headers
-            .get("authorization")
-            .is_none()
-    {
+    if mcp.oauth.is_some() && session.req_header().headers.get("authorization").is_none() {
         let listener_is_tls = session
             .digest()
             .and_then(|d| d.ssl_digest.as_ref())
@@ -1218,8 +1212,12 @@ pub(super) async fn handle_mcp_action(
                     return Ok(());
                 }
                 Some(id) if !store.validate(id) => {
-                    send_error(session, 404, "unknown or expired MCP session; re-initialize")
-                        .await?;
+                    send_error(
+                        session,
+                        404,
+                        "unknown or expired MCP session; re-initialize",
+                    )
+                    .await?;
                     return Ok(());
                 }
                 Some(id) => mcp_session_id = Some(id.to_string()),
@@ -1400,8 +1398,8 @@ pub(super) async fn handle_mcp_action(
                     out.push(']');
                     std::borrow::Cow::Owned(out)
                 };
-                let id_json = serde_json::to_string(&request.id)
-                    .unwrap_or_else(|_| "null".to_string());
+                let id_json =
+                    serde_json::to_string(&request.id).unwrap_or_else(|_| "null".to_string());
                 let body = format!(
                     "{{\"jsonrpc\":\"2.0\",\"id\":{id_json},\"result\":{{\"tools\":{tools_json}}}}}"
                 );
@@ -1539,7 +1537,10 @@ pub(super) async fn handle_mcp_action(
                             JsonRpcResponse::error(
                                 request.id.clone(),
                                 INVALID_PARAMS,
-                                &format!("tool '{}' is blocked by the version gate: {}", name, detail),
+                                &format!(
+                                    "tool '{}' is blocked by the version gate: {}",
+                                    name, detail
+                                ),
                             )
                         } else if !mcp.is_tool_allowed(&name) {
                             JsonRpcResponse::error(
@@ -2092,9 +2093,8 @@ async fn write_jsonrpc_with_session(
             e,
         )
     })?;
-    let mut header = pingora_http::ResponseHeader::build(200, Some(3)).map_err(|e| {
-        Error::because(ErrorType::InternalError, "failed to build mcp header", e)
-    })?;
+    let mut header = pingora_http::ResponseHeader::build(200, Some(3))
+        .map_err(|e| Error::because(ErrorType::InternalError, "failed to build mcp header", e))?;
     let _ = header.insert_header("content-type", "application/json");
     let _ = header.insert_header("content-length", body.len().to_string());
     let _ = header.insert_header("mcp-session-id", session_id);
@@ -2136,16 +2136,20 @@ async fn handle_mcp_server_stream(
                 return Ok(());
             }
             Some(id) if !store.validate(id) => {
-                send_error(session, 404, "unknown or expired MCP session; re-initialize").await?;
+                send_error(
+                    session,
+                    404,
+                    "unknown or expired MCP session; re-initialize",
+                )
+                .await?;
                 return Ok(());
             }
             Some(_) => {}
         }
     }
 
-    let mut header = pingora_http::ResponseHeader::build(200, Some(3)).map_err(|e| {
-        Error::because(ErrorType::InternalError, "failed to build sse header", e)
-    })?;
+    let mut header = pingora_http::ResponseHeader::build(200, Some(3))
+        .map_err(|e| Error::because(ErrorType::InternalError, "failed to build sse header", e))?;
     let _ = header.insert_header("content-type", "text/event-stream");
     let _ = header.insert_header("cache-control", "no-cache");
     session

@@ -1308,10 +1308,7 @@ impl McpFederation {
                     error = %e,
                     "tool-versioning lockfile unreadable; gate fails open"
                 );
-                sbproxy_observe::metrics::record_mcp_tool_compat_verdict(
-                    "none",
-                    "lockfile_error",
-                );
+                sbproxy_observe::metrics::record_mcp_tool_compat_verdict("none", "lockfile_error");
                 self.version_blocked.store(Arc::new(HashMap::new()));
                 return;
             }
@@ -1871,14 +1868,8 @@ mod tests {
         // Manually store a catalogue and bump the generation the way
         // a refresh would; the next call must rebuild.
         let mut map = std::collections::HashMap::new();
-        map.insert(
-            "b_tool".to_string(),
-            make_tool("b_tool", "srv"),
-        );
-        map.insert(
-            "a_tool".to_string(),
-            make_tool("a_tool", "srv"),
-        );
+        map.insert("b_tool".to_string(), make_tool("b_tool", "srv"));
+        map.insert("a_tool".to_string(), make_tool("a_tool", "srv"));
         fed.tools.store(std::sync::Arc::new(map));
         fed.generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -1988,7 +1979,8 @@ mod tests {
     async fn version_gate_blocks_unbumped_change_in_block_mode() {
         let path = write_lockfile("block", &gate_lockfile("original description"));
         let fed = gated_federation(path.clone(), VersioningMode::Block, None);
-        fed.evaluate_tool_versioning(&gate_registry("completely different meaning")).await;
+        fed.evaluate_tool_versioning(&gate_registry("completely different meaning"))
+            .await;
         let blocked = fed.version_blocked();
         assert!(
             blocked.contains_key("search"),
@@ -2001,7 +1993,8 @@ mod tests {
     async fn version_gate_warn_mode_never_blocks() {
         let path = write_lockfile("warn", &gate_lockfile("original description"));
         let fed = gated_federation(path.clone(), VersioningMode::Warn, None);
-        fed.evaluate_tool_versioning(&gate_registry("completely different meaning")).await;
+        fed.evaluate_tool_versioning(&gate_registry("completely different meaning"))
+            .await;
         assert!(fed.version_blocked().is_empty());
         let _ = std::fs::remove_file(path);
     }
@@ -2016,7 +2009,8 @@ mod tests {
             VersioningMode::Block,
             Some(semver::Version::new(1, 0, 1)),
         );
-        fed.evaluate_tool_versioning(&gate_registry("reworded description")).await;
+        fed.evaluate_tool_versioning(&gate_registry("reworded description"))
+            .await;
         assert!(
             fed.version_blocked().is_empty(),
             "a declared bump matching the grade must pass"
@@ -2028,7 +2022,8 @@ mod tests {
     async fn version_gate_unchanged_contract_is_untouched() {
         let path = write_lockfile("same", &gate_lockfile("original description"));
         let fed = gated_federation(path.clone(), VersioningMode::Block, None);
-        fed.evaluate_tool_versioning(&gate_registry("original description")).await;
+        fed.evaluate_tool_versioning(&gate_registry("original description"))
+            .await;
         assert!(fed.version_blocked().is_empty());
         let _ = std::fs::remove_file(path);
     }
@@ -2040,7 +2035,8 @@ mod tests {
             VersioningMode::Block,
             None,
         );
-        fed.evaluate_tool_versioning(&gate_registry("anything")).await;
+        fed.evaluate_tool_versioning(&gate_registry("anything"))
+            .await;
         assert!(
             fed.version_blocked().is_empty(),
             "an unreadable lockfile must fail open"

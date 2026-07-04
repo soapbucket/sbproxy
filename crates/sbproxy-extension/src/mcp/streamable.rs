@@ -330,9 +330,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_body_capped_passes_under_cap() {
-        let resp = reqwest::Response::from(
-            http::Response::builder().status(200).body("ok").unwrap(),
-        );
+        let resp =
+            reqwest::Response::from(http::Response::builder().status(200).body("ok").unwrap());
         let body = read_body_capped(resp, 1024).await.unwrap();
         assert_eq!(body, b"ok");
     }
@@ -340,9 +339,8 @@ mod tests {
     #[tokio::test]
     async fn read_sse_response_capped_returns_response() {
         let sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"result\":\"ok\",\"id\":1}\n\n";
-        let resp = reqwest::Response::from(
-            http::Response::builder().status(200).body(sse).unwrap(),
-        );
+        let resp =
+            reqwest::Response::from(http::Response::builder().status(200).body(sse).unwrap());
         let parsed = read_sse_response_capped(resp, 1024).await.unwrap();
         assert_eq!(parsed.id, Some(json!(1)));
     }
@@ -352,9 +350,8 @@ mod tests {
         // A stream that never carries a JSON-RPC response and exceeds
         // the cap must fail with the cap marker, not buffer forever.
         let noise = ": keep-alive\n".repeat(200);
-        let resp = reqwest::Response::from(
-            http::Response::builder().status(200).body(noise).unwrap(),
-        );
+        let resp =
+            reqwest::Response::from(http::Response::builder().status(200).body(noise).unwrap());
         let err = read_sse_response_capped(resp, 64).await.unwrap_err();
         assert!(
             err.to_string().contains(RESPONSE_CAP_MARKER),

@@ -157,7 +157,8 @@ fn drive_call(harness: &ProxyHarness) {
 #[test]
 fn priced_tool_call_produces_a_usage_row() {
     let upstream = MockUpstream::start();
-    let sink_path = std::env::temp_dir().join(format!("sbproxy-mcp-usage-{}.jsonl", std::process::id()));
+    let sink_path =
+        std::env::temp_dir().join(format!("sbproxy-mcp-usage-{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&sink_path);
     let yaml = format!(
         r#"
@@ -210,7 +211,8 @@ origins:
 #[test]
 fn unpriced_tool_call_still_produces_a_row() {
     let upstream = MockUpstream::start();
-    let sink_path = std::env::temp_dir().join(format!("sbproxy-mcp-usage-np-{}.jsonl", std::process::id()));
+    let sink_path =
+        std::env::temp_dir().join(format!("sbproxy-mcp-usage-np-{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&sink_path);
     let yaml = format!(
         r#"

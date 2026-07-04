@@ -322,7 +322,11 @@ fn load_tools(source: &str) -> Result<Vec<serde_json::Value>, String> {
 /// carry over from an existing lockfile at the output path; new tools
 /// start at 1.0.0. Bumps are declared by the operator (in sb.yml or
 /// by editing the lockfile), never invented here.
-fn lock_tools(source: &str, lockfile: &PathBuf, generated_for: Option<&str>) -> Result<i32, String> {
+fn lock_tools(
+    source: &str,
+    lockfile: &PathBuf,
+    generated_for: Option<&str>,
+) -> Result<i32, String> {
     use sbproxy_extension::mcp::compat::{contract_digest, Lockfile, ToolLock};
 
     let tools = load_tools(source)?;
@@ -398,7 +402,8 @@ fn check_tools(
         None => Default::default(),
         Some(path) => {
             let raw: std::collections::BTreeMap<String, String> = serde_yaml::from_str(
-                &fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?,
+                &fs::read_to_string(path)
+                    .map_err(|e| format!("reading {}: {e}", path.display()))?,
             )
             .map_err(|e| format!("parsing {}: {e}", path.display()))?;
             raw.into_iter()

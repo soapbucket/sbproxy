@@ -182,7 +182,10 @@ fn openapi_server_lists_and_dispatches_rest() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    assert!(names.contains(&"getPet"), "derived tools listed, got {names:?}");
+    assert!(
+        names.contains(&"getPet"),
+        "derived tools listed, got {names:?}"
+    );
     assert!(names.contains(&"listPets"));
 
     // tools/call dispatches REST with the path param substituted.

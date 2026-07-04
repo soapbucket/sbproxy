@@ -330,7 +330,10 @@ mod tests {
         let routes = openapi_to_routes(&spec);
         // One route per emitted tool, names in lockstep.
         assert_eq!(tools.len(), routes.len());
-        let get_pet = routes.iter().find(|r| r.name == "getPet").expect("getPet route");
+        let get_pet = routes
+            .iter()
+            .find(|r| r.name == "getPet")
+            .expect("getPet route");
         assert_eq!(get_pet.method, "GET");
         assert_eq!(get_pet.path, "/pets/{id}");
     }

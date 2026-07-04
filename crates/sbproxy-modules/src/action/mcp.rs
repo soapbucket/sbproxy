@@ -619,9 +619,7 @@ impl McpAction {
             progressive_discovery: cfg.progressive_discovery,
             oauth: cfg.oauth,
             quota_store: Arc::new(ToolQuotaStore::new()),
-            refresh_interval: cfg
-                .refresh_interval
-                .unwrap_or(Duration::from_secs(60)),
+            refresh_interval: cfg.refresh_interval.unwrap_or(Duration::from_secs(60)),
             has_principal_scoped_tools,
             sessions: cfg.sessions.as_ref().filter(|s| s.enabled).map(|s| {
                 Arc::new(SessionStore::new(
@@ -717,9 +715,7 @@ fn normalize_rest_origin(origin: &str) -> String {
 /// Load an OpenAPI spec for an `openapi` federated server (WOR-1648),
 /// from the inline `spec:` value or the `spec_path:` file. Reading and
 /// parsing happen at config-load time so a bad spec fails startup.
-fn load_openapi_spec(
-    upstream: &McpFederatedServerConfig,
-) -> anyhow::Result<serde_json::Value> {
+fn load_openapi_spec(upstream: &McpFederatedServerConfig) -> anyhow::Result<serde_json::Value> {
     match (&upstream.spec, &upstream.spec_path) {
         (Some(_), Some(_)) => anyhow::bail!(
             "mcp action: openapi server '{}' sets both spec and spec_path; pick one",
@@ -876,7 +872,10 @@ impl McpInjectSource {
 }
 
 /// Convert one federated tool object to the requested provider shape.
-fn to_provider_tool(tool: &serde_json::Value, format: sbproxy_ai::identity::McpToolFormat) -> serde_json::Value {
+fn to_provider_tool(
+    tool: &serde_json::Value,
+    format: sbproxy_ai::identity::McpToolFormat,
+) -> serde_json::Value {
     let name = tool.get("name").cloned().unwrap_or(serde_json::Value::Null);
     let description = tool
         .get("description")
@@ -1046,16 +1045,17 @@ mod tests {
 
         let source = lookup_inject_source("toolhub_test_1646").expect("source registered");
         let principal = sbproxy_plugin::Principal::anonymous();
-        let tools = source.resolve_tools(
-            &principal,
-            &[],
-            sbproxy_ai::identity::McpToolFormat::Openai,
-        );
+        let tools =
+            source.resolve_tools(&principal, &[], sbproxy_ai::identity::McpToolFormat::Openai);
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t["function"]["name"].as_str())
             .collect();
-        assert_eq!(names, vec!["gh.search"], "RBAC-denied tool must be filtered out");
+        assert_eq!(
+            names,
+            vec!["gh.search"],
+            "RBAC-denied tool must be filtered out"
+        );
     }
 
     #[test]

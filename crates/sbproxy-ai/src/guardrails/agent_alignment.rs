@@ -273,7 +273,8 @@ impl AgentAlignmentGuardrail {
                 // the same code the MCP action uses, so a deny rule
                 // written once governs this lane too. Runs before the
                 // static allow list so a policy deny is decisive.
-                if let (Some(policy), Some(principal)) = (self.cfg.rbac_policy.as_ref(), principal) {
+                if let (Some(policy), Some(principal)) = (self.cfg.rbac_policy.as_ref(), principal)
+                {
                     if matches!(
                         policy.check(principal, &name),
                         sbproxy_extension::mcp::ToolAccessDecision::Deny,
@@ -406,7 +407,9 @@ mod tests {
             {"function": {"name": "search", "arguments": "{}"}}
         ]));
         let principal = sbproxy_plugin::Principal::anonymous();
-        assert!(g.check_body_with_principal(&body, Some(&principal)).is_none());
+        assert!(g
+            .check_body_with_principal(&body, Some(&principal))
+            .is_none());
     }
 
     #[test]
