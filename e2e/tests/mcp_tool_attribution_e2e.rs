@@ -54,6 +54,10 @@ impl MockUpstream {
     fn url(&self) -> String {
         format!("http://127.0.0.1:{}/mcp", self.port)
     }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for MockUpstream {
@@ -191,6 +195,7 @@ origins:
     };
 
     drive_call(&harness);
+    assert!(upstream.calls() >= 1, "upstream must have served the tool call");
 
     let rows = read_sink_rows(&sink_path);
     let row = rows
@@ -243,6 +248,7 @@ origins:
     };
 
     drive_call(&harness);
+    assert!(upstream.calls() >= 1, "upstream must have served the tool call");
 
     let rows = read_sink_rows(&sink_path);
     let row = rows
