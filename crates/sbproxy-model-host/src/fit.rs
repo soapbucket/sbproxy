@@ -54,6 +54,12 @@ pub struct GpuDescriptor {
     /// Whether the card has usable FP8 tensor-core kernels. Turing
     /// (7.5) does not; Ada (8.9) and Hopper (9.0+) do.
     pub supports_fp8: bool,
+    /// Peak memory bandwidth in GB/s, when known. Decode is
+    /// memory-bandwidth bound, so this drives the throughput estimate
+    /// ([`estimate_throughput`]). `None` when the probe cannot report
+    /// it (throughput estimation is then skipped).
+    #[serde(default)]
+    pub mem_bandwidth_gbps: Option<f64>,
 }
 
 impl GpuDescriptor {
@@ -68,6 +74,7 @@ impl GpuDescriptor {
             free_vram_bytes: 15 * GIB,
             compute_capability: Some((7, 5)),
             supports_fp8: false,
+            mem_bandwidth_gbps: Some(320.0),
         }
     }
 
@@ -81,6 +88,7 @@ impl GpuDescriptor {
             free_vram_bytes: 23 * GIB,
             compute_capability: Some((8, 9)),
             supports_fp8: true,
+            mem_bandwidth_gbps: Some(300.0),
         }
     }
 }
@@ -326,6 +334,34 @@ impl ModelMetadata {
     pub fn vram_estimate_bytes(&self, quant: Quant, seq_len: u64, overhead: f64) -> f64 {
         (self.weight_bytes(quant) + self.kv_bytes(quant, seq_len)) * overhead
     }
+
+    /// KV-cache bytes at `seq_len` using an explicit bytes-per-element
+    /// (from a KV-quant override) instead of the weight quant's
+    /// default. `2 x layers x kv_heads x head_dim x bytes x seq_len`.
+    pub fn kv_bytes_with(&self, kv_bytes_per_element: f64, seq_len: u64) -> f64 {
+        2.0 * self.layers as f64
+            * self.kv_heads as f64
+            * self.head_dim as f64
+            * kv_bytes_per_element
+            * seq_len as f64
+    }
+
+    /// VRAM estimate with a KV-quant override (WOR-1676): weights at
+    /// the weight quant, KV at `kv_bytes_per_element`. `None` for the
+    /// KV bpe falls back to the weight quant's default KV dtype, which
+    /// is exactly [`Self::vram_estimate_bytes`].
+    pub fn vram_estimate_with_kv(
+        &self,
+        quant: Quant,
+        kv_bytes_per_element: Option<f64>,
+        seq_len: u64,
+        overhead: f64,
+    ) -> f64 {
+        match kv_bytes_per_element {
+            None => self.vram_estimate_bytes(quant, seq_len, overhead),
+            Some(bpe) => (self.weight_bytes(quant) + self.kv_bytes_with(bpe, seq_len)) * overhead,
+        }
+    }
 }
 
 /// A little-endian, bounds-checked cursor over a GGUF header. Every
@@ -477,6 +513,58 @@ pub enum FitError {
 
 /// Default framework-overhead multiplier on weights + KV.
 pub const DEFAULT_OVERHEAD: f64 = 1.15;
+
+/// A rough throughput prediction for a model + quant on a GPU
+/// (WOR-1670). Decode is memory-bandwidth bound, so single-stream
+/// tokens/sec is the achievable bandwidth divided by the bytes read
+/// per generated token (the weights, at the chosen quant). A real
+/// profiled model (Vidur/Dooly) would be more accurate; this roofline
+/// estimate needs only device specs and catches "this quant fits but
+/// will be painfully slow" before an engine ever starts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThroughputEstimate {
+    /// Estimated single-stream decode tokens/sec.
+    pub decode_tokens_per_sec: f64,
+    /// The bytes read per generated token (weights at this quant).
+    pub bytes_per_token: u64,
+    /// How many concurrent sequences the free VRAM can hold KV for at
+    /// the planned context (a coarse safe-batch ceiling).
+    pub safe_max_batch: u64,
+}
+
+/// Fraction of peak memory bandwidth a real engine sustains during
+/// decode. Empirically 60-80%; use a conservative midpoint.
+pub const DECODE_BANDWIDTH_EFFICIENCY: f64 = 0.7;
+
+/// Estimate decode throughput and a safe batch ceiling for a model +
+/// quant on a GPU. Returns `None` when the GPU does not report memory
+/// bandwidth. Note: for MoE models this is pessimistic, since decode
+/// reads only the active experts, not all weights; treat it as a
+/// lower bound.
+pub fn estimate_throughput(
+    gpu: &GpuDescriptor,
+    meta: &ModelMetadata,
+    quant: Quant,
+    seq_len: u64,
+) -> Option<ThroughputEstimate> {
+    let bw_gbps = gpu.mem_bandwidth_gbps?;
+    let bytes_per_token = meta.weight_bytes(quant).max(1.0);
+    let bw_bytes_per_sec = bw_gbps * 1e9 * DECODE_BANDWIDTH_EFFICIENCY;
+    let decode_tps = bw_bytes_per_sec / bytes_per_token;
+
+    // KV per sequence at the planned context; how many fit in the
+    // VRAM left after the weights.
+    let seq_len = seq_len.min(meta.max_context).max(1);
+    let kv_per_seq = meta.kv_bytes(quant, seq_len).max(1.0);
+    let free_after_weights = (gpu.free_vram_bytes as f64 - bytes_per_token).max(0.0);
+    let safe_max_batch = (free_after_weights / kv_per_seq).floor().max(0.0) as u64;
+
+    Some(ThroughputEstimate {
+        decode_tokens_per_sec: decode_tps,
+        bytes_per_token: bytes_per_token as u64,
+        safe_max_batch,
+    })
+}
 
 /// Pick the best quant for a model on a specific GPU.
 ///
@@ -723,6 +811,56 @@ mod tests {
         )
         .expect("fits on the L4");
         assert_eq!(plan.gpu_index, 1);
+    }
+
+    #[test]
+    fn throughput_decode_is_bandwidth_bound() {
+        // 14B model at Q4 (~0.56 bytes/param -> ~7.84 GB/token read).
+        // L4 at 300 GB/s * 0.7 efficiency = 210 GB/s effective.
+        // decode tps ~= 210e9 / 7.84e9 ~= 26-27 tok/s.
+        let est = estimate_throughput(&GpuDescriptor::l4(), &meta_14b(), Quant::Int4, 4096)
+            .expect("L4 reports bandwidth");
+        assert!(
+            est.decode_tokens_per_sec > 15.0 && est.decode_tokens_per_sec < 45.0,
+            "got {} tok/s",
+            est.decode_tokens_per_sec
+        );
+        assert!(est.safe_max_batch >= 1, "should fit at least one sequence");
+    }
+
+    #[test]
+    fn throughput_higher_for_smaller_quant() {
+        // A smaller quant reads fewer bytes per token, so decode is faster.
+        let q4 = estimate_throughput(&GpuDescriptor::l4(), &meta_14b(), Quant::Int4, 4096).unwrap();
+        let f16 = estimate_throughput(&GpuDescriptor::l4(), &meta_14b(), Quant::F16, 4096).unwrap();
+        assert!(q4.decode_tokens_per_sec > f16.decode_tokens_per_sec);
+    }
+
+    #[test]
+    fn kv_quant_shrinks_the_estimate_and_fits_more_context() {
+        // A model whose f16-KV estimate exceeds free VRAM should fit
+        // once KV is quantized to int4 (0.5 bytes/element).
+        let m = ModelMetadata {
+            params: 14_000_000_000,
+            layers: 40,
+            kv_heads: 8,
+            head_dim: 128,
+            max_context: 131072,
+        };
+        // Long context so KV dominates.
+        let seq = 131072;
+        let f16 = m.vram_estimate_with_kv(Quant::Int4, None, seq, DEFAULT_OVERHEAD);
+        let int4_kv = m.vram_estimate_with_kv(Quant::Int4, Some(0.5), seq, DEFAULT_OVERHEAD);
+        assert!(int4_kv < f16, "int4 KV must be smaller than default KV");
+        // The KV term is 4x smaller (2.0 -> 0.5), so the saving is large.
+        assert!(f16 - int4_kv > 10.0 * GIB as f64);
+    }
+
+    #[test]
+    fn throughput_none_without_bandwidth() {
+        let mut gpu = GpuDescriptor::l4();
+        gpu.mem_bandwidth_gbps = None;
+        assert!(estimate_throughput(&gpu, &meta_14b(), Quant::Int4, 4096).is_none());
     }
 
     #[test]

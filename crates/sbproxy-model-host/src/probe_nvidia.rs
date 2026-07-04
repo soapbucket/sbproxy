@@ -54,6 +54,7 @@ fn probe_via_nvml() -> Result<Vec<GpuDescriptor>, nvml_wrapper::error::NvmlError
             .cuda_compute_capability()
             .ok()
             .map(|c| (c.major as u32, c.minor as u32));
+        let mem_bandwidth_gbps = bandwidth_for_name(&name);
         out.push(GpuDescriptor {
             index: i,
             vendor: GpuVendor::Nvidia,
@@ -62,9 +63,28 @@ fn probe_via_nvml() -> Result<Vec<GpuDescriptor>, nvml_wrapper::error::NvmlError
             free_vram_bytes: mem.free,
             compute_capability: cc,
             supports_fp8: cc.map(fp8_supported).unwrap_or(false),
+            mem_bandwidth_gbps,
         });
     }
     Ok(out)
+}
+
+/// Peak memory bandwidth (GB/s) for known NVIDIA cards, matched by a
+/// substring of the reported device name. `None` for unknown cards, in
+/// which case throughput estimation is skipped rather than guessed.
+fn bandwidth_for_name(name: &str) -> Option<f64> {
+    let n = name.to_ascii_uppercase();
+    let table = [
+        ("T4", 320.0),
+        ("L4", 300.0),
+        ("L40", 864.0),
+        ("A10", 600.0),
+        ("A100", 1555.0),
+        ("H100", 3350.0),
+        ("H200", 4800.0),
+        ("4090", 1008.0),
+    ];
+    table.iter().find(|(k, _)| n.contains(k)).map(|(_, bw)| *bw)
 }
 
 /// Enumerate GPUs by parsing `nvidia-smi` CSV. Used when NVML cannot
@@ -98,6 +118,7 @@ fn parse_smi_line(line: &str) -> Option<GpuDescriptor> {
     let total_mib: u64 = cols[2].parse().ok()?;
     let free_mib: u64 = cols[3].parse().ok()?;
     let cc = parse_compute_cap(cols[4]);
+    let mem_bandwidth_gbps = bandwidth_for_name(&name);
     Some(GpuDescriptor {
         index,
         vendor: GpuVendor::Nvidia,
@@ -106,6 +127,7 @@ fn parse_smi_line(line: &str) -> Option<GpuDescriptor> {
         free_vram_bytes: free_mib * 1024 * 1024,
         compute_capability: cc,
         supports_fp8: cc.map(fp8_supported).unwrap_or(false),
+        mem_bandwidth_gbps,
     })
 }
 
