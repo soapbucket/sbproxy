@@ -529,6 +529,12 @@ fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFil
                 if !cred.inject_tools.is_empty() {
                     vk["inject_tools"] = json!(cred.inject_tools.clone());
                 }
+                // WOR-1646: pass through the federation-injection ref
+                // so the AI dispatch resolves the referenced gateway's
+                // live catalogue at request time.
+                if let Some(m) = &cred.inject_mcp {
+                    vk["inject_mcp"] = m.clone();
+                }
                 vk
             })
             .collect();

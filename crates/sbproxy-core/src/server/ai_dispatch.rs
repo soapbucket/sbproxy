@@ -60,6 +60,9 @@ fn key_record_to_virtual_key(
             .collect(),
         route_to_model: rec.route_to_model.clone(),
         inject_tools: rec.inject_tools.clone(),
+        // WOR-1646: keystore-sourced keys do not carry a federation
+        // injection ref today; it is a static-config surface.
+        inject_mcp: None,
         enabled: true,
         bypass_prompt_injection: rec.bypass_prompt_injection,
     }
@@ -1053,17 +1056,35 @@ pub(super) async fn handle_ai_proxy(
                         );
                     }
                 }
-                // WOR-893 PR2: per-key MCP tool injection. The key's tool
-                // set REPLACES any client-supplied `tools` so the key
-                // fully owns the tool surface the caller exposes. Each
-                // entry is the provider's tool-definition JSON
-                // verbatim, so the gateway stays provider-agnostic.
-                if !vk.inject_tools.is_empty() {
+                // WOR-893 PR2 + WOR-1646: per-key tool injection. The
+                // key's tool set REPLACES any client-supplied `tools`
+                // so the key fully owns the tool surface the caller
+                // exposes. Static `inject_tools` JSON and a
+                // federation-sourced `inject_mcp` compose: the live
+                // MCP catalogue (RBAC-filtered by this principal,
+                // converted to the requested provider shape) is
+                // appended to the static set.
+                let mut injected: Vec<serde_json::Value> = vk.inject_tools.clone();
+                if let Some(inject) = &vk.inject_mcp {
+                    match sbproxy_modules::action::lookup_inject_source(&inject.reference) {
+                        Some(source) => {
+                            injected.extend(source.resolve_tools(
+                                &ctx.principal,
+                                &inject.filter,
+                                inject.format,
+                            ));
+                        }
+                        None => {
+                            warn!(
+                                mcp_ref = %inject.reference,
+                                "AI proxy: inject_mcp references an unknown MCP gateway; no tools injected"
+                            );
+                        }
+                    }
+                }
+                if !injected.is_empty() {
                     if let Some(obj) = body.as_object_mut() {
-                        obj.insert(
-                            "tools".to_string(),
-                            serde_json::Value::Array(vk.inject_tools.clone()),
-                        );
+                        obj.insert("tools".to_string(), serde_json::Value::Array(injected));
                     }
                 }
                 // Per-key model gate. Enforce the matched key's

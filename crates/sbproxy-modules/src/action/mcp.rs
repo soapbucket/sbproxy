@@ -551,6 +551,19 @@ impl McpAction {
 
         let has_principal_scoped_tools = prefixes.values().any(|p| p.rbac.is_some());
 
+        // WOR-1646: publish an injectable source so a virtual key can
+        // reference this gateway's live catalogue by its
+        // `server_info.name`. Cloned data (cheap) so the action still
+        // owns its fields.
+        register_inject_source(
+            &server_name,
+            Arc::new(McpInjectSource {
+                federation: Arc::clone(&federation),
+                prefixes: prefixes.clone(),
+                rbac_policies: cfg.rbac_policies.clone(),
+            }),
+        );
+
         Ok(Self {
             mode: cfg.mode,
             server_name,
@@ -723,10 +736,208 @@ mod duration_str {
 
 // --- Tests ---
 
+/// A registered source of federated MCP tools that a virtual key can
+/// inject by name (WOR-1646). Holds the live federation snapshot plus
+/// the RBAC data needed to filter the injected set by the key's
+/// principal, so an injected catalogue never exposes a tool the MCP
+/// action would refuse to call for that principal.
+pub struct McpInjectSource {
+    federation: Arc<McpFederation>,
+    prefixes: HashMap<String, McpServerPrefix>,
+    rbac_policies: HashMap<String, ToolAccessPolicy>,
+}
+
+impl McpInjectSource {
+    fn policy_for_server(&self, server_name: &str) -> Option<&ToolAccessPolicy> {
+        let label = self.prefixes.get(server_name)?.rbac.as_deref()?;
+        self.rbac_policies.get(label)
+    }
+
+    /// Resolve the current federated catalogue to provider tool JSON,
+    /// RBAC-filtered by `principal` and optionally narrowed to tool
+    /// names matching one of `filter` (trailing-`*` glob or exact).
+    /// An empty `filter` includes every allowed tool.
+    pub fn resolve_tools(
+        &self,
+        principal: &sbproxy_plugin::Principal,
+        filter: &[String],
+        format: sbproxy_ai::identity::McpToolFormat,
+    ) -> Vec<serde_json::Value> {
+        let snapshot = self.federation.serialized_tools();
+        let mut out = Vec::new();
+        for entry in &snapshot.entries {
+            // RBAC: skip a tool the owning upstream's policy denies.
+            if let Some(policy) = self.policy_for_server(&entry.server_name) {
+                if !matches!(
+                    policy.check(principal, &entry.name),
+                    sbproxy_extension::mcp::ToolAccessDecision::Allow,
+                ) {
+                    continue;
+                }
+            }
+            if !filter.is_empty() && !filter.iter().any(|f| glob_match(f, &entry.name)) {
+                continue;
+            }
+            // The entry JSON is `{"name","description","inputSchema",_meta?}`.
+            let parsed: serde_json::Value = match serde_json::from_str(&entry.json) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            out.push(to_provider_tool(&parsed, format));
+        }
+        out
+    }
+}
+
+/// Convert one federated tool object to the requested provider shape.
+fn to_provider_tool(tool: &serde_json::Value, format: sbproxy_ai::identity::McpToolFormat) -> serde_json::Value {
+    let name = tool.get("name").cloned().unwrap_or(serde_json::Value::Null);
+    let description = tool
+        .get("description")
+        .cloned()
+        .unwrap_or(serde_json::Value::String(String::new()));
+    let schema = tool
+        .get("inputSchema")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+    match format {
+        sbproxy_ai::identity::McpToolFormat::Openai => serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": schema,
+            }
+        }),
+        sbproxy_ai::identity::McpToolFormat::Anthropic => serde_json::json!({
+            "name": name,
+            "description": description,
+            "input_schema": schema,
+        }),
+    }
+}
+
+/// Trailing-`*` glob or exact match, matching the ACL glob semantics.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => pattern == name,
+    }
+}
+
+/// Process-global registry of injectable MCP sources, keyed by the
+/// gateway's `server_info.name` (WOR-1646). An `McpAction` registers
+/// itself on compile; a virtual key's `inject_mcp.ref` looks it up at
+/// request time. A mutex guards the read-modify-write so concurrent
+/// registrations (parallel config compiles, tests) cannot lose an
+/// entry to a lost update.
+fn inject_registry() -> &'static std::sync::Mutex<HashMap<String, Arc<McpInjectSource>>> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Arc<McpInjectSource>>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Register an injectable source under `name`, replacing any prior
+/// entry (a hot reload rebuilds the action).
+pub fn register_inject_source(name: &str, source: Arc<McpInjectSource>) {
+    let mut map = match inject_registry().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    map.insert(name.to_string(), source);
+}
+
+/// Look up an injectable MCP source by name (WOR-1646). `None` when no
+/// `mcp` action has registered under that name yet.
+pub fn lookup_inject_source(name: &str) -> Option<Arc<McpInjectSource>> {
+    let map = match inject_registry().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    map.get(name).cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // --- WOR-1646: federation-sourced injection ---
+
+    #[test]
+    fn to_provider_tool_openai_and_anthropic_shapes() {
+        let tool = json!({
+            "name": "search",
+            "description": "find things",
+            "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}}
+        });
+        let openai = to_provider_tool(&tool, sbproxy_ai::identity::McpToolFormat::Openai);
+        assert_eq!(openai["type"], "function");
+        assert_eq!(openai["function"]["name"], "search");
+        assert_eq!(openai["function"]["parameters"]["type"], "object");
+
+        let anthropic = to_provider_tool(&tool, sbproxy_ai::identity::McpToolFormat::Anthropic);
+        assert_eq!(anthropic["name"], "search");
+        assert_eq!(anthropic["input_schema"]["type"], "object");
+        assert!(anthropic.get("type").is_none());
+    }
+
+    #[test]
+    fn glob_match_semantics() {
+        assert!(glob_match("gh.*", "gh.search"));
+        assert!(glob_match("search", "search"));
+        assert!(!glob_match("gh.*", "db.query"));
+        assert!(!glob_match("search", "search_repos"));
+    }
+
+    #[test]
+    fn inject_source_registers_and_resolves_rbac_filtered() {
+        // A gateway with a default-deny policy allowing only `search`
+        // registers under its server name; resolving the source for an
+        // anonymous principal yields just the allowed tool.
+        let value = json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "toolhub_test_1646", "version": "1.0.0"},
+            "rbac_policies": {
+                "ro": {"default_allow": false, "tool_access": [{"principals": [], "allowed": ["gh.search"]}]}
+            },
+            "federated_servers": [
+                {"origin": "test.sbproxy.dev", "prefix": "gh", "rbac": "ro"}
+            ]
+        });
+        let action = McpAction::from_config(value).expect("compile");
+        // Seed the federation registry directly (no network) so the
+        // resolve path has a catalogue to filter.
+        let mut map = std::collections::HashMap::new();
+        for name in ["gh.search", "gh.delete_repo"] {
+            map.insert(
+                name.to_string(),
+                sbproxy_extension::mcp::FederatedTool {
+                    name: name.to_string(),
+                    description: "t".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    server_name: "gh".to_string(),
+                    streaming: false,
+                    meta: None,
+                },
+            );
+        }
+        action.federation.seed_tools_for_test(map);
+
+        let source = lookup_inject_source("toolhub_test_1646").expect("source registered");
+        let principal = sbproxy_plugin::Principal::anonymous();
+        let tools = source.resolve_tools(
+            &principal,
+            &[],
+            sbproxy_ai::identity::McpToolFormat::Openai,
+        );
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["gh.search"], "RBAC-denied tool must be filtered out");
+    }
 
     #[test]
     fn compiles_with_minimal_config() {

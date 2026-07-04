@@ -1031,6 +1031,19 @@ impl McpFederation {
         result
     }
 
+    /// Test-only: publish a tool registry directly and bump the
+    /// generation, so a test can exercise the read path without
+    /// upstream IO. The serialized snapshot rebuilds on the next
+    /// `serialized_tools` call via the generation bump.
+    #[doc(hidden)]
+    pub fn seed_tools_for_test(&self, tools: HashMap<String, FederatedTool>) {
+        self.tools.store(Arc::new(tools));
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.tools_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
     /// Current catalogue generation. Starts at zero and bumps once
     /// per refresh that actually changed the tool or resource
     /// registry, so it is a stable cache key for anything derived

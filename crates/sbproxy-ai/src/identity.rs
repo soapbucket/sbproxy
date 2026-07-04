@@ -5,6 +5,37 @@ use sbproxy_plugin::Principal;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 
+/// Provider tool-JSON shape for federation-sourced injection
+/// (WOR-1646). Defined here (in `sbproxy-ai`) so it lives with the
+/// virtual-key config; `sbproxy-modules` reads it when resolving the
+/// injected catalogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum McpToolFormat {
+    /// OpenAI `{"type":"function","function":{...}}`.
+    #[default]
+    Openai,
+    /// Anthropic `{"name":...,"input_schema":...}`.
+    Anthropic,
+}
+
+/// Reference from a virtual key to a federated MCP gateway whose live
+/// catalogue is injected as the key's tool surface (WOR-1646).
+#[derive(Debug, Clone, Deserialize)]
+pub struct InjectMcpRef {
+    /// The target gateway's `server_info.name`, as registered by its
+    /// `mcp` action.
+    #[serde(rename = "ref")]
+    pub reference: String,
+    /// Provider tool-JSON shape to emit. Defaults to OpenAI.
+    #[serde(default)]
+    pub format: McpToolFormat,
+    /// Optional tool-name filter (trailing-`*` glob or exact). Empty
+    /// injects every allowed tool.
+    #[serde(default)]
+    pub filter: Vec<String>,
+}
+
 /// Virtual API key configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VirtualKeyConfig {
@@ -76,6 +107,14 @@ pub struct VirtualKeyConfig {
     /// caller exposes - matching the "key = model + tools" framing.
     #[serde(default)]
     pub inject_tools: Vec<serde_json::Value>,
+    /// WOR-1646: inject the live catalogue of a federated MCP gateway
+    /// instead of (or alongside) the static `inject_tools` JSON. The
+    /// injected set is resolved from the referenced gateway's current
+    /// `tools/list` at request time and RBAC-filtered by this key's
+    /// principal, so it tracks upstream changes without a config
+    /// reload and never exposes a tool the MCP action would refuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject_mcp: Option<InjectMcpRef>,
     /// Whether this key is active.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -347,6 +386,7 @@ mod tests {
             metadata: HashMap::new(),
             route_to_model: None,
             inject_tools: vec![],
+            inject_mcp: None,
             enabled,
             bypass_prompt_injection: false,
         }
@@ -370,6 +410,7 @@ mod tests {
             metadata: HashMap::new(),
             route_to_model: None,
             inject_tools: vec![],
+            inject_mcp: None,
             enabled: true,
             bypass_prompt_injection: false,
         }
