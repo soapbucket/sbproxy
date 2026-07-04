@@ -15,13 +15,18 @@ across many nodes is separate work.
 
 This is landing in phases. What ships today is the hardware-independent
 core: the model catalog and its resolver, the `serve:` config surface,
-the GPU fit planner (which quant fits and runs on a given card), and
-the engine-supervisor state machine. The pieces that need real hardware
-or a real engine, GPU discovery, Hugging Face weight download, and
-spawning vLLM or llama.cpp, plug in behind the traits this core defines
+the GPU fit planner (which quant fits and runs on a given card), the
+engine-supervisor state machine, the process launcher (it builds the
+engine argv, spawns the subprocess, polls a loopback readiness probe,
+and kills it), the VRAM-budget residency manager (LRU eviction under a
+byte budget), and the hybrid pieces (model aliases and the dollars-saved
+math). GPU discovery, Hugging Face weight download, and a real vLLM /
+llama.cpp bring-up plug in behind the traits this core defines
 (`GpuProbe`, `EngineLauncher`) and are certified against actual GPUs in
-later phases. On a host with no GPU or no engine binary, a `serve:`
-block parses and validates but starts no engine.
+later phases. The launcher's spawn / probe / kill machinery is tested
+against a fake process; what it cannot prove without hardware is that a
+real engine boots and serves tokens. On a host with no GPU or no engine
+binary, a `serve:` block parses and validates but starts no engine.
 
 ## The `serve:` block
 
