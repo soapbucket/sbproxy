@@ -195,7 +195,10 @@ origins:
     };
 
     drive_call(&harness);
-    assert!(upstream.calls() >= 1, "upstream must have served the tool call");
+    assert!(
+        upstream.calls() >= 1,
+        "upstream must have served the tool call"
+    );
 
     let rows = read_sink_rows(&sink_path);
     let row = rows
@@ -248,7 +251,10 @@ origins:
     };
 
     drive_call(&harness);
-    assert!(upstream.calls() >= 1, "upstream must have served the tool call");
+    assert!(
+        upstream.calls() >= 1,
+        "upstream must have served the tool call"
+    );
 
     let rows = read_sink_rows(&sink_path);
     let row = rows
