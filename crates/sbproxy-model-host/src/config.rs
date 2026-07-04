@@ -99,6 +99,69 @@ impl KvCacheQuant {
     }
 }
 
+/// How a model does speculative decoding (WOR-1674). Speculation
+/// wins when the batch is memory-bound (low load) and loses when it is
+/// compute-bound (full batch), so the runtime load-gates it; this is
+/// the config that says which method to use when it is on.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SpecMethod {
+    /// A separate small draft model proposes tokens.
+    DraftModel,
+    /// N-gram / prompt-lookup speculation (no draft model).
+    #[default]
+    Ngram,
+}
+
+/// Speculative-decoding settings for a served model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SpeculativeConfig {
+    /// Which speculation method.
+    #[serde(default)]
+    pub method: SpecMethod,
+    /// Draft model repo/id, required for [`SpecMethod::DraftModel`].
+    #[serde(default)]
+    pub draft_model: Option<String>,
+    /// How many tokens to propose per step.
+    #[serde(default = "default_spec_tokens")]
+    pub num_speculative_tokens: u32,
+}
+
+fn default_spec_tokens() -> u32 {
+    5
+}
+
+/// Chunked-prefill settings (WOR-1678). Chunked prefill trades a
+/// larger prefill chunk (higher throughput) against time-to-first-token
+/// (lower with smaller chunks). Set `max_batched_tokens` directly, or
+/// set `target_ttft_ms` to have the planner pick a chunk size.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+pub struct ChunkedPrefill {
+    /// Explicit prefill chunk size (engine `max-num-batched-tokens`).
+    /// `None` leaves it to the auto-tune or the engine default.
+    #[serde(default)]
+    pub max_batched_tokens: Option<u64>,
+    /// A TTFT SLO in milliseconds; when set (and no explicit chunk
+    /// size), the planner chooses a chunk size to hold it.
+    #[serde(default)]
+    pub target_ttft_ms: Option<u64>,
+}
+
+/// A LoRA adapter served over a base model (WOR-1673). Clients request
+/// it by `name`; the runtime hot-loads it over the resident base with
+/// an LRU adapter cache rather than swapping the base model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct LoraAdapter {
+    /// The model name clients request to hit this adapter.
+    pub name: String,
+    /// Adapter source: an `hf:Org/Repo` reference or a local path.
+    pub source: String,
+}
+
 /// One model an operator wants the gateway to serve locally.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServeEntry {
@@ -125,6 +188,15 @@ pub struct ServeEntry {
     /// default KV dtype).
     #[serde(default)]
     pub kv_quant: KvCacheQuant,
+    /// Speculative decoding. `None` disables it.
+    #[serde(default)]
+    pub speculative: Option<SpeculativeConfig>,
+    /// Chunked-prefill settings. `None` uses the engine default.
+    #[serde(default)]
+    pub chunked_prefill: Option<ChunkedPrefill>,
+    /// LoRA adapters served over this base model.
+    #[serde(default)]
+    pub lora_adapters: Vec<LoraAdapter>,
 }
 
 /// The `serve:` block: the local models plus host-wide policy.
@@ -228,6 +300,45 @@ models:
         );
     }
 
+    #[test]
+    fn serving_knobs_parse() {
+        let cfg: ModelHostConfig = serde_yaml::from_str(
+            "\
+models:
+  - model: qwen3-8b
+    speculative:
+      method: draft_model
+      draft_model: Qwen/Qwen3-0.6B
+      num_speculative_tokens: 4
+    chunked_prefill:
+      target_ttft_ms: 250
+    lora_adapters:
+      - name: support-bot
+        source: hf:acme/support-lora
+      - name: sql-helper
+        source: /models/sql-lora
+",
+        )
+        .expect("parse");
+        let e = &cfg.models[0];
+        let spec = e.speculative.as_ref().unwrap();
+        assert_eq!(spec.method, SpecMethod::DraftModel);
+        assert_eq!(spec.draft_model.as_deref(), Some("Qwen/Qwen3-0.6B"));
+        assert_eq!(spec.num_speculative_tokens, 4);
+        assert_eq!(e.chunked_prefill.unwrap().target_ttft_ms, Some(250));
+        assert_eq!(e.lora_adapters.len(), 2);
+        assert_eq!(e.lora_adapters[0].name, "support-bot");
+    }
+
+    #[test]
+    fn spec_defaults_to_ngram_five_tokens() {
+        let cfg: ModelHostConfig =
+            serde_yaml::from_str("models:\n  - model: x\n    speculative: {}\n").expect("parse");
+        let spec = cfg.models[0].speculative.as_ref().unwrap();
+        assert_eq!(spec.method, SpecMethod::Ngram);
+        assert_eq!(spec.num_speculative_tokens, 5);
+    }
+
     // --- WOR-1663: config-spawn surface guards ---
 
     #[test]
@@ -246,6 +357,9 @@ models:
             max_context: None,
             extra_args: vec![],
             kv_quant: KvCacheQuant::Auto,
+            speculative: None,
+            chunked_prefill: None,
+            lora_adapters: vec![],
         };
         let json = serde_json::to_value(&e).expect("serialize");
         let obj = json.as_object().expect("object");

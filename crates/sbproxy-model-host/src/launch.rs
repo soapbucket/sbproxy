@@ -183,6 +183,83 @@ fn llama_cache_type(kv: KvCacheQuant) -> Option<&'static str> {
     }
 }
 
+/// Additional engine flags for the serving knobs on a
+/// [`ServeEntry`](crate::config::ServeEntry):
+/// speculative decoding (WOR-1674), chunked prefill (WOR-1678), and
+/// LoRA adapters (WOR-1673). Returned separately from
+/// [`build_launch_spec`] so the base argv template stays stable; the
+/// runtime appends these to the spec's args. Only vLLM flags are
+/// emitted today (llama.cpp has different surfaces); an llama.cpp entry
+/// returns an empty vec for the vLLM-only knobs.
+pub fn serving_flags(engine: EngineKind, entry: &crate::config::ServeEntry) -> Vec<String> {
+    let mut args = Vec::new();
+    if engine != EngineKind::Vllm {
+        return args;
+    }
+    // Speculative decoding.
+    if let Some(spec) = &entry.speculative {
+        use crate::config::SpecMethod;
+        match spec.method {
+            SpecMethod::DraftModel => {
+                if let Some(dm) = &spec.draft_model {
+                    args.push("--speculative-model".to_string());
+                    args.push(dm.clone());
+                }
+            }
+            SpecMethod::Ngram => {
+                args.push("--speculative-model".to_string());
+                args.push("[ngram]".to_string());
+            }
+        }
+        args.push("--num-speculative-tokens".to_string());
+        args.push(spec.num_speculative_tokens.to_string());
+    }
+    // Chunked prefill.
+    if let Some(cp) = &entry.chunked_prefill {
+        args.push("--enable-chunked-prefill".to_string());
+        if let Some(mbt) = cp.max_batched_tokens {
+            args.push("--max-num-batched-tokens".to_string());
+            args.push(mbt.to_string());
+        }
+    }
+    // LoRA adapters.
+    if !entry.lora_adapters.is_empty() {
+        args.push("--enable-lora".to_string());
+        args.push("--max-loras".to_string());
+        args.push(entry.lora_adapters.len().to_string());
+        for a in &entry.lora_adapters {
+            args.push("--lora-modules".to_string());
+            args.push(format!("{}={}", a.name, a.source));
+        }
+    }
+    args
+}
+
+/// Whether speculation should be active right now, given the current
+/// batch occupancy (running sequences / max batch). Speculation helps
+/// when the batch is memory-bound (occupancy below the threshold) and
+/// hurts when compute-bound (a full batch), so the runtime gates it on
+/// live load rather than leaving it globally on (WOR-1674).
+pub fn should_speculate(batch_occupancy: f64, threshold: f64) -> bool {
+    batch_occupancy < threshold
+}
+
+/// Default batch-occupancy threshold below which speculation is on.
+pub const SPECULATE_OCCUPANCY_THRESHOLD: f64 = 0.5;
+
+/// Choose a chunked-prefill chunk size (`max-num-batched-tokens`) to
+/// hold a target TTFT, given the engine's estimated prefill throughput
+/// in tokens/sec (WOR-1678). Larger chunks raise throughput but push
+/// TTFT out; the chunk that fits the SLO is `throughput * ttft`,
+/// clamped to a sane floor so a tiny SLO does not starve prefill.
+pub fn chunk_size_for_ttft(target_ttft_ms: u64, prefill_tokens_per_sec: f64) -> u64 {
+    let budget = prefill_tokens_per_sec * (target_ttft_ms as f64 / 1000.0);
+    (budget as u64).max(MIN_PREFILL_CHUNK)
+}
+
+/// Floor on an auto-tuned prefill chunk size.
+pub const MIN_PREFILL_CHUNK: u64 = 512;
+
 /// The production launcher: spawns the engine binary as a child
 /// process, waits for its readiness endpoint, and kills it on evict.
 #[derive(Debug, Clone)]
@@ -434,6 +511,103 @@ mod tests {
             &spec.args[spec.args.len() - 2..],
             &["--enable-prefix-caching", "--seed=7"]
         );
+    }
+
+    fn entry_with(
+        spec: Option<crate::config::SpeculativeConfig>,
+        cp: Option<crate::config::ChunkedPrefill>,
+        loras: Vec<crate::config::LoraAdapter>,
+    ) -> crate::config::ServeEntry {
+        crate::config::ServeEntry {
+            model: "qwen3-8b".into(),
+            engine: EngineKind::Vllm,
+            keep_alive: None,
+            max_context: None,
+            extra_args: vec![],
+            kv_quant: KvCacheQuant::Auto,
+            speculative: spec,
+            chunked_prefill: cp,
+            lora_adapters: loras,
+        }
+    }
+
+    #[test]
+    fn serving_flags_speculative_draft_model() {
+        use crate::config::{SpecMethod, SpeculativeConfig};
+        let e = entry_with(
+            Some(SpeculativeConfig {
+                method: SpecMethod::DraftModel,
+                draft_model: Some("Qwen/Qwen3-0.6B".into()),
+                num_speculative_tokens: 4,
+            }),
+            None,
+            vec![],
+        );
+        let f = serving_flags(EngineKind::Vllm, &e);
+        let i = f.iter().position(|a| a == "--speculative-model").unwrap();
+        assert_eq!(f[i + 1], "Qwen/Qwen3-0.6B");
+        let n = f
+            .iter()
+            .position(|a| a == "--num-speculative-tokens")
+            .unwrap();
+        assert_eq!(f[n + 1], "4");
+    }
+
+    #[test]
+    fn serving_flags_chunked_and_lora() {
+        use crate::config::{ChunkedPrefill, LoraAdapter};
+        let e = entry_with(
+            None,
+            Some(ChunkedPrefill {
+                max_batched_tokens: Some(2048),
+                target_ttft_ms: None,
+            }),
+            vec![LoraAdapter {
+                name: "bot".into(),
+                source: "hf:org/bot".into(),
+            }],
+        );
+        let f = serving_flags(EngineKind::Vllm, &e);
+        assert!(f.iter().any(|a| a == "--enable-chunked-prefill"));
+        let m = f
+            .iter()
+            .position(|a| a == "--max-num-batched-tokens")
+            .unwrap();
+        assert_eq!(f[m + 1], "2048");
+        assert!(f.iter().any(|a| a == "--enable-lora"));
+        assert!(f.iter().any(|a| a == "bot=hf:org/bot"));
+    }
+
+    #[test]
+    fn serving_flags_empty_for_llama_cpp() {
+        use crate::config::{ChunkedPrefill, SpeculativeConfig};
+        let e = entry_with(
+            Some(SpeculativeConfig {
+                method: crate::config::SpecMethod::Ngram,
+                draft_model: None,
+                num_speculative_tokens: 3,
+            }),
+            Some(ChunkedPrefill::default()),
+            vec![],
+        );
+        // llama.cpp uses different surfaces; the vLLM-only knobs emit nothing.
+        assert!(serving_flags(EngineKind::LlamaCpp, &e).is_empty());
+    }
+
+    #[test]
+    fn speculation_load_gate() {
+        // Below the threshold (memory-bound) speculation is on; a full
+        // batch (compute-bound) turns it off.
+        assert!(should_speculate(0.2, SPECULATE_OCCUPANCY_THRESHOLD));
+        assert!(!should_speculate(0.9, SPECULATE_OCCUPANCY_THRESHOLD));
+    }
+
+    #[test]
+    fn chunk_size_tracks_ttft_and_throughput() {
+        // 10k tok/s prefill, 250ms SLO -> ~2500 token chunk.
+        assert_eq!(chunk_size_for_ttft(250, 10_000.0), 2500);
+        // A tiny SLO clamps to the floor.
+        assert_eq!(chunk_size_for_ttft(1, 10_000.0), MIN_PREFILL_CHUNK);
     }
 
     #[test]

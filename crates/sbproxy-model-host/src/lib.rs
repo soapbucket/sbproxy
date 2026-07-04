@@ -34,6 +34,7 @@ pub mod config;
 pub mod fit;
 pub mod hybrid;
 pub mod launch;
+pub mod lora;
 #[cfg(feature = "gpu-nvidia")]
 pub mod probe_nvidia;
 pub mod residency;
@@ -42,13 +43,20 @@ pub mod supply_chain;
 pub mod weights;
 
 pub use catalog::{Catalog, CatalogEntry, ModelRef, ResolveError};
-pub use config::{EngineKind, EvictionPolicy, KvCacheQuant, ModelHostConfig, ServeEntry};
+pub use config::{
+    ChunkedPrefill, EngineKind, EvictionPolicy, KvCacheQuant, LoraAdapter, ModelHostConfig,
+    ServeEntry, SpecMethod, SpeculativeConfig,
+};
 pub use fit::{
     estimate_throughput, fp8_supported, FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor,
     ModelMetadata, Quant, StaticGpuProbe, ThroughputEstimate,
 };
 pub use hybrid::{savings_micros, AliasTable, CloudPrice, LaneSplit};
-pub use launch::{build_launch_spec, parse_duration, ProcessEngineLauncher};
+pub use launch::{
+    build_launch_spec, chunk_size_for_ttft, parse_duration, serving_flags, should_speculate,
+    ProcessEngineLauncher,
+};
+pub use lora::{AdapterRoute, LoraCache};
 #[cfg(feature = "gpu-nvidia")]
 pub use probe_nvidia::NvmlGpuProbe;
 pub use residency::{Admission, ResidencyManager, Resident};
