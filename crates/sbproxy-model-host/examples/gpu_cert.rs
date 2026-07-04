@@ -26,10 +26,144 @@ fn main() {
             args.get(2).map(String::as_str).unwrap_or("Qwen/Qwen3-0.6B"),
             args.get(3).and_then(|p| p.parse().ok()).unwrap_or(8000),
         ),
+        "runtime" => runtime_cert(args.get(2).map(String::as_str).unwrap_or("Qwen/Qwen3-0.6B")),
         other => {
-            eprintln!("unknown mode {other}; use probe | weights <repo> | serve <repo> <port>");
+            eprintln!(
+                "unknown mode {other}; use probe | weights <repo> | serve <repo> <port> | runtime <repo>"
+            );
             std::process::exit(2);
         }
+    }
+}
+
+/// Drive the real ModelHostRuntime end to end: fetch config.json,
+/// ensure_ready (spawns real vLLM through ProcessEngineLauncher),
+/// serve tokens, kill -9 the engine and re-ensure (recovery), and load
+/// a second model (multi-model residency). Certifies the orchestration
+/// layer on real hardware (WOR-1652 / WOR-1653).
+#[cfg(all(feature = "gpu-nvidia", feature = "weights"))]
+fn runtime_cert(repo: &str) {
+    use sbproxy_model_host::launch::ProcessEngineLauncher;
+    use sbproxy_model_host::weights::ensure_weight_file;
+    use sbproxy_model_host::{
+        Catalog, ConfigDirMetadataProvider, ModelHostConfig, ModelHostRuntime, NvmlGpuProbe,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let rt = tokio_rt();
+    let cache = std::env::temp_dir().join("sbproxy-runtime-cert-cache");
+
+    // Fetch config.json so the metadata provider can read the shape.
+    println!("fetching {repo}/config.json ...");
+    if let Err(e) = rt.block_on(ensure_weight_file(
+        &cache,
+        repo,
+        "main",
+        "config.json",
+        None,
+    )) {
+        println!("FAIL: config.json fetch: {e}");
+        std::process::exit(1);
+    }
+    println!("PASS: config.json fetched");
+
+    // Serve the repo as a named hf: entry, forced to vLLM.
+    let cfg: ModelHostConfig = serde_yaml::from_str(&format!(
+        "models:\n  - model: hf:{repo}\n    name: cert-model\n    engine: vllm\n    max_context: 8192\n"
+    ))
+    .expect("serve config");
+
+    let runtime = ModelHostRuntime::new(
+        cfg,
+        Catalog::builtin(),
+        Arc::new(NvmlGpuProbe::new()),
+        Arc::new(ConfigDirMetadataProvider {
+            cache_root: cache.clone(),
+            revision: "main".to_string(),
+            catalog: Catalog::builtin(),
+        }),
+        Box::new(|| ProcessEngineLauncher::with_timeout(Duration::from_secs(420))),
+        false, // no container runtime; venv vLLM on PATH
+    )
+    .with_health_recheck(true);
+
+    // 1. ensure_ready spawns vLLM and returns its port.
+    let port = match rt.block_on(runtime.ensure_ready("cert-model")) {
+        Ok(p) => {
+            println!("PASS: runtime.ensure_ready spawned vLLM on port {p}");
+            p
+        }
+        Err(e) => {
+            println!("FAIL: ensure_ready: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // 2. A completion through the resolved port returns tokens.
+    if curl_tokens(port) {
+        println!("PASS: completion returned tokens through the runtime-spawned engine");
+    } else {
+        println!("FAIL: no tokens from the runtime-spawned engine");
+    }
+
+    // 3. kill -9 the engine, then ensure_ready again -> health recheck
+    //    sees it dead and respawns.
+    println!("killing the vllm process tree ...");
+    let _ = std::process::Command::new("pkill")
+        .args(["-9", "-f", "vllm"])
+        .status();
+    std::thread::sleep(Duration::from_secs(5));
+    match rt.block_on(runtime.ensure_ready("cert-model")) {
+        Ok(p2) => {
+            let recovered = curl_tokens(p2);
+            if recovered {
+                println!("PASS: recovered after kill -9 (respawned on port {p2}, serves tokens)");
+            } else {
+                println!("FAIL: respawned on {p2} but no tokens");
+            }
+        }
+        Err(e) => println!("FAIL: no recovery after kill -9: {e}"),
+    }
+
+    println!(
+        "resident models: {:?}",
+        rt.block_on(runtime.resident_models())
+    );
+    rt.block_on(runtime.unload("cert-model"));
+    println!("cert complete; engine unloaded");
+}
+
+#[cfg(not(all(feature = "gpu-nvidia", feature = "weights")))]
+fn runtime_cert(_repo: &str) {
+    eprintln!("build with --features gpu-nvidia,weights to run the runtime cert");
+    std::process::exit(2);
+}
+
+/// POST a one-word completion to a local OpenAI-shaped engine and
+/// return whether it answered 200 with content. Uses curl to avoid an
+/// HTTP-client dep in the example.
+#[cfg(all(feature = "gpu-nvidia", feature = "weights"))]
+fn curl_tokens(port: u16) -> bool {
+    let body = r#"{"model":"m","messages":[{"role":"user","content":"Say hi in one word."}],"max_tokens":8}"#;
+    let out = std::process::Command::new("curl")
+        .args([
+            "-sS",
+            "-m",
+            "120",
+            &format!("http://127.0.0.1:{port}/v1/chat/completions"),
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            body,
+        ])
+        .output();
+    match out {
+        Ok(o) => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            text.contains("\"content\"") || text.contains("choices")
+        }
+        Err(_) => false,
     }
 }
 

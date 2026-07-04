@@ -42,6 +42,68 @@ pub trait ModelMetadataProvider: Send + Sync {
     fn metadata(&self, model: &ModelRef) -> Option<ModelMetadata>;
 }
 
+/// Parse a catalog `params` string (`14B`, `30B-A3B`, `120b`, `8M`)
+/// into an approximate total parameter count. Reads the leading number
+/// and its magnitude suffix; ignores any trailing shape detail (the
+/// `-A3B` active-params note). Returns 0 when there is no leading
+/// number.
+pub fn parse_params(s: &str) -> u64 {
+    let s = s.trim();
+    let num: String = s
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let value: f64 = num.parse().unwrap_or(0.0);
+    let rest = s[num.len()..].to_ascii_lowercase();
+    let mult = if rest.starts_with('b') {
+        1e9
+    } else if rest.starts_with('m') {
+        1e6
+    } else if rest.starts_with('k') {
+        1e3
+    } else {
+        1.0
+    };
+    (value * mult) as u64
+}
+
+/// A [`ModelMetadataProvider`] that reads the model's `config.json`
+/// from the content-addressed weight cache and parses its shape. The
+/// total parameter count comes from the catalog entry's `params`
+/// string (or the config's own `num_parameters` when present). This is
+/// the production provider: the weight manager fetches `config.json`,
+/// this reads it, and the fit planner uses it.
+pub struct ConfigDirMetadataProvider {
+    /// Root of the content-addressed weight cache.
+    pub cache_root: std::path::PathBuf,
+    /// Revision the weights were fetched at.
+    pub revision: String,
+    /// Catalog, for the parameter-count lookup.
+    pub catalog: Catalog,
+}
+
+impl ModelMetadataProvider for ConfigDirMetadataProvider {
+    fn metadata(&self, model: &ModelRef) -> Option<ModelMetadata> {
+        let path = crate::weights::cache_file(
+            &self.cache_root,
+            &model.hf_repo,
+            &self.revision,
+            "config.json",
+        );
+        let text = std::fs::read_to_string(&path).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let params = model
+            .catalog_id
+            .as_ref()
+            .and_then(|id| self.catalog.get(id))
+            .map(|e| parse_params(&e.params))
+            .filter(|p| *p > 0)
+            .or_else(|| v.get("num_parameters").and_then(|x| x.as_u64()))
+            .unwrap_or(0);
+        ModelMetadata::from_hf_config(&v, params)
+    }
+}
+
 /// Why bringing a model to ready failed.
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
@@ -95,6 +157,12 @@ pub struct ModelHostRuntime<L: EngineLauncher> {
     /// later refinement).
     spawn_lock: Mutex<()>,
     tick: AtomicU64,
+    /// When true, `ensure_ready` re-probes a cached-ready engine's
+    /// `/health` and respawns it if the probe fails (so a `kill -9`ed
+    /// engine comes back on the next request). Off by default so mock
+    /// launchers with no real HTTP endpoint are not falsely respawned;
+    /// the production runtime turns it on.
+    health_recheck: bool,
 }
 
 impl<L: EngineLauncher> ModelHostRuntime<L> {
@@ -130,7 +198,16 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
             residency: Mutex::new(residency),
             spawn_lock: Mutex::new(()),
             tick: AtomicU64::new(0),
+            health_recheck: false,
         }
+    }
+
+    /// Turn on `/health` re-checking of cached-ready engines (see
+    /// [`Self::health_recheck`]). The production runtime enables this;
+    /// tests with mock launchers leave it off.
+    pub fn with_health_recheck(mut self, on: bool) -> Self {
+        self.health_recheck = on;
+        self
     }
 
     fn next_tick(&self) -> u64 {
@@ -165,14 +242,18 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
     /// already-ready model returns its port without respawning.
     pub async fn ensure_ready(&self, name: &str) -> Result<u16, RuntimeError> {
         // Fast path without the spawn lock.
-        if let Some(port) = self.ready_port(name).await {
+        if let Some(port) = self.ready_and_live(name).await {
             return Ok(port);
         }
         let _guard = self.spawn_lock.lock().await;
         // Re-check now that we hold the lock.
-        if let Some(port) = self.ready_port(name).await {
+        if let Some(port) = self.ready_and_live(name).await {
             return Ok(port);
         }
+        // A cached engine that failed the liveness check (or a Failed
+        // supervisor) is dropped so we respawn cleanly and free its
+        // residency slot.
+        self.drop_engine(name).await;
 
         let entry = self
             .entry_for(name)
@@ -253,10 +334,30 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         self.residency.lock().await.unload(name);
     }
 
-    /// The port of a resident, ready model.
-    async fn ready_port(&self, name: &str) -> Option<u16> {
-        let engines = self.engines.lock().await;
-        engines.get(name).and_then(|h| h.supervisor.state().port())
+    /// The port of a resident model that is ready and (when
+    /// health-rechecking) actually answering `/health`. Returns `None`
+    /// when there is no ready engine or the liveness probe fails, so
+    /// the caller respawns.
+    async fn ready_and_live(&self, name: &str) -> Option<u16> {
+        let port = {
+            let engines = self.engines.lock().await;
+            engines
+                .get(name)
+                .and_then(|h| h.supervisor.state().port())?
+        };
+        if self.health_recheck && !crate::launch::probe_health(port, "/health").await {
+            return None;
+        }
+        Some(port)
+    }
+
+    /// Drop a model's engine (kill + free residency) if present. Used
+    /// before a respawn to clear a dead or Failed handle.
+    async fn drop_engine(&self, name: &str) {
+        if let Some(mut handle) = self.engines.lock().await.remove(name) {
+            handle.supervisor.evict().await;
+        }
+        self.residency.lock().await.unload(name);
     }
 
     /// The quant candidates to fit, most-preferred first: the catalog
@@ -416,6 +517,123 @@ mod tests {
             rt.ensure_ready("qwen3-14b").await,
             Err(RuntimeError::Fit(_))
         ));
+    }
+
+    #[test]
+    fn parse_params_reads_magnitude() {
+        assert_eq!(parse_params("14B"), 14_000_000_000);
+        assert_eq!(parse_params("30B-A3B"), 30_000_000_000); // total, ignores active
+        assert_eq!(parse_params("120b"), 120_000_000_000);
+        assert_eq!(parse_params("8M"), 8_000_000);
+        assert_eq!(parse_params("7.5B"), 7_500_000_000);
+        assert_eq!(parse_params("nonsense"), 0);
+    }
+
+    #[test]
+    fn config_dir_metadata_reads_config_json() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write a config.json where the cache layout expects it.
+        let cfg_path =
+            crate::weights::cache_file(dir.path(), "Qwen/Qwen3-14B", "main", "config.json");
+        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cfg_path,
+            r#"{"num_hidden_layers":40,"num_attention_heads":40,"num_key_value_heads":8,"hidden_size":5120,"max_position_embeddings":40960}"#,
+        )
+        .unwrap();
+        let provider = ConfigDirMetadataProvider {
+            cache_root: dir.path().to_path_buf(),
+            revision: "main".to_string(),
+            catalog: Catalog::builtin(),
+        };
+        let model = ModelRef {
+            hf_repo: "Qwen/Qwen3-14B".to_string(),
+            quant: "FP8".to_string(),
+            catalog_id: Some("qwen3-14b".to_string()),
+        };
+        let meta = provider.metadata(&model).expect("reads config");
+        assert_eq!(meta.layers, 40);
+        assert_eq!(meta.kv_heads, 8);
+        assert_eq!(meta.head_dim, 128);
+        assert!(meta.params > 0, "params from catalog entry");
+        // A missing config returns None (not a panic).
+        let missing = ModelRef {
+            hf_repo: "Org/Absent".to_string(),
+            quant: String::new(),
+            catalog_id: None,
+        };
+        assert!(provider.metadata(&missing).is_none());
+    }
+
+    /// A launcher whose "engine" binds a real `/health` server on the
+    /// spec's port, so `probe_health` sees it live (for the
+    /// health-recheck path).
+    #[derive(Clone, Default)]
+    struct HealthServerLauncher {
+        launches: Arc<AtomicU64>,
+    }
+
+    impl EngineLauncher for HealthServerLauncher {
+        async fn launch(&self, spec: &crate::supervisor::LaunchSpec) -> Result<u16, String> {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+            self.launches.fetch_add(1, Ordering::SeqCst);
+            let mut port = 0u16;
+            let mut it = spec.args.iter();
+            while let Some(a) = it.next() {
+                if a == "--port" {
+                    port = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+                }
+            }
+            // Bind the health server on the requested port.
+            let listener = TcpListener::bind(("127.0.0.1", port))
+                .await
+                .map_err(|e| format!("bind {port}: {e}"))?;
+            let bound = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut s, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut b = [0u8; 128];
+                    let _ = s.read(&mut b).await;
+                    let _ = s
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await;
+                }
+            });
+            Ok(bound)
+        }
+        async fn kill(&self) {}
+    }
+
+    #[tokio::test]
+    async fn health_recheck_returns_live_engine_without_respawn() {
+        let launches = Arc::new(AtomicU64::new(0));
+        let calls = launches.clone();
+        let rt = ModelHostRuntime::new(
+            config("models:\n  - model: qwen3-14b\n"),
+            Catalog::builtin(),
+            Arc::new(StaticGpuProbe::new(vec![GpuDescriptor::l4()])),
+            Arc::new(FixtureMeta),
+            Box::new(move || HealthServerLauncher {
+                launches: calls.clone(),
+            }),
+            true,
+        )
+        .with_health_recheck(true);
+        let Ok(p1) = rt.ensure_ready("qwen3-14b").await else {
+            eprintln!("skipping: loopback bind denied");
+            return;
+        };
+        // Second call: the health probe passes, so no respawn.
+        let p2 = rt.ensure_ready("qwen3-14b").await.unwrap();
+        assert_eq!(p1, p2);
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            1,
+            "no respawn when healthy"
+        );
     }
 
     #[tokio::test]
