@@ -11,6 +11,17 @@ Work that has merged to `main` since the latest tag and is queued for
 the next version cut. No promises about backward compatibility for any
 of the new YAML fields below until the version that ships them.
 
+### Fixed
+
+- **Revoking a key now blocks OIDC/JWT identities mapped to it.** With
+  `key_management.oidc_claim_map` configured, a verified token whose mapped
+  claim named a revoked, blocked, or expired record was silently downgraded to
+  an ungoverned request (no per-key policy) instead of being denied. The
+  mapped-claim path now mirrors the bearer path: an inactive record denies with
+  403, a claim naming a missing record denies with 401, and a store outage
+  fails closed unless `failure_mode_allow` is set. Tokens that carry no mapped
+  claim are unaffected.
+
 ## [1.4.0] - 2026-06-27
 
 Fourth minor release on the Rust v1.x line. Hardening and reach for the

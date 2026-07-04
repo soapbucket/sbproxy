@@ -10,7 +10,8 @@
 use std::net::TcpListener;
 use std::time::Duration;
 
-use sbproxy_e2e::ProxyHarness;
+use sbproxy_e2e::{MockUpstream, ProxyHarness};
+use serde_json::json;
 
 fn pick_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -156,7 +157,9 @@ fn key_lifecycle_mint_use_revoke_rotate() {
     );
 
     // Rotate a fresh key: both the old and new tokens pass the gate during the
-    // grace window.
+    // grace window; once the window closes only the new token works. The grace
+    // is deliberately short (2 s) so the post-grace half of the contract is
+    // covered without slowing the suite.
     let (status, body) = admin_post(admin_port, "/admin/keys", &auth, Some(r#"{"name":"rot"}"#));
     assert_eq!(status, 201, "mint rotate key: {body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -167,7 +170,7 @@ fn key_lifecycle_mint_use_revoke_rotate() {
         admin_port,
         &format!("/admin/keys/{rot_id}/rotate"),
         &auth,
-        Some(r#"{"grace_secs":300}"#),
+        Some(r#"{"grace_secs":2}"#),
     );
     assert_eq!(status, 200, "rotate: {body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -180,6 +183,19 @@ fn key_lifecycle_mint_use_revoke_rotate() {
     assert!(
         !denied(ai_request(&base, &new_token)),
         "the rotated token must pass auth"
+    );
+
+    // Let the grace window lapse: the prior secret's hash is still stored but
+    // past prev_hash_expires_at, so it must verify-fail like a wrong secret.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        ai_request(&base, &old_token),
+        401,
+        "the prior token must be rejected once the grace window closes"
+    );
+    assert!(
+        !denied(ai_request(&base, &new_token)),
+        "the rotated token must keep passing after the grace window closes"
     );
 
     let _ = std::fs::remove_file(&store_path);
@@ -280,6 +296,233 @@ fn key_expiry_block_and_rate_limit() {
     );
 
     let _ = std::fs::remove_file(&store_path);
+}
+
+/// Per-key budget: spend recorded from upstream `usage` blocks accrues against
+/// the `api_key` budget scope, and once the cap is crossed the next request on
+/// the same key blocks with 402 while a different key's bucket stays clean.
+#[test]
+fn key_budget_spend_accrues_and_cap_blocks() {
+    let admin_port = pick_port();
+    let store_path = format!(
+        "{}/sbproxy_e2e_keymgmt_budget_{}.redb",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&store_path);
+
+    // A live mock provider reporting 1000+1000 tokens per call, far over the
+    // 100-token per-key cap below, so one successful call exhausts a bucket.
+    let upstream = MockUpstream::start(json!({
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 1_700_000_000,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 1000,
+            "completion_tokens": 1000,
+            "total_tokens": 2000,
+        }
+    }))
+    .unwrap();
+
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+  admin:
+    enabled: true
+    port: {admin_port}
+    username: admin
+    password: secret
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: {store_path}
+    cache:
+      ttl_secs: 60
+    crypto:
+      pepper: e2e-budget-pepper
+      master_key: e2e-budget-master
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: sk-dummy
+          base_url: "{upstream_base}"
+          allow_private_base_url: true
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+      budget:
+        on_exceed: block
+        limits:
+          - scope: api_key
+            max_tokens: 100
+"#,
+        upstream_base = upstream.base_url()
+    );
+
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+    ProxyHarness::wait_for_port(admin_port, Duration::from_secs(5)).expect("admin port to bind");
+    let auth = format!("Basic {}", base64_encode("admin:secret"));
+    let base = proxy.base_url();
+
+    let mint = |name: &str| -> String {
+        let (status, body) = admin_post(
+            admin_port,
+            "/admin/keys",
+            &auth,
+            Some(&format!(r#"{{"name":"{name}"}}"#)),
+        );
+        assert_eq!(status, 201, "mint {name}: {body}");
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let token_a = mint("budget-a");
+    let token_b = mint("budget-b");
+
+    // First request on key A passes (its bucket starts empty) and the mock's
+    // usage block debits 2000 tokens against key A's scope.
+    assert_eq!(
+        ai_request(&base, &token_a),
+        200,
+        "the first request on key A must pass and record spend"
+    );
+
+    // Second request on key A: its bucket is over the 100-token cap, so the
+    // pre-dispatch gate must block with 402 before the upstream is reached.
+    let calls_before = upstream.captured().len();
+    assert_eq!(
+        ai_request(&base, &token_a),
+        402,
+        "key A must be blocked once its budget cap is exceeded"
+    );
+    assert_eq!(
+        upstream.captured().len(),
+        calls_before,
+        "a budget-blocked request must not reach the upstream"
+    );
+
+    // Key B holds its own bucket: the cap firing on A must not bleed over.
+    assert_eq!(
+        ai_request(&base, &token_b),
+        200,
+        "key B's budget bucket must be independent of key A's"
+    );
+
+    let _ = std::fs::remove_file(&store_path);
+}
+
+/// Build a config whose key store is a Redis backend pointing at a dead
+/// loopback port, so every store lookup errors. `failure_mode_allow` decides
+/// whether a virtual-key-shaped token is denied (fail-closed default) or the
+/// request degrades through to the upstream.
+fn store_outage_config(dead_redis_port: u16, upstream_base: &str, allow: bool) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+  key_management:
+    enabled: true
+    store:
+      backend: redis
+      url: "redis://127.0.0.1:{dead_redis_port}"
+    cache:
+      ttl_secs: 60
+    crypto:
+      pepper: e2e-outage-pepper
+      master_key: e2e-outage-master
+    failure_mode_allow: {allow}
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: sk-dummy
+          base_url: "{upstream_base}"
+          allow_private_base_url: true
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+"#
+    )
+}
+
+/// Fail-closed (the default): with the store unreachable, a virtual-key-shaped
+/// bearer is denied with 503 before the upstream is reached.
+#[test]
+fn store_outage_fails_closed_by_default() {
+    let dead_redis_port = pick_port(); // nothing listens here
+    let upstream = MockUpstream::start(json!({"ok": true})).unwrap();
+
+    let proxy = ProxyHarness::start_with_yaml(&store_outage_config(
+        dead_redis_port,
+        &upstream.base_url(),
+        false,
+    ))
+    .expect("start proxy");
+    let base = proxy.base_url();
+
+    assert_eq!(
+        ai_request(&base, "sk-unknown-secretsecret"),
+        503,
+        "an unresolvable key must be denied when the store is down (fail-closed)"
+    );
+    assert!(
+        upstream.captured().is_empty(),
+        "a fail-closed denial must not reach the upstream"
+    );
+}
+
+/// `failure_mode_allow: true`: the same outage lets the request through in
+/// degraded mode (no per-key policy) instead of denying.
+#[test]
+fn store_outage_failure_mode_allow_passes_through() {
+    let dead_redis_port = pick_port();
+    let upstream = MockUpstream::start(json!({
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 1_700_000_000,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    }))
+    .unwrap();
+
+    let proxy = ProxyHarness::start_with_yaml(&store_outage_config(
+        dead_redis_port,
+        &upstream.base_url(),
+        true,
+    ))
+    .expect("start proxy");
+    let base = proxy.base_url();
+
+    assert_eq!(
+        ai_request(&base, "sk-unknown-secretsecret"),
+        200,
+        "failure_mode_allow must let the request through during a store outage"
+    );
+    assert_eq!(
+        upstream.captured().len(),
+        1,
+        "the degraded request must reach the upstream"
+    );
 }
 
 /// Minimal standard base64 (avoids a crate dep), matching admin_endpoints.rs.

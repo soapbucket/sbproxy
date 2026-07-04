@@ -184,6 +184,68 @@ fn jwt_claim_resolves_a_key_and_enforces_its_rate_limit() {
     let _ = std::fs::remove_file(&store_path);
 }
 
+/// Revoking the mapped record blocks the JWT: the identity declared itself
+/// governed by that record, so a revoke must deny the token rather than let it
+/// continue ungoverned. A claim naming a record that never existed is denied
+/// the same way the bearer path treats an unknown key id.
+#[test]
+fn revoking_the_mapped_record_blocks_the_jwt() {
+    let admin_port = pick_port();
+    let dead_port = pick_port();
+    let store_path = format!(
+        "{}/sbproxy_e2e_oidc_revoke_{}.redb",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&store_path);
+
+    let proxy = ProxyHarness::start_with_yaml(&config(admin_port, dead_port, &store_path))
+        .expect("start proxy");
+    ProxyHarness::wait_for_port(admin_port, Duration::from_secs(5)).expect("admin port to bind");
+    let auth = format!("Basic {}", base64_encode("admin:secret"));
+    let base = proxy.base_url();
+
+    // Mint an unlimited key and map a JWT onto it.
+    let (status, body) = admin_post(admin_port, "/admin/keys", &auth, Some(r#"{"name":"gov"}"#));
+    assert_eq!(status, 201, "mint key: {body}");
+    let key_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["key"]["key_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let jwt = jwt_for(JWT_SECRET, &key_id);
+
+    // The mapped JWT passes the gate while the record is active.
+    let first = ai_request(&base, &jwt);
+    assert!(
+        first != 401 && first != 403,
+        "a JWT mapped to an active record must pass the gate (got {first})"
+    );
+
+    // Revoke the record: the very next request with the same JWT is denied.
+    let (status, body) = admin_post(
+        admin_port,
+        &format!("/admin/keys/{key_id}/revoke"),
+        &auth,
+        None,
+    );
+    assert_eq!(status, 200, "revoke: {body}");
+    assert_eq!(
+        ai_request(&base, &jwt),
+        403,
+        "revoking the mapped record must block the JWT on the next request"
+    );
+
+    // A claim naming a record that never existed is denied, not ungoverned.
+    let stale = jwt_for(JWT_SECRET, "key-that-never-existed");
+    assert_eq!(
+        ai_request(&base, &stale),
+        401,
+        "a mapped claim naming a missing record must be denied"
+    );
+
+    let _ = std::fs::remove_file(&store_path);
+}
+
 /// Minimal standard base64 (avoids a crate dep), matching admin_endpoints.rs.
 fn base64_encode(input: &str) -> String {
     const ALPH: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

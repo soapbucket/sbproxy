@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-06-25*
+*Last modified: 2026-07-04*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -242,6 +242,14 @@ record. After the token is verified, the claim value resolves the record and its
 policy applies, so a bearer key and an OIDC identity converge on the same record
 and the same limits. No secret is checked on this path, since the identity was
 already proven by the token.
+
+Revocation applies to this front door the same way it applies to bearer keys: a
+token whose mapped claim names a revoked, blocked, or expired record is denied
+with 403 on the next request, and a claim naming a record that does not exist
+is denied with 401. A token that carries no mapped claim at all is simply
+unmapped; it authenticates on its own terms with no per-key policy. When the
+store is unreachable this path fails closed unless `failure_mode_allow` is set,
+matching the bearer path.
 
 ## Migrating from static credentials
 
