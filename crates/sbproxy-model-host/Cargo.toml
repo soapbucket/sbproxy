@@ -15,6 +15,10 @@ gpu-nvidia = ["dep:nvml-wrapper"]
 # Hugging Face weight download. Off by default; enabled on the host that
 # actually pulls and serves weights.
 weights = ["dep:reqwest"]
+# Accurate token counting (against a model's own tokenizer.json) and
+# chat-template rendering. Off by default; both crates are already in
+# the workspace (extension/classifiers), so this adds no new lock deps.
+tokenizer = ["dep:tokenizers", "dep:minijinja"]
 
 [dependencies]
 serde = { workspace = true }
@@ -32,6 +36,11 @@ nvml-wrapper = { version = "0.10", optional = true }
 # the relative Location the hub returns, which the old hf-hub 0.3 client
 # could not. No hf-hub dependency.
 reqwest = { workspace = true, optional = true }
+# Token counting + chat-template rendering, behind the `tokenizer`
+# feature. Versions match the existing workspace users (classifiers /
+# extension) so no new lock entries are pulled.
+tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
+minijinja = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

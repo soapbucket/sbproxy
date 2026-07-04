@@ -6761,6 +6761,7 @@ name = "sbproxy-model-host"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "minijinja",
  "nvml-wrapper",
  "reqwest",
  "schemars",
@@ -6769,6 +6770,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
+ "tokenizers",
  "tokio",
  "tracing",
  "yaml_serde",
