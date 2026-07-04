@@ -252,6 +252,10 @@ fn write_runtime_stub(out: &mut String, base_url: &str, tools: &[FederatedTool])
     let _ = writeln!(out, "  const headers: Record<string, string> = {{");
     let _ = writeln!(out, "    'content-type': 'application/json',");
     let _ = writeln!(out, "    'accept': 'application/json',");
+    // WOR-1644: mark calls originating from the code-execution
+    // sandbox so the gateway attributes them as Caller::CodeExecution
+    // in the session ledger instead of Direct.
+    let _ = writeln!(out, "    'mcp-caller': 'code-execution',");
     let _ = writeln!(out, "  }};");
     let _ = writeln!(out, "  const env = (globalThis as any).process?.env;");
     let _ = writeln!(out, "  const token = env?.AGENT_GATEWAY_TOKEN;");

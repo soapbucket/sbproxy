@@ -35,11 +35,13 @@
 pub mod budget;
 pub mod cache;
 pub mod client;
+pub mod compat_judge;
 pub mod telemetry;
 
 pub use budget::{BudgetExhausted, BudgetTracker};
 pub use cache::JudgeCache;
 pub use client::JudgeClient;
+pub use compat_judge::{CompatJudge, CompatJudgeConfig};
 
 /// Configuration for the single-provider judge backend.
 ///

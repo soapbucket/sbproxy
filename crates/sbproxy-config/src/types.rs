@@ -3066,6 +3066,12 @@ pub struct CredentialBlock {
     /// Mirrors `inject_tools` on the underlying `VirtualKeyConfig`.
     #[serde(default)]
     pub inject_tools: Vec<serde_json::Value>,
+    /// WOR-1646: inject a federated MCP gateway's live catalogue as
+    /// this credential's tool surface. Raw passthrough of the
+    /// `InjectMcpRef` shape (`{ref, format, filter}`) on the
+    /// underlying `VirtualKeyConfig`; resolved at request time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject_mcp: Option<serde_json::Value>,
 }
 
 /// Selector matching an inbound principal to a credential. At least

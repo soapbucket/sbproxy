@@ -60,17 +60,41 @@ origins:
       server_info:
         name: my-mcp
         version: "1.0.0"
+      # Named RBAC policies referenced by each upstream's `rbac:`
+      # label. Default-deny: a caller matching no rule is refused, so
+      # a tool is reachable only when a rule allows it. The `read_only`
+      # policy allows one tool; a `tools/call` for anything else on the
+      # gh upstream comes back as a JSON-RPC error and the upstream is
+      # never contacted.
+      rbac_policies:
+        read_only:
+          default_allow: false
+          tool_access:
+            - principals: []
+              allowed: ["gh.search_repos"]
+        db_writer:
+          default_allow: false
+          tool_access:
+            - principals: []
+              allowed: ["db.query"]
       federated_servers:
         # Bare hostnames are normalised to https://<host>/mcp.
-        # Use a full https://... URL for any other path.
-        # NOTE: per-server `rbac:` and `timeout:` knobs are planned but
-        # not yet enforced. Use the `tool_allowlist` guardrail below for
-        # equivalent access control until per-server dispatch lands.
+        # Use a full https://... URL for any other path. Per-server
+        # `rbac:` (a label above) and `timeout:` (Go duration) are
+        # enforced: RBAC gates every tools/call against the caller's
+        # principal, and a call that outlasts the timeout fails rather
+        # than hanging the request.
         - origin: github.example.com
           prefix: gh
+          rbac: read_only
+          timeout: 10s
         - origin: postgres.example.com
           prefix: db
+          rbac: db_writer
+          timeout: 5s
       guardrails:
+        # The allowlist is a second, coarser gate on top of RBAC: even
+        # an RBAC-allowed tool must also appear here to be forwarded.
         - type: tool_allowlist
           allow:
             - gh.search_repos

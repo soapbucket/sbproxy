@@ -2651,6 +2651,9 @@
           "default": [],
           "type": "array",
           "items": true
+        },
+        "inject_mcp": {
+          "description": "WOR-1646: inject a federated MCP gateway's live catalogue as this credential's tool surface. Raw passthrough of the `InjectMcpRef` shape (`{ref, format, filter}`) on the underlying `VirtualKeyConfig`; resolved at request time."
         }
       }
     },

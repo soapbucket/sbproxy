@@ -69,14 +69,16 @@ curl -s -X POST http://127.0.0.1:8080 \
 - `server_info.name` / `server_info.version` - identity returned in MCP `initialize`
 - `federated_servers[].origin` - upstream MCP endpoint (bare hostname or full URL)
 - `federated_servers[].prefix` - namespace applied to the upstream's tools
-- `guardrails[].type: tool_allowlist` - inline allowlist that short-circuits `tools/call`
+- `federated_servers[].rbac` - per-server RBAC label, enforced on every `tools/call` against the caller's principal (default-deny)
+- `federated_servers[].timeout` - per-server request budget; a call that outlasts it fails rather than hanging the request
+- `rbac_policies` - named default-deny tool-access policies referenced by each server's `rbac:` label
+- `guardrails[].type: tool_allowlist` - a second, coarser allowlist on top of RBAC that short-circuits `tools/call`
 
-### Planned but not yet enforced
-
-These knobs parse but the dispatch layer does not honour them yet.
-
-- `federated_servers[].rbac` - per-server RBAC label
-- `federated_servers[].timeout` - per-server request budget
+RBAC and timeout are enforced by the dispatch layer, not merely parsed:
+a tool the policy denies returns a JSON-RPC error and never reaches the
+upstream, and a call that exceeds the per-server `timeout` fails inside
+that budget. Deeper RBAC and quota behaviour has its own runnable
+example under [`examples/mcp-rbac-quotas`](../mcp-rbac-quotas).
 
 ### Caveat: cannot be run end-to-end as-shipped
 

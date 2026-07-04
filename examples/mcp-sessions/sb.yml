@@ -1,0 +1,26 @@
+# MCP gateway with streamable HTTP sessions and a file-sink ledger.
+#
+# sessions.enabled makes the gateway issue an Mcp-Session-Id on
+# initialize, require it on later requests, and end it on DELETE. The
+# session ledger writes one NDJSON record per tools/call to a file so
+# behavioral eval has an artifact to read.
+proxy:
+  http_bind_port: 8080
+session_ledger:
+  enabled: true
+  sink: file
+  path: "mcp-session-ledger.ndjson"
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: my-mcp
+        version: "1.0.0"
+      sessions:
+        enabled: true
+        ttl: "30m"
+      federated_servers:
+        - origin: github.example.com
+          prefix: gh

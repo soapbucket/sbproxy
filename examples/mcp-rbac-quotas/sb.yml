@@ -1,0 +1,32 @@
+# MCP gateway with principal-aware RBAC and per-tool quotas.
+#
+# rbac_policies are default-deny: a caller matching no rule is refused.
+# The read_only policy allows one tool and caps it with a sliding
+# window; a call beyond the window returns JSON-RPC error -32099.
+proxy:
+  http_bind_port: 8080
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: my-mcp
+        version: "1.0.0"
+      rbac_policies:
+        read_only:
+          default_allow: false
+          tool_access:
+            - principals: []
+              allowed: ["gh.search_repos"]
+          tool_quotas:
+            - tool_name: "gh.search_repos"
+              principals: []
+              rate:
+                per: "1m"
+                max: 30
+      federated_servers:
+        - origin: github.example.com
+          prefix: gh
+          rbac: read_only
+          timeout: 10s

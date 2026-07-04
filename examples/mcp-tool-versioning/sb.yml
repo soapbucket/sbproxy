@@ -1,0 +1,32 @@
+# MCP tool versioning: gate contract changes behind declared bumps.
+#
+# The gateway diffs the live federated catalogue against the committed
+# lockfile at every refresh. A tool whose contract changed without a
+# matching version bump is a violation: `mode: warn` logs and counts
+# it, `mode: block` removes the tool from tools/list and fails its
+# tools/call with an error naming the grade the change required.
+#
+# Generate the lockfile with sbproxy-mcp-drift against your live
+# gateway, commit it next to this config, and declare bumps here as
+# your upstreams evolve. Proof it works: change a tool description
+# upstream and watch sbproxy_mcp_tool_compat_verdicts_total pick up a
+# violation (warn), or the tool vanish from tools/list (block).
+proxy:
+  http_bind_port: 8080
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: my-mcp-gateway
+        version: "1.0.0"
+      refresh_interval: "60s"
+      tool_versioning:
+        lockfile: "tool-versions.lock.yaml"
+        mode: warn
+        declared_versions:
+          search: "1.1.0"
+      federated_servers:
+        - origin: "test.sbproxy.dev"
+          prefix: up

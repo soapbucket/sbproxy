@@ -2667,6 +2667,71 @@ pub fn record_mcp_tool_dispatch(tool: &str, result: &'static str, duration_secs:
         .observe(duration_secs);
 }
 
+/// Record MCP tool-call spend on
+/// `sbproxy_mcp_tool_cost_usd_total{tool, server}` (WOR-1644). Only
+/// emitted when a price map resolves a cost for the tool; the
+/// dispatch-count and duration already ride on
+/// `sbproxy_mcp_tool_dispatch_*`.
+pub fn record_mcp_tool_cost(tool: &str, server: &str, cost_usd: f64) {
+    use prometheus::{register_counter_vec, CounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<CounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_counter_vec!(
+            "sbproxy_mcp_tool_cost_usd_total",
+            "MCP tool-call cost in USD, by tool and owning server",
+            &["tool", "server"],
+        )
+        .expect("mcp tool cost counter registers")
+    });
+    let tool = sanitize_label("tool", tool);
+    let server = sanitize_label("server", server);
+    counter
+        .with_label_values(&[tool.as_str(), server.as_str()])
+        .inc_by(cost_usd);
+}
+
+/// Record a tool-versioning oracle verdict on
+/// `sbproxy_mcp_tool_compat_verdicts_total{grade, outcome}`
+/// (WOR-1635). `grade` is the computed semver grade (`none`, `patch`,
+/// `minor`, `major`); `outcome` is `ok`, `violation`, `removed_tool`,
+/// or `lockfile_error`.
+pub fn record_mcp_tool_compat_verdict(grade: &str, outcome: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_tool_compat_verdicts_total",
+            "Tool-versioning oracle verdicts, by computed grade and outcome",
+            &["grade", "outcome"],
+        )
+        .expect("mcp tool compat verdict counter registers")
+    });
+    let grade = sanitize_label("grade", grade);
+    counter.with_label_values(&[grade.as_str(), outcome]).inc();
+}
+
+/// Record an MCP upstream IO failure on
+/// `sbproxy_mcp_upstream_io_failures_total{kind}`. `kind` is one of
+/// `timeout`, `connect`, `response_cap`, `other`. Lets an operator
+/// see hung or oversized upstreams that the per-request deadlines
+/// and byte caps are absorbing.
+pub fn record_mcp_upstream_io_failure(kind: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_upstream_io_failures_total",
+            "MCP upstream IO failures absorbed by deadlines and byte caps, by kind",
+            &["kind"],
+        )
+        .expect("mcp upstream io failure counter registers")
+    });
+    counter.with_label_values(&[kind]).inc();
+}
+
 /// Record an MCP resource-fetch attempt on
 /// `sbproxy_mcp_resource_fetch_total{result}`. `result` is one of
 /// `ok`, `not_found`, `upstream_error`, `policy_denied`.

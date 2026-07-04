@@ -745,12 +745,21 @@ pub(super) async fn handle_mcp_action(
     has_agent_skills: bool,
 ) -> Result<()> {
     use sbproxy_extension::mcp::types::{
-        InitializeResult, JsonRpcRequest, JsonRpcResponse, ServerCapabilities, ServerInfo,
-        INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
+        is_supported_protocol_version, negotiate_protocol_version, InitializeResult,
+        JsonRpcRequest, JsonRpcResponse, ServerCapabilities, ServerInfo, INTERNAL_ERROR,
+        INVALID_PARAMS, INVALID_REQUEST, LATEST_PROTOCOL_VERSION, METHOD_NOT_FOUND, PARSE_ERROR,
+        SUPPORTED_PROTOCOL_VERSIONS,
     };
 
     let method = session.req_header().method.clone();
     let req_path = session.req_header().uri.path();
+
+    // WOR-1638: make the federation servable before any branch reads
+    // the registry. First request spawns the periodic refresh task
+    // and runs the cold-start prime (single-flight); every request
+    // after that is a no-op fast path serving the cached snapshot.
+    // Inbound traffic never fans out to upstream catalogues inline.
+    mcp.federation.ensure_ready(mcp.refresh_interval).await;
 
     // WOR-483: serve the federated tool catalogue as a typed
     // Cloudflare-Code-Mode TypeScript module at
@@ -760,8 +769,6 @@ pub(super) async fn handle_mcp_action(
     // any TypeScript agent or sandbox can `import` the module
     // directly without a separate codegen step.
     if method == http::Method::GET && req_path == "/.well-known/mcp/codemode.ts" {
-        use sha2::{Digest, Sha256};
-
         let listener_is_tls = session
             .digest()
             .and_then(|d| d.ssl_digest.as_ref())
@@ -783,21 +790,12 @@ pub(super) async fn handle_mcp_action(
             Some(authority) => format!("{scheme}://{authority}"),
             None => String::new(),
         };
-        let module = mcp.federation.codemode_ts(&callback_base);
-
         // Strong ETag is the lowercase hex SHA-256 of the emitted
-        // bytes wrapped in double quotes per RFC 9110 §8.8.3. The
-        // federation sorts tools lexicographically before emission,
-        // so the digest is stable across calls as long as the tool
-        // registry does not change; a CDN or browser can pin against
-        // it with `If-None-Match` and skip the body on the next pull.
-        let digest = Sha256::digest(module.as_bytes());
-        let mut etag_value = String::with_capacity(2 + digest.len() * 2);
-        etag_value.push('"');
-        for byte in digest.iter() {
-            etag_value.push_str(&format!("{:02x}", byte));
-        }
-        etag_value.push('"');
+        // bytes wrapped in double quotes per RFC 9110 §8.8.3.
+        // WOR-1640: module emission and hashing are cached by
+        // (registry generation, callback base), so a warm hit does
+        // neither; the ETag stays stable until the catalogue moves.
+        let (module, etag_value) = mcp.federation.codemode_ts_cached(&callback_base);
 
         let if_none_match = session
             .req_header()
@@ -843,7 +841,7 @@ pub(super) async fn handle_mcp_action(
 
         // 200 path: write content-type + content-length + etag +
         // cache-control inline so we can carry both custom headers.
-        let body = module.into_bytes();
+        let body = module.as_bytes().to_vec();
         let mut header = pingora_http::ResponseHeader::build(200, Some(4)).map_err(|e| {
             Error::because(
                 ErrorType::InternalError,
@@ -955,12 +953,7 @@ pub(super) async fn handle_mcp_action(
             .federation
             .list_tools()
             .into_iter()
-            .filter(|t| {
-                mcp.tool_allowlist
-                    .as_ref()
-                    .map(|allow| allow.iter().any(|a| a == &t.name))
-                    .unwrap_or(true)
-            })
+            .filter(|t| mcp.is_tool_allowed(&t.name))
             .filter(|t| match mcp.policy_for_server(&t.server_name) {
                 Some(policy) => matches!(
                     policy.check(&ctx.principal, &t.name),
@@ -985,7 +978,7 @@ pub(super) async fn handle_mcp_action(
         let manifest = sbproxy_extension::mcp::discovery::build_server_manifest(
             &mcp.server_name,
             &mcp.server_version,
-            "2025-06-18",
+            LATEST_PROTOCOL_VERSION,
             &endpoint,
             &tools,
             authorization,
@@ -1022,8 +1015,79 @@ pub(super) async fn handle_mcp_action(
         return Ok(());
     }
 
+    // WOR-1642: a GET with `Accept: text/event-stream` opens the
+    // streamable HTTP server-to-client channel. The gateway pushes
+    // `notifications/tools/list_changed` and
+    // `notifications/resources/list_changed` when the corresponding
+    // registry generation moves, which is what the `listChanged`
+    // capabilities advertised in `initialize` promise.
+    if method == http::Method::GET {
+        let accepts_sse = session
+            .req_header()
+            .headers
+            .get("accept")
+            .and_then(|v| v.to_str().ok())
+            .map(|a| a.contains("text/event-stream"))
+            .unwrap_or(false);
+        if accepts_sse {
+            return handle_mcp_server_stream(session, mcp, ctx).await;
+        }
+    }
+
+    // WOR-1642: DELETE ends a session when session management is on.
+    if method == http::Method::DELETE {
+        return handle_mcp_session_delete(session, mcp, ctx).await;
+    }
+
     if method != http::Method::POST {
         send_error(session, 405, "MCP gateway accepts POST only").await?;
+        return Ok(());
+    }
+
+    // WOR-1643: an OAuth-protected gateway must point credential-less
+    // callers at its protected-resource metadata; the MCP auth
+    // discovery flow starts from exactly this challenge (RFC 9728).
+    // Token validation stays in the generic auth layer; this covers
+    // only the no-Authorization-header case, so a request that passed
+    // header-based auth is never re-challenged. The well-known
+    // discovery routes above stay unauthenticated.
+    if mcp.oauth.is_some() && session.req_header().headers.get("authorization").is_none() {
+        let listener_is_tls = session
+            .digest()
+            .and_then(|d| d.ssl_digest.as_ref())
+            .is_some();
+        let scheme = if listener_is_tls { "https" } else { "http" };
+        let metadata_url = match session
+            .req_header()
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+        {
+            Some(authority) => format!(
+                "{scheme}://{authority}{}",
+                sbproxy_extension::mcp::discovery::OAUTH_PROTECTED_RESOURCE_PATH
+            ),
+            None => sbproxy_extension::mcp::discovery::OAUTH_PROTECTED_RESOURCE_PATH.to_string(),
+        };
+        let mut header = pingora_http::ResponseHeader::build(401, Some(2)).map_err(|e| {
+            Error::because(ErrorType::InternalError, "failed to build 401 header", e)
+        })?;
+        let _ = header.insert_header(
+            "www-authenticate",
+            format!("Bearer resource_metadata=\"{metadata_url}\""),
+        );
+        let _ = header.insert_header("content-length", "0");
+        session
+            .write_response_header(Box::new(header), true)
+            .await?;
+        tracing::info!(
+            target: "sbproxy::audit",
+            event = "mcp.oauth.challenge",
+            mcp_server = %mcp.server_name,
+            request_id = %ctx.request_id,
+            resource_metadata = %metadata_url,
+            "challenged credential-less MCP request with RFC 9728 pointer"
+        );
         return Ok(());
     }
 
@@ -1057,7 +1121,20 @@ pub(super) async fn handle_mcp_action(
     let request: JsonRpcRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
         Err(_) => {
-            let err = JsonRpcResponse::error(None, PARSE_ERROR, "invalid JSON-RPC body");
+            // WOR-1641: a JSON-RPC batch (top-level array) is valid
+            // JSON, so answer it with a specific message instead of
+            // a bare parse error. The 2025-06-18 revision removed
+            // batching and this gateway does not accept it.
+            let first_byte = body_bytes.iter().find(|b| !b.is_ascii_whitespace());
+            let (code, message) = if first_byte == Some(&b'[') {
+                (
+                    INVALID_REQUEST,
+                    "JSON-RPC batching is not supported (removed in MCP 2025-06-18); send one request per POST",
+                )
+            } else {
+                (PARSE_ERROR, "invalid JSON-RPC body")
+            };
+            let err = JsonRpcResponse::error(None, code, message);
             return write_jsonrpc(session, &err).await;
         }
     };
@@ -1071,17 +1148,103 @@ pub(super) async fn handle_mcp_action(
         return write_jsonrpc(session, &err).await;
     }
 
-    // Notifications (id absent) get an empty 204 per JSON-RPC 2.0.
+    // WOR-1641: post-initialize requests SHOULD carry
+    // `MCP-Protocol-Version`; when present it must name a revision
+    // the gateway serves, else 400 per the spec's version-validation
+    // rule. A missing header is accepted (the request is served at
+    // the gateway's newest revision). `initialize` is exempt: that
+    // is where negotiation happens.
+    if request.method != "initialize" {
+        if let Some(header_version) = session
+            .req_header()
+            .headers
+            .get("mcp-protocol-version")
+            .and_then(|v| v.to_str().ok())
+        {
+            if !is_supported_protocol_version(header_version) {
+                send_error(
+                    session,
+                    400,
+                    &format!(
+                        "unsupported MCP-Protocol-Version '{header_version}' (supported: {})",
+                        SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
+
+    // WOR-1644: code-mode's emitted runtime stub sends
+    // `mcp-caller: code-execution`, so tool calls it makes are
+    // attributed to the code-execution sandbox rather than a direct
+    // model call in the session ledger.
+    let is_code_execution = session
+        .req_header()
+        .headers
+        .get("mcp-caller")
+        .and_then(|v| v.to_str().ok())
+        .map(|c| c.eq_ignore_ascii_case("code-execution"))
+        .unwrap_or(false);
+
+    // WOR-1642: with session management enabled, every
+    // post-initialize request (notifications included) must carry
+    // the Mcp-Session-Id the gateway issued. Missing means 400;
+    // unknown or expired means 404, the client's cue to
+    // re-initialize.
+    let mut mcp_session_id: Option<String> = None;
+    if let Some(store) = mcp.sessions.as_deref() {
+        if request.method != "initialize" {
+            match session
+                .req_header()
+                .headers
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+            {
+                None => {
+                    send_error(
+                        session,
+                        400,
+                        "missing Mcp-Session-Id header (session management is enabled)",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Some(id) if !store.validate(id) => {
+                    send_error(
+                        session,
+                        404,
+                        "unknown or expired MCP session; re-initialize",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Some(id) => mcp_session_id = Some(id.to_string()),
+            }
+        }
+    }
+
+    // Notifications (id absent) get an empty 202 Accepted per the
+    // streamable HTTP transport (WOR-1642; previously 204).
     if request.id.is_none() {
-        let header = pingora_http::ResponseHeader::build(204, Some(0))
-            .map_err(|e| Error::because(ErrorType::InternalError, "failed to build mcp 204", e))?;
+        let header = pingora_http::ResponseHeader::build(202, Some(0))
+            .map_err(|e| Error::because(ErrorType::InternalError, "failed to build mcp 202", e))?;
         session
             .write_response_header(Box::new(header), true)
             .await?;
         return Ok(());
     }
 
-    let response = match request.method.as_str() {
+    // WOR-1640: take the method out so match arms can move
+    // `request.params` instead of cloning the full inbound JSON.
+    let mut request = request;
+    let rpc_method = std::mem::take(&mut request.method);
+    // WOR-1642: set when this request is an `initialize` on a
+    // session-managed gateway; the response then carries the issued
+    // `Mcp-Session-Id` header.
+    let mut issued_session: Option<String> = None;
+    let response = match rpc_method.as_str() {
         "initialize" => {
             // WOR-195: when the origin opts into Agent Skills, surface
             // `experimental.agentSkillsUrl` so MCP clients that have
@@ -1110,14 +1273,10 @@ pub(super) async fn handle_mcp_action(
             } else {
                 None
             };
-            // WOR-818: lazy-prime the resource registry on the
-            // first initialize so the mcpApps capability mirrors
-            // from any upstream that advertised SEP-1865. A failure
-            // here logs and continues; the rest of the initialize
-            // response is still useful for base-MCP clients.
-            if let Err(e) = mcp.federation.refresh_resources().await {
-                warn!(error = %e, "MCP federation resource refresh failed");
-            }
+            // WOR-818/WOR-1638: the resource registry (and the
+            // mirrored mcpApps capability) is primed by ensure_ready
+            // above and kept fresh by the background task; initialize
+            // reads the snapshot.
             let mcp_apps = mcp.federation.mcp_apps_capability();
             // Resources capability: present whenever this origin
             // surfaces resources to MCP clients, either via the
@@ -1135,10 +1294,28 @@ pub(super) async fn handle_mcp_action(
             let surfaces_resources =
                 has_agent_skills || !mcp.federation.list_resources().is_empty();
             let resources = surfaces_resources.then(|| serde_json::json!({ "listChanged": true }));
+            // WOR-1642: issue a session when session management is
+            // enabled. The id rides back on the Mcp-Session-Id
+            // response header, per the streamable HTTP transport.
+            if let Some(store) = mcp.sessions.as_deref() {
+                issued_session = Some(store.create());
+            }
+            // WOR-1641: spec-correct negotiation. Echo the client's
+            // requested revision when supported; otherwise answer
+            // with the newest revision the gateway serves and let
+            // the client decide.
+            let requested_version = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(|v| v.as_str());
             let result = InitializeResult {
-                protocol_version: "2025-06-18".to_string(),
+                protocol_version: negotiate_protocol_version(requested_version).to_string(),
                 capabilities: ServerCapabilities {
-                    tools: Some(serde_json::json!({})),
+                    // WOR-1642: `listChanged: true` is truthful now
+                    // that the GET server-to-client stream delivers
+                    // the notifications.
+                    tools: Some(serde_json::json!({ "listChanged": true })),
                     resources,
                     prompts: None,
                     experimental,
@@ -1160,73 +1337,79 @@ pub(super) async fn handle_mcp_action(
         }
         "ping" => JsonRpcResponse::success(request.id.clone(), serde_json::json!("pong")),
         "tools/list" => {
-            // Lazy refresh: kick off a tools fetch on the first call so
-            // the registry is populated. Subsequent calls reuse the
-            // cached snapshot until the operator wires up a periodic
-            // refresh task. Failures fall through to an empty list.
-            if let Err(e) = mcp.federation.refresh_tools().await {
-                warn!(error = %e, "MCP federation tool refresh failed");
-            }
+            // WOR-1638: serves the ArcSwap snapshot primed by
+            // ensure_ready and refreshed by the background task.
+            // Upstream fan-outs are bounded by the refresh interval,
+            // not by inbound request volume.
             // WOR-806: progressive discovery advertises two meta-tools
             // (`search` / `execute`) instead of the full catalogue, so
             // a large federated tool set stays out of the model's
             // context window.
-            let tool_defs: Vec<serde_json::Value> = if mcp.progressive_discovery {
-                mcp_progressive_meta_tools()
+            if mcp.progressive_discovery {
+                JsonRpcResponse::success(
+                    request.id.clone(),
+                    serde_json::json!({ "tools": mcp_progressive_meta_tools() }),
+                )
             } else {
-                mcp.federation
-                    .list_tools()
-                    .into_iter()
-                    // WOR-1065: RBAC filter. The legacy schema returned
-                    // the full catalogue here even when the gate would
-                    // deny the matching `tools/call`, leaking tool
-                    // names to callers that could not invoke them. Now
-                    // each tool is filtered by its owning upstream's
-                    // policy against the inbound principal. A tool
-                    // whose owning upstream has no `rbac:` label keeps
-                    // the open-by-default behaviour for that upstream
-                    // (the action-level allowlist guardrail still
-                    // applies).
-                    .filter(|t| mcp.is_tool_allowed(&t.name))
-                    .filter(|t| match mcp.policy_for_server(&t.server_name) {
-                        Some(policy) => matches!(
-                            policy.check(&ctx.principal, &t.name),
-                            sbproxy_extension::mcp::ToolAccessDecision::Allow,
-                        ),
-                        None => true,
-                    })
-                    .map(|t| {
-                        // WOR-818: preserve the upstream `_meta`
-                        // block (SEP-1865 UI-template metadata, etc.)
-                        // by inserting it conditionally; absent
-                        // keeps the JSON shape unchanged for
-                        // base-MCP clients.
-                        let mut entry = serde_json::json!({
-                            "name": t.name,
-                            "description": t.description,
-                            "inputSchema": t.input_schema,
-                        });
-                        if let Some(m) = t.meta {
-                            if let Some(obj) = entry.as_object_mut() {
-                                obj.insert("_meta".to_string(), m);
+                // WOR-1640: the catalogue is pre-serialized once per
+                // registry generation. With no allowlist and no
+                // principal-scoped RBAC the cached array is spliced
+                // into the envelope untouched (zero clones, zero
+                // re-serialization); otherwise the response is a
+                // string concat of the pre-serialized entries that
+                // pass the filters.
+                // WOR-1065: the RBAC filter still runs per principal
+                // so the catalogue never lists a tool the gate would
+                // refuse to call for this caller.
+                let snapshot = mcp.federation.serialized_tools();
+                // WOR-1635: tools blocked by the version gate are
+                // filtered out of the catalogue entirely.
+                let version_blocked = mcp.federation.version_blocked();
+                let needs_filter = mcp.tool_allowlist.is_some()
+                    || mcp.has_principal_scoped_tools
+                    || !version_blocked.is_empty();
+                let tools_json: std::borrow::Cow<'_, str> = if !needs_filter {
+                    std::borrow::Cow::Borrowed(snapshot.full_array.as_str())
+                } else {
+                    let mut out = String::with_capacity(snapshot.full_array.len());
+                    out.push('[');
+                    let mut first = true;
+                    for entry in &snapshot.entries {
+                        if version_blocked.contains_key(&entry.name) {
+                            continue;
+                        }
+                        if !mcp.is_tool_allowed(&entry.name) {
+                            continue;
+                        }
+                        if let Some(policy) = mcp.policy_for_server(&entry.server_name) {
+                            if !matches!(
+                                policy.check(&ctx.principal, &entry.name),
+                                sbproxy_extension::mcp::ToolAccessDecision::Allow,
+                            ) {
+                                continue;
                             }
                         }
-                        entry
-                    })
-                    .collect()
-            };
-            JsonRpcResponse::success(
-                request.id.clone(),
-                serde_json::json!({ "tools": tool_defs }),
-            )
+                        if !first {
+                            out.push(',');
+                        }
+                        first = false;
+                        out.push_str(&entry.json);
+                    }
+                    out.push(']');
+                    std::borrow::Cow::Owned(out)
+                };
+                let id_json =
+                    serde_json::to_string(&request.id).unwrap_or_else(|_| "null".to_string());
+                let body = format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{id_json},\"result\":{{\"tools\":{tools_json}}}}}"
+                );
+                return send_response(session, 200, "application/json", body.as_bytes()).await;
+            }
         }
         "resources/list" => {
-            // WOR-818: pass-through the federated resource list. The
-            // refresh runs lazily on the first call (same pattern as
-            // `tools/list`). Failures fall through to an empty list.
-            if let Err(e) = mcp.federation.refresh_resources().await {
-                warn!(error = %e, "MCP federation resource refresh failed");
-            }
+            // WOR-818/WOR-1638: pass-through the federated resource
+            // list from the primed snapshot (same pattern as
+            // `tools/list`).
             let resources: Vec<serde_json::Value> = mcp
                 .federation
                 .list_resources()
@@ -1255,7 +1438,7 @@ pub(super) async fn handle_mcp_action(
             // Pass-through only -- the gateway does not enforce
             // CSP / iframe-sandbox / cache-metadata at this layer;
             // those validators ship in the enterprise tier.
-            let params = request.params.clone().unwrap_or(serde_json::Value::Null);
+            let params = request.params.take().unwrap_or(serde_json::Value::Null);
             let uri = params.get("uri").and_then(|v| v.as_str()).unwrap_or("");
             if uri.is_empty() {
                 JsonRpcResponse::error(
@@ -1278,7 +1461,7 @@ pub(super) async fn handle_mcp_action(
             }
         }
         "tools/call" => {
-            let params = request.params.clone().unwrap_or(serde_json::Value::Null);
+            let params = request.params.take().unwrap_or(serde_json::Value::Null);
             // WOR-818 PR2: extract the OpenAI Apps SDK
             // `params.audit.cause` so it reaches the policy hook
             // and the audit chain. Absent on base-MCP calls.
@@ -1347,7 +1530,19 @@ pub(super) async fn handle_mcp_action(
                         "tools/call requires a 'name' parameter",
                     ),
                     Some(name) => {
-                        if !mcp.is_tool_allowed(&name) {
+                        // WOR-1635: version-gate check first; a
+                        // blocked tool is invisible in tools/list and
+                        // must fail calls with the violation detail.
+                        if let Some(detail) = mcp.federation.version_blocked().get(&name) {
+                            JsonRpcResponse::error(
+                                request.id.clone(),
+                                INVALID_PARAMS,
+                                &format!(
+                                    "tool '{}' is blocked by the version gate: {}",
+                                    name, detail
+                                ),
+                            )
+                        } else if !mcp.is_tool_allowed(&name) {
                             JsonRpcResponse::error(
                                 request.id.clone(),
                                 INVALID_PARAMS,
@@ -1495,6 +1690,7 @@ pub(super) async fn handle_mcp_action(
                                     None
                                 };
 
+                                let call_started = std::time::Instant::now();
                                 let call = mcp.federation.call_tool(&name, arguments);
                                 let outcome = match timeout {
                                     Some(d) => match tokio::time::timeout(d, call).await {
@@ -1524,8 +1720,28 @@ pub(super) async fn handle_mcp_action(
                                 // record (success or failure) before the
                                 // outcome is consumed by the response.
                                 if let Some(cap) = ledger_capture {
-                                    emit_tool_call_ledger(ctx, &name, cap, &outcome);
+                                    emit_tool_call_ledger(
+                                        ctx,
+                                        &name,
+                                        cap,
+                                        &outcome,
+                                        mcp_session_id.as_deref(),
+                                        is_code_execution,
+                                    );
                                 }
+
+                                // WOR-1644: attribute the call into the
+                                // usage plane. Metrics always fire;
+                                // cost and the usage-sink row appear
+                                // when a price map resolves the tool.
+                                emit_mcp_tool_attribution(
+                                    ctx,
+                                    mcp,
+                                    &name,
+                                    federated.as_ref().map(|t| t.server_name.as_str()),
+                                    &outcome,
+                                    call_started.elapsed(),
+                                );
 
                                 // WOR-508: bridge the prompt-linked audit
                                 // inputs to the enterprise audit layer over
@@ -1562,7 +1778,10 @@ pub(super) async fn handle_mcp_action(
         ),
     };
 
-    write_jsonrpc(session, &response).await
+    match issued_session.as_deref() {
+        Some(session_id) => write_jsonrpc_with_session(session, &response, session_id).await,
+        None => write_jsonrpc(session, &response).await,
+    }
 }
 
 /// WOR-1186: ledger inputs captured before the federated call consumes
@@ -1643,14 +1862,18 @@ fn emit_tool_call_ledger(
     tool_name: &str,
     cap: LedgerCapture,
     outcome: &anyhow::Result<serde_json::Value>,
+    mcp_session_id: Option<&str>,
+    is_code_execution: bool,
 ) {
     use sbproxy_observe::session_ledger::{emit_tool_call, Caller, ToolCallObservation};
 
-    // Session id: the MCP session when present, else the request id so a
-    // sessionless call still forms a coherent one-call session.
-    let session_id = ctx
-        .session_id
-        .map(|s| s.to_string())
+    // Session id preference (WOR-1642): the protocol-level MCP
+    // session when the gateway issued one, else the generic
+    // header-sourced session, else the request id so a sessionless
+    // call still forms a coherent one-call session.
+    let session_id = mcp_session_id
+        .map(str::to_string)
+        .or_else(|| ctx.session_id.map(|s| s.to_string()))
         .unwrap_or_else(|| ctx.request_id.to_string());
 
     // Agent id from the resolved principal; an empty subject is `None`.
@@ -1686,8 +1909,88 @@ fn emit_tool_call_ledger(
         is_error,
         started_at: cap.started_at,
         duration_ms: cap.started.elapsed().as_millis() as u64,
-        caller: Caller::Direct,
+        // WOR-1644: code-mode calls (from the emitted TS runtime,
+        // which sends `mcp-caller: code-execution`) are attributed to
+        // the sandbox; everything else is a direct call.
+        caller: if is_code_execution {
+            Caller::CodeExecution
+        } else {
+            Caller::Direct
+        },
     });
+}
+
+/// WOR-1644: attribute one MCP `tools/call` into the usage plane.
+/// Records the dispatch count and duration on
+/// `sbproxy_mcp_tool_dispatch_*`, the resolved cost on
+/// `sbproxy_mcp_tool_cost_usd_total`, and emits one `LlmUsageEvent`
+/// (keyed by tenant, principal, server, tool) to every configured
+/// usage sink, so tool spend lands in the same stream as model spend.
+fn emit_mcp_tool_attribution(
+    ctx: &RequestContext,
+    mcp: &sbproxy_modules::action::McpAction,
+    tool_name: &str,
+    server: Option<&str>,
+    outcome: &anyhow::Result<serde_json::Value>,
+    duration: std::time::Duration,
+) {
+    let (result_label, is_error): (&'static str, bool) = match outcome {
+        Ok(value) => {
+            let app_error = value
+                .get("isError")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if app_error {
+                ("tool_error", true)
+            } else {
+                ("ok", false)
+            }
+        }
+        Err(_) => ("tool_error", true),
+    };
+    sbproxy_observe::metrics::record_mcp_tool_dispatch(
+        tool_name,
+        result_label,
+        duration.as_secs_f64(),
+    );
+
+    let cost = mcp.tool_cost(tool_name);
+    let server = server.unwrap_or("unknown");
+    if let Some(cost_usd) = cost {
+        sbproxy_observe::metrics::record_mcp_tool_cost(tool_name, server, cost_usd);
+    }
+
+    // Usage-sink row: only build it when a sink is listening.
+    if mcp.usage_sinks.is_empty() {
+        return;
+    }
+    let event = sbproxy_ai::usage_sink::LlmUsageEvent {
+        // `mcp` provider + the owning server as the "model" so a tool
+        // call is filterable next to model completions without a
+        // separate schema.
+        provider: "mcp".to_string(),
+        model: server.to_string(),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+        cost_usd: cost.unwrap_or(0.0),
+        latency_ms: duration.as_millis() as u64,
+        status: if is_error { 500 } else { 200 },
+        key_id: {
+            let sub = ctx.principal.sub.clone();
+            (!sub.is_empty()).then_some(sub)
+        },
+        user: ctx.principal.attrs.user.clone(),
+        team: {
+            let tenant = ctx.principal.tenant_id.to_string();
+            (!tenant.is_empty()).then_some(tenant)
+        },
+        request_id: Some(ctx.request_id.to_string()),
+        tag: Some(format!("mcp_tool:{tool_name}")),
+    };
+    for sink in &mcp.usage_sinks {
+        sink.record(&event);
+    }
 }
 
 /// The two meta-tool definitions advertised by `tools/list` when
@@ -1773,4 +2076,176 @@ pub(super) async fn write_jsonrpc(
         )
     })?;
     send_response(session, 200, "application/json", &body).await
+}
+
+/// Serialise a JSON-RPC response and write it with the issued
+/// `Mcp-Session-Id` header (WOR-1642; used by `initialize` on a
+/// session-managed gateway).
+async fn write_jsonrpc_with_session(
+    session: &mut Session,
+    response: &sbproxy_extension::mcp::types::JsonRpcResponse,
+    session_id: &str,
+) -> Result<()> {
+    let body = serde_json::to_vec(response).map_err(|e| {
+        Error::because(
+            ErrorType::InternalError,
+            "failed to serialise JSON-RPC response",
+            e,
+        )
+    })?;
+    let mut header = pingora_http::ResponseHeader::build(200, Some(3))
+        .map_err(|e| Error::because(ErrorType::InternalError, "failed to build mcp header", e))?;
+    let _ = header.insert_header("content-type", "application/json");
+    let _ = header.insert_header("content-length", body.len().to_string());
+    let _ = header.insert_header("mcp-session-id", session_id);
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(bytes::Bytes::from(body)), true)
+        .await?;
+    Ok(())
+}
+
+/// WOR-1642: the streamable HTTP server-to-client channel. Opened by
+/// a GET with `Accept: text/event-stream`; pushes
+/// `notifications/tools/list_changed` and
+/// `notifications/resources/list_changed` when the corresponding
+/// federation registry generation moves, with periodic keep-alive
+/// comments in between. Runs until the client disconnects.
+async fn handle_mcp_server_stream(
+    session: &mut Session,
+    mcp: &sbproxy_modules::action::McpAction,
+    ctx: &RequestContext,
+) -> Result<()> {
+    // Session gating mirrors the POST path.
+    if let Some(store) = mcp.sessions.as_deref() {
+        match session
+            .req_header()
+            .headers
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            None => {
+                send_error(
+                    session,
+                    400,
+                    "missing Mcp-Session-Id header (session management is enabled)",
+                )
+                .await?;
+                return Ok(());
+            }
+            Some(id) if !store.validate(id) => {
+                send_error(
+                    session,
+                    404,
+                    "unknown or expired MCP session; re-initialize",
+                )
+                .await?;
+                return Ok(());
+            }
+            Some(_) => {}
+        }
+    }
+
+    let mut header = pingora_http::ResponseHeader::build(200, Some(3))
+        .map_err(|e| Error::because(ErrorType::InternalError, "failed to build sse header", e))?;
+    let _ = header.insert_header("content-type", "text/event-stream");
+    let _ = header.insert_header("cache-control", "no-cache");
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    tracing::info!(
+        target: "sbproxy::audit",
+        event = "mcp.stream.opened",
+        mcp_server = %mcp.server_name,
+        request_id = %ctx.request_id,
+        "opened MCP server-to-client stream"
+    );
+
+    let mut last_tools = mcp.federation.tools_generation();
+    let mut last_resources = mcp.federation.resources_generation();
+    let poll = std::time::Duration::from_millis(1000);
+    // Keep-alive cadence: one comment frame per 15 idle polls, so
+    // intermediaries do not reap the connection.
+    let mut idle_polls: u32 = 0;
+    loop {
+        tokio::time::sleep(poll).await;
+        let mut frames = String::new();
+        let tools_now = mcp.federation.tools_generation();
+        if tools_now != last_tools {
+            last_tools = tools_now;
+            frames.push_str(
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n",
+            );
+        }
+        let resources_now = mcp.federation.resources_generation();
+        if resources_now != last_resources {
+            last_resources = resources_now;
+            frames.push_str(
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\"}\n\n",
+            );
+        }
+        if frames.is_empty() {
+            idle_polls += 1;
+            if idle_polls < 15 {
+                continue;
+            }
+            frames.push_str(": keep-alive\n\n");
+        }
+        idle_polls = 0;
+        if session
+            .write_response_body(Some(bytes::Bytes::from(frames)), false)
+            .await
+            .is_err()
+        {
+            // Client went away; the stream is done.
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// WOR-1642: DELETE ends an MCP session on a session-managed
+/// gateway (405 otherwise, matching the POST-only contract).
+async fn handle_mcp_session_delete(
+    session: &mut Session,
+    mcp: &sbproxy_modules::action::McpAction,
+    ctx: &RequestContext,
+) -> Result<()> {
+    let Some(store) = mcp.sessions.as_deref() else {
+        send_error(session, 405, "MCP session management is not enabled").await?;
+        return Ok(());
+    };
+    match session
+        .req_header()
+        .headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+    {
+        None => {
+            send_error(session, 400, "missing Mcp-Session-Id header").await?;
+            Ok(())
+        }
+        Some(id) if store.end(id) => {
+            tracing::info!(
+                target: "sbproxy::audit",
+                event = "mcp.session.ended",
+                mcp_server = %mcp.server_name,
+                request_id = %ctx.request_id,
+                "ended MCP session on client DELETE"
+            );
+            let header = pingora_http::ResponseHeader::build(204, Some(0)).map_err(|e| {
+                Error::because(ErrorType::InternalError, "failed to build 204 header", e)
+            })?;
+            session
+                .write_response_header(Box::new(header), true)
+                .await?;
+            Ok(())
+        }
+        Some(_) => {
+            send_error(session, 404, "unknown or expired MCP session").await?;
+            Ok(())
+        }
+    }
 }

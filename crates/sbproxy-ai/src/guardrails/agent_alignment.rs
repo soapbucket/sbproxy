@@ -94,6 +94,18 @@ pub struct AgentAlignmentConfig {
     /// goal-divergent agents.
     #[serde(default)]
     pub max_tool_calls_per_turn: usize,
+    /// WOR-1645: an optional MCP tool-access policy, the same
+    /// [`sbproxy_extension::mcp::ToolAccessPolicy`] shape the `mcp`
+    /// action enforces on
+    /// `tools/call`. When set, every model-emitted tool call is
+    /// checked against it with the request principal, so a deny rule
+    /// written once (a YAML anchor referenced from both
+    /// `mcp.rbac_policies` and here) governs both the MCP lane and
+    /// the model lane. Evaluated by the same `ToolAccessPolicy::check`
+    /// as the MCP action, so the two lanes cannot drift. The static
+    /// allow/deny/forbid lists still apply, most-restrictive-wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rbac_policy: Option<sbproxy_extension::mcp::ToolAccessPolicy>,
 }
 
 fn default_enabled() -> bool {
@@ -109,6 +121,7 @@ impl Default for AgentAlignmentConfig {
             denied_tools: Vec::new(),
             forbidden_arg_substrings: Vec::new(),
             max_tool_calls_per_turn: 0,
+            rbac_policy: None,
         }
     }
 }
@@ -173,10 +186,22 @@ impl AgentAlignmentGuardrail {
     /// `None` but [`Self::find_violations`] still reports the
     /// per-tool reasons so the caller can record metrics.
     pub fn check_body(&self, body: &serde_json::Value) -> Option<GuardrailBlock> {
+        self.check_body_with_principal(body, None)
+    }
+
+    /// Body check with the request principal, so the shared MCP
+    /// `rbac_policy` (WOR-1645) can be evaluated against each tool
+    /// call. Without a principal the RBAC dimension is skipped and
+    /// this behaves exactly like [`Self::check_body`].
+    pub fn check_body_with_principal(
+        &self,
+        body: &serde_json::Value,
+        principal: Option<&sbproxy_plugin::Principal>,
+    ) -> Option<GuardrailBlock> {
         if !self.cfg.enabled {
             return None;
         }
-        let violations = self.find_violations(body);
+        let violations = self.find_violations_with_principal(body, principal);
         if violations.is_empty() {
             return None;
         }
@@ -199,6 +224,16 @@ impl AgentAlignmentGuardrail {
     /// vec when the guardrail is `enabled: false` so a dark-launched
     /// entry never produces metrics or log noise.
     pub fn find_violations(&self, body: &serde_json::Value) -> Vec<String> {
+        self.find_violations_with_principal(body, None)
+    }
+
+    /// Enumerate violations, including the shared MCP `rbac_policy`
+    /// dimension when a principal is supplied (WOR-1645).
+    pub fn find_violations_with_principal(
+        &self,
+        body: &serde_json::Value,
+        principal: Option<&sbproxy_plugin::Principal>,
+    ) -> Vec<String> {
         let mut violations = Vec::new();
 
         if !self.cfg.enabled {
@@ -233,6 +268,24 @@ impl AgentAlignmentGuardrail {
                 if !self.denied_tools_lc.is_empty() && self.denied_tools_lc.contains(&name_lc) {
                     violations.push(format!("tool {:?} is in denied_tools", name));
                     continue;
+                }
+
+                // WOR-1645: the shared MCP RBAC policy, evaluated by
+                // the same code the MCP action uses, so a deny rule
+                // written once governs this lane too. Runs before the
+                // static allow list so a policy deny is decisive.
+                if let (Some(policy), Some(principal)) = (self.cfg.rbac_policy.as_ref(), principal)
+                {
+                    if matches!(
+                        policy.check(principal, &name),
+                        sbproxy_extension::mcp::ToolAccessDecision::Deny,
+                    ) {
+                        violations.push(format!(
+                            "tool {:?} is denied by the shared MCP rbac_policy for this principal",
+                            name
+                        ));
+                        continue;
+                    }
                 }
 
                 if !self.allowed_tools_lc.is_empty() && !self.allowed_tools_lc.contains(&name_lc) {
@@ -313,6 +366,71 @@ mod tests {
                 {"role": "assistant", "content": null, "tool_calls": calls}
             ]
         })
+    }
+
+    #[test]
+    fn shared_rbac_policy_denies_tool_call() {
+        // WOR-1645: a default-deny policy that allows only `search`
+        // blocks a model-emitted `delete_repo` call, using the same
+        // ToolAccessPolicy the MCP action enforces.
+        let policy: sbproxy_extension::mcp::ToolAccessPolicy = serde_json::from_value(json!({
+            "default_allow": false,
+            "tool_access": [{"principals": [], "allowed": ["search"]}]
+        }))
+        .expect("policy parses");
+        let g = AgentAlignmentGuardrail::new(AgentAlignmentConfig {
+            mode: AgentAlignmentMode::Block,
+            rbac_policy: Some(policy),
+            ..Default::default()
+        });
+        let body = body_with_tool_calls(json!([
+            {"function": {"name": "delete_repo", "arguments": "{}"}}
+        ]));
+        let principal = sbproxy_plugin::Principal::anonymous();
+        let block = g.check_body_with_principal(&body, Some(&principal));
+        assert!(block.is_some(), "policy deny must block the tool call");
+        assert!(block.unwrap().reason.contains("rbac_policy"));
+    }
+
+    #[test]
+    fn shared_rbac_policy_allows_permitted_tool() {
+        let policy: sbproxy_extension::mcp::ToolAccessPolicy = serde_json::from_value(json!({
+            "default_allow": false,
+            "tool_access": [{"principals": [], "allowed": ["search"]}]
+        }))
+        .expect("policy parses");
+        let g = AgentAlignmentGuardrail::new(AgentAlignmentConfig {
+            mode: AgentAlignmentMode::Block,
+            rbac_policy: Some(policy),
+            ..Default::default()
+        });
+        let body = body_with_tool_calls(json!([
+            {"function": {"name": "search", "arguments": "{}"}}
+        ]));
+        let principal = sbproxy_plugin::Principal::anonymous();
+        assert!(g
+            .check_body_with_principal(&body, Some(&principal))
+            .is_none());
+    }
+
+    #[test]
+    fn shared_rbac_policy_skipped_without_principal() {
+        // With no principal the RBAC dimension is inert, so the old
+        // signature keeps its behaviour.
+        let policy: sbproxy_extension::mcp::ToolAccessPolicy = serde_json::from_value(json!({
+            "default_allow": false,
+            "tool_access": []
+        }))
+        .expect("policy parses");
+        let g = AgentAlignmentGuardrail::new(AgentAlignmentConfig {
+            mode: AgentAlignmentMode::Block,
+            rbac_policy: Some(policy),
+            ..Default::default()
+        });
+        let body = body_with_tool_calls(json!([
+            {"function": {"name": "anything", "arguments": "{}"}}
+        ]));
+        assert!(g.check_body(&body).is_none());
     }
 
     #[test]

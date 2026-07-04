@@ -108,3 +108,77 @@ fn non_oauth_gateway_omits_auth_discovery() {
     let doc: serde_json::Value = serde_json::from_slice(&m.body).expect("json");
     assert!(doc.get("authorization").is_none());
 }
+
+/// WOR-1643: the discovery flow starts from a 401 challenge. A
+/// credential-less MCP POST against an `oauth:`-configured gateway
+/// must return 401 with a `WWW-Authenticate` header pointing at the
+/// protected-resource metadata this gateway serves.
+#[test]
+fn credential_less_post_gets_rfc9728_challenge() {
+    let harness = ProxyHarness::start_with_yaml(CONFIG).expect("start proxy");
+    let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let resp = harness
+        .post_json("/", "mcp.localhost", &body, &[])
+        .expect("send");
+    assert_eq!(resp.status, 401, "credential-less POST must be challenged");
+    let challenge = resp
+        .headers
+        .get("www-authenticate")
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        challenge.starts_with("Bearer "),
+        "challenge must be a Bearer scheme, got: {challenge}"
+    );
+    assert!(
+        challenge.contains("resource_metadata=\"")
+            && challenge.contains("/.well-known/oauth-protected-resource"),
+        "challenge must point at the protected-resource metadata, got: {challenge}"
+    );
+
+    // Drive the flow the challenge advertises: the metadata URL it
+    // names must serve the RFC 9728 document.
+    let meta = harness
+        .get("/.well-known/oauth-protected-resource", "mcp.localhost")
+        .expect("fetch metadata");
+    assert_eq!(meta.status, 200);
+    let doc: serde_json::Value = serde_json::from_slice(&meta.body).expect("json");
+    assert_eq!(
+        doc["authorization_servers"][0],
+        "https://issuer.example.com"
+    );
+}
+
+/// WOR-1643: a request that carries credentials is never
+/// re-challenged by the MCP layer (token validation belongs to the
+/// generic auth layer, not this gate).
+#[test]
+fn authorized_post_is_not_challenged() {
+    let harness = ProxyHarness::start_with_yaml(CONFIG).expect("start proxy");
+    let body = serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "ping"});
+    let resp = harness
+        .post_json(
+            "/",
+            "mcp.localhost",
+            &body,
+            &[("Authorization", "Bearer test-token")],
+        )
+        .expect("send");
+    assert_eq!(resp.status, 200, "authorized POST must reach the handler");
+    let parsed: serde_json::Value = serde_json::from_slice(&resp.body).expect("json");
+    assert_eq!(parsed["result"], "pong");
+}
+
+/// WOR-1643: a gateway without `oauth:` keeps its open behaviour;
+/// no challenge is emitted for credential-less POSTs.
+#[test]
+fn non_oauth_gateway_does_not_challenge() {
+    let harness = ProxyHarness::start_with_yaml(CONFIG).expect("start proxy");
+    let body = serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "ping"});
+    let resp = harness
+        .post_json("/", "plain.localhost", &body, &[])
+        .expect("send");
+    assert_eq!(resp.status, 200);
+    let parsed: serde_json::Value = serde_json::from_slice(&resp.body).expect("json");
+    assert_eq!(parsed["result"], "pong");
+}

@@ -136,6 +136,20 @@ impl Guardrail {
         }
     }
 
+    /// Body check with the request principal, so the agent-alignment
+    /// guardrail can evaluate its shared MCP `rbac_policy` (WOR-1645).
+    /// Other guardrails ignore the principal.
+    pub fn check_body_with_principal(
+        &self,
+        body: &serde_json::Value,
+        principal: Option<&sbproxy_plugin::Principal>,
+    ) -> Option<GuardrailBlock> {
+        match self {
+            Self::AgentAlignment(g) => g.check_body_with_principal(body, principal),
+            _ => None,
+        }
+    }
+
     /// Whether this guardrail is safe to evaluate per-chunk on a
     /// streaming output (WOR-235 ADR / WOR-490).
     ///
@@ -232,8 +246,20 @@ impl GuardrailPipeline {
     /// Runs AFTER [`Self::check_input`] in the dispatch path so
     /// text-only guardrails still drive the first short-circuit.
     pub fn check_input_body(&self, body: &serde_json::Value) -> Option<GuardrailBlock> {
+        self.check_input_body_with_principal(body, None)
+    }
+
+    /// Body-aware input check with the request principal, so the
+    /// agent-alignment guardrail can evaluate its shared MCP
+    /// `rbac_policy` (WOR-1645). Passing `None` matches
+    /// [`Self::check_input_body`].
+    pub fn check_input_body_with_principal(
+        &self,
+        body: &serde_json::Value,
+        principal: Option<&sbproxy_plugin::Principal>,
+    ) -> Option<GuardrailBlock> {
         for guard in &self.input {
-            if let Some(block) = guard.check_body(body) {
+            if let Some(block) = guard.check_body_with_principal(body, principal) {
                 return Some(block);
             }
         }

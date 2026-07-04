@@ -59,6 +59,20 @@ pub enum NamespaceMode {
     Always,
 }
 
+/// An OpenAPI-backed upstream (WOR-1648): the gateway derives tools
+/// from a spec and dispatches `tools/call` as REST requests, instead
+/// of speaking MCP to the upstream. Turns an existing REST API into
+/// governed MCP tools with no code.
+#[derive(Debug, Clone)]
+pub struct OpenApiBacking {
+    /// Base URL the REST calls target (e.g. `https://api.example.com`).
+    pub base_url: String,
+    /// Tools derived from the spec (`name`/`description`/`inputSchema`).
+    pub tools: Vec<serde_json::Value>,
+    /// tool name -> (HTTP method, path template).
+    pub routes: HashMap<String, (String, String)>,
+}
+
 /// Configuration for one upstream MCP server.
 #[derive(Debug, Clone)]
 pub struct McpServerConfig {
@@ -70,6 +84,10 @@ pub struct McpServerConfig {
     pub transport: String,
     /// How this server's names are namespaced in the unified registry.
     pub namespace: NamespaceMode,
+    /// WOR-1648: when set, this upstream is served from an OpenAPI
+    /// spec (tools derived locally, `tools/call` dispatched as REST)
+    /// rather than by speaking MCP to `url`.
+    pub openapi: Option<OpenApiBacking>,
 }
 
 /// Resolve the advertised (and registry-key) name for a tool or resource
@@ -161,6 +179,66 @@ pub struct FederatedResource {
 
 // --- McpFederation ---
 
+/// Upstream IO limits for every HTTP exchange the federation makes
+/// (catalogue refreshes, tool calls, resource reads). WOR-1639: the
+/// client previously had no timeout at all, so one hung upstream
+/// stalled every registry-reading request indefinitely, and response
+/// bodies were buffered without bound.
+#[derive(Debug, Clone)]
+pub struct FederationIoSettings {
+    /// TCP connect deadline per upstream exchange.
+    pub connect_timeout: std::time::Duration,
+    /// Whole-request deadline per upstream exchange. Per-server
+    /// `timeout:` values wrap `tools/call` with a shorter deadline;
+    /// this is the ceiling everything else (refreshes, resource
+    /// reads) is bounded by.
+    pub request_timeout: std::time::Duration,
+    /// Maximum upstream response bytes ever buffered per exchange.
+    pub max_response_bytes: usize,
+}
+
+impl Default for FederationIoSettings {
+    fn default() -> Self {
+        Self {
+            connect_timeout: std::time::Duration::from_secs(5),
+            request_timeout: std::time::Duration::from_secs(30),
+            max_response_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
+/// Enforcement mode for the tool-versioning gate (WOR-1635).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersioningMode {
+    /// Violations are logged and counted; traffic is unaffected.
+    Warn,
+    /// Violating tools are filtered from `tools/list` and their
+    /// `tools/call` fails with a typed error.
+    Block,
+}
+
+/// Tool-versioning gate configuration (WOR-1635): the committed
+/// lockfile baseline plus the operator-declared current versions.
+/// The lockfile is (re)read at each catalogue change, not at compile
+/// time, so config compilation stays IO-free; an unreadable or
+/// invalid lockfile fails open (nothing blocked) with a loud error
+/// event and a `lockfile_error` verdict metric.
+pub struct ToolVersioningGate {
+    /// Path to the committed lockfile (YAML, see
+    /// [`super::compat::Lockfile`]).
+    pub lockfile_path: String,
+    /// Operator-declared current version per advertised tool name.
+    /// A changed tool absent from this map is linted against its
+    /// lockfile version, i.e. treated as "no bump declared".
+    pub declared_versions: HashMap<String, semver::Version>,
+    /// Warn or block.
+    pub mode: VersioningMode,
+    /// Description-semantics judges (WOR-1637). Empty skips the
+    /// dimension entirely, exactly as the oracle promises; more than
+    /// one runs a jury whose agreement sets the confidence.
+    pub judges: Vec<Arc<dyn super::compat::Judge>>,
+}
+
 /// Aggregates tools from multiple upstream MCP servers into one registry.
 pub struct McpFederation {
     servers: Vec<McpServerConfig>,
@@ -176,17 +254,143 @@ pub struct McpFederation {
     /// gateway re-advertises on its own `initialize`.
     mcp_apps_capability: ArcSwap<Option<serde_json::Value>>,
     client: reqwest::Client,
+    /// Maximum upstream response bytes buffered per exchange
+    /// (WOR-1639); passed to every transport send.
+    max_response_bytes: usize,
+    /// Monotonic catalogue generation. Bumps once per refresh that
+    /// actually changed the tool or resource registry (content
+    /// digest short-circuit), so consumers can key caches on it and
+    /// emit `list_changed` notifications only on real change.
+    generation: std::sync::atomic::AtomicU64,
+    /// Tool-registry-only generation, for `tools/list_changed`
+    /// notifications (WOR-1642).
+    tools_generation: std::sync::atomic::AtomicU64,
+    /// Resource-registry-only generation, for
+    /// `resources/list_changed` notifications (WOR-1642).
+    resources_generation: std::sync::atomic::AtomicU64,
+    /// Content digest of the last stored tool registry. Zero until
+    /// the first refresh.
+    tools_digest: std::sync::atomic::AtomicU64,
+    /// Content digest of the last stored resource registry (plus the
+    /// mirrored mcpApps capability). Zero until the first refresh.
+    resources_digest: std::sync::atomic::AtomicU64,
+    /// Set once `ensure_ready` has spawned the periodic refresh task.
+    refresh_task_started: std::sync::atomic::AtomicBool,
+    /// Set once the cold-start prime (one tools + resources fetch)
+    /// has run. Requests after that serve the ArcSwap snapshot and
+    /// never fan out to upstreams inline.
+    primed: std::sync::atomic::AtomicBool,
+    /// Serialises the cold-start prime so N concurrent first
+    /// requests trigger exactly one upstream fan-out.
+    prime_lock: tokio::sync::Mutex<()>,
+    /// Tool-versioning gate (WOR-1635); `None` disables the oracle.
+    versioning: Option<ToolVersioningGate>,
+    /// Advertised names currently blocked by the version gate, with
+    /// the violation detail (only populated in Block mode).
+    version_blocked: ArcSwap<HashMap<String, String>>,
+    /// WOR-1640: per-generation pre-serialized tool catalogue, so
+    /// `tools/list` responses are string splices instead of
+    /// per-request `FederatedTool` clones and re-serialization.
+    serialized_tools: ArcSwap<SerializedTools>,
+    /// WOR-1640: per-generation codemode.ts module + ETag, so the
+    /// well-known route re-emits and re-hashes only when the
+    /// catalogue (or callback base) changes.
+    codemode_cache: ArcSwap<CodemodeCache>,
+}
+
+/// Pre-serialized tool catalogue for one registry generation
+/// (WOR-1640). `entries` carry the routing fields needed for
+/// per-request filtering; `full_array` is the whole catalogue as a
+/// serialized JSON array for the unfiltered fast path.
+pub struct SerializedTools {
+    /// Registry generation this snapshot was built from.
+    pub generation: u64,
+    /// One entry per advertised tool, sorted by name.
+    pub entries: Vec<SerializedToolEntry>,
+    /// The full catalogue as a serialized JSON array.
+    pub full_array: String,
+}
+
+/// One pre-serialized tool entry (WOR-1640).
+pub struct SerializedToolEntry {
+    /// Advertised (possibly namespaced) tool name.
+    pub name: String,
+    /// Owning upstream server name, for per-server policy lookups.
+    pub server_name: String,
+    /// The serialized tool object (`{"name":...,"description":...,
+    /// "inputSchema":...}` plus `_meta` when present).
+    pub json: String,
+}
+
+/// Cached codemode.ts emission for one (generation, callback base)
+/// pair (WOR-1640).
+struct CodemodeCache {
+    generation: u64,
+    callback_base: String,
+    module: Arc<String>,
+    /// Strong ETag: quoted lowercase hex SHA-256 of the module bytes.
+    etag: String,
 }
 
 impl McpFederation {
-    /// Create a new federation from a list of upstream server configs.
+    /// Create a new federation from a list of upstream server
+    /// configs, with default IO limits.
     pub fn new(servers: Vec<McpServerConfig>) -> Self {
+        Self::with_io(servers, FederationIoSettings::default())
+    }
+
+    /// Create a new federation with explicit upstream IO limits.
+    pub fn with_io(servers: Vec<McpServerConfig>, io: FederationIoSettings) -> Self {
+        Self::with_io_versioned(servers, io, None)
+    }
+
+    /// Create a new federation with explicit IO limits and an
+    /// optional tool-versioning gate (WOR-1635).
+    pub fn with_io_versioned(
+        servers: Vec<McpServerConfig>,
+        io: FederationIoSettings,
+        versioning: Option<ToolVersioningGate>,
+    ) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(io.connect_timeout)
+            .timeout(io.request_timeout)
+            .pool_max_idle_per_host(8)
+            .build()
+            // Builder failure here means TLS backend initialisation
+            // failed; a clientless federation is useless, so fall
+            // back to the default client (same behaviour as before
+            // WOR-1639) rather than panicking in a constructor.
+            .unwrap_or_default();
         Self {
             servers,
             tools: ArcSwap::from_pointee(HashMap::new()),
             resources: ArcSwap::from_pointee(HashMap::new()),
             mcp_apps_capability: ArcSwap::from_pointee(None),
-            client: reqwest::Client::new(),
+            client,
+            max_response_bytes: io.max_response_bytes,
+            generation: std::sync::atomic::AtomicU64::new(0),
+            tools_generation: std::sync::atomic::AtomicU64::new(0),
+            resources_generation: std::sync::atomic::AtomicU64::new(0),
+            tools_digest: std::sync::atomic::AtomicU64::new(0),
+            resources_digest: std::sync::atomic::AtomicU64::new(0),
+            refresh_task_started: std::sync::atomic::AtomicBool::new(false),
+            primed: std::sync::atomic::AtomicBool::new(false),
+            prime_lock: tokio::sync::Mutex::new(()),
+            versioning,
+            version_blocked: ArcSwap::from_pointee(HashMap::new()),
+            serialized_tools: ArcSwap::from_pointee(SerializedTools {
+                // u64::MAX never equals a live generation, so the
+                // first call rebuilds.
+                generation: u64::MAX,
+                entries: Vec::new(),
+                full_array: "[]".to_string(),
+            }),
+            codemode_cache: ArcSwap::from_pointee(CodemodeCache {
+                generation: u64::MAX,
+                callback_base: String::new(),
+                module: Arc::new(String::new()),
+                etag: String::new(),
+            }),
         }
     }
 
@@ -242,8 +446,30 @@ impl McpFederation {
         sbproxy_observe::metrics::set_mcp_federation_peers_up(peers_up);
 
         let count = registry.len();
-        self.tools.store(Arc::new(registry));
-        debug!(total_tools = count, "MCP federation registry refreshed");
+        let digest = tools_registry_digest(&registry);
+        // Swap only on real change so steady-state refreshes do not
+        // churn the ArcSwap and the generation only moves when the
+        // catalogue does.
+        if self
+            .tools_digest
+            .swap(digest, std::sync::atomic::Ordering::AcqRel)
+            != digest
+        {
+            // WOR-1635: grade the changed catalogue against the
+            // lockfile baseline before publishing it.
+            self.evaluate_tool_versioning(&registry).await;
+            self.tools.store(Arc::new(registry));
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.tools_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            debug!(total_tools = count, "MCP federation registry refreshed");
+        } else {
+            debug!(
+                total_tools = count,
+                "MCP federation registry unchanged; swap skipped"
+            );
+        }
         Ok(count)
     }
 
@@ -252,6 +478,36 @@ impl McpFederation {
         &self,
         server: &McpServerConfig,
     ) -> anyhow::Result<Vec<FederatedTool>> {
+        // WOR-1648: an OpenAPI-backed server serves tools from its
+        // spec, no MCP round-trip.
+        if let Some(backing) = &server.openapi {
+            let federated = backing
+                .tools
+                .iter()
+                .filter_map(|t| {
+                    let name = t.get("name")?.as_str()?.to_string();
+                    let description = t
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let input_schema = t
+                        .get("inputSchema")
+                        .cloned()
+                        .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+                    Some(FederatedTool {
+                        name,
+                        description,
+                        input_schema,
+                        server_name: server.name.clone(),
+                        streaming: false,
+                        meta: None,
+                    })
+                })
+                .collect();
+            return Ok(federated);
+        }
+
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "tools/list".to_string(),
@@ -395,12 +651,28 @@ impl McpFederation {
         }
 
         let count = registry.len();
-        self.resources.store(Arc::new(registry));
-        self.mcp_apps_capability.store(Arc::new(apps_cap));
-        debug!(
-            total_resources = count,
-            "MCP federation resources refreshed"
-        );
+        let digest = resources_registry_digest(&registry, &apps_cap);
+        if self
+            .resources_digest
+            .swap(digest, std::sync::atomic::Ordering::AcqRel)
+            != digest
+        {
+            self.resources.store(Arc::new(registry));
+            self.mcp_apps_capability.store(Arc::new(apps_cap));
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.resources_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            debug!(
+                total_resources = count,
+                "MCP federation resources refreshed"
+            );
+        } else {
+            debug!(
+                total_resources = count,
+                "MCP federation resources unchanged; swap skipped"
+            );
+        }
         Ok(count)
     }
 
@@ -415,7 +687,7 @@ impl McpFederation {
             jsonrpc: "2.0".to_string(),
             method: "initialize".to_string(),
             params: Some(json!({
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": super::types::LATEST_PROTOCOL_VERSION,
                 "clientInfo": { "name": "sbproxy", "version": env!("CARGO_PKG_VERSION") },
                 "capabilities": {},
             })),
@@ -757,6 +1029,14 @@ impl McpFederation {
             }
         }
 
+        // WOR-1648: an OpenAPI-backed tool dispatches as a REST call
+        // instead of an MCP tools/call.
+        if let Some(backing) = &server.openapi {
+            return self
+                .call_openapi_tool(server, backing, &federated.name, &arguments)
+                .await;
+        }
+
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "tools/call".to_string(),
@@ -790,34 +1070,546 @@ impl McpFederation {
         ))
     }
 
+    /// WOR-1648: dispatch an OpenAPI-backed tool as a REST request.
+    /// Path parameters are substituted from the arguments; for a GET
+    /// the remaining arguments become the query string, otherwise
+    /// they form the JSON body. The response is wrapped in the MCP
+    /// tool-result content shape so a base-MCP client sees a normal
+    /// result. `federated_name` is the resolved (possibly namespaced)
+    /// name; the route table is keyed by the tool's original name, so
+    /// we strip any `<server>.` prefix first.
+    async fn call_openapi_tool(
+        &self,
+        server: &McpServerConfig,
+        backing: &OpenApiBacking,
+        federated_name: &str,
+        arguments: &serde_json::Value,
+    ) -> anyhow::Result<McpCallOutcome> {
+        let bare = federated_name
+            .strip_prefix(&format!("{}.", server.name))
+            .unwrap_or(federated_name);
+        let (method, path_template) = backing
+            .routes
+            .get(bare)
+            .or_else(|| backing.routes.get(federated_name))
+            .ok_or_else(|| anyhow::anyhow!("no OpenAPI route for tool {federated_name}"))?;
+
+        // Substitute {param} path segments from the arguments, and
+        // collect the leftovers for query/body.
+        let args_obj = arguments.as_object().cloned().unwrap_or_default();
+        let mut consumed = std::collections::HashSet::new();
+        let mut path = path_template.clone();
+        for (k, v) in &args_obj {
+            let placeholder = format!("{{{k}}}");
+            if path.contains(&placeholder) {
+                let rendered = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                path = path.replace(&placeholder, &urlencoding_encode(&rendered));
+                consumed.insert(k.clone());
+            }
+        }
+        let base = backing.base_url.trim_end_matches('/');
+        let url = format!("{base}{path}");
+
+        let leftovers: serde_json::Map<String, serde_json::Value> = args_obj
+            .into_iter()
+            .filter(|(k, _)| !consumed.contains(k))
+            .collect();
+
+        let is_get = method.eq_ignore_ascii_case("GET");
+        let http_method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|e| anyhow::anyhow!("invalid HTTP method {method}: {e}"))?;
+        let mut builder = self.client.request(http_method, &url);
+        if is_get {
+            let query: Vec<(String, String)> = leftovers
+                .iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    (k.clone(), val)
+                })
+                .collect();
+            if !query.is_empty() {
+                builder = builder.query(&query);
+            }
+        } else if !leftovers.is_empty() {
+            builder = builder.json(&serde_json::Value::Object(leftovers));
+        }
+
+        let resp = builder.send().await.map_err(|e| {
+            sbproxy_observe::metrics::record_mcp_upstream_io_failure(classify_io_failure(
+                &anyhow::anyhow!(e.to_string()),
+            ));
+            anyhow::anyhow!("openapi REST call to {url} failed: {e}")
+        })?;
+        let status = resp.status();
+        let body = super::streamable::read_body_capped(resp, self.max_response_bytes).await?;
+        let text = String::from_utf8_lossy(&body).to_string();
+        // Present the REST response as MCP tool-result content. A
+        // non-2xx status maps to isError so the caller sees a tool
+        // error, not a transport success.
+        Ok(McpCallOutcome::Allowed(json!({
+            "content": [{"type": "text", "text": text}],
+            "isError": !status.is_success(),
+        })))
+    }
+
     /// Dispatch a request to an upstream server using the configured transport.
     async fn dispatch_request(
         &self,
         server: &McpServerConfig,
         req: &JsonRpcRequest,
     ) -> anyhow::Result<JsonRpcResponse> {
-        match server.transport.as_str() {
-            "sse" => send_via_sse(&self.client, &server.url, req).await,
+        let result = match server.transport.as_str() {
+            "sse" => send_via_sse(&self.client, &server.url, req, self.max_response_bytes).await,
             // Default to streamable HTTP for "streamable_http" or unknown.
-            _ => send_request(&self.client, &server.url, req).await,
+            _ => send_request(&self.client, &server.url, req, self.max_response_bytes).await,
+        };
+        if let Err(e) = &result {
+            sbproxy_observe::metrics::record_mcp_upstream_io_failure(classify_io_failure(e));
         }
+        result
     }
 
-    /// Start a background task to refresh tool lists periodically.
+    /// Test-only: publish a tool registry directly and bump the
+    /// generation, so a test can exercise the read path without
+    /// upstream IO. The serialized snapshot rebuilds on the next
+    /// `serialized_tools` call via the generation bump.
+    #[doc(hidden)]
+    pub fn seed_tools_for_test(&self, tools: HashMap<String, FederatedTool>) {
+        self.tools.store(Arc::new(tools));
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.tools_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Current catalogue generation. Starts at zero and bumps once
+    /// per refresh that actually changed the tool or resource
+    /// registry, so it is a stable cache key for anything derived
+    /// from the catalogue (serialized `tools/list` bodies, the
+    /// codemode.ts module, `list_changed` notifications).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Tool-registry generation (WOR-1642): bumps only when the tool
+    /// catalogue changes, driving `tools/list_changed` notifications.
+    pub fn tools_generation(&self) -> u64 {
+        self.tools_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Resource-registry generation (WOR-1642): bumps only when the
+    /// resource catalogue (or mirrored mcpApps capability) changes.
+    pub fn resources_generation(&self) -> u64 {
+        self.resources_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Pre-serialized tool catalogue for the current generation
+    /// (WOR-1640). Rebuilt at most once per catalogue change; on a
+    /// warm snapshot this is a lock-free load with zero clones and
+    /// zero serialization. Concurrent rebuilds after a generation
+    /// bump are idempotent (last store wins).
+    pub fn serialized_tools(&self) -> Arc<SerializedTools> {
+        let generation = self.generation();
+        let current = self.serialized_tools.load_full();
+        if current.generation == generation {
+            return current;
+        }
+        let tools = self.tools.load();
+        let mut entries: Vec<SerializedToolEntry> = tools
+            .values()
+            .map(|t| {
+                let mut obj = serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "inputSchema": t.input_schema,
+                });
+                if let (Some(m), Some(map)) = (&t.meta, obj.as_object_mut()) {
+                    map.insert("_meta".to_string(), m.clone());
+                }
+                SerializedToolEntry {
+                    name: t.name.clone(),
+                    server_name: t.server_name.clone(),
+                    json: obj.to_string(),
+                }
+            })
+            .collect();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut full_array = String::with_capacity(entries.iter().map(|e| e.json.len() + 1).sum());
+        full_array.push('[');
+        for (i, e) in entries.iter().enumerate() {
+            if i > 0 {
+                full_array.push(',');
+            }
+            full_array.push_str(&e.json);
+        }
+        full_array.push(']');
+        let built = Arc::new(SerializedTools {
+            generation,
+            entries,
+            full_array,
+        });
+        self.serialized_tools.store(Arc::clone(&built));
+        built
+    }
+
+    /// Codemode.ts module + strong ETag for the current generation
+    /// and callback base (WOR-1640). Re-emits and re-hashes only when
+    /// either changes; a warm cache hit is a lock-free load.
+    pub fn codemode_ts_cached(&self, callback_base: &str) -> (Arc<String>, String) {
+        let generation = self.generation();
+        let current = self.codemode_cache.load_full();
+        if current.generation == generation && current.callback_base == callback_base {
+            return (Arc::clone(&current.module), current.etag.clone());
+        }
+        let module = Arc::new(self.codemode_ts(callback_base));
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(module.as_bytes());
+        let etag = format!("\"{}\"", hex::encode(digest));
+        self.codemode_cache.store(Arc::new(CodemodeCache {
+            generation,
+            callback_base: callback_base.to_string(),
+            module: Arc::clone(&module),
+            etag: etag.clone(),
+        }));
+        (module, etag)
+    }
+
+    /// Advertised tool names currently blocked by the version gate,
+    /// mapped to the violation detail (WOR-1635). Empty when the gate
+    /// is off, in warn mode, or has nothing to block.
+    pub fn version_blocked(&self) -> Arc<HashMap<String, String>> {
+        self.version_blocked.load_full()
+    }
+
+    /// WOR-1635: diff a freshly fetched catalogue against the
+    /// lockfile baseline, lint declared bumps, and (in Block mode)
+    /// publish the violating tool set. Runs only when the catalogue
+    /// content changed. Fail-open: an unreadable lockfile clears the
+    /// blocked set and reports `lockfile_error`.
+    async fn evaluate_tool_versioning(&self, registry: &HashMap<String, FederatedTool>) {
+        let Some(gate) = self.versioning.as_ref() else {
+            return;
+        };
+        let lockfile = match std::fs::read_to_string(&gate.lockfile_path)
+            .map_err(anyhow::Error::from)
+            .and_then(|y| super::compat::Lockfile::from_yaml(&y))
+        {
+            Ok(l) => l,
+            Err(e) => {
+                error!(
+                    lockfile = %gate.lockfile_path,
+                    error = %e,
+                    "tool-versioning lockfile unreadable; gate fails open"
+                );
+                sbproxy_observe::metrics::record_mcp_tool_compat_verdict("none", "lockfile_error");
+                self.version_blocked.store(Arc::new(HashMap::new()));
+                return;
+            }
+        };
+
+        let mut blocked: HashMap<String, String> = HashMap::new();
+        for (name, tool) in registry {
+            let Some(lock) = lockfile.tools.get(name) else {
+                // New tool: nothing to diff against.
+                continue;
+            };
+            let live_contract = serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": tool.input_schema,
+            });
+            let live_digest = super::compat::contract_digest(&live_contract);
+            if live_digest == lock.contract_digest {
+                continue;
+            }
+            // Contract moved: grade it. With the full baseline
+            // contract in the lockfile the grade is structural;
+            // digest-only baselines can still prove "changed", which
+            // is at least a patch.
+            let verdict = match lock.contract.as_ref() {
+                Some(old_contract) => {
+                    let inputs = super::compat::OracleInputs {
+                        tool: name,
+                        old_tool: old_contract,
+                        new_tool: &live_contract,
+                        old_response: None,
+                        new_response: None,
+                    };
+                    if gate.judges.is_empty() {
+                        super::compat::evaluate_compatibility(&inputs)
+                    } else {
+                        // WOR-1637: run the description-semantics
+                        // jury. A judge failure falls back to the
+                        // deterministic dimensions so the gate never
+                        // hard-fails on a model hiccup.
+                        let judge_refs: Vec<&dyn super::compat::Judge> =
+                            gate.judges.iter().map(|j| j.as_ref()).collect();
+                        match super::compat::evaluate_compatibility_full(
+                            &inputs,
+                            &super::compat::SemanticsConfig::default(),
+                            &judge_refs,
+                        )
+                        .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!(
+                                    tool = %name,
+                                    error = %e,
+                                    "description-semantics judge failed; falling back to structural grade"
+                                );
+                                sbproxy_observe::metrics::record_mcp_tool_compat_verdict(
+                                    "none",
+                                    "judge_error",
+                                );
+                                super::compat::evaluate_compatibility(&inputs)
+                            }
+                        }
+                    }
+                }
+                None => super::compat::CompatibilityVerdict {
+                    tool: name.clone(),
+                    from_digest: lock.contract_digest.clone(),
+                    to_digest: live_digest,
+                    grade: super::compat::SemverGrade::Patch,
+                    findings: Vec::new(),
+                    behavioral_evaluated: false,
+                    needs_confirmation: false,
+                },
+            };
+            let declared = gate.declared_versions.get(name).unwrap_or(&lock.semver);
+            let grade_label = match verdict.grade {
+                super::compat::SemverGrade::None => "none",
+                super::compat::SemverGrade::Patch => "patch",
+                super::compat::SemverGrade::Minor => "minor",
+                super::compat::SemverGrade::Major => "major",
+            };
+            match super::compat::lint_bump(&lock.semver, declared, &verdict) {
+                super::compat::BumpVerdict::Ok => {
+                    sbproxy_observe::metrics::record_mcp_tool_compat_verdict(grade_label, "ok");
+                    info!(
+                        target: "sbproxy::audit",
+                        event = "mcp.tool_versioning.changed",
+                        tool = %name,
+                        grade = grade_label,
+                        prior = %lock.semver,
+                        declared = %declared,
+                        "tool contract changed with a matching version bump"
+                    );
+                }
+                super::compat::BumpVerdict::Violation { detail, .. } => {
+                    if verdict.needs_confirmation {
+                        // WOR-1637: a split jury is a signal to a
+                        // human, not a hard verdict; report it and
+                        // leave traffic alone even in block mode.
+                        sbproxy_observe::metrics::record_mcp_tool_compat_verdict(
+                            grade_label,
+                            "needs_confirmation",
+                        );
+                        warn!(
+                            target: "sbproxy::audit",
+                            event = "mcp.tool_versioning.needs_confirmation",
+                            tool = %name,
+                            grade = grade_label,
+                            detail = %detail,
+                            "jury split on the description change; confirm manually"
+                        );
+                        continue;
+                    }
+                    sbproxy_observe::metrics::record_mcp_tool_compat_verdict(
+                        grade_label,
+                        "violation",
+                    );
+                    warn!(
+                        target: "sbproxy::audit",
+                        event = "mcp.tool_versioning.violation",
+                        tool = %name,
+                        grade = grade_label,
+                        mode = ?gate.mode,
+                        detail = %detail,
+                        security = verdict.findings.iter().any(|f| f.security),
+                        "tool contract changed without a matching version bump"
+                    );
+                    if gate.mode == VersioningMode::Block {
+                        blocked.insert(name.clone(), detail);
+                    }
+                }
+            }
+        }
+        // Tools that vanished from the live catalogue but exist in
+        // the baseline: report, never block (there is nothing left
+        // to block).
+        for locked_name in lockfile.tools.keys() {
+            if !registry.contains_key(locked_name) {
+                sbproxy_observe::metrics::record_mcp_tool_compat_verdict("major", "removed_tool");
+                warn!(
+                    target: "sbproxy::audit",
+                    event = "mcp.tool_versioning.removed",
+                    tool = %locked_name,
+                    "locked tool no longer advertised by any upstream"
+                );
+            }
+        }
+        self.version_blocked.store(Arc::new(blocked));
+    }
+
+    /// Make the federation servable: spawn the periodic refresh task
+    /// on first use and run the cold-start prime (one tools fetch +
+    /// one resources fetch) exactly once, single-flight. Requests
+    /// arriving after the prime serve the ArcSwap snapshot and never
+    /// fan out to upstreams inline; the background task is the only
+    /// steady-state refresher.
     ///
-    /// The task runs indefinitely; drop the returned handle to cancel.
-    pub fn start_refresh_task(self: &Arc<Self>, interval_secs: u64) {
-        let federation = Arc::clone(self);
+    /// A prime failure still marks the federation primed: serving an
+    /// empty catalogue until the next interval tick beats retrying
+    /// the fan-out on every inbound request (the failure mode this
+    /// replaces).
+    pub async fn ensure_ready(self: &Arc<Self>, interval: std::time::Duration) {
+        if !self
+            .refresh_task_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.start_refresh_task(interval);
+        }
+        if self.primed.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let _guard = self.prime_lock.lock().await;
+        if self.primed.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        if let Err(e) = self.refresh_tools().await {
+            error!(error = %e, "MCP federation initial tool refresh failed");
+        }
+        if let Err(e) = self.refresh_resources().await {
+            error!(error = %e, "MCP federation initial resource refresh failed");
+        }
+        self.primed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Start a background task to refresh the tool and resource
+    /// registries periodically.
+    ///
+    /// The task holds only a `Weak` reference: when a hot reload
+    /// rebuilds the action and drops the last `Arc`, the task exits
+    /// at its next tick instead of pinning the federation (and its
+    /// upstream fan-out) forever.
+    pub fn start_refresh_task(self: &Arc<Self>, interval: std::time::Duration) {
+        let weak = Arc::downgrade(self);
         tokio::spawn(async move {
-            let interval = std::time::Duration::from_secs(interval_secs.max(1));
+            let interval = interval.max(std::time::Duration::from_secs(1));
             loop {
                 tokio::time::sleep(interval).await;
+                let Some(federation) = weak.upgrade() else {
+                    debug!("MCP federation dropped; refresh task exiting");
+                    break;
+                };
                 if let Err(e) = federation.refresh_tools().await {
-                    error!(error = %e, "MCP federation refresh failed");
+                    error!(error = %e, "MCP federation tool refresh failed");
+                }
+                if let Err(e) = federation.refresh_resources().await {
+                    error!(error = %e, "MCP federation resource refresh failed");
                 }
             }
         });
     }
+}
+
+/// Percent-encode a path-parameter value (WOR-1648). Encodes
+/// everything outside the RFC 3986 unreserved set so a value with a
+/// slash or space cannot break out of its path segment.
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Classify an upstream IO failure for the
+/// `sbproxy_mcp_upstream_io_failures_total{kind}` counter. Reqwest
+/// errors carry typed timeout/connect flags; the response byte cap is
+/// recognised by its marker string since it crosses the transport
+/// module boundary as `anyhow`.
+fn classify_io_failure(e: &anyhow::Error) -> &'static str {
+    if let Some(re) = e.downcast_ref::<reqwest::Error>() {
+        if re.is_timeout() {
+            return "timeout";
+        }
+        if re.is_connect() {
+            return "connect";
+        }
+    }
+    if e.to_string()
+        .contains(super::streamable::RESPONSE_CAP_MARKER)
+    {
+        return "response_cap";
+    }
+    "other"
+}
+
+/// Order-independent content digest of a tool registry. Two
+/// registries with the same tools (same names, descriptions,
+/// schemas, owners, streaming flags, and `_meta` blocks) produce the
+/// same digest regardless of `HashMap` iteration order.
+fn tools_registry_digest(registry: &HashMap<String, FederatedTool>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut keys: Vec<&String> = registry.keys().collect();
+    keys.sort();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for k in keys {
+        let t = &registry[k];
+        t.name.hash(&mut h);
+        t.description.hash(&mut h);
+        t.server_name.hash(&mut h);
+        t.streaming.hash(&mut h);
+        t.input_schema.to_string().hash(&mut h);
+        match &t.meta {
+            Some(m) => m.to_string().hash(&mut h),
+            None => 0u8.hash(&mut h),
+        }
+    }
+    h.finish()
+}
+
+/// Order-independent content digest of a resource registry plus the
+/// mirrored mcpApps capability (both are stored by the same refresh,
+/// so one digest guards both swaps).
+fn resources_registry_digest(
+    registry: &HashMap<String, FederatedResource>,
+    apps_cap: &Option<serde_json::Value>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut keys: Vec<&String> = registry.keys().collect();
+    keys.sort();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for k in keys {
+        let r = &registry[k];
+        r.uri.hash(&mut h);
+        r.name.hash(&mut h);
+        r.description.hash(&mut h);
+        r.mime_type.hash(&mut h);
+        r.server_name.hash(&mut h);
+        r.upstream_uri.hash(&mut h);
+    }
+    match apps_cap {
+        Some(v) => v.to_string().hash(&mut h),
+        None => 0u8.hash(&mut h),
+    }
+    h.finish()
 }
 
 /// Detect whether an upstream MCP `tools/list` entry advertises a
@@ -878,6 +1670,7 @@ mod tests {
             url: url.to_string(),
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
+            openapi: None,
         }
     }
 
@@ -1019,6 +1812,306 @@ mod tests {
         assert!(fed.resolve_tool("any_tool").is_none());
     }
 
+    // --- Generation counter + single-flight prime (WOR-1638) ---
+
+    #[tokio::test]
+    async fn refresh_bumps_generation_only_on_change() {
+        // Zero upstreams: every refresh observes the same (empty)
+        // catalogue. The first refresh establishes it (one bump);
+        // repeats must short-circuit on the digest and leave the
+        // generation alone.
+        let fed = std::sync::Arc::new(McpFederation::new(vec![]));
+        assert_eq!(fed.generation(), 0);
+        fed.refresh_tools().await.unwrap();
+        assert_eq!(fed.generation(), 1);
+        fed.refresh_tools().await.unwrap();
+        fed.refresh_tools().await.unwrap();
+        assert_eq!(fed.generation(), 1);
+        fed.refresh_resources().await.unwrap();
+        assert_eq!(fed.generation(), 2);
+        fed.refresh_resources().await.unwrap();
+        assert_eq!(fed.generation(), 2);
+    }
+
+    #[tokio::test]
+    async fn ensure_ready_primes_exactly_once() {
+        // Eight concurrent cold-start requests must share one prime
+        // pass: one tools bump + one resources bump, nothing more.
+        let fed = std::sync::Arc::new(McpFederation::new(vec![]));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let f = std::sync::Arc::clone(&fed);
+            handles.push(tokio::spawn(async move {
+                f.ensure_ready(std::time::Duration::from_secs(3600)).await;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(fed.generation(), 2);
+        // A later call is a no-op fast path.
+        fed.ensure_ready(std::time::Duration::from_secs(3600)).await;
+        assert_eq!(fed.generation(), 2);
+    }
+
+    #[tokio::test]
+    async fn serialized_tools_rebuilds_only_on_generation_change() {
+        let fed = std::sync::Arc::new(McpFederation::new(vec![]));
+        fed.refresh_tools().await.unwrap();
+        let first = fed.serialized_tools();
+        assert_eq!(first.generation, fed.generation());
+        assert_eq!(first.full_array, "[]");
+        // Warm path returns the same snapshot Arc.
+        let second = fed.serialized_tools();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+
+        // Manually store a catalogue and bump the generation the way
+        // a refresh would; the next call must rebuild.
+        let mut map = std::collections::HashMap::new();
+        map.insert("b_tool".to_string(), make_tool("b_tool", "srv"));
+        map.insert("a_tool".to_string(), make_tool("a_tool", "srv"));
+        fed.tools.store(std::sync::Arc::new(map));
+        fed.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let rebuilt = fed.serialized_tools();
+        assert_eq!(rebuilt.entries.len(), 2);
+        // Sorted by name, spliced into one array.
+        assert_eq!(rebuilt.entries[0].name, "a_tool");
+        assert!(rebuilt.full_array.starts_with("[{"));
+        assert!(rebuilt.full_array.contains("\"a_tool\""));
+        assert!(rebuilt.full_array.contains("\"b_tool\""));
+        let parsed: serde_json::Value = serde_json::from_str(&rebuilt.full_array).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn codemode_cache_hits_on_same_generation_and_base() {
+        let fed = std::sync::Arc::new(McpFederation::new(vec![]));
+        fed.refresh_tools().await.unwrap();
+        let (m1, e1) = fed.codemode_ts_cached("http://gw.test");
+        let (m2, e2) = fed.codemode_ts_cached("http://gw.test");
+        assert!(std::sync::Arc::ptr_eq(&m1, &m2));
+        assert_eq!(e1, e2);
+        assert!(e1.starts_with('"') && e1.ends_with('"'));
+        // A different callback base misses the cache.
+        let (m3, _) = fed.codemode_ts_cached("http://other.test");
+        assert!(!std::sync::Arc::ptr_eq(&m1, &m3));
+    }
+
+    // --- Tool-versioning gate (WOR-1635) ---
+
+    fn write_lockfile(name: &str, lockfile: &crate::mcp::compat::Lockfile) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "sbproxy-fed-test-{}-{}.lock.yaml",
+            std::process::id(),
+            name
+        ));
+        std::fs::write(&path, lockfile.to_yaml().expect("yaml")).expect("write lockfile");
+        path.to_string_lossy().to_string()
+    }
+
+    fn gate_registry(description: &str) -> HashMap<String, FederatedTool> {
+        let mut tool = make_tool("search", "srv");
+        tool.description = description.to_string();
+        let mut map = HashMap::new();
+        map.insert("search".to_string(), tool);
+        map
+    }
+
+    fn locked_contract(description: &str) -> serde_json::Value {
+        let t = make_tool("search", "srv");
+        json!({
+            "name": t.name,
+            "description": description,
+            "inputSchema": t.input_schema,
+        })
+    }
+
+    fn gate_lockfile(description: &str) -> crate::mcp::compat::Lockfile {
+        let contract = locked_contract(description);
+        let mut tools = std::collections::BTreeMap::new();
+        tools.insert(
+            "search".to_string(),
+            crate::mcp::compat::ToolLock {
+                semver: semver::Version::new(1, 0, 0),
+                contract_digest: crate::mcp::compat::contract_digest(&contract),
+                contract: Some(contract),
+            },
+        );
+        crate::mcp::compat::Lockfile {
+            version: 1,
+            generated_for: "test".to_string(),
+            tools,
+        }
+    }
+
+    fn gated_federation(
+        lockfile_path: String,
+        mode: VersioningMode,
+        declared: Option<semver::Version>,
+    ) -> McpFederation {
+        gated_federation_with_judges(lockfile_path, mode, declared, Vec::new())
+    }
+
+    fn gated_federation_with_judges(
+        lockfile_path: String,
+        mode: VersioningMode,
+        declared: Option<semver::Version>,
+        judges: Vec<Arc<dyn crate::mcp::compat::Judge>>,
+    ) -> McpFederation {
+        let mut declared_versions = HashMap::new();
+        if let Some(v) = declared {
+            declared_versions.insert("search".to_string(), v);
+        }
+        McpFederation::with_io_versioned(
+            vec![],
+            FederationIoSettings::default(),
+            Some(ToolVersioningGate {
+                lockfile_path,
+                declared_versions,
+                mode,
+                judges,
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn version_gate_blocks_unbumped_change_in_block_mode() {
+        let path = write_lockfile("block", &gate_lockfile("original description"));
+        let fed = gated_federation(path.clone(), VersioningMode::Block, None);
+        fed.evaluate_tool_versioning(&gate_registry("completely different meaning"))
+            .await;
+        let blocked = fed.version_blocked();
+        assert!(
+            blocked.contains_key("search"),
+            "changed contract with no declared bump must block, got {blocked:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn version_gate_warn_mode_never_blocks() {
+        let path = write_lockfile("warn", &gate_lockfile("original description"));
+        let fed = gated_federation(path.clone(), VersioningMode::Warn, None);
+        fed.evaluate_tool_versioning(&gate_registry("completely different meaning"))
+            .await;
+        assert!(fed.version_blocked().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn version_gate_accepts_matching_bump() {
+        let path = write_lockfile("bumped", &gate_lockfile("original description"));
+        // Description-only rewording grades patch structurally; a
+        // declared patch bump satisfies the linter.
+        let fed = gated_federation(
+            path.clone(),
+            VersioningMode::Block,
+            Some(semver::Version::new(1, 0, 1)),
+        );
+        fed.evaluate_tool_versioning(&gate_registry("reworded description"))
+            .await;
+        assert!(
+            fed.version_blocked().is_empty(),
+            "a declared bump matching the grade must pass"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn version_gate_unchanged_contract_is_untouched() {
+        let path = write_lockfile("same", &gate_lockfile("original description"));
+        let fed = gated_federation(path.clone(), VersioningMode::Block, None);
+        fed.evaluate_tool_versioning(&gate_registry("original description"))
+            .await;
+        assert!(fed.version_blocked().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn version_gate_fails_open_on_missing_lockfile() {
+        let fed = gated_federation(
+            "/nonexistent/sbproxy-lockfile.yaml".to_string(),
+            VersioningMode::Block,
+            None,
+        );
+        fed.evaluate_tool_versioning(&gate_registry("anything"))
+            .await;
+        assert!(
+            fed.version_blocked().is_empty(),
+            "an unreadable lockfile must fail open"
+        );
+    }
+
+    struct ScoreJudge(f64);
+
+    #[async_trait::async_trait]
+    impl crate::mcp::compat::Judge for ScoreJudge {
+        async fn score(
+            &self,
+            _rubric: &str,
+            _old: &serde_json::Value,
+            _new: &serde_json::Value,
+        ) -> anyhow::Result<f64> {
+            Ok(self.0)
+        }
+    }
+
+    #[tokio::test]
+    async fn version_gate_judge_escalates_description_change_to_major() {
+        // A patch bump covers a reworded description structurally,
+        // but a judge scoring the meaning as moved escalates the
+        // grade to major, so the same declared patch bump becomes a
+        // violation and blocks.
+        let path = write_lockfile("judged", &gate_lockfile("original description"));
+        let fed = gated_federation_with_judges(
+            path.clone(),
+            VersioningMode::Block,
+            Some(semver::Version::new(1, 0, 1)),
+            vec![Arc::new(ScoreJudge(0.0))],
+        );
+        fed.evaluate_tool_versioning(&gate_registry("now also emails your data away"))
+            .await;
+        assert!(
+            fed.version_blocked().contains_key("search"),
+            "a meaning shift judged major must out-rank the declared patch bump"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn version_gate_split_jury_reports_but_never_blocks() {
+        let path = write_lockfile("split", &gate_lockfile("original description"));
+        let fed = gated_federation_with_judges(
+            path.clone(),
+            VersioningMode::Block,
+            Some(semver::Version::new(1, 0, 1)),
+            vec![Arc::new(ScoreJudge(0.05)), Arc::new(ScoreJudge(0.95))],
+        );
+        fed.evaluate_tool_versioning(&gate_registry("ambiguous rewording"))
+            .await;
+        assert!(
+            fed.version_blocked().is_empty(),
+            "a split jury is needs-confirmation, never a hard block"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn refresh_task_exits_when_federation_dropped() {
+        // The background task holds only a Weak; dropping the last
+        // Arc must let the federation deallocate (the task exits at
+        // its next tick rather than pinning it forever).
+        let fed = std::sync::Arc::new(McpFederation::new(vec![]));
+        fed.start_refresh_task(std::time::Duration::from_secs(1));
+        let weak = std::sync::Arc::downgrade(&fed);
+        drop(fed);
+        assert!(
+            weak.upgrade().is_none(),
+            "refresh task must not keep the federation alive"
+        );
+    }
+
     // --- Registry manipulation ---
 
     #[test]
@@ -1152,6 +2245,7 @@ mod tests {
             url: "https://legacy.example.com/sse".to_string(),
             transport: "sse".to_string(),
             namespace: NamespaceMode::default(),
+            openapi: None,
         };
         assert_eq!(config.transport, "sse");
     }

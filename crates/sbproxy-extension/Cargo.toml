@@ -56,6 +56,13 @@ base64.workspace = true
 sha2.workspace = true
 hex.workspace = true
 
+# MCP tool-versioning compatibility oracle (mcp/compat): semver comparison for
+# the version-bump linter, JCS canonicalization for the contract digest, and
+# async-trait for the injected Judge (description-semantics) abstraction.
+semver.workspace = true
+serde_json_canonicalizer.workspace = true
+async-trait.workspace = true
+
 # UUID
 uuid.workspace = true
 

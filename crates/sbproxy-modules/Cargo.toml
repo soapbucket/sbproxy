@@ -85,6 +85,7 @@ prometheus.workspace = true
 arc-swap.workspace = true
 bytes.workspace = true
 compact_str.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

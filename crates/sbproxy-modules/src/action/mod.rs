@@ -22,7 +22,8 @@ pub use grpc::*;
 pub use grpc_web::GrpcWebTranscoder;
 pub use loadbalancer::*;
 pub use mcp::{
-    McpAction, McpActionConfig, McpFederatedServerConfig, McpGuardrailEntry, McpServerInfoConfig,
+    lookup_inject_source, register_inject_source, McpAction, McpActionConfig,
+    McpFederatedServerConfig, McpGuardrailEntry, McpInjectSource, McpServerInfoConfig,
     McpServerPrefix,
 };
 pub use routing::{

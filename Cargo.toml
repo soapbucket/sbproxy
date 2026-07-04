@@ -233,6 +233,13 @@ bloomfilter = "1"
 sha2 = "0.11"
 hex = "0.4"
 hmac = "0.13"
+
+# MCP tool-versioning compatibility oracle (mcp/compat). `semver` compares
+# declared tool versions for the version-bump linter; `serde_json_canonicalizer`
+# produces the RFC 8785 (JCS) canonical form the tool contract digest is
+# computed over, so the digest is stable across key order and reproducible.
+semver = { version = "1", features = ["serde"] }
+serde_json_canonicalizer = "0.3"
 # MD5 is intentionally bundled here only for JA3 fingerprint computation
 # (RFC-out, weak hash, but the JA3 spec mandates MD5). The `md-5` crate
 # is the RustCrypto family member and matches the `sha2` API.

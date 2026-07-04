@@ -15,6 +15,8 @@ sbproxy-platform.workspace = true
 # engine. sbproxy-extension does not depend on sbproxy-ai, so this is
 # acyclic.
 sbproxy-extension.workspace = true
+# WOR-1637: the compat judge implements the extension's async Judge trait.
+async-trait.workspace = true
 # WOR-1223: local embedding source for the semantic cache. Only the
 # sidecar client is used here; the in-process embedder lives in sbproxy-core
 # because sbproxy-classifiers depends on sbproxy-ai (would be a cycle).

@@ -26,6 +26,9 @@ path = "src/lib.rs"
 
 [dependencies]
 sbproxy-config.workspace = true
+# WOR-1635: the tool-versioning e2e builds lockfile fixtures with the
+# same digest the gateway computes.
+sbproxy-extension.workspace = true
 sbproxy-cache.workspace = true
 # Wave 1 Q1.9 (redaction.rs) calls into the legacy regex-based redactor
 # as a regression floor; the typed redactor lands in R1.2.
