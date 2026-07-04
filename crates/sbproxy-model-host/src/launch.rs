@@ -339,6 +339,27 @@ pub async fn wait_for_ready(port: u16, path: &str, timeout: Duration) -> Result<
     }
 }
 
+/// A single-shot health check: one `GET {path}` to `127.0.0.1:port`,
+/// returning whether it answered `200`. Unlike [`wait_for_ready`] this
+/// does not loop; the runtime uses it to detect an engine that died
+/// under a cached-ready state so the next request respawns it.
+pub async fn probe_health(port: u16, path: &str) -> bool {
+    let addr = format!("127.0.0.1:{port}");
+    let attempt = async {
+        let mut stream = TcpStream::connect(&addr).await.ok()?;
+        let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.ok()?;
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).await.ok()?;
+        let head = String::from_utf8_lossy(&buf[..n]);
+        Some(head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200"))
+    };
+    matches!(
+        tokio::time::timeout(Duration::from_secs(2), attempt).await,
+        Ok(Some(true))
+    )
+}
+
 impl EngineLauncher for ProcessEngineLauncher {
     async fn launch(&self, spec: &LaunchSpec) -> Result<u16, String> {
         let port = Self::port_from_spec(spec)
@@ -375,6 +396,17 @@ impl EngineLauncher for ProcessEngineLauncher {
 
     async fn kill(&self) {
         if let Some(mut child) = self.child.lock().await.take() {
+            // vLLM forks worker processes (EngineCore) that hold the
+            // VRAM; killing only the parent PID leaks them. The child
+            // leads its own process group (`process_group(0)` at spawn),
+            // so kill the whole group by its negative PID. Falls back to
+            // the parent-only kill on non-Unix.
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &format!("-{pid}")])
+                    .status();
+            }
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
@@ -665,6 +697,18 @@ mod tests {
         let r = wait_for_ready(port, "/health", Duration::from_secs(3)).await;
         assert!(r.is_ok(), "should see 200: {r:?}");
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn probe_health_true_when_live_false_when_dead() {
+        let Some((port, handle)) = fake_health_server().await else {
+            eprintln!("skipping: loopback bind denied");
+            return;
+        };
+        assert!(probe_health(port, "/health").await, "live endpoint");
+        handle.abort();
+        // Nothing listening on port 1.
+        assert!(!probe_health(1, "/health").await, "dead port");
     }
 
     #[tokio::test]
