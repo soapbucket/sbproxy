@@ -39,9 +39,13 @@ pub mod lora;
 pub mod manifest;
 #[cfg(feature = "gpu-nvidia")]
 pub mod probe_nvidia;
+pub mod pull;
 pub mod residency;
+pub mod scheduling;
 pub mod supervisor;
 pub mod supply_chain;
+#[cfg(feature = "tokenizer")]
+pub mod tokenize;
 pub mod weights;
 
 pub use catalog::{Catalog, CatalogEntry, ModelRef, PullPolicy, ResolveError};
@@ -64,6 +68,10 @@ pub use lora::{AdapterRoute, LoraCache};
 pub use manifest::{resolve_cache_dir, validate_serve_against_manifest, SourceScheme};
 #[cfg(feature = "gpu-nvidia")]
 pub use probe_nvidia::NvmlGpuProbe;
+pub use pull::{pull_plan, PullItem, PullMode};
 pub use residency::{Admission, ResidencyManager, Resident};
+pub use scheduling::{admit, next_to_admit, PriorityClass, SchedulingDecision};
 pub use supervisor::{EngineLauncher, EngineState, LaunchSpec, SupervisorError};
 pub use supply_chain::{scan_pickle, select_weight_file, SupplyChainError, WeightFormat};
+#[cfg(feature = "tokenizer")]
+pub use tokenize::{count_tokens, render_chat_template, ChatMessage};
