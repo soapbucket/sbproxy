@@ -1,0 +1,25 @@
+# MCP gateway with OAuth (RFC 9728) auth discovery.
+#
+# With oauth: set, the gateway serves protected-resource metadata at
+# /.well-known/oauth-protected-resource, advertises it in the manifest,
+# and challenges credential-less MCP requests with a 401 whose
+# WWW-Authenticate header points a client at that metadata.
+proxy:
+  http_bind_port: 8080
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: my-mcp
+        version: "1.0.0"
+      oauth:
+        authorization_servers:
+          - "https://issuer.example.com"
+        scopes_supported:
+          - "mcp.read"
+          - "mcp.call"
+      federated_servers:
+        - origin: github.example.com
+          prefix: gh

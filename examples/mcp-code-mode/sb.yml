@@ -1,0 +1,20 @@
+# MCP gateway that serves a Cloudflare Code Mode TypeScript module.
+#
+# Any MCP federation origin also serves a typed TypeScript module at
+# GET /.well-known/mcp/codemode.ts covering the live tool catalogue, so
+# a TypeScript agent or sandbox can import the tools directly instead
+# of round-tripping tools/list. The module is cached and ETagged per
+# catalogue generation.
+proxy:
+  http_bind_port: 8080
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: my-mcp
+        version: "1.0.0"
+      federated_servers:
+        - origin: github.example.com
+          prefix: gh

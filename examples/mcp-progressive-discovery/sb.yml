@@ -1,0 +1,22 @@
+# MCP gateway with progressive tool discovery.
+#
+# progressive_discovery advertises two meta-tools (search / execute)
+# instead of the full catalogue, so a large federated tool set stays
+# out of the model's context window. The agent calls search to find a
+# tool, then execute to invoke it by name.
+proxy:
+  http_bind_port: 8080
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: my-mcp
+        version: "1.0.0"
+      progressive_discovery: true
+      federated_servers:
+        - origin: github.example.com
+          prefix: gh
+        - origin: postgres.example.com
+          prefix: db
