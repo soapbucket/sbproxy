@@ -33,8 +33,11 @@ make run CONFIG=examples/ai-local-serving/sb.yml
 - The engine allowlist (`vllm`, `llama_cpp`); an unknown engine is a
   config error, never an arbitrary command.
 - `keep_alive` per model and an `eviction: lru` host policy.
-- `allow_private_base_url: true`, the loopback exception a local
-  engine needs.
+- No address anywhere: a served provider carries no `base_url`, so the
+  gateway resolves the engine's loopback port itself (WOR-1680).
+  Writing `base_url` alongside `serve:` is now a config error;
+  `base_url` + `allow_private_base_url` stay only for a
+  separately-running engine (an unmanaged Ollama, a remote vLLM box).
 
 ## What proves the config is right
 

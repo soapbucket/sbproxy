@@ -24,11 +24,11 @@ origins:
       type: ai_proxy
       providers:
         - name: local
-          # base_url points at where the supervised engine will bind
-          # (loopback); allow_private_base_url opts into the loopback
-          # SSRF exception for a local engine.
-          base_url: http://127.0.0.1:8000/v1
-          allow_private_base_url: true
+          # No address: a served provider is hosted on this box, so the
+          # gateway resolves the engine's loopback port itself (WOR-1680).
+          # Writing base_url here is now a config error. base_url +
+          # allow_private_base_url stay only for a separately-running
+          # engine (an unmanaged Ollama, a remote vLLM box).
           default_model: qwen3-14b
           # The names below are the serve-entry names (WOR-1683): the
           # model id every plane sees. Once the serve -> provider

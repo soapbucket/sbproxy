@@ -644,6 +644,16 @@ impl AiHandlerConfig {
                 serve
                     .validate()
                     .map_err(|e| anyhow::anyhow!("ai provider {:?} serve: {e}", provider.name))?;
+                // WOR-1680: a served provider hosts the model on this box,
+                // so it needs no address. `serve:` with `base_url` is a
+                // config error (which one wins would be ambiguous); the
+                // gateway resolves the loopback port itself.
+                if provider.base_url.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "ai provider {:?}: sets both serve: and base_url:; a served provider is hosted locally and needs no base_url (remove it). Use base_url + allow_private_base_url only for a separately-running engine.",
+                        provider.name
+                    ));
+                }
             }
         }
         // WOR-625: validate provider names and the model allow-list here
@@ -1237,6 +1247,38 @@ mod tests {
             err.contains("openai"),
             "error suggests the canonical name: {err}"
         );
+    }
+
+    #[test]
+    fn from_config_rejects_serve_with_base_url() {
+        // WOR-1680: a served provider is hosted locally and must not
+        // also carry a base_url; `plan` rejects it with a clear message.
+        let json = serde_json::json!({
+            "providers": [{
+                "name": "local",
+                "base_url": "http://127.0.0.1:9000/v1",
+                "allow_private_base_url": true,
+                "serve": {"models": [{"model": "qwen3-14b"}]}
+            }]
+        });
+        let err = AiHandlerConfig::from_config(json).unwrap_err().to_string();
+        assert!(
+            err.contains("serve") && err.contains("base_url"),
+            "error explains the conflict: {err}"
+        );
+    }
+
+    #[test]
+    fn from_config_accepts_serve_only_provider() {
+        // The quickstart shape: a provider whose body is just serve:,
+        // with no address anywhere.
+        let json = serde_json::json!({
+            "providers": [{
+                "name": "local",
+                "serve": {"models": [{"model": "qwen3-14b"}]}
+            }]
+        });
+        assert!(AiHandlerConfig::from_config(json).is_ok());
     }
 
     #[test]
