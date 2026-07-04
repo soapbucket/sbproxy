@@ -1,0 +1,536 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ProviderConfig",
+  "description": "Provider configuration from YAML/JSON.",
+  "type": "object",
+  "required": [
+    "name"
+  ],
+  "properties": {
+    "name": {
+      "description": "Unique provider name used to reference this provider.",
+      "type": "string"
+    },
+    "provider_type": {
+      "description": "Optional provider type (e.g. \"openai\", \"anthropic\"); inferred from name if absent.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "api_key": {
+      "description": "API key used to authenticate with the upstream provider.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "base_url": {
+      "description": "Override the upstream base URL (defaults to the provider's well-known URL).",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "models": {
+      "description": "Models served by this provider; empty defers to the provider catalog.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "default_model": {
+      "description": "Default model used when the request omits an explicit model.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "model_map": {
+      "description": "Per-provider mapping from logical model name to upstream model name.",
+      "default": {},
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "weight": {
+      "description": "Weight used by weighted routing strategies.",
+      "default": 1,
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "priority": {
+      "description": "Priority used by priority-based routing (lower runs first).",
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "enabled": {
+      "description": "Whether this provider is eligible for routing.",
+      "default": true,
+      "type": "boolean"
+    },
+    "max_retries": {
+      "description": "Maximum retry attempts on transient upstream failures.",
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "timeout_ms": {
+      "description": "Request timeout in milliseconds.",
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "organization": {
+      "description": "Organization identifier (used by providers that scope keys per org).",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "api_version": {
+      "description": "API version header value (used by Anthropic and Azure OpenAI).",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "host_override": {
+      "description": "Override the `Host` header sent to the AI provider. Defaults to the provider's base URL hostname (api.openai.com, api.anthropic.com, ...). Set this when fronting the provider through a custom domain.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "disable_forwarded_host_header": {
+      "description": "When true, suppress the `X-Forwarded-Host` header that the proxy would otherwise set to the client's original `Host` whenever it rewrites the upstream `Host`.",
+      "default": false,
+      "type": "boolean"
+    },
+    "allow_private_base_url": {
+      "description": "Allow this provider's `base_url` to point at a private/loopback address. Defaults to `false`: a `base_url` resolving to a loopback, link-local, or RFC1918 target is rejected at config load as an SSRF risk. Set `true` for a local model server (Ollama, vLLM, LM Studio on `127.0.0.1`/LAN). Non-`http(s)` schemes (`file://`, ...) are always rejected regardless.",
+      "default": false,
+      "type": "boolean"
+    },
+    "no_prompt_training": {
+      "description": "Operator's declaration that this provider does not retain or train on the prompts sent to it, per the provider's published data-handling agreement. There is no standardized per-request training opt-out header across providers, so SBproxy treats this as a deployment-level fact: a request that opts out of training (the `x-sbproxy-disallow-prompt-training` signal) is routed only to providers marked here. Defaults to `false`.",
+      "default": false,
+      "type": "boolean"
+    },
+    "serve": {
+      "description": "WOR-1652: optional local model-serving block. When set, the gateway itself hosts the models (pull weights, fit an engine to the GPU, supervise it) and registers them as local providers ahead of any cloud fallback, instead of proxying `base_url` to an already-running server. `None` keeps the proxy-only behavior. The lifecycle half (spawn/evict) ships in phases of the model-host epic; this field is the config surface it reads.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ModelHostConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "ModelHostConfig": {
+      "description": "The `serve:` block: the local models plus host-wide policy.",
+      "type": "object",
+      "properties": {
+        "models": {
+          "description": "Models to serve locally. Registered as local providers ahead of any cloud fallback.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ServeEntry"
+          }
+        },
+        "catalog_file": {
+          "description": "Optional path to an operator catalog file, replacing the built-in certified catalog for id resolution.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cache_dir": {
+          "description": "Directory for the content-addressed weight cache. `None` uses the platform default (`$HF_HOME` / `~/.cache/sbproxy/models`).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cache_budget_gib": {
+          "description": "Disk budget in GiB for the weight cache before GC. `None` means unbounded (operator manages the disk).",
+          "default": null,
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "eviction": {
+          "description": "What to do under VRAM pressure. Defaults to LRU eviction.",
+          "default": "lru",
+          "allOf": [
+            {
+              "$ref": "#/definitions/EvictionPolicy"
+            }
+          ]
+        },
+        "engines": {
+          "description": "Per-engine provisioning (how to acquire each engine binary). Absent engines use the default (resolve from `PATH`).",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/EngineProvisioning"
+          }
+        }
+      }
+    },
+    "ServeEntry": {
+      "description": "One model an operator wants the gateway to serve locally.",
+      "type": "object",
+      "required": [
+        "model"
+      ],
+      "properties": {
+        "model": {
+          "description": "Catalog id (`qwen3-32b`) or an explicit `hf:Org/Repo:QUANT` reference. Resolved by [`crate::catalog`].",
+          "type": "string"
+        },
+        "name": {
+          "description": "The model id every other plane sees (WOR-1683): routing, `allowed_models`, rate limits, budgets, aliases. Defaults to the catalog id in `model`; **required** when `model` is a raw `hf:` reference (there is no catalog id to borrow). See [`Self::effective_name`].",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "engine": {
+          "description": "Engine to serve it with. Defaults to `auto` (resolved per model at boot from the weight format and what is installed).",
+          "default": "auto",
+          "allOf": [
+            {
+              "$ref": "#/definitions/EngineChoice"
+            }
+          ]
+        },
+        "keep_alive": {
+          "description": "Idle time before the engine is unloaded to free VRAM. Go duration syntax (`10m`, `1h`); `None` means never auto-unload.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_context": {
+          "description": "Context length to plan VRAM for and pass to the engine. `None` uses the model's declared max (clamped by the fit planner to what actually fits).",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "extra_args": {
+          "description": "Extra engine flags appended to the templated args. Values only, no shell: each entry is passed as one argv element.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "kv_quant": {
+          "description": "KV-cache quantization. Defaults to `Auto` (the weight quant's default KV dtype).",
+          "default": "auto",
+          "allOf": [
+            {
+              "$ref": "#/definitions/KvCacheQuant"
+            }
+          ]
+        },
+        "speculative": {
+          "description": "Speculative decoding. `None` disables it.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SpeculativeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "chunked_prefill": {
+          "description": "Chunked-prefill settings. `None` uses the engine default.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ChunkedPrefill"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lora_adapters": {
+          "description": "LoRA adapters served over this base model.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/LoraAdapter"
+          }
+        }
+      }
+    },
+    "EngineChoice": {
+      "description": "The engine an operator asks for on a model (WOR-1684). Unlike [`EngineKind`] (the resolved identity), this includes `Auto`, which the runtime resolves per model at boot from the weight format and what is installed. `Auto` is the default so a minimal `serve:` block does not have to name an engine.",
+      "oneOf": [
+        {
+          "description": "Resolve the engine from the weights and the environment.",
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
+        },
+        {
+          "description": "Force vLLM.",
+          "type": "string",
+          "enum": [
+            "vllm"
+          ]
+        },
+        {
+          "description": "Force llama.cpp.",
+          "type": "string",
+          "enum": [
+            "llama_cpp"
+          ]
+        }
+      ]
+    },
+    "KvCacheQuant": {
+      "description": "KV-cache quantization for a served model (WOR-1676). Quantizing the KV cache multiplies effective KV capacity, so a model can fit a longer context or a larger batch on the same VRAM at some quality cost. `Auto` keeps the cache at the weight quant's default (f16 for most, fp8 when serving FP8).",
+      "oneOf": [
+        {
+          "description": "Follow the weight quant's default KV dtype.",
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
+        },
+        {
+          "description": "16-bit KV (the safe, full-quality default).",
+          "type": "string",
+          "enum": [
+            "f16"
+          ]
+        },
+        {
+          "description": "8-bit float KV. Needs FP8-capable kernels.",
+          "type": "string",
+          "enum": [
+            "fp8"
+          ]
+        },
+        {
+          "description": "8-bit integer KV.",
+          "type": "string",
+          "enum": [
+            "int8"
+          ]
+        },
+        {
+          "description": "4-bit KV (maximum capacity, largest quality hit).",
+          "type": "string",
+          "enum": [
+            "int4"
+          ]
+        }
+      ]
+    },
+    "SpeculativeConfig": {
+      "description": "Speculative-decoding settings for a served model.",
+      "type": "object",
+      "properties": {
+        "method": {
+          "description": "Which speculation method.",
+          "default": "ngram",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SpecMethod"
+            }
+          ]
+        },
+        "draft_model": {
+          "description": "Draft model repo/id, required for [`SpecMethod::DraftModel`].",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "num_speculative_tokens": {
+          "description": "How many tokens to propose per step.",
+          "default": 5,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "SpecMethod": {
+      "description": "How a model does speculative decoding (WOR-1674). Speculation wins when the batch is memory-bound (low load) and loses when it is compute-bound (full batch), so the runtime load-gates it; this is the config that says which method to use when it is on.",
+      "oneOf": [
+        {
+          "description": "A separate small draft model proposes tokens.",
+          "type": "string",
+          "enum": [
+            "draft_model"
+          ]
+        },
+        {
+          "description": "N-gram / prompt-lookup speculation (no draft model).",
+          "type": "string",
+          "enum": [
+            "ngram"
+          ]
+        }
+      ]
+    },
+    "ChunkedPrefill": {
+      "description": "Chunked-prefill settings (WOR-1678). Chunked prefill trades a larger prefill chunk (higher throughput) against time-to-first-token (lower with smaller chunks). Set `max_batched_tokens` directly, or set `target_ttft_ms` to have the planner pick a chunk size.",
+      "type": "object",
+      "properties": {
+        "max_batched_tokens": {
+          "description": "Explicit prefill chunk size (engine `max-num-batched-tokens`). `None` leaves it to the auto-tune or the engine default.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "target_ttft_ms": {
+          "description": "A TTFT SLO in milliseconds; when set (and no explicit chunk size), the planner chooses a chunk size to hold it.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "LoraAdapter": {
+      "description": "A LoRA adapter served over a base model (WOR-1673). Clients request it by `name`; the runtime hot-loads it over the resident base with an LRU adapter cache rather than swapping the base model.",
+      "type": "object",
+      "required": [
+        "name",
+        "source"
+      ],
+      "properties": {
+        "name": {
+          "description": "The model name clients request to hit this adapter.",
+          "type": "string"
+        },
+        "source": {
+          "description": "Adapter source: an `hf:Org/Repo` reference or a local path.",
+          "type": "string"
+        }
+      }
+    },
+    "EvictionPolicy": {
+      "description": "What to do when VRAM is needed and an idle model is resident.",
+      "oneOf": [
+        {
+          "description": "Evict the least-recently-used idle model to make room (default).",
+          "type": "string",
+          "enum": [
+            "lru"
+          ]
+        },
+        {
+          "description": "Never evict; reject a new model when VRAM is full. Predictable residency for a pinned single model.",
+          "type": "string",
+          "enum": [
+            "never"
+          ]
+        }
+      ]
+    },
+    "EngineProvisioning": {
+      "description": "Provisioning for one engine (how to acquire it), keyed by engine in [`ModelHostConfig::engines`].",
+      "type": "object",
+      "properties": {
+        "launch": {
+          "description": "How the binary is acquired.",
+          "default": "binary",
+          "allOf": [
+            {
+              "$ref": "#/definitions/EngineLaunchMethod"
+            }
+          ]
+        },
+        "image": {
+          "description": "Pinned container image (a tag or digest, never `:latest`) for [`EngineLaunchMethod::Container`]. Rejected at plan time if it ends in `:latest` or has no tag.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "EngineLaunchMethod": {
+      "description": "How an engine binary is acquired (WOR-1684). Engine *identity* stays the allowlisted [`EngineKind`]; only the acquisition method is configurable, so the config-spawn security posture (no arbitrary `cmd:`) is unchanged.",
+      "oneOf": [
+        {
+          "description": "Resolve the engine binary from `PATH`.",
+          "type": "string",
+          "enum": [
+            "binary"
+          ]
+        },
+        {
+          "description": "Run the engine from a pinned container image.",
+          "type": "string",
+          "enum": [
+            "container"
+          ]
+        },
+        {
+          "description": "Run the engine from a managed uv/venv (vLLM's Python path).",
+          "type": "string",
+          "enum": [
+            "venv"
+          ]
+        }
+      ]
+    }
+  }
+}

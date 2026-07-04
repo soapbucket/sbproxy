@@ -7,7 +7,7 @@ use crate::ids::{ModelId, ProviderName};
 use crate::providers::get_provider_info;
 
 /// Provider configuration from YAML/JSON.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct ProviderConfig {
     /// Unique provider name used to reference this provider.
     pub name: ProviderName,
@@ -180,6 +180,22 @@ impl ProviderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_schema_carries_the_serve_surface() {
+        // WOR-1686: the committed ai-proxy-provider schema must expose
+        // the serve: block so an editor autocompletes it. Anchor that
+        // the derive actually reaches ModelHostConfig's fields.
+        let schema = schemars::schema_for!(ProviderConfig);
+        let json = serde_json::to_string(&schema).unwrap();
+        assert!(json.contains("\"serve\""), "serve field present");
+        // A serve/ModelHostConfig-specific field proves the subtree, not
+        // just the field name, is in the schema.
+        assert!(
+            json.contains("keep_alive") || json.contains("catalog_file"),
+            "serve subtree (ServeEntry/ModelHostConfig fields) present"
+        );
+    }
 
     fn make_provider(name: &str) -> ProviderConfig {
         ProviderConfig {

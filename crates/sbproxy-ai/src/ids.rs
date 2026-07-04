@@ -20,7 +20,19 @@ use serde::{Deserialize, Serialize};
 macro_rules! string_newtype {
     ($(#[$m:meta])* $name:ident) => {
         $(#[$m])*
-        #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[derive(
+            Clone,
+            Debug,
+            Default,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            Serialize,
+            Deserialize,
+            schemars::JsonSchema,
+        )]
         #[serde(transparent)]
         pub struct $name(String);
 
