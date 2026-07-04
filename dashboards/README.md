@@ -29,6 +29,7 @@ scrape_configs:
 | Security | `grafana/sbproxy-security.json` | `sbproxy-security` | WAF blocks, rate limiting, auth failures, IP filter blocks, bot detections |
 | Origins | `grafana/sbproxy-origins.json` | `sbproxy-origins` | Per-origin request rate, latency, and error rate |
 | AI Bot & Agent Traffic | `grafana/sbproxy-ai-bot-traffic.json` | `sbproxy-ai-bot-traffic` | Inbound AI bot / agent volume by class, vendor, and verification status (verified Web Bot Auth vs anonymous vs unknown); paid vs unpaid breakdown; AI crawl policy verdicts (allow / block / tarpit); bot-auth integrity (nonce replays, skill digest mismatches) |
+| Model Host | `grafana/sbproxy-model-host.json` | `sbproxy-model-host` | Local inference-engine lifecycle: resident models, cold-start (time-to-ready) latency, launch/eviction rates, load-queue depth, and per-device VRAM used/free and GPU utilization |
 
 ### Importing via Grafana UI
 
