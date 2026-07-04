@@ -1,13 +1,13 @@
 # MCP gateway
 
-*Last modified: 2026-06-05*
+*Last modified: 2026-07-03*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
-and the proxy serves the canonical MCP method set (`initialize`,
-`tools/list`, `tools/call`, `ping`), federates one or more upstream
-MCP servers, and enforces gateway-level guardrails before any
-`tools/call` is forwarded.
+and the proxy serves the MCP method set (`initialize`, `tools/list`,
+`tools/call`, `resources/list`, `resources/read`, `ping`), federates
+one or more upstream MCP servers, and enforces gateway-level
+guardrails before any `tools/call` is forwarded.
 
 This page is operator-facing. For the higher-level pitch, see
 [`features.md`](features.md).
@@ -27,16 +27,31 @@ Content-Type: application/json
 }
 ```
 
-`initialize` returns the server identity, the protocol version
-(`2025-06-18`), and a capability advertisement. `tools/list` returns
-the aggregated tool catalogue across every federated upstream.
-`tools/call` routes by tool name to the owning upstream. `ping`
-returns `"pong"`. Notifications (requests with no `id`) get no
-response. Unknown methods return JSON-RPC error `-32601`
+`initialize` negotiates the protocol version (see below) and returns
+the server identity plus a capability advertisement. `tools/list`
+returns the aggregated tool catalogue across every federated upstream.
+`tools/call` routes by tool name to the owning upstream.
+`resources/list` and `resources/read` pass the federated resource
+surface through (the OpenAI Apps SDK / SEP-1865 UI-template path).
+`ping` returns `"pong"`. Notifications (requests with no `id`) get a
+`202 Accepted`. Unknown methods return JSON-RPC error `-32601`
 (`method_not_found`). The gateway serves this from
 `crates/sbproxy-core/src/server/action_dispatch.rs`
 (`handle_mcp_action`); the wire enums are in
 `crates/sbproxy-extension/src/mcp/types.rs`.
+
+## Protocol version negotiation
+
+The gateway serves the revisions in `SUPPORTED_PROTOCOL_VERSIONS`
+(`2025-06-18` today). On `initialize` it echoes the client's requested
+`protocolVersion` when it is supported, otherwise it answers with the
+newest revision it does support and lets the client decide whether to
+continue. A post-initialize request carrying an unsupported
+`MCP-Protocol-Version` header gets a `400`; a missing header follows
+the spec's assumed-version rule. `2025-03-26` is deliberately absent:
+that revision requires servers to accept JSON-RPC batches, which this
+gateway does not, so a batch body returns a specific invalid-request
+error rather than a silent mis-negotiation.
 
 ## Minimal config
 
@@ -78,14 +93,26 @@ struct is `McpActionConfig` in
 | `rbac_policies` | map<string, ToolAccessPolicy> | `{}` | Named tool-access labels referenced by `federated_servers[].rbac`. |
 | `federated_servers` | list | required, non-empty | Upstream MCP servers to aggregate. |
 | `guardrails` | list | `[]` | Gateway-level safety checks. |
+| `progressive_discovery` | bool | `false` | Advertise `search` / `execute` meta-tools instead of the full catalogue (see [`examples/mcp-progressive-discovery`](../examples/mcp-progressive-discovery)). |
+| `oauth` | object | unset | RFC 9728 auth discovery (see the OAuth section below and [`examples/mcp-oauth-discovery`](../examples/mcp-oauth-discovery)). |
+| `sessions` | object | unset | Streamable HTTP session management: `{enabled, ttl}` (see [`examples/mcp-sessions`](../examples/mcp-sessions)). |
+| `refresh_interval` | duration | `60s` | How often the background task re-fetches upstream catalogues. Inbound requests always serve the cached snapshot; this is the only steady-state fan-out. |
+| `upstream_connect_timeout` | duration | `5s` | TCP connect deadline per upstream exchange. |
+| `upstream_timeout` | duration | `30s` | Whole-request deadline per upstream exchange (refreshes, calls, reads). Per-server `timeout:` can only shorten it for `tools/call`. |
+| `max_upstream_response_bytes` | integer | `8388608` | Cap on upstream response bytes buffered per exchange. |
+| `tool_versioning` | object | unset | Contract-versioning gate. See [tool-versioning.md](tool-versioning.md). |
+| `tool_pricing` | map<string, float> | `{}` | Per-tool USD cost for the usage-sink attribution. |
+| `usage_sinks` | list | `[]` | Sinks for MCP tool-call usage rows (same shapes as the AI path). |
 
 ### `federated_servers[]`
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `origin` | string | required | Bare hostname (normalised to `https://<host>/mcp`) or a full `https://...` URL. |
+| `origin` | string | required | For an `mcp` server, a bare hostname (normalised to `https://<host>/mcp`) or a full URL. For an `openapi` server, the REST base URL. |
+| `type` | string | `mcp` | `mcp` speaks MCP to the origin; `openapi` derives tools from a spec and dispatches `tools/call` as REST (see the OpenAPI section below). |
+| `spec` / `spec_path` | object / string | unset | Inline OpenAPI spec or a path to one, for a `type: openapi` server. Read at config load; a bad spec fails startup. |
 | `prefix` | string | derived from host | Namespace prefix applied to every tool from this upstream. Tools become `<prefix>.<tool>`. |
-| `rbac` | string | unset | Label referencing a key in `rbac_policies`. Validated at config-load time. |
+| `rbac` | string | unset | Label referencing a key in `rbac_policies`. Validated at config-load time. Enforced on every `tools/call`. |
 | `timeout` | duration | unset | Caps each `tools/call` dispatch. Accepts `250ms`, `10s`, `2m`. |
 | `transport` | string | `streamable_http` | Either `streamable_http` or `sse`. |
 
@@ -106,6 +133,80 @@ guardrails:
 Multiple `tool_allowlist` entries are unioned. An empty `allow` list
 denies every call. No guardrails means open access. Source:
 `crates/sbproxy-modules/src/action/mcp.rs:McpGuardrailEntry`.
+
+## Progressive discovery
+
+Set `progressive_discovery: true` and `tools/list` advertises exactly
+two meta-tools, `search` and `execute`, instead of the full federated
+catalogue. The agent calls `search` with a `query` to find relevant
+tools, then `execute` with a tool `name` and `arguments` to invoke
+one. This keeps a large catalogue out of the model's context window.
+See [`examples/mcp-progressive-discovery`](../examples/mcp-progressive-discovery).
+
+## OAuth auth discovery (RFC 9728)
+
+With an `oauth` block, the gateway serves OAuth 2.0 Protected Resource
+Metadata at `/.well-known/oauth-protected-resource`, advertises a
+pointer to it in the discovery manifest, and challenges a
+credential-less MCP request with a `401` whose `WWW-Authenticate`
+header names that metadata URL, which is where the MCP auth discovery
+flow begins.
+
+```yaml
+oauth:
+  authorization_servers: ["https://issuer.example.com"]
+  scopes_supported: ["mcp.read", "mcp.call"]
+```
+
+Token validation itself stays in the generic auth layer; this block
+only drives discovery and the challenge. A request that already
+carries an `Authorization` header is never re-challenged. See
+[`examples/mcp-oauth-discovery`](../examples/mcp-oauth-discovery).
+
+## OpenAPI-backed servers
+
+A `federated_servers[]` entry with `type: openapi` turns an existing
+REST API into governed MCP tools with no code: the gateway derives the
+tools from an OpenAPI spec and dispatches each `tools/call` as a REST
+request against the `origin`, substituting `{path}` parameters from the
+arguments and sending the rest as a query string (GET) or JSON body.
+The spec is read at config load (from inline `spec:` or `spec_path:`),
+so a bad or missing spec fails startup rather than the hot path. These
+tools live in the same registry as native MCP tools, so RBAC, quotas,
+the version gate, and usage attribution all apply.
+
+```yaml
+federated_servers:
+  - type: openapi
+    origin: "https://api.internal"
+    spec_path: "petstore.openapi.yaml"
+    prefix: pets
+```
+
+## Sessions
+
+With `sessions.enabled`, the gateway issues an `Mcp-Session-Id` on
+`initialize`, requires it on every later request (`400` when missing,
+`404` when unknown or expired, the client's cue to re-initialize), and
+ends a session on `DELETE`. A GET with `Accept: text/event-stream`
+opens the server-to-client stream that delivers
+`notifications/tools/list_changed` and
+`notifications/resources/list_changed` when the federated catalogue
+changes, which is what the `listChanged` capability advertises. Off by
+default: the gateway is otherwise stateless. See
+[`examples/mcp-sessions`](../examples/mcp-sessions).
+
+## Usage attribution
+
+Every `tools/call` records dispatch count and duration on
+`sbproxy_mcp_tool_dispatch_*`. With a `tool_pricing` map, the resolved
+USD cost also lands on `sbproxy_mcp_tool_cost_usd_total`, and with
+`usage_sinks` configured the gateway emits one usage row per call
+(provider `mcp`, the owning server as the model, the caller's
+principal and tenant, latency, cost) into the same sink stream as
+model spend, so tool spend is queryable next to it. Code-mode calls
+(from the emitted `codemode.ts` runtime) are attributed to the
+code-execution sandbox in the session ledger.
 
 ## Submodules
 
@@ -259,70 +360,27 @@ rebuilds the action and resets the counters.
 
 Source: `crates/sbproxy-extension/src/mcp/access_control.rs:ToolAccessPolicy`.
 
-### `guardrails`: blocklist and arg-size limits
+### `openapi_convert` + `rest_to_mcp`: OpenAPI-backed servers
 
-`McpGuardrailConfig` holds a blocked-tool list and a maximum
-serialised argument size. The gateway action exposes the
-`tool_allowlist` form in YAML; the blocklist and arg-size forms are
-available to plugin authors but have no top-level YAML knob in the
-OSS action today. Source:
-`crates/sbproxy-extension/src/mcp/guardrails.rs:check_tool_invocation`.
+`openapi_to_mcp_tools(spec)` converts an OpenAPI 3.x spec into MCP
+tool definitions and `openapi_to_routes(spec)` derives the matching
+`name -> (method, path)` routing table. A `federated_servers[]` entry
+with `type: openapi` uses both: the gateway serves the derived tools
+and dispatches `tools/call` as REST against the origin (see the
+OpenAPI section above). Source:
+`crates/sbproxy-extension/src/mcp/openapi_convert.rs`.
 
-### `code_mode`: schema compression
+### Prompt-linked audit
 
-`compress_tool_schema` walks a tool schema and strips `description`
-and `examples` keys at every level. The function is wired by the
-runtime when payload-size pressure justifies the trade-off; there is
-no top-level YAML knob today. Source:
-`crates/sbproxy-extension/src/mcp/code_mode.rs:compress_tool_schema`.
-
-### `context_opt`: usage-weighted tool prioritisation
-
-`ToolUsageTracker` counts invocations per tool and exposes
-`filter_by_budget(tools, max_tokens)`, which returns the
-most-frequently-used tools that fit a token budget (4-chars-per-token
-approximation). Used internally to trim oversized catalogues; no
-YAML knob today. Source:
-`crates/sbproxy-extension/src/mcp/context_opt.rs:ToolUsageTracker`.
-
-### `openapi_convert`: OpenAPI to MCP
-
-`openapi_to_mcp_tools(spec)` converts an OpenAPI 3.x JSON spec into a
-list of MCP tool definitions. Each `path + method` becomes one tool;
-`operationId` becomes the tool name, `summary` or `description`
-becomes the tool description, and `parameters` build the
-`inputSchema`. Source:
-`crates/sbproxy-extension/src/mcp/openapi_convert.rs:openapi_to_mcp_tools`.
-
-Used by `rest_to_mcp`. No direct YAML knob.
-
-### `rest_to_mcp`: wrap REST APIs as MCP servers
-
-`RestToMcpConfig { base_url, openapi_spec }` plus
-`create_mcp_handler(config)` turns an OpenAPI service into an MCP
-tool catalogue. Tool execution returns a request descriptor
-(`url`, `method`, `args`) for the caller to dispatch; the conversion
-is intentionally synchronous so callers control the HTTP I/O. Source:
-`crates/sbproxy-extension/src/mcp/rest_to_mcp.rs`.
-
-### `audit`: structured audit log
-
-Every tool invocation produces an `McpAuditEntry` (timestamp, tool
-name, server name, caller ID, arguments, result status, duration)
-emitted at INFO level under the tracing target `mcp_audit`. Filter
-this target separately in your log pipeline to route MCP audit
-events to long-term storage. Source:
-`crates/sbproxy-extension/src/mcp/audit.rs:McpAuditEntry`.
-
-No YAML knob; emission is unconditional.
-
-### `spans`: tracing spans
-
-`tool_call_span(tool_name, server_name)` opens a tracing span named
-`mcp.tool_call` with `tool` and `server` fields. These spans show
-up alongside regular proxy request spans in any OTLP / Jaeger
-backend. Source:
-`crates/sbproxy-extension/src/mcp/spans.rs:tool_call_span`.
+When a subscriber is attached to the `mcp_audit` tracing target (the
+enterprise audit layer), each `tools/call` emits an `mcp_audit` event
+carrying the tool name, arguments, the SEP-1865 `params.audit.cause`
+when present, the upstream status, and the duration. The event is
+gated on that subscriber, so an OSS-only deployment pays nothing;
+there is no separate YAML knob. The per-call spend and behavioural
+record live in the session ledger below, not this event. Source:
+`emit_mcp_prompt_audit` in
+`crates/sbproxy-core/src/server/action_dispatch.rs`.
 
 ## Session ledger
 
