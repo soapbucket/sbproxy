@@ -202,9 +202,10 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         }
     }
 
-    /// Turn on `/health` re-checking of cached-ready engines (see
-    /// [`Self::health_recheck`]). The production runtime enables this;
-    /// tests with mock launchers leave it off.
+    /// Turn on `/health` re-checking of cached-ready engines, so a
+    /// dead engine is respawned on the next `ensure_ready`. The
+    /// production runtime enables this; tests with mock launchers leave
+    /// it off.
     pub fn with_health_recheck(mut self, on: bool) -> Self {
         self.health_recheck = on;
         self
