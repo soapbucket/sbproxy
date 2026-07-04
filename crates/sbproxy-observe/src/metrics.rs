@@ -2768,6 +2768,146 @@ pub fn set_mcp_federation_peers_up(count: i64) {
     gauge.set(count);
 }
 
+// --- model host metrics (WOR-1652, WOR-1659) ---------------------------
+//
+// The local model host spawns/supervises inference engines and fits
+// them to the GPU. These families let an operator see cold-start cost,
+// residency, evictions, and per-device VRAM/utilization, and they
+// publish the `gpu_utilization` signal the gpu-aware routing strategy
+// already consumes. `engine` is the engine kind (`vllm`, `llama_cpp`);
+// `model` is the catalog id / advertised model name (sanitized).
+
+/// Record an engine reaching Ready on
+/// `sbproxy_model_host_time_to_ready_seconds{engine, model, outcome}`
+/// (a histogram) plus a launch counter. `outcome` is `ready` or
+/// `failed`. Buckets span 1s..600s (a cold weight load + warm-up).
+pub fn record_model_host_time_to_ready(
+    engine: &str,
+    model: &str,
+    outcome: &'static str,
+    duration_secs: f64,
+) {
+    use prometheus::{
+        register_histogram_vec, register_int_counter_vec, HistogramVec, IntCounterVec,
+    };
+    use std::sync::OnceLock;
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let hist = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_model_host_time_to_ready_seconds",
+            "Time from engine launch to Ready, by engine and model",
+            &["engine", "model"],
+            vec![1.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0],
+        )
+        .expect("model host time-to-ready histogram registers")
+    });
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_model_host_launches_total",
+            "Engine launch attempts by engine, model, and outcome",
+            &["engine", "model", "outcome"],
+        )
+        .expect("model host launches counter registers")
+    });
+    let engine = sanitize_label("engine", engine);
+    let model = sanitize_label("model", model);
+    if outcome == "ready" {
+        hist.with_label_values(&[engine.as_str(), model.as_str()])
+            .observe(duration_secs);
+    }
+    counter
+        .with_label_values(&[engine.as_str(), model.as_str(), outcome])
+        .inc();
+}
+
+/// Record a model eviction on
+/// `sbproxy_model_host_evictions_total{reason}`. `reason` is one of
+/// `lru`, `keep_alive`, `manual`.
+pub fn record_model_host_eviction(reason: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_model_host_evictions_total",
+            "Model evictions by reason",
+            &["reason"],
+        )
+        .expect("model host evictions counter registers")
+    });
+    counter.with_label_values(&[reason]).inc();
+}
+
+/// Set the count of currently-resident (Ready) local models on
+/// `sbproxy_model_host_resident_models`.
+pub fn set_model_host_resident_models(count: i64) {
+    use prometheus::{register_int_gauge, IntGauge};
+    use std::sync::OnceLock;
+    static G: OnceLock<IntGauge> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge!(
+            "sbproxy_model_host_resident_models",
+            "Local models currently loaded and Ready",
+        )
+        .expect("model host resident-models gauge registers")
+    });
+    gauge.set(count);
+}
+
+/// Set the request queue depth while an engine loads on
+/// `sbproxy_model_host_load_queue_depth{model}` (requests parked
+/// waiting for a cold model to become Ready).
+pub fn set_model_host_load_queue_depth(model: &str, depth: i64) {
+    use prometheus::{register_int_gauge_vec, IntGaugeVec};
+    use std::sync::OnceLock;
+    static G: OnceLock<IntGaugeVec> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge_vec!(
+            "sbproxy_model_host_load_queue_depth",
+            "Requests queued while a model loads, by model",
+            &["model"],
+        )
+        .expect("model host load-queue gauge registers")
+    });
+    let model = sanitize_label("model", model);
+    gauge.with_label_values(&[model.as_str()]).set(depth);
+}
+
+/// Publish per-device GPU VRAM and utilization on
+/// `sbproxy_model_host_gpu_vram_bytes{device, kind}` (kind = `total` |
+/// `free`) and `sbproxy_model_host_gpu_utilization{device}` (0.0..1.0).
+/// The utilization gauge is the signal the gpu-aware routing strategy
+/// reads; before this, nothing published it.
+pub fn set_model_host_gpu_stats(device: &str, total_bytes: i64, free_bytes: i64, utilization: f64) {
+    use prometheus::{register_gauge_vec, register_int_gauge_vec, GaugeVec, IntGaugeVec};
+    use std::sync::OnceLock;
+    static VRAM: OnceLock<IntGaugeVec> = OnceLock::new();
+    static UTIL: OnceLock<GaugeVec> = OnceLock::new();
+    let vram = VRAM.get_or_init(|| {
+        register_int_gauge_vec!(
+            "sbproxy_model_host_gpu_vram_bytes",
+            "GPU memory in bytes, by device and kind (total/free)",
+            &["device", "kind"],
+        )
+        .expect("model host gpu vram gauge registers")
+    });
+    let util = UTIL.get_or_init(|| {
+        register_gauge_vec!(
+            "sbproxy_model_host_gpu_utilization",
+            "GPU utilization fraction (0.0-1.0), by device",
+            &["device"],
+        )
+        .expect("model host gpu utilization gauge registers")
+    });
+    let device = sanitize_label("device", device);
+    vram.with_label_values(&[device.as_str(), "total"])
+        .set(total_bytes);
+    vram.with_label_values(&[device.as_str(), "free"])
+        .set(free_bytes);
+    util.with_label_values(&[device.as_str()]).set(utilization);
+}
+
 // --- k8s operator metrics ----------------------------------------------
 //
 // The operator runs a reconcile loop + a leader-election session. These
@@ -4130,6 +4270,30 @@ mod tests {
             out.contains("sbproxy_mcp_federation_peers_up"),
             "mcp federation peers gauge missing"
         );
+    }
+
+    // --- model host metrics (WOR-1659) ---
+
+    #[test]
+    fn model_host_metrics_emit() {
+        record_model_host_time_to_ready("vllm", "qwen3-32b", "ready", 12.5);
+        record_model_host_time_to_ready("vllm", "qwen3-32b", "failed", 0.0);
+        record_model_host_eviction("lru");
+        set_model_host_resident_models(2);
+        set_model_host_load_queue_depth("qwen3-32b", 4);
+        set_model_host_gpu_stats("0", 24 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024, 0.42);
+        let out = metrics().render();
+        for name in [
+            "sbproxy_model_host_time_to_ready_seconds",
+            "sbproxy_model_host_launches_total",
+            "sbproxy_model_host_evictions_total",
+            "sbproxy_model_host_resident_models",
+            "sbproxy_model_host_load_queue_depth",
+            "sbproxy_model_host_gpu_vram_bytes",
+            "sbproxy_model_host_gpu_utilization",
+        ] {
+            assert!(out.contains(name), "missing model-host metric {name}");
+        }
     }
 
     // --- k8s operator metrics ---
