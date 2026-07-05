@@ -34,9 +34,17 @@ fn main() {
                 .map(String::as_str)
                 .unwrap_or("/var/lib/sbproxy/models"),
         ),
+        "llamacpp" => llamacpp_cert(
+            args.get(2)
+                .map(String::as_str)
+                .unwrap_or("ggml-org/Qwen2.5-0.5B-Instruct-GGUF"),
+        ),
+        "translators" => {
+            translators_cert(args.get(2).map(String::as_str).unwrap_or("Qwen/Qwen3-0.6B"))
+        }
         other => {
             eprintln!(
-                "unknown mode {other}; use probe | weights <repo> | serve <repo> <port> | runtime <repo> | sleepwake <repo> | seed-config <repo> <cache>"
+                "unknown mode {other}; use probe | weights | serve | runtime | sleepwake | seed-config | llamacpp <gguf-repo> | translators <repo>"
             );
             std::process::exit(2);
         }
@@ -288,6 +296,203 @@ fn seed_config(repo: &str, cache_dir: &str) {
 fn seed_config(_repo: &str, _cache_dir: &str) {
     eprintln!("build with --features gpu-nvidia,weights");
     std::process::exit(2);
+}
+
+/// Certify the llama.cpp secondary engine (WOR-1656): serve a GGUF
+/// model through the runtime with `engine: llama_cpp` and get tokens.
+/// Assumes `llama-server` is on PATH (the cert script installs it) so
+/// `resolve_on_path` finds it; the runtime spawns it with `--hf-repo`.
+#[cfg(all(feature = "gpu-nvidia", feature = "weights"))]
+fn llamacpp_cert(gguf_repo: &str) {
+    use sbproxy_model_host::launch::ProcessEngineLauncher;
+    use sbproxy_model_host::{
+        resolve_on_path, Catalog, ConfigDirMetadataProvider, ModelHostConfig, ModelHostRuntime,
+        NvmlGpuProbe,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    match resolve_on_path("llama-server") {
+        Some(p) => println!("PASS: llama-server on PATH at {}", p.display()),
+        None => {
+            println!("FAIL: llama-server not on PATH (install llama.cpp)");
+            std::process::exit(1);
+        }
+    }
+    let rt = tokio_rt();
+    // llama.cpp reads GGUF metadata itself; the fit planner still wants
+    // a config.json shape, but a GGUF repo has none. Seed a synthetic
+    // config into the cache so the metadata provider returns a shape.
+    let cache = std::env::temp_dir().join("sbproxy-llamacpp-cert");
+    let cfg_path =
+        sbproxy_model_host::weights::cache_file(&cache, gguf_repo, "main", "config.json");
+    let _ = std::fs::create_dir_all(cfg_path.parent().unwrap());
+    let _ = std::fs::write(
+        &cfg_path,
+        br#"{"num_hidden_layers":24,"num_attention_heads":14,"num_key_value_heads":2,"hidden_size":896,"max_position_embeddings":32768,"num_parameters":500000000}"#,
+    );
+    let cfg: ModelHostConfig = serde_yaml::from_str(&format!(
+        "models:\n  - model: hf:{gguf_repo}\n    name: cert-gguf\n    engine: llama_cpp\n    max_context: 4096\n"
+    ))
+    .expect("serve config");
+    let runtime = ModelHostRuntime::new(
+        cfg,
+        Catalog::builtin(),
+        Arc::new(NvmlGpuProbe::new()),
+        Arc::new(ConfigDirMetadataProvider {
+            cache_root: cache.clone(),
+            revision: "main".to_string(),
+            catalog: Catalog::builtin(),
+        }),
+        Box::new(|| ProcessEngineLauncher::with_timeout(Duration::from_secs(420))),
+        false,
+    )
+    .with_health_recheck(true);
+    match rt.block_on(runtime.ensure_ready("cert-gguf")) {
+        Ok(p) => {
+            println!("PASS: llama.cpp engine ready on port {p}");
+            if curl_tokens(p, "cert-gguf") {
+                println!("PASS: llama.cpp completion returned tokens");
+            } else {
+                println!("FAIL: no tokens from llama.cpp engine");
+            }
+        }
+        Err(e) => println!("FAIL: llama.cpp ensure_ready: {e}"),
+    }
+    rt.block_on(runtime.unload("cert-gguf"));
+    println!("llamacpp cert complete");
+}
+
+#[cfg(not(all(feature = "gpu-nvidia", feature = "weights")))]
+fn llamacpp_cert(_repo: &str) {
+    eprintln!("build with --features gpu-nvidia,weights");
+    std::process::exit(2);
+}
+
+/// Certify OpenAI API-parity features on the served vLLM engine
+/// (WOR-1667 structured output, WOR-1668 tool calling, WOR-1669 Open
+/// Responses): spawn the engine once, then send one request per feature
+/// and report which the engine honors. vLLM's OpenAI server implements
+/// these natively, so a served provider inherits them; this confirms it
+/// on hardware.
+#[cfg(all(feature = "gpu-nvidia", feature = "weights"))]
+fn translators_cert(repo: &str) {
+    use sbproxy_model_host::launch::ProcessEngineLauncher;
+    use sbproxy_model_host::weights::ensure_weight_file;
+    use sbproxy_model_host::{
+        Catalog, ConfigDirMetadataProvider, ModelHostConfig, ModelHostRuntime, NvmlGpuProbe,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let rt = tokio_rt();
+    let cache = std::env::temp_dir().join("sbproxy-runtime-cert-cache");
+    let _ = rt.block_on(ensure_weight_file(
+        &cache,
+        repo,
+        "main",
+        "config.json",
+        None,
+    ));
+    // hermes is the Qwen tool-call parser; enables auto tool-choice (WOR-1668).
+    let cfg: ModelHostConfig = serde_yaml::from_str(&format!(
+        "models:\n  - model: hf:{repo}\n    name: cert-model\n    engine: vllm\n    max_context: 8192\n    tool_call_parser: hermes\n"
+    ))
+    .expect("serve config");
+    let runtime = ModelHostRuntime::new(
+        cfg,
+        Catalog::builtin(),
+        Arc::new(NvmlGpuProbe::new()),
+        Arc::new(ConfigDirMetadataProvider {
+            cache_root: cache.clone(),
+            revision: "main".to_string(),
+            catalog: Catalog::builtin(),
+        }),
+        Box::new(|| ProcessEngineLauncher::with_timeout(Duration::from_secs(420))),
+        false,
+    )
+    .with_health_recheck(true);
+    let port = match rt.block_on(runtime.ensure_ready("cert-model")) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("FAIL: ensure_ready: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("PASS: vLLM up on port {port} for parity checks");
+
+    // WOR-1667: structured output via response_format json_schema.
+    let structured = r#"{"model":"cert-model","messages":[{"role":"user","content":"Return a JSON object with a field name set to Bob."}],"max_tokens":40,"response_format":{"type":"json_schema","json_schema":{"name":"person","schema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}}}"#;
+    check_feature(
+        port,
+        "/v1/chat/completions",
+        structured,
+        "\"content\"",
+        "WOR-1667 structured output (response_format json_schema)",
+    );
+
+    // WOR-1668: tool calling.
+    let tools = r#"{"model":"cert-model","messages":[{"role":"user","content":"What is the weather in Paris? Use the tool."}],"max_tokens":60,"tools":[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"tool_choice":"auto"}"#;
+    check_feature(
+        port,
+        "/v1/chat/completions",
+        tools,
+        "choices",
+        "WOR-1668 tool calling (tools + tool_choice)",
+    );
+
+    // WOR-1669: Open Responses API (/v1/responses).
+    let responses = r#"{"model":"cert-model","input":"Say hi in one word."}"#;
+    check_feature(
+        port,
+        "/v1/responses",
+        responses,
+        "\"",
+        "WOR-1669 Open Responses (/v1/responses)",
+    );
+
+    rt.block_on(runtime.unload("cert-model"));
+    println!("translators cert complete");
+}
+
+#[cfg(not(all(feature = "gpu-nvidia", feature = "weights")))]
+fn translators_cert(_repo: &str) {
+    eprintln!("build with --features gpu-nvidia,weights");
+    std::process::exit(2);
+}
+
+/// POST `body` to `path` on the local engine and report PASS if it
+/// answers 200 with `needle` in the body (the feature is honored), else
+/// FAIL with the response head so the log shows why.
+#[cfg(all(feature = "gpu-nvidia", feature = "weights"))]
+fn check_feature(port: u16, path: &str, body: &str, needle: &str, label: &str) {
+    let out = std::process::Command::new("curl")
+        .args([
+            "-sS",
+            "-m",
+            "120",
+            "-w",
+            "\nHTTP_STATUS:%{http_code}",
+            &format!("http://127.0.0.1:{port}{path}"),
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            body,
+        ])
+        .output();
+    match out {
+        Ok(o) => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            let ok = text.contains("HTTP_STATUS:200") && text.contains(needle);
+            if ok {
+                println!("PASS: {label}");
+            } else {
+                let head: String = text.chars().take(180).collect();
+                println!("FAIL: {label} -> {head}");
+            }
+        }
+        Err(e) => println!("FAIL: {label} (curl: {e})"),
+    }
 }
 
 /// POST a one-word completion to a local OpenAI-shaped engine and

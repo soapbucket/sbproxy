@@ -307,6 +307,14 @@
           "description": "Keep this model resident: it is never evicted to make room for another (WOR-1672). Use for a latency-critical model that must stay hot. A set of pinned models is therefore never split. Admitting a new model that only fits by evicting a pinned one is rejected instead.",
           "default": false,
           "type": "boolean"
+        },
+        "tool_call_parser": {
+          "description": "vLLM tool-call parser to enable auto tool-choice (WOR-1668), e.g. `hermes` (Qwen), `llama3_json`, `mistral`. When set, the engine launches with `--enable-auto-tool-choice --tool-call-parser <name>` so `tool_choice: auto` requests work; without it vLLM rejects auto tool-choice. `None` leaves tool calling off.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },

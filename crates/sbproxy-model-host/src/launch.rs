@@ -204,6 +204,15 @@ pub fn serving_flags(engine: EngineKind, entry: &crate::config::ServeEntry) -> V
         args.push("--served-model-name".to_string());
         args.push(name);
     }
+    // WOR-1668: tool calling. vLLM rejects `tool_choice: auto` unless
+    // launched with an auto-tool-choice parser; the parser is
+    // model-specific (hermes for Qwen, llama3_json, mistral, ...), so
+    // the operator declares it and we enable it here.
+    if let Some(parser) = &entry.tool_call_parser {
+        args.push("--enable-auto-tool-choice".to_string());
+        args.push("--tool-call-parser".to_string());
+        args.push(parser.clone());
+    }
     // Speculative decoding.
     if let Some(spec) = &entry.speculative {
         use crate::config::SpecMethod;
@@ -652,6 +661,7 @@ mod tests {
             chunked_prefill: cp,
             lora_adapters: loras,
             pinned: false,
+            tool_call_parser: None,
         }
     }
 
@@ -700,6 +710,22 @@ mod tests {
         assert_eq!(f[m + 1], "2048");
         assert!(f.iter().any(|a| a == "--enable-lora"));
         assert!(f.iter().any(|a| a == "bot=hf:org/bot"));
+    }
+
+    #[test]
+    fn serving_flags_tool_call_parser() {
+        // WOR-1668: setting a parser enables vLLM auto tool-choice.
+        let mut e = entry_with(None, None, vec![]);
+        e.tool_call_parser = Some("hermes".to_string());
+        let f = serving_flags(EngineKind::Vllm, &e);
+        assert!(f.iter().any(|a| a == "--enable-auto-tool-choice"));
+        let i = f.iter().position(|a| a == "--tool-call-parser").unwrap();
+        assert_eq!(f[i + 1], "hermes");
+        // Absent by default.
+        let none = entry_with(None, None, vec![]);
+        assert!(!serving_flags(EngineKind::Vllm, &none)
+            .iter()
+            .any(|a| a == "--enable-auto-tool-choice"));
     }
 
     #[test]
