@@ -792,7 +792,12 @@ fn lookup_rerank_price(model: &str) -> Option<f64> {
 /// their own ledger if they need per-call accounting).
 pub fn estimate_cost_for_usage(model: &str, usage: &AiUsage) -> f64 {
     match usage {
-        AiUsage::Tokens { input, output } => estimate_cost(model, *input, *output),
+        AiUsage::Tokens {
+            input,
+            output,
+            cached_input,
+            cache_creation,
+        } => estimate_token_cost(model, *input, *output, *cached_input, *cache_creation),
         AiUsage::Images { count, resolution } => lookup_image_price(model, resolution)
             .map(|p| p * (*count as f64))
             .unwrap_or(0.0),
@@ -813,6 +818,23 @@ pub fn estimate_cost_for_usage(model: &str, usage: &AiUsage) -> f64 {
 /// counts. Unknown models fall back to a flat $5 per million blended
 /// rate so a missing entry never silently zero-rates a request.
 pub fn estimate_cost(model: &str, prompt_tokens: u64, completion_tokens: u64) -> f64 {
+    estimate_token_cost(model, prompt_tokens, completion_tokens, 0, 0)
+}
+
+/// Estimate the USD cost of a token-based request, billing the cached
+/// portion of the prompt at the model's cache-read rate and the
+/// cache-creation portion at its cache-write rate (WOR-1708). `input`
+/// is the true total prompt volume; `cached_input` and `cache_creation`
+/// are subsets of it. When a model has no separate cache rate, cached
+/// tokens fall back to the input rate (conservative: no phantom
+/// discount). Emits the WOR-1710 price-source metric once.
+fn estimate_token_cost(
+    model: &str,
+    input: u64,
+    output: u64,
+    cached_input: u64,
+    cache_creation: u64,
+) -> f64 {
     // WOR-1707: operator price table (config + rate card) overrides the
     // built-in catalog; unknown models keep the pessimistic fallback so
     // a budget cap fires earlier rather than later.
@@ -821,9 +843,29 @@ pub fn estimate_cost(model: &str, prompt_tokens: u64, completion_tokens: u64) ->
     // WOR-1710: record which layer priced this request so a high
     // fallback share (stale catalog / missing rate card) is visible.
     crate::ai_metrics::record_price_source(source.label());
-    let prompt_cost = (prompt_tokens as f64) * price.input_per_million / 1_000_000.0;
-    let completion_cost = (completion_tokens as f64) * price.output_per_million / 1_000_000.0;
-    prompt_cost + completion_cost
+    // Split the prompt: cached + cache-creation are subsets of `input`;
+    // the remainder is plain input. Clamp so malformed provider data
+    // (subsets exceeding the total) cannot produce a negative count.
+    let cached = cached_input.min(input);
+    let creation = cache_creation.min(input.saturating_sub(cached));
+    let plain_input = input.saturating_sub(cached).saturating_sub(creation);
+    // Absent a separate cache rate, bill cache tokens at the input rate
+    // (no discount) rather than free.
+    let cache_read_rate = if price.cache_read_per_million > 0.0 {
+        price.cache_read_per_million
+    } else {
+        price.input_per_million
+    };
+    let cache_write_rate = if price.cache_write_per_million > 0.0 {
+        price.cache_write_per_million
+    } else {
+        price.input_per_million
+    };
+    ((plain_input as f64) * price.input_per_million
+        + (cached as f64) * cache_read_rate
+        + (creation as f64) * cache_write_rate
+        + (output as f64) * price.output_per_million)
+        / 1_000_000.0
 }
 
 /// Pick the cheapest model from a list of candidates, using the
@@ -869,10 +911,24 @@ pub enum AiUsage {
     /// Token-based usage (chat completions, embeddings, assistants,
     /// fine-tuning training).
     Tokens {
-        /// Prompt/input tokens consumed.
+        /// Prompt/input tokens consumed. The *true total* prompt volume:
+        /// for OpenAI this is `prompt_tokens` (already includes cached);
+        /// for Anthropic it is `input_tokens + cache_read + cache_creation`
+        /// (whose `input_tokens` excludes them). `cached_input` and
+        /// `cache_creation` are subsets of it (WOR-1708).
         input: u64,
         /// Completion/output tokens emitted.
         output: u64,
+        /// Cache-read (cache-hit) prompt tokens, a subset of `input`
+        /// billed at the discounted cache-read rate (WOR-1708). Zero when
+        /// the provider reports no cache hit.
+        #[serde(default)]
+        cached_input: u64,
+        /// Cache-write (cache-creation) prompt tokens, a subset of
+        /// `input` billed at the cache-write rate (WOR-1708). Anthropic
+        /// only; zero elsewhere.
+        #[serde(default)]
+        cache_creation: u64,
     },
     /// Image generation usage. `count` is the number of images
     /// returned; `resolution` is the dimension string sent to the
@@ -1016,7 +1072,9 @@ fn now_unix_secs() -> i64 {
 /// lands when the enforceable-unit budget shapes ship.
 pub fn record_billing_event(tracker: &BudgetTracker, event: &AiBillingEvent) {
     let token_total: u64 = match &event.usage {
-        AiUsage::Tokens { input, output } => input.saturating_add(*output),
+        // `input` is the true total prompt (cached/creation are subsets),
+        // so total tokens is still input + output (WOR-1708).
+        AiUsage::Tokens { input, output, .. } => input.saturating_add(*output),
         _ => 0,
     };
     for key in &event.scope_keys {
@@ -1203,6 +1261,66 @@ mod tests {
         for m in ["cfg-model", "gpt-4o-mini", "totally-unknown-xyz-model"] {
             let _ = estimate_cost(m, 1000, 0);
         }
+        set_price_table(PriceTable::new());
+    }
+
+    #[test]
+    fn cache_tokens_billed_at_discounted_rates() {
+        // WOR-1708: cached input bills at the cache-read rate, cache
+        // creation at the cache-write rate, the remainder at input rate.
+        let _guard = PRICE_TABLE_TEST_LOCK.lock().unwrap();
+        let mut t = PriceTable::new();
+        t.insert(
+            "cache-model",
+            ModelPrice {
+                input_per_million: 10.0,
+                output_per_million: 20.0,
+                cache_read_per_million: 1.0,
+                cache_write_per_million: 12.5,
+            },
+            PriceSource::Config,
+        );
+        set_price_table(t);
+        // 1M total prompt = 400k plain + 500k cache-read + 100k cache-creation.
+        let usage = AiUsage::Tokens {
+            input: 1_000_000,
+            output: 0,
+            cached_input: 500_000,
+            cache_creation: 100_000,
+        };
+        // 400k*10 + 500k*1 + 100k*12.5 = 4.0 + 0.5 + 1.25 (per million).
+        let cost = estimate_cost_for_usage("cache-model", &usage);
+        assert!((cost - 5.75).abs() < 1e-6, "cache split cost: {cost}");
+        // No cache => all prompt at the input rate.
+        let plain = estimate_cost_for_usage(
+            "cache-model",
+            &AiUsage::Tokens {
+                input: 1_000_000,
+                output: 0,
+                cached_input: 0,
+                cache_creation: 0,
+            },
+        );
+        assert!((plain - 10.0).abs() < 1e-6, "plain cost: {plain}");
+        // A model with no separate cache rate bills cache at the input
+        // rate (conservative, no phantom discount).
+        let mut t2 = PriceTable::new();
+        t2.insert(
+            "no-cache-rate",
+            ModelPrice::tokens(10.0, 20.0),
+            PriceSource::Config,
+        );
+        set_price_table(t2);
+        let c = estimate_cost_for_usage(
+            "no-cache-rate",
+            &AiUsage::Tokens {
+                input: 1_000_000,
+                output: 0,
+                cached_input: 500_000,
+                cache_creation: 0,
+            },
+        );
+        assert!((c - 10.0).abs() < 1e-6, "no-cache-rate cost: {c}");
         set_price_table(PriceTable::new());
     }
 
@@ -1465,6 +1583,8 @@ mod tests {
             AiUsage::Tokens {
                 input: 1000,
                 output: 500,
+                cached_input: 0,
+                cache_creation: 0,
             },
         )
         .with_cost(0.012)
@@ -1559,6 +1679,8 @@ mod tests {
             AiUsage::Tokens {
                 input: 800,
                 output: 200,
+                cached_input: 0,
+                cache_creation: 0,
             },
         )
         .with_cost(0.01)
@@ -1583,6 +1705,8 @@ mod tests {
         let usage = AiUsage::Tokens {
             input: 1000,
             output: 500,
+            cached_input: 0,
+            cache_creation: 0,
         };
         let via_usage = estimate_cost_for_usage("gpt-4o", &usage);
         let via_legacy = estimate_cost("gpt-4o", 1000, 500);
