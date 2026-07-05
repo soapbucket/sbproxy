@@ -27,9 +27,16 @@ fn main() {
             args.get(3).and_then(|p| p.parse().ok()).unwrap_or(8000),
         ),
         "runtime" => runtime_cert(args.get(2).map(String::as_str).unwrap_or("Qwen/Qwen3-0.6B")),
+        "sleepwake" => sleepwake_cert(args.get(2).map(String::as_str).unwrap_or("Qwen/Qwen3-0.6B")),
+        "seed-config" => seed_config(
+            args.get(2).map(String::as_str).unwrap_or("Qwen/Qwen3-0.6B"),
+            args.get(3)
+                .map(String::as_str)
+                .unwrap_or("/var/lib/sbproxy/models"),
+        ),
         other => {
             eprintln!(
-                "unknown mode {other}; use probe | weights <repo> | serve <repo> <port> | runtime <repo>"
+                "unknown mode {other}; use probe | weights <repo> | serve <repo> <port> | runtime <repo> | sleepwake <repo> | seed-config <repo> <cache>"
             );
             std::process::exit(2);
         }
@@ -158,6 +165,128 @@ fn runtime_cert(repo: &str) {
 #[cfg(not(all(feature = "gpu-nvidia", feature = "weights")))]
 fn runtime_cert(_repo: &str) {
     eprintln!("build with --features gpu-nvidia,weights to run the runtime cert");
+    std::process::exit(2);
+}
+
+/// Certify vLLM sleep/wake (WOR-1655) on a real engine: spawn a model
+/// through the runtime (dev mode on, set by the launch spec), then
+/// drive the sleep/wake client and verify `is_sleeping` flips.
+#[cfg(all(feature = "gpu-nvidia", feature = "weights"))]
+fn sleepwake_cert(repo: &str) {
+    use sbproxy_model_host::launch::ProcessEngineLauncher;
+    use sbproxy_model_host::weights::ensure_weight_file;
+    use sbproxy_model_host::{
+        is_sleeping, sleep, wake_up, Catalog, ConfigDirMetadataProvider, ModelHostConfig,
+        ModelHostRuntime, NvmlGpuProbe, SleepLevel,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let rt = tokio_rt();
+    let cache = std::env::temp_dir().join("sbproxy-runtime-cert-cache");
+    if let Err(e) = rt.block_on(ensure_weight_file(
+        &cache,
+        repo,
+        "main",
+        "config.json",
+        None,
+    )) {
+        println!("FAIL: config.json fetch: {e}");
+        std::process::exit(1);
+    }
+    let cfg: ModelHostConfig = serde_yaml::from_str(&format!(
+        "models:\n  - model: hf:{repo}\n    name: cert-model\n    engine: vllm\n    max_context: 8192\n"
+    ))
+    .expect("serve config");
+    let runtime = ModelHostRuntime::new(
+        cfg,
+        Catalog::builtin(),
+        Arc::new(NvmlGpuProbe::new()),
+        Arc::new(ConfigDirMetadataProvider {
+            cache_root: cache.clone(),
+            revision: "main".to_string(),
+            catalog: Catalog::builtin(),
+        }),
+        Box::new(|| ProcessEngineLauncher::with_timeout(Duration::from_secs(420))),
+        false,
+    )
+    .with_health_recheck(true);
+
+    let port = match rt.block_on(runtime.ensure_ready("cert-model")) {
+        Ok(p) => {
+            println!("PASS: vLLM up on port {p} (dev mode for sleep/wake)");
+            p
+        }
+        Err(e) => {
+            println!("FAIL: ensure_ready: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match rt.block_on(sleep(port, SleepLevel::Weights)) {
+        Ok(()) => println!("PASS: sleep(level 1) accepted"),
+        Err(e) => println!("FAIL: sleep: {e}"),
+    }
+    // vLLM's sleep is async internally; give it a moment.
+    std::thread::sleep(Duration::from_secs(3));
+    match rt.block_on(is_sleeping(port)) {
+        Ok(true) => println!("PASS: is_sleeping reports true after sleep"),
+        Ok(false) => println!("FAIL: engine not sleeping after sleep()"),
+        Err(e) => println!("FAIL: is_sleeping: {e}"),
+    }
+    match rt.block_on(wake_up(port, false)) {
+        Ok(()) => println!("PASS: wake_up accepted"),
+        Err(e) => println!("FAIL: wake_up: {e}"),
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    match rt.block_on(is_sleeping(port)) {
+        Ok(false) => println!("PASS: engine awake after wake_up"),
+        Ok(true) => println!("FAIL: still sleeping after wake_up"),
+        Err(e) => println!("FAIL: is_sleeping: {e}"),
+    }
+    // A completion after wake proves the model is servable again.
+    if curl_tokens(port, repo) {
+        println!("PASS: completion after wake returned tokens");
+    } else {
+        println!("FAIL: no tokens after wake");
+    }
+    rt.block_on(runtime.unload("cert-model"));
+    println!("sleepwake cert complete");
+}
+
+#[cfg(not(all(feature = "gpu-nvidia", feature = "weights")))]
+fn sleepwake_cert(_repo: &str) {
+    eprintln!("build with --features gpu-nvidia,weights");
+    std::process::exit(2);
+}
+
+/// Pre-seed a model's `config.json` into the model host's weight cache
+/// so the running binary's fit planner can read the model shape without
+/// the (not-yet-wired) pull-policy execution. Used to set up the on-box
+/// binary end-to-end test.
+#[cfg(all(feature = "gpu-nvidia", feature = "weights"))]
+fn seed_config(repo: &str, cache_dir: &str) {
+    use sbproxy_model_host::weights::ensure_weight_file;
+    let rt = tokio_rt();
+    let cache = std::path::PathBuf::from(cache_dir);
+    match rt.block_on(ensure_weight_file(
+        &cache,
+        repo,
+        "main",
+        "config.json",
+        None,
+    )) {
+        Ok(p) => println!("PASS: seeded config.json at {}", p.display()),
+        Err(e) => {
+            println!("FAIL: seed config.json: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(all(feature = "gpu-nvidia", feature = "weights")))]
+fn seed_config(_repo: &str, _cache_dir: &str) {
+    eprintln!("build with --features gpu-nvidia,weights");
     std::process::exit(2);
 }
 
