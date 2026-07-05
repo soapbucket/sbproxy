@@ -378,17 +378,55 @@ impl EngineLauncher for ProcessEngineLauncher {
         // tokio's inherent Unix method.
         #[cfg(unix)]
         cmd.process_group(0);
-        let child = cmd
+        // Capture the engine's stderr to a per-port log so a crash
+        // reports why, not just that it died. A file sink needs no
+        // draining (unlike a pipe), so it cannot deadlock the child.
+        let log_path = std::env::temp_dir().join(format!("sbproxy-engine-{port}.log"));
+        match std::fs::File::create(&log_path) {
+            Ok(f) => {
+                cmd.stderr(Stdio::from(f));
+            }
+            Err(_) => {
+                cmd.stderr(Stdio::null());
+            }
+        }
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("spawn {}: {e}", spec.program))?;
-        *self.child.lock().await = Some(child);
 
-        match wait_for_ready(port, &self.health_path, self.ready_timeout).await {
-            Ok(()) => Ok(port),
+        // Race readiness against the child exiting. A crashed engine
+        // (bad flag, OOM, missing CUDA) would otherwise be polled for
+        // the full readiness timeout, and the supervisor would repeat
+        // that for every retry: a broken model could block a request
+        // for tens of minutes. Detecting the early exit fails fast.
+        let outcome = tokio::select! {
+            biased;
+            exited = child.wait() => {
+                let tail = std::fs::read_to_string(&log_path)
+                    .ok()
+                    .map(|s| last_lines(&s, 15))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "(no stderr captured)".to_string());
+                Err(format!(
+                    "engine '{}' exited before ready ({exited:?}); stderr tail:\n{tail}",
+                    spec.program
+                ))
+            }
+            ready = wait_for_ready(port, &self.health_path, self.ready_timeout) => {
+                ready.map(|()| port)
+            }
+        };
+
+        match outcome {
+            Ok(p) => {
+                *self.child.lock().await = Some(child);
+                Ok(p)
+            }
             Err(e) => {
-                // Readiness failed: kill the half-started child so it
-                // does not leak, then report the failure.
-                self.kill().await;
+                // Readiness failed or the engine exited; make sure the
+                // child (and its group) is reaped, then report.
+                let _ = child.start_kill();
+                let _ = child.wait().await;
                 Err(e)
             }
         }
@@ -435,6 +473,14 @@ impl EngineLauncher for ProcessEngineLauncher {
             }
         }
     }
+}
+
+/// The last `n` non-empty lines of `s`, joined, for a compact error
+/// tail from an engine's captured stderr.
+fn last_lines(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
 }
 
 /// The process-group id of `pid` via `ps`, or `None` if it cannot be
@@ -733,6 +779,37 @@ mod tests {
         let r = wait_for_ready(port, "/health", Duration::from_secs(3)).await;
         assert!(r.is_ok(), "should see 200: {r:?}");
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn launch_fails_fast_when_engine_exits() {
+        // A crashed engine must fail in well under the readiness
+        // timeout: we detect the child exiting rather than polling a
+        // dead port for the whole window (which, times the retry count,
+        // could block a request for tens of minutes).
+        let launcher = ProcessEngineLauncher::with_timeout(Duration::from_secs(60));
+        let spec = LaunchSpec {
+            program: "false".to_string(), // exits non-zero immediately
+            args: vec!["--port".to_string(), "59997".to_string()],
+            env: vec![],
+            vram_bytes: 0,
+        };
+        let start = tokio::time::Instant::now();
+        let r = launcher.launch(&spec).await;
+        let elapsed = start.elapsed();
+        assert!(r.is_err(), "a process that exits at once never gets ready");
+        // The point of the fix: it did not wait out the 60s timeout.
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "launch failed fast, not after the readiness timeout ({elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn last_lines_takes_the_tail() {
+        assert_eq!(last_lines("a\nb\nc\nd", 2), "c\nd");
+        assert_eq!(last_lines("only", 5), "only");
+        assert_eq!(last_lines("\n\n  \n", 3), "");
     }
 
     #[tokio::test]
