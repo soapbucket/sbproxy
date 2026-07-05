@@ -3480,12 +3480,15 @@ pub(super) async fn relay_ai_response_with_cache(
         // `validation_failed` waste, reusing the usage
         // already parsed for billing. Observational only.
         if let Some(args) = budget_recorder.as_ref() {
-            let (prompt_tokens, completion_tokens) = extract_usage(&resp_body);
+            let (prompt_tokens, completion_tokens, cached_input, cache_creation) =
+                extract_usage_full(&resp_body);
             let wasted = prompt_tokens.saturating_add(completion_tokens);
             if wasted > 0 {
                 let usage = sbproxy_ai::budget::AiUsage::Tokens {
                     input: prompt_tokens,
                     output: completion_tokens,
+                    cached_input,
+                    cache_creation,
                 };
                 let cost = sbproxy_ai::budget::estimate_cost_for_usage(args.model, &usage);
                 sbproxy_ai::ai_metrics::record_waste(
@@ -3598,7 +3601,8 @@ pub(super) async fn relay_ai_response_with_cache(
     // record and the limit fires later when a billable response lands.
     if let Some(args) = budget_recorder.as_ref() {
         if (200..300).contains(&status) {
-            let (prompt_tokens, completion_tokens) = extract_usage(&resp_body);
+            let (prompt_tokens, completion_tokens, cached_input, cache_creation) =
+                extract_usage_full(&resp_body);
             // WOR-1146: when a 2xx chat_completions response carries no
             // parseable `usage`, debit the budget (and feed the router)
             // from an estimate so a usage-less 200 cannot run unlimited
@@ -3712,6 +3716,8 @@ pub(super) async fn relay_ai_response_with_cache(
                 sbproxy_ai::budget::AiUsage::Tokens {
                     input: prompt_tokens,
                     output: completion_tokens,
+                    cached_input,
+                    cache_creation,
                 }
             } else if args.surface_label == "image_generation" {
                 let count = serde_json::from_slice::<serde_json::Value>(&resp_body)
@@ -3760,7 +3766,8 @@ pub(super) async fn relay_ai_response_with_cache(
         // Even without a budget recorder we still want the access log
         // to capture token usage when the upstream returned a body.
         if (200..300).contains(&status) {
-            let (prompt_tokens, completion_tokens) = extract_usage(&resp_body);
+            let (prompt_tokens, completion_tokens, cached_input, cache_creation) =
+                extract_usage_full(&resp_body);
             // WOR-232 reconcile: mirror the budget-recorder branch so
             // origins without a configured budget still settle their
             // TPM reservation against the upstream's reported usage.
@@ -3773,6 +3780,8 @@ pub(super) async fn relay_ai_response_with_cache(
                 let usage = sbproxy_ai::budget::AiUsage::Tokens {
                     input: prompt_tokens,
                     output: completion_tokens,
+                    cached_input,
+                    cache_creation,
                 };
                 let model = ctx.ai_model.clone().unwrap_or_default();
                 let cost = sbproxy_ai::budget::estimate_cost_for_usage(&model, &usage);
@@ -4795,6 +4804,12 @@ pub(super) async fn relay_ai_stream(
                     sbproxy_ai::budget::AiUsage::Tokens {
                         input: prompt,
                         output: completion,
+                        // WOR-1708: from the streaming usage parser. These
+                        // are 0 until the per-provider SSE parsers populate
+                        // cache tokens (follow-up); billing then discounts
+                        // them automatically.
+                        cached_input: tokens.cache_read_tokens as u64,
+                        cache_creation: tokens.cache_write_tokens as u64,
                     }
                 } else {
                     sbproxy_ai::budget::AiUsage::PerCall

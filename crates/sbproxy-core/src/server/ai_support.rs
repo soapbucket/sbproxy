@@ -947,25 +947,92 @@ pub(super) fn scope_label(scope: &sbproxy_ai::budget::BudgetScope) -> &'static s
 /// upstreams still report usage. Returns `(0, 0)` when no usage
 /// block is present.
 pub(super) fn extract_usage(body: &[u8]) -> (u64, u64) {
+    let (input, output, _cached, _creation) = extract_usage_full(body);
+    (input, output)
+}
+
+/// Parse token usage into `(input, output, cached_input, cache_creation)`
+/// (WOR-1708). `input` is the *true total* prompt volume: OpenAI's
+/// `prompt_tokens` already includes cached tokens, so it is used as-is;
+/// Anthropic's `input_tokens` excludes cache, so the cache-read and
+/// cache-creation counts are added. `cached_input` is the cache-read
+/// (cache-hit) portion (OpenAI `prompt_tokens_details.cached_tokens` or
+/// Anthropic `cache_read_input_tokens`); `cache_creation` is Anthropic's
+/// `cache_creation_input_tokens`. Both are subsets of `input`, billed at
+/// the discounted / cache-write rates by the cost estimator.
+pub(super) fn extract_usage_full(body: &[u8]) -> (u64, u64, u64, u64) {
     let parsed: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(_) => return (0, 0),
+        Err(_) => return (0, 0, 0, 0),
     };
     let usage = match parsed.get("usage") {
         Some(u) => u,
-        None => return (0, 0),
+        None => return (0, 0, 0, 0),
     };
+    let as_u64 = |v: &serde_json::Value| v.as_u64();
     let prompt = usage
         .get("prompt_tokens")
         .or_else(|| usage.get("input_tokens"))
-        .and_then(|v| v.as_u64())
+        .and_then(as_u64)
         .unwrap_or(0);
     let completion = usage
         .get("completion_tokens")
         .or_else(|| usage.get("output_tokens"))
-        .and_then(|v| v.as_u64())
+        .and_then(as_u64)
         .unwrap_or(0);
-    (prompt, completion)
+    // Cache-read: OpenAI nests it under prompt_tokens_details; Anthropic
+    // reports cache_read_input_tokens at the top level.
+    let cached = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(as_u64)
+        .or_else(|| usage.get("cache_read_input_tokens").and_then(as_u64))
+        .unwrap_or(0);
+    // Cache-creation is Anthropic-only.
+    let creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(as_u64)
+        .unwrap_or(0);
+    // OpenAI's prompt_tokens already includes cached; Anthropic's
+    // input_tokens excludes cache, so add the cache counts to get the
+    // true total prompt volume.
+    let openai_style = usage.get("prompt_tokens").is_some();
+    let input = if openai_style {
+        prompt
+    } else {
+        prompt.saturating_add(cached).saturating_add(creation)
+    };
+    (input, completion, cached, creation)
+}
+
+#[cfg(test)]
+mod usage_extract_tests {
+    use super::extract_usage_full;
+
+    #[test]
+    fn openai_cached_tokens_are_within_prompt() {
+        // WOR-1708: OpenAI reports cached_tokens inside prompt_tokens, so
+        // input stays prompt_tokens (not double-counted) and cached is a
+        // subset.
+        let body = br#"{"usage":{"prompt_tokens":1000,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":300}}}"#;
+        let (input, output, cached, creation) = extract_usage_full(body);
+        assert_eq!((input, output, cached, creation), (1000, 50, 300, 0));
+    }
+
+    #[test]
+    fn anthropic_cache_tokens_are_added_to_input_total() {
+        // WOR-1708: Anthropic's input_tokens excludes cache, so the true
+        // total is input_tokens + cache_read + cache_creation.
+        let body = br#"{"usage":{"input_tokens":700,"output_tokens":50,"cache_read_input_tokens":300,"cache_creation_input_tokens":100}}"#;
+        let (input, output, cached, creation) = extract_usage_full(body);
+        assert_eq!((input, output, cached, creation), (1100, 50, 300, 100));
+    }
+
+    #[test]
+    fn no_cache_fields_is_plain_usage() {
+        let body = br#"{"usage":{"prompt_tokens":12,"completion_tokens":34}}"#;
+        assert_eq!(extract_usage_full(body), (12, 34, 0, 0));
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1334,7 +1401,7 @@ pub(super) fn emit_ai_billing_event(
     // image / audio event records its USD cost without phantom token
     // rows.
     let (input_tokens, output_tokens) = match &usage {
-        sbproxy_ai::budget::AiUsage::Tokens { input, output } => (*input, *output),
+        sbproxy_ai::budget::AiUsage::Tokens { input, output, .. } => (*input, *output),
         _ => (0, 0),
     };
     let model_label = model.as_deref().unwrap_or("");
