@@ -2,6 +2,8 @@
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::handler::AiSurface;
@@ -399,12 +401,33 @@ pub struct BudgetCheckResult {
 /// Values are USD per million tokens. The catalog covers the major
 /// hosted families that the YAML provider list ships with; unknown
 /// models fall back to a conservative default in [`estimate_cost`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelPrice {
     /// Cost per million prompt tokens, in USD.
     pub input_per_million: f64,
     /// Cost per million completion tokens, in USD.
     pub output_per_million: f64,
+    /// Cost per million cache-read (cache-hit) prompt tokens, in USD
+    /// (WOR-1707). Providers bill cached prompt tokens at a discount;
+    /// `0.0` means "same as `input_per_million`" is not assumed, it means
+    /// no separate cache-read rate is known.
+    pub cache_read_per_million: f64,
+    /// Cost per million cache-write (cache-creation) tokens, in USD
+    /// (WOR-1707). `0.0` means no separate cache-write rate is known.
+    pub cache_write_per_million: f64,
+}
+
+impl ModelPrice {
+    /// A price with only the input/output rates set (no cache rates),
+    /// the common case for the built-in catalog and simple config.
+    pub const fn tokens(input_per_million: f64, output_per_million: f64) -> Self {
+        Self {
+            input_per_million,
+            output_per_million,
+            cache_read_per_million: 0.0,
+            cache_write_per_million: 0.0,
+        }
+    }
 }
 
 /// Built-in price catalog. Numbers are static published list prices
@@ -415,70 +438,249 @@ pub struct ModelPrice {
 /// unknown.
 fn lookup_price(model: &str) -> Option<ModelPrice> {
     let m = model.to_ascii_lowercase();
-    // OpenAI
+    // OpenAI. Order matters: match more specific prefixes first.
+    if m.starts_with("gpt-5-mini") || m.starts_with("gpt-5-nano") {
+        return Some(ModelPrice::tokens(0.25, 2.00));
+    }
+    if m.starts_with("gpt-5") {
+        return Some(ModelPrice::tokens(1.25, 10.00));
+    }
+    if m.starts_with("gpt-4.1-mini") {
+        return Some(ModelPrice::tokens(0.40, 1.60));
+    }
+    if m.starts_with("gpt-4.1-nano") {
+        return Some(ModelPrice::tokens(0.10, 0.40));
+    }
+    if m.starts_with("gpt-4.1") {
+        return Some(ModelPrice::tokens(2.00, 8.00));
+    }
+    if m.starts_with("o4-mini") || m.starts_with("o3-mini") || m.starts_with("o1-mini") {
+        return Some(ModelPrice::tokens(1.10, 4.40));
+    }
+    if m.starts_with("o3") {
+        return Some(ModelPrice::tokens(2.00, 8.00));
+    }
+    if m.starts_with("o1") {
+        return Some(ModelPrice::tokens(15.00, 60.00));
+    }
     if m.starts_with("gpt-4o-mini") {
-        return Some(ModelPrice {
-            input_per_million: 0.15,
-            output_per_million: 0.60,
-        });
+        return Some(ModelPrice::tokens(0.15, 0.60));
     }
     if m.starts_with("gpt-4o") {
-        return Some(ModelPrice {
-            input_per_million: 2.50,
-            output_per_million: 10.00,
-        });
+        return Some(ModelPrice::tokens(2.50, 10.00));
     }
     if m.starts_with("gpt-4-turbo") {
-        return Some(ModelPrice {
-            input_per_million: 10.00,
-            output_per_million: 30.00,
-        });
+        return Some(ModelPrice::tokens(10.00, 30.00));
     }
     if m.starts_with("gpt-4") {
-        return Some(ModelPrice {
-            input_per_million: 30.00,
-            output_per_million: 60.00,
-        });
+        return Some(ModelPrice::tokens(30.00, 60.00));
     }
     if m.starts_with("gpt-3.5") {
-        return Some(ModelPrice {
-            input_per_million: 0.50,
-            output_per_million: 1.50,
-        });
+        return Some(ModelPrice::tokens(0.50, 1.50));
     }
-    // Anthropic
+    // Anthropic. Claude 4.x families first, then 3.x.
+    if m.contains("claude-haiku-4") || m.contains("claude-4-5-haiku") {
+        return Some(ModelPrice::tokens(1.00, 5.00));
+    }
+    if m.contains("claude-opus-4") || m.contains("claude-4-opus") || m.contains("claude-4-5-opus") {
+        return Some(ModelPrice::tokens(15.00, 75.00));
+    }
+    if m.contains("claude-sonnet-4")
+        || m.contains("claude-4-sonnet")
+        || m.contains("claude-4-5-sonnet")
+    {
+        return Some(ModelPrice::tokens(3.00, 15.00));
+    }
     if m.contains("claude-3-5-haiku") || m.contains("claude-3-haiku") {
-        return Some(ModelPrice {
-            input_per_million: 0.80,
-            output_per_million: 4.00,
-        });
+        return Some(ModelPrice::tokens(0.80, 4.00));
     }
     if m.contains("claude-3-5-sonnet") || m.contains("claude-3-sonnet") {
-        return Some(ModelPrice {
-            input_per_million: 3.00,
-            output_per_million: 15.00,
-        });
+        return Some(ModelPrice::tokens(3.00, 15.00));
     }
     if m.contains("claude-3-opus") {
-        return Some(ModelPrice {
-            input_per_million: 15.00,
-            output_per_million: 75.00,
-        });
+        return Some(ModelPrice::tokens(15.00, 75.00));
     }
-    // Google
+    // Google. Gemini 2.x families first, then 1.5.
+    if m.contains("gemini-2.5-pro") {
+        return Some(ModelPrice::tokens(1.25, 10.00));
+    }
+    if m.contains("gemini-2.5-flash") || m.contains("gemini-2.0-flash") {
+        return Some(ModelPrice::tokens(0.30, 2.50));
+    }
     if m.contains("gemini-1.5-flash") || m.contains("gemini-flash") {
-        return Some(ModelPrice {
-            input_per_million: 0.075,
-            output_per_million: 0.30,
-        });
+        return Some(ModelPrice::tokens(0.075, 0.30));
     }
     if m.contains("gemini-1.5-pro") || m.contains("gemini-pro") {
-        return Some(ModelPrice {
-            input_per_million: 1.25,
-            output_per_million: 5.00,
-        });
+        return Some(ModelPrice::tokens(1.25, 5.00));
     }
     None
+}
+
+/// An operator-supplied model price table (WOR-1707): exact
+/// (case-insensitive) model name to price. Populated from the config
+/// `model_prices` map and/or an external rate-card file, and layered
+/// over the built-in `lookup_price` catalog so operators can price
+/// models the catalog does not know (or override stale entries) without
+/// a code change.
+#[derive(Debug, Clone, Default)]
+pub struct PriceTable {
+    exact: HashMap<String, ModelPrice>,
+}
+
+impl PriceTable {
+    /// An empty table.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the table has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.exact.is_empty()
+    }
+
+    /// Number of priced models.
+    pub fn len(&self) -> usize {
+        self.exact.len()
+    }
+
+    /// Insert or override the price for `model` (matched
+    /// case-insensitively).
+    pub fn insert(&mut self, model: impl Into<String>, price: ModelPrice) {
+        self.exact.insert(model.into().to_ascii_lowercase(), price);
+    }
+
+    /// The price for `model`, if present (exact, case-insensitive).
+    pub fn get(&self, model: &str) -> Option<ModelPrice> {
+        self.exact.get(&model.to_ascii_lowercase()).copied()
+    }
+
+    /// Merge a LiteLLM `model_prices_and_context_window.json` document
+    /// into the table (WOR-1707), the ecosystem's canonical rate card.
+    /// Its costs are per-token, so they are scaled to per-million here;
+    /// cache-read / cache-creation rates are carried through. Entries
+    /// with no input+output token cost (embeddings, image models, the
+    /// `sample_spec` template) are skipped. Existing entries are
+    /// overridden. Returns the number of models merged.
+    pub fn merge_litellm_json(&mut self, json: &str) -> Result<usize, String> {
+        let doc: serde_json::Value =
+            serde_json::from_str(json).map_err(|e| format!("parse rate card JSON: {e}"))?;
+        let obj = doc
+            .as_object()
+            .ok_or_else(|| "rate card is not a JSON object".to_string())?;
+        let mut merged = 0usize;
+        for (name, v) in obj {
+            if name == "sample_spec" {
+                continue;
+            }
+            let Some(entry) = v.as_object() else {
+                continue;
+            };
+            let per_token = |k: &str| entry.get(k).and_then(serde_json::Value::as_f64);
+            let (Some(inp), Some(out)) = (
+                per_token("input_cost_per_token"),
+                per_token("output_cost_per_token"),
+            ) else {
+                continue;
+            };
+            self.insert(
+                name.clone(),
+                ModelPrice {
+                    input_per_million: inp * 1_000_000.0,
+                    output_per_million: out * 1_000_000.0,
+                    cache_read_per_million: per_token("cache_read_input_token_cost").unwrap_or(0.0)
+                        * 1_000_000.0,
+                    cache_write_per_million: per_token("cache_creation_input_token_cost")
+                        .unwrap_or(0.0)
+                        * 1_000_000.0,
+                },
+            );
+            merged += 1;
+        }
+        Ok(merged)
+    }
+}
+
+/// The process-global operator price table (WOR-1707). Replaced on
+/// config (re)load via [`set_price_table`]; consulted by
+/// [`resolve_price`] before the built-in catalog. Empty by default, so
+/// with no config the behavior is exactly the built-in catalog.
+static PRICE_TABLE: RwLock<Option<PriceTable>> = RwLock::new(None);
+
+/// Install the operator price table, replacing any previous one (so a
+/// config hot-reload updates prices). WOR-1707.
+pub fn set_price_table(table: PriceTable) {
+    if let Ok(mut guard) = PRICE_TABLE.write() {
+        *guard = Some(table);
+    }
+}
+
+/// The effective price for `model`: the operator table (config +
+/// rate-card) first, then the built-in catalog, else `None` (the caller
+/// applies the pessimistic fallback). WOR-1707.
+fn resolve_price(model: &str) -> Option<ModelPrice> {
+    if let Ok(guard) = PRICE_TABLE.read() {
+        if let Some(table) = guard.as_ref() {
+            if let Some(price) = table.get(model) {
+                return Some(price);
+            }
+        }
+    }
+    lookup_price(model)
+}
+
+/// A config-supplied model price (WOR-1707). Rates are per-million USD
+/// so operators write human numbers (`input_per_million: 3.0`), not
+/// per-token fractions.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ModelPriceConfig {
+    /// USD per million prompt tokens.
+    pub input_per_million: f64,
+    /// USD per million completion tokens.
+    pub output_per_million: f64,
+    /// USD per million cache-read tokens (optional).
+    #[serde(default)]
+    pub cache_read_per_million: f64,
+    /// USD per million cache-write tokens (optional).
+    #[serde(default)]
+    pub cache_write_per_million: f64,
+}
+
+impl From<&ModelPriceConfig> for ModelPrice {
+    fn from(c: &ModelPriceConfig) -> Self {
+        ModelPrice {
+            input_per_million: c.input_per_million,
+            output_per_million: c.output_per_million,
+            cache_read_per_million: c.cache_read_per_million,
+            cache_write_per_million: c.cache_write_per_million,
+        }
+    }
+}
+
+/// Build the operator [`PriceTable`] from config (WOR-1707): load the
+/// external rate-card file first (its many models are the base layer),
+/// then apply the config `model_prices` on top so an operator's inline
+/// prices win. A missing or malformed rate card warns and is skipped
+/// rather than failing config load, since it is a reporting aid, not a
+/// correctness input (unknown models still get the pessimistic
+/// fallback).
+pub fn build_price_table(
+    prices: &HashMap<String, ModelPriceConfig>,
+    rate_card_path: Option<&str>,
+) -> PriceTable {
+    let mut table = PriceTable::new();
+    if let Some(path) = rate_card_path {
+        match std::fs::read_to_string(path) {
+            Ok(json) => match table.merge_litellm_json(&json) {
+                Ok(n) => tracing::info!("model prices: loaded {n} models from rate card {path}"),
+                Err(e) => tracing::warn!("model prices: rate card {path} ignored: {e}"),
+            },
+            Err(e) => tracing::warn!("model prices: cannot read rate card {path}: {e}"),
+        }
+    }
+    for (name, cfg) in prices {
+        table.insert(name.clone(), ModelPrice::from(cfg));
+    }
+    table
 }
 
 /// Look up a per-image USD price for `model` at the given resolution.
@@ -579,10 +781,10 @@ pub fn estimate_cost_for_usage(model: &str, usage: &AiUsage) -> f64 {
 /// counts. Unknown models fall back to a flat $5 per million blended
 /// rate so a missing entry never silently zero-rates a request.
 pub fn estimate_cost(model: &str, prompt_tokens: u64, completion_tokens: u64) -> f64 {
-    let price = lookup_price(model).unwrap_or(ModelPrice {
-        input_per_million: 5.0,
-        output_per_million: 5.0,
-    });
+    // WOR-1707: operator price table (config + rate card) overrides the
+    // built-in catalog; unknown models keep the pessimistic fallback so
+    // a budget cap fires earlier rather than later.
+    let price = resolve_price(model).unwrap_or(ModelPrice::tokens(5.0, 5.0));
     let prompt_cost = (prompt_tokens as f64) * price.input_per_million / 1_000_000.0;
     let completion_cost = (completion_tokens as f64) * price.output_per_million / 1_000_000.0;
     prompt_cost + completion_cost
@@ -596,10 +798,7 @@ pub fn estimate_cost(model: &str, prompt_tokens: u64, completion_tokens: u64) ->
 pub fn cheapest_model(candidates: &[String]) -> Option<String> {
     let mut best: Option<(f64, &String)> = None;
     for name in candidates {
-        let price = lookup_price(name).unwrap_or(ModelPrice {
-            input_per_million: 5.0,
-            output_per_million: 5.0,
-        });
+        let price = resolve_price(name).unwrap_or(ModelPrice::tokens(5.0, 5.0));
         // Score against a representative 1000-prompt / 500-completion
         // mix so input-heavy and output-heavy models are weighted
         // realistically rather than by either rate in isolation.
@@ -845,6 +1044,95 @@ pub fn windowed_key(base: &str, window: Option<std::time::Duration>, now_unix_se
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Serializes tests that mutate the process-global PRICE_TABLE so
+    // they do not race each other under the parallel test runner.
+    static PRICE_TABLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn litellm_ratecard_parses_per_million_and_cache() {
+        // WOR-1707: LiteLLM per-token costs scale to per-million; cache
+        // read/creation rates carry through.
+        let json = r#"{
+          "sample_spec": {"input_cost_per_token": 0.1},
+          "claude-x": {
+            "input_cost_per_token": 0.000003,
+            "output_cost_per_token": 0.000015,
+            "cache_read_input_token_cost": 0.0000003,
+            "cache_creation_input_token_cost": 0.00000375
+          },
+          "text-embedding-3": {"input_cost_per_token": 0.00000002}
+        }"#;
+        let mut t = PriceTable::new();
+        let n = t.merge_litellm_json(json).unwrap();
+        assert_eq!(n, 1, "only the model with input+output cost is priced");
+        let p = t.get("claude-x").unwrap();
+        assert!((p.input_per_million - 3.0).abs() < 1e-9);
+        assert!((p.output_per_million - 15.0).abs() < 1e-9);
+        assert!((p.cache_read_per_million - 0.30).abs() < 1e-9);
+        assert!((p.cache_write_per_million - 3.75).abs() < 1e-9);
+        // sample_spec and the embedding model (no output cost) are skipped.
+        assert!(t.get("text-embedding-3").is_none());
+    }
+
+    #[test]
+    fn config_price_overrides_ratecard_and_catalog() {
+        // WOR-1707: config `model_prices` win over the rate card, which
+        // wins over the built-in catalog.
+        let mut prices = HashMap::new();
+        prices.insert(
+            "gpt-4o".to_string(),
+            ModelPriceConfig {
+                input_per_million: 1.0,
+                output_per_million: 2.0,
+                cache_read_per_million: 0.0,
+                cache_write_per_million: 0.0,
+            },
+        );
+        // A rate card that prices gpt-4o differently; config must win.
+        // (build_price_table with no file path just applies config.)
+        let table = build_price_table(&prices, None);
+        let p = table.get("gpt-4o").unwrap();
+        assert_eq!(p.input_per_million, 1.0);
+        assert_eq!(p.output_per_million, 2.0);
+    }
+
+    #[test]
+    fn catalog_knows_current_model_families() {
+        // WOR-1707: the refreshed built-in catalog prices current
+        // families instead of hitting the $5/$5 fallback.
+        for m in [
+            "claude-haiku-4-5",
+            "claude-sonnet-4-5",
+            "gpt-5",
+            "gpt-4.1-mini",
+            "o3",
+            "gemini-2.5-flash",
+        ] {
+            assert!(lookup_price(m).is_some(), "catalog should price {m}");
+        }
+    }
+
+    #[test]
+    fn price_table_overrides_estimate_cost() {
+        // WOR-1707: installing a table changes estimate_cost for the
+        // named model; an unlisted model still uses the catalog.
+        let _guard = PRICE_TABLE_TEST_LOCK.lock().unwrap();
+        let mut t = PriceTable::new();
+        t.insert(
+            "my-local-model",
+            ModelPrice::tokens(10.0, 20.0), // $10/$20 per million
+        );
+        set_price_table(t);
+        // 1M input + 1M output at $10/$20 = $30.
+        let cost = estimate_cost("my-local-model", 1_000_000, 1_000_000);
+        assert!((cost - 30.0).abs() < 1e-6, "got {cost}");
+        // A catalog model is unaffected by this table (no entry for it).
+        let gpt = estimate_cost("gpt-4o-mini", 1_000_000, 0);
+        assert!((gpt - 0.15).abs() < 1e-6, "catalog still applies: {gpt}");
+        // Reset the global so other tests see catalog-only behavior.
+        set_price_table(PriceTable::new());
+    }
 
     #[test]
     fn budget_period_named_and_duration_strings_parse() {

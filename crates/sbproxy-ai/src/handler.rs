@@ -120,6 +120,18 @@ pub struct AiHandlerConfig {
     /// unchanged.
     #[serde(default)]
     pub ai_policy: Option<crate::ai_policy::AiPolicyConfig>,
+    /// WOR-1707: operator model price table for cost reporting. Each
+    /// entry (per-million USD input/output, optional cache rates)
+    /// overrides the built-in catalog for that model. Empty by default.
+    #[serde(default)]
+    pub model_prices: HashMap<String, crate::budget::ModelPriceConfig>,
+    /// WOR-1707: path to an external rate-card file in the LiteLLM
+    /// `model_prices_and_context_window.json` schema. Loaded at config
+    /// load as the base price layer (config `model_prices` win over it).
+    /// A snapshot is vendored and refreshed out of band, not fetched at
+    /// runtime. `None` uses only `model_prices` + the built-in catalog.
+    #[serde(default)]
+    pub rate_card: Option<String>,
     /// Lazy-built compiled redactor cached on the per-origin
     /// config. Built on first use so config-load does not pay the
     /// regex-compile cost for origins that never serve a request.
@@ -715,6 +727,14 @@ impl AiHandlerConfig {
                 }
             }
         }
+        // WOR-1707: install the operator price table (config prices +
+        // external rate card) into the process-global consulted by cost
+        // estimation. Runs on every config (re)load so prices update
+        // with the config; a missing/bad rate card warns and is skipped.
+        crate::budget::set_price_table(crate::budget::build_price_table(
+            &config.model_prices,
+            config.rate_card.as_deref(),
+        ));
         Ok(config)
     }
 
@@ -1032,6 +1052,8 @@ mod tests {
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
             ai_policy: None,
+            model_prices: std::collections::HashMap::new(),
+            rate_card: None,
             ai_policy_compiled: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
@@ -1065,6 +1087,8 @@ mod tests {
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
             ai_policy: None,
+            model_prices: std::collections::HashMap::new(),
+            rate_card: None,
             ai_policy_compiled: OnceLock::new(),
         };
         assert!(!config.is_model_allowed("gpt-4"));
@@ -1098,6 +1122,8 @@ mod tests {
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
             ai_policy: None,
+            model_prices: std::collections::HashMap::new(),
+            rate_card: None,
             ai_policy_compiled: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
@@ -1132,6 +1158,8 @@ mod tests {
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
             ai_policy: None,
+            model_prices: std::collections::HashMap::new(),
+            rate_card: None,
             ai_policy_compiled: OnceLock::new(),
         };
         // Block list wins
