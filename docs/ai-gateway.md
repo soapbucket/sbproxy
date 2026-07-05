@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-06-23*
+*Last modified: 2026-07-05*
 
 SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 66 native providers behind one OpenAI-compatible API, including native Anthropic, Gemini, and Bedrock translators. You bring your own provider keys and the model name passes straight through, so you reach 200+ models without waiting on us to add them.
 
@@ -550,6 +550,33 @@ action:
 - `on_exceed: downgrade` swaps the request's model to the firing limit's `downgrade_to` and proceeds. If `downgrade_to` is unset, the request is blocked.
 - Setting only `max_tokens` and leaving `max_cost_usd` unset (or vice versa) is supported. A limit with neither field is a no-op.
 - A hierarchical view (`org`, `team`, `project`, `user`, `model` keys with 80% warning band) is exposed to in-process callers via `HierarchicalBudget` in `hierarchical_budget.rs`. There is no top-level YAML knob for it today; it is wired by the runtime when the gateway tracks spend.
+
+### Model prices
+
+Cost tracking and cost-based routing need a per-model price. SBproxy ships a built-in catalog of current families (GPT-5 / 4.1 / 4o / o-series, Claude 4.x and 3.x, Gemini 2.x and 1.5); a model the catalog does not know is billed at a deliberately high $5 / $5 per million tokens so a budget cap fires early rather than late. You can supply prices two ways, both layered over the catalog.
+
+Inline prices, per model, in USD per million tokens:
+
+```yaml
+- name: gateway
+  action:
+    type: ai_proxy
+    model_prices:
+      claude-haiku-4-5:
+        input_per_million: 1.0
+        output_per_million: 5.0
+      my-local-qwen:
+        input_per_million: 0.0        # self-hosted, no marginal token cost
+        output_per_million: 0.0
+```
+
+Or point at an external rate card in the LiteLLM `model_prices_and_context_window.json` schema (the ecosystem's canonical dataset, 2,900+ models):
+
+```yaml
+    rate_card: /etc/sbproxy/model_prices.json
+```
+
+Refresh the vendored file out of band with `scripts/refresh-model-prices.sh /etc/sbproxy/model_prices.json`; the gateway loads it at config load and never fetches at runtime, so an egress-restricted host is unaffected. Resolution order for a model's price is: `model_prices` (highest), then the rate card, then the built-in catalog, then the $5 / $5 fallback. A missing or malformed rate card is logged and skipped, not fatal. Cache-read and cache-write rates carry through from both sources; the built-in catalog does not yet include them.
 
 ## Virtual API keys
 
