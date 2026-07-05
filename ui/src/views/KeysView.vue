@@ -1,0 +1,497 @@
+<script setup lang="ts">
+import { computed, onMounted, reactive, ref } from "vue";
+import { api, asList, ApiError, type AdminKey, type CreatedKey } from "../api";
+import { useAsync } from "../composables/useAsync";
+import { formatUsd, formatTime, shortId } from "../lib/format";
+import PageHeader from "../components/PageHeader.vue";
+import StatusBadge from "../components/StatusBadge.vue";
+import ErrorState from "../components/ErrorState.vue";
+import EmptyState from "../components/EmptyState.vue";
+import ModalDialog from "../components/ModalDialog.vue";
+import CopyText from "../components/CopyText.vue";
+
+const keysReq = useAsync(() => api.keys());
+const keys = computed<AdminKey[]>(() => asList<AdminKey>(keysReq.data.value, "keys", "items", "data"));
+
+onMounted(keysReq.run);
+
+// ---- helpers ----
+function keyId(k: AdminKey): string {
+  return String(k.id ?? k.prefix ?? k.name ?? "");
+}
+function toList(s: string): string[] {
+  return s
+    .split(/[,\n]/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+function fromList(v: unknown): string {
+  return Array.isArray(v) ? v.join(", ") : "";
+}
+function budgetOf(k: AdminKey): number | undefined {
+  if (typeof k.policy?.budget_usd === "number") return k.policy.budget_usd;
+  const b = k.policy?.budget as any;
+  if (typeof b === "number") return b;
+  if (b && typeof b === "object" && typeof b.usd === "number") return b.usd;
+  return undefined;
+}
+
+// ---- create ----
+const showCreate = ref(false);
+const createForm = reactive({
+  name: "",
+  allowed_models: "",
+  blocked_models: "",
+  allowed_providers: "",
+  blocked_providers: "",
+  budget_usd: "",
+  tags: "",
+  expires_at: "",
+});
+const createBusy = ref(false);
+const createError = ref<ApiError | null>(null);
+const createdToken = ref<string | null>(null);
+const createdMeta = ref<CreatedKey | null>(null);
+
+function resetCreate() {
+  Object.assign(createForm, {
+    name: "",
+    allowed_models: "",
+    blocked_models: "",
+    allowed_providers: "",
+    blocked_providers: "",
+    budget_usd: "",
+    tags: "",
+    expires_at: "",
+  });
+  createError.value = null;
+}
+
+function buildPolicy(f: typeof createForm) {
+  const policy: Record<string, unknown> = {};
+  if (f.allowed_models) policy.allowed_models = toList(f.allowed_models);
+  if (f.blocked_models) policy.blocked_models = toList(f.blocked_models);
+  if (f.allowed_providers) policy.allowed_providers = toList(f.allowed_providers);
+  if (f.blocked_providers) policy.blocked_providers = toList(f.blocked_providers);
+  if (f.budget_usd && !Number.isNaN(Number(f.budget_usd))) {
+    policy.budget_usd = Number(f.budget_usd);
+  }
+  if (f.tags) policy.tags = toList(f.tags);
+  return policy;
+}
+
+async function submitCreate() {
+  createBusy.value = true;
+  createError.value = null;
+  try {
+    const body: Record<string, unknown> = { policy: buildPolicy(createForm) };
+    if (createForm.name) body.name = createForm.name;
+    if (createForm.tags) body.tags = toList(createForm.tags);
+    if (createForm.expires_at) body.expires_at = createForm.expires_at;
+    const created = await api.createKey(body);
+    const token =
+      created?.token ?? created?.plaintext ?? created?.secret ?? created?.key ?? null;
+    createdMeta.value = created;
+    showCreate.value = false;
+    resetCreate();
+    if (token) {
+      createdToken.value = token;
+    }
+    keysReq.run();
+  } catch (e) {
+    createError.value = e instanceof ApiError ? e : new ApiError(0, String(e));
+  } finally {
+    createBusy.value = false;
+  }
+}
+
+// ---- edit policy ----
+const editing = ref<AdminKey | null>(null);
+const editForm = reactive({
+  allowed_models: "",
+  blocked_models: "",
+  allowed_providers: "",
+  blocked_providers: "",
+  budget_usd: "",
+  tags: "",
+});
+const editBusy = ref(false);
+const editError = ref<ApiError | null>(null);
+
+function openEdit(k: AdminKey) {
+  editing.value = k;
+  editError.value = null;
+  Object.assign(editForm, {
+    allowed_models: fromList(k.policy?.allowed_models),
+    blocked_models: fromList(k.policy?.blocked_models),
+    allowed_providers: fromList(k.policy?.allowed_providers),
+    blocked_providers: fromList(k.policy?.blocked_providers),
+    budget_usd: budgetOf(k) !== undefined ? String(budgetOf(k)) : "",
+    tags: fromList(k.tags ?? k.policy?.tags),
+  });
+}
+
+async function submitEdit() {
+  if (!editing.value) return;
+  editBusy.value = true;
+  editError.value = null;
+  try {
+    await api.patchKey(keyId(editing.value), { policy: buildPolicy(editForm as any) });
+    editing.value = null;
+    keysReq.run();
+  } catch (e) {
+    editError.value = e instanceof ApiError ? e : new ApiError(0, String(e));
+  } finally {
+    editBusy.value = false;
+  }
+}
+
+// ---- row actions ----
+const rowBusy = ref<string | null>(null);
+const actionError = ref<string | null>(null);
+
+async function doAction(
+  k: AdminKey,
+  action: "revoke" | "block" | "unblock" | "rotate",
+) {
+  const id = keyId(k);
+  if (action === "revoke" && !confirm(`Revoke key ${id}? This cannot be undone.`)) return;
+  rowBusy.value = id + action;
+  actionError.value = null;
+  try {
+    await api.keyAction(id, action);
+    keysReq.run();
+  } catch (e) {
+    actionError.value = e instanceof ApiError ? `${action}: ${e.hint}` : String(e);
+  } finally {
+    rowBusy.value = null;
+  }
+}
+
+async function doDelete(k: AdminKey) {
+  const id = keyId(k);
+  if (!confirm(`Delete key ${id}? This permanently removes it.`)) return;
+  rowBusy.value = id + "delete";
+  actionError.value = null;
+  try {
+    await api.deleteKey(id);
+    keysReq.run();
+  } catch (e) {
+    actionError.value = e instanceof ApiError ? `delete: ${e.hint}` : String(e);
+  } finally {
+    rowBusy.value = null;
+  }
+}
+
+function statusOf(k: AdminKey): string {
+  if (k.revoked) return "revoked";
+  if (k.blocked) return "blocked";
+  return String(k.status ?? k.state ?? "active");
+}
+</script>
+
+<template>
+  <PageHeader
+    title="Keys"
+    subtitle="API keys and their policy: allowed and blocked models and providers, budget, tags, and expiry."
+  >
+    <template #actions>
+      <button class="sb-btn" @click="keysReq.run">Refresh</button>
+      <button class="sb-btn sb-btn--primary" @click="showCreate = true">Create key</button>
+    </template>
+  </PageHeader>
+
+  <p class="notice" v-if="actionError">{{ actionError }}</p>
+
+  <ErrorState v-if="keysReq.error.value" :error="keysReq.error.value" @retry="keysReq.run" />
+  <EmptyState v-else-if="!keys.length" message="No keys yet.">
+    <button class="sb-btn sb-btn--primary" @click="showCreate = true">Create the first key</button>
+  </EmptyState>
+
+  <div class="table-wrap" v-else>
+    <table class="sb-table">
+      <thead>
+        <tr>
+          <th>Key</th>
+          <th>Status</th>
+          <th>Policy</th>
+          <th>Budget</th>
+          <th>Expiry</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="(k, i) in keys" :key="i">
+          <td>
+            <div class="kname">{{ k.name ?? k.label ?? "(unnamed)" }}</div>
+            <div class="sb-id">{{ shortId(keyId(k)) }}</div>
+            <div class="tags" v-if="(k.tags ?? k.policy?.tags)?.length">
+              <span class="tag" v-for="t in (k.tags ?? k.policy?.tags)" :key="t">{{ t }}</span>
+            </div>
+          </td>
+          <td>
+            <StatusBadge :label="statusOf(k)" />
+            <div v-if="k.rotation_pending" style="margin-top: 4px">
+              <StatusBadge label="rotation pending" tone="warn" />
+            </div>
+          </td>
+          <td class="policy">
+            <div v-if="k.policy?.allowed_models?.length" class="pol">
+              <span class="pol__k">allow models</span>
+              <span class="sb-mono">{{ k.policy.allowed_models.join(", ") }}</span>
+            </div>
+            <div v-if="k.policy?.blocked_models?.length" class="pol">
+              <span class="pol__k pol__k--block">block models</span>
+              <span class="sb-mono">{{ k.policy.blocked_models.join(", ") }}</span>
+            </div>
+            <div v-if="k.policy?.allowed_providers?.length" class="pol">
+              <span class="pol__k">allow providers</span>
+              <span class="sb-mono">{{ k.policy.allowed_providers.join(", ") }}</span>
+            </div>
+            <div v-if="k.policy?.blocked_providers?.length" class="pol">
+              <span class="pol__k pol__k--block">block providers</span>
+              <span class="sb-mono">{{ k.policy.blocked_providers.join(", ") }}</span>
+            </div>
+            <span
+              class="sb-faint"
+              v-if="!k.policy || !Object.keys(k.policy).some((p) => (k.policy as any)[p]?.length)"
+            >
+              no restrictions
+            </span>
+          </td>
+          <td>{{ budgetOf(k) !== undefined ? formatUsd(budgetOf(k)) : "n/a" }}</td>
+          <td>{{ k.expires_at ? formatTime(k.expires_at) : "never" }}</td>
+          <td class="actions">
+            <button class="sb-btn sb-btn--sm" @click="openEdit(k)">Edit</button>
+            <button
+              class="sb-btn sb-btn--sm"
+              :disabled="rowBusy === keyId(k) + 'rotate'"
+              @click="doAction(k, 'rotate')"
+            >
+              Rotate
+            </button>
+            <button
+              v-if="!k.blocked"
+              class="sb-btn sb-btn--sm"
+              :disabled="rowBusy === keyId(k) + 'block'"
+              @click="doAction(k, 'block')"
+            >
+              Block
+            </button>
+            <button
+              v-else
+              class="sb-btn sb-btn--sm"
+              :disabled="rowBusy === keyId(k) + 'unblock'"
+              @click="doAction(k, 'unblock')"
+            >
+              Unblock
+            </button>
+            <button
+              class="sb-btn sb-btn--sm sb-btn--danger"
+              :disabled="rowBusy === keyId(k) + 'revoke'"
+              @click="doAction(k, 'revoke')"
+            >
+              Revoke
+            </button>
+            <button
+              class="sb-btn sb-btn--sm sb-btn--danger"
+              :disabled="rowBusy === keyId(k) + 'delete'"
+              @click="doDelete(k)"
+            >
+              Delete
+            </button>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Create modal -->
+  <ModalDialog v-if="showCreate" title="Create key" @close="showCreate = false">
+    <ErrorState v-if="createError" :error="createError" title="Create failed" @retry="submitCreate" />
+    <form @submit.prevent="submitCreate">
+      <div class="sb-field">
+        <label class="sb-label">Name</label>
+        <input class="sb-input" v-model="createForm.name" placeholder="team-frontend" />
+      </div>
+      <div class="two">
+        <div class="sb-field">
+          <label class="sb-label">Allowed models</label>
+          <input class="sb-input" v-model="createForm.allowed_models" placeholder="comma separated" />
+        </div>
+        <div class="sb-field">
+          <label class="sb-label">Blocked models</label>
+          <input class="sb-input" v-model="createForm.blocked_models" placeholder="comma separated" />
+        </div>
+      </div>
+      <div class="two">
+        <div class="sb-field">
+          <label class="sb-label">Allowed providers</label>
+          <input class="sb-input" v-model="createForm.allowed_providers" placeholder="openai, anthropic" />
+        </div>
+        <div class="sb-field">
+          <label class="sb-label">Blocked providers</label>
+          <input class="sb-input" v-model="createForm.blocked_providers" placeholder="comma separated" />
+        </div>
+      </div>
+      <div class="two">
+        <div class="sb-field">
+          <label class="sb-label">Budget (USD)</label>
+          <input class="sb-input" v-model="createForm.budget_usd" inputmode="decimal" placeholder="100" />
+        </div>
+        <div class="sb-field">
+          <label class="sb-label">Expires at (ISO 8601)</label>
+          <input class="sb-input" v-model="createForm.expires_at" placeholder="2026-12-31T00:00:00Z" />
+        </div>
+      </div>
+      <div class="sb-field">
+        <label class="sb-label">Tags</label>
+        <input class="sb-input" v-model="createForm.tags" placeholder="comma separated" />
+      </div>
+    </form>
+    <template #footer>
+      <button class="sb-btn" @click="showCreate = false">Cancel</button>
+      <button class="sb-btn sb-btn--primary" :disabled="createBusy" @click="submitCreate">
+        {{ createBusy ? "Creating..." : "Create key" }}
+      </button>
+    </template>
+  </ModalDialog>
+
+  <!-- Copy-once token modal -->
+  <ModalDialog v-if="createdToken" title="Key created" @close="createdToken = null">
+    <p class="warn-line">
+      This is the only time the token is shown. Copy it now and store it somewhere safe.
+      It cannot be retrieved again.
+    </p>
+    <CopyText :value="createdToken" mono />
+    <p class="sb-faint" style="margin-top: 12px" v-if="createdMeta?.id">
+      Key id: <span class="sb-mono">{{ createdMeta.id }}</span>
+    </p>
+    <template #footer>
+      <button class="sb-btn sb-btn--primary" @click="createdToken = null">Done</button>
+    </template>
+  </ModalDialog>
+
+  <!-- Edit modal -->
+  <ModalDialog v-if="editing" title="Edit policy" @close="editing = null">
+    <p class="sb-faint" style="margin-bottom: 12px">
+      Editing <span class="sb-mono">{{ shortId(keyId(editing)) }}</span>. Leave a field empty to clear it.
+    </p>
+    <ErrorState v-if="editError" :error="editError" title="Update failed" @retry="submitEdit" />
+    <div class="two">
+      <div class="sb-field">
+        <label class="sb-label">Allowed models</label>
+        <input class="sb-input" v-model="editForm.allowed_models" />
+      </div>
+      <div class="sb-field">
+        <label class="sb-label">Blocked models</label>
+        <input class="sb-input" v-model="editForm.blocked_models" />
+      </div>
+    </div>
+    <div class="two">
+      <div class="sb-field">
+        <label class="sb-label">Allowed providers</label>
+        <input class="sb-input" v-model="editForm.allowed_providers" />
+      </div>
+      <div class="sb-field">
+        <label class="sb-label">Blocked providers</label>
+        <input class="sb-input" v-model="editForm.blocked_providers" />
+      </div>
+    </div>
+    <div class="two">
+      <div class="sb-field">
+        <label class="sb-label">Budget (USD)</label>
+        <input class="sb-input" v-model="editForm.budget_usd" inputmode="decimal" />
+      </div>
+      <div class="sb-field">
+        <label class="sb-label">Tags</label>
+        <input class="sb-input" v-model="editForm.tags" />
+      </div>
+    </div>
+    <template #footer>
+      <button class="sb-btn" @click="editing = null">Cancel</button>
+      <button class="sb-btn sb-btn--primary" :disabled="editBusy" @click="submitEdit">
+        {{ editBusy ? "Saving..." : "Save policy" }}
+      </button>
+    </template>
+  </ModalDialog>
+</template>
+
+<style scoped>
+.table-wrap {
+  border: 1px solid var(--sb-border);
+  border-radius: var(--sb-radius);
+  overflow-x: auto;
+}
+.kname {
+  font-weight: 600;
+}
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+.tag {
+  font-size: 0.72rem;
+  padding: 1px 8px;
+  border-radius: var(--sb-radius-pill);
+  background: var(--sb-surface-2);
+  color: var(--sb-text-muted);
+  border: 1px solid var(--sb-border);
+}
+.policy {
+  min-width: 240px;
+  font-size: 0.8rem;
+}
+.pol {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+.pol__k {
+  color: var(--sb-ok);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  min-width: 96px;
+  flex: none;
+  padding-top: 2px;
+}
+.pol__k--block {
+  color: var(--sb-err);
+}
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  justify-content: flex-end;
+  min-width: 200px;
+}
+.two {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sb-space-3);
+}
+@media (max-width: 560px) {
+  .two {
+    grid-template-columns: 1fr;
+  }
+}
+.warn-line {
+  background: var(--sb-warn-bg);
+  border: 1px solid rgba(180, 83, 9, 0.3);
+  border-radius: var(--sb-radius-sm);
+  padding: 10px 12px;
+  color: var(--sb-warn-fg);
+  font-size: 0.85rem;
+}
+.notice {
+  background: var(--sb-err-bg);
+  border: 1px solid rgba(180, 34, 63, 0.3);
+  border-radius: var(--sb-radius-sm);
+  padding: 8px 12px;
+  color: var(--sb-err);
+  font-size: 0.85rem;
+}
+</style>
