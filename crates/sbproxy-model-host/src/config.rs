@@ -328,6 +328,13 @@ pub struct ServeEntry {
     /// rejected instead.
     #[serde(default)]
     pub pinned: bool,
+    /// vLLM tool-call parser to enable auto tool-choice (WOR-1668), e.g.
+    /// `hermes` (Qwen), `llama3_json`, `mistral`. When set, the engine
+    /// launches with `--enable-auto-tool-choice --tool-call-parser
+    /// <name>` so `tool_choice: auto` requests work; without it vLLM
+    /// rejects auto tool-choice. `None` leaves tool calling off.
+    #[serde(default)]
+    pub tool_call_parser: Option<String>,
 }
 
 /// The `serve:` block: the local models plus host-wide policy.
@@ -651,6 +658,7 @@ models:
             chunked_prefill: None,
             lora_adapters: vec![],
             pinned: false,
+            tool_call_parser: None,
         };
         let json = serde_json::to_value(&e).expect("serialize");
         let obj = json.as_object().expect("object");
