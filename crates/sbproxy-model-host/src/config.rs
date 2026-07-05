@@ -370,6 +370,14 @@ pub struct ServeEntry {
     /// that does not fit can still load. `None` disables offload.
     #[serde(default)]
     pub cpu_offload_gib: Option<u64>,
+    /// Max LoRA adapters resident on the engine at once (WOR-1673).
+    /// When set below the number of configured `lora_adapters`, the
+    /// engine loads adapters on demand and evicts the least-recently
+    /// used past this cap (dynamic paging), rather than preloading all
+    /// of them. `None` preloads every configured adapter (static), which
+    /// suits a small, fixed adapter set.
+    #[serde(default)]
+    pub max_loras: Option<usize>,
 }
 
 /// The `serve:` block: the local models plus host-wide policy.
@@ -441,6 +449,21 @@ impl ServeEntry {
     pub fn serves(&self, name: &str) -> bool {
         self.effective_name().ok().as_deref() == Some(name)
             || self.lora_adapters.iter().any(|a| a.name == name)
+    }
+
+    /// Whether this entry pages LoRA adapters dynamically (WOR-1673):
+    /// `max_loras` is set below the configured adapter count, so the
+    /// engine loads adapters on demand and evicts the LRU past the cap
+    /// rather than preloading all of them.
+    pub fn dynamic_lora(&self) -> bool {
+        matches!(self.max_loras, Some(cap) if cap < self.lora_adapters.len())
+    }
+
+    /// The engine adapter-slot capacity: the configured `max_loras`, or
+    /// the number of adapters when unset (preload-all). At least 1 when
+    /// any adapter is configured.
+    pub fn lora_capacity(&self) -> usize {
+        self.max_loras.unwrap_or(self.lora_adapters.len()).max(1)
     }
 }
 
@@ -665,6 +688,27 @@ models:
     }
 
     #[test]
+    fn lora_dynamic_vs_static_and_capacity() {
+        // WOR-1673: max_loras below the adapter count pages dynamically;
+        // unset (or >= count) preloads all.
+        let dyn_cfg: ModelHostConfig = serde_yaml::from_str(
+            "models:\n  - model: base\n    max_loras: 1\n    lora_adapters:\n      - name: a\n        source: hf:o/a\n      - name: b\n        source: hf:o/b\n",
+        )
+        .unwrap();
+        let e = &dyn_cfg.models[0];
+        assert!(e.dynamic_lora());
+        assert_eq!(e.lora_capacity(), 1);
+
+        let static_cfg: ModelHostConfig = serde_yaml::from_str(
+            "models:\n  - model: base\n    lora_adapters:\n      - name: a\n        source: hf:o/a\n      - name: b\n        source: hf:o/b\n",
+        )
+        .unwrap();
+        let s = &static_cfg.models[0];
+        assert!(!s.dynamic_lora());
+        assert_eq!(s.lora_capacity(), 2);
+    }
+
+    #[test]
     fn embedded_engine_resolves_and_is_in_process() {
         // WOR-1658: `engine: embedded` parses, is a forced choice (Auto
         // never picks it), and marks the in-process launch path.
@@ -767,6 +811,7 @@ models:
             tool_call_parser: None,
             swap_space_gib: None,
             cpu_offload_gib: None,
+            max_loras: None,
         };
         let json = serde_json::to_value(&e).expect("serialize");
         let obj = json.as_object().expect("object");

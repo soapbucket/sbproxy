@@ -257,6 +257,12 @@ pub struct ModelHostRuntime<L: EngineLauncher> {
     /// Lifecycle observer for metrics (WOR-1659). Defaults to a no-op;
     /// the host injects a metrics-recording impl.
     observer: Arc<dyn ModelHostObserver>,
+    /// Per-base-model LoRA adapter LRU caches (WOR-1673), keyed by base
+    /// name. Present only for entries that page adapters dynamically;
+    /// tracks which adapters are loaded on each engine so a request for
+    /// an adapter loads it (evicting the LRU) via the vLLM load/unload
+    /// API. Cleared when the engine is dropped so a respawn reloads.
+    lora_caches: Mutex<HashMap<String, crate::lora::LoraCache>>,
 }
 
 impl<L: EngineLauncher> ModelHostRuntime<L> {
@@ -294,6 +300,7 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
             tick: AtomicU64::new(0),
             health_recheck: false,
             observer: Arc::new(NoopObserver),
+            lora_caches: Mutex::new(HashMap::new()),
         }
     }
 
@@ -430,12 +437,98 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
     ///
     /// `name` may be a served model or one of its LoRA adapters
     /// (WOR-1673); an adapter request brings up (or reuses) the base
-    /// model's engine, which serves the adapter.
+    /// model's engine and, in dynamic-paging mode, loads the adapter on
+    /// that engine (evicting the LRU adapter past the cap).
     pub async fn ensure_ready(&self, name: &str) -> Result<u16, RuntimeError> {
         // Map an adapter name to its base model's engine key; unknown
         // names fall through to the base path and surface UnknownModel.
-        let name_owned = self.base_name_for(name).unwrap_or_else(|| name.to_string());
-        let name = name_owned.as_str();
+        let base = self.base_name_for(name).unwrap_or_else(|| name.to_string());
+        let port = self.ensure_base_ready(&base).await?;
+        // Requested an adapter (not the base): ensure it is loaded on the
+        // engine. A no-op for statically-preloaded adapters.
+        if name != base {
+            self.ensure_adapter_loaded(&base, name, port).await?;
+        }
+        Ok(port)
+    }
+
+    /// Load the LoRA adapter `adapter` on the base engine at `port` if
+    /// it is not already resident, paging out the LRU adapter past the
+    /// engine's `max_loras` cap (WOR-1673). A no-op unless the base
+    /// entry pages adapters dynamically (statically-preloaded adapters
+    /// are already on the engine from launch).
+    async fn ensure_adapter_loaded(
+        &self,
+        base: &str,
+        adapter: &str,
+        port: u16,
+    ) -> Result<(), RuntimeError> {
+        let Some(entry) = self.entry_for(base) else {
+            return Ok(());
+        };
+        if !entry.dynamic_lora() {
+            return Ok(()); // preloaded at launch; nothing to page.
+        }
+        let capacity = entry.lora_capacity();
+        let adapters = entry.lora_adapters.clone();
+        // Decide the load/evict under the cache lock, then release it
+        // before the (slow) HTTP calls so we do not hold it across await
+        // on the engine.
+        let route = {
+            let mut caches = self.lora_caches.lock().await;
+            let cache = caches
+                .entry(base.to_string())
+                .or_insert_with(|| crate::lora::LoraCache::new(base, &adapters, capacity));
+            cache.route(adapter)
+        };
+        use crate::lora::AdapterRoute;
+        let (source, evict) = match route {
+            AdapterRoute::Resident { .. } | AdapterRoute::Base => return Ok(()),
+            AdapterRoute::Unknown => return Err(RuntimeError::UnknownModel(adapter.to_string())),
+            AdapterRoute::Load { source, evict } => (source, evict),
+        };
+        // Free the slot first so a full engine accepts the new adapter,
+        // then load. vLLM's path/name for load is the source with any
+        // `hf:` scheme stripped (it takes an HF repo id or local path).
+        if let Some(victim) = &evict {
+            let body = format!("{{\"lora_name\":\"{victim}\"}}");
+            let _ = crate::launch::post_json(
+                port,
+                "/v1/unload_lora_adapter",
+                &body,
+                std::time::Duration::from_secs(30),
+            )
+            .await;
+        }
+        let path = source.strip_prefix("hf:").unwrap_or(&source);
+        let body = format!("{{\"lora_name\":\"{adapter}\",\"lora_path\":\"{path}\"}}");
+        match crate::launch::post_json(
+            port,
+            "/v1/load_lora_adapter",
+            &body,
+            std::time::Duration::from_secs(120),
+        )
+        .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Roll the cache back so the next request retries the load
+                // rather than assuming this adapter is resident.
+                if let Some(c) = self.lora_caches.lock().await.get_mut(base) {
+                    c.forget(adapter);
+                }
+                Err(RuntimeError::Launch(format!(
+                    "load lora adapter '{adapter}': {e}"
+                )))
+            }
+        }
+    }
+
+    /// Bring the base model `name`'s engine to ready, spawning (and
+    /// evicting to make room) as needed, and return its loopback port.
+    /// `name` here is always a base model name (adapter names are mapped
+    /// to their base by [`Self::ensure_ready`]).
+    async fn ensure_base_ready(&self, name: &str) -> Result<u16, RuntimeError> {
         // Fast path without the spawn lock.
         if let Some(port) = self.ready_and_live(name).await {
             return Ok(port);
@@ -528,6 +621,14 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
             &entry.extra_args,
         );
         spec.args.extend(serving_flags(engine_kind, &entry));
+        // WOR-1673: dynamic adapter paging needs vLLM's runtime LoRA
+        // update endpoints, which are gated behind this env var.
+        if entry.dynamic_lora() {
+            spec.env.push((
+                "VLLM_ALLOW_RUNTIME_LORA_UPDATING".to_string(),
+                "1".to_string(),
+            ));
+        }
 
         let engine_label = engine_kind.binary_name();
         let started = std::time::Instant::now();
@@ -573,6 +674,9 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
             engines.len() as i64
         };
         self.residency.lock().await.unload(name);
+        // The engine is gone; drop its adapter cache so a respawn
+        // reloads adapters rather than assuming stale residency.
+        self.lora_caches.lock().await.remove(name);
         self.observer.set_resident_models(resident);
     }
 
@@ -606,6 +710,9 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
             }
         };
         self.residency.lock().await.unload(name);
+        // Drop the adapter cache: the respawned engine starts with no
+        // adapters loaded, so its cache must too.
+        self.lora_caches.lock().await.remove(name);
         if let Some(resident) = removed {
             self.observer.on_eviction("restart");
             self.observer.set_resident_models(resident);
@@ -782,6 +889,25 @@ mod tests {
         );
         // A second adapter request reuses the same engine (no respawn).
         assert_eq!(rt.ensure_ready("coder").await.unwrap(), port);
+    }
+
+    #[tokio::test]
+    async fn dynamic_lora_paging_brings_up_base_then_loads_adapter() {
+        // WOR-1673: with max_loras below the adapter count, an adapter
+        // request brings up the base engine and then pages the adapter
+        // via the vLLM load API. The test launcher binds no HTTP server,
+        // so the load attempt fails cleanly, proving the dynamic path is
+        // taken (a static config would not attempt any HTTP load).
+        let rt = l4_runtime(config(
+            "models:\n  - model: qwen3-14b\n    max_loras: 1\n    lora_adapters:\n      - name: a\n        source: hf:org/a\n      - name: b\n        source: hf:org/b\n",
+        ));
+        let err = rt.ensure_ready("a").await.unwrap_err();
+        assert!(
+            format!("{err}").contains("load lora"),
+            "expected an adapter-load error, got: {err}"
+        );
+        // The base engine did come up (only the adapter load failed).
+        assert_eq!(rt.resident_models().await, vec!["qwen3-14b".to_string()]);
     }
 
     #[tokio::test]
