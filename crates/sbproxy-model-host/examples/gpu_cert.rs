@@ -42,9 +42,14 @@ fn main() {
         "translators" => {
             translators_cert(args.get(2).map(String::as_str).unwrap_or("Qwen/Qwen3-0.6B"))
         }
+        "embedded" => embedded_cert(
+            args.get(2)
+                .map(String::as_str)
+                .unwrap_or("google/gemma-2-2b-it"),
+        ),
         other => {
             eprintln!(
-                "unknown mode {other}; use probe | weights | serve | runtime | sleepwake | seed-config | llamacpp <gguf-repo> | translators <repo>"
+                "unknown mode {other}; use probe | weights | serve | runtime | sleepwake | seed-config | llamacpp <gguf-repo> | translators <repo> | embedded <repo>"
             );
             std::process::exit(2);
         }
@@ -710,6 +715,62 @@ fn serve(repo: &str, port: u16) {
             std::process::exit(1);
         }
     }
+}
+
+/// Certify the in-process embedded engine (WOR-1658): load `repo` with
+/// mistral.rs, serve it on a loopback port, and get a completion. The
+/// default `repo` is a Gemma model (per the load-Gemma cert); Gemma is
+/// HF-gated, so this needs `HF_TOKEN` in the env. Build with
+/// `--features embedded` (add `gpu-nvidia` to run on the GPU).
+#[cfg(feature = "embedded")]
+fn embedded_cert(repo: &str) {
+    use sbproxy_model_host::embedded::EmbeddedServer;
+    let rt = tokio_rt();
+    let port = 8123u16;
+    println!("loading embedded model {repo} via mistral.rs (Gemma-capable) ...");
+    match rt.block_on(EmbeddedServer::start(repo, port)) {
+        Ok(server) => {
+            println!("PASS: embedded model loaded + serving on {port}");
+            let body = format!(
+                "{{\"model\":\"{repo}\",\"messages\":[{{\"role\":\"user\",\"content\":\"Say hi in one word\"}}],\"max_tokens\":10}}"
+            );
+            let out = std::process::Command::new("curl")
+                .args([
+                    "-sS",
+                    "-m",
+                    "180",
+                    "-w",
+                    "\nHTTP_STATUS:%{http_code}",
+                    &format!("http://127.0.0.1:{port}/v1/chat/completions"),
+                    "-H",
+                    "Content-Type: application/json",
+                    "-d",
+                    &body,
+                ])
+                .output();
+            match out {
+                Ok(o) => {
+                    let text = String::from_utf8_lossy(&o.stdout);
+                    if text.contains("HTTP_STATUS:200") && text.contains("\"content\"") {
+                        println!("PASS: embedded completion returned tokens");
+                    } else {
+                        let head: String = text.chars().take(200).collect();
+                        println!("FAIL: embedded completion -> {head}");
+                    }
+                }
+                Err(e) => println!("FAIL: curl embedded endpoint: {e}"),
+            }
+            rt.block_on(server.shutdown());
+        }
+        Err(e) => println!("FAIL: embedded load: {e} (Gemma is HF-gated; set HF_TOKEN)"),
+    }
+    println!("embedded cert complete");
+}
+
+#[cfg(not(feature = "embedded"))]
+fn embedded_cert(_repo: &str) {
+    eprintln!("build with --features embedded (add gpu-nvidia to run on the GPU)");
+    std::process::exit(2);
 }
 
 fn tokio_rt() -> tokio::runtime::Runtime {

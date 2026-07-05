@@ -364,6 +364,10 @@ pub struct ProcessEngineLauncher {
     pub health_path: String,
     /// Shared handle to the running child so `kill` can reach it.
     child: std::sync::Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
+    /// In-process embedded engine (WOR-1658), when the launched engine is
+    /// `EngineKind::Embedded`. Present only under the `embedded` feature.
+    #[cfg(feature = "embedded")]
+    embedded: std::sync::Arc<tokio::sync::Mutex<Option<crate::embedded::EmbeddedServer>>>,
 }
 
 impl Default for ProcessEngineLauncher {
@@ -372,6 +376,8 @@ impl Default for ProcessEngineLauncher {
             ready_timeout: Duration::from_secs(300),
             health_path: "/health".to_string(),
             child: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            #[cfg(feature = "embedded")]
+            embedded: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }
@@ -397,22 +403,27 @@ impl ProcessEngineLauncher {
         None
     }
 
-    /// Launch the in-process embedded engine (WOR-1658). The engine kind
-    /// is wired end to end (config, plan-time doctor, launch dispatch),
-    /// so `engine: embedded` is a first-class choice; the in-process
-    /// inference backend (a candle server bound to `port`, so the
-    /// runtime routes to it like any other engine) is the remaining
-    /// implementation and is gated behind the `embedded` cargo feature.
-    /// Until it lands this returns a state-accurate error rather than a
-    /// generic spawn failure, and the plan-time
-    /// [`EngineDoctor`](crate::config::EngineDoctor) already flags an
-    /// `embedded` model on a build without the feature.
+    /// Launch the in-process embedded engine (WOR-1658). With the
+    /// `embedded` feature, loads the model with mistral.rs and serves an
+    /// OpenAI endpoint on `port` (so the runtime routes to it like any
+    /// other engine); the model id is the first argv element from
+    /// `build_launch_spec`'s embedded arm. Without the feature it returns
+    /// a state-accurate error (the plan-time
+    /// [`EngineDoctor`](crate::config::EngineDoctor) also flags it).
+    #[cfg(feature = "embedded")]
+    async fn launch_embedded(&self, spec: &LaunchSpec, port: u16) -> Result<u16, String> {
+        let repo = spec
+            .args
+            .first()
+            .ok_or_else(|| "embedded launch spec has no model repo".to_string())?;
+        let server = crate::embedded::EmbeddedServer::start(repo, port).await?;
+        *self.embedded.lock().await = Some(server);
+        Ok(port)
+    }
+
+    #[cfg(not(feature = "embedded"))]
     async fn launch_embedded(&self, _spec: &LaunchSpec, _port: u16) -> Result<u16, String> {
-        if cfg!(feature = "embedded") {
-            Err("engine: embedded is not yet wired to an in-process backend (WOR-1658)".to_string())
-        } else {
-            Err("engine: embedded needs a build with --features embedded (WOR-1658)".to_string())
-        }
+        Err("engine: embedded needs a build with --features embedded (WOR-1658)".to_string())
     }
 }
 
@@ -590,6 +601,13 @@ impl EngineLauncher for ProcessEngineLauncher {
     }
 
     async fn kill(&self) {
+        // WOR-1658: an in-process embedded engine has no child process;
+        // stop its server task and drop the model to free memory.
+        #[cfg(feature = "embedded")]
+        if let Some(server) = self.embedded.lock().await.take() {
+            server.shutdown().await;
+            return;
+        }
         if let Some(mut child) = self.child.lock().await.take() {
             // vLLM forks worker processes (EngineCore) that hold the
             // VRAM, and it double-forks, so neither a parent SIGKILL nor
