@@ -165,6 +165,36 @@ pub fn build_launch_spec(
     }
 }
 
+/// Retarget a llama.cpp launch argv from a Hugging Face download to a
+/// locally pre-fetched GGUF (WOR-1656). Replaces the `--hf-repo <repo>`
+/// pair with `--model <path>`, so llama.cpp loads the file directly and
+/// needs no curl-enabled build or `--hf-file` quant guess. A no-op if
+/// there is no `--hf-repo` in the argv.
+pub fn llama_use_local_model(args: &mut [String], model_path: &std::path::Path) {
+    if let Some(i) = args.iter().position(|a| a == "--hf-repo") {
+        // Replace "--hf-repo" and its value (the next element).
+        args[i] = "--model".to_string();
+        if i + 1 < args.len() {
+            args[i + 1] = model_path.display().to_string();
+        }
+    }
+}
+
+/// Add `--hf-file <file>` to a llama.cpp launch argv (WOR-1656) so a
+/// curl-enabled llama.cpp downloads the right GGUF from a multi-file
+/// repo. Used only when the local pre-fetch is unavailable (the
+/// `weights` feature is off). Inserted right after `--hf-repo`; a no-op
+/// if `--hf-repo` is absent or `--hf-file` is already present.
+pub fn llama_set_hf_file(args: &mut Vec<String>, file: &str) {
+    if args.iter().any(|a| a == "--hf-file") {
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--hf-repo") {
+        args.insert(i + 2, file.to_string());
+        args.insert(i + 2, "--hf-file".to_string());
+    }
+}
+
 /// Map a catalog quant name to vLLM's `--quantization` value, or
 /// `None` when vLLM infers it from the weights (bf16/fp16 safetensors
 /// need no flag).
@@ -716,6 +746,46 @@ mod tests {
     }
 
     #[test]
+    fn llama_local_model_replaces_hf_repo() {
+        // WOR-1656: a pre-fetched GGUF turns --hf-repo into a local
+        // --model (no HF download, no curl needed).
+        let spec = build_launch_spec(
+            EngineKind::LlamaCpp,
+            &model(),
+            &plan("Q4_K_M"),
+            8020,
+            KvCacheQuant::Auto,
+            &[],
+        );
+        let mut args = spec.args;
+        llama_use_local_model(&mut args, std::path::Path::new("/cache/x.gguf"));
+        assert!(!args.iter().any(|a| a == "--hf-repo"));
+        let mi = args.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(args[mi + 1], "/cache/x.gguf");
+    }
+
+    #[test]
+    fn llama_hf_file_inserted_once_after_hf_repo() {
+        // WOR-1656: the download fallback disambiguates a multi-file repo.
+        let spec = build_launch_spec(
+            EngineKind::LlamaCpp,
+            &model(),
+            &plan("Q4_K_M"),
+            8021,
+            KvCacheQuant::Auto,
+            &[],
+        );
+        let mut args = spec.args;
+        llama_set_hf_file(&mut args, "x.gguf");
+        let ri = args.iter().position(|a| a == "--hf-repo").unwrap();
+        assert_eq!(args[ri + 2], "--hf-file");
+        assert_eq!(args[ri + 3], "x.gguf");
+        // Idempotent: a second call does not add a duplicate.
+        llama_set_hf_file(&mut args, "y.gguf");
+        assert_eq!(args.iter().filter(|a| *a == "--hf-file").count(), 1);
+    }
+
+    #[test]
     fn embedded_spec_carries_engine_repo_and_port() {
         // WOR-1658: the embedded spec is tagged as in-process and carries
         // the repo + loopback port the in-process server binds.
@@ -820,6 +890,7 @@ mod tests {
             swap_space_gib: None,
             cpu_offload_gib: None,
             max_loras: None,
+            gguf_file: None,
         }
     }
 

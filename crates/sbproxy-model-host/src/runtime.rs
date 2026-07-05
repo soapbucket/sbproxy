@@ -524,6 +524,49 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         }
     }
 
+    /// Pre-fetch the configured GGUF file for a llama.cpp model
+    /// (WOR-1656) into the weight cache, returning its local path so the
+    /// engine can load it with `--model` instead of downloading via
+    /// `--hf-repo`. Returns `None` when no `gguf_file` is configured, the
+    /// `weights` feature is off, or the fetch fails, in which case the
+    /// caller falls back to the download path.
+    #[cfg(feature = "weights")]
+    async fn prefetch_gguf(
+        &self,
+        entry: &crate::config::ServeEntry,
+        model_ref: &ModelRef,
+    ) -> Option<std::path::PathBuf> {
+        let file = entry.gguf_file.as_deref()?;
+        let cache_root = crate::manifest::resolve_cache_dir(self.config.cache_dir.as_deref(), None);
+        match crate::weights::ensure_weight_file(
+            &cache_root,
+            &model_ref.hf_repo,
+            "main",
+            file,
+            None,
+        )
+        .await
+        {
+            Ok(path) => Some(path),
+            Err(e) => {
+                tracing::warn!(
+                    "model host: GGUF pre-fetch failed for {}/{file}: {e}; falling back to --hf-repo",
+                    model_ref.hf_repo
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(not(feature = "weights"))]
+    async fn prefetch_gguf(
+        &self,
+        _entry: &crate::config::ServeEntry,
+        _model_ref: &ModelRef,
+    ) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// Bring the base model `name`'s engine to ready, spawning (and
     /// evicting to make room) as needed, and return its loopback port.
     /// `name` here is always a base model name (adapter names are mapped
@@ -628,6 +671,20 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                 "VLLM_ALLOW_RUNTIME_LORA_UPDATING".to_string(),
                 "1".to_string(),
             ));
+        }
+        // WOR-1656: for llama.cpp, prefer a locally pre-fetched GGUF over
+        // letting the engine download via `--hf-repo`. That needs a
+        // curl-enabled llama.cpp and, for a multi-file repo, picks the
+        // wrong file. Pre-fetching with our own weight manager and
+        // passing `--model` removes both problems; if we cannot fetch
+        // (the `weights` feature is off), fall back to `--hf-file` so a
+        // curl build at least gets the right file.
+        if engine_kind == crate::config::EngineKind::LlamaCpp {
+            if let Some(local) = self.prefetch_gguf(&entry, &model_ref).await {
+                crate::launch::llama_use_local_model(&mut spec.args, &local);
+            } else if let Some(file) = &entry.gguf_file {
+                crate::launch::llama_set_hf_file(&mut spec.args, file);
+            }
         }
 
         let engine_label = engine_kind.binary_name();
