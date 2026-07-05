@@ -40,15 +40,32 @@ pub enum EngineKind {
     Vllm,
     /// llama.cpp `llama-server`, the low-VRAM / GGUF / edge path.
     LlamaCpp,
+    /// In-process engine (WOR-1658): no subprocess, no external binary.
+    /// The model runs inside the gateway behind the `embedded` cargo
+    /// feature (candle backend), serving over a loopback HTTP port like
+    /// the others so the runtime routes to it unchanged. A build without
+    /// the `embedded` feature accepts the config but fails the launch
+    /// with a clear "rebuild with --features embedded" error.
+    Embedded,
 }
 
 impl EngineKind {
-    /// The binary name looked up on `PATH` for this engine.
+    /// The binary name looked up on `PATH` for this engine. For
+    /// [`EngineKind::Embedded`] this is a sentinel, not a real
+    /// executable: the embedded engine runs in-process and never spawns
+    /// a subprocess, so the name is never resolved on `PATH`.
     pub fn binary_name(self) -> &'static str {
         match self {
             EngineKind::Vllm => "vllm",
             EngineKind::LlamaCpp => "llama-server",
+            EngineKind::Embedded => "embedded",
         }
+    }
+
+    /// Whether this engine runs in-process (no subprocess spawn). Only
+    /// [`EngineKind::Embedded`] does; the launcher dispatches on it.
+    pub fn is_in_process(self) -> bool {
+        matches!(self, EngineKind::Embedded)
     }
 }
 
@@ -69,6 +86,11 @@ pub enum EngineChoice {
     Vllm,
     /// Force llama.cpp.
     LlamaCpp,
+    /// Force the in-process embedded engine (WOR-1658). `Auto` never
+    /// resolves to this; the embedded engine is an explicit opt-in
+    /// because it changes the deployment model (no subprocess) and is
+    /// only present when the `embedded` feature is compiled.
+    Embedded,
 }
 
 impl EngineChoice {
@@ -81,6 +103,7 @@ impl EngineChoice {
         match self {
             EngineChoice::Vllm => EngineKind::Vllm,
             EngineChoice::LlamaCpp => EngineKind::LlamaCpp,
+            EngineChoice::Embedded => EngineKind::Embedded,
             EngineChoice::Auto => {
                 if is_gguf || !container_runtime {
                     EngineKind::LlamaCpp
@@ -97,6 +120,7 @@ impl EngineChoice {
         match self {
             EngineChoice::Vllm => "engine: vllm (forced)",
             EngineChoice::LlamaCpp => "engine: llama_cpp (forced)",
+            EngineChoice::Embedded => "engine: embedded (forced, in-process)",
             EngineChoice::Auto if is_gguf => "auto -> llama_cpp (GGUF weights)",
             EngineChoice::Auto if !container_runtime => {
                 "auto -> llama_cpp (no container runtime for vLLM)"
@@ -553,6 +577,17 @@ impl EngineDoctor {
                     }),
                 )
             }
+            EngineKind::Embedded => {
+                // The in-process engine needs no binary; it needs the
+                // `embedded` feature compiled into this build (WOR-1658).
+                let compiled = cfg!(feature = "embedded");
+                (
+                    compiled,
+                    (!compiled).then(|| {
+                        "engine: embedded needs a build with --features embedded".to_string()
+                    }),
+                )
+            }
         };
         Self {
             model: entry
@@ -616,6 +651,7 @@ models:
     fn engine_binary_names() {
         assert_eq!(EngineKind::Vllm.binary_name(), "vllm");
         assert_eq!(EngineKind::LlamaCpp.binary_name(), "llama-server");
+        assert_eq!(EngineKind::Embedded.binary_name(), "embedded");
     }
 
     #[test]
@@ -626,6 +662,44 @@ models:
             r.is_err(),
             "engine is an allowlisted enum; sglang must reject"
         );
+    }
+
+    #[test]
+    fn embedded_engine_resolves_and_is_in_process() {
+        // WOR-1658: `engine: embedded` parses, is a forced choice (Auto
+        // never picks it), and marks the in-process launch path.
+        let cfg: ModelHostConfig =
+            serde_yaml::from_str("models:\n  - model: qwen3-0.6b\n    engine: embedded\n")
+                .expect("embedded parses");
+        assert_eq!(cfg.models[0].engine, EngineChoice::Embedded);
+        assert_eq!(
+            EngineChoice::Embedded.resolve(false, true),
+            EngineKind::Embedded
+        );
+        assert!(EngineKind::Embedded.is_in_process());
+        assert!(!EngineKind::Vllm.is_in_process());
+        assert!(!EngineKind::LlamaCpp.is_in_process());
+    }
+
+    #[test]
+    fn embedded_doctor_gated_on_feature() {
+        // The plan-time doctor reports an embedded model as runnable only
+        // when the `embedded` feature is compiled; otherwise it blocks
+        // with a clear rebuild hint (WOR-1658).
+        let cfg: ModelHostConfig =
+            serde_yaml::from_str("models:\n  - model: qwen3-0.6b\n    engine: embedded\n").unwrap();
+        let env = EngineEnv::default();
+        let doc = EngineDoctor::for_entry(&cfg.models[0], false, &env);
+        if cfg!(feature = "embedded") {
+            assert!(doc.runnable);
+        } else {
+            assert!(!doc.runnable);
+            assert!(doc
+                .blocker
+                .as_deref()
+                .unwrap()
+                .contains("--features embedded"));
+        }
     }
 
     #[test]
@@ -733,6 +807,7 @@ models:
         for (kind, expect) in [
             (EngineKind::Vllm, "vllm"),
             (EngineKind::LlamaCpp, "llama-server"),
+            (EngineKind::Embedded, "embedded"),
         ] {
             assert_eq!(kind.binary_name(), expect);
         }

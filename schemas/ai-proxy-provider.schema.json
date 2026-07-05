@@ -361,6 +361,13 @@
           "enum": [
             "llama_cpp"
           ]
+        },
+        {
+          "description": "Force the in-process embedded engine (WOR-1658). `Auto` never resolves to this; the embedded engine is an explicit opt-in because it changes the deployment model (no subprocess) and is only present when the `embedded` feature is compiled.",
+          "type": "string",
+          "enum": [
+            "embedded"
+          ]
         }
       ]
     },
