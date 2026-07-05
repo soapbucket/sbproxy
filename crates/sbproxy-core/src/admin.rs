@@ -1668,6 +1668,29 @@ async fn handle_admin_connection(
             auth_header = Some(rest.trim().to_string());
         }
     }
+    // WOR-1715: the built-in admin UI serves a real Vite bundle,
+    // including binary assets (fonts, images, wasm) that the `String`
+    // dispatcher path would corrupt. Serve it on the byte path here,
+    // behind the same Basic-auth gate as every other `/admin/*` route
+    // (the IP filter + rate limiter already ran in the accept loop).
+    if crate::admin_ui::path_is_ours(path) {
+        let authed = auth_header
+            .as_deref()
+            .and_then(decode_basic_auth)
+            .map(|(user, pass)| state.check_auth(&user, &pass))
+            .unwrap_or(false);
+        if !authed {
+            let _ =
+                write_admin_response(sock, 401, "application/json", r#"{"error":"Unauthorized"}"#)
+                    .await;
+            return;
+        }
+        if let Some((status, content_type, bytes)) = crate::admin_ui::dispatch_bytes(method, path) {
+            let _ = write_admin_response_bytes(sock, status, content_type, &bytes).await;
+            return;
+        }
+    }
+
     // Slice the body off the back of the buffer. Only valid when the
     // headers actually terminated; a malformed pre-header read falls
     // back to no body (the route's parser then 400s on missing JSON).
@@ -1730,14 +1753,9 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     None
 }
 
-async fn write_admin_response(
-    mut sock: tokio::net::TcpStream,
-    status: u16,
-    content_type: &str,
-    body: &str,
-) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let reason = match status {
+/// The HTTP reason phrase for the status codes the admin server emits.
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
@@ -1749,22 +1767,42 @@ async fn write_admin_response(
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "OK",
-    };
-    let response = format!(
+    }
+}
+
+async fn write_admin_response(
+    sock: tokio::net::TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    write_admin_response_bytes(sock, status, content_type, body.as_bytes()).await
+}
+
+/// Write an admin response with a raw byte body. `write_admin_response`
+/// is the `&str` convenience wrapper; the admin UI (WOR-1715) uses this
+/// directly so binary assets (fonts, images, wasm) are sent unmodified.
+async fn write_admin_response_bytes(
+    mut sock: tokio::net::TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let header = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {len}\r\n\
          Connection: close\r\n\
          WWW-Authenticate: Basic realm=\"sbproxy admin\"\r\n\
-         \r\n\
-         {body}",
+         \r\n",
         status = status,
-        reason = reason,
+        reason = reason_phrase(status),
         content_type = content_type,
         len = body.len(),
-        body = body,
     );
-    sock.write_all(response.as_bytes()).await?;
+    sock.write_all(header.as_bytes()).await?;
+    sock.write_all(body).await?;
     sock.shutdown().await
 }
 
