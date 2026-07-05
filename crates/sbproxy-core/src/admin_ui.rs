@@ -12,11 +12,11 @@
 //! operators see exactly what to run to enable the embedded UI. The
 //! default cargo build does not require a prior `npm build`.
 //!
-//! [`dispatch_bytes`] returns `(status, content_type, Vec<u8>)` so the
+//! `dispatch_bytes` returns `(status, content_type, Vec<u8>)` so the
 //! admin server can serve a real Vite bundle: binary assets (woff2
 //! fonts, png/webp images, wasm) are returned byte-for-byte, not just
 //! the text assets (HTML, JS, CSS, JSON, SVG, source maps). The older
-//! [`dispatch`] returns a `String` body and is kept for the callers
+//! `dispatch` returns a `String` body and is kept for the callers
 //! that only need text (and for the no-feature 404 path).
 
 /// Path prefix the admin server uses for the built-in UI. Mounted on

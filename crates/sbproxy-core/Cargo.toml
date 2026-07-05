@@ -68,6 +68,9 @@ sbproxy-plugin.workspace = true
 sbproxy-config.workspace = true
 sbproxy-tls.workspace = true
 sbproxy-modules.workspace = true
+# WOR-1717: optional TLS on the hand-rolled admin listener.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 # WOR-819: REST <-> gRPC transcoding is driven from the request pipeline
 # (proxy_http.rs) using the descriptor-backed Transcoder; the compiled
 # transcoder lives on the `grpc` action in sbproxy-modules but its methods

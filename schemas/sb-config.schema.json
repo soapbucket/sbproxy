@@ -1249,6 +1249,36 @@
             "string",
             "null"
           ]
+        },
+        "tls": {
+          "description": "Optional TLS for the admin server (WOR-1717). When set, the admin endpoint and the built-in UI are served over HTTPS using the PEM certificate and key at the configured paths, instead of plaintext HTTP. Leave unset to serve plaintext (loopback default).",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AdminTlsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "AdminTlsConfig": {
+      "description": "TLS material for the admin server (WOR-1717): filesystem paths to a PEM certificate chain and its matching private key. Both are required together; supplying `tls` makes the admin server, including the built-in UI, serve HTTPS instead of plaintext HTTP.",
+      "type": "object",
+      "required": [
+        "cert",
+        "key"
+      ],
+      "properties": {
+        "cert": {
+          "description": "Path to the PEM certificate chain file.",
+          "type": "string"
+        },
+        "key": {
+          "description": "Path to the PEM private key file (PKCS#8 or RSA).",
+          "type": "string"
         }
       }
     },

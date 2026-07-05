@@ -1939,6 +1939,24 @@ pub struct AdminConfig {
     /// Absent means PR3-style ephemeral mutations.
     #[serde(default)]
     pub prompt_persistence_path: Option<std::path::PathBuf>,
+    /// Optional TLS for the admin server (WOR-1717). When set, the admin
+    /// endpoint and the built-in UI are served over HTTPS using the PEM
+    /// certificate and key at the configured paths, instead of plaintext
+    /// HTTP. Leave unset to serve plaintext (loopback default).
+    #[serde(default)]
+    pub tls: Option<AdminTlsConfig>,
+}
+
+/// TLS material for the admin server (WOR-1717): filesystem paths to a
+/// PEM certificate chain and its matching private key. Both are required
+/// together; supplying `tls` makes the admin server, including the
+/// built-in UI, serve HTTPS instead of plaintext HTTP.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct AdminTlsConfig {
+    /// Path to the PEM certificate chain file.
+    pub cert: std::path::PathBuf,
+    /// Path to the PEM private key file (PKCS#8 or RSA).
+    pub key: std::path::PathBuf,
 }
 
 fn default_admin_port() -> u16 {
