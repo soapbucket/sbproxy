@@ -128,7 +128,10 @@ fn build_runtime(config: &AiHandlerConfig) -> Option<Arc<ModelHostRuntime<Proces
         Catalog::builtin(),
         make_probe(),
         metadata,
-        Box::new(ProcessEngineLauncher::default),
+        // A cold weight-load + engine warm-up can take minutes; give the
+        // readiness probe a generous budget so the first request does
+        // not fail over while the engine is still loading.
+        Box::new(|| ProcessEngineLauncher::with_timeout(std::time::Duration::from_secs(600))),
         // Container-runtime detection is a later refinement; the binary
         // path is the default and llama.cpp/vLLM resolve from PATH.
         false,
