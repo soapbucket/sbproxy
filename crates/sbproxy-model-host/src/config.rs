@@ -321,6 +321,13 @@ pub struct ServeEntry {
     /// LoRA adapters served over this base model.
     #[serde(default)]
     pub lora_adapters: Vec<LoraAdapter>,
+    /// Keep this model resident: it is never evicted to make room for
+    /// another (WOR-1672). Use for a latency-critical model that must
+    /// stay hot. A set of pinned models is therefore never split.
+    /// Admitting a new model that only fits by evicting a pinned one is
+    /// rejected instead.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// The `serve:` block: the local models plus host-wide policy.
@@ -643,6 +650,7 @@ models:
             speculative: None,
             chunked_prefill: None,
             lora_adapters: vec![],
+            pinned: false,
         };
         let json = serde_json::to_value(&e).expect("serialize");
         let obj = json.as_object().expect("object");

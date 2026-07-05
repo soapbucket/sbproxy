@@ -302,6 +302,11 @@
           "items": {
             "$ref": "#/definitions/LoraAdapter"
           }
+        },
+        "pinned": {
+          "description": "Keep this model resident: it is never evicted to make room for another (WOR-1672). Use for a latency-critical model that must stay hot. A set of pinned models is therefore never split. Admitting a new model that only fits by evicting a pinned one is rejected instead.",
+          "default": false,
+          "type": "boolean"
         }
       }
     },
