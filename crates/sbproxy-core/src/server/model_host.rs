@@ -73,6 +73,9 @@ impl sbproxy_model_host::ModelHostObserver for MetricsObserver {
     fn set_resident_adapters(&self, count: i64) {
         sbproxy_observe::metrics::set_model_host_resident_adapters(count);
     }
+    fn on_ensure_failed(&self, _model: &str, reason: &'static str) {
+        sbproxy_observe::metrics::record_model_host_ensure_failure(reason);
+    }
 }
 
 /// The GPU probe for the runtime, selected at compile time.

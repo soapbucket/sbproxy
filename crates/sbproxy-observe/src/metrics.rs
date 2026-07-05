@@ -2903,6 +2903,26 @@ pub fn set_model_host_resident_adapters(count: i64) {
     gauge.set(count);
 }
 
+/// Bringing a model to ready failed (WOR-1711):
+/// `sbproxy_model_host_ensure_failures_total{reason}`. `reason` is one of
+/// `unknown_model`, `resolve`, `no_metadata`, `fit`, `residency`, `port`,
+/// `launch`, distinguishing a model that cannot fit the GPU from an
+/// engine that crash-loops.
+pub fn record_model_host_ensure_failure(reason: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_model_host_ensure_failures_total",
+            "Model ensure-ready failures by reason",
+            &["reason"],
+        )
+        .expect("model host ensure-failures counter registers")
+    });
+    counter.with_label_values(&[reason]).inc();
+}
+
 /// Set the request queue depth while an engine loads on
 /// `sbproxy_model_host_load_queue_depth{model}` (requests parked
 /// waiting for a cold model to become Ready).
