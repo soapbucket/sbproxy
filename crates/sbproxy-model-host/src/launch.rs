@@ -113,8 +113,8 @@ pub fn build_launch_spec(
         }
         EngineKind::LlamaCpp => {
             // `llama-server --hf-repo <repo> --host 127.0.0.1
-            //   --port <p> --ctx-size <ctx>` (GGUF quant is selected
-            // by the file in the repo, not a flag).
+            //   --port <p> --ctx-size <ctx> --n-gpu-layers 999` (GGUF
+            // quant is selected by the file in the repo, not a flag).
             args.push("--hf-repo".to_string());
             args.push(model.hf_repo.clone());
             args.push("--host".to_string());
@@ -123,6 +123,13 @@ pub fn build_launch_spec(
             args.push(port.to_string());
             args.push("--ctx-size".to_string());
             args.push(plan.seq_len.to_string());
+            // WOR-1656: offload all layers to the GPU. Without this
+            // llama.cpp runs CPU-only; 999 means "as many as fit" and
+            // llama.cpp clamps to the model's layer count. A build
+            // without CUDA ignores it and stays on CPU, so it is safe on
+            // any host.
+            args.push("--n-gpu-layers".to_string());
+            args.push("999".to_string());
             if let Some(t) = llama_cache_type(kv_quant) {
                 // Quantize both K and V caches.
                 args.push("--cache-type-k".to_string());
@@ -200,9 +207,14 @@ pub fn serving_flags(engine: EngineKind, entry: &crate::config::ServeEntry) -> V
     // every plane routes with), not the underlying HF repo id. Without
     // this vLLM serves under the repo path and a request for the served
     // name 404s. `--served-model-name` makes the engine accept the name.
+    // WOR-1673: also list the LoRA adapter names, so a request that
+    // addresses an adapter is accepted by the same engine.
     if let Ok(name) = entry.effective_name() {
         args.push("--served-model-name".to_string());
         args.push(name);
+        for adapter in &entry.lora_adapters {
+            args.push(adapter.name.clone());
+        }
     }
     // WOR-1668: tool calling. vLLM rejects `tool_choice: auto` unless
     // launched with an auto-tool-choice parser; the parser is
@@ -212,6 +224,17 @@ pub fn serving_flags(engine: EngineKind, entry: &crate::config::ServeEntry) -> V
         args.push("--enable-auto-tool-choice".to_string());
         args.push("--tool-call-parser".to_string());
         args.push(parser.clone());
+    }
+    // WOR-1687: KV-cache tiering to CPU. `--swap-space` sizes the CPU
+    // pool vLLM spills GPU KV blocks into under pressure; `--cpu-offload-gb`
+    // keeps that many GiB of weights in CPU RAM.
+    if let Some(gib) = entry.swap_space_gib {
+        args.push("--swap-space".to_string());
+        args.push(gib.to_string());
+    }
+    if let Some(gib) = entry.cpu_offload_gib {
+        args.push("--cpu-offload-gb".to_string());
+        args.push(gib.to_string());
     }
     // Speculative decoding.
     if let Some(spec) = &entry.speculative {
@@ -596,6 +619,13 @@ mod tests {
         assert_eq!(spec.args[ri + 1], "Qwen/Qwen3-14B");
         let ci = spec.args.iter().position(|a| a == "--ctx-size").unwrap();
         assert_eq!(spec.args[ci + 1], "8192");
+        // WOR-1656: offload to the GPU.
+        let gi = spec
+            .args
+            .iter()
+            .position(|a| a == "--n-gpu-layers")
+            .unwrap();
+        assert_eq!(spec.args[gi + 1], "999");
     }
 
     #[test]
@@ -662,6 +692,8 @@ mod tests {
             lora_adapters: loras,
             pinned: false,
             tool_call_parser: None,
+            swap_space_gib: None,
+            cpu_offload_gib: None,
         }
     }
 
@@ -710,6 +742,37 @@ mod tests {
         assert_eq!(f[m + 1], "2048");
         assert!(f.iter().any(|a| a == "--enable-lora"));
         assert!(f.iter().any(|a| a == "bot=hf:org/bot"));
+    }
+
+    #[test]
+    fn serving_flags_served_name_includes_adapters() {
+        // WOR-1673: the engine answers to the base name and every
+        // adapter name, so an adapter-addressed request is accepted.
+        let e = entry_with(
+            None,
+            None,
+            vec![crate::config::LoraAdapter {
+                name: "coder".into(),
+                source: "hf:org/coder".into(),
+            }],
+        );
+        let f = serving_flags(EngineKind::Vllm, &e);
+        let i = f.iter().position(|a| a == "--served-model-name").unwrap();
+        assert_eq!(f[i + 1], "qwen3-8b");
+        assert_eq!(f[i + 2], "coder");
+    }
+
+    #[test]
+    fn serving_flags_kv_tiering() {
+        // WOR-1687: swap_space / cpu_offload emit the CPU-tier flags.
+        let mut e = entry_with(None, None, vec![]);
+        e.swap_space_gib = Some(16);
+        e.cpu_offload_gib = Some(8);
+        let f = serving_flags(EngineKind::Vllm, &e);
+        let s = f.iter().position(|a| a == "--swap-space").unwrap();
+        assert_eq!(f[s + 1], "16");
+        let c = f.iter().position(|a| a == "--cpu-offload-gb").unwrap();
+        assert_eq!(f[c + 1], "8");
     }
 
     #[test]

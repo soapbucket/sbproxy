@@ -315,6 +315,26 @@
             "string",
             "null"
           ]
+        },
+        "swap_space_gib": {
+          "description": "CPU KV-cache tier size in GiB (WOR-1687): vLLM's `--swap-space`, the CPU pool it spills GPU KV blocks to under pressure so a longer effective context / larger batch survives beyond GPU VRAM. `None` uses the engine default.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cpu_offload_gib": {
+          "description": "GiB of model weights to keep in CPU RAM (WOR-1687): vLLM's `--cpu-offload-gb`, trading PCIe bandwidth for VRAM so a model that does not fit can still load. `None` disables offload.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
         }
       }
     },

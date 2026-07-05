@@ -335,6 +335,17 @@ pub struct ServeEntry {
     /// rejects auto tool-choice. `None` leaves tool calling off.
     #[serde(default)]
     pub tool_call_parser: Option<String>,
+    /// CPU KV-cache tier size in GiB (WOR-1687): vLLM's `--swap-space`,
+    /// the CPU pool it spills GPU KV blocks to under pressure so a
+    /// longer effective context / larger batch survives beyond GPU
+    /// VRAM. `None` uses the engine default.
+    #[serde(default)]
+    pub swap_space_gib: Option<u64>,
+    /// GiB of model weights to keep in CPU RAM (WOR-1687): vLLM's
+    /// `--cpu-offload-gb`, trading PCIe bandwidth for VRAM so a model
+    /// that does not fit can still load. `None` disables offload.
+    #[serde(default)]
+    pub cpu_offload_gib: Option<u64>,
 }
 
 /// The `serve:` block: the local models plus host-wide policy.
@@ -398,6 +409,15 @@ impl ServeEntry {
         }
         Ok(self.model.clone())
     }
+
+    /// Whether this entry serves `name`, i.e. `name` is its effective
+    /// name or one of its LoRA adapter names (WOR-1673). An adapter is
+    /// served by its base model's engine, so a request addressing an
+    /// adapter routes to the base entry.
+    pub fn serves(&self, name: &str) -> bool {
+        self.effective_name().ok().as_deref() == Some(name)
+            || self.lora_adapters.iter().any(|a| a.name == name)
+    }
 }
 
 impl ModelHostConfig {
@@ -406,9 +426,12 @@ impl ModelHostConfig {
         self.models.is_empty()
     }
 
-    /// The registered model names, in order (WOR-1683). The provider's
+    /// The registered model names, in order (WOR-1683): each serve
+    /// entry's name plus its LoRA adapter names (WOR-1673), since a
+    /// request may address an adapter directly. The provider's
     /// `models:` list is derived from this when `serve:` is present.
-    /// Errors on a nameless raw reference or a duplicate name.
+    /// Errors on a nameless raw reference or a duplicate name (base or
+    /// adapter).
     pub fn model_names(&self) -> Result<Vec<String>, String> {
         let mut names = Vec::with_capacity(self.models.len());
         let mut seen = std::collections::HashSet::new();
@@ -418,6 +441,15 @@ impl ModelHostConfig {
                 return Err(format!("duplicate serve model name '{name}'"));
             }
             names.push(name);
+            for adapter in &entry.lora_adapters {
+                if !seen.insert(adapter.name.clone()) {
+                    return Err(format!(
+                        "duplicate serve model name '{}' (LoRA adapter)",
+                        adapter.name
+                    ));
+                }
+                names.push(adapter.name.clone());
+            }
         }
         Ok(names)
     }
@@ -659,6 +691,8 @@ models:
             lora_adapters: vec![],
             pinned: false,
             tool_call_parser: None,
+            swap_space_gib: None,
+            cpu_offload_gib: None,
         };
         let json = serde_json::to_value(&e).expect("serialize");
         let obj = json.as_object().expect("object");
