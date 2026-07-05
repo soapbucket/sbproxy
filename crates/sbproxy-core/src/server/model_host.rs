@@ -29,7 +29,7 @@ use sbproxy_ai::local_host::{resolve_served_base_url, LocalModelHost};
 use sbproxy_ai::AiHandlerConfig;
 use sbproxy_model_host::{
     Catalog, ConfigDirMetadataProvider, GpuProbe, ModelHostConfig, ModelHostRuntime,
-    ProcessEngineLauncher, StaticGpuProbe,
+    ProcessEngineLauncher,
 };
 
 /// Built once from the first config that declares any `serve:` block;
@@ -78,7 +78,7 @@ fn make_probe() -> Arc<dyn GpuProbe> {
         // so a serve: provider on a CPU-only build fails with a clear
         // "residency" error instead of launching an engine that cannot
         // fit. Building with --features gpu-nvidia enables real serving.
-        Arc::new(StaticGpuProbe::new(Vec::new()))
+        Arc::new(sbproxy_model_host::StaticGpuProbe::new(Vec::new()))
     }
 }
 

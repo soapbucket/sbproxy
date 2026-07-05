@@ -196,6 +196,14 @@ pub fn serving_flags(engine: EngineKind, entry: &crate::config::ServeEntry) -> V
     if engine != EngineKind::Vllm {
         return args;
     }
+    // WOR-1680/1683: the engine must answer to the served *name* (the id
+    // every plane routes with), not the underlying HF repo id. Without
+    // this vLLM serves under the repo path and a request for the served
+    // name 404s. `--served-model-name` makes the engine accept the name.
+    if let Ok(name) = entry.effective_name() {
+        args.push("--served-model-name".to_string());
+        args.push(name);
+    }
     // Speculative decoding.
     if let Some(spec) = &entry.speculative {
         use crate::config::SpecMethod;
