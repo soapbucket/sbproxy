@@ -348,6 +348,25 @@ pub fn record_realtime_frame(provider: &str, direction: &str, kind: &str) {
         .inc();
 }
 
+static AI_PRICE_SOURCE: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_price_source_total",
+            "Cost estimates by the price-table layer that produced the price (WOR-1710)"
+        ),
+        &["source"]
+    )
+    .unwrap()
+});
+
+/// Record which price-table layer produced a request's cost (WOR-1710).
+/// `source` is `config`, `rate_card`, `catalog`, or `fallback`. A high
+/// `fallback` share signals a stale catalog or a missing rate card, so
+/// reported cost is the pessimistic $5/$5 default rather than real.
+pub fn record_price_source(source: &str) {
+    AI_PRICE_SOURCE.with_label_values(&[source]).inc();
+}
+
 // --- Shadow supervisor metrics ---
 
 static AI_SHADOW_INFLIGHT: LazyLock<Gauge> = LazyLock::new(|| {

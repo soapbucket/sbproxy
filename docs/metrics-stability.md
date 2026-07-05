@@ -361,6 +361,18 @@ Buckets: `0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0`. Matches the bucket s
 
 ---
 
+#### `sbproxy_ai_price_source_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **alpha** |
+| Description | Cost estimates by the price-table layer that produced the price (WOR-1710). A high `fallback` share means models are being billed at the pessimistic $5/$5 default, a stale-catalog or missing-rate-card signal. |
+
+**Labels:** `source` (`config`, `rate_card`, `catalog`, `fallback`).
+
+---
+
 #### `sbproxy_ai_cost_usd_micros_total`
 
 | Property | Value |
