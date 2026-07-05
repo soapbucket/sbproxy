@@ -378,6 +378,16 @@ pub struct ServeEntry {
     /// suits a small, fixed adapter set.
     #[serde(default)]
     pub max_loras: Option<usize>,
+    /// For a llama.cpp GGUF model, the exact GGUF filename to serve from
+    /// a multi-file repo (WOR-1656), e.g.
+    /// `Qwen2.5-0.5B-Instruct-Q4_K_M.gguf`. With the `weights` feature
+    /// sbproxy pre-fetches this file and passes llama.cpp a local
+    /// `--model`, so it needs no curl-enabled build and never guesses
+    /// the quant. Without pre-fetch it becomes `--hf-file` so llama.cpp
+    /// downloads the right file. `None` lets llama.cpp resolve the repo
+    /// default (fine only for a single-file repo).
+    #[serde(default)]
+    pub gguf_file: Option<String>,
 }
 
 /// The `serve:` block: the local models plus host-wide policy.
@@ -812,6 +822,7 @@ models:
             swap_space_gib: None,
             cpu_offload_gib: None,
             max_loras: None,
+            gguf_file: None,
         };
         let json = serde_json::to_value(&e).expect("serialize");
         let obj = json.as_object().expect("object");
