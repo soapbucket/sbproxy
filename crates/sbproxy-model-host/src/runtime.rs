@@ -29,7 +29,7 @@ use tokio::sync::Mutex;
 
 use crate::catalog::{Catalog, ModelRef};
 use crate::config::ModelHostConfig;
-use crate::fit::{plan_fit_auto, GpuProbe, ModelMetadata, DEFAULT_OVERHEAD};
+use crate::fit::{plan_fit_auto_kv, GpuProbe, ModelMetadata, DEFAULT_OVERHEAD};
 use crate::launch::{build_launch_spec, serving_flags};
 use crate::residency::ResidencyManager;
 use crate::supervisor::{BackoffPolicy, EngineLauncher, Supervisor};
@@ -454,8 +454,20 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
 
         let candidates = self.candidate_quants(&model_ref);
         let seq_len = entry.max_context.unwrap_or(meta.max_context);
-        let plan = plan_fit_auto(&*self.probe, &meta, &candidates, seq_len, DEFAULT_OVERHEAD)
-            .map_err(|e| RuntimeError::Fit(e.to_string()))?;
+        // WOR-1676: if the entry quantizes the KV cache, the planner
+        // spends the smaller KV term on the fit (so a card can hold a
+        // context it could not at f16 KV). `bytes_per_element()` is
+        // `None` for Auto/F16, which follows the weight quant's default.
+        let kv_bpe = entry.kv_quant.bytes_per_element();
+        let plan = plan_fit_auto_kv(
+            &*self.probe,
+            &meta,
+            &candidates,
+            seq_len,
+            DEFAULT_OVERHEAD,
+            kv_bpe,
+        )
+        .map_err(|e| RuntimeError::Fit(e.to_string()))?;
 
         let engine_kind = entry.engine.resolve(
             looks_gguf(&plan.quant_name, &model_ref.hf_repo),
