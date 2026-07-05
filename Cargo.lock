@@ -6533,6 +6533,7 @@ dependencies = [
  "sbproxy-keystore",
  "sbproxy-mesh",
  "sbproxy-middleware",
+ "sbproxy-model-host",
  "sbproxy-modules",
  "sbproxy-observe",
  "sbproxy-openapi",
