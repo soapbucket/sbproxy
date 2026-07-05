@@ -651,6 +651,7 @@ mod tests {
             speculative: spec,
             chunked_prefill: cp,
             lora_adapters: loras,
+            pinned: false,
         }
     }
 

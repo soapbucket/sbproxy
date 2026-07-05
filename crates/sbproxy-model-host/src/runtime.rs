@@ -475,12 +475,22 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         );
 
         // Admit against the VRAM budget, evicting the models the
-        // residency manager chooses.
+        // residency manager chooses. WOR-1672: use the cost-minimizing
+        // solver, not plain LRU. Reload cost is dominated by weight
+        // size (a 2026 multi-model-scheduler study), so estimate it from
+        // the planned VRAM; `pinned` entries are never evicted.
         let now = self.next_tick();
+        let reload_cost_ms = reload_cost_ms_for(plan.estimated_vram_bytes);
         let evicted = {
             let mut res = self.residency.lock().await;
-            res.load(name, plan.estimated_vram_bytes, now)
-                .map_err(RuntimeError::Residency)?
+            res.load_managed(
+                name,
+                plan.estimated_vram_bytes,
+                now,
+                reload_cost_ms,
+                entry.pinned,
+            )
+            .map_err(RuntimeError::Residency)?
         };
         for victim in evicted {
             if let Some(mut handle) = self.engines.lock().await.remove(&victim) {
@@ -613,6 +623,16 @@ fn looks_gguf(quant_name: &str, hf_repo: &str) -> bool {
     let gguf_quant = q.starts_with('q')
         && (q.contains("_k") || q.ends_with("_0") || q.ends_with("_1") || q.contains("_k_"));
     gguf_quant || hf_repo.to_ascii_lowercase().contains("gguf")
+}
+
+/// Estimate an engine's reload cost from its VRAM footprint (WOR-1672).
+/// Preemption cost is dominated by reloading the weights, so a bigger
+/// model costs more to bring back; this is a size proxy (roughly
+/// milliseconds at ~1 GB/s effective load bandwidth) that the residency
+/// solver uses to break ties among equally-idle models. Recency still
+/// dominates the eviction decision.
+fn reload_cost_ms_for(vram_bytes: u64) -> u64 {
+    vram_bytes / (1024 * 1024)
 }
 
 /// Allocate a free loopback port by binding `:0` and releasing it. The
