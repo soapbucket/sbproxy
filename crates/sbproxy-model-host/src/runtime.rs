@@ -336,20 +336,28 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         self.tick.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// The serve entry registered under `name`.
+    /// The serve entry that serves `name` (its base name or a LoRA
+    /// adapter name, WOR-1673).
     fn entry_for(&self, name: &str) -> Option<&crate::config::ServeEntry> {
-        self.config
-            .models
-            .iter()
-            .find(|e| e.effective_name().ok().as_deref() == Some(name))
+        self.config.models.iter().find(|e| e.serves(name))
     }
 
-    /// The loopback base URL for a ready model, or `None` when it is
-    /// not resident/ready.
+    /// The base engine key for `name`: `name`'s own base name, or, when
+    /// `name` is a LoRA adapter, its base model's name. Engines are
+    /// keyed by base name (one engine serves the base and all its
+    /// adapters), so this is the lookup key for a request. `None` when
+    /// nothing serves `name`.
+    fn base_name_for(&self, name: &str) -> Option<String> {
+        self.entry_for(name).and_then(|e| e.effective_name().ok())
+    }
+
+    /// The loopback base URL for a ready model (or a ready adapter of
+    /// it), or `None` when it is not resident/ready.
     pub async fn resolved_base_url(&self, name: &str) -> Option<String> {
+        let base = self.base_name_for(name)?;
         let engines = self.engines.lock().await;
         engines
-            .get(name)
+            .get(&base)
             .filter(|h| h.supervisor.state().is_ready())
             .map(|h| format!("http://127.0.0.1:{}/v1", h.port))
     }
@@ -419,7 +427,15 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
     /// Bring `name` to ready, spawning (and evicting to make room) as
     /// needed, and return its loopback port. Idempotent: an
     /// already-ready model returns its port without respawning.
+    ///
+    /// `name` may be a served model or one of its LoRA adapters
+    /// (WOR-1673); an adapter request brings up (or reuses) the base
+    /// model's engine, which serves the adapter.
     pub async fn ensure_ready(&self, name: &str) -> Result<u16, RuntimeError> {
+        // Map an adapter name to its base model's engine key; unknown
+        // names fall through to the base path and surface UnknownModel.
+        let name_owned = self.base_name_for(name).unwrap_or_else(|| name.to_string());
+        let name = name_owned.as_str();
         // Fast path without the spawn lock.
         if let Some(port) = self.ready_and_live(name).await {
             return Ok(port);
@@ -740,6 +756,32 @@ mod tests {
         fn set_gpu_stats(&self, _d: &str, _t: u64, _f: u64, _u: f64) {
             self.gpu_reports.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test]
+    async fn adapter_request_routes_to_base_engine() {
+        // WOR-1673: a request addressing a LoRA adapter brings up (and
+        // reuses) the base model's engine and resolves to its port.
+        let rt = l4_runtime(config(
+            "models:\n  - model: qwen3-14b\n    lora_adapters:\n      - name: coder\n        source: hf:org/coder\n",
+        ));
+        let port = rt
+            .ensure_ready("coder")
+            .await
+            .expect("adapter routes to base");
+        // The engine is keyed by the base model, not the adapter.
+        assert_eq!(rt.resident_models().await, vec!["qwen3-14b".to_string()]);
+        // Both the adapter name and the base name resolve to that engine.
+        assert_eq!(
+            rt.resolved_base_url("coder").await,
+            Some(format!("http://127.0.0.1:{port}/v1"))
+        );
+        assert_eq!(
+            rt.resolved_base_url("qwen3-14b").await,
+            Some(format!("http://127.0.0.1:{port}/v1"))
+        );
+        // A second adapter request reuses the same engine (no respawn).
+        assert_eq!(rt.ensure_ready("coder").await.unwrap(), port);
     }
 
     #[tokio::test]
