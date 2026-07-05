@@ -19,6 +19,14 @@ weights = ["dep:reqwest"]
 # chat-template rendering. Off by default; both crates are already in
 # the workspace (extension/classifiers), so this adds no new lock deps.
 tokenizer = ["dep:tokenizers", "dep:minijinja"]
+# In-process embedded engine (WOR-1658): runs a model inside the gateway
+# with no subprocess, for a single-binary / zero-external-engine deploy.
+# Off by default and, today, a reserved gate: the EngineKind::Embedded
+# dispatch, config, and plan-time doctor are wired, but the candle
+# inference backend it will pull is the remaining implementation, so
+# enabling this alone does not yet serve. It carries no deps until that
+# backend lands, keeping the default build and lockfile unchanged.
+embedded = []
 
 [dependencies]
 serde = { workspace = true }

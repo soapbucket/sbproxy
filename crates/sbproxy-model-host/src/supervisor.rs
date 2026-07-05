@@ -67,7 +67,13 @@ impl EngineState {
 /// crate treats it as opaque data the launcher consumes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LaunchSpec {
-    /// Executable resolved from PATH (or a pinned release).
+    /// The engine this spec launches. The launcher dispatches on it:
+    /// an in-process engine ([`crate::config::EngineKind::Embedded`])
+    /// starts a server inside the process instead of spawning
+    /// `program` (WOR-1658).
+    pub engine: crate::config::EngineKind,
+    /// Executable resolved from PATH (or a pinned release). Unused for
+    /// an in-process engine.
     pub program: String,
     /// Full argument vector (already templated; no shell parsing).
     pub args: Vec<String>,
@@ -284,6 +290,7 @@ mod tests {
 
     fn spec() -> LaunchSpec {
         LaunchSpec {
+            engine: crate::config::EngineKind::Vllm,
             program: "vllm".into(),
             args: vec!["serve".into(), "Qwen/Qwen3-14B".into()],
             env: vec![],

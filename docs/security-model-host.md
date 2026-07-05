@@ -29,11 +29,14 @@ in `sbproxy-model-host::config`:
 - **No arbitrary command.** There is no `cmd:`, `command:`,
   `program:`, `binary:`, `exec:`, or `shell:` field anywhere in the
   `serve:` block. The only executable-selecting key is `engine`, an
-  allowlisted enum (`vllm`, `llama_cpp`). Config chooses among a fixed
-  set; it cannot introduce a new executable.
+  allowlisted enum (`vllm`, `llama_cpp`, `embedded`). Config chooses
+  among a fixed set; it cannot introduce a new executable. `embedded`
+  spawns no subprocess at all (it runs in-process), so it removes the
+  spawn surface rather than adding to it.
 - **Fixed engine-to-binary mapping.** Each `EngineKind` resolves to
-  one hard-coded binary name (`vllm`, `llama-server`). There is no
-  config path that supplies or overrides the binary name.
+  one hard-coded binary name (`vllm`, `llama-server`); `embedded` maps
+  to no external binary. There is no config path that supplies or
+  overrides the binary name.
 - **No shell.** `extra_args` entries are opaque argv values, stored
   and passed one element at a time. Shell metacharacters (`$(...)`,
   `;`, `&&`, redirects) are inert data because no shell ever

@@ -138,11 +138,26 @@ pub fn build_launch_spec(
                 args.push(t.to_string());
             }
         }
+        EngineKind::Embedded => {
+            // WOR-1658: in-process engine. No subprocess is spawned; the
+            // launcher reads these args to load the model into the
+            // gateway. The first arg is the model repo, then the loopback
+            // port the in-process server binds (so the runtime routes to
+            // it like any other engine), then the context window.
+            args.push(model.hf_repo.clone());
+            args.push("--host".to_string());
+            args.push("127.0.0.1".to_string());
+            args.push("--port".to_string());
+            args.push(port.to_string());
+            args.push("--ctx-size".to_string());
+            args.push(plan.seq_len.to_string());
+        }
     }
 
     args.extend(extra_args.iter().cloned());
 
     LaunchSpec {
+        engine,
         program: engine.binary_name().to_string(),
         args,
         env,
@@ -344,6 +359,24 @@ impl ProcessEngineLauncher {
         }
         None
     }
+
+    /// Launch the in-process embedded engine (WOR-1658). The engine kind
+    /// is wired end to end (config, plan-time doctor, launch dispatch),
+    /// so `engine: embedded` is a first-class choice; the in-process
+    /// inference backend (a candle server bound to `port`, so the
+    /// runtime routes to it like any other engine) is the remaining
+    /// implementation and is gated behind the `embedded` cargo feature.
+    /// Until it lands this returns a state-accurate error rather than a
+    /// generic spawn failure, and the plan-time
+    /// [`EngineDoctor`](crate::config::EngineDoctor) already flags an
+    /// `embedded` model on a build without the feature.
+    async fn launch_embedded(&self, _spec: &LaunchSpec, _port: u16) -> Result<u16, String> {
+        if cfg!(feature = "embedded") {
+            Err("engine: embedded is not yet wired to an in-process backend (WOR-1658)".to_string())
+        } else {
+            Err("engine: embedded needs a build with --features embedded (WOR-1658)".to_string())
+        }
+    }
 }
 
 /// Poll `127.0.0.1:port{path}` with a bare HTTP GET until it answers
@@ -404,6 +437,12 @@ impl EngineLauncher for ProcessEngineLauncher {
     async fn launch(&self, spec: &LaunchSpec) -> Result<u16, String> {
         let port = Self::port_from_spec(spec)
             .ok_or_else(|| "launch spec has no --port to probe".to_string())?;
+        // WOR-1658: an in-process engine is not a subprocess. Dispatch to
+        // the embedded path, which starts a server inside the gateway on
+        // `port` (behind the `embedded` feature) rather than spawning.
+        if spec.engine.is_in_process() {
+            return self.launch_embedded(spec, port).await;
+        }
         let mut cmd = tokio::process::Command::new(&spec.program);
         cmd.args(&spec.args)
             .stdout(Stdio::null())
@@ -626,6 +665,44 @@ mod tests {
             .position(|a| a == "--n-gpu-layers")
             .unwrap();
         assert_eq!(spec.args[gi + 1], "999");
+    }
+
+    #[test]
+    fn embedded_spec_carries_engine_repo_and_port() {
+        // WOR-1658: the embedded spec is tagged as in-process and carries
+        // the repo + loopback port the in-process server binds.
+        let spec = build_launch_spec(
+            EngineKind::Embedded,
+            &model(),
+            &plan("Q4_K_M"),
+            8010,
+            KvCacheQuant::Auto,
+            &[],
+        );
+        assert_eq!(spec.engine, EngineKind::Embedded);
+        assert!(spec.engine.is_in_process());
+        assert_eq!(spec.args[0], "Qwen/Qwen3-14B");
+        let pi = spec.args.iter().position(|a| a == "--port").unwrap();
+        assert_eq!(spec.args[pi + 1], "8010");
+    }
+
+    #[tokio::test]
+    async fn embedded_launch_reports_state_not_a_spawn_error() {
+        // The launcher dispatches an in-process engine to the embedded
+        // path; without the backend it returns a state-accurate error
+        // (naming embedded / WOR-1658), never a generic spawn failure.
+        let spec = build_launch_spec(
+            EngineKind::Embedded,
+            &model(),
+            &plan("Q4_K_M"),
+            8011,
+            KvCacheQuant::Auto,
+            &[],
+        );
+        let launcher = ProcessEngineLauncher::with_timeout(Duration::from_secs(1));
+        let err = launcher.launch(&spec).await.unwrap_err();
+        assert!(err.contains("embedded"), "unexpected error: {err}");
+        assert!(!err.contains("spawn"), "should not be a spawn error: {err}");
     }
 
     #[test]
@@ -887,6 +964,7 @@ mod tests {
         // could block a request for tens of minutes).
         let launcher = ProcessEngineLauncher::with_timeout(Duration::from_secs(60));
         let spec = LaunchSpec {
+            engine: EngineKind::Vllm,
             program: "false".to_string(), // exits non-zero immediately
             args: vec!["--port".to_string(), "59997".to_string()],
             env: vec![],
@@ -941,6 +1019,7 @@ mod tests {
         // Spawn `sleep 30` as the child; if spawn is denied, skip.
         let launcher = ProcessEngineLauncher::with_timeout(Duration::from_secs(5));
         let spec = LaunchSpec {
+            engine: EngineKind::Vllm,
             program: "sleep".to_string(),
             args: vec!["30".to_string(), "--port".to_string(), port.to_string()],
             env: vec![],
