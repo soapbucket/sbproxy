@@ -1271,6 +1271,10 @@ pub fn handle_admin_request(
     if let Some(response) = crate::admin_keys::dispatch(method, path, body) {
         return response;
     }
+    // WOR-1665: model-host status (what is running locally now).
+    if let Some(response) = crate::admin_model_host::dispatch(method, path) {
+        return response;
+    }
 
     // --- Method-aware routes first ---
     if path == "/admin/reload" {

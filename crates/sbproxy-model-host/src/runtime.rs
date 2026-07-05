@@ -80,6 +80,59 @@ pub trait ModelHostObserver: Send + Sync {
 pub struct NoopObserver;
 impl ModelHostObserver for NoopObserver {}
 
+/// A point-in-time view of the model host for the status admin API
+/// (WOR-1665): what is loaded now and the VRAM picture. Serializable so
+/// an admin handler can return it as JSON.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModelHostStatus {
+    /// Currently resident models, one entry each, sorted by name.
+    pub models: Vec<ModelStatus>,
+    /// VRAM residency + per-device view.
+    pub vram: VramStatus,
+}
+
+/// The status of one resident model.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModelStatus {
+    /// The served model name (the id every plane sees).
+    pub name: String,
+    /// Engine lifecycle state (loading / ready / failed / evicted).
+    pub state: crate::supervisor::EngineState,
+    /// The loopback port, when ready.
+    pub port: Option<u16>,
+    /// The fit-planner VRAM estimate for this engine, in bytes.
+    pub vram_bytes: u64,
+    /// Configured `keep_alive` TTL in seconds, if any (config value; TTL
+    /// enforcement is a later refinement).
+    pub keep_alive_secs: Option<u64>,
+}
+
+/// The residency + per-device VRAM view.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct VramStatus {
+    /// Residency budget (the largest device's total VRAM), in bytes.
+    pub budget_bytes: u64,
+    /// VRAM the resident set is estimated to use, in bytes.
+    pub used_bytes: u64,
+    /// Budget headroom, in bytes.
+    pub free_bytes: u64,
+    /// Per-device totals from the GPU probe.
+    pub devices: Vec<DeviceVram>,
+}
+
+/// One GPU device's VRAM totals from the probe.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeviceVram {
+    /// Device index.
+    pub index: u32,
+    /// Device name.
+    pub name: String,
+    /// Total VRAM, in bytes.
+    pub total_bytes: u64,
+    /// Free VRAM at the last probe, in bytes.
+    pub free_bytes: u64,
+}
+
 /// Parse a catalog `params` string (`14B`, `30B-A3B`, `120b`, `8M`)
 /// into an approximate total parameter count. Reads the leading number
 /// and its magnitude suffix; ignores any trailing shape detail (the
@@ -304,6 +357,63 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
     /// Currently resident model names.
     pub async fn resident_models(&self) -> Vec<String> {
         self.engines.lock().await.keys().cloned().collect()
+    }
+
+    /// A point-in-time status snapshot for the admin API (WOR-1665):
+    /// resident models with their engine state, port, and VRAM
+    /// estimate, plus the residency budget and per-device totals.
+    pub async fn status_snapshot(&self) -> ModelHostStatus {
+        let mut models: Vec<ModelStatus> = {
+            let engines = self.engines.lock().await;
+            engines
+                .iter()
+                .map(|(name, handle)| {
+                    let state = handle.supervisor.state();
+                    let port = state.port();
+                    let keep_alive_secs = self
+                        .config
+                        .models
+                        .iter()
+                        .find(|e| e.effective_name().ok().as_deref() == Some(name.as_str()))
+                        .and_then(|e| e.keep_alive_duration())
+                        .map(|d| d.as_secs());
+                    ModelStatus {
+                        name: name.clone(),
+                        state,
+                        port,
+                        vram_bytes: handle.supervisor.vram_bytes(),
+                        keep_alive_secs,
+                    }
+                })
+                .collect()
+        };
+        models.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let (used_bytes, free_bytes) = {
+            let res = self.residency.lock().await;
+            (res.used_bytes(), res.free_bytes())
+        };
+        let devices = self
+            .probe
+            .probe()
+            .into_iter()
+            .map(|g| DeviceVram {
+                index: g.index,
+                name: g.name,
+                total_bytes: g.total_vram_bytes,
+                free_bytes: g.free_vram_bytes,
+            })
+            .collect();
+
+        ModelHostStatus {
+            models,
+            vram: VramStatus {
+                budget_bytes: used_bytes + free_bytes,
+                used_bytes,
+                free_bytes,
+                devices,
+            },
+        }
     }
 
     /// Bring `name` to ready, spawning (and evicting to make room) as
@@ -598,6 +708,27 @@ mod tests {
         fn set_gpu_stats(&self, _d: &str, _t: u64, _f: u64, _u: f64) {
             self.gpu_reports.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test]
+    async fn status_snapshot_reports_resident_models_and_vram() {
+        let rt = l4_runtime(config(
+            "models:\n  - model: qwen3-14b\n    keep_alive: 30m\n",
+        ));
+        // Nothing loaded yet.
+        let empty = rt.status_snapshot().await;
+        assert!(empty.models.is_empty());
+        assert!(empty.vram.budget_bytes > 0, "L4 budget reported");
+        assert!(!empty.vram.devices.is_empty(), "device listed");
+
+        rt.ensure_ready("qwen3-14b").await.expect("ready");
+        let s = rt.status_snapshot().await;
+        assert_eq!(s.models.len(), 1);
+        let m = &s.models[0];
+        assert_eq!(m.name, "qwen3-14b");
+        assert!(m.port.is_some(), "ready model has a port");
+        assert_eq!(m.keep_alive_secs, Some(1800), "30m keep_alive surfaced");
+        assert!(s.vram.used_bytes > 0, "resident model uses budget");
     }
 
     #[tokio::test]

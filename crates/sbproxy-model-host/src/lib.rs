@@ -77,8 +77,8 @@ pub use pull::{pull_plan, PullItem, PullMode};
 pub use report::{ModelValue, ValueReport};
 pub use residency::{Admission, ResidencyManager, Resident};
 pub use runtime::{
-    parse_params, ConfigDirMetadataProvider, ModelHostObserver, ModelHostRuntime,
-    ModelMetadataProvider, NoopObserver, RuntimeError,
+    parse_params, ConfigDirMetadataProvider, DeviceVram, ModelHostObserver, ModelHostRuntime,
+    ModelHostStatus, ModelMetadataProvider, ModelStatus, NoopObserver, RuntimeError, VramStatus,
 };
 pub use scheduling::{admit, next_to_admit, PriorityClass, SchedulingDecision};
 pub use sleep_wake::{is_sleeping, sleep, wake_up, SleepLevel};

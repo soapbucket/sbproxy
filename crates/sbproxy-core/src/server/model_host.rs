@@ -144,6 +144,20 @@ fn model_host(config: &AiHandlerConfig) -> Option<Arc<ModelHostRuntime<ProcessEn
     MODEL_HOST.get_or_init(|| build_runtime(config)).clone()
 }
 
+/// The current model host, resolved from the live compiled pipeline's
+/// `ai_proxy` config, for read-only surfaces like the status admin API
+/// (WOR-1665). Returns `None` when no provider serves locally. Builds
+/// the runtime on first use (construction only, no engine spawn).
+pub(crate) fn current_model_host() -> Option<Arc<ModelHostRuntime<ProcessEngineLauncher>>> {
+    use sbproxy_modules::Action;
+    let pipeline = crate::reload::current_pipeline();
+    let cfg = pipeline.actions.iter().find_map(|a| match a {
+        Action::AiProxy(ai) => Some(&ai.config),
+        _ => None,
+    })?;
+    model_host(cfg)
+}
+
 /// Resolve a served provider's upstream to its live loopback base URL,
 /// bringing the engine to ready on demand.
 ///
