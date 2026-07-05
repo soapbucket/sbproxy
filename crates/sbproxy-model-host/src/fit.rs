@@ -581,6 +581,25 @@ pub fn plan_fit(
     seq_len: u64,
     overhead: f64,
 ) -> Result<FitPlan, FitError> {
+    plan_fit_kv(gpu, meta, candidates, seq_len, overhead, None)
+}
+
+/// Like [`plan_fit`], but with a KV-cache quantization lever
+/// (WOR-1676). `kv_bytes_per_element` overrides the bytes-per-KV-element
+/// in the fit math: `Some(0.5)` for int4 KV, `Some(1.0)` for fp8/int8,
+/// `None` to follow the weight quant's default. Quantizing the KV cache
+/// shrinks the KV term, so a card that could not hold a long context at
+/// f16 KV may fit it here. Only the fit math changes; making the engine
+/// use that KV dtype is [`crate::launch::build_launch_spec`]'s
+/// `--kv-cache-dtype`.
+pub fn plan_fit_kv(
+    gpu: &GpuDescriptor,
+    meta: &ModelMetadata,
+    candidates: &[String],
+    seq_len: u64,
+    overhead: f64,
+    kv_bytes_per_element: Option<f64>,
+) -> Result<FitPlan, FitError> {
     let seq_len = seq_len.min(meta.max_context).max(1);
     let free = gpu.free_vram_bytes as f64;
 
@@ -602,7 +621,7 @@ pub fn plan_fit(
             });
             continue;
         }
-        let est = meta.vram_estimate_bytes(quant, seq_len, overhead);
+        let est = meta.vram_estimate_with_kv(quant, kv_bytes_per_element, seq_len, overhead);
         smallest_fit_candidate = Some(match smallest_fit_candidate {
             Some(s) => s.min(est),
             None => est,
@@ -646,6 +665,18 @@ pub fn plan_fit_auto(
     seq_len: u64,
     overhead: f64,
 ) -> Result<FitPlan, FitError> {
+    plan_fit_auto_kv(probe, meta, candidates, seq_len, overhead, None)
+}
+
+/// Like [`plan_fit_auto`], with the KV-quant lever (see [`plan_fit_kv`]).
+pub fn plan_fit_auto_kv(
+    probe: &dyn GpuProbe,
+    meta: &ModelMetadata,
+    candidates: &[String],
+    seq_len: u64,
+    overhead: f64,
+    kv_bytes_per_element: Option<f64>,
+) -> Result<FitPlan, FitError> {
     let mut gpus = probe.probe();
     if gpus.is_empty() {
         return Err(FitError::NoGpu);
@@ -655,7 +686,14 @@ pub fn plan_fit_auto(
     // else the error from the most-free GPU (the most informative).
     let mut first_err = None;
     for gpu in &gpus {
-        match plan_fit(gpu, meta, candidates, seq_len, overhead) {
+        match plan_fit_kv(
+            gpu,
+            meta,
+            candidates,
+            seq_len,
+            overhead,
+            kv_bytes_per_element,
+        ) {
             Ok(plan) => return Ok(plan),
             Err(e) => {
                 if first_err.is_none() {
@@ -717,6 +755,46 @@ mod tests {
         .expect("Q4 should fit a T4");
         assert_eq!(plan.quant, Quant::Int4);
         assert_eq!(plan.quant_name, "Q4_K_M");
+    }
+
+    #[test]
+    fn kv_quant_lets_a_long_context_fit() {
+        // WOR-1676: at a long context the KV term dominates. A 14B model
+        // with a 128k window does not fit the L4 at f16 KV (~21 GiB KV +
+        // ~14 GiB FP8 weights > 24 GiB), but int4 KV (a quarter) brings
+        // it back inside. The planner now spends that lever.
+        let meta = ModelMetadata {
+            params: 14_000_000_000,
+            layers: 40,
+            kv_heads: 8,
+            head_dim: 128,
+            max_context: 131072,
+        };
+        let long = 131072;
+        let candidates = ["FP8".to_string()];
+        let default = plan_fit(
+            &GpuDescriptor::l4(),
+            &meta,
+            &candidates,
+            long,
+            DEFAULT_OVERHEAD,
+        );
+        let quantized = plan_fit_kv(
+            &GpuDescriptor::l4(),
+            &meta,
+            &candidates,
+            long,
+            DEFAULT_OVERHEAD,
+            Some(0.5),
+        );
+        assert!(
+            default.is_err(),
+            "long context should not fit at default KV"
+        );
+        assert!(
+            quantized.is_ok(),
+            "int4 KV should let the long context fit: {quantized:?}"
+        );
     }
 
     #[test]
