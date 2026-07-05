@@ -2923,6 +2923,46 @@ pub fn record_model_host_ensure_failure(reason: &'static str) {
     counter.with_label_values(&[reason]).inc();
 }
 
+/// A model-host weight pre-fetch completed (WOR-1712): `bytes` pulled in
+/// `secs`, `ok` false on failure. Records
+/// `sbproxy_model_host_weight_download_bytes_total`,
+/// `sbproxy_model_host_weight_download_seconds`, and, on failure,
+/// `sbproxy_model_host_weight_download_failures_total`.
+pub fn record_model_host_weight_download(bytes: u64, secs: f64, ok: bool) {
+    use prometheus::{register_histogram, register_int_counter, Histogram, IntCounter};
+    use std::sync::OnceLock;
+    static BYTES: OnceLock<IntCounter> = OnceLock::new();
+    static FAILS: OnceLock<IntCounter> = OnceLock::new();
+    static SECS: OnceLock<Histogram> = OnceLock::new();
+    if ok {
+        let bytes_c = BYTES.get_or_init(|| {
+            register_int_counter!(
+                "sbproxy_model_host_weight_download_bytes_total",
+                "Bytes downloaded by model-host weight pre-fetches",
+            )
+            .expect("model host weight-download bytes counter registers")
+        });
+        bytes_c.inc_by(bytes);
+    } else {
+        let fails = FAILS.get_or_init(|| {
+            register_int_counter!(
+                "sbproxy_model_host_weight_download_failures_total",
+                "Model-host weight pre-fetches that failed",
+            )
+            .expect("model host weight-download failures counter registers")
+        });
+        fails.inc();
+    }
+    let secs_h = SECS.get_or_init(|| {
+        register_histogram!(
+            "sbproxy_model_host_weight_download_seconds",
+            "Model-host weight pre-fetch duration in seconds",
+        )
+        .expect("model host weight-download duration histogram registers")
+    });
+    secs_h.observe(secs);
+}
+
 /// Set the request queue depth while an engine loads on
 /// `sbproxy_model_host_load_queue_depth{model}` (requests parked
 /// waiting for a cold model to become Ready).
@@ -4350,6 +4390,13 @@ mod tests {
         set_model_host_resident_models(2);
         set_model_host_load_queue_depth("qwen3-32b", 4);
         set_model_host_gpu_stats("0", 24 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024, 0.42);
+        // WOR-1709 / WOR-1711 / WOR-1712 additions.
+        record_model_host_lora_load();
+        record_model_host_lora_eviction();
+        set_model_host_resident_adapters(3);
+        record_model_host_ensure_failure("fit");
+        record_model_host_weight_download(1_000_000, 4.2, true);
+        record_model_host_weight_download(0, 0.5, false);
         let out = metrics().render();
         for name in [
             "sbproxy_model_host_time_to_ready_seconds",
@@ -4359,6 +4406,13 @@ mod tests {
             "sbproxy_model_host_load_queue_depth",
             "sbproxy_model_host_gpu_vram_bytes",
             "sbproxy_model_host_gpu_utilization",
+            "sbproxy_model_host_lora_loads_total",
+            "sbproxy_model_host_lora_evictions_total",
+            "sbproxy_model_host_resident_adapters",
+            "sbproxy_model_host_ensure_failures_total",
+            "sbproxy_model_host_weight_download_bytes_total",
+            "sbproxy_model_host_weight_download_failures_total",
+            "sbproxy_model_host_weight_download_seconds",
         ] {
             assert!(out.contains(name), "missing model-host metric {name}");
         }

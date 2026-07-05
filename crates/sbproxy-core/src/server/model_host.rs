@@ -76,6 +76,9 @@ impl sbproxy_model_host::ModelHostObserver for MetricsObserver {
     fn on_ensure_failed(&self, _model: &str, reason: &'static str) {
         sbproxy_observe::metrics::record_model_host_ensure_failure(reason);
     }
+    fn on_weight_download(&self, _model: &str, bytes: u64, secs: f64, ok: bool) {
+        sbproxy_observe::metrics::record_model_host_weight_download(bytes, secs, ok);
+    }
 }
 
 /// The GPU probe for the runtime, selected at compile time.

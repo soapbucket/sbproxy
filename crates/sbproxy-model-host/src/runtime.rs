@@ -96,6 +96,12 @@ pub trait ModelHostObserver: Send + Sync {
     fn on_ensure_failed(&self, model: &str, reason: &'static str) {
         let _ = (model, reason);
     }
+    /// A model-host weight pre-fetch completed (WOR-1712): `bytes`
+    /// downloaded in `secs`, `ok` false on failure. Lets a slow or
+    /// failing multi-GB GGUF pull surface before the launch times out.
+    fn on_weight_download(&self, model: &str, bytes: u64, secs: f64, ok: bool) {
+        let _ = (model, bytes, secs, ok);
+    }
 }
 
 /// A [`ModelHostObserver`] that does nothing; the runtime default.
@@ -607,18 +613,28 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         model_ref: &ModelRef,
     ) -> Option<std::path::PathBuf> {
         let file = entry.gguf_file.as_deref()?;
+        let model = entry
+            .effective_name()
+            .unwrap_or_else(|_| model_ref.hf_repo.clone());
         let cache_root = crate::manifest::resolve_cache_dir(self.config.cache_dir.as_deref(), None);
-        match crate::weights::ensure_weight_file(
-            &cache_root,
-            &model_ref.hf_repo,
-            "main",
-            file,
-            None,
-        )
-        .await
-        {
-            Ok(path) => Some(path),
+        let started = std::time::Instant::now();
+        let outcome =
+            crate::weights::ensure_weight_file(&cache_root, &model_ref.hf_repo, "main", file, None)
+                .await;
+        let secs = started.elapsed().as_secs_f64();
+        match outcome {
+            Ok(path) => {
+                // WOR-1712: report the pulled size so a slow multi-GB
+                // download is visible. Stat the file (0 if unreadable).
+                let bytes = tokio::fs::metadata(&path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                self.observer.on_weight_download(&model, bytes, secs, true);
+                Some(path)
+            }
             Err(e) => {
+                self.observer.on_weight_download(&model, 0, secs, false);
                 tracing::warn!(
                     "model host: GGUF pre-fetch failed for {}/{file}: {e}; falling back to --hf-repo",
                     model_ref.hf_repo

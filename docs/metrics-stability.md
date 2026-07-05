@@ -947,6 +947,30 @@ engine-runtime phases land; names may change before they graduate.
 
 **Labels:** `reason` (`unknown_model`, `resolve`, `no_metadata`, `fit`, `residency`, `port`, `launch`).
 
+#### `sbproxy_model_host_weight_download_bytes_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **alpha** |
+| Description | Bytes downloaded by model-host weight pre-fetches (the GGUF pull for a llama.cpp `--model`). |
+
+#### `sbproxy_model_host_weight_download_failures_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **alpha** |
+| Description | Model-host weight pre-fetches that failed. |
+
+#### `sbproxy_model_host_weight_download_seconds`
+
+| Property | Value |
+|---|---|
+| Type | Histogram |
+| Stability | **alpha** |
+| Description | Model-host weight pre-fetch duration in seconds, so a slow multi-GB pull is visible before the launch times out. |
+
 ---
 
 ## Deprecation process
