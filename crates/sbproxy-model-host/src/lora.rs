@@ -71,6 +71,14 @@ impl LoraCache {
         &self.loaded
     }
 
+    /// Drop `name` from the loaded set (WOR-1673). Used to roll back a
+    /// routing decision whose engine-side load failed, so the next
+    /// request for that adapter re-attempts the load rather than
+    /// assuming it is resident.
+    pub fn forget(&mut self, name: &str) {
+        self.loaded.retain(|n| n != name);
+    }
+
     /// Route a request for `model` and update the cache. Returns
     /// whether it is the base, a resident adapter, an adapter to load
     /// (with any eviction), or unknown. `Load`/`Resident` mutate the

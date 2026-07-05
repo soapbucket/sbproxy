@@ -335,6 +335,16 @@
           ],
           "format": "uint64",
           "minimum": 0.0
+        },
+        "max_loras": {
+          "description": "Max LoRA adapters resident on the engine at once (WOR-1673). When set below the number of configured `lora_adapters`, the engine loads adapters on demand and evicts the least-recently used past this cap (dynamic paging), rather than preloading all of them. `None` preloads every configured adapter (static), which suits a small, fixed adapter set.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
         }
       }
     },

@@ -277,14 +277,21 @@ pub fn serving_flags(engine: EngineKind, entry: &crate::config::ServeEntry) -> V
             args.push(mbt.to_string());
         }
     }
-    // LoRA adapters.
+    // LoRA adapters (WOR-1673). `--max-loras` is the engine adapter-slot
+    // capacity. In static mode (max_loras unset) every adapter is
+    // preloaded with `--lora-modules`. In dynamic mode (max_loras below
+    // the adapter count) adapters are loaded on demand at runtime, so no
+    // `--lora-modules` is emitted; the runtime pages them via the vLLM
+    // load/unload API (and sets VLLM_ALLOW_RUNTIME_LORA_UPDATING).
     if !entry.lora_adapters.is_empty() {
         args.push("--enable-lora".to_string());
         args.push("--max-loras".to_string());
-        args.push(entry.lora_adapters.len().to_string());
-        for a in &entry.lora_adapters {
-            args.push("--lora-modules".to_string());
-            args.push(format!("{}={}", a.name, a.source));
+        args.push(entry.lora_capacity().to_string());
+        if !entry.dynamic_lora() {
+            for a in &entry.lora_adapters {
+                args.push("--lora-modules".to_string());
+                args.push(format!("{}={}", a.name, a.source));
+            }
         }
     }
     args
@@ -431,6 +438,47 @@ pub async fn probe_health(port: u16, path: &str) -> bool {
         tokio::time::timeout(Duration::from_secs(2), attempt).await,
         Ok(Some(true))
     )
+}
+
+/// POST a JSON `body` to `127.0.0.1:port{path}` with a bare HTTP
+/// request (WOR-1673 LoRA load/unload), keeping the crate free of an
+/// HTTP-client dependency. Returns `Ok(())` on a `2xx`, else an error
+/// with the status line. `timeout` bounds the whole exchange because a
+/// cold adapter load can take a few seconds.
+pub async fn post_json(port: u16, path: &str, body: &str, timeout: Duration) -> Result<(), String> {
+    let addr = format!("127.0.0.1:{port}");
+    let attempt = async {
+        let mut stream = TcpStream::connect(&addr)
+            .await
+            .map_err(|e| format!("connect {addr}: {e}"))?;
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(req.as_bytes())
+            .await
+            .map_err(|e| format!("write {path}: {e}"))?;
+        let mut buf = [0u8; 128];
+        let n = stream
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("read {path}: {e}"))?;
+        let head = String::from_utf8_lossy(&buf[..n]);
+        // Accept any 2xx; vLLM answers 200 on load/unload.
+        if head.starts_with("HTTP/1.1 2") || head.starts_with("HTTP/1.0 2") {
+            Ok(())
+        } else {
+            Err(format!(
+                "{path}: {}",
+                head.lines().next().unwrap_or("no status line")
+            ))
+        }
+    };
+    match tokio::time::timeout(timeout, attempt).await {
+        Ok(r) => r,
+        Err(_) => Err(format!("{path}: timed out after {timeout:?}")),
+    }
 }
 
 impl EngineLauncher for ProcessEngineLauncher {
@@ -771,6 +819,7 @@ mod tests {
             tool_call_parser: None,
             swap_space_gib: None,
             cpu_offload_gib: None,
+            max_loras: None,
         }
     }
 
@@ -837,6 +886,36 @@ mod tests {
         let i = f.iter().position(|a| a == "--served-model-name").unwrap();
         assert_eq!(f[i + 1], "qwen3-8b");
         assert_eq!(f[i + 2], "coder");
+    }
+
+    #[test]
+    fn serving_flags_lora_static_preloads_dynamic_pages() {
+        // WOR-1673: static (max_loras unset) preloads via --lora-modules;
+        // dynamic (max_loras below count) sets the cap and omits preload.
+        let loras = vec![
+            crate::config::LoraAdapter {
+                name: "a".into(),
+                source: "hf:o/a".into(),
+            },
+            crate::config::LoraAdapter {
+                name: "b".into(),
+                source: "hf:o/b".into(),
+            },
+        ];
+        let mut stat = entry_with(None, None, loras.clone());
+        let sf = serving_flags(EngineKind::Vllm, &stat);
+        let mi = sf.iter().position(|a| a == "--max-loras").unwrap();
+        assert_eq!(sf[mi + 1], "2");
+        assert!(sf.iter().any(|a| a == "--lora-modules"));
+
+        stat.max_loras = Some(1);
+        let df = serving_flags(EngineKind::Vllm, &stat);
+        let dmi = df.iter().position(|a| a == "--max-loras").unwrap();
+        assert_eq!(df[dmi + 1], "1");
+        assert!(
+            !df.iter().any(|a| a == "--lora-modules"),
+            "dynamic paging loads on demand, not via --lora-modules"
+        );
     }
 
     #[test]
@@ -943,6 +1022,26 @@ mod tests {
             }
         });
         Some((port, handle))
+    }
+
+    #[tokio::test]
+    async fn post_json_ok_on_200_and_err_on_no_server() {
+        // WOR-1673: the raw-HTTP POST used for LoRA load/unload succeeds
+        // against a 200 and errors (not panics) when nothing is bound.
+        if let Some((port, handle)) = fake_health_server().await {
+            let r = post_json(
+                port,
+                "/v1/load_lora_adapter",
+                "{\"lora_name\":\"a\",\"lora_path\":\"o/a\"}",
+                Duration::from_secs(5),
+            )
+            .await;
+            assert!(r.is_ok(), "expected 200 to succeed: {r:?}");
+            handle.abort();
+        }
+        // A port with nothing listening: a clean Err, no panic.
+        let err = post_json(1, "/v1/load_lora_adapter", "{}", Duration::from_secs(1)).await;
+        assert!(err.is_err());
     }
 
     #[tokio::test]
