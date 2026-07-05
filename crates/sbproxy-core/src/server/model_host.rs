@@ -37,6 +37,35 @@ use sbproxy_model_host::{
 /// resident engine is not killed on an unrelated config change.
 static MODEL_HOST: OnceLock<Option<Arc<ModelHostRuntime<ProcessEngineLauncher>>>> = OnceLock::new();
 
+/// Records the model-host lifecycle into the `sbproxy_model_host_*`
+/// metrics (WOR-1659). The model-host crate stays observe-free and
+/// calls this seam; here we forward to the observe recording fns that
+/// the Grafana dashboard (WOR-1664) and value report (WOR-1665) consume.
+struct MetricsObserver;
+
+impl sbproxy_model_host::ModelHostObserver for MetricsObserver {
+    fn on_engine_ready(&self, engine: &str, model: &str, secs: f64) {
+        sbproxy_observe::metrics::record_model_host_time_to_ready(engine, model, "ready", secs);
+    }
+    fn on_engine_failed(&self, engine: &str, model: &str, secs: f64) {
+        sbproxy_observe::metrics::record_model_host_time_to_ready(engine, model, "failed", secs);
+    }
+    fn on_eviction(&self, reason: &'static str) {
+        sbproxy_observe::metrics::record_model_host_eviction(reason);
+    }
+    fn set_resident_models(&self, count: i64) {
+        sbproxy_observe::metrics::set_model_host_resident_models(count);
+    }
+    fn set_gpu_stats(&self, device: &str, total_bytes: u64, free_bytes: u64, utilization: f64) {
+        sbproxy_observe::metrics::set_model_host_gpu_stats(
+            device,
+            total_bytes as i64,
+            free_bytes as i64,
+            utilization,
+        );
+    }
+}
+
 /// The GPU probe for the runtime, selected at compile time.
 fn make_probe() -> Arc<dyn GpuProbe> {
     #[cfg(feature = "gpu-nvidia")]
@@ -104,7 +133,8 @@ fn build_runtime(config: &AiHandlerConfig) -> Option<Arc<ModelHostRuntime<Proces
         // path is the default and llama.cpp/vLLM resolve from PATH.
         false,
     )
-    .with_health_recheck(true);
+    .with_health_recheck(true)
+    .with_observer(Arc::new(MetricsObserver));
     Some(Arc::new(runtime))
 }
 

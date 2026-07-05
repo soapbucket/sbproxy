@@ -42,6 +42,44 @@ pub trait ModelMetadataProvider: Send + Sync {
     fn metadata(&self, model: &ModelRef) -> Option<ModelMetadata>;
 }
 
+/// Observes model-host lifecycle events so a host can emit metrics
+/// (WOR-1659) without this crate depending on the metrics stack. The
+/// runtime calls these at spawn / ready / evict points; the default
+/// impls are no-ops so a test or embedder can implement only what it
+/// needs. `sbproxy-core` provides an impl that records the
+/// `sbproxy_model_host_*` metrics. All methods are synchronous (they
+/// only touch counters/gauges) so they are safe to call inside the
+/// runtime's async paths.
+pub trait ModelHostObserver: Send + Sync {
+    /// An engine reached ready `secs` after launch. `engine` is the
+    /// resolved engine name, `model` the served name.
+    fn on_engine_ready(&self, engine: &str, model: &str, secs: f64) {
+        let _ = (engine, model, secs);
+    }
+    /// An engine failed to reach ready `secs` after launch.
+    fn on_engine_failed(&self, engine: &str, model: &str, secs: f64) {
+        let _ = (engine, model, secs);
+    }
+    /// A resident engine was evicted. `reason` is a short static label
+    /// (`make_room`, `unload`, `restart`).
+    fn on_eviction(&self, reason: &'static str) {
+        let _ = reason;
+    }
+    /// The count of resident (loaded) models changed to `count`.
+    fn set_resident_models(&self, count: i64) {
+        let _ = count;
+    }
+    /// Current GPU stats for `device` (index), for the residency budget
+    /// view: total and free VRAM in bytes and the used fraction.
+    fn set_gpu_stats(&self, device: &str, total_bytes: u64, free_bytes: u64, utilization: f64) {
+        let _ = (device, total_bytes, free_bytes, utilization);
+    }
+}
+
+/// A [`ModelHostObserver`] that does nothing; the runtime default.
+pub struct NoopObserver;
+impl ModelHostObserver for NoopObserver {}
+
 /// Parse a catalog `params` string (`14B`, `30B-A3B`, `120b`, `8M`)
 /// into an approximate total parameter count. Reads the leading number
 /// and its magnitude suffix; ignores any trailing shape detail (the
@@ -163,6 +201,9 @@ pub struct ModelHostRuntime<L: EngineLauncher> {
     /// launchers with no real HTTP endpoint are not falsely respawned;
     /// the production runtime turns it on.
     health_recheck: bool,
+    /// Lifecycle observer for metrics (WOR-1659). Defaults to a no-op;
+    /// the host injects a metrics-recording impl.
+    observer: Arc<dyn ModelHostObserver>,
 }
 
 impl<L: EngineLauncher> ModelHostRuntime<L> {
@@ -199,6 +240,7 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
             spawn_lock: Mutex::new(()),
             tick: AtomicU64::new(0),
             health_recheck: false,
+            observer: Arc::new(NoopObserver),
         }
     }
 
@@ -209,6 +251,32 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
     pub fn with_health_recheck(mut self, on: bool) -> Self {
         self.health_recheck = on;
         self
+    }
+
+    /// Attach a lifecycle observer for metrics (WOR-1659). The
+    /// production runtime injects an impl that records the
+    /// `sbproxy_model_host_*` metrics.
+    pub fn with_observer(mut self, observer: Arc<dyn ModelHostObserver>) -> Self {
+        self.observer = observer;
+        self
+    }
+
+    /// Emit the current GPU residency view (per device) to the observer.
+    fn report_gpu_stats(&self) {
+        for g in self.probe.probe() {
+            let util = if g.total_vram_bytes > 0 {
+                (g.total_vram_bytes.saturating_sub(g.free_vram_bytes)) as f64
+                    / g.total_vram_bytes as f64
+            } else {
+                0.0
+            };
+            self.observer.set_gpu_stats(
+                &g.index.to_string(),
+                g.total_vram_bytes,
+                g.free_vram_bytes,
+                util,
+            );
+        }
     }
 
     fn next_tick(&self) -> u64 {
@@ -295,8 +363,12 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         for victim in evicted {
             if let Some(mut handle) = self.engines.lock().await.remove(&victim) {
                 handle.supervisor.evict().await;
+                self.observer.on_eviction("make_room");
             }
         }
+        // The residency budget (and, on a GPU host, the live probe) is
+        // where the VRAM view is freshest; report it as engines change.
+        self.report_gpu_stats();
 
         let port = alloc_port().map_err(RuntimeError::Port)?;
         let mut spec = build_launch_spec(
@@ -309,30 +381,51 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         );
         spec.args.extend(serving_flags(engine_kind, &entry));
 
+        let engine_label = engine_kind.binary_name();
+        let started = std::time::Instant::now();
         let mut supervisor =
             Supervisor::new((self.make_launcher)(), spec, BackoffPolicy::default());
-        let bound = supervisor
-            .ensure_ready()
-            .await
-            .map_err(|e| RuntimeError::Launch(e.to_string()))?;
+        let bound = match supervisor.ensure_ready().await {
+            Ok(bound) => {
+                self.observer
+                    .on_engine_ready(engine_label, name, started.elapsed().as_secs_f64());
+                bound
+            }
+            Err(e) => {
+                self.observer
+                    .on_engine_failed(engine_label, name, started.elapsed().as_secs_f64());
+                return Err(RuntimeError::Launch(e.to_string()));
+            }
+        };
 
-        self.engines.lock().await.insert(
-            name.to_string(),
-            EngineHandle {
-                supervisor,
-                port: bound,
-            },
-        );
+        let resident = {
+            let mut engines = self.engines.lock().await;
+            engines.insert(
+                name.to_string(),
+                EngineHandle {
+                    supervisor,
+                    port: bound,
+                },
+            );
+            engines.len() as i64
+        };
+        self.observer.set_resident_models(resident);
         Ok(bound)
     }
 
     /// Unload a model: evict its engine and free its VRAM. No-op when
     /// not resident.
     pub async fn unload(&self, name: &str) {
-        if let Some(mut handle) = self.engines.lock().await.remove(name) {
-            handle.supervisor.evict().await;
-        }
+        let resident = {
+            let mut engines = self.engines.lock().await;
+            if let Some(mut handle) = engines.remove(name) {
+                handle.supervisor.evict().await;
+                self.observer.on_eviction("unload");
+            }
+            engines.len() as i64
+        };
         self.residency.lock().await.unload(name);
+        self.observer.set_resident_models(resident);
     }
 
     /// The port of a resident model that is ready and (when
@@ -355,10 +448,20 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
     /// Drop a model's engine (kill + free residency) if present. Used
     /// before a respawn to clear a dead or Failed handle.
     async fn drop_engine(&self, name: &str) {
-        if let Some(mut handle) = self.engines.lock().await.remove(name) {
-            handle.supervisor.evict().await;
-        }
+        let removed = {
+            let mut engines = self.engines.lock().await;
+            if let Some(mut handle) = engines.remove(name) {
+                handle.supervisor.evict().await;
+                Some(engines.len() as i64)
+            } else {
+                None
+            }
+        };
         self.residency.lock().await.unload(name);
+        if let Some(resident) = removed {
+            self.observer.on_eviction("restart");
+            self.observer.set_resident_models(resident);
+        }
     }
 
     /// The quant candidates to fit, most-preferred first: the catalog
@@ -471,6 +574,46 @@ mod tests {
         let url = rt.resolved_base_url("qwen3-14b").await.unwrap();
         assert_eq!(url, format!("http://127.0.0.1:{port}/v1"));
         assert_eq!(rt.resident_models().await, vec!["qwen3-14b".to_string()]);
+    }
+
+    /// Counts observer callbacks so a test can assert the runtime emits
+    /// lifecycle events (WOR-1659 wiring).
+    #[derive(Default)]
+    struct CountingObserver {
+        ready: AtomicU64,
+        evictions: AtomicU64,
+        resident_last: AtomicU64,
+        gpu_reports: AtomicU64,
+    }
+    impl ModelHostObserver for CountingObserver {
+        fn on_engine_ready(&self, _engine: &str, _model: &str, _secs: f64) {
+            self.ready.fetch_add(1, Ordering::SeqCst);
+        }
+        fn on_eviction(&self, _reason: &'static str) {
+            self.evictions.fetch_add(1, Ordering::SeqCst);
+        }
+        fn set_resident_models(&self, count: i64) {
+            self.resident_last.store(count as u64, Ordering::SeqCst);
+        }
+        fn set_gpu_stats(&self, _d: &str, _t: u64, _f: u64, _u: f64) {
+            self.gpu_reports.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_emits_observer_events() {
+        let obs = Arc::new(CountingObserver::default());
+        let rt = l4_runtime(config("models:\n  - model: qwen3-14b\n")).with_observer(obs.clone());
+        rt.ensure_ready("qwen3-14b").await.expect("ready");
+        assert_eq!(obs.ready.load(Ordering::SeqCst), 1, "engine-ready recorded");
+        assert_eq!(obs.resident_last.load(Ordering::SeqCst), 1, "resident=1");
+        assert!(
+            obs.gpu_reports.load(Ordering::SeqCst) >= 1,
+            "gpu stats reported"
+        );
+        rt.unload("qwen3-14b").await;
+        assert_eq!(obs.evictions.load(Ordering::SeqCst), 1, "eviction recorded");
+        assert_eq!(obs.resident_last.load(Ordering::SeqCst), 0, "resident=0");
     }
 
     #[tokio::test]
