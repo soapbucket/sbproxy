@@ -126,3 +126,27 @@ not per push. A fresh Deep Learning image also needs `cmake`, `clang`,
 `protobuf-compiler`, and `python3-dev` for the full binary and for
 vLLM's runtime `torch.compile`; the `gpu_cert` example alone needs none
 of these.
+
+## Embedded engine (mistral.rs)
+
+The in-process embedded engine (WOR-1658, `engine: embedded`) runs a
+model inside the gateway with no subprocess, behind the off-by-default
+`embedded` cargo feature. It has its own cert mode, since it neither
+spawns a process nor uses the Hugging Face weight-pull path (mistral.rs
+does its own download):
+
+```bash
+# HF_TOKEN is required for gated repos such as Gemma.
+HF_TOKEN=hf_... cargo run --release --example gpu_cert \
+  --features embedded,gpu-nvidia -- embedded google/gemma-2-2b-it
+```
+
+This loads the model with mistral.rs (in-situ 4-bit quantized), serves
+it on a loopback OpenAI endpoint, and asserts a `/v1/chat/completions`
+request returns tokens. It certifies the whole embedded path:
+`ModelBuilder` load, the axum server, and the runtime routing to it like
+any other engine. Repeat with a Qwen or Llama id to confirm other
+architectures. Gemma is Hugging Face-gated, so accept the license and
+set `HF_TOKEN`; without it the load fails with an auth error. The
+`embedded` feature pulls the (large) mistral.rs + candle trees, so build
+it only for this cert, not in the default binary.

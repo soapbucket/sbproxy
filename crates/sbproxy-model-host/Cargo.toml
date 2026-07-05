@@ -21,12 +21,12 @@ weights = ["dep:reqwest"]
 tokenizer = ["dep:tokenizers", "dep:minijinja"]
 # In-process embedded engine (WOR-1658): runs a model inside the gateway
 # with no subprocess, for a single-binary / zero-external-engine deploy.
-# Off by default and, today, a reserved gate: the EngineKind::Embedded
-# dispatch, config, and plan-time doctor are wired, but the candle
-# inference backend it will pull is the remaining implementation, so
-# enabling this alone does not yet serve. It carries no deps until that
-# backend lands, keeping the default build and lockfile unchanged.
-embedded = []
+# Off by default. Backed by mistral.rs (Gemma, Qwen, Llama, ...) served
+# over a loopback OpenAI endpoint via axum, so the runtime routes to it
+# exactly like a subprocess engine. mistral.rs is a large dependency
+# tree (candle etc.), so it is strictly opt-in and absent from the
+# default build + the lean lockfile path.
+embedded = ["dep:mistralrs", "dep:axum"]
 
 [dependencies]
 serde = { workspace = true }
@@ -49,6 +49,9 @@ reqwest = { workspace = true, optional = true }
 # extension) so no new lock entries are pulled.
 tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
 minijinja = { workspace = true, optional = true }
+# WOR-1658 embedded engine (feature `embedded`). Large dep tree; opt-in only.
+mistralrs = { version = "0.8", optional = true }
+axum = { version = "0.8", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

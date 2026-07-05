@@ -31,6 +31,8 @@
 
 pub mod catalog;
 pub mod config;
+#[cfg(feature = "embedded")]
+pub mod embedded;
 pub mod fit;
 pub mod hybrid;
 pub mod kv_tiering;
