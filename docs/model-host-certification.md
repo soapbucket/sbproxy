@@ -1,6 +1,6 @@
 # Model host GPU certification
 
-*Last modified: 2026-07-04*
+*Last modified: 2026-07-05*
 
 The model host's core is hardware-independent and unit-tested on CPU
 (see [model-host.md](model-host.md)). The parts that only a real GPU
@@ -44,9 +44,10 @@ scripts/provision-l4.sh down
 # vLLM in a uv venv (or a container; see the design doc).
 pipx install uv && uv venv && uv pip install vllm
 
-# Build sbproxy with the GPU features on.
-cargo build --release -p sbproxy \
-  --features sbproxy-model-host/gpu-nvidia,sbproxy-model-host/weights
+# Build sbproxy with the GPU features on. A from-scratch box also needs
+# cmake, clang, protobuf-compiler, and python3-dev (see the test-tier
+# note at the end).
+cargo build --release -p sbproxy --features gpu-nvidia,model-weights
 ```
 
 ## 3. Run with a serve: config and certify
@@ -87,3 +88,41 @@ Passing this closes the hardware-gated half of the model-host epic: the
 vLLM, end to end. The CPU-tested planner, supervisor state machine,
 residency manager, and metrics do not change; this proves they hold
 against real hardware.
+
+## Test tiers (the CI matrix)
+
+The model host is tested in two tiers, because the interesting parts
+split cleanly into "runs anywhere" and "needs a real GPU."
+
+**Tier 0, CPU, every push (CI).** The whole crate except the two
+GPU/network cargo features. This is the bulk of the coverage and runs
+in the normal workspace gate (`cargo nextest run --workspace`): the fit
+planner and capability gate (synthetic T4/L4 descriptors via
+`StaticGpuProbe`), the KV-quant lever, the supervisor state machine and
+backoff, the residency/eviction solver (evict-large-idle, pinned
+protection, reload-cost tiebreak), the launch-spec argv templates, the
+metadata parser, the sleep/wake client (against a mock endpoint), the
+`ModelHostRuntime` orchestration (with a fake launcher), the metrics
+observer seam, and the request-path resolution (`resolve_served_base_url`
+against a fake engine that binds a real loopback endpoint). The
+`gpu-nvidia` and `weights` features are off here, so CI needs no GPU,
+no CUDA, and no network.
+
+**Tier 1, real GPU, manual.** The code Tier 0 cannot exercise: NVML
+discovery, the Hugging Face weight pull, and a launcher spawning a real
+vLLM / llama-server. This is the procedure above, driven by the
+`gpu_cert` example built with `--features gpu-nvidia,weights`. Its modes
+map to what each certifies: `probe` (NVML + capability gate + throughput),
+`weights` (HF pull), `runtime` (spawn to tokens, evict-reap-reload),
+`sleepwake` (vLLM sleep/wake), `llamacpp` (llama.cpp GGUF serve),
+`translators` (structured-output / tool-calling / Open-Responses through
+the served engine), and the full binary end-to-end (a `serve:`-only
+config, `POST /v1/chat/completions`, `/admin/model-host/status`,
+`/metrics`).
+
+There is no cloud-GPU CI runner today, so Tier 1 is run by hand on an L4
+(and a T4 for the capability-refusal path) at feature-complete points,
+not per push. A fresh Deep Learning image also needs `cmake`, `clang`,
+`protobuf-compiler`, and `python3-dev` for the full binary and for
+vLLM's runtime `torch.compile`; the `gpu_cert` example alone needs none
+of these.

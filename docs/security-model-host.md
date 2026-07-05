@@ -1,14 +1,14 @@
 # Model host security
 
-*Last modified: 2026-07-04*
+*Last modified: 2026-07-05*
 
 The model host lets configuration start inference-engine subprocesses
 inside a gateway that also holds provider API keys. Spawning processes
 from config is a real attack surface, so it is constrained
 deliberately. This page states the posture, what the config surface
-guarantees today, and what the engine-spawn phase must still enforce
-when it lands. It mirrors the review done for unsandboxed ONNX model
-parsing.
+guarantees, what the shipped engine-spawn phase enforces, and the
+hardening that remains. It mirrors the review done for unsandboxed ONNX
+model parsing.
 
 ## Threat model
 
@@ -42,27 +42,47 @@ in `sbproxy-model-host::config`:
 - **Unknown fields do not silently pass.** An unrecognized engine
   value is a config error, not a fallthrough.
 
-## What the engine-spawn phase must enforce
+## What the shipped engine-spawn phase enforces
 
-The runtime launcher (the `EngineLauncher` implementation that spawns
-the real process) is not in this slice. When it lands it must:
+The runtime launcher (`ProcessEngineLauncher`) has landed and been
+certified on a real NVIDIA L4. The review of that surface:
 
-- **Resolve the binary from `PATH` or a pinned release only.** Never
-  from a config-supplied path. A pinned release is verified against a
-  checked-in sha256 before execution.
-- **Verify weights.** Downloaded weights are checked against a sha256
-  from the catalog (or the Hugging Face commit hash) before they are
-  handed to an engine. A hash mismatch aborts the launch.
-- **Kill the whole process tree.** vLLM forks worker processes that
-  hold VRAM; eviction and shutdown must reap the entire tree
-  (`PR_SET_PDEATHSIG` / process-group kill), not just the parent, or a
-  leaked worker keeps the GPU and the keys' host busy.
-- **Bound the child.** Apply cgroup memory/CPU limits (Linux) and drop
-  ambient privileges so a compromised engine cannot escalate.
-- **Keep the loopback exception narrow.** The engine binds loopback
-  and the provider `base_url` points at it under
-  `allow_private_base_url`; that opt-in must not widen the SSRF guard
+- **Binary resolved from `PATH` or a pinned release only, never from
+  config.** `EngineKind::binary_name` is the only source of the program
+  name; there is no config path that supplies one. The optional
+  auto-fetch (`llama_release`) downloads a pinned ggml-org release for
+  the host platform and refuses an unpinned tag (no `latest`); a fetched
+  release is sha256-verified before use.
+- **Weights verified before use.** The weight manager checks downloaded
+  files against the manifest/catalog sha256 (`weights::verify_sha256`),
+  and the supply-chain layer prefers safetensors and gates pickle
+  weights. A mismatch aborts the launch.
+- **The engine process tree is reaped, and the gateway is never
+  killed.** vLLM forks `EngineCore` workers that hold VRAM. Eviction and
+  shutdown are graceful-first: `SIGTERM` lets the engine tear down its
+  own workers, and only if it does not exit does a `SIGKILL` backstop
+  fire, guarded so it targets **only a process group the child truly
+  leads and that is distinct from the gateway's own group**. The L4
+  certification caught an earlier form of this that could `SIGKILL` the
+  gateway's own group; that is fixed and regression-tested. A crashed
+  engine also fails fast (readiness is raced against the child exiting)
+  with its captured stderr, so a broken model cannot hang a request for
+  the full retry budget.
+- **The loopback exception stays narrow.** A served provider carries no
+  `base_url`; `serve:` and `base_url` on one provider is a config error,
+  rejected at `plan` time. `allow_private_base_url` remains only for a
+  separately-running external engine, and does not widen the SSRF guard
   for any other upstream.
+- **Container images are pinned.** An `engines:` container launch is
+  rejected at `plan` time unless it names a tagged/digest image (no
+  `latest`, no untagged).
+
+### Remaining hardening (not yet enforced)
+
+- **Resource-bound the child.** cgroup memory/CPU limits (Linux) and
+  dropping ambient privileges are not applied yet; a compromised engine
+  currently runs with the gateway's privileges. Track before a
+  multi-tenant deployment where an untrusted party controls the weights.
 
 ## Related
 
