@@ -937,6 +937,16 @@ engine-runtime phases land; names may change before they graduate.
 | Stability | **alpha** |
 | Description | LoRA adapters currently loaded across all base engines. |
 
+#### `sbproxy_model_host_ensure_failures_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **alpha** |
+| Description | Model ensure-ready failures by reason, distinguishing a model that cannot fit the GPU from an engine that crash-loops. |
+
+**Labels:** `reason` (`unknown_model`, `resolve`, `no_metadata`, `fit`, `residency`, `port`, `launch`).
+
 ---
 
 ## Deprecation process

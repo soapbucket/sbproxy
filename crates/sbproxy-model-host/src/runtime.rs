@@ -89,6 +89,13 @@ pub trait ModelHostObserver: Send + Sync {
     fn set_resident_adapters(&self, count: i64) {
         let _ = count;
     }
+    /// Bringing `model` to ready failed (WOR-1711). `reason` is a short
+    /// static category (`unknown_model`, `resolve`, `no_metadata`, `fit`,
+    /// `residency`, `port`, `launch`), distinguishing a model that cannot
+    /// fit the GPU from an engine that crash-loops.
+    fn on_ensure_failed(&self, model: &str, reason: &'static str) {
+        let _ = (model, reason);
+    }
 }
 
 /// A [`ModelHostObserver`] that does nothing; the runtime default.
@@ -239,6 +246,22 @@ pub enum RuntimeError {
     /// The engine failed to reach ready.
     #[error("launch: {0}")]
     Launch(String),
+}
+
+impl RuntimeError {
+    /// A short static label for the failure category (WOR-1711), for the
+    /// `sbproxy_model_host_ensure_failures_total{reason}` metric.
+    pub fn reason_label(&self) -> &'static str {
+        match self {
+            RuntimeError::UnknownModel(_) => "unknown_model",
+            RuntimeError::Resolve { .. } => "resolve",
+            RuntimeError::NoMetadata(_) => "no_metadata",
+            RuntimeError::Fit(_) => "fit",
+            RuntimeError::Residency(_) => "residency",
+            RuntimeError::Port(_) => "port",
+            RuntimeError::Launch(_) => "launch",
+        }
+    }
 }
 
 /// A supervised, resident engine.
@@ -458,11 +481,22 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         // Map an adapter name to its base model's engine key; unknown
         // names fall through to the base path and surface UnknownModel.
         let base = self.base_name_for(name).unwrap_or_else(|| name.to_string());
-        let port = self.ensure_base_ready(&base).await?;
+        // WOR-1711: record every failure category so a model that cannot
+        // fit the GPU is distinguishable from an engine that crash-loops.
+        let port = match self.ensure_base_ready(&base).await {
+            Ok(p) => p,
+            Err(e) => {
+                self.observer.on_ensure_failed(name, e.reason_label());
+                return Err(e);
+            }
+        };
         // Requested an adapter (not the base): ensure it is loaded on the
         // engine. A no-op for statically-preloaded adapters.
         if name != base {
-            self.ensure_adapter_loaded(&base, name, port).await?;
+            if let Err(e) = self.ensure_adapter_loaded(&base, name, port).await {
+                self.observer.on_ensure_failed(name, e.reason_label());
+                return Err(e);
+            }
         }
         Ok(port)
     }
@@ -945,6 +979,8 @@ mod tests {
         adapter_loads: AtomicU64,
         adapter_evictions: AtomicU64,
         resident_adapters_last: AtomicU64,
+        ensure_failures: AtomicU64,
+        last_fail_reason: std::sync::Mutex<Option<String>>,
     }
     impl ModelHostObserver for CountingObserver {
         fn on_engine_ready(&self, _engine: &str, _model: &str, _secs: f64) {
@@ -968,6 +1004,10 @@ mod tests {
         fn set_resident_adapters(&self, count: i64) {
             self.resident_adapters_last
                 .store(count as u64, Ordering::SeqCst);
+        }
+        fn on_ensure_failed(&self, _model: &str, reason: &'static str) {
+            self.ensure_failures.fetch_add(1, Ordering::SeqCst);
+            *self.last_fail_reason.lock().unwrap() = Some(reason.to_string());
         }
     }
 
@@ -1087,6 +1127,35 @@ mod tests {
         assert_eq!(obs.adapter_loads.load(Ordering::SeqCst), 2);
         assert_eq!(obs.adapter_evictions.load(Ordering::SeqCst), 1);
         assert_eq!(obs.resident_adapters_last.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ensure_failures_are_observed_by_reason() {
+        // WOR-1711: an unknown model reports the unknown_model reason.
+        let obs = Arc::new(CountingObserver::default());
+        let rt = l4_runtime(config("models:\n  - model: qwen3-14b\n")).with_observer(obs.clone());
+        assert!(rt.ensure_ready("no-such-model").await.is_err());
+        assert_eq!(obs.ensure_failures.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            obs.last_fail_reason.lock().unwrap().as_deref(),
+            Some("unknown_model")
+        );
+
+        // A host with no GPU cannot fit or admit the model.
+        let obs2 = Arc::new(CountingObserver::default());
+        let rt2 = ModelHostRuntime::new(
+            config("models:\n  - model: qwen3-14b\n"),
+            Catalog::builtin(),
+            Arc::new(StaticGpuProbe::new(vec![])),
+            Arc::new(FixtureMeta),
+            Box::new(SpecPortLauncher::default),
+            true,
+        )
+        .with_observer(obs2.clone());
+        assert!(rt2.ensure_ready("qwen3-14b").await.is_err());
+        assert_eq!(obs2.ensure_failures.load(Ordering::SeqCst), 1);
+        let r = obs2.last_fail_reason.lock().unwrap().clone().unwrap();
+        assert!(r == "fit" || r == "residency", "unexpected reason: {r}");
     }
 
     #[tokio::test]
