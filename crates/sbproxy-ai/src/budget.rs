@@ -516,15 +516,43 @@ fn lookup_price(model: &str) -> Option<ModelPrice> {
     None
 }
 
+/// Which layer produced a model's price (WOR-1710), for the
+/// price-source metric. Ordered by precedence: `Config` and `RateCard`
+/// come from the operator table, `Catalog` from the built-in list, and
+/// `Fallback` is the pessimistic default when nothing matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriceSource {
+    /// Config `model_prices` entry.
+    Config,
+    /// External rate-card (LiteLLM) entry.
+    RateCard,
+    /// Built-in `lookup_price` catalog.
+    Catalog,
+    /// Pessimistic $5/$5 default (no price known).
+    Fallback,
+}
+
+impl PriceSource {
+    /// The metric label for this source.
+    pub fn label(self) -> &'static str {
+        match self {
+            PriceSource::Config => "config",
+            PriceSource::RateCard => "rate_card",
+            PriceSource::Catalog => "catalog",
+            PriceSource::Fallback => "fallback",
+        }
+    }
+}
+
 /// An operator-supplied model price table (WOR-1707): exact
-/// (case-insensitive) model name to price. Populated from the config
-/// `model_prices` map and/or an external rate-card file, and layered
-/// over the built-in `lookup_price` catalog so operators can price
-/// models the catalog does not know (or override stale entries) without
-/// a code change.
+/// (case-insensitive) model name to price, tagged with the layer it
+/// came from (WOR-1710). Populated from the config `model_prices` map
+/// and/or an external rate-card file, and layered over the built-in
+/// `lookup_price` catalog so operators can price models the catalog does
+/// not know (or override stale entries) without a code change.
 #[derive(Debug, Clone, Default)]
 pub struct PriceTable {
-    exact: HashMap<String, ModelPrice>,
+    exact: HashMap<String, (ModelPrice, PriceSource)>,
 }
 
 impl PriceTable {
@@ -544,13 +572,15 @@ impl PriceTable {
     }
 
     /// Insert or override the price for `model` (matched
-    /// case-insensitively).
-    pub fn insert(&mut self, model: impl Into<String>, price: ModelPrice) {
-        self.exact.insert(model.into().to_ascii_lowercase(), price);
+    /// case-insensitively), tagging it with the `source` layer.
+    pub fn insert(&mut self, model: impl Into<String>, price: ModelPrice, source: PriceSource) {
+        self.exact
+            .insert(model.into().to_ascii_lowercase(), (price, source));
     }
 
-    /// The price for `model`, if present (exact, case-insensitive).
-    pub fn get(&self, model: &str) -> Option<ModelPrice> {
+    /// The price + its source for `model`, if present (exact,
+    /// case-insensitive).
+    pub fn get(&self, model: &str) -> Option<(ModelPrice, PriceSource)> {
         self.exact.get(&model.to_ascii_lowercase()).copied()
     }
 
@@ -593,6 +623,7 @@ impl PriceTable {
                         .unwrap_or(0.0)
                         * 1_000_000.0,
                 },
+                PriceSource::RateCard,
             );
             merged += 1;
         }
@@ -614,18 +645,19 @@ pub fn set_price_table(table: PriceTable) {
     }
 }
 
-/// The effective price for `model`: the operator table (config +
-/// rate-card) first, then the built-in catalog, else `None` (the caller
-/// applies the pessimistic fallback). WOR-1707.
-fn resolve_price(model: &str) -> Option<ModelPrice> {
+/// The effective price for `model` and the layer it came from: the
+/// operator table (config + rate-card) first, then the built-in catalog,
+/// else `None` (the caller applies the pessimistic fallback). WOR-1707 /
+/// WOR-1710.
+fn resolve_price(model: &str) -> Option<(ModelPrice, PriceSource)> {
     if let Ok(guard) = PRICE_TABLE.read() {
         if let Some(table) = guard.as_ref() {
-            if let Some(price) = table.get(model) {
-                return Some(price);
+            if let Some(hit) = table.get(model) {
+                return Some(hit);
             }
         }
     }
-    lookup_price(model)
+    lookup_price(model).map(|p| (p, PriceSource::Catalog))
 }
 
 /// A config-supplied model price (WOR-1707). Rates are per-million USD
@@ -678,7 +710,7 @@ pub fn build_price_table(
         }
     }
     for (name, cfg) in prices {
-        table.insert(name.clone(), ModelPrice::from(cfg));
+        table.insert(name.clone(), ModelPrice::from(cfg), PriceSource::Config);
     }
     table
 }
@@ -784,7 +816,11 @@ pub fn estimate_cost(model: &str, prompt_tokens: u64, completion_tokens: u64) ->
     // WOR-1707: operator price table (config + rate card) overrides the
     // built-in catalog; unknown models keep the pessimistic fallback so
     // a budget cap fires earlier rather than later.
-    let price = resolve_price(model).unwrap_or(ModelPrice::tokens(5.0, 5.0));
+    let (price, source) =
+        resolve_price(model).unwrap_or((ModelPrice::tokens(5.0, 5.0), PriceSource::Fallback));
+    // WOR-1710: record which layer priced this request so a high
+    // fallback share (stale catalog / missing rate card) is visible.
+    crate::ai_metrics::record_price_source(source.label());
     let prompt_cost = (prompt_tokens as f64) * price.input_per_million / 1_000_000.0;
     let completion_cost = (completion_tokens as f64) * price.output_per_million / 1_000_000.0;
     prompt_cost + completion_cost
@@ -798,7 +834,11 @@ pub fn estimate_cost(model: &str, prompt_tokens: u64, completion_tokens: u64) ->
 pub fn cheapest_model(candidates: &[String]) -> Option<String> {
     let mut best: Option<(f64, &String)> = None;
     for name in candidates {
-        let price = resolve_price(name).unwrap_or(ModelPrice::tokens(5.0, 5.0));
+        // Routing scores, not billing: use the resolved price but do not
+        // emit the per-request price-source metric (WOR-1710).
+        let price = resolve_price(name)
+            .map(|(p, _)| p)
+            .unwrap_or(ModelPrice::tokens(5.0, 5.0));
         // Score against a representative 1000-prompt / 500-completion
         // mix so input-heavy and output-heavy models are weighted
         // realistically rather than by either rate in isolation.
@@ -1066,7 +1106,8 @@ mod tests {
         let mut t = PriceTable::new();
         let n = t.merge_litellm_json(json).unwrap();
         assert_eq!(n, 1, "only the model with input+output cost is priced");
-        let p = t.get("claude-x").unwrap();
+        let (p, src) = t.get("claude-x").unwrap();
+        assert_eq!(src, PriceSource::RateCard);
         assert!((p.input_per_million - 3.0).abs() < 1e-9);
         assert!((p.output_per_million - 15.0).abs() < 1e-9);
         assert!((p.cache_read_per_million - 0.30).abs() < 1e-9);
@@ -1092,7 +1133,8 @@ mod tests {
         // A rate card that prices gpt-4o differently; config must win.
         // (build_price_table with no file path just applies config.)
         let table = build_price_table(&prices, None);
-        let p = table.get("gpt-4o").unwrap();
+        let (p, src) = table.get("gpt-4o").unwrap();
+        assert_eq!(src, PriceSource::Config);
         assert_eq!(p.input_per_million, 1.0);
         assert_eq!(p.output_per_million, 2.0);
     }
@@ -1122,6 +1164,7 @@ mod tests {
         t.insert(
             "my-local-model",
             ModelPrice::tokens(10.0, 20.0), // $10/$20 per million
+            PriceSource::Config,
         );
         set_price_table(t);
         // 1M input + 1M output at $10/$20 = $30.
@@ -1131,6 +1174,35 @@ mod tests {
         let gpt = estimate_cost("gpt-4o-mini", 1_000_000, 0);
         assert!((gpt - 0.15).abs() < 1e-6, "catalog still applies: {gpt}");
         // Reset the global so other tests see catalog-only behavior.
+        set_price_table(PriceTable::new());
+    }
+
+    #[test]
+    fn price_source_reflects_the_layer_that_priced() {
+        // WOR-1710: resolve_price reports config vs catalog vs (no hit ->
+        // fallback), which is what the price-source metric labels.
+        let _guard = PRICE_TABLE_TEST_LOCK.lock().unwrap();
+        let mut t = PriceTable::new();
+        t.insert(
+            "cfg-model",
+            ModelPrice::tokens(1.0, 2.0),
+            PriceSource::Config,
+        );
+        set_price_table(t);
+        assert_eq!(resolve_price("cfg-model").unwrap().1, PriceSource::Config);
+        // A catalog model not in the table resolves via the catalog.
+        assert_eq!(
+            resolve_price("gpt-4o-mini").unwrap().1,
+            PriceSource::Catalog
+        );
+        // An unknown model resolves to nothing; estimate_cost applies the
+        // Fallback source + the $5/$5 default.
+        assert!(resolve_price("totally-unknown-xyz-model").is_none());
+        // estimate_cost runs (and records the source metric) for each
+        // layer without panicking.
+        for m in ["cfg-model", "gpt-4o-mini", "totally-unknown-xyz-model"] {
+            let _ = estimate_cost(m, 1000, 0);
+        }
         set_price_table(PriceTable::new());
     }
 
