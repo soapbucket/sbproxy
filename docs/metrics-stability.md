@@ -901,6 +901,30 @@ engine-runtime phases land; names may change before they graduate.
 
 **Labels:** `device`.
 
+#### `sbproxy_model_host_lora_loads_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **alpha** |
+| Description | LoRA adapters loaded onto a base engine (dynamic-paging cache misses). |
+
+#### `sbproxy_model_host_lora_evictions_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Stability | **alpha** |
+| Description | LoRA adapters paged out of a base engine's adapter cache to make room past `max_loras`. |
+
+#### `sbproxy_model_host_resident_adapters`
+
+| Property | Value |
+|---|---|
+| Type | Gauge |
+| Stability | **alpha** |
+| Description | LoRA adapters currently loaded across all base engines. |
+
 ---
 
 ## Deprecation process
