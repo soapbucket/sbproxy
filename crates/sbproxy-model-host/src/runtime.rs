@@ -74,6 +74,21 @@ pub trait ModelHostObserver: Send + Sync {
     fn set_gpu_stats(&self, device: &str, total_bytes: u64, free_bytes: u64, utilization: f64) {
         let _ = (device, total_bytes, free_bytes, utilization);
     }
+    /// A LoRA adapter was loaded onto a base engine (WOR-1709), i.e. a
+    /// dynamic-paging cache miss that reached the engine.
+    fn on_adapter_loaded(&self, base: &str, adapter: &str) {
+        let _ = (base, adapter);
+    }
+    /// A LoRA adapter was paged out of a base engine's adapter cache to
+    /// make room past `max_loras` (WOR-1709).
+    fn on_adapter_evicted(&self, base: &str, adapter: &str) {
+        let _ = (base, adapter);
+    }
+    /// The total count of resident (loaded) LoRA adapters across all base
+    /// engines changed to `count` (WOR-1709).
+    fn set_resident_adapters(&self, count: i64) {
+        let _ = count;
+    }
 }
 
 /// A [`ModelHostObserver`] that does nothing; the runtime default.
@@ -510,7 +525,17 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         )
         .await
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // WOR-1709: the adapter reached the engine. Report the
+                // load, any paged-out victim, and the new resident count.
+                self.observer.on_adapter_loaded(base, adapter);
+                if let Some(victim) = &evict {
+                    self.observer.on_adapter_evicted(base, victim);
+                }
+                self.observer
+                    .set_resident_adapters(self.resident_adapter_count().await);
+                Ok(())
+            }
             Err(e) => {
                 // Roll the cache back so the next request retries the load
                 // rather than assuming this adapter is resident.
@@ -522,6 +547,17 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                 )))
             }
         }
+    }
+
+    /// Total resident (loaded) LoRA adapters across all base engines
+    /// (WOR-1709), for the `resident_adapters` gauge.
+    async fn resident_adapter_count(&self) -> i64 {
+        self.lora_caches
+            .lock()
+            .await
+            .values()
+            .map(|c| c.loaded().len() as i64)
+            .sum()
     }
 
     /// Pre-fetch the configured GGUF file for a llama.cpp model
@@ -906,6 +942,9 @@ mod tests {
         evictions: AtomicU64,
         resident_last: AtomicU64,
         gpu_reports: AtomicU64,
+        adapter_loads: AtomicU64,
+        adapter_evictions: AtomicU64,
+        resident_adapters_last: AtomicU64,
     }
     impl ModelHostObserver for CountingObserver {
         fn on_engine_ready(&self, _engine: &str, _model: &str, _secs: f64) {
@@ -919,6 +958,59 @@ mod tests {
         }
         fn set_gpu_stats(&self, _d: &str, _t: u64, _f: u64, _u: f64) {
             self.gpu_reports.fetch_add(1, Ordering::SeqCst);
+        }
+        fn on_adapter_loaded(&self, _base: &str, _adapter: &str) {
+            self.adapter_loads.fetch_add(1, Ordering::SeqCst);
+        }
+        fn on_adapter_evicted(&self, _base: &str, _adapter: &str) {
+            self.adapter_evictions.fetch_add(1, Ordering::SeqCst);
+        }
+        fn set_resident_adapters(&self, count: i64) {
+            self.resident_adapters_last
+                .store(count as u64, Ordering::SeqCst);
+        }
+    }
+
+    /// A launcher that binds a real loopback HTTP server on the spec's
+    /// `--port` answering 200 to everything, so the adapter load/unload
+    /// POSTs succeed and the runtime's LoRA instrumentation fires
+    /// without a real engine (WOR-1709).
+    #[derive(Default)]
+    struct FakeServerLauncher {
+        handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    }
+    impl EngineLauncher for FakeServerLauncher {
+        async fn launch(&self, spec: &LaunchSpec) -> Result<u16, String> {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut port = 0u16;
+            let mut it = spec.args.iter();
+            while let Some(a) = it.next() {
+                if a == "--port" {
+                    port = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+                }
+            }
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .map_err(|e| format!("bind {port}: {e}"))?;
+            let h = tokio::spawn(async move {
+                loop {
+                    let Ok((mut s, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut buf = [0u8; 256];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await;
+                }
+            });
+            *self.handle.lock().await = Some(h);
+            Ok(port)
+        }
+        async fn kill(&self) {
+            if let Some(h) = self.handle.lock().await.take() {
+                h.abort();
+            }
         }
     }
 
@@ -965,6 +1057,36 @@ mod tests {
         );
         // The base engine did come up (only the adapter load failed).
         assert_eq!(rt.resident_models().await, vec!["qwen3-14b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn lora_paging_emits_load_and_evict_metrics() {
+        // WOR-1709: with a fake engine that answers 200, an adapter load
+        // fires on_adapter_loaded + updates the resident-adapter gauge,
+        // and loading past the cap fires on_adapter_evicted.
+        let obs = Arc::new(CountingObserver::default());
+        let rt = ModelHostRuntime::new(
+            config(
+                "models:\n  - model: qwen3-14b\n    max_loras: 1\n    lora_adapters:\n      - name: a\n        source: hf:org/a\n      - name: b\n        source: hf:org/b\n",
+            ),
+            Catalog::builtin(),
+            Arc::new(StaticGpuProbe::new(vec![GpuDescriptor::l4()])),
+            Arc::new(FixtureMeta),
+            Box::new(FakeServerLauncher::default),
+            true,
+        )
+        .with_observer(obs.clone());
+
+        rt.ensure_ready("a").await.expect("adapter a loads");
+        assert_eq!(obs.adapter_loads.load(Ordering::SeqCst), 1);
+        assert_eq!(obs.adapter_evictions.load(Ordering::SeqCst), 0);
+        assert_eq!(obs.resident_adapters_last.load(Ordering::SeqCst), 1);
+
+        // Cap is 1; loading b pages a out.
+        rt.ensure_ready("b").await.expect("adapter b loads");
+        assert_eq!(obs.adapter_loads.load(Ordering::SeqCst), 2);
+        assert_eq!(obs.adapter_evictions.load(Ordering::SeqCst), 1);
+        assert_eq!(obs.resident_adapters_last.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

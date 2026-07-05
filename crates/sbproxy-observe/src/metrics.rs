@@ -2855,6 +2855,54 @@ pub fn set_model_host_resident_models(count: i64) {
     gauge.set(count);
 }
 
+/// A LoRA adapter was loaded onto a base engine (WOR-1709):
+/// `sbproxy_model_host_lora_loads_total`.
+pub fn record_model_host_lora_load() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_model_host_lora_loads_total",
+            "LoRA adapters loaded onto a base engine (dynamic-paging cache misses)",
+        )
+        .expect("model host lora-loads counter registers")
+    });
+    counter.inc();
+}
+
+/// A LoRA adapter was paged out of a base engine's adapter cache
+/// (WOR-1709): `sbproxy_model_host_lora_evictions_total`.
+pub fn record_model_host_lora_eviction() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_model_host_lora_evictions_total",
+            "LoRA adapters evicted from a base engine's cache to make room",
+        )
+        .expect("model host lora-evictions counter registers")
+    });
+    counter.inc();
+}
+
+/// Total resident (loaded) LoRA adapters across all base engines
+/// (WOR-1709): `sbproxy_model_host_resident_adapters`.
+pub fn set_model_host_resident_adapters(count: i64) {
+    use prometheus::{register_int_gauge, IntGauge};
+    use std::sync::OnceLock;
+    static G: OnceLock<IntGauge> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge!(
+            "sbproxy_model_host_resident_adapters",
+            "LoRA adapters currently loaded across all base engines",
+        )
+        .expect("model host resident-adapters gauge registers")
+    });
+    gauge.set(count);
+}
+
 /// Set the request queue depth while an engine loads on
 /// `sbproxy_model_host_load_queue_depth{model}` (requests parked
 /// waiting for a cold model to become Ready).

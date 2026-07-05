@@ -64,6 +64,15 @@ impl sbproxy_model_host::ModelHostObserver for MetricsObserver {
             utilization,
         );
     }
+    fn on_adapter_loaded(&self, _base: &str, _adapter: &str) {
+        sbproxy_observe::metrics::record_model_host_lora_load();
+    }
+    fn on_adapter_evicted(&self, _base: &str, _adapter: &str) {
+        sbproxy_observe::metrics::record_model_host_lora_eviction();
+    }
+    fn set_resident_adapters(&self, count: i64) {
+        sbproxy_observe::metrics::set_model_host_resident_adapters(count);
+    }
 }
 
 /// The GPU probe for the runtime, selected at compile time.
