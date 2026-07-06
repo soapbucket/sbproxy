@@ -902,6 +902,9 @@ pub(super) async fn request_filter(
     // --- Health check endpoint ---
     if path == "/health" {
         send_response(session, 200, "application/json", b"{\"status\":\"ok\"}").await?;
+        // Record the real status so the request log / metrics show 200,
+        // not the unset-status 0 sentinel (WOR-1746).
+        ctx.response_status = Some(200);
         return Ok(true);
     }
 
@@ -915,6 +918,7 @@ pub(super) async fn request_filter(
             body.as_bytes(),
         )
         .await?;
+        ctx.response_status = Some(200);
         return Ok(true);
     }
 
@@ -1033,6 +1037,9 @@ pub(super) async fn request_filter(
         None => {
             warn!(hostname = %hostname, "no origin configured for hostname");
             send_error(session, 404, "not found").await?;
+            // Record the real 404 so the request log / metrics do not show
+            // the unset-status 0 sentinel for an unmatched host (WOR-1746).
+            ctx.response_status = Some(404);
             return Ok(true);
         }
     };

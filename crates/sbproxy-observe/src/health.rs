@@ -23,6 +23,16 @@ use serde::Serialize;
 
 static PROCESS_STARTED_AT: OnceLock<Instant> = OnceLock::new();
 
+/// Anchor the uptime clock at process start.
+///
+/// Call once, early in `main`, before serving. `handle_health` otherwise
+/// initializes this lazily on the first `/health` hit, which anchors
+/// uptime to the first request (so it reads ~0 on that render) rather
+/// than to real process start. Idempotent: the first call wins.
+pub fn mark_process_start() {
+    PROCESS_STARTED_AT.get_or_init(Instant::now);
+}
+
 // --- Component status enum ---
 
 /// Health verdict for one dependency.
@@ -87,7 +97,7 @@ pub struct HealthMetadata {
     pub build_hash: String,
     /// Current server-side timestamp.
     pub timestamp: String,
-    /// Seconds since the process first served a health report.
+    /// Seconds since process start (see `mark_process_start`).
     pub uptime_seconds: u64,
 }
 

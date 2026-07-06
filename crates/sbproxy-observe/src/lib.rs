@@ -79,8 +79,9 @@ pub use events::{EventBus, EventType, PolicySurface, PolicyVerdictEvent, ProxyEv
 pub use export::{WebhookConfig, WebhookExporter};
 pub use health::{
     default_registry, default_registry_optional, handle_health, handle_healthz, handle_livez,
-    handle_readyz, ComponentReport, ComponentStatus, HealthMetadata, HealthRegistry, HealthReport,
-    NotConfiguredProbe, Probe, ReadinessReport, Recency, RecencyProbe, SyntheticProbe,
+    handle_readyz, mark_process_start, ComponentReport, ComponentStatus, HealthMetadata,
+    HealthRegistry, HealthReport, NotConfiguredProbe, Probe, ReadinessReport, Recency,
+    RecencyProbe, SyntheticProbe,
 };
 pub use logging::{
     apply_redaction, apply_redaction_for, emit as emit_structured,
