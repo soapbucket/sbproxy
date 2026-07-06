@@ -2238,6 +2238,34 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
         auth_header.clone()
     };
 
+    // WOR-1758: session whoami. Lets the SPA recover its identity + CSRF
+    // token from the session cookie on load (a page reload keeps the
+    // cookie but loses the in-memory token), and decide whether to show
+    // the login form. Public: returns `{authenticated:false}` with no
+    // session rather than 401, so the SPA can distinguish "log in" from
+    // an error.
+    if path.split('?').next() == Some("/admin/session") && method.eq_ignore_ascii_case("GET") {
+        let body = match &principal {
+            Some(p) => serde_json::json!({
+                "authenticated": true,
+                "username": p.username,
+                "role": role_label(p.role),
+                "via_session": p.via_session,
+                "csrf_token": p.csrf,
+            }),
+            None => serde_json::json!({ "authenticated": false }),
+        };
+        let _ = write_admin_response_headed(
+            sock,
+            200,
+            "application/json",
+            body.to_string().as_bytes(),
+            &cors,
+        )
+        .await;
+        return;
+    }
+
     // WOR-1753: chat playground. Handled here (not in
     // `handle_admin_request`) because the chat call awaits the AI client.
     // Both routes require authentication; the chat POST is a mutation, so
@@ -2329,25 +2357,14 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
 
     // WOR-1715: the built-in admin UI serves a real Vite bundle,
     // including binary assets (fonts, images, wasm) that the `String`
-    // dispatcher path would corrupt. Serve it on the byte path here,
-    // behind the same Basic-auth gate as every other `/admin/*` route
-    // (the IP filter + rate limiter already ran in the accept loop).
+    // dispatcher path would corrupt. Serve it on the byte path here.
+    //
+    // WOR-1758: the SPA shell is served WITHOUT auth so the app can load
+    // and present a login form (POST /admin/login). The bundle is static
+    // JS/CSS/HTML with no secrets; every data-bearing call is a separate
+    // `/admin/*` API request that stays behind the auth gate. The IP
+    // filter + rate limiter already ran in the accept loop.
     if crate::admin_ui::path_is_ours(path) {
-        // Authenticated by session cookie or Basic (WOR-1714). The SPA
-        // shell loads once the browser is authenticated; its API calls
-        // then carry the session cookie.
-        let authed = principal.is_some();
-        if !authed {
-            let _ = write_admin_response_headed(
-                sock,
-                401,
-                "application/json",
-                br#"{"error":"Unauthorized"}"#,
-                &cors,
-            )
-            .await;
-            return;
-        }
         if let Some((status, content_type, bytes)) = crate::admin_ui::dispatch_bytes(method, path) {
             let _ = write_admin_response_headed(sock, status, content_type, &bytes, &cors).await;
             return;

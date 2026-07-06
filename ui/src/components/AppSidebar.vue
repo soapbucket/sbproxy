@@ -1,4 +1,8 @@
 <script setup lang="ts">
+import { useAuth } from "../composables/useAuth";
+
+const { username, role, logout } = useAuth();
+
 const nav = [
   { to: "/", label: "Overview" },
   { to: "/keys", label: "Keys" },
@@ -32,8 +36,12 @@ const nav = [
         {{ item.label }}
       </RouterLink>
     </nav>
-    <div class="sidebar__foot sb-faint">
-      Served at /admin/ui behind admin auth.
+    <div class="sidebar__foot">
+      <div v-if="username" class="who">
+        <span class="who__name">{{ username }}</span>
+        <span class="who__role" v-if="role">{{ role }}</span>
+      </div>
+      <button class="sb-btn sb-btn--sm logout" @click="logout">Sign out</button>
     </div>
   </aside>
 </template>
@@ -113,6 +121,26 @@ const nav = [
   padding: var(--sb-space-4) 8px 0;
   border-top: 1px solid var(--sb-border);
   line-height: 1.4;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sb-space-3);
+}
+.who {
+  display: flex;
+  flex-direction: column;
+}
+.who__name {
+  font-weight: 600;
+  font-size: 0.82rem;
+  color: var(--sb-text);
+}
+.who__role {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--sb-text-faint);
+}
+.logout {
+  align-self: flex-start;
 }
 @media (max-width: 720px) {
   /* Collapse the sidebar into a horizontal top bar. */
