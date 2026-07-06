@@ -1261,6 +1261,38 @@
               "type": "null"
             }
           ]
+        },
+        "bind": {
+          "description": "WOR-1717: address the admin server binds. Defaults to `127.0.0.1` (loopback only). Set to `0.0.0.0` or a specific interface for remote admin, and pair it with `allow_ips` and `tls`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "allow_ips": {
+          "description": "WOR-1717: IP / CIDR allowlist for admin clients. Empty means loopback-only (`127.0.0.1`, `::1`), the safe default. List CIDRs to permit remote admin from known networks.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cors_origins": {
+          "description": "WOR-1717: allowed CORS origins for the admin API, so a separately hosted SPA or dev server can call it cross-origin with credentials. Empty means no CORS headers are emitted (same-origin only).",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "operators": {
+          "description": "WOR-1716: additional admin operators with roles, for RBAC and an attributable audit trail. The top-level `username` / `password` is the implicit full-access `admin` operator; each entry here adds a read-only or admin identity that logs in with its own credentials.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AdminOperator"
+          }
         }
       }
     },
@@ -1281,6 +1313,52 @@
           "type": "string"
         }
       }
+    },
+    "AdminOperator": {
+      "description": "An admin operator identity with a role, for RBAC (WOR-1716).",
+      "type": "object",
+      "required": [
+        "password",
+        "username"
+      ],
+      "properties": {
+        "username": {
+          "description": "Login username.",
+          "type": "string"
+        },
+        "password": {
+          "description": "Login password.",
+          "type": "string"
+        },
+        "role": {
+          "description": "Role governing which admin actions this operator may perform.",
+          "default": "admin",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AdminRole"
+            }
+          ]
+        }
+      }
+    },
+    "AdminRole": {
+      "description": "Admin RBAC role (WOR-1716). `read_only` may call read (GET) endpoints only; `admin` may call every admin route.",
+      "oneOf": [
+        {
+          "description": "Read-only: GET / read endpoints only; state-changing routes 403.",
+          "type": "string",
+          "enum": [
+            "read_only"
+          ]
+        },
+        {
+          "description": "Full admin: every admin route.",
+          "type": "string",
+          "enum": [
+            "admin"
+          ]
+        }
+      ]
     },
     "SecretsConfig": {
       "description": "Top-level secrets management configuration.\n\nControls which vault backend is used to resolve `secret:` references in config values and how secret rotation is handled.",
