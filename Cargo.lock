@@ -8501,6 +8501,7 @@ dependencies = [
  "jsonwebtoken",
  "loom",
  "notify",
+ "parking_lot",
  "pingora-core",
  "pingora-error",
  "pingora-http",
@@ -8921,6 +8922,7 @@ name = "sbproxy-plugin"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "bytes",
  "chrono",
  "compact_str 0.8.1",

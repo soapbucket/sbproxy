@@ -330,7 +330,13 @@ impl KeyRateLimiter {
     /// Check if a request is within rate limits for a key. Returns true if allowed.
     pub fn check_rate(&self, key: &str, config: &VirtualKeyConfig) -> bool {
         let mut state = self.state.lock();
-        let entry = state.entry(key.to_string()).or_default();
+        // WOR-1691: allocate the key only on the first-seen miss instead
+        // of `entry(key.to_string())` cloning it on every request for a
+        // key that already exists after the first.
+        if !state.contains_key(key) {
+            state.insert(key.to_string(), KeyRateState::default());
+        }
+        let entry = state.get_mut(key).expect("inserted above if absent");
 
         let now = std::time::Instant::now();
 

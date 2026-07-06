@@ -32,9 +32,10 @@
 //! writes its verdict back to the per-request context, and the
 //! iteration short-circuits.
 
+use arc_swap::ArcSwap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 // --- View types ---
@@ -289,100 +290,76 @@ pub trait AnomalyDetectorHook: Send + Sync + 'static {
 // slots. Tests that need to install specific impls without touching
 // the inventory feed call `register_*_hook` directly.
 
-static IDENTITY_HOOKS: Mutex<Vec<Arc<dyn IdentityResolverHook>>> = Mutex::new(Vec::new());
-static ML_CLASSIFIER_HOOKS: Mutex<Vec<Arc<dyn MlClassifierHook>>> = Mutex::new(Vec::new());
-static ANOMALY_HOOKS: Mutex<Vec<Arc<dyn AnomalyDetectorHook>>> = Mutex::new(Vec::new());
+// WOR-1691: the registries are write-once at startup and read on the
+// per-request path. `ArcSwap` lets the request path read them with a
+// single atomic load (no lock, no poison, no `.expect()` cascade),
+// while registration appends via a retrying RCU that never loses a
+// concurrent write.
+type IdentityHooks = Vec<Arc<dyn IdentityResolverHook>>;
+type MlClassifierHooks = Vec<Arc<dyn MlClassifierHook>>;
+type AnomalyHooks = Vec<Arc<dyn AnomalyDetectorHook>>;
+
+static IDENTITY_HOOKS: LazyLock<ArcSwap<IdentityHooks>> =
+    LazyLock::new(|| ArcSwap::from_pointee(Vec::new()));
+static ML_CLASSIFIER_HOOKS: LazyLock<ArcSwap<MlClassifierHooks>> =
+    LazyLock::new(|| ArcSwap::from_pointee(Vec::new()));
+static ANOMALY_HOOKS: LazyLock<ArcSwap<AnomalyHooks>> =
+    LazyLock::new(|| ArcSwap::from_pointee(Vec::new()));
 
 /// Register an [`IdentityResolverHook`] at runtime.
 ///
 /// Each call appends a new impl, so the iteration runs all registered
 /// impls in registration order. Tests use this instead of
 /// `inventory::submit!` because inventory entries cannot be removed
-/// for cleanup.
-///
-/// ## Panics
-///
-/// Panics if the internal registry mutex is poisoned, which only
-/// happens if a previous caller panicked while holding the lock. The
-/// registry holds the lock only long enough to push one entry, so this
-/// should not occur in practice.
+/// for cleanup. The append is a retrying RCU, so concurrent
+/// registrations (as happen in parallel tests) never lose an entry.
 pub fn register_identity_hook(hook: Arc<dyn IdentityResolverHook>) {
-    IDENTITY_HOOKS
-        .lock()
-        .expect("identity hook registry poisoned")
-        .push(hook);
+    IDENTITY_HOOKS.rcu(|current| {
+        let mut next = IdentityHooks::clone(current);
+        next.push(hook.clone());
+        next
+    });
 }
 
 /// Register an [`MlClassifierHook`] at runtime. See
 /// [`register_identity_hook`] for the contract.
-///
-/// ## Panics
-///
-/// Panics if the internal registry mutex is poisoned (a prior holder
-/// panicked while holding the lock).
 pub fn register_ml_classifier_hook(hook: Arc<dyn MlClassifierHook>) {
-    ML_CLASSIFIER_HOOKS
-        .lock()
-        .expect("ml classifier hook registry poisoned")
-        .push(hook);
+    ML_CLASSIFIER_HOOKS.rcu(|current| {
+        let mut next = MlClassifierHooks::clone(current);
+        next.push(hook.clone());
+        next
+    });
 }
 
 /// Register an [`AnomalyDetectorHook`] at runtime. See
 /// [`register_identity_hook`] for the contract.
-///
-/// ## Panics
-///
-/// Panics if the internal registry mutex is poisoned (a prior holder
-/// panicked while holding the lock).
 pub fn register_anomaly_hook(hook: Arc<dyn AnomalyDetectorHook>) {
-    ANOMALY_HOOKS
-        .lock()
-        .expect("anomaly hook registry poisoned")
-        .push(hook);
+    ANOMALY_HOOKS.rcu(|current| {
+        let mut next = AnomalyHooks::clone(current);
+        next.push(hook.clone());
+        next
+    });
 }
 
 /// Snapshot all registered identity resolver hooks.
 ///
-/// Returns owned `Arc`s so the iteration stays valid even if the
-/// registry is modified concurrently.
-///
-/// ## Panics
-///
-/// Panics if the internal registry mutex is poisoned (a prior holder
-/// panicked while holding the lock).
-pub fn identity_hooks() -> Vec<Arc<dyn IdentityResolverHook>> {
-    IDENTITY_HOOKS
-        .lock()
-        .expect("identity hook registry poisoned")
-        .clone()
+/// Returns a shared `Arc` to the current registration list, so the
+/// caller iterates a stable snapshot even if a registration lands
+/// concurrently, and the read costs one atomic load with no lock.
+pub fn identity_hooks() -> Arc<IdentityHooks> {
+    IDENTITY_HOOKS.load_full()
 }
 
 /// Snapshot all registered ML classifier hooks. See [`identity_hooks`]
 /// for the contract.
-///
-/// ## Panics
-///
-/// Panics if the internal registry mutex is poisoned (a prior holder
-/// panicked while holding the lock).
-pub fn ml_classifier_hooks() -> Vec<Arc<dyn MlClassifierHook>> {
-    ML_CLASSIFIER_HOOKS
-        .lock()
-        .expect("ml classifier hook registry poisoned")
-        .clone()
+pub fn ml_classifier_hooks() -> Arc<MlClassifierHooks> {
+    ML_CLASSIFIER_HOOKS.load_full()
 }
 
 /// Snapshot all registered anomaly detector hooks. See
 /// [`identity_hooks`] for the contract.
-///
-/// ## Panics
-///
-/// Panics if the internal registry mutex is poisoned (a prior holder
-/// panicked while holding the lock).
-pub fn anomaly_hooks() -> Vec<Arc<dyn AnomalyDetectorHook>> {
-    ANOMALY_HOOKS
-        .lock()
-        .expect("anomaly hook registry poisoned")
-        .clone()
+pub fn anomaly_hooks() -> Arc<AnomalyHooks> {
+    ANOMALY_HOOKS.load_full()
 }
 
 #[cfg(test)]
@@ -476,7 +453,7 @@ mod tests {
         // matching hook wins per the pipeline contract; we just check
         // that our hook ran at least once.
         let mut saw_verdict = false;
-        for h in identity_hooks() {
+        for h in identity_hooks().iter() {
             if let Some(v) = h.resolve(&req).await {
                 assert_eq!(v.agent_id_source, "kya");
                 assert_eq!(v.agent_id, "openai-gptbot");
@@ -524,7 +501,7 @@ mod tests {
             hostname: "h.example.com",
             prior_agent_id: None,
         };
-        for h in identity_hooks() {
+        for h in identity_hooks().iter() {
             let _ = h.resolve(&req).await;
         }
 
@@ -570,7 +547,7 @@ mod tests {
             client_ip: None,
         };
         let mut saw_verdict = false;
-        for h in ml_classifier_hooks() {
+        for h in ml_classifier_hooks().iter() {
             if let Some(v) = h.classify(&snap).await {
                 if v.class == "human" {
                     assert!((v.confidence - 0.95).abs() < f32::EPSILON);
@@ -609,7 +586,7 @@ mod tests {
         };
 
         let mut total: usize = 0;
-        for h in anomaly_hooks() {
+        for h in anomaly_hooks().iter() {
             total += h.analyze(&view).await.len();
         }
         assert!(total >= 1);

@@ -10,6 +10,10 @@ publish = false
 
 [dependencies]
 inventory = { workspace = true }
+# arc-swap backs the lock-free runtime hook registries (WOR-1691): the
+# request path reads them without taking a lock or risking a poisoned
+# mutex; startup registration appends via a retrying RCU.
+arc-swap = { workspace = true }
 # `serde` is the (de)serialization framework behind the credentials-epic
 # Principal / Credential / SecretRef types. Already pulled transitively
 # by `serde_json` but listed explicitly here so
