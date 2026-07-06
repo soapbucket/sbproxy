@@ -1,0 +1,37 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: a hosted model plus prompt management, end to end.
+#
+# This example wires one hosted provider (Anthropic) behind the gateway
+# and turns on the admin server so you can manage prompt versions and
+# exercise the model from the dashboard. Clients send OpenAI-shaped chat
+# completions to ai.local; the gateway translates to the provider and
+# back, so OpenAI SDK clients work unchanged.
+#
+# What to do with it (see README.md for the full walkthrough):
+#   1. export ANTHROPIC_API_KEY=sk-ant-...
+#   2. make run CONFIG=examples/ai-hosted-prompts/sb.yml
+#   3. Add and pin a prompt version through the admin prompts API.
+#   4. Send a chat completion (curl, or the admin Playground) and watch
+#      it route to the hosted model with token usage and cost.
+#
+# The prompt store is runtime state managed over the admin API
+# (/admin/prompts), not config, so it is not declared here.
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: change-this
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          default_model: claude-haiku-4-5
+          models:
+            - claude-haiku-4-5
+      routing: round_robin
