@@ -31,10 +31,40 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 /// The hex hash that precedes the first real entry.
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Last usage-ledger append outcome, for the admin `ledger` health probe
+/// (WOR-1741). This tracks the append *outcome* rather than recency: the
+/// ledger only appends on AI traffic, so a freshness clock would report an
+/// idle-but-healthy ledger as stale. `0` = never appended, `1` = last
+/// append ok, `2` = last append failed.
+static LEDGER_HEALTH: AtomicU8 = AtomicU8::new(0);
+
+/// The outcome of the most recent usage-ledger append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerHealth {
+    /// No append has been attempted yet (ledger idle or not configured).
+    NeverAppended,
+    /// The last append succeeded (or was a dedup no-op).
+    Ok,
+    /// The last append failed, e.g. a disk or IO error.
+    Failed,
+}
+
+/// Read the most recent usage-ledger append outcome, for the admin health
+/// probe. Traffic-independent, so an idle ledger reports `NeverAppended`
+/// (which the probe maps to `NotConfigured`), not a false failure.
+pub fn ledger_health() -> LedgerHealth {
+    match LEDGER_HEALTH.load(Ordering::Relaxed) {
+        1 => LedgerHealth::Ok,
+        2 => LedgerHealth::Failed,
+        _ => LedgerHealth::NeverAppended,
+    }
+}
 
 /// One link in the ledger chain. Serialized as a single JSON line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,8 +250,12 @@ impl UsageLedger {
     /// Best-effort append for the sink hot path: errors are logged and
     /// swallowed so a ledger problem can never fail the request it logs.
     pub fn append(&self, event: &LlmUsageEvent) {
-        if let Err(e) = self.append_checked(event) {
-            tracing::warn!(error = %e, path = %self.path.display(), "usage ledger: append failed");
+        match self.append_checked(event) {
+            Ok(_) => LEDGER_HEALTH.store(1, Ordering::Relaxed),
+            Err(e) => {
+                LEDGER_HEALTH.store(2, Ordering::Relaxed);
+                tracing::warn!(error = %e, path = %self.path.display(), "usage ledger: append failed");
+            }
         }
     }
 }
