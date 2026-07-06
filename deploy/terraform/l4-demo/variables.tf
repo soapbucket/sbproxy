@@ -57,7 +57,8 @@ variable "acme_domain" {
 
 variable "acme_email" {
   type        = string
-  description = "Contact email for the ACME account."
+  default     = ""
+  description = "Contact email for the ACME account. Optional (Let's Encrypt allows none), but recommended so you get expiry/renewal warnings."
 }
 
 variable "bearer_token" {

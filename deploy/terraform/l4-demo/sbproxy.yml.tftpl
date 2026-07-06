@@ -9,7 +9,9 @@ proxy:
   https_bind_port: 443
   acme:
     enabled: true
+%{ if acme_email != "" ~}
     email: ${acme_email}
+%{ endif ~}
     storage_path: /var/lib/sbproxy/certs
   admin:
     enabled: true

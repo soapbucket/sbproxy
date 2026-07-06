@@ -47,7 +47,7 @@ control. Create `terraform.tfvars`:
 ```hcl
 project         = "your-project"
 acme_domain     = "demo.sbproxy.dev"
-acme_email      = "you@example.com"
+acme_email      = "you@example.com"             # optional; LE expiry notices go here
 bearer_token    = "PASTE_A_LONG_RANDOM_VALUE"   # e.g. openssl rand -hex 32
 ssh_public_key  = "ssh-ed25519 AAAA... you@host"
 ssh_source_cidr = "203.0.113.4/32"              # your IP
