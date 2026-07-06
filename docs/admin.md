@@ -179,6 +179,15 @@ mutations need the `admin` role.
 | POST | `/admin/model-host/evict` | Unload a model to free VRAM, `{"model":"<name>"}`. |
 | GET | `/admin/cluster/metrics` | Fleet-aggregated metrics (mesh tier; see [observability.md](observability.md)). |
 
+Config values support environment-variable interpolation (`${ENV_VAR}`)
+and secret backend references (HashiCorp Vault, AWS and GCP Secret
+Manager, Kubernetes Secrets, or a local secret file). The `/admin/config`
+editor reads and writes the raw config text, so those references are
+stored and shown exactly as written: a secret is never resolved into the
+saved config or exposed in the editor, and env vars resolve from the
+running process at load time. See [secrets.md](secrets.md) for the
+reference schemes.
+
 **API keys and upstream credentials.** Full lifecycle over HTTP: create
 (the plaintext token is returned once, on creation), list, get, edit
 policy and attribution, delete, revoke, block, unblock, and

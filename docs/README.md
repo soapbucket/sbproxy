@@ -99,9 +99,6 @@ New here? Read [manual.md](manual.md) for install and CLI, then [configuration.m
 - [headers-reference.md](headers-reference.md) - every response header the proxy can emit, with the config that triggers it.
 - [metrics-stability.md](metrics-stability.md) - Prometheus metric naming and stability.
 - [model-pinning.md](model-pinning.md) - how SHA-256 hashes get computed and pinned for the classifier known-model registry.
-- [adr-ai-hub-format.md](adr-ai-hub-format.md) - hub `ChatFormat` trait and the canonical `ChatRequest` / `ChatResponse` shape that backs `/v1/chat/completions`, `/v1/messages`, and `/v1/responses`.
-- [adr-outbound-credential-resolver.md](adr-outbound-credential-resolver.md) - the OSS vs enterprise line for the outbound credential resolver (RFC 8693 exchange, client-credentials, and vault resolution in OSS).
-- [adr-vault-reference-schemes.md](adr-vault-reference-schemes.md) - per-provider secret reference schemes and the migration path away from the `vault://` umbrella form.
 - [comparison.md](comparison.md) - how SBproxy compares to other proxies and AI gateways.
 
 ### Contributing
