@@ -105,6 +105,15 @@ pub async fn handle_chat(body: Option<&str>) -> (u16, &'static str, String) {
             r#"{"error":"missing 'origin'"}"#.to_string(),
         );
     }
+    // WOR-1760: per-request debug. The playground calls the AI client
+    // directly and does not traverse the data-plane pipeline that stamps
+    // `x-sbproxy-debug-*` headers, so we return the same correlation
+    // fields (a request id, logged server-side, plus the config revision)
+    // in a `debug` block when the client opts in.
+    let debug = parsed
+        .get("debug")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Own the pipeline Arc so the borrow of the AI config stays valid
     // across the await (the load guard alone is not Send).
@@ -183,20 +192,44 @@ pub async fn handle_chat(body: Option<&str>) -> (u16, &'static str, String) {
         },
     );
 
-    (
-        200,
-        "application/json",
-        json!({
-            "origin": origin,
-            "status": status,
-            "model": model,
-            "response": upstream,
-            "usage": { "input_tokens": input, "output_tokens": output },
-            "cost_usd": cost,
-            "latency_ms": latency_ms,
-        })
-        .to_string(),
-    )
+    let mut out = json!({
+        "origin": origin,
+        "status": status,
+        "model": model,
+        "response": upstream,
+        "usage": { "input_tokens": input, "output_tokens": output },
+        "cost_usd": cost,
+        "latency_ms": latency_ms,
+    });
+    if debug {
+        let request_id = format!(
+            "pg-{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        tracing::debug!(
+            target: "sbproxy::admin::playground",
+            request_id = %request_id,
+            origin = %origin,
+            model = %model,
+            status,
+            latency_ms,
+            "playground chat (debug)"
+        );
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert(
+                "debug".to_string(),
+                json!({
+                    "request_id": request_id,
+                    "config_revision": pipeline.config_revision.as_str(),
+                }),
+            );
+        }
+    }
+
+    (200, "application/json", out.to_string())
 }
 
 #[cfg(test)]
