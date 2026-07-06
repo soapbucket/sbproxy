@@ -976,6 +976,136 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
     )
 }
 
+// --- /admin/config (WOR-1720) ---
+
+/// `GET /admin/config`: return the current on-disk config YAML plus the
+/// loaded content-hash, which a client passes back as `if_match` on a
+/// write for optimistic concurrency.
+fn handle_config_read(state: &AdminState) -> (u16, &'static str, String) {
+    let path = match state.config_path.as_ref() {
+        Some(p) => p,
+        None => {
+            return (
+                503,
+                "application/json",
+                r#"{"error":"config path not wired"}"#.to_string(),
+            )
+        }
+    };
+    let yaml = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = sanitise_path_in_error(&e.to_string(), path);
+            return (
+                500,
+                "application/json",
+                format!(r#"{{"error":"read config: {}"}}"#, msg.replace('"', "'")),
+            );
+        }
+    };
+    let revision = state
+        .loaded_config_content_hash
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_default();
+    (
+        200,
+        "application/json",
+        serde_json::json!({"revision": revision, "yaml": yaml}).to_string(),
+    )
+}
+
+/// `PUT /admin/config`: validate a proposed config, persist it, and
+/// hot-swap the pipeline (WOR-1720). The body is the full `sb.yml`. An
+/// optional `if_match` (the content-hash from `GET /admin/config`) gives
+/// optimistic concurrency: a mismatch is `409`. The config is compiled
+/// before it is written, so an invalid config never clobbers the file.
+/// The swap reuses `handle_reload` (single-flight guard, reload hooks).
+fn handle_config_write(
+    state: &AdminState,
+    body: Option<&str>,
+    if_match: Option<&str>,
+) -> (u16, &'static str, String) {
+    let path = match state.config_path.as_ref() {
+        Some(p) => p.clone(),
+        None => {
+            return (
+                503,
+                "application/json",
+                r#"{"error":"config path not wired"}"#.to_string(),
+            )
+        }
+    };
+    let yaml = match body {
+        Some(b) if !b.trim().is_empty() => b,
+        _ => {
+            return (
+                400,
+                "application/json",
+                r#"{"error":"empty config body"}"#.to_string(),
+            )
+        }
+    };
+    // Optimistic concurrency: reject if the caller's expected revision no
+    // longer matches what is loaded.
+    if let Some(expected) = if_match {
+        let loaded = state
+            .loaded_config_content_hash
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
+        if loaded.as_deref() != Some(expected) {
+            return (
+                409,
+                "application/json",
+                format!(
+                    r#"{{"error":"revision mismatch","loaded":"{}"}}"#,
+                    loaded.unwrap_or_default()
+                ),
+            );
+        }
+    }
+    // Validate BEFORE writing so a bad config never clobbers the file.
+    let compiled = match sbproxy_config::compile_config(yaml) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                400,
+                "application/json",
+                format!(
+                    r#"{{"error":"invalid config: {}"}}"#,
+                    e.to_string().replace('"', "'")
+                ),
+            )
+        }
+    };
+    if let Err(e) = crate::pipeline::CompiledPipeline::from_config(compiled) {
+        return (
+            400,
+            "application/json",
+            format!(
+                r#"{{"error":"config does not compile: {}"}}"#,
+                e.to_string().replace('"', "'")
+            ),
+        );
+    }
+    // Persist atomically (temp file + rename in the same directory).
+    let tmp = path.with_extension("sbproxy-tmp");
+    if let Err(e) = std::fs::write(&tmp, yaml.as_bytes()).and_then(|_| std::fs::rename(&tmp, &path))
+    {
+        let _ = std::fs::remove_file(&tmp);
+        let msg = sanitise_path_in_error(&e.to_string(), &path);
+        return (
+            500,
+            "application/json",
+            format!(r#"{{"error":"write config: {}"}}"#, msg.replace('"', "'")),
+        );
+    }
+    // Re-read the just-written file and swap via the shared reload path.
+    handle_reload(state)
+}
+
 // --- /admin/drift ---
 
 /// Compare the on-disk config file at [`AdminState::config_path`]
@@ -1636,6 +1766,22 @@ pub fn handle_admin_request(
         })
         .to_string();
         return (200, "application/json", body);
+    }
+    // WOR-1720: config read + write (validate, persist, hot-swap). The
+    // write path is a mutation, so the connection handler's RBAC gate has
+    // already blocked read-only operators before we get here.
+    if path_only == "/admin/config" {
+        if method.eq_ignore_ascii_case("GET") {
+            return handle_config_read(state);
+        }
+        if method.eq_ignore_ascii_case("PUT") || method.eq_ignore_ascii_case("POST") {
+            return handle_config_write(state, body, rl_query_param(path, "if_match"));
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
     }
 
     // --- Route ---
@@ -2622,6 +2768,48 @@ mod tests {
         let page = state.query_requests(None, None, None, 2, 3);
         assert_eq!(page.len(), 3);
         assert_eq!(page[0].path, "/api/thing/7");
+    }
+
+    #[test]
+    fn config_write_guards() {
+        // WOR-1720: the pre-write guards (empty body, invalid config,
+        // revision mismatch) run before any file write or hot-swap.
+        let dir = tempfile::tempdir().unwrap();
+        let cfgpath = dir.path().join("sb.yml");
+        let original = "proxy:\n  http_bind_port: 8080\norigins: {}\n";
+        std::fs::write(&cfgpath, original).unwrap();
+        let state = AdminState::new(AdminConfig::default())
+            .with_config_path(cfgpath.clone())
+            .with_loaded_config_content_hash("known-revision");
+
+        // Empty body -> 400.
+        assert_eq!(handle_config_write(&state, None, None).0, 400);
+        // Invalid YAML -> 400, and the file is untouched.
+        assert_eq!(
+            handle_config_write(&state, Some("origins: [oops"), None).0,
+            400
+        );
+        // Revision mismatch -> 409 (checked before validation/write).
+        assert_eq!(
+            handle_config_write(&state, Some(original), Some("stale-revision")).0,
+            409
+        );
+        // The on-disk config was never clobbered by the rejected writes.
+        assert_eq!(std::fs::read_to_string(&cfgpath).unwrap(), original);
+    }
+
+    #[test]
+    fn config_read_returns_yaml_and_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfgpath = dir.path().join("sb.yml");
+        std::fs::write(&cfgpath, "proxy:\n  http_bind_port: 8080\n").unwrap();
+        let state = AdminState::new(AdminConfig::default())
+            .with_config_path(cfgpath)
+            .with_loaded_config_content_hash("rev-xyz");
+        let (status, _, body) = handle_config_read(&state);
+        assert_eq!(status, 200);
+        assert!(body.contains("http_bind_port"));
+        assert!(body.contains("rev-xyz"));
     }
 
     #[test]
