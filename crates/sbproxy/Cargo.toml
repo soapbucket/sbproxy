@@ -39,6 +39,8 @@ default = [
   "llms-txt",
   "tls-fingerprint",
   "inprocess-embed",
+  "gpu-nvidia",
+  "model-weights",
 ]
 tiered-pricing = ["sbproxy-modules/tiered-pricing"]
 # WOR-1235: in-process semantic-cache embedder (single-binary). Forwards to
@@ -62,15 +64,21 @@ tls-fingerprint = ["sbproxy-core/tls-fingerprint"]
 embed-admin-ui = ["sbproxy-core/embed-admin-ui"]
 # WOR-1680/1652: local model serving on a GPU host. `gpu-nvidia` gives
 # the model host a real NVML probe; `model-weights` enables the Hugging
-# Face weight pull. Off by default (a GPU-free build serves no local
-# models, so a serve: provider rejects admission cleanly); enable both
-# on a GPU host that hosts models locally.
+# Face weight pull. Both are on by default in the binary so one released
+# artifact adapts to its host at runtime: NVML is dlopen'd (never
+# linked), with an `nvidia-smi` fallback, so on a GPU-free host the
+# probe reports zero GPUs and a serve: provider rejects admission
+# cleanly. Library consumers of sbproxy-core still opt in per crate.
+# `sbproxy doctor` reports what the running host supports.
 gpu-nvidia = ["sbproxy-core/gpu-nvidia"]
-model-weights = ["sbproxy-core/model-weights"]
+model-weights = ["sbproxy-core/model-weights", "sbproxy-model-host/weights"]
 
 [dependencies]
 sbproxy-core.workspace = true
 sbproxy-config.workspace = true
+# `doctor --install`: PATH probes, the pinned llama.cpp release
+# download, and the cache-dir resolver.
+sbproxy-model-host.workspace = true
 # WOR-1540: `ai ledger verify` reuses the verifiable-ledger crypto.
 sbproxy-ai.workspace = true
 sbproxy-modules.workspace = true

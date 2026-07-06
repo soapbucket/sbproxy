@@ -569,6 +569,22 @@ pub struct EngineEnv {
     pub gpu_present: bool,
 }
 
+impl EngineEnv {
+    /// Fill the environment from the real host: `PATH` lookups for the
+    /// engine binaries and a container runtime (docker or podman).
+    /// `gpu_present` comes from the caller, which owns the GPU probe.
+    pub fn probe_host(gpu_present: bool) -> Self {
+        use crate::llama_release::resolve_on_path;
+        Self {
+            vllm_on_path: resolve_on_path("vllm").is_some(),
+            llama_server_on_path: resolve_on_path("llama-server").is_some(),
+            container_runtime: resolve_on_path("docker").is_some()
+                || resolve_on_path("podman").is_some(),
+            gpu_present,
+        }
+    }
+}
+
 /// One serve entry's engine resolution + whether the box can run it,
 /// reported by `sbproxy plan` before anything spawns.
 #[derive(Debug, Clone, PartialEq, Eq)]

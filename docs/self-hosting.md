@@ -1,6 +1,6 @@
 # Self-hosting SBproxy
 
-*Last modified: 2026-07-04*
+*Last modified: 2026-07-06*
 
 One binary to self-host your AI gateway, and the same binary runs the
 models. OpenRouter proved that teams want unified routing, fallbacks,
@@ -82,6 +82,16 @@ sbproxy models pull -f sb.yml
 (binary on PATH, container runtime present, GPU found). A missing
 dependency is a plan-time message, not a spawn failure at 2am on the
 first request.
+
+`sbproxy doctor` gives the host-wide version of the same answer with
+no config at all: visible GPUs, engines on PATH, container runtime,
+and a readiness verdict with every blocker listed. Add
+`--install vllm` or `--install llama-cpp` to acquire a missing engine
+on the spot (see [manual.md](manual.md) for the full flag surface).
+The proxy also re-checks these prerequisites every time a config with
+`serve:` loads, and logs a warning per missing piece, so a
+freshly-imaged box that lost its engine or driver tells you at boot,
+not at the first request.
 
 ## Point Claude Code at your own GPU
 

@@ -1,6 +1,6 @@
 # Model host GPU certification
 
-*Last modified: 2026-07-05*
+*Last modified: 2026-07-06*
 
 The model host's core is hardware-independent and unit-tested on CPU
 (see [model-host.md](model-host.md)). The parts that only a real GPU
@@ -10,12 +10,19 @@ cloud GPU with this procedure. It is written for a single NVIDIA L4
 (24 GB, Ada, FP8-capable) on GCP, which is the reference certification
 target.
 
-The GPU-only code is behind two off-by-default cargo features so the
-normal build and CI stay lean and GPU-free:
+The GPU-only code is behind two cargo features that the `sbproxy`
+binary enables by default (the crates themselves leave them off, so
+library builds and the crate-level CI test lane stay GPU-free):
 
 - `gpu-nvidia` turns on `NvmlGpuProbe` (real VRAM / compute-capability
-  discovery via NVML, with an `nvidia-smi` fallback).
-- `weights` turns on the Hugging Face weight download.
+  discovery via NVML at runtime via `dlopen`, with an `nvidia-smi`
+  fallback; nothing CUDA is needed at build time).
+- `weights` (`model-weights` at the binary level) turns on the Hugging
+  Face weight download.
+
+A released binary therefore needs no rebuild for this procedure; the
+build step below matters when certifying from source. `sbproxy doctor`
+on the box shows what the probe sees before any config is written.
 
 ## 1. Provision an L4
 
@@ -44,10 +51,11 @@ scripts/provision-l4.sh down
 # vLLM in a uv venv (or a container; see the design doc).
 pipx install uv && uv venv && uv pip install vllm
 
-# Build sbproxy with the GPU features on. A from-scratch box also needs
-# cmake, clang, protobuf-compiler, and python3-dev (see the test-tier
-# note at the end).
-cargo build --release -p sbproxy --features gpu-nvidia,model-weights
+# Build sbproxy. The GPU features are already in the binary's default
+# feature set. A from-scratch box also needs cmake, clang,
+# protobuf-compiler, and python3-dev (see the test-tier note at the
+# end).
+cargo build --release -p sbproxy
 ```
 
 ## 3. Run with a serve: config and certify
@@ -105,8 +113,10 @@ metadata parser, the sleep/wake client (against a mock endpoint), the
 `ModelHostRuntime` orchestration (with a fake launcher), the metrics
 observer seam, and the request-path resolution (`resolve_served_base_url`
 against a fake engine that binds a real loopback endpoint). The
-`gpu-nvidia` and `weights` features are off here, so CI needs no GPU,
-no CUDA, and no network.
+`gpu-nvidia` and `weights` features are off at the crate level, so
+this lane needs no GPU, no CUDA, and no network (the binary's default
+features only dlopen NVML at runtime; they add no build-time GPU
+dependency either).
 
 **Tier 1, real GPU, manual.** The code Tier 0 cannot exercise: NVML
 discovery, the Hugging Face weight pull, and a launcher spawning a real

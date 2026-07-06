@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-06-08*
+*Last modified: 2026-07-06*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -110,6 +110,7 @@ sbproxy plan -f <yaml> [--against <yaml>] [--format json|text] [--out <plan-file
 sbproxy apply -f <yaml>
 sbproxy apply -p <plan-file>
 sbproxy projections render --kind <kind> --config <path> [--hostname <h>]
+sbproxy doctor [--format text|json]
 sbproxy completions {bash|zsh|fish|powershell|elvish}
 sbproxy --version
 sbproxy --help
@@ -240,6 +241,67 @@ sbproxy projections render --kind llms-full --config sb.yml --hostname api.examp
 When `--hostname` is omitted, the first origin in the config is
 chosen. Accepted `--kind` values: `robots`, `llms`, `llms-full`,
 `licenses`, `tdmrep`.
+
+### `doctor` - what can this binary do on this host
+
+Prints a host-capability report: the capability features the binary
+was compiled with, the GPUs the local model host would see (same probe
+as the `serve:` admission path, so the two can never disagree), which
+inference engine binaries (`vllm`, `llama-server`) resolve on `PATH`,
+the default model-weight cache directory, and a final verdict on
+whether a `serve:` provider could admit a model on this host, with
+every blocker listed when it could not.
+
+```bash
+sbproxy doctor
+sbproxy doctor --format json
+```
+
+Collection is read-only: no engine starts, nothing is written. The
+released binary ships with GPU discovery compiled in and loads the
+NVIDIA driver library at runtime (falling back to `nvidia-smi`), so
+the same artifact reports "ready" on a GPU host and lists what is
+missing everywhere else. Always exits 0 once the report is produced;
+"this host cannot serve local models" is a finding, not an error. See
+[model-host.md](model-host.md) for the `serve:` block itself.
+
+The same host state is checked at startup and on every hot reload:
+when a loaded config declares `serve:` but the host is missing a
+prerequisite (no visible GPU, or a serve entry whose engine has no
+binary and no container runtime), the proxy logs a warning naming the
+model, the resolved engine, and the blocker. Requests still degrade
+gracefully (admission rejects, the attempt fails over to the next
+provider), but the gap surfaces when the config lands instead of on
+the first request.
+
+#### `doctor --install` - install a missing engine
+
+`--install` acquires a missing `serve:` prerequisite instead of just
+reporting it:
+
+```bash
+sbproxy doctor --install vllm                 # uv tool install / pipx install
+sbproxy doctor --install llama-cpp            # brew install llama.cpp
+sbproxy doctor --install llama-cpp \
+  --llama-tag b4589 --llama-sha256 <zip-sha>  # pinned upstream release
+sbproxy doctor --install vllm --yes           # no prompt (provisioning)
+```
+
+`vllm` installs through `uv` (preferred) or `pipx`; with neither
+present it prints where to get them, or how to run vLLM from a pinned
+container image instead. `llama-cpp` installs through Homebrew; with
+no Homebrew it downloads the named ggml-org release for this platform,
+verifies the archive against the sha256 you pass, extracts it into the
+model cache, and links `llama-server` into `--bin-dir` (default
+`/usr/local/bin`) so the engine launcher finds it on `PATH`.
+
+Every executed command is a fixed argument list (no shell), printed
+before it runs, and nothing runs without confirmation (`--yes` skips
+the prompt for scripts). The release path accepts only a pinned tag
+plus digest, never `latest`. GPU drivers are never installed; a
+missing driver is reported with guidance only. After a successful
+install the doctor report is printed again so you see the new
+verdict. Exits 0 only when the prerequisite is in place afterwards.
 
 ### `completions` - shell tab-completion scripts
 
