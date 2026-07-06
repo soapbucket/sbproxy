@@ -99,6 +99,49 @@ export function groupByLabel(
     .sort((a, b) => b.value - a.value);
 }
 
+/**
+ * Estimate a quantile (`q` in 0..1) from a histogram family's `_bucket`
+ * samples, summing cumulative buckets across all label sets by their `le`
+ * bound and interpolating linearly within the matched bucket. Returns the
+ * value in the metric's own unit, or `undefined` if there are no buckets.
+ */
+export function histogramQuantile(
+  family: MetricFamily | undefined,
+  q: number,
+): number | undefined {
+  if (!family) return undefined;
+  const byLe = new Map<number, number>();
+  let hasBuckets = false;
+  for (const s of family.samples) {
+    if (!s.name.endsWith("_bucket")) continue;
+    const leRaw = s.labels.le;
+    if (leRaw === undefined) continue;
+    const le = leRaw === "+Inf" ? Infinity : Number(leRaw);
+    if (Number.isNaN(le)) continue;
+    hasBuckets = true;
+    byLe.set(le, (byLe.get(le) ?? 0) + s.value);
+  }
+  if (!hasBuckets) return undefined;
+  const buckets = [...byLe.entries()].sort((a, b) => a[0] - b[0]);
+  const total = buckets.length ? buckets[buckets.length - 1][1] : 0;
+  if (total <= 0) return undefined;
+  const target = q * total;
+  let prevLe = 0;
+  let prevCount = 0;
+  for (const [le, count] of buckets) {
+    if (count >= target) {
+      if (!Number.isFinite(le)) return prevLe;
+      const bucketCount = count - prevCount;
+      if (bucketCount <= 0) return le;
+      const frac = (target - prevCount) / bucketCount;
+      return prevLe + (le - prevLe) * frac;
+    }
+    prevLe = Number.isFinite(le) ? le : prevLe;
+    prevCount = count;
+  }
+  return prevLe;
+}
+
 export function findFamily(
   families: MetricFamily[],
   ...names: string[]

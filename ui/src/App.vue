@@ -28,6 +28,10 @@ import AppSidebar from "./components/AppSidebar.vue";
   padding: var(--sb-space-6) var(--sb-space-6) var(--sb-space-7);
 }
 @media (max-width: 720px) {
+  /* Stack the sidebar above the content on narrow viewports. */
+  .shell {
+    flex-direction: column;
+  }
   .content__inner {
     padding: var(--sb-space-5) var(--sb-space-4) var(--sb-space-6);
   }

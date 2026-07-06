@@ -113,4 +113,39 @@ const nav = [
   border-top: 1px solid var(--sb-border);
   line-height: 1.4;
 }
+@media (max-width: 720px) {
+  /* Collapse the sidebar into a horizontal top bar. */
+  .sidebar {
+    width: 100%;
+    height: auto;
+    position: static;
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--sb-space-3);
+    padding: var(--sb-space-3) var(--sb-space-4);
+    border-right: none;
+    border-bottom: 1px solid var(--sb-border);
+  }
+  .brand {
+    padding: 0;
+  }
+  .nav {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 2px;
+  }
+  .nav__item {
+    border-left: none;
+    border-bottom: 2px solid transparent;
+    padding: 6px 10px;
+  }
+  .nav__item--active {
+    border-left-color: transparent;
+    border-bottom-color: var(--sb-accent);
+  }
+  .sidebar__foot {
+    display: none;
+  }
+}
 </style>

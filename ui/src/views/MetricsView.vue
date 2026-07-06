@@ -7,9 +7,10 @@ import {
   findFamily,
   groupByLabel,
   sumSamples,
+  histogramQuantile,
   type MetricFamily,
 } from "../lib/metrics";
-import { formatNumber } from "../lib/format";
+import { formatNumber, formatMs, formatUsd } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatCard from "../components/StatCard.vue";
 import MiniBars from "../components/MiniBars.vue";
@@ -49,6 +50,46 @@ const requestsByStatus = computed(() => {
 });
 const totalRequests = computed(() => sumSamples(requestFamily.value));
 
+const requestsByMethod = computed(() => {
+  const f = requestFamily.value;
+  if (!f || !f.samples.some((s) => "method" in s.labels)) return [];
+  return groupByLabel(f, "method").slice(0, 8);
+});
+const requestsByHost = computed(() => {
+  const f = requestFamily.value;
+  const label = ["hostname", "host", "origin"].find((l) =>
+    f?.samples.some((s) => l in s.labels),
+  );
+  return f && label ? groupByLabel(f, label).slice(0, 8) : [];
+});
+const errorRate = computed(() => {
+  const total = totalRequests.value;
+  if (!total) return undefined;
+  const errs = requestsByStatus.value
+    .filter((s) => /^[45]/.test(s.key))
+    .reduce((acc, s) => acc + s.value, 0);
+  return (errs / total) * 100;
+});
+
+// Latency percentiles from the request-duration histogram (seconds -> ms).
+const latencyFamily = computed(() =>
+  findFamily(families.value, "sbproxy_request_duration_seconds"),
+);
+const latencyPercentiles = computed(() => {
+  const f = latencyFamily.value;
+  if (!f) return [];
+  return [
+    { key: "p50", q: 0.5 },
+    { key: "p95", q: 0.95 },
+    { key: "p99", q: 0.99 },
+  ]
+    .map(({ key, q }) => {
+      const secs = histogramQuantile(f, q);
+      return secs === undefined ? null : { key, value: secs * 1000 };
+    })
+    .filter((x): x is { key: string; value: number } => x !== null);
+});
+
 // AI token and cost families, if present.
 const tokenFamily = computed(() =>
   findFamily(
@@ -61,21 +102,40 @@ const tokenFamily = computed(() =>
 const costFamily = computed(() =>
   findFamily(
     families.value,
+    // The server emits cost in micro-USD; keep the older names as fallbacks.
+    "sbproxy_ai_cost_usd_micros_total",
     "sbproxy_ai_cost_usd_total",
     "sbproxy_cost_usd_total",
     "sbproxy_ai_cost_total",
   ),
 );
 const totalTokens = computed(() => (tokenFamily.value ? sumSamples(tokenFamily.value) : undefined));
-const totalCost = computed(() => (costFamily.value ? sumSamples(costFamily.value) : undefined));
+const totalCost = computed(() => {
+  const f = costFamily.value;
+  if (!f) return undefined;
+  const raw = sumSamples(f);
+  // Micro-USD counter -> USD.
+  return f.name.includes("micros") ? raw / 1e6 : raw;
+});
 
 const tokensByKind = computed(() => {
   const f = tokenFamily.value;
   if (!f) return [];
-  const label = ["kind", "type", "direction", "token_type"].find((l) =>
+  const label = ["direction", "kind", "type", "token_type"].find((l) =>
     f.samples.some((s) => l in s.labels),
   );
   return label ? groupByLabel(f, label).slice(0, 8) : [];
+});
+const tokensByProvider = computed(() => {
+  const f = tokenFamily.value;
+  return f && f.samples.some((s) => "provider" in s.labels)
+    ? groupByLabel(f, "provider").slice(0, 8)
+    : [];
+});
+
+const activeConnections = computed(() => {
+  const f = findFamily(families.value, "sbproxy_active_connections");
+  return f ? sumSamples(f) : undefined;
 });
 
 // Model-host gauges (any sbproxy_model_host_* or sbproxy_*vram* gauge).
@@ -93,11 +153,19 @@ const modelHostGauges = computed(() => {
 const tiles = computed(() => {
   const t: { label: string; value: string | number; sub?: string }[] = [];
   t.push({ label: "Total requests", value: formatNumber(totalRequests.value) });
+  if (errorRate.value !== undefined) {
+    t.push({ label: "Error rate", value: `${errorRate.value.toFixed(1)}%` });
+  }
+  const p95 = latencyPercentiles.value.find((p) => p.key === "p95");
+  if (p95) t.push({ label: "p95 latency", value: formatMs(p95.value) });
+  if (activeConnections.value !== undefined) {
+    t.push({ label: "Active connections", value: formatNumber(activeConnections.value) });
+  }
   if (totalTokens.value !== undefined) {
     t.push({ label: "AI tokens", value: formatNumber(totalTokens.value) });
   }
   if (totalCost.value !== undefined) {
-    t.push({ label: "AI cost (USD)", value: `$${formatNumber(totalCost.value)}` });
+    t.push({ label: "AI cost", value: formatUsd(totalCost.value) });
   }
   t.push({ label: "sbproxy_* series", value: sbFamilies.value.length });
   return t;
@@ -140,12 +208,33 @@ const rawText = computed(() => req.data.value ?? "");
       </div>
 
       <div class="panels">
+        <div class="sb-card" v-if="latencyPercentiles.length">
+          <h3>Request latency</h3>
+          <dl class="pctl">
+            <template v-for="p in latencyPercentiles" :key="p.key">
+              <dt>{{ p.key }}</dt>
+              <dd>{{ formatMs(p.value) }}</dd>
+            </template>
+          </dl>
+        </div>
         <div class="sb-card" v-if="requestsByStatus.length">
           <h3>Requests by status</h3>
           <MiniBars :items="requestsByStatus" />
         </div>
+        <div class="sb-card" v-if="requestsByMethod.length">
+          <h3>Requests by method</h3>
+          <MiniBars :items="requestsByMethod" />
+        </div>
+        <div class="sb-card" v-if="requestsByHost.length">
+          <h3>Requests by host</h3>
+          <MiniBars :items="requestsByHost" />
+        </div>
+        <div class="sb-card" v-if="tokensByProvider.length">
+          <h3>Tokens by provider</h3>
+          <MiniBars :items="tokensByProvider" />
+        </div>
         <div class="sb-card" v-if="tokensByKind.length">
-          <h3>Tokens by kind</h3>
+          <h3>Tokens by direction</h3>
           <MiniBars :items="tokensByKind" />
         </div>
         <div class="sb-card" v-if="modelHostGauges.length">
@@ -154,8 +243,11 @@ const rawText = computed(() => req.data.value ?? "");
         </div>
       </div>
 
-      <p class="sb-faint" v-if="!requestsByStatus.length && !tokensByKind.length && !modelHostGauges.length">
-        No labelled series matched the known request, token, or model-host families. Use View raw to inspect the full scrape.
+      <p
+        class="sb-faint"
+        v-if="!requestsByStatus.length && !requestsByMethod.length && !requestsByHost.length && !latencyPercentiles.length && !tokensByKind.length && !tokensByProvider.length && !modelHostGauges.length"
+      >
+        No labelled series matched the known request, latency, token, or model-host families. Use View raw to inspect the full scrape.
       </p>
     </template>
   </template>
@@ -175,5 +267,24 @@ const rawText = computed(() => req.data.value ?? "");
 }
 .panels h3 {
   margin-bottom: var(--sb-space-4);
+}
+.pctl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--sb-space-2) var(--sb-space-4);
+  margin: 0;
+}
+.pctl dt {
+  font-variant-numeric: tabular-nums;
+  color: var(--sb-text-muted);
+  text-transform: uppercase;
+  font-size: 0.85em;
+  letter-spacing: 0.03em;
+}
+.pctl dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  font-weight: 600;
 }
 </style>
