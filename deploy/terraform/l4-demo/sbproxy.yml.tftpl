@@ -45,5 +45,8 @@ origins:
 %{ if m.name != null ~}
                 name: ${m.name}
 %{ endif ~}
+%{ if m.gguf_file != null ~}
+                gguf_file: ${m.gguf_file}
+%{ endif ~}
                 keep_alive: ${coalesce(m.keep_alive, "30m")}
 %{ endfor ~}

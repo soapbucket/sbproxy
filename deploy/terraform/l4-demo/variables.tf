@@ -26,7 +26,7 @@ variable "machine_type" {
 
 variable "image" {
   type        = string
-  default     = "projects/deeplearning-platform-release/global/images/family/common-cu124-debian-11"
+  default     = "projects/deeplearning-platform-release/global/images/family/common-cu129-ubuntu-2204-nvidia-580"
   description = "Boot image. The Deep Learning VM CUDA family ships the NVIDIA driver + CUDA toolkit."
 }
 
@@ -71,22 +71,23 @@ variable "serve_models" {
   type = list(object({
     model      = string           # catalog id (e.g. "qwen3-14b") OR "hf:Org/Repo:QUANT"
     name       = optional(string) # plane-visible id; REQUIRED for an hf: ref
+    gguf_file  = optional(string) # GGUF filename in the repo (llama.cpp path)
     keep_alive = optional(string, "30m")
   }))
-  # Two entries by default, one of each serve type: a built-in catalog id
-  # (the fit planner picks the quant the L4 can run) and a raw hf:
-  # reference (a non-catalog model, needs an explicit name). Add or swap
-  # entries to test other models; both fit a 24GB L4 at these quants.
+  # Default: CodeGeeX4-All-9B (GLM-based code model) as a GGUF served by
+  # llama.cpp, which the startup script builds. For a GGUF, set gguf_file
+  # so the model host fetches that file and reads its header for the fit
+  # metadata (a GGUF-only repo has no config.json). Q4_K_M fits a 24GB L4.
+  # A catalog id (e.g. qwen3-14b) resolves to a safetensors repo served by
+  # vLLM instead; add vLLM to the startup script to serve those.
   default = [
     {
-      model = "qwen3-14b"
-    },
-    {
-      model = "hf:THUDM/codegeex4-all-9b-GGUF:Q4_K_M"
-      name  = "codegeex4-all-9b"
+      model     = "hf:zai-org/codegeex4-all-9b-GGUF:Q4_K_M"
+      name      = "codegeex4-all-9b"
+      gguf_file = "codegeex4-all-9b-Q4_K_M.gguf"
     },
   ]
-  description = "Models the sbproxy model host serves locally. Each is a catalog id or an hf:Org/Repo:QUANT reference."
+  description = "Models the sbproxy model host serves locally. A catalog id (vLLM/safetensors) or an hf:Org/Repo:QUANT GGUF (llama.cpp; set gguf_file)."
 }
 
 variable "cache_budget_gib" {

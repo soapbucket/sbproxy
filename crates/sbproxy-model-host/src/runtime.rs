@@ -653,6 +653,32 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         None
     }
 
+    /// Read the fit metadata (`layers`, `kv_heads`, `head_dim`, params,
+    /// context) from a local GGUF file's header (WOR-1769). A GGUF-only
+    /// HF repo has no transformers `config.json`, so the header is the
+    /// only metadata source. Only the leading metadata block is parsed,
+    /// so a generous prefix is read rather than the multi-GB body.
+    async fn gguf_header_metadata(
+        path: &std::path::Path,
+        params_fallback: u64,
+    ) -> Option<ModelMetadata> {
+        use tokio::io::AsyncReadExt;
+        let mut f = tokio::fs::File::open(path).await.ok()?;
+        // Cover the header + all metadata KV pairs (the tokenizer arrays
+        // can be a few MiB) without reading the tensor body.
+        const HEADER_CAP: usize = 64 * 1024 * 1024;
+        let mut buf = Vec::with_capacity(1024 * 1024);
+        let mut chunk = vec![0u8; 1024 * 1024];
+        loop {
+            let n = f.read(&mut chunk).await.ok()?;
+            if n == 0 || buf.len() >= HEADER_CAP {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        ModelMetadata::from_gguf(&buf, params_fallback)
+    }
+
     /// Bring the base model `name`'s engine to ready, spawning (and
     /// evicting to make room) as needed, and return its loopback port.
     /// `name` here is always a base model name (adapter names are mapped
@@ -685,10 +711,30 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                 reason: e.to_string(),
             })?;
 
-        let meta = self
-            .metadata
-            .metadata(&model_ref)
-            .ok_or_else(|| RuntimeError::NoMetadata(name.to_string()))?;
+        // WOR-1769: for a GGUF model (gguf_file set), pre-fetch the GGUF
+        // now and read its header for the fit metadata a GGUF-only repo
+        // cannot supply via config.json. The fetched path is reused at
+        // launch below so we do not download twice. Falls back to the
+        // config.json metadata provider (safetensors / vLLM path).
+        let prefetched_gguf = if entry.gguf_file.is_some() {
+            self.prefetch_gguf(&entry, &model_ref).await
+        } else {
+            None
+        };
+        let params_fallback = model_ref
+            .catalog_id
+            .as_ref()
+            .and_then(|id| self.catalog.get(id))
+            .map(|e| parse_params(&e.params))
+            .filter(|p| *p > 0)
+            .unwrap_or(0);
+        let meta = match prefetched_gguf.as_deref() {
+            Some(path) => Self::gguf_header_metadata(path, params_fallback)
+                .await
+                .or_else(|| self.metadata.metadata(&model_ref)),
+            None => self.metadata.metadata(&model_ref),
+        }
+        .ok_or_else(|| RuntimeError::NoMetadata(name.to_string()))?;
 
         let candidates = self.candidate_quants(&model_ref);
         let seq_len = entry.max_context.unwrap_or(meta.max_context);
@@ -766,7 +812,14 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         // (the `weights` feature is off), fall back to `--hf-file` so a
         // curl build at least gets the right file.
         if engine_kind == crate::config::EngineKind::LlamaCpp {
-            if let Some(local) = self.prefetch_gguf(&entry, &model_ref).await {
+            // Reuse the GGUF already pre-fetched for metadata above; only
+            // fetch here if we did not (e.g. gguf_file unset but the fit
+            // resolved to a GGUF quant).
+            let local = match prefetched_gguf {
+                Some(p) => Some(p),
+                None => self.prefetch_gguf(&entry, &model_ref).await,
+            };
+            if let Some(local) = local {
                 crate::launch::llama_use_local_model(&mut spec.args, &local);
             } else if let Some(file) = &entry.gguf_file {
                 crate::launch::llama_set_hf_file(&mut spec.args, file);
@@ -956,6 +1009,57 @@ mod tests {
                 max_context: 40960,
             })
         }
+    }
+
+    /// Minimal GGUF v3 header with the shape KVs, for the metadata-read
+    /// test. No `general.parameter_count`, so `params` uses the fallback.
+    fn synth_min_gguf(arch: &str, layers: u32, heads: u32, kv_heads: u32, hidden: u32) -> Vec<u8> {
+        fn s(out: &mut Vec<u8>, v: &str) {
+            out.extend_from_slice(&(v.len() as u64).to_le_bytes());
+            out.extend_from_slice(v.as_bytes());
+        }
+        fn u32kv(out: &mut Vec<u8>, k: &str, v: u32) {
+            s(out, k);
+            out.extend_from_slice(&4u32.to_le_bytes()); // type u32
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut o = Vec::new();
+        o.extend_from_slice(b"GGUF");
+        o.extend_from_slice(&3u32.to_le_bytes()); // version
+        o.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        o.extend_from_slice(&5u64.to_le_bytes()); // kv_count
+        u32kv(&mut o, &format!("{arch}.block_count"), layers);
+        u32kv(&mut o, &format!("{arch}.attention.head_count"), heads);
+        u32kv(&mut o, &format!("{arch}.attention.head_count_kv"), kv_heads);
+        u32kv(&mut o, &format!("{arch}.embedding_length"), hidden);
+        u32kv(&mut o, &format!("{arch}.context_length"), 8192u32);
+        o
+    }
+
+    #[tokio::test]
+    async fn gguf_header_metadata_reads_shape_from_file() {
+        // WOR-1769: a GGUF-only model's shape comes from the header file,
+        // not a config.json. Write a synthetic GGUF and read it back.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.gguf");
+        std::fs::write(&path, synth_min_gguf("glm", 40, 32, 8, 4096)).unwrap();
+        let meta = ModelHostRuntime::<SpecPortLauncher>::gguf_header_metadata(&path, 9_000_000_000)
+            .await
+            .expect("gguf header parses");
+        assert_eq!(meta.layers, 40);
+        assert_eq!(meta.kv_heads, 8);
+        assert_eq!(meta.head_dim, 128); // 4096 / 32
+        assert_eq!(meta.params, 9_000_000_000); // fallback (no general.parameter_count)
+
+        // A non-GGUF file returns None so the caller falls back to the
+        // config.json provider.
+        let bad = dir.path().join("x.bin");
+        std::fs::write(&bad, b"not a gguf file").unwrap();
+        assert!(
+            ModelHostRuntime::<SpecPortLauncher>::gguf_header_metadata(&bad, 0)
+                .await
+                .is_none()
+        );
     }
 
     fn config(yaml: &str) -> ModelHostConfig {
