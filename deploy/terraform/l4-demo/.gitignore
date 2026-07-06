@@ -1,0 +1,7 @@
+# Terraform state + local settings + secrets: never commit.
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.*
+*.tfvars
+crash.log
