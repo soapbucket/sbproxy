@@ -47,6 +47,8 @@ pub mod builtin_enforcers;
 pub mod cluster_metrics;
 pub mod context;
 pub mod dispatch;
+/// Host capability diagnostics behind `sbproxy doctor`.
+pub mod doctor;
 pub mod hook_registry;
 pub mod hooks;
 pub mod identity;
