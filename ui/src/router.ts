@@ -61,6 +61,18 @@ const routes = [
     component: () => import("./views/ModelHostView.vue"),
     meta: { title: "Model host" },
   },
+  {
+    path: "/audit",
+    name: "audit",
+    component: () => import("./views/AuditView.vue"),
+    meta: { title: "Audit" },
+  },
+  {
+    path: "/cluster",
+    name: "cluster",
+    component: () => import("./views/ClusterView.vue"),
+    meta: { title: "Cluster" },
+  },
   { path: "/:pathMatch(.*)*", redirect: "/" },
 ];
 
