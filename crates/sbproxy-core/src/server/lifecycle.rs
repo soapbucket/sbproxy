@@ -1279,9 +1279,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
 
         // WOR-1740: replace the seeded NotConfigured health stubs with real
         // probes for the subsystems that expose a health signal. Registering
-        // under the same name overrides the stub. The remaining stubs
-        // (facilitator_quorum, stripe) have no OSS-side signal to read and
-        // stay NotConfigured.
+        // under the same name overrides the stub.
         //
         // agent_registry (WOR-1743): the agent-class resolver's load state.
         #[cfg(feature = "agent-class")]
@@ -1350,6 +1348,35 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                     sbproxy_ai::usage_ledger::LedgerHealth::Failed => (
                         sbproxy_observe::ComponentStatus::Unhealthy,
                         Some("last ledger append failed".to_string()),
+                    ),
+                },
+            )));
+
+        // mesh_quorum (WOR-1744): cluster peer quorum from the mesh
+        // IsolationObserver. NotConfigured when the mesh is not enabled;
+        // Unhealthy when the node is isolated (below its minimum peer
+        // quorum), else Healthy with the live peer count.
+        admin_state_inner
+            .health_registry
+            .register(std::sync::Arc::new(sbproxy_observe::SyntheticProbe::new(
+                "mesh_quorum",
+                || match crate::key_plane::current_mesh_node().and_then(|n| n.isolation_observer())
+                {
+                    None => (
+                        sbproxy_observe::ComponentStatus::NotConfigured,
+                        Some("mesh not enabled".to_string()),
+                    ),
+                    Some(obs) if obs.is_isolated() => (
+                        sbproxy_observe::ComponentStatus::Unhealthy,
+                        Some(format!(
+                            "isolated: {} of {} min peers alive",
+                            obs.last_alive_count(),
+                            obs.min_peers()
+                        )),
+                    ),
+                    Some(obs) => (
+                        sbproxy_observe::ComponentStatus::Healthy,
+                        Some(format!("{} peers alive", obs.last_alive_count())),
                     ),
                 },
             )));

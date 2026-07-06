@@ -3707,12 +3707,11 @@ origins:
         .with_health_registry(registry);
         let (status, _, body) = handle_admin_request("GET", "/readyz", &state, None, None);
         assert_eq!(status, 200, "fresh recencies + stubs => ready: {}", body);
-        // All five Wave 1 components show up.
+        // The seeded components show up.
         assert!(body.contains("ledger"));
         assert!(body.contains("bot_auth_directory"));
         assert!(body.contains("agent_registry"));
-        assert!(body.contains("stripe"));
-        assert!(body.contains("facilitator_quorum"));
+        assert!(body.contains("mesh_quorum"));
     }
 
     #[test]
