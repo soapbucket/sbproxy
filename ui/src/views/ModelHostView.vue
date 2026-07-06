@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted } from "vue";
-import { api, type ModelHostStatus, type ResidentModel } from "../api";
+import { computed, onMounted, ref } from "vue";
+import { api, ApiError, type ModelHostStatus, type ResidentModel } from "../api";
 import { useAsync } from "../composables/useAsync";
 import { parsePrometheus, findFamily, histogramAvgByLabel } from "../lib/metrics";
 import { formatBytes } from "../lib/format";
@@ -17,6 +17,31 @@ function refresh() {
   metricsReq.run();
 }
 onMounted(refresh);
+
+// ---- load / evict (WOR-1765) ----
+const loadName = ref("");
+const busy = ref("");
+const banner = ref<{ tone: "ok" | "err"; text: string } | null>(null);
+
+async function act(label: string, fn: () => Promise<unknown>, ok: string) {
+  if (busy.value) return;
+  busy.value = label;
+  banner.value = null;
+  try {
+    await fn();
+    banner.value = { tone: "ok", text: ok };
+    refresh();
+  } catch (e) {
+    const msg = e instanceof ApiError ? e.hint : e instanceof Error ? e.message : "Failed.";
+    banner.value = { tone: "err", text: msg };
+  } finally {
+    busy.value = "";
+  }
+}
+const loadModel = () =>
+  act("load", () => api.modelHostLoad(loadName.value.trim()), `Loading "${loadName.value.trim()}".`);
+const evictModel = (name: string) =>
+  act(`evict:${name}`, () => api.modelHostEvict(name), `Evicted "${name}".`);
 
 const status = computed<ModelHostStatus | null>(() => req.data.value);
 const serving = computed(() => !!status.value?.serving);
@@ -77,12 +102,36 @@ function stateTone(s: ResidentModel["state"]): "ok" | "warn" | "err" | "neutral"
       <StatCard label="VRAM free" :value="formatBytes(vram?.free_bytes)" />
     </div>
 
+    <p v-if="banner" class="banner" :class="`banner--${banner.tone}`">{{ banner.text }}</p>
+
+    <div class="sb-card panel">
+      <h3>Load a model</h3>
+      <div class="action">
+        <input
+          v-model="loadName"
+          class="sb-input"
+          placeholder="catalog id or hf:Org/Repo:QUANT"
+          @keydown.enter="loadModel"
+        />
+        <button class="sb-btn" :disabled="!loadName.trim() || busy === 'load'" @click="loadModel">
+          {{ busy === "load" ? "Loading..." : "Load" }}
+        </button>
+      </div>
+      <p class="sb-faint">
+        Spawns the engine and makes the model resident. keep_alive is set in
+        config; evicting frees its VRAM immediately.
+      </p>
+    </div>
+
     <div class="sb-card panel" v-if="models.length">
       <h3>Resident models</h3>
       <div class="table-wrap">
         <table class="sb-table">
           <thead>
-            <tr><th>Model</th><th>State</th><th>VRAM</th><th>Keep-alive</th><th>Throughput</th></tr>
+            <tr>
+              <th>Model</th><th>State</th><th>VRAM</th><th>Keep-alive</th>
+              <th>Throughput</th><th></th>
+            </tr>
           </thead>
           <tbody>
             <tr v-for="(m, i) in models" :key="i">
@@ -91,6 +140,16 @@ function stateTone(s: ResidentModel["state"]): "ok" | "warn" | "err" | "neutral"
               <td>{{ formatBytes(m.vram_bytes) }}</td>
               <td>{{ m.keep_alive_secs != null ? `${m.keep_alive_secs}s` : "-" }}</td>
               <td>{{ tpsFor(m.name) }}</td>
+              <td>
+                <button
+                  v-if="m.name"
+                  class="sb-btn sb-btn--sm"
+                  :disabled="busy === `evict:${m.name}`"
+                  @click="evictModel(m.name)"
+                >
+                  {{ busy === `evict:${m.name}` ? "Evicting..." : "Evict" }}
+                </button>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -133,5 +192,29 @@ function stateTone(s: ResidentModel["state"]): "ok" | "warn" | "err" | "neutral"
 }
 .table-wrap {
   overflow-x: auto;
+}
+.action {
+  display: flex;
+  align-items: center;
+  gap: var(--sb-space-3);
+  margin-bottom: var(--sb-space-3);
+  flex-wrap: wrap;
+}
+.action .sb-input {
+  max-width: 360px;
+}
+.banner {
+  padding: var(--sb-space-3) var(--sb-space-4);
+  border-radius: var(--sb-radius-sm);
+  margin-bottom: var(--sb-space-4);
+  font-size: 0.9rem;
+}
+.banner--ok {
+  background: var(--sb-accent-tint);
+  color: var(--sb-accent);
+}
+.banner--err {
+  background: #fdecea;
+  color: #c0392b;
 }
 </style>
