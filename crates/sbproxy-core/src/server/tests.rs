@@ -3329,3 +3329,33 @@ async fn jwt_with_require_mtls_bound_denies_when_cnf_absent() {
         other => panic!("expected 401 deny for a no-cnf token, got {other:?}"),
     }
 }
+
+// --- WOR-1702: shared Lua engine is cached and still isolates state ---
+
+#[test]
+fn shared_lua_engine_is_cached_and_isolates_request_state() {
+    // The engine is shared across requests (a cache hit returns the same
+    // Arc) rather than rebuilt on every modifier invocation.
+    let a = shared_lua_engine().expect("lua engine builds");
+    let b = shared_lua_engine().expect("lua engine builds");
+    assert!(
+        std::sync::Arc::ptr_eq(&a, &b),
+        "shared_lua_engine should reuse one instance, not rebuild per call"
+    );
+
+    // Sharing must not weaken isolation: each invocation runs in a fresh
+    // Lua state, so a global set by one script is invisible to the next.
+    a.execute(
+        "__wor1702_leak = 42\nreturn 1",
+        std::collections::HashMap::new(),
+    )
+    .expect("first script runs");
+    let second = a
+        .execute("return __wor1702_leak", std::collections::HashMap::new())
+        .expect("second script runs");
+    assert_ne!(
+        second,
+        serde_json::json!(42),
+        "a global from one invocation must not leak into the next; got {second:?}"
+    );
+}

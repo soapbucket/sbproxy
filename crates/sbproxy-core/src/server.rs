@@ -2995,6 +2995,40 @@ async fn check_policies(
 
 // --- Lua modifier helpers ---
 
+/// Return a process-wide shared [`sbproxy_extension::lua::LuaEngine`],
+/// rebuilding it only when the active Lua sandbox configuration changes
+/// (WOR-1702).
+///
+/// A `LuaEngine` holds no per-request state: every `execute` /
+/// `call_function` builds its own fresh sandboxed `mlua::Lua`, so one
+/// instance is safe to reuse across requests and workers. Sharing it
+/// removes the per-request engine construction (and, on the Go-format
+/// fallback path, the second construction per request). The engine
+/// snapshots the sandbox limits when it is built, so it is keyed by the
+/// `active_sandbox_config()` Arc: a hot reload of
+/// `proxy.scripting.lua.sandbox` swaps that Arc and this rebuilds the
+/// engine; otherwise the steady state is a cheap Arc clone. Building
+/// lazily (never at pipeline-compile time) means the engine always sees
+/// the operator's installed limits, not the boot-time defaults.
+fn shared_lua_engine() -> anyhow::Result<std::sync::Arc<sbproxy_extension::lua::LuaEngine>> {
+    use sbproxy_extension::lua::{active_sandbox_config, LuaEngine, SandboxConfig};
+    #[allow(clippy::type_complexity)]
+    static CACHE: std::sync::LazyLock<
+        parking_lot::Mutex<Option<(std::sync::Arc<SandboxConfig>, std::sync::Arc<LuaEngine>)>>,
+    > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(None));
+
+    let active = active_sandbox_config();
+    let mut cache = CACHE.lock();
+    if let Some((cfg, engine)) = cache.as_ref() {
+        if std::sync::Arc::ptr_eq(cfg, &active) {
+            return Ok(engine.clone());
+        }
+    }
+    let engine = std::sync::Arc::new(LuaEngine::with_config((*active).clone())?);
+    *cache = Some((active, engine.clone()));
+    Ok(engine)
+}
+
 /// Execute a Lua request modifier script.
 ///
 /// The script must define `modify_request(req, ctx)` which receives the request
@@ -3008,9 +3042,7 @@ fn lua_request_modifier(
     req_header: &RequestHeader,
     hostname: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    use sbproxy_extension::lua::LuaEngine;
-
-    let engine = LuaEngine::new()?;
+    let engine = shared_lua_engine()?;
 
     // Build request table for the Lua script
     let mut headers_map = std::collections::HashMap::new();
@@ -3086,7 +3118,7 @@ return __headers
 "#,
                 script = script,
             );
-            let go_engine = LuaEngine::new()?;
+            let go_engine = shared_lua_engine()?;
             let mut globals = std::collections::HashMap::new();
             globals.insert("__req_data".to_string(), req_table);
             globals.insert("__ctx_data".to_string(), ctx_table);
@@ -3116,9 +3148,7 @@ fn lua_response_modifier(
     response_headers: &serde_json::Map<String, serde_json::Value>,
     ctx: &RequestContext,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    use sbproxy_extension::lua::LuaEngine;
-
-    let engine = LuaEngine::new()?;
+    let engine = shared_lua_engine()?;
 
     let resp_table = serde_json::json!({
         "status_code": status,
@@ -3164,7 +3194,7 @@ return __headers
 "#,
                 script = script,
             );
-            let go_engine = LuaEngine::new()?;
+            let go_engine = shared_lua_engine()?;
             let mut globals = std::collections::HashMap::new();
             globals.insert("__resp_data".to_string(), resp_table);
             globals.insert("__ctx_data".to_string(), ctx_table);
