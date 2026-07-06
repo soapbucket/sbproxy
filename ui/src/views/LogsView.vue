@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from "vue";
 import { api, asList, type RequestLog } from "../api";
 import { useAsync } from "../composables/useAsync";
-import { formatTime, toDate } from "../lib/format";
+import { formatMs, formatTime, toDate } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
@@ -124,7 +124,7 @@ function clearFilters() {
           <td class="sb-mono">{{ r.method ?? "" }}</td>
           <td class="sb-mono path">{{ pathOf(r) || "n/a" }}</td>
           <td><StatusBadge :label="String(statusOf(r) ?? '?')" :tone="statusTone(statusOf(r))" /></td>
-          <td class="nowrap">{{ durationOf(r) !== undefined ? `${durationOf(r)} ms` : "n/a" }}</td>
+          <td class="nowrap">{{ formatMs(durationOf(r)) }}</td>
           <td class="sb-mono sb-muted">{{ r.upstream ?? r.target ?? "" }}</td>
         </tr>
       </tbody>

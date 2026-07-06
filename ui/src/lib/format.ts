@@ -30,6 +30,15 @@ export function formatDuration(seconds: number | undefined | null): string {
   return parts.join(" ") || "0s";
 }
 
+/** Format a millisecond latency at a sensible precision (us below 1ms). */
+export function formatMs(ms: number | undefined | null): string {
+  if (ms === undefined || ms === null || !isFinite(ms)) return "n/a";
+  if (ms < 1) return `${(ms * 1000).toFixed(0)} µs`;
+  if (ms < 10) return `${ms.toFixed(2)} ms`;
+  if (ms < 100) return `${ms.toFixed(1)} ms`;
+  return `${ms.toFixed(0)} ms`;
+}
+
 export function formatNumber(n: number | undefined | null): string {
   if (n === undefined || n === null || !isFinite(n)) return "n/a";
   return n.toLocaleString(undefined, { maximumFractionDigits: 2 });

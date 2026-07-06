@@ -188,6 +188,15 @@ export interface Credential {
 }
 
 export interface DriftResponse {
+  // Real server shape (GET /admin/drift).
+  drift?: boolean;
+  config_path?: string;
+  loaded_revision?: string;
+  loaded_content_hash?: string;
+  on_disk_content_hash?: string;
+  on_disk_size_bytes?: number;
+  checked_at?: string;
+  // Tolerated legacy / alternative shapes.
   in_sync?: boolean;
   drifted?: boolean;
   diff?: string;

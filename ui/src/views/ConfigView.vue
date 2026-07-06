@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from "vue";
 import { api, asList, ApiError, type TargetHealth } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { formatMs } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
@@ -54,8 +55,10 @@ const rawSpec = computed(() => JSON.stringify(openapi.data.value ?? {}, null, 2)
 
 // ---- drift ----
 const driftInSync = computed<boolean | null>(() => {
-  const d = drift.data.value;
+  const d = drift.data.value as any;
   if (!d) return null;
+  // Real server shape (GET /admin/drift): a `drift` boolean, true = drifted.
+  if (typeof d.drift === "boolean") return !d.drift;
   if (typeof d.in_sync === "boolean") return d.in_sync;
   if (typeof d.drifted === "boolean") return !d.drifted;
   // Empty diff / no changes implies in sync.
@@ -67,6 +70,21 @@ const driftInSync = computed<boolean | null>(() => {
 const driftDetail = computed(() => {
   const d = drift.data.value as any;
   if (!d) return "";
+  // Real server shape: loaded vs on-disk content hashes plus context.
+  if (d.loaded_content_hash !== undefined || d.on_disk_content_hash !== undefined) {
+    return JSON.stringify(
+      {
+        config_path: d.config_path,
+        loaded_revision: d.loaded_revision,
+        loaded_content_hash: d.loaded_content_hash,
+        on_disk_content_hash: d.on_disk_content_hash,
+        on_disk_size_bytes: d.on_disk_size_bytes,
+        checked_at: d.checked_at,
+      },
+      null,
+      2,
+    );
+  }
   if (typeof d.diff === "string" && d.diff.trim()) return d.diff;
   if (Array.isArray(d.changes) && d.changes.length) {
     return d.changes.map((c: unknown) => JSON.stringify(c)).join("\n");
@@ -226,7 +244,7 @@ async function reload() {
               />
               <span class="sb-faint" v-else>n/a</span>
             </td>
-            <td>{{ t.latency_ms !== undefined ? `${t.latency_ms} ms` : "n/a" }}</td>
+            <td>{{ formatMs(t.latency_ms) }}</td>
           </tr>
         </tbody>
       </table>
