@@ -9,11 +9,13 @@ description = "Local model-serving subsystem for sbproxy: model catalog, GPU fit
 [features]
 default = []
 # Real NVIDIA GPU discovery via NVML (runtime dlopen, no CUDA toolkit at
-# build time). Off by default so the lean binary needs no GPU libraries;
-# enabled on a GPU host for the certification track.
+# build time). Off by default at the crate level so library builds stay
+# lean; the `sbproxy` binary enables it by default, which is safe
+# everywhere because NVML is dlopen'd at runtime and a host without the
+# driver just probes zero GPUs.
 gpu-nvidia = ["dep:nvml-wrapper"]
-# Hugging Face weight download. Off by default; enabled on the host that
-# actually pulls and serves weights.
+# Hugging Face weight download. Off by default at the crate level;
+# enabled by default in the `sbproxy` binary.
 weights = ["dep:reqwest"]
 # Accurate token counting (against a model's own tokenizer.json) and
 # chat-template rendering. Off by default; both crates are already in

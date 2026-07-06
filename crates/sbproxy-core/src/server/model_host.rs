@@ -81,8 +81,10 @@ impl sbproxy_model_host::ModelHostObserver for MetricsObserver {
     }
 }
 
-/// The GPU probe for the runtime, selected at compile time.
-fn make_probe() -> Arc<dyn GpuProbe> {
+/// The GPU probe for the runtime, selected at compile time. Also used
+/// by [`crate::doctor`] so the diagnostics report the same devices the
+/// admission path will see.
+pub(crate) fn make_probe() -> Arc<dyn GpuProbe> {
     #[cfg(feature = "gpu-nvidia")]
     {
         Arc::new(sbproxy_model_host::NvmlGpuProbe::new())

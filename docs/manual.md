@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-06-08*
+*Last modified: 2026-07-06*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -110,6 +110,7 @@ sbproxy plan -f <yaml> [--against <yaml>] [--format json|text] [--out <plan-file
 sbproxy apply -f <yaml>
 sbproxy apply -p <plan-file>
 sbproxy projections render --kind <kind> --config <path> [--hostname <h>]
+sbproxy doctor [--format text|json]
 sbproxy completions {bash|zsh|fish|powershell|elvish}
 sbproxy --version
 sbproxy --help
@@ -240,6 +241,29 @@ sbproxy projections render --kind llms-full --config sb.yml --hostname api.examp
 When `--hostname` is omitted, the first origin in the config is
 chosen. Accepted `--kind` values: `robots`, `llms`, `llms-full`,
 `licenses`, `tdmrep`.
+
+### `doctor` - what can this binary do on this host
+
+Prints a host-capability report: the capability features the binary
+was compiled with, the GPUs the local model host would see (same probe
+as the `serve:` admission path, so the two can never disagree), which
+inference engine binaries (`vllm`, `llama-server`) resolve on `PATH`,
+the default model-weight cache directory, and a final verdict on
+whether a `serve:` provider could admit a model on this host, with
+every blocker listed when it could not.
+
+```bash
+sbproxy doctor
+sbproxy doctor --format json
+```
+
+Collection is read-only: no engine starts, nothing is written. The
+released binary ships with GPU discovery compiled in and loads the
+NVIDIA driver library at runtime (falling back to `nvidia-smi`), so
+the same artifact reports "ready" on a GPU host and lists what is
+missing everywhere else. Always exits 0 once the report is produced;
+"this host cannot serve local models" is a finding, not an error. See
+[model-host.md](model-host.md) for the `serve:` block itself.
 
 ### `completions` - shell tab-completion scripts
 

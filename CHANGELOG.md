@@ -11,6 +11,26 @@ Work that has merged to `main` since the latest tag and is queued for
 the next version cut. No promises about backward compatibility for any
 of the new YAML fields below until the version that ships them.
 
+### Added
+
+- **The released binary is GPU-aware out of the box.** The `gpu-nvidia`
+  (NVML GPU discovery with an `nvidia-smi` fallback) and `model-weights`
+  (Hugging Face weight download) features moved into the `sbproxy`
+  binary's default feature set, so one downloaded artifact adapts to its
+  host: the NVIDIA driver library is loaded at runtime when present,
+  never linked, and a GPU-free host still runs the same binary (a
+  `serve:` provider rejects admission cleanly there). Building with
+  `--features gpu-nvidia,model-weights` is no longer needed for local
+  model serving. Library consumers of the workspace crates still opt in
+  per crate.
+- **`sbproxy doctor`.** New subcommand that reports what the binary can
+  do on the current host: compiled capability features, the GPUs the
+  `serve:` admission path sees (same probe, so they cannot disagree),
+  which inference engines (`vllm`, `llama-server`) resolve on `PATH`,
+  the model-weight cache directory, and a readiness verdict for local
+  model serving with every blocker listed. `--format json` emits a
+  stable machine-readable report; collection is read-only.
+
 ### Fixed
 
 - **Revoking a key now blocks OIDC/JWT identities mapped to it.** With

@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-07-04*
+*Last modified: 2026-07-06*
 
 The model host lets the gateway run the model itself, not just proxy to
 a model server someone else started. You name a model in a provider's
@@ -28,10 +28,19 @@ against a fake process; what it cannot prove without hardware is that a
 real engine boots and serves tokens. On a host with no GPU or no engine
 binary, a `serve:` block parses and validates but starts no engine.
 
-The real GPU bindings exist too, behind off-by-default cargo features:
-`gpu-nvidia` (an NVML `GpuProbe` with an `nvidia-smi` fallback) and
-`weights` (Hugging Face weight download). They compile in CI but are
-exercised on a GPU host; see
+The real GPU bindings ship in the released binary: `gpu-nvidia` (an
+NVML `GpuProbe` with an `nvidia-smi` fallback) and `model-weights`
+(Hugging Face weight download) are default features of the `sbproxy`
+binary, so the artifact you download adapts to its host at runtime. The
+NVIDIA driver library is loaded with `dlopen` when present, never
+linked, so the same binary runs on a GPU-free host (the probe reports
+zero GPUs and `serve:` admission rejects cleanly) and discovers real
+devices on a GPU host with no rebuild. Run `sbproxy doctor` to see what
+the current host supports: compiled features, visible GPUs, engines on
+`PATH`, and the `serve:` readiness verdict (see
+[manual.md](manual.md)). Library consumers of the workspace crates
+still opt into these features per crate. The bindings are exercised on
+a GPU host; see
 [model-host-certification.md](model-host-certification.md) for the
 provisioning and Definition-of-Done run on a cloud L4.
 

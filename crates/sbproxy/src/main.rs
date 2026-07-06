@@ -153,6 +153,10 @@ enum Cmd {
     Projections(ProjectionsCmd),
     /// AI gateway tools (usage ledger verification, ...).
     Ai(AiCmd),
+    /// Diagnose what this binary can do on the current host: compiled
+    /// capability features, visible GPUs, inference engines on PATH,
+    /// and whether a `serve:` provider could admit a model here.
+    Doctor(DoctorArgs),
     /// Print a shell-completion script to stdout for the requested
     /// shell. Pipe into the shell's completion sink.
     Completions {
@@ -311,6 +315,14 @@ struct RenderArgs {
     hostname: Option<String>,
 }
 
+#[derive(clap::Args, Debug)]
+struct DoctorArgs {
+    /// Output format. `text` (default) prints the human report; `json`
+    /// emits a single structured object for tooling.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
 enum OutputFormat {
     Text,
@@ -463,6 +475,9 @@ fn main() {
         }
         Some(Cmd::Ai(cmd)) => {
             run_subcommand("ai", 2, handle_ai_subcommand(&cmd));
+        }
+        Some(Cmd::Doctor(args)) => {
+            run_subcommand("doctor", 2, handle_doctor_subcommand(&args));
         }
         Some(Cmd::Completions { shell }) => {
             print_completions(shell);
@@ -689,6 +704,20 @@ fn handle_validate_subcommand(args: &ValidateArgs) -> anyhow::Result<i32> {
             Ok(2)
         }
     }
+}
+
+// --- `doctor` handler ---
+
+/// Print the host-capability diagnostics report. Exits 0 once the
+/// report is produced: "this host cannot serve local models" is a
+/// finding, not an error.
+fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
+    let report = sbproxy_core::doctor::DoctorReport::collect();
+    match args.format {
+        OutputFormat::Text => print!("{}", report.render_text()),
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+    }
+    Ok(0)
 }
 
 // --- `projections` handler ---

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Run the model-host Definition-of-Done certification on a GPU host
 # (WOR-1652). Run this ON the provisioned L4 box, after vLLM is
-# installed and sbproxy is built with the GPU features:
+# installed and sbproxy is built (the GPU features are in the binary's
+# default feature set; `sbproxy doctor` on the box confirms the probe
+# sees the card):
 #
-#   cargo build --release -p sbproxy \
-#     --features sbproxy-model-host/gpu-nvidia,sbproxy-model-host/weights
+#   cargo build --release -p sbproxy
 #
 # It drives the DoD checklist against a running sbproxy that has a
 # `serve:` block, and prints PASS/FAIL per item. It does not provision
