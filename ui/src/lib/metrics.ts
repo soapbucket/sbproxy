@@ -58,10 +58,11 @@ export function parsePrometheus(text: string): MetricFamily[] {
     const labels = parseLabels(m[3]);
     const value = Number(m[4].split(/\s+/)[0]);
     if (Number.isNaN(value)) continue;
-    // Fold histogram/summary/counter suffixes back to the base family
-    // name so a family groups its own samples.
+    // Fold histogram/summary component suffixes (_bucket/_sum/_count)
+    // back to the base family so a family groups its own samples. A
+    // `_total` counter keeps its own name (the `_total` IS the metric).
     const base = name.replace(/_(bucket|sum|count|total)$/, (s) =>
-      s === "_total" ? "_total" : s,
+      s === "_total" ? "_total" : "",
     );
     const f = family(base === name ? name : base);
     f.samples.push({ name, labels, value });
